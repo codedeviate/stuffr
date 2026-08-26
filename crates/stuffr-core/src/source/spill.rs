@@ -110,7 +110,9 @@ impl SpillSource {
 
         // Phase 2: escalate to a temp file, carrying the memory buffer over.
         let SpillPolicy::Temp { dir, .. } = policy else {
-            // Memory-only policy exceeded its cap.
+            // Defensive, unreachable while `mem_cap == hard_limit()` holds for
+            // `Memory`: the `total > limit` check above always fires first, so
+            // the Phase-1 loop never breaks into this arm for that policy.
             return Err(Error::SpillLimitExceeded { limit });
         };
 
