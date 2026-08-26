@@ -82,13 +82,21 @@ pub struct BudgetInputs {
 
 /// Resolves the worker count. Never returns zero.
 pub fn resolve_workers(i: &BudgetInputs) -> usize {
+    // The first source that expresses an opinion wins, and `Some(0)` IS an
+    // opinion: it means "use the auto budget". A lower-precedence source must
+    // not override it — otherwise a stale STF_THREADS silently beats an
+    // explicit `--threads 0`, which is precedence backwards.
     let explicit = [i.cli, i.env, i.project_config, i.user_config]
         .into_iter()
         .flatten()
-        .find(|n| *n != 0);
+        .next();
 
     if let Some(n) = explicit {
-        return n.max(1);
+        if n != 0 {
+            return n;
+        }
+        // Explicit auto: fall through, but do not consult lower-precedence
+        // sources.
     }
 
     let detected = i.detected.max(1);
@@ -252,5 +260,60 @@ mod tests {
     #[test]
     fn detection_never_returns_zero_on_this_machine() {
         assert!(detect_cpu_budget() >= 1);
+    }
+
+    #[test]
+    fn an_explicit_zero_means_auto_and_is_not_overridden_by_lower_precedence() {
+        // `--threads 0` says "use auto". A stale STF_THREADS or a leftover
+        // config value must not silently win — that is precedence backwards,
+        // and it would take more of a shared machine than the operator asked.
+        let i = BudgetInputs {
+            cli: Some(0),
+            env: Some(5),
+            project_config: Some(6),
+            user_config: Some(7),
+            detected: 8,
+            turbo: false,
+        };
+        assert_eq!(
+            resolve_workers(&i),
+            4,
+            "expected the auto budget, not the env var"
+        );
+    }
+
+    #[test]
+    fn an_explicit_zero_still_honours_turbo() {
+        // "auto" plus --turbo is the full detected budget, uncapped.
+        let i = BudgetInputs {
+            cli: Some(0),
+            detected: 32,
+            turbo: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_workers(&i), 32);
+    }
+
+    #[test]
+    fn a_zero_from_a_middle_source_stops_the_search_too() {
+        // The rule is uniform across sources, not special-cased to the CLI.
+        let i = BudgetInputs {
+            env: Some(0),
+            project_config: Some(6),
+            detected: 8,
+            ..Default::default()
+        };
+        assert_eq!(resolve_workers(&i), 4);
+    }
+
+    #[test]
+    fn turbo_never_resolves_to_zero_workers() {
+        // Zero workers would deadlock Task 9's lease pool.
+        let i = BudgetInputs {
+            detected: 0,
+            turbo: true,
+            ..Default::default()
+        };
+        assert_eq!(resolve_workers(&i), 1);
     }
 }
