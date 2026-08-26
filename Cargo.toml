@@ -1,0 +1,16 @@
+[workspace]
+members = ["crates/stuffr-core", "crates/stuffr-formats", "crates/stuffr", "crates/stuffr-cli"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/codedeviate/stf"
+
+[workspace.dependencies]
+stuffr-core = { path = "crates/stuffr-core", version = "0.0.0" }
+stuffr-formats = { path = "crates/stuffr-formats", version = "0.0.0" }
+thiserror = "2"
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,14 @@
+[package]
+name = "stuffr-formats"
+version = "0.0.0"
+description = "Codec and container implementations for the stf toolkit"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[dependencies]
+stuffr-core = { workspace = true }

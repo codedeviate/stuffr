@@ -1,0 +1,19 @@
+[package]
+name = "stuffr"
+version = "0.0.0"
+description = "Universal compression and archive toolkit (library for the stf command)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["pure"]
+pure = []
+c-backed = []
+legacy = []
+full = ["pure", "c-backed", "legacy"]
+
+[dependencies]
+stuffr-core = { workspace = true }
+stuffr-formats = { workspace = true }
