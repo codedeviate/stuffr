@@ -289,4 +289,30 @@ mod tests {
         s.read_to_end(&mut out).unwrap();
         assert!(out.is_empty());
     }
+
+    #[test]
+    fn escalation_preserves_order_across_many_sub_cap_chunks() {
+        // A Cursor hands over the whole input in one read, so the multi-chunk
+        // accumulate-then-escalate path never runs. Force 100-byte reads so the
+        // memory buffer genuinely grows across several iterations before the
+        // temp file takes over.
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let src: Box<dyn Source> = Box::new(crate::source::ReaderSource::new(
+            crate::testing::ChunkedReader::new(data.clone(), 100),
+        ));
+        let mut s = SpillSource::materialize(
+            src,
+            &SpillPolicy::Temp {
+                dir: None,
+                mem_cap: 1000,
+                max: 1 << 20,
+            },
+        )
+        .unwrap();
+
+        assert!(s.spilled_to_disk());
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data, "bytes must survive escalation in order");
+    }
 }
