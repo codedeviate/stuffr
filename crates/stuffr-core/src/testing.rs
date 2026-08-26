@@ -459,4 +459,96 @@ mod tests {
         let _c: &dyn Codec = &MockCodec;
         let _k: &dyn Container = &MockContainer;
     }
+
+    #[test]
+    fn by_index_reaches_entries_out_of_order_and_agrees_with_sequential_reads() {
+        // by_index trusts offsets recorded by the writer. Reading out of order
+        // is what distinguishes real random access from an accidental
+        // sequential walk, and cross-checking against next_entry proves the
+        // two paths agree rather than merely that each returns something.
+        let bytes =
+            mock_archive_bytes(&[("a.txt", b"alpha"), ("b.bin", b"bravo!!"), ("c.log", b"")]);
+
+        let seekable = || -> Box<dyn Source> {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            std::io::Write::write_all(&mut f, &bytes).unwrap();
+            let (_, path) = f.keep().unwrap();
+            Box::new(crate::source::FileSource::open(&path).unwrap())
+        };
+
+        // Sequential pass, for cross-checking.
+        let mut ar = MockContainer
+            .open(seekable(), &OpenOpts::default())
+            .unwrap();
+        let mut sequential = Vec::new();
+        while let Some(mut e) = ar.next_entry().unwrap() {
+            let name = e.meta().name.clone();
+            let mut data = Vec::new();
+            e.reader().read_to_end(&mut data).unwrap();
+            sequential.push((name, data));
+        }
+
+        // Random access, deliberately out of order.
+        let mut ar = MockContainer
+            .open(seekable(), &OpenOpts::default())
+            .unwrap();
+        for i in [2usize, 0, 1] {
+            let mut e = ar.by_index(i).unwrap();
+            let name = e.meta().name.clone();
+            let mut data = Vec::new();
+            e.reader().read_to_end(&mut data).unwrap();
+            assert_eq!(
+                (name, data),
+                sequential[i].clone(),
+                "by_index({i}) disagreed with the sequential read"
+            );
+        }
+
+        // Past the end is a miss, not a panic or a wrong entry.
+        let mut ar = MockContainer
+            .open(seekable(), &OpenOpts::default())
+            .unwrap();
+        assert!(matches!(
+            ar.by_index(99),
+            Err(crate::Error::EntryNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn open_reports_lossless_fidelity_on_a_seekable_source() {
+        let bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, &bytes).unwrap();
+        let src: Box<dyn Source> = Box::new(crate::source::FileSource::open(f.path()).unwrap());
+
+        let ar = MockContainer.open(src, &OpenOpts::default()).unwrap();
+        let report = ar.fidelity();
+        assert_eq!(report.rung, crate::Rung::Exact);
+        assert!(
+            report.is_lossless(),
+            "a seekable source must yield an authoritative, warning-free report"
+        );
+    }
+
+    #[test]
+    fn open_reports_index_and_count_loss_on_a_non_seekable_source() {
+        let bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+
+        let ar = MockContainer.open(src, &OpenOpts::default()).unwrap();
+        let report = ar.fidelity();
+        assert_eq!(report.rung, crate::Rung::ForwardOnly);
+        assert!(
+            report
+                .warnings
+                .contains(&crate::Fidelity::TrailingIndexUnread {
+                    format: MOCK_CONTAINER
+                })
+        );
+        assert!(
+            report
+                .warnings
+                .contains(&crate::Fidelity::EntryCountUnknown)
+        );
+    }
 }
