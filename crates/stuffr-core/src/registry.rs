@@ -37,6 +37,9 @@ impl Registry {
     }
 
     fn index(&mut self, meta: FormatMeta) {
+        // Symmetric with the `magics` purge below: re-registering a format with
+        // a different extension list must not leave stale mappings behind.
+        self.by_ext.retain(|_, v| *v != meta.id);
         for ext in meta.extensions {
             self.by_ext.insert(ext.to_ascii_lowercase(), meta.id);
         }
