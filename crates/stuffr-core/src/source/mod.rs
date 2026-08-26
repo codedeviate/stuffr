@@ -3,9 +3,11 @@
 
 mod file;
 mod reader;
+pub mod spill;
 
 pub use file::FileSource;
 pub use reader::{PeekSource, ReaderSource};
+pub use spill::{SpillPolicy, SpillSource};
 
 use std::io::{Read, Seek};
 

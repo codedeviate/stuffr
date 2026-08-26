@@ -12,6 +12,8 @@ pub mod source;
 pub use error::{Error, Result};
 pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
 pub use format::{CodecCaps, ContainerCaps, FormatId, FormatKind, FormatMeta, MagicRule};
-pub use source::{FileSource, PeekSource, ReaderSource, Source, SourceCaps};
+pub use source::{
+    FileSource, PeekSource, ReaderSource, Source, SourceCaps, SpillPolicy, SpillSource,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
