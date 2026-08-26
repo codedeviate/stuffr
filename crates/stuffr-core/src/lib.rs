@@ -21,7 +21,7 @@ pub use archive::{
 pub use error::{Error, Result};
 pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
 pub use format::{CodecCaps, ContainerCaps, FormatId, FormatKind, FormatMeta, MagicRule};
-pub use governor::{BudgetInputs, resolve_workers};
+pub use governor::{BudgetInputs, Governor, Lease, default_memory_limit, resolve_workers};
 pub use ladder::{Resolved, StreamPolicy, resolve};
 pub use source::{
     FileSource, PeekSource, ReaderSource, Source, SourceCaps, SpillPolicy, SpillSource,
