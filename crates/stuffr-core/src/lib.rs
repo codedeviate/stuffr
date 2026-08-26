@@ -7,9 +7,11 @@
 pub mod error;
 pub mod fidelity;
 pub mod format;
+pub mod source;
 
 pub use error::{Error, Result};
 pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
 pub use format::{CodecCaps, ContainerCaps, FormatId, FormatKind, FormatMeta, MagicRule};
+pub use source::{FileSource, PeekSource, ReaderSource, Source, SourceCaps};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
