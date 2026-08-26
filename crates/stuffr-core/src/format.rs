@@ -3,6 +3,7 @@ use std::fmt;
 /// A stable, human-readable format identifier. `&'static str` rather than an
 /// enum so `stuffr-formats` can add formats without editing this crate.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct FormatId(&'static str);
 
 impl FormatId {

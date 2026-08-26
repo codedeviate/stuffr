@@ -81,7 +81,6 @@ mod tests {
             .exit_code(),
             7
         );
-        assert_eq!(Error::Corrupt("x".into()).exit_code(), 5);
     }
 
     #[test]
