@@ -10,6 +10,7 @@ pub mod fidelity;
 pub mod format;
 pub mod governor;
 pub mod ladder;
+pub mod registry;
 pub mod source;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -23,6 +24,7 @@ pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
 pub use format::{CodecCaps, ContainerCaps, FormatId, FormatKind, FormatMeta, MagicRule};
 pub use governor::{BudgetInputs, Governor, Lease, default_memory_limit, resolve_workers};
 pub use ladder::{Resolved, StreamPolicy, resolve};
+pub use registry::{FormatRow, Registry};
 pub use source::{
     FileSource, PeekSource, ReaderSource, Source, SourceCaps, SpillPolicy, SpillSource,
 };
