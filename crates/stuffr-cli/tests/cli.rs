@@ -283,6 +283,143 @@ fn cat_reads_a_stream_on_stdin() {
     let _ = std::fs::remove_file(&gz);
 }
 
+/// The motivating case for the whole flush contract: `stf pack - -o out.gz`
+/// reads a pipe with no path to fall back on, so the output name must be
+/// given explicitly, and the write must still land intact.
+#[test]
+fn pack_reads_input_from_stdin() {
+    let out = tmp("stdin-pack.gz");
+    let _ = std::fs::remove_file(&out);
+    let plain = b"stdin plaintext, packed then verified byte for byte".repeat(200);
+
+    let mut child = Command::new(STF)
+        .args(["pack", "-", "-o", out.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&plain).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(out.exists(), "pack must have written the output file");
+
+    // Round-trip through the binary rather than just checking the file
+    // exists — a truncated or otherwise corrupt stream must fail here.
+    let cat_out = Command::new(STF)
+        .args(["cat", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(cat_out.status.success());
+    assert_eq!(cat_out.stdout, plain, "round trip must be byte-identical");
+
+    let _ = std::fs::remove_file(&out);
+}
+
+/// The other motivating case: `stf pack x -o -` writes to a destination
+/// (stdout) that may be fully buffered and never see a newline — exactly the
+/// scenario `Sink::finish`'s flush contract exists for. A stream that was
+/// never flushed would truncate here.
+#[test]
+fn pack_writes_output_to_stdout() {
+    let src = tmp("stdout-pack.txt");
+    let _ = std::fs::remove_file(&src);
+    let plain = b"payload written straight through to stdout by pack".repeat(200);
+    std::fs::write(&src, &plain).unwrap();
+
+    let pack_out = Command::new(STF)
+        .args(["pack", src.to_str().unwrap(), "-o", "-"])
+        .output()
+        .unwrap();
+    assert!(
+        pack_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&pack_out.stderr)
+    );
+    assert_eq!(
+        &pack_out.stdout[..2],
+        &[0x1f, 0x8b],
+        "must be a real gzip stream"
+    );
+
+    // Pipe the captured bytes back through `stf cat -`: a truncated stream
+    // (an unflushed `Sink::finish`, notably) fails the equality below rather
+    // than merely "existing".
+    let mut child = Command::new(STF)
+        .args(["cat", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&pack_out.stdout)
+        .unwrap();
+    let cat_out = child.wait_with_output().unwrap();
+    assert!(cat_out.status.success());
+    assert_eq!(
+        cat_out.stdout, plain,
+        "round trip through a piped stdout destination must be byte-identical"
+    );
+
+    let _ = std::fs::remove_file(&src);
+}
+
+/// Mirrors `info_over_a_pipe_reports_forward_only_not_exact`: `compress` must
+/// compute its own fidelity rung from the source's actual seekability rather
+/// than assuming `Exact`, the same way `decompress` already does.
+#[test]
+fn pack_over_a_pipe_reports_forward_only_not_exact() {
+    let out = tmp("pack-rung-pipe.gz");
+    let _ = std::fs::remove_file(&out);
+    let plain = b"payload".repeat(50);
+
+    let mut child = Command::new(STF)
+        .args(["pack", "-", "-o", out.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&plain).unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(result.status.success());
+    let err_text = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        err_text.contains("forward-only"),
+        "a pipe cannot seek, so pack's reported rung must not be exact: {err_text}"
+    );
+
+    let _ = std::fs::remove_file(&out);
+}
+
+/// The other half of the pair above: together they prove the rung is
+/// computed rather than a constant either way.
+#[test]
+fn pack_of_a_seekable_file_reports_exact() {
+    let src = tmp("pack-rung-file.txt");
+    let gz = tmp("pack-rung-file.txt.gz");
+    let _ = std::fs::remove_file(&gz);
+    std::fs::write(&src, b"payload").unwrap();
+
+    let out = Command::new(STF)
+        .args(["pack", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let err_text = String::from_utf8_lossy(&out.stderr);
+    assert!(err_text.contains("exact"), "{err_text}");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
+
 #[test]
 fn an_existing_output_is_refused_with_exit_two() {
     let src = tmp("clash.txt");
