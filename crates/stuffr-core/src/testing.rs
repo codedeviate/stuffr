@@ -12,6 +12,7 @@ use crate::archive::{
 use crate::error::{Error, Result};
 use crate::fidelity::{Fidelity, FidelityReport, Rung};
 use crate::format::{CodecCaps, ContainerCaps, FormatId};
+use crate::ladder::Resolved;
 use crate::source::Source;
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
@@ -161,29 +162,29 @@ impl Container for MockContainer {
         }
     }
 
-    fn open(&self, mut src: Box<dyn Source>, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
-        // The mock reads eagerly for simplicity; the ladder is what is under
-        // test here, not incremental parsing.
-        let seekable = src.caps().seekable;
+    fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+        let Resolved {
+            mut source,
+            rung,
+            report,
+        } = resolved;
+        let seekable = source.caps().seekable;
         let mut buf = Vec::new();
-        src.read_to_end(&mut buf)?;
+        source.read_to_end(&mut buf)?;
 
-        let index = if seekable {
+        // Degraded means "salvage what you can": scan forward for record
+        // markers rather than trusting the structure. The mock's salvage is the
+        // same forward walk, but it records that it was asked.
+        let index = if seekable && rung != Rung::Degraded {
             Self::parse_index(&buf)
         } else {
             None
         };
-        let mut report = if seekable {
-            FidelityReport::exact()
-        } else {
-            let mut r = FidelityReport::new(Rung::ForwardOnly);
-            r.warn(Fidelity::TrailingIndexUnread {
-                format: MOCK_CONTAINER,
-            });
-            r.warn(Fidelity::EntryCountUnknown);
-            r
-        };
-        if seekable && index.is_none() {
+
+        // Start from the ladder's report rather than re-deriving it, then add
+        // only what parsing itself discovered.
+        let mut report = report;
+        if seekable && rung == Rung::Exact && index.is_none() {
             report.warn(Fidelity::TruncatedStream {
                 at: buf.len() as u64,
             });
@@ -376,6 +377,20 @@ mod tests {
     use crate::source::ReaderSource;
     use std::io::Read;
 
+    /// Runs `src` through the ladder with `MockContainer`'s own capabilities
+    /// and the default policy, producing the `Resolved` that `open` now
+    /// requires. Most tests here care about `open`'s behaviour, not the
+    /// ladder's, so this keeps that plumbing out of their way.
+    fn resolve_default(src: Box<dyn Source>) -> Resolved {
+        crate::resolve(
+            src,
+            MOCK_CONTAINER,
+            MockContainer.caps(),
+            &Default::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn a_decoder_returns_a_source_so_capabilities_survive_the_layer() {
         // The point of the Source return type: a decoded stream can report what
@@ -421,7 +436,9 @@ mod tests {
     fn mock_archive_reads_back_every_entry_in_order() {
         let bytes = mock_archive_bytes(&[("a.txt", b"alpha"), ("b.bin", b"bravo!!")]);
         let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
-        let mut ar = MockContainer.open(src, &OpenOpts::default()).unwrap();
+        let mut ar = MockContainer
+            .open(resolve_default(src), &OpenOpts::default())
+            .unwrap();
 
         let mut seen = Vec::new();
         while let Some(mut e) = ar.next_entry().unwrap() {
@@ -458,7 +475,9 @@ mod tests {
         }
         let buf = sink.contents();
         let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(buf)));
-        let mut ar = MockContainer.open(src, &OpenOpts::default()).unwrap();
+        let mut ar = MockContainer
+            .open(resolve_default(src), &OpenOpts::default())
+            .unwrap();
         let mut e = ar.next_entry().unwrap().expect("one entry");
         assert_eq!(e.meta().name, "only.txt");
         let mut data = Vec::new();
@@ -492,7 +511,7 @@ mod tests {
 
         // Sequential pass, for cross-checking.
         let mut ar = MockContainer
-            .open(seekable(), &OpenOpts::default())
+            .open(resolve_default(seekable()), &OpenOpts::default())
             .unwrap();
         let mut sequential = Vec::new();
         while let Some(mut e) = ar.next_entry().unwrap() {
@@ -504,7 +523,7 @@ mod tests {
 
         // Random access, deliberately out of order.
         let mut ar = MockContainer
-            .open(seekable(), &OpenOpts::default())
+            .open(resolve_default(seekable()), &OpenOpts::default())
             .unwrap();
         for i in [2usize, 0, 1] {
             let mut e = ar.by_index(i).unwrap();
@@ -520,7 +539,7 @@ mod tests {
 
         // Past the end is a miss, not a panic or a wrong entry.
         let mut ar = MockContainer
-            .open(seekable(), &OpenOpts::default())
+            .open(resolve_default(seekable()), &OpenOpts::default())
             .unwrap();
         assert!(matches!(
             ar.by_index(99),
@@ -535,7 +554,9 @@ mod tests {
         std::io::Write::write_all(&mut f, &bytes).unwrap();
         let src: Box<dyn Source> = Box::new(crate::source::FileSource::open(f.path()).unwrap());
 
-        let ar = MockContainer.open(src, &OpenOpts::default()).unwrap();
+        let ar = MockContainer
+            .open(resolve_default(src), &OpenOpts::default())
+            .unwrap();
         let report = ar.fidelity();
         assert_eq!(report.rung, crate::Rung::Exact);
         assert!(
@@ -549,7 +570,9 @@ mod tests {
         let bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
         let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
 
-        let ar = MockContainer.open(src, &OpenOpts::default()).unwrap();
+        let ar = MockContainer
+            .open(resolve_default(src), &OpenOpts::default())
+            .unwrap();
         let report = ar.fidelity();
         assert_eq!(report.rung, crate::Rung::ForwardOnly);
         assert!(
@@ -564,5 +587,79 @@ mod tests {
                 .warnings
                 .contains(&crate::Fidelity::EntryCountUnknown)
         );
+    }
+
+    #[test]
+    fn a_container_can_see_the_rung_it_was_opened_at() {
+        // Before this change the ladder could select Degraded but no container
+        // could learn it had been asked for a salvage scan.
+        let bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        let caps = ContainerCaps {
+            degraded_parse: true,
+            ..MockContainer.caps()
+        };
+        let policy = crate::StreamPolicy::Adaptive {
+            allow_forward_only: false,
+            spill: crate::SpillPolicy::Off,
+            allow_degraded: true,
+        };
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let resolved = crate::resolve(src, MOCK_CONTAINER, caps, &policy).unwrap();
+        assert_eq!(resolved.rung, crate::Rung::Degraded);
+
+        let ar = MockContainer.open(resolved, &OpenOpts::default()).unwrap();
+        assert_eq!(
+            ar.fidelity().rung,
+            crate::Rung::Degraded,
+            "the rung must reach the container"
+        );
+    }
+
+    #[test]
+    fn a_spilled_read_reports_spilled_without_a_manual_merge() {
+        // The ladder spills, so the container sees a SEEKABLE source. Before
+        // this change it therefore reported Exact, and the spill was invisible
+        // to anyone reading fidelity() alone.
+        let bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        let policy = crate::StreamPolicy::Adaptive {
+            allow_forward_only: false,
+            spill: crate::SpillPolicy::default(),
+            allow_degraded: true,
+        };
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let resolved = crate::resolve(src, MOCK_CONTAINER, MockContainer.caps(), &policy).unwrap();
+        assert_eq!(resolved.rung, crate::Rung::Spilled);
+
+        let ar = MockContainer.open(resolved, &OpenOpts::default()).unwrap();
+        assert_eq!(ar.fidelity().rung, crate::Rung::Spilled);
+        assert!(
+            ar.fidelity().is_lossless(),
+            "spilling costs disk, not accuracy"
+        );
+    }
+
+    #[test]
+    fn the_container_inherits_the_ladders_seed_rather_than_rederiving_it() {
+        // The ladder seeds TrailingIndexUnread + EntryCountUnknown from caps.
+        // The container must not independently derive the same two — inheriting
+        // them is what removes the duplication merge() had to paper over.
+        let bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let resolved = crate::resolve(
+            src,
+            MOCK_CONTAINER,
+            MockContainer.caps(),
+            &Default::default(),
+        )
+        .unwrap();
+        let ar = MockContainer.open(resolved, &OpenOpts::default()).unwrap();
+
+        let n = ar
+            .fidelity()
+            .warnings
+            .iter()
+            .filter(|w| matches!(w, crate::Fidelity::EntryCountUnknown))
+            .count();
+        assert_eq!(n, 1, "EntryCountUnknown must appear exactly once");
     }
 }

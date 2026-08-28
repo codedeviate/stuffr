@@ -123,7 +123,14 @@ pub trait Codec: Send + Sync {
 pub trait Container: Send + Sync {
     fn id(&self) -> FormatId;
     fn caps(&self) -> ContainerCaps;
-    fn open(&self, src: Box<dyn Source>, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>>;
+    /// Opens an archive from a ladder-resolved source.
+    ///
+    /// Takes the whole [`crate::Resolved`] rather than just its source so the
+    /// container knows which rung it was given — which is what makes
+    /// `Rung::Degraded` implementable — and so it can seed its fidelity report
+    /// from the ladder's rather than re-deriving the same facts.
+    fn open(&self, resolved: crate::ladder::Resolved, o: &OpenOpts)
+    -> Result<Box<dyn ArchiveRead>>;
     fn create(&self, dst: Box<dyn Write + Send>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>>;
 }
 

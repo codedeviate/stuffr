@@ -34,11 +34,8 @@ fn as_pipe(bytes: &[u8]) -> Box<dyn Source> {
 fn read_all(src: Box<dyn Source>) -> (Vec<(String, Vec<u8>)>, stuffr_core::FidelityReport) {
     let caps = MockContainer.caps();
     let resolved = resolve(src, MOCK_CONTAINER, caps, &StreamPolicy::default()).unwrap();
-    let ladder_report = resolved.report.clone();
+    let mut ar = MockContainer.open(resolved, &OpenOpts::default()).unwrap();
 
-    let mut ar = MockContainer
-        .open(resolved.source, &OpenOpts::default())
-        .unwrap();
     let mut out = Vec::new();
     while let Some(mut e) = ar.next_entry().unwrap() {
         let name = e.meta().name.clone();
@@ -47,8 +44,9 @@ fn read_all(src: Box<dyn Source>) -> (Vec<(String, Vec<u8>)>, stuffr_core::Fidel
         out.push((name, data));
     }
 
-    let mut report = ladder_report;
-    report.merge(ar.fidelity());
+    // No merge: fidelity() is now authoritative on its own. That is the point
+    // of passing Resolved into open().
+    let report = ar.fidelity().clone();
     (out, report)
 }
 
@@ -125,7 +123,7 @@ fn random_access_works_from_a_file_and_is_refused_on_a_pipe() {
         &StreamPolicy::default(),
     )
     .unwrap();
-    let mut ar = MockContainer.open(r.source, &OpenOpts::default()).unwrap();
+    let mut ar = MockContainer.open(r, &OpenOpts::default()).unwrap();
     let mut e = ar.by_index(1).unwrap();
     let mut data = Vec::new();
     e.reader().read_to_end(&mut data).unwrap();
@@ -138,7 +136,7 @@ fn random_access_works_from_a_file_and_is_refused_on_a_pipe() {
         &StreamPolicy::default(),
     )
     .unwrap();
-    let mut ar = MockContainer.open(r.source, &OpenOpts::default()).unwrap();
+    let mut ar = MockContainer.open(r, &OpenOpts::default()).unwrap();
     let err = ar.by_index(1).unwrap_err();
     assert!(matches!(err, stuffr_core::Error::NotSeekable { .. }));
 }
@@ -161,7 +159,7 @@ fn opting_out_of_approximation_recovers_full_fidelity_from_a_pipe() {
     .unwrap();
     assert_eq!(r.rung, Rung::Spilled);
 
-    let mut ar = MockContainer.open(r.source, &OpenOpts::default()).unwrap();
+    let mut ar = MockContainer.open(r, &OpenOpts::default()).unwrap();
     let mut e = ar.by_index(2).unwrap();
     let mut data = Vec::new();
     e.reader().read_to_end(&mut data).unwrap();
