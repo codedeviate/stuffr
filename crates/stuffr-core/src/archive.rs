@@ -87,6 +87,17 @@ impl<'a> Entry<'a> {
     }
 }
 
+/// Manual impl: `reader` is `Box<dyn Read + Send>`, which cannot derive
+/// `Debug`. Needed so `Result<Entry<'_>, Error>::unwrap_err()` type-checks in
+/// tests (`unwrap_err` requires the `Ok` side to be `Debug`).
+impl std::fmt::Debug for Entry<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("meta", &self.meta)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A writer that needs an explicit, fallible completion step (trailers, CRCs).
 pub trait Sink: Write + Send {
     fn finish(self: Box<Self>) -> Result<()>;
