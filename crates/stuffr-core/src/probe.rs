@@ -100,10 +100,14 @@ fn inner_from_path(reg: &Registry, path: Option<&Path>, outer: FormatId) -> Chai
     };
     let exts = extensions(path);
 
-    // Compound single extensions: "tgz" means tar-inside-gzip.
+    // `.tgz` and friends: one extension meaning "tar inside <codec>", spelled
+    // as "t" + the codec's own extension. The lookup uses the STRIPPED suffix,
+    // not the whole string — checking the whole string would only work if every
+    // codec also registered its compound alias, and one that forgot would
+    // silently resolve `.tbz2` to Raw instead of tar-over-bzip2.
     if let Some(last) = exts.last() {
         if let Some(stripped) = last.strip_prefix('t') {
-            if reg.by_extension(last) == Some(outer) && !stripped.is_empty() {
+            if !stripped.is_empty() && reg.by_extension(stripped) == Some(outer) {
                 if let Some(id) = reg.by_extension("tar") {
                     if reg.container(id).is_some() {
                         return Chain::Container { container: id };
@@ -313,6 +317,74 @@ mod tests {
                 inner: Box::new(Chain::Container { container: TAR })
             }
         );
+    }
+
+    #[test]
+    fn a_compound_extension_resolves_without_a_registered_compound_alias() {
+        // `.tgz` means "t" + gzip's own extension. Resolving it must not depend
+        // on gzip having separately registered "tgz" itself: a codec that
+        // forgets that alias would otherwise silently yield Raw instead of
+        // tar-over-<codec>, with no error raised.
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta {
+                id: GZIP,
+                kind: FormatKind::Codec,
+                extensions: &["gz"], // deliberately NO "tgz" alias
+                magics: GZIP_MAGIC,
+            },
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta {
+                id: TAR,
+                kind: FormatKind::Container,
+                extensions: &["tar"],
+                magics: TAR_MAGIC,
+            },
+        );
+
+        let chain = resolve_chain(&r, Some(Path::new("a.tgz")), &[0x1f, 0x8b]).unwrap();
+        assert_eq!(
+            chain,
+            Chain::Codec {
+                codec: GZIP,
+                inner: Box::new(Chain::Container { container: TAR })
+            }
+        );
+    }
+
+    #[test]
+    fn probe_does_not_consume_a_seekable_stream_either() {
+        // Non-consumption has two implementations — rewind for a seekable
+        // source, replay for a pipe. Only the pipe path was covered.
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, b"HEADERbody").unwrap();
+        let (_, path) = f.keep().unwrap();
+        let src: Box<dyn Source> = Box::new(crate::source::FileSource::open(&path).unwrap());
+
+        let (prefix, mut rest) = probe(src).unwrap();
+        assert_eq!(&prefix[..6], b"HEADER");
+
+        let mut all = Vec::new();
+        rest.read_to_end(&mut all).unwrap();
+        assert_eq!(
+            all, b"HEADERbody",
+            "a seekable source must be rewound to byte zero"
+        );
+    }
+
+    #[test]
+    fn probe_bounds_the_window_on_a_seekable_stream_too() {
+        let big = vec![b'x'; PROBE_LEN * 3];
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut f, &big).unwrap();
+        let (_, path) = f.keep().unwrap();
+        let src: Box<dyn Source> = Box::new(crate::source::FileSource::open(&path).unwrap());
+
+        let (prefix, _) = probe(src).unwrap();
+        assert_eq!(prefix.len(), PROBE_LEN);
     }
 
     #[test]

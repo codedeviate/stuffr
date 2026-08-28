@@ -289,4 +289,25 @@ mod tests {
         r.register_codec(Arc::new(MockCodec), codec_meta());
         assert_eq!(r.matrix().len(), 2);
     }
+
+    #[test]
+    fn re_registering_with_a_different_extension_list_drops_the_old_mapping() {
+        let mut r = populated();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta {
+                id: MOCK_CODEC,
+                kind: FormatKind::Codec,
+                extensions: &["mk2"],
+                magics: CODEC_MAGIC,
+            },
+        );
+        assert_eq!(r.by_extension("mk2"), Some(MOCK_CODEC));
+        assert_eq!(
+            r.by_extension("mk"),
+            None,
+            "a stale extension must not survive re-registration"
+        );
+        assert_eq!(r.by_extension("mock"), None);
+    }
 }
