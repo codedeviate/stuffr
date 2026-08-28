@@ -67,8 +67,10 @@ impl Codec for MockCodec {
         }
     }
 
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Read + Send>> {
-        Ok(Box::new(XorReader(Box::new(src))))
+    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        Ok(Box::new(crate::source::StreamOnly::new(XorReader(
+            Box::new(src),
+        ))))
     }
 
     fn encoder(&self, dst: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
@@ -373,6 +375,18 @@ mod tests {
     use super::*;
     use crate::source::ReaderSource;
     use std::io::Read;
+
+    #[test]
+    fn a_decoder_returns_a_source_so_capabilities_survive_the_layer() {
+        // The point of the Source return type: a decoded stream can report what
+        // it supports. The ordinary codec reports no seek; a codec with a frame
+        // index would report otherwise, and the ladder could then run between
+        // codec and container.
+        let encoded: Vec<u8> = b"the quick brown fox".iter().map(|b| b ^ 0xFF).collect();
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(encoded)));
+        let dec = MockCodec.decoder(src, &DecodeOpts::default()).unwrap();
+        assert!(!dec.caps().seekable);
+    }
 
     #[test]
     fn mock_codec_round_trips() {

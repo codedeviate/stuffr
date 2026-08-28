@@ -29,6 +29,7 @@ pub use probe::{Chain, PROBE_LEN, probe, resolve_chain};
 pub use registry::{FormatRow, Registry};
 pub use source::{
     FileSource, PeekSource, ReaderSource, SeekRead, Source, SourceCaps, SpillPolicy, SpillSource,
+    StreamOnly,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

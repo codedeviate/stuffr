@@ -4,10 +4,12 @@
 mod file;
 mod reader;
 pub mod spill;
+pub mod stream_only;
 
 pub use file::FileSource;
 pub use reader::{PeekSource, ReaderSource};
 pub use spill::{SpillPolicy, SpillSource};
+pub use stream_only::StreamOnly;
 
 use std::io::{Read, Seek};
 

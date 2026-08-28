@@ -107,7 +107,10 @@ pub trait Sink: Write + Send {
 pub trait Codec: Send + Sync {
     fn id(&self) -> FormatId;
     fn caps(&self) -> CodecCaps;
-    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Read + Send>>;
+    /// Decodes `src`. Returns a [`Source`] rather than a bare reader so a codec
+    /// carrying a frame index can advertise seekability to the layer above;
+    /// forward-only codecs wrap their reader in [`crate::StreamOnly`].
+    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>>;
     fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>>;
 }
 
