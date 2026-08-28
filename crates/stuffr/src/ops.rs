@@ -5,7 +5,6 @@
 //! to rebuild it. `compress`, `decompress` and `inspect` are the operations the
 //! `stf` command performs, and they are public API.
 
-use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,6 +14,18 @@ use stuffr_core::{
     EncodeOpts, Error, FidelityReport, FileSource, FormatId, FormatKind, ReaderSource, Registry,
     Result, Source,
 };
+
+/// Per-process counter mixed into the temp file name alongside the pid, so
+/// two concurrent `compress` calls in the same process (this is public
+/// library API, not just the single-threaded `stf` binary) get distinct temp
+/// paths on the very first attempt rather than racing to the same one.
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+
+/// How many colliding temp names `Output::create` will step over before
+/// giving up. Debris from a crashed run (or a recycled pid) should not
+/// permanently lock a destination out of being compressed to; a bound this
+/// generous only ever bites on something more structurally wrong.
+const MAX_TMP_ATTEMPTS: u32 = 100;
 
 /// Where bytes come from. `Stdin` is what `-` means on the command line.
 pub enum Input {
@@ -102,9 +113,40 @@ impl Output {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                let tmp = parent.join(format!(".{}.{}.tmp", std::process::id(), file_name));
 
-                let f = File::create(&tmp)?;
+                // Uniqueness by pid alone is only per-process: two threads in
+                // the same process racing to compress to the same
+                // destination would compute the identical temp path and
+                // silently stomp each other's in-flight write. A per-process
+                // counter alongside the pid gives concurrent callers in one
+                // process distinct paths on the first try; `create_new`
+                // makes a collision (or leftover debris from a crashed run,
+                // or a recycled pid) a hard error instead of a silent
+                // truncate, and the bounded retry below steps over that
+                // debris rather than letting it permanently lock the
+                // destination out of being compressed to at all.
+                let (tmp, f) = {
+                    let mut attempt = 0u32;
+                    loop {
+                        let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+                        let candidate =
+                            parent.join(format!(".{}.{}.{}.tmp", std::process::id(), n, file_name));
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&candidate)
+                        {
+                            Ok(f) => break (candidate, f),
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                                attempt += 1;
+                                if attempt >= MAX_TMP_ATTEMPTS {
+                                    return Err(Error::from(e));
+                                }
+                            }
+                            Err(e) => return Err(Error::from(e)),
+                        }
+                    }
+                };
                 if let Some(perms) = carry_over_perms {
                     std::fs::set_permissions(&tmp, perms)?;
                 }

@@ -170,3 +170,30 @@ fn a_rejected_level_leaves_no_temp_file_behind() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&dst);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_forced_overwrite_preserves_the_destinations_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let src = tmp("perm-in.txt");
+    let dst = tmp("perm-out.gz");
+    std::fs::write(&src, b"payload").unwrap();
+    std::fs::write(&dst, b"PRE-EXISTING").unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let o = CompressOpts {
+        force: true,
+        ..Default::default()
+    };
+    compress(Input::Path(src.clone()), Output::Path(dst.clone()), &o).unwrap();
+
+    let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "a rename onto the destination must not widen its permissions"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
