@@ -17,4 +17,3 @@ flate2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }
-flate2 = { workspace = true }

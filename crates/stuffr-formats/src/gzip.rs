@@ -143,12 +143,25 @@ mod tests {
 
     #[test]
     fn finish_surfaces_a_write_error_that_drop_would_swallow() {
-        // GzEncoder::drop calls finish() and discards the error. This test
-        // verifies that calling finish() explicitly surfaces errors that Drop
-        // would silently ignore. We test this by providing a writer that fails
-        // after N bytes, then verifying that finish() returns Err while
-        // dropping the encoder would not.
-
+        // GzEncoder::drop calls finish() and discards the error. This drives
+        // the failure through this project's own types — Gzip::encoder and
+        // Sink::finish — rather than flate2's inherent GzEncoder::finish, so
+        // a regression that swallows the error (e.g. `let _ = e.finish();`
+        // instead of `e.finish()?;` in `impl Sink for GzSink`) is actually
+        // caught by this test.
+        //
+        // Threshold, MEASURED (not assumed): a `GzEncoder` writes exactly a
+        // 10-byte gzip header to the underlying writer on the very first
+        // `write` call, regardless of chunk size, and nothing else reaches
+        // the underlying writer until `finish()` pushes the compressed body
+        // and the CRC32+size trailer. Confirmed with an instrumented
+        // counting writer plus a sweep of `FailAfterN` limits: limits below
+        // 10 make `write_all` itself fail (the wrong subject — that would
+        // be testing `Write::write`, not `Sink::finish`); a limit of exactly
+        // 10 lets `write_all` succeed (it only pushes the header) while
+        // `finish()` fails (it must push body + trailer), isolating the
+        // failure to `finish()` specifically. That is why 10 is used below,
+        // not some other N.
         struct FailAfterN {
             limit: usize,
             written: usize,
@@ -169,24 +182,25 @@ mod tests {
             }
         }
 
-        // Create an encoder with a writer that will fail during finish()
-        let writer = FailAfterN {
-            limit: 10,
-            written: 0,
-        };
-        let mut encoder = GzEncoder::new(writer, Compression::default());
-
-        // Write data that compresses to more than 10 bytes
-        // The actual compressed size varies, but with enough data we'll exceed the limit
-        encoder
-            .write_all(b"this is test data that should compress")
+        let mut sink = Gzip
+            .encoder(
+                Box::new(FailAfterN {
+                    limit: 10,
+                    written: 0,
+                }),
+                &EncodeOpts::default(),
+            )
             .unwrap();
 
-        // Now finish() should fail because the writer will fail
-        let result = encoder.finish();
+        // Consumes only the header budget (measured above); Sink::finish is
+        // the step that must fail.
+        sink.write_all(b"this is test data that should compress")
+            .unwrap();
+
+        let result = sink.finish();
         assert!(
             result.is_err(),
-            "finish() should return Err when the underlying writer fails"
+            "Sink::finish should surface the underlying writer's error instead of swallowing it"
         );
     }
 

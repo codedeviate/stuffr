@@ -40,6 +40,7 @@ test:
 release:
 	$(CARGO) build --release --workspace
 	$(CARGO) build -p stuffr-core --no-default-features
+	$(CARGO) build -p stuffr-formats --no-default-features
 
 hooks:
 	git config core.hooksPath .githooks
