@@ -326,6 +326,7 @@ name = "stuffr-cli"
 version = "0.0.1"
 dependencies = [
  "clap",
+ "serde_json",
  "stuffr",
 ]
 

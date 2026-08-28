@@ -44,8 +44,28 @@ fn round_trips_byte_identically() {
     let _ = std::fs::remove_file(&out);
 }
 
+// NOTE on what this file does NOT cover: `inspect` is supposed to compute its
+// `Rung` from the source's actual seekability rather than assume one, and the
+// test below only ever exercises the seekable (`Input::Path`) side — it would
+// pass just as well if `inspect` hardcoded `Rung::Exact`. A genuine
+// non-seekable case would need an `Input` backed by something other than a
+// file, but `Input` (see `stuffr::ops::Input`) has exactly two public
+// variants: `Path`, which always opens a `FileSource` (unconditionally
+// seekable), and `Stdin`, which always wraps the process's real
+// `std::io::stdin()` — there is no public constructor that accepts arbitrary
+// bytes as a non-seekable source. Faking that here would mean redirecting
+// this test binary's actual stdin (fd 0) out from under a test harness that
+// runs every `#[test]` in this file as a thread of one shared process, which
+// would be racy against any other test reading stdin concurrently. Spawning
+// the real `stf` binary with a piped stdin — a separate OS process, safe to
+// redirect — is the honest way to exercise that path, and
+// `info_over_a_pipe_reports_forward_only_not_exact` in
+// `crates/stuffr-cli/tests/cli.rs` already does exactly that for `inspect`
+// (and `pack_over_a_pipe_reports_forward_only_not_exact` does the same for
+// `compress`). So: renamed to describe only what it actually checks, rather
+// than implying pipe coverage that belongs — and lives — one layer up.
 #[test]
-fn a_seekable_source_reports_exact_and_a_pipe_reports_forward_only() {
+fn inspect_of_a_seekable_file_reports_exact() {
     // No container, so no entry-level ladder — but the rung is still real, and
     // reporting it honestly is what makes `stf info` meaningful before Phase 2.
     let gz = make_gz(b"payload", "rung");
