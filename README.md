@@ -9,12 +9,19 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 0 complete; Phase 1+ not started.** The `stuffr-core`
-> foundation layer is built and tested (102 tests passing, clean across build,
-> clippy, fmt). You can run `stf --version` and `stf formats` today. **But there
-> are no real formats or codecs yet** — Phase 0 intentionally carries no format
-> dependencies, so the stream ladder, governor, and registry are validated
-> against mocks. Phase 1 will add the actual codec and container implementations.
+> **Status: Phase 1b complete — gzip works end to end.** `stf pack`, `unpack`,
+> `cat`, `info` and `formats` all work today, on files and through pipes, and
+> `curl … | stf cat - | grep pattern` runs. 189 tests, clean across build,
+> clippy and fmt.
+>
+> **One codec so far.** Phase 1b was deliberately a walking skeleton: gzip taken
+> all the way from the codec trait through the operations layer to the CLI, so
+> that interface problems surfaced at codec one instead of codec nine. The other
+> formats in the matrix below are not implemented yet — Phase 1c adds the
+> remaining eight codecs and parallel encode, Phase 2 adds containers. Decoding
+> is already proven incremental rather than read-to-end, and `stuffr-core` still
+> carries zero format dependencies, so the ladder and governor stay testable
+> with no C toolchain.
 
 ## Why another one
 

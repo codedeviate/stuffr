@@ -82,6 +82,18 @@ impl Output {
     /// rather than truncating and then complaining. For `Output::Path` the
     /// real bytes land in a temp file beside the destination; the caller must
     /// rename it onto the destination on success (see `discard` for failure).
+    ///
+    /// **A non-regular destination trades away that crash safety.** A symlink,
+    /// a device node or a FIFO takes the direct-write branch with `finish:
+    /// None`, because renaming onto one would replace it rather than write
+    /// through it — which is the whole point for `-o /dev/null` and for a
+    /// `latest.gz -> archives/….gz` link. The cost is that a failure partway
+    /// through leaves the target truncated, where a plain file would have been
+    /// left untouched. It applies even to a symlink pointing *at* a regular
+    /// file, since `symlink_metadata` reports the link, never its target.
+    /// Closing that gap means resolving the link and renaming onto the
+    /// resolved path, which brings link chains, relative targets and its own
+    /// TOCTOU window along with it — deferred rather than rushed.
     pub(crate) fn create(&self, force: bool) -> Result<Opened> {
         match self {
             Output::Stdout => Ok(Opened {
