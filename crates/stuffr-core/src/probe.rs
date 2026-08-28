@@ -491,4 +491,53 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn an_extension_outside_the_tied_set_does_not_break_the_tie() {
+        // A tie between two formats sharing a magic, with a path whose
+        // extension names a THIRD format that does not share it. The extension
+        // must not select a format whose magic never matched, and the error
+        // must name the genuinely tied candidates rather than the irrelevant
+        // one.
+        const A: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("alpha"),
+        }];
+        const B: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("beta"),
+        }];
+        const C: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"GZ",
+            format: FormatId::new("gamma"),
+        }];
+        let mut r = Registry::new();
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("alpha"), &["alpha"], A),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("beta"), &["beta"], B),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("gamma"), &["gamma"], C),
+        );
+
+        let err = resolve_chain(&r, Some(Path::new("x.gamma")), b"PKrest").unwrap_err();
+        assert!(matches!(err, crate::Error::AmbiguousFormat { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("alpha") && msg.contains("beta"),
+            "must name the tied candidates: {msg}"
+        );
+        assert!(
+            !msg.contains("gamma"),
+            "must not name the irrelevant extension: {msg}"
+        );
+    }
 }

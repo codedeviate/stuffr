@@ -141,7 +141,22 @@ impl FidelityReport {
         self.warnings.push(w);
     }
 
+    /// Whether anything was approximated. **This is the `--strict-fidelity`
+    /// gate** (exit code 4).
+    ///
+    /// Gating on warnings rather than on the rung is deliberate: a tar read
+    /// from a pipe lands on `ForwardOnly`, but tar has no trailing index, so
+    /// nothing was lost. Failing it would hand a script an error it cannot act
+    /// on. The rung stays diagnostic — reported by `stf info`.
+    pub fn has_warnings(&self) -> bool {
+        !self.warnings.is_empty()
+    }
+
     /// True only if the rung was authoritative *and* nothing was approximated.
+    ///
+    /// Deliberately **not** the `--strict-fidelity` gate — see
+    /// [`Self::has_warnings`]. This is the stronger "the format's own index was
+    /// read and nothing was lost" claim, useful for archival verification.
     pub fn is_lossless(&self) -> bool {
         self.rung.is_authoritative() && self.warnings.is_empty()
     }
@@ -278,5 +293,28 @@ mod tests {
         };
         assert_eq!(m.missing(), vec!["mtime", "crc"]);
         assert!(MetaFields::default().missing().is_empty());
+    }
+
+    #[test]
+    fn a_forward_only_read_that_lost_nothing_passes_strict_mode() {
+        // tar on a pipe: rung is ForwardOnly, but tar has no trailing index, so
+        // nothing was approximated. Strict mode must not fail this.
+        let r = FidelityReport::new(Rung::ForwardOnly);
+        assert!(!r.has_warnings(), "nothing was approximated");
+        assert!(!r.is_lossless(), "but the rung was not authoritative");
+    }
+
+    #[test]
+    fn strict_mode_fires_on_any_warning_regardless_of_rung() {
+        let mut r = FidelityReport::exact();
+        r.warn(Fidelity::EntryCountUnknown);
+        assert!(r.has_warnings());
+    }
+
+    #[test]
+    fn a_clean_exact_read_passes_both_predicates() {
+        let r = FidelityReport::exact();
+        assert!(!r.has_warnings());
+        assert!(r.is_lossless());
     }
 }
