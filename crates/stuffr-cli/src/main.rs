@@ -307,21 +307,30 @@ fn json_escape(s: &str) -> String {
 /// that can ever originate outside this binary should be trusted to already
 /// be valid JSON. Revisit this once Phase 2 makes the payload structurally
 /// bigger than escaping-by-hand can comfortably cover.
-fn print_info_json(i: &ops::Inspection) {
+///
+/// Returns the built string rather than printing it directly, so a test can
+/// inspect what it produced instead of only what `json_escape` alone
+/// produces in isolation — see `builder_survives_a_hostile_warning_entry`
+/// below.
+fn build_info_json(i: &ops::Inspection) -> String {
     let warnings: Vec<String> = i
         .fidelity
         .warnings
         .iter()
         .map(|w| format!("\"{}\"", json_escape(&w.to_string())))
         .collect();
-    println!(
+    format!(
         "{{\"format\":\"{}\",\"chain\":\"{}\",\"rung\":\"{}\",\"bytes_in\":{},\"warnings\":[{}]}}",
         json_escape(&i.format.to_string()),
         json_escape(&i.chain),
         i.rung,
         i.bytes_in.map_or("null".to_string(), |n| n.to_string()),
         warnings.join(",")
-    );
+    )
+}
+
+fn print_info_json(i: &ops::Inspection) {
+    println!("{}", build_info_json(i));
 }
 
 fn print_formats() {
@@ -353,7 +362,10 @@ fn print_formats() {
 
 #[cfg(test)]
 mod tests {
-    use super::json_escape;
+    use super::{build_info_json, json_escape};
+    use stuffr::FormatId;
+    use stuffr::ops::Inspection;
+    use stuffr::{Fidelity, FidelityReport, Rung};
 
     #[test]
     fn json_escape_handles_quotes_backslashes_and_newlines() {
@@ -364,5 +376,61 @@ mod tests {
         assert_eq!(json_escape("tab\ttab"), "tab\\ttab");
         assert_eq!(json_escape("plain"), "plain");
         assert_eq!(json_escape("\u{0001}"), "\\u0001");
+    }
+
+    /// F1's actual point: prove `build_info_json` (and therefore
+    /// `print_info_json`) calls `json_escape` on data it does not control,
+    /// not merely that `json_escape` behaves correctly in isolation. A
+    /// black-box CLI test cannot reach this today — Phase 1b has no
+    /// containers, so no CLI-reachable `Inspection` ever carries a warning —
+    /// but the fields are public, so a synthetic one pins it right now and
+    /// keeps working the moment Phase 2 adds real entry names.
+    #[test]
+    fn builder_survives_a_hostile_warning_entry() {
+        // A warning entry name crafted to look like it's trying to close the
+        // warning string and inject a sibling key into the top-level object.
+        let hostile = "evil\", \"format\": \"pwned".to_string();
+
+        let mut fidelity = FidelityReport::new(Rung::ForwardOnly);
+        fidelity.warn(Fidelity::EncryptedEntrySkipped {
+            entry: hostile.clone(),
+        });
+
+        let inspection = Inspection {
+            format: FormatId::new("gzip"),
+            chain: "gzip".to_string(),
+            rung: Rung::ForwardOnly,
+            fidelity,
+            bytes_in: None,
+        };
+
+        let text = build_info_json(&inspection);
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("builder output was not valid JSON: {e}\n{text}"));
+
+        // Exactly the five fields this payload has ever had — a successful
+        // break-out would add or rename keys, not just corrupt one value.
+        let obj = value.as_object().expect("top level must be a JSON object");
+        assert_eq!(
+            obj.len(),
+            5,
+            "a break-out would add/rename keys rather than just corrupt a value: {text}"
+        );
+        assert_eq!(value.get("format").and_then(|v| v.as_str()), Some("gzip"));
+        assert_eq!(value.get("chain").and_then(|v| v.as_str()), Some("gzip"));
+        assert!(value.get("pwned").is_none(), "no injected key: {text}");
+
+        let warnings = value
+            .get("warnings")
+            .and_then(|w| w.as_array())
+            .expect("warnings must still be an array");
+        assert_eq!(warnings.len(), 1);
+        let warning_text = warnings[0]
+            .as_str()
+            .expect("the warning must still be a single JSON string, not broken into pieces");
+        assert!(
+            warning_text.contains(&hostile),
+            "the hostile entry text must survive intact as DATA: {warning_text}"
+        );
     }
 }
