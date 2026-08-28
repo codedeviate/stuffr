@@ -33,16 +33,22 @@ pub fn default_memory_limit() -> u64 {
     MEMORY_FLOOR
 }
 
+#[derive(Default)]
+struct GovState {
+    workers_out: usize,
+    bytes_out: u64,
+}
+
 /// The single source of parallelism in the process.
 ///
-/// Work units acquire [`Lease`]s rather than being handed a thread count, which
-/// is what makes nested parallelism safe: an outer "8 entries at once" and an
-/// inner "multi-threaded zstd" both draw from this one pool, so their product
-/// can never exceed the budget.
+/// Work units acquire [`LeaseSet`]s rather than being handed a thread count,
+/// which is what makes nested parallelism safe: an outer "8 entries at once"
+/// and an inner "multi-threaded zstd" both draw from this one pool, so their
+/// product can never exceed the budget.
 pub struct Governor {
     workers: usize,
     memory_limit: u64,
-    state: Mutex<usize>,
+    state: Mutex<GovState>,
     cv: Condvar,
 }
 
@@ -51,7 +57,7 @@ impl Governor {
         Arc::new(Self {
             workers: workers.max(1),
             memory_limit,
-            state: Mutex::new(0),
+            state: Mutex::new(GovState::default()),
             cv: Condvar::new(),
         })
     }
@@ -69,38 +75,87 @@ impl Governor {
     }
 
     pub fn outstanding(&self) -> usize {
-        *self.state.lock().expect("governor mutex poisoned")
+        self.state
+            .lock()
+            .expect("governor mutex poisoned")
+            .workers_out
     }
 
-    /// Blocks until a lease is available.
-    pub fn acquire(self: &Arc<Self>) -> Lease {
-        let mut n = self.state.lock().expect("governor mutex poisoned");
-        while *n >= self.workers {
-            n = self.cv.wait(n).expect("governor mutex poisoned");
+    pub fn reserved_bytes(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("governor mutex poisoned")
+            .bytes_out
+    }
+
+    /// Acquires up to `want` workers, and the memory they need, in one call.
+    ///
+    /// Grants `min(want, workers_free, memory_free / per_worker_bytes)`,
+    /// blocking only while no worker slot is free at all, and never granting
+    /// fewer than one — a single over-budget worker beats no progress.
+    ///
+    /// Granting the floor worker can push the reserved total past
+    /// `memory_limit`, by less than one worker's demand per grant. That
+    /// over-commitment is the price of the progress guarantee — a caller that
+    /// would otherwise wait forever runs slightly over budget instead.
+    ///
+    /// **Acquire once.** A unit takes its whole allocation in one call and does
+    /// not acquire again while holding. Hold-and-wait is what deadlocks: four
+    /// units each holding one lease and each blocking for a second would never
+    /// progress. Getting fewer workers than asked is fine, the work runs
+    /// slower; blocking for the full request would trade a deadlock for a stall.
+    pub fn acquire_many(self: &Arc<Self>, want: usize, per_worker_bytes: u64) -> LeaseSet {
+        let want = want.max(1);
+        let mut st = self.state.lock().expect("governor mutex poisoned");
+        loop {
+            let cpu_free = self.workers.saturating_sub(st.workers_out);
+            if cpu_free > 0 {
+                let mem_free = self.memory_limit.saturating_sub(st.bytes_out);
+                // `checked_div` rather than a manual zero-check-then-divide:
+                // `per_worker_bytes == 0` means "no memory constraint", i.e. `want`.
+                let by_mem = match mem_free.checked_div(per_worker_bytes) {
+                    Some(n) => n as usize,
+                    None => want,
+                };
+                // `.max(1)` cannot exceed cpu_free, which is at least 1 here.
+                let grant = want.min(cpu_free).min(by_mem).max(1);
+                let bytes = per_worker_bytes.saturating_mul(grant as u64);
+                st.workers_out += grant;
+                st.bytes_out = st.bytes_out.saturating_add(bytes);
+                return LeaseSet {
+                    gov: Arc::clone(self),
+                    workers: grant,
+                    bytes,
+                };
+            }
+            st = self.cv.wait(st).expect("governor mutex poisoned");
         }
-        *n += 1;
-        Lease {
-            gov: Arc::clone(self),
-        }
+    }
+
+    /// Blocks until at least one worker is available.
+    pub fn acquire(self: &Arc<Self>) -> LeaseSet {
+        self.acquire_many(1, 0)
     }
 
     /// Returns `None` immediately if the pool is full.
-    pub fn try_acquire(self: &Arc<Self>) -> Option<Lease> {
-        let mut n = self.state.lock().expect("governor mutex poisoned");
-        if *n >= self.workers {
+    pub fn try_acquire(self: &Arc<Self>) -> Option<LeaseSet> {
+        let mut st = self.state.lock().expect("governor mutex poisoned");
+        if st.workers_out >= self.workers {
             return None;
         }
-        *n += 1;
-        Some(Lease {
+        st.workers_out += 1;
+        Some(LeaseSet {
             gov: Arc::clone(self),
+            workers: 1,
+            bytes: 0,
         })
     }
 
-    /// How many workers a codec needing `per_worker_bytes` may use.
+    /// How many workers a codec needing `per_worker_bytes` *could* use.
     ///
-    /// Fewer, slower threads beat the OOM killer: multi-threaded xz at `-9`
-    /// wants ~700 MiB per worker, and sixteen of those will kill a modest
-    /// server long before CPU becomes the constraint.
+    /// A hint for sizing work before committing. It reserves nothing — two
+    /// concurrent callers both get the same answer. Call [`Self::acquire_many`]
+    /// to actually reserve.
     pub fn workers_for(&self, per_worker_bytes: u64) -> usize {
         if per_worker_bytes == 0 {
             return self.workers;
@@ -110,16 +165,31 @@ impl Governor {
     }
 }
 
-/// A permit to run one unit of work. Returns itself to the pool on drop.
-pub struct Lease {
+/// A granted allocation of workers and memory. Releases both on drop.
+pub struct LeaseSet {
     gov: Arc<Governor>,
+    workers: usize,
+    bytes: u64,
 }
 
-impl Drop for Lease {
+impl LeaseSet {
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for LeaseSet {
     fn drop(&mut self) {
-        let mut n = self.gov.state.lock().expect("governor mutex poisoned");
-        *n = n.saturating_sub(1);
-        self.gov.cv.notify_one();
+        let mut st = self.gov.state.lock().expect("governor mutex poisoned");
+        st.workers_out = st.workers_out.saturating_sub(self.workers);
+        st.bytes_out = st.bytes_out.saturating_sub(self.bytes);
+        // notify_all rather than notify_one: releasing several workers can
+        // satisfy several waiters.
+        self.gov.cv.notify_all();
     }
 }
 
@@ -246,5 +316,91 @@ mod tests {
     fn default_memory_limit_is_sane() {
         let m = default_memory_limit();
         assert!(m >= 256 * 1024 * 1024, "floor keeps small hosts usable");
+    }
+
+    #[test]
+    fn acquire_many_grants_what_is_available_rather_than_blocking_for_all() {
+        let g = Governor::new(4, GIB);
+        let a = g.acquire_many(3, 0);
+        assert_eq!(a.workers(), 3);
+        // Only one slot left, so a request for three yields one — not a wait.
+        let b = g.acquire_many(3, 0);
+        assert_eq!(b.workers(), 1);
+        assert_eq!(g.outstanding(), 4);
+    }
+
+    #[test]
+    fn acquire_many_reserves_memory_so_two_callers_cannot_both_take_the_budget() {
+        // The bug this fixes: workers_for is pure arithmetic reserving nothing,
+        // so two callers against 2 GiB were each told "you may use 2" and
+        // together allocated 2.8 GiB.
+        let g = Governor::new(8, 2 * GIB);
+        let a = g.acquire_many(2, 700 * 1024 * 1024);
+        assert_eq!(a.workers(), 2);
+
+        // Memory pressure reduces the second caller's grant. THIS is the
+        // composition property — without reservation it would also have got 2.
+        let b = g.acquire_many(2, 700 * 1024 * 1024);
+        assert_eq!(b.workers(), 1, "only one worker's memory remains");
+
+        // Reservation is exact: three granted workers, three charges. Note the
+        // total EXCEEDS memory_limit, and that is deliberate — b's worker was
+        // granted by the floor, which trades a bounded over-commitment for a
+        // progress guarantee. Bounded because a grant either fits in what is
+        // free, or is a single floored worker; see acquire_many's contract.
+        assert_eq!(g.reserved_bytes(), 3 * 700 * 1024 * 1024);
+        assert!(g.reserved_bytes() > g.memory_limit());
+    }
+
+    #[test]
+    fn a_lease_set_releases_both_resources_on_drop() {
+        let g = Governor::new(4, GIB);
+        {
+            let _a = g.acquire_many(4, 100);
+            assert_eq!(g.outstanding(), 4);
+            assert_eq!(g.reserved_bytes(), 400);
+        }
+        assert_eq!(g.outstanding(), 0);
+        assert_eq!(g.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn one_worker_is_granted_even_when_memory_alone_would_allow_none() {
+        // A single over-budget worker beats no progress, matching workers_for's
+        // existing clamp.
+        let g = Governor::new(8, 100);
+        let a = g.acquire_many(4, GIB);
+        assert_eq!(a.workers(), 1);
+    }
+
+    #[test]
+    fn acquire_many_blocks_only_while_no_worker_slot_is_free() {
+        let g = Governor::new(1, GIB);
+        let held = g.acquire_many(1, 0);
+        let g2 = Arc::clone(&g);
+        let h = std::thread::spawn(move || g2.acquire_many(4, 0).workers());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!h.is_finished(), "must wait while the pool is empty");
+        drop(held);
+        assert_eq!(h.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn single_shot_acquisition_does_not_deadlock_under_nested_demand() {
+        // Eight units each wanting three workers from a pool of four. Under
+        // repeated single acquire() with hold-and-wait this deadlocks; under
+        // single-shot acquisition it completes.
+        let g = Governor::new(4, GIB);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let g = Arc::clone(&g);
+                s.spawn(move || {
+                    let set = g.acquire_many(3, 0);
+                    assert!(set.workers() >= 1 && set.workers() <= 4);
+                    std::thread::yield_now();
+                });
+            }
+        });
+        assert_eq!(g.outstanding(), 0);
     }
 }
