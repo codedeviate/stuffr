@@ -34,6 +34,16 @@ impl Default for StreamPolicy {
 }
 
 /// A source prepared for a specific container, with the cost of preparing it.
+///
+/// `#[non_exhaustive]`: this struct is constructed only inside `stuffr-core`
+/// (see the constructors in this module) and destructured everywhere else —
+/// every `Container::open` impl will do `let Resolved { source, rung, report
+/// } = resolved;`. A struct in that shape — destructured downstream, never
+/// constructed — takes the attribute for free: there is no
+/// `..Default::default()` literal to break, only a future field to add
+/// without breaking every format crate's destructure at once. See the
+/// `#[non_exhaustive]` section of CONTRIBUTING.md.
+#[non_exhaustive]
 pub struct Resolved {
     pub source: Box<dyn Source>,
     pub rung: Rung,
@@ -61,7 +71,9 @@ static NO_SPILL: SpillPolicy = SpillPolicy::Off;
 /// Seeds the report with the losses implied by reading `caps` at `rung`.
 ///
 /// Only capability-derived warnings belong here. Per-entry findings are added
-/// by the container as it parses, via [`FidelityReport::merge`].
+/// by the container as it parses, by calling [`FidelityReport::warn`] directly
+/// on the report it inherited from [`Resolved`] — not by building a second
+/// report and folding it in with `merge`.
 fn seed_report(rung: Rung, format: FormatId, caps: ContainerCaps) -> FidelityReport {
     let mut report = FidelityReport::new(rung);
     if rung.is_authoritative() {

@@ -130,6 +130,49 @@ Capability and options structs therefore stay literal-constructible, and gain
 touches the constructors rather than every `caps()` implementation, which is
 the same protection by a cheaper route.
 
+**The exception: a struct that is only ever *destructured* downstream, never
+*constructed*.** `ladder::Resolved` is the case — it is built exclusively by
+`stuffr_core::ladder::resolve`, and every consumer (every `Container::open`
+impl, in every format crate) receives one and destructures it:
+`let Resolved { source, rung, report, .. } = resolved;`. No downstream crate
+ever writes `Resolved { .. }` as a constructor, so the cost that exempts the
+capability structs — breaking `Foo { a, ..Default::default() }` in a
+dependent crate — does not apply here. Adding a field to `Resolved` would
+instead break every one of those destructures at once, which is exactly what
+`#[non_exhaustive]` prevents (a struct pattern must end in `..` to match a
+`#[non_exhaustive]` struct from another crate). So `Resolved` carries the
+attribute, and the reference destructure ends in `..` for the same reason a
+`match` on a non-exhaustive enum ends in a wildcard arm. The rule for structs
+is therefore: **carry it if downstream only ever destructures; skip it if
+downstream ever constructs.**
+
+### Which enums are open, which are closed
+
+"Enums carry it" above is not quite universal either: four public enums —
+`Rung`, `StreamPolicy`, `FormatKind`, `SpillPolicy` — do **not** carry
+`#[non_exhaustive]`, deliberately. The distinction is whether the enum names
+an open-ended set that formats will keep adding to, or a closed domain fixed
+by the crate's own design:
+
+- **Open — carry the attribute.** `Error`, `Fidelity`, `EntryKind`, `Chain`.
+  Each is expected to grow as formats are added: `EntryKind` gains
+  `Hardlink`, `CharDevice`, `BlockDevice`, `Fifo` and `Socket` when tar and
+  cpio arrive, and `Fidelity` grows a variant for every new kind of loss a
+  future format can produce.
+- **Closed — no attribute, by design.**
+  - `Rung` — the adaptive stream ladder has exactly four rungs
+    (`Exact`/`ForwardOnly`/`Spilled`/`Degraded`); that is the ladder's whole
+    design, not a partial list waiting for a fifth.
+  - `FormatKind` — the codec/container dichotomy the crate is built on. A
+    third kind would be a different architecture, not an addition.
+  - `StreamPolicy`, `SpillPolicy` — user-facing choices, where an exhaustive
+    `match` in a caller (e.g. a CLI flag mapping) is desirable rather than a
+    hazard: the point is that the caller sees every option there is.
+
+A closed enum can still gain variants later, but doing so is a deliberate,
+documented redesign — the same bar `0.y.0` milestones already clear — not the
+routine addition `#[non_exhaustive]` exists to absorb.
+
 ## Architectural constraints
 
 Two rules hold across every phase. Both are load-bearing rather than stylistic,

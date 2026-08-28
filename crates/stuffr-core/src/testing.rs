@@ -185,6 +185,7 @@ impl Container for MockContainer {
             mut source,
             rung,
             report,
+            ..
         } = resolved;
         let seekable = source.caps().seekable;
         let mut buf = Vec::new();
@@ -209,7 +210,7 @@ impl Container for MockContainer {
         // Start from the ladder's report rather than re-deriving it, then add
         // only what parsing itself discovered.
         let mut report = report;
-        if seekable && rung == Rung::Exact && index.is_none() {
+        if seekable && index.is_none() {
             report.warn(Fidelity::TruncatedStream {
                 at: buf.len() as u64,
             });

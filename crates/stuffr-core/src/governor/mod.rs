@@ -141,9 +141,15 @@ impl Governor {
     /// fewer than one — a single over-budget worker beats no progress.
     ///
     /// Granting the floor worker can push the reserved total past
-    /// `memory_limit`, by less than one worker's demand per grant. That
+    /// `memory_limit` — by less than one worker's demand *per grant*, but that
+    /// bound does not sum across grants. Eight concurrent callers each asking
+    /// for one worker will each see `cpu_free > 0`, each floor to 1, and each
+    /// charge `per_worker_bytes`, so the reserved total can reach
+    /// `workers × per_worker_bytes` regardless of `memory_limit`. The memory
+    /// budget therefore bounds *voluntary* parallelism, not a hard ceiling on
+    /// reserved bytes; the hard ceiling is the worker count. That
     /// over-commitment is the price of the progress guarantee — a caller that
-    /// would otherwise wait forever runs slightly over budget instead.
+    /// would otherwise wait forever runs over budget instead of never running.
     ///
     /// **Acquire once.** A unit takes its whole allocation in one call and does
     /// not acquire again while holding. Hold-and-wait is what deadlocks: four
@@ -310,7 +316,7 @@ mod tests {
             let _l = g2.acquire();
             true
         });
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         assert!(
             !h.is_finished(),
             "acquire must block while the pool is full"
@@ -430,11 +436,13 @@ mod tests {
 
         // Reservation is exact: three granted workers, three charges. Note the
         // total EXCEEDS memory_limit, and that is deliberate — b's worker was
-        // granted by the floor, which trades a bounded over-commitment for a
-        // progress guarantee. Bounded because a grant either fits in what is
-        // free, or is a single floored worker; see acquire_many's contract.
+        // granted by the floor, which trades over-commitment for a progress
+        // guarantee.
         assert_eq!(g.reserved_bytes(), 3 * 700 * 1024 * 1024);
-        assert!(g.reserved_bytes() > g.memory_limit());
+
+        // Over-commitment is real and deliberate, but bounded: the worker
+        // count, not memory_limit, is the hard ceiling.
+        assert!(g.reserved_bytes() <= g.memory_limit() + (g.workers() as u64) * 700 * 1024 * 1024);
     }
 
     #[test]
@@ -464,7 +472,7 @@ mod tests {
         let held = g.acquire_many(1, 0);
         let g2 = Arc::clone(&g);
         let h = std::thread::spawn(move || g2.acquire_many(4, 0).workers());
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         assert!(!h.is_finished(), "must wait while the pool is empty");
         drop(held);
         assert_eq!(h.join().unwrap(), 1);

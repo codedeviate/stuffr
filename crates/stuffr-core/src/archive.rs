@@ -30,6 +30,7 @@ impl std::fmt::Debug for DecodeOpts {
 pub struct EncodeOpts {
     /// Format-relative compression level. `None` means the format's default.
     pub level: Option<i32>,
+    /// Worker hint. The governor has final say; this is only a request.
     pub threads: Option<usize>,
     /// The shared worker/memory budget. `None` means single-threaded — a codec
     /// parallelises only if handed a governor, never from an ambient global.
@@ -46,16 +47,45 @@ impl std::fmt::Debug for EncodeOpts {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct OpenOpts {
     pub password: Option<String>,
+    /// The shared worker/memory budget. `None` means single-threaded — a
+    /// container parallelises only if handed a governor, never from an
+    /// ambient global. Needed so a container with `per_entry_codec` can build
+    /// a `DecodeOpts` per entry, carrying the same governor forward.
+    pub governor: Option<std::sync::Arc<crate::Governor>>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+impl std::fmt::Debug for OpenOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenOpts")
+            .field("password", &self.password)
+            .field("governor", &self.governor.as_ref().map(|_| "Governor"))
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct CreateOpts {
     pub level: Option<i32>,
     /// Codec for entry payloads, for containers with `per_entry_codec`.
     pub entry_codec: Option<FormatId>,
+    /// The shared worker/memory budget. `None` means single-threaded — a
+    /// container parallelises only if handed a governor, never from an
+    /// ambient global. Needed so a container with `per_entry_codec` can build
+    /// an `EncodeOpts` per entry, carrying the same governor forward.
+    pub governor: Option<std::sync::Arc<crate::Governor>>,
+}
+
+impl std::fmt::Debug for CreateOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateOpts")
+            .field("level", &self.level)
+            .field("entry_codec", &self.entry_codec)
+            .field("governor", &self.governor.as_ref().map(|_| "Governor"))
+            .finish()
+    }
 }
 
 /// Phase 2 adds `Hardlink`, `CharDevice`, `BlockDevice`, `Fifo` and `Socket`

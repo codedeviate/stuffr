@@ -131,28 +131,33 @@ fn inner_from_path(reg: &Registry, path: Option<&Path>, outer: FormatId) -> Chai
 
 /// Turns a path and/or a probed prefix into a concrete pipeline.
 ///
-/// Magic wins; extensions break ties and act as the fallback. Failure names the
-/// bytes actually seen so a misdetection is debuggable without library prints.
+/// The extension is consulted first, against the full magic-hit set; priority
+/// decides only when the path is silent or names a format whose magic did not
+/// match. Failure names the bytes actually seen so a misdetection is
+/// debuggable without library prints.
 pub fn resolve_chain(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Result<Chain> {
     let mut candidates = reg.match_magic(prefix);
 
-    // A uniquely highest-priority candidate wins outright.
     if candidates.len() > 1 {
-        let top = reg.priority_of(candidates[0]);
-        let tied: Vec<FormatId> = candidates
-            .iter()
-            .copied()
-            .filter(|id| reg.priority_of(*id) == top)
-            .collect();
-        if tied.len() == 1 {
-            candidates = tied;
-        } else {
-            // Still tied: let the extension choose, else refuse to guess.
-            let by_ext =
-                path.and_then(|p| extensions(p).iter().rev().find_map(|e| reg.by_extension(e)));
-            match by_ext.filter(|id| tied.contains(id)) {
-                Some(id) => candidates = vec![id],
-                None => {
+        // The extension is consulted FIRST, and against every magic hit — a
+        // path saying `.apk` must reach apk even though zip outranks it. That
+        // is the spec's own worked example, and ranking cannot be allowed to
+        // pre-empt an explicit filename. Priority decides only when the path
+        // is silent, or names a format whose magic never matched.
+        let by_ext =
+            path.and_then(|p| extensions(p).iter().rev().find_map(|e| reg.by_extension(e)));
+        match by_ext.filter(|id| candidates.contains(id)) {
+            Some(id) => candidates = vec![id],
+            None => {
+                let top = reg.priority_of(candidates[0]);
+                let tied: Vec<FormatId> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|id| reg.priority_of(*id) == top)
+                    .collect();
+                if tied.len() == 1 {
+                    candidates = tied;
+                } else {
                     let names: Vec<&str> = tied.iter().map(|id| id.as_str()).collect();
                     return Err(Error::AmbiguousFormat {
                         candidates: names.join(", "),
@@ -538,6 +543,51 @@ mod tests {
         assert!(
             !msg.contains("gamma"),
             "must not name the irrelevant extension: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_extension_reaches_a_lower_priority_format_that_shares_the_magic() {
+        // The spec's worked example: zip outranks apk on a bare stream, but a
+        // path saying `.apk` must still reach apk. Ranking must not override an
+        // explicit filename.
+        const ZIP_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("zip"),
+        }];
+        const APK_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("apk"),
+        }];
+        let mut r = Registry::new();
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("zip"), &["zip"], ZIP_MAGIC),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("apk"), &["apk"], APK_MAGIC).with_priority(-5),
+        );
+
+        // With no path, the higher-priority zip wins on the bare magic hit.
+        let chain = resolve_chain(&r, None, b"PKrest").unwrap();
+        assert_eq!(
+            chain,
+            Chain::Container {
+                container: FormatId::new("zip")
+            }
+        );
+
+        // Same bytes, but the path names apk — the lower-ranked candidate must
+        // still be reached; ranking cannot pre-empt an explicit filename.
+        let chain = resolve_chain(&r, Some(Path::new("archive.apk")), b"PKrest").unwrap();
+        assert_eq!(
+            chain,
+            Chain::Container {
+                container: FormatId::new("apk")
+            }
         );
     }
 }

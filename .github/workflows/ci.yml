@@ -8,6 +8,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   gate:
     name: gate (stable)
@@ -18,6 +21,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml pins 1.95 for local development, and rustup
+      # honours it for every `cargo` invocation regardless of which toolchain
+      # actions/steps selected above — without removing it, this job's
+      # `dtolnay/rust-toolchain@stable` step is inert and "gate (stable)"
+      # silently runs on 1.95 instead of stable.
+      - run: rm rust-toolchain.toml
       # The same command CONTRIBUTING.md tells a human to run, so a green
       # local run and a green pipeline mean the same thing.
       - run: make check
