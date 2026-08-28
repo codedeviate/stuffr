@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: gate (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The same command CONTRIBUTING.md tells a human to run, so a green
+      # local run and a green pipeline mean the same thing.
+      - run: make check
+
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml pins 1.95 for local development and must not
+      # constrain the MSRV check. Remove it so the toolchain action's choice
+      # takes effect.
+      - run: rm rust-toolchain.toml
+      # rust-version claims 1.85 and nothing has ever checked it. Edition 2024
+      # sits exactly at that floor.
+      - run: cargo build --workspace --all-features
+      - run: cargo test --workspace --all-features
