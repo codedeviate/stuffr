@@ -7,6 +7,8 @@
 pub use stuffr_core as core;
 pub use stuffr_core::*;
 
+pub mod ops;
+
 /// A registry containing every format this build was compiled with.
 ///
 /// `stf formats` renders this, which is how a user tells a missing feature flag
