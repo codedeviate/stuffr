@@ -88,17 +88,6 @@ fn output_of(s: &str) -> Output {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        // Rust ignores SIGPIPE, so a write to a closed stdout surfaces as an
-        // EPIPE `io::Error` rather than terminating the process outright. An
-        // early-exiting consumer — `stf cat huge.gz | head`, `| grep -m1`,
-        // `| less` — is the flagship workflow for a `cat`-shaped tool, and
-        // every conventional Unix filter (zcat, gzip -d, cat itself) treats
-        // that as normal termination, not a failure. Exit success with no
-        // message: the consumer closing the pipe is the party that decided
-        // it had seen enough.
-        Err(stuffr::Error::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-            ExitCode::SUCCESS
-        }
         Err(e) => {
             eprintln!("stf: {e}");
             ExitCode::from(e.exit_code() as u8)
@@ -106,8 +95,54 @@ fn main() -> ExitCode {
     }
 }
 
+/// Whether a command's output goes to stdout — the only case in which a
+/// `BrokenPipe` is the reader's decision rather than this program's failure.
+///
+/// `Cat`, `Info` and `Formats` never write anywhere else. `Pack` and `Unpack`
+/// write to stdout only when `-o -` was passed explicitly; every other
+/// destination is a real file, where a `BrokenPipe` mid-write would mean
+/// something is actually wrong and must not be swallowed (see `run`).
+fn destination_is_stdout(cmd: &Command) -> bool {
+    match cmd {
+        Command::Cat { .. } | Command::Info { .. } | Command::Formats => true,
+        Command::Pack {
+            output: Some(o), ..
+        }
+        | Command::Unpack {
+            output: Some(o), ..
+        } => o == "-",
+        _ => false,
+    }
+}
+
 fn run() -> stuffr::Result<()> {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    let stdout_dest = destination_is_stdout(&command);
+    match dispatch(command) {
+        Ok(()) => Ok(()),
+        // Rust ignores SIGPIPE, so a write to a closed stdout surfaces as an
+        // EPIPE `io::Error` rather than terminating the process outright. An
+        // early-exiting consumer — `stf cat huge.gz | head`, `| grep -m1`,
+        // `| less` — is the flagship workflow for a `cat`-shaped tool, and
+        // every conventional Unix filter (zcat, gzip -d, cat itself) treats
+        // that as normal termination, not a failure. Success, no message: the
+        // consumer closing the pipe is the party that decided it had seen
+        // enough.
+        //
+        // This must NOT fire for a file destination: `stf unpack a.gz -o
+        // file` hitting BrokenPipe (e.g. a full disk manifesting oddly) would
+        // otherwise map a real failure to exit 0 — `run` returning `Err`
+        // still triggers `discard`, so the temp file is removed and the
+        // process would report success having produced nothing at all.
+        Err(stuffr::Error::Io(e)) if stdout_dest && e.kind() == std::io::ErrorKind::BrokenPipe => {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn dispatch(command: Command) -> stuffr::Result<()> {
+    match command {
         Command::Pack {
             input,
             output,
