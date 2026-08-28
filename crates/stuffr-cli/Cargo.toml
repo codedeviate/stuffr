@@ -1,6 +1,6 @@
 [package]
 name = "stuffr-cli"
-version = "0.0.0"
+version.workspace = true
 description = "The stf command line interface"
 edition.workspace = true
 rust-version.workspace = true
@@ -12,4 +12,4 @@ name = "stf"
 path = "src/main.rs"
 
 [dependencies]
-stuffr = { path = "../stuffr", version = "0.0.0" }
+stuffr = { path = "../stuffr", version = "0.0.1" }

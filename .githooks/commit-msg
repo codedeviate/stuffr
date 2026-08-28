@@ -1,0 +1,68 @@
+#!/bin/sh
+# commit-msg — enforce Conventional Commits on the subject line.
+#
+# Install once per clone:  make hooks   (or: git config core.hooksPath .githooks)
+#
+# The subject is the only part of a commit most readers ever see, and a
+# machine-readable type is what lets tooling derive a changelog and the next
+# semantic version. This hook checks the SHAPE of a subject, never its prose.
+
+set -eu
+
+msg_file="$1"
+
+# The subject is the first line that is neither blank nor a comment.
+subject=$(grep -v '^#' "$msg_file" | grep -v '^[[:space:]]*$' | head -n 1 || true)
+
+# An empty message is git's business to reject, not ours.
+[ -n "$subject" ] || exit 0
+
+# Git generates these shapes itself during merge, revert and rebase. Their
+# format is fixed by git rather than by us, so rejecting them would break
+# those operations outright.
+case "$subject" in
+	Merge\ *|Revert\ *|fixup!\ *|squash!\ *|amend!\ *) exit 0 ;;
+esac
+
+types='feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert'
+
+if ! printf '%s' "$subject" | grep -Eq "^($types)(\([a-z0-9._-]+\))?!?: .+"; then
+	cat >&2 <<EOF
+✗ Commit message does not follow Conventional Commits.
+
+  Your subject:
+    $subject
+
+  Expected:
+    <type>[(scope)][!]: <description>
+
+  Types:  feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert
+  Scopes: core, formats, cli  (omit for workspace-wide changes)
+
+  Examples:
+    feat(core): add seekable zstd frame index
+    fix(cli): exit 2 on an unknown verb, not 1
+    docs: record the Phase 1 carry-forward list
+    feat(core)!: return Box<dyn Source> from Codec::decoder
+
+  A trailing "!" marks a breaking change. See CONTRIBUTING.md.
+EOF
+	exit 1
+fi
+
+# Keep subjects scannable in `git log --oneline`. Byte count, which is a close
+# enough proxy for width on a mostly-ASCII subject line.
+limit=72
+length=$(printf '%s' "$subject" | wc -c | tr -d ' ')
+if [ "$length" -gt "$limit" ]; then
+	cat >&2 <<EOF
+✗ Commit subject is $length bytes; the limit is $limit.
+
+  Your subject:
+    $subject
+
+  Move the detail into the body, which has no length limit — and which is
+  where the reasoning belongs anyway.
+EOF
+	exit 1
+fi

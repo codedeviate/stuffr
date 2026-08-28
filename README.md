@@ -184,6 +184,8 @@ already taken on crates.io. The command you type stays `stf`.
 
 - **Design specification** — `~/Development/Thomas/superpowers/stf/specs/2026-08-25-stf-compression-tool-design.md`
   (kept outside this repository, alongside the plans and session reports)
+- [CONTRIBUTING.md](CONTRIBUTING.md) — the development gate, commit convention,
+  and the versioning policy with its milestone table
 - [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md) — deliberate exclusions, and the wishlist
 
 ## License

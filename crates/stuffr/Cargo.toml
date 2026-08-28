@@ -1,6 +1,6 @@
 [package]
 name = "stuffr"
-version = "0.0.0"
+version.workspace = true
 description = "Universal compression and archive toolkit (library for the stf command)"
 edition.workspace = true
 rust-version.workspace = true
