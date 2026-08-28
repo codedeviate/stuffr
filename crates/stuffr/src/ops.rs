@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
-    EncodeOpts, Error, FidelityReport, FileSource, FormatId, FormatKind, ReaderSource, Registry,
-    Result, Source,
+    Chain, Counting, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts, Error, FidelityReport, FileSource,
+    FormatId, FormatKind, RatioGuard, ReaderSource, Registry, Result, Rung, Source,
 };
 
 /// Per-process counter mixed into the temp file name alongside the pid, so
@@ -318,4 +318,170 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
             Err(e)
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct DecompressOpts {
+    /// An explicit format, overriding detection.
+    pub format: Option<FormatId>,
+    pub force: bool,
+    /// Expansion ratio past which the decode is refused. See
+    /// [`stuffr_core::RatioGuard`].
+    pub max_ratio: u64,
+}
+
+impl Default for DecompressOpts {
+    fn default() -> Self {
+        Self {
+            format: None,
+            force: false,
+            max_ratio: DEFAULT_MAX_RATIO,
+        }
+    }
+}
+
+/// Resolves the format of a probed stream, rejecting what this build cannot do.
+///
+/// `Chain` is `#[non_exhaustive]` and this crate is not its defining crate, so
+/// the match needs a wildcard arm even though only three variants exist today
+/// — a fourth added upstream must fail loudly here rather than fail to compile
+/// silently-wrong.
+fn codec_for(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Result<FormatId> {
+    match stuffr_core::resolve_chain(reg, path, prefix)? {
+        Chain::Codec { codec, .. } => Ok(codec),
+        Chain::Container { container } => Err(Error::Unsupported(format!(
+            "`{container}` is a container; this build has codecs only (containers arrive in Phase 2)"
+        ))),
+        Chain::Raw => Err(Error::UnknownFormat {
+            seen: "no codec layer".into(),
+        }),
+        _ => Err(Error::Unsupported(
+            "unrecognised chain shape; this build does not know how to decode it".into(),
+        )),
+    }
+}
+
+/// Decompresses `src` into `dst`.
+pub fn decompress(src: Input, dst: Output, o: &DecompressOpts) -> Result<Outcome> {
+    let registry = crate::registry();
+    let path = src.path().map(Path::to_path_buf);
+
+    let source = src.open()?;
+    // Read the rung from the RAW source's capabilities, before `probe` runs.
+    // In today's `probe`, a seekable source is handed back unwrapped (so caps
+    // read afterwards would happen to still agree), but a pipe is wrapped in
+    // a `PeekSource` whose `caps()` hardcodes `seekable: false`. Reading here,
+    // first, is the order that stays correct regardless of how `probe`'s
+    // wrapping evolves, rather than one that depends on today's wrapper
+    // reporting the same thing the raw source did.
+    let rung = if source.caps().seekable {
+        Rung::Exact
+    } else {
+        Rung::ForwardOnly
+    };
+
+    let (prefix, source) = stuffr_core::probe(source)?;
+    let format = match o.format {
+        Some(f) => f,
+        None => codec_for(&registry, path.as_deref(), &prefix)?,
+    };
+    let codec = registry.require_codec(format)?;
+
+    let (counting, consumed) = Counting::new(source);
+    let mut decoder = codec.decoder(Box::new(counting), &DecodeOpts::default())?;
+    let mut guard = RatioGuard::new(Arc::clone(&consumed), o.max_ratio);
+
+    let opened = dst.create(o.force)?;
+    let finish = opened.finish;
+    let mut writer = opened.writer;
+
+    let mut run = || -> Result<()> {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = decoder.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            guard.record(n)?;
+            writer.write_all(&buf[..n])?;
+        }
+        // `Sink::finish`'s flush contract is the write side; a decode writes
+        // straight to the destination rather than through a `Sink`, so it
+        // has to flush itself before publishing.
+        writer.flush()?;
+        Ok(())
+    };
+
+    match run() {
+        Ok(()) => {
+            // Rename onto the final path only now: every byte has been
+            // written AND flushed. Publishing earlier risks a truncated file
+            // visible under the real name.
+            publish(finish)?;
+            Ok(Outcome {
+                bytes_in: consumed.load(Ordering::Relaxed),
+                bytes_out: guard.produced(),
+                format,
+                fidelity: FidelityReport::new(rung),
+            })
+        }
+        Err(e) => {
+            discard(finish);
+            Err(e)
+        }
+    }
+}
+
+/// What `stf info` reports.
+#[derive(Clone, Debug)]
+pub struct Inspection {
+    pub format: FormatId,
+    /// The resolved pipeline, e.g. `"gzip"` or `"tar over gzip"`.
+    pub chain: String,
+    pub rung: Rung,
+    pub fidelity: FidelityReport,
+    /// Input size, when the source knows it. A pipe does not.
+    pub bytes_in: Option<u64>,
+}
+
+/// Identifies a stream without decoding it.
+pub fn inspect(src: Input) -> Result<Inspection> {
+    let registry = crate::registry();
+    let path = src.path().map(Path::to_path_buf);
+
+    let source = src.open()?;
+    // Read BEFORE `probe`, for the same reason as in `decompress`: this is
+    // the rung of the raw input, not of whatever wrapper detection happens to
+    // apply on top of it.
+    let caps = source.caps();
+    let rung = if caps.seekable {
+        Rung::Exact
+    } else {
+        Rung::ForwardOnly
+    };
+
+    let (prefix, _rest) = stuffr_core::probe(source)?;
+    let chain = stuffr_core::resolve_chain(&registry, path.as_deref(), &prefix)?;
+    let format = match &chain {
+        Chain::Codec { codec, .. } => *codec,
+        Chain::Container { container } => *container,
+        Chain::Raw => {
+            return Err(Error::UnknownFormat {
+                seen: "no codec layer".into(),
+            });
+        }
+        _ => {
+            return Err(Error::Unsupported(
+                "unrecognised chain shape; this build does not know how to describe it".into(),
+            ));
+        }
+    };
+
+    Ok(Inspection {
+        format,
+        chain: chain.describe(),
+        rung,
+        fidelity: FidelityReport::new(rung),
+        bytes_in: caps.len,
+    })
 }
