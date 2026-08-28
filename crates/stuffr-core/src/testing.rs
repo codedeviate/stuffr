@@ -145,6 +145,12 @@ impl MockContainer {
         }
         None
     }
+
+    /// First offset at which a record marker appears. Used only by the
+    /// Degraded rung, where the leading bytes cannot be trusted.
+    fn find_first_record(buf: &[u8]) -> Option<usize> {
+        buf.windows(2).position(|w| w == b"ME")
+    }
 }
 
 impl Container for MockContainer {
@@ -172,10 +178,17 @@ impl Container for MockContainer {
         let mut buf = Vec::new();
         source.read_to_end(&mut buf)?;
 
-        // Degraded means "salvage what you can": scan forward for record
-        // markers rather than trusting the structure. The mock's salvage is the
-        // same forward walk, but it records that it was asked.
-        let index = if seekable && rung != Rung::Degraded {
+        // Degraded means "salvage what you can": do not trust the stream to
+        // begin at a record boundary, scan for one. Reachable because the
+        // ladder only ever selects Degraded for a NON-seekable source — if it
+        // were seekable, rung 1 would have returned Exact long before.
+        let pos = if rung == Rung::Degraded {
+            Self::find_first_record(&buf).unwrap_or(buf.len())
+        } else {
+            0
+        };
+
+        let index = if seekable {
             Self::parse_index(&buf)
         } else {
             None
@@ -192,7 +205,7 @@ impl Container for MockContainer {
 
         Ok(Box::new(MockArchiveRead {
             buf,
-            pos: 0,
+            pos,
             report,
             index,
         }))
@@ -661,5 +674,57 @@ mod tests {
             .filter(|w| matches!(w, crate::Fidelity::EntryCountUnknown))
             .count();
         assert_eq!(n, 1, "EntryCountUnknown must appear exactly once");
+    }
+
+    #[test]
+    fn degraded_salvages_a_stream_that_forward_only_cannot_parse() {
+        // Eight bytes of junk before the first record. A forward parse trusts
+        // offset 0 and finds nothing; a salvage scan finds the record. Both
+        // sources are non-seekable, so this is the difference the Degraded rung
+        // actually buys — and it is reachable, unlike a difference gated on
+        // seekability, which the ladder never pairs with Degraded.
+        let mut bytes = b"JUNKJUNK".to_vec();
+        bytes.extend_from_slice(&mock_archive_bytes(&[("a.txt", b"alpha")]));
+
+        let forward = crate::resolve(
+            Box::new(ReaderSource::new(std::io::Cursor::new(bytes.clone()))),
+            MOCK_CONTAINER,
+            MockContainer.caps(),
+            &crate::StreamPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(forward.rung, crate::Rung::ForwardOnly);
+        let mut ar = MockContainer.open(forward, &OpenOpts::default()).unwrap();
+        assert!(
+            ar.next_entry().unwrap().is_none(),
+            "a forward parse cannot start mid-junk"
+        );
+
+        let caps = ContainerCaps {
+            degraded_parse: true,
+            ..MockContainer.caps()
+        };
+        let policy = crate::StreamPolicy::Adaptive {
+            allow_forward_only: false,
+            spill: crate::SpillPolicy::Off,
+            allow_degraded: true,
+        };
+        let salvage = crate::resolve(
+            Box::new(ReaderSource::new(std::io::Cursor::new(bytes))),
+            MOCK_CONTAINER,
+            caps,
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(salvage.rung, crate::Rung::Degraded);
+        let mut ar = MockContainer.open(salvage, &OpenOpts::default()).unwrap();
+        let mut e = ar
+            .next_entry()
+            .unwrap()
+            .expect("salvage must recover the record");
+        assert_eq!(e.meta().name, "a.txt");
+        let mut data = Vec::new();
+        e.reader().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"alpha");
     }
 }
