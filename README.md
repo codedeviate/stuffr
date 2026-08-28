@@ -190,5 +190,10 @@ already taken on crates.io. The command you type stays `stf`.
 
 ## License
 
-Not yet chosen. Note that the `unrar` feature, if enabled, carries its own
-restrictive upstream license — which is one reason it is opt-in.
+[MIT](LICENSE).
+
+That covers this project's own code. It does **not** extend to optional
+dependencies: the `unrar` feature, if enabled, links a library whose upstream
+license permits decompression only and forbids using the source to build a RAR
+compressor. A build with `--features c-backed` is therefore not wholly MIT,
+which is one reason that feature is opt-in rather than default.
