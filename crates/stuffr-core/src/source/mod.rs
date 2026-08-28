@@ -2,11 +2,13 @@
 //! it can do, and the ladder (see [`crate::ladder`]) supplies the best rung.
 
 mod file;
+pub mod limit;
 mod reader;
 pub mod spill;
 pub mod stream_only;
 
 pub use file::FileSource;
+pub use limit::{Counting, DEFAULT_MAX_RATIO, RATIO_FLOOR, RatioGuard};
 pub use reader::{PeekSource, ReaderSource};
 pub use spill::{SpillPolicy, SpillSource};
 pub use stream_only::StreamOnly;
