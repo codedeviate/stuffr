@@ -9,9 +9,12 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: design complete, implementation not started.** The design is
-> committed and the delivery phases are laid out, but there is no working code in
-> this repository yet. Nothing below describes behaviour you can run today.
+> **Status: Phase 0 complete; Phase 1+ not started.** The `stuffr-core`
+> foundation layer is built and tested (102 tests passing, clean across build,
+> clippy, fmt). You can run `stf --version` and `stf formats` today. **But there
+> are no real formats or codecs yet** — Phase 0 intentionally carries no format
+> dependencies, so the stream ladder, governor, and registry are validated
+> against mocks. Phase 1 will add the actual codec and container implementations.
 
 ## Why another one
 
@@ -95,6 +98,8 @@ reduces the thread count to fit `--memory-limit`. Fewer, slower threads beat the
 OOM killer.
 
 ## Planned CLI
+
+*Phase 1 and later. Only `stf formats` and `stf --version` are implemented today.*
 
 ```
 stf pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
