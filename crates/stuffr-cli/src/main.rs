@@ -88,6 +88,17 @@ fn output_of(s: &str) -> Output {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
+        // Rust ignores SIGPIPE, so a write to a closed stdout surfaces as an
+        // EPIPE `io::Error` rather than terminating the process outright. An
+        // early-exiting consumer — `stf cat huge.gz | head`, `| grep -m1`,
+        // `| less` — is the flagship workflow for a `cat`-shaped tool, and
+        // every conventional Unix filter (zcat, gzip -d, cat itself) treats
+        // that as normal termination, not a failure. Exit success with no
+        // message: the consumer closing the pipe is the party that decided
+        // it had seen enough.
+        Err(stuffr::Error::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("stf: {e}");
             ExitCode::from(e.exit_code() as u8)
@@ -314,6 +325,7 @@ mod tests {
         assert_eq!(json_escape("say \"hi\""), "say \\\"hi\\\"");
         assert_eq!(json_escape("a\\b"), "a\\\\b");
         assert_eq!(json_escape("line1\nline2"), "line1\\nline2");
+        assert_eq!(json_escape("cr\rcr"), "cr\\rcr");
         assert_eq!(json_escape("tab\ttab"), "tab\\ttab");
         assert_eq!(json_escape("plain"), "plain");
         assert_eq!(json_escape("\u{0001}"), "\\u0001");
