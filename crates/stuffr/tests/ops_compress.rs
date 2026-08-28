@@ -197,3 +197,35 @@ fn a_forced_overwrite_preserves_the_destinations_permissions() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&dst);
 }
+
+#[test]
+fn suggested_names_add_and_strip_the_extension() {
+    use std::path::Path;
+    use stuffr::ops::{suggest_packed, suggest_unpacked};
+
+    let gzip = stuffr::registry()
+        .by_extension("gz")
+        .expect("gzip must be registered");
+    assert_eq!(
+        suggest_packed(Path::new("/tmp/notes.txt"), gzip).unwrap(),
+        Path::new("/tmp/notes.txt.gz"),
+        "packing appends rather than replacing, so notes.txt.gz unpacks back to notes.txt"
+    );
+    assert_eq!(
+        suggest_unpacked(Path::new("/tmp/notes.txt.gz")).unwrap(),
+        Path::new("/tmp/notes.txt")
+    );
+}
+
+#[test]
+fn an_unrecognised_extension_asks_for_an_explicit_output() {
+    use std::path::Path;
+    use stuffr::ops::suggest_unpacked;
+
+    let err = suggest_unpacked(Path::new("/tmp/mystery.bin")).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("-o"),
+        "the error must say how to proceed"
+    );
+}

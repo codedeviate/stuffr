@@ -177,7 +177,14 @@ pub(crate) fn discard(finish: Option<Finish>) {
 /// name, so it has to be the last thing that happens on the success path.
 pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
     if let Some(f) = finish {
-        std::fs::rename(&f.tmp, &f.target)?;
+        if let Err(e) = std::fs::rename(&f.tmp, &f.target) {
+            // The rename itself failed, so nothing was published: remove the
+            // temp file rather than leaving it to strand on disk forever —
+            // the caller only ever branches on success (`publish`) vs.
+            // failure (`discard`), never both.
+            let _ = std::fs::remove_file(&f.tmp);
+            return Err(Error::from(e));
+        }
     }
     Ok(())
 }
@@ -231,6 +238,28 @@ pub struct Outcome {
     pub fidelity: FidelityReport,
 }
 
+/// The build's one codec, or a usage error naming what to do about zero or
+/// several.
+///
+/// While exactly one codec is registered, defaulting to it is unambiguous.
+/// This becomes a usage error on its own the moment 1c adds a second.
+fn default_format_in(reg: &Registry) -> Result<FormatId> {
+    let codecs: Vec<FormatId> = reg
+        .matrix()
+        .into_iter()
+        .filter(|r| r.kind == FormatKind::Codec)
+        .map(|r| r.id)
+        .collect();
+    match codecs.len() {
+        1 => Ok(codecs[0]),
+        0 => Err(Error::Usage("this build contains no codecs".into())),
+        _ => Err(Error::Usage(
+            "cannot infer the output format; pass --format or name the output with a known extension"
+                .into(),
+        )),
+    }
+}
+
 /// Chooses the output format: explicit flag, else the output extension, else
 /// the only codec in the build.
 fn choose_format(reg: &Registry, dst: &Output, explicit: Option<FormatId>) -> Result<FormatId> {
@@ -246,22 +275,18 @@ fn choose_format(reg: &Registry, dst: &Output, explicit: Option<FormatId>) -> Re
             return Ok(id);
         }
     }
-    // While one codec is registered, defaulting to it is unambiguous. This
-    // becomes a usage error on its own the moment 1c adds a second.
-    let codecs: Vec<FormatId> = reg
-        .matrix()
-        .into_iter()
-        .filter(|r| r.kind == FormatKind::Codec)
-        .map(|r| r.id)
-        .collect();
-    match codecs.len() {
-        1 => Ok(codecs[0]),
-        0 => Err(Error::Usage("this build contains no codecs".into())),
-        _ => Err(Error::Usage(
-            "cannot infer the output format; pass --format or name the output with a known extension"
-                .into(),
-        )),
-    }
+    default_format_in(reg)
+}
+
+/// What to use as the output format when nothing names one: the build's one
+/// codec.
+///
+/// A library consumer asks the same question `choose_format` answers
+/// internally for `compress` — e.g. the CLI, falling back for `stf pack` when
+/// neither `-o` nor `--format` was given — and duplicating the answer in the
+/// binary is how the two would drift apart.
+pub fn default_format() -> Result<FormatId> {
+    default_format_in(&crate::registry())
 }
 
 /// Compresses `src` into `dst`.
@@ -484,4 +509,43 @@ pub fn inspect(src: Input) -> Result<Inspection> {
         fidelity: FidelityReport::new(rung),
         bytes_in: caps.len,
     })
+}
+
+/// The extension a format's output should carry, e.g. `"gz"` for gzip.
+pub fn primary_extension(format: FormatId) -> Option<&'static str> {
+    crate::registry()
+        .matrix()
+        .into_iter()
+        .find(|r| r.id == format)
+        .and_then(|r| r.extensions.first().copied())
+}
+
+/// Where `stf pack INPUT` writes when no `-o` is given.
+///
+/// Appends rather than replaces, so `notes.txt` becomes `notes.txt.gz` and
+/// unpacking returns the original name.
+pub fn suggest_packed(input: &Path, format: FormatId) -> Result<PathBuf> {
+    let ext = primary_extension(format)
+        .ok_or_else(|| Error::Usage(format!("`{format}` has no registered extension; pass -o")))?;
+    let mut name = input.as_os_str().to_os_string();
+    name.push(".");
+    name.push(ext);
+    Ok(PathBuf::from(name))
+}
+
+/// Where `stf unpack INPUT` writes when no `-o` is given.
+pub fn suggest_unpacked(input: &Path) -> Result<PathBuf> {
+    let known = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(|e| crate::registry().by_extension(e))
+        .is_some();
+    if known {
+        Ok(input.with_extension(""))
+    } else {
+        Err(Error::Usage(format!(
+            "cannot infer an output name from `{}`; pass -o",
+            input.display()
+        )))
+    }
 }

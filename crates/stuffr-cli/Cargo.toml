@@ -13,3 +13,4 @@ path = "src/main.rs"
 
 [dependencies]
 stuffr = { path = "../stuffr", version = "0.0.1" }
+clap = { workspace = true }
