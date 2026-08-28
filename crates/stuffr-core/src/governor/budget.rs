@@ -36,6 +36,18 @@ pub fn parse_cgroup_v1_quota(quota: &str, period: &str) -> Option<usize> {
 fn cgroup_budget() -> Option<usize> {
     use std::fs::read_to_string;
 
+    // Try v2 at the process's own cgroup first (for nested slices), then the root.
+    if let Ok(cgroup_contents) = read_to_string("/proc/self/cgroup") {
+        if let Some(path) = super::cgroup::parse_self_cgroup_v2_path(&cgroup_contents) {
+            let nested_path = format!("/sys/fs/cgroup{}/cpu.max", path);
+            if let Ok(s) = read_to_string(&nested_path) {
+                if let Some(n) = parse_cgroup_v2_cpu_max(&s) {
+                    return Some(n);
+                }
+            }
+        }
+    }
+
     if let Ok(s) = read_to_string("/sys/fs/cgroup/cpu.max") {
         if let Some(n) = parse_cgroup_v2_cpu_max(&s) {
             return Some(n);

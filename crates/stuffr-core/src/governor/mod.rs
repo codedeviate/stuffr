@@ -2,6 +2,7 @@
 //! outside the governor.
 
 pub mod budget;
+pub mod cgroup;
 
 pub use budget::{BudgetInputs, DEFAULT_CAP, detect_cpu_budget, resolve_workers};
 
@@ -10,24 +11,53 @@ use std::sync::{Arc, Condvar, Mutex};
 /// Floor for the memory budget: below this, even single-threaded work struggles.
 pub const MEMORY_FLOOR: u64 = 256 * 1024 * 1024;
 
+/// Combines the readings into the effective budget: 25% of the smallest
+/// applicable figure, never below [`MEMORY_FLOOR`].
+///
+/// `available` is the host or cgroup-visible free memory; `cgroup_v2` and
+/// `cgroup_v1` are container limits when present. Taking the minimum is the
+/// fix: `/proc/meminfo` inside a container reports the host, so on its own it
+/// computes a budget the container cannot honour.
+pub fn effective_memory_limit(
+    available: u64,
+    cgroup_v2: Option<u64>,
+    cgroup_v1: Option<u64>,
+) -> u64 {
+    let mut smallest = available;
+    if let Some(v) = cgroup_v2 {
+        smallest = smallest.min(v);
+    }
+    if let Some(v) = cgroup_v1 {
+        smallest = smallest.min(v);
+    }
+    (smallest / 4).max(MEMORY_FLOOR)
+}
+
 /// 25% of *available* RAM. Available rather than total, because the distinction
 /// is exactly what matters on a host that is already loaded.
 ///
-/// Reads `MemAvailable` from `/proc/meminfo` on Linux; elsewhere it falls back
-/// to the floor, which is conservative by design.
+/// Reads `MemAvailable` from `/proc/meminfo` on Linux, and checks for cgroup
+/// limits (v2 and v1). Elsewhere it falls back to the floor, which is
+/// conservative by design.
 pub fn default_memory_limit() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
-            for line in s.lines() {
-                if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                    if let Some(kb) = rest.split_whitespace().next() {
-                        if let Ok(kb) = kb.parse::<u64>() {
-                            return ((kb * 1024) / 4).max(MEMORY_FLOOR);
-                        }
-                    }
-                }
-            }
+        let available = if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+            cgroup::parse_meminfo_available(&s)
+        } else {
+            None
+        };
+
+        if let Some(avail) = available {
+            let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+                .ok()
+                .and_then(|s| cgroup::parse_cgroup_v2_memory_max(&s));
+
+            let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                .ok()
+                .and_then(|s| cgroup::parse_cgroup_v1_memory_limit(&s));
+
+            return effective_memory_limit(avail, v2, v1);
         }
     }
     MEMORY_FLOOR
@@ -310,6 +340,45 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Governor::from_inputs(&i, GIB).workers(), 8);
+    }
+
+    #[test]
+    fn a_small_container_limit_is_clamped_up_to_the_floor() {
+        // 512 MiB / 4 = 128 MiB, below MEMORY_FLOOR, so the floor wins.
+        let host = 64 * 1024 * 1024 * 1024;
+        assert_eq!(
+            effective_memory_limit(host, Some(512 * 1024 * 1024), None),
+            MEMORY_FLOOR
+        );
+    }
+
+    #[test]
+    fn a_container_limit_beats_a_larger_host_reading() {
+        // The behaviour that matters: inside a container, /proc/meminfo reports
+        // the HOST, so the host reading alone would give 16 GiB. The container
+        // limit must win. Chosen large enough to clear MEMORY_FLOOR, so the
+        // floor cannot mask the result the way it does at 512 MiB.
+        let host = 64 * 1024 * 1024 * 1024;
+        let container = 8 * 1024 * 1024 * 1024;
+        assert_eq!(
+            effective_memory_limit(host, Some(container), None),
+            2 * 1024 * 1024 * 1024,
+            "8 GiB container -> 2 GiB budget, not the 16 GiB the host would give"
+        );
+    }
+
+    #[test]
+    fn with_no_cgroup_limit_the_host_reading_stands() {
+        let host = 64 * 1024 * 1024 * 1024;
+        assert_eq!(
+            effective_memory_limit(host, None, None),
+            16 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn the_floor_applies_after_every_other_clamp() {
+        assert_eq!(effective_memory_limit(1024, Some(2048), None), MEMORY_FLOOR);
     }
 
     #[test]
