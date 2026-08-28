@@ -49,10 +49,26 @@ pub fn default_memory_limit() -> u64 {
         };
 
         if let Some(avail) = available {
-            let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-                .ok()
-                .and_then(|s| cgroup::parse_cgroup_v2_memory_max(&s));
+            // Try v2 at the process's own cgroup first (for nested slices), then the root.
+            let v2 = {
+                let mut limit = None;
+                if let Ok(cgroup_contents) = std::fs::read_to_string("/proc/self/cgroup") {
+                    if let Some(path) = cgroup::parse_self_cgroup_v2_path(&cgroup_contents) {
+                        let nested_path = format!("/sys/fs/cgroup{}/memory.max", path);
+                        if let Ok(s) = std::fs::read_to_string(&nested_path) {
+                            limit = cgroup::parse_cgroup_v2_memory_max(&s);
+                        }
+                    }
+                }
+                limit.or_else(|| {
+                    std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+                        .ok()
+                        .and_then(|s| cgroup::parse_cgroup_v2_memory_max(&s))
+                })
+            };
 
+            // v1's hierarchy differs; only check the root. Nested v1 resolution was not
+            // required by the brief and might not have a per-cgroup memory limit set.
             let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
                 .ok()
                 .and_then(|s| cgroup::parse_cgroup_v1_memory_limit(&s));
