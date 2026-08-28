@@ -8,17 +8,42 @@ use crate::fidelity::FidelityReport;
 use crate::format::{CodecCaps, ContainerCaps, FormatId};
 use crate::source::Source;
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct DecodeOpts {
     /// Worker hint. The governor has final say; this is only a request.
     pub threads: Option<usize>,
+    /// The shared worker/memory budget. `None` means single-threaded — a codec
+    /// parallelises only if handed a governor, never from an ambient global.
+    pub governor: Option<std::sync::Arc<crate::Governor>>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+impl std::fmt::Debug for DecodeOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeOpts")
+            .field("threads", &self.threads)
+            .field("governor", &self.governor.as_ref().map(|_| "Governor"))
+            .finish()
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct EncodeOpts {
     /// Format-relative compression level. `None` means the format's default.
     pub level: Option<i32>,
     pub threads: Option<usize>,
+    /// The shared worker/memory budget. `None` means single-threaded — a codec
+    /// parallelises only if handed a governor, never from an ambient global.
+    pub governor: Option<std::sync::Arc<crate::Governor>>,
+}
+
+impl std::fmt::Debug for EncodeOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncodeOpts")
+            .field("level", &self.level)
+            .field("threads", &self.threads)
+            .field("governor", &self.governor.as_ref().map(|_| "Governor"))
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]

@@ -79,6 +79,18 @@ impl Codec for MockCodec {
     }
 }
 
+impl MockCodec {
+    /// Stands in for what a real MT codec does: ask the governor for workers,
+    /// use them, release. The mock immediately releases; a real codec would
+    /// hold the set for the duration of the work.
+    pub fn workers_for_opts(&self, o: &DecodeOpts) -> usize {
+        match (&o.governor, o.threads) {
+            (Some(g), want) => g.acquire_many(want.unwrap_or(1), 0).workers(),
+            (None, _) => 1,
+        }
+    }
+}
+
 /// A deliberately ZIP-shaped mock container.
 ///
 /// ```text
@@ -726,5 +738,42 @@ mod tests {
         let mut data = Vec::new();
         e.reader().read_to_end(&mut data).unwrap();
         assert_eq!(data, b"alpha");
+    }
+
+    #[test]
+    fn a_codec_parallelises_only_when_handed_a_governor() {
+        // The seam: no ambient global. Without a governor the codec must not
+        // claim workers; with one it draws from the shared budget.
+        let plain = b"the quick brown fox".to_vec();
+
+        let solo = DecodeOpts::default();
+        assert!(solo.governor.is_none());
+        assert_eq!(MockCodec.workers_for_opts(&solo), 1);
+
+        let gov = crate::Governor::new(4, 1024 * 1024 * 1024);
+        let opts = DecodeOpts {
+            threads: Some(4),
+            governor: Some(std::sync::Arc::clone(&gov)),
+        };
+        assert_eq!(MockCodec.workers_for_opts(&opts), 4);
+        assert_eq!(gov.outstanding(), 0, "the lease must be released again");
+
+        // Decoding still works either way.
+        let encoded: Vec<u8> = plain.iter().map(|b| b ^ 0xFF).collect();
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(encoded)));
+        let mut dec = MockCodec.decoder(src, &opts).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn opts_debug_does_not_require_a_debug_bound_on_governor() {
+        let gov = crate::Governor::new(2, 1024);
+        let o = DecodeOpts {
+            threads: None,
+            governor: Some(gov),
+        };
+        assert!(format!("{o:?}").contains("governor"));
     }
 }
