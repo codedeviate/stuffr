@@ -8,8 +8,8 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use stuffr_core::{
     EncodeOpts, Error, FidelityReport, FileSource, FormatId, FormatKind, ReaderSource, Registry,
@@ -45,64 +45,143 @@ pub enum Output {
     Stdout,
 }
 
-/// A destination, plus the path to remove if the write fails partway.
+/// A destination, plus what to do when the write finishes or fails.
+///
+/// `Output::Path` writes to a temp file beside the real destination and only
+/// renames onto it once the caller confirms the write succeeded; `finish`
+/// carries the temp path so a failure can remove it without ever touching the
+/// real destination, and `target` carries the final path the rename lands on.
 pub(crate) struct Opened {
     pub(crate) writer: Box<dyn Write + Send>,
-    pub(crate) cleanup: Option<PathBuf>,
+    pub(crate) finish: Option<Finish>,
+}
+
+/// What `Opened::writer` is actually writing to, and where it must end up.
+pub(crate) struct Finish {
+    /// The temp path currently being written. Removed on failure.
+    pub(crate) tmp: PathBuf,
+    /// The real destination. Renamed onto only after a successful write.
+    pub(crate) target: PathBuf,
 }
 
 impl Output {
     /// Opens the destination, refusing an existing file unless `force`.
     ///
     /// The check runs before any work, so a refused command does nothing at all
-    /// rather than truncating and then complaining.
+    /// rather than truncating and then complaining. For `Output::Path` the
+    /// real bytes land in a temp file beside the destination; the caller must
+    /// rename it onto the destination on success (see `discard` for failure).
     pub(crate) fn create(&self, force: bool) -> Result<Opened> {
         match self {
             Output::Stdout => Ok(Opened {
                 writer: Box::new(std::io::stdout()),
-                cleanup: None,
+                finish: None,
             }),
             Output::Path(p) => {
-                if !force && p.exists() {
+                let exists = p.exists();
+                if !force && exists {
                     return Err(Error::Usage(format!(
                         "{} already exists; pass --force to overwrite",
                         p.display()
                     )));
                 }
-                let f = File::create(p)?;
+                // Read the destination's permissions BEFORE creating or
+                // renaming anything: once the rename happens the original
+                // inode is gone and there is nothing left to read them from.
+                let carry_over_perms = if exists {
+                    Some(std::fs::metadata(p)?.permissions())
+                } else {
+                    None
+                };
+
+                let parent = match p.parent() {
+                    Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+                    _ => PathBuf::from("."),
+                };
+                let file_name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let tmp = parent.join(format!(".{}.{}.tmp", std::process::id(), file_name));
+
+                let f = File::create(&tmp)?;
+                if let Some(perms) = carry_over_perms {
+                    std::fs::set_permissions(&tmp, perms)?;
+                }
                 Ok(Opened {
                     writer: Box::new(f),
-                    cleanup: Some(p.clone()),
+                    finish: Some(Finish {
+                        tmp,
+                        target: p.clone(),
+                    }),
                 })
             }
         }
     }
 }
 
-/// Removes a partial output after a failed write.
-///
-/// Without this a transient failure becomes permanent: the file left behind
-/// would make the overwrite guard refuse the retry.
-pub(crate) fn discard(cleanup: Option<PathBuf>) {
-    if let Some(p) = cleanup {
-        let _ = std::fs::remove_file(p);
+/// Removes the temp file left by a failed write, leaving the real destination
+/// exactly as it was — untouched if it existed, still absent if it did not.
+pub(crate) fn discard(finish: Option<Finish>) {
+    if let Some(f) = finish {
+        let _ = std::fs::remove_file(f.tmp);
     }
 }
 
+/// Publishes a successful write: renames the temp file onto the destination.
+///
+/// Must only be called after every byte (including any trailer) is written
+/// and flushed — the rename is what makes the file visible under its real
+/// name, so it has to be the last thing that happens on the success path.
+pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
+    if let Some(f) = finish {
+        std::fs::rename(&f.tmp, &f.target)?;
+    }
+    Ok(())
+}
+
 /// Counts bytes on their way out, so `bytes_out` is correct for stdout too.
+///
+/// The real writer lives behind a mutex rather than being owned outright, so
+/// `compress` can keep a second handle (`SharedWriter`) to it even after the
+/// first handle is moved into the codec's `Sink`. That second handle is what
+/// lets `compress` flush the destination once `Sink::finish` has written the
+/// trailer — `Sink::finish` consumes its writer without giving it back, so
+/// without a shared handle there would be nothing left to flush.
 pub(crate) struct CountingWriter {
-    inner: Box<dyn Write + Send>,
+    inner: SharedWriter,
     count: Arc<AtomicU64>,
 }
 
+/// A second handle onto the writer a `CountingWriter` wraps.
+#[derive(Clone)]
+pub(crate) struct SharedWriter(Arc<Mutex<Box<dyn Write + Send>>>);
+
+impl SharedWriter {
+    /// Flushes the underlying writer through this handle.
+    pub(crate) fn flush(&self) -> std::io::Result<()> {
+        self.lock().flush()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn Write + Send>> {
+        // Nothing in this module ever panics while holding the lock, so
+        // poisoning cannot happen in practice; recovering the guard instead
+        // of unwrapping keeps a hypothetical poison from turning into a
+        // second, unrelated panic on top of whatever caused the first one.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 impl CountingWriter {
-    pub(crate) fn new(inner: Box<dyn Write + Send>) -> (Self, Arc<AtomicU64>) {
+    pub(crate) fn new(inner: Box<dyn Write + Send>) -> (Self, SharedWriter, Arc<AtomicU64>) {
+        let shared = SharedWriter(Arc::new(Mutex::new(inner)));
         let count = Arc::new(AtomicU64::new(0));
         (
             Self {
-                inner,
+                inner: shared.clone(),
                 count: Arc::clone(&count),
             },
+            shared,
             count,
         )
     }
@@ -110,7 +189,7 @@ impl CountingWriter {
 
 impl Write for CountingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
+        let n = self.inner.lock().write(buf)?;
         self.count.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
@@ -179,8 +258,7 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
 
     let mut reader = src.open()?;
     let opened = dst.create(o.force)?;
-    let cleanup = opened.cleanup.clone();
-    let (counted, written) = CountingWriter::new(opened.writer);
+    let (counted, shared, written) = CountingWriter::new(opened.writer);
 
     let encode = EncodeOpts {
         level: o.level,
@@ -201,18 +279,31 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
         }
         // Not optional: this writes gzip's CRC and length trailer.
         sink.finish()?;
+        // flate2 never flushes the writer it wraps, and stdout's LineWriter
+        // only auto-flushes on '\n' — without an explicit flush here, binary
+        // gzip bytes can sit unflushed and be lost if the process exits via
+        // std::process::exit (which runs no destructors). `sink.finish()`
+        // consumed the writer, so this goes through the second handle kept
+        // alive alongside it.
+        shared.flush()?;
         Ok(total_in)
     };
 
     match run() {
-        Ok(bytes_in) => Ok(Outcome {
-            bytes_in,
-            bytes_out: written.load(Ordering::Relaxed),
-            format,
-            fidelity: FidelityReport::exact(),
-        }),
+        Ok(bytes_in) => {
+            // Rename onto the final path only now: every byte, including the
+            // trailer, has been written AND flushed. Publishing any earlier
+            // risks a truncated file visible under the real name.
+            publish(opened.finish)?;
+            Ok(Outcome {
+                bytes_in,
+                bytes_out: written.load(Ordering::Relaxed),
+                format,
+                fidelity: FidelityReport::exact(),
+            })
+        }
         Err(e) => {
-            discard(cleanup);
+            discard(opened.finish);
             Err(e)
         }
     }

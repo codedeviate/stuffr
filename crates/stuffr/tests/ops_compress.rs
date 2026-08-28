@@ -109,3 +109,64 @@ fn an_out_of_range_level_surfaces_as_a_usage_error() {
 
     let _ = std::fs::remove_file(&src);
 }
+
+#[test]
+fn a_rejected_level_leaves_a_forced_destination_byte_for_byte_intact() {
+    let src = tmp("keep-in.txt");
+    let dst = tmp("keep-out.gz");
+    std::fs::write(&src, b"payload").unwrap();
+    std::fs::write(&dst, b"PRE-EXISTING-AND-PRECIOUS").unwrap();
+
+    // --force means "you may replace it", not "you may destroy it and produce
+    // nothing". A usage error must leave the original exactly as it was.
+    let o = CompressOpts {
+        force: true,
+        level: Some(12),
+        ..Default::default()
+    };
+    let err = compress(Input::Path(src.clone()), Output::Path(dst.clone()), &o).unwrap_err();
+    assert_eq!(err.exit_code(), 2);
+
+    assert!(
+        dst.exists(),
+        "a usage error must not delete the destination"
+    );
+    assert_eq!(std::fs::read(&dst).unwrap(), b"PRE-EXISTING-AND-PRECIOUS");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[test]
+fn a_rejected_level_leaves_no_temp_file_behind() {
+    let src = tmp("notemp-in.txt");
+    let dst = tmp("notemp-out.gz");
+    std::fs::write(&src, b"payload").unwrap();
+    std::fs::write(&dst, b"PRE-EXISTING").unwrap();
+
+    let o = CompressOpts {
+        force: true,
+        level: Some(12),
+        ..Default::default()
+    };
+    let _ = compress(Input::Path(src.clone()), Output::Path(dst.clone()), &o).unwrap_err();
+
+    let dst_name = dst.file_name().unwrap().to_owned();
+    let parent = dst.parent().unwrap().to_path_buf();
+    let pid_marker = format!(".{}.", std::process::id());
+    for entry in std::fs::read_dir(&parent).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        if name == dst_name || name == src.file_name().unwrap() {
+            continue;
+        }
+        let name_str = name.to_string_lossy();
+        assert!(
+            !name_str.contains(&pid_marker) || !name_str.contains("notemp-out"),
+            "a leftover temp file was found: {name_str}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
