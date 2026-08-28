@@ -51,6 +51,19 @@ enum Command {
         #[arg(long)]
         max_ratio: Option<u64>,
     },
+    /// Decompress a file and write it to stdout.
+    Cat {
+        /// Input path, or `-` for stdin.
+        input: String,
+    },
+    /// Identify a stream without decoding it.
+    Info {
+        /// Input path, or `-` for stdin.
+        input: String,
+        /// Emit machine-readable JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the formats this build contains.
     Formats,
 }
@@ -153,6 +166,34 @@ fn run() -> stuffr::Result<()> {
             eprintln!("{} -> {} bytes", out.format, out.bytes_out);
             Ok(())
         }
+        Command::Cat { input } => {
+            // The motivating case: `curl … | stf cat - | grep pattern`.
+            ops::decompress(input_of(&input), Output::Stdout, &DecompressOpts::default())?;
+            Ok(())
+        }
+        Command::Info { input, json } => {
+            let i = ops::inspect(input_of(&input))?;
+            if json {
+                print_info_json(&i);
+            } else {
+                println!("format:   {}", i.format);
+                println!("chain:    {}", i.chain);
+                println!("rung:     {}", i.rung);
+                match i.bytes_in {
+                    Some(n) => println!("size:     {n} bytes"),
+                    None => println!("size:     unknown (stream)"),
+                }
+                if i.fidelity.has_warnings() {
+                    println!("fidelity: {} warning(s)", i.fidelity.warnings.len());
+                    for w in &i.fidelity.warnings {
+                        println!("  - {w}");
+                    }
+                } else {
+                    println!("fidelity: nothing approximated");
+                }
+            }
+            Ok(())
+        }
         Command::Formats => {
             print_formats();
             Ok(())
@@ -190,6 +231,53 @@ fn format_by_name(name: &str) -> stuffr::Result<FormatId> {
         })
 }
 
+/// Escapes a string for embedding in the hand-rolled JSON below.
+///
+/// At minimum: `"`, `\`, and the control characters (`\n`, `\r`, `\t`, and any
+/// other byte below 0x20 as `\u00XX`).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Hand-rolled rather than serde: the payload is a handful of fields, so a
+/// dozen lines of escaping is cheaper than the dependency. It is NOT true that
+/// there is nothing to escape, though — `warnings` holds `Fidelity` values,
+/// and several of its variants (`SizeFromDataDescriptor`, `MetadataIncomplete`,
+/// `EncryptedEntrySkipped`) embed entry names read from the archive itself, so
+/// a hostile or merely unlucky entry name could otherwise break or forge this
+/// JSON. `format` and `chain` are escaped too, on the same principle: nothing
+/// that can ever originate outside this binary should be trusted to already
+/// be valid JSON. Revisit this once Phase 2 makes the payload structurally
+/// bigger than escaping-by-hand can comfortably cover.
+fn print_info_json(i: &ops::Inspection) {
+    let warnings: Vec<String> = i
+        .fidelity
+        .warnings
+        .iter()
+        .map(|w| format!("\"{}\"", json_escape(&w.to_string())))
+        .collect();
+    println!(
+        "{{\"format\":\"{}\",\"chain\":\"{}\",\"rung\":\"{}\",\"bytes_in\":{},\"warnings\":[{}]}}",
+        json_escape(&i.format.to_string()),
+        json_escape(&i.chain),
+        i.rung,
+        i.bytes_in.map_or("null".to_string(), |n| n.to_string()),
+        warnings.join(",")
+    );
+}
+
 fn print_formats() {
     let rows = stuffr::registry().matrix();
     if rows.is_empty() {
@@ -214,5 +302,20 @@ fn print_formats() {
             if r.parallel { "yes" } else { "-" },
             r.extensions.join(", "),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::json_escape;
+
+    #[test]
+    fn json_escape_handles_quotes_backslashes_and_newlines() {
+        assert_eq!(json_escape("say \"hi\""), "say \\\"hi\\\"");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("line1\nline2"), "line1\\nline2");
+        assert_eq!(json_escape("tab\ttab"), "tab\\ttab");
+        assert_eq!(json_escape("plain"), "plain");
+        assert_eq!(json_escape("\u{0001}"), "\\u0001");
     }
 }
