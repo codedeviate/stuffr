@@ -159,6 +159,15 @@ impl std::fmt::Debug for Entry<'_> {
 }
 
 /// A writer that needs an explicit, fallible completion step (trailers, CRCs).
+///
+/// `finish` must flush the underlying writer before returning, once every
+/// trailer byte has been written to it. `Codec::encoder` takes the
+/// destination `Box<dyn Write + Send>` by value, so once a caller has handed
+/// it over, `finish` is the only code left holding it — the caller has no
+/// remaining handle to flush afterwards. Skipping this is silent on an
+/// unbuffered destination (a plain `File`) but loses the tail of the stream
+/// on a buffered one: notably stdout's `LineWriter`, which only auto-flushes
+/// on `\n` and may see none in a long run of binary output.
 pub trait Sink: Write + Send {
     fn finish(self: Box<Self>) -> Result<()>;
 }

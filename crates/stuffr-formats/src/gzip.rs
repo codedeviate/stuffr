@@ -83,7 +83,11 @@ impl Sink for GzSink {
     /// completion step rather than relying on `Drop`.
     fn finish(self: Box<Self>) -> Result<()> {
         let GzSink(encoder) = *self;
-        encoder.finish()?;
+        // `GzEncoder::finish` hands the wrapped writer back; the caller gave
+        // it to us by value at `Codec::encoder` and has no other handle left
+        // to flush it, so that is done here — see the contract on `Sink`.
+        let mut w = encoder.finish()?;
+        w.flush()?;
         Ok(())
     }
 }
@@ -201,6 +205,53 @@ mod tests {
         assert!(
             result.is_err(),
             "Sink::finish should surface the underlying writer's error instead of swallowing it"
+        );
+    }
+
+    #[test]
+    fn finish_flushes_the_underlying_writer() {
+        // `Codec::encoder` takes the destination by value, so once `finish`
+        // consumes the sink, nothing outside it holds a handle to flush the
+        // writer — `finish` is the only place left that can. This matters for
+        // buffered destinations (stdout's LineWriter, notably), which may
+        // hold trailer bytes unflushed indefinitely otherwise.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FlushSpy {
+            buf: Vec<u8>,
+            flushed: Arc<AtomicBool>,
+        }
+
+        impl Write for FlushSpy {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.buf.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushed.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let flushed = Arc::new(AtomicBool::new(false));
+        let mut sink = Gzip
+            .encoder(
+                Box::new(FlushSpy {
+                    buf: Vec::new(),
+                    flushed: Arc::clone(&flushed),
+                }),
+                &EncodeOpts::default(),
+            )
+            .unwrap();
+
+        sink.write_all(b"payload").unwrap();
+        sink.finish().unwrap();
+
+        assert!(
+            flushed.load(Ordering::SeqCst),
+            "Sink::finish must flush the underlying writer before returning"
         );
     }
 

@@ -8,8 +8,8 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use stuffr_core::{
     EncodeOpts, Error, FidelityReport, FileSource, FormatId, FormatKind, ReaderSource, Registry,
@@ -141,47 +141,19 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
 }
 
 /// Counts bytes on their way out, so `bytes_out` is correct for stdout too.
-///
-/// The real writer lives behind a mutex rather than being owned outright, so
-/// `compress` can keep a second handle (`SharedWriter`) to it even after the
-/// first handle is moved into the codec's `Sink`. That second handle is what
-/// lets `compress` flush the destination once `Sink::finish` has written the
-/// trailer — `Sink::finish` consumes its writer without giving it back, so
-/// without a shared handle there would be nothing left to flush.
 pub(crate) struct CountingWriter {
-    inner: SharedWriter,
+    inner: Box<dyn Write + Send>,
     count: Arc<AtomicU64>,
 }
 
-/// A second handle onto the writer a `CountingWriter` wraps.
-#[derive(Clone)]
-pub(crate) struct SharedWriter(Arc<Mutex<Box<dyn Write + Send>>>);
-
-impl SharedWriter {
-    /// Flushes the underlying writer through this handle.
-    pub(crate) fn flush(&self) -> std::io::Result<()> {
-        self.lock().flush()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn Write + Send>> {
-        // Nothing in this module ever panics while holding the lock, so
-        // poisoning cannot happen in practice; recovering the guard instead
-        // of unwrapping keeps a hypothetical poison from turning into a
-        // second, unrelated panic on top of whatever caused the first one.
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-}
-
 impl CountingWriter {
-    pub(crate) fn new(inner: Box<dyn Write + Send>) -> (Self, SharedWriter, Arc<AtomicU64>) {
-        let shared = SharedWriter(Arc::new(Mutex::new(inner)));
+    pub(crate) fn new(inner: Box<dyn Write + Send>) -> (Self, Arc<AtomicU64>) {
         let count = Arc::new(AtomicU64::new(0));
         (
             Self {
-                inner: shared.clone(),
+                inner,
                 count: Arc::clone(&count),
             },
-            shared,
             count,
         )
     }
@@ -189,7 +161,7 @@ impl CountingWriter {
 
 impl Write for CountingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.lock().write(buf)?;
+        let n = self.inner.write(buf)?;
         self.count.fetch_add(n as u64, Ordering::Relaxed);
         Ok(n)
     }
@@ -258,7 +230,7 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
 
     let mut reader = src.open()?;
     let opened = dst.create(o.force)?;
-    let (counted, shared, written) = CountingWriter::new(opened.writer);
+    let (counted, written) = CountingWriter::new(opened.writer);
 
     let encode = EncodeOpts {
         level: o.level,
@@ -277,23 +249,20 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
             total_in += n as u64;
             sink.write_all(&buf[..n])?;
         }
-        // Not optional: this writes gzip's CRC and length trailer.
+        // Writes gzip's CRC and length trailer, then flushes the underlying
+        // writer — see the contract documented on `Sink::finish`. The writer
+        // was handed away by value above, so `finish` is the only place left
+        // that can flush it.
         sink.finish()?;
-        // flate2 never flushes the writer it wraps, and stdout's LineWriter
-        // only auto-flushes on '\n' — without an explicit flush here, binary
-        // gzip bytes can sit unflushed and be lost if the process exits via
-        // std::process::exit (which runs no destructors). `sink.finish()`
-        // consumed the writer, so this goes through the second handle kept
-        // alive alongside it.
-        shared.flush()?;
         Ok(total_in)
     };
 
     match run() {
         Ok(bytes_in) => {
             // Rename onto the final path only now: every byte, including the
-            // trailer, has been written AND flushed. Publishing any earlier
-            // risks a truncated file visible under the real name.
+            // trailer, has been written AND flushed (guaranteed by `finish`
+            // above). Publishing any earlier risks a truncated file visible
+            // under the real name.
             publish(opened.finish)?;
             Ok(Outcome {
                 bytes_in,
