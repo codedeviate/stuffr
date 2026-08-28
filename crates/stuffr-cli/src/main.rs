@@ -144,8 +144,8 @@ fn run() -> stuffr::Result<()> {
             };
             let out = ops::compress(input_of(&input), dst, &opts)?;
             eprintln!(
-                "{} -> {} ({} -> {} bytes)",
-                input, out.format, out.bytes_in, out.bytes_out
+                "{} -> {} ({} -> {} bytes, {} fidelity)",
+                input, out.format, out.bytes_in, out.bytes_out, out.fidelity.rung
             );
             Ok(())
         }

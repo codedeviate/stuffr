@@ -24,7 +24,20 @@ pub const PROBE_LEN: usize = 4096;
 pub fn probe(mut src: Box<dyn Source>) -> Result<(Vec<u8>, Box<dyn Source>)> {
     if src.caps().seekable {
         let mut prefix = vec![0u8; PROBE_LEN];
-        let seek = src.as_seek().expect("caps claimed seekable");
+        // `caps().seekable` is the `Source`'s own claim; `as_seek()` is a
+        // second, independent method on the same trait, and `Source` is
+        // public — a third-party codec (Phase 2+) can implement one without
+        // honouring the other. Trusting the claim with `.expect(..)` turned a
+        // buggy-but-foreign `Source` impl into a panic reachable through this
+        // crate's own public `probe`; surfacing it as a typed error instead
+        // lets a caller match on it same as any other seek failure. There is
+        // no format to name yet at this stage of detection, so the sentinel
+        // id below is a placeholder, not a registered format.
+        let Some(seek) = src.as_seek() else {
+            return Err(Error::NotSeekable {
+                format: FormatId::new("<probe>"),
+            });
+        };
         let mut filled = 0;
         while filled < PROBE_LEN {
             match std::io::Read::read(seek, &mut prefix[filled..])? {
@@ -589,5 +602,48 @@ mod tests {
                 container: FormatId::new("apk")
             }
         );
+    }
+
+    /// A `Source` that lies: it claims `seekable: true` but `as_seek()`
+    /// always returns `None`. Nothing in this crate can implement `Source`
+    /// this way today, but the trait is public and a third-party codec could
+    /// — the point of this test is that `probe` must survive that instead of
+    /// panicking.
+    struct LiesAboutSeekability(std::io::Cursor<Vec<u8>>);
+
+    impl Read for LiesAboutSeekability {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.0, buf)
+        }
+    }
+
+    impl Source for LiesAboutSeekability {
+        fn caps(&self) -> crate::source::SourceCaps {
+            crate::source::SourceCaps {
+                seekable: true,
+                len: Some(self.0.get_ref().len() as u64),
+            }
+        }
+
+        fn as_seek(&mut self) -> Option<&mut dyn crate::source::SeekRead> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_source_that_claims_seekable_but_has_no_seek_view_errors_instead_of_panicking() {
+        let src: Box<dyn Source> = Box::new(LiesAboutSeekability(std::io::Cursor::new(
+            b"payload".to_vec(),
+        )));
+        // Not `.unwrap_err()`: the `Ok` side is `(Vec<u8>, Box<dyn Source>)`,
+        // and `Source` is not `Debug`, so `Result::unwrap_err`'s `T: Debug`
+        // bound can't be satisfied here.
+        match probe(src) {
+            Err(err) => assert!(
+                matches!(err, crate::Error::NotSeekable { .. }),
+                "must be NotSeekable, not a panic: {err:?}"
+            ),
+            Ok(_) => panic!("expected NotSeekable, got Ok"),
+        }
     }
 }

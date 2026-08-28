@@ -89,13 +89,47 @@ impl Output {
                 finish: None,
             }),
             Output::Path(p) => {
-                let exists = p.exists();
+                // `symlink_metadata` inspects the path itself rather than
+                // following a symlink to its target. That is what both
+                // checks below need: whether something already sits at this
+                // exact path (a dangling symlink counts as "exists", unlike
+                // `Path::exists`, which follows the link and silently reports
+                // "absent" for one), and whether that something is a plain
+                // regular file — the only case the temp-then-rename dance
+                // below is safe for.
+                let link_meta = std::fs::symlink_metadata(p);
+                let exists = link_meta.is_ok();
                 if !force && exists {
                     return Err(Error::Usage(format!(
                         "{} already exists; pass --force to overwrite",
                         p.display()
                     )));
                 }
+
+                // A destination that already exists but is not a regular
+                // file — `/dev/null`, a FIFO, a block/character device — can
+                // never be the target of a rename (renaming a temp file onto
+                // `/dev/null` fails outright), and a destination that IS a
+                // symlink must be written *through* it: temp-then-rename
+                // would silently replace the symlink itself with a plain
+                // file, clobbering whatever pointed at it (e.g.
+                // `latest.gz -> archives/….gz`). Either way, skip the temp
+                // file and the rename entirely and write straight through the
+                // path, truncating (or creating, for a dangling symlink) in
+                // place.
+                let write_direct = link_meta.as_ref().is_ok_and(|m| !m.is_file());
+                if write_direct {
+                    let f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(p)?;
+                    return Ok(Opened {
+                        writer: Box::new(f),
+                        finish: None,
+                    });
+                }
+
                 // Read the destination's permissions BEFORE creating or
                 // renaming anything: once the rename happens the original
                 // inode is gone and there is nothing left to read them from.
@@ -131,11 +165,26 @@ impl Output {
                         let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
                         let candidate =
                             parent.join(format!(".{}.{}.{}.tmp", std::process::id(), n, file_name));
-                        match std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&candidate)
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.write(true).create_new(true);
+                        // Create the temp file at mode 0600 from the start.
+                        // Creating it at the default `0o666 & !umask` (usually
+                        // 0644) and narrowing permissions afterwards leaves a
+                        // window, between creation and the later
+                        // `set_permissions` call below, where another local
+                        // user can open the world/group-readable temp file and
+                        // keep reading from that descriptor even after
+                        // permissions are narrowed — a permission change never
+                        // revokes an already-open fd. Starting at 0600 closes
+                        // that window; the block below still widens the mode
+                        // afterwards to match a pre-existing destination's own
+                        // permissions.
+                        #[cfg(unix)]
                         {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            opts.mode(0o600);
+                        }
+                        match opts.open(&candidate) {
                             Ok(f) => break (candidate, f),
                             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                                 attempt += 1;
@@ -296,6 +345,15 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     let codec = registry.require_codec(format)?;
 
     let mut reader = src.open()?;
+    // Computed from the source's actual seekability, the same way
+    // `decompress` computes it — not assumed. `stf pack - -o x.gz` reads a
+    // pipe, and claiming `Exact` for that would be a rung `compress` invented
+    // rather than one it observed.
+    let rung = if reader.caps().seekable {
+        Rung::Exact
+    } else {
+        Rung::ForwardOnly
+    };
     let opened = dst.create(o.force)?;
     let (counted, written) = CountingWriter::new(opened.writer);
 
@@ -335,7 +393,7 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
                 bytes_in,
                 bytes_out: written.load(Ordering::Relaxed),
                 format,
-                fidelity: FidelityReport::exact(),
+                fidelity: FidelityReport::new(rung),
             })
         }
         Err(e) => {

@@ -198,6 +198,117 @@ fn a_forced_overwrite_preserves_the_destinations_permissions() {
     let _ = std::fs::remove_file(&dst);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_forced_overwrite_creates_the_temp_file_at_mode_0600() {
+    // F7: the temp file must never be world/group-readable even for the
+    // instant between creation and the later permissions widen — otherwise
+    // another local user can open it while it is still 0644 and keep reading
+    // from that descriptor regardless of what the permissions are set to
+    // afterwards. This can't observe the file mid-write directly, so it
+    // pins the weaker but still meaningful property: a destination with no
+    // pre-existing permissions to carry over (a brand-new file) ends up
+    // 0600, proving the temp file was created at 0600 rather than the
+    // default `0o666 & !umask` and never narrowed.
+    use std::os::unix::fs::PermissionsExt;
+
+    let src = tmp("mode-in.txt");
+    let dst = tmp("mode-out.gz");
+    let _ = std::fs::remove_file(&dst);
+    std::fs::write(&src, b"payload").unwrap();
+
+    compress(
+        Input::Path(src.clone()),
+        Output::Path(dst.clone()),
+        &CompressOpts::default(),
+    )
+    .unwrap();
+
+    let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "a new destination with nothing to carry over must end up at the temp file's own 0600, \
+         not a wider default"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressing_to_dev_null_succeeds_instead_of_failing_to_rename() {
+    // F8: `/dev/null` already exists and is not a regular file, so renaming a
+    // temp file onto it fails outright ("Operation not permitted"). The fix
+    // writes straight through it instead of going via a temp file.
+    let src = tmp("devnull-in.txt");
+    std::fs::write(&src, b"payload").unwrap();
+
+    let out = compress(
+        Input::Path(src.clone()),
+        Output::Path(std::path::PathBuf::from("/dev/null")),
+        &CompressOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(out.bytes_out > 0);
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[cfg(unix)]
+#[test]
+fn compressing_to_a_symlink_destination_writes_through_it() {
+    // F8: temp-then-rename would replace the symlink itself with a plain
+    // file, silently turning `latest.gz -> archives/….gz` into a regular
+    // file named `latest.gz` and leaving `archives/….gz` untouched. Writing
+    // through the symlink instead must update the TARGET and leave the
+    // symlink itself in place.
+    let src = tmp("symlink-in.txt");
+    let target = tmp("symlink-target.gz");
+    let link = tmp("symlink-dest.gz");
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&link);
+    std::fs::write(&src, b"the quick brown fox ".repeat(200)).unwrap();
+    std::fs::write(&target, b"PRE-EXISTING-TARGET-CONTENT").unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    compress(
+        Input::Path(src.clone()),
+        Output::Path(link.clone()),
+        &CompressOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the destination must still be a symlink after compressing to it"
+    );
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        target,
+        "the symlink must still point at the same target"
+    );
+    let written = std::fs::read(&target).unwrap();
+    assert_eq!(
+        &written[..2],
+        &[0x1f, 0x8b],
+        "the TARGET must have received the new gzip content"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_file(&link);
+}
+
 #[test]
 fn suggested_names_add_and_strip_the_extension() {
     use std::path::Path;
