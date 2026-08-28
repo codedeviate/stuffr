@@ -1,17 +1,21 @@
-//! Format implementations.
+//! Format implementations, each behind its own Cargo feature.
 //!
-//! Phase 0 registers nothing: `stuffr-core` is validated against mock formats.
-//! Phase 1 adds codecs here, each behind its own Cargo feature, and extends
-//! [`register_all`].
+//! `stuffr-core` deliberately carries no format dependency; this is where they
+//! live. [`register_all`] is the single extension point — a codec not
+//! registered there is invisible to `stf formats` and to detection.
 
 use stuffr_core::Registry;
 
+#[cfg(feature = "gzip")]
+pub mod gzip;
+
 /// Registers every format enabled in this build.
-///
-/// The single extension point for new formats — a codec that is not registered
-/// here is invisible to `stf formats` and to detection.
-pub fn register_all(_registry: &mut Registry) {
-    // Phase 1 populates this.
+pub fn register_all(registry: &mut Registry) {
+    #[cfg(not(feature = "gzip"))]
+    let _ = &registry;
+
+    #[cfg(feature = "gzip")]
+    registry.register_codec(std::sync::Arc::new(gzip::Gzip), gzip::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.
