@@ -170,3 +170,147 @@ fn cat_exits_cleanly_when_the_reader_closes_early() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&gz);
 }
+
+#[test]
+fn pack_then_unpack_round_trips_through_the_binary() {
+    let src = tmp("e2e.txt");
+    let gz = tmp("e2e.txt.gz");
+    let back = tmp("e2e-back.txt");
+    let _ = std::fs::remove_file(&gz);
+    let _ = std::fs::remove_file(&back);
+
+    let plain = b"the quick brown fox ".repeat(2000);
+    std::fs::write(&src, &plain).unwrap();
+
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        gz.exists(),
+        "pack must have written the .gz beside the input"
+    );
+    assert!(src.exists(), "pack must not destroy its input");
+
+    assert!(
+        Command::new(STF)
+            .args(["unpack", gz.to_str().unwrap(), "-o", back.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(&back).unwrap(),
+        plain,
+        "round trip must be byte-identical"
+    );
+
+    for p in [&src, &gz, &back] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn cat_reads_a_stream_on_stdin() {
+    // The project's motivating case: `curl … | stf cat - | grep pattern`.
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let src = tmp("pipe.txt");
+    let gz = tmp("pipe.txt.gz");
+    let _ = std::fs::remove_file(&gz);
+    std::fs::write(&src, b"needle in a haystack").unwrap();
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let packed = std::fs::read(&gz).unwrap();
+
+    let mut child = Command::new(STF)
+        .args(["cat", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(&packed).unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"needle in a haystack");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
+
+#[test]
+fn an_existing_output_is_refused_with_exit_two() {
+    let src = tmp("clash.txt");
+    let gz = tmp("clash.txt.gz");
+    std::fs::write(&src, b"payload").unwrap();
+    std::fs::write(&gz, b"PRE-EXISTING").unwrap();
+
+    let out = Command::new(STF)
+        .args(["pack", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--force"));
+    assert_eq!(
+        std::fs::read(&gz).unwrap(),
+        b"PRE-EXISTING",
+        "the refused command changed nothing"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
+
+#[test]
+fn a_bomb_exits_six_and_leaves_no_partial_output() {
+    let src = tmp("boom.bin");
+    let gz = tmp("boom.bin.gz");
+    let out_path = tmp("boom-out.bin");
+    let _ = std::fs::remove_file(&gz);
+    let _ = std::fs::remove_file(&out_path);
+
+    std::fs::write(&src, vec![0u8; 2 * 1024 * 1024]).unwrap();
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = Command::new(STF)
+        .args([
+            "unpack",
+            gz.to_str().unwrap(),
+            "-o",
+            out_path.to_str().unwrap(),
+            "--max-ratio",
+            "100",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6), "resource limits exit 6");
+    assert!(
+        !out_path.exists(),
+        "a refused decode must leave no partial file"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
+
+#[test]
+fn an_unknown_verb_exits_two() {
+    let out = Command::new(STF).arg("bogus").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+}

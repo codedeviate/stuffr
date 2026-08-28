@@ -291,4 +291,76 @@ mod tests {
         assert_eq!(m.extensions, &["gz"]);
         assert_eq!(m.priority, 0);
     }
+
+    #[test]
+    fn decoding_is_incremental_not_read_to_end() {
+        // Deferred here from Phase 1a: no mock ever streamed, so nothing had
+        // shown that a forward-only read is incremental rather than
+        // read-everything-then-parse. Peak heap is not observable from a unit
+        // test, so the measurable property is that output begins long before
+        // the input is exhausted.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct Metered {
+            inner: std::io::Cursor<Vec<u8>>,
+            served: Arc<AtomicU64>,
+        }
+        impl Read for Metered {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.served.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        impl Source for Metered {
+            fn caps(&self) -> stuffr_core::SourceCaps {
+                stuffr_core::SourceCaps {
+                    seekable: false,
+                    len: None,
+                }
+            }
+            fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
+                None
+            }
+        }
+
+        // 16 MiB of pseudo-random data from a small LCG, not the periodic
+        // `(i % 251)` pattern the brief originally specified: that pattern
+        // compresses to ~65,411 bytes (below the 64 KiB assertion below) and
+        // makes the whole stream small enough that a read-to-end decoder
+        // would still pass the `consumed` assertion. An LCG is deterministic
+        // (no `rand` dependency) but its output is incompressible, so both
+        // assertions below are load-bearing rather than decorative.
+        let mut s: u32 = 1;
+        let plain: Vec<u8> = (0..16 * 1024 * 1024u32)
+            .map(|_| {
+                s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                (s >> 16) as u8
+            })
+            .collect();
+        let packed = compress(&plain);
+        assert!(
+            packed.len() > 64 * 1024,
+            "the compressed stream must exceed one read buffer"
+        );
+
+        let served = Arc::new(AtomicU64::new(0));
+        let src: Box<dyn Source> = Box::new(Metered {
+            inner: std::io::Cursor::new(packed),
+            served: Arc::clone(&served),
+        });
+
+        let mut dec = Gzip.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut first = [0u8; 1024];
+        let n = dec.read(&mut first).unwrap();
+        assert!(n > 0, "the decoder must produce output");
+
+        let consumed = served.load(Ordering::Relaxed);
+        assert!(
+            consumed < 1024 * 1024,
+            "first output arrived only after reading {consumed} bytes; a read-to-end \
+             implementation would consume the whole stream before emitting anything"
+        );
+    }
 }
