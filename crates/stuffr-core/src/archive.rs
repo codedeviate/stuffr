@@ -33,6 +33,11 @@ pub struct CreateOpts {
     pub entry_codec: Option<FormatId>,
 }
 
+/// Phase 2 adds `Hardlink`, `CharDevice`, `BlockDevice`, `Fifo` and `Socket`
+/// for tar and cpio; `#[non_exhaustive]` keeps that from breaking downstream
+/// matches. Struct types deliberately do NOT carry this attribute — see
+/// CONTRIBUTING.md.
+#[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum EntryKind {
     #[default]

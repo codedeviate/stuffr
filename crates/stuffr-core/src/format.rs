@@ -80,6 +80,85 @@ pub struct FormatMeta {
     pub magics: &'static [MagicRule],
 }
 
+impl CodecCaps {
+    /// A codec that both compresses and decompresses, with no parallelism and
+    /// no frame index. The common shape.
+    pub const fn round_trip() -> Self {
+        Self {
+            encode: true,
+            decode: true,
+            parallel_encode: false,
+            parallel_decode: false,
+            frame_index: false,
+        }
+    }
+
+    /// A decode-only codec — the pure-Rust fallbacks that let a build with no C
+    /// toolchain still *open* a `.zst` or `.xz`.
+    pub const fn decode_only() -> Self {
+        Self {
+            encode: false,
+            decode: true,
+            parallel_encode: false,
+            parallel_decode: false,
+            frame_index: false,
+        }
+    }
+}
+
+impl ContainerCaps {
+    /// A container that can be read but not written — RAR, whose compressor is
+    /// proprietary.
+    pub const fn read_only() -> Self {
+        Self {
+            read: true,
+            write: false,
+            forward_parse: false,
+            degraded_parse: false,
+            trailing_index: false,
+            solid: false,
+            per_entry_codec: false,
+            needs_seek: false,
+        }
+    }
+
+    /// A container supporting both directions. Every other capability stays
+    /// false — a constructor must not claim what a format has not.
+    pub const fn read_write() -> Self {
+        let mut c = Self::read_only();
+        c.write = true;
+        c
+    }
+}
+
+impl FormatMeta {
+    pub const fn codec(
+        id: FormatId,
+        extensions: &'static [&'static str],
+        magics: &'static [MagicRule],
+    ) -> Self {
+        Self {
+            id,
+            kind: FormatKind::Codec,
+            extensions,
+            magics,
+        }
+    }
+
+    pub const fn container(
+        id: FormatId,
+        extensions: &'static [&'static str],
+        magics: &'static [MagicRule],
+    ) -> Self {
+        Self {
+            id,
+            kind: FormatKind::Container,
+            extensions,
+            magics,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,5 +178,36 @@ mod tests {
         assert!(!c.encode && !c.decode && !c.parallel_encode);
         let k = ContainerCaps::default();
         assert!(!k.read && !k.write && !k.forward_parse && !k.needs_seek);
+    }
+
+    #[test]
+    fn codec_caps_constructors_express_the_two_common_shapes() {
+        let rt = CodecCaps::round_trip();
+        assert!(rt.encode && rt.decode);
+        assert!(!rt.parallel_encode && !rt.parallel_decode && !rt.frame_index);
+
+        // The pure ruzstd / lzma-rs fallbacks: openable, not writable.
+        let d = CodecCaps::decode_only();
+        assert!(d.decode && !d.encode);
+    }
+
+    #[test]
+    fn container_caps_constructors_express_the_two_common_shapes() {
+        let ro = ContainerCaps::read_only();
+        assert!(ro.read && !ro.write);
+        let rw = ContainerCaps::read_write();
+        assert!(rw.read && rw.write);
+        // Everything else stays opt-in — a constructor must not smuggle in
+        // capabilities a format has not claimed.
+        assert!(!rw.forward_parse && !rw.trailing_index && !rw.needs_seek);
+    }
+
+    #[test]
+    fn format_meta_constructors_set_the_kind_for_you() {
+        const M: &[MagicRule] = &[];
+        let c = FormatMeta::codec(FormatId::new("gzip"), &["gz"], M);
+        assert_eq!(c.kind, FormatKind::Codec);
+        let k = FormatMeta::container(FormatId::new("tar"), &["tar"], M);
+        assert_eq!(k.kind, FormatKind::Container);
     }
 }

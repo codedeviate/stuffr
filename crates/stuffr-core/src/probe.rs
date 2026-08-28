@@ -43,6 +43,7 @@ pub fn probe(mut src: Box<dyn Source>) -> Result<(Vec<u8>, Box<dyn Source>)> {
 }
 
 /// A resolved decode pipeline.
+#[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Chain {
     /// A codec wrapping something else. Decode order: this codec, then `inner`.
@@ -180,7 +181,7 @@ pub fn resolve_chain(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{FormatId, FormatKind, FormatMeta, MagicRule};
+    use crate::format::{FormatId, FormatMeta, MagicRule};
     use crate::registry::Registry;
     use crate::source::{ReaderSource, Source};
     use crate::testing::{MockCodec, MockContainer};
@@ -206,21 +207,11 @@ mod tests {
         let mut r = Registry::new();
         r.register_codec(
             Arc::new(MockCodec),
-            FormatMeta {
-                id: GZIP,
-                kind: FormatKind::Codec,
-                extensions: &["gz", "tgz"],
-                magics: GZIP_MAGIC,
-            },
+            FormatMeta::codec(GZIP, &["gz", "tgz"], GZIP_MAGIC),
         );
         r.register_container(
             Arc::new(MockContainer),
-            FormatMeta {
-                id: TAR,
-                kind: FormatKind::Container,
-                extensions: &["tar"],
-                magics: TAR_MAGIC,
-            },
+            FormatMeta::container(TAR, &["tar"], TAR_MAGIC),
         );
         r
     }
@@ -328,21 +319,11 @@ mod tests {
         let mut r = Registry::new();
         r.register_codec(
             Arc::new(MockCodec),
-            FormatMeta {
-                id: GZIP,
-                kind: FormatKind::Codec,
-                extensions: &["gz"], // deliberately NO "tgz" alias
-                magics: GZIP_MAGIC,
-            },
+            FormatMeta::codec(GZIP, &["gz"], GZIP_MAGIC), // deliberately NO "tgz" alias
         );
         r.register_container(
             Arc::new(MockContainer),
-            FormatMeta {
-                id: TAR,
-                kind: FormatKind::Container,
-                extensions: &["tar"],
-                magics: TAR_MAGIC,
-            },
+            FormatMeta::container(TAR, &["tar"], TAR_MAGIC),
         );
 
         let chain = resolve_chain(&r, Some(Path::new("a.tgz")), &[0x1f, 0x8b]).unwrap();

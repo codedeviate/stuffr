@@ -157,21 +157,11 @@ mod tests {
     }];
 
     fn codec_meta() -> FormatMeta {
-        FormatMeta {
-            id: MOCK_CODEC,
-            kind: FormatKind::Codec,
-            extensions: &["mk", "mock"],
-            magics: CODEC_MAGIC,
-        }
+        FormatMeta::codec(MOCK_CODEC, &["mk", "mock"], CODEC_MAGIC)
     }
 
     fn container_meta() -> FormatMeta {
-        FormatMeta {
-            id: MOCK_CONTAINER,
-            kind: FormatKind::Container,
-            extensions: &["mar"],
-            magics: CONTAINER_MAGIC,
-        }
+        FormatMeta::container(MOCK_CONTAINER, &["mar"], CONTAINER_MAGIC)
     }
 
     fn populated() -> Registry {
@@ -251,12 +241,7 @@ mod tests {
         let mut r = Registry::new();
         r.register_container(
             Arc::new(MockContainer),
-            FormatMeta {
-                id: FormatId::new("tar"),
-                kind: FormatKind::Container,
-                extensions: &["tar"],
-                magics: OFFSET_MAGIC,
-            },
+            FormatMeta::container(FormatId::new("tar"), &["tar"], OFFSET_MAGIC),
         );
 
         let mut buf = vec![0u8; 512];
@@ -295,12 +280,7 @@ mod tests {
         let mut r = populated();
         r.register_codec(
             Arc::new(MockCodec),
-            FormatMeta {
-                id: MOCK_CODEC,
-                kind: FormatKind::Codec,
-                extensions: &["mk2"],
-                magics: CODEC_MAGIC,
-            },
+            FormatMeta::codec(MOCK_CODEC, &["mk2"], CODEC_MAGIC),
         );
         assert_eq!(r.by_extension("mk2"), Some(MOCK_CODEC));
         assert_eq!(
