@@ -104,6 +104,32 @@ These come from the design specification and are the reason Phase 0 shipped as
 After 1.0, normal semver applies: breaking changes to any public API in
 `stuffr-core` or the `stuffr` facade require a major bump.
 
+## `#[non_exhaustive]`
+
+Enums carry it. Structs do not.
+
+The asymmetry is principled rather than stylistic, and it follows from what
+each kind of addition breaks downstream:
+
+- **Adding a variant to a public enum** breaks every exhaustive `match` in
+  every dependent crate. `#[non_exhaustive]` forces a wildcard arm up front,
+  so the addition is not a breaking change. `Error`, `Fidelity`, `EntryKind`
+  and `Chain` all carry it, and all four are expected to grow — `EntryKind`
+  gains `Hardlink`, `CharDevice`, `BlockDevice`, `Fifo` and `Socket` when tar
+  and cpio arrive.
+- **Adding a field to a public struct** does not break `..Default::default()`,
+  so the attribute buys nothing there — and it costs something real. A
+  `#[non_exhaustive]` struct cannot be built with literal syntax from another
+  crate at all, so `CodecCaps { encode: true, ..Default::default() }` in
+  `stuffr-formats` would stop compiling. That punishes every format author to
+  solve a problem we do not have.
+
+Capability and options structs therefore stay literal-constructible, and gain
+**named constructors** instead — `CodecCaps::round_trip()`,
+`ContainerCaps::read_only()`, `FormatMeta::codec()`. A future field then
+touches the constructors rather than every `caps()` implementation, which is
+the same protection by a cheaper route.
+
 ## Architectural constraints
 
 Two rules hold across every phase. Both are load-bearing rather than stylistic,

@@ -35,8 +35,8 @@ pub struct CreateOpts {
 
 /// Phase 2 adds `Hardlink`, `CharDevice`, `BlockDevice`, `Fifo` and `Socket`
 /// for tar and cpio; `#[non_exhaustive]` keeps that from breaking downstream
-/// matches. Struct types deliberately do NOT carry this attribute — see
-/// CONTRIBUTING.md.
+/// matches. Struct types deliberately do NOT carry this attribute — see the
+/// `#[non_exhaustive]` section of CONTRIBUTING.md.
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum EntryKind {
