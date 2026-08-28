@@ -85,18 +85,32 @@ impl Registry {
 
     /// Every format whose magic matches `prefix`. Empty rather than a guess.
     pub fn match_magic(&self, prefix: &[u8]) -> Vec<FormatId> {
-        let mut hits: Vec<FormatId> = self
+        let mut hits: Vec<(i16, FormatId)> = self
             .magics
             .iter()
             .filter(|m| {
-                let end = m.offset + m.bytes.len();
+                let end = match m.offset.checked_add(m.bytes.len()) {
+                    Some(e) => e,
+                    None => return false,
+                };
                 prefix.len() >= end && &prefix[m.offset..end] == m.bytes
             })
-            .map(|m| m.format)
+            .map(|m| {
+                (
+                    self.metas.get(&m.format).map_or(0, |x| x.priority),
+                    m.format,
+                )
+            })
             .collect();
-        hits.sort_by_key(|id| id.as_str());
-        hits.dedup();
-        hits
+        // Priority descending, then id ascending so equal ranks stay stable.
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
+        hits.dedup_by_key(|(_, id)| *id);
+        hits.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// The priority of a registered format, or 0 if unknown.
+    pub fn priority_of(&self, id: FormatId) -> i16 {
+        self.metas.get(&id).map_or(0, |m| m.priority)
     }
 
     /// The capability matrix, sorted by id. Rendered by `stf formats`.
@@ -289,5 +303,66 @@ mod tests {
             "a stale extension must not survive re-registration"
         );
         assert_eq!(r.by_extension("mock"), None);
+    }
+
+    #[test]
+    fn match_magic_orders_by_priority_before_id() {
+        // Two formats sharing one magic — the ZIP family's exact situation.
+        const SHARED: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK\x03\x04",
+            format: FormatId::new("zip"),
+        }];
+        const SHARED2: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK\x03\x04",
+            format: FormatId::new("apk"),
+        }];
+
+        let mut r = Registry::new();
+        // "apk" sorts before "zip" alphabetically, so without priority it wins.
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("apk"), &["apk"], SHARED2).with_priority(-10),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("zip"), &["zip"], SHARED),
+        );
+
+        let hits = r.match_magic(b"PK\x03\x04rest");
+        assert_eq!(
+            hits.first().copied(),
+            Some(FormatId::new("zip")),
+            "the base format must outrank its derivative"
+        );
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn equal_priority_still_orders_deterministically_by_id() {
+        const A: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"XX",
+            format: FormatId::new("bbb"),
+        }];
+        const B: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"XX",
+            format: FormatId::new("aaa"),
+        }];
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(FormatId::new("bbb"), &["b"], A),
+        );
+        r.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(FormatId::new("aaa"), &["a"], B),
+        );
+        assert_eq!(
+            r.match_magic(b"XXrest"),
+            vec![FormatId::new("aaa"), FormatId::new("bbb")]
+        );
     }
 }

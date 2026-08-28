@@ -136,16 +136,27 @@ fn inner_from_path(reg: &Registry, path: Option<&Path>, outer: FormatId) -> Chai
 pub fn resolve_chain(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Result<Chain> {
     let mut candidates = reg.match_magic(prefix);
 
-    // More than one magic hit: let the extension disambiguate.
+    // A uniquely highest-priority candidate wins outright.
     if candidates.len() > 1 {
-        if let Some(path) = path {
-            if let Some(id) = extensions(path)
-                .iter()
-                .rev()
-                .find_map(|e| reg.by_extension(e))
-            {
-                if candidates.contains(&id) {
-                    candidates = vec![id];
+        let top = reg.priority_of(candidates[0]);
+        let tied: Vec<FormatId> = candidates
+            .iter()
+            .copied()
+            .filter(|id| reg.priority_of(*id) == top)
+            .collect();
+        if tied.len() == 1 {
+            candidates = tied;
+        } else {
+            // Still tied: let the extension choose, else refuse to guess.
+            let by_ext =
+                path.and_then(|p| extensions(p).iter().rev().find_map(|e| reg.by_extension(e)));
+            match by_ext.filter(|id| tied.contains(id)) {
+                Some(id) => candidates = vec![id],
+                None => {
+                    let names: Vec<&str> = tied.iter().map(|id| id.as_str()).collect();
+                    return Err(Error::AmbiguousFormat {
+                        candidates: names.join(", "),
+                    });
                 }
             }
         }
@@ -383,5 +394,101 @@ mod tests {
         let r = registry();
         let err = resolve_chain(&r, None, b"").unwrap_err();
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn equally_ranked_candidates_with_no_extension_are_an_error_not_a_guess() {
+        // A piped stream has no path to disambiguate with. Guessing silently is
+        // how a zip becomes an apk.
+        const A: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("alpha"),
+        }];
+        const B: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("beta"),
+        }];
+        let mut r = Registry::new();
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("alpha"), &["alpha"], A),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("beta"), &["beta"], B),
+        );
+
+        let err = resolve_chain(&r, None, b"PKrest").unwrap_err();
+        assert!(matches!(err, crate::Error::AmbiguousFormat { .. }));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("alpha") && msg.contains("beta"),
+            "must name the candidates: {msg}"
+        );
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn a_higher_priority_candidate_resolves_without_an_extension() {
+        const A: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("alpha"),
+        }];
+        const B: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("beta"),
+        }];
+        let mut r = Registry::new();
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("alpha"), &["alpha"], A).with_priority(-5),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("beta"), &["beta"], B),
+        );
+
+        let chain = resolve_chain(&r, None, b"PKrest").unwrap();
+        assert_eq!(
+            chain,
+            Chain::Container {
+                container: FormatId::new("beta")
+            }
+        );
+    }
+
+    #[test]
+    fn an_extension_still_disambiguates_equal_candidates() {
+        const A: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("alpha"),
+        }];
+        const B: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"PK",
+            format: FormatId::new("beta"),
+        }];
+        let mut r = Registry::new();
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("alpha"), &["alpha"], A),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(FormatId::new("beta"), &["beta"], B),
+        );
+
+        let chain = resolve_chain(&r, Some(Path::new("x.beta")), b"PKrest").unwrap();
+        assert_eq!(
+            chain,
+            Chain::Container {
+                container: FormatId::new("beta")
+            }
+        );
     }
 }

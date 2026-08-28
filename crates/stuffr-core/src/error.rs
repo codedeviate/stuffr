@@ -17,6 +17,9 @@ pub enum Error {
     #[error("could not detect format; leading bytes were {seen}")]
     UnknownFormat { seen: String },
 
+    #[error("format is ambiguous; candidates: {candidates}. Pass --format to choose.")]
+    AmbiguousFormat { candidates: String },
+
     #[error("input is not seekable and `{format}` requires random access")]
     NotSeekable { format: FormatId },
 

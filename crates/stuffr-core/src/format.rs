@@ -78,6 +78,13 @@ pub struct FormatMeta {
     /// Extensions without the leading dot, lowercase. e.g. `["gz", "tgz"]`.
     pub extensions: &'static [&'static str],
     pub magics: &'static [MagicRule],
+    /// Breaks ties when several formats share a magic. Higher wins.
+    ///
+    /// The ZIP family is why this exists: jar, apk, docx, epub, odt and zip all
+    /// begin `PK\x03\x04`, so longest-magic-wins cannot separate them. Rank the
+    /// base format above its derivatives, and a bare stream resolves to the
+    /// base while a derivative is reached by extension.
+    pub priority: i16,
 }
 
 impl CodecCaps {
@@ -142,6 +149,7 @@ impl FormatMeta {
             kind: FormatKind::Codec,
             extensions,
             magics,
+            priority: 0,
         }
     }
 
@@ -155,7 +163,13 @@ impl FormatMeta {
             kind: FormatKind::Container,
             extensions,
             magics,
+            priority: 0,
         }
+    }
+
+    pub const fn with_priority(mut self, priority: i16) -> Self {
+        self.priority = priority;
+        self
     }
 }
 
