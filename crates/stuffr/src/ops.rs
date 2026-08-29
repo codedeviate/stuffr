@@ -355,6 +355,12 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     let registry = crate::registry();
     let format = choose_format(&registry, &dst, o.format)?;
     let codec = registry.require_codec(format)?;
+    let encode = EncodeOpts {
+        level: o.level,
+        ..Default::default()
+    };
+    // Before any filesystem work: a rejected option must cost nothing.
+    codec.check_encode_opts(&encode)?;
 
     let mut reader = src.open()?;
     // Computed from the source's actual seekability, the same way
@@ -368,11 +374,6 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     };
     let opened = dst.create(o.force)?;
     let (counted, written) = CountingWriter::new(opened.writer);
-
-    let encode = EncodeOpts {
-        level: o.level,
-        ..Default::default()
-    };
 
     let run = || -> Result<u64> {
         let mut sink = codec.encoder(Box::new(counted), &encode)?;

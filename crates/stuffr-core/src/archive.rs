@@ -176,6 +176,19 @@ pub trait Sink: Write + Send {
 pub trait Codec: Send + Sync {
     fn id(&self) -> FormatId;
     fn caps(&self) -> CodecCaps;
+    /// Validates encode options without touching the filesystem.
+    ///
+    /// `ops` calls this before opening any destination, so a rejected option
+    /// costs nothing — no temp file created, no existing file disturbed. The
+    /// default accepts everything, for codecs with no options to reject.
+    ///
+    /// With one codec this looks like ceremony. With nine, each carrying its
+    /// own level range, "validate before touching the filesystem" has to be a
+    /// contract rather than a habit: in Phase 1b an invalid level created and
+    /// then deleted a file for nothing.
+    fn check_encode_opts(&self, _o: &EncodeOpts) -> Result<()> {
+        Ok(())
+    }
     /// Decodes `src`. Returns a [`Source`] rather than a bare reader so a codec
     /// carrying a frame index can advertise seekability to the layer above;
     /// forward-only codecs wrap their reader in [`crate::StreamOnly`].

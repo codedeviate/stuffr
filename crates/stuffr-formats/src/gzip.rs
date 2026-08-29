@@ -49,13 +49,20 @@ impl Codec for Gzip {
         Ok(Box::new(StreamOnly::new(MultiGzDecoder::new(src))))
     }
 
+    fn check_encode_opts(&self, o: &EncodeOpts) -> Result<()> {
+        // A `match` with a guard, not a let-chain: MSRV is 1.85 and let-chains
+        // are stable only from 1.88. This is the idiom the tree already uses.
+        match o.level {
+            Some(n) if !(0..=9).contains(&n) => Err(Error::Usage(format!(
+                "gzip compression level must be 0-9, got {n}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+        self.check_encode_opts(o)?;
         let level = match o.level {
-            Some(n) if !(0..=9).contains(&n) => {
-                return Err(Error::Usage(format!(
-                    "gzip compression level must be 0-9, got {n}"
-                )));
-            }
             Some(n) => Compression::new(n as u32),
             None => Compression::default(),
         };

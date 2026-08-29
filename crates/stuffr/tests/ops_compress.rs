@@ -111,6 +111,37 @@ fn an_out_of_range_level_surfaces_as_a_usage_error() {
 }
 
 #[test]
+fn an_invalid_level_is_rejected_before_the_destination_is_touched() {
+    // The destination sits in a directory that does not exist. If the level is
+    // validated first we get a Usage error naming the level; if the destination
+    // is opened first we get an i/o error about the missing directory. The two
+    // are distinguishable, which is what makes this test able to fail.
+    let src = tmp("order-in.txt");
+    std::fs::write(&src, b"payload").unwrap();
+
+    let mut dst = tmp("no-such-dir-order");
+    dst.push("out.gz");
+
+    let o = CompressOpts {
+        level: Some(12),
+        ..Default::default()
+    };
+    let err = compress(Input::Path(src.clone()), Output::Path(dst), &o).unwrap_err();
+
+    assert_eq!(
+        err.exit_code(),
+        2,
+        "an invalid level is a usage error, not i/o: {err}"
+    );
+    assert!(
+        err.to_string().contains("0-9"),
+        "the error must name the valid range, not the missing directory: {err}"
+    );
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn a_rejected_level_leaves_a_forced_destination_byte_for_byte_intact() {
     let src = tmp("keep-in.txt");
     let dst = tmp("keep-out.gz");
