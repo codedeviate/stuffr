@@ -371,3 +371,32 @@ fn an_unrecognised_extension_asks_for_an_explicit_output() {
         "the error must say how to proceed"
     );
 }
+
+#[test]
+fn sync_defaults_on_and_can_be_turned_off() {
+    // The durability itself is not observable without crashing the machine, so
+    // this pins the two things that are: the default, and that the flag reaches
+    // the code path. A round trip under --no-sync must still produce a correct
+    // file — the flag may cost durability, never correctness.
+    assert!(
+        CompressOpts::default().sync,
+        "durability must be the default, not the opt-in"
+    );
+
+    let src = tmp("nosync-in.txt");
+    let dst = tmp("nosync-out.gz");
+    let _ = std::fs::remove_file(&dst);
+    let plain = b"the quick brown fox ".repeat(100);
+    std::fs::write(&src, &plain).unwrap();
+
+    let o = CompressOpts {
+        sync: false,
+        ..Default::default()
+    };
+    let out = compress(Input::Path(src.clone()), Output::Path(dst.clone()), &o).unwrap();
+    assert_eq!(out.bytes_in, plain.len() as u64);
+    assert_eq!(&std::fs::read(&dst).unwrap()[..2], &[0x1f, 0x8b]);
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}

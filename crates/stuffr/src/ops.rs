@@ -73,6 +73,12 @@ pub(crate) struct Finish {
     pub(crate) tmp: PathBuf,
     /// The real destination. Renamed onto only after a successful write.
     pub(crate) target: PathBuf,
+    /// A second handle on the temp file, kept so `publish` can `sync_all()`
+    /// after the codec has consumed the writer it was handed.
+    pub(crate) handle: Option<std::fs::File>,
+    /// Whether `publish` should fsync at all. See `CompressOpts::sync` /
+    /// `DecompressOpts::sync` for what turning it off costs.
+    pub(crate) sync: bool,
 }
 
 impl Output {
@@ -94,7 +100,7 @@ impl Output {
     /// Closing that gap means resolving the link and renaming onto the
     /// resolved path, which brings link chains, relative targets and its own
     /// TOCTOU window along with it — deferred rather than rushed.
-    pub(crate) fn create(&self, force: bool) -> Result<Opened> {
+    pub(crate) fn create(&self, force: bool, sync: bool) -> Result<Opened> {
         match self {
             Output::Stdout => Ok(Opened {
                 writer: Box::new(std::io::stdout()),
@@ -211,11 +217,17 @@ impl Output {
                 if let Some(perms) = carry_over_perms {
                     std::fs::set_permissions(&tmp, perms)?;
                 }
+                // A second handle on the same temp file, taken before `f` is
+                // boxed away as the writer, so `publish` can `sync_all()` it
+                // after the codec has finished writing through the writer.
+                let handle = f.try_clone()?;
                 Ok(Opened {
                     writer: Box::new(f),
                     finish: Some(Finish {
                         tmp,
                         target: p.clone(),
+                        handle: Some(handle),
+                        sync,
                     }),
                 })
             }
@@ -231,22 +243,71 @@ pub(crate) fn discard(finish: Option<Finish>) {
     }
 }
 
-/// Publishes a successful write: renames the temp file onto the destination.
+/// Publishes a successful write: fsyncs the data, renames the temp file onto
+/// the destination, then fsyncs the directory entry.
 ///
 /// Must only be called after every byte (including any trailer) is written
 /// and flushed — the rename is what makes the file visible under its real
 /// name, so it has to be the last thing that happens on the success path.
+///
+/// **Durability, not just visibility.** Renaming without syncing first means
+/// a crash can make the rename durable while the data behind it is not,
+/// leaving a zero-length or partial file under the real name — exactly what
+/// temp-then-rename exists to prevent. So the order here is: sync the temp
+/// file's data, THEN rename, THEN (on unix) sync the directory entry so the
+/// rename itself survives a crash. A sync after the rename would be a weaker
+/// guarantee wearing the same name.
+///
+/// The directory fsync is unix-only — opening a directory as a `File` is not
+/// portable to Windows. On Windows the file sync plus the rename is the
+/// guarantee available; the two platforms are NOT equivalent here, and callers
+/// should not assume otherwise.
+///
+/// When `Finish::sync` is `false` (`--no-sync`), neither fsync runs: the
+/// rename still happens, but a crash immediately after it can leave a
+/// zero-length or partial file under the real name. That trade is the whole
+/// point of the flag — speed for bulk or scratch work, in exchange for the
+/// durability guarantee this function otherwise provides.
 pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
-    if let Some(f) = finish {
-        if let Err(e) = std::fs::rename(&f.tmp, &f.target) {
-            // The rename itself failed, so nothing was published: remove the
-            // temp file rather than leaving it to strand on disk forever —
-            // the caller only ever branches on success (`publish`) vs.
-            // failure (`discard`), never both.
-            let _ = std::fs::remove_file(&f.tmp);
-            return Err(Error::from(e));
+    let Some(f) = finish else { return Ok(()) };
+
+    // Order matters: the data must be durable BEFORE the rename that publishes
+    // it, or a crash can leave the name pointing at a file whose contents never
+    // reached the disk — the exact outcome temp-then-rename exists to prevent.
+    // Nested `if`s rather than a let-chain: MSRV 1.85, let-chains land in 1.88.
+    if f.sync {
+        if let Some(h) = &f.handle {
+            h.sync_all()?;
         }
     }
+
+    if let Err(e) = std::fs::rename(&f.tmp, &f.target) {
+        // The rename itself failed, so nothing was published: remove the
+        // temp file rather than leaving it to strand on disk forever —
+        // the caller only ever branches on success (`publish`) vs.
+        // failure (`discard`), never both.
+        let _ = std::fs::remove_file(&f.tmp);
+        return Err(Error::from(e));
+    }
+
+    // Then the directory entry itself. Opening a directory as a File is not
+    // portable, so this is unix-only: on Windows the file sync above plus the
+    // rename is the guarantee available, and the docs must say so rather than
+    // implying both platforms get the same promise.
+    #[cfg(unix)]
+    if f.sync {
+        if let Some(dir) = f.target.parent() {
+            let dir = if dir.as_os_str().is_empty() {
+                std::path::Path::new(".")
+            } else {
+                dir
+            };
+            if let Ok(d) = std::fs::File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -281,13 +342,29 @@ impl Write for CountingWriter {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CompressOpts {
     /// An explicit format. Wins over any extension — a flag is the more
     /// specific statement of intent, and an extension is only ever a hint.
     pub format: Option<FormatId>,
     pub level: Option<i32>,
     pub force: bool,
+    /// Fsync the output before publishing it, so a crash cannot leave a
+    /// zero-length or partial file under the real name. Defaults to `true`;
+    /// `--no-sync` trades this durability guarantee for speed on bulk or
+    /// scratch work — see `publish`.
+    pub sync: bool,
+}
+
+impl Default for CompressOpts {
+    fn default() -> Self {
+        Self {
+            format: None,
+            level: None,
+            force: false,
+            sync: true,
+        }
+    }
 }
 
 /// What an operation did.
@@ -372,7 +449,7 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     } else {
         Rung::ForwardOnly
     };
-    let opened = dst.create(o.force)?;
+    let opened = dst.create(o.force, o.sync)?;
     let (counted, written) = CountingWriter::new(opened.writer);
 
     let run = || -> Result<u64> {
@@ -424,6 +501,11 @@ pub struct DecompressOpts {
     /// Expansion ratio past which the decode is refused. See
     /// [`stuffr_core::RatioGuard`].
     pub max_ratio: u64,
+    /// Fsync the output before publishing it, so a crash cannot leave a
+    /// zero-length or partial file under the real name. Defaults to `true`;
+    /// `--no-sync` trades this durability guarantee for speed on bulk or
+    /// scratch work — see `publish`.
+    pub sync: bool,
 }
 
 impl Default for DecompressOpts {
@@ -432,6 +514,7 @@ impl Default for DecompressOpts {
             format: None,
             force: false,
             max_ratio: DEFAULT_MAX_RATIO,
+            sync: true,
         }
     }
 }
@@ -487,7 +570,7 @@ pub fn decompress(src: Input, dst: Output, o: &DecompressOpts) -> Result<Outcome
     let mut decoder = codec.decoder(Box::new(counting), &DecodeOpts::default())?;
     let mut guard = RatioGuard::new(Arc::clone(&consumed), o.max_ratio);
 
-    let opened = dst.create(o.force)?;
+    let opened = dst.create(o.force, o.sync)?;
     let finish = opened.finish;
     let mut writer = opened.writer;
 

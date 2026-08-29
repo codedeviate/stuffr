@@ -36,6 +36,9 @@ enum Command {
         /// Overwrite an existing output.
         #[arg(long)]
         force: bool,
+        /// Skip the fsync that makes the output durable before it is published.
+        #[arg(long)]
+        no_sync: bool,
     },
     /// Decompress a file.
     Unpack {
@@ -50,6 +53,9 @@ enum Command {
         /// Refuse a decode expanding by more than this ratio.
         #[arg(long)]
         max_ratio: Option<u64>,
+        /// Skip the fsync that makes the output durable before it is published.
+        #[arg(long)]
+        no_sync: bool,
     },
     /// Decompress a file and write it to stdout.
     Cat {
@@ -149,6 +155,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             format,
             level,
             force,
+            no_sync,
         } => {
             let fmt = match format.as_deref() {
                 Some(name) => Some(format_by_name(name)?),
@@ -158,6 +165,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 format: fmt,
                 level,
                 force,
+                sync: !no_sync,
             };
             let dst = match output {
                 Some(o) => output_of(&o),
@@ -189,9 +197,11 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             output,
             force,
             max_ratio,
+            no_sync,
         } => {
             let mut opts = DecompressOpts {
                 force,
+                sync: !no_sync,
                 ..Default::default()
             };
             if let Some(r) = max_ratio {
