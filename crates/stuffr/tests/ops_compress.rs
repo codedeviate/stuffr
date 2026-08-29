@@ -422,3 +422,33 @@ fn a_hostile_entry_name_survives_serialization_as_data() {
         "the entry name must come back as data, not as structure"
     );
 }
+
+#[test]
+fn a_caller_supplied_registry_is_the_one_that_is_used() {
+    // A registry containing no codecs at all. If compress_with consults the
+    // caller's registry the operation fails; if it quietly falls back to the
+    // default it succeeds, and this test catches that.
+    let empty = stuffr::core::Registry::new();
+
+    let src = tmp("regsel-in.txt");
+    let dst = tmp("regsel-out.gz");
+    let _ = std::fs::remove_file(&dst);
+    std::fs::write(&src, b"payload").unwrap();
+
+    let err = stuffr::ops::compress_with(
+        &empty,
+        Input::Path(src.clone()),
+        Output::Path(dst.clone()),
+        &CompressOpts::default(),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        err.exit_code(),
+        2,
+        "an empty registry offers no codec: {err}"
+    );
+    assert!(!dst.exists(), "nothing should have been written");
+
+    let _ = std::fs::remove_file(&src);
+}

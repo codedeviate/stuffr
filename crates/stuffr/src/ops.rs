@@ -440,13 +440,24 @@ fn choose_format(reg: &Registry, dst: &Output, explicit: Option<FormatId>) -> Re
 /// neither `-o` nor `--format` was given — and duplicating the answer in the
 /// binary is how the two would drift apart.
 pub fn default_format() -> Result<FormatId> {
-    default_format_in(&crate::registry())
+    default_format_in(crate::registry())
 }
 
-/// Compresses `src` into `dst`.
+/// Compresses `src` into `dst`, using the build's default registry.
 pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
-    let registry = crate::registry();
-    let format = choose_format(&registry, &dst, o.format)?;
+    compress_with(crate::registry(), src, dst, o)
+}
+
+/// Compresses `src` into `dst`, consulting `registry` rather than the
+/// build's default — the hook a library consumer uses to hand `stf` a codec
+/// it does not ship, or a deliberately reduced set.
+pub fn compress_with(
+    registry: &Registry,
+    src: Input,
+    dst: Output,
+    o: &CompressOpts,
+) -> Result<Outcome> {
+    let format = choose_format(registry, &dst, o.format)?;
     let codec = registry.require_encoder(format)?;
     let encode = EncodeOpts {
         level: o.level,
@@ -556,9 +567,19 @@ fn codec_for(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Result<Forma
     }
 }
 
-/// Decompresses `src` into `dst`.
+/// Decompresses `src` into `dst`, using the build's default registry.
 pub fn decompress(src: Input, dst: Output, o: &DecompressOpts) -> Result<Outcome> {
-    let registry = crate::registry();
+    decompress_with(crate::registry(), src, dst, o)
+}
+
+/// Decompresses `src` into `dst`, consulting `registry` rather than the
+/// build's default.
+pub fn decompress_with(
+    registry: &Registry,
+    src: Input,
+    dst: Output,
+    o: &DecompressOpts,
+) -> Result<Outcome> {
     let path = src.path().map(Path::to_path_buf);
 
     let source = src.open()?;
@@ -578,7 +599,7 @@ pub fn decompress(src: Input, dst: Output, o: &DecompressOpts) -> Result<Outcome
     let (prefix, source) = stuffr_core::probe(source)?;
     let format = match o.format {
         Some(f) => f,
-        None => codec_for(&registry, path.as_deref(), &prefix)?,
+        None => codec_for(registry, path.as_deref(), &prefix)?,
     };
     let codec = registry.require_decoder(format)?;
 
@@ -668,9 +689,15 @@ pub struct Inspection {
     pub detected_by: Detection,
 }
 
-/// Identifies a stream without decoding it.
+/// Identifies a stream without decoding it, using the build's default
+/// registry.
 pub fn inspect(src: Input) -> Result<Inspection> {
-    let registry = crate::registry();
+    inspect_with(crate::registry(), src)
+}
+
+/// Identifies a stream without decoding it, consulting `registry` rather
+/// than the build's default.
+pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
     let path = src.path().map(Path::to_path_buf);
 
     let source = src.open()?;
@@ -697,7 +724,7 @@ pub fn inspect(src: Input) -> Result<Inspection> {
     } else {
         Detection::Magic
     };
-    let chain = stuffr_core::resolve_chain(&registry, path.as_deref(), &prefix)?;
+    let chain = stuffr_core::resolve_chain(registry, path.as_deref(), &prefix)?;
     let format = match &chain {
         Chain::Codec { codec, .. } => *codec,
         Chain::Container { container } => *container,
