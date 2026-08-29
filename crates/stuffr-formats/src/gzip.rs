@@ -357,6 +357,11 @@ mod tests {
     }
 
     #[test]
+    fn gzip_conforms() {
+        stuffr_core::testing::assert_codec_conforms(&Gzip, &meta());
+    }
+
+    #[test]
     fn decoding_is_incremental_not_read_to_end() {
         // Deferred here from Phase 1a: no mock ever streamed, so nothing had
         // shown that a forward-only read is incremental rather than

@@ -73,9 +73,13 @@ impl Error {
     /// Classifies an io error that arose while decoding.
     ///
     /// Malformed input becomes [`Error::Corrupt`] (exit 5); everything else
-    /// stays [`Error::Io`] (exit 1). `InvalidData` is what flate2 returns for a
-    /// bad gzip checksum and what idiomatic Rust decoders use for malformed
-    /// input generally.
+    /// stays [`Error::Io`] (exit 1). `InvalidData` is the convention every
+    /// codec's decoder is expected to normalise onto for malformed input; a
+    /// codec whose backend disagrees adapts at its own boundary rather than
+    /// this classification changing. gzip is one such codec: flate2's
+    /// pure-Rust backend actually raises `InvalidInput` and `UnexpectedEof`,
+    /// never `InvalidData`, so gzip's decoder wraps it in an adapter that
+    /// folds both onto `InvalidData` before this function ever sees them.
     ///
     /// One rule here rather than a helper each codec calls: putting the
     /// decision in nine places means the natural code — a bare `?` on an

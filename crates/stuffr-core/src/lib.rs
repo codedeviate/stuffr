@@ -5,6 +5,8 @@
 //! against mock formats, with no C toolchain and no real archives.
 
 pub mod archive;
+#[cfg(feature = "testing")]
+pub mod conformance;
 pub mod error;
 pub mod fidelity;
 pub mod format;
