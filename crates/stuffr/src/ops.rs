@@ -354,7 +354,7 @@ pub fn default_format() -> Result<FormatId> {
 pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     let registry = crate::registry();
     let format = choose_format(&registry, &dst, o.format)?;
-    let codec = registry.require_codec(format)?;
+    let codec = registry.require_encoder(format)?;
     let encode = EncodeOpts {
         level: o.level,
         ..Default::default()
@@ -481,7 +481,7 @@ pub fn decompress(src: Input, dst: Output, o: &DecompressOpts) -> Result<Outcome
         Some(f) => f,
         None => codec_for(&registry, path.as_deref(), &prefix)?,
     };
-    let codec = registry.require_codec(format)?;
+    let codec = registry.require_decoder(format)?;
 
     let (counting, consumed) = Counting::new(source);
     let mut decoder = codec.decoder(Box::new(counting), &DecodeOpts::default())?;

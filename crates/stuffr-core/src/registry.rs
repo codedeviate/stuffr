@@ -73,6 +73,34 @@ impl Registry {
         self.codec(id).ok_or(Error::FormatNotEnabled(id))
     }
 
+    /// The codec for `id`, if this build has it **and** it can encode.
+    ///
+    /// Separate from [`Self::require_codec`] because a codec that cannot encode
+    /// is a normal thing to have: the pure-Rust zstd and xz fallbacks let a
+    /// build with no C toolchain still read those formats. Without this check
+    /// the caller reaches `encoder()` on such a codec, and the natural body for
+    /// that method is a panic — reachable straight from a command line.
+    pub fn require_encoder(&self, id: FormatId) -> Result<&Arc<dyn Codec>> {
+        let codec = self.require_codec(id)?;
+        if !codec.caps().encode {
+            return Err(Error::Unsupported(format!(
+                "`{id}` can be read but not written by this build"
+            )));
+        }
+        Ok(codec)
+    }
+
+    /// The codec for `id`, if this build has it **and** it can decode.
+    pub fn require_decoder(&self, id: FormatId) -> Result<&Arc<dyn Codec>> {
+        let codec = self.require_codec(id)?;
+        if !codec.caps().decode {
+            return Err(Error::Unsupported(format!(
+                "`{id}` can be written but not read by this build"
+            )));
+        }
+        Ok(codec)
+    }
+
     pub fn require_container(&self, id: FormatId) -> Result<&Arc<dyn Container>> {
         self.container(id).ok_or(Error::FormatNotEnabled(id))
     }
@@ -157,7 +185,11 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::{DecodeOpts, EncodeOpts, Sink};
+    use crate::format::CodecCaps;
+    use crate::source::Source;
     use crate::testing::{MOCK_CODEC, MOCK_CONTAINER, MockCodec, MockContainer};
+    use std::io::Write;
 
     const CODEC_MAGIC: &[MagicRule] = &[MagicRule {
         offset: 0,
@@ -363,6 +395,55 @@ mod tests {
         assert_eq!(
             r.match_magic(b"XXrest"),
             vec![FormatId::new("aaa"), FormatId::new("bbb")]
+        );
+    }
+
+    #[test]
+    fn a_decode_only_codec_is_refused_an_encoder_rather_than_reaching_it() {
+        use crate::testing::{MOCK_CODEC, MockCodec};
+
+        /// Stands in for 1c's pure-Rust zstd and xz fallbacks: readable, not
+        /// writable. Delegates decode to MockCodec so only `caps` differs.
+        struct ReadOnlyCodec;
+        impl Codec for ReadOnlyCodec {
+            fn id(&self) -> FormatId {
+                MOCK_CODEC
+            }
+            fn caps(&self) -> CodecCaps {
+                CodecCaps::decode_only()
+            }
+            fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+                MockCodec.decoder(src, o)
+            }
+            fn encoder(&self, _d: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+                panic!("a capability check must stop the caller before it reaches here");
+            }
+        }
+
+        let mut reg = Registry::new();
+        reg.register_codec(
+            std::sync::Arc::new(ReadOnlyCodec),
+            FormatMeta::codec(MOCK_CODEC, &["mock"], &[]),
+        );
+
+        // The decoder is available.
+        assert!(reg.require_decoder(MOCK_CODEC).is_ok());
+
+        // The encoder is refused with a typed error, NOT by panicking inside
+        // the codec — which is what the unreachable!/unimplemented! that a
+        // codec author would naturally write there would do.
+        //
+        // Destructured with `let ... else` rather than `.unwrap_err()`, same
+        // reason as `a_missing_format_is_format_not_enabled_not_a_generic_error`
+        // above: `unwrap_err` requires the `Ok` type to be `Debug`, and the
+        // `Ok` type here is `&Arc<dyn Codec>`.
+        let Err(err) = reg.require_encoder(MOCK_CODEC) else {
+            panic!("expected Unsupported for a decode-only codec");
+        };
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("mock-codec"),
+            "must name the format: {err}"
         );
     }
 }
