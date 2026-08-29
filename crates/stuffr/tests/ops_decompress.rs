@@ -153,3 +153,33 @@ fn a_generous_max_ratio_lets_the_same_stream_through() {
 fn the_default_max_ratio_is_ten_thousand() {
     assert_eq!(DecompressOpts::default().max_ratio, 10_000);
 }
+
+#[test]
+fn a_corrupted_stream_is_corrupt_not_an_io_error() {
+    let plain = b"the quick brown fox ".repeat(200);
+    let gz = make_gz(&plain, "corrupt");
+    let mut bytes = std::fs::read(&gz).unwrap();
+
+    // Flip a bit in the middle of the compressed body, past the 10-byte header
+    // and well before the 8-byte trailer, so this is malformed deflate data
+    // rather than a mismatched CRC. Both should classify the same way; the
+    // middle is the case a naive implementation gets wrong.
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&gz, &bytes).unwrap();
+
+    let out = tmp("corrupt-out.txt");
+    let _ = std::fs::remove_file(&out);
+    let err = decompress(
+        Input::Path(gz.clone()),
+        Output::Path(out.clone()),
+        &DecompressOpts::default(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.exit_code(), 5, "corruption is exit 5, not 1: {err}");
+    assert!(matches!(err, stuffr::Error::Corrupt(_)), "got {err:?}");
+    assert!(!out.exists(), "a refused decode must leave no partial file");
+
+    let _ = std::fs::remove_file(&gz);
+}

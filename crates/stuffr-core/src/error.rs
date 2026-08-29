@@ -69,6 +69,28 @@ impl Error {
             _ => 1,
         }
     }
+
+    /// Classifies an io error that arose while decoding.
+    ///
+    /// Malformed input becomes [`Error::Corrupt`] (exit 5); everything else
+    /// stays [`Error::Io`] (exit 1). `InvalidData` is what flate2 returns for a
+    /// bad gzip checksum and what idiomatic Rust decoders use for malformed
+    /// input generally.
+    ///
+    /// One rule here rather than a helper each codec calls: putting the
+    /// decision in nine places means the natural code — a bare `?` on an
+    /// `io::Error` — silently bypasses it, and a convention whose failure mode
+    /// is invisible is not a convention. Conformance property 8 enforces the
+    /// codec half, that malformed input surfaces as `InvalidData` at all.
+    ///
+    /// Lives in `stuffr-core` rather than in `ops` because Phase 2's containers
+    /// need the identical classification on their own decode paths.
+    pub fn from_decode_io(e: std::io::Error) -> Self {
+        match e.kind() {
+            std::io::ErrorKind::InvalidData => Error::Corrupt(e.to_string()),
+            _ => Error::Io(e),
+        }
+    }
 }
 
 #[cfg(test)]

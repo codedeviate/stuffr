@@ -494,7 +494,7 @@ pub fn decompress(src: Input, dst: Output, o: &DecompressOpts) -> Result<Outcome
     let mut run = || -> Result<()> {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            let n = decoder.read(&mut buf)?;
+            let n = decoder.read(&mut buf).map_err(Error::from_decode_io)?;
             if n == 0 {
                 break;
             }

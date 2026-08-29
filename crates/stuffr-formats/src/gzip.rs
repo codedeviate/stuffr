@@ -1,6 +1,6 @@
 //! gzip, via `flate2`'s pure-Rust backend.
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
@@ -54,8 +54,13 @@ impl Codec for Gzip {
     ///
     /// The result is wrapped in `StreamOnly`: a gzip stream carries no seek
     /// table, so its decoded output must not claim random access.
+    ///
+    /// `MultiGzDecoder` is wrapped again in `NormalizeDecodeErrors` first: see
+    /// that type for why.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
-        Ok(Box::new(StreamOnly::new(MultiGzDecoder::new(src))))
+        Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors(
+            MultiGzDecoder::new(src),
+        ))))
     }
 
     fn check_encode_opts(&self, o: &EncodeOpts) -> Result<()> {
@@ -76,6 +81,36 @@ impl Codec for Gzip {
             None => Compression::default(),
         };
         Ok(Box::new(GzSink(GzEncoder::new(dst, level))))
+    }
+}
+
+/// Maps flate2's error-kind vocabulary onto this project's decode-corruption
+/// convention.
+///
+/// `stuffr_core::Error::from_decode_io` classifies `io::ErrorKind::InvalidData`
+/// as `Error::Corrupt` (exit 5) and leaves everything else as `Error::Io`
+/// (exit code 1) — that is the one rule, and it stays one rule only if every
+/// codec's decoder actually speaks `InvalidData` for malformed input.
+///
+/// The pure-Rust backend of the `flate2` crate does not: measured directly
+/// against its source (`zio.rs`, `gz/mod.rs`), every decode-time failure —
+/// malformed deflate data, an invalid gzip header, a trailer CRC mismatch —
+/// is raised as `InvalidInput`, and a stream that runs out mid-member
+/// surfaces as `UnexpectedEof`. Both are folded into `InvalidData` here: a
+/// truncated archive is no better formed than a corrupted one, and "archive
+/// is corrupt" is more useful to a caller than "i/o error". Every other kind
+/// — a genuine failure reading the underlying source — passes through
+/// untouched, so a real disk error stays `Error::Io`, not `Error::Corrupt`.
+struct NormalizeDecodeErrors<R>(R);
+
+impl<R: Read> Read for NormalizeDecodeErrors<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf).map_err(|e| match e.kind() {
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::UnexpectedEof => {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+            }
+            _ => e,
+        })
     }
 }
 

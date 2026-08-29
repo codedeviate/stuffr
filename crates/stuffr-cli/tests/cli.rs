@@ -486,3 +486,40 @@ fn an_unknown_verb_exits_two() {
     let out = Command::new(STF).arg("bogus").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn a_corrupt_archive_exits_five_not_one() {
+    let src = tmp("cli-corrupt.txt");
+    let gz = tmp("cli-corrupt.txt.gz");
+    let out = tmp("cli-corrupt-out.txt");
+    let _ = std::fs::remove_file(&gz);
+    let _ = std::fs::remove_file(&out);
+
+    std::fs::write(&src, b"the quick brown fox ".repeat(200)).unwrap();
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut bytes = std::fs::read(&gz).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&gz, &bytes).unwrap();
+
+    let res = Command::new(STF)
+        .args(["unpack", gz.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        res.status.code(),
+        Some(5),
+        "a corrupt archive must be distinguishable from a full disk"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
