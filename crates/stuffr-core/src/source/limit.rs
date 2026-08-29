@@ -5,7 +5,7 @@
 //! is called by the copy loop with decompressed bytes coming out. Once output
 //! outgrows input implausibly, the decode is refused.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -69,6 +69,43 @@ impl Source for Counting {
 
     fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
         self.inner.as_seek()
+    }
+}
+
+/// Counts bytes on their way out, so a caller can report `bytes_out` correctly
+/// even for a destination with no length — stdout, notably.
+///
+/// The write-side twin of [`Counting`]. Both live here so Phase 2's containers,
+/// which need to account for bytes in both directions per entry, find one
+/// mechanism rather than re-inventing this one.
+pub struct CountingWriter {
+    inner: Box<dyn Write + Send>,
+    count: Arc<AtomicU64>,
+}
+
+impl CountingWriter {
+    /// Returns the wrapper and a handle to its running tally.
+    pub fn new(inner: Box<dyn Write + Send>) -> (Self, Arc<AtomicU64>) {
+        let count = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                inner,
+                count: Arc::clone(&count),
+            },
+            count,
+        )
+    }
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -189,5 +226,25 @@ mod tests {
         let mut g = RatioGuard::new(input, 1000);
         // Output past the floor with nothing counted in: must error, not panic.
         assert!(g.record(RATIO_FLOOR as usize + 1).is_err());
+    }
+
+    #[test]
+    fn counting_writer_tallies_every_byte_including_a_short_write() {
+        // A writer that accepts only part of each buffer, which write_all
+        // handles by looping. The tally must follow what was ACCEPTED, not what
+        // was offered, or bytes_out over-reports on any writer that short-writes.
+        struct Short;
+        impl std::io::Write for Short {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                Ok(b.len().min(3))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (mut w, count) = CountingWriter::new(Box::new(Short));
+        w.write_all(b"0123456789").unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 10);
     }
 }

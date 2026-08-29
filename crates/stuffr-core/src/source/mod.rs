@@ -8,7 +8,7 @@ pub mod spill;
 pub mod stream_only;
 
 pub use file::FileSource;
-pub use limit::{Counting, DEFAULT_MAX_RATIO, RATIO_FLOOR, RatioGuard};
+pub use limit::{Counting, CountingWriter, DEFAULT_MAX_RATIO, RATIO_FLOOR, RatioGuard};
 pub use reader::{PeekSource, ReaderSource};
 pub use spill::{SpillPolicy, SpillSource};
 pub use stream_only::StreamOnly;

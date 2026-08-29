@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
-    Chain, Counting, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts, Error, FidelityReport, FileSource,
-    FormatId, FormatKind, RatioGuard, ReaderSource, Registry, Result, Rung, Source,
+    Chain, Counting, CountingWriter, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts, Error,
+    FidelityReport, FileSource, FormatId, FormatKind, RatioGuard, ReaderSource, Registry, Result,
+    Rung, Source,
 };
 
 /// Per-process counter mixed into the temp file name alongside the pid, so
@@ -325,37 +326,6 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Counts bytes on their way out, so `bytes_out` is correct for stdout too.
-pub(crate) struct CountingWriter {
-    inner: Box<dyn Write + Send>,
-    count: Arc<AtomicU64>,
-}
-
-impl CountingWriter {
-    pub(crate) fn new(inner: Box<dyn Write + Send>) -> (Self, Arc<AtomicU64>) {
-        let count = Arc::new(AtomicU64::new(0));
-        (
-            Self {
-                inner,
-                count: Arc::clone(&count),
-            },
-            count,
-        )
-    }
-}
-
-impl Write for CountingWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.count.fetch_add(n as u64, Ordering::Relaxed);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 #[derive(Clone, Debug)]
