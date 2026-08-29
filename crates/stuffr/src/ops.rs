@@ -100,6 +100,10 @@ impl Output {
     /// Closing that gap means resolving the link and renaming onto the
     /// resolved path, which brings link chains, relative targets and its own
     /// TOCTOU window along with it — deferred rather than rushed.
+    ///
+    /// `sync` is carried through unchanged into the returned `Opened`'s
+    /// `Finish` (when there is one), for `publish` to act on later — see its
+    /// docs for what turning it off costs.
     pub(crate) fn create(&self, force: bool, sync: bool) -> Result<Opened> {
         match self {
             Output::Stdout => Ok(Opened {
@@ -262,6 +266,18 @@ pub(crate) fn discard(finish: Option<Finish>) {
 /// portable to Windows. On Windows the file sync plus the rename is the
 /// guarantee available; the two platforms are NOT equivalent here, and callers
 /// should not assume otherwise.
+///
+/// **Even on unix, the directory fsync is best-effort, unlike the file
+/// sync.** A failed `File::open` on the directory or a failed `sync_all` on
+/// it is silently dropped, where the temp file's own `sync_all` above is a
+/// hard error via `?`. That asymmetry is deliberate: the file sync protects
+/// the data itself, so a failure there must stop the publish before the
+/// rename makes anything visible. The directory sync only protects the
+/// durability of the *rename* — its worst case, if skipped or if it silently
+/// fails, is a crash that leaves the destination pointing at its previous
+/// consistent state (old content, or absent) rather than at today's data,
+/// not a corrupted file. That is a durability gap, not a correctness one, so
+/// it is not worth failing an otherwise-successful publish over.
 ///
 /// When `Finish::sync` is `false` (`--no-sync`), neither fsync runs: the
 /// rename still happens, but a crash immediately after it can leave a
@@ -611,16 +627,43 @@ pub fn decompress(src: Input, dst: Output, o: &DecompressOpts) -> Result<Outcome
     }
 }
 
+/// How `inspect` arrived at its answer.
+///
+/// `stf info` could not previously say this, so an empty `.gz` and a text file
+/// named `.gz` reported identically and only `unpack` failed. Extension-as-
+/// fallback is the documented design; the answer's provenance should still be
+/// visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+#[non_exhaustive]
+pub enum Detection {
+    /// Leading bytes matched a registered magic rule.
+    Magic,
+    /// No magic matched; the path's extension decided.
+    Extension,
+    /// The caller named the format and detection was not consulted.
+    Explicit,
+}
+
 /// What `stf info` reports.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Inspection {
     pub format: FormatId,
     /// The resolved pipeline, e.g. `"gzip"` or `"tar over gzip"`.
     pub chain: String,
     pub rung: Rung,
+    /// Flattened so `warnings` (and, redundantly with the field above, `rung`
+    /// again) land at the top level of the serialized object — the shape a
+    /// consumer of the old hand-rolled JSON already expected, rather than a
+    /// nested `"fidelity"` object nobody asked for.
+    #[cfg_attr(feature = "serde", serde(flatten))]
     pub fidelity: FidelityReport,
     /// Input size, when the source knows it. A pipe does not.
     pub bytes_in: Option<u64>,
+    /// How the format above was decided.
+    pub detected_by: Detection,
 }
 
 /// Identifies a stream without decoding it.
@@ -640,6 +683,18 @@ pub fn inspect(src: Input) -> Result<Inspection> {
     };
 
     let (prefix, _rest) = stuffr_core::probe(source)?;
+    // Mirrors the first branch of `resolve_chain`'s own decision: the outer
+    // format comes from the magic-hit set whenever that set is non-empty
+    // (even when a tie among magic hits was later broken by the extension),
+    // and only falls back to the path's extension when nothing matched by
+    // magic at all. `inspect` takes no explicit format today, so `Explicit`
+    // is unreachable from here — that is correct; it exists for the
+    // `--format` override arriving in 1d.
+    let detected_by = if registry.match_magic(&prefix).is_empty() {
+        Detection::Extension
+    } else {
+        Detection::Magic
+    };
     let chain = stuffr_core::resolve_chain(&registry, path.as_deref(), &prefix)?;
     let format = match &chain {
         Chain::Codec { codec, .. } => *codec,
@@ -662,6 +717,7 @@ pub fn inspect(src: Input) -> Result<Inspection> {
         rung,
         fidelity: FidelityReport::new(rung),
         bytes_in: caps.len,
+        detected_by,
     })
 }
 

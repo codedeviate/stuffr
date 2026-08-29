@@ -12,8 +12,6 @@ name = "stf"
 path = "src/main.rs"
 
 [dependencies]
-stuffr = { path = "../stuffr", version = "0.0.1" }
+stuffr = { path = "../stuffr", version = "0.0.1", features = ["serde"] }
 clap = { workspace = true }
-
-[dev-dependencies]
 serde_json = "1"

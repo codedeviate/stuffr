@@ -400,3 +400,25 @@ fn sync_defaults_on_and_can_be_turned_off() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&dst);
 }
+
+/// The property `json_escape` used to guarantee by hand-rolled escaping:
+/// warning variants embed archive-supplied entry names, so a quote,
+/// backslash or newline in one must not break or forge the surrounding JSON.
+/// serde guarantees it by construction now, but the property itself must
+/// stay pinned through the real serializer, not just asserted away.
+#[test]
+fn a_hostile_entry_name_survives_serialization_as_data() {
+    use stuffr::{Fidelity, FidelityReport, Rung};
+
+    let mut report = FidelityReport::new(Rung::ForwardOnly);
+    report.warn(Fidelity::EncryptedEntrySkipped {
+        entry: "evil\", \"format\": \"pwned\n\\".into(),
+    });
+
+    let text = serde_json::to_string(&report).unwrap();
+    let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        back["warnings"][0]["entry"], "evil\", \"format\": \"pwned\n\\",
+        "the entry name must come back as data, not as structure"
+    );
+}

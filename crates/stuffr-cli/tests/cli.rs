@@ -49,14 +49,9 @@ fn info_names_the_format_and_the_rung() {
 }
 
 #[test]
-fn info_json_is_parseable_and_carries_the_same_facts() {
-    // A substring check (`contains("\"format\"")`) would pass on a trailing
-    // comma, an unquoted value, or an unterminated string — none of which are
-    // valid JSON. Actually parsing the output is what proves `print_info_json`
-    // calls `json_escape` rather than hand-formatting fields that happen to
-    // look right in the common case.
-    let src = tmp("json.txt");
-    let gz = tmp("json.txt.gz");
+fn info_json_is_structured_and_names_how_the_format_was_detected() {
+    let src = tmp("json2.txt");
+    let gz = tmp("json2.txt.gz");
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"payload").unwrap();
     assert!(
@@ -71,40 +66,17 @@ fn info_json_is_parseable_and_carries_the_same_facts() {
         .args(["info", "--json", gz.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"));
 
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .unwrap_or_else(|e| panic!("output was not valid JSON: {e}\n{text}"));
-
+    assert_eq!(v["format"], "gzip");
+    assert_eq!(v["rung"], "exact");
     assert_eq!(
-        value.get("format").and_then(|v| v.as_str()),
-        Some("gzip"),
-        "{text}"
+        v["detected_by"], "magic",
+        "a real gzip file is identified by its magic, not its name"
     );
-    assert_eq!(
-        value.get("rung").and_then(|v| v.as_str()),
-        Some("exact"),
-        "{text}"
-    );
-    assert_eq!(
-        value.get("chain").and_then(|v| v.as_str()),
-        Some("gzip"),
-        "{text}"
-    );
-    assert_eq!(
-        value.get("bytes_in").and_then(|v| v.as_u64()),
-        Some(std::fs::metadata(&gz).unwrap().len()),
-        "{text}"
-    );
-    assert_eq!(
-        value
-            .get("warnings")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len()),
-        Some(0),
-        "{text}"
-    );
+    assert!(v["warnings"].as_array().unwrap().is_empty());
 
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&gz);

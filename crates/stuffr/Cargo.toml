@@ -13,7 +13,16 @@ pure = ["stuffr-formats/gzip"]
 c-backed = []
 legacy = []
 full = ["pure", "c-backed", "legacy"]
+serde = ["dep:serde", "stuffr-core/serde"]
 
 [dependencies]
 stuffr-core = { workspace = true }
 stuffr-formats = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Self dev-dependency with `serde` turned on: the same trick `stuffr-core`
+# uses on itself, so the feature is active for this crate's own tests without
+# making it a default for library consumers.
+stuffr = { path = ".", features = ["serde"] }
+serde_json = "1"
