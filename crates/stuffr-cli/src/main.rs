@@ -237,7 +237,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             } else {
                 println!("format:   {}", i.format);
                 println!("chain:    {}", i.chain);
-                println!("rung:     {}", i.rung);
+                println!("rung:     {}", i.fidelity.rung);
                 match i.bytes_in {
                     Some(n) => println!("size:     {n} bytes"),
                     None => println!("size:     unknown (stream)"),

@@ -1,4 +1,6 @@
-use stuffr::ops::{CompressOpts, DecompressOpts, Input, Output, compress, decompress, inspect};
+use stuffr::ops::{
+    CompressOpts, DecompressOpts, Detection, Input, Output, compress, decompress, inspect,
+};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
@@ -70,7 +72,7 @@ fn inspect_of_a_seekable_file_reports_exact() {
     // reporting it honestly is what makes `stf info` meaningful before Phase 2.
     let gz = make_gz(b"payload", "rung");
     let from_file = inspect(Input::Path(gz.clone())).unwrap();
-    assert_eq!(from_file.rung, stuffr::Rung::Exact);
+    assert_eq!(from_file.fidelity.rung, stuffr::Rung::Exact);
     assert!(
         !from_file.fidelity.has_warnings(),
         "gzip has no index; nothing is lost"
@@ -82,6 +84,35 @@ fn inspect_of_a_seekable_file_reports_exact() {
         Some(std::fs::metadata(&gz).unwrap().len())
     );
     let _ = std::fs::remove_file(&gz);
+}
+
+/// Every other test that touches `detected_by` uses a real gzip file, which
+/// magic always wins on — so a build that hardcoded `Detection::Magic` and
+/// never consulted the registry would pass all of them. This is the one case
+/// that can only pass if `inspect` actually falls back to the extension:
+/// content that is not gzip at all, named as if it were.
+///
+/// The fallback is real and reachable, not a hypothetical: `stf info` still
+/// identifies such a file (by name) even though `unpack` would then fail on
+/// it when the bytes turn out not to be gzip after all.
+#[test]
+fn a_non_gzip_file_named_dot_gz_is_detected_by_extension_not_magic() {
+    let path = tmp("not-actually-gzip.gz");
+    std::fs::write(&path, b"just plain text, no gzip magic here").unwrap();
+
+    let inspection = inspect(Input::Path(path.clone())).unwrap();
+    assert_eq!(
+        inspection.format.as_str(),
+        "gzip",
+        "the extension still names a real format"
+    );
+    assert_eq!(
+        inspection.detected_by,
+        Detection::Extension,
+        "no magic matched; only the name decided"
+    );
+
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]

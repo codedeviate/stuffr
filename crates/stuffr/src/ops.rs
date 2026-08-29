@@ -653,11 +653,13 @@ pub struct Inspection {
     pub format: FormatId,
     /// The resolved pipeline, e.g. `"gzip"` or `"tar over gzip"`.
     pub chain: String,
-    pub rung: Rung,
-    /// Flattened so `warnings` (and, redundantly with the field above, `rung`
-    /// again) land at the top level of the serialized object — the shape a
-    /// consumer of the old hand-rolled JSON already expected, rather than a
-    /// nested `"fidelity"` object nobody asked for.
+    /// Flattened so `rung` and `warnings` land at the top level of the
+    /// serialized object — the shape a consumer of the old hand-rolled JSON
+    /// already expected, rather than a nested `"fidelity"` object nobody
+    /// asked for. `Inspection` has no standalone `rung` field of its own:
+    /// `Outcome` (the `compress`/`decompress` result) already reads the rung
+    /// off its own `fidelity` this way, and a second field holding the same
+    /// value by convention rather than by type would invite the two to drift.
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub fidelity: FidelityReport,
     /// Input size, when the source knows it. A pipe does not.
@@ -714,7 +716,6 @@ pub fn inspect(src: Input) -> Result<Inspection> {
     Ok(Inspection {
         format,
         chain: chain.describe(),
-        rung,
         fidelity: FidelityReport::new(rung),
         bytes_in: caps.len,
         detected_by,
