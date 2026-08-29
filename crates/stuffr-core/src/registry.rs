@@ -83,9 +83,11 @@ impl Registry {
     pub fn require_encoder(&self, id: FormatId) -> Result<&Arc<dyn Codec>> {
         let codec = self.require_codec(id)?;
         if !codec.caps().encode {
-            return Err(Error::Unsupported(format!(
-                "`{id}` can be read but not written by this build"
-            )));
+            return Err(Error::CapabilityUnavailable {
+                format: id,
+                available: "read",
+                requested: "written",
+            });
         }
         Ok(codec)
     }
@@ -94,9 +96,11 @@ impl Registry {
     pub fn require_decoder(&self, id: FormatId) -> Result<&Arc<dyn Codec>> {
         let codec = self.require_codec(id)?;
         if !codec.caps().decode {
-            return Err(Error::Unsupported(format!(
-                "`{id}` can be written but not read by this build"
-            )));
+            return Err(Error::CapabilityUnavailable {
+                format: id,
+                available: "written",
+                requested: "read",
+            });
         }
         Ok(codec)
     }
@@ -416,6 +420,14 @@ mod tests {
                 MockCodec.decoder(src, o)
             }
             fn encoder(&self, _d: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+                // This panic is never exercised by this test — neither the
+                // test nor `require_encoder` ever calls `encoder()`. It
+                // documents the production failure mode a buggy
+                // implementation would hit via `ops::compress`: without the
+                // capability check below, a decode-only codec's natural
+                // `encoder()` body is exactly this panic, reachable straight
+                // from a command line. The real assertion in this test is
+                // the `Err`/exit-code check below.
                 panic!("a capability check must stop the caller before it reaches here");
             }
         }
@@ -438,12 +450,20 @@ mod tests {
         // above: `unwrap_err` requires the `Ok` type to be `Debug`, and the
         // `Ok` type here is `&Arc<dyn Codec>`.
         let Err(err) = reg.require_encoder(MOCK_CODEC) else {
-            panic!("expected Unsupported for a decode-only codec");
+            panic!("expected CapabilityUnavailable for a decode-only codec");
         };
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert!(
+            matches!(err, Error::CapabilityUnavailable { .. }),
+            "got {err:?}"
+        );
         assert!(
             err.to_string().contains("mock-codec"),
             "must name the format: {err}"
+        );
+        assert_eq!(
+            err.exit_code(),
+            3,
+            "a capability refusal must be distinguishable from other errors so a script can branch on it"
         );
     }
 }

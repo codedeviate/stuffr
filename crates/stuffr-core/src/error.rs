@@ -43,6 +43,15 @@ pub enum Error {
 
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    #[error("`{format}` can be {available} but not {requested} by this build")]
+    CapabilityUnavailable {
+        format: FormatId,
+        /// The direction that IS available, e.g. "read".
+        available: &'static str,
+        /// The direction that was asked for and is not, e.g. "written".
+        requested: &'static str,
+    },
 }
 
 impl Error {
@@ -52,6 +61,7 @@ impl Error {
         match self {
             Error::Usage(_) => 2,
             Error::FormatNotEnabled(_) => 3,
+            Error::CapabilityUnavailable { .. } => 3,
             Error::FidelityDegraded(_) => 4,
             Error::Corrupt(_) => 5,
             Error::SpillLimitExceeded { .. } | Error::ResourceLimit(_) => 6,
