@@ -39,6 +39,23 @@ pub struct CodecCaps {
     pub parallel_decode: bool,
     /// Stream carries a frame/block index enabling random access.
     pub frame_index: bool,
+    /// The format carries an integrity check — CRC, checksum, or framing —
+    /// that makes malformed input detectable.
+    ///
+    /// `false` for raw streams: a bare deflate or LZMA1 stream fed corrupt
+    /// bytes produces different output rather than an error. Such a format can
+    /// never produce [`crate::Error::Corrupt`], and a caller is entitled to
+    /// know that rather than assume a guarantee that is not there.
+    pub detects_corruption: bool,
+
+    /// Rough working-set cost of one encode worker, in bytes, when the codec
+    /// knows it. `None` means unknown — assume modest.
+    ///
+    /// Unused until Phase 1e wires parallel encode; it exists now because the
+    /// governor already reasons about figures like "xz -9 at ~700 MiB per
+    /// worker" with no way for a codec to supply one, and adding the field
+    /// after nine codecs exist means revisiting all nine.
+    pub memory_per_worker: Option<u64>,
 }
 
 /// What a container can do, and what it needs from its input.
@@ -97,6 +114,8 @@ impl CodecCaps {
             parallel_encode: false,
             parallel_decode: false,
             frame_index: false,
+            detects_corruption: false,
+            memory_per_worker: None,
         }
     }
 
@@ -109,6 +128,8 @@ impl CodecCaps {
             parallel_encode: false,
             parallel_decode: false,
             frame_index: false,
+            detects_corruption: false,
+            memory_per_worker: None,
         }
     }
 }

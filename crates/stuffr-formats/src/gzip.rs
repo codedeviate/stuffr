@@ -33,7 +33,16 @@ impl Codec for Gzip {
 
     fn caps(&self) -> CodecCaps {
         // Parallel encode and a frame index arrive in cycle 1c.
-        CodecCaps::round_trip()
+        CodecCaps {
+            // gzip's trailer carries a CRC32 over the uncompressed data, so a
+            // flipped byte anywhere in the stream is detected rather than
+            // silently decoded into different bytes.
+            detects_corruption: true,
+            // deflate's window is 32 KiB; miniz_oxide's encoder state plus our
+            // 64 KiB copy buffer puts one worker comfortably under 256 KiB.
+            memory_per_worker: Some(256 * 1024),
+            ..CodecCaps::round_trip()
+        }
     }
 
     /// Decodes with `MultiGzDecoder`, never `GzDecoder`.
@@ -297,6 +306,19 @@ mod tests {
         assert_eq!(m.id, GZIP);
         assert_eq!(m.extensions, &["gz"]);
         assert_eq!(m.priority, 0);
+    }
+
+    #[test]
+    fn gzip_declares_an_integrity_check_and_a_memory_figure() {
+        let c = Gzip.caps();
+        assert!(
+            c.detects_corruption,
+            "gzip carries a CRC32, so corrupt input is detectable and Error::Corrupt is reachable"
+        );
+        assert!(
+            c.memory_per_worker.is_some(),
+            "a codec that knows its working set should say so; the governor has no other source"
+        );
     }
 
     #[test]
