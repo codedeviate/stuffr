@@ -915,3 +915,16 @@ fn cat_honours_max_ratio() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&gz);
 }
+
+#[test]
+fn formats_lists_every_registered_format() {
+    let out = Command::new(STF).arg("formats").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    for row in stuffr::registry().matrix() {
+        assert!(
+            text.contains(row.id.as_str()),
+            "`stf formats` omits {}: {text}",
+            row.id
+        );
+    }
+}

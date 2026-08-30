@@ -9,24 +9,33 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 1c complete — the foundation is ready for the other codecs.**
-> `stf pack`, `unpack`, `cat`, `info` and `formats` all work today, on files and
-> through pipes, and `curl … | stf cat - | grep pattern` runs. 216 tests, clean
-> across build, clippy and fmt.
+> **Status: Phase 1d complete — seven codecs, proven to coexist.** `stf pack`,
+> `unpack`, `cat`, `info` and `formats` all work today, on files and through
+> pipes, and `curl … | stf cat - | grep pattern` runs. `stf formats` lists
+> `brotli`, `bzip2`, `deflate`, `gzip`, `lz4`, `snappy` and `zlib`, each proven
+> individually against the ten-property conformance harness Phase 1c added, and
+> then proven together: magic detection picks the right one out of seven
+> (`gzip`, `zlib`, `bzip2`, `lz4`, `snappy` all carry magic bytes; `zlib` alone
+> needs four rules, one per compression-level band), and `deflate` — which has
+> neither magic nor an extension convention — is reachable only via
+> `--format` and fails detection cleanly rather than being guessed at. 271
+> tests, clean across build, clippy and fmt.
 >
-> **Still one codec.** Phase 1b took gzip end to end as a walking skeleton, so
-> that interface problems surfaced at codec one instead of codec nine. Phase 1c
-> then fixed what that surfaced and added a ten-property **conformance harness**
-> every future codec adopts in one line — so the next eight arrive against a
-> contract that is checked rather than described. The other formats in the matrix
-> below are not implemented yet: Phase 1d adds them, 1e adds parallel encode and
-> reaches 0.1.0, Phase 2 adds containers.
+> **Not yet: the codecs that need a C toolchain, or a container.** `zstd`,
+> `xz` and `LZMA1` arrive in Phase 1e; parallel encode and the version bump to
+> `0.1.0` follow in Phase 1f; `tar`, `zip` and the rest of the container set
+> are Phase 2. Nothing in the matrix below beyond the seven listed above is
+> implemented yet.
 >
-> Already true and enforced for every codec that follows: decoding is incremental
-> rather than read-to-end, corruption is distinguishable from a full disk, output
-> is fsynced before it is published and never destroys an existing file on
-> failure, and `stuffr-core` carries zero format dependencies — so the ladder and
-> governor stay testable with no C toolchain.
+> Already true and enforced for every codec: decoding is incremental rather
+> than read-to-end, corruption is distinguishable from a full disk, output is
+> fsynced before it is published and never destroys an existing file on
+> failure, and `stuffr-core` carries zero format dependencies. The property
+> that actually matters is **no C toolchain is required** — `cargo install`
+> needs no `cc`, no `cmake`, nothing beyond `rustc` — not that the tree
+> contains no `-sys` crate: it contains three (`libbz2-rs-sys`,
+> `linux-raw-sys`, `windows-sys`), and all three are pure-Rust FFI
+> declarations that link nothing.
 
 ## Why another one
 
@@ -111,7 +120,9 @@ OOM killer.
 
 ## Planned CLI
 
-*Phase 1 and later. Only `stf formats` and `stf --version` are implemented today.*
+*Phase 1 and later. `pack`, `unpack`, `cat`, `info` and `formats` work today,
+for the seven codecs `stf formats` lists; `list`, `test`, `convert` and
+`install-links`, and every container, are not implemented yet.*
 
 ```
 stf pack     [-o out.tar.zst] [--format F] [--level N] PATHS...

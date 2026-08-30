@@ -1,3 +1,4 @@
+use stuffr::FormatId;
 use stuffr::ops::{
     CompressOpts, DecompressOpts, Detection, Input, Output, compress, decompress, inspect,
 };
@@ -6,6 +7,19 @@ fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("stf-1b-dec-{}-{}", std::process::id(), name));
     p
+}
+
+/// Looks the id up in the real registry rather than constructing a
+/// `FormatId` directly — `FormatId::new` would happily mint an id for a
+/// format that was never registered, and the tests below would then pass
+/// for the wrong reason (they'd never actually exercise the codec).
+fn fmt(name: &str) -> FormatId {
+    stuffr::registry()
+        .matrix()
+        .into_iter()
+        .find(|row| row.id.as_str() == name)
+        .unwrap_or_else(|| panic!("format `{name}` is not registered in this build"))
+        .id
 }
 
 fn make_gz(plain: &[u8], name: &str) -> std::path::PathBuf {
@@ -220,4 +234,81 @@ fn a_corrupted_stream_is_corrupt_not_an_io_error() {
     assert!(!out.exists(), "a refused decode must leave no partial file");
 
     let _ = std::fs::remove_file(&gz);
+}
+
+#[test]
+fn each_magic_bearing_format_is_detected_from_its_own_bytes() {
+    // Seven formats now share one registry. This is the test that would catch
+    // one format's magic shadowing another's — for instance a rule registered
+    // at the wrong offset, or a prefix collision nobody noticed.
+    for (id, ext) in [
+        ("gzip", "gz"),
+        ("zlib", "zz"),
+        ("bzip2", "bz2"),
+        ("lz4", "lz4"),
+        ("snappy", "sz"),
+    ] {
+        let src = tmp(&format!("detect-{id}.bin"));
+        let packed = tmp(&format!("detect-{id}.bin.{ext}"));
+        let _ = std::fs::remove_file(&packed);
+        std::fs::write(&src, b"the quick brown fox ".repeat(50)).unwrap();
+
+        let o = CompressOpts {
+            format: Some(fmt(id)),
+            ..Default::default()
+        };
+        compress(Input::Path(src.clone()), Output::Path(packed.clone()), &o).unwrap();
+
+        // Inspect WITHOUT the extension hint, so only the magic can decide.
+        let bare = tmp(&format!("detect-{id}-bare"));
+        std::fs::rename(&packed, &bare).unwrap();
+        let got = inspect(Input::Path(bare.clone())).unwrap();
+        assert_eq!(
+            got.format.as_str(),
+            id,
+            "magic detection picked the wrong format"
+        );
+        assert_eq!(got.detected_by, Detection::Magic);
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&bare);
+    }
+}
+
+#[test]
+fn a_magic_less_format_is_unreachable_without_an_explicit_format() {
+    // deflate has neither magic nor extension. Detection must fail cleanly
+    // rather than guessing, and --format must be the way in. If this ever
+    // starts succeeding, detection has begun guessing at streams it cannot
+    // identify.
+    let src = tmp("noformat.bin");
+    let packed = tmp("noformat.deflate");
+    let _ = std::fs::remove_file(&packed);
+    std::fs::write(&src, b"payload").unwrap();
+
+    let o = CompressOpts {
+        format: Some(fmt("deflate")),
+        ..Default::default()
+    };
+    compress(Input::Path(src.clone()), Output::Path(packed.clone()), &o).unwrap();
+
+    let err = inspect(Input::Path(packed.clone())).unwrap_err();
+    assert!(
+        matches!(err, stuffr::Error::UnknownFormat { .. }),
+        "detection must fail rather than guess: {err:?}"
+    );
+
+    // But it round-trips when named explicitly.
+    let out = tmp("noformat-out.bin");
+    let _ = std::fs::remove_file(&out);
+    let d = DecompressOpts {
+        format: Some(fmt("deflate")),
+        ..Default::default()
+    };
+    decompress(Input::Path(packed.clone()), Output::Path(out.clone()), &d).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), b"payload");
+
+    for p in [&src, &packed, &out] {
+        let _ = std::fs::remove_file(p);
+    }
 }
