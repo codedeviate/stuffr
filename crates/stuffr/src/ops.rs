@@ -390,6 +390,11 @@ pub struct CompressOpts {
     /// `--no-sync` trades this durability guarantee for speed on bulk or
     /// scratch work — see `publish`.
     pub sync: bool,
+    /// Consents to using a codec whose `CodecCaps::weak_encoder` is set — a
+    /// fallback encoder markedly worse than the format's usual one. Without
+    /// this, `compress_with` refuses such a codec outright: see
+    /// `CodecCaps::weak_encoder`'s docs for why silent use is not an option.
+    pub allow_weak_encoder: bool,
 }
 
 impl Default for CompressOpts {
@@ -399,6 +404,7 @@ impl Default for CompressOpts {
             level: None,
             force: false,
             sync: true,
+            allow_weak_encoder: false,
         }
     }
 }
@@ -494,6 +500,18 @@ pub fn compress_with(
 ) -> Result<Outcome> {
     let format = choose_format(registry, &dst, o.format)?;
     let codec = registry.require_encoder(format)?;
+
+    // Consent, not capability: a single-pattern `if let`, not the `&&`-joined
+    // let-chain form that only stabilised in 1.88 — MSRV here is 1.85.
+    if let (true, false) = (codec.caps().weak_encoder, o.allow_weak_encoder) {
+        return Err(Error::Usage(format!(
+            "`{format}` in this build has only a weak encoder: it produces valid \
+             output with a markedly worse ratio, and buffers the whole input in \
+             memory. Pass --allow-weak-encoder to use it anyway, or rebuild with \
+             --features c-backed for the real encoder."
+        )));
+    }
+
     let encode = EncodeOpts {
         level: o.level,
         ..Default::default()

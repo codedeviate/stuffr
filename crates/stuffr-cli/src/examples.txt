@@ -127,6 +127,18 @@ SKIPPING THE DURABILITY FSYNC
       --no-sync trades that guarantee for speed on bulk or scratch work.
 
 
+USING A WEAK FALLBACK ENCODER
+
+  stf pack big.dat --format xz --allow-weak-encoder
+      Some formats in this build may have only a fallback encoder in place
+      of the format's real one, in a build with no C toolchain. The output
+      is a valid file of that format, but much larger than the format's
+      usual encoder would produce, and it buffers the whole input in
+      memory — unsuitable for large files. pack refuses such an encoder
+      unless this flag is given; run `stf formats` to see which codecs in
+      THIS build are affected (WRITE shows `weak` rather than `yes`).
+
+
 EXIT CODES
 
   0  success

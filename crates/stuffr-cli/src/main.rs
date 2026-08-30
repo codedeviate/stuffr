@@ -113,6 +113,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             level,
             force,
             no_sync,
+            allow_weak_encoder,
         } => {
             let fmt = match format.as_deref() {
                 Some(name) => Some(format_by_name(name)?),
@@ -123,6 +124,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 level,
                 force,
                 sync: !no_sync,
+                allow_weak_encoder,
             };
             let dst = match output {
                 Some(o) => output_of(&o),
@@ -294,7 +296,19 @@ fn print_formats() -> stuffr::Result<()> {
         "{:<16} {:<10} {:<5} {:<5} {:<8} EXTENSIONS",
         "FORMAT", "KIND", "READ", "WRITE", "PARALLEL"
     )?;
+    writeln!(
+        out,
+        "(WRITE shows `weak` for a codec whose encoder in this build is a fallback markedly \
+         worse than the format's usual one — see --allow-weak-encoder.)"
+    )?;
+    let registry = stuffr::registry();
     for r in rows {
+        // A codec's own capabilities, not the matrix row's read/write/parallel
+        // summary, are what carry `weak_encoder` — look it up directly rather
+        // than growing FormatRow for one column only `stf formats` reads.
+        let weak = r.write
+            && r.kind == stuffr::FormatKind::Codec
+            && registry.codec(r.id).is_some_and(|c| c.caps().weak_encoder);
         writeln!(
             out,
             "{:<16} {:<10} {:<5} {:<5} {:<8} {}",
@@ -304,7 +318,13 @@ fn print_formats() -> stuffr::Result<()> {
                 stuffr::FormatKind::Container => "container",
             },
             if r.read { "yes" } else { "-" },
-            if r.write { "yes" } else { "-" },
+            if weak {
+                "weak"
+            } else if r.write {
+                "yes"
+            } else {
+                "-"
+            },
             if r.parallel { "yes" } else { "-" },
             r.extensions.join(", "),
         )?;

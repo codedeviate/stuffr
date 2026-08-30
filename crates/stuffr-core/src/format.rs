@@ -56,6 +56,15 @@ pub struct CodecCaps {
     /// worker" with no way for a codec to supply one, and adding the field
     /// after nine codecs exist means revisiting all nine.
     pub memory_per_worker: Option<u64>,
+
+    /// This build's encoder for the format is markedly worse than the format's
+    /// usual one — a fallback that produces valid output nobody would choose.
+    ///
+    /// `ops` refuses to use it unless the caller opts in, because the output is
+    /// indistinguishable afterwards: a user who asked for `.xz` expects xz
+    /// ratios, and two builds of stf would otherwise produce very different
+    /// files from an identical command with no way to tell which they got.
+    pub weak_encoder: bool,
 }
 
 /// What a container can do, and what it needs from its input.
@@ -116,6 +125,7 @@ impl CodecCaps {
             frame_index: false,
             detects_corruption: false,
             memory_per_worker: None,
+            weak_encoder: false,
         }
     }
 
@@ -130,6 +140,7 @@ impl CodecCaps {
             frame_index: false,
             detects_corruption: false,
             memory_per_worker: None,
+            weak_encoder: false,
         }
     }
 }

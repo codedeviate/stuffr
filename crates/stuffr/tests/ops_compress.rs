@@ -442,6 +442,95 @@ fn a_hostile_entry_name_survives_serialization_as_data() {
 }
 
 #[test]
+fn a_weak_encoder_is_refused_without_explicit_consent() {
+    // A codec that admits its encoder is much worse than the format's usual one
+    // must not be reachable by accident: a user who asked for `.xz` expects xz
+    // ratios, and two builds of stf would otherwise produce very different files
+    // from an identical command with no way to tell which they got.
+    use std::io::Write;
+    use stuffr_core::{
+        Codec, CodecCaps, DecodeOpts, EncodeOpts, FormatId, FormatMeta, Result, Sink, Source,
+    };
+
+    const WEAK: FormatId = FormatId::new("weak-mock");
+
+    #[derive(Debug)]
+    struct WeakCodec;
+    impl Codec for WeakCodec {
+        fn id(&self) -> FormatId {
+            WEAK
+        }
+        fn caps(&self) -> CodecCaps {
+            CodecCaps {
+                weak_encoder: true,
+                ..CodecCaps::round_trip()
+            }
+        }
+        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+            stuffr_core::testing::MockCodec.decoder(src, o)
+        }
+        fn encoder(&self, d: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+            stuffr_core::testing::MockCodec.encoder(d, o)
+        }
+    }
+
+    let mut reg = stuffr::core::Registry::new();
+    reg.register_codec(
+        std::sync::Arc::new(WeakCodec),
+        FormatMeta::codec(WEAK, &["weak"], &[]),
+    );
+
+    let src = tmp("weak-in.txt");
+    let dst = tmp("weak-out.weak");
+    let _ = std::fs::remove_file(&dst);
+    std::fs::write(&src, b"payload").unwrap();
+
+    // Refused by default.
+    let o = CompressOpts {
+        format: Some(WEAK),
+        ..Default::default()
+    };
+    let err = stuffr::ops::compress_with(
+        &reg,
+        Input::Path(src.clone()),
+        Output::Path(dst.clone()),
+        &o,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.exit_code(),
+        2,
+        "consent is a usage matter, not a capability one: {err}"
+    );
+    assert!(
+        err.to_string().contains("--allow-weak-encoder"),
+        "must name the flag: {err}"
+    );
+    assert!(
+        !dst.exists(),
+        "a refused compress must not have touched the destination"
+    );
+
+    // Allowed with consent.
+    let o = CompressOpts {
+        format: Some(WEAK),
+        allow_weak_encoder: true,
+        ..Default::default()
+    };
+    stuffr::ops::compress_with(
+        &reg,
+        Input::Path(src.clone()),
+        Output::Path(dst.clone()),
+        &o,
+    )
+    .unwrap();
+    assert!(dst.exists());
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[test]
 fn a_caller_supplied_registry_is_the_one_that_is_used() {
     // A registry containing no codecs at all. If compress_with consults the
     // caller's registry the operation fails; if it quietly falls back to the

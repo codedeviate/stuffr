@@ -17,7 +17,9 @@ serde = ["dep:serde", "stuffr-core/serde"]
 # Exposes test-only instrumentation (see `ops::sync_call_count`) that would
 # otherwise have no way to observe durability behavior without crashing the
 # machine. Not a default for library consumers, same as `stuffr-core`'s.
-testing = []
+# Forwards to `stuffr-core/testing` so `stuffr_core::testing` (e.g. MockCodec)
+# is reachable from this crate's own tests too.
+testing = ["stuffr-core/testing"]
 
 [dependencies]
 stuffr-core = { workspace = true }

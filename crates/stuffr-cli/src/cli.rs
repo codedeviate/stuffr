@@ -44,6 +44,10 @@ pub enum Command {
         /// Skip the fsync that makes the output durable before it is published.
         #[arg(long)]
         no_sync: bool,
+        /// Use a weak fallback encoder that this build ships in place of the
+        /// format's real one. Worse ratio, and buffers the whole input.
+        #[arg(long)]
+        allow_weak_encoder: bool,
     },
     /// Decompress a file.
     Unpack {
