@@ -223,6 +223,52 @@ mod tests {
     }
 
     #[test]
+    fn a_genuine_read_error_stays_io_not_corrupt() {
+        // NormalizeDecodeErrors' doc comment asserts twice that a real disk
+        // error stays Error::Io — this pins the negative half directly, since
+        // folding every io error onto InvalidData (making every disk failure
+        // look like corruption) would otherwise leave the whole suite green.
+        // This file is also the template every other codec's adapter copies.
+        struct AlwaysPermissionDenied;
+        impl Read for AlwaysPermissionDenied {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "simulated disk error",
+                ))
+            }
+        }
+        impl Source for AlwaysPermissionDenied {
+            fn caps(&self) -> stuffr_core::SourceCaps {
+                stuffr_core::SourceCaps {
+                    seekable: false,
+                    len: None,
+                }
+            }
+            fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
+                None
+            }
+        }
+
+        let src: Box<dyn Source> = Box::new(AlwaysPermissionDenied);
+        let mut dec = Gzip.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        let io_err = dec.read_to_end(&mut out).unwrap_err();
+        assert_eq!(
+            io_err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the adapter must not fold a real disk error onto InvalidData"
+        );
+
+        let err = Error::from_decode_io(io_err);
+        assert!(
+            matches!(err, Error::Io(_)),
+            "a genuine disk error must classify as Error::Io, not Error::Corrupt: got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 1, "Error::Io is exit 1, not 5");
+    }
+
+    #[test]
     fn capabilities_and_metadata_match_the_format() {
         let c = Gzip.caps();
         assert!(c.encode && c.decode);
@@ -248,78 +294,11 @@ mod tests {
 
     #[test]
     fn gzip_conforms() {
+        // Includes the incrementality check (harness property 8) against a
+        // relative threshold, and the truncation check (property 10) against
+        // gzip's real CRC32 trailer — this used to be duplicated in a private
+        // ~80-line, 16 MiB test here; the harness now covers it for every
+        // codec that adopts it, gzip included.
         stuffr_core::testing::assert_codec_conforms(&Gzip, &meta());
-    }
-
-    #[test]
-    fn decoding_is_incremental_not_read_to_end() {
-        // Deferred here from Phase 1a: no mock ever streamed, so nothing had
-        // shown that a forward-only read is incremental rather than
-        // read-everything-then-parse. Peak heap is not observable from a unit
-        // test, so the measurable property is that output begins long before
-        // the input is exhausted.
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering};
-
-        struct Metered {
-            inner: std::io::Cursor<Vec<u8>>,
-            served: Arc<AtomicU64>,
-        }
-        impl Read for Metered {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                let n = self.inner.read(buf)?;
-                self.served.fetch_add(n as u64, Ordering::Relaxed);
-                Ok(n)
-            }
-        }
-        impl Source for Metered {
-            fn caps(&self) -> stuffr_core::SourceCaps {
-                stuffr_core::SourceCaps {
-                    seekable: false,
-                    len: None,
-                }
-            }
-            fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
-                None
-            }
-        }
-
-        // 16 MiB of pseudo-random data from a small LCG, not the periodic
-        // `(i % 251)` pattern the brief originally specified: that pattern
-        // compresses to ~65,411 bytes (below the 64 KiB assertion below) and
-        // makes the whole stream small enough that a read-to-end decoder
-        // would still pass the `consumed` assertion. An LCG is deterministic
-        // (no `rand` dependency) but its output is incompressible, so both
-        // assertions below are load-bearing rather than decorative.
-        let mut s: u32 = 1;
-        let plain: Vec<u8> = (0..16 * 1024 * 1024u32)
-            .map(|_| {
-                s = s.wrapping_mul(1103515245).wrapping_add(12345);
-                (s >> 16) as u8
-            })
-            .collect();
-        let packed = compress(&plain);
-        assert!(
-            packed.len() > 64 * 1024,
-            "the compressed stream must exceed one read buffer"
-        );
-
-        let served = Arc::new(AtomicU64::new(0));
-        let src: Box<dyn Source> = Box::new(Metered {
-            inner: std::io::Cursor::new(packed),
-            served: Arc::clone(&served),
-        });
-
-        let mut dec = Gzip.decoder(src, &DecodeOpts::default()).unwrap();
-        let mut first = [0u8; 1024];
-        let n = dec.read(&mut first).unwrap();
-        assert!(n > 0, "the decoder must produce output");
-
-        let consumed = served.load(Ordering::Relaxed);
-        assert!(
-            consumed < 1024 * 1024,
-            "first output arrived only after reading {consumed} bytes; a read-to-end \
-             implementation would consume the whole stream before emitting anything"
-        );
     }
 }
