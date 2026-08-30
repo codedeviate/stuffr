@@ -418,6 +418,16 @@ mod tests {
     /// reason as the corruption probe above: this codec's own decoder folds
     /// `Other` and `UnexpectedEof` to the same `InvalidData`, which would
     /// hide exactly the distinction this test exists to confirm.
+    ///
+    /// What this test itself establishes is "no clean cut among the swept
+    /// positions other than the boundaries" — the local windows plus
+    /// midpoint samples, not literally every byte. A Phase 1d final-fix-wave
+    /// review ran the full exhaustive sweep this test declines to run (for
+    /// the timing reason above) and got exactly this same boundary set with
+    /// no additional clean cuts, confirming the stronger claim independently
+    /// — but that verification lives in the review record, not in this
+    /// file, so the assertion message below claims only what this test
+    /// itself can prove.
     #[test]
     fn snappy_conformance_probe_truncation_is_detected_at_almost_every_position() {
         use stuffr_core::testing::incompressible;
@@ -505,9 +515,11 @@ mod tests {
         assert_eq!(
             clean_cuts, boundaries,
             "expected a clean truncation cut at exactly the stream identifier boundary and \
-             every full chunk boundary after it, and no others (see this test's comment for \
-             why). Any other clean cut here would be a genuine truncation-detection gap, not \
-             this documented one — measured: {clean_cuts:?}, expected: {boundaries:?}"
+             every full chunk boundary after it, and no others AMONG THE POSITIONS SWEPT HERE \
+             (see this test's comment for why this sweep is local, not exhaustive, and for the \
+             independent exhaustive verification that found the same set). Any other clean cut \
+             within these windows would be a genuine truncation-detection gap, not this \
+             documented one — measured: {clean_cuts:?}, expected: {boundaries:?}"
         );
         assert_eq!(
             other_kind, 0,
