@@ -8,6 +8,8 @@ use stuffr_core::Registry;
 
 mod normalize;
 
+#[cfg(feature = "brotli")]
+pub mod brotli;
 #[cfg(feature = "bzip2")]
 pub mod bzip2;
 #[cfg(feature = "deflate")]
@@ -38,6 +40,9 @@ pub fn register_all(registry: &mut Registry) {
 
     #[cfg(feature = "bzip2")]
     registry.register_codec(std::sync::Arc::new(bzip2::Bzip2), bzip2::meta());
+
+    #[cfg(feature = "brotli")]
+    registry.register_codec(std::sync::Arc::new(brotli::Brotli), brotli::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.

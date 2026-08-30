@@ -13,11 +13,13 @@ gzip = ["dep:flate2"]
 zlib = ["dep:flate2"]
 deflate = ["dep:flate2"]
 bzip2 = ["dep:bzip2"]
+brotli = ["dep:brotli"]
 
 [dependencies]
 stuffr-core = { workspace = true }
 flate2 = { workspace = true, optional = true }
 bzip2 = { workspace = true, optional = true }
+brotli = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }
