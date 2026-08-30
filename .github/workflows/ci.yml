@@ -46,3 +46,6 @@ jobs:
       # sits exactly at that floor.
       - run: cargo build --workspace --all-features
       - run: cargo test --workspace --all-features
+      # The pure tier is a different test set, not a subset — see the
+      # `test-pure` target in the Makefile for why.
+      - run: cargo test --workspace
