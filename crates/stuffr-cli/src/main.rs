@@ -228,35 +228,35 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             Ok(())
         }
         Command::Info { input, json } => {
+            use std::io::Write;
             let i = ops::inspect(input_of(&input))?;
+            let mut out = std::io::stdout();
             if json {
-                println!(
+                writeln!(
+                    out,
                     "{}",
                     serde_json::to_string(&i).expect("Inspection serializes")
-                );
+                )?;
             } else {
-                println!("format:   {}", i.format);
-                println!("chain:    {}", i.chain);
-                println!("rung:     {}", i.fidelity.rung);
+                writeln!(out, "format:   {}", i.format)?;
+                writeln!(out, "chain:    {}", i.chain)?;
+                writeln!(out, "rung:     {}", i.fidelity.rung)?;
                 match i.bytes_in {
-                    Some(n) => println!("size:     {n} bytes"),
-                    None => println!("size:     unknown (stream)"),
+                    Some(n) => writeln!(out, "size:     {n} bytes")?,
+                    None => writeln!(out, "size:     unknown (stream)")?,
                 }
                 if i.fidelity.has_warnings() {
-                    println!("fidelity: {} warning(s)", i.fidelity.warnings.len());
+                    writeln!(out, "fidelity: {} warning(s)", i.fidelity.warnings.len())?;
                     for w in &i.fidelity.warnings {
-                        println!("  - {w}");
+                        writeln!(out, "  - {w}")?;
                     }
                 } else {
-                    println!("fidelity: nothing approximated");
+                    writeln!(out, "fidelity: nothing approximated")?;
                 }
             }
             Ok(())
         }
-        Command::Formats => {
-            print_formats();
-            Ok(())
-        }
+        Command::Formats => print_formats(),
     }
 }
 
@@ -290,19 +290,35 @@ fn format_by_name(name: &str) -> stuffr::Result<FormatId> {
         })
 }
 
-fn print_formats() {
+/// Writes through `std::io::stdout()` and propagates a write failure rather
+/// than `println!`ing it, so `run`'s `BrokenPipe`-to-success mapping can
+/// actually see it.
+///
+/// `println!`/`print!` panic on a write error instead of returning one — see
+/// the doc on `destination_is_stdout` — so `stf formats` and `stf info`
+/// (which `destination_is_stdout` already lists as stdout destinations) used
+/// to exit 101 with "failed printing to stdout: Broken pipe" instead of
+/// exiting cleanly like every other early-closed-reader case.
+fn print_formats() -> stuffr::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
     let rows = stuffr::registry().matrix();
     if rows.is_empty() {
-        println!("This build contains 0 formats.");
-        println!("(Phase 0 validates the core against mock formats; Phase 1 adds real ones.)");
-        return;
+        writeln!(out, "This build contains 0 formats.")?;
+        writeln!(
+            out,
+            "(Phase 0 validates the core against mock formats; Phase 1 adds real ones.)"
+        )?;
+        return Ok(());
     }
-    println!(
+    writeln!(
+        out,
         "{:<16} {:<10} {:<5} {:<5} {:<8} EXTENSIONS",
         "FORMAT", "KIND", "READ", "WRITE", "PARALLEL"
-    );
+    )?;
     for r in rows {
-        println!(
+        writeln!(
+            out,
             "{:<16} {:<10} {:<5} {:<5} {:<8} {}",
             r.id.as_str(),
             match r.kind {
@@ -313,6 +329,7 @@ fn print_formats() {
             if r.write { "yes" } else { "-" },
             if r.parallel { "yes" } else { "-" },
             r.extensions.join(", "),
-        );
+        )?;
     }
+    Ok(())
 }

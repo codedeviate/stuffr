@@ -179,6 +179,43 @@ fn cat_exits_cleanly_when_the_reader_closes_early() {
 }
 
 #[test]
+fn formats_exits_cleanly_on_a_closed_stdout() {
+    // `println!`/`print!` panic on a write error instead of returning one,
+    // which bypasses `run`'s BrokenPipe-to-success mapping entirely: `stf
+    // formats` and `stf info` used to exit 101 with "failed printing to
+    // stdout: Broken pipe" against a closed reader, even though
+    // `destination_is_stdout` already lists both as stdout destinations.
+    let mut child = Command::new(STF)
+        .arg("formats")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Close our read end without reading anything, before the child has a
+    // chance to write — same technique as
+    // `cat_exits_cleanly_when_the_reader_closes_early`, just without needing
+    // a large payload to keep the write in flight: `formats`' whole output
+    // fits in one pipe buffer, so what actually needs to race is the drop
+    // here against the child's startup, not against a long write.
+    drop(child.stdout.take().unwrap());
+
+    let mut stderr = child.stderr.take().unwrap();
+    let mut err_text = String::new();
+    stderr.read_to_string(&mut err_text).unwrap();
+
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "an early-closing reader must not look like a failure: {status:?}"
+    );
+    assert!(
+        err_text.is_empty(),
+        "a clean broken-pipe exit prints nothing: {err_text}"
+    );
+}
+
+#[test]
 fn pack_then_unpack_round_trips_through_the_binary() {
     let src = tmp("e2e.txt");
     let gz = tmp("e2e.txt.gz");
@@ -213,6 +250,56 @@ fn pack_then_unpack_round_trips_through_the_binary() {
         std::fs::read(&back).unwrap(),
         plain,
         "round trip must be byte-identical"
+    );
+
+    for p in [&src, &gz, &back] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn no_sync_is_accepted_by_pack_and_unpack_and_still_round_trips() {
+    // Nothing previously exercised --no-sync from the CLI at all. A subprocess
+    // test cannot observe the fsync itself being skipped (see
+    // stuffr/tests/sync_counter.rs, in the same process as the code under
+    // test, for that); this closes the cheaper gap — that the flag parses and
+    // reaches all the way through pack and unpack without breaking a round
+    // trip, which flipping `sync: !no_sync` to `sync: no_sync` would not.
+    let src = tmp("nosync-e2e.txt");
+    let gz = tmp("nosync-e2e.txt.gz");
+    let back = tmp("nosync-e2e-back.txt");
+    let _ = std::fs::remove_file(&gz);
+    let _ = std::fs::remove_file(&back);
+
+    let plain = b"the quick brown fox ".repeat(500);
+    std::fs::write(&src, &plain).unwrap();
+
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap(), "--no-sync"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(gz.exists(), "pack --no-sync must still write the output");
+
+    assert!(
+        Command::new(STF)
+            .args([
+                "unpack",
+                gz.to_str().unwrap(),
+                "-o",
+                back.to_str().unwrap(),
+                "--no-sync",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(&back).unwrap(),
+        plain,
+        "--no-sync must cost durability, never correctness"
     );
 
     for p in [&src, &gz, &back] {
