@@ -49,11 +49,15 @@ pub struct CodecCaps {
     /// `true` is a format-wide guarantee — it holds for any conforming
     /// stream, not just one this codec produced itself. Other formats make
     /// the check an option the writer can take or leave: zstd's content
-    /// checksum, lz4's frame checksums, xz's block/stream CRCs are all
-    /// per-writer choices, absent unless the encoder turns them on. For
-    /// those, `true` reflects only that *this build's own encoder* always
-    /// turns the check on — it says nothing about a stream some other
-    /// writer produced. A `.zst` file from another tool that left the
+    /// checksum, lz4's frame checksums and xz's check-type field are all
+    /// per-writer choices the format permits a writer to omit. How likely
+    /// that is varies by format and is worth knowing: zstd's crate-level
+    /// encoder omits it *by default* (its CLI does not), whereas every xz
+    /// encoder measured here — liblzma's and lzma-rust2's — selects CRC64
+    /// without being asked, so a checkless `.xz` is possible but rare where a
+    /// checkless `.zst` is routine. For all of them, `true` reflects only
+    /// that *this build's own encoder* always turns the check on — it says
+    /// nothing about a stream some other writer produced. A `.zst` file from another tool that left the
     /// checksum off is still perfectly valid zstd, and this codec's decoder
     /// only partially detects corruption in it — see `zstd_c.rs`'s
     /// `decoder` doc for a measured figure. A codec built over one of these
