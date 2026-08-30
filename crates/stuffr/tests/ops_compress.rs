@@ -231,35 +231,77 @@ fn a_forced_overwrite_preserves_the_destinations_permissions() {
 
 #[cfg(unix)]
 #[test]
-fn a_forced_overwrite_creates_the_temp_file_at_mode_0600() {
-    // F7: the temp file must never be world/group-readable even for the
-    // instant between creation and the later permissions widen — otherwise
-    // another local user can open it while it is still 0644 and keep reading
-    // from that descriptor regardless of what the permissions are set to
-    // afterwards. This can't observe the file mid-write directly, so it
-    // pins the weaker but still meaningful property: a destination with no
-    // pre-existing permissions to carry over (a brand-new file) ends up
-    // 0600, proving the temp file was created at 0600 rather than the
-    // default `0o666 & !umask` and never narrowed.
+fn overwriting_a_restrictive_destination_creates_the_temp_file_at_mode_0600() {
+    // The temp file must never be world/group-readable even for the instant
+    // between creation and the later permissions widen — otherwise another
+    // local user can open it while it is still at the default mode and keep
+    // reading from that descriptor regardless of what the permissions are
+    // set to afterwards. This can't observe the file mid-write directly, so
+    // it pins the weaker but still meaningful property: a destination whose
+    // OWN permissions are restrictive (carried over below) is the case this
+    // protects, and 0600-at-creation is right there because there IS
+    // something to race against a wider default. A brand-new destination has
+    // nothing to carry over and is a different test, below: forcing 0600
+    // there too would mean this project's own output ignores the user's
+    // umask, unlike gzip, zstd or xz.
     use std::os::unix::fs::PermissionsExt;
 
     let src = tmp("mode-in.txt");
     let dst = tmp("mode-out.gz");
-    let _ = std::fs::remove_file(&dst);
     std::fs::write(&src, b"payload").unwrap();
+    std::fs::write(&dst, b"PRE-EXISTING").unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     compress(
         Input::Path(src.clone()),
         Output::Path(dst.clone()),
-        &CompressOpts::default(),
+        &CompressOpts {
+            force: true,
+            ..Default::default()
+        },
     )
     .unwrap();
 
     let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
     assert_eq!(
         mode, 0o600,
-        "a new destination with nothing to carry over must end up at the temp file's own 0600, \
-         not a wider default"
+        "carrying over a restrictive destination's permissions must never widen them, even \
+         for the instant before the carry-over set_permissions call runs"
+    );
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
+
+#[cfg(unix)]
+#[test]
+fn setuid_and_setgid_never_carry_over_onto_the_output() {
+    // A destination that happens to carry setuid or setgid must never
+    // propagate either bit onto a freshly compressed or decompressed
+    // artefact — that is never what a user wants, regardless of how the
+    // pre-existing file came to have it.
+    use std::os::unix::fs::PermissionsExt;
+
+    let src = tmp("setuid-in.txt");
+    let dst = tmp("setuid-out.gz");
+    std::fs::write(&src, b"payload").unwrap();
+    std::fs::write(&dst, b"PRE-EXISTING").unwrap();
+    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o6644)).unwrap();
+
+    compress(
+        Input::Path(src.clone()),
+        Output::Path(dst.clone()),
+        &CompressOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(
+        mode, 0o644,
+        "setuid/setgid must be masked off, not carried over onto the output: got {mode:o}"
     );
 
     let _ = std::fs::remove_file(&src);

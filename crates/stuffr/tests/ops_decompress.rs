@@ -186,6 +186,13 @@ fn the_default_max_ratio_is_ten_thousand() {
 }
 
 #[test]
+fn the_default_sync_is_on() {
+    // Mirrors CompressOpts::default().sync — durability must be the default
+    // on the decompress side too, not just the compress side.
+    assert!(DecompressOpts::default().sync);
+}
+
+#[test]
 fn a_corrupted_stream_is_corrupt_not_an_io_error() {
     let plain = b"the quick brown fox ".repeat(200);
     let gz = make_gz(&plain, "corrupt");

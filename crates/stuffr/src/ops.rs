@@ -190,22 +190,33 @@ impl Output {
                             parent.join(format!(".{}.{}.{}.tmp", std::process::id(), n, file_name));
                         let mut opts = std::fs::OpenOptions::new();
                         opts.write(true).create_new(true);
-                        // Create the temp file at mode 0600 from the start.
-                        // Creating it at the default `0o666 & !umask` (usually
-                        // 0644) and narrowing permissions afterwards leaves a
-                        // window, between creation and the later
-                        // `set_permissions` call below, where another local
-                        // user can open the world/group-readable temp file and
+                        // Create the temp file at mode 0600 from the start,
+                        // but ONLY when there is a pre-existing destination
+                        // whose permissions get carried over below: creating
+                        // at the default `0o666 & !umask` and then widening
+                        // to match the destination afterwards leaves a
+                        // window, between creation and that later
+                        // `set_permissions` call, where another local user
+                        // can open the world/group-readable temp file and
                         // keep reading from that descriptor even after
-                        // permissions are narrowed — a permission change never
-                        // revokes an already-open fd. Starting at 0600 closes
-                        // that window; the block below still widens the mode
-                        // afterwards to match a pre-existing destination's own
-                        // permissions.
+                        // permissions are narrowed — a permission change
+                        // never revokes an already-open fd. Starting at 0600
+                        // closes that window.
+                        //
+                        // That reasoning has nothing to say about a BRAND-NEW
+                        // destination: there is no pre-existing mode to race
+                        // against, so the temp file's mode is simply the
+                        // user's own umask policy — exactly what `File::create`
+                        // would produce. Forcing 0600 there anyway (as this
+                        // used to) means `stf pack`/`stf unpack` silently
+                        // ignore the umask every other compressor (gzip, zstd,
+                        // xz) respects.
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::OpenOptionsExt;
-                            opts.mode(0o600);
+                            if exists {
+                                opts.mode(0o600);
+                            }
                         }
                         match opts.open(&candidate) {
                             Ok(f) => break (candidate, f),
@@ -220,6 +231,19 @@ impl Output {
                     }
                 };
                 if let Some(perms) = carry_over_perms {
+                    // Mask off setuid/setgid (0o6000) before applying: a
+                    // destination that happened to carry either bit must
+                    // never propagate it onto a freshly compressed or
+                    // decompressed artefact — that is never what a user
+                    // wants, and `metadata().permissions()` above copies the
+                    // full mode with no say in the matter otherwise.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let masked = perms.mode() & !0o6000;
+                        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(masked))?;
+                    }
+                    #[cfg(not(unix))]
                     std::fs::set_permissions(&tmp, perms)?;
                 }
                 // A second handle on the same temp file, taken before `f` is
@@ -238,6 +262,25 @@ impl Output {
             }
         }
     }
+}
+
+/// Counts calls to `sync_all()` on the temp file inside `publish`.
+///
+/// Durability is not directly observable in a test without actually crashing
+/// the machine mid-write — this is the next best thing: a test double that
+/// proves the fsync call is really on the path, and that `sync: false` really
+/// skips it, rather than asserting only the opts default and a round trip
+/// that would pass identically with the whole fsync block deleted.
+#[cfg(feature = "testing")]
+static SYNC_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// How many times `publish` has called `sync_all()` on a temp file so far, in
+/// this process. `#[doc(hidden)]` because this exists for this crate's own
+/// test suite under the `testing` feature, not as stable API.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn sync_call_count() -> u64 {
+    SYNC_CALLS.load(Ordering::Relaxed)
 }
 
 /// Removes the temp file left by a failed write, leaving the real destination
@@ -295,6 +338,8 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
     if f.sync {
         if let Some(h) = &f.handle {
             h.sync_all()?;
+            #[cfg(feature = "testing")]
+            SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -755,5 +800,46 @@ pub fn suggest_unpacked(input: &Path) -> Result<PathBuf> {
             "cannot infer an output name from `{}`; pass -o",
             input.display()
         )))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn tmp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("stf-ops-unit-{}-{}", std::process::id(), name));
+        p
+    }
+
+    #[test]
+    fn carrying_over_a_setuid_destination_masks_it_on_the_temp_file_immediately() {
+        // A black-box test going through `compress` end-to-end cannot isolate
+        // this: some platforms clear S_ISUID/S_ISGID themselves the moment a
+        // regular file that carries either bit is next written to, and
+        // `compress` always writes at least a codec trailer afterwards. That
+        // would let this pass even with no masking at all in `create` below.
+        // Calling `Output::create` directly and checking the temp file's mode
+        // before a single byte is written through it isolates what this
+        // code — not the OS's own write-time behavior — is responsible for.
+        let dst = tmp("setuid-dst");
+        std::fs::write(&dst, b"PRE-EXISTING").unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o6644)).unwrap();
+
+        let opened = Output::Path(dst.clone()).create(true, true).unwrap();
+        let tmp_path = opened.finish.as_ref().unwrap().tmp.clone();
+
+        let mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            mode, 0o644,
+            "setuid/setgid must be masked off the temp file itself, immediately upon carrying \
+             the destination's permissions over — not rely on a later write to strip it: got \
+             {mode:o}"
+        );
+
+        discard(opened.finish);
+        let _ = std::fs::remove_file(&dst);
     }
 }
