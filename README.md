@@ -18,7 +18,7 @@ read list.
 > (`gzip`, `zlib`, `bzip2`, `lz4`, `snappy` all carry magic bytes; `zlib` alone
 > needs four rules, one per compression-level band), and `deflate` — which has
 > neither magic nor an extension convention — is reachable only via
-> `--format` and fails detection cleanly rather than being guessed at. 271
+> `--format` and fails detection cleanly rather than being guessed at. 273
 > tests, clean across build, clippy and fmt.
 >
 > **Not yet: the codecs that need a C toolchain, or a container.** `zstd`,
