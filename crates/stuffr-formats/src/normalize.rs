@@ -112,6 +112,16 @@ pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 /// (zstd's own message: "Restored data doesn't match checksum"), and a stream
 /// truncated mid-frame reaches it as `UnexpectedEof` ("incomplete frame").
 ///
+/// That 65-of-65 figure holds only for streams `Zstd::encoder` itself wrote.
+/// The checksum is a per-writer option in the zstd frame format, not a
+/// mandatory part of every valid stream — a `.zst` from another tool that
+/// left it off is still fully valid zstd, and `Zstd::decoder` only partially
+/// detects corruption in one: 17 of 61 in the sweep above (checksum-less),
+/// 21 of 61 in an independently reproduced sweep on a different payload. See
+/// `zstd_c.rs`'s `decoder` doc, where a caller actually meets this limit, and
+/// `format.rs`'s `detects_corruption` doc for why this is a real distinction
+/// and not specific to this one codec.
+///
 /// `Other` is safe to fold onto `InvalidData` HERE for the same structural
 /// reason as `SNAPPY_MALFORMED_AS_OTHER_EOF`: traced directly against `zstd`
 /// 0.13's `stream::zio::Reader::read` (`stream/zio/reader.rs`), the only place

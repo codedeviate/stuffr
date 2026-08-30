@@ -17,9 +17,19 @@
 //! payload, a flipped byte went undetected — decoded to different bytes
 //! with no error — in 44 of 61 positions. Turning the checksum on with
 //! `include_checksum(true)` (below, in `encoder`) took that to 65 of 65
-//! detected on the same sweep. `caps().detects_corruption` below is honest
-//! only because `encoder` always turns it on; a future change that removes
-//! that call must also flip this claim back to `false`.
+//! detected on the same sweep, which is why `encoder` always turns it on
+//! (the reference `zstd` CLI does too, by default — this is the
+//! conventional choice, not a local invention).
+//!
+//! **This makes `caps().detects_corruption` honest only for streams THIS
+//! codec writes.** The checksum is a per-writer option in the zstd frame
+//! format, not a mandatory part of every valid stream the way gzip's
+//! trailer CRC32 or bzip2's per-block CRCs are — see `format.rs`'s
+//! `detects_corruption` doc for that general distinction. A `.zst` written
+//! by some other tool with the checksum left off is still fully valid zstd,
+//! and `decoder` below only partially detects corruption in it. See
+//! `decoder`'s doc for the measured figure on that case specifically — it
+//! is a real, separate limit, not covered by the 65-of-65 figure above.
 
 use std::io::Write;
 
@@ -40,8 +50,12 @@ impl Codec for Zstd {
 
     fn caps(&self) -> CodecCaps {
         CodecCaps {
-            // See the module doc: honest only because `encoder` always turns
-            // on `include_checksum(true)`.
+            // Honest for streams THIS codec writes: `encoder` always turns
+            // on `include_checksum(true)`. NOT a guarantee about a foreign
+            // `.zst` — the checksum is a per-writer option in the format,
+            // not mandatory in every valid stream. See the module doc and
+            // `decoder`'s doc (the measured partial-detection figure for
+            // that case lives there, where a caller actually meets it).
             detects_corruption: true,
             // Not measured: derived, not profiled. zstd's window at level 3
             // (the default) is 1 MiB; the encoder's match-finder tables and
@@ -63,6 +77,22 @@ impl Codec for Zstd {
     /// backing the kinds reused here: a corrupted stream (with the checksum
     /// this codec always writes) surfaces as `io::ErrorKind::Other`, and a
     /// stream truncated mid-frame surfaces as `UnexpectedEof`.
+    ///
+    /// **This decoder only partially detects corruption in a stream that was
+    /// not written with the checksum on.** `caps().detects_corruption` is
+    /// `true` because `encoder` above always calls `include_checksum(true)`
+    /// — but that is a property of streams *this codec* produces, not a
+    /// property this decoder can enforce on whatever it is handed. The
+    /// checksum is a per-writer option in the zstd frame format (see the
+    /// module doc and `format.rs`'s `detects_corruption` doc), so a `.zst`
+    /// from another tool that left it off is still fully valid zstd, and
+    /// corruption in such a stream is only sometimes caught here: measured
+    /// by sweeping every byte position of a real payload compressed
+    /// *without* the checksum, 17 of 61 flipped positions were detected in
+    /// one run and 21 of 61 in an independently reproduced run on a
+    /// different payload — never complete, and the exact count is
+    /// payload-dependent. There is no way for this decoder to tell, ahead of
+    /// reading, whether an incoming stream carries the checksum at all.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         let dec = zstd::stream::read::Decoder::new(src)?;
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(

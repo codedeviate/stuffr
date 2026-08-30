@@ -17,10 +17,12 @@
 
 use stuffr_core::{FormatId, FormatMeta, MagicRule};
 
-/// The zstd frame magic, `0xFD2FB528` little-endian — `28 b5 2f fd` on the
-/// wire — reused by both backends' `check_encode_opts`-free magic detection.
+/// The identity both backends register under.
 pub const ZSTD: FormatId = FormatId::new("zstd");
 
+/// The zstd frame magic, `0xFD2FB528` little-endian — `28 b5 2f fd` on the
+/// wire — reused by both backends' registration metadata for magic
+/// detection.
 pub(crate) const ZSTD_MAGIC: &[MagicRule] = &[MagicRule {
     offset: 0,
     bytes: &[0x28, 0xb5, 0x2f, 0xfd],

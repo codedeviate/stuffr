@@ -39,13 +39,35 @@ pub struct CodecCaps {
     pub parallel_decode: bool,
     /// Stream carries a frame/block index enabling random access.
     pub frame_index: bool,
-    /// The format carries an integrity check — CRC, checksum, or framing —
-    /// that makes malformed input detectable.
+    /// Whether decoding a stream *this codec itself wrote* will notice
+    /// corruption rather than silently returning wrong bytes.
     ///
-    /// `false` for raw streams: a bare deflate or LZMA1 stream fed corrupt
-    /// bytes produces different output rather than an error. Such a format can
-    /// never produce [`crate::Error::Corrupt`], and a caller is entitled to
-    /// know that rather than assume a guarantee that is not there.
+    /// That qualifier matters because the check backing this claim is not
+    /// the same kind of guarantee for every format. Some formats mandate it
+    /// in every valid stream: gzip's trailer CRC32, zlib's Adler-32, bzip2's
+    /// per-block and whole-stream CRCs, snappy's per-chunk CRC32C. For those,
+    /// `true` is a format-wide guarantee — it holds for any conforming
+    /// stream, not just one this codec produced itself. Other formats make
+    /// the check an option the writer can take or leave: zstd's content
+    /// checksum, lz4's frame checksums, xz's block/stream CRCs are all
+    /// per-writer choices, absent unless the encoder turns them on. For
+    /// those, `true` reflects only that *this build's own encoder* always
+    /// turns the check on — it says nothing about a stream some other
+    /// writer produced. A `.zst` file from another tool that left the
+    /// checksum off is still perfectly valid zstd, and this codec's decoder
+    /// only partially detects corruption in it — see `zstd_c.rs`'s
+    /// `decoder` doc for a measured figure. A codec built over one of these
+    /// optional-check formats must document, at the point a caller would
+    /// meet it, that reading a foreign stream is weaker than reading its own
+    /// output; the doc comment on the codec's own `caps()` is not enough by
+    /// itself; the decoder needs one too.
+    ///
+    /// `false` means the format carries no check at all — not optional,
+    /// structurally absent: a bare deflate, LZMA1 or brotli stream fed
+    /// corrupt bytes produces different output rather than an error, for any
+    /// writer, always. Such a format can never produce
+    /// [`crate::Error::Corrupt`], and a caller is entitled to know that
+    /// rather than assume a guarantee that is not there.
     pub detects_corruption: bool,
 
     /// Rough working-set cost of one encode worker, in bytes, when the codec
