@@ -64,7 +64,30 @@
 //!     bytes, property 9's exact gap) but its `BFINAL` bit means a stream cut
 //!     short before the final block surfaces as `UnexpectedEof` anyway. That
 //!     split — truncation catchable without any checksum, corruption not —
-//!     is exactly why the two properties are gated differently.
+//!     is exactly why the two properties are gated differently. Cuts at
+//!     several lengths, not only the midpoint — including one byte short of
+//!     the full length and a small prefix — because a cut exactly at a
+//!     format's own internal framing boundary (lz4's 64 KiB block boundary,
+//!     say) is a different code path than a cut through the middle of a
+//!     block's payload, and only sweeping the midpoint can miss it entirely
+//!     (see Phase 1d's final fix wave, item 1 and item 2: this property used
+//!     to cut only at `len/2`, and lz4's own truncated-frame data loss lived
+//!     entirely at block boundaries the midpoint alone never reached). Each
+//!     cut's error is also run through `Error::from_decode_io` and required
+//!     to classify as `Error::Corrupt` (exit 5), not merely checked for
+//!     `is_err()` — the entire purpose of each codec's `NormalizeDecodeErrors`
+//!     is that truncation lands on exit 5 rather than exit 1, and a property
+//!     that only checked `is_err()` could not have caught a codec whose
+//!     adapter classified truncation as some other error entirely.
+//! 11. A genuine I/O failure reading the SOURCE — not malformed content the
+//!     codec itself rejects — surfaces from the codec's decoder still
+//!     classified as `Error::Io` (exit 1), never `Error::Corrupt` (exit 5).
+//!     Unconditional on `caps.decode` alone, like property 10: no declared
+//!     capability describes a codec's error-passthrough behavior, so none
+//!     can gate this. Promoted from a hand-copied test that used to live,
+//!     verbatim, in five separate codec modules (gzip, bzip2, brotli, lz4,
+//!     snappy) and was silently absent from two more (zlib, deflate) — see
+//!     Phase 1d's final fix wave, item 3.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -590,6 +613,11 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
         //     doc's note on raw deflate's BFINAL bit — so a codec failing
         //     property 10 should detect truncation or be reconsidered, not
         //     assumed exempt because it is also exempt from property 9.
+        //
+        //     Cuts at several lengths — see the module doc's note on this
+        //     property for why the midpoint alone is not enough — and
+        //     requires the classified error, not merely that one occurred:
+        //     see the module doc's note on `Error::from_decode_io`.
         match &corruption_input {
             Some(base) if base.is_empty() => {
                 skip(
@@ -599,21 +627,106 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
                 );
             }
             Some(base) => {
-                let mid = base.len() / 2;
-                let truncated = base[..mid].to_vec();
-                let src: Box<dyn Source> =
-                    Box::new(ReaderSource::new(std::io::Cursor::new(truncated)));
-                let mut dec = codec
-                    .decoder(src, &DecodeOpts::default())
-                    .unwrap_or_else(|e| panic!("conformance[{id}] property 10 decoder: {e}"));
-                let mut out = Vec::new();
-                assert!(
-                    dec.read_to_end(&mut out).is_err(),
-                    "conformance[{id}] property 10: truncated input decoded without error; a \
-                     codec failing this should either detect truncation or be reconsidered"
-                );
+                let len = base.len();
+                let mut cuts: Vec<usize> = vec![1, len / 2, len.saturating_sub(1)];
+                cuts.retain(|&c| c < len);
+                cuts.sort_unstable();
+                cuts.dedup();
+                for cut in cuts {
+                    let truncated = base[..cut].to_vec();
+                    let src: Box<dyn Source> =
+                        Box::new(ReaderSource::new(std::io::Cursor::new(truncated)));
+                    let mut dec = codec
+                        .decoder(src, &DecodeOpts::default())
+                        .unwrap_or_else(|e| {
+                            panic!("conformance[{id}] property 10 decoder (cut {cut}/{len}): {e}")
+                        });
+                    let mut out = Vec::new();
+                    match dec.read_to_end(&mut out) {
+                        Ok(_) => panic!(
+                            "conformance[{id}] property 10: truncated input (cut to {cut} of \
+                             {len} bytes) decoded without error; a codec failing this should \
+                             either detect truncation or be reconsidered"
+                        ),
+                        Err(e) => {
+                            let classified = crate::Error::from_decode_io(e);
+                            assert!(
+                                matches!(classified, crate::Error::Corrupt(_)),
+                                "conformance[{id}] property 10: truncated input (cut to {cut} \
+                                 of {len} bytes) raised {classified:?}, expected \
+                                 Error::Corrupt (exit 5) — NormalizeDecodeErrors should \
+                                 classify truncation as InvalidData"
+                            );
+                            assert_eq!(
+                                classified.exit_code(),
+                                5,
+                                "conformance[{id}] property 10: Error::Corrupt must be exit \
+                                 code 5"
+                            );
+                        }
+                    }
+                }
             }
             None => skip(id, 10, NO_FIXTURE),
+        }
+
+        // 11. A genuine I/O failure reading the SOURCE — not malformed
+        //     content the codec itself rejects — must surface unchanged as
+        //     Error::Io (exit 1), never reclassified as Error::Corrupt (exit
+        //     5). See the module doc's note on this property for why it
+        //     replaces five hand-copied codec tests and fills a gap in two
+        //     more.
+        struct AlwaysPermissionDenied;
+        impl Read for AlwaysPermissionDenied {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "conformance: simulated disk error",
+                ))
+            }
+        }
+        impl Source for AlwaysPermissionDenied {
+            fn caps(&self) -> crate::source::SourceCaps {
+                crate::source::SourceCaps {
+                    seekable: false,
+                    len: None,
+                }
+            }
+            fn as_seek(&mut self) -> Option<&mut dyn crate::source::SeekRead> {
+                None
+            }
+        }
+
+        let src: Box<dyn Source> = Box::new(AlwaysPermissionDenied);
+        let mut dec = codec
+            .decoder(src, &DecodeOpts::default())
+            .unwrap_or_else(|e| panic!("conformance[{id}] property 11 decoder: {e}"));
+        let mut out = Vec::new();
+        match dec.read_to_end(&mut out) {
+            Ok(_) => panic!(
+                "conformance[{id}] property 11: decoding from an always-failing source \
+                 succeeded"
+            ),
+            Err(io_err) => {
+                assert_eq!(
+                    io_err.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "conformance[{id}] property 11: the decoder must not fold a genuine disk \
+                     error onto InvalidData — got {:?}",
+                    io_err.kind()
+                );
+                let classified = crate::Error::from_decode_io(io_err);
+                assert!(
+                    matches!(classified, crate::Error::Io(_)),
+                    "conformance[{id}] property 11: a genuine disk error must classify as \
+                     Error::Io, not Error::Corrupt — got {classified:?}"
+                );
+                assert_eq!(
+                    classified.exit_code(),
+                    1,
+                    "conformance[{id}] property 11: Error::Io must be exit code 1"
+                );
+            }
         }
     }
 }
@@ -1296,5 +1409,64 @@ mod broken_codecs {
         // codec for property 10: exactly what a raw, checksum-less stream
         // WITHOUT even deflate's BFINAL-style structure looks like.
         assert_panics_naming(&MockCodec, &mock_meta(&[]), "property 10");
+    }
+
+    /// Breaks property 11: the decoder wraps its source in an adapter that
+    /// reclassifies EVERY error — including a genuine disk failure — onto
+    /// `InvalidData`, the exact over-normalisation this file's module doc
+    /// warns a codec's own adapter must not do. A real `PermissionDenied`
+    /// from the source would be reported as `Error::Corrupt` (exit 5)
+    /// instead of `Error::Io` (exit 1).
+    ///
+    /// Delegates to [`super::framed_mock::FramedMock`], not `MockCodec`:
+    /// `MockCodec`'s bare, unframed stream fails property 10 unconditionally
+    /// (see `broken_truncation_is_caught` above), which would fire first and
+    /// mask the property this test exists to name. `FramedMock` has real
+    /// framing and clears properties 1 through 10 on its own, so this is the
+    /// only property it can fail.
+    struct OverNormalizingDecoder;
+
+    struct FoldsEveryErrorToInvalidData(Box<dyn Source>);
+    impl Read for FoldsEveryErrorToInvalidData {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0
+                .read(buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+        }
+    }
+    impl Source for FoldsEveryErrorToInvalidData {
+        fn caps(&self) -> crate::source::SourceCaps {
+            self.0.caps()
+        }
+        fn as_seek(&mut self) -> Option<&mut dyn crate::source::SeekRead> {
+            None
+        }
+    }
+
+    impl Codec for OverNormalizingDecoder {
+        fn id(&self) -> FormatId {
+            MOCK_CODEC
+        }
+        fn caps(&self) -> CodecCaps {
+            super::framed_mock::FramedMock.caps()
+        }
+        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+            // BUG: every error from the source, including a real disk
+            // failure, is reclassified as InvalidData before FramedMock's
+            // own decoder ever sees it.
+            super::framed_mock::FramedMock.decoder(Box::new(FoldsEveryErrorToInvalidData(src)), o)
+        }
+        fn encoder(
+            &self,
+            dst: Box<dyn Write + Send>,
+            o: &EncodeOpts,
+        ) -> crate::Result<Box<dyn Sink>> {
+            super::framed_mock::FramedMock.encoder(dst, o)
+        }
+    }
+
+    #[test]
+    fn over_normalizing_decoder_is_caught() {
+        assert_panics_naming(&OverNormalizingDecoder, &mock_meta(&[]), "property 11");
     }
 }

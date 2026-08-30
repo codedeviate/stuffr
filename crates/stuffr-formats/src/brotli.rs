@@ -221,47 +221,6 @@ mod tests {
     }
 
     #[test]
-    fn a_genuine_read_error_stays_io_not_corrupt() {
-        struct AlwaysPermissionDenied;
-        impl Read for AlwaysPermissionDenied {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "simulated disk error",
-                ))
-            }
-        }
-        impl Source for AlwaysPermissionDenied {
-            fn caps(&self) -> stuffr_core::SourceCaps {
-                stuffr_core::SourceCaps {
-                    seekable: false,
-                    len: None,
-                }
-            }
-            fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
-                None
-            }
-        }
-
-        let src: Box<dyn Source> = Box::new(AlwaysPermissionDenied);
-        let mut dec = Brotli.decoder(src, &DecodeOpts::default()).unwrap();
-        let mut out = Vec::new();
-        let io_err = dec.read_to_end(&mut out).unwrap_err();
-        assert_eq!(
-            io_err.kind(),
-            std::io::ErrorKind::PermissionDenied,
-            "brotli's Decompressor must not fold a real disk error onto InvalidData"
-        );
-
-        let err = Error::from_decode_io(io_err);
-        assert!(
-            matches!(err, Error::Io(_)),
-            "a genuine disk error must classify as Error::Io, not Error::Corrupt: got {err:?}"
-        );
-        assert_eq!(err.exit_code(), 1, "Error::Io is exit 1, not 5");
-    }
-
-    #[test]
     fn capabilities_and_metadata_match_the_format() {
         let c = Brotli.caps();
         assert!(c.encode && c.decode);

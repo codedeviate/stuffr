@@ -177,7 +177,6 @@ impl Sink for SnappySink {
 mod tests {
     use super::*;
     use std::io::Read;
-    use stuffr_core::Error;
     use stuffr_core::ReaderSource;
     use stuffr_core::testing::SharedBuf;
 
@@ -246,54 +245,6 @@ mod tests {
             Box::new(ReaderSource::new(std::io::Cursor::new(compress(b"x"))));
         let dec = Snappy.decoder(src, &DecodeOpts::default()).unwrap();
         assert!(!dec.caps().seekable);
-    }
-
-    /// The negative half of the `Other`-is-safe argument in `normalize.rs`:
-    /// a genuine I/O failure from the SOURCE — not a decode failure `snap`
-    /// itself raised — must stay `PermissionDenied` all the way through, and
-    /// classify as `Error::Io` (exit 1), never `Error::Corrupt` (exit 5).
-    /// If this ever regressed, `SNAPPY_MALFORMED_AS_OTHER_EOF` folding
-    /// `Other` onto `InvalidData` would silently reclassify a disk error as
-    /// a corrupt archive.
-    #[test]
-    fn a_genuine_read_error_stays_io_not_corrupt() {
-        struct AlwaysPermissionDenied;
-        impl Read for AlwaysPermissionDenied {
-            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "simulated disk error",
-                ))
-            }
-        }
-        impl Source for AlwaysPermissionDenied {
-            fn caps(&self) -> stuffr_core::SourceCaps {
-                stuffr_core::SourceCaps {
-                    seekable: false,
-                    len: None,
-                }
-            }
-            fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
-                None
-            }
-        }
-
-        let src: Box<dyn Source> = Box::new(AlwaysPermissionDenied);
-        let mut dec = Snappy.decoder(src, &DecodeOpts::default()).unwrap();
-        let mut out = Vec::new();
-        let io_err = dec.read_to_end(&mut out).unwrap_err();
-        assert_eq!(
-            io_err.kind(),
-            std::io::ErrorKind::PermissionDenied,
-            "the adapter must not fold a real disk error onto InvalidData"
-        );
-
-        let err = Error::from_decode_io(io_err);
-        assert!(
-            matches!(err, Error::Io(_)),
-            "a genuine disk error must classify as Error::Io, not Error::Corrupt: got {err:?}"
-        );
-        assert_eq!(err.exit_code(), 1, "Error::Io is exit 1, not 5");
     }
 
     #[test]
