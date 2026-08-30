@@ -7,6 +7,8 @@
 use stuffr_core::Registry;
 
 mod normalize;
+#[cfg(any(feature = "zstd-c", feature = "zstd-pure"))]
+mod zstd_shared;
 
 #[cfg(feature = "brotli")]
 pub mod brotli;
@@ -22,6 +24,8 @@ pub mod lz4;
 pub mod snappy;
 #[cfg(feature = "zlib")]
 pub mod zlib;
+#[cfg(feature = "zstd-c")]
+pub mod zstd_c;
 
 /// Registers every format enabled in this build.
 pub fn register_all(registry: &mut Registry) {
@@ -53,6 +57,12 @@ pub fn register_all(registry: &mut Registry) {
 
     #[cfg(feature = "snappy")]
     registry.register_codec(std::sync::Arc::new(snappy::Snappy), snappy::meta());
+
+    // Task 3 adds the mutually exclusive `zstd-pure` arm here (`cfg(all(
+    // feature = "zstd-pure", not(feature = "zstd-c")))`), so a build with
+    // neither C toolchain nor `zstd-c` still opens `.zst` at a lower rung.
+    #[cfg(feature = "zstd-c")]
+    registry.register_codec(std::sync::Arc::new(zstd_c::Zstd), zstd_c::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.

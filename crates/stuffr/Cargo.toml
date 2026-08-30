@@ -9,8 +9,21 @@ repository.workspace = true
 
 [features]
 default = ["pure"]
-pure = ["stuffr-formats/gzip", "stuffr-formats/zlib", "stuffr-formats/deflate", "stuffr-formats/bzip2", "stuffr-formats/brotli", "stuffr-formats/lz4", "stuffr-formats/snappy"]
-c-backed = []
+# One passthrough feature per format, `stuffr/<name>` mirroring
+# `stuffr-formats/<name>` exactly, so a caller can pick a single codec
+# (`stuffr = { features = ["zstd-c"] }`) instead of the whole `pure` or
+# `c-backed` bundle. `pure` and `c-backed` below are just named bundles of
+# these.
+gzip = ["stuffr-formats/gzip"]
+zlib = ["stuffr-formats/zlib"]
+deflate = ["stuffr-formats/deflate"]
+bzip2 = ["stuffr-formats/bzip2"]
+brotli = ["stuffr-formats/brotli"]
+lz4 = ["stuffr-formats/lz4"]
+snappy = ["stuffr-formats/snappy"]
+zstd-c = ["stuffr-formats/zstd-c"]
+pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy"]
+c-backed = ["zstd-c"]
 legacy = []
 full = ["pure", "c-backed", "legacy"]
 serde = ["dep:serde", "stuffr-core/serde"]

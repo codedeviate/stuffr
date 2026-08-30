@@ -1,0 +1,282 @@
+//! zstd, via the C `zstd` crate (bindings over the reference `libzstd`,
+//! built from C by `zstd-sys`). The first dependency in this project's
+//! history to compile C — see `Cargo.toml`'s `zstd-c` feature.
+//!
+//! `ZSTD`, the magic rule and `meta()` live in `crate::zstd_shared`, not
+//! here: Task 3's pure `ruzstd` fallback registers the very same
+//! `FormatId`, and a `zstd-pure`-only build has no `zstd_c` module to hang
+//! them off. This module re-exports them under its own name so callers see
+//! `zstd_c::{ZSTD, meta}` exactly as if they were defined here.
+//!
+//! ## The content checksum is opt-in, not automatic
+//!
+//! Measured directly against `zstd` 0.13 (see `crate::normalize`'s
+//! `ZSTD_MALFORMED_AS_OTHER_EOF` doc for the full sweep): a plain
+//! `zstd::stream::write::Encoder::new` writes no content checksum at all
+//! unless told to. Sweeping every byte position of a real compressed
+//! payload, a flipped byte went undetected — decoded to different bytes
+//! with no error — in 44 of 61 positions. Turning the checksum on with
+//! `include_checksum(true)` (below, in `encoder`) took that to 65 of 65
+//! detected on the same sweep. `caps().detects_corruption` below is honest
+//! only because `encoder` always turns it on; a future change that removes
+//! that call must also flip this claim back to `false`.
+
+use std::io::Write;
+
+use stuffr_core::{
+    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink, Source, StreamOnly,
+};
+
+use crate::normalize::{NormalizeDecodeErrors, ZSTD_MALFORMED_AS_OTHER_EOF};
+pub use crate::zstd_shared::{ZSTD, zstd_meta as meta};
+
+#[derive(Debug)]
+pub struct Zstd;
+
+impl Codec for Zstd {
+    fn id(&self) -> FormatId {
+        ZSTD
+    }
+
+    fn caps(&self) -> CodecCaps {
+        CodecCaps {
+            // See the module doc: honest only because `encoder` always turns
+            // on `include_checksum(true)`.
+            detects_corruption: true,
+            // Not measured: derived, not profiled. zstd's window at level 3
+            // (the default) is 1 MiB; the encoder's match-finder tables and
+            // internal buffers add a further working set on top of that. 8
+            // MiB is a defensible round figure for "a few times the window",
+            // the same spirit as bzip2.rs's derived figure.
+            memory_per_worker: Some(8 * 1024 * 1024),
+            weak_encoder: false,
+            ..CodecCaps::round_trip()
+        }
+    }
+
+    /// Wrapped in `StreamOnly`: the plain (non-"seekable format") zstd
+    /// stream this codec produces carries no frame index, so its decoded
+    /// output must not claim random access.
+    ///
+    /// Wrapped in `NormalizeDecodeErrors` first — see `crate::normalize` for
+    /// why, and `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for the measurement
+    /// backing the kinds reused here: a corrupted stream (with the checksum
+    /// this codec always writes) surfaces as `io::ErrorKind::Other`, and a
+    /// stream truncated mid-frame surfaces as `UnexpectedEof`.
+    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        let dec = zstd::stream::read::Decoder::new(src)?;
+        Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
+            dec,
+            ZSTD_MALFORMED_AS_OTHER_EOF,
+        ))))
+    }
+
+    fn check_encode_opts(&self, o: &EncodeOpts) -> Result<()> {
+        // zstd's real range, measured via `zstd::compression_level_range()`
+        // rather than assumed: `-131072..=22` on this build (`zstd-sys`
+        // 2.0.16 / libzstd 1.5.7), not the `0..=9` shape every other codec
+        // in this tree happens to share. Negative levels are zstd's "fast"
+        // modes, which is why `EncodeOpts::level` is already `Option<i32>`
+        // rather than an unsigned type.
+        let range = zstd::compression_level_range();
+        match o.level {
+            Some(n) if !range.contains(&n) => Err(Error::Usage(format!(
+                "zstd compression level must be {}-{}, got {n}",
+                range.start(),
+                range.end()
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+        self.check_encode_opts(o)?;
+        let level = o.level.unwrap_or(zstd::DEFAULT_COMPRESSION_LEVEL);
+        let mut enc = zstd::stream::write::Encoder::new(dst, level)?;
+        // See the module doc: this is what makes `caps().detects_corruption`
+        // true rather than aspirational.
+        enc.include_checksum(true)?;
+        Ok(Box::new(ZstdSink(enc)))
+    }
+}
+
+struct ZstdSink(zstd::stream::write::Encoder<'static, Box<dyn Write + Send>>);
+
+impl Write for ZstdSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Sink for ZstdSink {
+    /// Writes the closing block, and — because `encoder` turned it on — the
+    /// trailing content checksum.
+    fn finish(self: Box<Self>) -> Result<()> {
+        let ZstdSink(encoder) = *self;
+        let mut w = encoder.finish()?;
+        w.flush()?;
+        Ok(())
+    }
+}
+
+/// Compresses `plain` with this codec's default options, for tests only.
+///
+/// Not exercised directly by this file's own tests (which go through
+/// `Codec::encoder` the same way every other codec's test module does) —
+/// this exists for Task 3's pure `ruzstd` fallback and later cross-backend
+/// agreement tests, which need a known-good zstd stream from the C backend
+/// to decode without depending on either backend's test module reaching into
+/// the other's private test helpers.
+#[cfg(test)]
+pub(crate) fn encode_for_test(plain: &[u8]) -> Vec<u8> {
+    let buf = stuffr_core::testing::SharedBuf::new();
+    let mut sink = Zstd
+        .encoder(Box::new(buf.clone()), &EncodeOpts::default())
+        .unwrap();
+    sink.write_all(plain).unwrap();
+    sink.finish().unwrap();
+    buf.contents()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use stuffr_core::ReaderSource;
+    use stuffr_core::testing::SharedBuf;
+
+    fn compress(plain: &[u8]) -> Vec<u8> {
+        let buf = SharedBuf::new();
+        let mut sink = Zstd
+            .encoder(Box::new(buf.clone()), &EncodeOpts::default())
+            .unwrap();
+        sink.write_all(plain).unwrap();
+        sink.finish().unwrap();
+        buf.contents()
+    }
+
+    fn decompress(bytes: Vec<u8>) -> Vec<u8> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+        let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn round_trips_real_data() {
+        let plain = b"the quick brown fox jumps over the lazy dog".repeat(100);
+        let packed = compress(&plain);
+        assert!(
+            packed.len() < plain.len(),
+            "zstd must actually compress this"
+        );
+        assert_eq!(decompress(packed), plain);
+    }
+
+    #[test]
+    fn output_begins_with_the_zstd_magic() {
+        let packed = compress(b"payload");
+        assert_eq!(&packed[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+    }
+
+    #[test]
+    fn encode_for_test_helper_produces_a_decodable_stream() {
+        // Guards the helper Task 3 will depend on: it must go through the
+        // real `Codec::encoder` + `Sink::finish` path, not some shortcut.
+        let packed = encode_for_test(b"cross-backend payload");
+        assert_eq!(decompress(packed), b"cross-backend payload");
+    }
+
+    #[test]
+    fn the_real_level_range_is_far_wider_than_0_to_9() {
+        // Measured, not assumed: -131072..=22 on this build. A hardcoded
+        // 0..=9 copied from gzip would reject valid negative "fast" levels
+        // and silently accept 10-22 as if they meant something else.
+        let range = zstd::compression_level_range();
+        assert!(*range.start() < 0, "zstd's fast levels are negative");
+        assert_eq!(*range.end(), 22);
+
+        for n in [*range.start(), -1, 0, 1, *range.end()] {
+            let opts = EncodeOpts {
+                level: Some(n),
+                ..Default::default()
+            };
+            assert!(
+                Zstd.check_encode_opts(&opts).is_ok(),
+                "level {n} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_level_is_a_usage_error_not_a_silent_clamp() {
+        let range = zstd::compression_level_range();
+        let too_high = range.end() + 1;
+        let too_low = range.start() - 1;
+
+        for n in [too_high, too_low] {
+            let opts = EncodeOpts {
+                level: Some(n),
+                ..Default::default()
+            };
+            match Zstd.encoder(Box::new(SharedBuf::new()), &opts) {
+                Err(err) => {
+                    assert!(matches!(err, stuffr_core::Error::Usage(_)));
+                    assert_eq!(err.exit_code(), 2);
+                    assert!(
+                        err.to_string().contains(&range.start().to_string())
+                            && err.to_string().contains(&range.end().to_string()),
+                        "the error must name the real range: {err}"
+                    );
+                }
+                Ok(_) => panic!("level {n} is out of range and must be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_decoded_stream_reports_no_seek() {
+        // A plain zstd stream (not the experimental "seekable format")
+        // carries no frame index, so a container above it must not be told
+        // it can seek.
+        let src: Box<dyn Source> =
+            Box::new(ReaderSource::new(std::io::Cursor::new(compress(b"x"))));
+        let dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+        assert!(!dec.caps().seekable);
+    }
+
+    #[test]
+    fn capabilities_and_metadata_match_the_format() {
+        let c = Zstd.caps();
+        assert!(c.encode && c.decode);
+        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
+        assert!(!c.weak_encoder, "the C backend is the real encoder");
+        let m = meta();
+        assert_eq!(m.id, ZSTD);
+        assert_eq!(m.extensions, &["zst"]);
+        assert_eq!(m.priority, 0);
+    }
+
+    #[test]
+    fn zstd_declares_an_integrity_check_and_a_memory_figure() {
+        let c = Zstd.caps();
+        assert!(
+            c.detects_corruption,
+            "this codec always turns the content checksum on; see the module doc"
+        );
+        assert!(
+            c.memory_per_worker.is_some(),
+            "a codec that knows its working set should say so; the governor has no other source"
+        );
+    }
+
+    #[test]
+    fn zstd_c_conforms() {
+        stuffr_core::testing::assert_codec_conforms(&Zstd, &meta());
+    }
+}

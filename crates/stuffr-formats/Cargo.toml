@@ -16,6 +16,12 @@ bzip2 = ["dep:bzip2"]
 brotli = ["dep:brotli"]
 lz4 = ["dep:lz4_flex"]
 snappy = ["dep:snap"]
+zstd-c = ["dep:zstd"]
+# Declared now, with no dependency attached yet, purely so `#[cfg(feature =
+# "zstd-pure")]` in `zstd_shared.rs` is a known feature rather than tripping
+# `unexpected_cfgs` under `-D warnings`. Task 3 attaches `dep:ruzstd` to it
+# and adds the pure fallback module.
+zstd-pure = []
 
 [dependencies]
 stuffr-core = { workspace = true }
@@ -24,6 +30,7 @@ bzip2 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 lz4_flex = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }

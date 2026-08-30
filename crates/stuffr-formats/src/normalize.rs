@@ -92,6 +92,42 @@ pub(crate) const MALFORMED_AS_INVALID_INPUT_EOF: &[ErrorKind] =
 pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
+/// The `Other` + `UnexpectedEof` pair, measured independently against the
+/// `zstd` crate (backing `zstd_c.rs`) alone. Its own constant for the same
+/// reason `SNAPPY_MALFORMED_AS_OTHER_EOF` is not reused here: `Other` is
+/// `std::io::ErrorKind`'s catch-all, and two unrelated crates both raising it
+/// for malformed input is a coincidence of vocabulary, not evidence they mean
+/// the same thing everywhere — folding this into snappy's constant would
+/// apply it to snappy too, on no evidence at all.
+///
+/// Measured directly against `zstd` 0.13 with a throwaway probe (compress a
+/// real payload, flip every byte position in turn, count detected vs silent —
+/// not one flip): with the encoder's default settings — no content checksum,
+/// since `zstd::stream::write::Encoder` requires an explicit
+/// `include_checksum(true)` call to turn one on — a flipped byte went
+/// UNDETECTED in 44 of 61 positions, decoding to different bytes with no
+/// error at all. That is why `Zstd::encoder` in `zstd_c.rs` always turns the
+/// checksum on: with it enabled, the same sweep detected all 65 of 65 flipped
+/// positions. The corrupted case reaches the caller as `io::ErrorKind::Other`
+/// (zstd's own message: "Restored data doesn't match checksum"), and a stream
+/// truncated mid-frame reaches it as `UnexpectedEof` ("incomplete frame").
+///
+/// `Other` is safe to fold onto `InvalidData` HERE for the same structural
+/// reason as `SNAPPY_MALFORMED_AS_OTHER_EOF`: traced directly against `zstd`
+/// 0.13's `stream::zio::Reader::read` (`stream/zio/reader.rs`), the only place
+/// a genuine error from the wrapped SOURCE reaches the caller is
+/// `fill_buf(&mut self.reader)?`, propagated by `?` with its original kind
+/// untouched; every other fallible call in that function
+/// (`self.operation.run(..)?`, `self.operation.finish(..)?`) is zstd's own
+/// decompression operation, whose errors are constructed exclusively by
+/// `crate::map_error_code` (`lib.rs`) as `io::ErrorKind::Other` and never by
+/// rewrapping a source error. So `Other` reaching this wrapper always means
+/// zstd itself rejected the bytes, never a genuine I/O failure underneath —
+/// see conformance property 11 (a real `PermissionDenied` still classifies as
+/// `Error::Io`, exit 1) for the negative case this depends on.
+pub(crate) const ZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
+    &[ErrorKind::Other, ErrorKind::UnexpectedEof];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],

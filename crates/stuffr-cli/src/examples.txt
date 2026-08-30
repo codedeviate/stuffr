@@ -16,8 +16,8 @@ COMPRESSING A FILE
 
   stf pack notes.txt --format gzip -o out.bin
       --format names the codec explicitly instead of inferring one from -o's
-      extension. This build accepts gzip, zlib, deflate, bzip2, brotli, lz4
-      and snappy.
+      extension. This build accepts gzip, zlib, deflate, bzip2, brotli, lz4,
+      snappy and zstd.
 
   stf pack notes.txt --level 9
       --level asks the codec for a tradeoff: gzip accepts 0 (fastest,
@@ -26,9 +26,12 @@ COMPRESSING A FILE
       error (exit 2) rather than meaning "don't compress". brotli's range is
       0-11, and unlike every other codec here its OWN default is 11 (the
       slowest setting it has), not something in the middle of the range.
-      lz4 and snappy have no level at all — neither underlying crate exposes
-      such a knob — so --level is accepted and silently ignored rather than
-      rejected, unlike every other codec on this page.
+      zstd's range is the widest and the only one with negative numbers —
+      -131072 through 22 on this build — where negative levels are zstd's
+      "fast" modes, faster than level 1 at the cost of ratio; its default is
+      3. lz4 and snappy have no level at all — neither underlying crate
+      exposes such a knob — so --level is accepted and silently ignored
+      rather than rejected, unlike every other codec on this page.
 
   stf pack notes.txt --force
       Without --force, pack refuses to overwrite an existing output: exit
@@ -103,8 +106,9 @@ WHAT THIS BUILD CAN DO
 
   stf formats
       Lists the formats compiled into THIS binary, not everything stf will
-      ever support. Right now that is seven rows: gzip, zlib, deflate,
-      bzip2, brotli, lz4 and snappy.
+      ever support. A build with the `zstd-c` feature (needs a C toolchain)
+      has eight rows: gzip, zlib, deflate, bzip2, brotli, lz4, snappy and
+      zstd. A pure-Rust build without it has the first seven.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -153,8 +157,9 @@ EXIT CODES
 
 NOT YET
 
-  This build has seven codecs: gzip, zlib, deflate, bzip2, brotli, lz4 and
-  snappy. No archive containers (tar, zip, ...) and no other codecs (zstd,
-  xz, ...) exist yet — they arrive in later phases. `stf formats` always
-  tells you the truth about the build you are actually running, whatever
-  this page says.
+  This build has eight codecs with a C toolchain (gzip, zlib, deflate,
+  bzip2, brotli, lz4, snappy and zstd) or seven without one (everything but
+  zstd). zstd's pure-Rust fallback, xz and LZMA1 arrive later in Phase 1e.
+  No archive containers (tar, zip, ...) exist yet — Phase 2. `stf formats`
+  always tells you the truth about the build you are actually running,
+  whatever this page says.
