@@ -15,9 +15,20 @@ use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 pub const ZLIB: FormatId = FormatId::new("zlib");
 
 /// The zlib header's second byte encodes the compression level, so one rule
-/// cannot cover every stream: 0x01 is level 0-1, 0x5e is 2-5, 0x9c is the
-/// default 6, and 0xda is 7-9. Conformance property 3 requires ANY registered
-/// rule to match, which is what makes registering all four work.
+/// cannot cover every stream. Measured through this CLI across all ten
+/// levels against `flate2`'s own backend (not read off the RFC 1950 spec,
+/// which does not pin exact byte values to levels) — 0x01 is level 0-1, 0x5e
+/// is 2-3, 0x9c is 4-8 (which includes the default, 6), and 0xda is level 9
+/// alone:
+///
+/// ```text
+/// 0→7801  1→7801  2→785e  3→785e  4→789c  5→789c  6→789c  7→789c  8→789c  9→78da
+/// ```
+///
+/// All four rules do cover every level and all ten levels are magic-detected
+/// correctly either way; this is a correction to the comment, not to a live
+/// defect. Conformance property 3 requires ANY registered rule to match, not
+/// EVERY one, which is what makes registering all four work.
 pub(crate) const ZLIB_MAGIC: &[MagicRule] = &[
     MagicRule {
         offset: 0,
@@ -156,7 +167,13 @@ mod tests {
         // single magic rule covers every stream. Registering all four is only
         // viable because conformance property 3 requires ANY rule to match,
         // not every one.
-        for level in [0, 6, 9] {
+        //
+        // Levels 0, 2, 6, 9 — not the earlier 0, 6, 9 — so every registered
+        // rule in ZLIB_MAGIC is exercised by at least one case: 0x01 (levels
+        // 0-1), 0x5e (levels 2-3), 0x9c (levels 4-8, the default among them),
+        // and 0xda (level 9 alone) — see ZLIB_MAGIC's own doc comment for the
+        // measurement. The old set of three skipped 0x5e entirely.
+        for level in [0, 2, 6, 9] {
             let opts = EncodeOpts {
                 level: Some(level),
                 ..Default::default()
