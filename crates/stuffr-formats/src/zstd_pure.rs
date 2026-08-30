@@ -130,6 +130,31 @@ impl Codec for Zstd {
     /// construction must be deferred to the first read rather than
     /// attempted here, and the corruption-sweep tests for the measured
     /// error kinds `RUZSTD_MALFORMED_AS_OTHER_EOF` folds onto `InvalidData`.
+    ///
+    /// **This decoder only weakly detects corruption in a stream that was
+    /// not written with the content checksum on.** `caps().detects_corruption`
+    /// is `true` because THIS codec's own encoder cannot even produce a
+    /// checksumless stream (the `hash` feature is unconditional here — see
+    /// the module doc) — but that says nothing about a `.zst` some other
+    /// tool wrote with its own checksum left off, still fully valid zstd
+    /// under the format (see `format.rs`'s `detects_corruption` doc for why
+    /// this distinction applies to zstd generally, and `zstd_c.rs`'s
+    /// `decoder` doc for the same disclosure on the C backend, whose
+    /// checksumless figure is measured separately and comes out very
+    /// different). Measured directly here, sweeping every byte position of
+    /// a real payload encoded via the raw `zstd` crate with no
+    /// `include_checksum` call (built via `zstd::stream::write::Encoder`
+    /// directly — `zstd_c::Zstd`'s own encoder always turns the checksum
+    /// on, so it cannot produce this case itself): only 8 of 4105 flipped
+    /// positions were detected, 4096 decoded to silently WRONG bytes, and
+    /// one (the structural window-descriptor exception documented on the
+    /// corruption-sweep tests below) was silently unchanged. That is a much
+    /// higher miss rate than `zstd_c.rs`'s own measured checksumless figure
+    /// (17-21 of 61) — the two backends' block layout for incompressible
+    /// data differs enough that the comparison is only useful qualitatively
+    /// ("both are weak without the checksum"), not by ratio. See
+    /// `corruption_sweep_on_a_checksumless_foreign_stream` for the sweep
+    /// this cites.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         let normalized = crate::normalize::NormalizeDecodeErrors::new(
             LazyRuzstdDecoder::new(src),
@@ -223,7 +248,13 @@ impl Sink for RuzstdSink {
 }
 
 /// Defers constructing `ruzstd::decoding::StreamingDecoder` to the first
-/// `read` call, rather than inside `Codec::decoder`.
+/// `read` call, rather than inside `Codec::decoder`, and — because a single
+/// `StreamingDecoder` handles exactly one zstd frame, never more (its own
+/// doc says so explicitly: "expects the underlying stream to only contain a
+/// single frame") — re-constructs a fresh one for each further frame in a
+/// concatenated stream, rather than stopping at the first frame's clean end.
+///
+/// ## Why construction is deferred at all
 ///
 /// Every other codec in this tree can wrap its backend's reader directly,
 /// because none of them do any real work until the first read — but
@@ -245,11 +276,59 @@ impl Sink for RuzstdSink {
 /// any — is turned into an `io::Error` the same way a `read()` failure
 /// would be, so it flows through `NormalizeDecodeErrors` exactly like any
 /// other malformed-input error this codec raises.
+///
+/// ## Concatenated frames: the defect this fixes and how
+///
+/// A `.zst` made of several concatenated frames (`cat a.zst b.zst >
+/// both.zst`) is ordinary, valid zstd — the same shape gzip's
+/// `MultiGzDecoder` and `lz4.rs`'s own `EnforceEndMark` (see its module doc)
+/// already exist to handle for their own formats. Before this fix,
+/// `LazyRuzstdDecoder` reported the first frame's clean `Ok(0)` straight to
+/// its caller as end of stream: every byte after the first frame's end was
+/// silently dropped, with `read_to_end` returning `Ok` and no error at all —
+/// confirmed independently by two reviewers on different cut points (1900 of
+/// 3900 bytes; 2000 of 4100 bytes), and the single worst failure mode this
+/// project recognises, because the caller gets a plausible-looking partial
+/// result with no signal anything was lost. It survived `make check`
+/// specifically because that gate runs `--all-features`, where `zstd_c`
+/// (immune to this — the C `zstd` crate's `Decoder` handles concatenated
+/// frames internally, confirmed to return all 4100 of 4100 bytes on the
+/// review's own repro) wins format selection in the registry, so the pure
+/// decoder was never reached through that path at all; the regression tests
+/// below call `Zstd` directly rather than through `stuffr::registry()`, so
+/// they exercise `ruzstd` regardless of which other backend is also
+/// compiled in.
+///
+/// The fix: on a clean `Ok(0)` (current frame ended, checksum verified —
+/// see the note below on where that check runs), recover the underlying
+/// source via `into_inner`, and peek exactly one byte from what remains
+/// (`PeekSource::fill(remaining, 1)`, non-destructive — the peeked byte is
+/// replayed, not consumed). Peeking is what tells apart the two ways this
+/// can go, which look identical until you actually try to read past the
+/// frame boundary:
+///
+/// - The peek's prefix is empty: the source is genuinely, entirely
+///   exhausted. No more frames follow — this is the one legitimate `Ok(0)`,
+///   reported once and (via the `Done` state) idempotently on every further
+///   call.
+/// - The peek's prefix holds a byte: something follows. Constructing a new
+///   `StreamingDecoder` on the peeked-plus-remaining source either succeeds
+///   (a genuine next frame; the loop continues and serves its bytes
+///   transparently) or fails the same way any truncated/malformed header
+///   would (`frame_decoder_error_to_io` applies unchanged) — so a complete
+///   first frame followed by a TRUNCATED second one is still rejected, not
+///   waved through as "just the first frame, nothing more". See
+///   `a_truncated_second_frame_in_a_concatenated_stream_is_rejected`.
 enum LazyRuzstdDecoder {
     Pending(Box<dyn Source>),
     Ready(Box<StreamingDecoder<Box<dyn Source>, ruzstd::decoding::FrameDecoder>>),
-    /// The one attempt at construction already failed. Reading again must
-    /// keep failing rather than panic on an already-taken `Pending` value.
+    /// Every frame has ended, and the underlying source confirmed
+    /// genuinely empty (not merely a `Ok(0)` from one frame's own end).
+    /// Every further `read` keeps returning `Ok(0)` without re-probing.
+    Done,
+    /// The one attempt at construction — of the first frame, or of a
+    /// concatenated later one — already failed. Reading again must keep
+    /// failing rather than panic on an already-taken `Pending` value.
     Failed,
 }
 
@@ -261,41 +340,94 @@ impl LazyRuzstdDecoder {
 
 impl Read for LazyRuzstdDecoder {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // A zero-length buffer conventionally yields `Ok(0)` with no I/O
+        // attempted at all — see `lz4.rs`'s `EnforceEndMark::read` for the
+        // identical guard and why it exists: running an empty read through
+        // the state machine below would misread it as a genuine frame end
+        // and start probing for a concatenated next frame (or verifying a
+        // checksum) that nothing actually reached yet.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
             match self {
+                LazyRuzstdDecoder::Done => return Ok(0),
                 LazyRuzstdDecoder::Ready(dec) => {
                     let n = dec.read(buf)?;
-                    if n == 0 {
-                        // `StreamingDecoder::read` stores both checksums
-                        // (`get_checksum_from_data`: what the stream claims;
-                        // `get_calculated_checksum`: what was actually
-                        // decoded) but never compares them itself — measured
-                        // directly against `streaming_decoder.rs`'s `read`
-                        // impl, which has no such comparison anywhere. Doing
-                        // it here, once, at end of stream, is what turns the
-                        // `hash` feature's checksum from a value merely
-                        // carried in the frame into something this decoder
-                        // actually enforces — see the module doc.
-                        // A single-pattern `if let` on the tuple, not the
-                        // `&&`-joined let-chain form that only stabilised in
-                        // 1.88 — MSRV here is 1.85 (see `ops.rs`'s identical
-                        // comment on its own weak-encoder consent check).
-                        if let (Some(expected), Some(actual)) = (
-                            dec.decoder.get_checksum_from_data(),
-                            dec.decoder.get_calculated_checksum(),
-                        ) {
-                            if expected != actual {
-                                return Err(std::io::Error::new(
-                                    ErrorKind::InvalidData,
-                                    format!(
-                                        "ruzstd: content checksum mismatch: stream claims \
-                                         {expected:#010x}, calculated {actual:#010x}"
-                                    ),
-                                ));
-                            }
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                    // n == 0: this frame ended cleanly. Verify its checksum
+                    // — if it carried one — before considering whether a
+                    // concatenated next frame follows.
+                    //
+                    // This check fires only here, at a clean `Ok(0)` — a
+                    // caller that stops reading before reaching one (never
+                    // asks for the last few bytes) skips it. That is
+                    // inherent to any TRAILER checksum, not a gap specific
+                    // to this codec: gzip's own trailer CRC32 behaves
+                    // identically, and every caller in `ops.rs` reads to a
+                    // clean `Ok(0)` via `read_to_end`/the copy loop, so this
+                    // is documented rather than "fixed" — there is nothing
+                    // to fix; a checksum that could fire before its own
+                    // bytes arrive would not be verifying anything.
+                    //
+                    // `StreamingDecoder::read` stores both checksums
+                    // (`get_checksum_from_data`: what the stream claims;
+                    // `get_calculated_checksum`: what was actually decoded)
+                    // but never compares them itself — measured directly
+                    // against `streaming_decoder.rs`'s `read` impl, which
+                    // has no such comparison anywhere. Doing it here is
+                    // what turns the `hash` feature's checksum from a value
+                    // merely carried in the frame into something this
+                    // decoder actually enforces — see the module doc.
+                    //
+                    // A single-pattern `if let` on the tuple, not the
+                    // `&&`-joined let-chain form that only stabilised in
+                    // 1.88 — MSRV here is 1.85 (see `ops.rs`'s identical
+                    // comment on its own weak-encoder consent check).
+                    if let (Some(expected), Some(actual)) = (
+                        dec.decoder.get_checksum_from_data(),
+                        dec.decoder.get_calculated_checksum(),
+                    ) {
+                        if expected != actual {
+                            return Err(std::io::Error::new(
+                                ErrorKind::InvalidData,
+                                format!(
+                                    "ruzstd: content checksum mismatch: stream claims \
+                                     {expected:#010x}, calculated {actual:#010x}"
+                                ),
+                            ));
                         }
                     }
-                    return Ok(n);
+
+                    // Recover the underlying source and check — by peeking,
+                    // non-destructively, exactly one byte — whether a
+                    // concatenated next frame follows. See the module doc's
+                    // note on concatenation for why this is the mechanism.
+                    let LazyRuzstdDecoder::Ready(dec) =
+                        std::mem::replace(self, LazyRuzstdDecoder::Failed)
+                    else {
+                        unreachable!("just matched Ready above")
+                    };
+                    let remaining = dec.into_inner();
+                    let peeked = match stuffr_core::PeekSource::fill(remaining, 1) {
+                        Ok(p) => p,
+                        Err(e) => return Err(std::io::Error::other(e)),
+                    };
+                    if peeked.prefix().is_empty() {
+                        // Genuinely nothing left: the whole stream — one
+                        // frame or several — is done.
+                        *self = LazyRuzstdDecoder::Done;
+                        return Ok(0);
+                    }
+                    match StreamingDecoder::new(Box::new(peeked) as Box<dyn Source>) {
+                        Ok(next) => *self = LazyRuzstdDecoder::Ready(Box::new(next)),
+                        Err(e) => return Err(frame_decoder_error_to_io(e)),
+                    }
+                    // Loop back around: the state is now Ready(next), and
+                    // the top of the loop serves its bytes like any other
+                    // frame's.
                 }
                 LazyRuzstdDecoder::Failed => {
                     return Err(std::io::Error::new(
@@ -407,6 +539,54 @@ mod tests {
         let plain = b"payload".repeat(500);
         let packed = compress_with(Some(0), &plain);
         assert_eq!(decompress(packed), plain);
+    }
+
+    /// Regression for the silent-data-loss defect found in review: a single
+    /// `StreamingDecoder` handles exactly one zstd frame (its own doc says
+    /// so), and `LazyRuzstdDecoder` used to report that frame's clean
+    /// `Ok(0)` straight to the caller — a concatenated `.zst` (ordinary,
+    /// valid zstd; `cat a.zst b.zst > both.zst` produces exactly this)
+    /// decoded to only its first frame, with `read_to_end` returning `Ok`
+    /// and no error at all. Confirmed independently by two reviewers on two
+    /// different cut points before the fix (1900 of 3900 bytes; 2000 of
+    /// 4100 bytes) — this test pins the general shape rather than either
+    /// specific number, since the exact byte count depends on compression
+    /// output, not on the defect.
+    ///
+    /// This calls `Zstd` directly, the same way every other test in this
+    /// module does, rather than through `stuffr::registry()` — that is
+    /// what makes it exercise `ruzstd` regardless of whether `zstd-c` is
+    /// ALSO compiled in (which wins registry selection and would otherwise
+    /// make a registry-level test of this exercise the C backend instead,
+    /// proving nothing about this defect). See the module doc's note on
+    /// concatenation for why `make check` alone never caught this: it runs
+    /// `--all-features`, where the registry always resolves to `zstd_c`.
+    #[test]
+    fn decodes_concatenated_frames_not_just_the_first() {
+        let mut two = compress(b"first-");
+        two.extend_from_slice(&compress(b"second"));
+        assert_eq!(decompress(two), b"first-second");
+    }
+
+    #[test]
+    fn a_truncated_second_frame_in_a_concatenated_stream_is_rejected() {
+        // The concatenation fix must not reopen its own hole: a complete
+        // first frame followed by a TRUNCATED second one must still be
+        // rejected, not silently accepted as "just the first frame,
+        // nothing more" — see `lz4.rs`'s identical test for the same
+        // property proven against a different backend's concatenation fix.
+        let complete = compress(b"first-");
+        let second_full = compress(b"second-frame-payload");
+        let mut two = complete.clone();
+        two.extend_from_slice(&second_full[..second_full.len() - 1]);
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(two)));
+        let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        assert!(
+            dec.read_to_end(&mut out).is_err(),
+            "a complete frame followed by a truncated second one must not decode cleanly"
+        );
     }
 
     #[test]
@@ -611,6 +791,211 @@ mod tests {
             "expected exactly one silently-unchanged position — byte 5, the window \
              descriptor, same structural reason as the self-written sweep: measured \
              {silently_unchanged}"
+        );
+    }
+
+    /// The measurement `decoder`'s own doc requires: what THIS decoder does
+    /// with a `.zst` that carries no content checksum at all — a foreign
+    /// tool's choice, not this codec's own (see the module doc: this
+    /// codec's encoder cannot even produce one, since `content_checksum:
+    /// cfg!(feature = "hash")` is unconditional whenever the default `hash`
+    /// feature is on). Built with the raw `zstd` crate directly, NOT
+    /// through `zstd_c::Zstd` (which always calls `include_checksum(true)`
+    /// and so can never produce this case) — deliberately skipping that
+    /// call is what "a foreign tool that left the checksum off" looks like.
+    #[cfg(all(feature = "zstd-pure", feature = "zstd-c"))]
+    #[test]
+    fn corruption_sweep_on_a_checksumless_foreign_stream() {
+        use stuffr_core::testing::incompressible;
+
+        let plain = incompressible(4 * 1024);
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        enc.write_all(&plain).unwrap();
+        let packed = enc.finish().unwrap();
+
+        let (invalid_data, other_kind, silently_wrong, silently_unchanged) = sweep(&plain, &packed);
+        eprintln!(
+            "zstd_pure corruption sweep (checksumless foreign stream, {} bytes): \
+             detected(InvalidData)={} silently_wrong={} silently_unchanged={} other_kind={}",
+            packed.len(),
+            invalid_data,
+            silently_wrong,
+            silently_unchanged,
+            other_kind
+        );
+        assert_eq!(
+            other_kind, 0,
+            "every malformed-input error here must classify as InvalidData once \
+             NormalizeDecodeErrors has run — {other_kind} positions did not"
+        );
+        // Measured, not merely bounded: 8 of 4105 detected (structural
+        // framing bytes only — no checksum exists to catch a corrupted
+        // literal), 4096 silently wrong, and the same 1 silently-unchanged
+        // window-descriptor position the other two sweeps hit. A
+        // dramatically weaker showing than either checksummed sweep above,
+        // which is the whole point of this test — see the `decoder` doc's
+        // disclosure this backs.
+        assert_eq!(
+            invalid_data,
+            8,
+            "measured {invalid_data} of {} positions detected without a checksum to check \
+             against — only structural framing bytes remain protected",
+            packed.len()
+        );
+        assert_eq!(
+            silently_wrong,
+            4096,
+            "measured {silently_wrong} of {} positions silently wrong — with no checksum, \
+             a corrupted literal byte decodes to a different byte with no error at all",
+            packed.len()
+        );
+        assert_eq!(
+            silently_unchanged, 1,
+            "the same structural window-descriptor position as the checksummed sweeps, \
+             independent of the checksum question entirely: measured {silently_unchanged}"
+        );
+    }
+
+    /// Makes the "corrupting the window descriptor cannot change decoded
+    /// output" claim (see the sweep tests above) demonstrable, not merely
+    /// argued: those sweeps used an INCOMPRESSIBLE payload, which contains
+    /// no repeat at all — every byte is a literal, so of course no offset
+    /// ever gets checked against the window there.
+    ///
+    /// Proving the SHRINK direction is actually caught turned out to need
+    /// more than just "a payload with a real match", measured directly
+    /// while building this test: a marker repeated with a real gap, as long
+    /// as the WHOLE marker-gap-marker payload stays under the format's 128
+    /// KiB max block size, still round-trips even with byte 5 zeroed.
+    /// Traced to `ruzstd`'s own decode-side behavior, not anything
+    /// encoder-specific: within one compressed block, `decode_blocks`
+    /// resolves every sequence in that block in one atomic pass, and the
+    /// external draining that actually enforces the declared window
+    /// (`DecodeBuffer::drain_to_window_size`, invoked between separate
+    /// `decode_blocks` calls as `StreamingDecoder::read` pulls bytes out)
+    /// never runs in the middle of it. So a shrunk window is structurally
+    /// unable to matter for a match resolved within a single block — this
+    /// test's marker and filler must be large enough that the payload spans
+    /// MULTIPLE compressed blocks, with the second marker copy in a later
+    /// block referencing back into an earlier one, for the shrink to have
+    /// anything to catch.
+    ///
+    /// `ruzstd`'s own `Fastest` encoder cannot be used to build that payload
+    /// reliably: its `FrameCompressor` matcher holds only ONE 128 KiB slice
+    /// in its matching window at a time (`MatchGeneratorDriver::new(1024 *
+    /// 128, 1)` — the `1` is `max_slices_in_window`), so it cannot find a
+    /// match crossing its own block boundary even in principle. This test
+    /// instead builds its payload with the raw `zstd` crate at level 19 (a
+    /// real, independent implementation with no such limit) — what's under
+    /// test is THIS codec's DECODER reacting to a corrupted window field,
+    /// not either encoder's own matching behavior, so using the more
+    /// capable encoder to construct the fixture is not a shortcut around
+    /// what matters here.
+    ///
+    /// Two corruptions of byte 5, in the two directions that matter:
+    /// - XOR 0xFF (what the sweep tests actually flip to): the window
+    ///   GROWS, which cannot invalidate a match that already fit in the
+    ///   smaller original window. Still round-trips.
+    /// - Overwritten to 0x00: the window SHRINKS to 1 KiB (windowLog 10,
+    ///   the format's minimum — `ruzstd::common::MIN_WINDOW_SIZE`), well
+    ///   below the real cross-block match's ~250 KiB offset — and, with the
+    ///   payload now spanning multiple blocks, `drain_to_window_size` gets
+    ///   the chance (described above) to actually discard the earlier
+    ///   block's bytes before the later block's sequence needs them:
+    ///   `DecodeBufferError::OffsetTooBig`, confirmed to surface through
+    ///   this codec's decoder as a real, detected error. This is the
+    ///   reviewer's independently-confirmed case.
+    #[cfg(all(feature = "zstd-pure", feature = "zstd-c"))]
+    #[test]
+    fn window_descriptor_corruption_is_harmless_only_in_the_direction_that_grows_it() {
+        // A 50 KiB marker (not a short one: a small marker's savings get
+        // lost in per-block-header overhead once the payload spans multiple
+        // wire blocks, measured directly while building this test) repeated
+        // with 200 KiB of DIFFERENT incompressible filler in between — well
+        // past the format's 128 KiB max block size, so the two marker
+        // copies land in separate compressed blocks. That is required, not
+        // incidental: within a single block, ruzstd resolves every sequence
+        // in one atomic pass before any external drain can run (confirmed
+        // directly while building this test — a marker-gap-marker payload
+        // under 128 KiB round-tripped fine even with byte 5 zeroed, because
+        // the corrupted window was never actually consulted). Only once a
+        // backreference crosses a REAL block boundary does ruzstd's
+        // decode-buffer draining between blocks (`DecodeBuffer::
+        // drain_to_window_size`, driven by `StreamingDecoder::read`'s own
+        // calls) get a chance to discard the earlier block's bytes before
+        // the later block's sequence needs them.
+        //
+        // Built with the raw `zstd` crate directly (not `zstd_c::Zstd`,
+        // whose own encoder never turns on a custom level) at level 19 —
+        // level 3 also finds this particular match, 19 just gives more
+        // margin. Neither encoder's own matching behavior is what's under
+        // test here: this is about ruzstd's DECODER reacting to a corrupted
+        // window field.
+        fn seeded_incompressible(len: usize, seed: u32) -> Vec<u8> {
+            let mut s = seed;
+            (0..len)
+                .map(|_| {
+                    s = s.wrapping_mul(1103515245).wrapping_add(12345);
+                    (s >> 16) as u8
+                })
+                .collect()
+        }
+        let marker = seeded_incompressible(50 * 1024, 1);
+        let filler = seeded_incompressible(200 * 1024, 2);
+        let mut plain = Vec::new();
+        plain.extend_from_slice(&marker);
+        plain.extend_from_slice(&filler);
+        plain.extend_from_slice(&marker);
+
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 19).unwrap();
+        enc.write_all(&plain).unwrap();
+        let packed = enc.finish().unwrap();
+        // Both `marker` and `filler` are individually incompressible, so an
+        // UNMATCHED encoding would be close to `plain.len()` (two full
+        // marker copies plus the filler, virtually nothing shrinking). A
+        // MATCHED encoding is close to `filler.len() + marker.len()` (one
+        // marker copy paid for, the second nearly free) — the two differ by
+        // roughly `marker.len()` (50 KiB), an unambiguous signal.
+        assert!(
+            packed.len() < filler.len() + marker.len() + 4096,
+            "expected a real cross-block backreference to the repeated marker: measured {} \
+             bytes packed, matched estimate ~{} bytes, unmatched estimate ~{} bytes",
+            packed.len(),
+            filler.len() + marker.len(),
+            plain.len()
+        );
+        assert_eq!(&packed[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
+        assert_eq!(
+            decompress(packed.clone()),
+            plain,
+            "an uncorrupted stream must round-trip"
+        );
+
+        // Direction 1: grow the window. Harmless, exactly as claimed — and
+        // already exhaustively confirmed at this exact byte position by
+        // the corruption-sweep tests above; repeated here on a stream that
+        // actually contains a real, large cross-block match, so the same
+        // claim holds under the stricter case too.
+        let mut grown = packed.clone();
+        grown[5] ^= 0xFF;
+        assert_eq!(
+            decompress(grown),
+            plain,
+            "growing the declared window must not be able to change decoded output"
+        );
+
+        // Direction 2: shrink the window well below the real match's
+        // distance (250 KiB+, comfortably past the 1 KiB the format's
+        // minimum window descriptor allows).
+        let mut shrunk = packed;
+        shrunk[5] = 0x00;
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(shrunk)));
+        let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        assert!(
+            dec.read_to_end(&mut out).is_err(),
+            "shrinking the window below the real match's offset must be detected, not decode \
+             to wrong or truncated output silently"
         );
     }
 

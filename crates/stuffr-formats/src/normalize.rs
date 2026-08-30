@@ -135,6 +135,13 @@ pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 /// zstd itself rejected the bytes, never a genuine I/O failure underneath —
 /// see conformance property 11 (a real `PermissionDenied` still classifies as
 /// `Error::Io`, exit 1) for the negative case this depends on.
+///
+/// Gated `#[cfg(feature = "zstd-c")]`: `zstd_c.rs` is the only consumer, and
+/// a build with `zstd-pure` but not `zstd-c` has no `zstd_c` module at all,
+/// which left this constant unused and warning under `-D warnings` (caught
+/// once `make check` gained a pure-tier leg that actually builds that
+/// combination — see the `Makefile`'s `test-pure` target).
+#[cfg(feature = "zstd-c")]
 pub(crate) const ZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
@@ -162,6 +169,11 @@ pub(crate) const ZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 /// its kind intact rather than reconstructed) reaches the caller as
 /// anything other than `Other` or the `InvalidData` this module's own
 /// `LazyRuzstdDecoder` already produces directly.
+///
+/// Gated `#[cfg(feature = "zstd-pure")]` for the mirror-image reason above:
+/// a `zstd-c`-only build has no `zstd_pure` module, so this constant would
+/// otherwise be unused there too.
+#[cfg(feature = "zstd-pure")]
 pub(crate) const RUZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
