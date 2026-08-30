@@ -9,19 +9,24 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 1b complete — gzip works end to end.** `stf pack`, `unpack`,
-> `cat`, `info` and `formats` all work today, on files and through pipes, and
-> `curl … | stf cat - | grep pattern` runs. 189 tests, clean across build,
-> clippy and fmt.
+> **Status: Phase 1c complete — the foundation is ready for the other codecs.**
+> `stf pack`, `unpack`, `cat`, `info` and `formats` all work today, on files and
+> through pipes, and `curl … | stf cat - | grep pattern` runs. 216 tests, clean
+> across build, clippy and fmt.
 >
-> **One codec so far.** Phase 1b was deliberately a walking skeleton: gzip taken
-> all the way from the codec trait through the operations layer to the CLI, so
-> that interface problems surfaced at codec one instead of codec nine. The other
-> formats in the matrix below are not implemented yet — Phase 1c adds the
-> remaining eight codecs and parallel encode, Phase 2 adds containers. Decoding
-> is already proven incremental rather than read-to-end, and `stuffr-core` still
-> carries zero format dependencies, so the ladder and governor stay testable
-> with no C toolchain.
+> **Still one codec.** Phase 1b took gzip end to end as a walking skeleton, so
+> that interface problems surfaced at codec one instead of codec nine. Phase 1c
+> then fixed what that surfaced and added a ten-property **conformance harness**
+> every future codec adopts in one line — so the next eight arrive against a
+> contract that is checked rather than described. The other formats in the matrix
+> below are not implemented yet: Phase 1d adds them, 1e adds parallel encode and
+> reaches 0.1.0, Phase 2 adds containers.
+>
+> Already true and enforced for every codec that follows: decoding is incremental
+> rather than read-to-end, corruption is distinguishable from a full disk, output
+> is fsynced before it is published and never destroys an existing file on
+> failure, and `stuffr-core` carries zero format dependencies — so the ladder and
+> governor stay testable with no C toolchain.
 
 ## Why another one
 
