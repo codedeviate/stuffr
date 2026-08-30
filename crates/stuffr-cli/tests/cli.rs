@@ -9,6 +9,12 @@ fn tmp(name: &str) -> std::path::PathBuf {
     p
 }
 
+// A bare `pack src` with neither `-o` nor `--format` can only default when
+// exactly one codec is registered (see `default_format_in`'s doc comment in
+// `stuffr::ops`). Phase 1d's `pure` build now registers three, so tests that
+// are not actually exercising format inference pin gzip explicitly with
+// `--format gzip` rather than relying on a default that no longer exists.
+
 #[test]
 fn formats_now_reports_gzip() {
     let out = Command::new(STF).arg("formats").output().unwrap();
@@ -29,7 +35,7 @@ fn info_names_the_format_and_the_rung() {
     std::fs::write(&src, b"payload").unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -56,7 +62,7 @@ fn info_json_is_structured_and_names_how_the_format_was_detected() {
     std::fs::write(&src, b"payload").unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -94,7 +100,7 @@ fn info_over_a_pipe_reports_forward_only_not_exact() {
     std::fs::write(&src, b"payload").unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -140,7 +146,7 @@ fn cat_exits_cleanly_when_the_reader_closes_early() {
     std::fs::write(&src, payload.as_bytes()).unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -228,7 +234,7 @@ fn pack_then_unpack_round_trips_through_the_binary() {
 
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -278,7 +284,13 @@ fn no_sync_is_accepted_by_pack_and_unpack_and_still_round_trips() {
 
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap(), "--no-sync"])
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "--no-sync",
+                "--format",
+                "gzip"
+            ])
             .status()
             .unwrap()
             .success()
@@ -321,7 +333,7 @@ fn cat_reads_a_stream_on_stdin() {
     std::fs::write(&src, b"needle in a haystack").unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -393,7 +405,7 @@ fn pack_writes_output_to_stdout() {
     std::fs::write(&src, &plain).unwrap();
 
     let pack_out = Command::new(STF)
-        .args(["pack", src.to_str().unwrap(), "-o", "-"])
+        .args(["pack", src.to_str().unwrap(), "--format", "gzip", "-o", "-"])
         .output()
         .unwrap();
     assert!(
@@ -470,7 +482,7 @@ fn pack_of_a_seekable_file_reports_exact() {
     std::fs::write(&src, b"payload").unwrap();
 
     let out = Command::new(STF)
-        .args(["pack", src.to_str().unwrap()])
+        .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -489,7 +501,7 @@ fn an_existing_output_is_refused_with_exit_two() {
     std::fs::write(&gz, b"PRE-EXISTING").unwrap();
 
     let out = Command::new(STF)
-        .args(["pack", src.to_str().unwrap()])
+        .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
@@ -515,7 +527,7 @@ fn a_bomb_exits_six_and_leaves_no_partial_output() {
     std::fs::write(&src, vec![0u8; 2 * 1024 * 1024]).unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -607,7 +619,7 @@ fn a_corrupt_archive_exits_five_not_one() {
     std::fs::write(&src, b"the quick brown fox ".repeat(200)).unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -645,7 +657,7 @@ fn unpack_accepts_an_explicit_format() {
     std::fs::write(&src, b"payload").unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -682,7 +694,7 @@ fn cat_accepts_an_explicit_format() {
     std::fs::write(&src, b"payload").unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
@@ -701,6 +713,81 @@ fn cat_accepts_an_explicit_format() {
 
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&gz);
+}
+
+#[test]
+fn unpack_format_flag_is_honoured_not_merely_accepted() {
+    // Raw deflate is the format that can actually prove this: it has no
+    // magic and no conventional extension (see deflate::meta), so it is
+    // undetectable by construction. gzip cannot make this distinction —
+    // it is detectable from its magic regardless of whether --format was
+    // read — which is exactly how Task 1's review found all four of its
+    // --format tests still green after the resolved format was dropped on
+    // the floor in main.rs. This test packs with --format deflate into a
+    // name carrying no hint of the format, then requires unpack to FAIL
+    // without --format (detection has nothing to go on) and to SUCCEED
+    // with it, recovering the original bytes exactly.
+    let src = tmp("fmt-deflate.txt");
+    let packed = tmp("fmt-deflate.dat");
+    let out = tmp("fmt-deflate-out.txt");
+    for p in [&packed, &out] {
+        let _ = std::fs::remove_file(p);
+    }
+    let payload = b"the quick brown fox jumps over the lazy dog".repeat(50);
+    std::fs::write(&src, &payload).unwrap();
+
+    assert!(
+        Command::new(STF)
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "--format",
+                "deflate",
+                "-o",
+                packed.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let no_format = Command::new(STF)
+        .args([
+            "unpack",
+            packed.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !no_format.status.success(),
+        "a raw deflate stream must NOT be detectable without --format"
+    );
+
+    let with_format = Command::new(STF)
+        .args([
+            "unpack",
+            packed.to_str().unwrap(),
+            "--format",
+            "deflate",
+            "-o",
+            out.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        with_format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_format.stderr)
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), payload);
+
+    for p in [&src, &packed, &out] {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 #[test]
@@ -733,7 +820,7 @@ fn cat_honours_max_ratio() {
     std::fs::write(&src, vec![0u8; 2 * 1024 * 1024]).unwrap();
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap()])
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()

@@ -16,7 +16,7 @@ COMPRESSING A FILE
 
   stf pack notes.txt --format gzip -o out.bin
       --format names the codec explicitly instead of inferring one from -o's
-      extension. The only value this build accepts is gzip.
+      extension. This build accepts gzip, zlib and deflate.
 
   stf pack notes.txt --level 9
       --level asks the codec for a tradeoff: gzip accepts 0 (fastest,
@@ -40,6 +40,10 @@ DECOMPRESSING
       --format names the codec explicitly instead of detecting it. Some
       formats carry no magic bytes and no conventional extension, so an
       explicit --format is the only way to reach them.
+
+  stf unpack raw.bin --format deflate -o data.txt
+      Raw deflate has no header, no trailer and no conventional extension,
+      so it cannot be detected at all — --format is the ONLY way in.
 
 
 STREAMING TO STDOUT
@@ -85,7 +89,7 @@ WHAT THIS BUILD CAN DO
 
   stf formats
       Lists the formats compiled into THIS binary, not everything stf will
-      ever support. Right now that is one row: gzip.
+      ever support. Right now that is three rows: gzip, zlib and deflate.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -122,7 +126,8 @@ EXIT CODES
 
 NOT YET
 
-  This build has one codec: gzip. No archive containers (tar, zip, ...)
-  and no other codecs (zstd, xz, bzip2, ...) exist yet — they arrive in
-  later phases. `stf formats` always tells you the truth about the build
-  you are actually running, whatever this page says.
+  This build has three codecs: gzip, zlib and deflate. No archive
+  containers (tar, zip, ...) and no other codecs (zstd, xz, bzip2, ...)
+  exist yet — they arrive in later phases. `stf formats` always tells you
+  the truth about the build you are actually running, whatever this page
+  says.

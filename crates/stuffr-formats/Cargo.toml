@@ -10,6 +10,8 @@ repository.workspace = true
 [features]
 default = []
 gzip = ["dep:flate2"]
+zlib = ["dep:flate2"]
+deflate = ["dep:flate2"]
 
 [dependencies]
 stuffr-core = { workspace = true }

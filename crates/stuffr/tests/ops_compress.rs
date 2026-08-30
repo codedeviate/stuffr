@@ -291,6 +291,12 @@ fn compressing_to_dev_null_succeeds_instead_of_failing_to_rename() {
         Input::Path(src.clone()),
         Output::Path(std::path::PathBuf::from("/dev/null")),
         &CompressOpts {
+            // `/dev/null` has no extension to infer a format from, and this
+            // build now registers more than one codec (Phase 1d), so an
+            // explicit format is required — see `default_format_in`'s doc
+            // comment. This test is about the dev/null write-through, not
+            // format inference, so name one directly.
+            format: Some(stuffr::FormatId::new("gzip")),
             force: true,
             ..Default::default()
         },
