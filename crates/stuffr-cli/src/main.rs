@@ -153,14 +153,20 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             input,
             output,
             force,
+            format,
             max_ratio,
             no_sync,
         } => {
+            let fmt = match format.as_deref() {
+                Some(name) => Some(format_by_name(name)?),
+                None => None,
+            };
             let mut opts = DecompressOpts {
                 force,
                 sync: !no_sync,
                 ..Default::default()
             };
+            opts.format = fmt;
             if let Some(r) = max_ratio {
                 opts.max_ratio = r;
             }
@@ -179,9 +185,24 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             eprintln!("{} -> {} bytes", out.format, out.bytes_out);
             Ok(())
         }
-        Command::Cat { input } => {
+        Command::Cat {
+            input,
+            format,
+            max_ratio,
+        } => {
+            let fmt = match format.as_deref() {
+                Some(name) => Some(format_by_name(name)?),
+                None => None,
+            };
+            let mut opts = DecompressOpts {
+                format: fmt,
+                ..Default::default()
+            };
+            if let Some(r) = max_ratio {
+                opts.max_ratio = r;
+            }
             // The motivating case: `curl … | stf cat - | grep pattern`.
-            ops::decompress(input_of(&input), Output::Stdout, &DecompressOpts::default())?;
+            ops::decompress(input_of(&input), Output::Stdout, &opts)?;
             Ok(())
         }
         Command::Info { input, json } => {

@@ -36,12 +36,21 @@ DECOMPRESSING
   stf unpack notes.txt.gz -o out.txt --force
       Choose the name and allow overwriting an existing one.
 
+  stf unpack data.bin --format gzip -o data.txt
+      --format names the codec explicitly instead of detecting it. Some
+      formats carry no magic bytes and no conventional extension, so an
+      explicit --format is the only way to reach them.
+
 
 STREAMING TO STDOUT
 
   curl -s https://example.com/log.gz | stf cat - | grep pattern
       cat decompresses straight to stdout without ever naming an output
       file — the shape for feeding a compressed stream into another tool.
+
+  stf cat data.bin --format gzip
+      cat takes --format for the same reason, and --max-ratio to bound a
+      decode that would otherwise stream an enormous file to stdout.
 
 
 STDIN AND STDOUT VIA `-`

@@ -55,6 +55,10 @@ pub enum Command {
         /// Overwrite an existing output.
         #[arg(long)]
         force: bool,
+        /// Use this format instead of detecting one. Required for formats with
+        /// no magic bytes and no extension.
+        #[arg(long)]
+        format: Option<String>,
         /// Refuse a decode expanding by more than this ratio.
         #[arg(long)]
         max_ratio: Option<u64>,
@@ -66,6 +70,13 @@ pub enum Command {
     Cat {
         /// Input path, or `-` for stdin.
         input: String,
+        /// Use this format instead of detecting one. Required for formats with
+        /// no magic bytes and no extension.
+        #[arg(long)]
+        format: Option<String>,
+        /// Refuse a decode expanding by more than this ratio.
+        #[arg(long)]
+        max_ratio: Option<u64>,
     },
     /// Identify a stream without decoding it.
     Info {

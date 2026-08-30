@@ -632,3 +632,119 @@ fn a_corrupt_archive_exits_five_not_one() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&gz);
 }
+
+#[test]
+fn unpack_accepts_an_explicit_format() {
+    // Detection would find gzip here anyway; the point is that the flag is
+    // accepted and honoured, so the codecs that CANNOT be detected have a way in.
+    let src = tmp("fmt-unpack.txt");
+    let gz = tmp("fmt-unpack.txt.gz");
+    let out = tmp("fmt-unpack-out.txt");
+    let _ = std::fs::remove_file(&gz);
+    let _ = std::fs::remove_file(&out);
+    std::fs::write(&src, b"payload").unwrap();
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let res = Command::new(STF)
+        .args([
+            "unpack",
+            gz.to_str().unwrap(),
+            "--format",
+            "gzip",
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), b"payload");
+
+    for p in [&src, &gz, &out] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn cat_accepts_an_explicit_format() {
+    let src = tmp("fmt-cat.txt");
+    let gz = tmp("fmt-cat.txt.gz");
+    let _ = std::fs::remove_file(&gz);
+    std::fs::write(&src, b"payload").unwrap();
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let res = Command::new(STF)
+        .args(["cat", gz.to_str().unwrap(), "--format", "gzip"])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert_eq!(res.stdout, b"payload");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
+
+#[test]
+fn an_unknown_format_name_is_a_usage_error_on_every_verb() {
+    // pack already rejected these; unpack and cat must agree rather than
+    // silently ignoring a flag the user believed they had set.
+    for verb in ["unpack", "cat"] {
+        let out = Command::new(STF)
+            .args([verb, "/dev/null", "--format", "bogus"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{verb} --format bogus must be a usage error"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("gzip"),
+            "the error must name what this build does have"
+        );
+    }
+}
+
+#[test]
+fn cat_honours_max_ratio() {
+    // A bomb reaches stdout as easily as a file; cat had no way to bound it.
+    let src = tmp("cat-bomb.bin");
+    let gz = tmp("cat-bomb.bin.gz");
+    let _ = std::fs::remove_file(&gz);
+    std::fs::write(&src, vec![0u8; 2 * 1024 * 1024]).unwrap();
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = Command::new(STF)
+        .args(["cat", gz.to_str().unwrap(), "--max-ratio", "100"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6), "resource limits exit 6");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
