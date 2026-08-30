@@ -11,17 +11,23 @@
 //! streaming types, and `.sz` files are frame-format streams — this is the
 //! only snappy shape in scope this cycle.
 //!
-//! One genuine, narrow finding from sweeping truncation at every byte
+//! A genuine, structural finding from sweeping truncation at every byte
 //! position (see `snappy_conformance_probe_truncation_is_detected_at_almost_
-//! every_position` below): a stream cut to EXACTLY its 10-byte stream
-//! identifier chunk, with no data chunk following at all, decodes cleanly to
-//! an empty result rather than erroring. This is not a detection gap to
-//! paper over — the frame format is explicitly a sequence of independent
-//! chunks designed to support concatenation, so a reader genuinely cannot
-//! distinguish "this is the whole (empty) stream" from "more chunks were cut
-//! off" at that one clean boundary with nothing read yet. It does not touch
-//! conformance property 10, which cuts at the payload's midpoint, nowhere
-//! near this boundary.
+//! every_position` below): a stream cut at ANY chunk boundary decodes
+//! cleanly to a truncated-but-unerrored result, not just the one right
+//! after the 10-byte stream identifier. A single-chunk (4 KiB) payload only
+//! ever exercises that first boundary, which is why an earlier version of
+//! this doc and its probe both claimed "exactly one" clean cut — true only
+//! as an artifact of a payload smaller than one chunk (`MAX_BLOCK_SIZE`, 64
+//! KiB); a payload spanning several chunks shows every chunk boundary
+//! behaves the same way. This is not a detection gap to paper over — the
+//! frame format is explicitly a sequence of independent chunks designed to
+//! support concatenation, so a reader genuinely cannot distinguish "this is
+//! the whole stream, and it happens to end right here" from "more chunks
+//! were meant to follow but got cut off" at any chunk boundary, with
+//! nothing left unread from the chunk before it. It does not touch
+//! conformance property 10, which cuts at the payload's midpoint, deep
+//! inside a single chunk's payload bytes, nowhere near any chunk boundary.
 
 use std::io::Write;
 
@@ -377,19 +383,36 @@ mod tests {
         );
     }
 
-    /// The truncation counterpart to the corruption probe above: sweeps every
-    /// prefix length of a real encoded payload (instead of flipping bytes,
-    /// cuts the stream short) and confirms every truncation is rejected, with
-    /// the reported kind always inside `SNAPPY_MALFORMED_AS_OTHER_EOF` — with
-    /// ONE measured, documented exception (see below). `FrameDecoder` uses
-    /// `read_exact` internally, so this is expected to be almost entirely
-    /// `UnexpectedEof` — measured directly rather than assumed.
+    /// The truncation counterpart to the corruption probe above: cuts a real
+    /// encoded payload short at many prefix lengths and confirms every
+    /// truncation is rejected, with the reported kind always inside
+    /// `SNAPPY_MALFORMED_AS_OTHER_EOF` — except at a chunk boundary, where
+    /// the format is genuinely ambiguous (see below and the module doc).
+    /// `FrameDecoder` uses `read_exact` internally, so this is expected to be
+    /// almost entirely `UnexpectedEof` — measured directly rather than
+    /// assumed.
     ///
-    /// Same 4 KiB sizing rationale as the corruption probe above (an O(n^2)
-    /// sweep over a real payload, at a size that keeps a debug run fast
-    /// without changing the outcome shape) — a single block either size, so
-    /// the finding below reproduces identically at 64 KiB, just slower to
-    /// demonstrate it.
+    /// 200 KiB, spanning several chunks (`MAX_BLOCK_SIZE` is 64 KiB) — NOT
+    /// the 4 KiB single-chunk payload the corruption probe above uses. Item
+    /// 4 of Phase 1d's final fix wave: a single-chunk payload can only ever
+    /// exercise the ONE chunk boundary it has, which understated the clean
+    /// cuts below as "exactly one" when the true shape is "every chunk
+    /// boundary".
+    ///
+    /// Unlike the corruption probe (and unlike this test's own previous
+    /// version), this does NOT sweep every one of ~200,000 byte positions:
+    /// each decode attempt processes up to the full payload, so an
+    /// exhaustive sweep at this size is quadratic over 200 KiB — measured
+    /// directly, over a minute and still running in a debug build, not the
+    /// few seconds the 4 KiB corruption probe takes. Sweeping only a
+    /// generous local window around each candidate boundary (every chunk
+    /// header and checksum is 8 bytes; the window below is 32) still
+    /// exercises every byte position where the format's own framing could
+    /// plausibly turn a truncation clean, and a handful of deep-interior
+    /// samples (each chunk's own midpoint) confirm ordinary mid-chunk
+    /// truncation is untouched by this change — without re-doing the
+    /// original full byte-for-byte sweep this test itself already ran at 4
+    /// KiB, where it remains cheap.
     ///
     /// Measured against the RAW `snap::read::FrameDecoder`, for the same
     /// reason as the corruption probe above: this codec's own decoder folds
@@ -399,14 +422,59 @@ mod tests {
     fn snappy_conformance_probe_truncation_is_detected_at_almost_every_position() {
         use stuffr_core::testing::incompressible;
 
-        let plain = incompressible(4 * 1024);
+        // Measured directly against the `snap` crate's own source
+        // (`frame.rs`): `CHUNK_HEADER_AND_CRC_SIZE` and `MAX_BLOCK_SIZE`,
+        // also cited in `caps()`'s own memory-sizing doc comment above.
+        // Neither is `pub` from the crate, so they are pinned here as local
+        // constants rather than imported.
+        const CHUNK_HEADER_AND_CRC_SIZE: usize = 8;
+        const MAX_BLOCK_SIZE: usize = 64 * 1024;
+        const WINDOW: usize = 32;
+        let stream_identifier_len = SNAPPY_MAGIC[0].bytes.len();
+
+        let plain = incompressible(200 * 1024);
         let packed = compress(&plain);
+        assert_eq!(&packed[..stream_identifier_len], SNAPPY_MAGIC[0].bytes);
+
+        // Every chunk boundary, DERIVED from the encoded output's own length
+        // rather than hardcoded, so this self-corrects against anything that
+        // would change the chunk layout (a different payload size, a future
+        // `snap` whose chunking changed) rather than silently sweeping the
+        // wrong positions.
+        let full_chunk_len = CHUNK_HEADER_AND_CRC_SIZE + MAX_BLOCK_SIZE;
+        let num_full_chunks = (packed.len() - stream_identifier_len) / full_chunk_len;
+        assert!(
+            num_full_chunks >= 3,
+            "fixture must span several full chunks, not one, or this test regresses back to \
+             the single-chunk artifact item 4 fixed — measured {num_full_chunks} full chunks \
+             in a {} byte payload",
+            packed.len()
+        );
+        let boundaries: Vec<usize> = std::iter::once(stream_identifier_len)
+            .chain((1..=num_full_chunks).map(|k| stream_identifier_len + k * full_chunk_len))
+            .collect();
+
+        // Cuts to actually try: a window of WINDOW bytes on each side of
+        // every boundary above, plus one deep-interior sample per full chunk
+        // (its own midpoint) as a sanity check that ordinary mid-chunk
+        // truncation is untouched. A `BTreeSet` both de-duplicates (the
+        // stream-identifier boundary's window and block 1's window would
+        // otherwise overlap) and gives a stable, sorted iteration order.
+        let mut cuts_to_try: std::collections::BTreeSet<usize> = boundaries
+            .iter()
+            .flat_map(|&b| b.saturating_sub(WINDOW)..=(b + WINDOW).min(packed.len() - 1))
+            .filter(|&c| c >= 1)
+            .collect();
+        for k in 1..=num_full_chunks {
+            let chunk_start = stream_identifier_len + (k - 1) * full_chunk_len;
+            cuts_to_try.insert(chunk_start + full_chunk_len / 2);
+        }
 
         let mut unexpected_eof = 0usize;
         let mut other = 0usize;
         let mut other_kind = 0usize;
         let mut clean_cuts = Vec::new();
-        for cut in 1..packed.len() {
+        for cut in cuts_to_try {
             let truncated = packed[..cut].to_vec();
             let mut dec = FrameDecoder::new(std::io::Cursor::new(truncated));
             let mut out = Vec::new();
@@ -420,27 +488,26 @@ mod tests {
             }
         }
 
-        // The ONE genuine, measured exception: cutting the stream to EXACTLY
-        // the 10-byte stream identifier chunk — before any data chunk begins
-        // — decodes cleanly to an EMPTY result, not an error. This is not a
-        // codec defect to paper over: the frame format is an explicit
+        // Exactly the boundaries themselves are clean, nothing in the
+        // windows around them and nothing at any chunk's midpoint. This is
+        // not a codec defect to paper over: the frame format is an explicit
         // sequence of independent chunks, designed so complete streams can
         // be concatenated (the format spec calls this out directly), so a
-        // reader has no way to tell "this is genuinely the whole (empty)
-        // stream" from "more chunks were meant to follow but got cut off"
-        // at a clean chunk boundary with nothing read yet. Every OTHER
-        // position — inside the header, inside a checksum, inside the data
-        // chunk's payload bytes — has no such ambiguity and is rejected,
-        // which is exactly what conformance property 10 exercises: it cuts
-        // at `len/2`, deep inside the single data chunk, nowhere near this
-        // one boundary.
+        // reader has no way to tell "this is genuinely the whole stream, and
+        // it happens to end right here" from "more chunks were meant to
+        // follow but got cut off" at any such boundary, with nothing left
+        // unread from the chunk before it. Every OTHER position — inside a
+        // chunk header, inside a checksum, inside a chunk's payload bytes —
+        // has no such ambiguity and is rejected, which is exactly what
+        // conformance property 10 exercises: it cuts at `len/2` (among other
+        // lengths), deep inside a single chunk's payload, nowhere near any
+        // chunk boundary.
         assert_eq!(
-            clean_cuts,
-            vec![SNAPPY_MAGIC[0].bytes.len()],
-            "expected exactly one truncation cut to decode without error: right after the \
-             10-byte stream identifier chunk, before any data chunk begins (see this test's \
-             comment for why). Any other clean cut here would be a genuine truncation-detection \
-             gap, not this documented one — measured clean cuts: {clean_cuts:?}"
+            clean_cuts, boundaries,
+            "expected a clean truncation cut at exactly the stream identifier boundary and \
+             every full chunk boundary after it, and no others (see this test's comment for \
+             why). Any other clean cut here would be a genuine truncation-detection gap, not \
+             this documented one — measured: {clean_cuts:?}, expected: {boundaries:?}"
         );
         assert_eq!(
             other_kind, 0,
