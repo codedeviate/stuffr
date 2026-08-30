@@ -548,6 +548,54 @@ fn an_unknown_verb_exits_two() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+/// Keeps `stf --examples` honest as the tool grows: every format this build
+/// registers, and every long flag / subcommand clap knows about, must be
+/// mentioned on the page. This is what makes the page a contract rather than
+/// prose that quietly goes stale — Phase 1d adding a codec, or any future
+/// flag, fails this test until the page is updated to match.
+#[test]
+fn examples_page_covers_every_format_and_flag() {
+    use clap::CommandFactory;
+    use stuffr_cli::cli::Cli;
+
+    let out = Command::new(STF).arg("--examples").output().unwrap();
+    assert!(out.status.success(), "stf --examples must exit 0");
+    let text = String::from_utf8(out.stdout).unwrap();
+
+    for row in stuffr::registry().matrix() {
+        let id = row.id.as_str();
+        assert!(
+            text.contains(id),
+            "the examples page does not mention the `{id}` format"
+        );
+    }
+
+    let root = Cli::command();
+    for sub in root.get_subcommands() {
+        let name = sub.get_name();
+        if name == "help" {
+            continue;
+        }
+        assert!(
+            text.contains(name),
+            "the examples page does not mention the `{name}` subcommand"
+        );
+        for arg in sub.get_arguments() {
+            let Some(long) = arg.get_long() else {
+                continue;
+            };
+            if long == "help" || long == "version" {
+                continue;
+            }
+            let flag = format!("--{long}");
+            assert!(
+                text.contains(flag.as_str()),
+                "the examples page does not mention {flag}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_corrupt_archive_exits_five_not_one() {
     let src = tmp("cli-corrupt.txt");

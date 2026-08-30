@@ -3,76 +3,14 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser};
 use stuffr::FormatId;
 use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output};
+use stuffr_cli::cli::{Cli, Command};
 
-#[derive(Parser)]
-#[command(
-    name = "stf",
-    version,
-    about = "Universal compression and archive toolkit"
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Compress a file.
-    Pack {
-        /// Input path, or `-` for stdin.
-        input: String,
-        /// Output path. Defaults to INPUT plus the format's extension.
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Use this format instead of inferring one from the output name.
-        #[arg(long)]
-        format: Option<String>,
-        /// Compression level. gzip accepts 0-9.
-        #[arg(long)]
-        level: Option<i32>,
-        /// Overwrite an existing output.
-        #[arg(long)]
-        force: bool,
-        /// Skip the fsync that makes the output durable before it is published.
-        #[arg(long)]
-        no_sync: bool,
-    },
-    /// Decompress a file.
-    Unpack {
-        /// Input path, or `-` for stdin.
-        input: String,
-        /// Output path. Defaults to INPUT with its extension removed.
-        #[arg(short, long)]
-        output: Option<String>,
-        /// Overwrite an existing output.
-        #[arg(long)]
-        force: bool,
-        /// Refuse a decode expanding by more than this ratio.
-        #[arg(long)]
-        max_ratio: Option<u64>,
-        /// Skip the fsync that makes the output durable before it is published.
-        #[arg(long)]
-        no_sync: bool,
-    },
-    /// Decompress a file and write it to stdout.
-    Cat {
-        /// Input path, or `-` for stdin.
-        input: String,
-    },
-    /// Identify a stream without decoding it.
-    Info {
-        /// Input path, or `-` for stdin.
-        input: String,
-        /// Emit machine-readable JSON instead of the human-readable report.
-        #[arg(long)]
-        json: bool,
-    },
-    /// List the formats this build contains.
-    Formats,
-}
+/// The `--examples` page. A static asset rather than an inline literal so it
+/// reads (and diffs) like the terminal page it is, not like Rust source.
+const EXAMPLES: &str = include_str!("examples.txt");
 
 /// `-` means the stream, everywhere.
 fn input_of(s: &str) -> Input {
@@ -92,7 +30,27 @@ fn output_of(s: &str) -> Output {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let cli = Cli::parse();
+
+    if cli.examples {
+        print!("{EXAMPLES}");
+        return ExitCode::SUCCESS;
+    }
+
+    let command = match cli.command {
+        Some(c) => c,
+        // `command` is `Option` (rather than clap enforcing a required
+        // subcommand itself) purely so `--examples` can be given with no
+        // subcommand at all. Absent both, reproduce clap's own behaviour for
+        // a missing required subcommand by hand: the full help, on exit 2.
+        None => {
+            let _ = Cli::command().print_help();
+            println!();
+            return ExitCode::from(2);
+        }
+    };
+
+    match run(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("stf: {e}");
@@ -121,8 +79,7 @@ fn destination_is_stdout(cmd: &Command) -> bool {
     }
 }
 
-fn run() -> stuffr::Result<()> {
-    let command = Cli::parse().command;
+fn run(command: Command) -> stuffr::Result<()> {
     let stdout_dest = destination_is_stdout(&command);
     match dispatch(command) {
         Ok(()) => Ok(()),

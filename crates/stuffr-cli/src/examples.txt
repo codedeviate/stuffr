@@ -1,0 +1,119 @@
+stf — worked examples
+
+Everything below runs against this build as shown. `stf <command> --help`
+lists the full flag reference for any one command.
+
+
+COMPRESSING A FILE
+
+  stf pack notes.txt
+      Writes notes.txt.gz beside it. The input, notes.txt, is left alone —
+      unlike gzip(1), stf never deletes or replaces what you compressed.
+
+  stf pack notes.txt -o archive.gz
+      Choose the output name with -o/--output. Without it, the default is
+      the input path plus the chosen format's extension (".gz" today).
+
+  stf pack notes.txt --format gzip -o out.bin
+      --format names the codec explicitly instead of inferring one from -o's
+      extension. The only value this build accepts is gzip.
+
+  stf pack notes.txt --level 9
+      --level asks the codec for a tradeoff: gzip accepts 0 (fastest,
+      largest output) through 9 (slowest, smallest output).
+
+  stf pack notes.txt --force
+      Without --force, pack refuses to overwrite an existing output: exit
+      code 2, the existing file left untouched, nothing written.
+
+
+DECOMPRESSING
+
+  stf unpack notes.txt.gz
+      Writes notes.txt, stripping the recognised extension. As with pack,
+      an existing destination is refused unless --force is given too.
+
+  stf unpack notes.txt.gz -o out.txt --force
+      Choose the name and allow overwriting an existing one.
+
+
+STREAMING TO STDOUT
+
+  curl -s https://example.com/log.gz | stf cat - | grep pattern
+      cat decompresses straight to stdout without ever naming an output
+      file — the shape for feeding a compressed stream into another tool.
+
+
+STDIN AND STDOUT VIA `-`
+
+  `-` means the stream, wherever a path is expected: stdin for an input,
+  stdout for an output.
+
+  cat notes.txt | stf pack - -o notes.txt.gz
+      Stdin has no path to derive a name from, so -o is mandatory here;
+      leaving it out is a usage error (exit 2).
+
+  cat notes.txt | stf pack - -o - | wc -c
+      Both ends can be `-` at once: stdin in, stdout out.
+
+
+INSPECTING A STREAM WITHOUT DECODING IT
+
+  stf info notes.txt.gz
+      Reports the format, the resolved chain, the fidelity "rung", and the
+      size when it's known.
+
+  stf info notes.txt.gz --json
+      The same report as machine-readable JSON, for scripting.
+
+  A plain file reports `rung: exact` — stf can seek it, so what it reports
+  is verified. A pipe (`stf info -`) reports `rung: forward-only` — a
+  stream can only be read once, so this is the tool telling you the format
+  was inferred from bytes it saw going by, not confirmed by looking back.
+
+
+WHAT THIS BUILD CAN DO
+
+  stf formats
+      Lists the formats compiled into THIS binary, not everything stf will
+      ever support. Right now that is one row: gzip.
+
+
+GUARDING AGAINST DECOMPRESSION BOMBS
+
+  stf unpack bomb.gz --max-ratio 100
+      A decompression bomb is a small compressed file that expands to an
+      enormous one. --max-ratio refuses a decode once output has grown
+      past this multiple of the compressed input (default 10000). gzip's
+      structural ceiling is roughly 1032:1, so it cannot reach that default
+      alone — here the flag mostly guards oversized input, or lets a
+      cautious caller set a tighter bound by hand. It earns its keep once
+      later phases add codecs and containers that CAN reach 10000:1.
+
+
+SKIPPING THE DURABILITY FSYNC
+
+  stf pack big.txt --no-sync
+      By default, pack and unpack fsync the output before renaming it into
+      place, so a crash cannot leave a truncated file under the real name.
+      --no-sync trades that guarantee for speed on bulk or scratch work.
+
+
+EXIT CODES
+
+  0  success
+  1  general failure (i/o error, or anything not listed below)
+  2  usage error (bad flag, missing -o, existing output without --force)
+  3  format not available in this build
+  4  fidelity degraded under strict mode
+  5  archive or stream is corrupt
+  6  resource limit exceeded (e.g. --max-ratio tripped)
+  7  unsafe path refused
+
+
+NOT YET
+
+  This build has one codec: gzip. No archive containers (tar, zip, ...)
+  and no other codecs (zstd, xz, bzip2, ...) exist yet — they arrive in
+  later phases. `stf formats` always tells you the truth about the build
+  you are actually running, whatever this page says.
