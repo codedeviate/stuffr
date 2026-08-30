@@ -29,35 +29,64 @@
 //! checksums are validated, if at all, only for bytes already accepted as
 //! real, and this bug fires before any of that runs.
 //!
-//! [`EndMarkTracker`]/[`TrackedRead`]/[`EnforceEndMark`] close this from
-//! outside the crate, since the defect is internal to `read_block` and not
-//! reachable through any public `FrameInfo` knob (verified: the reviewer
-//! swept `content_checksum`, `block_checksums`, both, and `content_size`,
-//! all five configurations identical). `TrackedRead` wraps the raw
-//! compressed-byte SOURCE and keeps a rolling 8-byte window of the last
-//! bytes it actually served to `FrameDecoder`. `EnforceEndMark` wraps
-//! `FrameDecoder`'s output and, the instant it reports `Ok(0)`, asks the
-//! tracker whether the source truly ended with the frame's own EndMark (4
-//! zero bytes, optionally followed by a 4-byte content checksum — the only
-//! thing the format ever permits after it; nothing else does, since a
-//! per-block checksum is consumed inside `read_block` before the loop ever
-//! asks for the next block's size word). If not, `Ok(0)` becomes
-//! `InvalidData` instead: the exact classification every other truncation in
-//! this codec already uses via [`NormalizeDecodeErrors`].
+//! **First attempt, since reverted: a byte-pattern heuristic.** The first
+//! version of this fix kept a rolling window of the last bytes served to
+//! `FrameDecoder` and accepted completion only when that window held the
+//! literal EndMark bytes (four zeros). A second review pass broke it: cuts
+//! made at every 64 KiB boundary of a 256 KiB zero-PADDED text file — tar
+//! members, disk images, ELF/PE section padding, anything page-aligned, none
+//! of it exotic — decoded cleanly too, because ordinary zero-padded content
+//! reproduces the same four-zero-byte pattern the check was looking for. It
+//! also cost 160-180 ms per 64 MiB of input for the per-byte window shift,
+//! against ~34 microseconds for the mechanism below — on the codec chosen
+//! specifically for throughput, that made the guard the dominant cost of
+//! decoding. Both problems trace to the same design error: matching a byte
+//! PATTERN can never be data-independent, and no fixed window size is immune
+//! to content that happens to look like the pattern.
 //!
-//! This depends on one fact about `FrameDecoder` that is not part of its
-//! public contract: that reading a genuine EndMark actually consumes those 4
-//! (or 8) bytes from its source before its own `read()` call returns `Ok(0)`
-//! — not merely that the frame is logically exhausted. Confirmed directly in
-//! `read_block`'s `BlockInfo::EndMark` arm, which performs its own
-//! `read_exact` for the block-size word (and, if `content_checksum` is set,
-//! `read_checksum` right after) before returning `Ok(0)`, all within the same
-//! outer `read()` call — see
-//! `lz4_frame_decoder_actually_consumes_the_endmark_on_a_complete_stream`
-//! below, which pins this directly rather than trusting the source reading.
+//! **The fix: an EOF discriminator, not a byte pattern.** Instrumented
+//! directly against `lz4_flex`: a complete stream never causes the
+//! underlying SOURCE's own `read` to return `Ok(0)` while `FrameDecoder` is
+//! still processing the CURRENT frame — `read_block`'s `BlockInfo::EndMark`
+//! arm reads its block-size word (and optional checksum) as ordinary,
+//! successful, nonzero-length reads. A stream truncated at a block boundary
+//! is different in exactly one way that matters: the source's own `read`
+//! genuinely returns `Ok(0)` — a real "I have nothing left" signal — at the
+//! moment `read_block`'s `read_exact` tries to fetch that word, and
+//! `read_exact` folds that into the same swallowed `UnexpectedEof` described
+//! above. So [`TrackedRead`] records one fact per read attempt — did the
+//! wrapped source's `read` return `Ok(0)` — and [`EnforceEndMark`] checks
+//! that fact, not stream content, when `FrameDecoder` reports `Ok(0)`: a
+//! genuine EndMark was read using ordinary nonzero reads (fact is `false`);
+//! a stream cut anywhere the parser still expected more hit real source
+//! exhaustion getting there (fact is `true`). This is O(1) per read attempt,
+//! not O(bytes) — no window, no byte comparison, nothing content-dependent.
+//!
+//! **Concatenation composes with this, and had to be fixed alongside it.**
+//! `FrameDecoder` already supports concatenated frames internally — after one
+//! frame's `Ok(0)`, calling `read()` again resumes into a following frame's
+//! header if more data exists — but a bare `Ok(0)` from `EnforceEndMark`
+//! itself would stop `read_to_end` right there, silently losing every frame
+//! after the first (verified: prepending one complete frame to a truncated
+//! one used to exit 0 with only the first frame's bytes — the same failure
+//! shape gzip's and bzip2's multi-stream decoders already solve for their own
+//! formats). `EnforceEndMark` closes this the same way: after a CLEAN `Ok(0)`
+//! (fact `false` — a real EndMark was read), it does not report completion
+//! yet. It asks `FrameDecoder` to read again, which either resumes a
+//! following frame (real bytes come back, served transparently) or hits a
+//! GENUINE source exhaustion while checking for one (`FrameDecoder`'s own
+//! frame-header parse returns `Ok(0)` only when its own read of the next
+//! frame's magic bytes gets nothing at all — never via the swallowed-error
+//! path above, which is specific to `read_block`'s mid-frame position) — and
+//! that combination is the one place a `true` fact is NOT truncation: it is
+//! "no more frames, the whole stream — one member or several — is genuinely
+//! done." The two states are kept apart by tracking whether a frame has ever
+//! ended cleanly since the last time real bytes were served; see
+//! `EnforceEndMark::read`'s own comments for the exact state transitions.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use lz4_flex::frame::{BlockSize, FrameDecoder, FrameEncoder, FrameInfo};
 use stuffr_core::{
@@ -67,89 +96,45 @@ use stuffr_core::{
 
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
-/// A rolling window over the last 8 bytes a [`TrackedRead`] has actually
-/// served to `FrameDecoder`, used by [`EnforceEndMark`] to tell a genuine
-/// EndMark from `FrameDecoder`'s own EOF-swallowing bug (see the module doc).
-///
-/// 8 bytes, not 4: the frame format permits an optional 4-byte content
-/// checksum to trail the 4-byte EndMark itself (never anything else — see
-/// the module doc for why per-block checksums cannot land here). Checking
-/// only the last 4 bytes would wrongly reject a legitimately-checksummed
-/// stream produced by another encoder, since its true last 4 bytes are the
-/// checksum, not the EndMark. This codec's own encoder never turns
-/// checksums on, so this only matters for decoding another implementation's
-/// output — which this decoder is otherwise built to accept (see `caps()`'s
-/// memory-sizing rationale for the same "must handle input we didn't
-/// produce" argument).
-struct EndMarkTracker {
-    window: [u8; 8],
-    filled: u8,
-}
-
-impl EndMarkTracker {
-    fn new() -> Self {
-        Self {
-            window: [0; 8],
-            filled: 0,
-        }
-    }
-
-    fn record(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.window.copy_within(1..8, 0);
-            self.window[7] = b;
-        }
-        self.filled = self
-            .filled
-            .saturating_add(bytes.len().min(u8::MAX as usize) as u8);
-    }
-
-    /// True once the stream's real EndMark was actually read: either the
-    /// last 4 bytes served are all zero (no trailing checksum), or the 4
-    /// bytes before those are all zero and at least 8 bytes total have been
-    /// served (a trailing 4-byte content checksum, whatever its value).
-    /// `filled` gates both arms so the window's zero-initialised bytes
-    /// before anything real has been read can never masquerade as an
-    /// EndMark on a very short stream.
-    fn is_end_mark(&self) -> bool {
-        (self.filled >= 4 && self.window[4..8] == [0, 0, 0, 0])
-            || (self.filled >= 8 && self.window[0..4] == [0, 0, 0, 0])
-    }
-}
-
-/// Feeds every byte a source actually serves to `FrameDecoder` into a shared
-/// [`EndMarkTracker`]. Errors pass through unchanged and are never recorded
-/// (nothing was actually served).
+/// Wraps the raw compressed-byte SOURCE and records, in `hit_eof`, whether
+/// its most recent read attempt returned a genuine `Ok(0)` — the source had
+/// nothing left at all, not merely fewer bytes than asked for. Shared with
+/// [`EnforceEndMark`], which resets this flag before each attempt it makes
+/// and inspects it immediately after, so the flag always answers "did the
+/// source run dry DURING THIS SPECIFIC attempt" rather than accumulating
+/// across the whole decode. See the module doc for why this — not a
+/// byte-content window — is the right discriminator.
 struct TrackedRead {
     inner: Box<dyn Source>,
-    tracker: Arc<Mutex<EndMarkTracker>>,
+    hit_eof: Arc<AtomicBool>,
 }
 
 impl std::io::Read for TrackedRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.tracker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .record(&buf[..n]);
+        if n == 0 {
+            self.hit_eof.store(true, Ordering::Relaxed);
         }
         Ok(n)
     }
 }
 
-/// Wraps `FrameDecoder`'s (normalized) output and, the moment it reports
-/// clean `Ok(0)`, checks the shared tracker for whether the source it read
-/// from actually ended with the frame's EndMark. See the module doc for the
-/// full defect this closes.
+/// Wraps `FrameDecoder`'s (normalized) output. See the module doc for the
+/// full mechanism and the defect this closes.
 struct EnforceEndMark<R> {
     inner: R,
-    tracker: Arc<Mutex<EndMarkTracker>>,
-    /// `None`: not yet checked. `Some(false)`: already found truncated —
-    /// every further call keeps reporting the same error rather than
-    /// falling back to `Ok(0)`, the same idempotence
-    /// `conformance::framed_mock`'s reference double uses for its own
-    /// truncated-or-corrupted state.
+    hit_eof: Arc<AtomicBool>,
+    /// Set once a frame has ended cleanly (its `Ok(0)` involved no source
+    /// exhaustion) and we are now checking whether a concatenated frame
+    /// follows. Reset to `false` the instant real decoded bytes arrive —
+    /// from this frame's own continuation, or transparently from a
+    /// newly-discovered concatenated one — so that frame's eventual ending
+    /// is judged by the same rule again, never waved through just because
+    /// an earlier frame completed cleanly.
+    awaiting_concat_probe: bool,
+    /// Latches truncation so every further call keeps reporting the same
+    /// error, the same idempotence `conformance::framed_mock`'s reference
+    /// double uses for its own truncated-or-corrupted state.
     truncated: bool,
 }
 
@@ -158,28 +143,55 @@ const LZ4_TRUNCATED_NO_ENDMARK: &str =
 
 impl<R: std::io::Read> std::io::Read for EnforceEndMark<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // A zero-length buffer conventionally yields Ok(0) with no I/O
+        // attempted at all (nothing calls this with one today, but nothing
+        // stops a future caller from doing so) — it says nothing about the
+        // stream's real state, and running it through the state machine
+        // below would latch a false "truncated" the instant one arrived
+        // mid-stream.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if self.truncated {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 LZ4_TRUNCATED_NO_ENDMARK,
             ));
         }
-        let n = self.inner.read(buf)?;
-        if n == 0 {
-            let ok = self
-                .tracker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_end_mark();
-            if !ok {
+        loop {
+            self.hit_eof.store(false, Ordering::Relaxed);
+            let n = self.inner.read(buf)?;
+            if n > 0 {
+                self.awaiting_concat_probe = false;
+                return Ok(n);
+            }
+            // n == 0: did the wrapped source genuinely run dry reaching this
+            // result, or did FrameDecoder read a real EndMark in full?
+            if self.hit_eof.load(Ordering::Relaxed) {
+                if self.awaiting_concat_probe {
+                    // This Ok(0) came from FrameDecoder checking for a
+                    // concatenated next frame (its own frame-header parse),
+                    // not from mid-frame block processing — a genuine
+                    // source exhaustion here means "no more frames", not
+                    // truncation. See the module doc for why these two
+                    // Ok(0)-with-exhaustion cases are distinguishable at
+                    // all.
+                    return Ok(0);
+                }
                 self.truncated = true;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     LZ4_TRUNCATED_NO_ENDMARK,
                 ));
             }
+            // Clean Ok(0): a real EndMark (and optional checksum) was read
+            // in full, no source exhaustion involved. Do not report
+            // completion yet — loop back and ask again, in case a
+            // concatenated frame follows. If none does, the next iteration
+            // resolves through the branch above; if one does, its bytes are
+            // served like any other and this flag resets on that return.
+            self.awaiting_concat_probe = true;
         }
-        Ok(n)
     }
 }
 
@@ -275,18 +287,21 @@ impl Codec for Lz4 {
     /// correct classification `NormalizeDecodeErrors` would have produced
     /// from `UnexpectedEof` regardless, so this does not introduce a new
     /// error vocabulary, only reaches truncations that were reaching neither
-    /// path before.
+    /// path before. `EnforceEndMark` also transparently continues into a
+    /// concatenated next frame rather than stopping at the first `Ok(0)` —
+    /// see the module doc's note on concatenation.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
-        let tracker = Arc::new(Mutex::new(EndMarkTracker::new()));
+        let hit_eof = Arc::new(AtomicBool::new(false));
         let tracked = TrackedRead {
             inner: src,
-            tracker: Arc::clone(&tracker),
+            hit_eof: Arc::clone(&hit_eof),
         };
         let normalized =
             NormalizeDecodeErrors::new(FrameDecoder::new(tracked), MALFORMED_AS_INVALID_INPUT_EOF);
         Ok(Box::new(StreamOnly::new(EnforceEndMark {
             inner: normalized,
-            tracker,
+            hit_eof,
+            awaiting_concat_probe: false,
             truncated: false,
         })))
     }
@@ -410,6 +425,46 @@ mod tests {
     }
 
     #[test]
+    fn decodes_concatenated_frames_not_just_the_first() {
+        // Concatenated lz4 frames are valid lz4 (the frame format spec calls
+        // this out explicitly — see snappy.rs's own module doc for the same
+        // property in a different format), and `FrameDecoder` supports it
+        // internally: after one frame's Ok(0), reading again resumes into a
+        // following frame's header if more data exists. Verified previously
+        // via the CLI directly against the gzip control (which already
+        // handles this): prepending a second complete frame used to be lost
+        // entirely, exiting 0 with only the first frame's bytes, because
+        // EnforceEndMark stopped at the first Ok(0) instead of checking for
+        // more. See the module doc's note on concatenation for why the fix
+        // for this and the EndMark fix compose in one mechanism.
+        let mut two = compress(b"first-");
+        two.extend_from_slice(&compress(b"second"));
+        assert_eq!(decompress(two), b"first-second");
+    }
+
+    #[test]
+    fn a_truncated_second_frame_in_a_concatenated_stream_is_rejected() {
+        // The concatenation fix must not reopen item 1's own hole: a
+        // complete first frame followed by a TRUNCATED second one must
+        // still be rejected, not silently accepted as "just the first
+        // frame, nothing more" — the two frames are handled by the exact
+        // same state machine, and this pins that the truncation half of it
+        // still fires once concatenation is in play.
+        let complete = compress(b"first-");
+        let second_full = compress(b"second-frame-payload");
+        let mut two = complete.clone();
+        two.extend_from_slice(&second_full[..second_full.len() - 1]);
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(two)));
+        let mut dec = Lz4.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        assert!(
+            dec.read_to_end(&mut out).is_err(),
+            "a complete frame followed by a truncated second one must not decode cleanly"
+        );
+    }
+
+    #[test]
     fn any_level_is_accepted_because_lz4_flex_exposes_none() {
         for level in [i32::MIN, -1, 0, 1, i32::MAX] {
             let opts = EncodeOpts {
@@ -524,24 +579,59 @@ mod tests {
     }
 
     /// Verifies the one fact the EndMark fix depends on, directly, before
-    /// trusting anything built on it: that `FrameDecoder` actually reads the
-    /// frame's real EndMark bytes from its source before reporting a clean
-    /// `Ok(0)`, rather than merely inferring completion some other way. If a
-    /// future `lz4_flex` upgrade ever stopped doing this, this test — not
-    /// the truncation test below it — is the one that would fail, and it
-    /// would fail by naming exactly this assumption instead of by the fix
-    /// silently going inert.
+    /// trusting anything built on it: that a COMPLETE, single (non-
+    /// concatenated) frame never causes the wrapped source's own `read` to
+    /// return a genuine `Ok(0)` while `FrameDecoder` is still processing it
+    /// — `FrameDecoder` reads the real EndMark (and any trailing checksum)
+    /// as ordinary, successful, nonzero-length reads, and stops asking
+    /// before ever touching true source exhaustion. If a future `lz4_flex`
+    /// upgrade ever changed this, this test — not the truncation test below
+    /// it — is the one that would fail, and it would fail by naming exactly
+    /// this assumption instead of by the fix silently going inert.
+    ///
+    /// Mirrors the reviewer's own instrumentation against `padded.lz4`
+    /// directly: `saw_eof=false` with `served == packed.len()` for a
+    /// complete stream, `saw_eof=true` for every truncated cut (see the
+    /// sweep test below).
     #[test]
-    fn lz4_frame_decoder_actually_consumes_the_endmark_on_a_complete_stream() {
+    fn lz4_frame_decoder_never_touches_source_eof_on_a_complete_stream() {
         use stuffr_core::testing::incompressible;
 
         let plain = incompressible(4 * 1024);
         let packed = compress(&plain);
+        let packed_len = packed.len();
 
-        let tracker = Arc::new(Mutex::new(EndMarkTracker::new()));
+        let hit_eof = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingSource {
+            inner: std::io::Cursor<Vec<u8>>,
+            served: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl std::io::Read for CountingSource {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = std::io::Read::read(&mut self.inner, buf)?;
+                self.served.fetch_add(n, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+        impl Source for CountingSource {
+            fn caps(&self) -> stuffr_core::SourceCaps {
+                stuffr_core::SourceCaps {
+                    seekable: false,
+                    len: None,
+                }
+            }
+            fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
+                None
+            }
+        }
+
         let tracked = TrackedRead {
-            inner: Box::new(ReaderSource::new(std::io::Cursor::new(packed))),
-            tracker: Arc::clone(&tracker),
+            inner: Box::new(CountingSource {
+                inner: std::io::Cursor::new(packed),
+                served: Arc::clone(&served),
+            }),
+            hit_eof: Arc::clone(&hit_eof),
         };
         let mut dec = FrameDecoder::new(tracked);
         let mut out = Vec::new();
@@ -551,10 +641,16 @@ mod tests {
             "sanity: this must still be a real, valid round trip"
         );
         assert!(
-            tracker.lock().unwrap().is_end_mark(),
-            "FrameDecoder reported clean EOF without the tracker ever observing the frame's \
-             real EndMark bytes — the whole fix in this module's EnforceEndMark depends on \
-             this being true, and it no longer is"
+            !hit_eof.load(Ordering::Relaxed),
+            "FrameDecoder touched genuine source exhaustion decoding a COMPLETE stream — the \
+             whole EOF-based discriminator in this module's EnforceEndMark depends on this \
+             never happening for a well-formed frame"
+        );
+        assert_eq!(
+            served.load(Ordering::Relaxed),
+            packed_len,
+            "expected FrameDecoder to have consumed exactly the packed stream's own bytes, no \
+             fewer and no more, without ever probing past its real end"
         );
     }
 
@@ -652,6 +748,119 @@ mod tests {
             dec.read_to_end(&mut out).is_err(),
             "truncating just the final EndMark byte (cut at {cut}) decoded without error"
         );
+    }
+
+    /// The specific payload shape that defeated the first (reverted)
+    /// EndMark fix: `incompressible()` never produces zero bytes at a
+    /// block's tail, so neither this file's other truncation test nor
+    /// property 10's own fixture ever exercised the case a second review
+    /// pass found — ordinary zero-padded content (tar members, disk images,
+    /// ELF/PE section padding, anything page-aligned) reproduces the
+    /// EndMark's own four-zero-byte pattern inside real block data, which a
+    /// byte-pattern check cannot tell apart from the genuine article. The
+    /// EOF-based discriminator this module now uses does not look at
+    /// content at all, so this sweeps the exact shape that broke the old
+    /// approach and confirms the new one does not share the defect.
+    #[test]
+    fn truncated_lz4_frame_with_zero_padded_content_is_still_rejected() {
+        const BLOCK_LEN: usize = 64 * 1024;
+        const NUM_BLOCKS: usize = 4;
+
+        // Each 64 KiB block: real, repeating text, then zero padding to
+        // fill out the rest of the block — the page/tar/ELF-alignment shape
+        // the review named, not an artificial worst case.
+        let text = b"the quick brown fox jumps over the lazy dog
+"
+        .repeat(400);
+        let mut plain = Vec::with_capacity(BLOCK_LEN * NUM_BLOCKS);
+        for _ in 0..NUM_BLOCKS {
+            let mut block = vec![0u8; BLOCK_LEN];
+            let take = text.len().min(BLOCK_LEN);
+            block[..take].copy_from_slice(&text[..take]);
+            plain.extend_from_slice(&block);
+        }
+        assert_eq!(plain.len(), BLOCK_LEN * NUM_BLOCKS);
+
+        let packed = compress(&plain);
+        assert_eq!(
+            decompress(packed.clone()),
+            plain,
+            "sanity: this must still be a real, valid round trip"
+        );
+
+        let boundaries = lz4_block_boundaries(&packed);
+        assert!(
+            boundaries.len() >= NUM_BLOCKS,
+            "expected at least {NUM_BLOCKS} block boundaries (one per block, plus the \
+             EndMark), found {}: {boundaries:?}",
+            boundaries.len()
+        );
+
+        for &boundary in &boundaries {
+            for cut in [
+                boundary.saturating_sub(2),
+                boundary.saturating_sub(1),
+                boundary,
+                boundary + 1,
+                boundary + 2,
+            ] {
+                if cut == 0 || cut >= packed.len() {
+                    continue;
+                }
+                let truncated = packed[..cut].to_vec();
+                let src: Box<dyn Source> =
+                    Box::new(ReaderSource::new(std::io::Cursor::new(truncated)));
+                let mut dec = Lz4.decoder(src, &DecodeOpts::default()).unwrap();
+                let mut out = Vec::new();
+                assert!(
+                    dec.read_to_end(&mut out).is_err(),
+                    "zero-padded fixture: cut at byte {cut} (near boundary {boundary}) decoded \
+                     without error — a byte-pattern EndMark check would have accepted this \
+                     (real content reproducing the EndMark's own zero-byte pattern); the \
+                     EOF-based one must not"
+                );
+            }
+        }
+    }
+
+    /// Walks a stream produced by THIS codec's own encoder (no checksums, no
+    /// content size, no dictionary — see `encoder`'s own `FrameInfo`) and
+    /// returns the byte offset of every block's own size-word, including the
+    /// final EndMark's. General over whether each block ended up stored raw
+    /// or compressed, unlike the arithmetic
+    /// `truncated_lz4_frame_is_rejected_at_every_block_boundary` uses —
+    /// that test's fixture is guaranteed raw (`incompressible()`), the
+    /// zero-padded one above is not.
+    fn lz4_block_boundaries(packed: &[u8]) -> Vec<usize> {
+        // FLG (byte 4) bit 3 is content_size, bit 0 is dict_id — neither is
+        // set by this codec's own encoder, but computed here rather than
+        // assumed, so a future FrameInfo change to `encoder` cannot silently
+        // desync this helper from the bytes it is parsing.
+        let flg = packed[4];
+        let mut header_len = 4 + 2 + 1; // magic + FLG/BD + HC
+        if flg & 0x08 != 0 {
+            header_len += 8; // content_size
+        }
+        if flg & 0x01 != 0 {
+            header_len += 4; // dictionary ID
+        }
+
+        let mut boundaries = Vec::new();
+        let mut pos = header_len;
+        loop {
+            assert!(
+                pos + 4 <= packed.len(),
+                "ran off the end of the stream while walking blocks"
+            );
+            boundaries.push(pos);
+            let word = u32::from_le_bytes(packed[pos..pos + 4].try_into().unwrap());
+            if word == 0 {
+                break; // EndMark
+            }
+            let len = (word & 0x7FFF_FFFF) as usize;
+            pos += 4 + len; // block_checksums off in this codec's own output
+        }
+        boundaries
     }
 
     #[test]
