@@ -15,6 +15,7 @@ deflate = ["dep:flate2"]
 bzip2 = ["dep:bzip2"]
 brotli = ["dep:brotli"]
 lz4 = ["dep:lz4_flex"]
+snappy = ["dep:snap"]
 
 [dependencies]
 stuffr-core = { workspace = true }
@@ -22,6 +23,7 @@ flate2 = { workspace = true, optional = true }
 bzip2 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 lz4_flex = { workspace = true, optional = true }
+snap = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }

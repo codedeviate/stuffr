@@ -19,4 +19,5 @@ flate2 = "1"
 bzip2 = "0.6"
 brotli = "8"
 lz4_flex = "0.14"
+snap = "1"
 clap = { version = "4", features = ["derive"] }

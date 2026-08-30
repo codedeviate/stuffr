@@ -18,6 +18,8 @@ pub mod deflate;
 pub mod gzip;
 #[cfg(feature = "lz4")]
 pub mod lz4;
+#[cfg(feature = "snappy")]
+pub mod snappy;
 #[cfg(feature = "zlib")]
 pub mod zlib;
 
@@ -48,6 +50,9 @@ pub fn register_all(registry: &mut Registry) {
 
     #[cfg(feature = "lz4")]
     registry.register_codec(std::sync::Arc::new(lz4::Lz4), lz4::meta());
+
+    #[cfg(feature = "snappy")]
+    registry.register_codec(std::sync::Arc::new(snappy::Snappy), snappy::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.

@@ -55,6 +55,43 @@ use std::io::{ErrorKind, Read, Write};
 pub(crate) const MALFORMED_AS_INVALID_INPUT_EOF: &[ErrorKind] =
     &[ErrorKind::InvalidInput, ErrorKind::UnexpectedEof];
 
+/// The `Other` + `UnexpectedEof` pair, measured independently against the
+/// `snap` crate (backing `snappy.rs`) alone. It is deliberately its OWN
+/// constant rather than a widening of [`MALFORMED_AS_INVALID_INPUT_EOF`]
+/// above: `Other` is `std::io::ErrorKind`'s generic catch-all, and folding it
+/// into the shared constant would apply it to every codec reusing that
+/// constant (currently flate2 and bzip2), most of which never raise `Other`
+/// for anything and would suddenly have a generic kind reclassified as
+/// corrupt on their behalf. A future codec whose measurement also comes back
+/// `Other` gets its own constant too, for the same reason — see that
+/// constant's doc comment.
+///
+/// Measured directly against `snap` (see the `snappy_conformance_probe` test
+/// in `snappy.rs`, sweeping every byte position of a real encoded payload,
+/// not one flip): a corrupted `.sz` frame — a bad chunk CRC32C, a bad stream
+/// identifier, an invalid chunk length, an unsupported chunk type — reaches
+/// `read::FrameDecoder`'s caller via `snap::Error`'s `From<Error> for
+/// io::Error` impl, which unconditionally wraps every variant as
+/// `io::ErrorKind::Other`. A stream truncated mid-frame instead surfaces as
+/// `UnexpectedEof`, raised by the inner `Read::read_exact` calls
+/// `FrameDecoder` makes on its source — which the frame decoder does not
+/// intercept or rewrap.
+///
+/// `Other` is safe to fold onto `InvalidData` HERE, for a reason specific to
+/// this backend rather than assumed of the generic kind in general: every
+/// decoder in this tree (this one included) passes an error surfaced by its
+/// underlying source through unchanged — `read::FrameDecoder::read` only
+/// ever constructs an `Other` error itself from `snap::Error`, via the
+/// `From` impl above; every other `io::Error` it sees (including one a
+/// misbehaving source hands it, e.g. `PermissionDenied`) is propagated by `?`
+/// with its original kind intact, never rewrapped as `Other`. So `Other`
+/// reaching this wrapper always means the `snap` decoder itself rejected the
+/// bytes as malformed, never a genuine I/O failure underneath it — see the
+/// negative test proving a real `PermissionDenied` still classifies as
+/// `Error::Io` (exit 1), not `Error::Corrupt` (exit 5).
+pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
+    &[ErrorKind::Other, ErrorKind::UnexpectedEof];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],
