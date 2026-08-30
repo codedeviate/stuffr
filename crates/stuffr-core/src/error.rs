@@ -84,7 +84,7 @@ impl Error {
     /// One rule here rather than a helper each codec calls: putting the
     /// decision in nine places means the natural code — a bare `?` on an
     /// `io::Error` — silently bypasses it, and a convention whose failure mode
-    /// is invisible is not a convention. Conformance property 8 enforces the
+    /// is invisible is not a convention. Conformance property 9 enforces the
     /// codec half, that malformed input surfaces as `InvalidData` at all.
     ///
     /// Lives in `stuffr-core` rather than in `ops` because Phase 2's containers
