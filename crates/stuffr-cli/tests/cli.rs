@@ -871,6 +871,63 @@ fn unpack_format_flag_is_honoured_not_merely_accepted() {
 }
 
 #[test]
+fn cat_format_flag_is_honoured_not_merely_accepted() {
+    // Character-for-character the gap Task 1's review found for `unpack` and
+    // closed with `unpack_format_flag_is_honoured_not_merely_accepted` above
+    // (raw deflate, undetectable by construction) — never mirrored for
+    // `cat`. `cat_accepts_an_explicit_format` uses gzip, which detection
+    // identifies anyway (its own comment admits this), so it proves
+    // `format_by_name` ran, not that its result reaches `DecompressOpts`.
+    // Replacing `format: fmt` with `format: None` in main.rs's `Command::Cat`
+    // arm would leave that test green; this one requires it to fail without
+    // --format and succeed with it, the same shape as the unpack test above.
+    let src = tmp("fmt-cat-deflate.txt");
+    let packed = tmp("fmt-cat-deflate.dat");
+    let _ = std::fs::remove_file(&packed);
+    let payload = b"the quick brown fox jumps over the lazy dog".repeat(50);
+    std::fs::write(&src, &payload).unwrap();
+
+    assert!(
+        Command::new(STF)
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "--format",
+                "deflate",
+                "-o",
+                packed.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let no_format = Command::new(STF)
+        .args(["cat", packed.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !no_format.status.success(),
+        "a raw deflate stream must NOT be detectable without --format"
+    );
+
+    let with_format = Command::new(STF)
+        .args(["cat", packed.to_str().unwrap(), "--format", "deflate"])
+        .output()
+        .unwrap();
+    assert!(
+        with_format.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_format.stderr)
+    );
+    assert_eq!(with_format.stdout, payload);
+
+    for p in [&src, &packed] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
 fn an_unknown_format_name_is_a_usage_error_on_every_verb() {
     // pack already rejected these; unpack and cat must agree rather than
     // silently ignoring a flag the user believed they had set.
