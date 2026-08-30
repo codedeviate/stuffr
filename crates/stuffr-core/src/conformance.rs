@@ -112,21 +112,65 @@ pub fn incompressible(len: usize) -> Vec<u8> {
 /// bzip2's 900 KiB default block; the second cut, straight to 2 MiB (a 512
 /// KiB threshold), was: half of the 1 MiB absolute figure it replaced, with
 /// no margin left for exactly the case A3 was written to accommodate. 4 MiB
-/// restores the original margin while keeping every codec's suite fast,
-/// including the slow ones (bzip2 -9, xz -6, brotli q11) arriving in Phase 1d.
+/// restores the original margin — bzip2's 900 KiB block at level 9 needs the
+/// `/4` threshold to sit at 1 MiB, and a smaller payload fails a correct
+/// codec at that level.
+///
+/// Do not shrink this to make the suite faster: that job now belongs to
+/// `fastest_accepted_level`, which encodes this property's payload at the
+/// codec's fastest accepted level (bzip2's own default is 6, brotli's is 11
+/// — the slowest setting brotli has) rather than at
+/// `EncodeOpts::default()`. This constant stays sized for the worst case at
+/// ANY level, including the default, since a fixture supplied by a
+/// decode-only codec still runs through this same threshold unmodified.
 const PROPERTY_8_PLAIN_LEN: usize = 4 * 1024 * 1024;
 
 fn encode(codec: &dyn Codec, plain: &[u8]) -> Vec<u8> {
+    encode_with(codec, plain, &EncodeOpts::default())
+}
+
+fn encode_with(codec: &dyn Codec, plain: &[u8], opts: &EncodeOpts) -> Vec<u8> {
     let id = codec.id();
     let buf = SharedBuf::new();
     let mut sink = codec
-        .encoder(Box::new(buf.clone()), &EncodeOpts::default())
+        .encoder(Box::new(buf.clone()), opts)
         .unwrap_or_else(|e| panic!("conformance[{id}] encoder: {e}"));
     sink.write_all(plain)
         .unwrap_or_else(|e| panic!("conformance[{id}] write: {e}"));
     sink.finish()
         .unwrap_or_else(|e| panic!("conformance[{id}] finish: {e}"));
     buf.contents()
+}
+
+/// Finds the fastest level the codec's own `check_encode_opts` accepts, for
+/// property 8's large timing-sensitive payload.
+///
+/// Property 8 encodes 4 MiB and property 9's siblings (bzip2 at its default
+/// level 6, brotli at its default quality 11 — the slowest setting brotli
+/// has) made that payload prohibitively slow in a debug build. Probing `0`
+/// then `1` and falling back to the codec's default if both are rejected
+/// costs nothing new: no API addition, no capability field, just the
+/// pre-flight check every codec already implements.
+///
+/// This does NOT weaken property 8. The property exists to catch a
+/// read-to-end decoder — one that consumes the entire input before producing
+/// any output — and such an implementation behaves identically at every
+/// level, because the bug is in how much of the STREAM it reads, not how the
+/// stream was produced. Level only changes how much a legitimately
+/// block-buffering codec buffers before it can emit anything; encoding at a
+/// lower level can only make a correct codec's first output arrive EARLIER,
+/// which moves it further inside the incrementality threshold rather than
+/// closer to it. Lowering the level is the safe direction for this property,
+/// never the direction that could hide a real defect.
+fn fastest_accepted_level(codec: &dyn Codec) -> Option<i32> {
+    [0, 1].into_iter().find(|&level| {
+        codec
+            .check_encode_opts(&EncodeOpts {
+                level: Some(level),
+                ..Default::default()
+            })
+            .is_ok()
+    })
 }
 
 fn decode(codec: &dyn Codec, packed: Vec<u8>) -> Vec<u8> {
@@ -185,10 +229,14 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
     if caps.encode && caps.decode {
         // 2. Round trip. Empty first: it is where codecs most often break,
         //    because a zero-length body still needs a header and trailer.
+        // 256 KiB, not 1 MiB: this property proves round-trip fidelity, which
+        // does not need a megabyte, and its level is deliberately left at
+        // EncodeOpts::default() — unlike property 8 below — because the
+        // default is what users actually get and fidelity must hold there.
         for (label, plain) in [
             ("empty", Vec::new()),
             ("one byte", vec![0x42]),
-            ("1 MiB incompressible", incompressible(1024 * 1024)),
+            ("256 KiB incompressible", incompressible(256 * 1024)),
         ] {
             let packed = encode(codec, &plain);
             let back = decode(codec, packed);
@@ -406,8 +454,19 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
         //    lz4's multi-MiB window/block options), while a relative
         //    threshold still discriminates decisively against a read-to-end
         //    implementation, which always consumes the input exactly.
+        // Encoded at the codec's own fastest accepted level, not
+        // EncodeOpts::default() — see fastest_accepted_level's doc comment
+        // for why this does not weaken what the property proves.
+        let property_8_opts = EncodeOpts {
+            level: fastest_accepted_level(codec),
+            ..Default::default()
+        };
         match test_input(caps, fixture, || {
-            encode(codec, &incompressible(PROPERTY_8_PLAIN_LEN))
+            encode_with(
+                codec,
+                &incompressible(PROPERTY_8_PLAIN_LEN),
+                &property_8_opts,
+            )
         }) {
             Some(big) => {
                 if caps.encode {

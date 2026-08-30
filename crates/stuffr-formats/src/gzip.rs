@@ -10,7 +10,7 @@ use stuffr_core::{
     Source, StreamOnly,
 };
 
-use crate::normalize::{FLATE2_MALFORMED, NormalizeDecodeErrors};
+use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
 pub const GZIP: FormatId = FormatId::new("gzip");
 
@@ -62,7 +62,7 @@ impl Codec for Gzip {
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             MultiGzDecoder::new(src),
-            FLATE2_MALFORMED,
+            MALFORMED_AS_INVALID_INPUT_EOF,
         ))))
     }
 

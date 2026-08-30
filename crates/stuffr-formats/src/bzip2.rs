@@ -15,7 +15,7 @@ use stuffr_core::{
     Source, StreamOnly,
 };
 
-use crate::normalize::{FLATE2_MALFORMED, NormalizeDecodeErrors};
+use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
 pub const BZIP2: FormatId = FormatId::new("bzip2");
 
@@ -69,7 +69,7 @@ impl Codec for Bzip2 {
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             MultiBzDecoder::new(src),
-            FLATE2_MALFORMED,
+            MALFORMED_AS_INVALID_INPUT_EOF,
         ))))
     }
 

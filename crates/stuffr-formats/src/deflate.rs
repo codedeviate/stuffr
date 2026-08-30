@@ -11,7 +11,7 @@ use stuffr_core::{
     StreamOnly,
 };
 
-use crate::normalize::{FLATE2_MALFORMED, NormalizeDecodeErrors};
+use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
 pub const DEFLATE: FormatId = FormatId::new("deflate");
 
@@ -55,7 +55,7 @@ impl Codec for Deflate {
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             DeflateDecoder::new(src),
-            FLATE2_MALFORMED,
+            MALFORMED_AS_INVALID_INPUT_EOF,
         ))))
     }
 
