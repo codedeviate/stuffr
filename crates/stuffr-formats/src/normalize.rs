@@ -25,6 +25,16 @@ use std::io::{ErrorKind, Read};
 /// stream that runs out mid-member is `UnexpectedEof`. Both mean the archive
 /// is not well-formed. Shared by gzip, zlib and deflate — the three codecs in
 /// this tree backed by `flate2`.
+///
+/// Also reused by bzip2, which is backed by a different crate entirely
+/// (`bzip2`, over `libbz2-rs-sys`) but was independently measured — via a
+/// throwaway test compressing data, flipping a mid-stream byte, and printing
+/// `e.kind()`, then repeating for a truncated stream — to raise exactly this
+/// same pair: `InvalidInput` ("bzip2: invalid data") for a corrupted stream
+/// and `UnexpectedEof` ("decompression not finished but EOF reached") for a
+/// truncated one. The name stays `FLATE2_MALFORMED` rather than being
+/// generalised, so a future codec whose measurement comes back different
+/// still gets its own constant instead of being tempted to bend this one.
 pub(crate) const FLATE2_MALFORMED: &[ErrorKind] =
     &[ErrorKind::InvalidInput, ErrorKind::UnexpectedEof];
 

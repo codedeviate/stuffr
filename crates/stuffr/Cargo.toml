@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["pure"]
-pure = ["stuffr-formats/gzip", "stuffr-formats/zlib", "stuffr-formats/deflate"]
+pure = ["stuffr-formats/gzip", "stuffr-formats/zlib", "stuffr-formats/deflate", "stuffr-formats/bzip2"]
 c-backed = []
 legacy = []
 full = ["pure", "c-backed", "legacy"]
