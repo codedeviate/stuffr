@@ -28,6 +28,57 @@ static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 /// generous only ever bites on something more structurally wrong.
 const MAX_TMP_ATTEMPTS: u32 = 100;
 
+/// Creates a fresh, uniquely-named temp file beside `parent`/`file_name`, at
+/// the mode this destination's carry-over case demands.
+///
+/// `exists` selects between the two modes this project cares about: 0600
+/// (`exists: true`) when a pre-existing destination's permissions are about
+/// to be carried over onto this file — closing the window between creation
+/// and that later widening, during which another local user could otherwise
+/// open the file while it is still world/group-readable and keep reading
+/// from that descriptor even after permissions are narrowed — or the
+/// ordinary umask-derived default (`exists: false`) a brand-new destination
+/// has nothing to protect and should not silently override.
+///
+/// Split out from `Output::create` specifically so this one decision is
+/// independently testable: inlined, the widening `set_permissions` call that
+/// always immediately follows whenever there is anything to carry over
+/// overwrites whatever mode creation chose, so the file's PERSISTED state by
+/// the time `Output::create` returns can never reveal which mode this
+/// function actually picked — the two would look identical to any test that
+/// only inspects `Output::create`'s result. Calling this directly, without
+/// the widening step, is what makes the choice observable at all.
+fn create_temp_file(
+    parent: &Path,
+    file_name: &str,
+    exists: bool,
+) -> Result<(PathBuf, std::fs::File)> {
+    let mut attempt = 0u32;
+    loop {
+        let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{}.{}.{}.tmp", std::process::id(), n, file_name));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if exists {
+                opts.mode(0o600);
+            }
+        }
+        match opts.open(&candidate) {
+            Ok(f) => return Ok((candidate, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+                if attempt >= MAX_TMP_ATTEMPTS {
+                    return Err(Error::from(e));
+                }
+            }
+            Err(e) => return Err(Error::from(e)),
+        }
+    }
+}
+
 /// Where bytes come from. `Stdin` is what `-` means on the command line.
 pub enum Input {
     Path(PathBuf),
@@ -179,57 +230,11 @@ impl Output {
                 // process distinct paths on the first try; `create_new`
                 // makes a collision (or leftover debris from a crashed run,
                 // or a recycled pid) a hard error instead of a silent
-                // truncate, and the bounded retry below steps over that
-                // debris rather than letting it permanently lock the
-                // destination out of being compressed to at all.
-                let (tmp, f) = {
-                    let mut attempt = 0u32;
-                    loop {
-                        let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
-                        let candidate =
-                            parent.join(format!(".{}.{}.{}.tmp", std::process::id(), n, file_name));
-                        let mut opts = std::fs::OpenOptions::new();
-                        opts.write(true).create_new(true);
-                        // Create the temp file at mode 0600 from the start,
-                        // but ONLY when there is a pre-existing destination
-                        // whose permissions get carried over below: creating
-                        // at the default `0o666 & !umask` and then widening
-                        // to match the destination afterwards leaves a
-                        // window, between creation and that later
-                        // `set_permissions` call, where another local user
-                        // can open the world/group-readable temp file and
-                        // keep reading from that descriptor even after
-                        // permissions are narrowed — a permission change
-                        // never revokes an already-open fd. Starting at 0600
-                        // closes that window.
-                        //
-                        // That reasoning has nothing to say about a BRAND-NEW
-                        // destination: there is no pre-existing mode to race
-                        // against, so the temp file's mode is simply the
-                        // user's own umask policy — exactly what `File::create`
-                        // would produce. Forcing 0600 there anyway (as this
-                        // used to) means `stf pack`/`stf unpack` silently
-                        // ignore the umask every other compressor (gzip, zstd,
-                        // xz) respects.
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::OpenOptionsExt;
-                            if exists {
-                                opts.mode(0o600);
-                            }
-                        }
-                        match opts.open(&candidate) {
-                            Ok(f) => break (candidate, f),
-                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                                attempt += 1;
-                                if attempt >= MAX_TMP_ATTEMPTS {
-                                    return Err(Error::from(e));
-                                }
-                            }
-                            Err(e) => return Err(Error::from(e)),
-                        }
-                    }
-                };
+                // truncate, and the bounded retry steps over that debris
+                // rather than letting it permanently lock the destination out
+                // of being compressed to at all. See `create_temp_file` for
+                // the mode this starts at and why.
+                let (tmp, f) = create_temp_file(&parent, &file_name, exists)?;
                 if let Some(perms) = carry_over_perms {
                     // Mask off setuid/setgid (0o6000) before applying: a
                     // destination that happened to carry either bit must
@@ -840,6 +845,47 @@ mod tests {
         );
 
         discard(opened.finish);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn carrying_over_a_destination_creates_the_temp_file_at_0600_before_any_widening() {
+        // The race `create_temp_file`'s 0600 exists to close: between
+        // creation and the later `set_permissions` widening in
+        // `Output::create`, the file must never be visible at a wider mode
+        // than 0600, or another local user could grab an fd while it is
+        // world/group-readable and keep reading from it even after
+        // permissions are narrowed.
+        //
+        // That widening ALWAYS immediately follows creation whenever there
+        // is a destination to carry permissions over from — the same
+        // `exists` flag gates both — so it always overwrites whatever mode
+        // creation chose before `Output::create` ever returns. A test that
+        // only inspects `Output::create`'s result (as
+        // `carrying_over_a_setuid_destination_masks_it_on_the_temp_file_
+        // immediately` above does, for the masking behavior specifically)
+        // cannot tell "created at 0600, then widened" from "created at the
+        // umask default, then widened to the exact same final mode" — for
+        // ANY destination mode, since chmod always applies its target
+        // exactly regardless of the file's prior mode. Calling
+        // `create_temp_file` directly, without ever letting the widening
+        // step run, is what makes the initial mode observable at all.
+        let dst = tmp("race-dst");
+        std::fs::write(&dst, b"PRE-EXISTING").unwrap();
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let parent = dst.parent().unwrap();
+        let file_name = dst.file_name().unwrap().to_string_lossy().into_owned();
+        let (tmp_path, _f) = create_temp_file(parent, &file_name, true).unwrap();
+
+        let mode = std::fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the temp file must be created at 0600 when carrying permissions over, before any \
+             widening ever runs: got {mode:o}"
+        );
+
+        let _ = std::fs::remove_file(&tmp_path);
         let _ = std::fs::remove_file(&dst);
     }
 }

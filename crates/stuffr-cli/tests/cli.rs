@@ -262,9 +262,11 @@ fn no_sync_is_accepted_by_pack_and_unpack_and_still_round_trips() {
     // Nothing previously exercised --no-sync from the CLI at all. A subprocess
     // test cannot observe the fsync itself being skipped (see
     // stuffr/tests/sync_counter.rs, in the same process as the code under
-    // test, for that); this closes the cheaper gap — that the flag parses and
-    // reaches all the way through pack and unpack without breaking a round
-    // trip, which flipping `sync: !no_sync` to `sync: no_sync` would not.
+    // test, for that) — a wrong-polarity `sync: no_sync` instead of
+    // `sync: !no_sync` would round-trip identically and this test would not
+    // catch it either. What this DOES close is the cheaper, still-real gap
+    // that nothing previously confirmed the flag even parses and reaches
+    // pack and unpack without breaking anything along the way.
     let src = tmp("nosync-e2e.txt");
     let gz = tmp("nosync-e2e.txt.gz");
     let back = tmp("nosync-e2e-back.txt");

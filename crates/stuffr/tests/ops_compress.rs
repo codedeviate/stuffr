@@ -229,49 +229,19 @@ fn a_forced_overwrite_preserves_the_destinations_permissions() {
     let _ = std::fs::remove_file(&dst);
 }
 
-#[cfg(unix)]
-#[test]
-fn overwriting_a_restrictive_destination_creates_the_temp_file_at_mode_0600() {
-    // The temp file must never be world/group-readable even for the instant
-    // between creation and the later permissions widen — otherwise another
-    // local user can open it while it is still at the default mode and keep
-    // reading from that descriptor regardless of what the permissions are
-    // set to afterwards. This can't observe the file mid-write directly, so
-    // it pins the weaker but still meaningful property: a destination whose
-    // OWN permissions are restrictive (carried over below) is the case this
-    // protects, and 0600-at-creation is right there because there IS
-    // something to race against a wider default. A brand-new destination has
-    // nothing to carry over and is a different test, below: forcing 0600
-    // there too would mean this project's own output ignores the user's
-    // umask, unlike gzip, zstd or xz.
-    use std::os::unix::fs::PermissionsExt;
-
-    let src = tmp("mode-in.txt");
-    let dst = tmp("mode-out.gz");
-    std::fs::write(&src, b"payload").unwrap();
-    std::fs::write(&dst, b"PRE-EXISTING").unwrap();
-    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-    compress(
-        Input::Path(src.clone()),
-        Output::Path(dst.clone()),
-        &CompressOpts {
-            force: true,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-
-    let mode = std::fs::metadata(&dst).unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        mode, 0o600,
-        "carrying over a restrictive destination's permissions must never widen them, even \
-         for the instant before the carry-over set_permissions call runs"
-    );
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&dst);
-}
+// The test formerly here (asserting the DESTINATION's final mode after a
+// restrictive-permissions carry-over) was a byte-for-byte duplicate of
+// `a_forced_overwrite_preserves_the_destinations_permissions` above: both
+// check exactly the same thing, which the carry-over `set_permissions` call
+// guarantees on its own regardless of what mode the temp file started at.
+// Mutation-verified: removing `create_temp_file`'s `opts.mode(0o600)` left
+// this test green, because the widening step that always immediately
+// follows overwrites the temp file's mode before `Output::create` ever
+// returns — the race the 0600-at-creation exists to close cannot be
+// observed from the destination's final state at all. The test that
+// actually pins it, `carrying_over_a_destination_creates_the_temp_file_at_
+// 0600_before_any_widening` in `ops.rs`, calls `create_temp_file` directly,
+// without letting the widening step run.
 
 #[cfg(unix)]
 #[test]
