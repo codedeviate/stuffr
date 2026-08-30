@@ -59,14 +59,21 @@ impl Codec for Lz4 {
             // decoded fine is not a contradiction with detecting truncation
             // just fine (below).
             detects_corruption: false,
-            // Not measured: derived from the block size lz4_flex's
-            // `BlockSize::Auto` can select for a single large write —
-            // `from_buf_length` tops out at `Max4MB` (4 MiB) once the first
-            // write exceeds 256 KiB — with independent block mode (the
-            // default) sizing both the encoder's `src`/`dst` buffers and the
-            // decoder's `src`/`dst` buffers to roughly that block size each.
-            // 8 MiB is a defensible round figure for "two buffers around a 4
-            // MiB block", not a profiled number.
+            // Not measured: derived from the DECODE side, not the encode
+            // side this codec actually uses. `encoder` below pins the block
+            // size this codec ever PRODUCES to `Max64KB` (see its own doc
+            // comment) — every stream this codec writes therefore works a
+            // ~128 KiB region (independent block mode sizes both the
+            // encoder's `src` and `dst` buffers to roughly the block size
+            // each). But `decoder` above accepts any conformant `.lz4` file,
+            // including one produced by another encoder entirely — lz4_flex
+            // itself, at default settings, or another implementation
+            // altogether — which is free to use up to `BlockSize::Max4MB`
+            // (4 MiB), the frame format's own ceiling. A decoder must size
+            // for the input it might be asked to handle, not the input this
+            // codec happens to produce. 8 MiB is a defensible round figure
+            // for "two buffers around a 4 MiB block" on that basis, not a
+            // profiled number.
             memory_per_worker: Some(8 * 1024 * 1024),
             ..CodecCaps::round_trip()
         }
@@ -112,6 +119,21 @@ impl Codec for Lz4 {
     /// `write` call. Content and block checksums stay off either way — this
     /// only changes the block-size field, not the ones `caps()`'s corruption
     /// measurement depends on.
+    ///
+    /// `Max64KB` specifically, not merely "small enough to pass property
+    /// 8" — property 8's threshold is `big_len / 4`, a full 1 MiB against
+    /// its 4 MiB payload, so anything up to `Max1MB` would ALSO have
+    /// satisfied the test; the test did not force this particular value.
+    /// lz4 is chosen in this tree for streaming latency rather than
+    /// compression ratio, and `Max64KB` is the streaming argument taken to
+    /// its natural size: a container reading this codec's own output
+    /// incrementally — `stf cat huge.lz4 | head`, say — sees its first
+    /// bytes after one 64 KiB block decodes, not after a 1 MiB (or 4 MiB)
+    /// block does. The flip side is real and worth naming rather than
+    /// hiding: a smaller block also shrinks the LZ77 match window, so data
+    /// with redundancy spread out further than 64 KiB compresses worse here
+    /// than it would at a larger block size — a real ratio cost this codec
+    /// accepts deliberately, for latency, not a free choice.
     fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
         self.check_encode_opts(o)?;
         let frame_info = FrameInfo::new().block_size(BlockSize::Max64KB);
