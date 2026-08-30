@@ -16,6 +16,8 @@ pub mod bzip2;
 pub mod deflate;
 #[cfg(feature = "gzip")]
 pub mod gzip;
+#[cfg(feature = "lz4")]
+pub mod lz4;
 #[cfg(feature = "zlib")]
 pub mod zlib;
 
@@ -43,6 +45,9 @@ pub fn register_all(registry: &mut Registry) {
 
     #[cfg(feature = "brotli")]
     registry.register_codec(std::sync::Arc::new(brotli::Brotli), brotli::meta());
+
+    #[cfg(feature = "lz4")]
+    registry.register_codec(std::sync::Arc::new(lz4::Lz4), lz4::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.

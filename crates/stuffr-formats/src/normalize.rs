@@ -109,34 +109,31 @@ impl<W> CaptureWriteError<W> {
     pub(crate) fn take_error(&mut self) -> Option<std::io::Error> {
         self.first.take()
     }
+
+    /// Records `e` as the first observed error if none has been recorded yet,
+    /// then hands back an equivalent error for the immediate caller.
+    ///
+    /// `io::Error` is not `Clone`, so both the stashed copy and the returned
+    /// one are built from the same `(kind, message)` pair rather than sharing
+    /// one value. Shared by `write` and `flush` — both call sites were
+    /// otherwise identical but for which method's `Err` they were reacting
+    /// to.
+    fn record(&mut self, e: std::io::Error) -> std::io::Error {
+        let kind = e.kind();
+        let msg = e.to_string();
+        if self.first.is_none() {
+            self.first = Some(std::io::Error::new(kind, msg.clone()));
+        }
+        std::io::Error::new(kind, msg)
+    }
 }
 
 impl<W: Write> Write for CaptureWriteError<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self.inner.write(buf) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                let kind = e.kind();
-                let msg = e.to_string();
-                if self.first.is_none() {
-                    self.first = Some(std::io::Error::new(kind, msg.clone()));
-                }
-                Err(std::io::Error::new(kind, msg))
-            }
-        }
+        self.inner.write(buf).map_err(|e| self.record(e))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        match self.inner.flush() {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let kind = e.kind();
-                let msg = e.to_string();
-                if self.first.is_none() {
-                    self.first = Some(std::io::Error::new(kind, msg.clone()));
-                }
-                Err(std::io::Error::new(kind, msg))
-            }
-        }
+        self.inner.flush().map_err(|e| self.record(e))
     }
 }
