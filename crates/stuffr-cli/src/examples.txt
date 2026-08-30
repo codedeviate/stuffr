@@ -106,9 +106,14 @@ WHAT THIS BUILD CAN DO
 
   stf formats
       Lists the formats compiled into THIS binary, not everything stf will
-      ever support. A build with the `zstd-c` feature (needs a C toolchain)
-      has eight rows: gzip, zlib, deflate, bzip2, brotli, lz4, snappy and
-      zstd. A pure-Rust build without it has the first seven.
+      ever support. Every build has eight rows: gzip, zlib, deflate, bzip2,
+      brotli, lz4, snappy and zstd. zstd's row differs by which backend
+      compiled in: a build with the `zstd-c` feature (needs a C toolchain)
+      shows `yes` in WRITE, using the real `libzstd`; a pure-Rust build
+      falls back to `ruzstd` instead, and shows `weak` in WRITE — see
+      "USING A WEAK FALLBACK ENCODER" below. Either way the format still
+      reads `.zst` unconditionally; only writing it without the C backend
+      needs the flag.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -133,14 +138,19 @@ SKIPPING THE DURABILITY FSYNC
 
 USING A WEAK FALLBACK ENCODER
 
-  stf pack big.dat --format xz --allow-weak-encoder
-      Some formats in this build may have only a fallback encoder in place
-      of the format's real one, in a build with no C toolchain. The output
-      is a valid file of that format, but much larger than the format's
-      usual encoder would produce, and it buffers the whole input in
-      memory — unsuitable for large files. pack refuses such an encoder
-      unless this flag is given; run `stf formats` to see which codecs in
-      THIS build are affected (WRITE shows `weak` rather than `yes`).
+  stf pack big.dat --format zstd --allow-weak-encoder
+      A build with no C toolchain writes `.zst` through `ruzstd`, a
+      pure-Rust fallback, instead of the reference `libzstd`. The output is
+      valid zstd any tool can read, but markedly larger — measured at 3.53x
+      on an 11.7 MB corpus where the C backend's default reaches 6.21x
+      (files 76% larger) — and slower (969ms against 118ms in that same
+      measurement), and it buffers the whole input in memory rather than
+      streaming it, unsuitable for large files. pack refuses such an
+      encoder unless this flag is given; run `stf formats` to see which
+      codecs in THIS build are affected (WRITE shows `weak` rather than
+      `yes`). Rebuild with `--features c-backed` to remove the limitation.
+      Some other formats in this build may have the same shape once a
+      future phase adds their own pure-Rust fallback (xz, LZMA1).
 
 
 EXIT CODES
@@ -157,9 +167,12 @@ EXIT CODES
 
 NOT YET
 
-  This build has eight codecs with a C toolchain (gzip, zlib, deflate,
-  bzip2, brotli, lz4, snappy and zstd) or seven without one (everything but
-  zstd). zstd's pure-Rust fallback, xz and LZMA1 arrive later in Phase 1e.
+  This build has eight codecs either way: gzip, zlib, deflate, bzip2,
+  brotli, lz4, snappy and zstd — the last through the real `libzstd` with
+  a C toolchain (`--features c-backed`) or the pure-Rust `ruzstd` fallback
+  without one (see "USING A WEAK FALLBACK ENCODER" above). xz and LZMA1
+  arrive later in Phase 1e, each expected to follow the same pattern: a
+  real encoder behind `c-backed`, a weak pure-Rust fallback without it.
   No archive containers (tar, zip, ...) exist yet — Phase 2. `stf formats`
   always tells you the truth about the build you are actually running,
   whatever this page says.

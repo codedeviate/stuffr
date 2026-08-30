@@ -1,9 +1,27 @@
+use stuffr::FormatId;
 use stuffr::ops::{CompressOpts, Input, Output, compress};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("stf-1b-{}-{}", std::process::id(), name));
     p
+}
+
+/// Looks the id up in the real registry rather than constructing a
+/// `FormatId` directly — see `ops_decompress.rs`'s identical helper for why.
+///
+/// Only consumed by `a_pure_build_reads_zstd_and_writes_it_only_on_request`,
+/// which is itself gated on `zstd-pure` without `zstd-c` — so under
+/// `--all-features` (both backends on) that test does not compile in and
+/// this helper would otherwise be flagged dead code.
+#[allow(dead_code)]
+fn fmt(name: &str) -> FormatId {
+    stuffr::registry()
+        .matrix()
+        .into_iter()
+        .find(|row| row.id.as_str() == name)
+        .unwrap_or_else(|| panic!("format `{name}` is not registered in this build"))
+        .id
 }
 
 #[test]
@@ -558,4 +576,69 @@ fn a_caller_supplied_registry_is_the_one_that_is_used() {
     assert!(!dst.exists(), "nothing should have been written");
 
     let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn this_build_registers_exactly_one_backend_per_format() {
+    // zstd_c and zstd_pure share a FormatId, so a registry with both would
+    // silently keep whichever registered last. This asserts the cfg arms in
+    // `stuffr_formats::register_all` are genuinely exclusive rather than
+    // accidentally both-or-neither.
+    let reg = stuffr::registry();
+    let zstd_rows: Vec<_> = reg
+        .matrix()
+        .into_iter()
+        .filter(|r| r.id.as_str() == "zstd")
+        .collect();
+    assert!(
+        zstd_rows.len() <= 1,
+        "zstd registered {} times",
+        zstd_rows.len()
+    );
+}
+
+#[test]
+#[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
+fn a_pure_build_reads_zstd_and_writes_it_only_on_request() {
+    // Reading is unconditional: opening a .zst must never need a flag.
+    let reg = stuffr::registry();
+    let id = fmt("zstd");
+    assert!(reg.require_decoder(id).is_ok());
+    assert!(
+        reg.require_encoder(id).is_ok(),
+        "ruzstd can encode, so the codec is not decode-only"
+    );
+
+    let src = tmp("zpure-in.txt");
+    std::fs::write(&src, b"payload".repeat(500)).unwrap();
+    let dst = tmp("zpure-out.zst");
+    let _ = std::fs::remove_file(&dst);
+
+    // Refused by default, naming the flag and the rebuild.
+    let o = CompressOpts {
+        format: Some(id),
+        ..Default::default()
+    };
+    let err = compress(Input::Path(src.clone()), Output::Path(dst.clone()), &o).unwrap_err();
+    assert_eq!(err.exit_code(), 2, "consent is a usage matter: {err}");
+    assert!(
+        err.to_string().contains("--allow-weak-encoder"),
+        "must name the flag: {err}"
+    );
+    assert!(
+        !dst.exists(),
+        "a refused compress must not have touched the destination"
+    );
+
+    // Written on request, and the result is real zstd this build can read back.
+    let o = CompressOpts {
+        format: Some(id),
+        allow_weak_encoder: true,
+        ..Default::default()
+    };
+    compress(Input::Path(src.clone()), Output::Path(dst.clone()), &o).unwrap();
+    assert!(dst.exists());
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
 }

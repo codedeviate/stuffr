@@ -21,4 +21,19 @@ brotli = "8"
 lz4_flex = "0.14"
 snap = "1"
 zstd = "0.13"
+# Exact-pinned, not a caret range, and pinned BELOW `cargo add`'s own pick.
+# `cargo add ruzstd` refuses 0.9.0 and 0.8.3 outright (both declare
+# `rust-version = "1.87"`, above this workspace's 1.85) and lands on 0.8.2 —
+# but 0.8.2 does not actually build on 1.85: it declares no `rust-version`
+# at all, yet its `bit_io`/`fse`/`huff0` modules call the unsigned
+# `is_multiple_of` stdlib method, stabilised in 1.87. Cargo's MSRV-aware
+# resolver only reads the declared field, so it cannot see this and picks
+# 0.8.2 anyway; `rustup run 1.85.0 cargo check --workspace --all-features`
+# is what actually caught it. 0.8.1 predates that call and genuinely builds
+# on 1.85, confirmed the same way — an ordinary "0.8.1" (caret) requirement
+# would still let `cargo update` float back up to the broken 0.8.2, so this
+# is `=0.8.1` rather than a range. Bumping this crate's MSRV would be the
+# natural way to move past it once 0.9.0's API (verified identical to
+# 0.8.1/0.8.2 for everything zstd_pure.rs uses) is worth requiring 1.87 for.
+ruzstd = "=0.8.1"
 clap = { version = "4", features = ["derive"] }

@@ -353,6 +353,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruzstd"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3640bec8aad418d7d03c72ea2de10d5c646a598f9883c7babc160d91e3c1b26c"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -458,6 +467,7 @@ dependencies = [
  "bzip2",
  "flate2",
  "lz4_flex",
+ "ruzstd",
  "snap",
  "stuffr-core",
  "zstd",

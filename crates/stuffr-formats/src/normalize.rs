@@ -138,6 +138,33 @@ pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 pub(crate) const ZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
+/// The `Other` + `UnexpectedEof` pair, measured independently against
+/// `ruzstd` 0.8.1 (backing `zstd_pure.rs` — see its module doc for why this
+/// version specifically, not the newer ones) — a wholly different
+/// implementation of the same format, so this is its own constant rather
+/// than a reuse of [`ZSTD_MALFORMED_AS_OTHER_EOF`] on the strength of a
+/// shared format alone; see that constant's doc for the reasoning this
+/// mirrors, and `zstd_pure.rs`'s corruption-sweep tests for the sweep this
+/// was measured against, on both a stream `ruzstd` itself wrote and one the
+/// C backend wrote.
+///
+/// `StreamingDecoder::read` (`ruzstd::decoding::streaming_decoder`) wraps
+/// every error its own `decode_blocks` call raises as `io::Error::other`
+/// (`std::io::ErrorKind::Other`) — unconditionally, regardless of what kind
+/// of malformation `decode_blocks` detected. Construction
+/// (`StreamingDecoder::new`, which parses the frame header eagerly) raises
+/// a `FrameDecoderError` rather than an `io::Error` at all; `zstd_pure.rs`'s
+/// `LazyRuzstdDecoder` defers that call to the first `read` and turns a
+/// construction failure into `io::ErrorKind::InvalidData` directly — see
+/// its own doc for why deferring is necessary at all. Only a genuine I/O
+/// failure reading the underlying SOURCE (a real disk error, or the source
+/// simply running out of bytes — `UnexpectedEof`, propagated by `?` with
+/// its kind intact rather than reconstructed) reaches the caller as
+/// anything other than `Other` or the `InvalidData` this module's own
+/// `LazyRuzstdDecoder` already produces directly.
+pub(crate) const RUZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
+    &[ErrorKind::Other, ErrorKind::UnexpectedEof];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],

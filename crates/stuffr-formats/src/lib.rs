@@ -26,6 +26,8 @@ pub mod snappy;
 pub mod zlib;
 #[cfg(feature = "zstd-c")]
 pub mod zstd_c;
+#[cfg(feature = "zstd-pure")]
+pub mod zstd_pure;
 
 /// Registers every format enabled in this build.
 pub fn register_all(registry: &mut Registry) {
@@ -58,11 +60,16 @@ pub fn register_all(registry: &mut Registry) {
     #[cfg(feature = "snappy")]
     registry.register_codec(std::sync::Arc::new(snappy::Snappy), snappy::meta());
 
-    // Task 3 adds the mutually exclusive `zstd-pure` arm here (`cfg(all(
-    // feature = "zstd-pure", not(feature = "zstd-c")))`), so a build with
-    // neither C toolchain nor `zstd-c` still opens `.zst` at a lower rung.
+    // Mutually exclusive: both arms register the same FormatId (see
+    // `zstd_shared`), so only one may ever be active. `not(feature =
+    // "zstd-c")` is what makes the C backend win when both are compiled —
+    // without it, a build with both features on would register `zstd` twice
+    // and silently keep whichever happened to register last. A build with
+    // neither feature has no `zstd` row at all.
     #[cfg(feature = "zstd-c")]
     registry.register_codec(std::sync::Arc::new(zstd_c::Zstd), zstd_c::meta());
+    #[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
+    registry.register_codec(std::sync::Arc::new(zstd_pure::Zstd), zstd_pure::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.
