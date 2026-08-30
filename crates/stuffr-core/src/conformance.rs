@@ -58,8 +58,13 @@
 //! 10. Truncated input is rejected. Unlike property 9, nothing can switch
 //!     this off: every framed format detects premature EOF regardless of
 //!     checksum, so a codec failing this should either detect truncation or
-//!     be reconsidered — a raw, unframed stream that fails here honestly has
-//!     no `detects_corruption: true` to claim anyway.
+//!     be reconsidered. This is not the same guarantee as property 9's: even
+//!     a raw, unframed stream can often still catch truncation structurally
+//!     — raw deflate has no checksum (so corruption decodes to silently wrong
+//!     bytes, property 9's exact gap) but its `BFINAL` bit means a stream cut
+//!     short before the final block surfaces as `UnexpectedEof` anyway. That
+//!     split — truncation catchable without any checksum, corruption not —
+//!     is exactly why the two properties are gated differently.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -89,12 +94,27 @@ pub fn incompressible(len: usize) -> Vec<u8> {
 /// The plaintext size property 8 encodes when the codec can encode its own
 /// input.
 ///
-/// Shrunk from Phase 1b's 8 MiB: the relative threshold (see property 8)
-/// discriminates against a read-to-end decoder regardless of absolute size,
-/// so the payload only needs to stay comfortably incompressible, not huge.
-/// Smaller keeps every codec's suite fast, including the slow ones (bzip2 -9,
-/// xz -6, brotli q11) arriving in Phase 1d.
-const PROPERTY_8_PLAIN_LEN: usize = 2 * 1024 * 1024;
+/// 4 MiB, with the relative `/4` threshold (see property 8) giving a 1 MiB
+/// discrimination margin — the same absolute figure Phase 1b used, now
+/// derived from a stream instead of hardcoded, so it moves if the stream
+/// does. A codec whose block or window is larger than this payload can never
+/// pass property 8 by construction, no matter how genuinely incremental its
+/// decoder is: the whole stream fits in under one block, so nothing can
+/// arrive before the last byte does. If Phase 1d adds a codec configured
+/// with a block that large (lz4 supports up to 4 MiB, though its own default
+/// is 64 KiB), the payload here is the knob to turn, not the property — see
+/// the threshold-too-small guard below, which says so at the point it would
+/// otherwise look like a codec defect.
+///
+/// Shrunk once already from Phase 1b's 8 MiB. That earlier attempt paired an
+/// 8 MiB payload with a `/4` divisor for a 2 MiB threshold — WIDER than
+/// today's 1 MiB, not narrower, so it was never actually a regression against
+/// bzip2's 900 KiB default block; the second cut, straight to 2 MiB (a 512
+/// KiB threshold), was: half of the 1 MiB absolute figure it replaced, with
+/// no margin left for exactly the case A3 was written to accommodate. 4 MiB
+/// restores the original margin while keeping every codec's suite fast,
+/// including the slow ones (bzip2 -9, xz -6, brotli q11) arriving in Phase 1d.
+const PROPERTY_8_PLAIN_LEN: usize = 4 * 1024 * 1024;
 
 fn encode(codec: &dyn Codec, plain: &[u8]) -> Vec<u8> {
     let id = codec.id();
@@ -138,12 +158,15 @@ fn test_input(
     }
 }
 
-fn skip_no_fixture(id: crate::format::FormatId, property: u32) {
-    eprintln!(
-        "conformance[{id}] property {property}: skipped — this codec cannot encode its own \
-         test input and no fixture was supplied; pass one via assert_codec_conforms_with"
-    );
+/// Reports a skipped property visibly rather than silently doing nothing —
+/// every skip in this harness goes through here, whatever the reason, so a
+/// Phase 1d author sees *why* a property did not run instead of a quiet pass.
+fn skip(id: crate::format::FormatId, property: u32, reason: &str) {
+    eprintln!("conformance[{id}] property {property}: skipped — {reason}");
 }
+
+const NO_FIXTURE: &str = "this codec cannot encode its own test input and no fixture was \
+                           supplied; pass one via assert_codec_conforms_with";
 
 /// Asserts every conformance property that applies to `codec`, using `fixture`
 /// as the encoded test input for a codec that cannot encode its own — see the
@@ -369,7 +392,7 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
                     "conformance[{id}] property 7: decoder claims seekable without frame_index"
                 );
             }
-            None => skip_no_fixture(id, 7),
+            None => skip(id, 7, NO_FIXTURE),
         }
 
         // 8. Decoding is incremental, not read-to-end. Peak heap is not
@@ -395,6 +418,22 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
                     );
                 }
                 let big_len = big.len() as u64;
+                let threshold = big_len / 4;
+                if threshold == 0 {
+                    // Not a codec defect: the stream itself is too small for
+                    // ANY threshold to be satisfiable — `consumed` can never
+                    // be negative, so `consumed < 0` would reject every
+                    // decoder, incremental or not. This is a sizing problem
+                    // with the payload (or, for a decode-only codec, the
+                    // fixture passed to assert_codec_conforms_with) — raise
+                    // PROPERTY_8_PLAIN_LEN or pass a bigger fixture.
+                    panic!(
+                        "conformance[{id}] property 8: the encoded stream is only {big_len} \
+                         bytes long, so big_len/4 rounds down to 0 and no decoder could ever \
+                         satisfy this threshold — this names a sizing problem with the \
+                         payload/fixture, not the codec"
+                    );
+                }
 
                 struct Metered {
                     inner: std::io::Cursor<Vec<u8>>,
@@ -436,7 +475,6 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
                     "conformance[{id}] property 8: decoder produced no output"
                 );
                 let consumed = served.load(Ordering::Relaxed);
-                let threshold = big_len / 4;
                 assert!(
                     consumed < threshold,
                     "conformance[{id}] property 8: first output arrived only after reading \
@@ -444,7 +482,7 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
                      implementation looks exactly like this"
                 );
             }
-            None => skip_no_fixture(id, 8),
+            None => skip(id, 8, NO_FIXTURE),
         }
 
         // Shared base for properties 9 and 10: a modest incompressible
@@ -480,7 +518,7 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
                         ),
                     }
                 }
-                None => skip_no_fixture(id, 9),
+                None => skip(id, 9, NO_FIXTURE),
             }
         }
 
@@ -488,14 +526,20 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
         //     detects_corruption: no declaration can switch this one off. The
         //     incentive on a red property 9 at 11pm is to flip
         //     detects_corruption to false, and the only consequence used to
-        //     be that property 9 disappeared. A framed format detects
-        //     premature EOF regardless of checksum — gzip, zstd, bzip2, xz,
-        //     brotli, lz4 frame and framed snappy all do. A raw, unframed
-        //     stream honestly does not, and honestly fails here — the right
-        //     outcome for a format that would have declared
-        //     detects_corruption: false anyway.
+        //     be that property 9 disappeared. Even a codec with no checksum
+        //     at all often still catches this structurally — see the module
+        //     doc's note on raw deflate's BFINAL bit — so a codec failing
+        //     property 10 should detect truncation or be reconsidered, not
+        //     assumed exempt because it is also exempt from property 9.
         match &corruption_input {
-            Some(base) if !base.is_empty() => {
+            Some(base) if base.is_empty() => {
+                skip(
+                    id,
+                    10,
+                    "the encoded stream/fixture is empty; nothing to truncate",
+                );
+            }
+            Some(base) => {
                 let mid = base.len() / 2;
                 let truncated = base[..mid].to_vec();
                 let src: Box<dyn Source> =
@@ -510,8 +554,7 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
                      codec failing this should either detect truncation or be reconsidered"
                 );
             }
-            Some(_) => {}
-            None => skip_no_fixture(id, 10),
+            None => skip(id, 10, NO_FIXTURE),
         }
     }
 }
@@ -525,6 +568,42 @@ pub fn assert_codec_conforms(codec: &dyn Codec, meta: &FormatMeta) {
     assert_codec_conforms_with(codec, meta, None)
 }
 
+/// Runs `assert_codec_conforms` and asserts it panics with a message
+/// containing `expected` — not merely that it panics at all.
+///
+/// `catch_unwind` alone proves nothing about *which* property fired: every
+/// codec here shares one property (10, truncation, unconditional on
+/// `caps.decode`) that a bare, unframed double cannot satisfy, so a test that
+/// only checked `result.is_err()` would pass even when the property it names
+/// was never actually exercised — mutating it away left the suite green.
+/// Checking the panic's own message is what ties each test back to the one
+/// property it claims to cover.
+#[cfg(test)]
+fn assert_panics_naming(codec: &dyn Codec, meta: &FormatMeta, expected: &str) {
+    let id = codec.id();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_codec_conforms(codec, meta);
+    }));
+    match result {
+        Ok(()) => panic!(
+            "conformance[{id}]: expected assert_codec_conforms to panic naming {expected:?}, \
+             but it passed"
+        ),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>");
+            assert!(
+                message.contains(expected),
+                "conformance[{id}]: panicked, but the message did not mention {expected:?}: \
+                 {message}"
+            );
+        }
+    }
+}
+
 /// A minimally FRAMED double, built only to prove the harness's full property
 /// set — including 9 and 10, which need an actual integrity check — can be
 /// satisfied by a well-behaved codec.
@@ -532,12 +611,14 @@ pub fn assert_codec_conforms(codec: &dyn Codec, meta: &FormatMeta) {
 /// `testing::MockCodec` stays a bare XOR pass-through: dozens of unrelated
 /// tests (governor, ladder, container) rely on it being exactly that, with no
 /// framing to get in the way. Property 10 is unconditional on any
-/// decode-capable codec (see its module docs), and a bare XOR stream — like
-/// the raw deflate the module docs describe — has no way to notice its input
-/// was cut short, so `MockCodec` itself can no longer be the "conforms to
-/// everything" fixture once property 10 exists. `FramedMock` is that fixture
-/// instead, kept local to this test module so the change carries no weight
-/// anywhere else.
+/// decode-capable codec (see its module docs), and a bare XOR stream has no
+/// way to notice its input was cut short, so `MockCodec` itself can no longer
+/// be the "conforms to everything" fixture once property 10 exists.
+/// `FramedMock` is that fixture instead, kept local to this test module so
+/// the change carries no weight anywhere else. `MockCodec` remains useful as
+/// the harness's second shape — see `mock_codec_clears_every_property_up_to_
+/// truncation` below — one that is well-behaved everywhere EXCEPT the one
+/// property framing actually buys.
 ///
 /// Wire format: XOR(payload) followed by a 4-byte big-endian checksum of the
 /// XORed bytes — the same shape a real codec's CRC trailer takes, just with a
@@ -702,18 +783,39 @@ mod tests {
     use framed_mock::FramedMock;
 
     #[test]
-    fn the_mock_codec_conforms() {
-        // MockCodec registers no magic, so property 3 is skipped on evidence
-        // rather than waived. That is the point of running the harness against
-        // two shapes: one that satisfies every property and one that honestly
-        // does not. MockCodec's own bare XOR stream has no framing, so it
-        // cannot pass property 10 (truncation, unconditional — see the module
-        // docs); FramedMock stands in as the fully-conforming shape.
+    fn framed_mock_conforms_to_every_property() {
+        // FramedMock is the fully-conforming shape: a real trailer gives it
+        // both an integrity check (property 9) and truncation detection
+        // (property 10), so assert_codec_conforms should raise nothing at
+        // all. MockCodec — the harness's OTHER reference shape, honestly
+        // missing that framing — is exercised separately below, in
+        // mock_codec_clears_every_property_up_to_truncation.
         assert_codec_conforms(&FramedMock, &FormatMeta::codec(MOCK_CODEC, &["mock"], &[]));
     }
 
     #[test]
-    fn a_codec_conforms_when_only_one_of_several_registered_magics_matches() {
+    fn mock_codec_clears_every_property_up_to_truncation() {
+        // MockCodec is a bare XOR pass-through: no magic (property 3 skips on
+        // evidence), no trailer (property 5's skip-on-measurement branch —
+        // finish() emits nothing extra, so the branch never fires), and
+        // detects_corruption: false (property 9's skip-on-declaration
+        // branch). Asserting it panics naming property 10 SPECIFICALLY — not
+        // any earlier property — is what proves it clears 1 through 9
+        // cleanly, including both skip branches: a wrongly-firing property 5
+        // or 9 would name itself in the message instead of 10.
+        //
+        // This is the harness's second reference shape, restored: a codec
+        // that is well-behaved everywhere except where framing genuinely
+        // matters, same as raw deflate would be.
+        assert_panics_naming(
+            &MockCodec,
+            &FormatMeta::codec(MOCK_CODEC, &["mock"], &[]),
+            "property 10",
+        );
+    }
+
+    #[test]
+    fn framed_mock_conforms_when_only_one_of_several_registered_magics_matches() {
         // The direct regression test for A1: lz4 registers a frame magic AND
         // a legacy-frame magic; zstd has a legacy magic. Property 3 must
         // accept a codec whose output matches at least one registered rule,
@@ -738,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn a_decode_only_codec_is_tested_from_a_fixture() {
+    fn a_decode_only_codec_wrapping_framed_mock_is_tested_from_a_fixture() {
         // The motivating shape: the pure-Rust zstd/xz fallbacks from spec
         // §1.3, which can decode but not encode. Build a fixture the normal
         // way (through the real encoder), then hand the harness only the
@@ -824,28 +926,27 @@ mod tests {
 /// this project has spent two phases hunting — A1 (property 3's ANY-vs-EVERY
 /// bug) shipped because nothing exercised property 3's loop semantics. Each
 /// test here builds a codec that breaks exactly one property and asserts,
-/// via `catch_unwind`, that `assert_codec_conforms` panics on it. Every
-/// broken codec delegates to `MockCodec` for everything except the one thing
-/// it deliberately gets wrong.
+/// via [`assert_panics_naming`], that `assert_codec_conforms` panics
+/// specifically naming that property — not merely that it panics at all.
+/// That distinction matters here more than almost anywhere else: every
+/// broken codec below shares `MockCodec`'s bare, unframed wire format, which
+/// means every one of them ALSO fails property 10 (truncation, unconditional
+/// — see the module docs). A bare `result.is_err()` check cannot tell "failed
+/// for the property this test names" from "failed for property 10 because
+/// the property this test names was silently never reached" — which is
+/// exactly how a deleted property 2 or 9 check went unnoticed here before.
+///
+/// Every broken codec delegates to `MockCodec` for everything except the one
+/// thing it deliberately gets wrong; two of them (properties 4 and 5) must
+/// delegate the ENCODE path through `MockCodec.encoder` specifically, or the
+/// missing XOR breaks round-trip as a side effect and property 2 fires first
+/// instead of the property each test actually names.
 #[cfg(test)]
 mod broken_codecs {
     use super::*;
     use crate::archive::Sink;
     use crate::format::{FormatId, MagicRule};
     use crate::testing::{MOCK_CODEC, MockCodec};
-    use std::panic::catch_unwind;
-
-    fn conforms_panics(codec: &dyn Codec, meta: &FormatMeta) {
-        let id = codec.id();
-        let result = catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert_codec_conforms(codec, meta);
-        }));
-        assert!(
-            result.is_err(),
-            "conformance[{id}]: expected assert_codec_conforms to panic on a broken codec, \
-             but it passed"
-        );
-    }
 
     fn mock_meta(magics: &'static [MagicRule]) -> FormatMeta {
         FormatMeta::codec(MOCK_CODEC, &["mock"], magics)
@@ -892,7 +993,7 @@ mod broken_codecs {
 
     #[test]
     fn broken_round_trip_is_caught() {
-        conforms_panics(&BrokenRoundTrip, &mock_meta(&[]));
+        assert_panics_naming(&BrokenRoundTrip, &mock_meta(&[]), "property 2");
     }
 
     #[test]
@@ -913,24 +1014,28 @@ mod broken_codecs {
                 format: MOCK_CODEC,
             },
         ];
-        conforms_panics(&MockCodec, &mock_meta(MAGICS));
+        assert_panics_naming(&MockCodec, &mock_meta(MAGICS), "property 3");
     }
 
-    /// Breaks property 4: finish() never flushes the underlying writer.
+    /// Breaks property 4: finish() never flushes the underlying writer. Wraps
+    /// `MockCodec`'s own `Sink` (not `dst` directly) so writes are still
+    /// correctly XORed — only the finish/flush step is broken, not
+    /// round-trip.
     struct BrokenFlush;
 
-    struct NoFlushSink(Box<dyn Write + Send>);
+    struct NoFlushSink(Box<dyn Sink>);
     impl Write for NoFlushSink {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             self.0.write(b)
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+            self.0.flush()
         }
     }
     impl Sink for NoFlushSink {
         fn finish(self: Box<Self>) -> crate::Result<()> {
-            // BUG: never calls self.0.flush().
+            // BUG: never calls self.0.finish(), so the underlying writer's
+            // flush() (which MockCodec's own finish() performs) never runs.
             Ok(())
         }
     }
@@ -948,22 +1053,28 @@ mod broken_codecs {
         fn encoder(
             &self,
             dst: Box<dyn Write + Send>,
-            _o: &EncodeOpts,
+            o: &EncodeOpts,
         ) -> crate::Result<Box<dyn Sink>> {
-            Ok(Box::new(NoFlushSink(dst)))
+            Ok(Box::new(NoFlushSink(MockCodec.encoder(dst, o)?)))
         }
     }
 
     #[test]
     fn broken_flush_is_caught() {
-        conforms_panics(&BrokenFlush, &mock_meta(&[]));
+        assert_panics_naming(&BrokenFlush, &mock_meta(&[]), "property 4");
     }
 
-    /// Breaks property 5: finish() writes a trailer but swallows the error
-    /// if writing it fails, exactly what `Drop` would also have swallowed.
+    /// Breaks property 5: finish() writes a trailer but swallows the error if
+    /// writing it fails, exactly what `Drop` would also have swallowed. Wraps
+    /// `MockCodec`'s own `Sink` so the payload is still correctly XORed; the
+    /// extra trailer bytes this adds have no framing for a plain
+    /// `MockCodec`-style decoder to strip back out again, so this codec
+    /// declares `decode: false` — its whole point is property 5, which never
+    /// touches decode, and a `false` here is honest rather than papering over
+    /// a round trip this shape cannot actually offer.
     struct BrokenFinishSwallowsError;
 
-    struct SwallowingSink(Box<dyn Write + Send>);
+    struct SwallowingSink(Box<dyn Sink>);
     impl Write for SwallowingSink {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             self.0.write(b)
@@ -975,8 +1086,8 @@ mod broken_codecs {
     impl Sink for SwallowingSink {
         fn finish(mut self: Box<Self>) -> crate::Result<()> {
             // BUG: a real trailer write whose error is ignored.
-            let _ = self.0.write_all(b"TRAILER");
-            let _ = self.0.flush();
+            let _ = self.0.write_all(b"TRAILER!");
+            let _ = self.0.finish();
             Ok(())
         }
     }
@@ -986,7 +1097,10 @@ mod broken_codecs {
             MOCK_CODEC
         }
         fn caps(&self) -> CodecCaps {
-            MockCodec.caps()
+            CodecCaps {
+                decode: false,
+                ..MockCodec.caps()
+            }
         }
         fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
             MockCodec.decoder(src, o)
@@ -994,21 +1108,26 @@ mod broken_codecs {
         fn encoder(
             &self,
             dst: Box<dyn Write + Send>,
-            _o: &EncodeOpts,
+            o: &EncodeOpts,
         ) -> crate::Result<Box<dyn Sink>> {
-            Ok(Box::new(SwallowingSink(dst)))
+            Ok(Box::new(SwallowingSink(MockCodec.encoder(dst, o)?)))
         }
     }
 
     #[test]
     fn broken_finish_swallowing_a_write_error_is_caught() {
-        conforms_panics(&BrokenFinishSwallowsError, &mock_meta(&[]));
+        assert_panics_naming(&BrokenFinishSwallowsError, &mock_meta(&[]), "property 5");
     }
 
     /// Breaks property 6: `check_encode_opts` accepts every level (the
     /// default impl), but `encoder()` indexes an array by the raw level —
     /// the classic lower-bound panic a validator that only checks `n > max`
-    /// leaves open.
+    /// leaves open. This one panics with Rust's own "index out of bounds"
+    /// message rather than one of this harness's "property 6: ..." messages
+    /// — which IS the correct signal here: property 6's entire mandate is
+    /// "never a panic", so any panic raised from inside its own
+    /// `codec.encoder()` call is a genuine property-6 failure, textually
+    /// labeled by Rust rather than by us.
     struct BrokenLevelPanics;
 
     impl Codec for BrokenLevelPanics {
@@ -1038,7 +1157,7 @@ mod broken_codecs {
 
     #[test]
     fn broken_level_validation_is_caught() {
-        conforms_panics(&BrokenLevelPanics, &mock_meta(&[]));
+        assert_panics_naming(&BrokenLevelPanics, &mock_meta(&[]), "index out of bounds");
     }
 
     /// Breaks property 8: decodes by reading the whole input up front, then
@@ -1077,7 +1196,7 @@ mod broken_codecs {
 
     #[test]
     fn broken_incremental_decode_is_caught() {
-        conforms_panics(&BrokenIncremental, &mock_meta(&[]));
+        assert_panics_naming(&BrokenIncremental, &mock_meta(&[]), "property 8");
     }
 
     /// Breaks property 9: declares `detects_corruption: true` but the
@@ -1108,6 +1227,15 @@ mod broken_codecs {
 
     #[test]
     fn lying_about_corruption_detection_is_caught() {
-        conforms_panics(&LyingAboutCorruption, &mock_meta(&[]));
+        assert_panics_naming(&LyingAboutCorruption, &mock_meta(&[]), "property 9");
+    }
+
+    #[test]
+    fn broken_truncation_is_caught() {
+        // MockCodec's bare XOR stream has no framing at all, so it is — by
+        // construction, not a further bug added here — the ready-made broken
+        // codec for property 10: exactly what a raw, checksum-less stream
+        // WITHOUT even deflate's BFINAL-style structure looks like.
+        assert_panics_naming(&MockCodec, &mock_meta(&[]), "property 10");
     }
 }
