@@ -412,11 +412,23 @@ pub struct Outcome {
     pub fidelity: FidelityReport,
 }
 
-/// The build's one codec, or a usage error naming what to do about zero or
-/// several.
+/// The build's one codec, or a usage error naming what to do about zero.
 ///
-/// While exactly one codec is registered, defaulting to it is unambiguous.
-/// This becomes a usage error on its own the moment 1c adds a second.
+/// Encode-only: this is reached from `choose_format`/`compress` when no
+/// `--format` was given and the destination has no recognised extension. It
+/// is never consulted for decode, which detects the format from the input's
+/// own magic bytes (`Registry::match_magic`) and fails with its own separate
+/// error when nothing matches — so a wrong guess here carries no correctness
+/// risk on decode, because this function is not on that path at all.
+///
+/// With more than one codec registered, this is a UX default, not a
+/// correctness claim: every registered codec produces valid, self-consistent
+/// output, so there is no "wrong" choice to protect against by refusing to
+/// pick one. gzip is preferred when present because it is the most widely
+/// recognised container-less codec; `-o` (via its extension) and `--format`
+/// both override this outright. Only when gzip is absent, and more than one
+/// other codec remains, does inference stay genuinely ambiguous and fall back
+/// to a usage error.
 fn default_format_in(reg: &Registry) -> Result<FormatId> {
     let codecs: Vec<FormatId> = reg
         .matrix()
@@ -424,6 +436,9 @@ fn default_format_in(reg: &Registry) -> Result<FormatId> {
         .filter(|r| r.kind == FormatKind::Codec)
         .map(|r| r.id)
         .collect();
+    if let Some(gzip) = codecs.iter().find(|id| id.as_str() == "gzip") {
+        return Ok(*gzip);
+    }
     match codecs.len() {
         1 => Ok(codecs[0]),
         0 => Err(Error::Usage("this build contains no codecs".into())),
@@ -435,7 +450,7 @@ fn default_format_in(reg: &Registry) -> Result<FormatId> {
 }
 
 /// Chooses the output format: explicit flag, else the output extension, else
-/// the only codec in the build.
+/// this build's default codec (see `default_format_in`).
 fn choose_format(reg: &Registry, dst: &Output, explicit: Option<FormatId>) -> Result<FormatId> {
     if let Some(f) = explicit {
         return Ok(f);
@@ -452,8 +467,8 @@ fn choose_format(reg: &Registry, dst: &Output, explicit: Option<FormatId>) -> Re
     default_format_in(reg)
 }
 
-/// What to use as the output format when nothing names one: the build's one
-/// codec.
+/// What to use as the output format when nothing names one: see
+/// `default_format_in` for the encode-only preference this applies.
 ///
 /// A library consumer asks the same question `choose_format` answers
 /// internally for `compress` — e.g. the CLI, falling back for `stf pack` when

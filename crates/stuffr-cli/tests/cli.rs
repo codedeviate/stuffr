@@ -232,9 +232,11 @@ fn pack_then_unpack_round_trips_through_the_binary() {
     let plain = b"the quick brown fox ".repeat(2000);
     std::fs::write(&src, &plain).unwrap();
 
+    // Bare invocation, no --format: exercises default_format_in's
+    // gzip preference, not just gzip named explicitly.
     assert!(
         Command::new(STF)
-            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
+            .args(["pack", src.to_str().unwrap()])
             .status()
             .unwrap()
             .success()
@@ -481,8 +483,10 @@ fn pack_of_a_seekable_file_reports_exact() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"payload").unwrap();
 
+    // Bare invocation, no --format: exercises default_format_in's
+    // gzip preference, not just gzip named explicitly.
     let out = Command::new(STF)
-        .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
+        .args(["pack", src.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -608,6 +612,48 @@ fn examples_page_covers_every_format_and_flag() {
     }
 }
 
+/// Pins ONE documented claim end-to-end rather than all of them: the page's
+/// very first example, run verbatim in its own directory. `--examples`'
+/// header claims "Everything below runs against this build as shown" —
+/// `examples_page_covers_every_format_and_flag` only checks that words are
+/// *mentioned*, so a page whose first command was actually broken (as this
+/// task's own investigation found `stf pack notes.txt` briefly was) would
+/// still pass it. A full executable-docs test extracting and running every
+/// line on the page is the right long-term fix; this is the narrow stopgap.
+#[test]
+fn examples_pages_first_worked_example_runs_as_documented() {
+    let dir = tmp("examples-first-example-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let notes = dir.join("notes.txt");
+    let packed = dir.join("notes.txt.gz");
+    std::fs::write(&notes, b"the documented example's payload").unwrap();
+
+    // Verbatim: `stf pack notes.txt`, run from the directory containing it.
+    let out = Command::new(STF)
+        .arg("pack")
+        .arg("notes.txt")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        packed.exists(),
+        "the page says this writes notes.txt.gz beside it"
+    );
+    assert!(
+        notes.exists(),
+        "the page says the input, notes.txt, is left alone"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_corrupt_archive_exits_five_not_one() {
     let src = tmp("cli-corrupt.txt");
@@ -710,6 +756,40 @@ fn cat_accepts_an_explicit_format() {
         String::from_utf8_lossy(&res.stderr)
     );
     assert_eq!(res.stdout, b"payload");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
+
+#[test]
+fn pack_with_no_flags_defaults_to_gzip() {
+    // Now that this build registers three codecs, a bare `pack src` with
+    // neither -o nor --format goes through choose_format's fallback to
+    // default_format_in with no extension to infer from at all. This is
+    // the path 14 other tests used to exercise incidentally before they
+    // were pinned to --format gzip explicitly; this test is the one that
+    // exists specifically to cover it, and would fail with the ambiguity
+    // usage error ("cannot infer the output format") if default_format_in
+    // did not prefer gzip when it is registered alongside other codecs.
+    let src = tmp("bare-default.txt");
+    let gz = tmp("bare-default.txt.gz");
+    let _ = std::fs::remove_file(&gz);
+    std::fs::write(&src, b"payload").unwrap();
+
+    let out = Command::new(STF)
+        .args(["pack", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        gz.exists(),
+        "a bare pack with no --format must default to gzip and write {}.gz",
+        src.display()
+    );
 
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&gz);
