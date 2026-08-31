@@ -24,7 +24,9 @@ pub use archive::{
 };
 pub use error::{Error, Result};
 pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
-pub use format::{CodecCaps, ContainerCaps, FormatId, FormatKind, FormatMeta, MagicRule};
+pub use format::{
+    CodecCaps, ContainerCaps, CorruptionDetection, FormatId, FormatKind, FormatMeta, MagicRule,
+};
 pub use governor::{BudgetInputs, Governor, LeaseSet, default_memory_limit, resolve_workers};
 pub use ladder::{Resolved, StreamPolicy, resolve};
 pub use probe::{Chain, PROBE_LEN, probe, resolve_chain};

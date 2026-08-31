@@ -11,8 +11,8 @@ use bzip2::Compression;
 use bzip2::read::MultiBzDecoder;
 use bzip2::write::BzEncoder;
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta, MagicRule, Result, Sink,
-    Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
+    MagicRule, Result, Sink, Source, StreamOnly,
 };
 
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
@@ -43,7 +43,7 @@ impl Codec for Bzip2 {
             // bzip2 carries a per-block CRC32 plus a whole-stream combined
             // CRC32, so both a flipped byte and a truncated stream are
             // detected rather than silently decoded into different bytes.
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::Always,
             // Not measured: derived from the level-9 block size. bzip2's
             // block is 100 KiB * level, so 900 KiB at level 9; the encoder's
             // working set is several multiples of that for its Burrows-
@@ -240,8 +240,9 @@ mod tests {
     #[test]
     fn bzip2_declares_an_integrity_check_and_a_memory_figure() {
         let c = Bzip2.caps();
-        assert!(
+        assert_eq!(
             c.detects_corruption,
+            CorruptionDetection::Always,
             "bzip2 carries per-block and stream CRCs, so corrupt input is detectable"
         );
         assert!(

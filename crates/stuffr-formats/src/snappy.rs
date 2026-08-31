@@ -34,8 +34,8 @@ use std::io::Write;
 use snap::read::FrameDecoder;
 use snap::write::FrameEncoder;
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, FormatId, FormatMeta, MagicRule, Result, Sink,
-    Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, FormatId, FormatMeta, MagicRule,
+    Result, Sink, Source, StreamOnly,
 };
 
 use crate::normalize::{NormalizeDecodeErrors, SNAPPY_MALFORMED_AS_OTHER_EOF};
@@ -94,7 +94,7 @@ impl Codec for Snappy {
             // conformance property 9, which flips a byte at the payload's
             // MIDPOINT, nowhere near this one structural byte — see the
             // probe test for the exact position and count.
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::Always,
             // Measured from the crate's own fixed buffer sizes, not
             // profiled: `write::FrameEncoder` allocates a `src` buffer of
             // `MAX_BLOCK_SIZE` (2^16 = 65536 bytes) plus an `Inner::dst`
@@ -267,8 +267,9 @@ mod tests {
     #[test]
     fn snappy_declares_an_integrity_check_and_a_memory_figure() {
         let c = Snappy.caps();
-        assert!(
+        assert_eq!(
             c.detects_corruption,
+            CorruptionDetection::Always,
             "the frame format CRC32Cs every chunk's uncompressed bytes unconditionally — \
              measured directly against this crate, see caps()'s doc comment and the probe test \
              below"
@@ -291,8 +292,8 @@ mod tests {
     /// both kinds, not just `Other` alone. Almost no position decodes to
     /// silently wrong bytes: the checksum is unconditional (see `caps()`),
     /// so this doubles as the direct evidence backing `detects_corruption:
-    /// true` — with exactly ONE measured, documented exception, asserted
-    /// precisely below rather than papered over.
+    /// CorruptionDetection::Always` — with exactly ONE measured, documented
+    /// exception, asserted precisely below rather than papered over.
     ///
     /// 4 KiB rather than the 64 KiB conformance property 9 itself uses — same
     /// reasoning as `lz4_conformance_probe_corruption_is_silent_at_almost_

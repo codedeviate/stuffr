@@ -6,8 +6,8 @@ use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta, MagicRule, Result, Sink,
-    Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
+    MagicRule, Result, Sink, Source, StreamOnly,
 };
 
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
@@ -39,7 +39,7 @@ impl Codec for Gzip {
             // gzip's trailer carries a CRC32 over the uncompressed data, so a
             // flipped byte anywhere in the stream is detected rather than
             // silently decoded into different bytes.
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::Always,
             // deflate's window is 32 KiB; miniz_oxide's encoder state plus our
             // 64 KiB copy buffer puts one worker comfortably under 256 KiB.
             memory_per_worker: Some(256 * 1024),
@@ -209,8 +209,9 @@ mod tests {
     #[test]
     fn gzip_declares_an_integrity_check_and_a_memory_figure() {
         let c = Gzip.caps();
-        assert!(
+        assert_eq!(
             c.detects_corruption,
+            CorruptionDetection::Always,
             "gzip carries a CRC32, so corrupt input is detectable and Error::Corrupt is reachable"
         );
         assert!(

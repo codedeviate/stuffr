@@ -6,8 +6,8 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta, MagicRule, Result, Sink,
-    Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
+    MagicRule, Result, Sink, Source, StreamOnly,
 };
 
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
@@ -70,7 +70,7 @@ impl Codec for Zlib {
     fn caps(&self) -> CodecCaps {
         CodecCaps {
             // zlib's trailer carries an Adler-32 over the uncompressed data.
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::Always,
             memory_per_worker: Some(256 * 1024),
             ..CodecCaps::round_trip()
         }

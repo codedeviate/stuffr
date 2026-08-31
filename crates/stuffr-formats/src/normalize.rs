@@ -192,9 +192,9 @@ pub(crate) const RUZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 /// corruption was detected at all 4,156 positions swept, split 4,154
 /// `InvalidData` / 2 `UnexpectedEof`, zero silently wrong and zero silently
 /// unchanged; truncation was detected at all 4,155 cuts swept, entirely
-/// `UnexpectedEof`. `detects_corruption: true` in `xz_c.rs`'s `caps()` is
-/// direct evidence from this same sweep, not an assumption — see RULING R15
-/// in this cycle's task brief.
+/// `UnexpectedEof`. `detects_corruption: CorruptionDetection::WhenPresent`
+/// in `xz_c.rs`'s `caps()` is direct evidence from this same sweep, not an
+/// assumption — see RULING R15 in this cycle's task brief.
 ///
 /// Traced directly against `liblzma_0_4_8::bufread::XzDecoder::read`
 /// (`bufread.rs`): a genuine error reading the underlying SOURCE reaches the
@@ -249,8 +249,9 @@ pub(crate) const XZ_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// was detected at all 4,156 positions swept, split 4,149 `InvalidData` /
 /// 5 `InvalidInput` / 2 `UnexpectedEof`, zero silently wrong and zero
 /// silently unchanged; truncation was detected at all 4,155 cuts swept,
-/// entirely `UnexpectedEof`. `detects_corruption: true` in `xz_pure.rs`'s
-/// `caps()` is direct evidence from this same sweep, not an assumption.
+/// entirely `UnexpectedEof`. `detects_corruption: CorruptionDetection::
+/// WhenPresent` in `xz_pure.rs`'s `caps()` is direct evidence from this same
+/// sweep, not an assumption.
 ///
 /// The `InvalidInput` cases matter specifically: without folding that kind
 /// too, 5 of 4,156 corrupted positions in the sweep above would reach a
@@ -312,8 +313,9 @@ pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF: &[ErrorKind] = &[
 /// internal buffer — so corrupting it changes nothing observable for a
 /// payload far smaller than either the true or the corrupted declared size.
 /// Truncation was detected at all 4,169 cuts swept, entirely `UnexpectedEof`.
-/// `detects_corruption: true` in `lzma_c.rs`'s `caps()` is direct evidence
-/// from this same sweep — see that module's doc for why this holds despite
+/// `detects_corruption: CorruptionDetection::Structural` in `lzma_c.rs`'s
+/// `caps()` is direct evidence from this same sweep — see that module's doc
+/// for why this holds despite
 /// LZMA1 carrying no checksum field at all, unlike gzip/zlib/bzip2/snappy's
 /// mandatory CRCs or even xz's per-writer check type.
 ///

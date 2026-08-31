@@ -76,9 +76,9 @@
 //! baggage: present in every stream, verified by nothing.
 //! `LazyRuzstdDecoder` below does that comparison itself, once, at end of
 //! stream, which is what actually makes `caps()`'s `detects_corruption:
-//! true` true rather than aspirational — see the corruption-sweep tests for
-//! the measured figures, on both a stream this codec wrote and one
-//! `zstd_c` wrote.
+//! CorruptionDetection::WhenPresent` real rather than aspirational — see the
+//! corruption-sweep tests for the measured figures, on both a stream this
+//! codec wrote and one `zstd_c` wrote.
 //!
 //! ## `FrameCompressor` buffers the whole input — this is not an accident
 //!
@@ -97,7 +97,8 @@ use ruzstd::decoding::StreamingDecoder;
 use ruzstd::encoding::{CompressionLevel, FrameCompressor};
 
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink, Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
+    Source, StreamOnly,
 };
 
 pub use crate::zstd_shared::{ZSTD, zstd_meta as meta};
@@ -116,7 +117,7 @@ impl Codec for Zstd {
             // codec's own encoder always emit the content checksum, and the
             // corruption-sweep tests below measure detection against both a
             // stream this codec wrote and one `zstd_c` wrote.
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::WhenPresent,
             weak_encoder: true,
             ..CodecCaps::round_trip()
         }
@@ -133,8 +134,9 @@ impl Codec for Zstd {
     ///
     /// **This decoder only weakly detects corruption in a stream that was
     /// not written with the content checksum on.** `caps().detects_corruption`
-    /// is `true` because THIS codec's own encoder cannot even produce a
-    /// checksumless stream (the `hash` feature is unconditional here — see
+    /// is `CorruptionDetection::WhenPresent` because THIS codec's own encoder
+    /// cannot even produce a checksumless stream (the `hash` feature is
+    /// unconditional here — see
     /// the module doc) — but that says nothing about a `.zst` some other
     /// tool wrote with its own checksum left off, still fully valid zstd
     /// under the format (see `format.rs`'s `detects_corruption` doc for why
@@ -1010,8 +1012,9 @@ mod tests {
             "and ops must refuse it without --allow-weak-encoder"
         );
         assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
-        assert!(
+        assert_eq!(
             c.detects_corruption,
+            CorruptionDetection::WhenPresent,
             "the hash feature is on by default — see the module doc"
         );
 

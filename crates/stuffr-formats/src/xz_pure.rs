@@ -157,7 +157,8 @@ use std::io::Write;
 use lzma_rust2::{XzOptions, XzReader, XzWriter};
 
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink, Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
+    Source, StreamOnly,
 };
 
 use crate::normalize::{NormalizeDecodeErrors, XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF};
@@ -176,7 +177,7 @@ impl Codec for Xz {
             // Honest for streams THIS codec writes: `encoder` always selects
             // `CheckType::Crc64`. See the module doc for the measured sweep
             // and `decoder`'s own doc for the foreign-stream caveat.
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::WhenPresent,
             // preset 6's dictionary (8 MiB) — see the module doc's note on
             // why this, not preset 9's, is the right single-worker figure.
             memory_per_worker: Some(8 * 1024 * 1024),
@@ -202,8 +203,9 @@ impl Codec for Xz {
     /// frame after the first in Phase 1d.
     ///
     /// **Reading a foreign stream.** [`CodecCaps::detects_corruption`] is
-    /// `true` for this codec, and the doc on that field requires every
-    /// optional-check format to say here what that is worth on a stream this
+    /// `CorruptionDetection::WhenPresent` for this codec, and the doc on that
+    /// variant requires every optional-check format to say here what that is
+    /// worth on a stream this
     /// build did not write. xz's check type is a per-writer choice — the
     /// format permits `CheckType::None` — so a `.xz` carrying no check is
     /// legal and would decode with far weaker detection than the sweep in
@@ -655,8 +657,9 @@ mod tests {
     #[test]
     fn xz_declares_an_integrity_check_and_a_memory_figure() {
         let c = Xz.caps();
-        assert!(
+        assert_eq!(
             c.detects_corruption,
+            CorruptionDetection::WhenPresent,
             "this codec always selects CheckType::Crc64; see the module doc"
         );
         assert!(
@@ -667,8 +670,8 @@ mod tests {
 
     /// Sweeps every byte position of a real encoded payload rather than
     /// flipping one, mirroring `xz_c.rs`'s and `snappy.rs`'s probes. Backs
-    /// `detects_corruption: true` with direct measurement instead of leaving
-    /// it aspirational: see `crate::normalize`'s
+    /// `detects_corruption: CorruptionDetection::WhenPresent` with direct
+    /// measurement instead of leaving it aspirational: see `crate::normalize`'s
     /// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF` doc for the same
     /// figures quoted there, measured against the RAW `XzReader`.
     #[test]

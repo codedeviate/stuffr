@@ -34,7 +34,8 @@
 use std::io::Write;
 
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink, Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
+    Source, StreamOnly,
 };
 
 use crate::normalize::{NormalizeDecodeErrors, ZSTD_MALFORMED_AS_OTHER_EOF};
@@ -56,7 +57,7 @@ impl Codec for Zstd {
             // not mandatory in every valid stream. See the module doc and
             // `decoder`'s doc (the measured partial-detection figure for
             // that case lives there, where a caller actually meets it).
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::WhenPresent,
             // Not measured: derived, not profiled. zstd's window at level 3
             // (the default) is 1 MiB; the encoder's match-finder tables and
             // internal buffers add a further working set on top of that. 8
@@ -80,8 +81,9 @@ impl Codec for Zstd {
     ///
     /// **This decoder only partially detects corruption in a stream that was
     /// not written with the checksum on.** `caps().detects_corruption` is
-    /// `true` because `encoder` above always calls `include_checksum(true)`
-    /// — but that is a property of streams *this codec* produces, not a
+    /// `CorruptionDetection::WhenPresent` because `encoder` above always
+    /// calls `include_checksum(true)` — but that is a property of streams
+    /// *this codec* produces, not a
     /// property this decoder can enforce on whatever it is handed. The
     /// checksum is a per-writer option in the zstd frame format (see the
     /// module doc and `format.rs`'s `detects_corruption` doc), so a `.zst`
@@ -124,7 +126,7 @@ impl Codec for Zstd {
         let level = o.level.unwrap_or(zstd::DEFAULT_COMPRESSION_LEVEL);
         let mut enc = zstd::stream::write::Encoder::new(dst, level)?;
         // See the module doc: this is what makes `caps().detects_corruption`
-        // true rather than aspirational.
+        // `CorruptionDetection::WhenPresent` rather than aspirational.
         enc.include_checksum(true)?;
         Ok(Box::new(ZstdSink(enc)))
     }
@@ -295,8 +297,9 @@ mod tests {
     #[test]
     fn zstd_declares_an_integrity_check_and_a_memory_figure() {
         let c = Zstd.caps();
-        assert!(
+        assert_eq!(
             c.detects_corruption,
+            CorruptionDetection::WhenPresent,
             "this codec always turns the content checksum on; see the module doc"
         );
         assert!(

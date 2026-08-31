@@ -7,8 +7,8 @@ use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta, Result, Sink, Source,
-    StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
+    Result, Sink, Source, StreamOnly,
 };
 
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
@@ -39,14 +39,15 @@ impl Codec for Deflate {
             //
             // Truncation is a different question, and this codec still
             // passes conformance property 10 despite `detects_corruption:
-            // false`: the final block's `BFINAL` bit means a stream cut short
+            // CorruptionDetection::Never`: the final block's `BFINAL` bit
+            // means a stream cut short
             // ends mid-block, which flate2 surfaces as `UnexpectedEof` — the
             // adapter folds that onto `InvalidData` the same as any other
             // codec here. "No integrity check" and "truncation is still
             // detectable" are not a contradiction: one is a missing checksum
             // over content that decoded fine, the other is a stream that
             // never finished decoding at all.
-            detects_corruption: false,
+            detects_corruption: CorruptionDetection::Never,
             memory_per_worker: Some(256 * 1024),
             ..CodecCaps::round_trip()
         }

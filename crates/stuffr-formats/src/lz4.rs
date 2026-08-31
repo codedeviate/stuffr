@@ -90,8 +90,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use lz4_flex::frame::{BlockSize, FrameDecoder, FrameEncoder, FrameInfo};
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, FormatId, FormatMeta, MagicRule, Result, Sink,
-    Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, FormatId, FormatMeta, MagicRule,
+    Result, Sink, Source, StreamOnly,
 };
 
 use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
@@ -233,7 +233,7 @@ impl Codec for Lz4 {
             // deflate.rs and brotli.rs) — no checksum over content that
             // decoded fine is not a contradiction with detecting truncation
             // just fine (below).
-            detects_corruption: false,
+            detects_corruption: CorruptionDetection::Never,
             // Item 6 of Phase 1d's final fix wave: this field's own contract
             // (see `format.rs`) is "cost of one ENCODE worker", and this is
             // now that — not the earlier figure, which was measurably the
@@ -507,8 +507,9 @@ mod tests {
     #[test]
     fn lz4_declares_no_integrity_check_but_a_memory_figure() {
         let c = Lz4.caps();
-        assert!(
-            !c.detects_corruption,
+        assert_eq!(
+            c.detects_corruption,
+            CorruptionDetection::Never,
             "lz4_flex's FrameEncoder turns off both the content checksum and the per-block \
              checksum by default; a byte flipped almost anywhere in the frame decodes to \
              different bytes with no error, measured directly against this crate — see \
@@ -573,7 +574,7 @@ mod tests {
             silently_wrong * 2 > packed.len(),
             "expected a clear majority of {} byte positions to decode silently wrong \
              (measured: {silently_wrong} silent, {errored} errored) — if this ever flips, \
-             detects_corruption should become true instead of staying false",
+             detects_corruption should move off Never instead of staying there",
             packed.len()
         );
     }

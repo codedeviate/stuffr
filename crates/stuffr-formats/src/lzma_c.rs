@@ -65,7 +65,7 @@
 //! LZMA1 carries no CRC, Adler-32 or any other designed integrity check —
 //! unlike gzip/zlib/bzip2/snappy's mandatory checksums or even xz's
 //! per-writer check type. A naive reading of that fact alone would suggest
-//! `detects_corruption: false`, the same as raw deflate or brotli. Measured
+//! `CorruptionDetection::Never`, the same as raw deflate or brotli. Measured
 //! instead, with the same sweep methodology used throughout this project
 //! (flip every byte position of a real compressed 4 KiB incompressible
 //! payload, not one flip; then separately truncate at every prefix length):
@@ -87,14 +87,16 @@
 //! a decode that runs past or short of the embedded end-of-payload marker)
 //! plus this codec's own trailing-garbage check above, not from a
 //! deliberately added check bit. It is nonetheless real and measured, so
-//! `caps().detects_corruption` reports `true` here rather than declaring a
-//! structural absence the data does not support. The one honest carve-out
-//! is the dictionary-size field named above.
+//! `caps().detects_corruption` reports [`CorruptionDetection::Structural`]
+//! here rather than declaring a structural absence the data does not
+//! support. The one honest carve-out is the dictionary-size field named
+//! above.
 
 use std::io::{BufRead, BufReader, Read, Write};
 
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink, Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
+    Source, StreamOnly,
 };
 
 pub use crate::lzma_shared::{LZMA, lzma_meta as meta};
@@ -113,7 +115,7 @@ impl Codec for Lzma {
             // Measured, not the format-carries-no-check assumption a reader
             // might reach for by analogy with raw deflate/brotli. See the
             // module doc's "Corruption detection" section for the sweep.
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::Structural,
             // Not measured: derived the same way `xz_c.rs` derives its
             // figure, from LZMA1's preset-6 dictionary size (8 MiB — see
             // `lzma_encoder_presets.c`'s `dict_pow2` table, index 6 is 2^23
@@ -466,8 +468,9 @@ mod tests {
     #[test]
     fn lzma_declares_corruption_detection_and_a_memory_figure() {
         let c = Lzma.caps();
-        assert!(
+        assert_eq!(
             c.detects_corruption,
+            CorruptionDetection::Structural,
             "measured at 4,166 of 4,170 swept positions; see the module doc"
         );
         assert!(
@@ -478,8 +481,9 @@ mod tests {
 
     /// Sweeps every byte position of a real encoded payload rather than
     /// flipping one, mirroring `xz_c.rs`'s and `snappy.rs`'s probes. Backs
-    /// `detects_corruption: true` with direct measurement, and documents
-    /// the one honest exception: the dictionary-size field.
+    /// `detects_corruption: CorruptionDetection::Structural` with direct
+    /// measurement, and documents the one honest exception: the
+    /// dictionary-size field.
     #[test]
     fn corruption_sweep_is_detected_almost_everywhere() {
         use stuffr_core::testing::incompressible;

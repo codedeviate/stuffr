@@ -12,8 +12,8 @@ use std::io::Write;
 use brotli::CompressorWriter;
 use brotli::Decompressor;
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta, Result, Sink, Source,
-    StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
+    Result, Sink, Source, StreamOnly,
 };
 
 use crate::normalize::CaptureWriteError;
@@ -50,7 +50,7 @@ impl Codec for Brotli {
             // same gap raw deflate already declares honestly (see
             // deflate.rs): no checksum over content that decoded fine is not
             // a contradiction with detecting truncation just fine (below).
-            detects_corruption: false,
+            detects_corruption: CorruptionDetection::Never,
             // Not measured: derived from the window size, not profiled.
             // Quality 11 (this codec's default) uses lgwin 22, a 4 MiB
             // window; the encoder's working set is a small multiple of that
@@ -74,7 +74,8 @@ impl Codec for Brotli {
     /// is deliberate, not an oversight: there is no other kind this backend
     /// raises for malformed input that would need folding onto
     /// `InvalidData`. It is a separate question from `caps().
-    /// detects_corruption` (`false`, see above) — that capability is about
+    /// detects_corruption` (`CorruptionDetection::Never`, see above) — that
+    /// capability is about
     /// whether EVERY corruption is caught, which brotli's checksum-less
     /// format cannot promise; this comment is only about what kind is used
     /// on the occasions it does.
@@ -235,8 +236,9 @@ mod tests {
     #[test]
     fn brotli_declares_no_integrity_check_but_a_memory_figure() {
         let c = Brotli.caps();
-        assert!(
-            !c.detects_corruption,
+        assert_eq!(
+            c.detects_corruption,
+            CorruptionDetection::Never,
             "brotli carries no checksum; a byte flipped in the middle of an incompressible \
              payload decodes to different bytes with no error, measured directly against this \
              crate — see caps()'s doc comment"
@@ -253,7 +255,7 @@ mod tests {
     /// incompressible payload — the same shape conformance property 9 would
     /// use — flips the midpoint byte, and shows the decode succeeds anyway
     /// (producing wrong bytes, silently). This is why `caps().
-    /// detects_corruption` is `false`, not `true`.
+    /// detects_corruption` is `CorruptionDetection::Never`, not `Always`.
     #[test]
     fn corruption_in_incompressible_data_can_decode_without_error() {
         use stuffr_core::testing::incompressible;
@@ -272,7 +274,7 @@ mod tests {
         assert!(
             result.is_ok(),
             "if this ever starts erroring, brotli's corruption detection changed — recheck \
-             whether detects_corruption should flip back to true: {result:?}"
+             whether detects_corruption should flip away from Never: {result:?}"
         );
         assert_ne!(
             out, plain,

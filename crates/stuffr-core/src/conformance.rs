@@ -52,9 +52,10 @@
 //! 8. Decoding is incremental, not read-to-end: output must begin long before
 //!    the input is exhausted. The threshold is relative to the stream's own
 //!    length, not an absolute figure tuned to one codec's window.
-//! 9. Corrupted input is reported as `InvalidData`, gated on the codec's own
-//!    declared `detects_corruption` — a format with no integrity check
-//!    genuinely cannot detect corruption, and demanding it would force a fake.
+//! 9. Corrupted input is reported as `InvalidData`, run for every declared
+//!    `detects_corruption` state except [`CorruptionDetection::Never`] — a
+//!    format with no integrity check genuinely cannot detect corruption, and
+//!    demanding it would force a fake.
 //! 10. Truncated input is rejected. Unlike property 9, nothing can switch
 //!     this off: every framed format detects premature EOF regardless of
 //!     checksum, so a codec failing this should either detect truncation or
@@ -94,7 +95,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::archive::{Codec, DecodeOpts, EncodeOpts};
-use crate::format::{CodecCaps, FormatMeta};
+use crate::format::{CodecCaps, CorruptionDetection, FormatMeta};
 use crate::source::{ReaderSource, Source};
 use crate::testing::SharedBuf;
 
@@ -572,10 +573,17 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
         let corruption_input =
             test_input(caps, fixture, || encode(codec, &incompressible(64 * 1024)));
 
-        // 9. Corrupted input is reported as InvalidData — declared, because a
-        //    format with no integrity check genuinely cannot detect it and a
-        //    harness that demanded it would force a fake.
-        if caps.detects_corruption {
+        // 9. Corrupted input is reported as InvalidData — run for every
+        //    declared state except Never, because a format with no integrity
+        //    check genuinely cannot detect it and a harness that demanded it
+        //    would force a fake.
+        if caps.detects_corruption == CorruptionDetection::Never {
+            skip(
+                id,
+                9,
+                "this codec declares CorruptionDetection::Never — no check exists to prove",
+            );
+        } else {
             match &corruption_input {
                 Some(base) => {
                     let mut bytes = base.clone();
@@ -596,7 +604,8 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
                         ),
                         Ok(_) => panic!(
                             "conformance[{id}] property 9: corrupted input decoded without \
-                             error, but this codec declares detects_corruption = true"
+                             error, but this codec declares detects_corruption = {:?}",
+                            caps.detects_corruption
                         ),
                     }
                 }
@@ -607,7 +616,7 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
         // 10. Truncated input is rejected. Gated on caps.decode alone, not on
         //     detects_corruption: no declaration can switch this one off. The
         //     incentive on a red property 9 at 11pm is to flip
-        //     detects_corruption to false, and the only consequence used to
+        //     detects_corruption to Never, and the only consequence used to
         //     be that property 9 disappeared. Even a codec with no checksum
         //     at all often still catches this structurally — see the module
         //     doc's note on raw deflate's BFINAL bit — so a codec failing
@@ -819,7 +828,7 @@ mod framed_mock {
             CodecCaps {
                 encode: true,
                 decode: true,
-                detects_corruption: true,
+                detects_corruption: CorruptionDetection::Always,
                 ..Default::default()
             }
         }
@@ -970,7 +979,7 @@ mod tests {
         // MockCodec is a bare XOR pass-through: no magic (property 3 skips on
         // evidence), no trailer (property 5's skip-on-measurement branch —
         // finish() emits nothing extra, so the branch never fires), and
-        // detects_corruption: false (property 9's skip-on-declaration
+        // detects_corruption: CorruptionDetection::Never (property 9's skip-on-declaration
         // branch). Asserting it panics naming property 10 SPECIFICALLY — not
         // any earlier property — is what proves it clears 1 through 9
         // cleanly, including both skip branches: a wrongly-firing property 5
@@ -1025,7 +1034,7 @@ mod tests {
             fn caps(&self) -> CodecCaps {
                 CodecCaps {
                     decode: true,
-                    detects_corruption: true,
+                    detects_corruption: CorruptionDetection::Always,
                     ..Default::default()
                 }
             }
@@ -1371,7 +1380,7 @@ mod broken_codecs {
         assert_panics_naming(&BrokenIncremental, &mock_meta(&[]), "property 8");
     }
 
-    /// Breaks property 9: declares `detects_corruption: true` but the
+    /// Breaks property 9: declares `detects_corruption: CorruptionDetection::Always` but the
     /// decoder cannot actually fail on corrupted input (XOR never errors).
     struct LyingAboutCorruption;
 
@@ -1381,7 +1390,7 @@ mod broken_codecs {
         }
         fn caps(&self) -> CodecCaps {
             CodecCaps {
-                detects_corruption: true, // BUG: nothing backs this claim.
+                detects_corruption: CorruptionDetection::Always, // BUG: nothing backs this claim.
                 ..MockCodec.caps()
             }
         }

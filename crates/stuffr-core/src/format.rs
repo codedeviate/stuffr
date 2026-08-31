@@ -30,7 +30,68 @@ pub enum FormatKind {
     Container,
 }
 
-/// What a codec can do. Every field defaults to `false`: a backend must opt in.
+/// Whether decoding a stream *this codec itself wrote* will notice corruption
+/// rather than silently returning wrong bytes, and — where it does — what
+/// kind of guarantee that is. A single `bool` used to carry this and meant two
+/// different things depending on the codec: a format-wide guarantee for gzip,
+/// but only "this build's encoder turns on an optional checksum" for zstd. A
+/// caller reading one undifferentiated bool had no way to tell which promise
+/// it was getting, so the two review findings that added careful wording to
+/// the old field's doc comment are migrated here, one paragraph per variant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CorruptionDetection {
+    /// The format mandates a check in every valid stream: gzip's trailer
+    /// CRC32, zlib's Adler-32, bzip2's per-block and whole-stream CRCs,
+    /// snappy's per-chunk CRC32C. This is a format-wide guarantee — it holds
+    /// for any conforming stream, not just one this codec produced itself.
+    Always,
+    /// The format permits a check but leaves it to the writer, so the
+    /// guarantee holds only for streams *this build's own encoder* produced —
+    /// zstd's content checksum, lz4's frame checksum, xz's check-type field
+    /// are all per-writer choices the format permits a writer to omit. How
+    /// likely that is varies by format and is worth knowing: zstd's
+    /// crate-level encoder omits it *by default* (its CLI does not), whereas
+    /// every xz encoder measured here — liblzma's and lzma-rust2's — selects
+    /// CRC64 without being asked, so a checkless `.xz` is possible but rare
+    /// where a checkless `.zst` is routine. A `.zst` file from another tool
+    /// that left the checksum off is still perfectly valid zstd, and this
+    /// codec's decoder only partially detects corruption in it — see
+    /// `zstd_c.rs`'s `decoder` doc for a measured figure. A codec built over
+    /// one of these optional-check formats must document, at the point a
+    /// caller would meet it, that reading a foreign stream is weaker than
+    /// reading its own output; the doc comment on the codec's own `caps()` is
+    /// not enough by itself — the decoder needs one too.
+    WhenPresent,
+    /// No checksum exists, yet malformed input is still detected because the
+    /// format's own decoding constraints make corruption produce an invalid
+    /// decoder state. LZMA1 is the example: it has no checksum, so it looked
+    /// like `Never` — but it was never measured. Measured: sweeping four
+    /// payload shapes — compressible text, incompressible random, a source
+    /// corpus and all zeros — every corrupted stream either errored or
+    /// decoded identically, with **zero** silent-wrong decodes in any of
+    /// them. LZMA1's range coder plus its end marker are constrained enough
+    /// that a flipped bit almost always drives the decoder into an invalid
+    /// state. This is **detection by structural invalidity, not
+    /// verification**, and the difference from `Always` matters: a CRC gives
+    /// a guarantee against arbitrary corruption, whereas structure gives a
+    /// high empirical rate against *random* corruption and no promise at all
+    /// against a deliberately crafted edit.
+    Structural,
+    /// The format carries no check at all — not optional, structurally
+    /// absent: a bare deflate or brotli stream fed corrupt bytes produces
+    /// different output rather than an error, for any writer, always. Such a
+    /// format can never produce [`crate::Error::Corrupt`], and a caller is
+    /// entitled to know that rather than assume a guarantee that is not
+    /// there. The conservative default: a codec must opt in to claiming any
+    /// detection, matching `CodecCaps`'s "every field defaults to false"
+    /// contract.
+    #[default]
+    Never,
+}
+
+/// What a codec can do. Every field defaults to `false` (or, for
+/// `detects_corruption`, its equivalent conservative variant): a backend must
+/// opt in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct CodecCaps {
     pub encode: bool,
@@ -39,56 +100,8 @@ pub struct CodecCaps {
     pub parallel_decode: bool,
     /// Stream carries a frame/block index enabling random access.
     pub frame_index: bool,
-    /// Whether decoding a stream *this codec itself wrote* will notice
-    /// corruption rather than silently returning wrong bytes.
-    ///
-    /// That qualifier matters because the check backing this claim is not
-    /// the same kind of guarantee for every format. Some formats mandate it
-    /// in every valid stream: gzip's trailer CRC32, zlib's Adler-32, bzip2's
-    /// per-block and whole-stream CRCs, snappy's per-chunk CRC32C. For those,
-    /// `true` is a format-wide guarantee — it holds for any conforming
-    /// stream, not just one this codec produced itself. Other formats make
-    /// the check an option the writer can take or leave: zstd's content
-    /// checksum, lz4's frame checksums and xz's check-type field are all
-    /// per-writer choices the format permits a writer to omit. How likely
-    /// that is varies by format and is worth knowing: zstd's crate-level
-    /// encoder omits it *by default* (its CLI does not), whereas every xz
-    /// encoder measured here — liblzma's and lzma-rust2's — selects CRC64
-    /// without being asked, so a checkless `.xz` is possible but rare where a
-    /// checkless `.zst` is routine. For all of them, `true` reflects only
-    /// that *this build's own encoder* always turns the check on — it says
-    /// nothing about a stream some other writer produced. A `.zst` file from another tool that left the
-    /// checksum off is still perfectly valid zstd, and this codec's decoder
-    /// only partially detects corruption in it — see `zstd_c.rs`'s
-    /// `decoder` doc for a measured figure. A codec built over one of these
-    /// optional-check formats must document, at the point a caller would
-    /// meet it, that reading a foreign stream is weaker than reading its own
-    /// output; the doc comment on the codec's own `caps()` is not enough by
-    /// itself; the decoder needs one too.
-    ///
-    /// `false` means the format carries no check at all — not optional,
-    /// structurally absent: a bare deflate or brotli stream fed corrupt bytes
-    /// produces different output rather than an error, for any writer, always.
-    /// Such a format can never produce [`crate::Error::Corrupt`], and a caller
-    /// is entitled to know that rather than assume a guarantee that is not
-    /// there.
-    ///
-    /// **LZMA1 was cited here as a third example and that was wrong.** It has
-    /// no checksum, so the reasoning looked sound, but it was never measured.
-    /// It is: sweeping four payload shapes — compressible text, incompressible
-    /// random, a source corpus and all zeros — every corrupted stream either
-    /// errored or decoded identically, with **zero** silent-wrong decodes in
-    /// any of them. LZMA1's range coder plus its end marker are constrained
-    /// enough that a flipped bit almost always drives the decoder into an
-    /// invalid state.
-    ///
-    /// That is **detection by structural invalidity, not verification**, and
-    /// the difference is worth keeping in view: a CRC gives a guarantee against
-    /// arbitrary corruption, whereas structure gives a high empirical rate
-    /// against *random* corruption and no promise at all against a
-    /// deliberately crafted edit. `true` is the honest declaration for LZMA1
-    /// on the evidence, but it is `true` for a different reason than gzip's.
-    pub detects_corruption: bool,
+    /// See [`CorruptionDetection`] for what each state promises.
+    pub detects_corruption: CorruptionDetection,
 
     /// Rough working-set cost of one encode worker, in bytes, when the codec
     /// knows it. `None` means unknown — assume modest.
@@ -165,7 +178,7 @@ impl CodecCaps {
             parallel_encode: false,
             parallel_decode: false,
             frame_index: false,
-            detects_corruption: false,
+            detects_corruption: CorruptionDetection::Never,
             memory_per_worker: None,
             weak_encoder: false,
         }
@@ -180,7 +193,7 @@ impl CodecCaps {
             parallel_encode: false,
             parallel_decode: false,
             frame_index: false,
-            detects_corruption: false,
+            detects_corruption: CorruptionDetection::Never,
             memory_per_worker: None,
             weak_encoder: false,
         }
@@ -264,6 +277,7 @@ mod tests {
         // anywhere would let an unimplemented backend silently claim support.
         let c = CodecCaps::default();
         assert!(!c.encode && !c.decode && !c.parallel_encode);
+        assert_eq!(c.detects_corruption, CorruptionDetection::Never);
         let k = ContainerCaps::default();
         assert!(!k.read && !k.write && !k.forward_parse && !k.needs_seek);
     }

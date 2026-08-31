@@ -140,7 +140,8 @@
 //! coder's flush (the same flush bytes behind the truncation finding above —
 //! their *values* don't affect the decoded output, only their *presence*
 //! sometimes does). See `corruption_sweep_is_detected_almost_everywhere` for
-//! the exact counts this backs `detects_corruption: true` with, and
+//! the exact counts this backs `detects_corruption: CorruptionDetection::
+//! Structural` with, and
 //! `crate::normalize`'s `LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF` doc
 //! for the raw error-kind vocabulary measured underneath.
 //!
@@ -170,7 +171,8 @@ use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use lzma_rust2::{LzmaOptions, LzmaReader, LzmaWriter};
 
 use stuffr_core::{
-    Codec, CodecCaps, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink, Source, StreamOnly,
+    Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
+    Source, StreamOnly,
 };
 
 pub use crate::lzma_shared::{LZMA, lzma_meta as meta};
@@ -188,7 +190,7 @@ impl Codec for Lzma {
         CodecCaps {
             // Measured against THIS backend specifically — see the module
             // doc's "Corruption detection" section for the sweep.
-            detects_corruption: true,
+            detects_corruption: CorruptionDetection::Structural,
             // preset 6's dictionary (8 MiB) — see the module doc.
             memory_per_worker: Some(8 * 1024 * 1024),
             // A full codec, not a weaker stand-in: see
@@ -785,8 +787,9 @@ mod tests {
     #[test]
     fn lzma_declares_corruption_detection_and_a_memory_figure() {
         let c = Lzma.caps();
-        assert!(
+        assert_eq!(
             c.detects_corruption,
+            CorruptionDetection::Structural,
             "measured against lzma-rust2 specifically; see the module doc"
         );
         assert!(
@@ -797,8 +800,9 @@ mod tests {
 
     /// Sweeps every byte position of a real encoded payload — mirrors
     /// `lzma_c.rs`'s own sweep of the same name, against THIS backend.
-    /// Backs `detects_corruption: true` with direct measurement and
-    /// documents the honest exceptions: the header's dictionary-size field
+    /// Backs `detects_corruption: CorruptionDetection::Structural` with
+    /// direct measurement and documents the honest exceptions: the header's
+    /// dictionary-size field
     /// (4 bytes, same as `lzma_c.rs`) plus, only for this backend, the
     /// range coder's final flush bytes (4 more) — see the module doc's
     /// "Corruption detection" section.
