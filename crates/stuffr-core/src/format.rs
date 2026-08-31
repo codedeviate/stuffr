@@ -67,11 +67,27 @@ pub struct CodecCaps {
     /// itself; the decoder needs one too.
     ///
     /// `false` means the format carries no check at all — not optional,
-    /// structurally absent: a bare deflate, LZMA1 or brotli stream fed
-    /// corrupt bytes produces different output rather than an error, for any
-    /// writer, always. Such a format can never produce
-    /// [`crate::Error::Corrupt`], and a caller is entitled to know that
-    /// rather than assume a guarantee that is not there.
+    /// structurally absent: a bare deflate or brotli stream fed corrupt bytes
+    /// produces different output rather than an error, for any writer, always.
+    /// Such a format can never produce [`crate::Error::Corrupt`], and a caller
+    /// is entitled to know that rather than assume a guarantee that is not
+    /// there.
+    ///
+    /// **LZMA1 was cited here as a third example and that was wrong.** It has
+    /// no checksum, so the reasoning looked sound, but it was never measured.
+    /// It is: sweeping four payload shapes — compressible text, incompressible
+    /// random, a source corpus and all zeros — every corrupted stream either
+    /// errored or decoded identically, with **zero** silent-wrong decodes in
+    /// any of them. LZMA1's range coder plus its end marker are constrained
+    /// enough that a flipped bit almost always drives the decoder into an
+    /// invalid state.
+    ///
+    /// That is **detection by structural invalidity, not verification**, and
+    /// the difference is worth keeping in view: a CRC gives a guarantee against
+    /// arbitrary corruption, whereas structure gives a high empirical rate
+    /// against *random* corruption and no promise at all against a
+    /// deliberately crafted edit. `true` is the honest declaration for LZMA1
+    /// on the evidence, but it is `true` for a different reason than gzip's.
     pub detects_corruption: bool,
 
     /// Rough working-set cost of one encode worker, in bytes, when the codec
