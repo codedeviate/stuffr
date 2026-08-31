@@ -27,6 +27,14 @@ jobs:
       # `dtolnay/rust-toolchain@stable` step is inert and "gate (stable)"
       # silently runs on 1.95 instead of stable.
       - run: rm rust-toolchain.toml
+      # `lzip.rs`'s reference-tool tests (`which_lzip`) skip silently when
+      # the binary is absent from PATH — correct behaviour for a
+      # contributor's machine, but `ubuntu-latest` doesn't ship it (unlike
+      # `xz`, which is already on the image), so without this install the
+      # trailing-data rule that took two review rounds to get right was
+      # never actually exercised in CI (Finding 8 of the Phase 1e final
+      # review).
+      - run: sudo apt-get update && sudo apt-get install -y lzip
       # The same command CONTRIBUTING.md tells a human to run, so a green
       # local run and a green pipeline mean the same thing.
       - run: make check
@@ -42,6 +50,9 @@ jobs:
       # constrain the MSRV check. Remove it so the toolchain action's choice
       # takes effect.
       - run: rm rust-toolchain.toml
+      # See "gate"'s identical step: without this, lzip's reference-tool
+      # tests silently no-op on this runner too.
+      - run: sudo apt-get update && sudo apt-get install -y lzip
       # rust-version claims 1.88 and this job is the only thing that checks it.
       # The floor was 1.85 through Phase 1d; it moved because holding it forced an
       # exact pin on a dependency, which blocked patch-level security fixes, and
