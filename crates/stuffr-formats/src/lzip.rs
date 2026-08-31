@@ -115,9 +115,27 @@
 //! black-box probing alone — probing pinned the shape, reading the C++
 //! confirmed the exact rule and one case probing alone would have gotten
 //! wrong (below). Verified byte-for-byte against the installed `lzip`
-//! 1.26 binary, both via a regular file and via a pipe (`decompress()`
-//! runs the identical logic on stdin — there is no seek-based shortcut
-//! here to diverge from):
+//! 1.26 binary, both via a regular file and via a pipe: `decompress()`'s
+//! member-loop logic itself (`check_prefix`/`check_corrupt`/`check_magic`,
+//! everything this section documents) runs identically either way. That is
+//! NOT true of every check in `main.cc`, though, and one is worth naming
+//! precisely rather than glossed over: `decompress()` also rejects a
+//! FILE (not stdin) whose LAST member decodes to zero bytes, in a
+//! multi-member archive — `"Empty member not allowed"` — gated on
+//! `!from_stdin`, not on seekability as such, but `from_stdin` is exactly
+//! "was a file path given rather than `-`" in this tool, so the practical
+//! effect is the same. Verified directly: a real member followed by a
+//! genuinely empty second member exits 2 as a file, 0 through a pipe, same
+//! bytes either way. `stf` never distinguishes file input from pipe input
+//! at this codec's layer — a seekable source is still read forward, never
+//! seeked, by `GuardedLzipReader` — so this codec's behavior always matches
+//! reference lzip's PIPE path, never its file path, on this one check. That
+//! is the defensible side to match: it is the one that still means
+//! something once the input genuinely cannot be seeked, which the
+//! file-only check does not generalize to.
+//!
+//! The bullets below (the member-loop rule this codec DOES reproduce) hold
+//! identically whether reference lzip reads a file or a pipe:
 //!
 //! - **No member decoded yet.** Reference lzip's `first_member` branches
 //!   never consult any forgiveness rule at all — even a complete,
@@ -439,21 +457,55 @@ impl Sink for LzipSink {
 ///    it produces (verified against `lzma_rust2` 0.20.1's own control
 ///    flow) — recovers the right byte VALUES, but `tail` alone cannot say
 ///    how MANY of them belong to the failed attempt once it has already
-///    saturated at 6 from earlier, unrelated reads (the same "LZ" + 40
-///    case: `tail` fills with 2 stale trailer bytes ahead of the real
-///    `"LZXX"`, misaligning everything unless something else supplies the
-///    count). `classify_trailing_data` supplies that count itself, from
-///    `consumed` and a snapshot taken just before the read that produced
-///    `Ok(0)` — see that function's doc for the arithmetic — and combines
-///    it with `tail`'s byte values to reconstruct the reference's atomic
-///    6-byte header read after the fact, instead of only seeing its
-///    aftermath.
+///    saturated at 6 from earlier, unrelated reads.
+///
+///    Review Round 2 caught that the fix's first version got this count via
+///    arithmetic that assumed exactly one 20-byte trailer preceded the
+///    failed attempt within the same outer read call (later widened,
+///    still wrongly, to "one trailer plus N complete 26-byte empty-member
+///    cycles"). Both were WRONG, and reachable with a single genuinely
+///    empty-content member (legal LZIP — this codec's own `lzip_conforms`
+///    test round-trips one) sitting between a real member and a corrupted
+///    header: `LzipReader`'s loop processes the empty member's
+///    already-succeeded header, its trailer, AND the next (failed) header
+///    attempt all within ONE outer call, and the empty member's own LZMA
+///    end-marker has no fixed, predictable byte cost (measured: 36 bytes
+///    total for this codec's own empty-payload member, not the 26 either
+///    fix assumed) — no per-member byte count is safe to assume, ever.
+///
+///    The fix that actually holds does not try to predict any member's
+///    byte cost at all. `call_sizes` tracks the sizes of the last 3 `read`
+///    calls, watching for the one pattern that can only mean "a trailer
+///    was just fully, successfully read": `4, 8, 8` — `LzipTrailer::parse`
+///    reads its three fields (CRC, data size, member size) via exactly
+///    those three fixed-size calls, in that order, and a trailer that
+///    fails partway is a genuine `Err` this codec never reaches
+///    `classify_trailing_data` for at all (propagated directly, not
+///    folded into `Ok(0)`). Every time that pattern is seen,
+///    `consumed_after_last_trailer` snapshots `consumed` — so by
+///    construction, whatever has been consumed SINCE that snapshot is
+///    EXACTLY "everything after the most recently confirmed trailer",
+///    updated fresh at every member boundary, however many intervened,
+///    however large their content. The failed attempt is always the very
+///    last thing consumed before `Ok(0)` (nothing else reads in between),
+///    so `consumed - consumed_after_last_trailer` recovers its byte count
+///    directly, with no assumption left to falsify — including the
+///    partial-attempt case (a header failing partway because the source
+///    itself ran out, contributing a genuine but harmless 0-byte read).
 struct TailWrapper<R> {
     inner: R,
     consumed: u64,
     /// Last up to 6 bytes consumed, oldest at index 0 of the filled prefix.
     tail: [u8; 6],
     tail_len: usize,
+    /// Sizes of the last 3 `read` calls, oldest first (`[0]`) to most
+    /// recent (`[2]`) — watched only for the `[4, 8, 8]` shape a
+    /// completed trailer read always produces. See this type's doc, point
+    /// 2, for why that shape is unambiguous.
+    call_sizes: [usize; 3],
+    /// `consumed`, snapshotted every time `call_sizes` becomes `[4, 8, 8]`
+    /// (a trailer was just fully read). See this type's doc, point 2.
+    consumed_after_last_trailer: u64,
 }
 
 impl<R> TailWrapper<R> {
@@ -463,16 +515,18 @@ impl<R> TailWrapper<R> {
             consumed: 0,
             tail: [0u8; 6],
             tail_len: 0,
+            call_sizes: [0; 3],
+            consumed_after_last_trailer: 0,
         }
     }
 
     /// Reaches the wrapped reader directly — for `GuardedLzipReader`'s own
     /// peeks (`fill_buf`, and the destructive forward read past a failed
-    /// header attempt), which must not themselves feed back into `tail` or
-    /// `consumed`: by the time either peek runs, the decision they exist to
-    /// support has either not yet been made (`fill_buf`, non-destructive by
-    /// construction) or already has been (the forward read, which runs
-    /// AFTER `consumed`/`tail` were already consulted).
+    /// header attempt), which must not themselves feed back into `tail`,
+    /// `consumed`, or `call_sizes`: by the time either peek runs, the
+    /// decision they exist to support has either not yet been made
+    /// (`fill_buf`, non-destructive by construction) or already has been
+    /// (the forward read, which runs AFTER everything else was consulted).
     fn raw_mut(&mut self) -> &mut R {
         &mut self.inner
     }
@@ -503,6 +557,10 @@ impl<R: Read> Read for TailWrapper<R> {
         let n = self.inner.read(buf)?;
         self.consumed += n as u64;
         self.push_tail(&buf[..n]);
+        self.call_sizes = [self.call_sizes[1], self.call_sizes[2], n];
+        if self.call_sizes == [4, 8, 8] {
+            self.consumed_after_last_trailer = self.consumed;
+        }
         Ok(n)
     }
 }
@@ -515,15 +573,6 @@ impl<R: Read> Read for TailWrapper<R> {
 struct GuardedLzipReader {
     inner: LzipReader<TailWrapper<BufReader<Box<dyn Source>>>>,
     state: GuardState,
-    /// `TailWrapper::consumed` snapshotted immediately before the most
-    /// recent outer call to `self.inner.read`. Needed because a header
-    /// attempt can consume anywhere from 0 to 6 bytes before giving up —
-    /// `TailWrapper`'s sliding `tail` alone cannot tell "these K bytes are
-    /// this attempt's own" apart from "these are leftover bytes from
-    /// whatever came immediately before it" once `tail` has already
-    /// saturated at 6 from earlier, unrelated reads. See
-    /// `classify_trailing_data`'s doc for the arithmetic this backs.
-    consumed_before_this_read: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -555,7 +604,6 @@ impl GuardedLzipReader {
         Self {
             inner: LzipReader::new(TailWrapper::new(BufReader::new(src))),
             state: GuardState::Unchecked,
-            consumed_before_this_read: 0,
         }
     }
 
@@ -668,22 +716,44 @@ impl GuardedLzipReader {
         // member's trailer at the front, misaligning the window and (in
         // that specific case) hiding the magic mismatch entirely.
         //
-        // The fix: `consumed_before_this_read` (snapshotted right before
-        // the outer `self.inner.read` call that produced this `Ok(0)`)
-        // gives the TOTAL bytes consumed during that one call. Given we are
-        // past the `MIN_VALID_MEMBER_SIZE` check above, that call's shape
-        // is always "finish the just-drained member's 20-byte trailer,
-        // then attempt (and fail) the next header" — `Lzip_trailer::size`
-        // is fixed at 20 regardless of payload size, so subtracting it
-        // isolates exactly the failed attempt's own byte count. (This
-        // assumes a single trailer per such call — true for any member
-        // this codec or any ordinary encoder produces; a contrived stream
-        // chaining several genuinely empty members back-to-back before the
-        // final corrupted header is the one narrow case this does not
-        // reconstruct byte-perfectly. Nothing in this project's own tests,
-        // nor an ordinary `lzip`-written file, does that.)
-        let delta = wrapper.consumed - self.consumed_before_this_read;
-        let k = (delta.saturating_sub(20) as usize).min(6);
+        // Review Round 2 caught that this fix's first version tried to
+        // recover the count via byte-count arithmetic that assumed a fixed
+        // cost per intervening member (one 20-byte trailer, later widened
+        // to "20 + 26*M" for M intervening empty members) — WRONG either
+        // way, and reachable by a perfectly ordinary, CONFORMING encoder
+        // with just ONE intervening empty member, not a contrived chain: a
+        // genuinely empty-content member is legal LZIP (this codec's own
+        // `lzip_conforms` test round-trips one), and its own LZMA
+        // end-marker has no fixed, predictable byte cost — "26 bytes per
+        // empty member" was itself an unverified assumption, and the real
+        // figure (measured: 36 bytes for this codec's own empty-payload
+        // member) broke the arithmetic the same way the original "one
+        // trailer" assumption did. One real member, one genuinely EMPTY
+        // member, then a corrupted third header is enough to reach this —
+        // and it is exactly the kind of file `lzip` itself can produce and
+        // reference lzip 1.26 still rejects ("Corrupt header in
+        // multimember file", file and stdin agreeing). A second attempt,
+        // tracking read-call SIZES instead of an aggregate count, fixed
+        // that case but broke a DIFFERENT one it hadn't been checked
+        // against: a header attempt failing because the source itself ran
+        // out partway through (a genuine, harmless 0-byte read) doesn't
+        // fit a fixed [4]/[4,1]/[4,1,1] size pattern either.
+        //
+        // No fixed per-member cost, and no fixed read-call-size pattern,
+        // survived contact with a real case — so the fix that holds
+        // predicts neither. [`TailWrapper::consumed_after_last_trailer`]
+        // is a snapshot of `consumed` taken every time a trailer is
+        // confirmed fully read (the unambiguous `[4, 8, 8]` read-size
+        // shape `LzipTrailer::parse` always produces) — updated fresh at
+        // EVERY member boundary, however many intervened, however large
+        // their content, with no need to predict any of it. The failed
+        // attempt is always the very last thing consumed before `Ok(0)`
+        // (nothing else reads in between), so simply summing bytes
+        // consumed since that snapshot recovers its count directly —
+        // including the partial-attempt case, since a harmless 0-byte read
+        // contributes 0 to a sum without needing special-casing the way it
+        // broke the size-pattern match.
+        let k = ((wrapper.consumed - wrapper.consumed_after_last_trailer) as usize).min(6);
         let tail = wrapper.tail;
         let mut window = [0u8; 6];
         window[..k].copy_from_slice(&tail[6 - k..]);
@@ -787,26 +857,23 @@ impl Read for GuardedLzipReader {
                     }
                     self.state = GuardState::Streaming;
                 }
-                GuardState::Streaming => {
-                    self.consumed_before_this_read = self.inner.inner_mut().consumed;
-                    match self.inner.read(buf) {
-                        Ok(0) => match self.classify_trailing_data()? {
-                            TrailingVerdict::Accept => {
-                                self.state = GuardState::Done;
-                                return Ok(0);
-                            }
-                            TrailingVerdict::Reject(msg) => {
-                                self.state = GuardState::Failed;
-                                return Err(std::io::Error::new(ErrorKind::InvalidData, msg));
-                            }
-                        },
-                        Ok(n) => return Ok(n),
-                        Err(e) => {
-                            self.state = GuardState::Failed;
-                            return Err(e);
+                GuardState::Streaming => match self.inner.read(buf) {
+                    Ok(0) => match self.classify_trailing_data()? {
+                        TrailingVerdict::Accept => {
+                            self.state = GuardState::Done;
+                            return Ok(0);
                         }
+                        TrailingVerdict::Reject(msg) => {
+                            self.state = GuardState::Failed;
+                            return Err(std::io::Error::new(ErrorKind::InvalidData, msg));
+                        }
+                    },
+                    Ok(n) => return Ok(n),
+                    Err(e) => {
+                        self.state = GuardState::Failed;
+                        return Err(e);
                     }
-                }
+                },
                 GuardState::Done => return Ok(0),
                 GuardState::Failed => {
                     return Err(std::io::Error::new(
@@ -1542,6 +1609,76 @@ mod tests {
             try_decompress(lone_header).is_err(),
             "a lone, complete-looking header with no body must be rejected, matching the \
              reference tool, not accepted as an empty stream"
+        );
+    }
+
+    /// Review Round 2's minimal reproduction: a genuinely empty-content
+    /// member (legal LZIP, produced by an ordinary conforming encoder — no
+    /// crafted file needed) sitting between a real member and a corrupted
+    /// header is enough, on its own, to shift the byte-counting arithmetic
+    /// this codec's fix used to assume "exactly one trailer" for. Judged by
+    /// the reference tool, per that review's own standard.
+    #[test]
+    fn a_corrupted_header_after_one_empty_member_is_rejected_not_silently_dropped() {
+        let Some(lzip) = which_lzip() else {
+            return;
+        };
+
+        let real = compress(&b"a real, non-empty member, repeated a bit ".repeat(64));
+        let empty = compress(b""); // legal LZIP: a genuinely empty-content member
+
+        let mut candidate = real;
+        candidate.extend_from_slice(&empty);
+        // 3 of 4 magic bytes match ("L","Z",_,"P") — reference lzip's own
+        // `check_corrupt` rule, not a blanket "any leftover byte" one.
+        candidate.extend_from_slice(b"LZXP");
+        candidate.extend_from_slice(b"junk trailing the corrupted third header");
+
+        assert!(
+            !reference_accepts(&lzip, &candidate),
+            "sanity check on the reference tool itself: real member + empty member + corrupted \
+             third header must be rejected — reference disagreed, so this test's own premise is \
+             wrong"
+        );
+        assert!(
+            try_decompress(candidate).is_err(),
+            "a corrupted third member's header, following one real member and one genuinely \
+             EMPTY member, must be rejected — not silently accepted with the third member \
+             dropped, which is exactly the defect class this codec exists to close"
+        );
+    }
+
+    /// The generality the fix's arithmetic claims: not "one empty member",
+    /// any number of them. Two intervening empty members, not one, so a
+    /// fix narrowly patched to the minimal reproduction above (rather than
+    /// the general per-boundary reset it actually uses) would still fail
+    /// here.
+    #[test]
+    fn a_corrupted_header_after_two_empty_members_is_rejected_not_silently_dropped() {
+        let Some(lzip) = which_lzip() else {
+            return;
+        };
+
+        let real = compress(&b"a real, non-empty member, repeated a bit ".repeat(64));
+        let empty = compress(b"");
+
+        let mut candidate = real;
+        candidate.extend_from_slice(&empty);
+        candidate.extend_from_slice(&empty);
+        candidate.extend_from_slice(b"LZXP");
+        candidate.extend_from_slice(b"junk trailing the corrupted fourth header");
+
+        assert!(
+            !reference_accepts(&lzip, &candidate),
+            "sanity check on the reference tool itself: real member + two empty members + \
+             corrupted header must be rejected — reference disagreed, so this test's own \
+             premise is wrong"
+        );
+        assert!(
+            try_decompress(candidate).is_err(),
+            "a corrupted fourth member's header, following one real member and TWO genuinely \
+             empty members, must be rejected — not silently accepted with the fourth member \
+             dropped"
         );
     }
 }

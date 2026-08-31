@@ -15,7 +15,7 @@ read list.
 > `curl … | stf cat - | grep pattern` runs. `stf formats` lists `brotli`,
 > `bzip2`, `deflate`, `gzip`, `lz4`, `lzip`, `lzma`, `snappy`, `xz`, `zlib` and
 > `zstd`, each proven against the ten-property conformance harness Phase 1c
-> added and then proven to coexist. 394 tests under `--all-features`, 347 on
+> added and then proven to coexist. 396 tests under `--all-features`, 349 on
 > the default tier — a different set, not a subset, because the two tiers
 > select different backends. Clean across build, clippy and fmt.
 >
