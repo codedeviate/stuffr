@@ -24,6 +24,8 @@ pub mod deflate;
 pub mod gzip;
 #[cfg(feature = "lz4")]
 pub mod lz4;
+#[cfg(feature = "lzip")]
+pub mod lzip;
 #[cfg(feature = "lzma-c")]
 pub mod lzma_c;
 #[cfg(feature = "lzma-pure")]
@@ -71,6 +73,11 @@ pub fn register_all(registry: &mut Registry) {
 
     #[cfg(feature = "snappy")]
     registry.register_codec(std::sync::Arc::new(snappy::Snappy), snappy::meta());
+
+    // No mutual-exclusion dance here: unlike xz/lzma/zstd, LZIP has only
+    // one backend, so there is nothing else it could collide with.
+    #[cfg(feature = "lzip")]
+    registry.register_codec(std::sync::Arc::new(lzip::Lzip), lzip::meta());
 
     // Mutually exclusive, same shape as xz's and zstd's pairs below: both
     // arms register the same FormatId (see `lzma_shared`), and `not(feature =

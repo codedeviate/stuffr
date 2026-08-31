@@ -391,6 +391,39 @@ pub(crate) const LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF: &[ErrorKind] = &
     ErrorKind::UnexpectedEof,
 ];
 
+/// Its OWN constant, not a widening of [`LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF`]
+/// or any other — sharing would make a kind mean "corrupt" for every codec
+/// that shares it, which is exactly the mistake this file's module doc warns
+/// against.
+///
+/// `lzip.rs`'s two OWN checks (magic verification and the trailing-bytes
+/// check — see that module's doc) already raise `InvalidData` directly for
+/// the failure modes `lzma_rust2::LzipReader` itself cannot detect, so they
+/// need no folding here. This constant covers what is left: the raw kinds
+/// the backend DOES recognize as malformed. `LzipReader`'s own CRC32/
+/// data-size/member-size mismatches already construct `io::ErrorKind::
+/// InvalidData` directly (`error_invalid_data`, per `lzma-rust2` 0.20.1's
+/// `lib.rs`), so those need no folding either — what remains is corruption
+/// inside the member's embedded LZMA1 body, decoded by the same
+/// `lzma_rust2::LzmaReader` `lzma_pure.rs` uses, and measured (via
+/// `lzip.rs`'s own `corruption_sweep_is_detected_everywhere`, a full sweep
+/// of every byte position in a small one-member stream, not one flip) to
+/// raise the identical `Other`/`InvalidInput`/`UnexpectedEof` set that
+/// constant documents for the same underlying reason: same crate, same
+/// LZMA1 decode path underneath a different outer format.
+///
+/// Gated `#[cfg(feature = "lzip")]`: `lzip.rs` is the only consumer, and a
+/// build without it would otherwise leave this constant unused and warning
+/// under `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how
+/// that class of mistake was caught once `make check` gained the pure-tier
+/// leg.
+#[cfg(feature = "lzip")]
+pub(crate) const LZIP_MALFORMED_AS_INVALID_DATA: &[ErrorKind] = &[
+    ErrorKind::Other,
+    ErrorKind::InvalidInput,
+    ErrorKind::UnexpectedEof,
+];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],

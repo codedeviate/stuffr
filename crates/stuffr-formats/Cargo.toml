@@ -22,6 +22,7 @@ xz-c = ["dep:liblzma"]
 xz-pure = ["dep:lzma-rust2"]
 lzma-c = ["dep:liblzma"]
 lzma-pure = ["dep:lzma-rust2"]
+lzip = ["dep:lzma-rust2"]
 
 [dependencies]
 stuffr-core = { workspace = true }

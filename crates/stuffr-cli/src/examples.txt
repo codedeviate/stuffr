@@ -17,7 +17,8 @@ COMPRESSING A FILE
   stf pack notes.txt --format gzip -o out.bin
       --format names the codec explicitly instead of inferring one from -o's
       extension. Every build — even one with no C toolchain — accepts
-      gzip, zlib, deflate, bzip2, brotli, lz4, snappy, zstd and xz.
+      gzip, zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma and
+      lzip.
 
   stf pack notes.txt --format xz -o out.xz
       A default build writes xz through `lzma-rust2`, a pure-Rust port of
@@ -47,20 +48,35 @@ COMPRESSING A FILE
       4,170 swept byte positions) through the LZMA range coder's own
       structural sensitivity, not a designed check.
 
+  stf pack notes.txt --format lzip -o out.lz
+      LZIP, a newer container around the same LZMA1 payload `lzma` above
+      wraps, with two differences that matter: it carries a 4-byte `"LZIP"`
+      magic (so, unlike `.lzma`, a `.lz` file IS detected automatically —
+      see "DECOMPRESSING" below), and it defines a real multi-member
+      concatenation convention with a mandatory CRC32/size trailer per
+      member, so `cat a.lz b.lz | stf cat --format lzip -` decodes both
+      members' data, not just the first. Only one backend exists for it —
+      the same pure-Rust `lzma-rust2` xz and lzma use — so `--features
+      c-backed` makes no difference to this row at all, unlike zstd's or
+      xz's. Validated directly against the reference `lzip` 1.26 tool in
+      both directions, including the two-member case.
+
   stf pack notes.txt --level 9
       --level asks the codec for a tradeoff: gzip accepts 0 (fastest,
       largest output) through 9 (slowest, smallest output). xz's range is
-      the same shape, 0-9, with 6 as its default too. bzip2's range
-      is 1-9, not 0-9 — it has no "store" level, so --level 0 is a usage
-      error (exit 2) rather than meaning "don't compress". brotli's range is
-      0-11, and unlike every other codec here its OWN default is 11 (the
-      slowest setting it has), not something in the middle of the range.
-      zstd's range is the widest and the only one with negative numbers —
-      -131072 through 22 on this build — where negative levels are zstd's
-      "fast" modes, faster than level 1 at the cost of ratio; its default is
-      3. lz4 and snappy have no level at all — neither underlying crate
-      exposes such a knob — so --level is accepted and silently ignored
-      rather than rejected, unlike every other codec on this page.
+      the same shape, 0-9, with 6 as its default too, and lzma and lzip
+      share that exact range too — both wrap an LZMA1 payload under the
+      hood. bzip2's range is 1-9, not 0-9 — it has no "store" level, so
+      --level 0 is a usage error (exit 2) rather than meaning "don't
+      compress". brotli's range is 0-11, and unlike every other codec here
+      its OWN default is 11 (the slowest setting it has), not something in
+      the middle of the range. zstd's range is the widest and the only one
+      with negative numbers — -131072 through 22 on this build — where
+      negative levels are zstd's "fast" modes, faster than level 1 at the
+      cost of ratio; its default is 3. lz4 and snappy have no level at all —
+      neither underlying crate exposes such a knob — so --level is accepted
+      and silently ignored rather than rejected, unlike every other codec on
+      this page.
 
   stf pack notes.txt --force
       Without --force, pack refuses to overwrite an existing output: exit
@@ -97,6 +113,11 @@ DECOMPRESSING
       arriving on a pipe, with no filename to go by, cannot be detected at
       all, so --format lzma is the only way in there too. No special build
       is needed — every build has an LZMA1 backend.
+
+  stf unpack data.lz
+      LZIP, unlike its older sibling LZMA1 just above, DOES carry a 4-byte
+      `"LZIP"` magic at offset 0 — so this is detected automatically, on a
+      file or a pipe, and needs no --format at all.
 
 
 STREAMING TO STDOUT
@@ -142,21 +163,24 @@ WHAT THIS BUILD CAN DO
 
   stf formats
       Lists the formats compiled into THIS binary, not everything stf will
-      ever support. A pure build (the default) has nine rows: gzip, zlib,
-      deflate, bzip2, brotli, lz4, snappy, zstd and xz. zstd's row differs by
-      which backend compiled in: a build with the `zstd-c` feature (needs a
-      C toolchain) shows `yes` in WRITE, using the real `libzstd`; a
-      pure-Rust build falls back to `ruzstd` instead, and shows `weak` in
-      WRITE — see "USING A WEAK FALLBACK ENCODER" below. Either way the
-      format still reads `.zst` unconditionally; only writing it without the
-      C backend needs the flag. xz's row does NOT have this shape: both
-      backends show `yes` in WRITE, never `weak` — `--features c-backed`
-      swaps the pure-Rust `lzma-rust2` backend for the real `liblzma`, which
-      is faster (see "COMPRESSING A FILE" above) but not more capable.
-      `lzma`'s row has the same shape as xz's: both backends show `yes` in
-      WRITE. Both tiers list all ten formats — the ONLY capability
-      difference between a default build and `--features c-backed` is
-      zstd's WRITE column, `weak` against `yes`.
+      ever support. A pure build (the default) has eleven rows: gzip, zlib,
+      deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma and lzip. zstd's
+      row differs by which backend compiled in: a build with the `zstd-c`
+      feature (needs a C toolchain) shows `yes` in WRITE, using the real
+      `libzstd`; a pure-Rust build falls back to `ruzstd` instead, and shows
+      `weak` in WRITE — see "USING A WEAK FALLBACK ENCODER" below. Either
+      way the format still reads `.zst` unconditionally; only writing it
+      without the C backend needs the flag. xz's and lzma's rows do NOT have
+      this shape: both backends show `yes` in WRITE, never `weak` —
+      `--features c-backed` swaps the pure-Rust `lzma-rust2` backend for the
+      real `liblzma`, which is faster (see "COMPRESSING A FILE" above) but
+      not more capable. lzip's row is unaffected by `c-backed` entirely — it
+      has only ever had the one, pure-Rust `lzma-rust2` backend, so this
+      feature changes nothing about it, in either direction. All three
+      tiers (`pure`, `pure` plus `c-backed`, and any granular combination)
+      list all eleven formats — the ONLY capability difference the
+      `c-backed` feature makes anywhere in this matrix is zstd's WRITE
+      column, `weak` against `yes`.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -194,12 +218,14 @@ USING A WEAK FALLBACK ENCODER
       `yes`). Rebuild with `--features c-backed` to remove the limitation.
       xz does not have this shape: its pure-Rust backend (`lzma-rust2`) is a
       full codec at ratio parity with `liblzma`, not a weaker fallback, so
-      `--allow-weak-encoder` never applies to it, in any build. LZMA1 does
-      not have this shape either, for a different reason: its only backend
-      so far is the real `liblzma` (via `--features c-backed` or `lzma-c`
-      alone) — there is no pure-Rust LZMA1 backend yet for it to fall back
-      to, weakly or otherwise. `c-backed` remains a speed choice for xz, not
-      a capability one.
+      `--allow-weak-encoder` never applies to it, in any build. lzma (the
+      older LZMA1 "alone" format) shares xz's shape now too: its pure-Rust
+      backend is the same full-ratio `lzma-rust2`, so `--features c-backed`
+      is purely a speed choice for it as well, never a capability one.
+      lzip does not have this shape either, for a simpler reason still: it
+      has exactly one backend, period — there is no second, C-backed
+      implementation for it to differ from, weakly or otherwise, so
+      `--features c-backed` changes nothing about its row at all.
 
 
 EXIT CODES
@@ -216,18 +242,17 @@ EXIT CODES
 
 NOT YET
 
-  A pure build (the default) has nine codecs: gzip, zlib, deflate, bzip2,
-  brotli, lz4, snappy, zstd and xz. zstd's pure backend (`ruzstd`) is a weak
-  fallback (see "USING A WEAK FALLBACK ENCODER" above); xz's pure backend
-  (`lzma-rust2`) is not — it reads and writes full-ratio xz with no C
-  toolchain, just slower than `--features c-backed`'s `liblzma` (roughly
-  1.2-1.3x to encode, 2-2.2x to decode, measured on a 6.5 MB payload).
-  `--features c-backed` upgrades both: zstd to the real `libzstd`, and xz to
-  `liblzma` for speed. `--features c-backed` (or `lzma-c` alone) also adds a
-  tenth codec, `lzma` — LZMA1, the older format xz superseded — via the real
-  `liblzma`; it defines no magic bytes, so it is reachable only through
-  `--format lzma`, never by detection. LZMA1's pure-Rust backend does not
-  exist yet, so the default pure build has no `lzma` row at all. No archive
-  containers (tar, zip, ...) exist yet — Phase 2. `stf formats` always tells
-  you the truth about the build you are actually running, whatever this
-  page says.
+  A pure build (the default) has eleven codecs: gzip, zlib, deflate, bzip2,
+  brotli, lz4, snappy, zstd, xz, lzma and lzip. zstd's pure backend
+  (`ruzstd`) is a weak fallback (see "USING A WEAK FALLBACK ENCODER" above);
+  xz's and lzma's pure backends are not — both read and write full-ratio
+  output with no C toolchain, just slower than `--features c-backed`'s
+  `liblzma` (roughly 1.2-1.3x to encode, 2-2.2x to decode, measured on a
+  6.5 MB payload). `--features c-backed` upgrades all three: zstd to the
+  real `libzstd`, and xz/lzma to `liblzma` for speed. lzip has no such
+  upgrade path at all — it has exactly one backend (the same pure-Rust
+  `lzma-rust2` xz and lzma use), so `--features c-backed` changes nothing
+  about it, and there is no weak-fallback distinction for it either. No
+  archive containers (tar, zip, ...) exist yet — Phase 2. `stf formats`
+  always tells you the truth about the build you are actually running,
+  whatever this page says.

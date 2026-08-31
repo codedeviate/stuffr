@@ -9,15 +9,15 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 1e complete — ten codecs, and a default build that needs no
-> C toolchain to read *or write* xz.** `stf pack`, `unpack`, `cat`, `info` and
-> `formats` all work, on files and through pipes, and
+> **Status: Phase 1e complete — eleven codecs, and a default build that needs
+> no C toolchain to read *or write* xz, LZMA1 or LZIP.** `stf pack`, `unpack`,
+> `cat`, `info` and `formats` all work, on files and through pipes, and
 > `curl … | stf cat - | grep pattern` runs. `stf formats` lists `brotli`,
-> `bzip2`, `deflate`, `gzip`, `lz4`, `lzma`, `snappy`, `xz`, `zlib` and `zstd`,
-> each proven against the ten-property conformance harness Phase 1c added and
-> then proven to coexist. 371 tests under `--all-features`, 325 on the default
-> tier — a different set, not a subset, because the two tiers select different
-> backends. Clean across build, clippy and fmt.
+> `bzip2`, `deflate`, `gzip`, `lz4`, `lzip`, `lzma`, `snappy`, `xz`, `zlib` and
+> `zstd`, each proven against the ten-property conformance harness Phase 1c
+> added and then proven to coexist. 391 tests under `--all-features`, 344 on
+> the default tier — a different set, not a subset, because the two tiers
+> select different backends. Clean across build, clippy and fmt.
 >
 > **The build tiers, and what actually differs between them:**
 >
@@ -25,6 +25,7 @@ read list.
 > |---|---|---|
 > | `xz`, `lzma` | read **and write** | read and write — ~1.4x faster encode |
 > | `zstd` | read; write only under `--allow-weak-encoder` | read and write |
+> | `lzip` | read and write | identical — no second backend exists |
 > | the other seven | read and write | identical |
 >
 > **The only capability difference is zstd's encoder.** For xz and LZMA1,
@@ -33,7 +34,9 @@ read list.
 > 2,098,920 against 2,098,968 bytes — parity. The pure xz and LZMA1 backends
 > come from `lzma-rust2`, a port of Tukaani's "XZ for Java"; the system `xz`
 > tool validates and byte-for-byte decodes what they write, and they read its
-> output the same way.
+> output the same way. LZIP is a third format built on that same dependency,
+> but unlike xz and LZMA1 it has no second, C-backed implementation to speed up
+> — `c-backed` simply does not touch its row, in either direction.
 >
 > A default build writes `.zst` only behind `--allow-weak-encoder`, because
 > `ruzstd`'s encoder produces files about 76% larger (3.53x against C zstd's
@@ -51,9 +54,21 @@ read list.
 > closes it, and a `DecodeOpts` memory bound arrives with the governor in
 > Phase 1f.
 >
+> **A fifth instance of a defect class this project keeps finding: a
+> concatenated stream silently truncated to less than all of it.** Bare
+> `lzma-rust2::LzipReader` treats a damaged LATER member's header exactly like
+> a clean end of stream — it returns `Ok` with only the earlier members'
+> bytes, no error, the same shape gzip's, bzip2's, xz's and LZMA1's naive
+> bindings were each caught doing earlier in this project. `lzip.rs` closes it
+> with two checks of its own (a magic check ahead of the first member, and an
+> unconsumed-bytes check after the reader reports done), each with a
+> regression test, and validates the fix and the format's ordinary
+> multi-member case against the reference `lzip` 1.26 tool directly, in both
+> directions.
+>
 > **Not yet: containers.** `tar`, `zip` and the rest are Phase 2. Parallel
 > encode and the version bump to `0.1.0` are Phase 1f. Nothing in the matrix
-> below beyond the ten codecs above is implemented.
+> below beyond the eleven codecs above is implemented.
 >
 > Already true and enforced for every codec: decoding is incremental rather
 > than read-to-end, corruption is distinguishable from a full disk, truncation
@@ -145,7 +160,7 @@ OOM killer.
 ## Planned CLI
 
 *Phase 1 and later. `pack`, `unpack`, `cat`, `info` and `formats` work today,
-for the ten codecs `stf formats` lists; `list`, `test`, `convert` and
+for the eleven codecs `stf formats` lists; `list`, `test`, `convert` and
 `install-links`, and every container, are not implemented yet.*
 
 ```
@@ -179,7 +194,7 @@ domain, so:
 
 Read and write symmetry wherever it is technically possible.
 
-- **Modern codecs:** zstd, xz/LZMA2, LZMA1, brotli, lz4, snappy, gzip/zlib/deflate, bzip2
+- **Modern codecs:** zstd, xz/LZMA2, LZMA1, LZIP, brotli, lz4, snappy, gzip/zlib/deflate, bzip2
 - **Containers:** tar, cpio, ar, zip/zip64, 7z, squashfs, ISO 9660, MS CAB, RAR *(read only)*
 - **Plain storage:** collecting and compressing are separate axes — tar, cpio, ar, zip-stored and 7z-copy all give you a container with no compression
 - **Legacy:** LHA/LZH, Unix `compress` `.Z`, `pack` `.z`, ARC, ARJ, ZOO, StuffIt `.sit` *(older methods)*, LZX
@@ -195,13 +210,16 @@ like an oversight.
 Pure Rust is the default, so `cargo install` needs no C toolchain — and as of
 Phase 1e that is no longer a reduced experience for xz. The pure tier reads and
 writes xz and LZMA1 at parity with `liblzma`'s output size, within about 1.4x of
-its speed. Only **zstd's encoder** is genuinely better for linking C; the pure
-one works but is gated behind `--allow-weak-encoder` because its output is
-markedly larger. RAR remains decode-only for licence reasons, not effort.
+its speed, and LZIP — a third format built on the same `lzma-rust2` dependency
+— has no C-backed alternative to be at parity with in the first place; it is
+simply the only implementation, at full ratio, in every build. Only **zstd's
+encoder** is genuinely better for linking C; the pure one works but is gated
+behind `--allow-weak-encoder` because its output is markedly larger. RAR
+remains decode-only for licence reasons, not effort.
 
 | Feature | Contents |
 |---|---|
-| `pure` *(default)* | everything with a pure-Rust implementation — all ten codecs, including read+write xz and LZMA1 |
+| `pure` *(default)* | everything with a pure-Rust implementation — all eleven codecs, including read+write xz, LZMA1 and LZIP |
 | `c-backed` | `zstd-sys` and `liblzma`, both vendored and built statically; later `unrar` (decode) |
 | `legacy` | the historical format set |
 | `full` | all of the above |
@@ -251,7 +269,7 @@ already taken on crates.io. The command you type stays `stf`.
 That covers this project's own code. It does **not** extend to dependencies, and
 two are worth naming.
 
-`lzma-rust2`, which provides the pure-Rust xz and LZMA1 backends, is
+`lzma-rust2`, which provides the pure-Rust xz, LZMA1 and LZIP backends, is
 **Apache-2.0**. It is the first non-MIT dependency in a *default* build — until
 Phase 1e, only the opt-in `c-backed` tier carried a licence caveat. Apache-2.0 is
 permissive and compatible, but a downstream consumer auditing licences should
