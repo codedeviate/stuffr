@@ -147,7 +147,7 @@ impl Codec for Zstd {
     /// a real payload encoded via the raw `zstd` crate with no
     /// `include_checksum` call (built via `zstd::stream::write::Encoder`
     /// directly — `zstd_c::Zstd`'s own encoder always turns the checksum
-    /// on, so it cannot produce this case itself): only 8 of 4105 flipped
+    /// on, so it cannot produce this case itself): only 9 of 4105 flipped
     /// positions were detected, 4096 decoded to silently WRONG bytes, and
     /// one (the structural window-descriptor exception documented on the
     /// corruption-sweep tests below) was silently unchanged. That is a much
@@ -735,15 +735,19 @@ mod tests {
             packed.len()
         );
         assert_eq!(
-            silently_unchanged, 1,
-            "expected exactly one silently-unchanged position — byte 5, the window \
-             descriptor (see this test's doc for why). Any other count would be a genuine, \
-             undocumented change in detection coverage: measured {silently_unchanged}"
+            silently_unchanged, 0,
+            "ruzstd 0.9.0 detects every flipped position in a stream it wrote, byte 5 \
+             (the window descriptor) included. Under the previously pinned 0.8.1 that \
+             one byte decoded unchanged and this assertion read 1, so the upgrade \
+             improved coverage rather than regressing it. Any non-zero count now is a \
+             genuine change in detection coverage: measured {silently_unchanged}"
         );
         assert_eq!(
             invalid_data,
-            packed.len() - 1,
-            "every position except the one documented structural exception must be detected"
+            packed.len(),
+            "ruzstd 0.9.0 detects EVERY position, with no structural exception. The \
+             previously pinned 0.8.1 left byte 5 (the window descriptor) undetected, \
+             so this read `packed.len() - 1`; the upgrade closed that gap."
         );
     }
 
@@ -784,9 +788,9 @@ mod tests {
             packed.len()
         );
         assert_eq!(
-            silently_unchanged, 1,
-            "expected exactly one silently-unchanged position — byte 5, the window \
-             descriptor, same structural reason as the self-written sweep: measured \
+            silently_unchanged, 0,
+            "as with the self-written sweep, ruzstd 0.9.0 detects byte 5 (the window \
+             descriptor) where the previously pinned 0.8.1 did not: measured \
              {silently_unchanged}"
         );
     }
@@ -825,16 +829,16 @@ mod tests {
             "every malformed-input error here must classify as InvalidData once \
              NormalizeDecodeErrors has run — {other_kind} positions did not"
         );
-        // Measured, not merely bounded: 8 of 4105 detected (structural
+        // Measured, not merely bounded: 9 of 4105 detected (structural
         // framing bytes only — no checksum exists to catch a corrupted
-        // literal), 4096 silently wrong, and the same 1 silently-unchanged
+        // literal), 4096 silently wrong, and no silently-unchanged
         // window-descriptor position the other two sweeps hit. A
         // dramatically weaker showing than either checksummed sweep above,
         // which is the whole point of this test — see the `decoder` doc's
         // disclosure this backs.
         assert_eq!(
             invalid_data,
-            8,
+            9,
             "measured {invalid_data} of {} positions detected without a checksum to check \
              against — only structural framing bytes remain protected",
             packed.len()
@@ -847,9 +851,10 @@ mod tests {
             packed.len()
         );
         assert_eq!(
-            silently_unchanged, 1,
-            "the same structural window-descriptor position as the checksummed sweeps, \
-             independent of the checksum question entirely: measured {silently_unchanged}"
+            silently_unchanged, 0,
+            "0.9.0's window-size cap catches the flipped window descriptor here too, so \
+             no position decodes unchanged — independent of the checksum question, which \
+             is the point of this sweep: measured {silently_unchanged}"
         );
     }
 
@@ -904,7 +909,7 @@ mod tests {
     ///   reviewer's independently-confirmed case.
     #[cfg(all(feature = "zstd-pure", feature = "zstd-c"))]
     #[test]
-    fn window_descriptor_corruption_is_harmless_only_in_the_direction_that_grows_it() {
+    fn window_descriptor_corruption_is_detected_in_both_directions() {
         // A 50 KiB marker (not a short one: a small marker's savings get
         // lost in per-block-header overhead once the payload spans multiple
         // wire blocks, measured directly while building this test) repeated
@@ -968,17 +973,28 @@ mod tests {
             "an uncorrupted stream must round-trip"
         );
 
-        // Direction 1: grow the window. Harmless, exactly as claimed — and
-        // already exhaustively confirmed at this exact byte position by
-        // the corruption-sweep tests above; repeated here on a stream that
-        // actually contains a real, large cross-block match, so the same
-        // claim holds under the stricter case too.
+        // Direction 1: grow the window. **This reversed with the upgrade from
+        // ruzstd 0.8.1 to 0.9.0, and the reversal is why this test is worth
+        // keeping.** Under 0.8.1, growing the declared window was harmless and
+        // this asserted a clean round-trip. 0.9.0 added a window-size cap and
+        // now REJECTS it — measured: `WindowSizeTooBig { requested:
+        // 2199023255552, max: 104857600 }`, i.e. a flipped descriptor asking
+        // for 2.2 TB against a 100 MiB ceiling.
+        //
+        // That is a resource guard rather than an integrity check, and it is
+        // worth noticing as such: it is precisely the protection `lzma-rust2`'s
+        // xz decoder lacks (see `xz_pure.rs`'s module doc, where a 60-byte file
+        // can demand an allocation sized by its own declared dictionary).
         let mut grown = packed.clone();
         grown[5] ^= 0xFF;
-        assert_eq!(
-            decompress(grown),
-            plain,
-            "growing the declared window must not be able to change decoded output"
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(grown)));
+        let mut dec = Zstd.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        assert!(
+            dec.read_to_end(&mut out).is_err(),
+            "ruzstd 0.9.0 caps the window at 100 MiB, so a grown descriptor must be \
+             refused rather than honoured; if this starts passing, the cap was removed \
+             or raised and the sweep tests' silently_unchanged counts will have moved too"
         );
 
         // Direction 2: shrink the window well below the real match's
