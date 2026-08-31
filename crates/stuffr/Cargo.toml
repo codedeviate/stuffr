@@ -23,8 +23,12 @@ lz4 = ["stuffr-formats/lz4"]
 snappy = ["stuffr-formats/snappy"]
 zstd-c = ["stuffr-formats/zstd-c"]
 zstd-pure = ["stuffr-formats/zstd-pure"]
+xz-c = ["stuffr-formats/xz-c"]
+# Task 5 adds `xz-pure = ["stuffr-formats/xz-pure"]` and puts it in `pure`
+# below, mirroring `zstd-pure`. Left out here: xz's pure backend does not
+# exist yet, and `pure` must stay a build any caller can actually make today.
 pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pure"]
-c-backed = ["zstd-c"]
+c-backed = ["zstd-c", "xz-c"]
 legacy = []
 full = ["pure", "c-backed", "legacy"]
 serde = ["dep:serde", "stuffr-core/serde"]

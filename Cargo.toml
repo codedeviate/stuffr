@@ -36,4 +36,12 @@ zstd = "0.13"
 # natural way to move past it once 0.9.0's API (verified identical to
 # 0.8.1/0.8.2 for everything zstd_pure.rs uses) is worth requiring 1.87 for.
 ruzstd = "=0.8.1"
+# Not the bare `liblzma = "0.4"` a plain `cargo add` would produce. Default
+# features pull in `bindgen` (needs libclang at build time) and, without
+# `static`, `liblzma-sys`'s build.rs takes a pkg-config path linking a
+# *system* liblzma instead of building one — silently fine on a developer
+# machine with Homebrew's `xz` installed, broken on a clean one or CI. This
+# line vendors and builds `liblzma.a` from source instead: no pkg-config, no
+# system library, no libclang. Verified: zstd plus liblzma builds in ~8s.
+liblzma = { version = "0.4", default-features = false, features = ["static"] }
 clap = { version = "4", features = ["derive"] }

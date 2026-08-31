@@ -177,6 +177,61 @@ pub(crate) const ZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 pub(crate) const RUZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
+/// The `InvalidData` + `UnexpectedEof` pair, measured independently against
+/// the `liblzma` crate (backing `xz_c.rs`) alone. Its own constant rather
+/// than a reuse of [`MALFORMED_AS_INVALID_INPUT_EOF`] even though the target
+/// kind after folding is the same: that constant's actual SOURCE kind is
+/// `InvalidInput`, not `InvalidData` — a different pair of raw kinds that
+/// only coincides with xz's in the `UnexpectedEof` half. Widening it to
+/// admit `InvalidData` too would apply that fold to flate2 and bzip2 as
+/// well, on no evidence either of them ever raises it.
+///
+/// Measured directly against `liblzma` 0.4.8 with a throwaway probe
+/// (compress a 4 KiB incompressible payload, flip every byte position in
+/// turn — not one flip; then, separately, truncate at every prefix length):
+/// corruption was detected at all 4,156 positions swept, split 4,154
+/// `InvalidData` / 2 `UnexpectedEof`, zero silently wrong and zero silently
+/// unchanged; truncation was detected at all 4,155 cuts swept, entirely
+/// `UnexpectedEof`. `detects_corruption: true` in `xz_c.rs`'s `caps()` is
+/// direct evidence from this same sweep, not an assumption — see RULING R15
+/// in this cycle's task brief.
+///
+/// Traced directly against `liblzma_0_4_8::bufread::XzDecoder::read`
+/// (`bufread.rs`): a genuine error reading the underlying SOURCE reaches the
+/// caller via `self.obj.fill_buf()?`, propagated with its original kind
+/// intact; every other fallible path in that function is this crate's own
+/// classification, constructed directly rather than by rewrapping a source
+/// error — `io::ErrorKind::UnexpectedEof` ("premature eof") when input ends
+/// before the decoder reaches `Status::StreamEnd`, `io::ErrorKind::
+/// InvalidData` ("corrupt xz stream") when a read makes no progress without
+/// having reached eof, and liblzma's own richer `Error` enum (`Error::Data`,
+/// `Error::Format`, ...) converted to `io::Error` by its `From` impl in
+/// `stream.rs`, which already maps the two malformed-input variants
+/// (`Error::Data`, `Error::Format`) to `InvalidData` itself — this codec's
+/// fold is a near no-op for that half and does the real work only on the
+/// `UnexpectedEof` half. So either kind reaching this wrapper always means
+/// the xz decoder itself rejected the bytes, never a genuine I/O failure
+/// underneath — the same structural guarantee `ZSTD_MALFORMED_AS_OTHER_EOF`
+/// and `SNAPPY_MALFORMED_AS_OTHER_EOF` depend on, re-verified here against
+/// this backend specifically rather than assumed to carry over.
+///
+/// Unlike zstd's content checksum, xz's integrity check is not something
+/// this codec has to opt into: `xz_c.rs`'s `encoder` calls `liblzma::write::
+/// XzEncoder::new`, which selects `Check::Crc64` unconditionally. The check
+/// is still an optional field in the xz format itself (`Check::None` is
+/// legal) — see `format.rs`'s `detects_corruption` doc — so a `.xz` written
+/// by some other tool with no check at all is not covered by the sweep
+/// above, which only measured a stream this codec's own encoder wrote.
+///
+/// Gated `#[cfg(feature = "xz-c")]`: `xz_c.rs` is the only consumer, and a
+/// build with `xz-pure` but not `xz-c` has no `xz_c` module at all, which
+/// would otherwise leave this constant unused and warning under `-D
+/// warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how this was
+/// caught for zstd once `make check` gained the pure-tier leg.
+#[cfg(feature = "xz-c")]
+pub(crate) const XZ_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
+    &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],
