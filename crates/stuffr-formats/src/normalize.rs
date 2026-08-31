@@ -335,6 +335,60 @@ pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF: &[ErrorKind] = &[
 pub(crate) const LZMA_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
     &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
 
+/// The `Other` + `InvalidInput` + `UnexpectedEof` TRIPLE, measured
+/// independently against `lzma-rust2` 0.20.1's LZMA1 "alone" decode path
+/// (backing `lzma_pure.rs`) — a different crate entirely from
+/// [`LZMA_MALFORMED_AS_INVALID_DATA_EOF`] (which measures `liblzma`), so its
+/// own constant for the same reason every other constant in this file is:
+/// a different implementation of the same format is not evidence about
+/// this one.
+///
+/// Measured directly with a throwaway probe against the raw
+/// `lzma_rust2::LzmaReader` (compress a payload with this codec's own
+/// encoder, flip every byte position of the compressed stream in turn — a
+/// full sweep, not one flip — then, separately, truncate at every prefix
+/// length), across THREE payload shapes (compressible text, incompressible
+/// random data, all zeros): corruption was detected in every case but the
+/// honest exception `lzma_pure.rs`'s module doc documents (the header's
+/// dictionary-size field, plus this backend's own flush-tail bytes), split
+/// almost entirely `Other` (`lzma_rust2`'s own generic error variant,
+/// constructed internally rather than by rewrapping a source error — traced
+/// against the crate's `decoder.rs` and `lzma_reader.rs`, whose fallible
+/// paths raise `error_other`/`error_invalid_data` variants for a corrupted
+/// range-coder state) with a small number of `InvalidInput` (the range
+/// decoder's own "first byte is not zero" structural check in
+/// `range_dec.rs`'s `new_stream`); truncation was detected as
+/// `UnexpectedEof` for every cut inside the fixed 18-byte header-plus-prologue
+/// (13-byte `.lzma` header, 5-byte range-coder prologue) and as `Other` for
+/// deeper cuts, except a cut of exactly the stream's last byte — see
+/// `lzma_pure.rs`'s module doc for why that one case needs
+/// [`crate::lzma_pure`]'s own `GuardedReader` rather than anything this fold
+/// list could cover, since the raw crate reports that one case as `Ok`, not
+/// an error of any kind.
+///
+/// Traced the same way as this file's other constants: a genuine error
+/// reading the underlying SOURCE reaches the caller via a `?` on the
+/// wrapped reader's own `read`/`read_exact` call, kind intact; every other
+/// fallible path is this crate's own classification, constructed directly
+/// rather than by rewrapping a source error (see `lib.rs`'s `error_other`,
+/// `error_invalid_input`, `error_eof` helpers, all `#[cfg(feature =
+/// "std")]` constructors of a plain `std::io::Error`). So any of these three
+/// kinds reaching this wrapper always means the LZMA1 decoder itself
+/// rejected the bytes, never a genuine I/O failure underneath.
+///
+/// Gated `#[cfg(feature = "lzma-pure")]`: `lzma_pure.rs` is the only
+/// consumer, and a build with `lzma-c` but not `lzma-pure` has no
+/// `lzma_pure` module at all, which would otherwise leave this constant
+/// unused and warning under `-D warnings` — see
+/// `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how this was caught once `make
+/// check` gained the pure-tier leg.
+#[cfg(feature = "lzma-pure")]
+pub(crate) const LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF: &[ErrorKind] = &[
+    ErrorKind::Other,
+    ErrorKind::InvalidInput,
+    ErrorKind::UnexpectedEof,
+];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],

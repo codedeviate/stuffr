@@ -26,6 +26,8 @@ pub mod gzip;
 pub mod lz4;
 #[cfg(feature = "lzma-c")]
 pub mod lzma_c;
+#[cfg(feature = "lzma-pure")]
+pub mod lzma_pure;
 #[cfg(feature = "snappy")]
 pub mod snappy;
 #[cfg(feature = "xz-c")]
@@ -70,12 +72,13 @@ pub fn register_all(registry: &mut Registry) {
     #[cfg(feature = "snappy")]
     registry.register_codec(std::sync::Arc::new(snappy::Snappy), snappy::meta());
 
-    // Mutually exclusive: both arms will register the same FormatId (see
-    // `lzma_shared`). Only the C arm exists yet — Task 6 adds the
-    // `#[cfg(all(feature = "lzma-pure", not(feature = "lzma-c")))]` pure arm,
-    // same shape as xz's and zstd's pairs below.
+    // Mutually exclusive, same shape as xz's and zstd's pairs below: both
+    // arms register the same FormatId (see `lzma_shared`), and `not(feature =
+    // "lzma-c")` is what makes the C backend win when both are compiled.
     #[cfg(feature = "lzma-c")]
     registry.register_codec(std::sync::Arc::new(lzma_c::Lzma), lzma_c::meta());
+    #[cfg(all(feature = "lzma-pure", not(feature = "lzma-c")))]
+    registry.register_codec(std::sync::Arc::new(lzma_pure::Lzma), lzma_pure::meta());
 
     // Mutually exclusive, same shape as zstd's pair below: both arms
     // register the same FormatId (see `xz_shared`), and `not(feature =

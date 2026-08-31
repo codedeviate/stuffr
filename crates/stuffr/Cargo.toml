@@ -26,9 +26,8 @@ zstd-pure = ["stuffr-formats/zstd-pure"]
 xz-c = ["stuffr-formats/xz-c"]
 xz-pure = ["stuffr-formats/xz-pure"]
 lzma-c = ["stuffr-formats/lzma-c"]
-# lzma-pure joins `pure` below once Task 6 adds it; until then LZMA1 has no
-# pure-Rust backend and a `pure` build simply has no `lzma` row.
-pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pure", "xz-pure"]
+lzma-pure = ["stuffr-formats/lzma-pure"]
+pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pure", "xz-pure", "lzma-pure"]
 c-backed = ["zstd-c", "xz-c", "lzma-c"]
 legacy = []
 full = ["pure", "c-backed", "legacy"]

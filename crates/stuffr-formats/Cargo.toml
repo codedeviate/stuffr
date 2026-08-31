@@ -21,12 +21,7 @@ zstd-pure = ["dep:ruzstd"]
 xz-c = ["dep:liblzma"]
 xz-pure = ["dep:lzma-rust2"]
 lzma-c = ["dep:liblzma"]
-# Declared now, with no dependency attached yet, purely so `#[cfg(feature =
-# "lzma-pure")]` in `lzma_shared.rs` is a known feature rather than tripping
-# `unexpected_cfgs` under `-D warnings`. Task 6 attaches `dep:lzma-rust2` to
-# it and adds the pure counterpart module — same shape as `xz-pure` above
-# before Task 5 landed.
-lzma-pure = []
+lzma-pure = ["dep:lzma-rust2"]
 
 [dependencies]
 stuffr-core = { workspace = true }
