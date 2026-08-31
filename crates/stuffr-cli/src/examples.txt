@@ -33,9 +33,11 @@ COMPRESSING A FILE
       capability one.
 
   stf pack notes.txt --format lzma -o out.lzma
-      LZMA1, the older "alone" format xz superseded, needs `--features
-      c-backed` (or `lzma-c` alone) — the default pure build has no LZMA1
-      backend yet. Unlike every other codec on this page, `.lzma` defines
+      LZMA1, the older "alone" format xz superseded. Every build reads and
+      writes it, including one with no C toolchain: `--features c-backed`
+      swaps the pure-Rust `lzma-rust2` backend for the real `liblzma`, which
+      is faster but produces a byte-identical stream at the same preset.
+      Unlike every other codec on this page, `.lzma` defines
       NO magic bytes at all: its header's first byte encodes lc/lp/pb and
       the next four the dictionary size, not a fixed signature, so this
       format can never be detected from bytes alone, on a file or a pipe —
@@ -93,9 +95,8 @@ DECOMPRESSING
       LZMA1 defines no magic bytes either, the same as brotli — detection
       from a file works only by the `.lzma` extension, and a `.lzma` stream
       arriving on a pipe, with no filename to go by, cannot be detected at
-      all, so --format lzma is the only way in there too. Needs a build
-      with `--features c-backed` (or `lzma-c` alone); the default pure
-      build has no LZMA1 backend yet.
+      all, so --format lzma is the only way in there too. No special build
+      is needed — every build has an LZMA1 backend.
 
 
 STREAMING TO STDOUT
@@ -152,9 +153,10 @@ WHAT THIS BUILD CAN DO
       backends show `yes` in WRITE, never `weak` — `--features c-backed`
       swaps the pure-Rust `lzma-rust2` backend for the real `liblzma`, which
       is faster (see "COMPRESSING A FILE" above) but not more capable.
-      `--features c-backed` adds a TENTH row, `lzma`, that the pure build
-      does not have at all yet — LZMA1 has only a C backend so far; its
-      pure-Rust counterpart is not implemented yet.
+      `lzma`'s row has the same shape as xz's: both backends show `yes` in
+      WRITE. Both tiers list all ten formats — the ONLY capability
+      difference between a default build and `--features c-backed` is
+      zstd's WRITE column, `weak` against `yes`.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS

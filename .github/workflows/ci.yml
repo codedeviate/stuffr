@@ -51,3 +51,46 @@ jobs:
       # The pure tier is a different test set, not a subset — see the
       # `test-pure` target in the Makefile for why.
       - run: cargo test --workspace
+
+  c-backed:
+    name: c-backed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml pins 1.95 for local development, which would
+      # otherwise make the toolchain selection above inert (see "gate"'s
+      # identical step).
+      - run: rm rust-toolchain.toml
+      # The first job in this project's history that needs a C compiler on
+      # the runner — and it needs nothing else. `zstd` vendors its own C
+      # source and builds it statically by default, and `liblzma` is pinned
+      # to `{ version = "0.4", default-features = false, features =
+      # ["static"] }` specifically so it never reaches for `libclang` (for
+      # bindgen) or a system liblzma via pkg-config. Do NOT add an
+      # `apt-get install` step "to be safe" — that would mask a regression
+      # back to the pkg-config path, which is the failure this job's minimal
+      # setup exists to catch. If this job ever fails for a missing system
+      # library, that is the bug, not the runner.
+      - run: cargo build --workspace --no-default-features --features c-backed
+      - run: cargo test --workspace --no-default-features --features c-backed
+
+  purity:
+    name: purity (pure pulls in no C-compiling crate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: rm rust-toolchain.toml
+      # Structural, not environmental: this cannot prove `cc` is absent from
+      # a runner (runners have compilers), only that a default `pure` build
+      # never reaches for `zstd-sys` or `liblzma-sys` in the first place.
+      # The exit code is inverted on purpose: `grep` succeeding means it
+      # FOUND a C-compiling crate, which is the failure.
+      - name: pure builds pull in no C-compiling crate
+        run: |
+          cargo tree -p stuffr --no-default-features --features pure -e normal \
+            | grep -E 'zstd-sys|liblzma-sys' && exit 1
+          echo "pure graph is free of C-compiling crates"

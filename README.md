@@ -9,33 +9,57 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 1d complete — seven codecs, proven to coexist.** `stf pack`,
-> `unpack`, `cat`, `info` and `formats` all work today, on files and through
-> pipes, and `curl … | stf cat - | grep pattern` runs. `stf formats` lists
-> `brotli`, `bzip2`, `deflate`, `gzip`, `lz4`, `snappy` and `zlib`, each proven
-> individually against the ten-property conformance harness Phase 1c added, and
-> then proven together: magic detection picks the right one out of seven
-> (`gzip`, `zlib`, `bzip2`, `lz4`, `snappy` all carry magic bytes; `zlib` alone
-> needs four rules, one per compression-level band), and `deflate` — which has
-> neither magic nor an extension convention — is reachable only via
-> `--format` and fails detection cleanly rather than being guessed at. 273
-> tests, clean across build, clippy and fmt.
+> **Status: Phase 1e complete — ten codecs, and a default build that needs no
+> C toolchain to read *or write* xz.** `stf pack`, `unpack`, `cat`, `info` and
+> `formats` all work, on files and through pipes, and
+> `curl … | stf cat - | grep pattern` runs. `stf formats` lists `brotli`,
+> `bzip2`, `deflate`, `gzip`, `lz4`, `lzma`, `snappy`, `xz`, `zlib` and `zstd`,
+> each proven against the ten-property conformance harness Phase 1c added and
+> then proven to coexist. 371 tests under `--all-features`, 325 on the default
+> tier — a different set, not a subset, because the two tiers select different
+> backends. Clean across build, clippy and fmt.
 >
-> **Not yet: the codecs that need a C toolchain, or a container.** `zstd`,
-> `xz` and `LZMA1` arrive in Phase 1e; parallel encode and the version bump to
-> `0.1.0` follow in Phase 1f; `tar`, `zip` and the rest of the container set
-> are Phase 2. Nothing in the matrix below beyond the seven listed above is
-> implemented yet.
+> **The build tiers, and what actually differs between them:**
+>
+> | format | default (`pure`) build | `--features c-backed` |
+> |---|---|---|
+> | `xz`, `lzma` | read **and write** | read and write — ~1.4x faster encode |
+> | `zstd` | read; write only under `--allow-weak-encoder` | read and write |
+> | the other seven | read and write | identical |
+>
+> **The only capability difference is zstd's encoder.** For xz and LZMA1,
+> `c-backed` is a speed choice: measured in release on a 6.5 MB payload, encode
+> 252 ms against 346 ms and decode 9.4 ms against 16.7 ms, at output sizes
+> 2,098,920 against 2,098,968 bytes — parity. The pure xz and LZMA1 backends
+> come from `lzma-rust2`, a port of Tukaani's "XZ for Java"; the system `xz`
+> tool validates and byte-for-byte decodes what they write, and they read its
+> output the same way.
+>
+> A default build writes `.zst` only behind `--allow-weak-encoder`, because
+> `ruzstd`'s encoder produces files about 76% larger (3.53x against C zstd's
+> 6.21x on an 11.7 MB corpus) at roughly 8x the time. `stf formats` shows
+> `weak` rather than `yes` in that row, so a build's honesty is visible without
+> running anything.
+>
+> **One known limitation, stated rather than buried.** On the default tier,
+> `xz` decoding allocates a dictionary buffer sized by the value the *file
+> declares in its own header*, before any output exists. Measured peak RSS
+> decoding a 60-byte `.xz` that declares preset 9's dictionary: 69.35 MB,
+> against 2.39 MB for `liblzma`. The format permits declaring roughly 4 GiB.
+> `--max-ratio` cannot catch this — it counts decoded *output* bytes, and the
+> cost is paid before there is any output to count. `--features c-backed`
+> closes it, and a `DecodeOpts` memory bound arrives with the governor in
+> Phase 1f.
+>
+> **Not yet: containers.** `tar`, `zip` and the rest are Phase 2. Parallel
+> encode and the version bump to `0.1.0` are Phase 1f. Nothing in the matrix
+> below beyond the ten codecs above is implemented.
 >
 > Already true and enforced for every codec: decoding is incremental rather
-> than read-to-end, corruption is distinguishable from a full disk, output is
-> fsynced before it is published and never destroys an existing file on
-> failure, and `stuffr-core` carries zero format dependencies. The property
-> that actually matters is **no C toolchain is required** — `cargo install`
-> needs no `cc`, no `cmake`, nothing beyond `rustc` — not that the tree
-> contains no `-sys` crate: it contains three (`libbz2-rs-sys`,
-> `linux-raw-sys`, `windows-sys`), and all three are pure-Rust FFI
-> declarations that link nothing.
+> than read-to-end, corruption is distinguishable from a full disk, truncation
+> and concatenated streams are detected rather than silently truncating, output
+> is fsynced before it is published and never destroys an existing file on
+> failure, and `stuffr-core` carries zero format dependencies.
 
 ## Why another one
 
@@ -121,7 +145,7 @@ OOM killer.
 ## Planned CLI
 
 *Phase 1 and later. `pack`, `unpack`, `cat`, `info` and `formats` work today,
-for the seven codecs `stf formats` lists; `list`, `test`, `convert` and
+for the ten codecs `stf formats` lists; `list`, `test`, `convert` and
 `install-links`, and every container, are not implemented yet.*
 
 ```
@@ -168,17 +192,26 @@ like an oversight.
 
 ## Build tiers
 
-Pure Rust is the default, so `cargo install` needs no C toolchain. Formats that
-realistically require linking C — zstd and xz *encoders*, RAR — sit behind opt-in
-features, and pure-Rust *decode-only* fallbacks cover the common case of merely
-wanting to open the file.
+Pure Rust is the default, so `cargo install` needs no C toolchain — and as of
+Phase 1e that is no longer a reduced experience for xz. The pure tier reads and
+writes xz and LZMA1 at parity with `liblzma`'s output size, within about 1.4x of
+its speed. Only **zstd's encoder** is genuinely better for linking C; the pure
+one works but is gated behind `--allow-weak-encoder` because its output is
+markedly larger. RAR remains decode-only for licence reasons, not effort.
 
 | Feature | Contents |
 |---|---|
-| `pure` *(default)* | everything with a pure-Rust implementation |
-| `c-backed` | `zstd-sys`, `liblzma`, `unrar` (decode) |
+| `pure` *(default)* | everything with a pure-Rust implementation — all ten codecs, including read+write xz and LZMA1 |
+| `c-backed` | `zstd-sys` and `liblzma`, both vendored and built statically; later `unrar` (decode) |
 | `legacy` | the historical format set |
 | `full` | all of the above |
+
+`c-backed` needs a C compiler and **nothing else** — no `libclang`, no system
+liblzma. Both dependencies vendor their own C source: `zstd` does by default, and
+`liblzma` is pinned with `default-features = false, features = ["static"]`
+specifically so it never falls back to linking a system library via pkg-config,
+which would succeed on a developer machine and fail on a clean one. A CI job
+checks that the `pure` graph contains neither `zstd-sys` nor `liblzma-sys`.
 
 There is also one granular feature per format, so a dependent can take
 `stuffr = { default-features = false, features = ["zip", "zstd"] }` and compile
@@ -215,8 +248,16 @@ already taken on crates.io. The command you type stays `stf`.
 
 [MIT](LICENSE).
 
-That covers this project's own code. It does **not** extend to optional
-dependencies: the `unrar` feature, if enabled, links a library whose upstream
-license permits decompression only and forbids using the source to build a RAR
-compressor. A build with `--features c-backed` is therefore not wholly MIT,
-which is one reason that feature is opt-in rather than default.
+That covers this project's own code. It does **not** extend to dependencies, and
+two are worth naming.
+
+`lzma-rust2`, which provides the pure-Rust xz and LZMA1 backends, is
+**Apache-2.0**. It is the first non-MIT dependency in a *default* build — until
+Phase 1e, only the opt-in `c-backed` tier carried a licence caveat. Apache-2.0 is
+permissive and compatible, but a downstream consumer auditing licences should
+know it is there without having to read the lockfile.
+
+The `unrar` feature, if enabled, links a library whose upstream license permits
+decompression only and forbids using the source to build a RAR compressor. A
+build with `--features c-backed` is therefore not wholly MIT, which is one reason
+that feature is opt-in rather than default.

@@ -579,6 +579,59 @@ fn a_caller_supplied_registry_is_the_one_that_is_used() {
 }
 
 #[test]
+fn a_registry_with_two_non_gzip_codecs_reports_ambiguity_rather_than_guessing() {
+    // Closes a Phase 1d deferred item: `default_format_in`'s ambiguity branch
+    // (more than one codec, none of them gzip) was unreachable, because every
+    // buildable configuration at the time always registered gzip alongside
+    // whatever else was enabled. A hand-built registry with two non-gzip
+    // codecs reaches it deterministically — this does not depend on finding a
+    // real Cargo feature combination that excludes gzip, which turns out not
+    // to be `--no-default-features --features zstd-pure` on this crate: that
+    // invocation is a single-codec build (the "1 =>" branch below it, not
+    // this one), and is covered separately by
+    // `a_pure_build_reads_zstd_and_writes_it_only_on_request`.
+    use std::sync::Arc;
+    use stuffr::core::format::{FormatKind, FormatMeta};
+    use stuffr::core::testing::MockCodec;
+
+    let mut reg = stuffr::core::Registry::new();
+    for name in ["mock-a", "mock-b"] {
+        reg.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta {
+                id: FormatId::new(name),
+                kind: FormatKind::Codec,
+                extensions: &[],
+                magics: &[],
+                priority: 0,
+            },
+        );
+    }
+
+    let src = tmp("ambig-in.txt");
+    std::fs::write(&src, b"payload").unwrap();
+    let dst = tmp("ambig-out"); // no extension to infer from
+    let _ = std::fs::remove_file(&dst);
+
+    let err = stuffr::ops::compress_with(
+        &reg,
+        Input::Path(src.clone()),
+        Output::Path(dst.clone()),
+        &CompressOpts::default(),
+    )
+    .unwrap_err();
+
+    assert_eq!(err.exit_code(), 2, "ambiguity is a usage matter: {err}");
+    assert!(
+        err.to_string().contains("cannot infer"),
+        "must name the actual problem, not a generic usage error: {err}"
+    );
+    assert!(!dst.exists(), "nothing should have been written");
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
 fn this_build_registers_exactly_one_backend_per_format() {
     // zstd_c and zstd_pure share a FormatId, so a registry with both would
     // silently keep whichever registered last. This asserts the cfg arms in
