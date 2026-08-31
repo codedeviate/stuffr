@@ -232,6 +232,63 @@ pub(crate) const RUZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 pub(crate) const XZ_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
     &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
 
+/// The `InvalidData` + `InvalidInput` + `UnexpectedEof` TRIPLE, measured
+/// independently against `lzma-rust2` 0.20.1 (backing `xz_pure.rs`) alone —
+/// a THIRD kind beyond the pair [`XZ_MALFORMED_AS_INVALID_DATA_EOF`] folds
+/// for the C backend, and its own constant for the same reason every other
+/// constant here is its own: a different implementation of the same format
+/// is not evidence about this one, even though two of its three raw kinds
+/// coincide.
+///
+/// Measured directly with a throwaway probe (compress a 4 KiB incompressible
+/// payload with this codec's own encoder, flip every byte position of the
+/// compressed stream in turn — a full sweep, not a single flip — reading
+/// through the RAW `lzma_rust2::XzReader` so this codec's own
+/// `NormalizeDecodeErrors` wrapper cannot mask what the crate actually
+/// raises; then, separately, truncate at every prefix length): corruption
+/// was detected at all 4,156 positions swept, split 4,149 `InvalidData` /
+/// 5 `InvalidInput` / 2 `UnexpectedEof`, zero silently wrong and zero
+/// silently unchanged; truncation was detected at all 4,155 cuts swept,
+/// entirely `UnexpectedEof`. `detects_corruption: true` in `xz_pure.rs`'s
+/// `caps()` is direct evidence from this same sweep, not an assumption.
+///
+/// The `InvalidInput` cases matter specifically: without folding that kind
+/// too, 5 of 4,156 corrupted positions in the sweep above would reach a
+/// caller as a raw, un-normalised `InvalidInput` rather than
+/// `Error::Corrupt` (exit 5) — a real, if narrow, gap this constant closes.
+/// Traced directly against `lzma_rust2`'s own `error_invalid_input` call
+/// sites (`src/lib.rs`; reached from `src/xz/writer.rs`'s filter-count
+/// check and a couple of header-parsing paths in `src/xz/reader.rs` and
+/// `src/xz/mod.rs`): every one of them rejects a value read from the
+/// stream itself as structurally invalid before any I/O on a wrapped
+/// SOURCE is attempted at that call site, never a source's own error
+/// merely passed through — the same structural guarantee every other
+/// constant in this file depends on (see `ZSTD_MALFORMED_AS_OTHER_EOF`'s
+/// doc for the fullest statement of it), re-verified here against this
+/// backend specifically.
+///
+/// Unlike zstd's content checksum, xz's integrity check is not something
+/// this codec has to opt into: `XzOptions::with_preset` (`xz_pure.rs`'s
+/// `encoder`) sets `check_type: CheckType::Crc64` unconditionally. See
+/// `xz_c.rs`'s module doc and `format.rs`'s `detects_corruption` doc for
+/// the same caveat that applies here too: the check is still a per-writer
+/// field the xz format permits omitting (`CheckType::None` is legal), so a
+/// `.xz` from some other tool with the check turned off is not covered by
+/// the sweep above, which only measured a stream this codec's own encoder
+/// wrote.
+///
+/// Gated `#[cfg(feature = "xz-pure")]`: `xz_pure.rs` is the only consumer,
+/// and a build with `xz-c` but not `xz-pure` has no `xz_pure` module at
+/// all, which would otherwise leave this constant unused and warning under
+/// `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how this was
+/// caught for zstd once `make check` gained the pure-tier leg.
+#[cfg(feature = "xz-pure")]
+pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF: &[ErrorKind] = &[
+    ErrorKind::InvalidData,
+    ErrorKind::InvalidInput,
+    ErrorKind::UnexpectedEof,
+];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],

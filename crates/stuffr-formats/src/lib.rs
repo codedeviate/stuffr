@@ -26,6 +26,8 @@ pub mod lz4;
 pub mod snappy;
 #[cfg(feature = "xz-c")]
 pub mod xz_c;
+#[cfg(feature = "xz-pure")]
+pub mod xz_pure;
 #[cfg(feature = "zlib")]
 pub mod zlib;
 #[cfg(feature = "zstd-c")]
@@ -64,11 +66,13 @@ pub fn register_all(registry: &mut Registry) {
     #[cfg(feature = "snappy")]
     registry.register_codec(std::sync::Arc::new(snappy::Snappy), snappy::meta());
 
-    // Task 5 adds the mutually exclusive `xz-pure` arm here (`cfg(all(
-    // feature = "xz-pure", not(feature = "xz-c")))`), same shape as zstd's
-    // pair below — see that comment.
+    // Mutually exclusive, same shape as zstd's pair below: both arms
+    // register the same FormatId (see `xz_shared`), and `not(feature =
+    // "xz-c")` is what makes the C backend win when both are compiled.
     #[cfg(feature = "xz-c")]
     registry.register_codec(std::sync::Arc::new(xz_c::Xz), xz_c::meta());
+    #[cfg(all(feature = "xz-pure", not(feature = "xz-c")))]
+    registry.register_codec(std::sync::Arc::new(xz_pure::Xz), xz_pure::meta());
 
     // Mutually exclusive: both arms register the same FormatId (see
     // `zstd_shared`), so only one may ever be active. `not(feature =

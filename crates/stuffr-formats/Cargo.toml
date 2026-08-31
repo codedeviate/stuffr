@@ -19,12 +19,7 @@ snappy = ["dep:snap"]
 zstd-c = ["dep:zstd"]
 zstd-pure = ["dep:ruzstd"]
 xz-c = ["dep:liblzma"]
-# Declared now, with no dependency attached yet, purely so `#[cfg(feature =
-# "xz-pure")]` in `xz_shared.rs` is a known feature rather than tripping
-# `unexpected_cfgs` under `-D warnings`. Task 5 attaches `dep:lzma-rust2` to
-# it and adds the pure fallback module — same shape as `zstd-pure` above
-# before Task 3 landed.
-xz-pure = []
+xz-pure = ["dep:lzma-rust2"]
 
 [dependencies]
 stuffr-core = { workspace = true }
@@ -36,6 +31,7 @@ snap = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 ruzstd = { workspace = true, optional = true }
 liblzma = { workspace = true, optional = true }
+lzma-rust2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }
