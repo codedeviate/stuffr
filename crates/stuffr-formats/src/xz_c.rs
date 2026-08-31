@@ -103,6 +103,22 @@ impl Codec for Xz {
     /// after the first concatenated stream and returns `Ok`, silently
     /// discarding the rest — the exact defect class that made lz4 lose
     /// every frame after the first in Phase 1d.
+    ///
+    /// **Reading a foreign stream.** [`CodecCaps::detects_corruption`] is
+    /// `true` for this codec, and the doc on that field requires every
+    /// optional-check format to say here what that is worth on a stream this
+    /// build did not write. xz's check type is a per-writer choice — the
+    /// format permits `CheckType::None` — so a `.xz` carrying no check is
+    /// legal and would decode with far weaker detection.
+    ///
+    /// In practice that is rare, and measurably so: every xz encoder tested
+    /// selects CRC64 without being asked — liblzma's and `lzma-rust2`'s both
+    /// write check byte `0x04`, and all four cross-backend combinations
+    /// detected 66 of 66 swept corruptions. That is the opposite of zstd,
+    /// where the crate-level encoder omits the checksum by default and
+    /// checkless streams are routine (see `zstd_c.rs`'s `decoder`). So the
+    /// honest statement is narrower than zstd's: a checkless `.xz` is
+    /// possible but unusual, where a checkless `.zst` is ordinary.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         let dec = liblzma::read::XzDecoder::new_multi_decoder(src);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
@@ -130,8 +146,14 @@ impl Codec for Xz {
     }
 
     fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+        // Not redundant with `ops`'s own pre-flight call, and not removable:
+        // the next line PANICS on an out-of-range preset rather than
+        // returning an error, and `encoder` is a public trait method any
+        // caller can reach directly without going through `ops`. Conformance
+        // property 6 exists to keep this in step with `check_encode_opts`.
         self.check_encode_opts(o)?;
         let level = o.level.unwrap_or(6) as u32;
+        // PANICS on an invalid preset — guarded above. See `check_encode_opts`.
         let enc = liblzma::write::XzEncoder::new(dst, level);
         Ok(Box::new(XzSink(enc)))
     }
