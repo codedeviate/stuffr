@@ -79,6 +79,42 @@ impl Codec for Brotli {
     /// whether EVERY corruption is caught, which brotli's checksum-less
     /// format cannot promise; this comment is only about what kind is used
     /// on the occasions it does.
+    /// **KNOWN DIVERGENCE from the reference tool: trailing data is ignored.**
+    ///
+    /// RFC 7932 defines a single brotli stream, so bytes after a complete one are
+    /// malformed. The reference `brotli` CLI agrees: on `cat a.br b.br` it emits
+    /// the first stream's output and then **fails with "corrupt input", exit 1**.
+    /// This decoder emits the first stream and exits **0**. So a user who appends
+    /// to a `.br`, or whose file has trailing junk from a partial write, gets a
+    /// plausible partial result and a success code.
+    ///
+    /// This is NOT the same as zlib and deflate, which also stop at the first
+    /// stream — there the reference does too (Python's one-shot
+    /// `zlib.decompress` returns only the first stream), so matching it is
+    /// correct. Here we are more permissive than the reference, which is the
+    /// defect.
+    ///
+    /// **Three fixes were measured and rejected; do not re-derive them:**
+    ///
+    /// 1. *Check the source for leftover bytes after decode reports EOF* — the
+    ///    obvious approach, and it cannot work. `Decompressor::new(src, 4096)`
+    ///    reads ahead: on a 29-byte concatenated fixture it pulled all 29 bytes
+    ///    from the source while decoding only the first 14-byte stream, so the
+    ///    trailing bytes sit in the decompressor's own buffer and the source
+    ///    looks exhausted. `get_mut()`/`into_inner()` inherit the same problem.
+    /// 2. *Give the decompressor a 1-byte input buffer so it consumes exactly
+    ///    what it needs, with our own `BufReader` underneath doing the real
+    ///    buffering.* This works correctly — verified: it pulls exactly 14 of 29
+    ///    bytes, leaving the remainder visible to us — and it is **60x slower**:
+    ///    8 MiB decodes in 1.92 s against 32 ms. Unusable.
+    /// 3. *Parse the stream's length ourselves* — that is writing a brotli
+    ///    decoder, which this module exists not to do.
+    ///
+    /// The remaining honest fix is the low-level `BrotliDecompressStream` API,
+    /// which reports `available_in` and so gives exact input accounting. That
+    /// means writing an incremental `Read` adapter over it that still satisfies
+    /// conformance property 8, which is a task with its own review rather than a
+    /// docstring's worth of work. Scheduled, not forgotten.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         Ok(Box::new(StreamOnly::new(Decompressor::new(src, 4096))))
     }
