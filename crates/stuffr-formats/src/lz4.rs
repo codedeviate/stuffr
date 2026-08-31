@@ -162,6 +162,89 @@ impl std::io::Read for TrackedRead {
     }
 }
 
+/// If `err` is exactly `lz4_flex::frame::Error::SkippableFrame`, returns the
+/// skippable payload's declared length. `lz4_flex` reports this through
+/// `From<Error> for io::Error`'s `Error::SkippableFrame(_) =>
+/// io::Error::other(e)` arm — an ordinary `ErrorKind::Other` carrying the
+/// original `lz4_flex::frame::Error` as its source, recoverable by
+/// downcasting rather than string-matching. Any other `Other` (or any other
+/// kind) returns `None` and is left for [`SkipSkippableFrames`]'s caller to
+/// reject exactly as before this fix — this only recognises the one shape
+/// the LZ4 frame format defines as "not an error, skip it".
+fn skippable_frame_len(err: &std::io::Error) -> Option<u32> {
+    if err.kind() != std::io::ErrorKind::Other {
+        return None;
+    }
+    match err.get_ref()?.downcast_ref::<lz4_flex::frame::Error>()? {
+        lz4_flex::frame::Error::SkippableFrame(len) => Some(*len),
+        _ => None,
+    }
+}
+
+/// Skips LZ4 skippable frames (magic `0x184D2A50`-`0x184D2A5F`), which the
+/// frame format requires a conforming decoder to pass over rather than
+/// reject — see Finding 6 of the Phase 1e final review. `lz4_flex`'s
+/// `FrameDecoder` already parses a skippable frame's 8-byte header (magic +
+/// little-endian length) far enough to recognise it, and stops there,
+/// surfacing [`lz4_flex::frame::Error::SkippableFrame`] with the payload
+/// length and leaving those payload bytes unread on the underlying source —
+/// exactly the "caller may read the specified amount of bytes" contract its
+/// own doc comment describes.
+///
+/// This wraps the [`FrameDecoder`] that would otherwise see that error
+/// directly: on `SkippableFrame(len)`, it reclaims the underlying
+/// [`TrackedRead`] via `into_inner`, discards exactly `len` bytes from it,
+/// and starts a fresh `FrameDecoder` over the same reader — which may see
+/// real frame data, another skippable frame (handled the same way, any
+/// number of times), or genuine end of stream. Measured against the
+/// reference `lz4` CLI (v1.10.0) on all three placements a skippable frame
+/// can take relative to real data — leading, trailing, and between two real
+/// frames — this now matches it exit-for-exit and byte-for-byte where
+/// before every one of the three was rejected outright (exit 1) or lost
+/// everything after the skippable frame.
+///
+/// A cleanly-consumed skippable frame resets `served_since_probe` itself,
+/// the same way [`EnforceEndMark`] resets it for a cleanly-ended real frame:
+/// without this, a file ending right after a skippable frame (the "trailing"
+/// case above) would have its own header-and-payload bytes counted as "the
+/// next frame started, then truncated", latching a false truncation report
+/// on a file the reference reads whole. Only a genuine mid-payload EOF
+/// during the discard itself is left to surface as an ordinary I/O error,
+/// which is the truncation it actually is.
+struct SkipSkippableFrames {
+    dec: Option<FrameDecoder<TrackedRead>>,
+    served_since_probe: Arc<AtomicBool>,
+}
+
+impl std::io::Read for SkipSkippableFrames {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let dec = self
+                .dec
+                .as_mut()
+                .expect("dec is only ever None inside this loop body, never across calls");
+            match dec.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(e) => {
+                    let Some(len) = skippable_frame_len(&e) else {
+                        return Err(e);
+                    };
+                    let mut tracked = self.dec.take().unwrap().into_inner();
+                    let mut remaining = len as usize;
+                    let mut scratch = [0u8; 4096];
+                    while remaining > 0 {
+                        let want = remaining.min(scratch.len());
+                        tracked.read_exact(&mut scratch[..want])?;
+                        remaining -= want;
+                    }
+                    self.served_since_probe.store(false, Ordering::Relaxed);
+                    self.dec = Some(FrameDecoder::new(tracked));
+                }
+            }
+        }
+    }
+}
+
 /// Wraps `FrameDecoder`'s (normalized) output. See the module doc for the
 /// full mechanism and the defect this closes.
 struct EnforceEndMark<R> {
@@ -397,8 +480,11 @@ impl Codec for Lz4 {
             hit_eof: Arc::clone(&hit_eof),
             served_since_probe: Arc::clone(&served_since_probe),
         };
-        let normalized =
-            NormalizeDecodeErrors::new(FrameDecoder::new(tracked), LZ4_MALFORMED_AS_OTHER_EOF);
+        let skip_skippable = SkipSkippableFrames {
+            dec: Some(FrameDecoder::new(tracked)),
+            served_since_probe: Arc::clone(&served_since_probe),
+        };
+        let normalized = NormalizeDecodeErrors::new(skip_skippable, LZ4_MALFORMED_AS_OTHER_EOF);
         Ok(Box::new(StreamOnly::new(EnforceEndMark {
             inner: normalized,
             hit_eof,
@@ -664,6 +750,108 @@ mod tests {
                 "cut {offset} byte(s) into the third frame's header (absolute offset {cut}) \
                  decoded without error — a reference-written concatenated stream cut here \
                  must be rejected, not silently accepted as \"only two frames\""
+            );
+        }
+    }
+
+    /// An LZ4 skippable frame: magic `0x184D2A5X` (any of the 16 values in
+    /// range) followed by a little-endian `u32` payload length, then that
+    /// many arbitrary bytes. A conforming decoder must pass over the whole
+    /// thing untouched — this is the one shape of "extra bytes" the LZ4
+    /// frame format itself declares legal, unlike gzip/bzip2's trailing-data
+    /// leniency (Finding 7), which is a reference-tool convention with no
+    /// spec backing it.
+    fn skippable_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&0x184D2A50u32.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Reproduces Finding 6 of the Phase 1e final review: a `.lz4` carrying
+    /// a skippable frame (magic `0x184D2A50`-`0x184D2A5F`) is unreadable by
+    /// this codec at every placement — leading, trailing, and between two
+    /// real frames — while the reference `lz4` CLI decodes all three whole.
+    /// `lz4_flex` itself recognises the shape (`Error::SkippableFrame`); it
+    /// was simply never handled here. The reference binary is the arbiter
+    /// for what a valid file must decode to, exactly as the finding
+    /// prescribes; this test skips cleanly where it is absent.
+    #[test]
+    fn skippable_frames_are_passed_over_at_every_placement() {
+        let Some(lz4) = which_lz4() else {
+            return;
+        };
+
+        let plain = b"skippable-frame regression payload, repeated for a real block. ".repeat(50);
+        let src_path =
+            std::env::temp_dir().join(format!("stf-lz4-skippable-src-{}.bin", std::process::id()));
+        std::fs::write(&src_path, &plain).unwrap();
+        let out = std::process::Command::new(&lz4)
+            .arg("-z")
+            .arg("-c")
+            .arg(&src_path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "reference lz4 failed to compress: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let real_frame = out.stdout;
+        let _ = std::fs::remove_file(&src_path);
+
+        let skip = skippable_frame(b"arbitrary skippable payload, not lz4 data at all");
+
+        let cases: &[(&str, Vec<u8>, Vec<u8>)] = &[
+            (
+                "leading",
+                [skip.clone(), real_frame.clone()].concat(),
+                plain.clone(),
+            ),
+            (
+                "trailing",
+                [real_frame.clone(), skip.clone()].concat(),
+                plain.clone(),
+            ),
+            (
+                "embedded",
+                [real_frame.clone(), skip.clone(), real_frame.clone()].concat(),
+                [plain.clone(), plain.clone()].concat(),
+            ),
+        ];
+
+        for (name, file_bytes, expected) in cases {
+            // Reference arbiter: this file must be one the reference itself
+            // reads whole, or the case proves nothing about our own gap.
+            let check_path = std::env::temp_dir().join(format!(
+                "stf-lz4-skippable-check-{name}-{}.lz4",
+                std::process::id()
+            ));
+            std::fs::write(&check_path, file_bytes).unwrap();
+            let ref_out = std::process::Command::new(&lz4)
+                .arg("-d")
+                .arg("-c")
+                .arg(&check_path)
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(&check_path);
+            assert!(
+                ref_out.status.success() && ref_out.stdout == *expected,
+                "sanity ({name}): reference lz4 must decode this file whole for the case to \
+                 prove anything about our own decoder"
+            );
+
+            let src: Box<dyn Source> =
+                Box::new(ReaderSource::new(std::io::Cursor::new(file_bytes.clone())));
+            let mut dec = Lz4.decoder(src, &DecodeOpts::default()).unwrap();
+            let mut got = Vec::new();
+            dec.read_to_end(&mut got).unwrap_or_else(|e| {
+                panic!("case {name}: expected the skippable frame to be passed over, got {e}")
+            });
+            assert_eq!(
+                &got, expected,
+                "case {name}: decoded bytes must match the reference exactly"
             );
         }
     }
