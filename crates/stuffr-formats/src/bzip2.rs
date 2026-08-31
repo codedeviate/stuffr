@@ -407,7 +407,7 @@ mod tests {
     fn capabilities_and_metadata_match_the_format() {
         let c = Bzip2.caps();
         assert!(c.encode && c.decode);
-        assert!(!c.parallel_encode && !c.frame_index, "not until cycle 1c");
+        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
         let m = meta();
         assert_eq!(m.id, BZIP2);
         assert_eq!(m.extensions, &["bz2"]);

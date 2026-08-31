@@ -8,33 +8,35 @@
 //! both are compiled), so neither backend module can own the shared
 //! identity.
 //!
-//! ## The version pin: neither 0.9.0 NOR 0.8.2 build here
+//! ## No version pin any more — the root `Cargo.toml` has the history
 //!
-//! The brief for this task cites API paths verified against `ruzstd` 0.9.0.
-//! That version declares `rust-version = "1.87"`; this workspace's MSRV is
-//! 1.85 (see the root `Cargo.toml`), so `cargo add` refused it outright and
-//! landed on 0.8.2 instead — which turns out to be a second, subtler trap:
-//! 0.8.2 declares no `rust-version` at all, so cargo's MSRV-aware resolver
-//! has no reason to skip it, yet its `bit_io`/`fse`/`huff0` modules call the
-//! unsigned `is_multiple_of` stdlib method, stabilised in 1.87. `cargo
-//! check --all-features` on stable 1.95 does not catch this — only `rustup
-//! run 1.85.0 cargo check --workspace --all-features` does, which is
-//! exactly why that command is one of this project's required gates rather
-//! than an afterthought. The root `Cargo.toml` pins `ruzstd = "=0.8.1"` —
-//! an exact pin, not a caret range, because an ordinary range would let
-//! `cargo update` float back up to the broken 0.8.2 — the last release
-//! confirmed to actually build on 1.85. Every API surface this module
-//! depends on — `decoding::StreamingDecoder`, `encoding::{FrameCompressor,
-//! CompressionLevel, compress_to_vec}` — was confirmed directly against
-//! BOTH 0.8.1's and 0.8.2's own source before writing a line of this file;
-//! 0.9.0's source was not fetched (there was no need to, once it was ruled
-//! out on MSRV grounds), but the brief's own description of its API — the
-//! same names, at the same paths — matches what 0.8.1/0.8.2 actually
-//! expose, for whatever that corroboration is worth.
+//! Earlier in this project's history the root `Cargo.toml` pinned
+//! `ruzstd = "=0.8.1"` exactly, because the 1.85 MSRV floor of the time
+//! refused 0.9.0 (`rust-version = "1.87"`) and 0.8.2 built on a modern
+//! toolchain but failed under 1.85 (it calls the unsigned
+//! `is_multiple_of` stdlib method, stabilised in 1.87, without declaring
+//! that as its own `rust-version`). Raising the MSRV floor to 1.88 freed
+//! both, and the root `Cargo.toml` now carries a caret range,
+//! `ruzstd = "0.9"`, with the full story in its own comment there rather
+//! than duplicated here.
+//!
+//! **Upgrading did not let any workaround in this module be deleted.**
+//! Every API surface this module depends on —
+//! `decoding::StreamingDecoder`, `encoding::{FrameCompressor,
+//! CompressionLevel, compress_to_vec}` — was re-confirmed directly
+//! against 0.9.0's own source, and all three defects this module works
+//! around persist there unchanged: `Default`/`Better`/`Best` still panic,
+//! the content checksum is still never verified on read, and multi-frame
+//! `.zst` is still truncated to its first frame. Do not remove a guard
+//! below on the assumption that a newer release fixed it; re-measure
+//! first, the way this file's own history did. 0.9.0 did buy one real
+//! improvement — see "The content checksum is on here BY DEFAULT" below
+//! for the window-size-cap detail.
 //!
 //! ## Three of five compression levels panic — read this before touching `level`
 //!
-//! Measured directly against `ruzstd` 0.8.1's `encoding::frame_compressor`:
+//! Measured directly against `ruzstd` 0.8.1's `encoding::frame_compressor`,
+//! and reconfirmed directly against 0.9.0's after the unpin:
 //! `CompressionLevel::Default`, `Better` and `Best` all fall through to a
 //! bare `unimplemented!()` in `FrameCompressor::compress` — a genuine
 //! process abort, never an `Err`. Only `Uncompressed` and `Fastest` have a

@@ -12,14 +12,15 @@
 //! the two mutually exclusive (`xz_c` wins whenever both are compiled), so
 //! neither backend module can own the shared identity.
 //!
-//! ## The dependency: pure Rust, on this workspace's MSRV floor exactly
+//! ## The dependency: pure Rust, below this workspace's MSRV floor
 //!
 //! `lzma-rust2` 0.20.1 depends only on `sha2` + `digest` (needed for xz's
 //! optional SHA-256 check type; this codec always selects CRC64 instead, see
 //! below) — no `-sys` crate, no C toolchain, no bindgen. It declares
-//! `rust-version = "1.85"`, exactly this workspace's floor rather than above
-//! it (contrast `zstd_pure.rs`'s `ruzstd`, whose newer releases needed 1.87
-//! and had to be pinned below what `cargo add` picked). Its license is
+//! `rust-version = "1.85"` — below this workspace's 1.88 floor, so it
+//! imposes no constraint here (contrast `zstd_pure.rs`'s `ruzstd`, whose
+//! newer releases needed 1.87 and had to be pinned below what `cargo add`
+//! picked until the floor itself moved). Its license is
 //! Apache-2.0 — permissive, but the first non-MIT dependency reachable from
 //! a *default* build (every other default-tier dependency in this workspace
 //! is MIT or a compatible dual license) — see Task 8's README note, which

@@ -262,7 +262,7 @@ mod tests {
     fn capabilities_and_metadata_match_the_format() {
         let c = Snappy.caps();
         assert!(c.encode && c.decode);
-        assert!(!c.parallel_encode && !c.frame_index, "not until cycle 1c");
+        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
         let m = meta();
         assert_eq!(m.id, SNAPPY);
         assert_eq!(m.extensions, &["sz"]);

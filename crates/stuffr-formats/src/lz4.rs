@@ -455,23 +455,21 @@ impl Codec for Lz4 {
     /// concatenated next frame rather than stopping at the first `Ok(0)` —
     /// see the module doc's note on concatenation.
     ///
-    /// **Reading a foreign stream — the reverse of zstd's asymmetry.**
-    /// `caps().detects_corruption` is `CorruptionDetection::WhenPresent`, but
-    /// unlike `zstd_c.rs` (whose own encoder always writes the checksum, so
-    /// detection is *weaker* on a foreign stream than on this codec's own
-    /// output), lz4 has the checksum turned off in `encoder` above, so
-    /// detection here is *better* on a typical foreign stream than on
-    /// anything this codec itself produced. This decoder is a bare,
-    /// unconfigured `lz4_flex::frame::FrameDecoder`: it verifies whatever
+    /// **Reading a foreign stream.** `caps().detects_corruption` is
+    /// `CorruptionDetection::WhenPresent`: this decoder is a bare,
+    /// unconfigured `lz4_flex::frame::FrameDecoder` that verifies whatever
     /// checksum the incoming stream actually carries, regardless of what
-    /// this codec's own encoder does. Measured against the reference `lz4`
-    /// CLI (v1.10.0): a `.lz4` written with its default flags (content
-    /// checksum on, frame descriptor `0x64`) had 26 of 26 swept corrupted
-    /// positions error, zero silently wrong; the same file re-encoded with
-    /// `--no-frame-crc` (`0x60`) had only 10 of 26 error, 16 silently wrong —
-    /// matching this codec's own gap. Since the reference CLI enables the
-    /// checksum by default, most real-world `.lz4` files get materially
-    /// better detection here than a stream this codec wrote itself.
+    /// this codec's own encoder does. `encoder` below now writes the content
+    /// checksum by default (matching the reference `lz4` CLI's own
+    /// default), so this is no longer the reverse of zstd's asymmetry it
+    /// used to be — see `caps()`'s own doc for that history. Measured
+    /// against the reference `lz4` CLI (v1.10.0): a `.lz4` written with its
+    /// default flags (content checksum on, frame descriptor `0x64`) had 26
+    /// of 26 swept corrupted positions error, zero silently wrong —
+    /// matching what this codec's own encoder now produces; the same file
+    /// re-encoded with `--no-frame-crc` (`0x60`) had only 10 of 26 error, 16
+    /// silently wrong, which is the one case left where this decoder cannot
+    /// help: a foreign writer that deliberately turns the checksum off.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         let hit_eof = Arc::new(AtomicBool::new(false));
         let served_since_probe = Arc::new(AtomicBool::new(false));
@@ -516,9 +514,9 @@ impl Codec for Lz4 {
     /// `Max64KB` — the size the frame format's own docs call "the default
     /// block size" — makes block boundaries fall well inside any payload
     /// property 8 uses, regardless of how many bytes the caller hands to one
-    /// `write` call. Content and block checksums stay off either way — this
-    /// only changes the block-size field, not the ones `caps()`'s corruption
-    /// measurement depends on.
+    /// `write` call. The content checksum stays on and block checksums stay
+    /// off either way — this only changes the block-size field, not the
+    /// ones `caps()`'s corruption measurement depends on.
     ///
     /// `Max64KB` specifically, not merely "small enough to pass property
     /// 8" — property 8's threshold is `big_len / 4`, a full 1 MiB against
@@ -889,7 +887,7 @@ mod tests {
     fn capabilities_and_metadata_match_the_format() {
         let c = Lz4.caps();
         assert!(c.encode && c.decode);
-        assert!(!c.parallel_encode && !c.frame_index, "not until cycle 1c");
+        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
         let m = meta();
         assert_eq!(m.id, LZ4);
         assert_eq!(m.extensions, &["lz4"]);
@@ -902,13 +900,12 @@ mod tests {
         assert_eq!(
             c.detects_corruption,
             CorruptionDetection::WhenPresent,
-            "lz4_flex's FrameEncoder turns off both the content checksum and the per-block \
-             checksum by default, so a byte flipped almost anywhere in a stream THIS codec \
-             wrote decodes to different bytes with no error (see lz4_conformance_probe below) \
-             — but the bare FrameDecoder in `decoder` verifies whatever checksum a foreign \
-             stream actually carries, and the reference lz4 CLI turns the checksum on by \
-             default, so most real .lz4 files get real detection here; see caps()'s and \
-             decoder's doc comments"
+            "`encoder` below now writes the content checksum by default (it did not always), \
+             so a byte flipped almost anywhere in a stream THIS codec wrote is now caught \
+             rather than decoding to different bytes with no error (see lz4_conformance_probe \
+             below) — the check is still writer-optional in the format itself, so a foreign \
+             stream written with it turned off (e.g. reference lz4's --no-frame-crc) is the \
+             one case detection is not universal; see caps()'s and decoder's doc comments"
         );
         assert!(
             c.memory_per_worker.is_some(),
@@ -916,30 +913,32 @@ mod tests {
         );
     }
 
-    /// Pins the exact discrepancy against the brief's (and the design doc's)
-    /// original expectation that lz4 always detects corruption: for a
-    /// stream THIS codec's own encoder wrote, it measurably does not, for
-    /// the vast majority of byte positions — the `Never`-shaped half of the
-    /// `WhenPresent` evidence; see `decoder`'s doc for the other half, where
-    /// a foreign, checksummed `.lz4` fares far better.
+    /// Pins the current state of the discrepancy the brief's (and the
+    /// design doc's) original expectation raised — that lz4 always detects
+    /// corruption. It did not always hold: before `6c35db3` turned this
+    /// codec's own content checksum on, a stream THIS codec's own encoder
+    /// wrote measurably failed to detect corruption for the vast majority
+    /// of byte positions. This test now pins the opposite, current fact —
+    /// every one of those positions is caught — and doubles as the
+    /// regression guard: if a future change ever turns the checksum back
+    /// off, this is what goes red first.
     ///
     /// A single flipped byte proves almost nothing on its own — this cycle's
     /// brotli measurement was disputed twice, and the first attempt at it was
     /// wrong for exactly that reason (see brotli.rs). So this sweeps EVERY
     /// byte position of a real encoded payload, not one, and counts outcomes:
-    /// silently-wrong decode vs. a real error. If corruption detection here
-    /// were real rather than incidental, the overwhelming majority of flips
-    /// would error; measured directly, the overwhelming majority instead
-    /// decode successfully with different bytes.
+    /// silently-wrong decode vs. a real error. Measured directly: zero
+    /// positions of either payload shape decode silently wrong.
     ///
     /// 4 KiB rather than the 64 KiB conformance property 9 itself would use:
     /// this test's job is to justify the capability declaration with a wide
     /// sweep, not to duplicate property 9's own probe, and the outcome
-    /// distribution is the same shape at both sizes (independently checked
-    /// during this measurement: 65536 of 65551 byte positions in a 64 KiB
-    /// payload also decoded silently wrong).
+    /// distribution was the same shape at both sizes in the ORIGINAL,
+    /// pre-fix measurement (independently checked at the time: 65536 of
+    /// 65551 byte positions in a 64 KiB payload also decoded silently
+    /// wrong).
     #[test]
-    fn lz4_conformance_probe_corruption_is_silent_at_almost_every_position() {
+    fn lz4_conformance_probe_corruption_is_caught_now_the_checksum_is_on() {
         use stuffr_core::testing::{compressible, incompressible};
 
         // Both shapes, not just incompressible: a whole-branch review found
@@ -1263,8 +1262,9 @@ mod tests {
         }
     }
 
-    /// Walks a stream produced by THIS codec's own encoder (no checksums, no
-    /// content size, no dictionary — see `encoder`'s own `FrameInfo`) and
+    /// Walks a stream produced by THIS codec's own encoder (content
+    /// checksum on, no block checksums, no content size, no dictionary —
+    /// see `encoder`'s own `FrameInfo`) and
     /// returns the byte offset of every block's own size-word, including the
     /// final EndMark's. General over whether each block ended up stored raw
     /// or compressed, unlike the arithmetic

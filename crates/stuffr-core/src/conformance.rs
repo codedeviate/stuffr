@@ -263,12 +263,7 @@ const NO_FIXTURE: &str = "this codec cannot encode its own test input and no fix
 /// Asserts every conformance property that applies to `codec`, using `fixture`
 /// as the encoded test input for a codec that cannot encode its own — see the
 /// module docs.
-fn assert_codec_conforms_impl(
-    codec: &dyn Codec,
-    meta: &FormatMeta,
-    fixture: Option<&[u8]>,
-    corruption_fixture: Option<&[u8]>,
-) {
+fn assert_codec_conforms_impl(codec: &dyn Codec, meta: &FormatMeta, fixture: Option<&[u8]>) {
     let id = codec.id();
     let caps = codec.caps();
 
@@ -598,16 +593,12 @@ fn assert_codec_conforms_impl(
         }
 
         // Shared base for property 10: a modest incompressible payload,
-        // encoded (or drawn from the fixture) once. `corruption_fixture` —
-        // distinct from the ordinary round-trip `fixture` above — exists for
-        // a WhenPresent codec whose own default encoder does not include the
-        // optional check (lz4): properties 2-8 still exercise the codec's REAL
-        // shipped encoder untouched, but 9 and 10 need a stream demonstrating
-        // what WhenPresent actually promises, which this codec's own encoder does
-        let corruption_input = match corruption_fixture {
-            Some(f) => Some(f.to_vec()),
-            None => test_input(caps, fixture, || encode(codec, &incompressible(64 * 1024))),
-        };
+        // encoded (or drawn from the ordinary round-trip `fixture` above)
+        // once. Property 9 below draws its own, separate compressible base
+        // the same way, rather than reusing this one — see its own comment
+        // for why both shapes matter.
+        let corruption_input =
+            test_input(caps, fixture, || encode(codec, &incompressible(64 * 1024)));
 
         // 9. Corrupted input is reported as InvalidData — run for every
         //    declared state except Never, because a format with no integrity
@@ -632,10 +623,8 @@ fn assert_codec_conforms_impl(
                 "this codec declares CorruptionDetection::Never — no check exists to prove",
             );
         } else {
-            let compressible_input = match corruption_fixture {
-                Some(f) => Some(f.to_vec()),
-                None => test_input(caps, fixture, || encode(codec, &compressible(64 * 1024))),
-            };
+            let compressible_input =
+                test_input(caps, fixture, || encode(codec, &compressible(64 * 1024)));
             for (shape, base) in [
                 ("incompressible", &corruption_input),
                 ("compressible", &compressible_input),
@@ -808,14 +797,14 @@ fn assert_codec_conforms_impl(
 /// that can encode its own test input. See [`assert_codec_conforms_with`] for
 /// a codec that cannot.
 pub fn assert_codec_conforms(codec: &dyn Codec, meta: &FormatMeta) {
-    assert_codec_conforms_impl(codec, meta, None, None)
+    assert_codec_conforms_impl(codec, meta, None)
 }
 
 /// Asserts every conformance property that applies to `codec`, using `fixture`
 /// as the encoded test input for a codec that cannot encode its own — see the
 /// module docs.
 pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture: Option<&[u8]>) {
-    assert_codec_conforms_impl(codec, meta, fixture, None)
+    assert_codec_conforms_impl(codec, meta, fixture)
 }
 
 /// Runs `assert_codec_conforms` and asserts it panics with a message

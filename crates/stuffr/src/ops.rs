@@ -499,9 +499,9 @@ pub fn compress_with(
     let format = choose_format(registry, &dst, o.format)?;
     let codec = registry.require_encoder(format)?;
 
-    // Consent, not capability: a single-pattern `if let`, not the `&&`-joined
-    // let-chain form that only stabilised in 1.88 — MSRV here is 1.85.
-    if let (true, false) = (codec.caps().weak_encoder, o.allow_weak_encoder) {
+    // Consent, not capability: refuse only when this build's encoder is
+    // weak AND the caller has not opted in via `--allow-weak-encoder`.
+    if codec.caps().weak_encoder && !o.allow_weak_encoder {
         return Err(Error::Usage(format!(
             "`{format}` in this build has only a weak encoder: it produces valid \
              output with a markedly worse ratio, and buffers the whole input in \

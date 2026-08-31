@@ -199,8 +199,9 @@ pub(crate) const ZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
 /// The `Other` + `UnexpectedEof` pair, measured independently against
-/// `ruzstd` 0.8.1 (backing `zstd_pure.rs` — see its module doc for why this
-/// version specifically, not the newer ones) — a wholly different
+/// `ruzstd` 0.8.1 (backing `zstd_pure.rs`) and still exercised green under
+/// the crate's current, unpinned `"0.9"` range (see that module's own doc
+/// for the unpin's history) — a wholly different
 /// implementation of the same format, so this is its own constant rather
 /// than a reuse of [`ZSTD_MALFORMED_AS_OTHER_EOF`] on the strength of a
 /// shared format alone; see that constant's doc for the reasoning this
@@ -411,10 +412,10 @@ pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF: &[ErrorKind]
 /// always means the LZMA1 decoder itself rejected the bytes.
 ///
 /// Gated `#[cfg(feature = "lzma-c")]`: `lzma_c.rs` is the only consumer, and
-/// a build with `lzma-pure` but not `lzma-c` (once Task 6 lands) would have
-/// no `lzma_c` module at all, which would otherwise leave this constant
-/// unused and warning under `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s
-/// doc for how this was caught once `make check` gained the pure-tier leg.
+/// a build with `lzma-pure` but not `lzma-c` has no `lzma_c` module at all,
+/// which would otherwise leave this constant unused and warning under
+/// `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how this was
+/// caught once `make check` gained the pure-tier leg.
 #[cfg(feature = "lzma-c")]
 pub(crate) const LZMA_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
     &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
@@ -500,7 +501,7 @@ pub(crate) const LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF: &[ErrorKind] = &
 /// that class of mistake was caught once `make check` gained the pure-tier
 /// leg.
 #[cfg(feature = "lzip")]
-pub(crate) const LZIP_MALFORMED_AS_INVALID_DATA: &[ErrorKind] = &[
+pub(crate) const LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF: &[ErrorKind] = &[
     ErrorKind::Other,
     ErrorKind::InvalidInput,
     ErrorKind::UnexpectedEof,

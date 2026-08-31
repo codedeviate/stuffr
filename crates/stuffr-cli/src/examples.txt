@@ -36,9 +36,12 @@ COMPRESSING A FILE
   stf pack notes.txt --format lzma -o out.lzma
       LZMA1, the older "alone" format xz superseded. Every build reads and
       writes it, including one with no C toolchain: `--features c-backed`
-      swaps the pure-Rust `lzma-rust2` backend for the real `liblzma`, which
-      is faster but produces a byte-identical stream at the same preset.
-      Unlike every other codec on this page, `.lzma` defines
+      swaps the pure-Rust `lzma-rust2` backend for the real `liblzma`,
+      which is faster. The two match byte-for-byte on small ordinary
+      payloads, but that is not a guarantee across every preset: measured
+      on a real file at presets 0/3/6/9, only preset 3 came out identical;
+      the rest differ by roughly 0.02-1.4% in size, parity rather than
+      identity. Unlike every other codec on this page, `.lzma` defines
       NO magic bytes at all: its header's first byte encodes lc/lp/pb and
       the next four the dictionary size, not a fixed signature, so this
       format can never be detected from bytes alone, on a file or a pipe —

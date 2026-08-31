@@ -112,7 +112,7 @@ impl Codec for Gzip {
     }
 
     fn caps(&self) -> CodecCaps {
-        // Parallel encode and a frame index arrive in cycle 1c.
+        // Parallel encode and a frame index arrive in 1f.
         CodecCaps {
             // gzip's trailer carries a CRC32 over the uncompressed data, so a
             // flipped byte anywhere in the stream is detected rather than
@@ -150,8 +150,6 @@ impl Codec for Gzip {
     }
 
     fn check_encode_opts(&self, o: &EncodeOpts) -> Result<()> {
-        // A `match` with a guard, not a let-chain: MSRV is 1.85 and let-chains
-        // are stable only from 1.88. This is the idiom the tree already uses.
         match o.level {
             Some(n) if !(0..=9).contains(&n) => Err(Error::Usage(format!(
                 "gzip compression level must be 0-9, got {n}"
@@ -245,8 +243,9 @@ mod tests {
     fn decodes_concatenated_members_not_just_the_first() {
         // Concatenated gzip members are valid gzip, and every parallel encoder
         // produces them — including the multi-member encode this project adds
-        // in cycle 1c. GzDecoder stops after the first member and returns a
-        // short read WITHOUT an error, so a regression here truncates silently.
+        // in 1f. A single-member decoder stops after the first member and
+        // returns a short read WITHOUT an error, so a regression here
+        // truncates silently.
         let mut two = compress(b"first-");
         two.extend_from_slice(&compress(b"second"));
         assert_eq!(decompress(two), b"first-second");
@@ -397,7 +396,7 @@ mod tests {
     fn capabilities_and_metadata_match_the_format() {
         let c = Gzip.caps();
         assert!(c.encode && c.decode);
-        assert!(!c.parallel_encode && !c.frame_index, "not until cycle 1c");
+        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
         let m = meta();
         assert_eq!(m.id, GZIP);
         assert_eq!(m.extensions, &["gz"]);

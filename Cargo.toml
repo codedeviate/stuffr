@@ -51,7 +51,8 @@ liblzma = { version = "0.4", default-features = false, features = ["static"] }
 # The pure-Rust xz backend (Task 5 of Phase 1e): a port of Tukaani's "XZ for
 # Java" that both encodes and decodes, unlike zstd's decode-only pure
 # fallback. Pure Rust (`sha2` + `digest`, no `-sys` crate), `rust-version =
-# "1.85"` exactly on this workspace's floor, edition 2024, Apache-2.0 — the
+# "1.85"` — below this workspace's floor since it moved to 1.88, so it
+# imposes no constraint here — edition 2024, Apache-2.0 — the
 # first non-MIT dependency reachable from a *default* build (see Task 8's
 # README note).
 lzma-rust2 = "0.20"

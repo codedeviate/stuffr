@@ -94,7 +94,7 @@
 //! — that wrapper exists for the raw error kinds the backend itself raises
 //! on a genuinely malformed member it DOES detect (CRC/data-size/member-size
 //! mismatch, a corrupted embedded LZMA1 body), which is a different set. See
-//! [`crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA`]'s doc for that
+//! [`crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF`]'s doc for that
 //! measurement.
 //!
 //! ## Matching the reference tool's trailing-data rule
@@ -305,7 +305,7 @@ use stuffr_core::{
     MagicRule, Result, Sink, Source, StreamOnly,
 };
 
-use crate::normalize::{LZIP_MALFORMED_AS_INVALID_DATA, NormalizeDecodeErrors};
+use crate::normalize::{LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF, NormalizeDecodeErrors};
 
 /// The four-byte magic every LZIP member's header begins with.
 const MAGIC_BYTES: &[u8; 4] = b"LZIP";
@@ -356,12 +356,12 @@ impl Codec for Lzip {
     /// needed and raise `InvalidData` directly. Wrapped in
     /// `NormalizeDecodeErrors` for the raw kinds the backend itself raises
     /// on a member it DOES recognize as malformed — see
-    /// `crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA`'s doc.
+    /// `crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF`'s doc.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         let guarded = GuardedLzipReader::new(src);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             guarded,
-            LZIP_MALFORMED_AS_INVALID_DATA,
+            LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF,
         ))))
     }
 

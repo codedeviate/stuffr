@@ -47,30 +47,29 @@ pub enum CorruptionDetection {
     Always,
     /// The format permits a check but leaves it to the writer, so what a
     /// caller can trust depends on which writer actually produced the stream
-    /// in front of them — not on which writer this codec happens to be. That
-    /// cuts both ways, and a codec can sit on either side of it:
-    ///
-    /// - **This build's encoder turns the check on; a foreign writer might
-    ///   not.** zstd's content checksum and xz's check-type field are both
-    ///   per-writer choices the format permits omitting, and this project's
-    ///   own encoders choose to enable them: zstd's crate-level encoder
-    ///   omits it *by default* (its CLI does not, but `zstd_c.rs` and
-    ///   `zstd_pure.rs` both turn it on regardless), and every xz encoder
-    ///   measured here — liblzma's and lzma-rust2's — selects CRC64 without
-    ///   being asked, so a checkless `.xz` is possible but rare where a
-    ///   checkless `.zst` is routine. Here, detection is *weaker* on a
-    ///   foreign stream than on this codec's own output — see `zstd_c.rs`'s
-    ///   `decoder` doc for a measured figure.
-    /// - **This build's encoder leaves the check off; a foreign writer
-    ///   likely turns it on.** lz4's frame checksum is the mirror case:
-    ///   `lz4_flex`'s encoder (what this project uses) disables both the
-    ///   content and per-block checksums by default, so a stream *this
-    ///   codec* wrote carries no check at all — but the reference `lz4` CLI
-    ///   enables the content checksum *by default*, so most real-world
-    ///   `.lz4` files get real detection this codec's own decoder can
-    ///   verify. Here, detection is *better* on a typical foreign stream
-    ///   than on this codec's own output — see `lz4.rs`'s `decoder` doc for
-    ///   the measured figures.
+    /// in front of them — not on which writer this codec happens to be. In
+    /// principle that cuts both ways: a codec's own encoder could turn the
+    /// check on while some foreign writer leaves it off, or the reverse.
+    /// Every codec in this tree currently sits on the first side —
+    /// **this build's encoder turns the check on; a foreign writer might
+    /// not.** zstd's content checksum, xz's check-type field, and lz4's
+    /// frame content checksum are all per-writer choices the format permits
+    /// omitting, and this project's own encoders choose to enable all
+    /// three: zstd's crate-level encoder omits it *by default* (its CLI
+    /// does not, but `zstd_c.rs` and `zstd_pure.rs` both turn it on
+    /// regardless), every xz encoder measured here — liblzma's and
+    /// lzma-rust2's — selects CRC64 without being asked, and `lz4.rs`'s
+    /// encoder calls `content_checksum(true)`, matching what the reference
+    /// `lz4` CLI writes by default. lz4 did not always sit here: earlier in
+    /// this project's history its own encoder left the checksum off, making
+    /// it the mirror case — detection *better* on a typical foreign stream
+    /// than on this codec's own output — until that was measured to leave
+    /// most corrupted positions in a self-written stream silently wrong
+    /// (see `lz4.rs`'s `caps()` and `decoder` docs for the before/after
+    /// figures). For all three formats, detection is *weaker* on a foreign
+    /// stream than on this codec's own output only when that foreign writer
+    /// skipped the checksum — see `zstd_c.rs`'s `decoder` doc for a measured
+    /// figure.
     ///
     /// Either way, a codec built over one of these optional-check formats
     /// must document, at the point a caller would meet it, which direction
@@ -122,10 +121,10 @@ pub struct CodecCaps {
     /// Rough working-set cost of one encode worker, in bytes, when the codec
     /// knows it. `None` means unknown — assume modest.
     ///
-    /// Unused until Phase 1e wires parallel encode; it exists now because the
+    /// Unused until Phase 1f wires parallel encode; it exists now because the
     /// governor already reasons about figures like "xz -9 at ~700 MiB per
     /// worker" with no way for a codec to supply one, and adding the field
-    /// after nine codecs exist means revisiting all nine.
+    /// after eleven codecs exist means revisiting all eleven.
     pub memory_per_worker: Option<u64>,
 
     /// This build's encoder for the format is markedly worse than the format's
