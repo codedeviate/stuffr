@@ -492,6 +492,17 @@ impl Sink for LzipSink {
 ///    directly, with no assumption left to falsify — including the
 ///    partial-attempt case (a header failing partway because the source
 ///    itself ran out, contributing a genuine but harmless 0-byte read).
+///
+///    One residual worth naming rather than leaving implicit: `[4, 8, 8]`
+///    is a READ-SIZE pattern, not a content check, so a real LZMA content
+///    read that the CALLER happened to split into three consecutive calls
+///    of exactly 4, then 8, then 8 bytes would reset the snapshot too
+///    early, by coincidence. Not ruled out by construction — but not
+///    reachable by anything this project's own callers do either: `ops`
+///    drives decoding with a 64 KiB buffer, and the conformance harness's
+///    incremental-decode property bounds every read at 1 byte, which can
+///    never produce an 8-byte call at all. No test exercises this because
+///    no caller in this codebase is shaped to trigger it.
 struct TailWrapper<R> {
     inner: R,
     consumed: u64,
