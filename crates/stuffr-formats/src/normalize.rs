@@ -232,41 +232,69 @@ pub(crate) const RUZSTD_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 pub(crate) const XZ_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
     &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
 
-/// The `InvalidData` + `InvalidInput` + `UnexpectedEof` TRIPLE, measured
-/// independently against `lzma-rust2` 0.20.1 (backing `xz_pure.rs`) alone —
-/// a THIRD kind beyond the pair [`XZ_MALFORMED_AS_INVALID_DATA_EOF`] folds
-/// for the C backend, and its own constant for the same reason every other
-/// constant here is its own: a different implementation of the same format
-/// is not evidence about this one, even though two of its three raw kinds
-/// coincide.
+/// The `InvalidData` + `InvalidInput` + `Other` + `UnexpectedEof` QUADRUPLE,
+/// measured independently against `lzma-rust2` 0.20.1 (backing `xz_pure.rs`)
+/// alone — a different implementation of the same format from
+/// [`XZ_MALFORMED_AS_INVALID_DATA_EOF`]'s `liblzma`, so its own constant for
+/// the same reason every other constant here is its own, even though several
+/// of its raw kinds coincide.
 ///
-/// Measured directly with a throwaway probe (compress a 4 KiB incompressible
-/// payload with this codec's own encoder, flip every byte position of the
-/// compressed stream in turn — a full sweep, not a single flip — reading
-/// through the RAW `lzma_rust2::XzReader` so this codec's own
-/// `NormalizeDecodeErrors` wrapper cannot mask what the crate actually
-/// raises; then, separately, truncate at every prefix length): corruption
-/// was detected at all 4,156 positions swept, split 4,149 `InvalidData` /
-/// 5 `InvalidInput` / 2 `UnexpectedEof`, zero silently wrong and zero
-/// silently unchanged; truncation was detected at all 4,155 cuts swept,
-/// entirely `UnexpectedEof`. `detects_corruption: CorruptionDetection::
-/// WhenPresent` in `xz_pure.rs`'s `caps()` is direct evidence from this same
-/// sweep, not an assumption.
+/// **Its own constant, not a reuse of
+/// [`LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF`]**, despite both backing
+/// crates being `lzma-rust2` and both ultimately bottoming out in the same
+/// `lz::LzDecoder` (see below): a shared dependency is not shared evidence,
+/// and every other constant in this file already makes its own crate's case
+/// on its own terms rather than borrowing a sibling's.
+///
+/// Originally measured with a 4 KiB INCOMPRESSIBLE payload only: corruption
+/// was detected at all 4,156 positions swept, split 4,149 `InvalidData` / 5
+/// `InvalidInput` / 2 `UnexpectedEof`, zero `Other` — and the fold list
+/// below was drawn from exactly that split, omitting `Other` because the
+/// sweep that produced it never raised one. That omission was wrong: an
+/// incompressible payload's encoded stream is almost pure literal copy, so
+/// corrupting it almost never lands inside the LZ77 match machinery where
+/// `Other` originates. A whole-branch review re-measured with a
+/// COMPRESSIBLE payload (164 positions) and found `Other` at 99 of them —
+/// **60%**, not zero — reaching the caller as `Error::Io` (exit 1,
+/// `"i/o error: dist overflow"`) instead of `Error::Corrupt` (exit 5),
+/// identically confirmed against the mixed corpus (1,616 of 1,708, 95%) and
+/// all-zeros (55 of 124) payloads. Conformance property 9, once it started
+/// sweeping a compressible fixture too (see `conformance.rs`'s `compressible`
+/// doc), reproduced this directly. Isolated against the raw crate alone
+/// (`lzma_rust2` 0.20.1, `XzReader::new(_, true)`, compressible payload, 164
+/// positions): `InvalidData: 52, InvalidInput: 9, Other: 99, UnexpectedEof:
+/// 4` — `Other` is not a rare corner case for this backend, it is the
+/// PLURALITY outcome.
+///
+/// **`Other` is safe to fold onto `InvalidData` here, for the same
+/// structural reason [`LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF`]'s doc
+/// gives, because it is the SAME code path underneath a different
+/// container**: `XzReader::read` (`src/xz/reader.rs`) drives its LZMA2
+/// filter (`src/lzma2_reader.rs`), which decodes into the same
+/// `lz::LzDecoder` the raw `LzmaReader` behind `lzma_pure.rs` also drives
+/// (`src/lzma_reader.rs`) — traced directly to `LzDecoder::repeat`
+/// (`src/lz/lz_decoder.rs:107-109`), whose `dist >= self.full` check
+/// constructs `error_other("dist overflow")` (`Error::other`, `src/lib.rs`)
+/// directly from the decoder's own internal state, never by rewrapping an
+/// error from anywhere else. Every genuine error reading the underlying
+/// SOURCE reaches `XzReader::read`'s caller via its own `self.reader.read
+/// (buf)?` (`src/xz/reader.rs:410`) or one of `parse`/`read_exact`'s `?`
+/// propagations elsewhere in the same file, with the original kind intact —
+/// never reconstructed as `Other`. So `Other` reaching this wrapper always
+/// means the LZMA2 core inside this xz stream rejected the bytes, never a
+/// genuine I/O failure underneath — the same negative case conformance
+/// property 11 covers for every other constant in this file.
 ///
 /// The `InvalidInput` cases matter specifically: without folding that kind
-/// too, 5 of 4,156 corrupted positions in the sweep above would reach a
-/// caller as a raw, un-normalised `InvalidInput` rather than
-/// `Error::Corrupt` (exit 5) — a real, if narrow, gap this constant closes.
-/// Traced directly against `lzma_rust2`'s own `error_invalid_input` call
-/// sites (`src/lib.rs`; reached from `src/xz/writer.rs`'s filter-count
-/// check and a couple of header-parsing paths in `src/xz/reader.rs` and
-/// `src/xz/mod.rs`): every one of them rejects a value read from the
-/// stream itself as structurally invalid before any I/O on a wrapped
-/// SOURCE is attempted at that call site, never a source's own error
-/// merely passed through — the same structural guarantee every other
-/// constant in this file depends on (see `ZSTD_MALFORMED_AS_OTHER_EOF`'s
-/// doc for the fullest statement of it), re-verified here against this
-/// backend specifically.
+/// too, some corrupted positions would reach a caller as a raw,
+/// un-normalised `InvalidInput` rather than `Error::Corrupt` (exit 5) — a
+/// real, if narrow, gap this constant closes. Traced directly against
+/// `lzma_rust2`'s own `error_invalid_input` call sites (`src/lib.rs`;
+/// reached from `src/xz/writer.rs`'s filter-count check and a couple of
+/// header-parsing paths in `src/xz/reader.rs` and `src/xz/mod.rs`): every
+/// one of them rejects a value read from the stream itself as structurally
+/// invalid before any I/O on a wrapped SOURCE is attempted at that call
+/// site, never a source's own error merely passed through.
 ///
 /// Unlike zstd's content checksum, xz's integrity check is not something
 /// this codec has to opt into: `XzOptions::with_preset` (`xz_pure.rs`'s
@@ -284,9 +312,10 @@ pub(crate) const XZ_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how this was
 /// caught for zstd once `make check` gained the pure-tier leg.
 #[cfg(feature = "xz-pure")]
-pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF: &[ErrorKind] = &[
+pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF: &[ErrorKind] = &[
     ErrorKind::InvalidData,
     ErrorKind::InvalidInput,
+    ErrorKind::Other,
     ErrorKind::UnexpectedEof,
 ];
 

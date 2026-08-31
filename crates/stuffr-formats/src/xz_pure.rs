@@ -80,18 +80,24 @@
 //! `check_type: CheckType::Crc64` unconditionally — this codec never has to
 //! opt in the way `zstd_c.rs`'s encoder opts in to its content checksum.
 //! Measured with the same sweep methodology `xz_c.rs` uses (flip every byte
-//! position of a real 4 KiB payload's compressed form, read through the RAW
+//! position of a real payload's compressed form, read through the RAW
 //! `lzma_rust2::XzReader` so this codec's own error-normalising wrapper
-//! cannot mask what the crate itself raises): all 4,156 positions swept were
-//! detected, split 4,149 `InvalidData` / 5 `InvalidInput` / 2
-//! `UnexpectedEof`, zero silently wrong and zero silently unchanged; a
-//! separate truncation sweep at every one of 4,155 prefix lengths was
-//! detected entirely as `UnexpectedEof`. See
-//! `crate::normalize`'s `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF` doc for
-//! the full measurement and the source-level reasoning behind folding all
-//! three kinds onto `InvalidData`, and `fn decoder`'s own doc below for the
-//! caveat this measurement does NOT cover (a foreign stream with the check
-//! turned off).
+//! cannot mask what the crate itself raises): every position swept is
+//! detected, zero silently wrong and zero silently unchanged, split across
+//! four raw kinds — `InvalidData`, `InvalidInput`, `Other`, `UnexpectedEof`
+//! — and the split is NOT dominated by `InvalidData` the way a first,
+//! incompressible-only sweep suggested (4,149 of 4,156 `InvalidData`, zero
+//! `Other`): re-measured with a compressible payload, `Other` is the
+//! PLURALITY outcome (99 of 164 positions), because corrupting a stream with
+//! real LZ77 matches actually reaches the match-distance validation `Other`
+//! comes from, which an incompressible stream's near-all-literal encoding
+//! almost never does. A separate truncation sweep at every prefix length is
+//! detected entirely as `UnexpectedEof`. See `crate::normalize`'s
+//! `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF` doc for the full
+//! measurement, both payload shapes, and the source-level reasoning behind
+//! folding all four kinds onto `InvalidData`, and `fn decoder`'s own doc
+//! below for the caveat this measurement does NOT cover (a foreign stream
+//! with the check turned off).
 //!
 //! ## Preset validation is NOT delegated to the crate
 //!
@@ -161,7 +167,7 @@ use stuffr_core::{
     Source, StreamOnly,
 };
 
-use crate::normalize::{NormalizeDecodeErrors, XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF};
+use crate::normalize::{NormalizeDecodeErrors, XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF};
 pub use crate::xz_shared::{XZ, xz_meta as meta};
 
 #[derive(Debug)]
@@ -194,7 +200,7 @@ impl Codec for Xz {
     /// `xz_c.rs`'s identical note.
     ///
     /// Wrapped in `NormalizeDecodeErrors` — see
-    /// `crate::normalize::XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF`'s doc
+    /// `crate::normalize::XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s doc
     /// for the measurement backing the kinds folded here.
     ///
     /// **`allow_multiple_streams: true`, always.** See the module doc: the
@@ -222,7 +228,7 @@ impl Codec for Xz {
         let dec = XzReader::new(src, true);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,
-            XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF,
+            XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF,
         ))))
     }
 
@@ -672,53 +678,69 @@ mod tests {
     /// flipping one, mirroring `xz_c.rs`'s and `snappy.rs`'s probes. Backs
     /// `detects_corruption: CorruptionDetection::WhenPresent` with direct
     /// measurement instead of leaving it aspirational: see `crate::normalize`'s
-    /// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF` doc for the same
+    /// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF` doc for the same
     /// figures quoted there, measured against the RAW `XzReader`.
+    ///
+    /// Run over BOTH an incompressible and a compressible payload, not just
+    /// the former: a whole-branch review found that an incompressible-only
+    /// version of this exact sweep passed with `other_kind == 0` while the
+    /// fold list omitted `Other` entirely — the incompressible payload's
+    /// encoded stream is almost pure literal copy and essentially never
+    /// exercises the LZ77 match-distance validation `Other` comes from. The
+    /// compressible sweep is the one that would have caught it; see
+    /// `crate::normalize`'s doc for the measured split.
     #[test]
     fn corruption_sweep_is_detected_at_every_position() {
-        use stuffr_core::testing::incompressible;
+        use stuffr_core::testing::{compressible, incompressible};
 
-        let plain = incompressible(4 * 1024);
-        let packed = compress_fastest(&plain);
+        for (shape, plain) in [
+            ("incompressible", incompressible(4 * 1024)),
+            ("compressible", compressible(4 * 1024)),
+        ] {
+            let packed = compress_fastest(&plain);
 
-        let mut invalid_data = 0usize;
-        let mut other_kind = 0usize;
-        let mut silently_wrong = 0usize;
-        let mut silently_unchanged = 0usize;
-        for i in 0..packed.len() {
-            let mut corrupted = packed.clone();
-            corrupted[i] ^= 0xFF;
-            let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(corrupted)));
-            let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
-            let mut out = Vec::new();
-            match dec.read_to_end(&mut out) {
-                Ok(_) if out == plain => silently_unchanged += 1,
-                Ok(_) => silently_wrong += 1,
-                Err(e) => match e.kind() {
-                    std::io::ErrorKind::InvalidData => invalid_data += 1,
-                    _ => other_kind += 1,
-                },
+            let mut invalid_data = 0usize;
+            let mut other_kind = 0usize;
+            let mut silently_wrong = 0usize;
+            let mut silently_unchanged = 0usize;
+            for i in 0..packed.len() {
+                let mut corrupted = packed.clone();
+                corrupted[i] ^= 0xFF;
+                let src: Box<dyn Source> =
+                    Box::new(ReaderSource::new(std::io::Cursor::new(corrupted)));
+                let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
+                let mut out = Vec::new();
+                match dec.read_to_end(&mut out) {
+                    Ok(_) if out == plain => silently_unchanged += 1,
+                    Ok(_) => silently_wrong += 1,
+                    Err(e) => match e.kind() {
+                        std::io::ErrorKind::InvalidData => invalid_data += 1,
+                        _ => other_kind += 1,
+                    },
+                }
             }
-        }
 
-        assert_eq!(
-            silently_wrong, 0,
-            "every flipped position must be caught; measured {silently_wrong} silently wrong"
-        );
-        assert_eq!(
-            silently_unchanged, 0,
-            "every flipped position must be caught; measured {silently_unchanged} silently \
-             unchanged"
-        );
-        assert_eq!(
-            other_kind, 0,
-            "NormalizeDecodeErrors folds InvalidData, InvalidInput and UnexpectedEof from this \
-             backend onto InvalidData; {other_kind} positions reported neither"
-        );
-        assert!(
-            invalid_data > 0,
-            "expected at least one position to be detected; measured 0"
-        );
+            assert_eq!(
+                silently_wrong, 0,
+                "[{shape}] every flipped position must be caught; measured {silently_wrong} \
+                 silently wrong"
+            );
+            assert_eq!(
+                silently_unchanged, 0,
+                "[{shape}] every flipped position must be caught; measured \
+                 {silently_unchanged} silently unchanged"
+            );
+            assert_eq!(
+                other_kind, 0,
+                "[{shape}] NormalizeDecodeErrors folds InvalidData, InvalidInput, Other and \
+                 UnexpectedEof from this backend onto InvalidData; {other_kind} positions \
+                 reported neither"
+            );
+            assert!(
+                invalid_data > 0,
+                "[{shape}] expected at least one position to be detected; measured 0"
+            );
+        }
     }
 
     /// The truncation counterpart, at several cut lengths rather than one —
