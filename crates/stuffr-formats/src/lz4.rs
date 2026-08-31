@@ -74,15 +74,39 @@
 //! (fact `false` — a real EndMark was read), it does not report completion
 //! yet. It asks `FrameDecoder` to read again, which either resumes a
 //! following frame (real bytes come back, served transparently) or hits a
-//! GENUINE source exhaustion while checking for one (`FrameDecoder`'s own
-//! frame-header parse returns `Ok(0)` only when its own read of the next
-//! frame's magic bytes gets nothing at all — never via the swallowed-error
-//! path above, which is specific to `read_block`'s mid-frame position) — and
-//! that combination is the one place a `true` fact is NOT truncation: it is
-//! "no more frames, the whole stream — one member or several — is genuinely
-//! done." The two states are kept apart by tracking whether a frame has ever
-//! ended cleanly since the last time real bytes were served; see
-//! `EnforceEndMark::read`'s own comments for the exact state transitions.
+//! genuine source exhaustion while checking for one.
+//!
+//! **That "checking for one" step swallows EOF too, and the first version of
+//! this fix assumed it didn't.** The assumption here used to be that
+//! `FrameDecoder`'s own frame-header parse returns `Ok(0)` only when its own
+//! read of the next frame's magic bytes gets nothing AT ALL — never via the
+//! swallowed-error path `read_block` uses mid-frame. Measured directly
+//! against a whole-branch review's sweep, that is false: `read_frame_info`
+//! itself falls straight through to `Ok(0)` the moment ANY of its own
+//! sub-reads (the magic, then the rest of the fixed header) comes back
+//! short, and `read_block`'s own swallow — the exact mid-frame mechanism
+//! this module's EndMark fix was written to close — fires again on a NEXT
+//! frame's block-info word once the header parses cleanly. A file cut right
+//! after a following frame's complete magic, or right after its complete
+//! header, hits one of these and reads back as a clean "no more frames" —
+//! at 5 of 15 swept header offsets, against the reference `lz4` CLI's exit
+//! 26 at every one. `hit_eof` alone cannot tell "genuinely nothing left"
+//! apart from "some of the next frame's header arrived, then nothing" —
+//! both look identical to it.
+//!
+//! `served_since_probe` (see [`TrackedRead`]'s own doc) is the fact that
+//! actually distinguishes them: reset to `false` the instant a probe begins
+//! (right when `awaiting_concat_probe` is set), and latched `true` by ANY
+//! byte `TrackedRead` serves afterward, from either sub-read above. Zero
+//! bytes served during the probe, followed by genuine exhaustion, really is
+//! "no more frames, the whole stream — one member or several — is
+//! genuinely done." Any bytes served during the probe, followed by genuine
+//! exhaustion, is a following frame cut short — truncation, exactly as if
+//! it had happened mid-block. See `EnforceEndMark::read`'s own comments for
+//! the exact state transitions, and
+//! `a_truncated_concatenated_stream_is_rejected_at_every_header_offset`
+//! below for the regression sweep, driven by files the REFERENCE `lz4` CLI
+//! wrote, cut at every offset inside a following frame's header.
 
 use std::io::Write;
 use std::sync::Arc;
@@ -94,7 +118,7 @@ use stuffr_core::{
     Result, Sink, Source, StreamOnly,
 };
 
-use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
+use crate::normalize::{LZ4_MALFORMED_AS_OTHER_EOF, NormalizeDecodeErrors};
 
 /// Wraps the raw compressed-byte SOURCE and records, in `hit_eof`, whether
 /// its most recent read attempt returned a genuine `Ok(0)` — the source had
@@ -104,9 +128,26 @@ use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 /// source run dry DURING THIS SPECIFIC attempt" rather than accumulating
 /// across the whole decode. See the module doc for why this — not a
 /// byte-content window — is the right discriminator.
+///
+/// Also records, in `served_since_probe`, whether ANY bytes at all have been
+/// served since [`EnforceEndMark`] last started checking for a concatenated
+/// next frame — unlike `hit_eof`, this is NOT reset on every attempt, only
+/// when a fresh probe begins (see `EnforceEndMark::read`). This closes a gap
+/// the `hit_eof`-alone version of this mechanism had: `FrameDecoder`'s own
+/// `read_frame_info` and `read_block` each swallow a genuine source `Ok(0)`
+/// partway through parsing a NEXT frame's header into their own `Ok(0)` —
+/// the same collapsing the original EndMark bug had, just one frame-header
+/// later — so a source that hands over a complete magic, or a complete
+/// header, and THEN runs out looks identical to "no more frames" by
+/// `hit_eof` alone, even though real bytes of a truncated next frame were
+/// unmistakably read. `served_since_probe` is the one fact that tells those
+/// two cases apart: zero bytes served during the probe really does mean no
+/// more frames; any bytes served during the probe, followed by genuine
+/// exhaustion, means a following frame's header was cut short.
 struct TrackedRead {
     inner: Box<dyn Source>,
     hit_eof: Arc<AtomicBool>,
+    served_since_probe: Arc<AtomicBool>,
 }
 
 impl std::io::Read for TrackedRead {
@@ -114,6 +155,8 @@ impl std::io::Read for TrackedRead {
         let n = self.inner.read(buf)?;
         if n == 0 {
             self.hit_eof.store(true, Ordering::Relaxed);
+        } else {
+            self.served_since_probe.store(true, Ordering::Relaxed);
         }
         Ok(n)
     }
@@ -124,6 +167,7 @@ impl std::io::Read for TrackedRead {
 struct EnforceEndMark<R> {
     inner: R,
     hit_eof: Arc<AtomicBool>,
+    served_since_probe: Arc<AtomicBool>,
     /// Set once a frame has ended cleanly (its `Ok(0)` involved no source
     /// exhaustion) and we are now checking whether a concatenated frame
     /// follows. Reset to `false` the instant real decoded bytes arrive —
@@ -168,14 +212,19 @@ impl<R: std::io::Read> std::io::Read for EnforceEndMark<R> {
             // n == 0: did the wrapped source genuinely run dry reaching this
             // result, or did FrameDecoder read a real EndMark in full?
             if self.hit_eof.load(Ordering::Relaxed) {
-                if self.awaiting_concat_probe {
+                if self.awaiting_concat_probe && !self.served_since_probe.load(Ordering::Relaxed) {
                     // This Ok(0) came from FrameDecoder checking for a
                     // concatenated next frame (its own frame-header parse),
-                    // not from mid-frame block processing — a genuine
-                    // source exhaustion here means "no more frames", not
-                    // truncation. See the module doc for why these two
-                    // Ok(0)-with-exhaustion cases are distinguishable at
-                    // all.
+                    // not from mid-frame block processing, AND not one byte
+                    // of a next frame was ever served while checking — a
+                    // genuine source exhaustion here means "no more frames",
+                    // not truncation. See the module doc and this struct's
+                    // own doc for why these cases are distinguishable at
+                    // all, and why `served_since_probe`, not `hit_eof`
+                    // alone, is what tells them apart: a source that handed
+                    // over a complete magic (or a complete header) before
+                    // running out is NOT this case, even though `hit_eof`
+                    // looks identical either way.
                     return Ok(0);
                 }
                 self.truncated = true;
@@ -190,6 +239,10 @@ impl<R: std::io::Read> std::io::Read for EnforceEndMark<R> {
             // concatenated frame follows. If none does, the next iteration
             // resolves through the branch above; if one does, its bytes are
             // served like any other and this flag resets on that return.
+            // A fresh probe starts now, so `served_since_probe` resets here
+            // too — bytes served by the frame that just ended cleanly must
+            // not be mistaken for bytes served by the NEXT frame's header.
+            self.served_since_probe.store(false, Ordering::Relaxed);
             self.awaiting_concat_probe = true;
         }
     }
@@ -280,14 +333,31 @@ impl Codec for Lz4 {
         }
     }
 
-    /// Wrapped in `NormalizeDecodeErrors`: measured directly against this
-    /// crate (see `lz4_conformance_probe` below), a truncated lz4 frame
-    /// stream — cut anywhere past its first few header bytes — surfaces as
-    /// `UnexpectedEof`, the same kind flate2 and bzip2 raise for their own
-    /// truncated streams, so reusing `MALFORMED_AS_INVALID_INPUT_EOF` is
-    /// correct. lz4_flex never raises `InvalidInput` itself; folding that
-    /// unused kind onto `InvalidData` alongside `UnexpectedEof` is harmless,
-    /// same as it is for zlib and raw deflate.
+    /// Wrapped in `NormalizeDecodeErrors`, folding
+    /// [`crate::normalize::LZ4_MALFORMED_AS_OTHER_EOF`] — its OWN constant,
+    /// not the shared `MALFORMED_AS_INVALID_INPUT_EOF` this used to reuse.
+    ///
+    /// **That reuse was wrong, and the probe that used to justify it could
+    /// not have caught the mistake.** `lz4_conformance_probe_corruption_is_
+    /// silent_at_almost_every_position` below compresses
+    /// `incompressible(4 * 1024)` and counts only silently-wrong vs. errored
+    /// — it never inspects *which* `io::ErrorKind` a rejection carries, and
+    /// an incompressible payload's near-all-literal encoding almost never
+    /// reaches `lz4_flex`'s own `Error::DecompressionError` path in the first
+    /// place (measured: 0 of 4,115 swept positions raised `Other` for that
+    /// payload shape). So the probe could see "detected vs. not", which it
+    /// still proves correctly, but had no way to see "detected as WHICH
+    /// kind" even in principle — the old doc's "correct" verdict rested on
+    /// evidence that could not have found the defect it was vouching for.
+    ///
+    /// Measured directly against the raw crate instead, with a COMPRESSIBLE
+    /// payload (147 positions): `InvalidData: 62`, `Other: 82`,
+    /// `UnexpectedEof: 3` — `Other` at 56% of positions, reaching a caller as
+    /// `Error::Io` (exit 1) instead of `Error::Corrupt` (exit 5) before this
+    /// fix. See `crate::normalize::LZ4_MALFORMED_AS_OTHER_EOF`'s doc for the
+    /// full measurement, both payload shapes, and the source-level trace
+    /// showing `Other` here always means `lz4_flex` itself rejected the
+    /// bytes, never a wrapped source's I/O error passed through.
     ///
     /// Also wrapped, outermost, in [`EnforceEndMark`] — over a source first
     /// wrapped in [`TrackedRead`] — closing the truncation gap this module's
@@ -321,15 +391,18 @@ impl Codec for Lz4 {
     /// better detection here than a stream this codec wrote itself.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         let hit_eof = Arc::new(AtomicBool::new(false));
+        let served_since_probe = Arc::new(AtomicBool::new(false));
         let tracked = TrackedRead {
             inner: src,
             hit_eof: Arc::clone(&hit_eof),
+            served_since_probe: Arc::clone(&served_since_probe),
         };
         let normalized =
-            NormalizeDecodeErrors::new(FrameDecoder::new(tracked), MALFORMED_AS_INVALID_INPUT_EOF);
+            NormalizeDecodeErrors::new(FrameDecoder::new(tracked), LZ4_MALFORMED_AS_OTHER_EOF);
         Ok(Box::new(StreamOnly::new(EnforceEndMark {
             inner: normalized,
             hit_eof,
+            served_since_probe,
             awaiting_concat_probe: false,
             truncated: false,
         })))
@@ -507,6 +580,94 @@ mod tests {
         );
     }
 
+    fn which_lz4() -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join("lz4");
+            candidate.is_file().then_some(candidate)
+        })
+    }
+
+    /// Reproduces the whole-branch Phase 1e review's Finding 1 directly: a
+    /// `.lz4` made of several frames, written by the REFERENCE `lz4` CLI (not
+    /// this codec's own encoder — a truncated concatenated stream is what a
+    /// backup tool or `cat a.lz4 b.lz4 c.lz4 > combined.lz4` produces, and it
+    /// must be caught regardless of which encoder wrote the earlier frames),
+    /// cut at every offset inside the THIRD frame's header.
+    ///
+    /// Before the `served_since_probe` fix (see the module doc's note on
+    /// concatenation), 5 of 15 swept offsets exited 0 with 7,800 bytes of
+    /// silently-short output — offset 4 (complete magic, nothing else) and
+    /// offsets 7-10 (complete header, then 0-3 bytes of the next block-size
+    /// word) — while the reference `lz4` CLI itself errors (exit 26) at
+    /// every one. Skips cleanly on a machine with no `lz4` binary, the same
+    /// pattern `xz_pure.rs`'s and `lzip.rs`'s reference-tool tests use.
+    #[test]
+    fn a_reference_written_concatenated_stream_cut_inside_a_following_header_is_rejected() {
+        let Some(lz4) = which_lz4() else {
+            return;
+        };
+
+        let plain = b"reference-written frame payload, repeated for a real block. ".repeat(200);
+        let src_path =
+            std::env::temp_dir().join(format!("stf-lz4-header-cut-src-{}.bin", std::process::id()));
+        std::fs::write(&src_path, &plain).unwrap();
+
+        // Three frames, each written by the reference CLI, concatenated —
+        // exactly the shape the module doc's concatenation note describes.
+        let mut frame_bytes = Vec::new();
+        let mut frame_starts = Vec::new();
+        for _ in 0..3 {
+            frame_starts.push(frame_bytes.len());
+            let out = std::process::Command::new(&lz4)
+                .arg("-z")
+                .arg("-c")
+                .arg(&src_path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "reference lz4 failed to compress: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            frame_bytes.extend_from_slice(&out.stdout);
+        }
+        let _ = std::fs::remove_file(&src_path);
+
+        // Sanity: this codec must read the reference's own 3-frame file
+        // whole, or the cuts below would prove nothing.
+        let expected: Vec<u8> = [plain.clone(), plain.clone(), plain.clone()].concat();
+        assert_eq!(
+            decompress(frame_bytes.clone()),
+            expected,
+            "sanity: this codec must read the reference's own 3-frame file whole"
+        );
+
+        let third_start = frame_starts[2];
+        let header_len = lz4_header_len(&frame_bytes[third_start..]);
+        // Every offset from 1 byte into the third frame's header through the
+        // header plus its own 4-byte block-size word — the exact span the
+        // review measured (1 through header_len + 4 inclusive; offsets
+        // beyond that cut into block data already-covered mid-frame
+        // truncation handles).
+        for offset in 1..=(header_len + 4) {
+            let cut = third_start + offset;
+            if cut >= frame_bytes.len() {
+                break;
+            }
+            let truncated = frame_bytes[..cut].to_vec();
+            let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(truncated)));
+            let mut dec = Lz4.decoder(src, &DecodeOpts::default()).unwrap();
+            let mut out = Vec::new();
+            assert!(
+                dec.read_to_end(&mut out).is_err(),
+                "cut {offset} byte(s) into the third frame's header (absolute offset {cut}) \
+                 decoded without error — a reference-written concatenated stream cut here \
+                 must be rejected, not silently accepted as \"only two frames\""
+            );
+        }
+    }
+
     #[test]
     fn any_level_is_accepted_because_lz4_flex_exposes_none() {
         for level in [i32::MIN, -1, 0, 1, i32::MAX] {
@@ -591,51 +752,76 @@ mod tests {
     /// payload also decoded silently wrong).
     #[test]
     fn lz4_conformance_probe_corruption_is_silent_at_almost_every_position() {
-        use stuffr_core::testing::incompressible;
+        use stuffr_core::testing::{compressible, incompressible};
 
-        let plain = incompressible(4 * 1024);
-        let packed = compress(&plain);
+        // Both shapes, not just incompressible: a whole-branch review found
+        // that this exact probe — incompressible-only, and previously not
+        // even inspecting error KINDS — could not have caught `lz4_flex`
+        // raising `io::ErrorKind::Other` (folded onto `InvalidData` only
+        // once `crate::normalize::LZ4_MALFORMED_AS_OTHER_EOF` existed): an
+        // incompressible payload's near-all-literal encoding almost never
+        // reaches the `Error::DecompressionError` path `Other` comes from.
+        // The compressible sweep is the one that actually exercises it, and
+        // `other_kind` below is the assertion the old version never made.
+        for (shape, plain) in [
+            ("incompressible", incompressible(4 * 1024)),
+            ("compressible", compressible(4 * 1024)),
+        ] {
+            let packed = compress(&plain);
 
-        let mut silently_wrong = 0usize;
-        let mut errored = 0usize;
-        let mut silently_unchanged = 0usize;
-        for i in 0..packed.len() {
-            let mut corrupted = packed.clone();
-            corrupted[i] ^= 0xFF;
-            let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(corrupted)));
-            let mut dec = Lz4.decoder(src, &DecodeOpts::default()).unwrap();
-            let mut out = Vec::new();
-            match dec.read_to_end(&mut out) {
-                Ok(_) if out == plain => silently_unchanged += 1,
-                Ok(_) => silently_wrong += 1,
-                Err(_) => errored += 1,
+            let mut silently_wrong = 0usize;
+            let mut invalid_data = 0usize;
+            let mut other_kind = 0usize;
+            let mut silently_unchanged = 0usize;
+            for i in 0..packed.len() {
+                let mut corrupted = packed.clone();
+                corrupted[i] ^= 0xFF;
+                let src: Box<dyn Source> =
+                    Box::new(ReaderSource::new(std::io::Cursor::new(corrupted)));
+                let mut dec = Lz4.decoder(src, &DecodeOpts::default()).unwrap();
+                let mut out = Vec::new();
+                match dec.read_to_end(&mut out) {
+                    Ok(_) if out == plain => silently_unchanged += 1,
+                    Ok(_) => silently_wrong += 1,
+                    Err(e) => match e.kind() {
+                        std::io::ErrorKind::InvalidData => invalid_data += 1,
+                        _ => other_kind += 1,
+                    },
+                }
             }
-        }
 
-        assert_eq!(
-            silently_unchanged,
-            0,
-            "every one of {} flipped positions changed exactly one output byte; a flip landing \
-             with zero effect would be a probe bug, not a codec property",
-            packed.len()
-        );
-        // This assertion used to run the other way round, and the flip is the
-        // point. It required a clear majority of positions to decode SILENTLY
-        // WRONG, and documented that as what made a stream THIS codec wrote the
-        // weak half of WhenPresent -- adding, presciently, that if the encoder
-        // ever turned the checksum on, this needed revisiting. It did, and this
-        // is that revision: with content_checksum(true) our own output is
-        // verifiable, and every flipped position is now caught.
-        assert_eq!(
-            silently_wrong,
-            0,
-            "expected every one of {} flipped positions to be detected \
-             (measured: {silently_wrong} silently wrong, {errored} errored) — our own \
-             encoder writes a content checksum, so no corrupted position should decode \
-             to plausible-but-wrong output; if this regresses, check whether `encoder` \
-             still calls content_checksum(true)",
-            packed.len()
-        );
+            assert_eq!(
+                silently_unchanged,
+                0,
+                "[{shape}] every one of {} flipped positions changed exactly one output byte; a \
+                 flip landing with zero effect would be a probe bug, not a codec property",
+                packed.len()
+            );
+            // This assertion used to run the other way round, and the flip is
+            // the point. It required a clear majority of positions to decode
+            // SILENTLY WRONG, and documented that as what made a stream THIS
+            // codec wrote the weak half of WhenPresent -- adding, presciently,
+            // that if the encoder ever turned the checksum on, this needed
+            // revisiting. It did, and this is that revision: with
+            // content_checksum(true) our own output is verifiable, and every
+            // flipped position is now caught.
+            assert_eq!(
+                silently_wrong,
+                0,
+                "[{shape}] expected every one of {} flipped positions to be detected (measured: \
+                 {silently_wrong} silently wrong, {invalid_data} InvalidData, {other_kind} \
+                 other-kind) — our own encoder writes a content checksum, so no corrupted \
+                 position should decode to plausible-but-wrong output; if this regresses, check \
+                 whether `encoder` still calls content_checksum(true)",
+                packed.len()
+            );
+            assert_eq!(
+                other_kind, 0,
+                "[{shape}] NormalizeDecodeErrors folds Other and UnexpectedEof from lz4_flex \
+                 onto InvalidData (see crate::normalize::LZ4_MALFORMED_AS_OTHER_EOF); \
+                 {other_kind} positions reported neither, meaning exit 1 instead of exit 5"
+            );
+        }
     }
 
     /// Verifies the one fact the EndMark fix depends on, directly, before
@@ -692,6 +878,7 @@ mod tests {
                 served: Arc::clone(&served),
             }),
             hit_eof: Arc::clone(&hit_eof),
+            served_since_probe: Arc::new(AtomicBool::new(false)),
         };
         let mut dec = FrameDecoder::new(tracked);
         let mut out = Vec::new();
@@ -896,12 +1083,15 @@ mod tests {
     /// `truncated_lz4_frame_is_rejected_at_every_block_boundary` uses —
     /// that test's fixture is guaranteed raw (`incompressible()`), the
     /// zero-padded one above is not.
-    fn lz4_block_boundaries(packed: &[u8]) -> Vec<usize> {
-        // FLG (byte 4) bit 3 is content_size, bit 0 is dict_id — neither is
-        // set by this codec's own encoder, but computed here rather than
-        // assumed, so a future FrameInfo change to `encoder` cannot silently
-        // desync this helper from the bytes it is parsing.
-        let flg = packed[4];
+    /// An LZ4 frame header's length, computed from its own bytes rather than
+    /// assumed — `frame` must start at the frame's own magic. FLG (byte 4)
+    /// bit 3 is content_size, bit 0 is dict_id; neither is set by this
+    /// codec's own encoder, but this is computed regardless so it stays
+    /// correct for a header this codec did NOT write (a reference-tool
+    /// frame, or a future `FrameInfo` change to `encoder`) rather than
+    /// silently desyncing from the bytes it is parsing.
+    fn lz4_header_len(frame: &[u8]) -> usize {
+        let flg = frame[4];
         let mut header_len = 4 + 2 + 1; // magic + FLG/BD + HC
         if flg & 0x08 != 0 {
             header_len += 8; // content_size
@@ -909,7 +1099,11 @@ mod tests {
         if flg & 0x01 != 0 {
             header_len += 4; // dictionary ID
         }
+        header_len
+    }
 
+    fn lz4_block_boundaries(packed: &[u8]) -> Vec<usize> {
+        let header_len = lz4_header_len(packed);
         let mut boundaries = Vec::new();
         let mut pos = header_len;
         loop {

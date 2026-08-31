@@ -92,6 +92,59 @@ pub(crate) const MALFORMED_AS_INVALID_INPUT_EOF: &[ErrorKind] =
 pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
+/// The `Other` + `UnexpectedEof` pair, measured independently against
+/// `lz4_flex` 0.14 (backing `lz4.rs`) alone. Its own constant rather than a
+/// widening of [`MALFORMED_AS_INVALID_INPUT_EOF`] — the pair `lz4.rs` used
+/// to reuse — for the same reason every `Other`-folding constant in this
+/// file is its own: `Other` is `std::io::ErrorKind`'s catch-all, and
+/// widening a shared constant to admit it would apply the fold to flate2
+/// and bzip2 too, on no evidence either backend ever raises it.
+///
+/// `lz4.rs`'s own doc used to claim the reuse was "correct" on the strength
+/// of `lz4_conformance_probe_corruption_is_silent_at_almost_every_position`,
+/// which compresses `incompressible(4 * 1024)` and does not even inspect
+/// error KINDS, only whether the decode erred at all — a probe that
+/// structurally could not have told `InvalidInput`, `Other` and
+/// `UnexpectedEof` apart, let alone measured their split. A whole-branch
+/// review measured the raw crate directly instead (`lz4_flex` 0.14, this
+/// codec's own `FrameInfo`: `Max64KB` + `content_checksum(true)`): with a
+/// COMPRESSIBLE payload (147 positions), `InvalidData: 62`, **`Other: 82`**,
+/// `UnexpectedEof: 3` — `Other` at 56% of positions, not the zero the old
+/// doc assumed. With an incompressible payload (4,115 positions), `Other`
+/// really is 0 — confirming the old probe's shape, not its conclusion: it
+/// measured a payload for which `Other` cannot occur and then generalised
+/// that absence to the format. Through the CLI, corrupting a stream this
+/// codec wrote reached a caller as `Error::Io` (exit 1) instead of
+/// `Error::Corrupt` (exit 5) at 82 of 147 (compressible) and 106 of 1,556
+/// (mixed corpus) swept positions, on both tiers identically (this codec has
+/// only one backend).
+///
+/// `Other` is safe to fold onto `InvalidData` HERE, for the same structural
+/// reason as `SNAPPY_MALFORMED_AS_OTHER_EOF` and `ZSTD_MALFORMED_AS_OTHER_EOF`:
+/// traced directly against `lz4_flex::frame::decompress::FrameDecoder::
+/// read_block` (`frame/decompress.rs`) and the crate's `impl From<Error> for
+/// io::Error` (`frame/mod.rs`), a genuine error reading the underlying
+/// SOURCE reaches the caller via `self.r.read_exact(..)?` / `self.r.read(..)?`
+/// calls on the wrapped reader, propagated with their original kind intact —
+/// `Error::IoError(e)` round-trips through the `From` impl's `IoError(e) =>
+/// e` arm unchanged. `Other` is constructed ONLY from `Error::
+/// DecompressionError` (a corrupted block's own LZ77 match/literal
+/// validation — the `map_err(Error::DecompressionError)` call in
+/// `read_block`, the direct analogue of `xz-pure`'s `LzDecoder::repeat`
+/// "dist overflow" — see `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s
+/// doc), `Error::CompressionError`, `Error::SkippableFrame` or `Error::
+/// DictionaryNotSupported`, none of which this codec's own `decoder` can
+/// ever receive from a wrapped source's I/O — so `Other` reaching this
+/// wrapper always means `lz4_flex` itself rejected the bytes, never a
+/// genuine I/O failure underneath. `InvalidInput` is deliberately absent
+/// from this list, unlike the constant it replaces: `lz4_flex` never raises
+/// it (traced through the same `From` impl — every one of its variants maps
+/// to either `Other` or `InvalidData` directly, never `InvalidInput`), so
+/// including it would be a no-op at best and, per this file's own
+/// discipline, an unevidenced claim at worst.
+pub(crate) const LZ4_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
+    &[ErrorKind::Other, ErrorKind::UnexpectedEof];
+
 /// The `Other` + `UnexpectedEof` pair, measured independently against the
 /// `zstd` crate (backing `zstd_c.rs`) alone. Its own constant for the same
 /// reason `SNAPPY_MALFORMED_AS_OTHER_EOF` is not reused here: `Other` is
