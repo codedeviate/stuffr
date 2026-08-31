@@ -115,6 +115,42 @@
 //! `caps()` doc for why this is deliberately the SINGLE-WORKER figure for
 //! the default preset rather than preset 9's 64 MiB, or the much larger
 //! multi-hundred-MiB figure Phase 1f's parallel encode will need.
+//!
+//! ## KNOWN LIMITATION: decode memory is bounded by the file, not by us
+//!
+//! `XzReader::new` allocates a dictionary buffer sized by the value the
+//! *stream declares in its own header*, before any output is produced and
+//! regardless of how small the file is. Measured peak RSS decoding a **60-byte**
+//! `.xz` that declares preset 9's 64 MiB dictionary:
+//!
+//! | decoder | peak RSS |
+//! |---|---|
+//! | baseline, no decode | 2.26 MB |
+//! | this backend (`lzma-rust2`) | **69.35 MB** |
+//! | `xz_c` (liblzma) | 2.39 MB |
+//!
+//! liblzma grows its dictionary as needed and is unaffected; this backend does
+//! not. `lzma-rust2`'s `DICT_SIZE_MAX` is `!15u32`, about 4 GiB, so a crafted
+//! file of a few dozen bytes can demand an allocation of that order — roughly a
+//! millionfold amplification.
+//!
+//! **`--max-ratio` does not cover this.** That guard counts decoded *output*
+//! bytes, which for such a file is a handful; the cost is paid in the allocation
+//! before any output exists. This is the one bomb-shaped hole in a tool whose
+//! README promises bomb limits, and it is worth knowing that
+//! `--features c-backed` closes it completely.
+//!
+//! The fix is not applied here because it is not cheap and this codec should not
+//! grow an xz header parser: `lzma_rust2::XzStream::new_mem_limit` takes a
+//! `mem_limit_kb` and errors with "needed memory too big for mem_limit_kb", but
+//! it is on the lower-level push/pull `XzStream`, and the `Read`-shaped
+//! `XzReader` this codec uses exposes no equivalent constructor. Closing it means
+//! either driving `XzStream` directly or pre-parsing the LZMA2 filter property
+//! byte out of the block header. Both are real work, and both want a
+//! `DecodeOpts` memory bound that does not exist yet — `DecodeOpts` currently
+//! carries only `threads` and `governor`, and the governor's memory reasoning
+//! arrives in Phase 1f. Scheduled there, with this measurement, rather than
+//! rushed.
 
 use std::io::Write;
 
