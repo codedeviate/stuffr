@@ -239,7 +239,12 @@ const NO_FIXTURE: &str = "this codec cannot encode its own test input and no fix
 /// Asserts every conformance property that applies to `codec`, using `fixture`
 /// as the encoded test input for a codec that cannot encode its own — see the
 /// module docs.
-pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture: Option<&[u8]>) {
+fn assert_codec_conforms_impl(
+    codec: &dyn Codec,
+    meta: &FormatMeta,
+    fixture: Option<&[u8]>,
+    corruption_fixture: Option<&[u8]>,
+) {
     let id = codec.id();
     let caps = codec.caps();
 
@@ -569,9 +574,17 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
         }
 
         // Shared base for properties 9 and 10: a modest incompressible
-        // payload, encoded (or drawn from the fixture) once.
-        let corruption_input =
-            test_input(caps, fixture, || encode(codec, &incompressible(64 * 1024)));
+        // payload, encoded (or drawn from the fixture) once. `corruption_fixture`
+        // — distinct from the ordinary round-trip `fixture` above — exists for a
+        // WhenPresent codec whose own default encoder does not include the
+        // optional check (lz4): properties 2-8 still exercise the codec's REAL
+        // shipped encoder untouched, but 9 and 10 need a stream demonstrating
+        // what WhenPresent actually promises, which this codec's own encoder does
+        // not produce. See `assert_codec_conforms_with_corruption_fixture`.
+        let corruption_input = match corruption_fixture {
+            Some(f) => Some(f.to_vec()),
+            None => test_input(caps, fixture, || encode(codec, &incompressible(64 * 1024))),
+        };
 
         // 9. Corrupted input is reported as InvalidData — run for every
         //    declared state except Never, because a format with no integrity
@@ -746,7 +759,38 @@ pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture:
 /// that can encode its own test input. See [`assert_codec_conforms_with`] for
 /// a codec that cannot.
 pub fn assert_codec_conforms(codec: &dyn Codec, meta: &FormatMeta) {
-    assert_codec_conforms_with(codec, meta, None)
+    assert_codec_conforms_impl(codec, meta, None, None)
+}
+
+/// Asserts every conformance property that applies to `codec`, using `fixture`
+/// as the encoded test input for a codec that cannot encode its own — see the
+/// module docs.
+pub fn assert_codec_conforms_with(codec: &dyn Codec, meta: &FormatMeta, fixture: Option<&[u8]>) {
+    assert_codec_conforms_impl(codec, meta, fixture, None)
+}
+
+/// Asserts every conformance property that applies to `codec`, using
+/// `corruption_fixture` — not `fixture` above — as the encoded stream
+/// properties 9 and 10 corrupt or truncate.
+///
+/// For a `WhenPresent` codec whose own default encoder happens to include the
+/// optional check (zstd, xz), `assert_codec_conforms`'s ordinary corruption
+/// input already demonstrates the codec's own promise, and this function is
+/// unnecessary. It exists for the other `WhenPresent` shape: a codec (lz4)
+/// whose own encoder leaves the check off by design, so a stream *this
+/// codec's shipped encoder* wrote can never demonstrate the detection its
+/// `WhenPresent` declaration is about — the promise is about what a caller
+/// gets from a stream that DOES carry the check, typically written by some
+/// other tool, not from this codec's own default output. Properties 2
+/// through 8 are unaffected: they still exercise the codec's real, shipped
+/// `encoder()` exactly as `assert_codec_conforms` does — only the corruption
+/// and truncation base changes.
+pub fn assert_codec_conforms_with_corruption_fixture(
+    codec: &dyn Codec,
+    meta: &FormatMeta,
+    corruption_fixture: Option<&[u8]>,
+) {
+    assert_codec_conforms_impl(codec, meta, None, corruption_fixture)
 }
 
 /// Runs `assert_codec_conforms` and asserts it panics with a message

@@ -92,8 +92,13 @@ impl Codec for Snappy {
             // DEFINED type (0xFF/0x00/0x01/0xFE, or the 0x80-0xFD skippable
             // range) is unprotected by construction. It does not threaten
             // conformance property 9, which flips a byte at the payload's
-            // MIDPOINT, nowhere near this one structural byte — see the
-            // probe test for the exact position and count.
+            // MIDPOINT, nowhere near this one structural byte. Measured in
+            // Phase 1d at exactly 1 of 4,114 swept positions — see
+            // `snappy_conformance_probe_corruption_is_detected_at_almost_
+            // every_position` below for the sweep and the exact count;
+            // `Always` here means "the format mandates a check", not "no
+            // silent failure is possible" — this one framing-byte position
+            // is the documented exception.
             detects_corruption: CorruptionDetection::Always,
             // Measured from the crate's own fixed buffer sizes, not
             // profiled: `write::FrameEncoder` allocates a `src` buffer of

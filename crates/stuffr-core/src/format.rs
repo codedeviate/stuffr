@@ -45,22 +45,38 @@ pub enum CorruptionDetection {
     /// snappy's per-chunk CRC32C. This is a format-wide guarantee — it holds
     /// for any conforming stream, not just one this codec produced itself.
     Always,
-    /// The format permits a check but leaves it to the writer, so the
-    /// guarantee holds only for streams *this build's own encoder* produced —
-    /// zstd's content checksum, lz4's frame checksum, xz's check-type field
-    /// are all per-writer choices the format permits a writer to omit. How
-    /// likely that is varies by format and is worth knowing: zstd's
-    /// crate-level encoder omits it *by default* (its CLI does not), whereas
-    /// every xz encoder measured here — liblzma's and lzma-rust2's — selects
-    /// CRC64 without being asked, so a checkless `.xz` is possible but rare
-    /// where a checkless `.zst` is routine. A `.zst` file from another tool
-    /// that left the checksum off is still perfectly valid zstd, and this
-    /// codec's decoder only partially detects corruption in it — see
-    /// `zstd_c.rs`'s `decoder` doc for a measured figure. A codec built over
-    /// one of these optional-check formats must document, at the point a
-    /// caller would meet it, that reading a foreign stream is weaker than
-    /// reading its own output; the doc comment on the codec's own `caps()` is
-    /// not enough by itself — the decoder needs one too.
+    /// The format permits a check but leaves it to the writer, so what a
+    /// caller can trust depends on which writer actually produced the stream
+    /// in front of them — not on which writer this codec happens to be. That
+    /// cuts both ways, and a codec can sit on either side of it:
+    ///
+    /// - **This build's encoder turns the check on; a foreign writer might
+    ///   not.** zstd's content checksum and xz's check-type field are both
+    ///   per-writer choices the format permits omitting, and this project's
+    ///   own encoders choose to enable them: zstd's crate-level encoder
+    ///   omits it *by default* (its CLI does not, but `zstd_c.rs` and
+    ///   `zstd_pure.rs` both turn it on regardless), and every xz encoder
+    ///   measured here — liblzma's and lzma-rust2's — selects CRC64 without
+    ///   being asked, so a checkless `.xz` is possible but rare where a
+    ///   checkless `.zst` is routine. Here, detection is *weaker* on a
+    ///   foreign stream than on this codec's own output — see `zstd_c.rs`'s
+    ///   `decoder` doc for a measured figure.
+    /// - **This build's encoder leaves the check off; a foreign writer
+    ///   likely turns it on.** lz4's frame checksum is the mirror case:
+    ///   `lz4_flex`'s encoder (what this project uses) disables both the
+    ///   content and per-block checksums by default, so a stream *this
+    ///   codec* wrote carries no check at all — but the reference `lz4` CLI
+    ///   enables the content checksum *by default*, so most real-world
+    ///   `.lz4` files get real detection this codec's own decoder can
+    ///   verify. Here, detection is *better* on a typical foreign stream
+    ///   than on this codec's own output — see `lz4.rs`'s `decoder` doc for
+    ///   the measured figures.
+    ///
+    /// Either way, a codec built over one of these optional-check formats
+    /// must document, at the point a caller would meet it, which direction
+    /// it sits and what that is worth on a stream this build did not write;
+    /// the doc comment on the codec's own `caps()` is not enough by itself —
+    /// the decoder needs one too.
     WhenPresent,
     /// No checksum exists, yet malformed input is still detected because the
     /// format's own decoding constraints make corruption produce an invalid

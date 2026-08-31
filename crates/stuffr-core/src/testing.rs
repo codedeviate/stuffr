@@ -15,7 +15,10 @@ use crate::format::{CodecCaps, ContainerCaps, FormatId};
 use crate::ladder::Resolved;
 use crate::source::Source;
 
-pub use crate::conformance::{assert_codec_conforms, assert_codec_conforms_with, incompressible};
+pub use crate::conformance::{
+    assert_codec_conforms, assert_codec_conforms_with,
+    assert_codec_conforms_with_corruption_fixture, incompressible,
+};
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
 pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");
