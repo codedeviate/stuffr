@@ -5,10 +5,10 @@
 //! nonexistent `libbz2-rs-sys` feature flag) actually pulls in. No C
 //! toolchain is required to build this codec.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 
 use bzip2::Compression;
-use bzip2::read::MultiBzDecoder;
+use bzip2::bufread::BzDecoder as BzMemberDecoder;
 use bzip2::write::BzEncoder;
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
@@ -19,11 +19,69 @@ use crate::normalize::{MALFORMED_AS_INVALID_INPUT_EOF, NormalizeDecodeErrors};
 
 pub const BZIP2: FormatId = FormatId::new("bzip2");
 
+const BZIP2_MAGIC_BYTES: &[u8] = &[0x42, 0x5a, 0x68];
+
 const BZIP2_MAGIC: &[MagicRule] = &[MagicRule {
     offset: 0,
-    bytes: &[0x42, 0x5a, 0x68],
+    bytes: BZIP2_MAGIC_BYTES,
     format: BZIP2,
 }];
+
+/// Chains single-member `BzDecoder`s across a concatenated `.bz2` file
+/// instead of `bzip2::read::MultiBzDecoder` — the same fix as gzip's
+/// [`crate::gzip`] module for the same reason (Finding 7 of the Phase 1e
+/// final review): reference `bzip2 -dc` and Python's `bz2` module both
+/// recover the real data whole when trailing NUL/`'X'` bytes follow a
+/// complete, valid stream (measured at 1, 2, 5, 9, 10, 16, 40 and 512
+/// trailing bytes of each), while `MultiBzDecoder` rejected the file
+/// outright.
+///
+/// `bzip2::bufread::BzDecoder(multi: false)` stops the instant its stream
+/// footer (the combined CRC) verifies, and never attempts a next one — so
+/// its `Ok(0)` is unambiguous proof of a complete, valid stream, never a
+/// probe result, and truncation anywhere up through that footer still
+/// errors straight out of `BzMemberDecoder` itself before this type's own
+/// peek ever runs. From there this type peeks (`BufRead::fill_buf`,
+/// non-consuming) for the `BZh` magic on the same `BufReader`, exactly as
+/// `MultiMemberGzip` peeks for gzip's: a match chains into a fresh
+/// `BzMemberDecoder` (the legitimate multi-stream case, e.g. `pbzip2`
+/// output, unchanged from before); anything else — a mismatch, or fewer
+/// than three bytes because the source is genuinely exhausted — stops
+/// cleanly, matching the reference tools.
+struct MultiMemberBzip2 {
+    /// `None` only once a clean stop has been decided; every further read
+    /// returns `Ok(0)` without repeating the peek.
+    cur: Option<BzMemberDecoder<BufReader<Box<dyn Source>>>>,
+}
+
+impl MultiMemberBzip2 {
+    fn new(src: Box<dyn Source>) -> Self {
+        Self {
+            cur: Some(BzMemberDecoder::new(BufReader::new(src))),
+        }
+    }
+}
+
+impl std::io::Read for MultiMemberBzip2 {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let Some(dec) = self.cur.as_mut() else {
+                return Ok(0);
+            };
+            match dec.read(buf)? {
+                0 => {
+                    let mut rest = self.cur.take().unwrap().into_inner();
+                    if rest.fill_buf()?.starts_with(BZIP2_MAGIC_BYTES) {
+                        self.cur = Some(BzMemberDecoder::new(rest));
+                        continue;
+                    }
+                    return Ok(0);
+                }
+                n => return Ok(n),
+            }
+        }
+    }
+}
 
 /// Registration metadata for bzip2.
 pub fn meta() -> FormatMeta {
@@ -54,11 +112,14 @@ impl Codec for Bzip2 {
         }
     }
 
-    /// Decodes with `MultiBzDecoder`, never `BzDecoder`, for the same reason
-    /// gzip uses `MultiGzDecoder`: concatenated bzip2 streams are valid
-    /// bzip2, `pbzip2` produces them, and the single-stream decoder stops
-    /// after the first stream without erroring — silently truncating exactly
-    /// the files a parallel bzip2 encoder produces.
+    /// Decodes with [`MultiMemberBzip2`], never a bare single-stream
+    /// `BzDecoder` and never `bzip2::read::MultiBzDecoder` — concatenated
+    /// bzip2 streams are valid bzip2, `pbzip2` produces them, and a bare
+    /// single-stream decoder stops after the first without erroring,
+    /// silently truncating exactly the files a parallel bzip2 encoder
+    /// produces. [`MultiMemberBzip2`]'s own doc explains why its own
+    /// chaining — not `MultiBzDecoder` — is what closes this without
+    /// reopening Finding 7 (trailing NUL/`'X'` padding wrongly rejected).
     ///
     /// Wrapped in `StreamOnly` (a bzip2 stream carries no seek table) and in
     /// `NormalizeDecodeErrors` — see `crate::normalize` for why, and for the
@@ -68,7 +129,7 @@ impl Codec for Bzip2 {
     /// this crate rather than assumed from gzip's.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
-            MultiBzDecoder::new(src),
+            MultiMemberBzip2::new(src),
             MALFORMED_AS_INVALID_INPUT_EOF,
         ))))
     }
@@ -167,6 +228,122 @@ mod tests {
         let mut two = compress(b"first-");
         two.extend_from_slice(&compress(b"second"));
         assert_eq!(decompress(two), b"first-second");
+    }
+
+    fn which(bin: &str) -> Option<std::path::PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path).find_map(|dir| {
+            let candidate = dir.join(bin);
+            candidate.is_file().then_some(candidate)
+        })
+    }
+
+    /// Reproduces Finding 7 of the Phase 1e final review: trailing NUL or
+    /// `'X'` padding after a complete, valid stream used to be rejected
+    /// outright (exit 5, no file from `unpack`), where reference
+    /// `bzip2 -dc` and Python's `bz2` module both recover the data whole
+    /// (reference `bzip2 -dc` even exits 0, no warning at all). Swept at
+    /// every length the review measured, plus the sub-magic lengths (1, 2)
+    /// it didn't spell out but which the reference tool treats identically.
+    #[test]
+    fn trailing_padding_after_a_valid_stream_is_ignored_like_the_reference() {
+        let plain = b"trailing-padding regression payload, repeated a bit. ".repeat(40);
+        let packed = compress(&plain);
+
+        for pad_byte in [0x00u8, b'X'] {
+            for pad_len in [1, 2, 5, 9, 10, 16, 40, 512] {
+                let mut padded = packed.clone();
+                padded.extend(std::iter::repeat_n(pad_byte, pad_len));
+                assert_eq!(
+                    decompress(padded),
+                    plain,
+                    "pad_byte={pad_byte:#04x} pad_len={pad_len}: trailing padding after a \
+                     valid stream must not lose or corrupt the real data"
+                );
+            }
+        }
+    }
+
+    /// The regression this fix must not reopen: a stream cut short — mid
+    /// block, or anywhere inside its own trailer — is genuine truncation
+    /// and must still error, even though the fix above now tolerates
+    /// trailing bytes that follow a stream which completed and verified in
+    /// full.
+    #[test]
+    fn a_truncated_stream_is_still_rejected_even_though_trailing_padding_is_now_tolerated() {
+        let packed = compress(b"truncation must still be caught after this fix");
+        for cut in 1..packed.len() {
+            let truncated = &packed[..cut];
+            let src: Box<dyn Source> =
+                Box::new(ReaderSource::new(std::io::Cursor::new(truncated.to_vec())));
+            let mut dec = Bzip2.decoder(src, &DecodeOpts::default()).unwrap();
+            let mut out = Vec::new();
+            assert!(
+                dec.read_to_end(&mut out).is_err(),
+                "cut at byte {cut} of {} decoded without error",
+                packed.len()
+            );
+        }
+    }
+
+    /// Reference arbiter for the case above: the reference `bzip2` CLI (or,
+    /// if absent, Python's `bz2` module) must independently agree that
+    /// trailing NUL/`'X'` padding is recoverable, or the case above proves
+    /// nothing about matching the reference.
+    #[test]
+    fn trailing_padding_matches_the_reference_tool() {
+        let plain = b"reference-tool trailing-padding payload, repeated. ".repeat(40);
+        let packed = compress(&plain);
+
+        let bzip2_bin = which("bzip2");
+        let python_bin = which("python3");
+        if bzip2_bin.is_none() && python_bin.is_none() {
+            return;
+        }
+
+        for pad_len in [1, 16, 40, 512] {
+            let mut padded = packed.clone();
+            padded.extend(std::iter::repeat_n(0u8, pad_len));
+
+            let path = std::env::temp_dir().join(format!(
+                "stf-bzip2-trailing-pad-{pad_len}-{}.bz2",
+                std::process::id()
+            ));
+            std::fs::write(&path, &padded).unwrap();
+
+            if let Some(bzip2_bin) = &bzip2_bin {
+                let out = std::process::Command::new(bzip2_bin)
+                    .arg("-dc")
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    out.stdout, plain,
+                    "pad_len={pad_len}: reference bzip2 must recover the real data"
+                );
+            }
+            if let Some(python_bin) = &python_bin {
+                let out = std::process::Command::new(python_bin)
+                    .arg("-c")
+                    .arg(format!(
+                        "import bz2,sys; sys.stdout.buffer.write(bz2.open({:?},'rb').read())",
+                        path.to_str().unwrap()
+                    ))
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "python bz2 module rejected pad_len={pad_len}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert_eq!(
+                    out.stdout, plain,
+                    "pad_len={pad_len}: python bz2 module must recover the real data"
+                );
+            }
+
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]
