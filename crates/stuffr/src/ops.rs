@@ -339,13 +339,12 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
     // Order matters: the data must be durable BEFORE the rename that publishes
     // it, or a crash can leave the name pointing at a file whose contents never
     // reached the disk — the exact outcome temp-then-rename exists to prevent.
-    // Nested `if`s rather than a let-chain: MSRV 1.85, let-chains land in 1.88.
-    if f.sync {
-        if let Some(h) = &f.handle {
-            h.sync_all()?;
-            #[cfg(feature = "testing")]
-            SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
-        }
+    if f.sync
+        && let Some(h) = &f.handle
+    {
+        h.sync_all()?;
+        #[cfg(feature = "testing")]
+        SYNC_CALLS.fetch_add(1, Ordering::Relaxed);
     }
 
     if let Err(e) = std::fs::rename(&f.tmp, &f.target) {
@@ -362,16 +361,16 @@ pub(crate) fn publish(finish: Option<Finish>) -> Result<()> {
     // rename is the guarantee available, and the docs must say so rather than
     // implying both platforms get the same promise.
     #[cfg(unix)]
-    if f.sync {
-        if let Some(dir) = f.target.parent() {
-            let dir = if dir.as_os_str().is_empty() {
-                std::path::Path::new(".")
-            } else {
-                dir
-            };
-            if let Ok(d) = std::fs::File::open(dir) {
-                let _ = d.sync_all();
-            }
+    if f.sync
+        && let Some(dir) = f.target.parent()
+    {
+        let dir = if dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dir
+        };
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
         }
     }
 
@@ -461,14 +460,13 @@ fn choose_format(reg: &Registry, dst: &Output, explicit: Option<FormatId>) -> Re
     if let Some(f) = explicit {
         return Ok(f);
     }
-    if let Output::Path(p) = dst {
-        if let Some(id) = p
+    if let Output::Path(p) = dst
+        && let Some(id) = p
             .extension()
             .and_then(|e| e.to_str())
             .and_then(|e| reg.by_extension(e))
-        {
-            return Ok(id);
-        }
+    {
+        return Ok(id);
     }
     default_format_in(reg)
 }

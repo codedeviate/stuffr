@@ -382,23 +382,18 @@ impl Read for LazyRuzstdDecoder {
                     // merely carried in the frame into something this
                     // decoder actually enforces — see the module doc.
                     //
-                    // A single-pattern `if let` on the tuple, not the
-                    // `&&`-joined let-chain form that only stabilised in
-                    // 1.88 — MSRV here is 1.85 (see `ops.rs`'s identical
-                    // comment on its own weak-encoder consent check).
                     if let (Some(expected), Some(actual)) = (
                         dec.decoder.get_checksum_from_data(),
                         dec.decoder.get_calculated_checksum(),
-                    ) {
-                        if expected != actual {
-                            return Err(std::io::Error::new(
-                                ErrorKind::InvalidData,
-                                format!(
-                                    "ruzstd: content checksum mismatch: stream claims \
-                                     {expected:#010x}, calculated {actual:#010x}"
-                                ),
-                            ));
-                        }
+                    ) && expected != actual
+                    {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "ruzstd: content checksum mismatch: stream claims \
+                                 {expected:#010x}, calculated {actual:#010x}"
+                            ),
+                        ));
                     }
 
                     // Recover the underlying source and check — by peeking,

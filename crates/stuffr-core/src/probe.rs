@@ -119,25 +119,22 @@ fn inner_from_path(reg: &Registry, path: Option<&Path>, outer: FormatId) -> Chai
     // not the whole string — checking the whole string would only work if every
     // codec also registered its compound alias, and one that forgot would
     // silently resolve `.tbz2` to Raw instead of tar-over-bzip2.
-    if let Some(last) = exts.last() {
-        if let Some(stripped) = last.strip_prefix('t') {
-            if !stripped.is_empty() && reg.by_extension(stripped) == Some(outer) {
-                if let Some(id) = reg.by_extension("tar") {
-                    if reg.container(id).is_some() {
-                        return Chain::Container { container: id };
-                    }
-                }
-            }
-        }
+    if let Some(last) = exts.last()
+        && let Some(stripped) = last.strip_prefix('t')
+        && !stripped.is_empty()
+        && reg.by_extension(stripped) == Some(outer)
+        && let Some(id) = reg.by_extension("tar")
+        && reg.container(id).is_some()
+    {
+        return Chain::Container { container: id };
     }
 
     // Otherwise look one extension inwards.
-    if exts.len() >= 2 {
-        if let Some(id) = reg.by_extension(&exts[exts.len() - 2]) {
-            if reg.container(id).is_some() {
-                return Chain::Container { container: id };
-            }
-        }
+    if exts.len() >= 2
+        && let Some(id) = reg.by_extension(&exts[exts.len() - 2])
+        && reg.container(id).is_some()
+    {
+        return Chain::Container { container: id };
     }
     Chain::Raw
 }

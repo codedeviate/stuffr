@@ -32,18 +32,20 @@ jobs:
       - run: make check
 
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
       # rust-toolchain.toml pins 1.95 for local development and must not
       # constrain the MSRV check. Remove it so the toolchain action's choice
       # takes effect.
       - run: rm rust-toolchain.toml
-      # rust-version claims 1.85 and nothing has ever checked it. Edition 2024
-      # sits exactly at that floor.
+      # rust-version claims 1.88 and this job is the only thing that checks it.
+      # The floor was 1.85 through Phase 1d; it moved because holding it forced an
+      # exact pin on a dependency, which blocked patch-level security fixes, and
+      # because let-chains (stable in 1.88) were being routed around in every task.
       - run: cargo build --workspace --all-features
       - run: cargo test --workspace --all-features
       # The pure tier is a different test set, not a subset — see the

@@ -103,12 +103,12 @@ pub fn resolve_workers(i: &BudgetInputs) -> usize {
         .flatten()
         .next();
 
-    if let Some(n) = explicit {
-        if n != 0 {
-            return n;
-        }
-        // Explicit auto: fall through, but do not consult lower-precedence
-        // sources.
+    // Explicit auto (`0`) falls through, but must not consult lower-precedence
+    // sources — hence matching on `explicit` rather than re-reading them.
+    if let Some(n) = explicit
+        && n != 0
+    {
+        return n;
     }
 
     let detected = i.detected.max(1);
