@@ -62,24 +62,26 @@
 //!    immediately. This alone catches non-LZIP input and a damaged first
 //!    header — but NOT a damaged later member, because by the time that
 //!    member's bytes are current, this check has already run and passed.
-//! 2. **Once `LzipReader` itself reports `Ok(0)`, this wrapper checks
-//!    whether the underlying reader still holds any unconsumed bytes** —
-//!    the same peek-without-consuming `fill_buf` mechanism, at the opposite
-//!    end of the stream. A genuinely finished stream has nothing left; a
-//!    stream that stopped early because a later member's header failed to
-//!    parse still has that member's undigested bytes sitting there. This is
-//!    the same mechanism `lzma_c.rs`'s `RejectTrailingGarbage` uses, reused
-//!    rather than reinvented — see that module's doc — though what it
-//!    means here differs: there it is "extra data appended after one
-//!    complete stream"; here it is "a later member's header that the crate
-//!    swallowed as if it were the end". `lzma_pure.rs`'s `GuardedReader`
-//!    is the other prior art surveyed and not the fit here: its `hit_eof`
-//!    flag exists because the crate it wraps FAKES a sentinel byte past
-//!    real EOF, so a plain "anything left over" peek cannot tell a one-byte
-//!    truncation from a genuine finish. `LzipReader` has no equivalent —
-//!    measured truncation already reports `Err` unaided (see the table
-//!    above) — so only the `has_more`-shaped half of that prior art is
-//!    needed, not the `hit_eof` half.
+//! 2. **Once `LzipReader` itself reports `Ok(0)`, this wrapper classifies
+//!    whatever the underlying reader still holds** — NOT a blanket "any
+//!    unconsumed byte is corrupt" (Review Round 1 caught that: it rejected
+//!    files the reference `lzip` binary itself accepts, e.g. NUL-padded
+//!    trailing garbage), but [`GuardedLzipReader::classify_trailing_data`],
+//!    which reproduces reference lzip's own forgiveness rule bit-for-bit —
+//!    see "Matching the reference tool's trailing-data rule" below for the
+//!    derivation. A genuinely finished stream has nothing left, which this
+//!    still accepts unconditionally; a stream that stopped early because a
+//!    later member's header failed to parse usually — but, per the
+//!    reference tool's own rule, not always — has that failure's bytes
+//!    still sitting there as a detectable signal. `lzma_pure.rs`'s
+//!    `GuardedReader` is prior art surveyed and not the fit here: its
+//!    `hit_eof` flag exists because the crate it wraps FAKES a sentinel
+//!    byte past real EOF, so a plain "anything left over" peek cannot tell
+//!    a one-byte truncation from a genuine finish. `LzipReader` has no
+//!    equivalent — measured truncation already reports `Err` unaided (see
+//!    the table above) — so this check only ever has to answer "what DO
+//!    these leftover bytes mean", never "did the crate fake past a missing
+//!    one".
 //!
 //! Check 2 is not a special case of check 1: check 1 only ever looks at the
 //! stream's first four bytes. A later member's header, corrupted or not,
@@ -94,6 +96,96 @@
 //! mismatch, a corrupted embedded LZMA1 body), which is a different set. See
 //! [`crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA`]'s doc for that
 //! measurement.
+//!
+//! ## Matching the reference tool's trailing-data rule
+//!
+//! Review Round 1's critical finding: the first version of check 2 above
+//! ("any unconsumed byte after `Ok(0)` is corrupt") is STRICTER than
+//! reference `lzip` 1.26, and rejects real files the reference accepts —
+//! NUL padding, arbitrary trailing bytes of many lengths, all decode
+//! cleanly through the reference tool (`lzip -t`/`-dc` exit 0) but were
+//! rejected here. That is a genuine defect in the opposite direction from
+//! `brotli.rs`'s documented divergence (too permissive there; too strict
+//! here) — matching the reference exactly is the fix, not picking a
+//! direction and calling it good enough.
+//!
+//! Extracted directly from reference lzip 1.26's own source
+//! (`lzip.h`'s `Lzip_header::check_prefix`/`check_corrupt`, driving
+//! `main.cc`'s `decompress()` member loop), NOT reverse-engineered from
+//! black-box probing alone — probing pinned the shape, reading the C++
+//! confirmed the exact rule and one case probing alone would have gotten
+//! wrong (below). Verified byte-for-byte against the installed `lzip`
+//! 1.26 binary, both via a regular file and via a pipe (`decompress()`
+//! runs the identical logic on stdin — there is no seek-based shortcut
+//! here to diverge from):
+//!
+//! - **No member decoded yet.** Reference lzip's `first_member` branches
+//!   never consult any forgiveness rule at all — even a complete,
+//!   well-formed 6-byte header with nothing after it (no body, no
+//!   trailer) is rejected ("File ends unexpectedly at member header"),
+//!   verified directly against the binary. This project's own upfront
+//!   magic check (check 1 above) already independently confirms the first
+//!   four bytes of the whole stream before `LzipReader` ever runs, so the
+//!   only way [`GuardedLzipReader::classify_trailing_data`] is reached
+//!   with no member decoded yet is a bad version or dictionary-size byte
+//!   in that very first member — which the reference also rejects
+//!   unconditionally. [`TrailingVerdict::Reject`] unconditionally in this
+//!   case, no further inspection.
+//! - **At least one member decoded, and the stream then truly ends** (no
+//!   more bytes exist anywhere, verified by pulling up to 7 bytes in a
+//!   loop rather than trusting a single `fill_buf`, matching reference
+//!   lzip's own `readblock` loop in spirit — see
+//!   [`GuardedLzipReader::peek_tail`]'s doc): reference lzip's
+//!   `check_prefix` applies — a CONTIGUOUS match against the magic,
+//!   starting at position 0, over however many of the first 4 bytes are
+//!   actually available. Looks like the truncated start of a real header →
+//!   reject ("Truncated header in multimember file"); otherwise → accept.
+//! - **At least one member decoded, and more data follows a 6-byte
+//!   header-shaped read:** reference lzip's `check_magic`/`check_corrupt`
+//!   apply instead — an EXACT 4-byte match means something else in that
+//!   header was wrong (version/dictionary size), which is an unconditional
+//!   reject, same reasoning as the no-member-decoded-yet case; otherwise,
+//!   count how many of the 4 magic-byte POSITIONS match, independent of
+//!   contiguity or order — 2 or 3 matches → reject ("Corrupt header in
+//!   multimember file"); 0 or 1 → accept.
+//!
+//! The last two rules are NOT the same predicate, and conflating them was
+//! the trap a naive re-implementation would fall into. Measured the
+//! distinguishing case directly against the binary: trailing bytes
+//! `"XZIP"` (position 0 wrong, positions 1-3 correct — 3 POSITIONAL
+//! matches) with NOTHING after them are ACCEPTED (`check_prefix` fails
+//! immediately at position 0, contiguity broken), but the identical 4
+//! bytes followed by more data are REJECTED (`check_corrupt`'s count of 3
+//! doesn't care about contiguity at all). Both directions are pinned by
+//! [`the_two_trailing_data_rules_are_genuinely_different`] with fixtures
+//! this project constructed and then asked the reference tool to judge —
+//! not the tool's own vocabulary assumed and hard-coded, which is exactly
+//! what let the original, too-strict version through review undetected.
+//!
+//! ## An undocumented dependency: this codec assumes a pre-filled prefix
+//!
+//! Check 1's magic peek is one non-destructive `BufRead::fill_buf` call —
+//! it does not loop, and on a source that hands back data one byte at a
+//! time it could in principle see fewer than 4 bytes on the first call and
+//! wrongly conclude "no match" before the real magic has fully arrived.
+//! This is not a latent bug so much as an undocumented DEPENDENCY on this
+//! codec's only caller: `stuffr`'s `ops::decompress_with`
+//! (`crates/stuffr/src/ops.rs:650`) calls `stuffr_core::probe` before ANY
+//! codec's `decoder()` is invoked, and `probe` (`crates/stuffr-core/src/
+//! probe.rs`) reads up to `PROBE_LEN` (4096) bytes via `PeekSource::fill`
+//! for a non-seekable source, replaying them non-destructively to whatever
+//! reads the source afterward. By the time this codec's `decoder()` ever
+//! sees the stream, at least the first 4096 bytes (or the whole stream, if
+//! shorter) are already resident and replayable — the single `fill_buf`
+//! call in check 1 is guaranteed to see all of them at once. If `ops` ever
+//! stopped pre-filling before handing a codec its source, THIS codec would
+//! break on a slow/fragmented pipe and its own tests — which all construct
+//! sources from an in-memory `Cursor`, not a genuinely slow pipe — would
+//! not catch it. [`GuardedLzipReader::peek_tail`] (check 2, at the tail of
+//! the stream rather than the head) does not share this dependency: it
+//! loops its own reads rather than trusting one `fill_buf`, precisely
+//! because nothing upstream pre-fills the TAIL of the stream the way
+//! `probe` pre-fills the head.
 //!
 //! ## Corruption detection: `Always`, and why the header blind spot does not undermine it
 //!
@@ -311,12 +403,127 @@ impl Sink for LzipSink {
     }
 }
 
+/// Wraps `BufReader<Box<dyn Source>>` for two things `lzma_rust2::LzipReader`
+/// gives no way to ask from the outside, both needed by
+/// `GuardedLzipReader::classify_trailing_data`:
+///
+/// 1. **How many bytes has `LzipReader` genuinely consumed so far** (via its
+///    own `Read::read` calls — never via `fill_buf` alone, which is a
+///    non-destructive peek this codec's own upfront magic check relies on
+///    NOT counting as consumption). This is what makes "has at least one
+///    member been successfully decoded yet" answerable at all: the crate
+///    exposes no such accessor, and the two scenarios
+///    `classify_trailing_data` must tell apart (a header-parse failure on
+///    the very first attempt, versus a fully decoded — possibly
+///    empty-content — first member followed by nothing else) are otherwise
+///    indistinguishable purely from `Ok`/`Err` timing at the outer `read`
+///    call boundary: both manifest as "the very first call returns `Ok(0)`".
+/// 2. **The last up to 6 bytes actually consumed.** This is the harder
+///    problem, and the one that broke the first version of this fix: when
+///    `LzipReader::start_next_member` fails to parse the next member's
+///    header, it does NOT fail atomically — `LzipHeader::parse` reads
+///    magic, then version, then the dictionary-size byte, sequentially,
+///    and returns as soon as any one of them is wrong. Those bytes are
+///    genuinely consumed (the read calls that obtained them succeeded)
+///    before the failure, and once `LzipReader` gives up and hands control
+///    back to us as `Ok(0)`, they are GONE — not retrievable by peeking
+///    forward, because peeking forward only sees what comes AFTER them.
+///    Measured directly what this breaks: appending `"LZ"` + 40 unrelated
+///    bytes after a valid member, `LzipReader`'s own failed header attempt
+///    reads exactly 4 bytes (`"LZXX"`, the magic mismatching at the third
+///    byte) before giving up — so a plain forward peek from that point
+///    only ever sees the 38 REMAINING bytes, none of which resemble the
+///    magic at all, and would wrongly ACCEPT what reference lzip rejects.
+///    Recording the last 6 consumed bytes as they flow through — nothing
+///    else ever intervenes between a failed header attempt and the `Ok(0)`
+///    it produces (verified against `lzma_rust2` 0.20.1's own control
+///    flow) — recovers the right byte VALUES, but `tail` alone cannot say
+///    how MANY of them belong to the failed attempt once it has already
+///    saturated at 6 from earlier, unrelated reads (the same "LZ" + 40
+///    case: `tail` fills with 2 stale trailer bytes ahead of the real
+///    `"LZXX"`, misaligning everything unless something else supplies the
+///    count). `classify_trailing_data` supplies that count itself, from
+///    `consumed` and a snapshot taken just before the read that produced
+///    `Ok(0)` — see that function's doc for the arithmetic — and combines
+///    it with `tail`'s byte values to reconstruct the reference's atomic
+///    6-byte header read after the fact, instead of only seeing its
+///    aftermath.
+struct TailWrapper<R> {
+    inner: R,
+    consumed: u64,
+    /// Last up to 6 bytes consumed, oldest at index 0 of the filled prefix.
+    tail: [u8; 6],
+    tail_len: usize,
+}
+
+impl<R> TailWrapper<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            consumed: 0,
+            tail: [0u8; 6],
+            tail_len: 0,
+        }
+    }
+
+    /// Reaches the wrapped reader directly — for `GuardedLzipReader`'s own
+    /// peeks (`fill_buf`, and the destructive forward read past a failed
+    /// header attempt), which must not themselves feed back into `tail` or
+    /// `consumed`: by the time either peek runs, the decision they exist to
+    /// support has either not yet been made (`fill_buf`, non-destructive by
+    /// construction) or already has been (the forward read, which runs
+    /// AFTER `consumed`/`tail` were already consulted).
+    fn raw_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+
+    /// Slides up to 6 bytes' worth of newly-consumed data into `tail`,
+    /// dropping the oldest bytes first if it would overflow.
+    fn push_tail(&mut self, new: &[u8]) {
+        if new.is_empty() {
+            return;
+        }
+        if new.len() >= self.tail.len() {
+            let start = new.len() - self.tail.len();
+            self.tail.copy_from_slice(&new[start..]);
+            self.tail_len = self.tail.len();
+            return;
+        }
+        let total = (self.tail_len + new.len()).min(self.tail.len());
+        let drop_from_front = (self.tail_len + new.len()).saturating_sub(self.tail.len());
+        let kept = self.tail_len - drop_from_front;
+        self.tail.copy_within(drop_from_front..self.tail_len, 0);
+        self.tail[kept..kept + new.len()].copy_from_slice(new);
+        self.tail_len = total;
+    }
+}
+
+impl<R: Read> Read for TailWrapper<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.consumed += n as u64;
+        self.push_tail(&buf[..n]);
+        Ok(n)
+    }
+}
+
 /// See the module doc's "The backend has a silent-data-loss defect" and
-/// "The fix" sections for what this closes and why it needs two checks
-/// rather than one.
+/// "The fix" sections for what this closes, and "Matching the reference
+/// tool's trailing-data rule" for why the trailing-bytes check is not a
+/// blanket "any leftover byte is corrupt" — that was Review Round 1's
+/// finding: it rejected files the reference `lzip` accepts.
 struct GuardedLzipReader {
-    inner: LzipReader<BufReader<Box<dyn Source>>>,
+    inner: LzipReader<TailWrapper<BufReader<Box<dyn Source>>>>,
     state: GuardState,
+    /// `TailWrapper::consumed` snapshotted immediately before the most
+    /// recent outer call to `self.inner.read`. Needed because a header
+    /// attempt can consume anywhere from 0 to 6 bytes before giving up —
+    /// `TailWrapper`'s sliding `tail` alone cannot tell "these K bytes are
+    /// this attempt's own" apart from "these are leftover bytes from
+    /// whatever came immediately before it" once `tail` has already
+    /// saturated at 6 from earlier, unrelated reads. See
+    /// `classify_trailing_data`'s doc for the arithmetic this backs.
+    consumed_before_this_read: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -329,32 +536,227 @@ enum GuardState {
     /// `inner` reported `Ok(0)` and the trailing-bytes check already ran
     /// clean. Every further read returns `Ok(0)` without repeating it.
     Done,
-    /// A prior read already failed (bad magic, unconsumed trailing bytes,
-    /// or a genuine error from `inner`). Reading again must keep failing.
+    /// A prior read already failed (bad magic, rejected trailing bytes, or
+    /// a genuine error from `inner`). Reading again must keep failing.
     Failed,
+}
+
+/// What to do once `inner` reports `Ok(0)` ("no more members") and some
+/// number of bytes remain unconsumed in the underlying source.
+enum TrailingVerdict {
+    /// Nothing else to see here — a genuinely clean end of stream.
+    Accept,
+    /// Reject with this message (always folds to `InvalidData`).
+    Reject(&'static str),
 }
 
 impl GuardedLzipReader {
     fn new(src: Box<dyn Source>) -> Self {
         Self {
-            inner: LzipReader::new(BufReader::new(src)),
+            inner: LzipReader::new(TailWrapper::new(BufReader::new(src))),
             state: GuardState::Unchecked,
+            consumed_before_this_read: 0,
         }
-    }
-
-    /// Non-destructive: does the underlying source still hold any
-    /// unconsumed bytes? One `BufRead::fill_buf` call — the same mechanism
-    /// `lzma_c.rs`'s `RejectTrailingGarbage` and `lzma_pure.rs`'s
-    /// `GuardedReader::has_more` use.
-    fn has_more(&mut self) -> std::io::Result<bool> {
-        Ok(!self.inner.inner_mut().fill_buf()?.is_empty())
     }
 
     /// Non-destructive: do the first bytes available match LZIP's magic?
     /// One `BufRead::fill_buf` call, run once before `inner` ever sees the
-    /// stream.
+    /// stream. Reaches straight through `TailWrapper` via `raw_mut()`: this
+    /// peek must NOT be recorded as consumption (see `TailWrapper`'s doc).
     fn magic_matches(&mut self) -> std::io::Result<bool> {
-        Ok(self.inner.inner_mut().fill_buf()?.starts_with(MAGIC_BYTES))
+        Ok(self
+            .inner
+            .inner_mut()
+            .raw_mut()
+            .fill_buf()?
+            .starts_with(MAGIC_BYTES))
+    }
+
+    /// Pulls up to `need` more bytes from whatever remains once `inner`
+    /// reports `Ok(0)`, looping `Read::read` calls (not a single
+    /// `fill_buf`) until either `need` bytes are in hand or a `read` call
+    /// genuinely returns `Ok(0)` — the same "keep trying until enough or
+    /// true EOF" shape reference `lzip`'s own `readblock` uses
+    /// (`decoder.cc`), needed so a source that happens to deliver these
+    /// final bytes across more than one physical read (a slow pipe, say)
+    /// is not mistaken for having fewer bytes left than it really does.
+    /// Reaches straight through `TailWrapper` via `raw_mut()`: by this
+    /// point `classify_trailing_data` has already consulted `tail` and
+    /// `consumed`, so nothing is lost by bypassing further tracking, and
+    /// destructive is fine regardless — `inner` has already finished, so
+    /// nothing downstream will ever see these bytes again either way.
+    ///
+    /// Returns `(bytes, how_many_are_real)`.
+    fn read_more(&mut self, need: usize) -> std::io::Result<(Vec<u8>, usize)> {
+        let mut probe = vec![0u8; need];
+        let mut n = 0usize;
+        while n < need {
+            match self.inner.inner_mut().raw_mut().read(&mut probe[n..])? {
+                0 => break,
+                read => n += read,
+            }
+        }
+        Ok((probe, n))
+    }
+
+    /// Decides what leftover bytes mean, once `inner` has reported `Ok(0)`.
+    /// Reproduces reference `lzip` 1.26's OWN rule bit-for-bit
+    /// (`Lzip_header::check_prefix`/`check_corrupt` in `lzip.h`, driving
+    /// `decompress()`'s member loop in `main.cc`) rather than an invented
+    /// approximation — see the module doc's "Matching the reference tool's
+    /// trailing-data rule" section for the derivation and the byte-level
+    /// probes that pinned it down, including the two cases that would look
+    /// alike under a naive "count how many magic bytes match" reading but
+    /// do not under the reference's actual (contiguous-prefix) one.
+    ///
+    /// The one case this function does NOT need to handle at all: leftover
+    /// bytes whose first four match `"LZIP"` exactly AND at least one more
+    /// byte follows them. That combination never reaches here — if the
+    /// magic is fully intact and something follows, `lzma_rust2::LzipReader`
+    /// itself successfully starts parsing it as a genuine next member and
+    /// keeps decoding (or fails with a real decode error), so `inner.read`
+    /// does not return `Ok(0)` in the first place.
+    fn classify_trailing_data(&mut self) -> std::io::Result<TrailingVerdict> {
+        // Reference `lzip`'s decompress() loop only ever forgives trailing
+        // bytes in its `!first_member` branches. For the very first member,
+        // ANY header-level failure is unconditional: "File ends unexpectedly
+        // at member header" / bad-version / bad-dictionary-size, none of
+        // which ever consult `check_prefix`/`check_corrupt`.
+        //
+        // The ONLY way this function is reached with no member successfully
+        // decoded yet: `LzipHeader::parse` failed on version or dictionary
+        // size (magic itself is already covered by this codec's own upfront
+        // check, run before `inner` ever sees the stream). That failure
+        // consumes at most 6 bytes (`lzma_rust2`'s own `HEADER_SIZE`) before
+        // giving up — nowhere near enough for a genuine member, which needs
+        // at least `HEADER_SIZE + TRAILER_SIZE` (26) bytes even for a
+        // zero-byte payload, and measurably more in practice (a real
+        // empty-payload member is 36 bytes). This is NOT reachable via "a
+        // fully valid header with a missing body" — that combination
+        // succeeds `start_next_member` and fails later, as a genuine `Err`
+        // from constructing/reading the LZMA body, never as `Ok(0)` here;
+        // verified directly (see
+        // `a_lone_valid_looking_header_with_no_body_is_rejected_as_the_first_member`,
+        // which passes via that `Err` path, not through this branch at all).
+        //
+        // [`TailWrapper`] is what makes "at least one member decoded"
+        // externally observable at all, since `lzma_rust2::LzipReader`
+        // exposes no such accessor and the two scenarios are otherwise
+        // indistinguishable from outside (both look like "the very first
+        // `read` call returns `Ok(0)`") — see that type's doc.
+        const MIN_VALID_MEMBER_SIZE: u64 = 26; // HEADER_SIZE (6) + TRAILER_SIZE (20)
+        let wrapper = self.inner.inner_mut();
+        if wrapper.consumed < MIN_VALID_MEMBER_SIZE {
+            return Ok(TrailingVerdict::Reject(
+                "the LZIP stream's first member header parsed far enough to pass the magic \
+                 check but failed later (version or dictionary size) — the reference lzip tool \
+                 treats this as an unconditional error too, never as ignorable trailing data",
+            ));
+        }
+
+        // Reconstruct the up-to-6-byte header attempt `LzipReader`'s own
+        // failed `start_next_member` just made. `tail`'s LAST 6 bytes are
+        // "the last 6 bytes consumed overall, oldest at index 0" — but that
+        // window saturates at 6, so once it has been filled by an earlier,
+        // UNRELATED read (a prior member's trailer, say), the sliding
+        // window alone cannot tell "these are this attempt's own bytes"
+        // apart from "these are stale bytes from whatever came before it".
+        // Measured directly why this distinction matters: appending `"LZ"`
+        // + 40 unrelated bytes after a valid member, the failed attempt
+        // consumes exactly 4 bytes (`"LZXX"`) — using `tail`'s full 6 bytes
+        // unconditionally would silently include 2 bytes from the PRIOR
+        // member's trailer at the front, misaligning the window and (in
+        // that specific case) hiding the magic mismatch entirely.
+        //
+        // The fix: `consumed_before_this_read` (snapshotted right before
+        // the outer `self.inner.read` call that produced this `Ok(0)`)
+        // gives the TOTAL bytes consumed during that one call. Given we are
+        // past the `MIN_VALID_MEMBER_SIZE` check above, that call's shape
+        // is always "finish the just-drained member's 20-byte trailer,
+        // then attempt (and fail) the next header" — `Lzip_trailer::size`
+        // is fixed at 20 regardless of payload size, so subtracting it
+        // isolates exactly the failed attempt's own byte count. (This
+        // assumes a single trailer per such call — true for any member
+        // this codec or any ordinary encoder produces; a contrived stream
+        // chaining several genuinely empty members back-to-back before the
+        // final corrupted header is the one narrow case this does not
+        // reconstruct byte-perfectly. Nothing in this project's own tests,
+        // nor an ordinary `lzip`-written file, does that.)
+        let delta = wrapper.consumed - self.consumed_before_this_read;
+        let k = (delta.saturating_sub(20) as usize).min(6);
+        let tail = wrapper.tail;
+        let mut window = [0u8; 6];
+        window[..k].copy_from_slice(&tail[6 - k..]);
+
+        // Peek `7 - k` bytes forward: enough to fill out the rest of the
+        // conceptual 6-byte window plus one more, to answer reference
+        // lzip's own "is there anything beyond it" question in the same
+        // single step.
+        let forward_needed = 6 - k + 1;
+        let (forward, forward_got) = self.read_more(forward_needed)?;
+        let extra = forward_got.min(6 - k);
+        window[k..k + extra].copy_from_slice(&forward[..extra]);
+        let window_len = k + extra;
+        // Got fewer bytes forward than asked for only because a `read` call
+        // genuinely returned `Ok(0)` — true end of the source, nothing
+        // beyond the window. Reference lzip's own `rdec.finished()` check,
+        // reconstructed the same way.
+        let at_eof = forward_got < forward_needed;
+
+        if at_eof {
+            if window_len == 0 {
+                return Ok(TrailingVerdict::Accept);
+            }
+            // `check_prefix`: a CONTIGUOUS match starting at position 0,
+            // over however many of the first 4 magic bytes are actually
+            // available — not a count of matching positions regardless of
+            // order. Measured directly why this distinction matters: a
+            // trailing `"XZIP"` with nothing following (position 0 wrong,
+            // 1-3 right) is ACCEPTED by the reference (exit 0) because the
+            // prefix check fails immediately at position 0, while the same
+            // 4 bytes followed by more data are REJECTED (see below) —
+            // `check_corrupt` counts positions independently of order.
+            let looks_like_a_header_start =
+                (0..window_len.min(4)).all(|i| window[i] == MAGIC_BYTES[i]);
+            if looks_like_a_header_start {
+                return Ok(TrailingVerdict::Reject(
+                    "the LZIP stream ends with what looks like the start of a truncated member \
+                     header — matching reference lzip's \"Truncated header in multimember \
+                     file\"",
+                ));
+            }
+            return Ok(TrailingVerdict::Accept);
+        }
+
+        // Not at EOF: a full 6-byte header-shaped read, with more data
+        // still following it. Exact magic match here means SOMETHING ELSE
+        // in that header is what's wrong (version or dictionary size) — see
+        // this function's doc for why that combination never reaches this
+        // point when the magic ISN'T exact but the header otherwise would
+        // have been fine; when magic IS exact, the reference always treats
+        // it as a hard error too (`check_version`/dictionary-size checks
+        // never consult `ignore_trailing`), so there is no forgiveness to
+        // apply either way.
+        if window[..4] == *MAGIC_BYTES {
+            return Ok(TrailingVerdict::Reject(
+                "a later member's header has an intact magic but fails validation further in \
+                 (version or dictionary size) — the reference lzip tool treats this as an \
+                 unconditional error too, never as ignorable trailing data",
+            ));
+        }
+        // `check_corrupt`: count how many of the 4 magic-byte POSITIONS
+        // match, independent of contiguity or order — 2 or 3 matches reads
+        // as "this was probably an attempt at a header, now corrupted",
+        // matching reference lzip's "Corrupt header in multimember file".
+        // 0 or 1 matches is ordinary trailing data.
+        let matches = (0..4).filter(|&i| window[i] == MAGIC_BYTES[i]).count();
+        if matches > 1 {
+            return Ok(TrailingVerdict::Reject(
+                "trailing bytes look like a corrupted member header (2 or more of the 4 magic \
+                 bytes present) — matching reference lzip's own detection rule",
+            ));
+        }
+        Ok(TrailingVerdict::Accept)
     }
 }
 
@@ -369,6 +771,13 @@ impl Read for GuardedLzipReader {
         loop {
             match self.state {
                 GuardState::Unchecked => {
+                    // The magic peek is non-destructive and never blocks
+                    // waiting for more than one buffer's worth of data, but
+                    // it relies on the caller having already primed that
+                    // buffer with at least a few bytes — see the module
+                    // doc's "An undocumented dependency" section for why
+                    // that is always true in practice for this codec's only
+                    // caller, `stuffr`'s `ops::decompress_with`.
                     if !self.magic_matches()? {
                         self.state = GuardState::Failed;
                         return Err(std::io::Error::new(
@@ -378,26 +787,26 @@ impl Read for GuardedLzipReader {
                     }
                     self.state = GuardState::Streaming;
                 }
-                GuardState::Streaming => match self.inner.read(buf) {
-                    Ok(0) => {
-                        if self.has_more()? {
+                GuardState::Streaming => {
+                    self.consumed_before_this_read = self.inner.inner_mut().consumed;
+                    match self.inner.read(buf) {
+                        Ok(0) => match self.classify_trailing_data()? {
+                            TrailingVerdict::Accept => {
+                                self.state = GuardState::Done;
+                                return Ok(0);
+                            }
+                            TrailingVerdict::Reject(msg) => {
+                                self.state = GuardState::Failed;
+                                return Err(std::io::Error::new(ErrorKind::InvalidData, msg));
+                            }
+                        },
+                        Ok(n) => return Ok(n),
+                        Err(e) => {
                             self.state = GuardState::Failed;
-                            return Err(std::io::Error::new(
-                                ErrorKind::InvalidData,
-                                "LZIP stream ended with unconsumed bytes remaining — a later \
-                                 member's header failed to parse, which lzma-rust2's LzipReader \
-                                 misreads as a clean end of stream rather than as corruption",
-                            ));
+                            return Err(e);
                         }
-                        self.state = GuardState::Done;
-                        return Ok(0);
                     }
-                    Ok(n) => return Ok(n),
-                    Err(e) => {
-                        self.state = GuardState::Failed;
-                        return Err(e);
-                    }
-                },
+                }
                 GuardState::Done => return Ok(0),
                 GuardState::Failed => {
                     return Err(std::io::Error::new(
@@ -961,5 +1370,178 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&both_path);
+    }
+
+    // --- Review Round 1, Finding 2: the reference tool decides the expected
+    // outcome for every trailing-data case, rather than this codec's own
+    // reading of `lzip.h` being trusted and asserted directly. See the
+    // module doc's "Matching the reference tool's trailing-data rule"
+    // section.
+
+    /// Feeds `lzip -t` the exact bytes under test and reports whether it
+    /// accepted them (exit 0) — the verdict every case below is graded
+    /// against, not this codec's own expectation of what `lzip.h` says.
+    fn reference_accepts(lzip: &std::path::Path, bytes: &[u8]) -> bool {
+        let path = std::env::temp_dir().join(format!(
+            "stf-lzip-trailing-probe-{}-{}.lz",
+            std::process::id(),
+            bytes.len()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let out = std::process::Command::new(lzip)
+            .arg("-t")
+            .arg(&path)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        out.status.success()
+    }
+
+    /// Review Round 1's own table, reproduced as fixtures and judged live by
+    /// the installed reference binary — this is what was missing before: a
+    /// test that ASKS rather than asserts. Skips cleanly with no `lzip`
+    /// installed, same as every other reference-tool test in this module.
+    #[test]
+    fn trailing_data_after_a_valid_member_matches_the_reference_tool() {
+        let Some(lzip) = which_lzip() else {
+            return;
+        };
+
+        let plain = b"trailing-data classification payload, repeated a bit ".repeat(64);
+        let base = compress(&plain);
+
+        let mut cases: Vec<(&'static str, Vec<u8>)> = vec![
+            ("32 NUL bytes", vec![0u8; 32]),
+            ("1 X byte", vec![b'X'; 1]),
+            ("4 X bytes", vec![b'X'; 4]),
+            ("5 X bytes", vec![b'X'; 5]),
+            ("6 X bytes", vec![b'X'; 6]),
+            ("17 X bytes", vec![b'X'; 17]),
+            ("35 X bytes", vec![b'X'; 35]),
+            ("36 X bytes", vec![b'X'; 36]),
+            ("37 X bytes", vec![b'X'; 37]),
+            ("50 X bytes", vec![b'X'; 50]),
+            ("113 X bytes", vec![b'X'; 113]),
+            ("114 X bytes", vec![b'X'; 114]),
+            ("1-byte magic prefix L, then junk", {
+                let mut v = b"L".to_vec();
+                v.extend(std::iter::repeat_n(b'X', 40));
+                v
+            }),
+            ("2-byte magic prefix LZ, then junk", {
+                let mut v = b"LZ".to_vec();
+                v.extend(std::iter::repeat_n(b'X', 40));
+                v
+            }),
+            ("3-byte magic prefix LZI, then junk", {
+                let mut v = b"LZI".to_vec();
+                v.extend(std::iter::repeat_n(b'X', 40));
+                v
+            }),
+            ("full magic + garbage body", {
+                let mut v = b"LZIP".to_vec();
+                v.push(1); // version
+                v.push(0x0c); // a validly-encoded dictionary size
+                v.extend_from_slice(b"garbagegarbagegarbagegarbage");
+                v
+            }),
+        ];
+        // Exactly the magic, nothing else at all (true EOF right at the
+        // 4-byte boundary) — reference lzip: "Truncated header".
+        cases.push(("exactly the 4-byte magic, nothing after", b"LZIP".to_vec()));
+        // Exactly a 2-byte magic prefix, nothing else.
+        cases.push((
+            "exactly a 2-byte magic prefix, nothing after",
+            b"LZ".to_vec(),
+        ));
+
+        for (desc, extra) in cases {
+            let mut candidate = base.clone();
+            candidate.extend_from_slice(&extra);
+
+            let expected = reference_accepts(&lzip, &candidate);
+            let ours = try_decompress(candidate).is_ok();
+            assert_eq!(
+                ours,
+                expected,
+                "case {desc:?}: reference lzip {}, this codec {}",
+                if expected { "accepted" } else { "rejected" },
+                if ours { "accepted" } else { "rejected" }
+            );
+        }
+    }
+
+    /// The specific divergence Review Round 1 flagged as the trap a naive
+    /// re-implementation would fall into: `check_prefix` (contiguous, from
+    /// position 0) and `check_corrupt` (a position-independent count) are
+    /// NOT the same predicate, and they disagree on exactly this input.
+    /// Judged by the reference tool directly, not asserted from this
+    /// codec's own reading of `lzip.h` — see the module doc.
+    #[test]
+    fn the_two_trailing_data_rules_are_genuinely_different() {
+        let Some(lzip) = which_lzip() else {
+            return;
+        };
+
+        let plain = b"xzip divergence payload, repeated a bit ".repeat(64);
+        let base = compress(&plain);
+
+        // "XZIP": position 0 wrong ('X' vs 'L'), positions 1-3 correct — 3
+        // POSITIONAL matches, but NOT a valid prefix (fails at position 0).
+        let mut nothing_after = base.clone();
+        nothing_after.extend_from_slice(b"XZIP");
+        let mut something_after = base.clone();
+        something_after.extend_from_slice(b"XZIP");
+        something_after.extend(std::iter::repeat_n(b'Y', 40));
+
+        let nothing_after_expected = reference_accepts(&lzip, &nothing_after);
+        let something_after_expected = reference_accepts(&lzip, &something_after);
+        assert!(
+            nothing_after_expected,
+            "sanity check on the reference tool itself: \"XZIP\" with nothing after must be \
+             accepted (check_prefix fails at position 0) — reference disagreed, so this test's \
+             own premise is wrong"
+        );
+        assert!(
+            !something_after_expected,
+            "sanity check on the reference tool itself: \"XZIP\" followed by more data must be \
+             rejected (check_corrupt counts 3 positional matches) — reference disagreed, so \
+             this test's own premise is wrong"
+        );
+
+        assert_eq!(
+            try_decompress(nothing_after).is_ok(),
+            nothing_after_expected,
+            "\"XZIP\" with nothing after: must match the reference tool's accept"
+        );
+        assert_eq!(
+            try_decompress(something_after).is_ok(),
+            something_after_expected,
+            "\"XZIP\" followed by more data: must match the reference tool's reject"
+        );
+    }
+
+    /// The narrow edge case the module doc's "Matching the reference tool's
+    /// trailing-data rule" section calls out by name: even a COMPLETE,
+    /// well-formed 6-byte header (valid magic, version, dictionary size)
+    /// with nothing after it at all is still rejected when no member has
+    /// been decoded yet — reference lzip never consults `check_prefix`'s
+    /// forgiveness for the very first member. Judged by the reference tool.
+    #[test]
+    fn a_lone_valid_looking_header_with_no_body_is_rejected_as_the_first_member() {
+        let Some(lzip) = which_lzip() else {
+            return;
+        };
+        let lone_header: Vec<u8> = vec![b'L', b'Z', b'I', b'P', 1, 0x0c];
+        assert!(
+            !reference_accepts(&lzip, &lone_header),
+            "sanity check on the reference tool itself: a bare 6-byte header with no body must \
+             be rejected — reference disagreed, so this test's own premise is wrong"
+        );
+        assert!(
+            try_decompress(lone_header).is_err(),
+            "a lone, complete-looking header with no body must be rejected, matching the \
+             reference tool, not accepted as an empty stream"
+        );
     }
 }
