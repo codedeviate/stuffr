@@ -113,3 +113,90 @@ pub fn count() -> usize {
     register_all(&mut r);
     r.matrix().len()
 }
+
+#[cfg(test)]
+mod backend_selection {
+    //! Why only zstd has a backend-selection test, and why that is honest
+    //! rather than a gap.
+    //!
+    //! The test that used to guard selection counted registry rows per
+    //! `FormatId` and asserted `<= 1`. It could never fail: `Registry` is keyed
+    //! by `FormatId`, so a duplicate registration silently overwrites and the
+    //! count is 1 either way. The final review proved it by mutation — deleting
+    //! every `not(feature = "x-c")` guard left the whole suite green while a
+    //! `c-backed` binary quietly selected the PURE backends.
+    //!
+    //! Detecting misselection needs something observably different between the
+    //! two backends. Measured, for each pair:
+    //!
+    //! - **zstd** — the backends differ in *capability*: the pure encoder is
+    //!   `weak_encoder`, the C one is not. That is a real discriminator, and
+    //!   `crates/stuffr/tests/ops_compress.rs` asserts selection with it. Its
+    //!   failure was verified by deleting the guard.
+    //! - **xz** and **LZMA1** — the backends are **indistinguishable through
+    //!   the `Codec` interface**: identical `CodecCaps` (both declare
+    //!   `memory_per_worker: Some(8 MiB)` and `WhenPresent`), identical level
+    //!   ranges and rejection messages, identical `io::ErrorKind` folding since
+    //!   the final review's fix, and byte-identical encoder output on ordinary
+    //!   payloads — verified below, and for LZMA1 also by
+    //!   `lzma_pure::tests::both_backends_write_an_identical_stream_for_the_same_input`.
+    //!
+    //! For those two, misselection is not an untested risk but an *unobservable*
+    //! one: if no caller can tell which backend ran, selecting the wrong one
+    //! cannot produce a wrong answer. C is preferred there for speed, which is
+    //! not a correctness property. Interchangeability was an explicit goal of
+    //! Phase 1e, and achieving it is what removed the discriminator.
+    //!
+    //! That argument rests on the premise, so the premise is what gets tested.
+    //! If the backends ever diverge, the test below fails, and at that moment
+    //! selection becomes observable and needs a real assertion — the failure
+    //! message says so. All three formats use the identical `cfg` pattern, so
+    //! zstd's test also exercises the mechanism itself.
+
+    use super::*;
+    use stuffr_core::{Codec, EncodeOpts};
+
+    fn encode_with(codec: &dyn Codec, plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut sink = codec
+            .encoder(Box::new(buf.clone()), &EncodeOpts::default())
+            .unwrap();
+        sink.write_all(plain).unwrap();
+        sink.finish().unwrap();
+        buf.contents()
+    }
+
+    /// The premise that makes xz's missing selection test acceptable: whichever
+    /// backend `register_all` picked, a caller cannot tell.
+    #[test]
+    #[cfg(all(feature = "xz-c", feature = "xz-pure"))]
+    fn the_two_xz_backends_are_interchangeable_so_selection_is_unobservable() {
+        let plain = b"backend interchangeability payload ".repeat(4096);
+
+        let via_c = encode_with(&xz_c::Xz, &plain);
+        let via_pure = encode_with(&xz_pure::Xz, &plain);
+        assert_eq!(
+            via_c, via_pure,
+            "the xz backends no longer emit identical bytes. Misselection has just \
+             become observable, so this module's argument for having no selection \
+             test is void: add one discriminating on this difference, the way \
+             ops_compress.rs does for zstd using weak_encoder."
+        );
+
+        assert_eq!(
+            xz_c::Xz.caps(),
+            xz_pure::Xz.caps(),
+            "declared caps diverged"
+        );
+
+        let mut reg = Registry::new();
+        register_all(&mut reg);
+        let registered = reg.codec(xz_shared::XZ).expect("xz must be registered");
+        assert_eq!(
+            encode_with(registered.as_ref(), &plain),
+            via_c,
+            "the registered xz codec must behave like both backends"
+        );
+    }
+}
