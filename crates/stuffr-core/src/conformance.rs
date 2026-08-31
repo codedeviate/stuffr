@@ -55,7 +55,11 @@
 //! 9. Corrupted input is reported as `InvalidData`, run for every declared
 //!    `detects_corruption` state except [`CorruptionDetection::Never`] — a
 //!    format with no integrity check genuinely cannot detect corruption, and
-//!    demanding it would force a fake.
+//!    demanding it would force a fake. Swept over BOTH an incompressible and
+//!    a compressible payload: an incompressible-only fixture left this
+//!    property blind to two codecs whose corrupted-decode failure path is
+//!    only reached through a compressible stream's match/back-reference
+//!    structure — see [`compressible`]'s doc.
 //! 10. Truncated input is rejected. Unlike property 9, nothing can switch
 //!     this off: every framed format detects premature EOF regardless of
 //!     checksum, so a codec failing this should either detect truncation or
@@ -113,6 +117,26 @@ pub fn incompressible(len: usize) -> Vec<u8> {
             (s >> 16) as u8
         })
         .collect()
+}
+
+/// A pseudo-random, HIGHLY compressible payload: repetitive prose, not
+/// random bytes.
+///
+/// Property 9 corrupts the ENCODED stream and expects `InvalidData`. An
+/// incompressible plaintext encodes to a stream that is almost entirely
+/// literal bytes copied through with little to no back-reference or
+/// match-length machinery exercised — real data is not shaped like that, and
+/// two codecs (lz4, xz-pure) were measured raising `io::ErrorKind::Other`
+/// instead of `InvalidData` for a corrupted byte that lands inside the
+/// decode path only a compressible stream's matches/literals structure
+/// reaches. `incompressible`'s own fixture never turned this up because it
+/// never produces that structure. See `normalize.rs`'s
+/// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF` and lz4.rs's fold constant
+/// for the codecs this was measured against directly.
+pub fn compressible(len: usize) -> Vec<u8> {
+    const PHRASE: &[u8] =
+        b"the quick brown fox jumps over the lazy dog, again and again and again. ";
+    PHRASE.iter().copied().cycle().take(len).collect()
 }
 
 /// The plaintext size property 8 encodes when the codec can encode its own
@@ -573,10 +597,10 @@ fn assert_codec_conforms_impl(
             None => skip(id, 8, NO_FIXTURE),
         }
 
-        // Shared base for properties 9 and 10: a modest incompressible
-        // payload, encoded (or drawn from the fixture) once. `corruption_fixture`
-        // — distinct from the ordinary round-trip `fixture` above — exists for a
-        // WhenPresent codec whose own default encoder does not include the
+        // Shared base for property 10: a modest incompressible payload,
+        // encoded (or drawn from the fixture) once. `corruption_fixture` —
+        // distinct from the ordinary round-trip `fixture` above — exists for
+        // a WhenPresent codec whose own default encoder does not include the
         // optional check (lz4): properties 2-8 still exercise the codec's REAL
         // shipped encoder untouched, but 9 and 10 need a stream demonstrating
         // what WhenPresent actually promises, which this codec's own encoder does
@@ -589,6 +613,18 @@ fn assert_codec_conforms_impl(
         //    declared state except Never, because a format with no integrity
         //    check genuinely cannot detect it and a harness that demanded it
         //    would force a fake.
+        //
+        //    Swept over BOTH an incompressible and a compressible payload,
+        //    not just the incompressible one property 10 reuses: a whole-
+        //    branch review measured this property passing for lz4 and
+        //    xz-pure ONLY because an incompressible fixture never reaches
+        //    the decode path (matches/back-references) where those two
+        //    codecs' backends raise `io::ErrorKind::Other` instead of
+        //    `InvalidData` on corruption — the same trap that already hid a
+        //    truncation defect in lzma_pure's own tests once. Real data is
+        //    compressible; that is the shape a fixture must cover, in
+        //    addition to (not instead of) the incompressible one, so this
+        //    does not just trade one blind spot for another.
         if caps.detects_corruption == CorruptionDetection::Never {
             skip(
                 id,
@@ -596,32 +632,46 @@ fn assert_codec_conforms_impl(
                 "this codec declares CorruptionDetection::Never — no check exists to prove",
             );
         } else {
-            match &corruption_input {
-                Some(base) => {
-                    let mut bytes = base.clone();
-                    let mid = bytes.len() / 2;
-                    bytes[mid] ^= 0xFF;
-                    let src: Box<dyn Source> =
-                        Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
-                    let mut dec = codec
-                        .decoder(src, &DecodeOpts::default())
-                        .unwrap_or_else(|e| panic!("conformance[{id}] property 9 decoder: {e}"));
-                    let mut out = Vec::new();
-                    match dec.read_to_end(&mut out) {
-                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
-                        Err(e) => panic!(
-                            "conformance[{id}] property 9: corrupted input gave {:?}, expected \
-                             InvalidData — Error::from_decode_io keys exit 5 off that kind",
-                            e.kind()
-                        ),
-                        Ok(_) => panic!(
-                            "conformance[{id}] property 9: corrupted input decoded without \
-                             error, but this codec declares detects_corruption = {:?}",
-                            caps.detects_corruption
-                        ),
+            let compressible_input = match corruption_fixture {
+                Some(f) => Some(f.to_vec()),
+                None => test_input(caps, fixture, || encode(codec, &compressible(64 * 1024))),
+            };
+            for (shape, base) in [
+                ("incompressible", &corruption_input),
+                ("compressible", &compressible_input),
+            ] {
+                match base {
+                    Some(base) => {
+                        let mut bytes = base.clone();
+                        let mid = bytes.len() / 2;
+                        bytes[mid] ^= 0xFF;
+                        let src: Box<dyn Source> =
+                            Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+                        let mut dec =
+                            codec
+                                .decoder(src, &DecodeOpts::default())
+                                .unwrap_or_else(|e| {
+                                    panic!("conformance[{id}] property 9 ({shape}) decoder: {e}")
+                                });
+                        let mut out = Vec::new();
+                        match dec.read_to_end(&mut out) {
+                            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {}
+                            Err(e) => panic!(
+                                "conformance[{id}] property 9 ({shape}): corrupted input gave \
+                                 {:?}, expected InvalidData — Error::from_decode_io keys exit 5 \
+                                 off that kind",
+                                e.kind()
+                            ),
+                            Ok(_) => panic!(
+                                "conformance[{id}] property 9 ({shape}): corrupted input decoded \
+                                 without error, but this codec declares detects_corruption = \
+                                 {:?}",
+                                caps.detects_corruption
+                            ),
+                        }
                     }
+                    None => skip(id, 9, NO_FIXTURE),
                 }
-                None => skip(id, 9, NO_FIXTURE),
             }
         }
 
