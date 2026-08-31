@@ -10,10 +10,12 @@ fn tmp(name: &str) -> std::path::PathBuf {
 /// Looks the id up in the real registry rather than constructing a
 /// `FormatId` directly — see `ops_decompress.rs`'s identical helper for why.
 ///
-/// Only consumed by `a_pure_build_reads_zstd_and_writes_it_only_on_request`,
-/// which is itself gated on `zstd-pure` without `zstd-c` — so under
-/// `--all-features` (both backends on) that test does not compile in and
-/// this helper would otherwise be flagged dead code.
+/// Consumed by `a_pure_build_reads_zstd_and_writes_it_only_on_request`
+/// (gated on `zstd-pure` without `zstd-c`) and
+/// `the_c_backend_wins_when_both_zstd_features_are_compiled` (gated on
+/// both) — mutually exclusive cfgs, so under any single feature
+/// combination at most one of them compiles in and this helper would
+/// otherwise be flagged dead code.
 #[allow(dead_code)]
 fn fmt(name: &str) -> FormatId {
     stuffr::registry()
@@ -637,6 +639,20 @@ fn this_build_registers_exactly_one_backend_per_format() {
     // silently keep whichever registered last. This asserts the cfg arms in
     // `stuffr_formats::register_all` are genuinely exclusive rather than
     // accidentally both-or-neither.
+    //
+    // This assertion alone is structurally UNABLE to catch a misselection,
+    // though, and used to be the only one here: `Registry` is a
+    // `HashMap<FormatId, _>` (`registry.rs`'s `codecs` field), so
+    // `register_codec` on a duplicate id silently overwrites rather than
+    // duplicating — `zstd_rows.len() <= 1` is true in EVERY possible build,
+    // including one where `register_all`'s `not(feature = "zstd-c")` guard
+    // was deleted and the wrong backend won. Proven by mutation during the
+    // Phase 1e final review: deleting all three mutual-exclusion guards left
+    // 396/396 tests and clippy green while a `c-backed` release binary
+    // silently reported the PURE zstd backend active. See
+    // `the_c_backend_wins_when_both_zstd_features_are_compiled` below for
+    // the test that actually detects that failure mode — this one only
+    // documents the row-count invariant that mutation left untouched.
     let reg = stuffr::registry();
     let zstd_rows: Vec<_> = reg
         .matrix()
@@ -647,6 +663,40 @@ fn this_build_registers_exactly_one_backend_per_format() {
         zstd_rows.len() <= 1,
         "zstd registered {} times",
         zstd_rows.len()
+    );
+}
+
+/// The test the finding above names: a genuine selection check, not a count.
+///
+/// `zstd_pure`'s `caps().weak_encoder` is `true` (a real, admitted
+/// limitation — see `zstd_pure.rs`'s module doc) and `zstd_c`'s is `false`.
+/// That is an observable difference between the two backends that survives
+/// even after `register_all`'s `not(feature = "zstd-c")` guard makes the C
+/// backend win, unlike a corrupted-stream exit code (xz's two backends are
+/// DELIBERATELY made to agree on that — see the Phase 1e final review's
+/// Finding 2 — so exit code cannot be the discriminator for every pair).
+/// `Registry`'s `HashMap`-keyed storage means a duplicate registration
+/// always collapses to one row (see the test above), so the only way to
+/// prove WHICH one survived is to inspect a capability the two backends
+/// actually disagree on.
+///
+/// Verified by mutation, the same way the review proved the old test
+/// vacuous: deleting `register_all`'s `not(feature = "zstd-c")` guard from
+/// the `zstd-pure` arm (`stuffr-formats/src/lib.rs`) makes this test FAIL —
+/// `weak_encoder` flips to `true` because the pure arm, registered after the
+/// C arm in `register_all`, silently overwrites it. The guard was restored
+/// immediately afterward; the tree is clean.
+#[test]
+#[cfg(all(feature = "zstd-c", feature = "zstd-pure"))]
+fn the_c_backend_wins_when_both_zstd_features_are_compiled() {
+    let reg = stuffr::registry();
+    let id = fmt("zstd");
+    let caps = reg.codec(id).expect("zstd must be registered").caps();
+    assert!(
+        !caps.weak_encoder,
+        "zstd's C backend must win when both zstd-c and zstd-pure are compiled — \
+         weak_encoder=true means the pure backend silently took over, exactly the \
+         regression register_all's `not(feature = \"zstd-c\")` guard exists to prevent"
     );
 }
 
