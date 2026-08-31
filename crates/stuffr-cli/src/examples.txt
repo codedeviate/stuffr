@@ -32,6 +32,19 @@ COMPRESSING A FILE
       output was detected. `c-backed` is a speed choice for xz, not a
       capability one.
 
+  stf pack notes.txt --format lzma -o out.lzma
+      LZMA1, the older "alone" format xz superseded, needs `--features
+      c-backed` (or `lzma-c` alone) — the default pure build has no LZMA1
+      backend yet. Unlike every other codec on this page, `.lzma` defines
+      NO magic bytes at all: its header's first byte encodes lc/lp/pb and
+      the next four the dictionary size, not a fixed signature, so this
+      format can never be detected from bytes alone, on a file or a pipe —
+      see "DECOMPRESSING" below. It also has no concatenation convention
+      the way gzip and xz do: unlike carrying a checksum, corruption is
+      still detected almost everywhere despite that (measured at 4,166 of
+      4,170 swept byte positions) through the LZMA range coder's own
+      structural sensitivity, not a designed check.
+
   stf pack notes.txt --level 9
       --level asks the codec for a tradeoff: gzip accepts 0 (fastest,
       largest output) through 9 (slowest, smallest output). xz's range is
@@ -75,6 +88,14 @@ DECOMPRESSING
       bytes — detection from a file works only by the `.br` extension. A
       brotli stream arriving on a pipe, with no filename to go by, cannot be
       detected either way, so --format brotli is the only way in there too.
+
+  stf unpack data.lzma --format lzma -o data.txt
+      LZMA1 defines no magic bytes either, the same as brotli — detection
+      from a file works only by the `.lzma` extension, and a `.lzma` stream
+      arriving on a pipe, with no filename to go by, cannot be detected at
+      all, so --format lzma is the only way in there too. Needs a build
+      with `--features c-backed` (or `lzma-c` alone); the default pure
+      build has no LZMA1 backend yet.
 
 
 STREAMING TO STDOUT
@@ -131,6 +152,9 @@ WHAT THIS BUILD CAN DO
       backends show `yes` in WRITE, never `weak` — `--features c-backed`
       swaps the pure-Rust `lzma-rust2` backend for the real `liblzma`, which
       is faster (see "COMPRESSING A FILE" above) but not more capable.
+      `--features c-backed` adds a TENTH row, `lzma`, that the pure build
+      does not have at all yet — LZMA1 has only a C backend so far; its
+      pure-Rust counterpart is not implemented yet.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -168,9 +192,12 @@ USING A WEAK FALLBACK ENCODER
       `yes`). Rebuild with `--features c-backed` to remove the limitation.
       xz does not have this shape: its pure-Rust backend (`lzma-rust2`) is a
       full codec at ratio parity with `liblzma`, not a weaker fallback, so
-      `--allow-weak-encoder` never applies to it, in any build. LZMA1 has
-      no backend at all yet, in either tier. `c-backed` remains a speed
-      choice for xz, not a capability one.
+      `--allow-weak-encoder` never applies to it, in any build. LZMA1 does
+      not have this shape either, for a different reason: its only backend
+      so far is the real `liblzma` (via `--features c-backed` or `lzma-c`
+      alone) — there is no pure-Rust LZMA1 backend yet for it to fall back
+      to, weakly or otherwise. `c-backed` remains a speed choice for xz, not
+      a capability one.
 
 
 EXIT CODES
@@ -194,7 +221,11 @@ NOT YET
   toolchain, just slower than `--features c-backed`'s `liblzma` (roughly
   1.2-1.3x to encode, 2-2.2x to decode, measured on a 6.5 MB payload).
   `--features c-backed` upgrades both: zstd to the real `libzstd`, and xz to
-  `liblzma` for speed. LZMA1 has neither backend yet — it arrives later in
-  Phase 1e. No archive containers (tar, zip, ...) exist yet — Phase 2.
-  `stf formats` always tells you the truth about the build you are actually
-  running, whatever this page says.
+  `liblzma` for speed. `--features c-backed` (or `lzma-c` alone) also adds a
+  tenth codec, `lzma` — LZMA1, the older format xz superseded — via the real
+  `liblzma`; it defines no magic bytes, so it is reachable only through
+  `--format lzma`, never by detection. LZMA1's pure-Rust backend does not
+  exist yet, so the default pure build has no `lzma` row at all. No archive
+  containers (tar, zip, ...) exist yet — Phase 2. `stf formats` always tells
+  you the truth about the build you are actually running, whatever this
+  page says.

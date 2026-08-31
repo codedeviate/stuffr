@@ -6,6 +6,8 @@
 
 use stuffr_core::Registry;
 
+#[cfg(any(feature = "lzma-c", feature = "lzma-pure"))]
+mod lzma_shared;
 mod normalize;
 #[cfg(any(feature = "xz-c", feature = "xz-pure"))]
 mod xz_shared;
@@ -22,6 +24,8 @@ pub mod deflate;
 pub mod gzip;
 #[cfg(feature = "lz4")]
 pub mod lz4;
+#[cfg(feature = "lzma-c")]
+pub mod lzma_c;
 #[cfg(feature = "snappy")]
 pub mod snappy;
 #[cfg(feature = "xz-c")]
@@ -65,6 +69,13 @@ pub fn register_all(registry: &mut Registry) {
 
     #[cfg(feature = "snappy")]
     registry.register_codec(std::sync::Arc::new(snappy::Snappy), snappy::meta());
+
+    // Mutually exclusive: both arms will register the same FormatId (see
+    // `lzma_shared`). Only the C arm exists yet — Task 6 adds the
+    // `#[cfg(all(feature = "lzma-pure", not(feature = "lzma-c")))]` pure arm,
+    // same shape as xz's and zstd's pairs below.
+    #[cfg(feature = "lzma-c")]
+    registry.register_codec(std::sync::Arc::new(lzma_c::Lzma), lzma_c::meta());
 
     // Mutually exclusive, same shape as zstd's pair below: both arms
     // register the same FormatId (see `xz_shared`), and `not(feature =

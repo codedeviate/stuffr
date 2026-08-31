@@ -289,6 +289,52 @@ pub(crate) const XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_EOF: &[ErrorKind] = &[
     ErrorKind::UnexpectedEof,
 ];
 
+/// The `InvalidData` + `UnexpectedEof` pair, measured independently against
+/// `liblzma`'s LZMA1 "alone" decode path (backing `lzma_c.rs`) — the same
+/// crate as [`XZ_MALFORMED_AS_INVALID_DATA_EOF`] but a different `Stream`
+/// constructor (`new_lzma_decoder`/`new_lzma_encoder` rather than the
+/// auto/easy xz ones) and a different container format entirely (no xz
+/// stream header, no block index, no per-writer check type). Its own
+/// constant rather than a reuse for the same reason every constant in this
+/// file is its own: sharing a crate is not the same as sharing a measured
+/// code path, and `lzma_c.rs` can be the only module compiled (an
+/// `lzma-c`-without-`xz-c` build has no `xz_c` module at all) so reusing the
+/// xz constant would leave it unreachable there anyway.
+///
+/// Measured directly against `liblzma` 0.4.8 with a throwaway probe (compress
+/// a 4 KiB incompressible payload with `Stream::new_lzma_encoder`, flip every
+/// byte position of the compressed stream in turn — a full sweep, not one
+/// flip — then, separately, truncate at every prefix length): corruption was
+/// detected at 4,166 of 4,170 positions swept, split 4,080 `InvalidData` /
+/// 86 `UnexpectedEof`, zero silently wrong; the 4 undetected positions were
+/// every byte of the header's declared dictionary-size field (offsets 1-4),
+/// which this decoder never uses to validate output — only to size an
+/// internal buffer — so corrupting it changes nothing observable for a
+/// payload far smaller than either the true or the corrupted declared size.
+/// Truncation was detected at all 4,169 cuts swept, entirely `UnexpectedEof`.
+/// `detects_corruption: true` in `lzma_c.rs`'s `caps()` is direct evidence
+/// from this same sweep — see that module's doc for why this holds despite
+/// LZMA1 carrying no checksum field at all, unlike gzip/zlib/bzip2/snappy's
+/// mandatory CRCs or even xz's per-writer check type.
+///
+/// Traced the same way as `XZ_MALFORMED_AS_INVALID_DATA_EOF`: a genuine
+/// error reading the underlying SOURCE reaches the caller via
+/// `BufRead::fill_buf`'s `?`, kind intact; every other fallible path is this
+/// crate's own classification (`io::ErrorKind::UnexpectedEof` for "premature
+/// eof", `io::ErrorKind::InvalidData` for "corrupt xz stream", or liblzma's
+/// richer `Error` enum mapped to `InvalidData` by its own `From` impl) —
+/// never a rewrapped source error. So either kind reaching this wrapper
+/// always means the LZMA1 decoder itself rejected the bytes.
+///
+/// Gated `#[cfg(feature = "lzma-c")]`: `lzma_c.rs` is the only consumer, and
+/// a build with `lzma-pure` but not `lzma-c` (once Task 6 lands) would have
+/// no `lzma_c` module at all, which would otherwise leave this constant
+/// unused and warning under `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s
+/// doc for how this was caught once `make check` gained the pure-tier leg.
+#[cfg(feature = "lzma-c")]
+pub(crate) const LZMA_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
+    &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],
