@@ -121,10 +121,16 @@ pub struct CodecCaps {
     /// Rough working-set cost of one encode worker, in bytes, when the codec
     /// knows it. `None` means unknown — assume modest.
     ///
-    /// Unused until Phase 1f wires parallel encode; it exists now because the
-    /// governor already reasons about figures like "xz -9 at ~700 MiB per
-    /// worker" with no way for a codec to supply one, and adding the field
-    /// after eleven codecs exist means revisiting all eleven.
+    /// A static, conservative HIGH figure for callers who introspect
+    /// `CodecCaps` without encoding anything (property 12's own governor
+    /// sizing, and each codec's clamp test) — it is not what the governor
+    /// actually divides by during a real encode. The four codecs Phase 1f
+    /// gave a multi-threaded encoder (`zstd-c`, `xz-c`, `xz-pure`, `lzip`)
+    /// each call their own level-aware `per_worker_bytes(level)` for that,
+    /// because the true cost varies by preset (roughly 128 MiB below preset
+    /// 7, ~896 MiB at 7 and above, for xz and lzip) and this field's
+    /// contract is to round up to a single figure that covers every level a
+    /// caller might ask for.
     pub memory_per_worker: Option<u64>,
 
     /// This build's encoder for the format is markedly worse than the format's

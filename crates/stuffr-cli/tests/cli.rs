@@ -1055,7 +1055,16 @@ fn a_malformed_memory_limit_is_a_usage_error() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2), "malformed size must be exit 2");
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("512M"), "must name the accepted forms: {err}");
+    // `err.contains("512M")` alone is not discriminating: the message echoes
+    // the bad input back (`512MB`), which itself contains the substring
+    // `512M`, so the assertion would pass even with the actual guidance
+    // removed entirely. Same weak-assertion class `size.rs`'s
+    // `malformed_input_is_an_error_naming_the_accepted_forms` was
+    // strengthened against (R3) — require a form the input cannot supply.
+    assert!(
+        err.contains("512M") && err.contains("2G"),
+        "must name the accepted forms concretely: {err}"
+    );
     assert!(!out_path.exists(), "a refused pack must leave no output");
 
     let _ = std::fs::remove_file(&src);
