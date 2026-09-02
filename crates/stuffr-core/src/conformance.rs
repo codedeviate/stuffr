@@ -93,6 +93,16 @@
 //!     verbatim, in five separate codec modules (gzip, bzip2, brotli, lz4,
 //!     snappy) and was silently absent from two more (zlib, deflate) — see
 //!     Phase 1d's final fix wave, item 3.
+//! 12. Parallel encode: run only for `caps.parallel_encode`, like properties
+//!     3, 5 and 9's capability-gated skips. Asserts the governor lease was
+//!     actually TAKEN — observed while the sink is alive, since it is
+//!     released on `finish`/`Drop` — not merely that the encoded bytes round
+//!     trip. A parallel test that only checks round-tripping passes whether
+//!     or not parallelism engaged: a codec that ignores the governor entirely
+//!     satisfies it perfectly. That shape — a test that cannot fail — has
+//!     been found ten times across four phases, most recently in Phase 1e's
+//!     backend-selection test, which was green while a `c-backed` binary
+//!     silently selected the pure backends.
 
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -787,6 +797,69 @@ fn assert_codec_conforms_impl(codec: &dyn Codec, meta: &FormatMeta, fixture: Opt
                     "conformance[{id}] property 11: Error::Io must be exit code 1"
                 );
             }
+        }
+
+        // 12. Parallel encode. Skipped on the declared capability, like
+        //     properties 3, 5 and 9 — a codec whose backend has no
+        //     multi-threaded encoder cannot demonstrate one, and demanding it
+        //     would force a fake.
+        if !caps.parallel_encode {
+            skip(id, 12, "declares parallel_encode: false");
+        } else {
+            let plain = incompressible(PROPERTY_8_PLAIN_LEN);
+            let per_worker = caps.memory_per_worker.unwrap_or(0);
+            // Four workers and room for all of them: this property is about
+            // whether the codec USES a grant, not about clamping. The refusal
+            // path (a grant of one) is each codec's own test — see the plan.
+            let gov = crate::Governor::new(4, per_worker.saturating_mul(4).max(1));
+
+            let buf = SharedBuf::new();
+            let mut sink = codec
+                .encoder(
+                    Box::new(buf.clone()),
+                    &EncodeOpts {
+                        governor: Some(Arc::clone(&gov)),
+                        ..EncodeOpts::default()
+                    },
+                )
+                .unwrap_or_else(|e| panic!("conformance[{id}] property 12: encoder: {e}"));
+            sink.write_all(&plain)
+                .unwrap_or_else(|e| panic!("conformance[{id}] property 12: write: {e}"));
+
+            // THE ANTI-FAKE CHECK, and the reason this property is worth
+            // having. A codec that ignores the governor still round-trips
+            // perfectly, so bytes alone prove nothing. Observed while the
+            // sink is ALIVE, because the lease is released on finish/drop.
+            assert!(
+                gov.outstanding() > 0,
+                "conformance[{id}] property 12: declares parallel_encode but held no \
+                 lease while encoding — it is not using the governor. Round-tripping \
+                 does not demonstrate parallelism."
+            );
+
+            sink.finish()
+                .unwrap_or_else(|e| panic!("conformance[{id}] property 12: finish: {e}"));
+
+            assert_eq!(
+                gov.outstanding(),
+                0,
+                "conformance[{id}] property 12: lease not released after finish — the \
+                 Sink must own the LeaseSet so the budget frees when the encode ends"
+            );
+
+            let packed = buf.contents();
+            let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+            let mut dec = codec
+                .decoder(src, &DecodeOpts::default())
+                .unwrap_or_else(|e| panic!("conformance[{id}] property 12: decoder: {e}"));
+            let mut out = Vec::new();
+            dec.read_to_end(&mut out)
+                .unwrap_or_else(|e| panic!("conformance[{id}] property 12: read: {e}"));
+            assert_eq!(
+                out, plain,
+                "conformance[{id}] property 12: parallel-encoded stream did not round \
+                 trip. Bytes may differ from single-threaded output; DATA may not."
+            );
         }
     }
 }
@@ -1535,5 +1608,52 @@ mod broken_codecs {
     #[test]
     fn over_normalizing_decoder_is_caught() {
         assert_panics_naming(&OverNormalizingDecoder, &mock_meta(&[]), "property 11");
+    }
+
+    /// Breaks property 12: declares `parallel_encode` but never acquires a
+    /// lease, so nothing it does is actually parallel. This is the failure
+    /// mode a round-trip-only test cannot see.
+    ///
+    /// Delegates to [`super::framed_mock::FramedMock`], not `MockCodec`, for
+    /// the same reason `OverNormalizingDecoder` does above: `MockCodec`'s
+    /// bare, unframed stream fails property 10 unconditionally, which fires
+    /// first and masks the property this test exists to name. `FramedMock`
+    /// clears properties 1 through 11 on its own (real framing, and
+    /// `detects_corruption: Always`), so this is the only property it can
+    /// fail.
+    #[derive(Debug)]
+    struct LiesAboutParallel;
+
+    impl Codec for LiesAboutParallel {
+        fn id(&self) -> FormatId {
+            FormatId::new("lies-about-parallel")
+        }
+        fn caps(&self) -> CodecCaps {
+            CodecCaps {
+                parallel_encode: true,
+                memory_per_worker: Some(1024),
+                ..super::framed_mock::FramedMock.caps()
+            }
+        }
+        fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> crate::Result<Box<dyn Source>> {
+            super::framed_mock::FramedMock.decoder(src, o)
+        }
+        fn encoder(
+            &self,
+            dst: Box<dyn Write + Send>,
+            o: &EncodeOpts,
+        ) -> crate::Result<Box<dyn Sink>> {
+            // The bug: ignores `o.governor` entirely.
+            super::framed_mock::FramedMock.encoder(dst, o)
+        }
+    }
+
+    #[test]
+    fn property_12_catches_a_codec_that_declares_parallel_and_ignores_the_governor() {
+        assert_panics_naming(
+            &LiesAboutParallel,
+            &FormatMeta::codec(FormatId::new("lies-about-parallel"), &["lap"], &[]),
+            "property 12",
+        );
     }
 }
