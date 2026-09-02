@@ -408,11 +408,78 @@ mod tests {
             .unwrap();
         sink.write_all(&plain).unwrap();
         sink.finish().unwrap();
+
+        // AND the bytes must match a no-governor encode exactly.
+        //
+        // This is what makes the `granted.workers() > 1` guard testable at all.
+        // A review mutation-tested that guard by deleting it and found every
+        // test still passed, because a one-worker grant round-trips whether or
+        // not `multithread(1)` is called. Measured, the call IS observable —
+        // but only in a narrow window:
+        //
+        //   payload        none      mt(1)     mt(4)
+        //   2 MiB       2097213    2097210   2097210   <- differs
+        //   8/32/64 MiB identical  identical identical <- does not
+        //
+        // So a 2 MiB incompressible payload is the size at which "did we call
+        // multithread?" is visible in the output. Above ~8 MiB the worker count
+        // stops changing the bytes entirely, which is also why no byte
+        // comparison anywhere in this module can prove that parallel work
+        // actually happened.
         assert_eq!(
             decompress(buf.contents()),
             plain,
             "a one-worker grant must still work"
         );
+        assert_eq!(
+            buf.contents(),
+            compress(&plain),
+            "a one-worker grant must produce byte-identical output to a \
+             single-threaded encode. If this differs by a few bytes, the \
+             `granted.workers() > 1` guard has been removed and multithread(1) \
+             is being called for a grant with nothing to parallelise."
+        );
+    }
+
+    #[test]
+    fn a_payload_large_enough_to_split_round_trips_under_four_workers() {
+        // Every other parallel test here uses 512 KiB to 2 MiB, and a review
+        // measured that at those sizes multi-threaded zstd is no faster — it is
+        // sometimes SLOWER (2 MiB: 968us multi-threaded against 760us single).
+        // Real speedup starts around 32 MiB (512 MiB: 253ms against 442ms).
+        // So those tests prove the lease and governor wiring, not parallel
+        // compute, and this one covers a size where the work is genuinely split.
+        //
+        // It asserts CORRECTNESS only, deliberately. Two things it cannot do:
+        // assert timing, because the measurements above are noisy enough to
+        // flake in CI; and assert bytes, because above roughly 8 MiB the output
+        // is byte-identical regardless of worker count (measured: 8, 32 and 64
+        // MiB all produce the same bytes at 1 and 4 workers). What it does prove
+        // is that a stream produced by genuinely parallel encoding decodes back
+        // to exactly the input, which is the property a user depends on.
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(16 * 1024 * 1024);
+        let gov = stuffr_core::Governor::new(4, 512 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Zstd
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        assert_eq!(
+            gov.outstanding(),
+            4,
+            "four workers must be held while encoding"
+        );
+        sink.finish().unwrap();
+        assert_eq!(gov.outstanding(), 0, "finish must release all four");
+        assert_eq!(decompress(buf.contents()), plain);
     }
 
     #[test]
@@ -441,10 +508,14 @@ mod tests {
 
     #[test]
     fn the_c_decoder_reads_our_parallel_output() {
-        // A stream only we can read would be worse than no parallelism. If a
-        // `zstd` binary is on PATH, prefer it as the arbiter; otherwise the
-        // crate's own decoder is a different code path from the encoder and
-        // still worth asserting.
+        // A stream only we can read would be worse than no parallelism.
+        //
+        // The arbiter here is the crate's own `stream::read::Decoder`, which is
+        // a genuinely different code path from the encoder — not the `zstd`
+        // binary. An earlier version of this comment claimed to prefer the
+        // binary when one is on PATH; it never checked, and describing a check
+        // that does not exist is worse than admitting there is none. If
+        // binary-level arbitration is wanted, add it and say so.
         use stuffr_core::testing::incompressible;
         let plain = incompressible(2 * 1024 * 1024);
         let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
