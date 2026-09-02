@@ -52,7 +52,13 @@ ruzstd = "0.9"
 # machine with Homebrew's `xz` installed, broken on a clean one or CI. This
 # line vendors and builds `liblzma.a` from source instead: no pkg-config, no
 # system library, no libclang. Verified: zstd plus liblzma builds in ~8s.
-liblzma = { version = "0.4", default-features = false, features = ["static"] }
+#
+# `parallel` (Phase 1f, Task 5) is required for `MtStreamBuilder` — it is not
+# reachable without it, even though the symbol appears in the crate's source.
+# It pulls in `num_cpus`, confined to this `c-backed` dependency graph; the
+# `pure` graph is unaffected (verified with `cargo tree -p stuffr
+# --no-default-features --features pure -e normal`).
+liblzma = { version = "0.4", default-features = false, features = ["static", "parallel"] }
 # The pure-Rust xz backend (Task 5 of Phase 1e): a port of Tukaani's "XZ for
 # Java" that both encodes and decodes, unlike zstd's decode-only pure
 # fallback. Pure Rust (`sha2` + `digest`, no `-sys` crate), `rust-version =

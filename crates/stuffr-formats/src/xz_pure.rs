@@ -369,18 +369,7 @@ mod tests {
         out
     }
 
-    /// Finds the `xz` binary on `PATH` without shelling out to `which` (not
-    /// guaranteed present either, and one external dependency is enough).
-    /// Returns `None` rather than panicking so the interop tests below skip
-    /// cleanly on a machine with no `xz` installed, rather than failing the
-    /// whole suite.
-    fn which_xz() -> Option<std::path::PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path).find_map(|dir| {
-            let candidate = dir.join("xz");
-            candidate.is_file().then_some(candidate)
-        })
-    }
+    use crate::xz_shared::which_xz;
 
     fn encode_with(codec: &Xz, plain: &[u8]) -> Vec<u8> {
         let buf = SharedBuf::new();

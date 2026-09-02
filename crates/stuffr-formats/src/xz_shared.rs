@@ -34,3 +34,21 @@ pub(crate) const XZ_MAGIC: &[MagicRule] = &[MagicRule {
 pub fn xz_meta() -> FormatMeta {
     FormatMeta::codec(XZ, &["xz"], XZ_MAGIC)
 }
+
+/// Finds the `xz` binary on `PATH` without shelling out to `which` (not
+/// guaranteed present either, and one external dependency is enough).
+/// Returns `None` rather than panicking so interop tests skip cleanly on a
+/// machine with no `xz` installed, rather than failing the whole suite.
+///
+/// Lives here, not in either backend module, so both `xz_pure`'s and
+/// `xz_c`'s test modules can share one implementation: this module is gated
+/// `any(feature = "xz-c", feature = "xz-pure")`, so it compiles whenever
+/// either backend's tests could need it.
+#[cfg(test)]
+pub(crate) fn which_xz() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join("xz");
+        candidate.is_file().then_some(candidate)
+    })
+}

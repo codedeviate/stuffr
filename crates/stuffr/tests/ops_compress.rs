@@ -700,6 +700,30 @@ fn the_c_backend_wins_when_both_zstd_features_are_compiled() {
     );
 }
 
+/// xz's counterpart to the zstd test above, added once Phase 1f's Task 5
+/// gave `parallel_encode` an observable difference between xz's two
+/// backends — see `stuffr-formats/src/lib.rs`'s `backend_selection` module
+/// doc for the full history: xz used to have no selection test at all,
+/// because through Phase 1e the two backends were genuinely
+/// indistinguishable through the `Codec` interface. `xz_c`'s
+/// `MtStreamBuilder`-driven parallel encode (this task) broke that premise
+/// without a matching change to `xz_pure`, so `caps().parallel_encode` is
+/// now the discriminator, the same role `weak_encoder` plays for zstd.
+#[test]
+#[cfg(all(feature = "xz-c", feature = "xz-pure"))]
+fn the_c_backend_wins_when_both_xz_features_are_compiled() {
+    let reg = stuffr::registry();
+    let id = fmt("xz");
+    let caps = reg.codec(id).expect("xz must be registered").caps();
+    assert!(
+        caps.parallel_encode,
+        "xz's C backend must win when both xz-c and xz-pure are compiled — \
+         parallel_encode=false means the pure backend silently took over, exactly \
+         the regression register_all's `not(feature = \"xz-c\")` guard exists to \
+         prevent"
+    );
+}
+
 #[test]
 #[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
 fn a_pure_build_reads_zstd_and_writes_it_only_on_request() {

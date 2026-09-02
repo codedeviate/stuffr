@@ -133,28 +133,44 @@ mod backend_selection {
     //!   `weak_encoder`, the C one is not. That is a real discriminator, and
     //!   `crates/stuffr/tests/ops_compress.rs` asserts selection with it. Its
     //!   failure was verified by deleting the guard.
-    //! - **xz** and **LZMA1** — the backends are **indistinguishable through
-    //!   the `Codec` interface**: identical `CodecCaps` (both declare
-    //!   `memory_per_worker: Some(8 MiB)` and `WhenPresent`), identical level
-    //!   ranges and rejection messages, identical `io::ErrorKind` folding since
-    //!   the final review's fix, and byte-identical encoder output on ordinary
-    //!   payloads — verified below, and for LZMA1 also by
+    //! - **LZMA1** — the backends are **indistinguishable through the `Codec`
+    //!   interface**: identical `CodecCaps` (both declare `memory_per_worker:
+    //!   Some(8 MiB)` and `WhenPresent`), identical level ranges and
+    //!   rejection messages, identical `io::ErrorKind` folding since the
+    //!   final review's fix, and byte-identical encoder output on ordinary
+    //!   payloads — verified by
     //!   `lzma_pure::tests::both_backends_write_an_identical_stream_for_the_same_input`.
     //!
-    //! For those two, misselection is not an untested risk but an *unobservable*
-    //! one: if no caller can tell which backend ran, selecting the wrong one
-    //! cannot produce a wrong answer. C is preferred there for speed, which is
-    //! not a correctness property. Interchangeability was an explicit goal of
-    //! Phase 1e, and achieving it is what removed the discriminator.
+    //! For that pair, misselection is not an untested risk but an
+    //! *unobservable* one: if no caller can tell which backend ran, selecting
+    //! the wrong one cannot produce a wrong answer. C is preferred there for
+    //! speed, which is not a correctness property. Interchangeability was an
+    //! explicit goal of Phase 1e, and achieving it is what removed the
+    //! discriminator.
+    //!
+    //! - **xz** — indistinguishable through Phase 1e, but Phase 1f's Task 5
+    //!   gave the C backend `MtStreamBuilder`-driven parallel encode without
+    //!   giving the pure `lzma-rust2` backend an equivalent, so
+    //!   `caps().parallel_encode` now reads `true` for `xz_c` and `false` for
+    //!   `xz_pure`. That is exactly the kind of real, observable discriminator
+    //!   this module's own argument said would retire the "no selection test"
+    //!   exemption: `the_two_xz_backends_are_interchangeable_so_selection_is_unobservable`
+    //!   below still asserts the caps it can — everything except
+    //!   `parallel_encode` — and encoder output remains byte-identical for an
+    //!   ordinary (non-parallel, no-governor) encode, but selection is no
+    //!   longer unobservable, so `crates/stuffr/tests/ops_compress.rs` now
+    //!   also carries a real xz selection test on `parallel_encode`, mirroring
+    //!   zstd's on `weak_encoder`.
     //!
     //! That argument rests on the premise, so the premise is what gets tested.
-    //! If the backends ever diverge, the test below fails, and at that moment
-    //! selection becomes observable and needs a real assertion — the failure
-    //! message says so. All three formats use the identical `cfg` pattern, so
-    //! zstd's test also exercises the mechanism itself.
+    //! If a backend pair still assumed interchangeable ever diverges further,
+    //! the test below fails, and at that moment selection becomes observable
+    //! and needs a real assertion — the failure message says so. All three
+    //! formats use the identical `cfg` pattern, so zstd's test also exercises
+    //! the mechanism itself.
 
     use super::*;
-    use stuffr_core::{Codec, EncodeOpts};
+    use stuffr_core::{Codec, CodecCaps, EncodeOpts};
 
     fn encode_with(codec: &dyn Codec, plain: &[u8]) -> Vec<u8> {
         use std::io::Write;
@@ -167,8 +183,18 @@ mod backend_selection {
         buf.contents()
     }
 
-    /// The premise that makes xz's missing selection test acceptable: whichever
-    /// backend `register_all` picked, a caller cannot tell.
+    /// The premise that used to make xz's missing selection test acceptable:
+    /// whichever backend `register_all` picked, a caller could not tell.
+    ///
+    /// Phase 1f's Task 5 partly retired that premise: `xz_c` gained
+    /// `parallel_encode: true` (`MtStreamBuilder`) without a matching change
+    /// to `xz_pure`, so `caps().parallel_encode` is now a real, observable
+    /// discriminator — see the module doc. This test still asserts everything
+    /// it honestly can: byte-identical output for an ordinary (non-parallel)
+    /// encode, and every OTHER `CodecCaps` field still agreeing. The real
+    /// selection assertion on `parallel_encode` lives in
+    /// `crates/stuffr/tests/ops_compress.rs`, mirroring zstd's on
+    /// `weak_encoder`.
     #[test]
     #[cfg(all(feature = "xz-c", feature = "xz-pure"))]
     fn the_two_xz_backends_are_interchangeable_so_selection_is_unobservable() {
@@ -178,16 +204,33 @@ mod backend_selection {
         let via_pure = encode_with(&xz_pure::Xz, &plain);
         assert_eq!(
             via_c, via_pure,
-            "the xz backends no longer emit identical bytes. Misselection has just \
-             become observable, so this module's argument for having no selection \
+            "the xz backends no longer emit identical bytes on an ordinary, \
+             non-parallel encode. Misselection has just become observable through \
+             a second channel, so this module's argument for having no selection \
              test is void: add one discriminating on this difference, the way \
              ops_compress.rs does for zstd using weak_encoder."
         );
 
+        let (c_caps, pure_caps) = (xz_c::Xz.caps(), xz_pure::Xz.caps());
+        assert!(
+            c_caps.parallel_encode && !pure_caps.parallel_encode,
+            "parallel_encode is the one KNOWN, EXPECTED divergence (Task 5 of \
+             Phase 1f gave xz_c MtStreamBuilder, not xz_pure); if this no longer \
+             holds, the discriminator ops_compress.rs relies on has moved and \
+             that test needs to move with it: got c={:?} pure={:?}",
+            c_caps.parallel_encode,
+            pure_caps.parallel_encode
+        );
         assert_eq!(
-            xz_c::Xz.caps(),
-            xz_pure::Xz.caps(),
-            "declared caps diverged"
+            CodecCaps {
+                parallel_encode: false,
+                ..c_caps
+            },
+            CodecCaps {
+                parallel_encode: false,
+                ..pure_caps
+            },
+            "declared caps diverged somewhere other than the known parallel_encode gap"
         );
 
         let mut reg = Registry::new();

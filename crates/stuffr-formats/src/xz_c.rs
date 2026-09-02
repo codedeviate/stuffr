@@ -86,6 +86,11 @@ impl Codec for Xz {
             // level and a different encode mode.
             memory_per_worker: Some(8 * 1024 * 1024),
             weak_encoder: false,
+            // `liblzma::stream::MtStreamBuilder` is real: `encoder` below
+            // wires it to a governor grant. See `encoder`'s doc for the
+            // refusal path (a grant of one runs single-threaded, not an
+            // error) and for why `.check(Check::Crc64)` is mandatory there.
+            parallel_encode: true,
             ..CodecCaps::round_trip()
         }
     }
@@ -147,6 +152,18 @@ impl Codec for Xz {
         }
     }
 
+    /// Single-threaded by default; opts into `liblzma::stream::MtStreamBuilder`
+    /// when the governor grants more than one worker.
+    ///
+    /// **`.check(Check::Crc64)` is mandatory on the MT path, unlike the
+    /// single-threaded `XzEncoder::new` above.** `MtStreamBuilder` selects no
+    /// check type of its own — measured directly, reading byte 7 of the
+    /// stream header: `XzEncoder::new` writes `0x04` (CRC64), an
+    /// `MtStreamBuilder` encoder built without `.check()` writes `0x00`
+    /// (none). Omitting it would silently drop the integrity check
+    /// `caps().detects_corruption`'s `WhenPresent` declaration is measured
+    /// against, for every parallel stream this codec produces. See
+    /// `parallel_output_still_carries_crc64` below.
     fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
         // Not redundant with `ops`'s own pre-flight call, and not removable:
         // the next line PANICS on an out-of-range preset rather than
@@ -155,26 +172,70 @@ impl Codec for Xz {
         // property 6 exists to keep this in step with `check_encode_opts`.
         self.check_encode_opts(o)?;
         let level = o.level.unwrap_or(6) as u32;
-        // PANICS on an invalid preset — guarded above. See `check_encode_opts`.
-        let enc = liblzma::write::XzEncoder::new(dst, level);
-        Ok(Box::new(XzSink(enc)))
+
+        // `filter(|n| *n > 0)`, not a bare unwrap_or_else: `--threads 0` means
+        // AUTO, and passing 0 through as a request would ask for zero workers.
+        // ops resolves auto into the governor's own count (resolve_workers
+        // handles Some(0)), so EncodeOpts.threads is a library caller's
+        // request for LESS than the budget. Mirrors zstd_c.rs's `encoder`.
+        let (enc, lease) = match &o.governor {
+            Some(gov) => {
+                let want = o
+                    .threads
+                    .filter(|n| *n > 0)
+                    .unwrap_or_else(|| gov.workers());
+                let granted = gov.acquire_many(want, self.caps().memory_per_worker.unwrap_or(0));
+                // A grant of one is single-threaded. `acquire_many` clamps
+                // rather than failing, so a tight budget is a smaller grant
+                // here, never an error — only opt into the MT builder above
+                // one worker.
+                let enc = if granted.workers() > 1 {
+                    // `MtStreamBuilder::encoder` returns `liblzma::stream::
+                    // Error`, not `io::Error`; `stuffr_core::Error` only
+                    // `#[from]`s the latter, and `?` chains one `From` hop,
+                    // not two, so the conversion is explicit here.
+                    let stream = liblzma::stream::MtStreamBuilder::new()
+                        .threads(granted.workers() as u32)
+                        .preset(level)
+                        .check(liblzma::stream::Check::Crc64)
+                        .encoder()
+                        .map_err(std::io::Error::from)?;
+                    liblzma::write::XzEncoder::new_stream(dst, stream)
+                } else {
+                    // PANICS on an invalid preset — guarded above.
+                    liblzma::write::XzEncoder::new(dst, level)
+                };
+                (enc, Some(granted))
+            }
+            // PANICS on an invalid preset — guarded above.
+            None => (liblzma::write::XzEncoder::new(dst, level), None),
+        };
+        Ok(Box::new(XzSink { enc, _lease: lease }))
     }
 }
 
-struct XzSink(liblzma::write::XzEncoder<Box<dyn Write + Send>>);
+struct XzSink {
+    enc: liblzma::write::XzEncoder<Box<dyn Write + Send>>,
+    /// Held, not read. Dropping it returns the workers and bytes to the
+    /// governor, and `Drop` runs on error paths too — which is why the lease
+    /// lives here rather than in `encoder()`'s stack frame, whose scope ends
+    /// long before the encode does. Mirrors `zstd_c.rs`'s `ZstdSink`.
+    _lease: Option<stuffr_core::LeaseSet>,
+}
 
 impl Write for XzSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
+        self.enc.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        self.enc.flush()
     }
 }
 
 impl Sink for XzSink {
-    /// Writes the closing block, index and stream footer.
+    /// Writes the closing block, index and stream footer. The governor lease
+    /// (if any) is released when `self` drops at the end of this call.
     ///
     /// `liblzma::write::XzEncoder::finish` already propagates a destination
     /// write error genuinely encountered during finalisation (its internal
@@ -183,8 +244,8 @@ impl Sink for XzSink {
     /// `crate::normalize`'s `CaptureWriteError` doc for the contrasting
     /// case), so no such adapter is needed here.
     fn finish(self: Box<Self>) -> Result<()> {
-        let XzSink(encoder) = *self;
-        let mut w = encoder.finish()?;
+        let XzSink { enc, _lease } = *self;
+        let mut w = enc.finish()?;
         w.flush()?;
         Ok(())
     }
@@ -350,7 +411,8 @@ mod tests {
     fn capabilities_and_metadata_match_the_format() {
         let c = Xz.caps();
         assert!(c.encode && c.decode);
-        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
+        assert!(c.parallel_encode, "1f: the C backend has MtStreamBuilder");
+        assert!(!c.frame_index, "not until 1f");
         assert!(!c.weak_encoder, "the C backend is the real encoder");
         let m = meta();
         assert_eq!(m.id, XZ);
@@ -458,5 +520,229 @@ mod tests {
     #[test]
     fn xz_c_conforms() {
         stuffr_core::testing::assert_codec_conforms(&Xz, &meta());
+    }
+
+    #[test]
+    fn parallel_encode_is_declared() {
+        assert!(
+            Xz.caps().parallel_encode,
+            "xz's C backend has liblzma::stream::MtStreamBuilder"
+        );
+    }
+
+    #[test]
+    fn a_governor_grant_is_used_and_released() {
+        // Property 12 covers this generically; pinned here so a regression
+        // names this module rather than the harness.
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let gov = stuffr_core::Governor::new(4, 64 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&incompressible(1024 * 1024)).unwrap();
+        assert!(
+            gov.outstanding() > 0,
+            "the sink must hold its lease while encoding"
+        );
+        sink.finish().unwrap();
+        assert_eq!(gov.outstanding(), 0, "finish must release the lease");
+    }
+
+    #[test]
+    fn a_grant_of_one_worker_still_round_trips() {
+        // THE REFUSAL PATH, and the one most likely to be written wrong.
+        // `acquire_many` clamps rather than failing: a memory limit below one
+        // worker's demand yields exactly one worker, and the codec must run
+        // single-threaded rather than erroring or oversubscribing.
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(512 * 1024);
+        // 1 byte of budget against a multi-MiB per-worker demand.
+        let gov = stuffr_core::Governor::new(8, 1);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        assert_eq!(
+            decompress(buf.contents()),
+            plain,
+            "a one-worker grant must still work"
+        );
+
+        // AND the bytes must match a no-governor encode exactly.
+        //
+        // This is what makes the `granted.workers() > 1` guard testable at
+        // all: unlike zstd, where a review found the two paths agree in
+        // bytes at small sizes (so mutation-testing the guard needed a
+        // carefully chosen size), xz's MT stream format differs from the
+        // single-threaded easy-encoder format at every size measured,
+        // including a 1-byte payload — the MT container always carries an
+        // 8-byte larger index/block structure regardless of thread count.
+        // Measured (single-threaded len / mt(threads=1) len, always unequal):
+        //
+        //   1 B        60 /   68
+        //   1 KiB    1084 / 1092
+        //   64 KiB  65600 / 65608
+        //
+        // So this 512 KiB payload discriminates the guard comfortably; if
+        // `granted.workers() > 1` is deleted and `MtStreamBuilder` is used
+        // for a one-worker grant, this assertion catches it.
+        assert_eq!(
+            buf.contents(),
+            compress(&plain),
+            "a one-worker grant must produce byte-identical output to a \
+             single-threaded encode. If this differs, the `granted.workers() \
+             > 1` guard has been removed and the MT builder is being used for \
+             a grant with nothing to parallelise."
+        );
+    }
+
+    #[test]
+    fn parallel_output_decodes_to_the_same_plaintext_as_single_threaded() {
+        // Bytes may differ — multi-threaded xz splits input into blocks per
+        // worker. DATA may not. Asserting the plaintext rather than the bytes
+        // is the whole reason parallelism is safe to offer.
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(2 * 1024 * 1024);
+        let st = compress(&plain);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        assert_eq!(decompress(buf.contents()), decompress(st));
+    }
+
+    #[test]
+    fn parallel_output_still_carries_crc64() {
+        // MtStreamBuilder does NOT default to CRC64 the way XzEncoder::new
+        // does, so omitting .check() would silently drop the integrity check
+        // this codec's WhenPresent declaration depends on. Byte 7 of the xz
+        // stream header is the check-type flag; 0x04 is CRC64. Measured
+        // directly: a builder without .check() writes 0x00 (none) here.
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&stuffr_core::testing::incompressible(1024 * 1024))
+            .unwrap();
+        sink.finish().unwrap();
+        let packed = buf.contents();
+        assert_eq!(
+            packed[7], 0x04,
+            "parallel xz output must still declare CRC64"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "xz-pure")]
+    fn the_pure_backend_reads_our_parallel_output() {
+        let plain = stuffr_core::testing::incompressible(2 * 1024 * 1024);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        let src: Box<dyn Source> =
+            Box::new(ReaderSource::new(std::io::Cursor::new(buf.contents())));
+        let mut dec = crate::xz_pure::Xz
+            .decoder(src, &DecodeOpts::default())
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain, "the two backends must stay interchangeable");
+    }
+
+    /// Verifies against the system `xz` binary, not just this crate's own
+    /// decoder — a stream that only our own code can read would be worse
+    /// than no parallelism. Skips cleanly when `xz` is not on PATH, using
+    /// `xz_shared`'s shared `which_xz` helper rather than a second copy.
+    #[test]
+    fn the_system_xz_binary_accepts_our_parallel_output() {
+        let Some(xz) = crate::xz_shared::which_xz() else {
+            return;
+        };
+        let plain = stuffr_core::testing::incompressible(2 * 1024 * 1024);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        let packed = buf.contents();
+
+        let path = std::env::temp_dir().join("stf-xz-c-parallel-interop.xz");
+        std::fs::write(&path, &packed).unwrap();
+
+        let test_status = std::process::Command::new(&xz)
+            .arg("-t")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(
+            test_status.success(),
+            "system `xz -t` rejected our parallel output"
+        );
+
+        let out = std::process::Command::new(&xz)
+            .arg("-dc")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "system xz -dc failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout, plain,
+            "system xz decoded our parallel output to different bytes"
+        );
     }
 }
