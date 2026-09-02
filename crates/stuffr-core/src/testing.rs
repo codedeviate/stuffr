@@ -759,6 +759,7 @@ mod tests {
         let opts = DecodeOpts {
             threads: Some(4),
             governor: Some(std::sync::Arc::clone(&gov)),
+            ..Default::default()
         };
         assert_eq!(MockCodec.workers_for_opts(&opts), 4);
         assert_eq!(gov.outstanding(), 0, "the lease must be released again");
@@ -778,6 +779,7 @@ mod tests {
         let o = DecodeOpts {
             threads: None,
             governor: Some(gov),
+            ..Default::default()
         };
         assert!(format!("{o:?}").contains("governor"));
     }

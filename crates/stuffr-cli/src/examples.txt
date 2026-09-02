@@ -280,9 +280,15 @@ PARALLEL ENCODE FLAGS
   reports but not yet the bytes a pack produces; `stf info` shows the
   resolved memory limit (info takes no --threads, since decode has no
   worker count to report) so the resolution is observable ahead of that.
-  unpack, cat and info accept --memory-limit and validate it the same way,
-  but do not yet act on it: only pack's encode governor consumes it so
-  far.
+  unpack, cat and info accept --memory-limit and validate it the same way.
+  info only reports the resolved figure (it never decodes), but unpack and
+  cat pass it through to the decoder: a handful of pure codecs size a
+  dictionary buffer from a value the file declares in its own header,
+  before producing any output, so an unbounded decode of a hostile file
+  can allocate far more than the archive's own size would suggest.
+  Omitting the flag on unpack/cat still binds — it resolves to the same
+  25%-of-RAM default as pack — because a bound that defaults off closes
+  nothing.
 
 
 EXIT CODES
@@ -293,7 +299,7 @@ EXIT CODES
   3  format not available in this build
   4  fidelity degraded under strict mode
   5  archive or stream is corrupt
-  6  resource limit exceeded (e.g. --max-ratio tripped)
+  6  resource limit exceeded (e.g. --max-ratio or --memory-limit tripped)
   7  unsafe path refused
 
 

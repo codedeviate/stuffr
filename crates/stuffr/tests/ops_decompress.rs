@@ -312,3 +312,99 @@ fn a_magic_less_format_is_unreachable_without_an_explicit_format() {
         let _ = std::fs::remove_file(p);
     }
 }
+
+#[test]
+fn the_default_memory_limit_is_none() {
+    // The library default is unbounded; the CLI is what resolves this to
+    // `governor::default_memory_limit()` when `--memory-limit` is absent —
+    // see `stuffr_core::DecodeOpts::memory_limit`'s doc.
+    assert_eq!(DecompressOpts::default().memory_limit, None);
+}
+
+/// End-to-end: `DecompressOpts::memory_limit` reaches the decoder and
+/// refuses a hostile declaration before allocating, through the same path
+/// `stf unpack --memory-limit` uses. Gated to the pure backend actually
+/// selected here — under `--all-features` `lzma-c` wins registration for
+/// `lzma` (see `stuffr-formats/src/lzma_shared.rs`), and `lzma-c` is not
+/// part of this defect or this task's fix, so `Makefile`'s `test` (all
+/// features) never runs this and `test-pure` (default features) does —
+/// the same split the Makefile documents for `lzma-pure` generally.
+#[test]
+#[cfg(all(feature = "lzma-pure", not(feature = "lzma-c")))]
+fn a_declared_lzma_dictionary_over_the_memory_limit_is_refused_end_to_end() {
+    let src = tmp("lzma-mem.bin");
+    let packed = tmp("lzma-mem.bin.lzma");
+    let _ = std::fs::remove_file(&packed);
+    std::fs::write(&src, b"payload".repeat(200)).unwrap();
+    compress(
+        Input::Path(src.clone()),
+        Output::Path(packed.clone()),
+        &CompressOpts {
+            format: Some(fmt("lzma")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // A `.lzma` header declares its dictionary in bytes 1-4, little-endian —
+    // patch it to claim 512 MiB, mirroring `lzma_pure.rs`'s own unit test.
+    let mut bytes = std::fs::read(&packed).unwrap();
+    bytes[1..5].copy_from_slice(&(512u32 * 1024 * 1024).to_le_bytes());
+    std::fs::write(&packed, &bytes).unwrap();
+
+    let out = tmp("lzma-mem-out.bin");
+    let _ = std::fs::remove_file(&out);
+    let o = DecompressOpts {
+        memory_limit: Some(1024 * 1024),
+        ..Default::default()
+    };
+    let err = decompress(Input::Path(packed.clone()), Output::Path(out.clone()), &o).unwrap_err();
+
+    assert_eq!(
+        err.exit_code(),
+        6,
+        "a memory refusal is ResourceLimit, not Corrupt: {err}"
+    );
+    assert!(
+        err.to_string().contains("--memory-limit"),
+        "the message must name the flag so the user can raise it: {err}"
+    );
+    assert!(!out.exists(), "a refused decode must leave no partial file");
+
+    for p in [&src, &packed, &out] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// The acceptance counterpart: a legitimate file decodes when its declared
+/// dictionary fits under the limit, proving the bound is not merely strict.
+#[test]
+#[cfg(all(feature = "lzma-pure", not(feature = "lzma-c")))]
+fn a_legitimate_lzma_dictionary_under_the_memory_limit_still_decodes_end_to_end() {
+    let src = tmp("lzma-mem-ok.bin");
+    let packed = tmp("lzma-mem-ok.bin.lzma");
+    let _ = std::fs::remove_file(&packed);
+    std::fs::write(&src, b"ordinary payload ".repeat(2000)).unwrap();
+    compress(
+        Input::Path(src.clone()),
+        Output::Path(packed.clone()),
+        &CompressOpts {
+            format: Some(fmt("lzma")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let out = tmp("lzma-mem-ok-out.bin");
+    let _ = std::fs::remove_file(&out);
+    let o = DecompressOpts {
+        memory_limit: Some(64 * 1024 * 1024),
+        ..Default::default()
+    };
+    decompress(Input::Path(packed.clone()), Output::Path(out.clone()), &o).unwrap();
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&src).unwrap());
+
+    for p in [&src, &packed, &out] {
+        let _ = std::fs::remove_file(p);
+    }
+}

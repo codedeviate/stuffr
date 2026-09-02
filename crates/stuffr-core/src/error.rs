@@ -81,6 +81,15 @@ impl Error {
     /// never `InvalidData`, so gzip's decoder wraps it in an adapter that
     /// folds both onto `InvalidData` before this function ever sees them.
     ///
+    /// `OutOfMemory` becomes [`Error::ResourceLimit`] (exit 6), not
+    /// `Corrupt`: a codec whose dictionary allocation would exceed
+    /// `DecodeOpts::memory_limit` is refusing to allocate, not reporting a
+    /// damaged file, and exit 5 would actively mislead the caller about
+    /// which of those happened. A codec that raises this kind is expected to
+    /// have NOT routed it through the same `InvalidData`-folding adapter it
+    /// uses for malformed input, the same way `InvalidData` above is a
+    /// convention the codec opts into deliberately.
+    ///
     /// One rule here rather than a helper each codec calls: putting the
     /// decision in nine places means the natural code — a bare `?` on an
     /// `io::Error` — silently bypasses it, and a convention whose failure mode
@@ -92,6 +101,7 @@ impl Error {
     pub fn from_decode_io(e: std::io::Error) -> Self {
         match e.kind() {
             std::io::ErrorKind::InvalidData => Error::Corrupt(e.to_string()),
+            std::io::ErrorKind::OutOfMemory => Error::ResourceLimit(e.to_string()),
             _ => Error::Io(e),
         }
     }
@@ -120,6 +130,16 @@ mod tests {
             .exit_code(),
             7
         );
+    }
+
+    #[test]
+    fn from_decode_io_keys_resource_limit_off_out_of_memory_not_corrupt() {
+        // A codec refusing to allocate a declared dictionary is not reporting
+        // a damaged file — exit 6, never exit 5. See `DecodeOpts::memory_limit`.
+        let io_err = std::io::Error::new(std::io::ErrorKind::OutOfMemory, "too big");
+        let classified = Error::from_decode_io(io_err);
+        assert!(matches!(classified, Error::ResourceLimit(_)));
+        assert_eq!(classified.exit_code(), 6);
     }
 
     #[test]

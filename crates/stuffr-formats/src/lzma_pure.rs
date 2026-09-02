@@ -210,9 +210,21 @@ impl Codec for Lzma {
     /// `InvalidData` directly for the two cases only it can detect (a
     /// stream truncated by exactly one byte, and trailing bytes appended
     /// after a complete one) — see the module doc's "Truncation by exactly
-    /// one byte" and "No concatenation convention" sections.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
-        let dec = LazyLzmaDecoder::new(src);
+    /// one byte" and "No concatenation convention" sections. It also raises
+    /// `OutOfMemory` directly, when `o.memory_limit` refuses the header's
+    /// declared dictionary — deliberately NOT one of the kinds
+    /// `LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF` folds, so it survives
+    /// `NormalizeDecodeErrors` untouched and reaches `Error::from_decode_io`
+    /// as `ResourceLimit` (exit 6), not `Corrupt` (exit 5) — see
+    /// `DecodeOpts::memory_limit`'s doc.
+    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        // The crate's parameter is KiB in a u32. `u32::MAX` KiB is ~4 TiB, so
+        // saturating there is equivalent to "unbounded" for any real limit.
+        let mem_limit_kb = match o.memory_limit {
+            Some(bytes) => (bytes / 1024).min(u32::MAX as u64) as u32,
+            None => u32::MAX,
+        };
+        let dec = LazyLzmaDecoder::new(src, mem_limit_kb);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,
             LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF,
@@ -303,6 +315,27 @@ impl GuardedReader {
     fn has_more(&mut self) -> std::io::Result<bool> {
         Ok(!self.inner.fill_buf()?.is_empty())
     }
+
+    /// Best-effort, non-destructive read of the `.lzma` header's declared
+    /// memory need, in KiB — for the `memory_limit` refusal's message only.
+    ///
+    /// One `fill_buf` call, same non-destructive mechanism [`Self::has_more`]
+    /// uses: it peeks the buffered bytes without consuming them, so
+    /// `LzmaReader::new_mem_limit`'s own `props`/`dict_size` reads afterward
+    /// see the exact same first 5 bytes. Returns `None` rather than erroring
+    /// when fewer than 5 bytes are buffered (a genuinely truncated header) —
+    /// that case is `new_mem_limit`'s own EOF error to raise, not this
+    /// method's; a missing declared-size figure just means the refusal
+    /// message below omits it rather than naming it.
+    fn peek_declared_need_kb(&mut self) -> Option<u32> {
+        let buf = self.inner.fill_buf().ok()?;
+        if buf.len() < 5 {
+            return None;
+        }
+        let props = buf[0];
+        let dict_size = u32::from_le_bytes(buf[1..5].try_into().expect("checked len >= 5"));
+        lzma_rust2::lzma_get_memory_usage_by_props(dict_size, props).ok()
+    }
 }
 
 impl Read for GuardedReader {
@@ -322,7 +355,9 @@ impl Read for GuardedReader {
 /// "Truncation by exactly one byte" and "No concatenation convention"
 /// sections.
 enum LazyLzmaDecoder {
-    Pending(Box<dyn Source>),
+    /// The source, and the caller's `DecodeOpts::memory_limit` already
+    /// converted to the crate's KiB unit — see `Codec::decoder`.
+    Pending(Box<dyn Source>, u32),
     Ready {
         // Boxed because `LzmaReader` is ~3,969 bytes while every other variant
         // here is at most 16, and this enum is assigned through `*self = ...`
@@ -341,8 +376,8 @@ enum LazyLzmaDecoder {
 }
 
 impl LazyLzmaDecoder {
-    fn new(src: Box<dyn Source>) -> Self {
-        Self::Pending(src)
+    fn new(src: Box<dyn Source>, mem_limit_kb: u32) -> Self {
+        Self::Pending(src, mem_limit_kb)
     }
 }
 
@@ -363,14 +398,45 @@ impl Read for LazyLzmaDecoder {
                         "lzma-rust2: stream failed to decode",
                     ));
                 }
-                LazyLzmaDecoder::Pending(_) => {
-                    let LazyLzmaDecoder::Pending(src) =
+                LazyLzmaDecoder::Pending(_, _) => {
+                    let LazyLzmaDecoder::Pending(src, mem_limit_kb) =
                         std::mem::replace(self, LazyLzmaDecoder::Failed)
                     else {
                         unreachable!("just matched Pending above")
                     };
-                    let guarded = GuardedReader::new(src);
-                    let dec = LzmaReader::new_mem_limit(guarded, u32::MAX, None)?;
+                    let mut guarded = GuardedReader::new(src);
+                    // Best-effort only — see `peek_declared_need_kb`'s doc.
+                    // Peeked, not consumed, so `new_mem_limit`'s own header
+                    // read below sees the identical first 5 bytes.
+                    let declared_need_kb = guarded.peek_declared_need_kb();
+                    let dec =
+                        LzmaReader::new_mem_limit(guarded, mem_limit_kb, None).map_err(|e| {
+                            if e.kind() != ErrorKind::OutOfMemory {
+                                return e;
+                            }
+                            // Replace the crate's static, number-free message
+                            // ("needed memory too big for mem_limit_kb") with
+                            // one naming the declared size, the limit, and
+                            // the flag to raise — see `DecodeOpts::memory_limit`.
+                            // NOT `InvalidData`: this is not a corrupt file,
+                            // it is a refusal to allocate, and must reach
+                            // `Error::from_decode_io` as `OutOfMemory` so it
+                            // classifies as `ResourceLimit` (exit 6), not
+                            // `Corrupt` (exit 5).
+                            let msg = match declared_need_kb {
+                                Some(need_kb) => format!(
+                                    "lzma: header declares a dictionary needing {need_kb} KiB, \
+                                     but --memory-limit allows only {mem_limit_kb} KiB — raise \
+                                     --memory-limit to decode this file"
+                                ),
+                                None => format!(
+                                    "lzma: header declares a dictionary exceeding the \
+                                     {mem_limit_kb} KiB --memory-limit — raise --memory-limit \
+                                     to decode this file"
+                                ),
+                            };
+                            std::io::Error::new(ErrorKind::OutOfMemory, msg)
+                        })?;
                     *self = LazyLzmaDecoder::Ready {
                         inner: Box::new(dec),
                         finished: false,
@@ -909,5 +975,92 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A `.lzma` header declares its dictionary in bytes 1-4, little-endian.
+    /// Craft one claiming 512 MiB and hand it a 1 MiB limit: the reader must
+    /// refuse rather than allocate, and the refusal must be exit 6
+    /// (`ResourceLimit`), NOT exit 5 — reporting "your file is corrupt" when
+    /// the real problem is "this build will not allocate that much" would be
+    /// actively misleading.
+    ///
+    /// `LzmaReader::new_mem_limit` (measured, this crate version) refuses
+    /// eagerly at construction, before any byte is decoded — but that is a
+    /// property of `lzma-rust2`, not of this codec's contract, so the test
+    /// accepts a refusal surfacing on the first `read` too rather than
+    /// assuming which one fires.
+    #[test]
+    fn a_declared_dictionary_over_the_limit_is_refused_before_allocating() {
+        let mut packed = encode_with(&Lzma, b"payload".repeat(100).as_slice());
+        packed[1..5].copy_from_slice(&(512u32 * 1024 * 1024).to_le_bytes());
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let construct_err = Lzma.decoder(
+            src,
+            &DecodeOpts {
+                memory_limit: Some(1024 * 1024),
+                ..Default::default()
+            },
+        );
+        let err = match construct_err {
+            Err(e) => e,
+            Ok(mut dec) => {
+                // Construction succeeded; the crate defers the check, so it
+                // must surface on the first read instead.
+                let mut buf = [0u8; 1];
+                let io_err = dec
+                    .read(&mut buf)
+                    .expect_err("a 512 MiB declaration under a 1 MiB limit must be refused");
+                stuffr_core::Error::from_decode_io(io_err)
+            }
+        };
+        assert_eq!(
+            err.exit_code(),
+            6,
+            "a memory refusal is ResourceLimit, not Corrupt: {err}"
+        );
+        assert!(
+            err.to_string().contains("--memory-limit"),
+            "the message must name the flag so the user can raise it: {err}"
+        );
+    }
+
+    /// Matters more than the refusal above: over-strictness rejects valid
+    /// files, and this project shipped that mirror defect twice in Phase 1e
+    /// (lzip's trailing-data guard, and gzip/bzip2 refusing padding the
+    /// reference tools recover). A legitimate dictionary that fits under the
+    /// limit must still decode.
+    #[test]
+    fn a_legitimate_dictionary_under_the_limit_still_decodes() {
+        let plain = b"ordinary payload ".repeat(2000);
+        let packed = encode_with(&Lzma, &plain);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let mut dec = Lzma
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit: Some(64 * 1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    /// `DecodeOpts::default()` has `memory_limit: None`. The CLI always sets
+    /// a limit (25% of available RAM); a library caller who deliberately
+    /// passes `None` keeps the old, unbounded behaviour rather than getting a
+    /// surprise ceiling.
+    #[test]
+    fn no_limit_means_no_bound_for_library_callers() {
+        let plain = b"payload ".repeat(2000);
+        let packed = encode_with(&Lzma, &plain);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let mut dec = Lzma.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
     }
 }

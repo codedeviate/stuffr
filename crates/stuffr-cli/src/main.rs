@@ -187,11 +187,15 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             memory_limit,
         } => {
             // Decode has no worker count to govern (multi-threaded decode is
-            // out of scope this phase), so there is nothing for
-            // `--memory-limit` to bound here yet; parsing it still validates
-            // a malformed value up front, matching every other subcommand.
-            let memory_limit = parse_memory_limit(memory_limit)?;
-            let _ = memory_limit;
+            // out of scope this phase), but it does bound dictionary
+            // allocation for the pure codecs that size a buffer from a value
+            // the file declares in its own header — see
+            // `stuffr_core::DecodeOpts::memory_limit`. The CLI default is
+            // the bound, not unbounded: a bound that defaults off closes
+            // nothing.
+            let memory_limit = Some(
+                parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit),
+            );
             let fmt = match format.as_deref() {
                 Some(name) => Some(format_by_name(name)?),
                 None => None,
@@ -199,6 +203,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             let mut opts = DecompressOpts {
                 force,
                 sync: !no_sync,
+                memory_limit,
                 ..Default::default()
             };
             opts.format = fmt;
@@ -226,15 +231,18 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             max_ratio,
             memory_limit,
         } => {
-            // Same as `unpack`: nothing to bound yet, but still validated.
-            let memory_limit = parse_memory_limit(memory_limit)?;
-            let _ = memory_limit;
+            // Same as `unpack`: bounds dictionary allocation for the pure
+            // codecs; the CLI default is the bound, not unbounded.
+            let memory_limit = Some(
+                parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit),
+            );
             let fmt = match format.as_deref() {
                 Some(name) => Some(format_by_name(name)?),
                 None => None,
             };
             let mut opts = DecompressOpts {
                 format: fmt,
+                memory_limit,
                 ..Default::default()
             };
             if let Some(r) = max_ratio {

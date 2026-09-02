@@ -15,6 +15,20 @@ pub struct DecodeOpts {
     /// The shared worker/memory budget. `None` means single-threaded — a codec
     /// parallelises only if handed a governor, never from an ambient global.
     pub governor: Option<std::sync::Arc<crate::Governor>>,
+    /// Cap on memory a decoder may ask the allocator for. `None` means
+    /// unbounded, which is the library default; the CLI always sets a value.
+    ///
+    /// This exists because three pure codecs size a dictionary buffer from a
+    /// value the *file declares in its own header*, before producing any
+    /// output — measured at 69.35 MB peak RSS for a 60-byte `.xz`, and 538 MB
+    /// for a crafted 114-byte `.lz` that decoded correctly, so the cost came
+    /// purely from the declaration. `--max-ratio` cannot see it: that guard
+    /// counts decoded output bytes and the allocation precedes any output.
+    ///
+    /// Exceeding it is [`crate::Error::ResourceLimit`] (exit 6), never
+    /// `Corrupt` (exit 5) — the file is not damaged, this build simply will
+    /// not allocate that much.
+    pub memory_limit: Option<u64>,
 }
 
 impl std::fmt::Debug for DecodeOpts {
@@ -22,6 +36,7 @@ impl std::fmt::Debug for DecodeOpts {
         f.debug_struct("DecodeOpts")
             .field("threads", &self.threads)
             .field("governor", &self.governor.as_ref().map(|_| "Governor"))
+            .field("memory_limit", &self.memory_limit)
             .finish()
     }
 }

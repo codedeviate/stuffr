@@ -671,6 +671,13 @@ pub struct DecompressOpts {
     /// `--no-sync` trades this durability guarantee for speed on bulk or
     /// scratch work — see `publish`.
     pub sync: bool,
+    /// Cap on memory a decoder may ask the allocator for, passed straight
+    /// through to [`stuffr_core::DecodeOpts::memory_limit`]. `None` is the
+    /// library default (unbounded); the CLI always resolves this to
+    /// `Some(governor::default_memory_limit())` when the flag is absent — a
+    /// bound that defaults off closes nothing. See that field's doc for what
+    /// this guards against.
+    pub memory_limit: Option<u64>,
 }
 
 impl Default for DecompressOpts {
@@ -680,6 +687,7 @@ impl Default for DecompressOpts {
             force: false,
             max_ratio: DEFAULT_MAX_RATIO,
             sync: true,
+            memory_limit: None,
         }
     }
 }
@@ -742,7 +750,11 @@ pub fn decompress_with(
     let codec = registry.require_decoder(format)?;
 
     let (counting, consumed) = Counting::new(source);
-    let mut decoder = codec.decoder(Box::new(counting), &DecodeOpts::default())?;
+    let decode_opts = DecodeOpts {
+        memory_limit: o.memory_limit,
+        ..Default::default()
+    };
+    let mut decoder = codec.decoder(Box::new(counting), &decode_opts)?;
     let mut guard = RatioGuard::new(Arc::clone(&consumed), o.max_ratio);
 
     let opened = dst.create(o.force, o.sync)?;
