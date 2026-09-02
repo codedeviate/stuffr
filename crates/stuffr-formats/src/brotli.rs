@@ -7,10 +7,10 @@
 //! that evidence rather than being forced to invent a signature that does not
 //! exist.
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use brotli::CompressorWriter;
-use brotli::Decompressor;
+use brotli::{BrotliDecompressStream, BrotliResult, BrotliState, HeapAlloc, HuffmanCode};
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
     Result, Sink, Source, StreamOnly,
@@ -65,58 +65,57 @@ impl Codec for Brotli {
     /// `NormalizeDecodeErrors`, unlike every flate2/bzip2-backed codec in this
     /// tree.
     ///
-    /// Measured directly: whenever `brotli::Decompressor` DOES reject
-    /// malformed input (a corrupted, back-reference-heavy stream; any
-    /// truncated stream, including the unconditional property-10 case below)
-    /// it reports `io::ErrorKind::InvalidData` natively, with no translation
-    /// needed — brotli already speaks this project's convention for the
-    /// cases it does catch. This absence of a `NormalizeDecodeErrors` wrapper
-    /// is deliberate, not an oversight: there is no other kind this backend
-    /// raises for malformed input that would need folding onto
-    /// `InvalidData`. It is a separate question from `caps().
-    /// detects_corruption` (`CorruptionDetection::Never`, see above) — that
-    /// capability is about
+    /// Measured directly: whenever the backend DOES reject malformed input (a
+    /// corrupted, back-reference-heavy stream; any truncated stream, including
+    /// the unconditional property-10 case below; trailing data, below) it
+    /// reports `io::ErrorKind::InvalidData` natively, with no translation
+    /// needed — brotli already speaks this project's convention for the cases
+    /// it does catch. This absence of a `NormalizeDecodeErrors` wrapper is
+    /// deliberate, not an oversight: there is no other kind this backend
+    /// raises for malformed input that would need folding onto `InvalidData`.
+    /// It is a separate question from `caps().detects_corruption`
+    /// (`CorruptionDetection::Never`, see above) — that capability is about
     /// whether EVERY corruption is caught, which brotli's checksum-less
-    /// format cannot promise; this comment is only about what kind is used
-    /// on the occasions it does.
-    /// **KNOWN DIVERGENCE from the reference tool: trailing data is ignored.**
+    /// format cannot promise; this comment is only about what kind is used on
+    /// the occasions it does.
     ///
-    /// RFC 7932 defines a single brotli stream, so bytes after a complete one are
-    /// malformed. The reference `brotli` CLI agrees: on `cat a.br b.br` it emits
-    /// the first stream's output and then **fails with "corrupt input", exit 1**.
-    /// This decoder emits the first stream and exits **0**. So a user who appends
-    /// to a `.br`, or whose file has trailing junk from a partial write, gets a
-    /// plausible partial result and a success code.
+    /// ## Trailing data is rejected, matching the reference tool
+    ///
+    /// RFC 7932 defines a single brotli stream, so bytes after a complete one
+    /// are malformed, and the reference `brotli` CLI treats them that way: on
+    /// `cat a.br b.br` it emits the first stream's output and then **fails
+    /// with "corrupt input", exit 1**. `BrotliStreamDecoder` below matches
+    /// that: it reports `InvalidData` instead of silently stopping at the
+    /// first stream and exiting 0.
     ///
     /// This is NOT the same as zlib and deflate, which also stop at the first
     /// stream — there the reference does too (Python's one-shot
-    /// `zlib.decompress` returns only the first stream), so matching it is
-    /// correct. Here we are more permissive than the reference, which is the
-    /// defect.
+    /// `zlib.decompress` returns only the first stream), so stopping there
+    /// (not erroring) is what matches. Brotli's reference errors, so this
+    /// decoder does too.
     ///
-    /// **Three fixes were measured and rejected; do not re-derive them:**
+    /// Three fixes over the high-level `brotli::Decompressor` were measured
+    /// and rejected before this one: checking the source for leftover bytes
+    /// after decode reports EOF cannot work, because `Decompressor::new(src,
+    /// 4096)` reads ahead — on a 29-byte concatenated fixture it pulled all 29
+    /// bytes from the source while decoding only the first 14-byte stream, so
+    /// the trailing bytes sit in the decompressor's own buffer and the source
+    /// looks exhausted (`get_mut()`/`into_inner()` inherit the same
+    /// blindness); giving the decompressor a 1-byte input buffer over our own
+    /// `BufReader` does work, by making it consume exactly what it needs, but
+    /// costs **60x** throughput — 8 MiB in 1.92 s against 32 ms, measured;
+    /// and parsing the stream's length ourselves is writing a brotli decoder,
+    /// which this module exists not to do.
     ///
-    /// 1. *Check the source for leftover bytes after decode reports EOF* — the
-    ///    obvious approach, and it cannot work. `Decompressor::new(src, 4096)`
-    ///    reads ahead: on a 29-byte concatenated fixture it pulled all 29 bytes
-    ///    from the source while decoding only the first 14-byte stream, so the
-    ///    trailing bytes sit in the decompressor's own buffer and the source
-    ///    looks exhausted. `get_mut()`/`into_inner()` inherit the same problem.
-    /// 2. *Give the decompressor a 1-byte input buffer so it consumes exactly
-    ///    what it needs, with our own `BufReader` underneath doing the real
-    ///    buffering.* This works correctly — verified: it pulls exactly 14 of 29
-    ///    bytes, leaving the remainder visible to us — and it is **60x slower**:
-    ///    8 MiB decodes in 1.92 s against 32 ms. Unusable.
-    /// 3. *Parse the stream's length ourselves* — that is writing a brotli
-    ///    decoder, which this module exists not to do.
-    ///
-    /// The remaining honest fix is the low-level `BrotliDecompressStream` API,
-    /// which reports `available_in` and so gives exact input accounting. That
-    /// means writing an incremental `Read` adapter over it that still satisfies
-    /// conformance property 8, which is a task with its own review rather than a
-    /// docstring's worth of work. Scheduled, not forgotten.
+    /// `BrotliStreamDecoder` below avoids all three problems by driving the
+    /// low-level `BrotliDecompressStream` directly: its `available_in` and
+    /// `input_offset` are `&mut`, so after a `ResultSuccess` the exact
+    /// consumed/unconsumed boundary is known without any read-ahead guesswork
+    /// — the accounting the high-level reader never exposes — at the same
+    /// buffer size (4096 bytes) the high-level reader used, so there is no
+    /// throughput cost to pay for it.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
-        Ok(Box::new(StreamOnly::new(Decompressor::new(src, 4096))))
+        Ok(Box::new(StreamOnly::new(BrotliStreamDecoder::new(src))))
     }
 
     fn check_encode_opts(&self, o: &EncodeOpts) -> Result<()> {
@@ -139,6 +138,158 @@ impl Codec for Brotli {
         Ok(Box::new(BrotliSink(CompressorWriter::new(
             captured, 4096, quality, 22,
         ))))
+    }
+}
+
+/// Input buffer size for [`BrotliStreamDecoder`]. Matches the buffer size the
+/// former high-level `brotli::Decompressor` used — chosen for parity, not
+/// re-tuned, since the whole point of this adapter is that it costs nothing
+/// extra over that baseline.
+const DECODE_BUF_SIZE: usize = 4096;
+
+type DecoderState = BrotliState<HeapAlloc<u8>, HeapAlloc<u32>, HeapAlloc<HuffmanCode>>;
+
+/// A `Read` adapter over the low-level `BrotliDecompressStream`, in place of
+/// the high-level `brotli::Decompressor` — see the trailing-data section of
+/// `Codec::decoder`'s doc comment above for why. Reports malformed input,
+/// truncation, and trailing data as `io::ErrorKind::InvalidData`.
+struct BrotliStreamDecoder {
+    src: Box<dyn Source>,
+    dec: DecoderState,
+    in_buf: [u8; DECODE_BUF_SIZE],
+    /// Start of the unconsumed region of `in_buf`.
+    in_pos: usize,
+    /// End of the valid region of `in_buf` (bytes actually filled by the last read).
+    in_len: usize,
+    /// `src` has reported EOF at least once; do not call `read` on it again.
+    src_eof: bool,
+    /// The stream has concluded — successfully or with an error — and every
+    /// further call to `read` must return `Ok(0)` without touching `src` or
+    /// `dec` again.
+    done: bool,
+}
+
+impl BrotliStreamDecoder {
+    fn new(src: Box<dyn Source>) -> Self {
+        Self {
+            src,
+            dec: BrotliState::new(
+                HeapAlloc::<u8>::default(),
+                HeapAlloc::<u32>::default(),
+                HeapAlloc::<HuffmanCode>::default(),
+            ),
+            in_buf: [0u8; DECODE_BUF_SIZE],
+            in_pos: 0,
+            in_len: 0,
+            src_eof: false,
+            done: false,
+        }
+    }
+
+    /// Refills `in_buf` from `src`, starting at index 0. Only called once the
+    /// current buffer is fully consumed (`in_pos == in_len`), so nothing
+    /// unconsumed is ever overwritten.
+    fn refill(&mut self) -> std::io::Result<()> {
+        if self.src_eof {
+            self.in_pos = 0;
+            self.in_len = 0;
+            return Ok(());
+        }
+        let n = self.src.read(&mut self.in_buf)?;
+        self.in_pos = 0;
+        self.in_len = n;
+        if n == 0 {
+            self.src_eof = true;
+        }
+        Ok(())
+    }
+
+    /// Reached `ResultSuccess` with nothing left to serve from this call.
+    /// Any bytes still sitting in `in_buf`, or arriving from one more
+    /// physical read of `src`, are trailing data RFC 7932 does not allow —
+    /// checked right here, before ever reporting `Ok(0)`, so the standard
+    /// `Read` contract (stop at the first zero-length read) cannot skip past
+    /// it the way `read_to_end` skipped past the high-level reader's
+    /// equivalent check.
+    fn finish_after_success(&mut self) -> std::io::Result<usize> {
+        self.done = true;
+        if self.in_pos < self.in_len {
+            return Err(trailing_data_error());
+        }
+        if !self.src_eof {
+            self.refill()?;
+            if self.in_len > 0 {
+                return Err(trailing_data_error());
+            }
+        }
+        Ok(0)
+    }
+}
+
+fn trailing_data_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "trailing data after a complete brotli stream",
+    )
+}
+
+fn truncated_stream_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "brotli stream truncated: input ended mid-stream",
+    )
+}
+
+fn corrupt_stream_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "brotli stream is corrupt")
+}
+
+impl Read for BrotliStreamDecoder {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.done {
+            return Ok(0);
+        }
+        loop {
+            if self.in_pos >= self.in_len {
+                self.refill()?;
+            }
+
+            let mut available_in = self.in_len - self.in_pos;
+            let mut input_offset = self.in_pos;
+            let mut available_out = buf.len();
+            let mut output_offset = 0usize;
+            let mut total_out = 0usize;
+
+            let result = BrotliDecompressStream(
+                &mut available_in,
+                &mut input_offset,
+                &self.in_buf[..self.in_len],
+                &mut available_out,
+                &mut output_offset,
+                buf,
+                &mut total_out,
+                &mut self.dec,
+            );
+            self.in_pos = input_offset;
+
+            match result {
+                BrotliResult::NeedsMoreOutput => return Ok(output_offset),
+                BrotliResult::ResultSuccess if output_offset > 0 => return Ok(output_offset),
+                BrotliResult::ResultSuccess => return self.finish_after_success(),
+                BrotliResult::NeedsMoreInput if output_offset > 0 => return Ok(output_offset),
+                BrotliResult::NeedsMoreInput if self.src_eof => {
+                    self.done = true;
+                    return Err(truncated_stream_error());
+                }
+                // Genuinely needs more input and none was produced this call:
+                // loop back around, the top-of-loop refill picks it up.
+                BrotliResult::NeedsMoreInput => {}
+                BrotliResult::ResultFailure => {
+                    self.done = true;
+                    return Err(corrupt_stream_error());
+                }
+            }
+        }
     }
 }
 
@@ -209,6 +360,65 @@ mod tests {
             "brotli must actually compress this"
         );
         assert_eq!(decompress(packed), plain);
+    }
+
+    #[test]
+    fn trailing_data_after_a_complete_stream_is_rejected() {
+        // The reference brotli CLI prints the first stream and then exits 1
+        // with "corrupt input" (verified directly against the installed
+        // binary: `cat a.br b.br | brotli -d` behaves exactly this way). We
+        // used to exit 0 with half the data.
+        let mut two = compress(b"first-stream-payload");
+        two.extend_from_slice(&compress(b"second-stream-payload"));
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(two)));
+        let mut dec = Brotli.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        match dec.read_to_end(&mut out) {
+            Ok(_) => panic!(
+                "trailing data must be rejected; got Ok with {} bytes",
+                out.len()
+            ),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+        }
+    }
+
+    #[test]
+    fn trailing_nul_padding_is_rejected_too() {
+        // Whatever the reference does is the answer. Phase 1e learned not to
+        // generalise one format's padding answer to another: reference lzip
+        // ACCEPTS trailing padding while reference xz/lzma REJECT it. Verified
+        // directly against the installed `brotli` 1.2.0 binary: NUL-padding a
+        // stream and running `brotli -d` on it prints the first stream's
+        // output, then fails with "corrupt input", exit 1 — same as
+        // concatenated streams, so this is not inverted.
+        let mut padded = compress(b"payload-with-padding");
+        padded.extend_from_slice(&[0u8; 32]);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(padded)));
+        let mut dec = Brotli.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        assert!(dec.read_to_end(&mut out).is_err());
+    }
+
+    #[test]
+    fn a_single_stream_with_nothing_appended_still_decodes() {
+        let plain = b"ordinary payload ".repeat(4096);
+        assert_eq!(decompress(compress(&plain)), plain);
+    }
+
+    #[test]
+    fn truncation_is_still_reported_as_invalid_data() {
+        // NeedsMoreInput at genuine EOF is truncation, not trailing data.
+        // Both are InvalidData, and conformance property 10 is unconditional,
+        // so this must not regress while the trailing-data check is added.
+        let packed = compress(&b"payload ".repeat(4096));
+        let cut = packed[..packed.len() / 2].to_vec();
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(cut)));
+        let mut dec = Brotli.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        match dec.read_to_end(&mut out) {
+            Ok(_) => panic!("a truncated stream must not decode cleanly"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+        }
     }
 
     #[test]
