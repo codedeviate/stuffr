@@ -150,6 +150,47 @@
 //! designed checksum — a high empirical rate against *random* corruption,
 //! not a promise against a deliberately crafted edit.
 //!
+//! ## Corruption vs resource limit: a heuristic, because LZMA1 has no magic
+//!
+//! `xz_pure.rs` and `lzip.rs` both require their format's own magic before
+//! trusting a declared dictionary size enough to refuse it as
+//! `Error::ResourceLimit` — without that, non-matching garbage whose bytes
+//! happen to decode a large dictionary would be misreported as exit 6, a
+//! resource limit, when the truth is exit 5, corruption. **LZMA1 has no
+//! magic anywhere in its header** — one props byte, four dictionary-size
+//! bytes, then eight uncompressed-size bytes, no signature — which is
+//! exactly why this codec is extension/`--format`-only and cannot be
+//! auto-detected on a pipe. So the xz/lzip remedy cannot port directly:
+//! there is no signature to check first.
+//!
+//! Measured before any fix: 34 of 40 fresh random 200-byte inputs fed as
+//! `--format lzma` with no flags misreported as exit 6 ("raise
+//! --memory-limit") rather than exit 5. `LzmaReader::new_mem_limit` already
+//! rejects an invalid props byte or an out-of-range dictionary size with
+//! `InvalidInput` (folded to `Corrupt` by
+//! `LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF` below) *before* it ever
+//! reaches the memory check, so those two fields are not the leak — the
+//! leak is the third header field, the 8-byte uncompressed-size, which the
+//! crate reads but never inspects for plausibility before deciding a
+//! declared dictionary is a genuine ask.
+//!
+//! Every real encoder measured (`xz --format=lzma`, `lzma`, and this
+//! codec's own writer via `LzmaWriter::new_use_header(.., None)`) writes
+//! the all-ones "unknown" sentinel there, even when the input length was
+//! known up front — streaming-only is the convention in practice, not just
+//! in principle. [`GuardedReader::header_uncompressed_size_is_plausible`]
+//! trusts the resource-limit refusal only when that field is the sentinel
+//! or at least within [`PLAUSIBLE_UNCOMPRESSED_SIZE_MAX`] (a bound with
+//! slack above any real archive, but far below where a genuinely random
+//! 64-bit value lands almost every time). **This is a heuristic, not a
+//! signature check** — a format with no magic cannot tell "hostile LZMA1"
+//! from "not LZMA1 at all" with certainty, only with high confidence, and a
+//! hand-crafted stream that clears the bound deliberately still gets the
+//! resource-limit refusal it asked for (measured: a real `.lzma` with only
+//! its dictionary field raised, sentinel intact, still exits 6). What the
+//! heuristic closes is the overwhelming case: bytes that are not LZMA1 at
+//! all, where the third field is essentially always outside the bound.
+//!
 //! ## Level validation: not delegated to the crate, same reasoning as `xz_pure.rs`
 //!
 //! Measured directly: `lzma_rust2::LzmaOptions::with_preset`/`set_preset`
@@ -288,6 +329,16 @@ impl Sink for LzmaPureSink {
     }
 }
 
+/// Above this, a `.lzma` header's uncompressed-size field (bytes 5..13)
+/// stops being treated as a plausible real size — see the module doc's
+/// "Corruption vs resource limit" section. 256 TiB is far beyond anything
+/// this project expects to meet as a genuine archive; it exists only to
+/// admit slack above outrageous-but-conceivable sizes while still rejecting
+/// the near-certainly-random 64-bit values ~200 bytes of noise produces
+/// (a uniformly random `u64` lands below this bound only about 1 time in
+/// 65,536).
+const PLAUSIBLE_UNCOMPRESSED_SIZE_MAX: u64 = 1 << 48;
+
 /// Wraps the raw byte source so [`LazyLzmaDecoder`] can answer two questions
 /// the crate's own `LzmaReader` cannot be asked directly — see the module
 /// doc's "Truncation by exactly one byte" section for why both are needed
@@ -335,6 +386,37 @@ impl GuardedReader {
         let props = buf[0];
         let dict_size = u32::from_le_bytes(buf[1..5].try_into().expect("checked len >= 5"));
         lzma_rust2::lzma_get_memory_usage_by_props(dict_size, props).ok()
+    }
+
+    /// Best-effort, non-destructive check of whether the header's
+    /// uncompressed-size field (bytes 5..13) looks like a genuine LZMA1
+    /// stream rather than noise that happened to decode a large
+    /// dictionary — see the module doc's "Corruption vs resource limit"
+    /// section for why this field, not the props byte or the dictionary
+    /// size, is the one worth checking here.
+    ///
+    /// Same non-destructive `fill_buf` mechanism as
+    /// [`Self::peek_declared_need_kb`], reading further into the same
+    /// buffered prefix so `LzmaReader::new_mem_limit`'s own header read
+    /// afterward still sees identical bytes. Returns `true` ("trust the
+    /// refusal") when fewer than 13 bytes are buffered: reaching this check
+    /// at all requires `new_mem_limit` to have already computed a memory
+    /// figure from a *valid* props byte and dictionary size, which itself
+    /// requires having read all 13 header bytes successfully, so "too
+    /// short to tell" cannot actually arise at the call site — the
+    /// permissive default exists only so this method has a well-defined
+    /// answer in isolation, the same "cannot decide" convention
+    /// `xz_pure.rs`'s and `lzip.rs`'s parsers use.
+    fn header_uncompressed_size_is_plausible(&mut self) -> bool {
+        let Ok(buf) = self.inner.fill_buf() else {
+            return true;
+        };
+        if buf.len() < 13 {
+            return true;
+        }
+        let uncompressed_size =
+            u64::from_le_bytes(buf[5..13].try_into().expect("checked len >= 13"));
+        uncompressed_size == u64::MAX || uncompressed_size <= PLAUSIBLE_UNCOMPRESSED_SIZE_MAX
     }
 }
 
@@ -407,12 +489,39 @@ impl Read for LazyLzmaDecoder {
                     let mut guarded = GuardedReader::new(src);
                     // Best-effort only — see `peek_declared_need_kb`'s doc.
                     // Peeked, not consumed, so `new_mem_limit`'s own header
-                    // read below sees the identical first 5 bytes.
+                    // read below sees the identical first 5 (then 13) bytes.
                     let declared_need_kb = guarded.peek_declared_need_kb();
+                    let uncompressed_size_plausible =
+                        guarded.header_uncompressed_size_is_plausible();
                     let dec =
                         LzmaReader::new_mem_limit(guarded, mem_limit_kb, None).map_err(|e| {
                             if e.kind() != ErrorKind::OutOfMemory {
                                 return e;
+                            }
+                            // The props byte and dictionary size were BOTH
+                            // already valid — an invalid one of either would
+                            // have raised `InvalidInput` (folded to
+                            // `InvalidData`/`Corrupt` below) before
+                            // `new_mem_limit` ever computed a memory figure
+                            // to compare against `mem_limit_kb`. So the only
+                            // remaining question is whether the header's
+                            // THIRD field — the uncompressed size, which the
+                            // crate reads but never inspects for plausibility
+                            // — looks like a real LZMA1 stream. See the
+                            // module doc's "Corruption vs resource limit"
+                            // section: LZMA1 has no magic, so this is a
+                            // heuristic, not a signature check.
+                            if !uncompressed_size_plausible {
+                                // Almost certainly not LZMA1 at all: hand it
+                                // back as corruption (exit 5), not a memory
+                                // refusal (exit 6) that would tell the user
+                                // to raise a limit that cannot help.
+                                return std::io::Error::new(
+                                    ErrorKind::InvalidData,
+                                    "lzma: header does not look like a genuine LZMA1 stream \
+                                     (implausible uncompressed-size field) — treating the \
+                                     declared dictionary as corrupt input, not a resource limit",
+                                );
                             }
                             // Replace the crate's static, number-free message
                             // ("needed memory too big for mem_limit_kb") with
@@ -1022,6 +1131,61 @@ mod tests {
         assert!(
             err.to_string().contains("--memory-limit"),
             "the message must name the flag so the user can raise it: {err}"
+        );
+    }
+
+    /// HIGH-1 (whole-branch review, 2026-09-02): before this fix, feeding
+    /// arbitrary non-LZMA1 bytes to `--format lzma` misreported as
+    /// `ResourceLimit` (exit 6, "raise --memory-limit") on 34 of 40 fresh
+    /// random 200-byte inputs, because `LzmaReader::new_mem_limit` computes
+    /// its memory figure from the props byte and dictionary size alone and
+    /// never inspects the uncompressed-size field for plausibility. See the
+    /// module doc's "Corruption vs resource limit" section for the
+    /// heuristic this pins: a header whose uncompressed-size field is
+    /// neither the "unknown" sentinel nor within a plausible bound is
+    /// treated as not genuinely LZMA1, and the refusal must be corruption,
+    /// not a resource limit that tells the user to raise a flag that cannot
+    /// help.
+    ///
+    /// Deterministic stand-in for "not LZMA1 at all", not real randomness:
+    /// a valid props byte and an over-limit dictionary size (so the crate
+    /// WOULD compute an over-limit memory figure, exactly like the test
+    /// above), but an uncompressed-size field that is neither the sentinel
+    /// nor plausible — the one field every real encoder measured
+    /// (`xz --format=lzma`, `lzma`, and this codec's own writer) leaves as
+    /// the sentinel even when the input length is known up front.
+    #[test]
+    fn an_implausible_header_reports_corruption_not_a_resource_limit() {
+        let mut packed = vec![0u8; 64];
+        packed[0] = 0x5d; // a valid props byte (93, preset 6's)
+        packed[1..5].copy_from_slice(&(512u32 * 1024 * 1024).to_le_bytes()); // over the limit below
+        packed[5..13].copy_from_slice(&0x1234_5678_9abc_def0u64.to_le_bytes()); // not the sentinel, not plausible
+        for (i, b) in packed[13..].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3); // deterministic filler
+        }
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let construct_err = Lzma.decoder(
+            src,
+            &DecodeOpts {
+                memory_limit: Some(1024 * 1024),
+                ..Default::default()
+            },
+        );
+        let err = match construct_err {
+            Err(e) => e,
+            Ok(mut dec) => {
+                let mut buf = [0u8; 1];
+                let io_err = dec
+                    .read(&mut buf)
+                    .expect_err("an implausible header must not silently decode");
+                stuffr_core::Error::from_decode_io(io_err)
+            }
+        };
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "an implausible header is corruption (exit 5), not a memory refusal: {err}"
         );
     }
 
