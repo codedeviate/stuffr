@@ -254,7 +254,51 @@
 //! `8 * 1024 * 1024` (8 MiB) — the same figure `lzma_pure.rs` and
 //! `lzma_c.rs` declare for the same reason: LZIP's payload is an LZMA1
 //! stream, and preset 6 (this codec's default level when no `--level` is
-//! given) uses an 8 MiB dictionary.
+//! given) uses an 8 MiB dictionary. **Unchanged by parallel encode below** —
+//! Task 7, which measures `memory_per_worker` for parallel encode, measures
+//! it against the 24 MiB member size chosen there, not this single-worker
+//! figure; see that section.
+//!
+//! ## Parallel encode: member size, and why the single-worker guard needs
+//! ## an above-threshold payload to be testable
+//!
+//! `lzma_rust2::LzipWriterMt::new` refuses to construct without a member
+//! size set, the same way `xz_pure.rs`'s `XzWriterMt::new` refuses without a
+//! block size — measured directly: `error_invalid_input("member size must
+//! be set")` on `LzipOptions::default()`'s `member_size: None`. `encoder`
+//! below sets it to **three times the preset's dictionary size**, mirroring
+//! `xz_pure.rs`'s `block_size_for` and, through it, liblzma's own documented
+//! convention for `lzma_stream_encoder_mt` — LZIP has no C multi-threaded
+//! reference of its own to measure against, since `liblzma` has no notion of
+//! an LZIP member. At the default preset (6, 8 MiB dictionary) that is 24
+//! MiB. The crate floors the effective size at the dictionary itself
+//! (`member_size.max(dict_size)`), so only the multiplier is this codec's
+//! choice to make.
+//!
+//! **A payload at or below the member size yields ONE member, and this
+//! backend's one-member MT output is BYTE-IDENTICAL to the single-threaded
+//! writer's** — measured directly, mirroring `xz_pure.rs`'s identical
+//! finding for its XZ blocks: at preset 0 (768 KiB member size, three times
+//! its 256 KiB dictionary), `LzipWriterMt` with exactly one worker matches
+//! `LzipWriter` byte-for-byte from 1 byte up to 512 KiB. **The guard-under-
+//! test payload must exceed the member size at the level under test** — at
+//! preset 0's 768 KiB threshold, a 1 MiB payload diverges (single-threaded
+//! 1,063,714 bytes against one-worker MT's 1,063,762), which is what
+//! `a_grant_of_one_worker_still_round_trips` below exercises. And, again
+//! mirroring `xz_pure.rs`: **worker count, once above one, does not change
+//! the output bytes at all** — a 2 MiB preset-0 payload (spanning multiple
+//! 768 KiB members) produces byte-identical output at one worker and at
+//! four, because member boundaries are fixed by `member_size` alone. No
+//! payload size exists at which this codec's own output could prove
+//! multiple workers actually ran; `parallel_output_decodes_to_the_same_plaintext_as_single_threaded`
+//! below proves correctness under a genuinely multi-member encode instead,
+//! and says so in its own comment.
+//!
+//! **No integrity-check call is needed on the MT path.** LZIP's trailer CRC32
+//! is mandatory in every member regardless of how it was produced (see the
+//! "Corruption detection" section above) — there is no per-writer check-type
+//! choice the way xz's `CheckType` is, so nothing analogous to
+//! `xz_pure.rs`'s CRC64 note applies here.
 //!
 //! ## Cross-implementation validation: the reference `lzip` tool, plus liblzma at the payload level
 //!
@@ -297,8 +341,9 @@
 //! header, trailer and multi-member framing) that `liblzma` never sees.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::num::NonZeroU64;
 
-use lzma_rust2::{LzipOptions, LzipReader, LzipWriter};
+use lzma_rust2::{LzipOptions, LzipReader, LzipWriter, LzipWriterMt};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
@@ -343,6 +388,12 @@ impl Codec for Lzip {
             // preset 6's dictionary (8 MiB) — see the module doc.
             memory_per_worker: Some(8 * 1024 * 1024),
             weak_encoder: false,
+            // `lzma_rust2::LzipWriterMt` is real: `encoder` below wires it
+            // to a governor grant, using `member_size_for`'s three-times-
+            // the-dictionary figure — see the module doc's "Parallel
+            // encode" section for why that figure and for the refusal path
+            // (a grant of one runs single-threaded, not an error).
+            parallel_encode: true,
             ..CodecCaps::round_trip()
         }
     }
@@ -378,6 +429,10 @@ impl Codec for Lzip {
         }
     }
 
+    /// Single-threaded by default; opts into `lzma_rust2::LzipWriterMt` when
+    /// the governor grants more than one worker. See the module doc's
+    /// "Parallel encode" section for the member size chosen and the
+    /// refusal path.
     fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
         // Not redundant with `ops`'s own pre-flight call: `encoder` is a
         // public trait method any caller can reach directly without going
@@ -388,34 +443,121 @@ impl Codec for Lzip {
         // `check_encode_opts`.
         self.check_encode_opts(o)?;
         let level = o.level.unwrap_or(6) as u32;
-        let opts = LzipOptions::with_preset(level);
-        let writer = LzipWriter::new(dst, opts);
-        Ok(Box::new(LzipSink(writer)))
+
+        // `filter(|n| *n > 0)`, not a bare unwrap_or_else: `--threads 0`
+        // means AUTO, and passing 0 through as a request would ask for zero
+        // workers. Mirrors `xz_pure.rs`'s and `xz_c.rs`'s `encoder`.
+        let (writer, lease) = match &o.governor {
+            Some(gov) => {
+                let want = o
+                    .threads
+                    .filter(|n| *n > 0)
+                    .unwrap_or_else(|| gov.workers());
+                let granted = gov.acquire_many(want, self.caps().memory_per_worker.unwrap_or(0));
+                // A grant of one is single-threaded: `LzipWriterMt::new(_,
+                // _, 1)` is a different code path from `LzipWriter::new`
+                // with nothing to gain from it — `acquire_many` clamps
+                // rather than failing, so a tight budget is a smaller grant
+                // here, never an error. See the module doc's "Parallel
+                // encode" section for the measurement backing this guard's
+                // test.
+                let writer = if granted.workers() > 1 {
+                    let mut opts = LzipOptions::with_preset(level);
+                    opts.set_member_size(Some(member_size_for(&opts)));
+                    LzipPureWriter::Mt(Box::new(LzipWriterMt::new(
+                        dst,
+                        opts,
+                        granted.workers() as u32,
+                    )?))
+                } else {
+                    // Not a single member by any special case: `member_size`
+                    // is left `None`, so `LzipWriter` never partitions.
+                    LzipPureWriter::St(Box::new(LzipWriter::new(
+                        dst,
+                        LzipOptions::with_preset(level),
+                    )))
+                };
+                (writer, Some(granted))
+            }
+            None => {
+                let writer = LzipWriter::new(dst, LzipOptions::with_preset(level));
+                (LzipPureWriter::St(Box::new(writer)), None)
+            }
+        };
+        Ok(Box::new(LzipSink {
+            writer,
+            _lease: lease,
+        }))
     }
 }
 
-struct LzipSink(LzipWriter<Box<dyn Write + Send>>);
+/// This codec's member size for `LzipWriterMt`: three times the preset's
+/// dictionary size, mirroring `xz_pure.rs`'s `block_size_for` — see the
+/// module doc's "Parallel encode" section for the full justification.
+/// `dict_size` is always positive (256 KiB at preset 0 through 64 MiB at
+/// preset 9), so tripling it can never be zero.
+fn member_size_for(opts: &LzipOptions) -> NonZeroU64 {
+    NonZeroU64::new(u64::from(opts.lzma_options.dict_size) * 3)
+        .expect("a preset's dict_size is always positive")
+}
 
-impl Write for LzipSink {
+/// Either writer this codec's `encoder` can produce, unified so `LzipSink`
+/// needs only one field regardless of which path was taken.
+enum LzipPureWriter {
+    St(Box<LzipWriter<Box<dyn Write + Send>>>),
+    Mt(Box<LzipWriterMt<Box<dyn Write + Send>>>),
+}
+
+impl Write for LzipPureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
+        match self {
+            LzipPureWriter::St(w) => w.write(buf),
+            LzipPureWriter::Mt(w) => w.write(buf),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        match self {
+            LzipPureWriter::St(w) => w.flush(),
+            LzipPureWriter::Mt(w) => w.flush(),
+        }
+    }
+}
+
+struct LzipSink {
+    writer: LzipPureWriter,
+    /// Held, not read. Dropping it returns the workers and bytes to the
+    /// governor, and `Drop` runs on error paths too — mirrors `xz_pure.rs`'s
+    /// `XzPureSink` and `zstd_c.rs`'s `ZstdSink`.
+    _lease: Option<stuffr_core::LeaseSet>,
+}
+
+impl Write for LzipSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
     }
 }
 
 impl Sink for LzipSink {
-    /// Writes the trailer of the last open member.
+    /// Writes the trailer of the last open member (or members, on the MT
+    /// path). The governor lease (if any) is released when `self` drops at
+    /// the end of this call.
     ///
-    /// `lzma_rust2::LzipWriter::finish` returns `io::Result<W>` (the inner
-    /// destination), propagating a genuine write error encountered during
-    /// finalisation rather than discarding it — no `CaptureWriteError`
-    /// adapter needed, the same as `lzma_pure.rs` and `xz_pure.rs`.
+    /// Both `LzipWriter::finish` and `LzipWriterMt::finish` return
+    /// `io::Result<W>` (the inner destination), propagating a genuine write
+    /// error encountered during finalisation rather than discarding it — no
+    /// `CaptureWriteError` adapter needed, the same as `lzma_pure.rs` and
+    /// `xz_pure.rs`.
     fn finish(self: Box<Self>) -> Result<()> {
-        let LzipSink(writer) = *self;
-        let mut w = writer.finish()?;
+        let LzipSink { writer, _lease } = *self;
+        let mut w = match writer {
+            LzipPureWriter::St(w) => w.finish()?,
+            LzipPureWriter::Mt(w) => w.finish()?,
+        };
         w.flush()?;
         Ok(())
     }
@@ -924,6 +1066,26 @@ mod tests {
         encode_for_test(plain)
     }
 
+    /// Encodes at preset 0 rather than the default 6, for the parallel
+    /// encode tests below — mirrors `xz_pure.rs`'s helper of the same name:
+    /// preset 0's member size (768 KiB, three times its 256 KiB dictionary)
+    /// is small enough that a payload well above it still encodes fast.
+    fn compress_fastest(plain: &[u8]) -> Vec<u8> {
+        let buf = SharedBuf::new();
+        let mut sink = Lzip
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    level: Some(0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(plain).unwrap();
+        sink.finish().unwrap();
+        buf.contents()
+    }
+
     fn decompress(bytes: Vec<u8>) -> Vec<u8> {
         let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
         let mut dec = Lzip.decoder(src, &DecodeOpts::default()).unwrap();
@@ -973,7 +1135,8 @@ mod tests {
     fn capabilities_and_metadata_match_the_format() {
         let c = Lzip.caps();
         assert!(c.encode && c.decode);
-        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
+        assert!(c.parallel_encode, "1f: lzma_rust2::LzipWriterMt");
+        assert!(!c.frame_index, "not until 1f");
         assert!(!c.weak_encoder, "a full codec, not a weaker fallback");
         let m = meta();
         assert_eq!(m.id, LZIP);
@@ -1296,6 +1459,135 @@ mod tests {
         );
     }
 
+    // --- Parallel encode (Phase 1f Task 6) — see the module doc's
+    // "Parallel encode" section for the measurements these tests rest on.
+
+    #[test]
+    fn parallel_encode_is_declared() {
+        assert!(
+            Lzip.caps().parallel_encode,
+            "lzip's lzma_rust2 backend has LzipWriterMt"
+        );
+    }
+
+    #[test]
+    fn a_governor_grant_is_used_and_released() {
+        // Property 12 covers this generically; pinned here so a regression
+        // names this module rather than the harness.
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let gov = stuffr_core::Governor::new(4, 64 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Lzip
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&incompressible(1024 * 1024)).unwrap();
+        assert!(
+            gov.outstanding() > 0,
+            "the sink must hold its lease while encoding"
+        );
+        sink.finish().unwrap();
+        assert_eq!(gov.outstanding(), 0, "finish must release the lease");
+    }
+
+    #[test]
+    fn a_grant_of_one_worker_still_round_trips() {
+        // THE REFUSAL PATH, and the one most likely to be written wrong.
+        // `acquire_many` clamps rather than failing: a memory limit below
+        // one worker's demand yields exactly one worker, and the codec must
+        // run single-threaded rather than erroring or oversubscribing.
+        //
+        // The payload here MUST exceed the member size at the level under
+        // test — see the module doc's "Parallel encode" section: below the
+        // member size, `LzipWriterMt` at one worker is byte-identical to
+        // `LzipWriter` regardless of whether the `granted.workers() > 1`
+        // guard is even present. Level 0's member size is 768 KiB (three
+        // times its 256 KiB dictionary); 1 MiB clears it with headroom, and
+        // encoding at level 0 keeps this fast.
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(1024 * 1024);
+        // 1 byte of budget against a multi-MiB per-worker demand.
+        let gov = stuffr_core::Governor::new(8, 1);
+        let buf = SharedBuf::new();
+        let mut sink = Lzip
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    level: Some(0),
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        assert_eq!(
+            decompress(buf.contents()),
+            plain,
+            "a one-worker grant must still work"
+        );
+
+        // AND the bytes must match a no-governor, single-threaded encode at
+        // the same level exactly.
+        //
+        // Measured (single-threaded len / one-worker-MT len at level 0 on
+        // this 1 MiB payload, above the 768 KiB member size): 1,063,714 /
+        // 1,063,762 — always unequal above the threshold, which is what
+        // makes this assertion able to catch a deleted guard.
+        assert_eq!(
+            buf.contents(),
+            compress_fastest(&plain),
+            "a one-worker grant must produce byte-identical output to a \
+             single-threaded encode. If this differs, the `granted.workers() \
+             > 1` guard has been removed and the MT writer is being used for \
+             a grant with nothing to parallelise."
+        );
+    }
+
+    #[test]
+    fn parallel_output_decodes_to_the_same_plaintext_as_single_threaded() {
+        // Bytes may differ from a single-threaded encode — multi-threaded
+        // LZIP splits input into members. DATA may not. Asserting the
+        // plaintext rather than the bytes is the whole reason parallelism
+        // is safe to offer.
+        //
+        // The 2 MiB payload, at level 0 (768 KiB member size), spans
+        // multiple members — well above the threshold, so this is a
+        // genuinely multi-member encode, not the single-member case the
+        // module doc warns produces identical bytes regardless of worker
+        // count. What this test CANNOT do, and does not attempt: prove
+        // multiple workers actually ran — measured directly (see the module
+        // doc), this backend's output bytes do not change with worker count
+        // at all, only `member_size` decides the member boundaries.
+        // Correctness under a real multi-member encode is the property this
+        // test proves instead.
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(2 * 1024 * 1024);
+        let st = compress_fastest(&plain);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Lzip
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    level: Some(0),
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        assert_eq!(decompress(buf.contents()), decompress(st));
+    }
+
     // --- Reference `lzip` binary interop — see the module doc's
     // "Cross-implementation validation" section.
 
@@ -1310,6 +1602,71 @@ mod tests {
             let candidate = dir.join("lzip");
             candidate.is_file().then_some(candidate)
         })
+    }
+
+    /// Cross-implementation arbiter for the parallel path specifically: a
+    /// stream `LzipWriterMt` produced must be accepted and correctly
+    /// decoded by the reference `lzip` tool, not just by this codec's own
+    /// decoder — mirrors `the_system_lzip_tool_accepts_what_this_writes`
+    /// below, but through the governed encoder path. Uses
+    /// `EncodeOpts::default()` (level 6, 24 MiB member size) on a 2 MiB
+    /// payload — below the member size, so this is a single-member MT
+    /// stream; it proves format compatibility, not multi-member splitting
+    /// (`parallel_output_decodes_to_the_same_plaintext_as_single_threaded`
+    /// above already covers that).
+    #[test]
+    fn the_system_lzip_tool_accepts_our_parallel_output() {
+        let Some(lzip) = which_lzip() else {
+            return;
+        };
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(2 * 1024 * 1024);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Lzip
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        let packed = buf.contents();
+
+        let path = std::env::temp_dir().join("stf-lzip-interop-parallel.lz");
+        std::fs::write(&path, &packed).unwrap();
+
+        let test = std::process::Command::new(&lzip)
+            .arg("-t")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            test.status.success(),
+            "system lzip -t rejected our parallel output: {}",
+            String::from_utf8_lossy(&test.stderr)
+        );
+
+        let cat = std::process::Command::new(&lzip)
+            .arg("-dc")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            cat.status.success(),
+            "system lzip -dc failed on our parallel output: {}",
+            String::from_utf8_lossy(&cat.stderr)
+        );
+        assert_eq!(
+            cat.stdout, plain,
+            "system lzip decoded our parallel output to different bytes"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The write direction: a member THIS codec writes must be accepted and

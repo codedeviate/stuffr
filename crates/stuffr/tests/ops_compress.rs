@@ -700,26 +700,64 @@ fn the_c_backend_wins_when_both_zstd_features_are_compiled() {
     );
 }
 
-/// xz's counterpart to the zstd test above, added once Phase 1f's Task 5
-/// gave `parallel_encode` an observable difference between xz's two
-/// backends — see `stuffr-formats/src/lib.rs`'s `backend_selection` module
-/// doc for the full history: xz used to have no selection test at all,
-/// because through Phase 1e the two backends were genuinely
-/// indistinguishable through the `Codec` interface. `xz_c`'s
-/// `MtStreamBuilder`-driven parallel encode (this task) broke that premise
-/// without a matching change to `xz_pure`, so `caps().parallel_encode` is
-/// now the discriminator, the same role `weak_encoder` plays for zstd.
+/// xz's counterpart to the zstd test above.
+///
+/// `caps().parallel_encode` was this discriminator through Phase 1f's Task
+/// 5 (which gave `xz_c` `MtStreamBuilder` without a matching change to
+/// `xz_pure`) but stopped being one once Task 6 gave `xz_pure`
+/// `XzWriterMt`: both backends now declare `parallel_encode: true`, so that
+/// field can no longer tell them apart — see `stuffr-formats/src/lib.rs`'s
+/// `backend_selection` module doc for the full history of both changes.
+///
+/// The discriminator that survives is the two backends' PARALLEL OUTPUT
+/// BYTES, which still differ even though their capabilities no longer do:
+/// liblzma's `MtStreamBuilder` and lzma-rust2's `XzWriterMt` write different
+/// multi-threaded container framing for the same governed encode — measured
+/// directly, and true at every size checked from 1 byte up, not just large
+/// ones (1 byte: 68 against 60; 1 KiB: 1,092 against 1,084; 1 MiB: 1,048,696
+/// against 1,048,684). A 64 KiB incompressible payload is used here only to
+/// keep the test cheap, not because smaller sizes fail to discriminate.
 #[test]
 #[cfg(all(feature = "xz-c", feature = "xz-pure"))]
 fn the_c_backend_wins_when_both_xz_features_are_compiled() {
+    use std::io::Write;
+    use std::sync::Arc;
+    use stuffr_core::{Codec, EncodeOpts};
+
+    let encode = |codec: &dyn Codec, plain: &[u8], opts: &EncodeOpts| -> Vec<u8> {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut sink = codec.encoder(Box::new(buf.clone()), opts).unwrap();
+        sink.write_all(plain).unwrap();
+        sink.finish().unwrap();
+        buf.contents()
+    };
+
+    let plain = stuffr_core::testing::incompressible(64 * 1024);
+    let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+    let opts = EncodeOpts {
+        governor: Some(Arc::clone(&gov)),
+        ..Default::default()
+    };
+
+    let via_c = encode(&stuffr_formats::xz_c::Xz, &plain, &opts);
+    let via_pure = encode(&stuffr_formats::xz_pure::Xz, &plain, &opts);
+    assert_ne!(
+        via_c, via_pure,
+        "the two xz backends' parallel output bytes now agree — this test's \
+         discriminator has stopped discriminating; see this test's own doc \
+         for what to replace it with"
+    );
+
     let reg = stuffr::registry();
     let id = fmt("xz");
-    let caps = reg.codec(id).expect("xz must be registered").caps();
-    assert!(
-        caps.parallel_encode,
-        "xz's C backend must win when both xz-c and xz-pure are compiled — \
-         parallel_encode=false means the pure backend silently took over, exactly \
-         the regression register_all's `not(feature = \"xz-c\")` guard exists to \
+    let registered = reg.codec(id).expect("xz must be registered");
+    let via_registered = encode(registered.as_ref(), &plain, &opts);
+    assert_eq!(
+        via_registered, via_c,
+        "xz's C backend must win when both xz-c and xz-pure are compiled — the \
+         registered codec's parallel output matched xz_pure's bytes instead of \
+         xz_c's, meaning the pure backend silently took over, exactly the \
+         regression register_all's `not(feature = \"xz-c\")` guard exists to \
          prevent"
     );
 }

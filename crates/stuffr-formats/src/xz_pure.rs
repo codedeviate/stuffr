@@ -123,6 +123,67 @@
 //! the default preset rather than preset 9's 64 MiB, or the much larger
 //! multi-hundred-MiB figure Phase 1f's parallel encode will need.
 //!
+//! ## Parallel encode: block size, and why the single-worker guard needs an
+//! ## above-threshold payload to be testable
+//!
+//! `lzma_rust2::XzWriterMt::new` REFUSES to construct without a block size:
+//! measured directly, calling it with `XzOptions::default()`'s `block_size:
+//! None` returns `error_invalid_input("block size must be set")` rather than
+//! picking a default the way liblzma's `lzma_stream_encoder_mt` does when
+//! its own block size is left at `LZMA_VLI_UNKNOWN`. So this codec must pick
+//! one, and `encoder` below sets it to **three times the preset's
+//! dictionary size** — `block_size_for` — mirroring liblzma's own
+//! documented convention for `lzma_stream_encoder_mt` rather than inventing
+//! a figure. The crate floors the effective size at the dictionary itself
+//! (`block_size.max(dict_size)`), so this codec only has to choose the
+//! multiplier, not guard the floor. At the default preset (6, 8 MiB
+//! dictionary) that is 24 MiB. **Task 7, which measures `memory_per_worker`
+//! for parallel encode, measures it against this 24 MiB figure** — this
+//! module still declares the single-worker 8 MiB figure below, unchanged,
+//! the same posture `xz_c.rs`'s `caps()` doc documents for its own
+//! `MtStreamBuilder` figure.
+//!
+//! **A payload at or below the block size yields ONE block, and this
+//! backend's one-block MT output is BYTE-IDENTICAL to the single-threaded
+//! writer's** — measured directly at the default preset: an 8 MiB payload
+//! produces identical bytes whether `block_size` is set to 8 MiB or 24 MiB
+//! (one block either way), and at preset 0 (768 KiB block size, three times
+//! its 256 KiB dictionary), `XzWriterMt` with exactly one worker matches
+//! `XzWriter` byte-for-byte at every size swept from 1 byte to 512 KiB. That
+//! is a real difference from `xz_c.rs`'s `liblzma` backend, whose
+//! `MtStreamBuilder` container differs from its single-threaded encoder's
+//! output at every size measured there, down to one byte — so the same
+//! "MT-with-one-worker against single-threaded" byte-equality test that
+//! discriminates `xz_c`'s `granted.workers() > 1` guard at 512 KiB proves
+//! nothing here at that size, because both paths would produce the same
+//! bytes regardless of whether the guard is even present. **The guard-under-
+//! test payload here must exceed the block size at the level under test** —
+//! measured at preset 0's 768 KiB block size, a 1 MiB payload already
+//! diverges (single-threaded 1,048,684 bytes against one-worker MT's
+//! 1,048,716), which is what `a_grant_of_one_worker_still_round_trips` below
+//! actually exercises.
+//!
+//! **Worker count, once above one, does not change the output bytes at
+//! all** — measured directly: a 2 MiB preset-0 payload (which spans three
+//! 768 KiB blocks) produces byte-identical output at one worker and at
+//! four. Block boundaries are fixed by `block_size` alone; the worker count
+//! only changes how many of those blocks compress concurrently, not what
+//! they compress to. So unlike `zstd_c.rs`'s equivalent test, no payload
+//! size exists at which this codec's own output could prove multiple
+//! workers actually ran — `parallel_output_decodes_to_the_same_plaintext_as_single_threaded`
+//! below proves correctness (a genuinely multi-block encode still decodes
+//! to the original plaintext) rather than a byte-level parallelism signal,
+//! and says so in its own comment.
+//!
+//! **The integrity check needs no `.check()` call on the MT path either.**
+//! `XzOptions::with_preset` already selects `CheckType::Crc64`
+//! unconditionally (see the section above), and `XzWriterMt` reads that same
+//! field — measured directly on parallel output: stream header byte 7 is
+//! `0x04` (CRC64), with nothing to opt into. This is the opposite of
+//! `xz_c.rs`'s `liblzma` binding, whose `MtStreamBuilder` selects no check
+//! type of its own and needs an explicit `.check(Check::Crc64)`; there is no
+//! equivalent call to hunt for here.
+//!
 //! ## KNOWN LIMITATION: decode memory is bounded by the file, not by us
 //!
 //! `XzReader::new` allocates a dictionary buffer sized by the value the
@@ -160,8 +221,9 @@
 //! rushed.
 
 use std::io::Write;
+use std::num::NonZeroU64;
 
-use lzma_rust2::{XzOptions, XzReader, XzWriter};
+use lzma_rust2::{XzOptions, XzReader, XzWriter, XzWriterMt};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
@@ -191,6 +253,12 @@ impl Codec for Xz {
             // Measured at ratio parity with liblzma (see the module doc) —
             // this is a real codec, not a weaker stand-in like zstd_pure's.
             weak_encoder: false,
+            // `lzma_rust2::XzWriterMt` is real: `encoder` below wires it to
+            // a governor grant, using `block_size_for`'s three-times-the-
+            // dictionary figure — see the module doc's "Parallel encode"
+            // section for why that figure and for the refusal path (a grant
+            // of one runs single-threaded, not an error).
+            parallel_encode: true,
             ..CodecCaps::round_trip()
         }
     }
@@ -248,6 +316,11 @@ impl Codec for Xz {
         }
     }
 
+    /// Single-threaded by default; opts into `lzma_rust2::XzWriterMt` when
+    /// the governor grants more than one worker. See the module doc's
+    /// "Parallel encode" section for the block size chosen, the refusal
+    /// path, and why no `.check()` call is needed on the MT path (unlike
+    /// `xz_c.rs`'s `MtStreamBuilder`).
     fn encoder(&self, dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
         // Not redundant with `ops`'s own pre-flight call: `encoder` is a
         // public trait method any caller can reach directly without going
@@ -257,39 +330,125 @@ impl Codec for Xz {
         // property 6 keeps this in step with `check_encode_opts`.
         self.check_encode_opts(o)?;
         let level = o.level.unwrap_or(6) as u32;
-        let opts = XzOptions::with_preset(level);
-        // `XzWriter::new` returns a `Result` only because it also validates
-        // a caller-supplied filter chain (at most 3 pre-filters); this
-        // codec never sets any, so this can only ever be `Ok` in practice —
-        // propagated with `?` anyway, defensively, rather than `.unwrap()`.
-        let writer = XzWriter::new(dst, opts)?;
-        Ok(Box::new(XzPureSink(writer)))
+
+        // `filter(|n| *n > 0)`, not a bare unwrap_or_else: `--threads 0`
+        // means AUTO, and passing 0 through as a request would ask for zero
+        // workers. Mirrors `xz_c.rs`'s and `zstd_c.rs`'s `encoder`.
+        let (writer, lease) = match &o.governor {
+            Some(gov) => {
+                let want = o
+                    .threads
+                    .filter(|n| *n > 0)
+                    .unwrap_or_else(|| gov.workers());
+                let granted = gov.acquire_many(want, self.caps().memory_per_worker.unwrap_or(0));
+                // A grant of one is single-threaded: `XzWriterMt::new(_, _,
+                // 1)` is a different code path from `XzWriter::new` with
+                // nothing to gain from it — `acquire_many` clamps rather
+                // than failing, so a tight budget is a smaller grant here,
+                // never an error. See the module doc's "Parallel encode"
+                // section for the measurement backing this guard's test.
+                let writer = if granted.workers() > 1 {
+                    let mut opts = XzOptions::with_preset(level);
+                    opts.set_block_size(Some(block_size_for(&opts)));
+                    // `XzWriterMt::new` returns `lzma_rust2::Result`, which
+                    // is `io::Result` under this crate's `std` feature (see
+                    // `lib.rs`'s `pub(crate) use std::io::Error;`), so `?`
+                    // converts the same way `XzWriter::new`'s does below.
+                    XzPureWriter::Mt(Box::new(XzWriterMt::new(
+                        dst,
+                        opts,
+                        granted.workers() as u32,
+                    )?))
+                } else {
+                    // Not a single block by any special case: `block_size`
+                    // is left `None`, so `XzWriter` never partitions.
+                    XzPureWriter::St(Box::new(XzWriter::new(dst, XzOptions::with_preset(level))?))
+                };
+                (writer, Some(granted))
+            }
+            None => {
+                let writer = XzWriter::new(dst, XzOptions::with_preset(level))?;
+                (XzPureWriter::St(Box::new(writer)), None)
+            }
+        };
+        Ok(Box::new(XzPureSink {
+            writer,
+            _lease: lease,
+        }))
     }
 }
 
-struct XzPureSink(XzWriter<Box<dyn Write + Send>>);
+/// This codec's block size for `XzWriterMt`: three times the preset's
+/// dictionary size, mirroring liblzma's own documented convention for
+/// `lzma_stream_encoder_mt` — see the module doc's "Parallel encode"
+/// section for the full justification, the refusal-without-a-block-size
+/// measurement it responds to, and the payload-size consequences.
+/// `dict_size` is always positive (256 KiB at preset 0 through 64 MiB at
+/// preset 9), so tripling it can never be zero.
+fn block_size_for(opts: &XzOptions) -> NonZeroU64 {
+    NonZeroU64::new(u64::from(opts.lzma_options.dict_size) * 3)
+        .expect("a preset's dict_size is always positive")
+}
 
-impl Write for XzPureSink {
+/// Either writer this codec's `encoder` can produce, unified so `XzPureSink`
+/// needs only one field regardless of which path was taken.
+enum XzPureWriter {
+    St(Box<XzWriter<Box<dyn Write + Send>>>),
+    Mt(Box<XzWriterMt<Box<dyn Write + Send>>>),
+}
+
+impl Write for XzPureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
+        match self {
+            XzPureWriter::St(w) => w.write(buf),
+            XzPureWriter::Mt(w) => w.write(buf),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        match self {
+            XzPureWriter::St(w) => w.flush(),
+            XzPureWriter::Mt(w) => w.flush(),
+        }
+    }
+}
+
+struct XzPureSink {
+    writer: XzPureWriter,
+    /// Held, not read. Dropping it returns the workers and bytes to the
+    /// governor, and `Drop` runs on error paths too — which is why the
+    /// lease lives here rather than in `encoder()`'s stack frame. Mirrors
+    /// `zstd_c.rs`'s `ZstdSink` and `xz_c.rs`'s `XzSink`.
+    _lease: Option<stuffr_core::LeaseSet>,
+}
+
+impl Write for XzPureSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
     }
 }
 
 impl Sink for XzPureSink {
-    /// Writes the closing block, index and stream footer.
+    /// Writes the closing block(s), index and stream footer. The governor
+    /// lease (if any) is released when `self` drops at the end of this
+    /// call.
     ///
-    /// `XzWriter::finish` returns `io::Result<W>` (the inner destination),
-    /// propagating a genuine write error encountered during finalisation
-    /// rather than discarding it the way brotli's `into_inner` does (see
-    /// `crate::normalize`'s `CaptureWriteError` doc for that contrasting
-    /// case) — no such adapter is needed here.
+    /// Both `XzWriter::finish` and `XzWriterMt::finish` return
+    /// `io::Result<W>` (the inner destination), propagating a genuine write
+    /// error encountered during finalisation rather than discarding it the
+    /// way brotli's `into_inner` does (see `crate::normalize`'s
+    /// `CaptureWriteError` doc for that contrasting case) — no such adapter
+    /// is needed here.
     fn finish(self: Box<Self>) -> Result<()> {
-        let XzPureSink(writer) = *self;
-        let mut w = writer.finish()?;
+        let XzPureSink { writer, _lease } = *self;
+        let mut w = match writer {
+            XzPureWriter::St(w) => w.finish()?,
+            XzPureWriter::Mt(w) => w.finish()?,
+        };
         w.flush()?;
         Ok(())
     }
@@ -642,7 +801,8 @@ mod tests {
     fn capabilities_and_metadata_match_the_format() {
         let c = Xz.caps();
         assert!(c.encode && c.decode);
-        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
+        assert!(c.parallel_encode, "1f: lzma_rust2::XzWriterMt");
+        assert!(!c.frame_index, "not until 1f");
         assert!(!c.weak_encoder, "measured at ratio parity with liblzma");
         let m = meta();
         assert_eq!(m.id, XZ);
@@ -787,5 +947,172 @@ mod tests {
         let plain = b"cross-backend: liblzma writes, lzma-rust2 reads".repeat(50);
         let packed = crate::xz_c::encode_for_test(plain.as_slice());
         assert_eq!(decompress(packed), plain);
+    }
+
+    // --- Parallel encode (Phase 1f Task 6) — see the module doc's
+    // "Parallel encode" section for the measurements these tests rest on.
+
+    #[test]
+    fn parallel_encode_is_declared() {
+        assert!(
+            Xz.caps().parallel_encode,
+            "xz_pure's lzma_rust2 backend has XzWriterMt"
+        );
+    }
+
+    #[test]
+    fn a_governor_grant_is_used_and_released() {
+        // Property 12 covers this generically; pinned here so a regression
+        // names this module rather than the harness.
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let gov = stuffr_core::Governor::new(4, 64 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&incompressible(1024 * 1024)).unwrap();
+        assert!(
+            gov.outstanding() > 0,
+            "the sink must hold its lease while encoding"
+        );
+        sink.finish().unwrap();
+        assert_eq!(gov.outstanding(), 0, "finish must release the lease");
+    }
+
+    #[test]
+    fn a_grant_of_one_worker_still_round_trips() {
+        // THE REFUSAL PATH, and the one most likely to be written wrong.
+        // `acquire_many` clamps rather than failing: a memory limit below
+        // one worker's demand yields exactly one worker, and the codec must
+        // run single-threaded rather than erroring or oversubscribing.
+        //
+        // Unlike `xz_c.rs`'s and `zstd_c.rs`'s equivalent tests, the payload
+        // here MUST exceed the block size at the level under test — see the
+        // module doc's "Parallel encode" section: below the block size,
+        // `XzWriterMt` at one worker is byte-identical to `XzWriter`
+        // regardless of whether the `granted.workers() > 1` guard is even
+        // present, so a small payload could not catch a deleted guard. Level
+        // 0's block size is 768 KiB (three times its 256 KiB dictionary);
+        // 1 MiB clears it with headroom, and encoding at level 0 keeps this
+        // fast (see `compress_fastest`'s doc for why).
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(1024 * 1024);
+        // 1 byte of budget against a multi-MiB per-worker demand.
+        let gov = stuffr_core::Governor::new(8, 1);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    level: Some(0),
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        assert_eq!(
+            decompress(buf.contents()),
+            plain,
+            "a one-worker grant must still work"
+        );
+
+        // AND the bytes must match a no-governor, single-threaded encode at
+        // the same level exactly.
+        //
+        // Measured (single-threaded len / one-worker-MT len at level 0 on
+        // this 1 MiB payload, above the 768 KiB block size): 1,048,684 /
+        // 1,048,716 — always unequal above the threshold, which is what
+        // makes this assertion able to catch a deleted guard.
+        assert_eq!(
+            buf.contents(),
+            compress_fastest(&plain),
+            "a one-worker grant must produce byte-identical output to a \
+             single-threaded encode. If this differs, the `granted.workers() \
+             > 1` guard has been removed and the MT writer is being used for \
+             a grant with nothing to parallelise."
+        );
+    }
+
+    #[test]
+    fn parallel_output_decodes_to_the_same_plaintext_as_single_threaded() {
+        // Bytes may differ from a single-threaded encode — multi-threaded
+        // xz splits input into blocks. DATA may not. Asserting the
+        // plaintext rather than the bytes is the whole reason parallelism
+        // is safe to offer.
+        //
+        // The 2 MiB payload, at level 0 (768 KiB block size), spans three
+        // blocks — well above the threshold, so this is a genuinely
+        // multi-block encode, not the single-block case the module doc
+        // warns produces identical bytes regardless of worker count. What
+        // this test CANNOT do, and does not attempt: prove multiple workers
+        // actually ran. Measured directly (see the module doc), this
+        // backend's output bytes do not change with worker count at all —
+        // only `block_size` decides the block boundaries — so no byte
+        // comparison in this module can serve as a parallelism signal the
+        // way `zstd_c.rs`'s can. Correctness under a real multi-block encode
+        // is the property this test proves instead.
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(2 * 1024 * 1024);
+        let st = compress_fastest(&plain);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    level: Some(0),
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        assert_eq!(decompress(buf.contents()), decompress(st));
+    }
+
+    /// Cross-backend arbiter for the parallel path specifically: a stream
+    /// `XzWriterMt` produced must be readable by `xz_c.rs`'s `liblzma`
+    /// binding too, not just by this codec's own decoder. Uses
+    /// `EncodeOpts::default()` (level 6, 24 MiB block size) on a 2 MiB
+    /// payload — below the block size, so this is a single-block MT stream;
+    /// it proves format compatibility, not multi-block splitting (the test
+    /// above already covers that).
+    #[test]
+    #[cfg(feature = "xz-c")]
+    fn liblzma_reads_our_parallel_output() {
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(2 * 1024 * 1024);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        let src: Box<dyn Source> =
+            Box::new(ReaderSource::new(std::io::Cursor::new(buf.contents())));
+        let mut dec = crate::xz_c::Xz
+            .decoder(src, &DecodeOpts::default())
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
     }
 }
