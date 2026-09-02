@@ -9,7 +9,7 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 1 complete at `0.1.0` — eleven codecs, four of them
+> **Status: Phase 1 complete at `0.1.0` — eleven codecs, three of them
 > parallel on request, and a default build that needs no C toolchain to read
 > *or write* xz, LZMA1 or LZIP.** `stf pack`, `unpack`, `cat`, `info` and
 > `formats` all work, on files and through pipes, and
@@ -45,10 +45,13 @@ read list.
 > `weak` rather than `yes` in that row, so a build's honesty is visible without
 > running anything.
 >
-> **Parallel encode, opt-in and off by default.** Four of the eleven codecs
-> encode in parallel when asked: `zstd` (behind `--features c-backed`; the
-> default `ruzstd` encoder has no multi-threaded path), `xz` on both
-> backends, and `lzip`. `--threads N`, `--threads 0` (auto), `--turbo` and
+> **Parallel encode, opt-in and off by default.** Three of the eleven
+> formats parallelise when asked — `xz` and `lzip` on every build, and
+> `zstd` behind `--features c-backed` (the default `ruzstd` encoder has no
+> multi-threaded path) — across four codec *implementations* (`zstd-c`,
+> `xz-c`, `xz-pure`, `lzip`): `xz-c` and `xz-pure` are the same format and
+> registration picks exactly one, so no single build ever has more than
+> three parallel rows. `--threads N`, `--threads 0` (auto), `--turbo` and
 > `STF_THREADS` all enable it; omitting every one of them encodes
 > single-threaded, so the same input always produces the same bytes.
 > Reproducibility is scoped precisely — **same input + same flags + same

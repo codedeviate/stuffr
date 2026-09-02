@@ -243,21 +243,29 @@ PARALLEL ENCODE FLAGS
 
   stf pack big.dat --format xz --threads 4
       Encode with 4 worker threads instead of stf's default of one. Only
-      FOUR of this build's eleven codecs actually parallelise their
-      encoder: zstd (only with --features c-backed; the default ruzstd
-      encoder has no multi-threaded path), xz (either backend) and lzip.
-      The other seven accept --threads without error but encode
+      THREE of this build's eleven formats actually parallelise their
+      encoder: xz and lzip on every build, and zstd only with --features
+      c-backed (the default ruzstd encoder has no multi-threaded path).
+      Counted by implementation rather than format this is four
+      (zstd-c, xz-c, xz-pure, lzip), because xz has two interchangeable
+      backends — but xz-c and xz-pure register the same format and never
+      both compile in, so no single build ever shows more than three
+      PARALLEL rows in `stf formats`. The other eight (nine counting only
+      one xz backend) accept --threads without error but encode
       single-threaded regardless, since their crates expose no MT encoder
       to hand a worker count to. --threads is deliberately opt-in rather
       than auto-detected: a multi-threaded encoder splits its input across
       workers, so the very same file compresses to different bytes
-      depending on how many workers ran. Omitting --threads (and --turbo
-      and --memory-limit, and leaving STF_THREADS unset) keeps pack
-      single-threaded, so a given input, given the same flags and the same
-      environment, always produces the same output bytes — "same machine"
-      is not part of the promise once --threads 0 is in play, because
-      auto-detection resolves against cgroup CPU quotas, not just core
-      count. Passing --threads 0 asks stf to auto-detect a worker count
+      depending on how many workers ran. Omitting --threads (and --turbo,
+      and leaving STF_THREADS unset) keeps pack single-threaded, so a
+      given input, given the same flags and the same environment, always
+      produces the same output bytes — "same machine" is not part of the
+      promise once --threads 0 is in play, because auto-detection
+      resolves against cgroup CPU quotas, not just core count.
+      --memory-limit does not affect this: it bounds allocation and the
+      worker count the governor can grant, never which bytes a worker
+      count already granted produces. Passing --threads 0 asks stf to
+      auto-detect a worker count
       instead, trading that byte-for-byte reproducibility for speed.
       --threads exists only on pack; multi-threaded decode is out of scope
       for this phase, and unpack/cat refuse the flag outright rather than
