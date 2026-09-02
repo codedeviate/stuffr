@@ -830,11 +830,32 @@ fn assert_codec_conforms_impl(codec: &dyn Codec, meta: &FormatMeta, fixture: Opt
             // having. A codec that ignores the governor still round-trips
             // perfectly, so bytes alone prove nothing. Observed while the
             // sink is ALIVE, because the lease is released on finish/drop.
+            //
+            // `> 1`, not `> 0`: a lone worker is not parallelism, and `> 0`
+            // alone cannot tell a codec that genuinely spread the work across
+            // four workers from one that grabbed a single-worker lease and
+            // then encoded on that thread anyway. It also silently stops
+            // discriminating the moment `memory_per_worker` regresses to an
+            // under-declared figure — this governor's budget is exactly
+            // `per_worker * 4`, so a HONEST figure leaves room for all four
+            // workers the real `encoder()` call asks for (which uses its own,
+            // separately measured, level-aware per-worker figure — see each
+            // codec's `per_worker_bytes`), while a figure too small to cover
+            // what `encoder()` actually needs narrows the real grant to one
+            // worker via the governor's progress-guarantee floor, without
+            // erroring anywhere else in the suite. Whole-branch review LOW-3
+            // (2026-09-02): setting all four codecs' `memory_per_worker` to
+            // `Some(1)` left the entire suite green under the old `> 0` form.
             assert!(
-                gov.outstanding() > 0,
-                "conformance[{id}] property 12: declares parallel_encode but held no \
-                 lease while encoding — it is not using the governor. Round-tripping \
-                 does not demonstrate parallelism."
+                gov.outstanding() > 1,
+                "conformance[{id}] property 12: declares parallel_encode and a \
+                 memory_per_worker that should leave room for {} of the governor's 4 \
+                 workers, but only {} were held while encoding — either it is not using \
+                 the governor at all, or memory_per_worker is declared too small for what \
+                 encoder() actually asks per worker. Round-tripping does not demonstrate \
+                 parallelism.",
+                gov.workers_for(per_worker),
+                gov.outstanding()
             );
 
             sink.finish()
