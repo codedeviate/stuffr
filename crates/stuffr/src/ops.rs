@@ -429,16 +429,58 @@ impl Default for CompressOpts {
 /// auto-detected count would make identical commands produce different bytes
 /// on machines with different core counts.
 pub fn resolved_budget(o: &CompressOpts) -> Option<Arc<Governor>> {
-    // `Some(1)` is single-threaded: nothing to allocate. `None` never asked.
-    match o.threads {
-        None | Some(1) if !o.turbo => return None,
-        _ => {}
+    // Read the environment BEFORE deciding whether the user asked, not after.
+    // An earlier version of this gate returned `None` on `threads: None` and so
+    // never consulted `STF_THREADS` at all: the variable is documented on
+    // `BudgetInputs` and did nothing whatsoever. A knob that exists and has no
+    // effect is worse than no knob.
+    let env = std::env::var("STF_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    resolved_budget_inner(o, env)
+}
+
+/// [`resolved_budget`] with the environment injected rather than read.
+///
+/// Exists so the precedence rules can be tested without mutating the process
+/// environment. `std::env::set_var` is unsafe from Rust 2024 and, more to the
+/// point, is shared with every other test in the binary — a test that exported
+/// `STF_THREADS` raced the rest of the suite and failed the gate. Injecting the
+/// value removes the race entirely rather than serialising around it.
+///
+/// Exposed under the `testing` feature only, following `sync_call_count`.
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub fn resolved_budget_with_env(o: &CompressOpts, env: Option<usize>) -> Option<Arc<Governor>> {
+    resolved_budget_inner(o, env)
+}
+
+fn resolved_budget_inner(o: &CompressOpts, env: Option<usize>) -> Option<Arc<Governor>> {
+    // An explicit `--threads 1` is the most specific statement available and
+    // wins outright — including over `STF_THREADS` and over `--turbo`, because
+    // someone who typed `1` on the command line means one.
+    if o.threads == Some(1) {
+        return None;
     }
+
+    // Otherwise: did the user ask for parallelism by ANY route? A flag, the
+    // environment, or --turbo. `Some(0)` counts — it means auto, which is an
+    // explicit request to detect a budget.
+    //
+    // This is what "deterministic by default" rests on, so the promise is worth
+    // stating exactly: identical input plus identical flags plus an identical
+    // environment gives identical bytes. The environment clause is not a
+    // weasel — `--threads 0` already resolves against cgroup CPU quotas, so
+    // auto-detection was never machine-independent. What IS guaranteed is that
+    // asking for nothing gets you a single-threaded, reproducible encode.
+    let asked = o.turbo || o.threads.is_some() || env.map(|n| n != 1).unwrap_or(false);
+    if !asked {
+        return None;
+    }
+
     let inputs = BudgetInputs {
         cli: o.threads,
-        env: std::env::var("STF_THREADS")
-            .ok()
-            .and_then(|s| s.parse().ok()),
+        env,
         // `./.stf.toml` and `~/.config/stf/config.toml`. `BudgetInputs`
         // anticipates both; no config-file machinery exists yet and parallel
         // encode does not need one, so they stay None deliberately rather

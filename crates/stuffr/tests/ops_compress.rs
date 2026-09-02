@@ -791,6 +791,56 @@ fn threads_one_builds_no_governor() {
 }
 
 #[test]
+fn stf_threads_alone_builds_a_governor() {
+    // `STF_THREADS` is documented on `BudgetInputs` as a precedence source. An
+    // earlier gate checked `o.threads` and returned before the environment was
+    // ever read, so the variable existed and did nothing — a knob with no
+    // effect, which is worse than no knob.
+    //
+    // Injects the value rather than exporting it: `set_var` is unsafe from Rust
+    // 2024 and is shared with every other test in this binary, so a test that
+    // exported it raced the suite and failed the gate.
+    let gov = stuffr::ops::resolved_budget_with_env(&CompressOpts::default(), Some(3))
+        .expect("STF_THREADS alone must build a governor");
+    assert_eq!(
+        gov.workers(),
+        3,
+        "the environment's worker count must be honoured"
+    );
+}
+
+#[test]
+fn an_explicit_threads_one_beats_the_environment() {
+    // The most specific statement wins: someone who typed `--threads 1` means
+    // one, whatever their shell exports.
+    let got = stuffr::ops::resolved_budget_with_env(
+        &CompressOpts {
+            threads: Some(1),
+            ..Default::default()
+        },
+        Some(8),
+    );
+    assert!(
+        got.is_none(),
+        "--threads 1 must stay single-threaded despite STF_THREADS"
+    );
+}
+
+#[test]
+fn stf_threads_of_one_is_not_a_request_for_parallelism() {
+    let got = stuffr::ops::resolved_budget_with_env(&CompressOpts::default(), Some(1));
+    assert!(got.is_none(), "STF_THREADS=1 asks for single-threaded");
+}
+
+#[test]
+fn no_flags_and_no_environment_builds_no_governor() {
+    // The other half of the promise: asking for nothing gets a single-threaded,
+    // reproducible encode.
+    let got = stuffr::ops::resolved_budget_with_env(&CompressOpts::default(), None);
+    assert!(got.is_none());
+}
+
+#[test]
 fn threads_zero_means_auto_and_yields_at_least_one_worker() {
     // `Some(0)` is the zstd/xz convention for auto. `resolve_workers` handles
     // it; this pins that ops does not pass the 0 through as a worker request.
