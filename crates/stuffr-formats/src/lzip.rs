@@ -341,6 +341,44 @@
 //! member, independently of this project's own two LZMA1 backends agreeing,
 //! while the `lzip`-binary checks validate the outer LZIP container (the
 //! header, trailer and multi-member framing) that `liblzma` never sees.
+//!
+//! ## Decode memory bound: a dictionary pre-flight, not a bounded constructor
+//!
+//! Header byte 5 (the 6th byte: `"LZIP"` magic, 1-byte version, then this)
+//! declares the member's dictionary size, and `lzma_rust2::LzipReader`
+//! allocates a buffer of that size before producing any output — the same
+//! shape `xz_pure.rs`'s module doc documents for `XzReader`, measured here
+//! independently: a 114-byte member with byte 5 crafted to `0x1d` (declaring
+//! `1 << 29` = 512 MiB) drove peak RSS to **538 MB** against a roughly 1.6 MB
+//! baseline, and it decoded correctly — the cost is paid purely by the
+//! declaration, not by anything actually wrong with the file. **lzip shrinks
+//! the dictionary to fit small inputs** (measured: byte `0x0c` on a real
+//! `lzip -9` encode of an 11-byte payload decodes to 4,096, not a fixed
+//! preset size), so this pre-flight cannot assume a preset default the way a
+//! level-only check could — it has to read the byte.
+//!
+//! Closed the same way as `xz_pure.rs`: [`declared_dictionary_bytes`] parses
+//! header byte 5 directly out of the buffered prefix and `decoder` below
+//! checks it against [`DecodeOpts::memory_limit`] *before* `LzipReader::new`
+//! is ever called, rather than building a push-to-pull bridge onto
+//! `lzma_rust2::LzipStream`'s own bounded constructor — see `lzma_pure.rs`'s
+//! module doc, "The push-to-pull bridge is cancelled", for why that bridge is
+//! not on the table.
+//!
+//! The formula, verified against reference `lzip` 1.26's own output:
+//! `base = 1 << (b & 0x1f)`, then `base - (base / 16) * ((b >> 5) & 0x07)`.
+//! Reference `lzip` itself still accepts and correctly decodes a file whose
+//! declared size has been raised after the fact — evidently it grows its own
+//! buffer rather than preallocating the full declared size up front, unlike
+//! this project's `lzma-rust2` backend — which is exactly what makes the
+//! crafted 512 MiB fixture above a *legitimate* file to refuse on resource
+//! grounds, not a corrupt one: see
+//! `the_reference_tool_still_accepts_what_we_now_refuse`.
+//!
+//! **`None` means ALLOW, not refuse.** Fewer than 6 bytes in the prefix means
+//! a truncated header, which is corruption belonging to
+//! [`GuardedLzipReader`]'s own checks (or the backend's), not to this
+//! resource check.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::num::NonZeroU64;
@@ -419,8 +457,27 @@ impl Codec for Lzip {
     /// `NormalizeDecodeErrors` for the raw kinds the backend itself raises
     /// on a member it DOES recognize as malformed — see
     /// `crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF`'s doc.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
-        let guarded = GuardedLzipReader::new(src);
+    ///
+    /// **Memory pre-flight**: before `GuardedLzipReader` (and the
+    /// `LzipReader` it wraps) ever exists, header byte 5's declared
+    /// dictionary size is read out of the buffered prefix and checked
+    /// against [`DecodeOpts::memory_limit`] — see the module doc's "Decode
+    /// memory bound" section. `None` (cannot decide) means allow.
+    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        let mut buffered = BufReader::new(src);
+        if let Some(limit) = o.memory_limit {
+            let prefix = buffered.fill_buf().unwrap_or(&[]);
+            if let Some(declared) = declared_dictionary_bytes(prefix)
+                && declared > limit
+            {
+                return Err(Error::ResourceLimit(format!(
+                    "lzip: header declares a dictionary needing {declared} bytes, but \
+                     --memory-limit allows only {limit} bytes — raise --memory-limit to \
+                     decode this file"
+                )));
+            }
+        }
+        let guarded = GuardedLzipReader::new(buffered);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             guarded,
             LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF,
@@ -510,6 +567,35 @@ impl Codec for Lzip {
 fn member_size_for(opts: &LzipOptions) -> NonZeroU64 {
     NonZeroU64::new(u64::from(opts.lzma_options.dict_size) * 3)
         .expect("a preset's dict_size is always positive")
+}
+
+/// Reads the declared dictionary size out of an LZIP member header's byte 5
+/// (the 6th byte: 4-byte `"LZIP"` magic, 1-byte version, then this) —
+/// without constructing `LzipReader` or allocating anything sized by it. See
+/// the module doc's "Decode memory bound" section for why this exists and
+/// what it was measured against.
+///
+/// `None` means "the prefix does not contain enough to decide" and MUST be
+/// treated as allow, not refuse, by every caller — see [`Codec::decoder`]'s
+/// doc. Fewer than 6 bytes (a truncated header), or a magic mismatch, is
+/// corruption belonging to [`GuardedLzipReader`]'s own checks, not this
+/// one's to call: the magic is checked here too (not just presence of 6
+/// bytes) so that non-LZIP input under a `--memory-limit` is left for
+/// `GuardedLzipReader`'s own magic check to report as `Corrupt` (exit 5),
+/// rather than this pre-flight racing ahead of it and misreporting arbitrary
+/// bytes as a resource refusal (exit 6) whenever they happen to decode to a
+/// large number.
+///
+/// Formula verified against reference `lzip` 1.26's own output (see the
+/// module doc): `base = 1 << (b & 0x1f)`, then
+/// `base - (base / 16) * ((b >> 5) & 0x07)`.
+fn declared_dictionary_bytes(prefix: &[u8]) -> Option<u64> {
+    if prefix.len() < 6 || !prefix.starts_with(MAGIC_BYTES) {
+        return None;
+    }
+    let b = prefix[5];
+    let base = 1u64 << (b & 0x1f);
+    Some(base - (base / 16) * u64::from((b >> 5) & 0x07))
 }
 
 /// This codec's per-worker demand for `acquire_many` — level-aware, unlike
@@ -807,9 +893,16 @@ enum TrailingVerdict {
 }
 
 impl GuardedLzipReader {
-    fn new(src: Box<dyn Source>) -> Self {
+    /// Takes an already-constructed `BufReader` rather than a bare
+    /// `Box<dyn Source>` so `Codec::decoder` can peek the header's declared
+    /// dictionary size (via one non-destructive `fill_buf` call — see the
+    /// module doc's "Decode memory bound" section) *before* this type, and
+    /// the `LzipReader` it wraps, ever exist — nothing already buffered by
+    /// that peek is re-read from the underlying source, because it is the
+    /// same `BufReader`, not a fresh one.
+    fn new(buffered: BufReader<Box<dyn Source>>) -> Self {
         Self {
-            inner: LzipReader::new(TailWrapper::new(BufReader::new(src))),
+            inner: LzipReader::new(TailWrapper::new(buffered)),
             state: GuardState::Unchecked,
         }
     }
@@ -2132,5 +2225,217 @@ mod tests {
              empty members, must be rejected — not silently accepted with the fourth member \
              dropped"
         );
+    }
+
+    // --- Dictionary pre-flight (Phase 1f Task 9) — see the module doc's
+    // "Decode memory bound" section and `declared_dictionary_bytes`'s own
+    // doc for the formula and why `None` means allow.
+
+    /// The formula pinned against three concrete bytes: `0x6e` and `0x1d`
+    /// are the module doc's own measurements (13,312 against reference
+    /// `lzip` 1.26's real output; `1 << 29` = 512 MiB, the crafted DoS
+    /// byte), `0x0c` is this codec's own preset-6-on-a-tiny-payload output
+    /// (4,096 — see `a_real_small_file_shrinks_its_declared_dictionary`
+    /// below for where that number comes from).
+    #[test]
+    fn declared_dictionary_bytes_matches_the_measured_formula() {
+        let header_with = |b: u8| -> Vec<u8> { vec![b'L', b'Z', b'I', b'P', 1, b] };
+        assert_eq!(
+            declared_dictionary_bytes(&header_with(0x6e)),
+            Some(13_312),
+            "measured against reference lzip 1.26 — see the module doc"
+        );
+        assert_eq!(
+            declared_dictionary_bytes(&header_with(0x1d)),
+            Some(512 * 1024 * 1024),
+            "1 << 29 — the crafted DoS byte"
+        );
+        assert_eq!(declared_dictionary_bytes(&header_with(0x0c)), Some(4_096));
+    }
+
+    /// `lzip` shrinks the dictionary to fit a small input rather than always
+    /// using the preset's full size — measured here directly against the
+    /// installed reference `lzip` 1.26 binary, so
+    /// `declared_dictionary_bytes_matches_the_measured_formula`'s `0x0c`
+    /// fixture is not an unexplained magic number. Deliberately NOT tested
+    /// through this codec's own `compress()`: `lzma_rust2::LzipWriter` does
+    /// not perform this shrink at all (measured directly — it declares
+    /// preset 6's full 8 MiB, `0x16`, even for an 11-byte payload), so only
+    /// the reference tool's own output demonstrates the behavior
+    /// `declared_dictionary_bytes` must decode correctly. Skips cleanly when
+    /// `lzip` is not on `PATH`.
+    #[test]
+    fn a_real_small_file_shrinks_its_declared_dictionary() {
+        let Some(lzip) = which_lzip() else {
+            return;
+        };
+        let src_path = std::env::temp_dir().join("stf-lzip-preflight-shrink-src.bin");
+        std::fs::write(&src_path, b"hello world").unwrap();
+        let out = std::process::Command::new(&lzip)
+            .arg("-9")
+            .arg("-k")
+            .arg("-f")
+            .arg("-c")
+            .arg(&src_path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            declared_dictionary_bytes(&out.stdout),
+            Some(4_096),
+            "byte 5 of a real small-input member must reflect the shrunk dictionary, not \
+             preset 6's full 8 MiB"
+        );
+        let _ = std::fs::remove_file(&src_path);
+    }
+
+    /// `None` on a prefix too short to contain even the magic, and on a
+    /// prefix that does not start with LZIP's magic at all — both are
+    /// corruption's territory ([`GuardedLzipReader`]'s own checks), not this
+    /// one's to call. The magic check matters specifically so non-LZIP input
+    /// under a `--memory-limit` is left to be reported as `Corrupt` (exit
+    /// 5), not misreported as a resource refusal (exit 6) by this pre-flight
+    /// racing ahead of the real detection.
+    #[test]
+    fn declared_dictionary_bytes_is_none_without_a_matching_magic() {
+        assert_eq!(declared_dictionary_bytes(&[]), None);
+        assert_eq!(declared_dictionary_bytes(b"LZI"), None);
+        assert_eq!(
+            declared_dictionary_bytes(b"not an lzip stream at all!!"),
+            None
+        );
+    }
+
+    /// The refusal path: a member declaring `0x1d`'s 512 MiB dictionary
+    /// (exactly the module doc's crafted DoS byte), under a 1 MiB limit,
+    /// must be refused by `decoder()` itself — before `LzipReader::new` (and
+    /// its allocation) ever runs — and the refusal must be exit 6
+    /// (`ResourceLimit`), NEVER exit 5: the file is not damaged, this build
+    /// simply will not allocate that much.
+    #[test]
+    fn a_declared_dictionary_over_the_limit_is_refused_before_allocating() {
+        let mut packed = compress(b"payload".repeat(100).as_slice());
+        packed[5] = 0x1d;
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let err = match Lzip.decoder(
+            src,
+            &DecodeOpts {
+                memory_limit: Some(1024 * 1024),
+                ..Default::default()
+            },
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a declared 512 MiB dictionary must be refused under a 1 MiB limit"),
+        };
+        assert_eq!(
+            err.exit_code(),
+            6,
+            "a memory refusal is ResourceLimit, not Corrupt: {err}"
+        );
+        assert!(
+            err.to_string().contains("--memory-limit"),
+            "the message must name the flag so the user can raise it: {err}"
+        );
+    }
+
+    /// Matters more than the refusal above: over-strictness rejects valid
+    /// files, and this project shipped that mirror defect twice in Phase 1e
+    /// (this very module's trailing-data guard, and gzip/bzip2 refusing
+    /// padding the reference tools recover). A legitimate dictionary that
+    /// fits under the limit must still decode.
+    #[test]
+    fn a_legitimate_dictionary_under_the_limit_still_decodes() {
+        let plain = b"ordinary payload ".repeat(2000);
+        let packed = compress(&plain);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let mut dec = Lzip
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit: Some(64 * 1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    /// `DecodeOpts::default()` has `memory_limit: None`. The CLI always sets
+    /// a limit; a library caller who deliberately passes `None` keeps the
+    /// old, unbounded behaviour.
+    #[test]
+    fn no_limit_means_no_bound_for_library_callers() {
+        let plain = b"payload ".repeat(2000);
+        let packed = compress(&plain);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let mut dec = Lzip.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    /// The test that matters more than the refusal: we are refusing on a
+    /// resource policy, not on validity. Reproduces the exact 114-byte
+    /// crafted fixture that produced the 538 MB measurement in the module
+    /// doc (byte 5 raised to `0x1d` after an otherwise-genuine encode) and
+    /// confirms the installed reference `lzip` binary still accepts and
+    /// decodes it — so refusing it here must be exit 6 (`ResourceLimit`),
+    /// never exit 5 (`Corrupt`). Getting that backwards would tell users
+    /// their archive is damaged when it is fine. Skips cleanly when `lzip`
+    /// is not on `PATH`.
+    #[test]
+    fn the_reference_tool_still_accepts_what_we_now_refuse() {
+        let Some(lzip) = which_lzip() else {
+            return;
+        };
+
+        let mut packed = compress(b"hello world");
+        packed[5] = 0x1d; // declares 1 << 29 = 512 MiB
+
+        let path = std::env::temp_dir().join("stf-lzip-preflight-crafted.lz");
+        std::fs::write(&path, &packed).unwrap();
+
+        let test = std::process::Command::new(&lzip)
+            .arg("-t")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            test.status.success(),
+            "sanity check on the reference tool itself: it must accept a file whose only fault \
+             is an inflated declared dictionary — reference disagreed, so this test's own \
+             premise is wrong: {}",
+            String::from_utf8_lossy(&test.stderr)
+        );
+        let cat = std::process::Command::new(&lzip)
+            .arg("-dc")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(cat.status.success());
+        assert_eq!(cat.stdout, b"hello world");
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let err = match Lzip.decoder(
+            src,
+            &DecodeOpts {
+                memory_limit: Some(1024 * 1024),
+                ..Default::default()
+            },
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a declared 512 MiB dictionary must be refused under a 1 MiB limit"),
+        };
+        assert_eq!(
+            err.exit_code(),
+            6,
+            "a legitimate, reference-tool-accepted file refused on a resource policy must be \
+             ResourceLimit, never Corrupt: {err}"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

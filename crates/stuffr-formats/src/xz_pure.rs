@@ -187,43 +187,74 @@
 //! type of its own and needs an explicit `.check(Check::Crc64)`; there is no
 //! equivalent call to hunt for here.
 //!
-//! ## KNOWN LIMITATION: decode memory is bounded by the file, not by us
+//! ## Decode memory bound: a dictionary pre-flight, not a bounded constructor
 //!
 //! `XzReader::new` allocates a dictionary buffer sized by the value the
 //! *stream declares in its own header*, before any output is produced and
-//! regardless of how small the file is. Measured peak RSS decoding a **60-byte**
-//! `.xz` that declares preset 9's 64 MiB dictionary:
+//! regardless of how small the file is. Measured peak RSS decoding a
+//! **60-byte-class** `.xz` that declares preset 9's 64 MiB dictionary (a
+//! locally crafted 68-byte equivalent, `xz -9` on a 1-byte payload):
 //!
 //! | decoder | peak RSS |
 //! |---|---|
 //! | baseline, no decode | 2.26 MB |
-//! | this backend (`lzma-rust2`) | **69.35 MB** |
+//! | this backend (`lzma-rust2`), unpatched | **69.35 MB** (68.45 MB measured directly here) |
+//! | this backend, after the pre-flight below | ~1.7 MB (allocation never happens) |
 //! | `xz_c` (liblzma) | 2.39 MB |
 //!
-//! liblzma grows its dictionary as needed and is unaffected; this backend does
-//! not. `lzma-rust2`'s `DICT_SIZE_MAX` is `!15u32`, about 4 GiB, so a crafted
-//! file of a few dozen bytes can demand an allocation of that order — roughly a
-//! millionfold amplification.
+//! liblzma grows its dictionary as needed and is unaffected by this at all;
+//! this backend does not grow its buffer, so `lzma_rust2`'s `DICT_SIZE_MAX`
+//! (`!15u32`, about 4 GiB) means a crafted file of a few dozen bytes can
+//! demand an allocation of that order — roughly a millionfold amplification.
+//! **`--max-ratio` does not cover this**: that guard counts decoded *output*
+//! bytes, which for such a file is a handful, and the cost is paid in the
+//! allocation before any output exists.
 //!
-//! **`--max-ratio` does not cover this.** That guard counts decoded *output*
-//! bytes, which for such a file is a handful; the cost is paid in the allocation
-//! before any output exists. This is the one bomb-shaped hole in a tool whose
-//! README promises bomb limits, and it is worth knowing that
-//! `--features c-backed` closes it completely.
+//! Neither `XzReader` nor the lower-level push/pull `XzStream`'s bounded
+//! `new_mem_limit` constructor is used to close this — the latter is real,
+//! but reaching it from the `Read`-shaped `XzReader` this codec is built on
+//! would mean a push-to-pull bridge, which Phase 1e measured and cancelled as
+//! unworkable (see `lzma_pure.rs`'s module doc, "The push-to-pull bridge is
+//! cancelled", for the two measurements that killed it). Instead,
+//! [`declared_dictionary_bytes`] parses just enough of the stream header and
+//! block header to read the LZMA2 filter's dictionary-size byte directly, and
+//! `decoder` below checks it against [`DecodeOpts::memory_limit`] *before*
+//! `XzReader::new` is ever called — a pre-flight, not a bounded constructor.
 //!
-//! The fix is not applied here because it is not cheap and this codec should not
-//! grow an xz header parser: `lzma_rust2::XzStream::new_mem_limit` takes a
-//! `mem_limit_kb` and errors with "needed memory too big for mem_limit_kb", but
-//! it is on the lower-level push/pull `XzStream`, and the `Read`-shaped
-//! `XzReader` this codec uses exposes no equivalent constructor. Closing it means
-//! either driving `XzStream` directly or pre-parsing the LZMA2 filter property
-//! byte out of the block header. Both are real work, and both want a
-//! `DecodeOpts` memory bound that does not exist yet — `DecodeOpts` currently
-//! carries only `threads` and `governor`, and the governor's memory reasoning
-//! arrives in Phase 1f. Scheduled there, with this measurement, rather than
-//! rushed.
+//! **Verified against real `xz` output at four presets** (`-0`, `-3`, `-6`,
+//! `-9`) and confirmed to match the documented preset dictionaries exactly —
+//! see [`declared_dictionary_bytes`]'s own tests for the byte-level fixtures.
+//! Two traps, both exercised by a test:
+//!
+//! 1. **A BCJ-filtered stream has TWO filters, LZMA2 last, not first.**
+//!    `xz --x86 --lzma2=preset=6` measured directly: block header flags claim
+//!    `filter_count = 2`, filter 1 is BCJ (id `0x04`, zero properties),
+//!    filter 2 is LZMA2 (id `0x21`). A parser that reads only the first
+//!    filter would read BCJ's (absent) properties as a dictionary code and
+//!    produce nonsense. `declared_dictionary_bytes` walks the whole filter
+//!    list and matches on id `0x21` specifically.
+//! 2. **A block-header-size byte of `0` is the index indicator, not a block
+//!    header.** An empty stream (`xz -9` on zero bytes) has no block at all;
+//!    byte 12 (the first byte after the 12-byte stream header) is `0x00`
+//!    there, and treating it as `(0+1)*4 = 4` bytes of block header would
+//!    misparse the index that actually follows. `declared_dictionary_bytes`
+//!    treats this as "cannot decide" (`None`), same as any other case it
+//!    cannot confidently parse.
+//!
+//! **`None` means ALLOW, not refuse.** The block header is at most `(255 +
+//! 1) * 4 = 1024` bytes past the 12-byte stream header, so everything needed
+//! lies within the first 1036 bytes — comfortably inside the 4096-byte prefix
+//! `stuffr`'s `ops::decompress_with` already fills via [`stuffr_core::probe`]
+//! before any codec's `decoder()` runs (the same prefix
+//! `lzip.rs`'s magic peek and `lzma_pure.rs`'s `peek_declared_need_kb` rely
+//! on). A well-formed file can therefore always be decided; a prefix
+//! genuinely too short to parse means a truncated header, which is
+//! corruption belonging to the decode path (property 9/10's territory), not
+//! to this resource check — refusing there would misreport a damaged file as
+//! a memory refusal, the same mistake in the opposite direction from
+//! `DecodeOpts::memory_limit`'s own exit-6-not-exit-5 rule.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::num::NonZeroU64;
 
 use lzma_rust2::{XzOptions, XzReader, XzWriter, XzWriterMt};
@@ -304,8 +335,29 @@ impl Codec for Xz {
     /// streams are routine (see `zstd_c.rs`'s `decoder`). So the honest
     /// statement is narrower than zstd's: a checkless `.xz` is possible but
     /// unusual, where a checkless `.zst` is ordinary.
-    fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
-        let dec = XzReader::new(src, true);
+    ///
+    /// **Memory pre-flight**: before `XzReader::new` ever runs, the block
+    /// header's declared LZMA2 dictionary size is read out of the buffered
+    /// prefix and checked against [`DecodeOpts::memory_limit`] — see the
+    /// module doc's "Decode memory bound" section. `None` (cannot decide)
+    /// means allow; the fill happens once, non-destructively, into the same
+    /// `BufReader` that goes on to back the decoder, so nothing already
+    /// buffered is re-read from the underlying source.
+    fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
+        let mut buffered = BufReader::new(src);
+        if let Some(limit) = o.memory_limit {
+            let prefix = buffered.fill_buf().unwrap_or(&[]);
+            if let Some(declared) = declared_dictionary_bytes(prefix)
+                && declared > limit
+            {
+                return Err(Error::ResourceLimit(format!(
+                    "xz: header declares a dictionary needing {declared} bytes, but \
+                     --memory-limit allows only {limit} bytes — raise --memory-limit to \
+                     decode this file"
+                )));
+            }
+        }
+        let dec = XzReader::new(buffered, true);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,
             XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF,
@@ -399,6 +451,130 @@ impl Codec for Xz {
 fn block_size_for(opts: &XzOptions) -> NonZeroU64 {
     NonZeroU64::new(u64::from(opts.lzma_options.dict_size) * 3)
         .expect("a preset's dict_size is always positive")
+}
+
+/// Reads the LZMA2 filter's declared dictionary size out of `prefix`,
+/// without constructing `XzReader` or allocating anything sized by it — see
+/// the module doc's "Decode memory bound" section for why this exists and
+/// what it was measured against.
+///
+/// `None` means "the prefix does not contain enough to decide" and MUST be
+/// treated as allow, not refuse, by every caller — see
+/// [`Codec::decoder`]'s doc. That covers a stream header shorter than 13
+/// bytes, a magic mismatch, a block header whose declared length runs past
+/// the end of `prefix`, a malformed varint, a filter list with no LZMA2
+/// filter in it (a foreign filter chain this codec cannot characterize), and
+/// the index indicator (trap 2 below) — none of these are this function's
+/// job to call corrupt; that is the decode path's job. The magic is checked
+/// (not just 13 bytes of *something*) so non-xz input under a
+/// `--memory-limit` is left for the decode path's own detection to report as
+/// `Corrupt` (exit 5), rather than this pre-flight racing ahead of it and
+/// misreporting arbitrary bytes as a resource refusal (exit 6) whenever they
+/// happen to decode to a large number.
+///
+/// Layout, byte-verified against real `xz` 5.8.3 output at presets `-0`,
+/// `-3`, `-6` and `-9` (see this function's own tests): a 12-byte stream
+/// header, then a block header whose first byte's real length is `(b + 1) *
+/// 4`, then a flags byte whose low two bits give `filter_count - 1` and
+/// whose `0x40`/`0x80` bits gate two optional size varints, then per filter
+/// a varint id, a varint properties length, and that many property bytes.
+///
+/// Two traps, each pinned by a dedicated test:
+///
+/// 1. **Walk the whole filter list and match id `0x21` (LZMA2) — never
+///    assume it is the first filter.** A BCJ-filtered file
+///    (`xz --x86 --lzma2=preset=6`) has two filters, BCJ (id `0x04`, zero
+///    properties) before LZMA2. Stopping at the first filter would read
+///    BCJ's absent properties as a dictionary code.
+/// 2. **A block-header-size byte of `0` is the index indicator, not a block
+///    header** — an empty stream has no block at all, and treating that
+///    byte as a length misparses the index that actually follows.
+///
+/// The block header is at most `(255 + 1) * 4 = 1024` bytes, so everything
+/// needed always lies within the first `12 + 1024 = 1036` bytes — well
+/// inside the 4096-byte prefix `ops::decompress_with` fills via
+/// [`stuffr_core::probe`] before any codec's `decoder()` runs.
+fn declared_dictionary_bytes(prefix: &[u8]) -> Option<u64> {
+    const LZMA2_FILTER_ID: u64 = 0x21;
+    const XZ_MAGIC: &[u8; 6] = &[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00];
+
+    // Stream header (12 bytes) plus the block header's own size byte.
+    if prefix.len() < 13 || !prefix.starts_with(XZ_MAGIC) {
+        return None;
+    }
+    let block_header_size_byte = prefix[12];
+    if block_header_size_byte == 0 {
+        // Trap 2: the index indicator, not a block header — see this
+        // function's doc.
+        return None;
+    }
+    let block_header_len = (block_header_size_byte as usize + 1) * 4;
+    if prefix.len() < 12 + block_header_len {
+        return None;
+    }
+    let block = &prefix[12..12 + block_header_len];
+    if block.len() < 2 {
+        return None;
+    }
+    let flags = block[1];
+    let filter_count = (flags & 0x03) as usize + 1;
+    let mut pos = 2usize;
+    if flags & 0x40 != 0 {
+        read_xz_varint(block, &mut pos)?;
+    }
+    if flags & 0x80 != 0 {
+        read_xz_varint(block, &mut pos)?;
+    }
+    // Trap 1: walk every filter, do not stop at the first one.
+    for _ in 0..filter_count {
+        let filter_id = read_xz_varint(block, &mut pos)?;
+        let prop_len = read_xz_varint(block, &mut pos)? as usize;
+        let props = block.get(pos..pos + prop_len)?;
+        pos += prop_len;
+        if filter_id == LZMA2_FILTER_ID {
+            return lzma2_dict_size(*props.first()?);
+        }
+    }
+    None
+}
+
+/// Reads one xz "variable length integer" (little-endian base-128, high bit
+/// of each byte marking continuation) from `data` starting at `*pos`,
+/// advancing `*pos` past it. `None` on a byte-starved or non-terminating
+/// (more than 9 bytes) encoding — both fold into `declared_dictionary_bytes`'s
+/// own "cannot decide" contract.
+fn read_xz_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    for _ in 0..9 {
+        let byte = *data.get(*pos)?;
+        *pos += 1;
+        result |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+    }
+    None
+}
+
+/// Decodes LZMA2's one-byte dictionary-size code, verified against real `xz`
+/// output at presets `-0` (`0x0c` → 262,144), `-3` (`0x14` → 4,194,304), `-6`
+/// (`0x16` → 8,388,608) and `-9` (`0x1c` → 67,108,864) — see this function's
+/// tests. `None` for a code above LZMA2's defined range (0-40): a value the
+/// spec never assigns is not something this function should guess a size
+/// for. Shift never overflows for a valid code: the largest defined shift
+/// (code 39) is 30 bits.
+fn lzma2_dict_size(code: u8) -> Option<u64> {
+    if code > 40 {
+        return None;
+    }
+    if code == 40 {
+        return Some(0xFFFF_FFFF);
+    }
+    let base: u64 = 2 | (u64::from(code) & 1);
+    let shift = u32::from(code) / 2 + 11;
+    Some(base << shift)
 }
 
 /// This codec's per-worker demand for `acquire_many` — level-aware, unlike
@@ -1198,5 +1374,263 @@ mod tests {
         let mut out = Vec::new();
         dec.read_to_end(&mut out).unwrap();
         assert_eq!(out, plain);
+    }
+
+    // --- Dictionary pre-flight (Phase 1f Task 9) — see the module doc's
+    // "Decode memory bound" section and `declared_dictionary_bytes`'s own
+    // doc for the layout and both traps these tests pin.
+
+    /// Byte-level fixtures captured directly from real `xz` 5.8.3 output
+    /// (`xz -N -k -c` on a 1-byte payload, N = 0, 3, 6, 9) — pinned as
+    /// literal bytes rather than shelled out to `xz`, so this test runs with
+    /// no `xz` binary installed. Confirms the parser reproduces the
+    /// documented preset dictionaries exactly, at four presets, matching the
+    /// module doc's table.
+    #[test]
+    fn declared_dictionary_bytes_matches_documented_preset_sizes() {
+        let preset0: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x03, 0xc0,
+            0x1d, 0x19, 0x21, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9a, 0x6f, 0xb8, 0x9b,
+        ];
+        let preset3: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x04, 0xc0,
+            0x1d, 0x19, 0x21, 0x01, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xd4, 0x05, 0x73, 0x32,
+        ];
+        let preset6: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x04, 0xc0,
+            0x1d, 0x19, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xe9, 0xd5, 0x86, 0x36,
+        ];
+        let preset9: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x04, 0xc0,
+            0x1d, 0x19, 0x21, 0x01, 0x1c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x20, 0x45, 0xa4, 0x21,
+        ];
+        assert_eq!(
+            declared_dictionary_bytes(preset0),
+            Some(262_144),
+            "preset 0"
+        );
+        assert_eq!(
+            declared_dictionary_bytes(preset3),
+            Some(4_194_304),
+            "preset 3"
+        );
+        assert_eq!(
+            declared_dictionary_bytes(preset6),
+            Some(8_388_608),
+            "preset 6"
+        );
+        assert_eq!(
+            declared_dictionary_bytes(preset9),
+            Some(67_108_864),
+            "preset 9"
+        );
+    }
+
+    /// Trap 1, pinned: a BCJ-filtered stream (`xz --x86 --lzma2=preset=6`)
+    /// has TWO filters, BCJ (id `0x04`, zero properties) before LZMA2 (id
+    /// `0x21`) — captured directly from real output. A parser that reads
+    /// only the first filter would read BCJ's absent properties as a
+    /// dictionary code and produce nonsense; this must still recover
+    /// preset 6's 8 MiB.
+    #[test]
+    fn declared_dictionary_bytes_skips_a_leading_bcj_filter() {
+        let bcj_then_lzma2: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x04, 0xc1,
+            0x1d, 0x19, 0x04, 0x00, 0x21, 0x01, 0x16, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x87, 0xc8, 0xe1, 0xe9,
+        ];
+        assert_eq!(
+            declared_dictionary_bytes(bcj_then_lzma2),
+            Some(8_388_608),
+            "must walk past the BCJ filter to find LZMA2, not read BCJ's own \
+             (absent) properties as a dictionary code"
+        );
+    }
+
+    /// Trap 2, pinned: an empty stream has no block at all — the byte right
+    /// after the 12-byte stream header is `0x00`, the index indicator, not
+    /// a block-header-size byte. Captured from real `xz -9` on zero bytes.
+    /// Treating it as a block header would misparse the index; this must
+    /// return `None` ("cannot decide"), never a bogus size.
+    #[test]
+    fn declared_dictionary_bytes_treats_the_index_indicator_as_undecidable() {
+        let empty_stream: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x00,
+        ];
+        assert_eq!(
+            declared_dictionary_bytes(empty_stream),
+            None,
+            "byte 12 is 0x00 (the index indicator), not a block header"
+        );
+    }
+
+    /// `None` on a prefix too short to contain even the block header's own
+    /// size byte — this is corruption's territory (property 9/10), not this
+    /// check's; a too-short prefix must ALLOW, never refuse.
+    #[test]
+    fn declared_dictionary_bytes_is_none_on_a_too_short_prefix() {
+        assert_eq!(declared_dictionary_bytes(&[]), None);
+        assert_eq!(declared_dictionary_bytes(&[0xfd, 0x37, 0x7a]), None);
+    }
+
+    /// `None` when the block header's own declared length runs past what
+    /// the prefix actually holds — a truncated header, not this check's to
+    /// call corrupt.
+    #[test]
+    fn declared_dictionary_bytes_is_none_when_the_block_header_is_cut_short() {
+        // Stream header + a size byte claiming 16 bytes of block header,
+        // with only 4 actually present.
+        let cut: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x03, 0xc0,
+            0x1d, 0x19,
+        ];
+        assert_eq!(declared_dictionary_bytes(cut), None);
+    }
+
+    /// The refusal path: preset 9's 64 MiB dictionary, under a 1 MiB limit,
+    /// must be refused by `decoder()` itself — before `XzReader::new` (and
+    /// its allocation) ever runs — and the refusal must be exit 6
+    /// (`ResourceLimit`), NEVER exit 5: the file is not damaged, this build
+    /// simply will not allocate that much.
+    #[test]
+    fn a_declared_dictionary_over_the_limit_is_refused_before_allocating() {
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    level: Some(9),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(b"tiny payload").unwrap();
+        sink.finish().unwrap();
+        let packed = buf.contents();
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let err = match Xz.decoder(
+            src,
+            &DecodeOpts {
+                memory_limit: Some(1024 * 1024),
+                ..Default::default()
+            },
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("preset 9's 64 MiB dictionary must be refused under a 1 MiB limit"),
+        };
+        assert_eq!(
+            err.exit_code(),
+            6,
+            "a memory refusal is ResourceLimit, not Corrupt: {err}"
+        );
+        assert!(
+            err.to_string().contains("--memory-limit"),
+            "the message must name the flag so the user can raise it: {err}"
+        );
+    }
+
+    /// Matters more than the refusal above: over-strictness rejects valid
+    /// files. A legitimate dictionary that fits under the limit must still
+    /// decode.
+    #[test]
+    fn a_legitimate_dictionary_under_the_limit_still_decodes() {
+        let plain = b"ordinary payload ".repeat(2000);
+        let packed = encode_with(&Xz, &plain);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let mut dec = Xz
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit: Some(64 * 1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    /// `DecodeOpts::default()` has `memory_limit: None`. The CLI always sets
+    /// a limit; a library caller who deliberately passes `None` keeps the
+    /// old, unbounded behaviour.
+    #[test]
+    fn no_limit_means_no_bound_for_library_callers() {
+        let plain = b"payload ".repeat(2000);
+        let packed = encode_with(&Xz, &plain);
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    /// The test that matters more than the refusal: we are refusing on a
+    /// resource policy, not on validity. A real `xz -9` stream on a tiny
+    /// payload legitimately declares preset 9's 64 MiB dictionary — the
+    /// reference tool decodes it without complaint — so refusing it here
+    /// must be exit 6 (`ResourceLimit`), never exit 5 (`Corrupt`). Getting
+    /// that backwards would tell users their archive is damaged when it is
+    /// fine. Skips cleanly when `xz` is not on `PATH`.
+    #[test]
+    fn the_reference_tool_still_accepts_what_we_now_refuse() {
+        let Some(xz) = which_xz() else {
+            return;
+        };
+        let src_path = std::env::temp_dir().join("stf-xz-pure-preflight-src.bin");
+        std::fs::write(&src_path, b"a").unwrap();
+        let out = std::process::Command::new(&xz)
+            .arg("-9")
+            .arg("-k")
+            .arg("-f")
+            .arg("-c")
+            .arg(&src_path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "system xz failed to compress: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let packed = out.stdout;
+
+        let xz_path = std::env::temp_dir().join("stf-xz-pure-preflight-src.bin.xz");
+        std::fs::write(&xz_path, &packed).unwrap();
+        let reference = std::process::Command::new(&xz)
+            .arg("-dc")
+            .arg(&xz_path)
+            .output()
+            .unwrap();
+        assert!(
+            reference.status.success(),
+            "sanity check on the reference tool itself: it must accept its own -9 output — \
+             reference disagreed, so this test's own premise is wrong"
+        );
+        assert_eq!(reference.stdout, b"a");
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(packed)));
+        let err = match Xz.decoder(
+            src,
+            &DecodeOpts {
+                memory_limit: Some(1024 * 1024),
+                ..Default::default()
+            },
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("preset 9's dictionary must be refused under a 1 MiB limit"),
+        };
+        assert_eq!(
+            err.exit_code(),
+            6,
+            "a legitimate, reference-tool-accepted file refused on a resource policy must be \
+             ResourceLimit, never Corrupt: {err}"
+        );
+
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&xz_path);
     }
 }
