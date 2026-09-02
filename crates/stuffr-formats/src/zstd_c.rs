@@ -65,6 +65,10 @@ impl Codec for Zstd {
             // the same spirit as bzip2.rs's derived figure.
             memory_per_worker: Some(8 * 1024 * 1024),
             weak_encoder: false,
+            // `ZSTD_c_nbWorkers` is real: `Encoder::multithread` below wires
+            // it to a governor grant. See `encoder`'s doc for the refusal
+            // path (a grant of one runs single-threaded, not an error).
+            parallel_encode: true,
             ..CodecCaps::round_trip()
         }
     }
@@ -128,28 +132,60 @@ impl Codec for Zstd {
         // See the module doc: this is what makes `caps().detects_corruption`
         // `CorruptionDetection::WhenPresent` rather than aspirational.
         enc.include_checksum(true)?;
-        Ok(Box::new(ZstdSink(enc)))
+
+        // `filter(|n| *n > 0)`, not a bare unwrap_or_else: `--threads 0` means
+        // AUTO, and passing 0 through as a request would ask for zero workers.
+        // ops resolves auto into the governor's own count (resolve_workers
+        // handles Some(0)), so EncodeOpts.threads is a library caller's
+        // request for LESS than the budget.
+        let lease = match &o.governor {
+            Some(gov) => {
+                let want = o
+                    .threads
+                    .filter(|n| *n > 0)
+                    .unwrap_or_else(|| gov.workers());
+                let granted = gov.acquire_many(want, self.caps().memory_per_worker.unwrap_or(0));
+                // A grant of one is single-threaded. `multithread(1)` is not
+                // the same as not calling it, so only opt in above one:
+                // `acquire_many` clamps rather than failing, so a tight
+                // budget is a smaller grant here, never an error.
+                if granted.workers() > 1 {
+                    enc.multithread(granted.workers() as u32)?;
+                }
+                Some(granted)
+            }
+            None => None,
+        };
+        Ok(Box::new(ZstdSink { enc, _lease: lease }))
     }
 }
 
-struct ZstdSink(zstd::stream::write::Encoder<'static, Box<dyn Write + Send>>);
+struct ZstdSink {
+    enc: zstd::stream::write::Encoder<'static, Box<dyn Write + Send>>,
+    /// Held, not read. Dropping it returns the workers and bytes to the
+    /// governor, and `Drop` runs on error paths too — which is why the lease
+    /// lives here rather than in `encoder()`'s stack frame, whose scope ends
+    /// long before the encode does.
+    _lease: Option<stuffr_core::LeaseSet>,
+}
 
 impl Write for ZstdSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
+        self.enc.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        self.enc.flush()
     }
 }
 
 impl Sink for ZstdSink {
     /// Writes the closing block, and — because `encoder` turned it on — the
-    /// trailing content checksum.
+    /// trailing content checksum. The governor lease (if any) is released
+    /// when `self` drops at the end of this call.
     fn finish(self: Box<Self>) -> Result<()> {
-        let ZstdSink(encoder) = *self;
-        let mut w = encoder.finish()?;
+        let ZstdSink { enc, _lease } = *self;
+        let mut w = enc.finish()?;
         w.flush()?;
         Ok(())
     }
@@ -286,7 +322,8 @@ mod tests {
     fn capabilities_and_metadata_match_the_format() {
         let c = Zstd.caps();
         assert!(c.encode && c.decode);
-        assert!(!c.parallel_encode && !c.frame_index, "not until 1f");
+        assert!(c.parallel_encode, "1f: the C backend has ZSTD_c_nbWorkers");
+        assert!(!c.frame_index, "not until 1f");
         assert!(!c.weak_encoder, "the C backend is the real encoder");
         let m = meta();
         assert_eq!(m.id, ZSTD);
@@ -311,5 +348,124 @@ mod tests {
     #[test]
     fn zstd_c_conforms() {
         stuffr_core::testing::assert_codec_conforms(&Zstd, &meta());
+    }
+
+    #[test]
+    fn parallel_encode_is_declared() {
+        assert!(
+            Zstd.caps().parallel_encode,
+            "zstd's C backend has ZSTD_c_nbWorkers"
+        );
+    }
+
+    #[test]
+    fn a_governor_grant_is_used_and_released() {
+        // Property 12 covers this generically; pinned here so a regression
+        // names this module rather than the harness.
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let gov = stuffr_core::Governor::new(4, 64 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Zstd
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&incompressible(1024 * 1024)).unwrap();
+        assert!(
+            gov.outstanding() > 0,
+            "the sink must hold its lease while encoding"
+        );
+        sink.finish().unwrap();
+        assert_eq!(gov.outstanding(), 0, "finish must release the lease");
+    }
+
+    #[test]
+    fn a_grant_of_one_worker_still_round_trips() {
+        // THE REFUSAL PATH, and the one most likely to be written wrong.
+        // `acquire_many` clamps rather than failing: a memory limit below one
+        // worker's demand yields exactly one worker, and the codec must run
+        // single-threaded rather than erroring or oversubscribing. This is
+        // what makes Phase 2's nested container parallelism safe.
+        use std::sync::Arc;
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(512 * 1024);
+        // 1 byte of budget against a multi-MiB per-worker demand.
+        let gov = stuffr_core::Governor::new(8, 1);
+        let buf = SharedBuf::new();
+        let mut sink = Zstd
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(Arc::clone(&gov)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        assert_eq!(
+            decompress(buf.contents()),
+            plain,
+            "a one-worker grant must still work"
+        );
+    }
+
+    #[test]
+    fn parallel_output_decodes_to_the_same_plaintext_as_single_threaded() {
+        // Bytes may differ — multi-threaded zstd splits input per worker.
+        // DATA may not. Asserting the plaintext rather than the bytes is the
+        // whole reason parallelism is safe to offer.
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(2 * 1024 * 1024);
+        let st = compress(&plain);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Zstd
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        assert_eq!(decompress(buf.contents()), decompress(st));
+    }
+
+    #[test]
+    fn the_c_decoder_reads_our_parallel_output() {
+        // A stream only we can read would be worse than no parallelism. If a
+        // `zstd` binary is on PATH, prefer it as the arbiter; otherwise the
+        // crate's own decoder is a different code path from the encoder and
+        // still worth asserting.
+        use stuffr_core::testing::incompressible;
+        let plain = incompressible(2 * 1024 * 1024);
+        let gov = stuffr_core::Governor::new(4, 256 * 1024 * 1024);
+        let buf = SharedBuf::new();
+        let mut sink = Zstd
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    governor: Some(gov),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(&plain).unwrap();
+        sink.finish().unwrap();
+        let mut out = Vec::new();
+        use std::io::Read;
+        zstd::stream::read::Decoder::new(std::io::Cursor::new(buf.contents()))
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, plain);
     }
 }

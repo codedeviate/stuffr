@@ -20,7 +20,7 @@ bzip2 = "0.6"
 brotli = "8"
 lz4_flex = "0.14"
 snap = "1"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 # Exact-pinned, not a caret range, and pinned BELOW `cargo add`'s own pick.
 # The exact pin is gone. Under the old 1.85 floor there was no choice: 0.9.0
 # declares `rust-version = "1.87"` and cargo refused it, and 0.8.2 declares no
