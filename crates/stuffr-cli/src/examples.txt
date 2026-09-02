@@ -185,6 +185,14 @@ WHAT THIS BUILD CAN DO
       `c-backed` feature makes anywhere in this matrix is zstd's WRITE
       column, `weak` against `yes`.
 
+      The PARALLEL column is truthful per build too, and independent of
+      the WRITE column above: on the default (`pure`) tier it reads `yes`
+      for `xz` and `lzip` and `-` for every other format, including
+      `zstd` — `ruzstd` has no multi-threaded encoder to hand a worker
+      count to. Adding `--features c-backed` flips `zstd` to `yes` as
+      well, alongside its WRITE column becoming `yes`; it changes nothing
+      else in this column, on any tier.
+
 
 GUARDING AGAINST DECOMPRESSION BOMBS
 
@@ -234,19 +242,28 @@ USING A WEAK FALLBACK ENCODER
 PARALLEL ENCODE FLAGS
 
   stf pack big.dat --format xz --threads 4
-      Encode with 4 worker threads instead of stf's default of one.
-      --threads is deliberately opt-in rather than auto-detected: a
-      multi-threaded xz or zstd encoder splits its input across workers,
-      so the very same file compresses to different bytes depending on
-      how many workers ran. Omitting --threads keeps pack single-threaded,
-      so a given input always produces the same output bytes on any
-      machine, regardless of how many cores it has. Passing --threads 0
-      asks stf to auto-detect a worker count instead, trading that
-      byte-for-byte reproducibility for speed. --threads exists only on
-      pack; multi-threaded decode is out of scope for this phase, and
-      unpack/cat refuse the flag outright rather than silently accepting
-      and ignoring it — see "threads_is_not_offered_on_decode_subcommands"
-      if you want the enforcement in test form.
+      Encode with 4 worker threads instead of stf's default of one. Only
+      FOUR of this build's eleven codecs actually parallelise their
+      encoder: zstd (only with --features c-backed; the default ruzstd
+      encoder has no multi-threaded path), xz (either backend) and lzip.
+      The other seven accept --threads without error but encode
+      single-threaded regardless, since their crates expose no MT encoder
+      to hand a worker count to. --threads is deliberately opt-in rather
+      than auto-detected: a multi-threaded encoder splits its input across
+      workers, so the very same file compresses to different bytes
+      depending on how many workers ran. Omitting --threads (and --turbo
+      and --memory-limit, and leaving STF_THREADS unset) keeps pack
+      single-threaded, so a given input, given the same flags and the same
+      environment, always produces the same output bytes — "same machine"
+      is not part of the promise once --threads 0 is in play, because
+      auto-detection resolves against cgroup CPU quotas, not just core
+      count. Passing --threads 0 asks stf to auto-detect a worker count
+      instead, trading that byte-for-byte reproducibility for speed.
+      --threads exists only on pack; multi-threaded decode is out of scope
+      for this phase, and unpack/cat refuse the flag outright rather than
+      silently accepting and ignoring it — see
+      "threads_is_not_offered_on_decode_subcommands" if you want the
+      enforcement in test form.
 
   stf pack big.dat --format xz --threads 4 --turbo
       --turbo lifts the CPU cap only, letting stf use the full detected
@@ -263,30 +280,40 @@ PARALLEL ENCODE FLAGS
       (512MB, a decimal unit, anything else this parser doesn't recognise)
       is a usage error naming the accepted forms, never a silent fall back
       to the default — a user who typed 512MB and got 25% of RAM instead
-      would have no way to notice. On pack this will bound the worker
-      count; unpack, cat and info accept it too, since a decode can also
-      need to fit inside a memory ceiling even with no threads to bound.
-      Defaults to 25% of available RAM, honouring cgroup limits.
+      would have no way to notice. On pack this bounds the worker count;
+      unpack, cat and info accept it too, since a decode can also need to
+      fit inside a memory ceiling even with no threads to bound. Defaults
+      to 25% of available RAM, honouring cgroup limits; `stf info` reports
+      the resolved figure, humanized (e.g. "256 MiB"), on every build.
+
+      The bound has teeth: xz and lzip cost roughly 128 MiB per worker
+      below preset 7 and roughly 896 MiB per worker at preset 7 and above
+      (the match finder, not the block buffer, dominates). On the 256 MiB
+      floor this build defaults to when it cannot read available memory
+      (macOS, with no /proc/meminfo), that means `stf pack big.dat --format
+      xz --threads 8 --level 9` silently runs with exactly ONE worker —
+      the governor protecting the machine, not a bug — unless
+      --memory-limit is raised. A 4 GiB budget gets 4 workers at that same
+      level, or 32 (then CPU-capped) at the default level 6.
 
   --threads, --turbo and --memory-limit build the thread governor that
-  pack's encode path now consumes: --threads and --turbo resolve to a
-  worker count via the same precedence STF_THREADS and a future config
-  file will follow, and --memory-limit resolves to the byte cap that
-  count is clamped against. Omitting --threads builds no governor at all
-  — the codec sees no worker count and encodes single-threaded, which is
-  what keeps output byte-reproducible by default. No codec in this build
-  reads its governor's worker count yet (that lands with each codec in a
-  later task), so passing --threads today changes what stf resolves and
-  reports but not yet the bytes a pack produces; `stf info` shows the
-  resolved memory limit (info takes no --threads, since decode has no
-  worker count to report) so the resolution is observable ahead of that.
-  unpack, cat and info accept --memory-limit and validate it the same way.
-  info only reports the resolved figure (it never decodes), but unpack and
-  cat pass it through to the decoder: a handful of pure codecs size a
-  dictionary buffer from a value the file declares in its own header,
-  before producing any output, so an unbounded decode of a hostile file
-  can allocate far more than the archive's own size would suggest.
-  Omitting the flag on unpack/cat still binds — it resolves to the same
+  pack's encode path consumes: --threads and --turbo resolve to a worker
+  count via the same precedence STF_THREADS and a future config file will
+  follow, and --memory-limit resolves to the byte cap that count is
+  clamped against — divided by the codec's own measured per-worker demand,
+  never a flat division. Omitting --threads builds no governor at all —
+  the codec sees no worker count and encodes single-threaded, which is
+  what keeps output byte-reproducible by default. unpack, cat and info
+  accept --memory-limit and validate it the same way. info only reports
+  the resolved figure (it never decodes), but unpack and cat pass it
+  through to the decoder: a handful of pure codecs size a dictionary
+  buffer from a value the file declares in its own header, before
+  producing any output, so an unbounded decode of a hostile file can
+  allocate far more than the archive's own size would suggest — this is
+  what closed the xz-pure/lzip/lzma-pure decode denial-of-service, each
+  refusing at exit 6 (see "EXIT CODES" below) naming the declared size,
+  the limit and the flag, never the exit 5 a genuinely corrupt archive
+  gets. Omitting the flag on unpack/cat still binds — it resolves to the same
   25%-of-RAM default as pack — because a bound that defaults off closes
   nothing.
 

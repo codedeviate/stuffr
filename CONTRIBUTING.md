@@ -75,8 +75,10 @@ in the root `Cargo.toml` — and each crate inherits it with
 > the workspace, so the three inter-crate entries carry the number literally:
 > two in `[workspace.dependencies]` (root `Cargo.toml`) and one in
 > `crates/stuffr-cli/Cargo.toml`. Bump those together with the workspace
-> version. `grep -rn '0\.0\.1' Cargo.toml crates/*/Cargo.toml` should show
-> every occurrence changing at once.
+> version. `grep -rn 'version' Cargo.toml crates/*/Cargo.toml | grep -v
+> rust-version` should show every occurrence reading the new number at once —
+> a missed one fails the build, but the recipe is worth running anyway,
+> because the failure is confusing when it happens.
 
 ### While below 1.0
 
@@ -96,13 +98,18 @@ These come from the design specification and are the reason Phase 0 shipped as
 | Version | Contents |
 |---|---|
 | `0.0.z` | Phase 0 — core abstractions, validated against mock formats. No real formats. |
-| `0.1.0` | Phase 1 — the modern codecs. Streams and single files, no containers. |
+| `0.1.0` | Phase 1 — the modern codecs, parallel encode and the thread governor. Streams and single files, no containers. |
 | `0.2.0` | Phase 2 — containers, and the ZIP-on-a-pipe contract test. |
-| `1.0.0` | Phases 3–4 — legacy read and write, fuzzed. The read/write symmetry claim becomes true. |
-| `1.x` | Phase 5 — compatibility symlinks, `convert`, polish. |
+| `0.3.0` | Phases 3–4 — legacy read and write, fuzzed. The read/write symmetry claim becomes true. |
+| `0.4.x` | Phase 5 — compatibility symlinks, `convert`, polish. |
+| `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
-After 1.0, normal semver applies: breaking changes to any public API in
-`stuffr-core` or the `stuffr` facade require a major bump.
+This table was revised after Phase 1: the original plan put legacy read/write
+at `1.0.0` and treated it as the last stop. Fuzzed legacy symmetry is a real
+milestone, but it is not the same claim as "feature-complete," so it moved to
+`0.3.0` and `1.0.0` was freed to mean what it says. After 1.0, normal semver
+applies: breaking changes to any public API in `stuffr-core` or the `stuffr`
+facade require a major bump.
 
 ## `#[non_exhaustive]`
 

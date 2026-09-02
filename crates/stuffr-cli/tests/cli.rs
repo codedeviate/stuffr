@@ -1079,3 +1079,10 @@ fn threads_is_not_offered_on_decode_subcommands() {
         );
     }
 }
+
+#[test]
+fn the_binary_reports_its_version() {
+    let out = Command::new(STF).arg("--version").output().unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("0.1.0"), "--version must report 0.1.0, got: {s}");
+}

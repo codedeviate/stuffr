@@ -9,13 +9,14 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 1e complete — eleven codecs, and a default build that needs
-> no C toolchain to read *or write* xz, LZMA1 or LZIP.** `stf pack`, `unpack`,
-> `cat`, `info` and `formats` all work, on files and through pipes, and
+> **Status: Phase 1 complete at `0.1.0` — eleven codecs, four of them
+> parallel on request, and a default build that needs no C toolchain to read
+> *or write* xz, LZMA1 or LZIP.** `stf pack`, `unpack`, `cat`, `info` and
+> `formats` all work, on files and through pipes, and
 > `curl … | stf cat - | grep pattern` runs. `stf formats` lists `brotli`,
 > `bzip2`, `deflate`, `gzip`, `lz4`, `lzip`, `lzma`, `snappy`, `xz`, `zlib` and
 > `zstd`, each proven against the ten-property conformance harness Phase 1c
-> added and then proven to coexist. 396 tests under `--all-features`, 349 on
+> added and then proven to coexist. 486 tests under `--all-features`, 420 on
 > the default tier — a different set, not a subset, because the two tiers
 > select different backends. Clean across build, clippy and fmt.
 >
@@ -44,15 +45,51 @@ read list.
 > `weak` rather than `yes` in that row, so a build's honesty is visible without
 > running anything.
 >
-> **One known limitation, stated rather than buried.** On the default tier,
-> `xz` decoding allocates a dictionary buffer sized by the value the *file
-> declares in its own header*, before any output exists. Measured peak RSS
-> decoding a 60-byte `.xz` that declares preset 9's dictionary: 69.35 MB,
-> against 2.39 MB for `liblzma`. The format permits declaring roughly 4 GiB.
-> `--max-ratio` cannot catch this — it counts decoded *output* bytes, and the
-> cost is paid before there is any output to count. `--features c-backed`
-> closes it, and a `DecodeOpts` memory bound arrives with the governor in
-> Phase 1f.
+> **Parallel encode, opt-in and off by default.** Four of the eleven codecs
+> encode in parallel when asked: `zstd` (behind `--features c-backed`; the
+> default `ruzstd` encoder has no multi-threaded path), `xz` on both
+> backends, and `lzip`. `--threads N`, `--threads 0` (auto), `--turbo` and
+> `STF_THREADS` all enable it; omitting every one of them encodes
+> single-threaded, so the same input always produces the same bytes.
+> Reproducibility is scoped precisely — **same input + same flags + same
+> environment** — because `--threads 0`'s auto-detection resolves against
+> cgroup CPU quotas and so is not machine-independent by itself. `stf
+> formats`' PARALLEL column reports this truthfully per build: `yes` for `xz`
+> and `lzip` on the default (`pure`) tier and `-` for `zstd`; add
+> `--features c-backed` and `zstd` becomes `yes` too.
+>
+> **`--memory-limit` does two jobs.** On encode it bounds the worker count —
+> the governor divides the limit by each codec's measured per-worker demand,
+> handing out fewer, slower threads rather than risking the OOM killer. On
+> decode it bounds allocation instead, defaulting to 25% of available RAM
+> (cgroup-aware); `stf info` reports the resolved figure, rendered for humans
+> (`256 MiB`, never a raw byte count).
+>
+> **The per-worker figures, measured directly in release, have a consequence
+> worth stating plainly.** Below preset 7, `xz` and `lzip` cost roughly
+> **128 MiB per worker**; at preset 7 and above that jumps to roughly
+> **896 MiB** — the match finder dominates, at about 10.5x the dictionary
+> size, not the block buffer. So at the default budget:
+>
+> | `--memory-limit` budget | preset ≤ 6 | preset ≥ 7 |
+> |---|---|---|
+> | 256 MiB (the floor — what macOS gets, with no `/proc/meminfo`) | 2 workers | **1 worker** |
+> | 4 GiB (Linux, 16 GB available) | 32, then CPU-capped | 4 workers |
+>
+> **Someone on macOS running `--threads 8 --level 9` silently gets one
+> worker** unless `--memory-limit` is raised — that is the governor working
+> as designed, not a bug, and it reads as one if left undocumented.
+>
+> **Two defects carried out of Phase 1e are now closed.** The decode
+> denial-of-service is fixed for all three pure codecs it touched, with the
+> allocation prevented rather than merely reported: `lzma-pure` 538.8 MB →
+> 1.66 MB, `xz-pure` 68.45 MB → 1.18 MB, `lzip` 538.4 MB → 1.18 MB peak RSS,
+> each now refusing at exit 6 with a message naming the declared size, the
+> limit and the flag — never exit 5, so a corrupt file and an oversized one
+> stay distinguishable. A legitimate large-dictionary file still decodes.
+> Brotli's trailing-data divergence is fixed too: it now rejects concatenated
+> streams and NUL-padded input, matching reference `brotli` 1.2.0 exactly, at
+> no throughput cost.
 >
 > **A fifth instance of a defect class this project keeps finding: a
 > concatenated stream silently truncated to less than all of it.** Bare
@@ -66,9 +103,8 @@ read list.
 > multi-member case against the reference `lzip` 1.26 tool directly, in both
 > directions.
 >
-> **Not yet: containers.** `tar`, `zip` and the rest are Phase 2. Parallel
-> encode and the version bump to `0.1.0` are Phase 1f. Nothing in the matrix
-> below beyond the eleven codecs above is implemented.
+> **Not yet: containers.** `tar`, `zip` and the rest are Phase 2. Nothing in
+> the matrix below beyond the eleven codecs above is implemented.
 >
 > Already true and enforced for every codec: decoding is incremental rather
 > than read-to-end, corruption is distinguishable from a full disk, truncation
