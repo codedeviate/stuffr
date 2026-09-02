@@ -387,7 +387,7 @@ use lzma_rust2::{LzipOptions, LzipReader, LzipWriter, LzipWriterMt};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
-    MagicRule, Result, Sink, Source, StreamOnly,
+    MagicRule, Result, Sink, Source, StreamOnly, format_size,
 };
 
 use crate::normalize::{LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF, NormalizeDecodeErrors};
@@ -471,9 +471,10 @@ impl Codec for Lzip {
                 && declared > limit
             {
                 return Err(Error::ResourceLimit(format!(
-                    "lzip: header declares a dictionary needing {declared} bytes, but \
-                     --memory-limit allows only {limit} bytes — raise --memory-limit to \
-                     decode this file"
+                    "lzip: header declares a dictionary needing {}, but --memory-limit \
+                     allows only {} — raise --memory-limit to decode this file",
+                    format_size(declared),
+                    format_size(limit)
                 )));
             }
         }

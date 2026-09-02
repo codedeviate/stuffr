@@ -213,7 +213,7 @@ use lzma_rust2::{LzmaOptions, LzmaReader, LzmaWriter};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
-    Source, StreamOnly,
+    Source, StreamOnly, format_size,
 };
 
 pub use crate::lzma_shared::{LZMA, lzma_meta as meta};
@@ -532,16 +532,24 @@ impl Read for LazyLzmaDecoder {
                             // `Error::from_decode_io` as `OutOfMemory` so it
                             // classifies as `ResourceLimit` (exit 6), not
                             // `Corrupt` (exit 5).
+                            // Rendered via the shared `format_size` (MiB/GiB,
+                            // matching `stf info` and the xz/lzip refusal
+                            // messages) rather than this codec's own KiB
+                            // unit — see the whole-branch review's LOW-5
+                            // finding: three different unit conventions for
+                            // the same quantity across this one tool.
                             let msg = match declared_need_kb {
                                 Some(need_kb) => format!(
-                                    "lzma: header declares a dictionary needing {need_kb} KiB, \
-                                     but --memory-limit allows only {mem_limit_kb} KiB — raise \
-                                     --memory-limit to decode this file"
+                                    "lzma: header declares a dictionary needing {}, but \
+                                     --memory-limit allows only {} — raise --memory-limit to \
+                                     decode this file",
+                                    format_size(u64::from(need_kb) * 1024),
+                                    format_size(u64::from(mem_limit_kb) * 1024)
                                 ),
                                 None => format!(
-                                    "lzma: header declares a dictionary exceeding the \
-                                     {mem_limit_kb} KiB --memory-limit — raise --memory-limit \
-                                     to decode this file"
+                                    "lzma: header declares a dictionary exceeding the {} \
+                                     --memory-limit — raise --memory-limit to decode this file",
+                                    format_size(u64::from(mem_limit_kb) * 1024)
                                 ),
                             };
                             std::io::Error::new(ErrorKind::OutOfMemory, msg)

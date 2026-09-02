@@ -14,6 +14,7 @@ pub mod governor;
 pub mod ladder;
 pub mod probe;
 pub mod registry;
+pub mod size;
 pub mod source;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -31,6 +32,7 @@ pub use governor::{BudgetInputs, Governor, LeaseSet, default_memory_limit, resol
 pub use ladder::{Resolved, StreamPolicy, resolve};
 pub use probe::{Chain, PROBE_LEN, probe, resolve_chain};
 pub use registry::{FormatRow, Registry};
+pub use size::format_size;
 pub use source::{
     Counting, CountingWriter, DEFAULT_MAX_RATIO, FileSource, PeekSource, RATIO_FLOOR, RatioGuard,
     ReaderSource, SeekRead, Source, SourceCaps, SpillPolicy, SpillSource, StreamOnly,

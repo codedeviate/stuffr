@@ -261,7 +261,7 @@ use lzma_rust2::{XzOptions, XzReader, XzWriter, XzWriterMt};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
-    Source, StreamOnly,
+    Source, StreamOnly, format_size,
 };
 
 use crate::normalize::{NormalizeDecodeErrors, XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF};
@@ -351,9 +351,10 @@ impl Codec for Xz {
                 && declared > limit
             {
                 return Err(Error::ResourceLimit(format!(
-                    "xz: header declares a dictionary needing {declared} bytes, but \
-                     --memory-limit allows only {limit} bytes — raise --memory-limit to \
-                     decode this file"
+                    "xz: header declares a dictionary needing {}, but --memory-limit \
+                     allows only {} — raise --memory-limit to decode this file",
+                    format_size(declared),
+                    format_size(limit)
                 )));
             }
         }
