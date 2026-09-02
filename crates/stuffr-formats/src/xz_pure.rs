@@ -115,13 +115,15 @@
 //! `xz_c.rs`'s message wording and exit code (`Error::Usage`, exit 2) rather
 //! than inventing a second one.
 //!
-//! ## `memory_per_worker`: preset 6's dictionary, not preset 9's
+//! ## `memory_per_worker`: preset 6's dictionary for `caps()`, level-aware for `acquire_many`
 //!
-//! `8 * 1024 * 1024` (8 MiB) — `LzmaOptions::PRESET_TO_DICT_SIZE[6]`, this
-//! codec's default level when no `--level` is given. See `xz_c.rs`'s own
-//! `caps()` doc for why this is deliberately the SINGLE-WORKER figure for
-//! the default preset rather than preset 9's 64 MiB, or the much larger
-//! multi-hundred-MiB figure Phase 1f's parallel encode will need.
+//! `caps().memory_per_worker` declares `896 * 1024 * 1024` (896 MiB) — the
+//! STATIC, conservative figure for preset 9, the highest this codec accepts.
+//! `encoder` below instead calls `per_worker_bytes(level)`, defined near
+//! `block_size_for`, which is level-aware and returns a much smaller figure
+//! (128 MiB) at the default preset 6. See `per_worker_bytes`'s own doc for
+//! the Task 7 measurement backing both numbers, and `xz_c.rs`'s identical
+//! split for the sibling backend.
 //!
 //! ## Parallel encode: block size, and why the single-worker guard needs an
 //! ## above-threshold payload to be testable
@@ -137,11 +139,12 @@
 //! a figure. The crate floors the effective size at the dictionary itself
 //! (`block_size.max(dict_size)`), so this codec only has to choose the
 //! multiplier, not guard the floor. At the default preset (6, 8 MiB
-//! dictionary) that is 24 MiB. **Task 7, which measures `memory_per_worker`
-//! for parallel encode, measures it against this 24 MiB figure** — this
-//! module still declares the single-worker 8 MiB figure below, unchanged,
-//! the same posture `xz_c.rs`'s `caps()` doc documents for its own
-//! `MtStreamBuilder` figure.
+//! dictionary) that is 24 MiB. **Task 7 measured `memory_per_worker` against
+//! this 24 MiB figure and found the true per-worker cost roughly five times
+//! larger** — 122.8 MiB, not 24 MiB, because a worker's memory holds the
+//! match-finder's hash chains alongside the block buffer, not the block
+//! alone. See `per_worker_bytes`'s doc, right after this function, for the
+//! full measurement.
 //!
 //! **A payload at or below the block size yields ONE block, and this
 //! backend's one-block MT output is BYTE-IDENTICAL to the single-threaded
@@ -247,9 +250,17 @@ impl Codec for Xz {
             // `CheckType::Crc64`. See the module doc for the measured sweep
             // and `decoder`'s own doc for the foreign-stream caveat.
             detects_corruption: CorruptionDetection::WhenPresent,
-            // preset 6's dictionary (8 MiB) — see the module doc's note on
-            // why this, not preset 9's, is the right single-worker figure.
-            memory_per_worker: Some(8 * 1024 * 1024),
+            // Task 7 measurement: preset 9 (the highest this codec accepts)
+            // derives a per-worker delta of ~833.0 MiB — see
+            // `per_worker_bytes`'s doc for the full table. THIS FIELD is the
+            // STATIC, conservative figure for the highest preset, rounded up
+            // to 896 MiB — a static advertisement for callers that
+            // introspect `caps()` without ever calling `encoder`. `encoder`
+            // below calls `per_worker_bytes(level)` instead, which is
+            // level-aware and uses a much smaller figure (128 MiB) at the
+            // default preset 6. See the module doc's "memory_per_worker"
+            // section.
+            memory_per_worker: Some(896 * 1024 * 1024),
             // Measured at ratio parity with liblzma (see the module doc) —
             // this is a real codec, not a weaker stand-in like zstd_pure's.
             weak_encoder: false,
@@ -340,7 +351,7 @@ impl Codec for Xz {
                     .threads
                     .filter(|n| *n > 0)
                     .unwrap_or_else(|| gov.workers());
-                let granted = gov.acquire_many(want, self.caps().memory_per_worker.unwrap_or(0));
+                let granted = gov.acquire_many(want, per_worker_bytes(level));
                 // A grant of one is single-threaded: `XzWriterMt::new(_, _,
                 // 1)` is a different code path from `XzWriter::new` with
                 // nothing to gain from it — `acquire_many` clamps rather
@@ -388,6 +399,49 @@ impl Codec for Xz {
 fn block_size_for(opts: &XzOptions) -> NonZeroU64 {
     NonZeroU64::new(u64::from(opts.lzma_options.dict_size) * 3)
         .expect("a preset's dict_size is always positive")
+}
+
+/// This codec's per-worker demand for `acquire_many` — level-aware, unlike
+/// `caps().memory_per_worker`, which is a static, conservative figure for
+/// callers that introspect `caps()` without ever calling `encoder`. `o.level`
+/// is available right here, which `caps()` cannot see.
+///
+/// Measured directly (release build, `/usr/bin/time -l` on macOS, a
+/// streamed, tiled-repetitive payload — content does not change dictionary
+/// or match-finder memory, only encode speed, which is why a large payload
+/// is affordable to measure at all), at 1, 2, 4 and 8 workers, deriving the
+/// per-worker delta as `(rss_at_n - rss_at_1) / (n - 1)`:
+///
+/// | preset | payload | 1w | 2w | 4w | 8w | derived (n=8) |
+/// |---|---|---|---|---|---|---|
+/// | 6 (default) | 256 MiB | 86.9 MB | 468.2 MB | 662.0 MB | 988.0 MB | 122.8 MiB |
+/// | 9 (highest) | 1536 MiB | 645.1 MB | 3025.8 MB | 4272.3 MB | 6759.6 MB | 833.0 MiB |
+///
+/// **Both figures are far above `block_size_for`'s `3 × dict_size` guess**
+/// (24 MiB at preset 6, 192 MiB at preset 9) — trust the measurement, per
+/// the brief. The gap matches this crate's match-finder cost for the
+/// default BT4 finder, roughly `10.5 × dict_size` per thread, on top of the
+/// block buffer itself: `10.5 × 8 MiB + 24 MiB ≈ 108 MiB` at preset 6 and
+/// `10.5 × 64 MiB + 192 MiB ≈ 864 MiB` at preset 9 — both within a few
+/// percent of the measured deltas above, and within a few MiB of `xz_c.rs`'s
+/// independent measurement of the same two presets against `liblzma`
+/// instead of this crate, which is why the figures below are the measured
+/// ones, not the block-size guess.
+///
+/// Two tiers, thresholded at preset 7 (`lzma_encoder_presets.c`'s
+/// `dict_pow2` table doubles the dictionary from there on — see
+/// `xz_c.rs`'s identical threshold): presets 0-6 get the measured preset-6
+/// figure (rounded up to 128 MiB), presets 7-9 get the measured preset-9
+/// figure (rounded up to 896 MiB). Coarser than a per-preset table, and safe
+/// in the direction that matters — every preset below 6 has a smaller
+/// dictionary than 6 itself, and 7-8's true cost is well under 9's, so both
+/// tiers over-declare rather than under-declare.
+fn per_worker_bytes(level: u32) -> u64 {
+    if level >= 7 {
+        896 * 1024 * 1024 // 896 MiB: headroom over the measured ~833.0 MiB.
+    } else {
+        128 * 1024 * 1024 // 128 MiB: headroom over the measured ~122.8 MiB.
+    }
 }
 
 /// Either writer this codec's `encoder` can produce, unified so `XzPureSink`
@@ -821,6 +875,36 @@ mod tests {
         assert!(
             c.memory_per_worker.is_some(),
             "a codec that knows its working set should say so; the governor has no other source"
+        );
+    }
+
+    #[test]
+    fn a_tight_memory_limit_clamps_the_worker_count() {
+        // The declared figure is what the governor divides by, so a limit of
+        // three workers' worth must yield at most three however many CPUs
+        // the budget allows. Reads memory_per_worker rather than repeating
+        // it: a test with its own copy of the constant stops tracking it.
+        let per = Xz
+            .caps()
+            .memory_per_worker
+            .expect("a parallel codec must declare one");
+        let gov = stuffr_core::Governor::new(16, per * 3);
+        assert!(
+            gov.workers_for(per) <= 3,
+            "16 CPU workers but only three workers' worth of memory: got {}",
+            gov.workers_for(per)
+        );
+    }
+
+    #[test]
+    fn per_worker_bytes_is_level_aware() {
+        // Guards against `per_worker_bytes` silently regressing to a
+        // constant: preset 9 must demand more memory per worker than the
+        // default preset 6, matching Task 7's measurement (~833.0 MiB
+        // derived at preset 9 against ~122.8 MiB at preset 6).
+        assert!(
+            per_worker_bytes(9) > per_worker_bytes(6),
+            "the highest preset must demand more memory per worker than the default"
         );
     }
 

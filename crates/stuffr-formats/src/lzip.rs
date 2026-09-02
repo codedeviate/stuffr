@@ -249,15 +249,17 @@
 //! same message wording and exit code (`Error::Usage`, exit 2) the other two
 //! `lzma-rust2`-backed codecs in this project use.
 //!
-//! ## `memory_per_worker`: preset 6's dictionary
+//! ## `memory_per_worker`: preset 6's dictionary for `caps()`, level-aware for `acquire_many`
 //!
-//! `8 * 1024 * 1024` (8 MiB) — the same figure `lzma_pure.rs` and
-//! `lzma_c.rs` declare for the same reason: LZIP's payload is an LZMA1
-//! stream, and preset 6 (this codec's default level when no `--level` is
-//! given) uses an 8 MiB dictionary. **Unchanged by parallel encode below** —
-//! Task 7, which measures `memory_per_worker` for parallel encode, measures
-//! it against the 24 MiB member size chosen there, not this single-worker
-//! figure; see that section.
+//! `caps().memory_per_worker` declares `896 * 1024 * 1024` (896 MiB) — the
+//! STATIC, conservative figure for preset 9, the highest this codec accepts.
+//! `encoder` below instead calls `per_worker_bytes(level)`, defined near
+//! `member_size_for`, which is level-aware and returns a much smaller figure
+//! (128 MiB) at the default preset 6. See `per_worker_bytes`'s own doc for
+//! the Task 7 measurement backing both numbers — it found the true
+//! per-worker cost roughly five times the naive `3 × dict_size` member-size
+//! guess, at both presets — and `xz_pure.rs`'s identical split, measured
+//! independently against the same underlying crate.
 //!
 //! ## Parallel encode: member size, and why the single-worker guard needs
 //! ## an above-threshold payload to be testable
@@ -385,8 +387,17 @@ impl Codec for Lzip {
             // detection" section for why the header blind spot this codec
             // closes does not undermine the claim.
             detects_corruption: CorruptionDetection::Always,
-            // preset 6's dictionary (8 MiB) — see the module doc.
-            memory_per_worker: Some(8 * 1024 * 1024),
+            // Task 7 measurement: preset 9 (the highest this codec accepts)
+            // derives a per-worker delta of ~833.7 MiB — see
+            // `per_worker_bytes`'s doc for the full table. THIS FIELD is the
+            // STATIC, conservative figure for the highest preset, rounded up
+            // to 896 MiB — a static advertisement for callers that
+            // introspect `caps()` without ever calling `encoder`. `encoder`
+            // below calls `per_worker_bytes(level)` instead, which is
+            // level-aware and uses a much smaller figure (128 MiB) at the
+            // default preset 6. See the module doc's "memory_per_worker"
+            // section.
+            memory_per_worker: Some(896 * 1024 * 1024),
             weak_encoder: false,
             // `lzma_rust2::LzipWriterMt` is real: `encoder` below wires it
             // to a governor grant, using `member_size_for`'s three-times-
@@ -453,7 +464,7 @@ impl Codec for Lzip {
                     .threads
                     .filter(|n| *n > 0)
                     .unwrap_or_else(|| gov.workers());
-                let granted = gov.acquire_many(want, self.caps().memory_per_worker.unwrap_or(0));
+                let granted = gov.acquire_many(want, per_worker_bytes(level));
                 // A grant of one is single-threaded: `LzipWriterMt::new(_,
                 // _, 1)` is a different code path from `LzipWriter::new`
                 // with nothing to gain from it — `acquire_many` clamps
@@ -499,6 +510,49 @@ impl Codec for Lzip {
 fn member_size_for(opts: &LzipOptions) -> NonZeroU64 {
     NonZeroU64::new(u64::from(opts.lzma_options.dict_size) * 3)
         .expect("a preset's dict_size is always positive")
+}
+
+/// This codec's per-worker demand for `acquire_many` — level-aware, unlike
+/// `caps().memory_per_worker`, which is a static, conservative figure for
+/// callers that introspect `caps()` without ever calling `encoder`. `o.level`
+/// is available right here, which `caps()` cannot see.
+///
+/// Measured directly (release build, `/usr/bin/time -l` on macOS, a
+/// streamed, tiled-repetitive payload — content does not change dictionary
+/// or match-finder memory, only encode speed, which is why a large payload
+/// is affordable to measure at all), at 1, 2, 4 and 8 workers, deriving the
+/// per-worker delta as `(rss_at_n - rss_at_1) / (n - 1)`:
+///
+/// | preset | payload | 1w | 2w | 4w | 8w | derived (n=8) |
+/// |---|---|---|---|---|---|---|
+/// | 6 (default) | 256 MiB | 86.9 MB | 473.8 MB | 666.7 MB | 1000.9 MB | 124.5 MiB |
+/// | 9 (highest) | 1536 MiB | 645.0 MB | 3017.4 MB | 4371.9 MB | 6765.2 MB | 833.7 MiB |
+///
+/// **Both figures are far above `member_size_for`'s `3 × dict_size` guess**
+/// (24 MiB at preset 6, 192 MiB at preset 9) — trust the measurement, per
+/// the brief. The gap matches this crate's match-finder cost for the
+/// default BT4 finder, roughly `10.5 × dict_size` per thread, on top of the
+/// member buffer itself: `10.5 × 8 MiB + 24 MiB ≈ 108 MiB` at preset 6 and
+/// `10.5 × 64 MiB + 192 MiB ≈ 864 MiB` at preset 9 — both within a few
+/// percent of the measured deltas above, and within a fraction of a percent
+/// of `xz_pure.rs`'s independent measurement of the same underlying crate at
+/// the same two presets, which is why the figures below are the measured
+/// ones, not the member-size guess.
+///
+/// Two tiers, thresholded at preset 7 (`lzma_encoder_presets.c`'s
+/// `dict_pow2` table doubles the dictionary from there on — see
+/// `xz_c.rs`'s and `xz_pure.rs`'s identical threshold): presets 0-6 get the
+/// measured preset-6 figure (rounded up to 128 MiB), presets 7-9 get the
+/// measured preset-9 figure (rounded up to 896 MiB). Coarser than a
+/// per-preset table, and safe in the direction that matters — every preset
+/// below 6 has a smaller dictionary than 6 itself, and 7-8's true cost is
+/// well under 9's, so both tiers over-declare rather than under-declare.
+fn per_worker_bytes(level: u32) -> u64 {
+    if level >= 7 {
+        896 * 1024 * 1024 // 896 MiB: headroom over the measured ~833.7 MiB.
+    } else {
+        128 * 1024 * 1024 // 128 MiB: headroom over the measured ~124.5 MiB.
+    }
 }
 
 /// Either writer this codec's `encoder` can produce, unified so `LzipSink`
@@ -1158,6 +1212,36 @@ mod tests {
         assert!(
             c.memory_per_worker.is_some(),
             "a codec that knows its working set should say so; the governor has no other source"
+        );
+    }
+
+    #[test]
+    fn a_tight_memory_limit_clamps_the_worker_count() {
+        // The declared figure is what the governor divides by, so a limit of
+        // three workers' worth must yield at most three however many CPUs
+        // the budget allows. Reads memory_per_worker rather than repeating
+        // it: a test with its own copy of the constant stops tracking it.
+        let per = Lzip
+            .caps()
+            .memory_per_worker
+            .expect("a parallel codec must declare one");
+        let gov = stuffr_core::Governor::new(16, per * 3);
+        assert!(
+            gov.workers_for(per) <= 3,
+            "16 CPU workers but only three workers' worth of memory: got {}",
+            gov.workers_for(per)
+        );
+    }
+
+    #[test]
+    fn per_worker_bytes_is_level_aware() {
+        // Guards against `per_worker_bytes` silently regressing to a
+        // constant: preset 9 must demand more memory per worker than the
+        // default preset 6, matching Task 7's measurement (~833.7 MiB
+        // derived at preset 9 against ~124.5 MiB at preset 6).
+        assert!(
+            per_worker_bytes(9) > per_worker_bytes(6),
+            "the highest preset must demand more memory per worker than the default"
         );
     }
 

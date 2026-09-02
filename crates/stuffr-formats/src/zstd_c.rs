@@ -58,12 +58,20 @@ impl Codec for Zstd {
             // `decoder`'s doc (the measured partial-detection figure for
             // that case lives there, where a caller actually meets it).
             detects_corruption: CorruptionDetection::WhenPresent,
-            // Not measured: derived, not profiled. zstd's window at level 3
-            // (the default) is 1 MiB; the encoder's match-finder tables and
-            // internal buffers add a further working set on top of that. 8
-            // MiB is a defensible round figure for "a few times the window",
-            // the same spirit as bzip2.rs's derived figure.
-            memory_per_worker: Some(8 * 1024 * 1024),
+            // Task 7 measurement (release build, `/usr/bin/time -l`, a
+            // streamed tiled-repetitive payload, 1/2/4/8 workers): level 22
+            // (the highest this build accepts) derives a per-worker delta of
+            // ~897 MiB — see `per_worker_bytes`'s doc for the full table and
+            // the plateau this figure had to correct for. THIS FIELD is the
+            // STATIC, conservative figure for the highest level, rounded up
+            // to 1 GiB for headroom — a static advertisement for callers
+            // that introspect `caps()` without ever calling `encoder`.
+            // `encoder` below calls `per_worker_bytes(level)` instead, which
+            // is level-aware and uses a much smaller figure (16 MiB) at the
+            // default level 3: declaring the highest-level figure here would
+            // needlessly limit a default-level encode to a fraction of the
+            // workers it can safely use.
+            memory_per_worker: Some(1024 * 1024 * 1024),
             weak_encoder: false,
             // `ZSTD_c_nbWorkers` is real: `Encoder::multithread` below wires
             // it to a governor grant. See `encoder`'s doc for the refusal
@@ -144,7 +152,7 @@ impl Codec for Zstd {
                     .threads
                     .filter(|n| *n > 0)
                     .unwrap_or_else(|| gov.workers());
-                let granted = gov.acquire_many(want, self.caps().memory_per_worker.unwrap_or(0));
+                let granted = gov.acquire_many(want, per_worker_bytes(level));
                 // A grant of one is single-threaded. `multithread(1)` is not
                 // the same as not calling it, so only opt in above one:
                 // `acquire_many` clamps rather than failing, so a tight
@@ -157,6 +165,47 @@ impl Codec for Zstd {
             None => None,
         };
         Ok(Box::new(ZstdSink { enc, _lease: lease }))
+    }
+}
+
+/// This codec's per-worker demand for `acquire_many` — level-aware, unlike
+/// `caps().memory_per_worker`, which is a static, conservative figure for
+/// callers that introspect `caps()` without ever calling `encoder`. `o.level`
+/// is available right here, which `caps()` cannot see.
+///
+/// Measured directly (release build, `/usr/bin/time -l` on macOS, a
+/// streamed, tiled-repetitive payload — content does not change the
+/// encoder's window/match-finder memory, only its speed, which is why a
+/// large payload is affordable to measure at all), at 1, 2, 4 and 8 workers,
+/// deriving the per-worker delta as `(rss_at_n - rss_at_1) / (n - 1)`:
+///
+/// | level | payload | 1w | 2w | 4w | 8w |
+/// |---|---|---|---|---|---|
+/// | 3 (default) | 256 MiB | 5.3 MB | 46.1 MB | 64.8 MB | 102.2 MB |
+/// | 22 ("ultra", highest accepted) | 1536 MiB | 875.9 MB | 3025.4 MB | 3697.7 MB | 3697.8 MB |
+///
+/// Level 3's `(rss_8 - rss_1) / 7` derives to 13.2 MiB, declared as 16 MiB.
+///
+/// **Level 22's RSS PLATEAUS between 4 and 8 workers** — 3697.7 MB and
+/// 3697.8 MB, functionally identical. This build's zstd did not run 8 real
+/// concurrent jobs for this payload/level, so `(rss_8 - rss_1) / 7` (only
+/// 384.5 MiB) silently folds four idle "workers" into the denominator and
+/// UNDER-counts the true marginal cost. The pre-plateau `(rss_4 - rss_1) / 3`
+/// derives to 897.0 MiB and is what this function returns for the ultra
+/// tier, rounded up to 1 GiB for headroom — trust the measurement that
+/// contradicts the naive "divide by however many workers were asked for"
+/// arithmetic, per the brief.
+///
+/// Two tiers, not a continuous formula: zstd's levels 20-22 are its "ultra"
+/// tier (the reference CLI gates them behind `--ultra` for the same
+/// reason — a materially larger window than every level below), and only
+/// two points were measured, so a step at that boundary is honest where an
+/// unverified interpolation across the other 25 levels would not be.
+fn per_worker_bytes(level: i32) -> u64 {
+    if level >= 20 {
+        1024 * 1024 * 1024 // 1 GiB: headroom over the measured ~897 MiB.
+    } else {
+        16 * 1024 * 1024 // 16 MiB: headroom over the measured ~13.2 MiB.
     }
 }
 
@@ -342,6 +391,37 @@ mod tests {
         assert!(
             c.memory_per_worker.is_some(),
             "a codec that knows its working set should say so; the governor has no other source"
+        );
+    }
+
+    #[test]
+    fn a_tight_memory_limit_clamps_the_worker_count() {
+        // The declared figure is what the governor divides by, so a limit of
+        // three workers' worth must yield at most three however many CPUs
+        // the budget allows. Reads memory_per_worker rather than repeating
+        // it: a test with its own copy of the constant stops tracking it.
+        let per = Zstd
+            .caps()
+            .memory_per_worker
+            .expect("a parallel codec must declare one");
+        let gov = stuffr_core::Governor::new(16, per * 3);
+        assert!(
+            gov.workers_for(per) <= 3,
+            "16 CPU workers but only three workers' worth of memory: got {}",
+            gov.workers_for(per)
+        );
+    }
+
+    #[test]
+    fn per_worker_bytes_is_level_aware() {
+        // Guards against `per_worker_bytes` silently regressing to a
+        // constant: the highest accepted level must demand more memory per
+        // worker than the default, matching Task 7's measurement (~897 MiB
+        // derived at level 22 against ~13.2 MiB at level 3).
+        let highest = *zstd::compression_level_range().end();
+        assert!(
+            per_worker_bytes(highest) > per_worker_bytes(zstd::DEFAULT_COMPRESSION_LEVEL),
+            "the highest accepted level must demand more memory per worker than the default"
         );
     }
 
