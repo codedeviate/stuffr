@@ -184,9 +184,21 @@ mod backend_selection {
     //! message says so. All three formats use the identical `cfg` pattern, so
     //! zstd's test also exercises the mechanism itself.
 
+    // Gated identically to the one test that uses them below
+    // (`the_two_xz_backends_are_interchangeable_so_selection_is_unobservable`,
+    // `#[cfg(all(feature = "xz-c", feature = "xz-pure"))]`): every OTHER
+    // build — including the default `pure` tier, and a plain `cargo
+    // install` — has no caller left for `encode_with`, and `make lint`
+    // only denies warnings under `--all-features` (where both features
+    // are on and this compiles live), so an unguarded `use`/`fn` here
+    // compiled dead on every build the lint leg cannot see. Whole-branch
+    // review LOW-4 (2026-09-02).
+    #[cfg(all(feature = "xz-c", feature = "xz-pure"))]
     use super::*;
+    #[cfg(all(feature = "xz-c", feature = "xz-pure"))]
     use stuffr_core::{Codec, EncodeOpts};
 
+    #[cfg(all(feature = "xz-c", feature = "xz-pure"))]
     fn encode_with(codec: &dyn Codec, plain: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let buf = stuffr_core::testing::SharedBuf::new();
