@@ -114,7 +114,21 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             force,
             no_sync,
             allow_weak_encoder,
+            threads,
+            turbo,
+            memory_limit,
         } => {
+            // Nothing consumes these three yet — Phase 1f's next task builds
+            // the thread governor that will. Parsing (and thus validating)
+            // `--memory-limit` here, ahead of any consumer, is deliberate: a
+            // malformed value must be caught before anything else runs.
+            let _ = threads;
+            let _ = turbo;
+            let memory_limit = match memory_limit {
+                Some(s) => Some(stuffr_cli::size::parse_size(&s).map_err(stuffr::Error::Usage)?),
+                None => None,
+            };
+            let _ = memory_limit;
             let fmt = match format.as_deref() {
                 Some(name) => Some(format_by_name(name)?),
                 None => None,
@@ -158,7 +172,14 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             format,
             max_ratio,
             no_sync,
+            memory_limit,
         } => {
+            // Nothing consumes this yet — see the note in the `Pack` arm.
+            let memory_limit = match memory_limit {
+                Some(s) => Some(stuffr_cli::size::parse_size(&s).map_err(stuffr::Error::Usage)?),
+                None => None,
+            };
+            let _ = memory_limit;
             let fmt = match format.as_deref() {
                 Some(name) => Some(format_by_name(name)?),
                 None => None,
@@ -191,7 +212,14 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             input,
             format,
             max_ratio,
+            memory_limit,
         } => {
+            // Nothing consumes this yet — see the note in the `Pack` arm.
+            let memory_limit = match memory_limit {
+                Some(s) => Some(stuffr_cli::size::parse_size(&s).map_err(stuffr::Error::Usage)?),
+                None => None,
+            };
+            let _ = memory_limit;
             let fmt = match format.as_deref() {
                 Some(name) => Some(format_by_name(name)?),
                 None => None,
@@ -207,8 +235,18 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             ops::decompress(input_of(&input), Output::Stdout, &opts)?;
             Ok(())
         }
-        Command::Info { input, json } => {
+        Command::Info {
+            input,
+            json,
+            memory_limit,
+        } => {
             use std::io::Write;
+            // Nothing consumes this yet — see the note in the `Pack` arm.
+            let memory_limit = match memory_limit {
+                Some(s) => Some(stuffr_cli::size::parse_size(&s).map_err(stuffr::Error::Usage)?),
+                None => None,
+            };
+            let _ = memory_limit;
             let i = ops::inspect(input_of(&input))?;
             let mut out = std::io::stdout();
             if json {

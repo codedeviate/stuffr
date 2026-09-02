@@ -985,3 +985,43 @@ fn formats_lists_every_registered_format() {
         );
     }
 }
+
+#[test]
+fn a_malformed_memory_limit_is_a_usage_error() {
+    let src = tmp("mem-bad.txt");
+    let out_path = tmp("mem-bad.gz");
+    let _ = std::fs::remove_file(&out_path);
+    std::fs::write(&src, b"payload").unwrap();
+
+    let out = Command::new(STF)
+        .args(["pack", "--memory-limit", "512MB", "--format", "gzip", "-o"])
+        .arg(&out_path)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "malformed size must be exit 2");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("512M"), "must name the accepted forms: {err}");
+    assert!(!out_path.exists(), "a refused pack must leave no output");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out_path);
+}
+
+#[test]
+fn threads_is_not_offered_on_decode_subcommands() {
+    // Multi-threaded decode is out of scope, and this project refuses a flag
+    // rather than accepting and ignoring it. If MT decode is ever added, this
+    // test should fail and be deleted deliberately.
+    for sub in ["unpack", "cat"] {
+        let out = Command::new(STF)
+            .args([sub, "--threads", "4", "-"])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("unexpected argument") || err.contains("--threads"),
+            "{sub} must reject --threads, got: {err}"
+        );
+    }
+}

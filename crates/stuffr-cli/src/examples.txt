@@ -231,6 +231,51 @@ USING A WEAK FALLBACK ENCODER
       `--features c-backed` changes nothing about its row at all.
 
 
+PARALLEL ENCODE FLAGS
+
+  stf pack big.dat --format xz --threads 4
+      Encode with 4 worker threads instead of stf's default of one.
+      --threads is deliberately opt-in rather than auto-detected: a
+      multi-threaded xz or zstd encoder splits its input across workers,
+      so the very same file compresses to different bytes depending on
+      how many workers ran. Omitting --threads keeps pack single-threaded,
+      so a given input always produces the same output bytes on any
+      machine, regardless of how many cores it has. Passing --threads 0
+      asks stf to auto-detect a worker count instead, trading that
+      byte-for-byte reproducibility for speed. --threads exists only on
+      pack; multi-threaded decode is out of scope for this phase, and
+      unpack/cat refuse the flag outright rather than silently accepting
+      and ignoring it — see "threads_is_not_offered_on_decode_subcommands"
+      if you want the enforcement in test form.
+
+  stf pack big.dat --format xz --threads 4 --turbo
+      --turbo lifts the CPU cap only, letting stf use the full detected
+      core budget instead of a conservative default worker count.
+      --memory-limit (below) still binds regardless of --turbo: turbo
+      means "use my cores," not "ignore the OOM killer."
+
+  stf pack big.dat --format xz --memory-limit 512M
+  stf unpack archive.xz --memory-limit 512M
+      --memory-limit caps the memory stf will ask for. It accepts a plain
+      byte count or a binary, 1024-based K/M/G suffix (e.g. 512M or 2G) —
+      matching what `xz --memlimit` and every other tool in this space
+      mean by "M", not the decimal 1000-based reading. A malformed value
+      (512MB, a decimal unit, anything else this parser doesn't recognise)
+      is a usage error naming the accepted forms, never a silent fall back
+      to the default — a user who typed 512MB and got 25% of RAM instead
+      would have no way to notice. On pack this will bound the worker
+      count; unpack, cat and info accept it too, since a decode can also
+      need to fit inside a memory ceiling even with no threads to bound.
+      Defaults to 25% of available RAM, honouring cgroup limits.
+
+  As shipped in this build, --threads, --turbo and --memory-limit are
+  parsed and strictly validated but not yet wired to pack's actual encode
+  path or to any decode path — the thread governor that consumes them is
+  separate, later work. Passing them today changes nothing about how a
+  file is encoded or decoded; only a malformed --memory-limit's usage
+  error is currently observable.
+
+
 EXIT CODES
 
   0  success

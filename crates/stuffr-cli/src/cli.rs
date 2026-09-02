@@ -48,6 +48,26 @@ pub enum Command {
         /// format's real one. Worse ratio, and buffers the whole input.
         #[arg(long)]
         allow_weak_encoder: bool,
+        /// Encode with N worker threads. 0 means auto-detect.
+        ///
+        /// OMITTING this flag is not the same as passing 0: without it, stf
+        /// encodes single-threaded, so the same input always produces the same
+        /// bytes on any machine. Multi-threaded xz and zstd split the input
+        /// per worker, so their output depends on the worker count.
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Use the full detected CPU budget, uncapped.
+        ///
+        /// Lifts the CPU cap only — `--memory-limit` still binds. Turbo means
+        /// "use my cores", not "ignore the OOM killer".
+        #[arg(long)]
+        turbo: bool,
+        /// Cap the memory stf will ask for, e.g. 512M or 2G.
+        ///
+        /// On encode this bounds the worker count. Defaults to 25% of
+        /// available RAM, honouring cgroup limits.
+        #[arg(long, value_name = "SIZE")]
+        memory_limit: Option<String>,
     },
     /// Decompress a file.
     Unpack {
@@ -69,6 +89,11 @@ pub enum Command {
         /// Skip the fsync that makes the output durable before it is published.
         #[arg(long)]
         no_sync: bool,
+        /// Cap the memory stf will ask for, e.g. 512M or 2G.
+        ///
+        /// Defaults to 25% of available RAM, honouring cgroup limits.
+        #[arg(long, value_name = "SIZE")]
+        memory_limit: Option<String>,
     },
     /// Decompress a file and write it to stdout.
     Cat {
@@ -81,6 +106,11 @@ pub enum Command {
         /// Refuse a decode expanding by more than this ratio.
         #[arg(long)]
         max_ratio: Option<u64>,
+        /// Cap the memory stf will ask for, e.g. 512M or 2G.
+        ///
+        /// Defaults to 25% of available RAM, honouring cgroup limits.
+        #[arg(long, value_name = "SIZE")]
+        memory_limit: Option<String>,
     },
     /// Identify a stream without decoding it.
     Info {
@@ -89,6 +119,11 @@ pub enum Command {
         /// Emit machine-readable JSON instead of the human-readable report.
         #[arg(long)]
         json: bool,
+        /// Cap the memory stf will ask for, e.g. 512M or 2G.
+        ///
+        /// Defaults to 25% of available RAM, honouring cgroup limits.
+        #[arg(long, value_name = "SIZE")]
+        memory_limit: Option<String>,
     },
     /// List the formats this build contains.
     Formats,
