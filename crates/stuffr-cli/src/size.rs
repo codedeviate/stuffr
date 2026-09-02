@@ -11,7 +11,11 @@
 pub fn parse_size(s: &str) -> Result<u64, String> {
     let t = s.trim();
     if t.is_empty() {
-        return Err("empty size; expected a number with an optional K, M or G suffix".into());
+        // Shows the same concrete forms every other error here shows. A user
+        // who passed an empty value needs the guidance at least as much as one
+        // who mistyped a suffix, and a test now requires every syntax error to
+        // carry it.
+        return Err("empty size; expected e.g. 512M, 2G, or a byte count".into());
     }
     let (digits, mult) = match t.as_bytes()[t.len() - 1] {
         b'K' | b'k' => (&t[..t.len() - 1], 1024u64),
@@ -19,10 +23,15 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         b'G' | b'g' => (&t[..t.len() - 1], 1024 * 1024 * 1024),
         _ => (t, 1),
     };
-    let n: u64 = digits
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid size `{s}`; expected e.g. 512M, 2G, or a byte count"))?;
+    let n: u64 = digits.trim().parse::<u64>().map_err(|e| match e.kind() {
+        // A digit string too large for u64 is an overflow, not a syntax
+        // error, and saying "invalid size" for `99999999999999999999` would
+        // send the reader hunting for a typo that is not there.
+        std::num::IntErrorKind::PosOverflow => {
+            format!("size `{s}` overflows a 64-bit byte count")
+        }
+        _ => format!("invalid size `{s}`; expected e.g. 512M, 2G, or a byte count"),
+    })?;
     n.checked_mul(mult)
         .ok_or_else(|| format!("size `{s}` overflows a 64-bit byte count"))
 }
@@ -50,13 +59,44 @@ mod tests {
 
     #[test]
     fn malformed_input_is_an_error_naming_the_accepted_forms() {
-        for bad in ["", "  ", "512MB", "M", "-1", "1.5G", "abc"] {
+        // The `||` this replaced was too weak to constrain anything: its
+        // second branch, `contains("expected")`, matches nearly every message
+        // the function can produce, so the assertion passed almost by default.
+        // Requiring the concrete example means a future rewording that drops
+        // the guidance actually fails.
+        for bad in [
+            "", "  ", "512MB", "M", "-1", "1.5G", "abc", "512 MB", "K512",
+        ] {
             let err = parse_size(bad).unwrap_err();
             assert!(
-                err.contains("512M") || err.contains("expected"),
-                "error for {bad:?} must name the accepted forms, got: {err}"
+                err.contains("512M") && err.contains("2G"),
+                "error for {bad:?} must show the accepted forms concretely, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn forms_that_parse_but_are_worth_pinning() {
+        // Neither is documented anywhere a user would look, so pin the actual
+        // behaviour rather than leaving it to be discovered and "fixed".
+        //
+        // A space before the suffix is accepted, because the digit half is
+        // trimmed: `512 M` is 512 MiB.
+        assert_eq!(parse_size("512 M").unwrap(), 512 * 1024 * 1024);
+        // A leading `+` is accepted by Rust's unsigned FromStr.
+        assert_eq!(parse_size("+512").unwrap(), 512);
+    }
+
+    #[test]
+    fn a_digit_string_too_large_for_u64_reports_overflow_not_a_syntax_error() {
+        // Distinct from the exact-u64::MAX-times-a-multiplier case below:
+        // this overflows before any multiplier applies, and calling it
+        // "invalid size" would send the reader hunting for a typo.
+        let err = parse_size("99999999999999999999999").unwrap_err();
+        assert!(
+            err.contains("overflow"),
+            "expected an overflow message, got: {err}"
+        );
     }
 
     #[test]
