@@ -827,6 +827,65 @@ fn an_explicit_threads_one_beats_the_environment() {
 }
 
 #[test]
+fn an_explicit_count_from_the_environment_outranks_turbo() {
+    // Deliberate, and pinned because it looks inconsistent until you read
+    // `resolve_workers`: the first source expressing an opinion wins, and
+    // `turbo` sits BELOW every explicit count. So `STF_THREADS=1` with
+    // `--turbo` resolves to one worker rather than the full budget — an
+    // explicit number beats "use everything", whichever way it was supplied.
+    //
+    // Note this differs from a literal `--threads 1`, which returns no
+    // governor at all. Both mean one worker and both are single-threaded to
+    // every codec, so the difference is representational rather than
+    // behavioural; it is tested rather than smoothed over because a reader who
+    // notices the asymmetry deserves to find it deliberate.
+    let gov = stuffr::ops::resolved_budget_with_env(
+        &CompressOpts {
+            turbo: true,
+            ..Default::default()
+        },
+        Some(1),
+    )
+    .expect("turbo asks for parallelism, so a governor is built");
+    assert_eq!(
+        gov.workers(),
+        1,
+        "an explicit count from the environment must outrank --turbo"
+    );
+}
+
+#[test]
+fn turbo_alone_takes_the_full_detected_budget() {
+    // The other half: with no explicit count anywhere, turbo lifts the
+    // half-and-cap-at-8 rule and takes everything detected.
+    let plain = stuffr::ops::resolved_budget_with_env(&CompressOpts::default(), None);
+    assert!(plain.is_none(), "no flags means no governor");
+
+    let turbo = stuffr::ops::resolved_budget_with_env(
+        &CompressOpts {
+            turbo: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .expect("--turbo must build a governor");
+    let capped = stuffr::ops::resolved_budget_with_env(
+        &CompressOpts {
+            threads: Some(0),
+            ..Default::default()
+        },
+        None,
+    )
+    .expect("--threads 0 must build a governor");
+    assert!(
+        turbo.workers() >= capped.workers(),
+        "turbo ({}) must be at least the capped auto budget ({})",
+        turbo.workers(),
+        capped.workers()
+    );
+}
+
+#[test]
 fn stf_threads_of_one_is_not_a_request_for_parallelism() {
     let got = stuffr::ops::resolved_budget_with_env(&CompressOpts::default(), Some(1));
     assert!(got.is_none(), "STF_THREADS=1 asks for single-threaded");
