@@ -268,12 +268,21 @@ PARALLEL ENCODE FLAGS
       need to fit inside a memory ceiling even with no threads to bound.
       Defaults to 25% of available RAM, honouring cgroup limits.
 
-  As shipped in this build, --threads, --turbo and --memory-limit are
-  parsed and strictly validated but not yet wired to pack's actual encode
-  path or to any decode path — the thread governor that consumes them is
-  separate, later work. Passing them today changes nothing about how a
-  file is encoded or decoded; only a malformed --memory-limit's usage
-  error is currently observable.
+  --threads, --turbo and --memory-limit build the thread governor that
+  pack's encode path now consumes: --threads and --turbo resolve to a
+  worker count via the same precedence STF_THREADS and a future config
+  file will follow, and --memory-limit resolves to the byte cap that
+  count is clamped against. Omitting --threads builds no governor at all
+  — the codec sees no worker count and encodes single-threaded, which is
+  what keeps output byte-reproducible by default. No codec in this build
+  reads its governor's worker count yet (that lands with each codec in a
+  later task), so passing --threads today changes what stf resolves and
+  reports but not yet the bytes a pack produces; `stf info` shows the
+  resolved memory limit (info takes no --threads, since decode has no
+  worker count to report) so the resolution is observable ahead of that.
+  unpack, cat and info accept --memory-limit and validate it the same way,
+  but do not yet act on it: only pack's encode governor consumes it so
+  far.
 
 
 EXIT CODES

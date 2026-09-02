@@ -745,3 +745,84 @@ fn a_pure_build_reads_zstd_and_writes_it_only_on_request() {
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&dst);
 }
+
+#[test]
+fn omitting_threads_builds_no_governor_and_output_is_reproducible() {
+    // Deterministic-by-default, which is the whole reason parallelism is
+    // opt-in: multi-threaded xz and zstd split input per worker, so an
+    // auto-detected worker count would make output depend on core count.
+    // Testing it here rather than "on two machines" — the property that
+    // IMPLIES cross-machine reproducibility is that no worker count reaches
+    // the encoder at all.
+    let src = tmp("nogov-in.txt");
+    std::fs::write(&src, b"reproducible payload ".repeat(4096)).unwrap();
+
+    let mut bytes = Vec::new();
+    for i in 0..3 {
+        let dst = tmp(&format!("nogov-out-{i}.gz"));
+        let _ = std::fs::remove_file(&dst);
+        let o = CompressOpts {
+            format: Some(fmt("gzip")),
+            ..Default::default()
+        };
+        compress(Input::Path(src.clone()), Output::Path(dst.clone()), &o).unwrap();
+        bytes.push(std::fs::read(&dst).unwrap());
+        let _ = std::fs::remove_file(&dst);
+    }
+    assert_eq!(bytes[0], bytes[1], "repeated runs must be byte-identical");
+    assert_eq!(bytes[1], bytes[2], "repeated runs must be byte-identical");
+
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+fn threads_one_builds_no_governor() {
+    // `--threads 1` is single-threaded, so there is nothing for a governor to
+    // allocate. Asserting the resolved value rather than the absence of a
+    // field, because `resolved_budget` is what ops actually acts on.
+    let o = CompressOpts {
+        threads: Some(1),
+        ..Default::default()
+    };
+    assert!(
+        stuffr::ops::resolved_budget(&o).is_none(),
+        "--threads 1 must not build a governor"
+    );
+}
+
+#[test]
+fn threads_zero_means_auto_and_yields_at_least_one_worker() {
+    // `Some(0)` is the zstd/xz convention for auto. `resolve_workers` handles
+    // it; this pins that ops does not pass the 0 through as a worker request.
+    let o = CompressOpts {
+        threads: Some(0),
+        ..Default::default()
+    };
+    let gov = stuffr::ops::resolved_budget(&o).expect("auto must build a governor");
+    assert!(
+        gov.workers() >= 1,
+        "auto must resolve to at least one worker"
+    );
+}
+
+#[test]
+fn an_explicit_count_is_honoured_and_memory_still_binds() {
+    // --turbo and --threads lift the CPU cap; --memory-limit is a separate
+    // argument to Governor::from_inputs and must keep binding. A flag that
+    // silently disabled a memory bound is the kind of thing users discover
+    // via the OOM killer.
+    let o = CompressOpts {
+        threads: Some(8),
+        memory_limit: Some(16 * 1024 * 1024),
+        ..Default::default()
+    };
+    let gov = stuffr::ops::resolved_budget(&o).unwrap();
+    assert_eq!(gov.workers(), 8, "an explicit count must be honoured");
+    assert_eq!(gov.memory_limit(), 16 * 1024 * 1024);
+    // 8 MiB per worker against a 16 MiB limit leaves room for two.
+    assert_eq!(
+        gov.workers_for(8 * 1024 * 1024),
+        2,
+        "memory must still clamp"
+    );
+}

@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use stuffr_core::governor::detect_cpu_budget;
 use stuffr_core::{
-    Chain, Counting, CountingWriter, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts, Error,
-    FidelityReport, FileSource, FormatId, FormatKind, RatioGuard, ReaderSource, Registry, Result,
-    Rung, Source,
+    BudgetInputs, Chain, Counting, CountingWriter, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts,
+    Error, FidelityReport, FileSource, FormatId, FormatKind, Governor, RatioGuard, ReaderSource,
+    Registry, Result, Rung, Source, default_memory_limit,
 };
 
 /// Per-process counter mixed into the temp file name alongside the pid, so
@@ -394,6 +395,16 @@ pub struct CompressOpts {
     /// this, `compress_with` refuses such a codec outright: see
     /// `CodecCaps::weak_encoder`'s docs for why silent use is not an option.
     pub allow_weak_encoder: bool,
+    /// Worker count. `None` means single-threaded and builds no governor at
+    /// all, which is what makes output byte-reproducible by default.
+    /// `Some(0)` means auto-detect, per the zstd/xz convention.
+    pub threads: Option<usize>,
+    /// Use the full detected CPU budget, uncapped. Does NOT lift
+    /// `memory_limit`.
+    pub turbo: bool,
+    /// Cap on memory stf will ask for. `None` uses
+    /// `governor::default_memory_limit()` — 25% of available RAM, cgroup-aware.
+    pub memory_limit: Option<u64>,
 }
 
 impl Default for CompressOpts {
@@ -404,8 +415,41 @@ impl Default for CompressOpts {
             force: false,
             sync: true,
             allow_weak_encoder: false,
+            threads: None,
+            turbo: false,
+            memory_limit: None,
         }
     }
+}
+
+/// The governor this request resolves to, or `None` for single-threaded.
+///
+/// `None` is the default and the common case. Parallel encode is opt-in
+/// because multi-threaded xz and zstd split their input per worker, so an
+/// auto-detected count would make identical commands produce different bytes
+/// on machines with different core counts.
+pub fn resolved_budget(o: &CompressOpts) -> Option<Arc<Governor>> {
+    // `Some(1)` is single-threaded: nothing to allocate. `None` never asked.
+    match o.threads {
+        None | Some(1) if !o.turbo => return None,
+        _ => {}
+    }
+    let inputs = BudgetInputs {
+        cli: o.threads,
+        env: std::env::var("STF_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        // `./.stf.toml` and `~/.config/stf/config.toml`. `BudgetInputs`
+        // anticipates both; no config-file machinery exists yet and parallel
+        // encode does not need one, so they stay None deliberately rather
+        // than by omission.
+        project_config: None,
+        user_config: None,
+        detected: detect_cpu_budget(),
+        turbo: o.turbo,
+    };
+    let mem = o.memory_limit.unwrap_or_else(default_memory_limit);
+    Some(Governor::from_inputs(&inputs, mem))
 }
 
 /// What an operation did.
@@ -512,6 +556,7 @@ pub fn compress_with(
 
     let encode = EncodeOpts {
         level: o.level,
+        governor: resolved_budget(o),
         ..Default::default()
     };
     // Before any filesystem work: a rejected option must cost nothing.

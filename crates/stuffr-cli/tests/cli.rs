@@ -88,6 +88,55 @@ fn info_json_is_structured_and_names_how_the_format_was_detected() {
     let _ = std::fs::remove_file(&gz);
 }
 
+/// `info` has no `--threads` (multi-threaded decode is out of scope this
+/// phase), so there is no worker count to resolve — only the memory limit a
+/// subsequent pack/unpack would use, either the value `--memory-limit`
+/// names or `default_memory_limit()`'s auto-detected reading. Pinning an
+/// explicit value keeps this test independent of the host's actual RAM.
+#[test]
+fn info_reports_the_resolved_memory_limit() {
+    let src = tmp("info-mem.txt");
+    let gz = tmp("info-mem.txt.gz");
+    let _ = std::fs::remove_file(&gz);
+    std::fs::write(&src, b"payload").unwrap();
+    assert!(
+        Command::new(STF)
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = Command::new(STF)
+        .args(["info", "--memory-limit", "512M", gz.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(&(512 * 1024 * 1024).to_string()),
+        "an explicit --memory-limit must be reflected in the report: {text}"
+    );
+
+    let out = Command::new(STF)
+        .args([
+            "info",
+            "--json",
+            "--memory-limit",
+            "512M",
+            gz.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"));
+    assert_eq!(v["memory_limit"], 512 * 1024 * 1024);
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
+
 /// Together with `info_names_the_format_and_the_rung` (a file, "exact"),
 /// this proves the rung is COMPUTED from the source's seekability rather
 /// than hardcoded — neither test alone would catch a rung that was pinned

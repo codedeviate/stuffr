@@ -134,14 +134,10 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             turbo,
             memory_limit,
         } => {
-            // Nothing consumes these three yet — Phase 1f's next task builds
-            // the thread governor that will. Parsing (and thus validating)
-            // `--memory-limit` here, ahead of any consumer, is deliberate: a
-            // malformed value must be caught before anything else runs.
-            let _ = threads;
-            let _ = turbo;
+            // Parsing (and thus validating) `--memory-limit` here, ahead of
+            // `ops::resolved_budget`, is deliberate: a malformed value must
+            // be caught before anything else runs.
             let memory_limit = parse_memory_limit(memory_limit)?;
-            let _ = memory_limit;
             let fmt = match format.as_deref() {
                 Some(name) => Some(format_by_name(name)?),
                 None => None,
@@ -152,6 +148,9 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 force,
                 sync: !no_sync,
                 allow_weak_encoder,
+                threads,
+                turbo,
+                memory_limit,
             };
             let dst = match output {
                 Some(o) => output_of(&o),
@@ -187,7 +186,10 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             no_sync,
             memory_limit,
         } => {
-            // Nothing consumes this yet — see the note in the `Pack` arm.
+            // Decode has no worker count to govern (multi-threaded decode is
+            // out of scope this phase), so there is nothing for
+            // `--memory-limit` to bound here yet; parsing it still validates
+            // a malformed value up front, matching every other subcommand.
             let memory_limit = parse_memory_limit(memory_limit)?;
             let _ = memory_limit;
             let fmt = match format.as_deref() {
@@ -224,7 +226,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             max_ratio,
             memory_limit,
         } => {
-            // Nothing consumes this yet — see the note in the `Pack` arm.
+            // Same as `unpack`: nothing to bound yet, but still validated.
             let memory_limit = parse_memory_limit(memory_limit)?;
             let _ = memory_limit;
             let fmt = match format.as_deref() {
@@ -248,17 +250,21 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             memory_limit,
         } => {
             use std::io::Write;
-            // Nothing consumes this yet — see the note in the `Pack` arm.
-            let memory_limit = parse_memory_limit(memory_limit)?;
-            let _ = memory_limit;
+            // `info` takes no `--threads`, so there is no worker count to
+            // resolve or print here — only the memory limit a subsequent
+            // pack/unpack would use, the same value `--memory-limit`
+            // resolves to on those subcommands (an explicit value, or
+            // `default_memory_limit()`'s 25%-of-available-RAM reading).
+            let memory_limit =
+                parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit);
             let i = ops::inspect(input_of(&input))?;
             let mut out = std::io::stdout();
             if json {
-                writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string(&i).expect("Inspection serializes")
-                )?;
+                let mut v = serde_json::to_value(&i).expect("Inspection serializes");
+                if let serde_json::Value::Object(ref mut map) = v {
+                    map.insert("memory_limit".into(), serde_json::json!(memory_limit));
+                }
+                writeln!(out, "{v}")?;
             } else {
                 writeln!(out, "format:   {}", i.format)?;
                 writeln!(out, "chain:    {}", i.chain)?;
@@ -275,6 +281,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 } else {
                     writeln!(out, "fidelity: nothing approximated")?;
                 }
+                writeln!(out, "memory:   {memory_limit} bytes")?;
             }
             Ok(())
         }
