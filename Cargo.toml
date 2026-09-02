@@ -20,8 +20,13 @@ bzip2 = "0.6"
 brotli = "8"
 lz4_flex = "0.14"
 snap = "1"
+# `zstdmt` is required, not decorative: `Encoder::multithread` does not exist
+# without it. The method is present in the crate's source unconditionally, so
+# grepping for it says nothing about whether you can call it — a distinction
+# that cost Task 4 a discovery. It enables multithreading inside the vendored C
+# library and is reachable only through `zstd-c`, so the `pure` graph is
+# unaffected; a CI job asserts that.
 zstd = { version = "0.13", features = ["zstdmt"] }
-# Exact-pinned, not a caret range, and pinned BELOW `cargo add`'s own pick.
 # The exact pin is gone. Under the old 1.85 floor there was no choice: 0.9.0
 # declares `rust-version = "1.87"` and cargo refused it, and 0.8.2 declares no
 # `rust-version` at all while using a 1.87 stdlib method, so it built on a modern
