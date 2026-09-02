@@ -281,7 +281,11 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 } else {
                     writeln!(out, "fidelity: nothing approximated")?;
                 }
-                writeln!(out, "memory:   {memory_limit} bytes")?;
+                writeln!(
+                    out,
+                    "memory:   {}",
+                    stuffr_cli::size::format_size(memory_limit)
+                )?;
             }
             Ok(())
         }

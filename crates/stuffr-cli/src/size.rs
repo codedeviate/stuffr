@@ -36,9 +36,80 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size `{s}` overflows a 64-bit byte count"))
 }
 
+/// Renders a byte count the way a human reads it, for `stf info`.
+///
+/// The inverse of [`parse_size`], and it lives beside it so the two cannot
+/// drift: anything this prints must parse back to the same value, which a test
+/// below asserts by round-tripping.
+///
+/// Exact multiples get a bare suffix (`256 MiB`); anything else keeps one
+/// decimal (`1.5 GiB`), because rounding `1610612736` to `2 GiB` in a field
+/// someone is using to check a limit would be actively unhelpful.
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 3] = [
+        (1024 * 1024 * 1024, "GiB"),
+        (1024 * 1024, "MiB"),
+        (1024, "KiB"),
+    ];
+    for (unit, name) in UNITS {
+        if bytes >= unit {
+            // `is_multiple_of` rather than `% == 0` because clippy requires it,
+            // and it is available only because Phase 1e raised the floor to
+            // 1.88 — it stabilised in 1.87. The same method, used by ruzstd
+            // 0.8.2, is what made that crate unbuildable under the old 1.85
+            // floor and forced the exact pin the bump removed.
+            if bytes.is_multiple_of(unit) {
+                return format!("{} {name}", bytes / unit);
+            }
+            return format!("{:.1} {name}", bytes as f64 / unit as f64);
+        }
+    }
+    format!("{bytes} bytes")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_size_is_readable_and_exact_where_it_can_be() {
+        assert_eq!(format_size(256 * 1024 * 1024), "256 MiB");
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2 GiB");
+        assert_eq!(format_size(512), "512 bytes");
+        assert_eq!(format_size(1536), "1.5 KiB");
+        // Not rounded to "2 GiB": someone reading this to check a limit needs
+        // the value, not a tidy approximation of it.
+        assert_eq!(
+            format_size(1024 * 1024 * 1024 + 512 * 1024 * 1024),
+            "1.5 GiB"
+        );
+    }
+
+    #[test]
+    fn every_exact_rendering_parses_back_to_itself() {
+        // The two functions live together so they cannot drift; this is what
+        // enforces it. Only exact multiples round-trip — a "1.5 KiB" rendering
+        // is for human eyes and parse_size deliberately rejects floats.
+        for n in [
+            512u64,
+            1024,
+            4096,
+            256 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+        ] {
+            let rendered = format_size(n);
+            let compact: String = rendered
+                .replace(" bytes", "")
+                .replace(" KiB", "K")
+                .replace(" MiB", "M")
+                .replace(" GiB", "G");
+            assert_eq!(
+                parse_size(&compact).unwrap(),
+                n,
+                "{n} rendered as {rendered:?} did not parse back"
+            );
+        }
+    }
 
     #[test]
     fn plain_bytes_and_every_suffix() {

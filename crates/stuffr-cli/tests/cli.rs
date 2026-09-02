@@ -113,8 +113,13 @@ fn info_reports_the_resolved_memory_limit() {
         .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
+    // Asserts the RENDERED form, because that is what a user reads. `info`
+    // prints "512 MiB" rather than "536870912 bytes" — the raw count is
+    // technically the same information and unusable for checking a limit at a
+    // glance. If this is ever changed back, the assertion should change with
+    // it rather than being loosened to match both.
     assert!(
-        text.contains(&(512 * 1024 * 1024).to_string()),
+        text.contains("512 MiB"),
         "an explicit --memory-limit must be reflected in the report: {text}"
     );
 
