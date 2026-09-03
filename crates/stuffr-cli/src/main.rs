@@ -357,11 +357,6 @@ fn print_formats() -> stuffr::Result<()> {
         "{:<16} {:<10} {:<5} {:<5} {:<8} EXTENSIONS",
         "FORMAT", "KIND", "READ", "WRITE", "PARALLEL"
     )?;
-    writeln!(
-        out,
-        "(WRITE shows `weak` for a codec whose encoder in this build is a fallback markedly \
-         worse than the format's usual one — see --allow-weak-encoder.)"
-    )?;
     let registry = stuffr::registry();
     for r in rows {
         // A codec's own capabilities, not the matrix row's read/write/parallel
@@ -390,5 +385,14 @@ fn print_formats() -> stuffr::Result<()> {
             r.extensions.join(", "),
         )?;
     }
+    // Below the table, not between the header and the first row. Inline, it
+    // separated the column headings from the data they label, which made the
+    // whole table hard to scan.
+    writeln!(out)?;
+    writeln!(
+        out,
+        "(WRITE shows `weak` for a codec whose encoder in this build is a fallback markedly \
+         worse than the format's usual one — see --allow-weak-encoder.)"
+    )?;
     Ok(())
 }

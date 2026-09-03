@@ -16,8 +16,8 @@ read list.
 > `curl … | stuffr cat - | grep pattern` runs. `stuffr formats` lists `brotli`,
 > `bzip2`, `deflate`, `gzip`, `lz4`, `lzip`, `lzma`, `snappy`, `xz`, `zlib` and
 > `zstd`, each proven against the conformance harness Phase 1c introduced and
-> later cycles grew to twelve properties, and then proven to coexist. 487
-> tests under `--all-features`, 421 on the default tier — a different set, not
+> later cycles grew to twelve properties, and then proven to coexist. 488
+> tests under `--all-features`, 422 on the default tier — a different set, not
 > a subset, because the two tiers select different backends. Clean across
 > build, clippy and fmt.
 >

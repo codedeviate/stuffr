@@ -1040,6 +1040,49 @@ fn formats_lists_every_registered_format() {
     }
 }
 
+/// The WRITE/`weak` note belongs BELOW the table, after a blank line. It used
+/// to sit between the column headings and the first row, which split the
+/// headings from the data they label and made the table hard to scan.
+///
+/// Asserting only that the output `contains` the note — which is all the test
+/// above does for the rows — would pass with the note back in its old place,
+/// so this pins the position: every format row must come before it, and the
+/// line before it must be blank.
+#[test]
+fn the_formats_note_sits_below_the_table_after_a_blank_line() {
+    let out = Command::new(STUFFR).arg("formats").output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+
+    let note = lines
+        .iter()
+        .position(|l| l.starts_with("(WRITE shows"))
+        .unwrap_or_else(|| panic!("`stuffr formats` printed no WRITE note:\n{text}"));
+
+    for row in stuffr::registry().matrix() {
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with(row.id.as_str()))
+            .unwrap_or_else(|| panic!("`stuffr formats` omits {}:\n{text}", row.id));
+        assert!(
+            at < note,
+            "{} is listed at line {at}, below the note at line {note}:\n{text}",
+            row.id
+        );
+    }
+
+    assert!(
+        note > 0,
+        "the note is the first line, so no table precedes it"
+    );
+    assert_eq!(
+        lines[note - 1],
+        "",
+        "the note must be separated from the table by a blank line, got {:?}:\n{text}",
+        lines[note - 1]
+    );
+}
+
 #[test]
 fn a_malformed_memory_limit_is_a_usage_error() {
     let src = tmp("mem-bad.txt");
