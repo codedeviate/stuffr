@@ -35,8 +35,17 @@ jobs:
       # never actually exercised in CI (Finding 8 of the Phase 1e final
       # review).
       - run: sudo apt-get update && sudo apt-get install -y lzip
-      # The same command CONTRIBUTING.md tells a human to run, so a green
-      # local run and a green pipeline mean the same thing.
+      # The same command CONTRIBUTING.md tells a human to run — but NOT the
+      # same toolchain, and not the same platform. The `rm` above puts this
+      # job on current stable while `rust-toolchain.toml` keeps local runs on
+      # 1.95, so a newer stable's clippy can turn this job red with no code
+      # change (it has: four `collapsible_if` errors on 1.98). The cgroup
+      # code is also `cfg(target_os = "linux")`, so a macOS `make check`
+      # never compiles it at all. To reproduce this job locally before
+      # pushing:
+      #
+      #   cargo +stable clippy --workspace --all-targets --all-features \
+      #     --target x86_64-unknown-linux-gnu -- -D warnings
       - run: make check
 
   msrv:

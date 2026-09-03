@@ -52,12 +52,12 @@ pub fn default_memory_limit() -> u64 {
             // Try v2 at the process's own cgroup first (for nested slices), then the root.
             let v2 = {
                 let mut limit = None;
-                if let Ok(cgroup_contents) = std::fs::read_to_string("/proc/self/cgroup") {
-                    if let Some(path) = cgroup::parse_self_cgroup_v2_path(&cgroup_contents) {
-                        let nested_path = format!("/sys/fs/cgroup{}/memory.max", path);
-                        if let Ok(s) = std::fs::read_to_string(&nested_path) {
-                            limit = cgroup::parse_cgroup_v2_memory_max(&s);
-                        }
+                if let Ok(cgroup_contents) = std::fs::read_to_string("/proc/self/cgroup")
+                    && let Some(path) = cgroup::parse_self_cgroup_v2_path(&cgroup_contents)
+                {
+                    let nested_path = format!("/sys/fs/cgroup{}/memory.max", path);
+                    if let Ok(s) = std::fs::read_to_string(&nested_path) {
+                        limit = cgroup::parse_cgroup_v2_memory_max(&s);
                     }
                 }
                 limit.or_else(|| {
