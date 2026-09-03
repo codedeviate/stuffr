@@ -146,6 +146,22 @@ Wanted, not scheduled.
 - Better `stuffr info` output: entropy estimate, "this is already compressed, don't
   bother" advice
 - `tar` compat symlink (see Part 1 for why it is not in v1)
+- `stuffr convert IN OUT`, taking the destination as a second positional and
+  inferring both formats from the filenames, alongside the `convert IN -o OUT`
+  already planned for Phase 5. Wanted for the case that prompted it: an archive
+  arrives in one format and has to go out in another —
+  `stuffr convert logfile.tgz logfile.zip`.
+
+  This is a larger job than the planned `convert`, and the two should not be
+  conflated. That one is codec-level recompression with the container held
+  fixed (`.tar.gz` → `.tar.zst`), which the streaming design already supports.
+  Crossing *container* formats means reading entries out of one container and
+  writing them into another, so it cannot land before Phase 2 puts containers
+  in the tree at all. A `.zip` destination also carries its own constraint:
+  the central directory needs per-entry sizes the stream has not produced yet,
+  which is the same tension the ZIP-on-a-pipe contract test exists to pin
+  down — so "without staging to disk" may not survive for every format pair,
+  and which pairs it survives for is part of what the spec has to settle.
 
 ## Metadata fidelity
 
