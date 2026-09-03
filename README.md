@@ -298,8 +298,8 @@ already taken on crates.io, and the command was `stf` to match them.
 
 ## Documentation
 
-- **Design specification** — `~/Development/Thomas/superpowers/stuffr/specs/2026-08-25-stuffr-compression-tool-design.md`
-  (kept outside this repository, alongside the plans and session reports)
+- **Design specification** — maintained outside this repository, alongside the
+  implementation plans and session reports, and not currently published
 - [CONTRIBUTING.md](CONTRIBUTING.md) — the development gate, commit convention,
   and the versioning policy with its milestone table
 - [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md) — deliberate exclusions, and the wishlist
