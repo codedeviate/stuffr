@@ -2,7 +2,7 @@
 //!
 //! `stuffr-core` deliberately carries no format dependency; this is where they
 //! live. [`register_all`] is the single extension point — a codec not
-//! registered there is invisible to `stf formats` and to detection.
+//! registered there is invisible to `stuffr formats` and to detection.
 
 use stuffr_core::Registry;
 

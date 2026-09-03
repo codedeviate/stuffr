@@ -1,26 +1,26 @@
-stf — worked examples
+stuffr — worked examples
 
-Everything below runs against this build as shown. `stf <command> --help`
+Everything below runs against this build as shown. `stuffr <command> --help`
 lists the full flag reference for any one command.
 
 
 COMPRESSING A FILE
 
-  stf pack notes.txt
+  stuffr pack notes.txt
       Writes notes.txt.gz beside it. The input, notes.txt, is left alone —
-      unlike gzip(1), stf never deletes or replaces what you compressed.
+      unlike gzip(1), stuffr never deletes or replaces what you compressed.
 
-  stf pack notes.txt -o archive.gz
+  stuffr pack notes.txt -o archive.gz
       Choose the output name with -o/--output. Without it, the default is
       the input path plus the chosen format's extension (".gz" today).
 
-  stf pack notes.txt --format gzip -o out.bin
+  stuffr pack notes.txt --format gzip -o out.bin
       --format names the codec explicitly instead of inferring one from -o's
       extension. Every build — even one with no C toolchain — accepts
       gzip, zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma and
       lzip.
 
-  stf pack notes.txt --format xz -o out.xz
+  stuffr pack notes.txt --format xz -o out.xz
       A default build writes xz through `lzma-rust2`, a pure-Rust port of
       Tukaani's "XZ for Java" — no C toolchain needed, and unlike zstd's
       pure fallback this is a FULL codec, not a weaker one:
@@ -33,7 +33,7 @@ COMPRESSING A FILE
       output was detected. `c-backed` is a speed choice for xz, not a
       capability one.
 
-  stf pack notes.txt --format lzma -o out.lzma
+  stuffr pack notes.txt --format lzma -o out.lzma
       LZMA1, the older "alone" format xz superseded. Every build reads and
       writes it, including one with no C toolchain: `--features c-backed`
       swaps the pure-Rust `lzma-rust2` backend for the real `liblzma`,
@@ -51,20 +51,20 @@ COMPRESSING A FILE
       4,170 swept byte positions) through the LZMA range coder's own
       structural sensitivity, not a designed check.
 
-  stf pack notes.txt --format lzip -o out.lz
+  stuffr pack notes.txt --format lzip -o out.lz
       LZIP, a newer container around the same LZMA1 payload `lzma` above
       wraps, with two differences that matter: it carries a 4-byte `"LZIP"`
       magic (so, unlike `.lzma`, a `.lz` file IS detected automatically —
       see "DECOMPRESSING" below), and it defines a real multi-member
       concatenation convention with a mandatory CRC32/size trailer per
-      member, so `cat a.lz b.lz | stf cat --format lzip -` decodes both
+      member, so `cat a.lz b.lz | stuffr cat --format lzip -` decodes both
       members' data, not just the first. Only one backend exists for it —
       the same pure-Rust `lzma-rust2` xz and lzma use — so `--features
       c-backed` makes no difference to this row at all, unlike zstd's or
       xz's. Validated directly against the reference `lzip` 1.26 tool in
       both directions, including the two-member case.
 
-  stf pack notes.txt --level 9
+  stuffr pack notes.txt --level 9
       --level asks the codec for a tradeoff: gzip accepts 0 (fastest,
       largest output) through 9 (slowest, smallest output). xz's range is
       the same shape, 0-9, with 6 as its default too, and lzma and lzip
@@ -81,43 +81,43 @@ COMPRESSING A FILE
       and silently ignored rather than rejected, unlike every other codec on
       this page.
 
-  stf pack notes.txt --force
+  stuffr pack notes.txt --force
       Without --force, pack refuses to overwrite an existing output: exit
       code 2, the existing file left untouched, nothing written.
 
 
 DECOMPRESSING
 
-  stf unpack notes.txt.gz
+  stuffr unpack notes.txt.gz
       Writes notes.txt, stripping the recognised extension. As with pack,
       an existing destination is refused unless --force is given too.
 
-  stf unpack notes.txt.gz -o out.txt --force
+  stuffr unpack notes.txt.gz -o out.txt --force
       Choose the name and allow overwriting an existing one.
 
-  stf unpack data.bin --format gzip -o data.txt
+  stuffr unpack data.bin --format gzip -o data.txt
       --format names the codec explicitly instead of detecting it. Some
       formats carry no magic bytes and no conventional extension, so an
       explicit --format is the only way to reach them.
 
-  stf unpack raw.bin --format deflate -o data.txt
+  stuffr unpack raw.bin --format deflate -o data.txt
       Raw deflate has no header, no trailer and no conventional extension,
       so it cannot be detected at all — --format is the ONLY way in.
 
-  stf unpack data.br --format brotli -o data.txt
+  stuffr unpack data.br --format brotli -o data.txt
       brotli defines no magic bytes at all, unlike gzip/zlib/bzip2's header
       bytes — detection from a file works only by the `.br` extension. A
       brotli stream arriving on a pipe, with no filename to go by, cannot be
       detected either way, so --format brotli is the only way in there too.
 
-  stf unpack data.lzma --format lzma -o data.txt
+  stuffr unpack data.lzma --format lzma -o data.txt
       LZMA1 defines no magic bytes either, the same as brotli — detection
       from a file works only by the `.lzma` extension, and a `.lzma` stream
       arriving on a pipe, with no filename to go by, cannot be detected at
       all, so --format lzma is the only way in there too. No special build
       is needed — every build has an LZMA1 backend.
 
-  stf unpack data.lz
+  stuffr unpack data.lz
       LZIP, unlike its older sibling LZMA1 just above, DOES carry a 4-byte
       `"LZIP"` magic at offset 0 — so this is detected automatically, on a
       file or a pipe, and needs no --format at all.
@@ -125,11 +125,11 @@ DECOMPRESSING
 
 STREAMING TO STDOUT
 
-  curl -s https://example.com/log.gz | stf cat - | grep pattern
+  curl -s https://example.com/log.gz | stuffr cat - | grep pattern
       cat decompresses straight to stdout without ever naming an output
       file — the shape for feeding a compressed stream into another tool.
 
-  stf cat data.bin --format gzip
+  stuffr cat data.bin --format gzip
       cat takes --format for the same reason, and --max-ratio to bound a
       decode that would otherwise stream an enormous file to stdout.
 
@@ -139,33 +139,33 @@ STDIN AND STDOUT VIA `-`
   `-` means the stream, wherever a path is expected: stdin for an input,
   stdout for an output.
 
-  cat notes.txt | stf pack - -o notes.txt.gz
+  cat notes.txt | stuffr pack - -o notes.txt.gz
       Stdin has no path to derive a name from, so -o is mandatory here;
       leaving it out is a usage error (exit 2).
 
-  cat notes.txt | stf pack - -o - | wc -c
+  cat notes.txt | stuffr pack - -o - | wc -c
       Both ends can be `-` at once: stdin in, stdout out.
 
 
 INSPECTING A STREAM WITHOUT DECODING IT
 
-  stf info notes.txt.gz
+  stuffr info notes.txt.gz
       Reports the format, the resolved chain, the fidelity "rung", and the
       size when it's known.
 
-  stf info notes.txt.gz --json
+  stuffr info notes.txt.gz --json
       The same report as machine-readable JSON, for scripting.
 
-  A plain file reports `rung: exact` — stf can seek it, so what it reports
-  is verified. A pipe (`stf info -`) reports `rung: forward-only` — a
+  A plain file reports `rung: exact` — stuffr can seek it, so what it reports
+  is verified. A pipe (`stuffr info -`) reports `rung: forward-only` — a
   stream can only be read once, so this is the tool telling you the format
   was inferred from bytes it saw going by, not confirmed by looking back.
 
 
 WHAT THIS BUILD CAN DO
 
-  stf formats
-      Lists the formats compiled into THIS binary, not everything stf will
+  stuffr formats
+      Lists the formats compiled into THIS binary, not everything stuffr will
       ever support. A pure build (the default) has eleven rows: gzip, zlib,
       deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma and lzip. zstd's
       row differs by which backend compiled in: a build with the `zstd-c`
@@ -196,7 +196,7 @@ WHAT THIS BUILD CAN DO
 
 GUARDING AGAINST DECOMPRESSION BOMBS
 
-  stf unpack bomb.gz --max-ratio 100
+  stuffr unpack bomb.gz --max-ratio 100
       A decompression bomb is a small compressed file that expands to an
       enormous one. --max-ratio refuses a decode once output has grown
       past this multiple of the compressed input (default 10000). gzip's
@@ -208,7 +208,7 @@ GUARDING AGAINST DECOMPRESSION BOMBS
 
 SKIPPING THE DURABILITY FSYNC
 
-  stf pack big.txt --no-sync
+  stuffr pack big.txt --no-sync
       By default, pack and unpack fsync the output before renaming it into
       place, so a crash cannot leave a truncated file under the real name.
       --no-sync trades that guarantee for speed on bulk or scratch work.
@@ -216,7 +216,7 @@ SKIPPING THE DURABILITY FSYNC
 
 USING A WEAK FALLBACK ENCODER
 
-  stf pack big.dat --format zstd --allow-weak-encoder
+  stuffr pack big.dat --format zstd --allow-weak-encoder
       A build with no C toolchain writes `.zst` through `ruzstd`, a
       pure-Rust fallback, instead of the reference `libzstd`. The output is
       valid zstd any tool can read, but markedly larger — measured at 3.53x
@@ -224,7 +224,7 @@ USING A WEAK FALLBACK ENCODER
       (files 76% larger) — and slower (969ms against 118ms in that same
       measurement), and it buffers the whole input in memory rather than
       streaming it, unsuitable for large files. pack refuses such an
-      encoder unless this flag is given; run `stf formats` to see which
+      encoder unless this flag is given; run `stuffr formats` to see which
       codecs in THIS build are affected (WRITE shows `weak` rather than
       `yes`). Rebuild with `--features c-backed` to remove the limitation.
       xz does not have this shape: its pure-Rust backend (`lzma-rust2`) is a
@@ -241,8 +241,8 @@ USING A WEAK FALLBACK ENCODER
 
 PARALLEL ENCODE FLAGS
 
-  stf pack big.dat --format xz --threads 4
-      Encode with 4 worker threads instead of stf's default of one. Only
+  stuffr pack big.dat --format xz --threads 4
+      Encode with 4 worker threads instead of stuffr's default of one. Only
       THREE of this build's eleven formats actually parallelise their
       encoder: xz and lzip on every build, and zstd only with --features
       c-backed (the default ruzstd encoder has no multi-threaded path).
@@ -250,21 +250,21 @@ PARALLEL ENCODE FLAGS
       (zstd-c, xz-c, xz-pure, lzip), because xz has two interchangeable
       backends — but xz-c and xz-pure register the same format and never
       both compile in, so no single build ever shows more than three
-      PARALLEL rows in `stf formats`. The other eight (nine counting only
+      PARALLEL rows in `stuffr formats`. The other eight (nine counting only
       one xz backend) accept --threads without error but encode
       single-threaded regardless, since their crates expose no MT encoder
       to hand a worker count to. --threads is deliberately opt-in rather
       than auto-detected: a multi-threaded encoder splits its input across
       workers, so the very same file compresses to different bytes
       depending on how many workers ran. Omitting --threads (and --turbo,
-      and leaving STF_THREADS unset) keeps pack single-threaded, so a
+      and leaving STUFFR_THREADS unset) keeps pack single-threaded, so a
       given input, given the same flags and the same environment, always
       produces the same output bytes — "same machine" is not part of the
       promise once --threads 0 is in play, because auto-detection
       resolves against cgroup CPU quotas, not just core count.
       --memory-limit does not affect this: it bounds allocation and the
       worker count the governor can grant, never which bytes a worker
-      count already granted produces. Passing --threads 0 asks stf to
+      count already granted produces. Passing --threads 0 asks stuffr to
       auto-detect a worker count
       instead, trading that byte-for-byte reproducibility for speed.
       --threads exists only on pack; multi-threaded decode is out of scope
@@ -273,15 +273,15 @@ PARALLEL ENCODE FLAGS
       "threads_is_not_offered_on_decode_subcommands" if you want the
       enforcement in test form.
 
-  stf pack big.dat --format xz --threads 4 --turbo
-      --turbo lifts the CPU cap only, letting stf use the full detected
+  stuffr pack big.dat --format xz --threads 4 --turbo
+      --turbo lifts the CPU cap only, letting stuffr use the full detected
       core budget instead of a conservative default worker count.
       --memory-limit (below) still binds regardless of --turbo: turbo
       means "use my cores," not "ignore the OOM killer."
 
-  stf pack big.dat --format xz --memory-limit 512M
-  stf unpack archive.xz --memory-limit 512M
-      --memory-limit caps the memory stf will ask for. It accepts a plain
+  stuffr pack big.dat --format xz --memory-limit 512M
+  stuffr unpack archive.xz --memory-limit 512M
+      --memory-limit caps the memory stuffr will ask for. It accepts a plain
       byte count or a binary, 1024-based K/M/G suffix (e.g. 512M or 2G) —
       matching what `xz --memlimit` and every other tool in this space
       mean by "M", not the decimal 1000-based reading. A malformed value
@@ -291,14 +291,14 @@ PARALLEL ENCODE FLAGS
       would have no way to notice. On pack this bounds the worker count;
       unpack, cat and info accept it too, since a decode can also need to
       fit inside a memory ceiling even with no threads to bound. Defaults
-      to 25% of available RAM, honouring cgroup limits; `stf info` reports
+      to 25% of available RAM, honouring cgroup limits; `stuffr info` reports
       the resolved figure, humanized (e.g. "256 MiB"), on every build.
 
       The bound has teeth: xz and lzip cost roughly 128 MiB per worker
       below preset 7 and roughly 896 MiB per worker at preset 7 and above
       (the match finder, not the block buffer, dominates). On the 256 MiB
       floor this build defaults to when it cannot read available memory
-      (macOS, with no /proc/meminfo), that means `stf pack big.dat --format
+      (macOS, with no /proc/meminfo), that means `stuffr pack big.dat --format
       xz --threads 8 --level 9` silently runs with exactly ONE worker —
       the governor protecting the machine, not a bug — unless
       --memory-limit is raised. A 4 GiB budget gets 4 workers at that same
@@ -306,7 +306,7 @@ PARALLEL ENCODE FLAGS
 
   --threads, --turbo and --memory-limit build the thread governor that
   pack's encode path consumes: --threads and --turbo resolve to a worker
-  count via the same precedence STF_THREADS and a future config file will
+  count via the same precedence STUFFR_THREADS and a future config file will
   follow, and --memory-limit resolves to the byte cap that count is
   clamped against — divided by the codec's own measured per-worker demand,
   never a flat division. Omitting --threads builds no governor at all —
@@ -351,6 +351,6 @@ NOT YET
   upgrade path at all — it has exactly one backend (the same pure-Rust
   `lzma-rust2` xz and lzma use), so `--features c-backed` changes nothing
   about it, and there is no weak-fallback distinction for it either. No
-  archive containers (tar, zip, ...) exist yet — Phase 2. `stf formats`
+  archive containers (tar, zip, ...) exist yet — Phase 2. `stuffr formats`
   always tells you the truth about the build you are actually running,
   whatever this page says.

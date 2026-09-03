@@ -1,6 +1,6 @@
 //! The Phase 0 contract test.
 //!
-//! If this test is honest, the whole streaming premise of `stf` holds: a
+//! If this test is honest, the whole streaming premise of `stuffr` holds: a
 //! container with a trailing index, read from a pipe, still yields real data —
 //! and says exactly what it approximated to do so.
 

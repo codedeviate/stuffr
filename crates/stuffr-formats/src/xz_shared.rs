@@ -7,7 +7,7 @@
 //! speed choice for xz rather than a capability one. That does not change
 //! the shape here: whichever backend is compiled in must alone still expose
 //! the identical [`FormatId`], magic rule and [`FormatMeta`], because that
-//! identity is what makes `--format xz`, magic detection, and `stf formats`'
+//! identity is what makes `--format xz`, magic detection, and `stuffr formats`'
 //! single `xz` row work the same regardless of which backend produced the
 //! binary. Neither backend module can own it: an `xz-pure`-only build has no
 //! `xz_c` module at all, and vice versa, so the shared pieces live here

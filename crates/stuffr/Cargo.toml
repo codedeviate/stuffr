@@ -1,7 +1,7 @@
 [package]
 name = "stuffr"
 version.workspace = true
-description = "Universal compression and archive toolkit (library for the stf command)"
+description = "Universal compression and archive toolkit (library for the stuffr command)"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

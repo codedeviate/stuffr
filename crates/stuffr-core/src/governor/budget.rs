@@ -80,11 +80,11 @@ pub fn detect_cpu_budget() -> usize {
 pub struct BudgetInputs {
     /// `--threads N`. `Some(0)` means "auto", per the zstd/xz convention.
     pub cli: Option<usize>,
-    /// `STF_THREADS`.
+    /// `STUFFR_THREADS`.
     pub env: Option<usize>,
-    /// `./.stf.toml`.
+    /// `./.stuffr.toml`.
     pub project_config: Option<usize>,
-    /// `~/.config/stf/config.toml`.
+    /// `~/.config/stuffr/config.toml`.
     pub user_config: Option<usize>,
     /// From [`detect_cpu_budget`].
     pub detected: usize,
@@ -96,7 +96,7 @@ pub struct BudgetInputs {
 pub fn resolve_workers(i: &BudgetInputs) -> usize {
     // The first source that expresses an opinion wins, and `Some(0)` IS an
     // opinion: it means "use the auto budget". A lower-precedence source must
-    // not override it — otherwise a stale STF_THREADS silently beats an
+    // not override it — otherwise a stale STUFFR_THREADS silently beats an
     // explicit `--threads 0`, which is precedence backwards.
     let explicit = [i.cli, i.env, i.project_config, i.user_config]
         .into_iter()
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn an_explicit_zero_means_auto_and_is_not_overridden_by_lower_precedence() {
-        // `--threads 0` says "use auto". A stale STF_THREADS or a leftover
+        // `--threads 0` says "use auto". A stale STUFFR_THREADS or a leftover
         // config value must not silently win — that is precedence backwards,
         // and it would take more of a shared machine than the operator asked.
         let i = BudgetInputs {

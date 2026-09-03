@@ -366,7 +366,7 @@ impl Codec for Lz4 {
             //    difference is stark: sweeping a stream this codec wrote,
             //    before the change 16 of 26 corrupted positions decoded to
             //    plausible-but-wrong output with no error; after it, 0 do and
-            //    all are caught. `stf` had been the only writer whose lz4
+            //    all are caught. `stuffr` had been the only writer whose lz4
             //    output its own decoder could not check.
             // 2. Foreign streams are verified when they carry a check.
             //    `decoder` below is a bare, unconfigured
@@ -525,7 +525,7 @@ impl Codec for Lz4 {
     /// lz4 is chosen in this tree for streaming latency rather than
     /// compression ratio, and `Max64KB` is the streaming argument taken to
     /// its natural size: a container reading this codec's own output
-    /// incrementally — `stf cat huge.lz4 | head`, say — sees its first
+    /// incrementally — `stuffr cat huge.lz4 | head`, say — sees its first
     /// bytes after one 64 KiB block decodes, not after a 1 MiB (or 4 MiB)
     /// block does. The flip side is real and worth naming rather than
     /// hiding: a smaller block also shrinks the LZ77 match window, so data
@@ -542,7 +542,7 @@ impl Codec for Lz4 {
         // positions detected and **16 silently wrong**, while the same sweep over
         // the reference CLI's checksummed output gave 26 of 26 and none wrong. Our
         // decoder already verified a checksum whenever a stream carried one — we
-        // simply were not writing one, so `stf` was the only writer whose lz4
+        // simply were not writing one, so `stuffr` was the only writer whose lz4
         // output it could not check. Same defect, and same 4-byte fix, that Task 2
         // found in zstd, where a third of corruptions decoded to wrong data until
         // `include_checksum(true)` was added.
@@ -693,8 +693,10 @@ mod tests {
         };
 
         let plain = b"reference-written frame payload, repeated for a real block. ".repeat(200);
-        let src_path =
-            std::env::temp_dir().join(format!("stf-lz4-header-cut-src-{}.bin", std::process::id()));
+        let src_path = std::env::temp_dir().join(format!(
+            "stuffr-lz4-header-cut-src-{}.bin",
+            std::process::id()
+        ));
         std::fs::write(&src_path, &plain).unwrap();
 
         // Three frames, each written by the reference CLI, concatenated —
@@ -782,8 +784,10 @@ mod tests {
         };
 
         let plain = b"skippable-frame regression payload, repeated for a real block. ".repeat(50);
-        let src_path =
-            std::env::temp_dir().join(format!("stf-lz4-skippable-src-{}.bin", std::process::id()));
+        let src_path = std::env::temp_dir().join(format!(
+            "stuffr-lz4-skippable-src-{}.bin",
+            std::process::id()
+        ));
         std::fs::write(&src_path, &plain).unwrap();
         let out = std::process::Command::new(&lz4)
             .arg("-z")
@@ -823,7 +827,7 @@ mod tests {
             // Reference arbiter: this file must be one the reference itself
             // reads whole, or the case proves nothing about our own gap.
             let check_path = std::env::temp_dir().join(format!(
-                "stf-lz4-skippable-check-{name}-{}.lz4",
+                "stuffr-lz4-skippable-check-{name}-{}.lz4",
                 std::process::id()
             ));
             std::fs::write(&check_path, file_bytes).unwrap();

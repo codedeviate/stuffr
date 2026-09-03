@@ -1,4 +1,4 @@
-# stf — development gates.
+# stuffr — development gates.
 #
 # `make check` is the project's Definition of Done, made executable. It runs
 # the same commands in the same order a CI job would, so a green local run and
@@ -9,7 +9,7 @@ CARGO ?= cargo
 .PHONY: help check fmt fmt-check lint test test-pure release hooks clean
 
 help:
-	@echo 'stf development targets:'
+	@echo 'stuffr development targets:'
 	@echo '  make check    fmt, lint, test, release build — the full gate'
 	@echo '  make fmt      format the workspace'
 	@echo '  make lint     clippy, all targets and features, warnings denied'

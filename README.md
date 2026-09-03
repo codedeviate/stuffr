@@ -1,6 +1,6 @@
-# stf
+# stuffr
 
-**stf** (pronounced *"stuff"*) is a universal compression and archive toolkit in
+**stuffr** (pronounced *"stuff"*) is a universal compression and archive toolkit in
 Rust — one library and one command for the whole format space, from `zstd` back
 to `.arc`.
 
@@ -11,9 +11,9 @@ read list.
 
 > **Status: Phase 1 complete at `0.1.0` — eleven codecs, three of them
 > parallel on request, and a default build that needs no C toolchain to read
-> *or write* xz, LZMA1 or LZIP.** `stf pack`, `unpack`, `cat`, `info` and
+> *or write* xz, LZMA1 or LZIP.** `stuffr pack`, `unpack`, `cat`, `info` and
 > `formats` all work, on files and through pipes, and
-> `curl … | stf cat - | grep pattern` runs. `stf formats` lists `brotli`,
+> `curl … | stuffr cat - | grep pattern` runs. `stuffr formats` lists `brotli`,
 > `bzip2`, `deflate`, `gzip`, `lz4`, `lzip`, `lzma`, `snappy`, `xz`, `zlib` and
 > `zstd`, each proven against the ten-property conformance harness Phase 1c
 > added and then proven to coexist. 486 tests under `--all-features`, 420 on
@@ -41,7 +41,7 @@ read list.
 >
 > A default build writes `.zst` only behind `--allow-weak-encoder`, because
 > `ruzstd`'s encoder produces files about 76% larger (3.53x against C zstd's
-> 6.21x on an 11.7 MB corpus) at roughly 8x the time. `stf formats` shows
+> 6.21x on an 11.7 MB corpus) at roughly 8x the time. `stuffr formats` shows
 > `weak` rather than `yes` in that row, so a build's honesty is visible without
 > running anything.
 >
@@ -52,11 +52,11 @@ read list.
 > `xz-c`, `xz-pure`, `lzip`): `xz-c` and `xz-pure` are the same format and
 > registration picks exactly one, so no single build ever has more than
 > three parallel rows. `--threads N`, `--threads 0` (auto), `--turbo` and
-> `STF_THREADS` all enable it; omitting every one of them encodes
+> `STUFFR_THREADS` all enable it; omitting every one of them encodes
 > single-threaded, so the same input always produces the same bytes.
 > Reproducibility is scoped precisely — **same input + same flags + same
 > environment** — because `--threads 0`'s auto-detection resolves against
-> cgroup CPU quotas and so is not machine-independent by itself. `stf
+> cgroup CPU quotas and so is not machine-independent by itself. `stuffr
 > formats`' PARALLEL column reports this truthfully per build: `yes` for `xz`
 > and `lzip` on the default (`pure`) tier and `-` for `zstd`; add
 > `--features c-backed` and `zstd` becomes `yes` too.
@@ -65,7 +65,7 @@ read list.
 > the governor divides the limit by each codec's measured per-worker demand,
 > handing out fewer, slower threads rather than risking the OOM killer. On
 > decode it bounds allocation instead, defaulting to 25% of available RAM
-> (cgroup-aware); `stf info` reports the resolved figure, rendered for humans
+> (cgroup-aware); `stuffr info` reports the resolved figure, rendered for humans
 > (`256 MiB`, never a raw byte count).
 >
 > **The per-worker figures, measured directly in release, have a consequence
@@ -173,7 +173,7 @@ data, or that a solid block cost 40 MB of wasted decode to reach one file.
 `--strict-fidelity` turns any such warning into a non-zero exit;
 `--fidelity=json` emits them machine-readably.
 
-So `curl … | stf cat - | grep pattern` works on a ZIP, on real data, and tells
+So `curl … | stuffr cat - | grep pattern` works on a ZIP, on real data, and tells
 you honestly what it approximated.
 
 ### 3. One governed thread budget, conservative by default
@@ -199,19 +199,19 @@ OOM killer.
 ## Planned CLI
 
 *Phase 1 and later. `pack`, `unpack`, `cat`, `info` and `formats` work today,
-for the eleven codecs `stf formats` lists; `list`, `test`, `convert` and
+for the eleven codecs `stuffr formats` lists; `list`, `test`, `convert` and
 `install-links`, and every container, are not implemented yet.*
 
 ```
-stf pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
-stf unpack   [-C dir] ARCHIVE [PATTERNS...]
-stf list     ARCHIVE                    # alias: ls
-stf cat      ARCHIVE [PATTERNS...]      # streams entry data; works on a pipe
-stf info     ARCHIVE                    # resolved chain, ladder rung, fidelity
-stf formats                             # capability matrix for THIS build
-stf test     ARCHIVE                    # integrity check, no extraction
-stf convert  IN -o OUT                  # recompress without staging to disk
-stf install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
+stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
+stuffr unpack   [-C dir] ARCHIVE [PATTERNS...]
+stuffr list     ARCHIVE                    # alias: ls
+stuffr cat      ARCHIVE [PATTERNS...]      # streams entry data; works on a pipe
+stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
+stuffr formats                             # capability matrix for THIS build
+stuffr test     ARCHIVE                    # integrity check, no extraction
+stuffr convert  IN -o OUT                  # recompress without staging to disk
+stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
 ```
 
 `ARCHIVE` accepts `-` for stdin everywhere. Optional compat symlinks
@@ -272,7 +272,7 @@ checks that the `pure` graph contains neither `zstd-sys` nor `liblzma-sys`.
 
 There is also one granular feature per format, so a dependent can take
 `stuffr = { default-features = false, features = ["zip", "zstd"] }` and compile
-almost nothing. `stf formats` always reports what *this* build actually has.
+almost nothing. `stuffr formats` always reports what *this* build actually has.
 
 ## Layout
 
@@ -287,15 +287,17 @@ crates/
 │                     #   each behind its own feature
 ├── stuffr/           # facade: re-exports core + formats, owns the feature
 │                     #   taxonomy. The `cargo add` target.
-└── stuffr-cli/       # the `stf` binary
+└── stuffr-cli/       # the `stuffr` binary
 ```
 
-Crates are published as `stuffr-*` because `stf`, `stf-core` and `stf-cli` are
-already taken on crates.io. The command you type stays `stf`.
+The binary is `stuffr`, built from the `stuffr-cli` crate. Command and crates
+agree, which they did not before this project was renamed: the `stuffr-*` crate
+names originally existed only because `stf`, `stf-core` and `stf-cli` were
+already taken on crates.io, and the command was `stf` to match them.
 
 ## Documentation
 
-- **Design specification** — `~/Development/Thomas/superpowers/stf/specs/2026-08-25-stf-compression-tool-design.md`
+- **Design specification** — `~/Development/Thomas/superpowers/stuffr/specs/2026-08-25-stuffr-compression-tool-design.md`
   (kept outside this repository, alongside the plans and session reports)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — the development gate, commit convention,
   and the versioning policy with its milestone table

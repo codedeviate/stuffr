@@ -2,7 +2,7 @@
 
 This file has two jobs.
 
-**Part 1** records what `stf` deliberately does *not* do, so a gap reads as a
+**Part 1** records what `stuffr` deliberately does *not* do, so a gap reads as a
 decision rather than an oversight. When something is excluded because of an
 external constraint rather than our own effort budget, that is stated plainly.
 
@@ -42,8 +42,8 @@ well-understood surfaces; `tar` does not.
 
 ### Network transport
 
-`stf` reads stdin and files. It does not speak HTTP, FTP, S3, or anything else.
-`curl … | stf cat -` composes perfectly well, and the whole point of the
+`stuffr` reads stdin and files. It does not speak HTTP, FTP, S3, or anything else.
+`curl … | stuffr cat -` composes perfectly well, and the whole point of the
 streaming ladder is to make that pipeline work — which is precisely why the tool
 does not need its own client, retry logic, credential handling, or TLS
 dependency.
@@ -67,7 +67,7 @@ Each of these is a legitimate tool; none of them is this tool.
 
 PAQ, cmix, and the rest of the top of the Hutter Prize leaderboard. Excellent
 ratios at runtimes measured in hours per gigabyte and memory in the tens of
-gigabytes. Nobody can use them for the things `stf` is for. (A `--max` mode using
+gigabytes. Nobody can use them for the things `stuffr` is for. (A `--max` mode using
 Zopfli for deflate is on the wishlist — that one is merely slow, not unusable.)
 
 ### Self-extracting executable generation
@@ -78,7 +78,7 @@ that generates executables is a fundamentally different security proposition.
 
 ### A GUI, a TUI, or a file manager
 
-`stf` is a library and a CLI. It is designed to be a dependency, so anyone who
+`stuffr` is a library and a CLI. It is designed to be a dependency, so anyone who
 wants a GUI has a good foundation to build one on — separately.
 
 ---
@@ -93,7 +93,7 @@ Wanted, not scheduled.
   indexes. These are the honest fix for the ladder's compromises: a real index
   means random access *and* parallel decode on a format that otherwise offers
   neither. Probably the highest-value item on this list.
-- **`stf mount`** — FUSE mount of any supported container. Falls out fairly
+- **`stuffr mount`** — FUSE mount of any supported container. Falls out fairly
   naturally once `by_index` is solid.
 - **Multi-volume and split archives** — `.z01`/`.zip`, `.part1.rar`, `.001`.
   Needs a source abstraction that spans files, which the ladder could grow into.
@@ -101,7 +101,7 @@ Wanted, not scheduled.
 
 ## Search
 
-- **`stf grep`** — built-in search across entries, parallel over the governor's
+- **`stuffr grep`** — built-in search across entries, parallel over the governor's
   lease pool, with entry-name prefixes and the usual context flags. The original
   motivation for the streaming work was piping to an external grep; doing it
   in-process avoids a full decode-and-copy per entry and can skip entries by
@@ -140,10 +140,10 @@ Wanted, not scheduled.
 
 - Progress bars and ETA, suppressed when not a TTY
 - Shell completions (bash, zsh, fish) and generated man pages
-- `stf bench` — compare formats and levels on real input, report the ratio and
+- `stuffr bench` — compare formats and levels on real input, report the ratio and
   throughput trade-off
 - `--verify-sha256` and manifest emission on pack
-- Better `stf info` output: entropy estimate, "this is already compressed, don't
+- Better `stuffr info` output: entropy estimate, "this is already compressed, don't
   bother" advice
 - `tar` compat symlink (see Part 1 for why it is not in v1)
 

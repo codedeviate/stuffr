@@ -1,6 +1,6 @@
 //! Format registry: what this build actually contains.
 //!
-//! Dispatch stays internal, but discovery is explicit — `stf formats` renders
+//! Dispatch stays internal, but discovery is explicit — `stuffr formats` renders
 //! [`Registry::matrix`], so a user can always tell a missing feature flag from
 //! a broken file.
 
@@ -145,7 +145,7 @@ impl Registry {
         self.metas.get(&id).map_or(0, |m| m.priority)
     }
 
-    /// The capability matrix, sorted by id. Rendered by `stf formats`.
+    /// The capability matrix, sorted by id. Rendered by `stuffr formats`.
     pub fn matrix(&self) -> Vec<FormatRow> {
         let mut rows: Vec<FormatRow> = self
             .metas

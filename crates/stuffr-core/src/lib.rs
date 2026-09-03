@@ -1,4 +1,4 @@
-//! Core abstractions for the `stf` toolkit.
+//! Core abstractions for the `stuffr` toolkit.
 //!
 //! This crate deliberately depends on **no** compression format crate. That
 //! constraint is what makes the stream ladder and the thread governor testable

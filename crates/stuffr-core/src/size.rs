@@ -1,11 +1,11 @@
 //! Human-readable byte-count rendering.
 //!
 //! Lives here, not in the CLI, so a codec's `--memory-limit` refusal message
-//! and `stf info`'s resolved-limit display share one formatter rather than
+//! and `stuffr info`'s resolved-limit display share one formatter rather than
 //! inventing their own — see the whole-branch review's LOW-5 finding: before
 //! this, the same quantity (a declared or configured memory bound) appeared
 //! as raw **bytes** (`xz_pure.rs`, `lzip.rs`), **KiB** (`lzma_pure.rs`), and
-//! **MiB/GiB** (`stf info`) in the same build, which is exactly backwards for
+//! **MiB/GiB** (`stuffr info`) in the same build, which is exactly backwards for
 //! the one message a user reads to decide what to pass back to
 //! `--memory-limit`.
 //!

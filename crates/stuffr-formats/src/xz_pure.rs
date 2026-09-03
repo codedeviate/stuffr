@@ -50,7 +50,7 @@
 //! real, varied-distance redundancy; and a shuffled concatenation of this
 //! repository's own `.rs` source), encode came out 1.13-1.30x slower than
 //! `liblzma` and decode 1.33-2.25x slower — a real, consistent, but far
-//! smaller gap than originally briefed. `stf`'s own `examples.txt` and
+//! smaller gap than originally briefed. `stuffr`'s own `examples.txt` and
 //! Task 8's README note use these directly measured figures, not the
 //! originally briefed ones. The likely explanation is a difference in
 //! measurement machine or `lzma-rust2` version rather than an error in
@@ -110,7 +110,7 @@
 //! the same bad input: `liblzma::write::XzEncoder::new` PANICS on an
 //! out-of-range preset. Neither behavior is what a caller should see:
 //! `check_encode_opts` below enforces `0..=9` itself, independent of both
-//! backends, specifically so `stf pack --format xz --level 99` behaves
+//! backends, specifically so `stuffr pack --format xz --level 99` behaves
 //! identically whichever backend a given build compiled — matching
 //! `xz_c.rs`'s message wording and exit code (`Error::Usage`, exit 2) rather
 //! than inventing a second one.
@@ -827,7 +827,7 @@ mod tests {
         );
     }
 
-    /// The interop claim, pinned. A pure build writing `.xz` that only stf
+    /// The interop claim, pinned. A pure build writing `.xz` that only stuffr
     /// can read would be worse than not writing `.xz` at all.
     #[test]
     fn the_system_xz_tool_accepts_what_this_writes() {
@@ -836,7 +836,7 @@ mod tests {
         };
         let plain = b"interop payload ".repeat(4096);
         let packed = encode_with(&Xz, &plain);
-        let path = std::env::temp_dir().join("stf-xz-pure-interop.xz");
+        let path = std::env::temp_dir().join("stuffr-xz-pure-interop.xz");
         std::fs::write(&path, &packed).unwrap();
         let out = std::process::Command::new(&xz)
             .arg("-dc")
@@ -864,8 +864,8 @@ mod tests {
             return;
         };
         let plain = b"the system tool wrote this, lzma-rust2 must read it back ".repeat(4096);
-        let src_path = std::env::temp_dir().join("stf-xz-pure-interop-src.bin");
-        let xz_path = std::env::temp_dir().join("stf-xz-pure-interop-src.bin.xz");
+        let src_path = std::env::temp_dir().join("stuffr-xz-pure-interop-src.bin");
+        let xz_path = std::env::temp_dir().join("stuffr-xz-pure-interop-src.bin.xz");
         std::fs::write(&src_path, &plain).unwrap();
         let out = std::process::Command::new(&xz)
             .arg("-9")
@@ -1582,7 +1582,7 @@ mod tests {
         let Some(xz) = which_xz() else {
             return;
         };
-        let src_path = std::env::temp_dir().join("stf-xz-pure-preflight-src.bin");
+        let src_path = std::env::temp_dir().join("stuffr-xz-pure-preflight-src.bin");
         std::fs::write(&src_path, b"a").unwrap();
         let out = std::process::Command::new(&xz)
             .arg("-9")
@@ -1599,7 +1599,7 @@ mod tests {
         );
         let packed = out.stdout;
 
-        let xz_path = std::env::temp_dir().join("stf-xz-pure-preflight-src.bin.xz");
+        let xz_path = std::env::temp_dir().join("stuffr-xz-pure-preflight-src.bin.xz");
         std::fs::write(&xz_path, &packed).unwrap();
         let reference = std::process::Command::new(&xz)
             .arg("-dc")

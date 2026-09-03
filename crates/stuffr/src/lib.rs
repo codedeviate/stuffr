@@ -1,4 +1,4 @@
-//! Universal compression and archive toolkit — the library behind the `stf`
+//! Universal compression and archive toolkit — the library behind the `stuffr`
 //! command.
 //!
 //! Re-exports [`stuffr_core`] and owns the feature taxonomy: `pure` (default),
@@ -18,7 +18,7 @@ fn build_registry() -> stuffr_core::Registry {
 
 /// The registry this build ships, built once.
 ///
-/// `stf formats` renders this, which is how a user tells a missing feature flag
+/// `stuffr formats` renders this, which is how a user tells a missing feature flag
 /// from a corrupt file.
 ///
 /// Returns a shared reference rather than a fresh value: it was rebuilding five

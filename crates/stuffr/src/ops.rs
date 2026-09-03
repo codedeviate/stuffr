@@ -3,7 +3,7 @@
 //!
 //! An orchestration that lives only inside a binary forces every library user
 //! to rebuild it. `compress`, `decompress` and `inspect` are the operations the
-//! `stf` command performs, and they are public API.
+//! `stuffr` command performs, and they are public API.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +19,7 @@ use stuffr_core::{
 
 /// Per-process counter mixed into the temp file name alongside the pid, so
 /// two concurrent `compress` calls in the same process (this is public
-/// library API, not just the single-threaded `stf` binary) get distinct temp
+/// library API, not just the single-threaded `stuffr` binary) get distinct temp
 /// paths on the very first attempt rather than racing to the same one.
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
@@ -402,7 +402,7 @@ pub struct CompressOpts {
     /// Use the full detected CPU budget, uncapped. Does NOT lift
     /// `memory_limit`.
     pub turbo: bool,
-    /// Cap on memory stf will ask for. `None` uses
+    /// Cap on memory stuffr will ask for. `None` uses
     /// `governor::default_memory_limit()` — 25% of available RAM, cgroup-aware.
     pub memory_limit: Option<u64>,
 }
@@ -431,10 +431,10 @@ impl Default for CompressOpts {
 pub fn resolved_budget(o: &CompressOpts) -> Option<Arc<Governor>> {
     // Read the environment BEFORE deciding whether the user asked, not after.
     // An earlier version of this gate returned `None` on `threads: None` and so
-    // never consulted `STF_THREADS` at all: the variable is documented on
+    // never consulted `STUFFR_THREADS` at all: the variable is documented on
     // `BudgetInputs` and did nothing whatsoever. A knob that exists and has no
     // effect is worse than no knob.
-    let env = std::env::var("STF_THREADS")
+    let env = std::env::var("STUFFR_THREADS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok());
     resolved_budget_inner(o, env)
@@ -445,7 +445,7 @@ pub fn resolved_budget(o: &CompressOpts) -> Option<Arc<Governor>> {
 /// Exists so the precedence rules can be tested without mutating the process
 /// environment. `std::env::set_var` is unsafe from Rust 2024 and, more to the
 /// point, is shared with every other test in the binary — a test that exported
-/// `STF_THREADS` raced the rest of the suite and failed the gate. Injecting the
+/// `STUFFR_THREADS` raced the rest of the suite and failed the gate. Injecting the
 /// value removes the race entirely rather than serialising around it.
 ///
 /// Exposed under the `testing` feature only, following `sync_call_count`.
@@ -457,7 +457,7 @@ pub fn resolved_budget_with_env(o: &CompressOpts, env: Option<usize>) -> Option<
 
 fn resolved_budget_inner(o: &CompressOpts, env: Option<usize>) -> Option<Arc<Governor>> {
     // An explicit `--threads 1` is the most specific statement available and
-    // wins outright — including over `STF_THREADS` and over `--turbo`, because
+    // wins outright — including over `STUFFR_THREADS` and over `--turbo`, because
     // someone who typed `1` on the command line means one.
     if o.threads == Some(1) {
         return None;
@@ -481,7 +481,7 @@ fn resolved_budget_inner(o: &CompressOpts, env: Option<usize>) -> Option<Arc<Gov
     let inputs = BudgetInputs {
         cli: o.threads,
         env,
-        // `./.stf.toml` and `~/.config/stf/config.toml`. `BudgetInputs`
+        // `./.stuffr.toml` and `~/.config/stuffr/config.toml`. `BudgetInputs`
         // anticipates both; no config-file machinery exists yet and parallel
         // encode does not need one, so they stay None deliberately rather
         // than by omission.
@@ -561,7 +561,7 @@ fn choose_format(reg: &Registry, dst: &Output, explicit: Option<FormatId>) -> Re
 /// `default_format_in` for the encode-only preference this applies.
 ///
 /// A library consumer asks the same question `choose_format` answers
-/// internally for `compress` — e.g. the CLI, falling back for `stf pack` when
+/// internally for `compress` — e.g. the CLI, falling back for `stuffr pack` when
 /// neither `-o` nor `--format` was given — and duplicating the answer in the
 /// binary is how the two would drift apart.
 pub fn default_format() -> Result<FormatId> {
@@ -574,7 +574,7 @@ pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
 }
 
 /// Compresses `src` into `dst`, consulting `registry` rather than the
-/// build's default — the hook a library consumer uses to hand `stf` a codec
+/// build's default — the hook a library consumer uses to hand `stuffr` a codec
 /// it does not ship, or a deliberately reduced set.
 pub fn compress_with(
     registry: &Registry,
@@ -606,7 +606,7 @@ pub fn compress_with(
 
     let mut reader = src.open()?;
     // Computed from the source's actual seekability, the same way
-    // `decompress` computes it — not assumed. `stf pack - -o x.gz` reads a
+    // `decompress` computes it — not assumed. `stuffr pack - -o x.gz` reads a
     // pipe, and claiming `Exact` for that would be a rung `compress` invented
     // rather than one it observed.
     let rung = if reader.caps().seekable {
@@ -800,7 +800,7 @@ pub fn decompress_with(
 
 /// How `inspect` arrived at its answer.
 ///
-/// `stf info` could not previously say this, so an empty `.gz` and a text file
+/// `stuffr info` could not previously say this, so an empty `.gz` and a text file
 /// named `.gz` reported identically and only `unpack` failed. Extension-as-
 /// fallback is the documented design; the answer's provenance should still be
 /// visible.
@@ -817,7 +817,7 @@ pub enum Detection {
     Explicit,
 }
 
-/// What `stf info` reports.
+/// What `stuffr info` reports.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Inspection {
@@ -908,7 +908,7 @@ pub fn primary_extension(format: FormatId) -> Option<&'static str> {
         .and_then(|r| r.extensions.first().copied())
 }
 
-/// Where `stf pack INPUT` writes when no `-o` is given.
+/// Where `stuffr pack INPUT` writes when no `-o` is given.
 ///
 /// Appends rather than replaces, so `notes.txt` becomes `notes.txt.gz` and
 /// unpacking returns the original name.
@@ -921,7 +921,7 @@ pub fn suggest_packed(input: &Path, format: FormatId) -> Result<PathBuf> {
     Ok(PathBuf::from(name))
 }
 
-/// Where `stf unpack INPUT` writes when no `-o` is given.
+/// Where `stuffr unpack INPUT` writes when no `-o` is given.
 pub fn suggest_unpacked(input: &Path) -> Result<PathBuf> {
     let known = input
         .extension()
@@ -945,7 +945,7 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("stf-ops-unit-{}-{}", std::process::id(), name));
+        p.push(format!("stuffr-ops-unit-{}-{}", std::process::id(), name));
         p
     }
 

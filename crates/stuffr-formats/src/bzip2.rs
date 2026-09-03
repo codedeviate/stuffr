@@ -306,7 +306,7 @@ mod tests {
             padded.extend(std::iter::repeat_n(0u8, pad_len));
 
             let path = std::env::temp_dir().join(format!(
-                "stf-bzip2-trailing-pad-{pad_len}-{}.bz2",
+                "stuffr-bzip2-trailing-pad-{pad_len}-{}.bz2",
                 std::process::id()
             ));
             std::fs::write(&path, &padded).unwrap();

@@ -793,7 +793,7 @@ mod tests {
         sink.finish().unwrap();
         let packed = buf.contents();
 
-        let path = std::env::temp_dir().join("stf-xz-c-parallel-interop.xz");
+        let path = std::env::temp_dir().join("stuffr-xz-c-parallel-interop.xz");
         std::fs::write(&path, &packed).unwrap();
 
         let test_status = std::process::Command::new(&xz)

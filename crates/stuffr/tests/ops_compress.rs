@@ -3,7 +3,7 @@ use stuffr::ops::{CompressOpts, Input, Output, compress};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("stf-1b-{}-{}", std::process::id(), name));
+    p.push(format!("stuffr-1b-{}-{}", std::process::id(), name));
     p
 }
 
@@ -465,7 +465,7 @@ fn a_hostile_entry_name_survives_serialization_as_data() {
 fn a_weak_encoder_is_refused_without_explicit_consent() {
     // A codec that admits its encoder is much worse than the format's usual one
     // must not be reachable by accident: a user who asked for `.xz` expects xz
-    // ratios, and two builds of stf would otherwise produce very different files
+    // ratios, and two builds of stuffr would otherwise produce very different files
     // from an identical command with no way to tell which they got.
     use std::io::Write;
     use stuffr_core::{
@@ -853,8 +853,8 @@ fn threads_one_builds_no_governor() {
 }
 
 #[test]
-fn stf_threads_alone_builds_a_governor() {
-    // `STF_THREADS` is documented on `BudgetInputs` as a precedence source. An
+fn stuffr_threads_alone_builds_a_governor() {
+    // `STUFFR_THREADS` is documented on `BudgetInputs` as a precedence source. An
     // earlier gate checked `o.threads` and returned before the environment was
     // ever read, so the variable existed and did nothing — a knob with no
     // effect, which is worse than no knob.
@@ -863,7 +863,7 @@ fn stf_threads_alone_builds_a_governor() {
     // 2024 and is shared with every other test in this binary, so a test that
     // exported it raced the suite and failed the gate.
     let gov = stuffr::ops::resolved_budget_with_env(&CompressOpts::default(), Some(3))
-        .expect("STF_THREADS alone must build a governor");
+        .expect("STUFFR_THREADS alone must build a governor");
     assert_eq!(
         gov.workers(),
         3,
@@ -884,7 +884,7 @@ fn an_explicit_threads_one_beats_the_environment() {
     );
     assert!(
         got.is_none(),
-        "--threads 1 must stay single-threaded despite STF_THREADS"
+        "--threads 1 must stay single-threaded despite STUFFR_THREADS"
     );
 }
 
@@ -892,7 +892,7 @@ fn an_explicit_threads_one_beats_the_environment() {
 fn an_explicit_count_from_the_environment_outranks_turbo() {
     // Deliberate, and pinned because it looks inconsistent until you read
     // `resolve_workers`: the first source expressing an opinion wins, and
-    // `turbo` sits BELOW every explicit count. So `STF_THREADS=1` with
+    // `turbo` sits BELOW every explicit count. So `STUFFR_THREADS=1` with
     // `--turbo` resolves to one worker rather than the full budget — an
     // explicit number beats "use everything", whichever way it was supplied.
     //
@@ -948,9 +948,9 @@ fn turbo_alone_takes_the_full_detected_budget() {
 }
 
 #[test]
-fn stf_threads_of_one_is_not_a_request_for_parallelism() {
+fn stuffr_threads_of_one_is_not_a_request_for_parallelism() {
     let got = stuffr::ops::resolved_budget_with_env(&CompressOpts::default(), Some(1));
-    assert!(got.is_none(), "STF_THREADS=1 asks for single-threaded");
+    assert!(got.is_none(), "STUFFR_THREADS=1 asks for single-threaded");
 }
 
 #[test]

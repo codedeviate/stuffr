@@ -144,7 +144,7 @@ impl SpillSource {
         })
     }
 
-    /// Whether the spool escalated past the memory cap. Surfaced by `stf info`.
+    /// Whether the spool escalated past the memory cap. Surfaced by `stuffr info`.
     pub fn spilled_to_disk(&self) -> bool {
         self.on_disk
     }

@@ -18,7 +18,11 @@ use stuffr::ops::{CompressOpts, Input, Output, compress, sync_call_count};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("stf-sync-counter-{}-{}", std::process::id(), name));
+    p.push(format!(
+        "stuffr-sync-counter-{}-{}",
+        std::process::id(),
+        name
+    ));
     p
 }
 

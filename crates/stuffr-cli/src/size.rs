@@ -36,7 +36,7 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size `{s}` overflows a 64-bit byte count"))
 }
 
-/// Renders a byte count the way a human reads it, for `stf info`.
+/// Renders a byte count the way a human reads it, for `stuffr info`.
 ///
 /// The inverse of [`parse_size`], and the two live in different crates but
 /// are tested together below so they cannot drift: anything this prints

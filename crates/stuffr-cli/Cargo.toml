@@ -1,14 +1,14 @@
 [package]
 name = "stuffr-cli"
 version.workspace = true
-description = "The stf command line interface"
+description = "The stuffr command line interface"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "stf"
+name = "stuffr"
 path = "src/main.rs"
 
 [dependencies]

@@ -47,7 +47,7 @@
 //! | intact 2-member concatenation | correct, both members' bytes |
 //! | truncation | `Err` |
 //!
-//! Untreated, `stf cat --format lzip notes.txt` on a file with a damaged
+//! Untreated, `stuffr cat --format lzip notes.txt` on a file with a damaged
 //! later member prints only the earlier members' data and exits 0 — silent
 //! data loss, indistinguishable from a short, honest file.
 //!
@@ -126,7 +126,7 @@
 //! "was a file path given rather than `-`" in this tool, so the practical
 //! effect is the same. Verified directly: a real member followed by a
 //! genuinely empty second member exits 2 as a file, 0 through a pipe, same
-//! bytes either way. `stf` never distinguishes file input from pipe input
+//! bytes either way. `stuffr` never distinguishes file input from pipe input
 //! at this codec's layer — a seekable source is still read forward, never
 //! seeked, by `GuardedLzipReader` — so this codec's behavior always matches
 //! reference lzip's PIPE path, never its file path, on this one check. That
@@ -1815,7 +1815,7 @@ mod tests {
         sink.finish().unwrap();
         let packed = buf.contents();
 
-        let path = std::env::temp_dir().join("stf-lzip-interop-parallel.lz");
+        let path = std::env::temp_dir().join("stuffr-lzip-interop-parallel.lz");
         std::fs::write(&path, &packed).unwrap();
 
         let test = std::process::Command::new(&lzip)
@@ -1856,7 +1856,7 @@ mod tests {
         };
         let plain = b"interop payload, written by this codec ".repeat(4096);
         let packed = compress(&plain);
-        let path = std::env::temp_dir().join("stf-lzip-interop-ours.lz");
+        let path = std::env::temp_dir().join("stuffr-lzip-interop-ours.lz");
         std::fs::write(&path, &packed).unwrap();
 
         let test = std::process::Command::new(&lzip)
@@ -1896,7 +1896,7 @@ mod tests {
             return;
         };
         let plain = b"the system lzip tool wrote this, lzma-rust2 must read it back ".repeat(4096);
-        let src_path = std::env::temp_dir().join("stf-lzip-interop-theirs-src.bin");
+        let src_path = std::env::temp_dir().join("stuffr-lzip-interop-theirs-src.bin");
         std::fs::write(&src_path, &plain).unwrap();
 
         let out = std::process::Command::new(&lzip)
@@ -1933,7 +1933,8 @@ mod tests {
         let second = b"second member, written by the reference tool ".repeat(2048);
 
         let compress_with_reference = |plain: &[u8], tag: &str| -> Vec<u8> {
-            let src_path = std::env::temp_dir().join(format!("stf-lzip-interop-multi-{tag}.bin"));
+            let src_path =
+                std::env::temp_dir().join(format!("stuffr-lzip-interop-multi-{tag}.bin"));
             std::fs::write(&src_path, plain).unwrap();
             let out = std::process::Command::new(&lzip)
                 .arg("-9")
@@ -1955,7 +1956,7 @@ mod tests {
         let mut both = compress_with_reference(&first, "a");
         both.extend_from_slice(&compress_with_reference(&second, "b"));
 
-        let both_path = std::env::temp_dir().join("stf-lzip-interop-multi-both.lz");
+        let both_path = std::env::temp_dir().join("stuffr-lzip-interop-multi-both.lz");
         std::fs::write(&both_path, &both).unwrap();
         let reference_cat = std::process::Command::new(&lzip)
             .arg("-dc")
@@ -1996,7 +1997,7 @@ mod tests {
     /// against, not this codec's own expectation of what `lzip.h` says.
     fn reference_accepts(lzip: &std::path::Path, bytes: &[u8]) -> bool {
         let path = std::env::temp_dir().join(format!(
-            "stf-lzip-trailing-probe-{}-{}.lz",
+            "stuffr-lzip-trailing-probe-{}-{}.lz",
             std::process::id(),
             bytes.len()
         ));
@@ -2270,7 +2271,7 @@ mod tests {
         let Some(lzip) = which_lzip() else {
             return;
         };
-        let src_path = std::env::temp_dir().join("stf-lzip-preflight-shrink-src.bin");
+        let src_path = std::env::temp_dir().join("stuffr-lzip-preflight-shrink-src.bin");
         std::fs::write(&src_path, b"hello world").unwrap();
         let out = std::process::Command::new(&lzip)
             .arg("-9")
@@ -2396,7 +2397,7 @@ mod tests {
         let mut packed = compress(b"hello world");
         packed[5] = 0x1d; // declares 1 << 29 = 512 MiB
 
-        let path = std::env::temp_dir().join("stf-lzip-preflight-crafted.lz");
+        let path = std::env::temp_dir().join("stuffr-lzip-preflight-crafted.lz");
         std::fs::write(&path, &packed).unwrap();
 
         let test = std::process::Command::new(&lzip)

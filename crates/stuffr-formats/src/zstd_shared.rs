@@ -5,7 +5,7 @@
 //! once — Task 3 gates them mutually exclusive — but whichever one is
 //! compiled in must alone still expose the identical [`FormatId`], magic
 //! rule and [`FormatMeta`], because that identity is what makes `--format
-//! zstd`, magic detection, and `stf formats`' single `zstd` row work the
+//! zstd`, magic detection, and `stuffr formats`' single `zstd` row work the
 //! same regardless of which backend produced the binary. Neither backend
 //! module can own it: a `zstd-pure`-only build has no `zstd_c` module at
 //! all, and vice versa, so the shared pieces live here instead and each

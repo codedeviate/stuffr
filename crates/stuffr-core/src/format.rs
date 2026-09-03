@@ -138,7 +138,7 @@ pub struct CodecCaps {
     ///
     /// `ops` refuses to use it unless the caller opts in, because the output is
     /// indistinguishable afterwards: a user who asked for `.xz` expects xz
-    /// ratios, and two builds of stf would otherwise produce very different
+    /// ratios, and two builds of stuffr would otherwise produce very different
     /// files from an identical command with no way to tell which they got.
     pub weak_encoder: bool,
 }

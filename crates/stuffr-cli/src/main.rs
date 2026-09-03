@@ -1,4 +1,4 @@
-//! The `stf` command.
+//! The `stuffr` command.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -53,7 +53,7 @@ fn main() -> ExitCode {
     match run(command) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("stf: {e}");
+            eprintln!("stuffr: {e}");
             ExitCode::from(e.exit_code() as u8)
         }
     }
@@ -85,14 +85,14 @@ fn run(command: Command) -> stuffr::Result<()> {
         Ok(()) => Ok(()),
         // Rust ignores SIGPIPE, so a write to a closed stdout surfaces as an
         // EPIPE `io::Error` rather than terminating the process outright. An
-        // early-exiting consumer — `stf cat huge.gz | head`, `| grep -m1`,
+        // early-exiting consumer — `stuffr cat huge.gz | head`, `| grep -m1`,
         // `| less` — is the flagship workflow for a `cat`-shaped tool, and
         // every conventional Unix filter (zcat, gzip -d, cat itself) treats
         // that as normal termination, not a failure. Success, no message: the
         // consumer closing the pipe is the party that decided it had seen
         // enough.
         //
-        // This must NOT fire for a file destination: `stf unpack a.gz -o
+        // This must NOT fire for a file destination: `stuffr unpack a.gz -o
         // file` hitting BrokenPipe (e.g. a full disk manifesting oddly) would
         // otherwise map a real failure to exit 0 — `run` returning `Err`
         // still triggers `discard`, so the temp file is removed and the
@@ -248,7 +248,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             if let Some(r) = max_ratio {
                 opts.max_ratio = r;
             }
-            // The motivating case: `curl … | stf cat - | grep pattern`.
+            // The motivating case: `curl … | stuffr cat - | grep pattern`.
             ops::decompress(input_of(&input), Output::Stdout, &opts)?;
             Ok(())
         }
@@ -336,7 +336,7 @@ fn format_by_name(name: &str) -> stuffr::Result<FormatId> {
 /// actually see it.
 ///
 /// `println!`/`print!` panic on a write error instead of returning one — see
-/// the doc on `destination_is_stdout` — so `stf formats` and `stf info`
+/// the doc on `destination_is_stdout` — so `stuffr formats` and `stuffr info`
 /// (which `destination_is_stdout` already lists as stdout destinations) used
 /// to exit 101 with "failed printing to stdout: Broken pipe" instead of
 /// exiting cleanly like every other early-closed-reader case.
@@ -366,7 +366,7 @@ fn print_formats() -> stuffr::Result<()> {
     for r in rows {
         // A codec's own capabilities, not the matrix row's read/write/parallel
         // summary, are what carry `weak_encoder` — look it up directly rather
-        // than growing FormatRow for one column only `stf formats` reads.
+        // than growing FormatRow for one column only `stuffr formats` reads.
         let weak = r.write
             && r.kind == stuffr::FormatKind::Codec
             && registry.codec(r.id).is_some_and(|c| c.caps().weak_encoder);

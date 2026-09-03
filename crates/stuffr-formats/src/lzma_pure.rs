@@ -198,7 +198,7 @@
 //! erroring — preset 10 and preset 99 both come back as preset 9's options,
 //! no error, no panic. `check_encode_opts` below enforces `0..=9` itself,
 //! independently of the crate, with the same message wording and exit code
-//! `lzma_c.rs` uses (`Error::Usage`, exit 2), so `stf pack --format lzma
+//! `lzma_c.rs` uses (`Error::Usage`, exit 2), so `stuffr pack --format lzma
 //! --level 99` behaves identically whichever backend a given build compiled.
 //!
 //! ## `memory_per_worker`: preset 6's dictionary
@@ -533,7 +533,7 @@ impl Read for LazyLzmaDecoder {
                             // classifies as `ResourceLimit` (exit 6), not
                             // `Corrupt` (exit 5).
                             // Rendered via the shared `format_size` (MiB/GiB,
-                            // matching `stf info` and the xz/lzip refusal
+                            // matching `stuffr info` and the xz/lzip refusal
                             // messages) rather than this codec's own KiB
                             // unit — see the whole-branch review's LOW-5
                             // finding: three different unit conventions for

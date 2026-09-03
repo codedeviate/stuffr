@@ -7,7 +7,7 @@
 //!
 //! Same shape as `xz_shared.rs`: whichever backend is compiled in must alone
 //! still expose the identical [`FormatId`] and [`FormatMeta`], because that
-//! identity is what makes `--format lzma` and `stf formats`' single `lzma`
+//! identity is what makes `--format lzma` and `stuffr formats`' single `lzma`
 //! row work the same regardless of which backend produced the binary.
 //! Neither backend module can own it: an `lzma-pure`-only build has no
 //! `lzma_c` module at all, and vice versa, so the shared pieces live here

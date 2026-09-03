@@ -1,11 +1,11 @@
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
-const STF: &str = env!("CARGO_BIN_EXE_stf");
+const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("stf-cli-{}-{}", std::process::id(), name));
+    p.push(format!("stuffr-cli-{}-{}", std::process::id(), name));
     p
 }
 
@@ -17,7 +17,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
 
 #[test]
 fn formats_now_reports_gzip() {
-    let out = Command::new(STF).arg("formats").output().unwrap();
+    let out = Command::new(STUFFR).arg("formats").output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("gzip"), "gzip must appear: {text}");
@@ -34,14 +34,14 @@ fn info_names_the_format_and_the_rung() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"payload").unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
     );
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args(["info", gz.to_str().unwrap()])
         .output()
         .unwrap();
@@ -61,14 +61,14 @@ fn info_json_is_structured_and_names_how_the_format_was_detected() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"payload").unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
     );
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args(["info", "--json", gz.to_str().unwrap()])
         .output()
         .unwrap();
@@ -100,14 +100,14 @@ fn info_reports_the_resolved_memory_limit() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"payload").unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
     );
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args(["info", "--memory-limit", "512M", gz.to_str().unwrap()])
         .output()
         .unwrap();
@@ -123,7 +123,7 @@ fn info_reports_the_resolved_memory_limit() {
         "an explicit --memory-limit must be reflected in the report: {text}"
     );
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args([
             "info",
             "--json",
@@ -153,7 +153,7 @@ fn info_over_a_pipe_reports_forward_only_not_exact() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"payload").unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
@@ -162,7 +162,7 @@ fn info_over_a_pipe_reports_forward_only_not_exact() {
 
     let gz_bytes = std::fs::read(&gz).unwrap();
 
-    let mut child = Command::new(STF)
+    let mut child = Command::new(STUFFR)
         .args(["info", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -199,14 +199,14 @@ fn cat_exits_cleanly_when_the_reader_closes_early() {
     let payload = "the quick brown fox jumps over the lazy dog\n".repeat(500_000);
     std::fs::write(&src, payload.as_bytes()).unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
     );
 
-    let mut child = Command::new(STF)
+    let mut child = Command::new(STUFFR)
         .args(["cat", gz.to_str().unwrap()])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -241,11 +241,11 @@ fn cat_exits_cleanly_when_the_reader_closes_early() {
 #[test]
 fn formats_exits_cleanly_on_a_closed_stdout() {
     // `println!`/`print!` panic on a write error instead of returning one,
-    // which bypasses `run`'s BrokenPipe-to-success mapping entirely: `stf
-    // formats` and `stf info` used to exit 101 with "failed printing to
+    // which bypasses `run`'s BrokenPipe-to-success mapping entirely: `stuffr
+    // formats` and `stuffr info` used to exit 101 with "failed printing to
     // stdout: Broken pipe" against a closed reader, even though
     // `destination_is_stdout` already lists both as stdout destinations.
-    let mut child = Command::new(STF)
+    let mut child = Command::new(STUFFR)
         .arg("formats")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -289,7 +289,7 @@ fn pack_then_unpack_round_trips_through_the_binary() {
     // Bare invocation, no --format: exercises default_format_in's
     // gzip preference, not just gzip named explicitly.
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap()])
             .status()
             .unwrap()
@@ -302,7 +302,7 @@ fn pack_then_unpack_round_trips_through_the_binary() {
     assert!(src.exists(), "pack must not destroy its input");
 
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["unpack", gz.to_str().unwrap(), "-o", back.to_str().unwrap()])
             .status()
             .unwrap()
@@ -339,7 +339,7 @@ fn no_sync_is_accepted_by_pack_and_unpack_and_still_round_trips() {
     std::fs::write(&src, &plain).unwrap();
 
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args([
                 "pack",
                 src.to_str().unwrap(),
@@ -354,7 +354,7 @@ fn no_sync_is_accepted_by_pack_and_unpack_and_still_round_trips() {
     assert!(gz.exists(), "pack --no-sync must still write the output");
 
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args([
                 "unpack",
                 gz.to_str().unwrap(),
@@ -379,7 +379,7 @@ fn no_sync_is_accepted_by_pack_and_unpack_and_still_round_trips() {
 
 #[test]
 fn cat_reads_a_stream_on_stdin() {
-    // The project's motivating case: `curl … | stf cat - | grep pattern`.
+    // The project's motivating case: `curl … | stuffr cat - | grep pattern`.
     use std::io::Write;
     use std::process::Stdio;
 
@@ -388,7 +388,7 @@ fn cat_reads_a_stream_on_stdin() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"needle in a haystack").unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
@@ -396,7 +396,7 @@ fn cat_reads_a_stream_on_stdin() {
     );
     let packed = std::fs::read(&gz).unwrap();
 
-    let mut child = Command::new(STF)
+    let mut child = Command::new(STUFFR)
         .args(["cat", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -412,7 +412,7 @@ fn cat_reads_a_stream_on_stdin() {
     let _ = std::fs::remove_file(&gz);
 }
 
-/// The motivating case for the whole flush contract: `stf pack - -o out.gz`
+/// The motivating case for the whole flush contract: `stuffr pack - -o out.gz`
 /// reads a pipe with no path to fall back on, so the output name must be
 /// given explicitly, and the write must still land intact.
 #[test]
@@ -421,7 +421,7 @@ fn pack_reads_input_from_stdin() {
     let _ = std::fs::remove_file(&out);
     let plain = b"stdin plaintext, packed then verified byte for byte".repeat(200);
 
-    let mut child = Command::new(STF)
+    let mut child = Command::new(STUFFR)
         .args(["pack", "-", "-o", out.to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -439,7 +439,7 @@ fn pack_reads_input_from_stdin() {
 
     // Round-trip through the binary rather than just checking the file
     // exists — a truncated or otherwise corrupt stream must fail here.
-    let cat_out = Command::new(STF)
+    let cat_out = Command::new(STUFFR)
         .args(["cat", out.to_str().unwrap()])
         .output()
         .unwrap();
@@ -449,7 +449,7 @@ fn pack_reads_input_from_stdin() {
     let _ = std::fs::remove_file(&out);
 }
 
-/// The other motivating case: `stf pack x -o -` writes to a destination
+/// The other motivating case: `stuffr pack x -o -` writes to a destination
 /// (stdout) that may be fully buffered and never see a newline — exactly the
 /// scenario `Sink::finish`'s flush contract exists for. A stream that was
 /// never flushed would truncate here.
@@ -460,7 +460,7 @@ fn pack_writes_output_to_stdout() {
     let plain = b"payload written straight through to stdout by pack".repeat(200);
     std::fs::write(&src, &plain).unwrap();
 
-    let pack_out = Command::new(STF)
+    let pack_out = Command::new(STUFFR)
         .args(["pack", src.to_str().unwrap(), "--format", "gzip", "-o", "-"])
         .output()
         .unwrap();
@@ -475,10 +475,10 @@ fn pack_writes_output_to_stdout() {
         "must be a real gzip stream"
     );
 
-    // Pipe the captured bytes back through `stf cat -`: a truncated stream
+    // Pipe the captured bytes back through `stuffr cat -`: a truncated stream
     // (an unflushed `Sink::finish`, notably) fails the equality below rather
     // than merely "existing".
-    let mut child = Command::new(STF)
+    let mut child = Command::new(STUFFR)
         .args(["cat", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -509,7 +509,7 @@ fn pack_over_a_pipe_reports_forward_only_not_exact() {
     let _ = std::fs::remove_file(&out);
     let plain = b"payload".repeat(50);
 
-    let mut child = Command::new(STF)
+    let mut child = Command::new(STUFFR)
         .args(["pack", "-", "-o", out.to_str().unwrap()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -539,7 +539,7 @@ fn pack_of_a_seekable_file_reports_exact() {
 
     // Bare invocation, no --format: exercises default_format_in's
     // gzip preference, not just gzip named explicitly.
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args(["pack", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -558,7 +558,7 @@ fn an_existing_output_is_refused_with_exit_two() {
     std::fs::write(&src, b"payload").unwrap();
     std::fs::write(&gz, b"PRE-EXISTING").unwrap();
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
         .output()
         .unwrap();
@@ -584,14 +584,14 @@ fn a_bomb_exits_six_and_leaves_no_partial_output() {
 
     std::fs::write(&src, vec![0u8; 2 * 1024 * 1024]).unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
     );
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args([
             "unpack",
             gz.to_str().unwrap(),
@@ -614,11 +614,11 @@ fn a_bomb_exits_six_and_leaves_no_partial_output() {
 
 #[test]
 fn an_unknown_verb_exits_two() {
-    let out = Command::new(STF).arg("bogus").output().unwrap();
+    let out = Command::new(STUFFR).arg("bogus").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
 
-/// Keeps `stf --examples` honest as the tool grows: every format this build
+/// Keeps `stuffr --examples` honest as the tool grows: every format this build
 /// registers, and every long flag / subcommand clap knows about, must be
 /// mentioned on the page. This is what makes the page a contract rather than
 /// prose that quietly goes stale — Phase 1d adding a codec, or any future
@@ -628,8 +628,8 @@ fn examples_page_covers_every_format_and_flag() {
     use clap::CommandFactory;
     use stuffr_cli::cli::Cli;
 
-    let out = Command::new(STF).arg("--examples").output().unwrap();
-    assert!(out.status.success(), "stf --examples must exit 0");
+    let out = Command::new(STUFFR).arg("--examples").output().unwrap();
+    assert!(out.status.success(), "stuffr --examples must exit 0");
     let text = String::from_utf8(out.stdout).unwrap();
 
     for row in stuffr::registry().matrix() {
@@ -671,7 +671,7 @@ fn examples_page_covers_every_format_and_flag() {
 /// header claims "Everything below runs against this build as shown" —
 /// `examples_page_covers_every_format_and_flag` only checks that words are
 /// *mentioned*, so a page whose first command was actually broken (as this
-/// task's own investigation found `stf pack notes.txt` briefly was) would
+/// task's own investigation found `stuffr pack notes.txt` briefly was) would
 /// still pass it. A full executable-docs test extracting and running every
 /// line on the page is the right long-term fix; this is the narrow stopgap.
 #[test]
@@ -683,8 +683,8 @@ fn examples_pages_first_worked_example_runs_as_documented() {
     let packed = dir.join("notes.txt.gz");
     std::fs::write(&notes, b"the documented example's payload").unwrap();
 
-    // Verbatim: `stf pack notes.txt`, run from the directory containing it.
-    let out = Command::new(STF)
+    // Verbatim: `stuffr pack notes.txt`, run from the directory containing it.
+    let out = Command::new(STUFFR)
         .arg("pack")
         .arg("notes.txt")
         .current_dir(&dir)
@@ -718,7 +718,7 @@ fn a_corrupt_archive_exits_five_not_one() {
 
     std::fs::write(&src, b"the quick brown fox ".repeat(200)).unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
@@ -730,7 +730,7 @@ fn a_corrupt_archive_exits_five_not_one() {
     bytes[mid] ^= 0xFF;
     std::fs::write(&gz, &bytes).unwrap();
 
-    let res = Command::new(STF)
+    let res = Command::new(STUFFR)
         .args(["unpack", gz.to_str().unwrap(), "-o", out.to_str().unwrap()])
         .output()
         .unwrap();
@@ -756,14 +756,14 @@ fn unpack_accepts_an_explicit_format() {
     let _ = std::fs::remove_file(&out);
     std::fs::write(&src, b"payload").unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
     );
 
-    let res = Command::new(STF)
+    let res = Command::new(STUFFR)
         .args([
             "unpack",
             gz.to_str().unwrap(),
@@ -793,14 +793,14 @@ fn cat_accepts_an_explicit_format() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"payload").unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
     );
 
-    let res = Command::new(STF)
+    let res = Command::new(STUFFR)
         .args(["cat", gz.to_str().unwrap(), "--format", "gzip"])
         .output()
         .unwrap();
@@ -830,7 +830,7 @@ fn pack_with_no_flags_defaults_to_gzip() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, b"payload").unwrap();
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args(["pack", src.to_str().unwrap()])
         .output()
         .unwrap();
@@ -871,7 +871,7 @@ fn unpack_format_flag_is_honoured_not_merely_accepted() {
     std::fs::write(&src, &payload).unwrap();
 
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args([
                 "pack",
                 src.to_str().unwrap(),
@@ -885,7 +885,7 @@ fn unpack_format_flag_is_honoured_not_merely_accepted() {
             .success()
     );
 
-    let no_format = Command::new(STF)
+    let no_format = Command::new(STUFFR)
         .args([
             "unpack",
             packed.to_str().unwrap(),
@@ -900,7 +900,7 @@ fn unpack_format_flag_is_honoured_not_merely_accepted() {
         "a raw deflate stream must NOT be detectable without --format"
     );
 
-    let with_format = Command::new(STF)
+    let with_format = Command::new(STUFFR)
         .args([
             "unpack",
             packed.to_str().unwrap(),
@@ -942,7 +942,7 @@ fn cat_format_flag_is_honoured_not_merely_accepted() {
     std::fs::write(&src, &payload).unwrap();
 
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args([
                 "pack",
                 src.to_str().unwrap(),
@@ -956,7 +956,7 @@ fn cat_format_flag_is_honoured_not_merely_accepted() {
             .success()
     );
 
-    let no_format = Command::new(STF)
+    let no_format = Command::new(STUFFR)
         .args(["cat", packed.to_str().unwrap()])
         .output()
         .unwrap();
@@ -965,7 +965,7 @@ fn cat_format_flag_is_honoured_not_merely_accepted() {
         "a raw deflate stream must NOT be detectable without --format"
     );
 
-    let with_format = Command::new(STF)
+    let with_format = Command::new(STUFFR)
         .args(["cat", packed.to_str().unwrap(), "--format", "deflate"])
         .output()
         .unwrap();
@@ -986,7 +986,7 @@ fn an_unknown_format_name_is_a_usage_error_on_every_verb() {
     // pack already rejected these; unpack and cat must agree rather than
     // silently ignoring a flag the user believed they had set.
     for verb in ["unpack", "cat"] {
-        let out = Command::new(STF)
+        let out = Command::new(STUFFR)
             .args([verb, "/dev/null", "--format", "bogus"])
             .output()
             .unwrap();
@@ -1010,14 +1010,14 @@ fn cat_honours_max_ratio() {
     let _ = std::fs::remove_file(&gz);
     std::fs::write(&src, vec![0u8; 2 * 1024 * 1024]).unwrap();
     assert!(
-        Command::new(STF)
+        Command::new(STUFFR)
             .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
             .status()
             .unwrap()
             .success()
     );
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args(["cat", gz.to_str().unwrap(), "--max-ratio", "100"])
         .output()
         .unwrap();
@@ -1029,12 +1029,12 @@ fn cat_honours_max_ratio() {
 
 #[test]
 fn formats_lists_every_registered_format() {
-    let out = Command::new(STF).arg("formats").output().unwrap();
+    let out = Command::new(STUFFR).arg("formats").output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
     for row in stuffr::registry().matrix() {
         assert!(
             text.contains(row.id.as_str()),
-            "`stf formats` omits {}: {text}",
+            "`stuffr formats` omits {}: {text}",
             row.id
         );
     }
@@ -1047,7 +1047,7 @@ fn a_malformed_memory_limit_is_a_usage_error() {
     let _ = std::fs::remove_file(&out_path);
     std::fs::write(&src, b"payload").unwrap();
 
-    let out = Command::new(STF)
+    let out = Command::new(STUFFR)
         .args(["pack", "--memory-limit", "512MB", "--format", "gzip", "-o"])
         .arg(&out_path)
         .arg(&src)
@@ -1077,7 +1077,7 @@ fn threads_is_not_offered_on_decode_subcommands() {
     // rather than accepting and ignoring it. If MT decode is ever added, this
     // test should fail and be deleted deliberately.
     for sub in ["unpack", "cat"] {
-        let out = Command::new(STF)
+        let out = Command::new(STUFFR)
             .args([sub, "--threads", "4", "-"])
             .output()
             .unwrap();
@@ -1091,7 +1091,7 @@ fn threads_is_not_offered_on_decode_subcommands() {
 
 #[test]
 fn the_binary_reports_its_version() {
-    let out = Command::new(STF).arg("--version").output().unwrap();
+    let out = Command::new(STUFFR).arg("--version").output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("0.1.0"), "--version must report 0.1.0, got: {s}");
 }

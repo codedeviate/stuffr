@@ -147,7 +147,7 @@ impl FidelityReport {
     /// Gating on warnings rather than on the rung is deliberate: a tar read
     /// from a pipe lands on `ForwardOnly`, but tar has no trailing index, so
     /// nothing was lost. Failing it would hand a script an error it cannot act
-    /// on. The rung stays diagnostic — reported by `stf info`.
+    /// on. The rung stays diagnostic — reported by `stuffr info`.
     pub fn has_warnings(&self) -> bool {
         !self.warnings.is_empty()
     }

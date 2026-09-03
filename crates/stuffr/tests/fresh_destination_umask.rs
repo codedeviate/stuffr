@@ -15,7 +15,7 @@ unsafe extern "C" {
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("stf-umask-{}-{}", std::process::id(), name));
+    p.push(format!("stuffr-umask-{}-{}", std::process::id(), name));
     p
 }
 

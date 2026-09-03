@@ -1,5 +1,5 @@
 /target
 **/*.rs.bk
 *.pdb
-/.stf.toml
+/.stuffr.toml
 /.superpowers

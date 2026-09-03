@@ -1,4 +1,4 @@
-//! The `stf` command's argument surface.
+//! The `stuffr` command's argument surface.
 //!
 //! Pulled out of `main.rs` and re-exported from `lib.rs` so an integration
 //! test can ask clap itself — via [`clap::CommandFactory`] — what flags and
@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "stf",
+    name = "stuffr",
     version,
     about = "Universal compression and archive toolkit"
 )]
@@ -50,7 +50,7 @@ pub enum Command {
         allow_weak_encoder: bool,
         /// Encode with N worker threads. 0 means auto-detect.
         ///
-        /// OMITTING this flag is not the same as passing 0: without it, stf
+        /// OMITTING this flag is not the same as passing 0: without it, stuffr
         /// encodes single-threaded, so the same input always produces the same
         /// bytes on any machine. Multi-threaded xz and zstd split the input
         /// per worker, so their output depends on the worker count.
@@ -62,7 +62,7 @@ pub enum Command {
         /// "use my cores", not "ignore the OOM killer".
         #[arg(long)]
         turbo: bool,
-        /// Cap the memory stf will ask for, e.g. 512M or 2G.
+        /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
         ///
         /// On encode this bounds the worker count. Defaults to 25% of
         /// available RAM, honouring cgroup limits.
@@ -89,7 +89,7 @@ pub enum Command {
         /// Skip the fsync that makes the output durable before it is published.
         #[arg(long)]
         no_sync: bool,
-        /// Cap the memory stf will ask for, e.g. 512M or 2G.
+        /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
         ///
         /// Defaults to 25% of available RAM, honouring cgroup limits.
         #[arg(long, value_name = "SIZE")]
@@ -106,7 +106,7 @@ pub enum Command {
         /// Refuse a decode expanding by more than this ratio.
         #[arg(long)]
         max_ratio: Option<u64>,
-        /// Cap the memory stf will ask for, e.g. 512M or 2G.
+        /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
         ///
         /// Defaults to 25% of available RAM, honouring cgroup limits.
         #[arg(long, value_name = "SIZE")]
@@ -119,7 +119,7 @@ pub enum Command {
         /// Emit machine-readable JSON instead of the human-readable report.
         #[arg(long)]
         json: bool,
-        /// Cap the memory stf will ask for, e.g. 512M or 2G.
+        /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
         ///
         /// Defaults to 25% of available RAM, honouring cgroup limits.
         #[arg(long, value_name = "SIZE")]

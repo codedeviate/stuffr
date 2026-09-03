@@ -1,7 +1,7 @@
 [package]
 name = "stuffr-formats"
 version.workspace = true
-description = "Codec and container implementations for the stf toolkit"
+description = "Codec and container implementations for the stuffr toolkit"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

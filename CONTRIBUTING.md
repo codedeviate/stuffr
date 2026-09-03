@@ -1,4 +1,4 @@
-# Contributing to stf
+# Contributing to stuffr
 
 ## Setup
 
@@ -25,7 +25,7 @@ hook that silently does nothing.
 
 Run it after every change, not just before committing. The last step is not
 redundant with the first build: it proves `stuffr-core` still compiles with no
-optional features, which is the guarantee behind "installing `stf` needs no C
+optional features, which is the guarantee behind "installing `stuffr` needs no C
 toolchain".
 
 ## Commit messages

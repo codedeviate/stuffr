@@ -5,7 +5,7 @@ use stuffr::ops::{
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("stf-1b-dec-{}-{}", std::process::id(), name));
+    p.push(format!("stuffr-1b-dec-{}-{}", std::process::id(), name));
     p
 }
 
@@ -73,7 +73,7 @@ fn round_trips_byte_identically() {
 // this test binary's actual stdin (fd 0) out from under a test harness that
 // runs every `#[test]` in this file as a thread of one shared process, which
 // would be racy against any other test reading stdin concurrently. Spawning
-// the real `stf` binary with a piped stdin — a separate OS process, safe to
+// the real `stuffr` binary with a piped stdin — a separate OS process, safe to
 // redirect — is the honest way to exercise that path, and
 // `info_over_a_pipe_reports_forward_only_not_exact` in
 // `crates/stuffr-cli/tests/cli.rs` already does exactly that for `inspect`
@@ -83,7 +83,7 @@ fn round_trips_byte_identically() {
 #[test]
 fn inspect_of_a_seekable_file_reports_exact() {
     // No container, so no entry-level ladder — but the rung is still real, and
-    // reporting it honestly is what makes `stf info` meaningful before Phase 2.
+    // reporting it honestly is what makes `stuffr info` meaningful before Phase 2.
     let gz = make_gz(b"payload", "rung");
     let from_file = inspect(Input::Path(gz.clone())).unwrap();
     assert_eq!(from_file.fidelity.rung, stuffr::Rung::Exact);
@@ -106,7 +106,7 @@ fn inspect_of_a_seekable_file_reports_exact() {
 /// that can only pass if `inspect` actually falls back to the extension:
 /// content that is not gzip at all, named as if it were.
 ///
-/// The fallback is real and reachable, not a hypothetical: `stf info` still
+/// The fallback is real and reachable, not a hypothetical: `stuffr info` still
 /// identifies such a file (by name) even though `unpack` would then fail on
 /// it when the bytes turn out not to be gzip after all.
 #[test]
@@ -323,7 +323,7 @@ fn the_default_memory_limit_is_none() {
 
 /// End-to-end: `DecompressOpts::memory_limit` reaches the decoder and
 /// refuses a hostile declaration before allocating, through the same path
-/// `stf unpack --memory-limit` uses. Gated to the pure backend actually
+/// `stuffr unpack --memory-limit` uses. Gated to the pure backend actually
 /// selected here — under `--all-features` `lzma-c` wins registration for
 /// `lzma` (see `stuffr-formats/src/lzma_shared.rs`), and `lzma-c` is not
 /// part of this defect or this task's fix, so `Makefile`'s `test` (all

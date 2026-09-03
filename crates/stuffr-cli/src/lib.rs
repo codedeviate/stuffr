@@ -1,4 +1,4 @@
-//! Library surface behind the `stf` binary.
+//! Library surface behind the `stuffr` binary.
 //!
 //! Exists solely so `tests/cli.rs` can reach [`cli::Cli`] and introspect it
 //! through `clap::CommandFactory` — the examples page's test asserts every
