@@ -7,6 +7,8 @@
 pub mod archive;
 #[cfg(feature = "testing")]
 pub mod conformance;
+#[cfg(feature = "testing")]
+mod container_conformance;
 pub mod error;
 pub mod fidelity;
 pub mod format;

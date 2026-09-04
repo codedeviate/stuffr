@@ -11,13 +11,14 @@ use crate::archive::{
 };
 use crate::error::{Error, Result};
 use crate::fidelity::{Fidelity, FidelityReport, Rung};
-use crate::format::{CodecCaps, ContainerCaps, FormatId};
+use crate::format::{CodecCaps, ContainerCaps, FormatId, FormatMeta, MagicRule};
 use crate::ladder::Resolved;
 use crate::source::Source;
 
 pub use crate::conformance::{
     assert_codec_conforms, assert_codec_conforms_with, compressible, incompressible,
 };
+pub use crate::container_conformance::assert_container_conforms;
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
 pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");
@@ -337,6 +338,185 @@ impl ArchiveWrite for MockArchiveWrite {
         self.dst.write_all(b"MEND")?;
         self.dst.flush()?;
         Ok(())
+    }
+}
+
+/// A well-behaved FRAMED double for the container conformance harness,
+/// analogous to `conformance::framed_mock::FramedMock` on the codec side.
+///
+/// `MockContainer` above stays exactly as it is — governor, ladder and probe
+/// tests rely on its shape — but it reads its whole source to end before
+/// returning even the first entry, which is fine for those tests and would
+/// fail the harness's incrementality property outright (Task 2). This double
+/// streams instead: [`ArchiveRead::next_entry`] parses one length-prefixed
+/// record at a time and only ever buffers a single entry's payload, never the
+/// whole archive.
+///
+/// Wire format:
+/// ```text
+/// repeat: "FE" | name_len u32le | name | data_len u64le | data
+/// trailer: "FZ"
+/// ```
+pub struct FramedMockContainer;
+
+pub const FRAMED_CONTAINER: FormatId = FormatId::new("framed-mock-container");
+
+const FRAMED_MAGICS: &[MagicRule] = &[MagicRule {
+    offset: 0,
+    bytes: b"FE",
+    format: FRAMED_CONTAINER,
+}];
+
+/// Registration metadata for [`FramedMockContainer`], for
+/// `assert_container_conforms(&FramedMockContainer, &framed_container_meta())`.
+pub fn framed_container_meta() -> FormatMeta {
+    FormatMeta::container(FRAMED_CONTAINER, &["fmc"], FRAMED_MAGICS)
+}
+
+impl Container for FramedMockContainer {
+    fn id(&self) -> FormatId {
+        FRAMED_CONTAINER
+    }
+
+    fn caps(&self) -> ContainerCaps {
+        ContainerCaps {
+            read: true,
+            write: true,
+            forward_parse: true,
+            ..Default::default()
+        }
+    }
+
+    fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+        let Resolved { source, report, .. } = resolved;
+        Ok(Box::new(FramedArchiveRead {
+            source,
+            pending: 0,
+            report,
+        }))
+    }
+
+    fn create(&self, dst: Box<dyn Write + Send>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+        Ok(Box::new(FramedArchiveWrite { dst }))
+    }
+}
+
+struct FramedArchiveWrite {
+    dst: Box<dyn Write + Send>,
+}
+
+impl ArchiveWrite for FramedArchiveWrite {
+    fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        let mut payload = Vec::new();
+        data.read_to_end(&mut payload)?;
+        let name = meta.name.as_bytes();
+        self.dst.write_all(b"FE")?;
+        self.dst.write_all(&(name.len() as u32).to_le_bytes())?;
+        self.dst.write_all(name)?;
+        self.dst.write_all(&(payload.len() as u64).to_le_bytes())?;
+        self.dst.write_all(&payload)?;
+        Ok(())
+    }
+
+    fn finish(mut self: Box<Self>) -> Result<()> {
+        self.dst.write_all(b"FZ")?;
+        self.dst.flush()?;
+        Ok(())
+    }
+}
+
+/// Bounds reads to `*remaining` bytes of `*source`, decrementing it as bytes
+/// are actually delivered. Lets [`FramedArchiveRead::next_entry`] tell how
+/// many bytes of a partially-read entry still need to be skipped before the
+/// next record can be parsed.
+struct BoundedReader<'a> {
+    source: &'a mut Box<dyn Source>,
+    remaining: &'a mut u64,
+}
+
+impl Read for BoundedReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if *self.remaining == 0 {
+            return Ok(0);
+        }
+        let cap = (buf.len() as u64).min(*self.remaining) as usize;
+        let n = self.source.read(&mut buf[..cap])?;
+        *self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Streams one length-prefixed record at a time — see the struct's own doc
+/// comment on why `MockArchiveRead`'s whole-source read cannot stand in once
+/// the incrementality property (Task 2) exists.
+struct FramedArchiveRead {
+    source: Box<dyn Source>,
+    /// Bytes of the current entry's payload not yet delivered to the caller.
+    pending: u64,
+    report: FidelityReport,
+}
+
+impl FramedArchiveRead {
+    /// Discards whatever is left of the entry the caller did not fully read,
+    /// so the next call starts exactly at the next record's tag.
+    fn skip_pending(&mut self) -> Result<()> {
+        if self.pending > 0 {
+            let mut reader = BoundedReader {
+                source: &mut self.source,
+                remaining: &mut self.pending,
+            };
+            std::io::copy(&mut reader, &mut std::io::sink())?;
+        }
+        Ok(())
+    }
+}
+
+impl ArchiveRead for FramedArchiveRead {
+    fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+        self.skip_pending()?;
+
+        let mut tag = [0u8; 2];
+        self.source.read_exact(&mut tag)?;
+        match &tag {
+            b"FZ" => Ok(None),
+            b"FE" => {
+                let mut len_buf = [0u8; 4];
+                self.source.read_exact(&mut len_buf)?;
+                let name_len = u32::from_le_bytes(len_buf) as usize;
+                let mut name_buf = vec![0u8; name_len];
+                self.source.read_exact(&mut name_buf)?;
+                let name = String::from_utf8_lossy(&name_buf).into_owned();
+
+                let mut dlen_buf = [0u8; 8];
+                self.source.read_exact(&mut dlen_buf)?;
+                let data_len = u64::from_le_bytes(dlen_buf);
+                self.pending = data_len;
+
+                let mut meta = EntryMeta::file(name);
+                meta.size = Some(data_len);
+
+                let reader = BoundedReader {
+                    source: &mut self.source,
+                    remaining: &mut self.pending,
+                };
+                Ok(Some(Entry::new(meta, Box::new(reader))))
+            }
+            _ => Err(Error::Corrupt(
+                "framed mock container: unrecognised record tag".into(),
+            )),
+        }
+    }
+
+    fn by_index(&mut self, _index: usize) -> Result<Entry<'_>> {
+        // No index is implemented by this double — every consumer of it so
+        // far only needs forward iteration.
+        Err(Error::NotSeekable {
+            format: FRAMED_CONTAINER,
+        })
+    }
+
+    fn fidelity(&self) -> &FidelityReport {
+        &self.report
     }
 }
 
