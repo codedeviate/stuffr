@@ -22,16 +22,35 @@ impl ArchiveBudget {
         }
     }
 
-    /// The absolute output ceiling. `RATIO_FLOOR` is why a 3-byte file
-    /// expanding to 30 bytes is not a "bomb": without a floor, every tiny
-    /// input trips the ratio. When the compressed size is unknown the floor
-    /// alone applies, so the budget is still bounded rather than unlimited.
+    /// The absolute output ceiling.
+    ///
+    /// For a known size: `RATIO_FLOOR` is why a 3-byte file expanding to 30
+    /// bytes is not a "bomb" — without a floor, every tiny input trips the
+    /// ratio. The ratio is floored, and a genuine multiplication overflow
+    /// falls back to `u64::MAX`, the permissive direction; a wrapping product
+    /// would instead yield a tiny ceiling that rejects legitimate archives.
+    ///
+    /// For an unknown size (a pipe): the floor is the whole budget. This must
+    /// NOT fall through to the overflow fallback — that is what made the pipe
+    /// path unbounded. A pipe is where untrusted input of unknown size
+    /// arrives, and the budget must still bound output rather than becoming
+    /// unlimited.
+    #[allow(clippy::manual_saturating_arithmetic)]
     fn ceiling(&self) -> u64 {
-        let from_ratio = self
-            .compressed_total
-            .and_then(|c| c.checked_mul(self.max_ratio))
-            .unwrap_or(u64::MAX);
-        from_ratio.max(RATIO_FLOOR)
+        match self.compressed_total {
+            // Known size: the ratio applies, floored so a tiny file is not a
+            // "bomb". A genuine multiplication overflow falls back to u64::MAX,
+            // the permissive direction — a wrapping product would instead yield a
+            // tiny ceiling that rejects legitimate archives.
+            Some(c) => c
+                .checked_mul(self.max_ratio)
+                .unwrap_or(u64::MAX)
+                .max(RATIO_FLOOR),
+            // Unknown size (a pipe): the floor is the whole budget. This must NOT
+            // share the overflow fallback above — that is what made the pipe path
+            // unbounded.
+            None => RATIO_FLOOR,
+        }
     }
 
     /// Charges `decoded` bytes for `entry`. The error names the entry, which
@@ -105,10 +124,27 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_compressed_size_falls_back_to_the_absolute_floor() {
+    fn an_unknown_compressed_size_is_still_bounded_by_the_absolute_floor() {
         // A pipe does not know its own size. The budget must still bound output
-        // rather than becoming unlimited.
+        // rather than becoming unlimited — this is the case where untrusted input
+        // arrives, so an unbounded ceiling here would defeat the control entirely.
         let mut b = ArchiveBudget::new(None, DEFAULT_MAX_RATIO);
         assert!(b.charge("a", RATIO_FLOOR).is_ok());
+
+        let mut b = ArchiveBudget::new(None, DEFAULT_MAX_RATIO);
+        let err = b
+            .charge("huge.bin", RATIO_FLOOR + 1)
+            .expect_err("an unknown compressed size must still be bounded by the floor");
+        assert!(matches!(err, Error::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn overflow_on_known_size_falls_back_to_permissive_u64_max() {
+        // A very large known compressed size times the ratio overflows u64.
+        // The fallback must be permissive (u64::MAX), not a wrapping product
+        // that yields a tiny ceiling and rejects legitimate archives.
+        let mut b = ArchiveBudget::new(Some(u64::MAX / 2), DEFAULT_MAX_RATIO);
+        let large_charge = u64::MAX / 3;
+        assert!(b.charge("large.bin", large_charge).is_ok());
     }
 }
