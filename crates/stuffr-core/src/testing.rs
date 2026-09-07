@@ -471,24 +471,41 @@ impl FramedArchiveRead {
     }
 }
 
+/// Reads exactly `buf.len()` bytes, reclassifying a bare `UnexpectedEof` —
+/// the shape every truncated stream produces once it runs out of bytes
+/// mid-record — onto [`Error::Corrupt`], so a cut archive surfaces as
+/// `io::ErrorKind::InvalidData` (conformance property 9) rather than a
+/// generic `Error::Io`. Any other kind, notably a genuine source failure such
+/// as `PermissionDenied`, passes through unchanged as `Error::Io` so it is
+/// never mistaken for corruption (property 10).
+fn read_exact_or_corrupt(source: &mut Box<dyn Source>, buf: &mut [u8]) -> Result<()> {
+    source.read_exact(buf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::Corrupt("framed mock container: truncated stream".into())
+        } else {
+            Error::Io(e)
+        }
+    })
+}
+
 impl ArchiveRead for FramedArchiveRead {
     fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
         self.skip_pending()?;
 
         let mut tag = [0u8; 2];
-        self.source.read_exact(&mut tag)?;
+        read_exact_or_corrupt(&mut self.source, &mut tag)?;
         match &tag {
             b"FZ" => Ok(None),
             b"FE" => {
                 let mut len_buf = [0u8; 4];
-                self.source.read_exact(&mut len_buf)?;
+                read_exact_or_corrupt(&mut self.source, &mut len_buf)?;
                 let name_len = u32::from_le_bytes(len_buf) as usize;
                 let mut name_buf = vec![0u8; name_len];
-                self.source.read_exact(&mut name_buf)?;
+                read_exact_or_corrupt(&mut self.source, &mut name_buf)?;
                 let name = String::from_utf8_lossy(&name_buf).into_owned();
 
                 let mut dlen_buf = [0u8; 8];
-                self.source.read_exact(&mut dlen_buf)?;
+                read_exact_or_corrupt(&mut self.source, &mut dlen_buf)?;
                 let data_len = u64::from_le_bytes(dlen_buf);
                 self.pending = data_len;
 

@@ -5,8 +5,7 @@
 //! so the same method applies. Properties skip on EVIDENCE — `ContainerCaps`
 //! and measurement — never on trust, exactly as the codec harness does.
 //!
-//! This file carries properties 1-8; Task 3 adds 9-12 to the same
-//! [`assert_container_conforms`] function.
+//! Twelve properties, one function.
 //!
 //! 1. Identity: `Container::id()` must agree with the `FormatMeta` it is
 //!    registered under, or a mismatched registration is completely silent —
@@ -40,6 +39,24 @@
 //!    actually pulled from the source, not assumed from an implementation's
 //!    shape — this is the property that caught lz4 buffering 4 MiB on the
 //!    codec side.
+//! 9. Truncation is detected and reported as `io::ErrorKind::InvalidData`,
+//!    UNCONDITIONALLY on `caps.read` — the one property a container author
+//!    cannot vote themselves out of, mirroring codec property 10. Even a
+//!    format with no integrity check at all can usually still detect a
+//!    header promising a payload the stream does not deliver.
+//! 10. A genuine source I/O error (a disk failure reading the archive)
+//!     passes through as itself and must never be relabelled as corruption —
+//!     forgetting this reports a full disk as exit 5 instead of exit 1.
+//! 11. Metadata survives to the declared fidelity. Only fields the container
+//!     actually reports are checked; a container that does not claim to
+//!     carry a field is free to drop it, but one that reports a value must
+//!     report the value that was written, not an altered one.
+//! 12. Hostile entry names (path traversal, absolute paths) survive
+//!     VERBATIM. A deliberate INVERSION of the usual instinct: the project's
+//!     non-negotiable is "refused, not silently sanitised", and refusal
+//!     happens once, at the ops layer, in a later task. A container that
+//!     helpfully rewrote `../../etc/passwd` would destroy the evidence that
+//!     refusal depends on.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -284,6 +301,138 @@ fn first_entry_source_bytes(container: &dyn Container, source: CountingSource) -
     counter.load(Ordering::Relaxed) as usize
 }
 
+/// Recovers the `io::ErrorKind` a container's own `crate::Error` was raised
+/// from, so properties 9 and 10 can assert on it directly rather than on the
+/// error's `Display` text. `Error::Io` unwraps to the original `io::Error`
+/// unchanged; `Error::Corrupt` — the classification every container is
+/// expected to raise for malformed input, mirroring `Error::from_decode_io`
+/// on the codec side — becomes `InvalidData`. Anything else becomes
+/// `io::Error::other`, which satisfies neither property's expected kind and
+/// so still fails loudly rather than passing by accident.
+fn classify_container_error(e: crate::error::Error) -> io::Error {
+    match e {
+        crate::error::Error::Io(io_err) => io_err,
+        crate::error::Error::Corrupt(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
+        other => io::Error::other(other.to_string()),
+    }
+}
+
+/// Attempts a full read of `bytes` through `container`, returning the first
+/// error encountered (classified per [`classify_container_error`]), or `None`
+/// if the archive read back with no error at all — which, fed a truncated
+/// archive, means the truncation went completely undetected.
+fn read_all_expecting_error(container: &dyn Container, bytes: &[u8]) -> Option<io::Error> {
+    read_all(container, bytes)
+        .err()
+        .map(classify_container_error)
+}
+
+/// A source whose every read fails with `PermissionDenied`, standing in for a
+/// disk that has gone bad partway through reading an archive. Property 10
+/// exists to prove a container passes such an error through as itself rather
+/// than relabelling it as corruption.
+struct FailingSource;
+
+impl Read for FailingSource {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "conformance: FailingSource",
+        ))
+    }
+}
+
+impl Source for FailingSource {
+    fn caps(&self) -> SourceCaps {
+        SourceCaps {
+            seekable: false,
+            len: None,
+        }
+    }
+
+    fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
+        None
+    }
+}
+
+/// Opens `container` over a [`FailingSource`] and reads it to exhaustion,
+/// returning the first error encountered (classified per
+/// [`classify_container_error`]), or `None` if the whole archive read back
+/// with no error at all — which, fed a source that fails every read, means
+/// the failure went completely unnoticed. Panics with a generic message if
+/// `resolve` or `open` themselves fail.
+fn read_all_over_failing_source(container: &dyn Container) -> Option<io::Error> {
+    let id = container.id();
+    let src: Box<dyn Source> = Box::new(FailingSource);
+    let resolved = crate::resolve(src, id, container.caps(), &crate::StreamPolicy::default())
+        .unwrap_or_else(|e| panic!("conformance[{id}] resolve over a failing source: {e}"));
+    let mut ar = container
+        .open(resolved, &OpenOpts::default())
+        .unwrap_or_else(|e| panic!("conformance[{id}] open over a failing source: {e}"));
+    loop {
+        match ar.next_entry() {
+            Ok(Some(mut entry)) => {
+                let mut data = Vec::new();
+                if let Err(e) = entry.reader().read_to_end(&mut data) {
+                    return Some(e);
+                }
+            }
+            Ok(None) => return None,
+            Err(e) => return Some(classify_container_error(e)),
+        }
+    }
+}
+
+/// Like [`build`], but takes full [`EntryMeta`] per entry rather than
+/// synthesizing a plain file entry — property 11 needs fields (e.g. `mode`)
+/// that a bare name cannot express.
+fn build_with_meta(container: &dyn Container, entries: &[(EntryMeta, &[u8])]) -> Vec<u8> {
+    let id = container.id();
+    let cap = CaptureWriter::new();
+    let mut w = container
+        .create(Box::new(cap.clone()), &CreateOpts::default())
+        .unwrap_or_else(|e| panic!("conformance[{id}] create: {e}"));
+    for (meta, data) in entries {
+        w.add(meta, &mut io::Cursor::new(*data))
+            .unwrap_or_else(|e| panic!("conformance[{id}] add({}): {e}", meta.name));
+    }
+    w.finish()
+        .unwrap_or_else(|e| panic!("conformance[{id}] finish: {e}"));
+    cap.contents()
+}
+
+/// Like [`read_all`], but returns the full [`EntryMeta`] per entry rather
+/// than just name and data — property 11 needs to inspect fields such as
+/// `mode` that a bare name/data pair drops.
+fn read_all_meta(container: &dyn Container, bytes: &[u8]) -> Vec<EntryMeta> {
+    let id = container.id();
+    let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes.to_vec())));
+    let resolved = crate::resolve(
+        src,
+        container.id(),
+        container.caps(),
+        &crate::StreamPolicy::default(),
+    )
+    .unwrap_or_else(|e| panic!("conformance[{id}] resolve: {e}"));
+    let mut ar = container
+        .open(resolved, &OpenOpts::default())
+        .unwrap_or_else(|e| panic!("conformance[{id}] open: {e}"));
+    let mut out = Vec::new();
+    while let Some(mut entry) = ar
+        .next_entry()
+        .unwrap_or_else(|e| panic!("conformance[{id}] next_entry: {e}"))
+    {
+        let meta = entry.meta().clone();
+        let mut data = Vec::new();
+        entry
+            .reader()
+            .read_to_end(&mut data)
+            .unwrap_or_else(|e| panic!("conformance[{id}] entry read: {e}"));
+        out.push(meta);
+    }
+    out
+}
+
 pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
     let id = container.id();
     let caps = container.caps();
@@ -433,6 +582,83 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 big.len()
             );
         }
+
+        // 9. Truncation. UNCONDITIONAL on caps.read: cutting a stream is
+        //    detectable structurally by every container here — a header
+        //    promises a payload length the stream does not deliver.
+        for cut in [1usize, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
+            if cut == 0 || cut >= bytes.len() {
+                continue;
+            }
+            let err = read_all_expecting_error(container, &bytes[..cut]);
+            let Some(e) = err else {
+                panic!(
+                    "conformance[{id}] property 9: an archive truncated at {cut} of {} bytes \
+                     was accepted silently",
+                    bytes.len()
+                )
+            };
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidData,
+                "conformance[{id}] property 9: truncation at {cut} reported as {:?}, must be \
+                 InvalidData so the CLI exits 5 rather than reporting a full disk",
+                e.kind()
+            );
+        }
+
+        // 10. A genuine source I/O error passes through as itself.
+        {
+            let e = read_all_over_failing_source(container)
+                .expect("a source that fails every read must produce an error");
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::PermissionDenied,
+                "conformance[{id}] property 10: a source error surfaced as {:?} rather than \
+                 passing through — a disk failure must not be reported as corruption",
+                e.kind()
+            );
+        }
+
+        // 11. Metadata survives to the declared fidelity. Only fields the
+        //     container claims to carry are checked; approximation is allowed
+        //     on a lossy rung, silent LOSS on an exact one is not.
+        if caps.write {
+            let mut meta_in = EntryMeta::file("m.txt");
+            meta_in.mode = Some(0o640);
+            let bytes = build_with_meta(container, &[(meta_in.clone(), &b"m"[..])]);
+            let got = read_all_meta(container, &bytes);
+            assert_eq!(
+                got[0].name, meta_in.name,
+                "conformance[{id}] property 11: entry name not preserved"
+            );
+            if got[0].mode.is_some() {
+                assert_eq!(
+                    got[0].mode, meta_in.mode,
+                    "conformance[{id}] property 11: mode reported but altered"
+                );
+            }
+        }
+
+        // 12. Hostile names survive VERBATIM. Deliberate inversion: the
+        //     container must not help. Containment is enforced once, in ops,
+        //     and it can only refuse what it can still see.
+        if caps.write {
+            let hostile = ["../../etc/passwd", "/abs/path", "a/../../b"];
+            for name in hostile {
+                let bytes = build(container, &[(name, &b"x"[..])]);
+                let got = read_all(container, &bytes).unwrap_or_else(|e| {
+                    panic!("conformance[{id}] property 12: failed to read back {name:?}: {e}")
+                });
+                assert_eq!(
+                    got[0].0, name,
+                    "conformance[{id}] property 12: entry name {name:?} came back as {:?}. \
+                     Containers must report names EXACTLY as stored — sanitising here \
+                     destroys the evidence the ops-layer refusal depends on",
+                    got[0].0
+                );
+            }
+        }
     }
 }
 
@@ -476,7 +702,7 @@ mod tests {
     use crate::testing::{FramedMockContainer, framed_container_meta};
 
     #[test]
-    fn a_well_behaved_container_satisfies_properties_one_to_eight() {
+    fn a_well_behaved_container_satisfies_properties_one_to_twelve() {
         assert_container_conforms(&FramedMockContainer, &framed_container_meta());
     }
 }
@@ -776,5 +1002,161 @@ mod broken_containers {
     #[test]
     fn property_eight_catches_a_container_that_buffers_the_whole_archive() {
         assert_panics_naming(&ReadsToEnd, &framed_container_meta(), "property 8");
+    }
+
+    /// Property 9 is unconditional, like codec property 10: the one property
+    /// a container author cannot vote themselves out of.
+    struct AcceptsTruncation;
+
+    struct AcceptsTruncationRead {
+        inner: Box<dyn ArchiveRead>,
+    }
+
+    impl ArchiveRead for AcceptsTruncationRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            // BUG: any error reading the next record — including a stream
+            // that ran out of bytes mid-header — is treated as a clean end
+            // of archive instead of surfacing.
+            Ok(self.inner.next_entry().unwrap_or(None))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for AcceptsTruncation {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            FramedMockContainer.caps()
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(AcceptsTruncationRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+            }))
+        }
+        fn create(
+            &self,
+            dst: Box<dyn Write + Send>,
+            o: &CreateOpts,
+        ) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    #[test]
+    fn property_nine_catches_silent_acceptance_of_a_truncated_archive() {
+        assert_panics_naming(&AcceptsTruncation, &framed_container_meta(), "property 9");
+    }
+
+    /// Property 10: a disk error reading the SOURCE must not be reported as
+    /// archive corruption. Forget this and a full disk reports as exit 5.
+    struct MislabelsSourceErrors;
+
+    struct MislabelsSourceErrorsRead {
+        inner: Box<dyn ArchiveRead>,
+    }
+
+    impl ArchiveRead for MislabelsSourceErrorsRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            // BUG: every error — including a genuine source I/O failure — is
+            // relabelled as archive corruption.
+            self.inner
+                .next_entry()
+                .map_err(|e| crate::error::Error::Corrupt(e.to_string()))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for MislabelsSourceErrors {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            FramedMockContainer.caps()
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(MislabelsSourceErrorsRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+            }))
+        }
+        fn create(
+            &self,
+            dst: Box<dyn Write + Send>,
+            o: &CreateOpts,
+        ) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    #[test]
+    fn property_ten_catches_a_source_error_reported_as_corruption() {
+        assert_panics_naming(
+            &MislabelsSourceErrors,
+            &framed_container_meta(),
+            "property 10",
+        );
+    }
+
+    /// Property 12 is an INVERSION: the container must NOT sanitise. The
+    /// README's non-negotiable is "refused, not silently sanitised", so a
+    /// parser that rewrote a traversal name would destroy the evidence the
+    /// ops-layer refusal runs on.
+    struct Sanitises;
+
+    struct SanitisesWrite {
+        inner: Box<dyn ArchiveWrite>,
+    }
+
+    impl ArchiveWrite for SanitisesWrite {
+        fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+            // BUG: silently rewrites a hostile name instead of storing it
+            // verbatim and letting the ops layer refuse it later.
+            let mut sanitised = meta.clone();
+            sanitised.name = sanitised
+                .name
+                .replace("..", "")
+                .trim_start_matches('/')
+                .to_string();
+            self.inner.add(&sanitised, data)
+        }
+        fn finish(self: Box<Self>) -> Result<()> {
+            self.inner.finish()
+        }
+    }
+
+    impl Container for Sanitises {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            FramedMockContainer.caps()
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            FramedMockContainer.open(resolved, o)
+        }
+        fn create(
+            &self,
+            dst: Box<dyn Write + Send>,
+            o: &CreateOpts,
+        ) -> Result<Box<dyn ArchiveWrite>> {
+            Ok(Box::new(SanitisesWrite {
+                inner: FramedMockContainer.create(dst, o)?,
+            }))
+        }
+    }
+
+    #[test]
+    fn property_twelve_catches_a_container_that_sanitises_hostile_names() {
+        assert_panics_naming(&Sanitises, &framed_container_meta(), "property 12");
     }
 }
