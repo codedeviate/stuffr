@@ -9,6 +9,7 @@ pub mod archive;
 pub mod conformance;
 #[cfg(feature = "testing")]
 mod container_conformance;
+pub mod containment;
 pub mod error;
 pub mod fidelity;
 pub mod format;
@@ -25,6 +26,7 @@ pub use archive::{
     ArchiveRead, ArchiveWrite, Codec, Container, CreateOpts, DecodeOpts, EncodeOpts, Entry,
     EntryKind, EntryMeta, OpenOpts, Sink,
 };
+pub use containment::{check_symlink_target, safe_join};
 pub use error::{Error, Result};
 pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
 pub use format::{

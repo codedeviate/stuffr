@@ -32,8 +32,8 @@ pub enum Error {
     #[error("archive is corrupt: {0}")]
     Corrupt(String),
 
-    #[error("unsafe entry path `{path}` refused")]
-    UnsafePath { path: String },
+    #[error("unsafe entry path `{path}` refused: {reason}")]
+    UnsafePath { path: String, reason: &'static str },
 
     #[error("fidelity degraded under strict mode: {0} warning(s)")]
     FidelityDegraded(usize),
@@ -130,7 +130,8 @@ mod tests {
         assert_eq!(Error::ResourceLimit("oom".into()).exit_code(), 6);
         assert_eq!(
             Error::UnsafePath {
-                path: "../x".into()
+                path: "../x".into(),
+                reason: "path traversal above the destination",
             }
             .exit_code(),
             7
