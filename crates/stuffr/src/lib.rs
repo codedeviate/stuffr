@@ -7,6 +7,7 @@
 pub use stuffr_core as core;
 pub use stuffr_core::*;
 
+pub mod entries;
 pub mod ops;
 
 /// Builds a registry containing every format this build was compiled with.
