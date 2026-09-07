@@ -304,11 +304,9 @@ pub fn resolve_chain_deep(
 mod tests {
     use super::*;
     use crate::archive::{Codec, DecodeOpts, EncodeOpts, Sink};
-    use crate::format::CodecCaps;
-    use crate::format::{FormatId, FormatMeta, MagicRule};
+    use crate::format::{CodecCaps, FormatId, FormatMeta, MagicRule};
     use crate::registry::Registry;
-    use crate::source::StreamOnly;
-    use crate::source::{ReaderSource, Source};
+    use crate::source::{ReaderSource, Source, StreamOnly};
     use crate::testing::{
         MOCK_CODEC, MOCK_CONTAINER, MockCodec, MockContainer, SharedBuf, mock_archive_bytes,
     };
