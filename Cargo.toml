@@ -67,4 +67,13 @@ liblzma = { version = "0.4", default-features = false, features = ["static", "pa
 # first non-MIT dependency reachable from a *default* build (see Task 8's
 # README note).
 lzma-rust2 = "0.20"
+# `default-features = false` drops the `xattr` feature, which `tar` turns ON
+# by default (`default = ["xattr"]`) and which is the only optional
+# dependency in its graph — `xattr 1.1.3`, on unix. Nothing here needs it:
+# stuffr never asks `tar` to touch the filesystem — `Container::open` hands it an in-memory `Source` and
+# `Container::create` a `Box<dyn Write>`, and extraction is `ops`'s job, done
+# entry by entry through `safe_join`. Reading or writing extended attributes
+# via `tar`'s own unpack path would bypass that gate entirely, so the feature
+# is not merely unused, it is one this project must not use.
+tar = { version = "0.4.46", default-features = false }
 clap = { version = "4", features = ["derive"] }

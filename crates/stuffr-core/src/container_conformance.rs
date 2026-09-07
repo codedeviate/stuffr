@@ -43,7 +43,13 @@
 //!    UNCONDITIONALLY on `caps.read` — the one property a container author
 //!    cannot vote themselves out of, mirroring codec property 10. Even a
 //!    format with no integrity check at all can usually still detect a
-//!    header promising a payload the stream does not deliver.
+//!    header promising a payload the stream does not deliver. Cut in two
+//!    places for two different reasons: at four fractions of a small
+//!    fixture, which land in FRAMING, and at the midpoint of a fixture whose
+//!    incompressible payload dominates its measured framing, which is proven
+//!    to land in PAYLOAD. The second was added with tar (Task 7) because the
+//!    first four cannot reach the payload path at all, so a container that
+//!    silently accepted a cut inside an entry's data still passed.
 //! 10. A genuine source I/O error (a disk failure reading the archive)
 //!     passes through as itself and must never be relabelled as corruption —
 //!     forgetting this reports a full disk as exit 5 instead of exit 1.
@@ -204,7 +210,14 @@ fn read_all(container: &dyn Container, bytes: &[u8]) -> Result<Vec<(String, Vec<
 /// same reason `build` does: a resolve/open failure here means the container
 /// cannot do what `ContainerCaps` claims, not that one specific property was
 /// violated.
-fn open_forward_only(container: &dyn Container, bytes: &[u8]) -> Box<dyn ArchiveRead> {
+///
+/// `pub` and re-exported from [`crate::testing`] rather than private to this
+/// module: a container's own tests in `stuffr-formats` need the IDENTICAL
+/// "as if from a pipe" setup the harness uses — `tar.rs`'s rung test is the
+/// first — and a hand-rolled second copy over there would be free to drift
+/// from this one, which is exactly how a test ends up asserting against a
+/// setup the harness no longer uses.
+pub fn open_forward_only(container: &dyn Container, bytes: &[u8]) -> Box<dyn ArchiveRead> {
     let id = container.id();
     let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes.to_vec())));
     let resolved = crate::resolve(src, id, container.caps(), &crate::StreamPolicy::ForwardOnly)
@@ -603,6 +616,77 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 io::ErrorKind::InvalidData,
                 "conformance[{id}] property 9: truncation at {cut} reported as {:?}, must be \
                  InvalidData so the CLI exits 5 rather than reporting a full disk",
+                e.kind()
+            );
+        }
+
+        // 9b. Truncation INSIDE an entry's payload, which the four cuts above
+        //     cannot reach: on the small two-entry fixture they all land in a
+        //     header or a trailer, so the payload path was never exercised
+        //     and property 9 passed on framing checks alone. A cut `.tar.gz`
+        //     is ordinary real-world damage, and Phase 1d found seven
+        //     separate silent-truncation bugs on the codec side — including
+        //     lz4 accepting a cut frame at every 64 KiB boundary while
+        //     reporting success — so "some truncation is caught" is not
+        //     enough.
+        //
+        //     The cut offset is PROVEN to land in payload rather than
+        //     assumed, from three facts and no knowledge of any particular
+        //     container's layout:
+        //
+        //     1. `framing` is measured — the same entry, same name, with an
+        //        EMPTY payload — so it is this container's real per-entry
+        //        overhead, not a guess.
+        //     2. The payload is incompressible, so a container that
+        //        compresses entries (zip) still stores ~`PAYLOAD` bytes of
+        //        it; a repetitive payload would deflate to almost nothing
+        //        and this construction would collapse.
+        //     3. The payload occupies ONE contiguous run: everything before
+        //        it plus everything after it is framing, so it starts at or
+        //        before `framing` and ends at or after `len - framing`.
+        //
+        //     With `framing * 4 < len` asserted below, the midpoint is
+        //     therefore strictly inside that run. If a future container's
+        //     framing grows enough to break that margin, the assertion says
+        //     so instead of the cut silently sliding back into a header.
+        //
+        //     Detection is required by the end of a full read, not
+        //     necessarily mid-payload: a streaming container legitimately
+        //     discovers the cut when the NEXT record's header comes up short
+        //     (which is what `FramedMockContainer` does), and demanding an
+        //     error from the payload read itself would fail a correct
+        //     implementation.
+        if caps.write {
+            const PAYLOAD: usize = 64 * 1024;
+            let name = "payload-truncation.bin";
+            let framing = build(container, &[(name, &[][..])]).len();
+            let payload = crate::conformance::incompressible(PAYLOAD);
+            let bytes = build(container, &[(name, &payload)]);
+            assert!(
+                framing * 4 < bytes.len(),
+                "conformance[{id}] property 9 (payload): this container's per-entry framing \
+                 is {framing} bytes of a {}-byte archive, so a midpoint cut can no longer be \
+                 proven to land inside the entry payload — raise PAYLOAD until it can",
+                bytes.len()
+            );
+
+            let cut = bytes.len() / 2;
+            let Some(e) = read_all_expecting_error(container, &bytes[..cut]) else {
+                panic!(
+                    "conformance[{id}] property 9 (payload): an archive truncated at {cut} \
+                     of {} bytes — INSIDE the entry's payload, which starts at or before \
+                     {framing} and runs to at or after {} — was accepted silently. The \
+                     entry's own header promises {PAYLOAD} bytes the stream does not deliver",
+                    bytes.len(),
+                    bytes.len() - framing
+                )
+            };
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidData,
+                "conformance[{id}] property 9 (payload): truncation inside the entry payload \
+                 reported as {:?}, must be InvalidData so the CLI exits 5 rather than \
+                 reporting a full disk",
                 e.kind()
             );
         }
@@ -1051,6 +1135,110 @@ mod broken_containers {
     #[test]
     fn property_nine_catches_silent_acceptance_of_a_truncated_archive() {
         assert_panics_naming(&AcceptsTruncation, &framed_container_meta(), "property 9");
+    }
+
+    /// Property 9's payload cut, proven able to fail on its own.
+    ///
+    /// [`AcceptsTruncation`] above is caught by the FRAMING cuts, so it says
+    /// nothing about whether the payload cut works — pointing both negative
+    /// tests at the same double is how a sub-property ends up untested. This
+    /// double is the mirror image: it detects every framing cut correctly
+    /// (the four fractional cuts all end mid-record on the small fixture, and
+    /// those errors propagate untouched) and silently accepts a cut inside an
+    /// entry's payload, which is exactly the shape a real container takes
+    /// when it SEEKS to the next header instead of reading its way there —
+    /// `tar::Archive::entries_with_seek` does precisely that, and a seek past
+    /// end-of-file succeeds, after which the missing header reads back as a
+    /// clean end of archive.
+    ///
+    /// The panic must therefore name "property 9 (payload)", not merely
+    /// "property 9": that marker is what proves the new cut fired and not one
+    /// of the four that were already there.
+    struct SwallowsPayloadTruncation;
+
+    /// Turns a short payload read into a clean end of archive, mimicking a
+    /// container that skips to the next header by seeking.
+    struct SwallowsPayloadTruncationRead {
+        inner: Box<dyn ArchiveRead>,
+        done: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct PaddingReader<'a> {
+        entry: Entry<'a>,
+        /// Payload bytes the entry's own header promised and has not yet
+        /// delivered.
+        remaining: u64,
+        done: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Read for PaddingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.entry.reader().read(buf)?;
+            // BUG: the payload ended early and that is reported as a
+            // complete entry, with the rest of the archive declared over so
+            // the missing next header is never looked for.
+            if n == 0 && self.remaining > 0 {
+                self.done.store(true, Ordering::Relaxed);
+            }
+            self.remaining = self.remaining.saturating_sub(n as u64);
+            Ok(n)
+        }
+    }
+
+    impl ArchiveRead for SwallowsPayloadTruncationRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            if self.done.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let Some(entry) = self.inner.next_entry()? else {
+                return Ok(None);
+            };
+            let meta = entry.meta().clone();
+            let remaining = meta.size.unwrap_or(0);
+            let reader = PaddingReader {
+                entry,
+                remaining,
+                done: Arc::clone(&self.done),
+            };
+            Ok(Some(Entry::new(meta, Box::new(reader))))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for SwallowsPayloadTruncation {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            FramedMockContainer.caps()
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(SwallowsPayloadTruncationRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+                done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }))
+        }
+        fn create(
+            &self,
+            dst: Box<dyn Write + Send>,
+            o: &CreateOpts,
+        ) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    #[test]
+    fn property_nine_catches_silent_acceptance_of_a_cut_inside_an_entry_payload() {
+        assert_panics_naming(
+            &SwallowsPayloadTruncation,
+            &framed_container_meta(),
+            "property 9 (payload)",
+        );
     }
 
     /// Property 10: a disk error reading the SOURCE must not be reported as

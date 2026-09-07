@@ -18,7 +18,7 @@ use crate::source::Source;
 pub use crate::conformance::{
     assert_codec_conforms, assert_codec_conforms_with, compressible, incompressible,
 };
-pub use crate::container_conformance::assert_container_conforms;
+pub use crate::container_conformance::{assert_container_conforms, open_forward_only};
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
 pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");

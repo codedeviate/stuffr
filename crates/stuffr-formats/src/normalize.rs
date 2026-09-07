@@ -507,6 +507,39 @@ pub(crate) const LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF: &[ErrorKind] = &[
     ErrorKind::UnexpectedEof,
 ];
 
+/// tar's SINGLE malformed-input kind: `io::ErrorKind::Other`, on its own.
+///
+/// Its OWN constant rather than a reuse of one of the codec lists above, for
+/// this file's usual reason — sharing a list makes a kind mean "corrupt" for
+/// every format that shares it — and it is the shortest one here because
+/// `tar 0.4.46` is unusually disciplined about error construction. TRACED
+/// rather than sampled: every malformed-input error on the read path is
+/// built by one private helper, `other(msg)` in the crate's `lib.rs`
+/// (`Error::new(ErrorKind::Other, msg)`), across 42 call sites — the header
+/// checksum mismatch, "failed to read entire block", "unexpected EOF during
+/// skip", the GNU sparse-map consistency checks and the PAX/GNU extension
+/// checks among them. `header.rs`'s own error paths re-wrap with
+/// `io::Error::new(err.kind(), ..)`, which preserves that kind rather than
+/// inventing another. The one exception is `InvalidData`, raised for a
+/// non-UTF-8 path on Windows, and it needs no folding: it is already the
+/// kind this list exists to produce.
+///
+/// The reason this matters for tar specifically is property 10. A genuine
+/// source failure is never rewrapped by the crate: every read reaches the
+/// caller through `?` on `&ArchiveInner`'s own `Read` impl with its kind
+/// intact, so `Other` arriving from tar always means tar rejected the bytes,
+/// never that the disk did. Widening this list — to `UnexpectedEof`, say,
+/// which tar never raises here — would start relabelling source failures as
+/// corruption.
+///
+/// Gated `#[cfg(feature = "tar")]`: `tar.rs` is the only consumer, and a
+/// build without it would otherwise leave this constant unused and warning
+/// under `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how
+/// that class of mistake was caught once `make check` gained the pure-tier
+/// leg.
+#[cfg(feature = "tar")]
+pub(crate) const TAR_MALFORMED_AS_OTHER: &[ErrorKind] = &[ErrorKind::Other];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],

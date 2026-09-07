@@ -32,6 +32,8 @@ pub mod lzma_c;
 pub mod lzma_pure;
 #[cfg(feature = "snappy")]
 pub mod snappy;
+#[cfg(feature = "tar")]
+pub mod tar;
 #[cfg(feature = "xz-c")]
 pub mod xz_c;
 #[cfg(feature = "xz-pure")]
@@ -73,6 +75,13 @@ pub fn register_all(registry: &mut Registry) {
 
     #[cfg(feature = "snappy")]
     registry.register_codec(std::sync::Arc::new(snappy::Snappy), snappy::meta());
+
+    // The first container. Registering it is also what switches on
+    // `probe.rs`'s dormant `.tar.gz` / `.tgz` resolution, which was gated on
+    // `reg.container(id).is_some()` and returned `Chain::Raw` until now —
+    // `tar.rs`'s `tar_gz_and_tgz_now_resolve_to_tar_over_gzip` pins that.
+    #[cfg(feature = "tar")]
+    registry.register_container(std::sync::Arc::new(tar::Tar), tar::meta());
 
     // No mutual-exclusion dance here: unlike xz/lzma/zstd, LZIP has only
     // one backend, so there is nothing else it could collide with.
