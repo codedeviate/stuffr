@@ -2,13 +2,18 @@
 //!
 //! Streams have no filename, so extensions are a hint and never the decision.
 //!
-//! **Known Phase 0 limitation:** when an outer codec is detected on an input
-//! with no path (stdin), the inner layer resolves to [`Chain::Raw`] because
-//! there is no extension to consult. Phase 2 refines this by peeking at the
-//! first decoded block. This is a documented boundary, not a bug.
+//! [`resolve_chain`] is the single-layer resolution: outer format only, with
+//! the inner layer decided from the path's remaining extensions when one is
+//! given ([`inner_from_path`]) and [`Chain::Raw`] otherwise. [`resolve_chain_deep`]
+//! closes that gap for the no-path case (stdin): when the outer layer is a
+//! codec and no path was given to consult, it decodes that layer, peeks
+//! [`PROBE_LEN`] of the *decoded* bytes, and resolves again — recursively,
+//! bounded by [`MAX_CHAIN_DEPTH`] so that re-probing a decoded stream cannot
+//! be turned into an unbounded decompression-nesting attack.
 
 use std::path::Path;
 
+use crate::archive::DecodeOpts;
 use crate::error::{Error, Result};
 use crate::format::{FormatId, FormatKind};
 use crate::registry::Registry;
@@ -16,6 +21,14 @@ use crate::source::{PeekSource, Source};
 
 /// The detection window, per the spec.
 pub const PROBE_LEN: usize = 4096;
+
+/// Maximum layers when re-probing a decoded stream.
+///
+/// Four, chosen against real shapes: `.tar.gz` is depth 2 and `.tar.gz.gz` at
+/// depth 3 is already pathological, so this leaves headroom without admitting
+/// a decompression-nesting bomb. `Chain` is recursive, so the bound lives at
+/// the resolution site rather than in the type.
+pub const MAX_CHAIN_DEPTH: usize = 4;
 
 /// Reads a bounded prefix without consuming it.
 ///
@@ -204,14 +217,103 @@ pub fn resolve_chain(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Resu
     })
 }
 
+/// Builds `innermost` back up under each codec in `layers`, outermost last so
+/// the final fold produces the correct nesting order.
+fn wrap_layers(layers: &[FormatId], innermost: Chain) -> Chain {
+    layers
+        .iter()
+        .rev()
+        .fold(innermost, |inner, codec| Chain::Codec {
+            codec: *codec,
+            inner: Box::new(inner),
+        })
+}
+
+/// [`resolve_chain`], but when the path is silent and the outer layer is a
+/// codec, keeps going: decodes that layer, peeks [`PROBE_LEN`] of the
+/// *decoded* bytes, and resolves again — closing the Phase 0 limitation
+/// where a codec on stdin always bottomed out at [`Chain::Raw`] purely for
+/// lack of an extension.
+///
+/// A path is still authoritative when given: peeling only ever triggers with
+/// `path: None`, so the existing extension-based route
+/// ([`inner_from_path`]) is untouched — this function defers to
+/// [`resolve_chain`] immediately whenever a path is present.
+///
+/// Bounded by [`MAX_CHAIN_DEPTH`], because re-probing a *decoded* stream is
+/// exactly what makes unbounded nesting attackable: each layer is cheap to
+/// produce and expensive to expand. Exceeding the bound is a typed
+/// [`Error::ChainTooDeep`], never a panic and never a silent stop.
+///
+/// Returns the resolved [`Chain`] alongside the [`Source`] positioned at the
+/// start of whatever layer that chain's innermost entry describes — already
+/// decoded past every codec this function peeled through, so a caller does
+/// not redo that work. A layer whose decoded prefix names nothing this
+/// registry knows falls back to [`Chain::Raw`], the same terminal answer
+/// [`resolve_chain`] itself gives for stdin — it is not escalated to an
+/// error, since the outer codec was still resolved correctly.
+pub fn resolve_chain_deep(
+    reg: &Registry,
+    path: Option<&Path>,
+    src: Box<dyn Source>,
+) -> Result<(Chain, Box<dyn Source>)> {
+    let (prefix, src) = probe(src)?;
+
+    if path.is_some() {
+        let chain = resolve_chain(reg, path, &prefix)?;
+        return Ok((chain, src));
+    }
+
+    let mut prefix = prefix;
+    let mut src = src;
+    let mut layers: Vec<FormatId> = Vec::new();
+    let mut depth = 1usize;
+
+    loop {
+        let chain = match resolve_chain(reg, None, &prefix) {
+            Ok(chain) => chain,
+            Err(Error::UnknownFormat { .. }) => {
+                return Ok((wrap_layers(&layers, Chain::Raw), src));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let Chain::Codec { codec, .. } = chain else {
+            return Ok((wrap_layers(&layers, chain), src));
+        };
+
+        if depth >= MAX_CHAIN_DEPTH {
+            return Err(Error::ChainTooDeep {
+                depth: MAX_CHAIN_DEPTH,
+            });
+        }
+
+        let decoded = reg
+            .require_codec(codec)?
+            .decoder(src, &DecodeOpts::default())?;
+        let (next_prefix, next_src) = probe(decoded)?;
+
+        layers.push(codec);
+        prefix = next_prefix;
+        src = next_src;
+        depth += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::{Codec, DecodeOpts, EncodeOpts, Sink};
+    use crate::format::CodecCaps;
     use crate::format::{FormatId, FormatMeta, MagicRule};
     use crate::registry::Registry;
+    use crate::source::StreamOnly;
     use crate::source::{ReaderSource, Source};
-    use crate::testing::{MockCodec, MockContainer};
-    use std::io::Read;
+    use crate::testing::{
+        MOCK_CODEC, MOCK_CONTAINER, MockCodec, MockContainer, SharedBuf, mock_archive_bytes,
+    };
+    use std::io;
+    use std::io::{Read, Write};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -641,6 +743,154 @@ mod tests {
                 "must be NotSeekable, not a panic: {err:?}"
             ),
             Ok(_) => panic!("expected NotSeekable, got Ok"),
+        }
+    }
+
+    // --- Peek-based inner resolution (Task 4) -----------------------------
+    //
+    // `testing::MockCodec`'s bitwise-NOT transform is its own inverse:
+    // encoding through it an EVEN number of times reproduces the original
+    // bytes exactly, which would make a nesting-depth test silently
+    // degenerate (the "6-deep" stream would collapse back to the bare
+    // container and never exercise the bound at all). `PrefixedMockCodec`
+    // instead prepends a fixed magic and passes the payload through
+    // unchanged, so decoding always strips exactly one layer no matter how
+    // many are stacked.
+    const NESTED_MAGIC: &[u8] = b"MOCK";
+
+    struct PrefixedMockCodec;
+
+    impl Codec for PrefixedMockCodec {
+        fn id(&self) -> FormatId {
+            MOCK_CODEC
+        }
+
+        fn caps(&self) -> CodecCaps {
+            CodecCaps {
+                encode: true,
+                decode: true,
+                ..Default::default()
+            }
+        }
+
+        fn decoder(&self, mut src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+            let mut discard = vec![0u8; NESTED_MAGIC.len()];
+            src.read_exact(&mut discard)?;
+            Ok(Box::new(StreamOnly::new(src)))
+        }
+
+        fn encoder(
+            &self,
+            mut dst: Box<dyn Write + Send>,
+            _o: &EncodeOpts,
+        ) -> Result<Box<dyn Sink>> {
+            dst.write_all(NESTED_MAGIC)?;
+            Ok(Box::new(PassthroughSink(dst)))
+        }
+    }
+
+    struct PassthroughSink(Box<dyn Write + Send>);
+
+    impl Write for PassthroughSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl Sink for PassthroughSink {
+        fn finish(mut self: Box<Self>) -> Result<()> {
+            self.0.flush()?;
+            Ok(())
+        }
+    }
+
+    fn mock_registry_with_codec_and_container() -> Registry {
+        const CODEC_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: NESTED_MAGIC,
+            format: MOCK_CODEC,
+        }];
+        const CONTAINER_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"ME",
+            format: MOCK_CONTAINER,
+        }];
+        let mut r = Registry::new();
+        r.register_codec(
+            Arc::new(PrefixedMockCodec),
+            FormatMeta::codec(MOCK_CODEC, &["mock"], CODEC_MAGIC),
+        );
+        r.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(MOCK_CONTAINER, &["mar"], CONTAINER_MAGIC),
+        );
+        r
+    }
+
+    /// Wraps `payload` in one `PrefixedMockCodec` layer, via the codec's own
+    /// `encoder` rather than hand-building the bytes, so the fixture is
+    /// provably decodable by the exact codec `resolve_chain_deep` will call.
+    fn mock_codec_encode(payload: &[u8]) -> Vec<u8> {
+        let sink = SharedBuf::new();
+        let mut s = PrefixedMockCodec
+            .encoder(Box::new(sink.clone()), &EncodeOpts::default())
+            .unwrap();
+        s.write_all(payload).unwrap();
+        s.finish().unwrap();
+        sink.contents()
+    }
+
+    #[test]
+    fn a_container_inside_a_codec_resolves_from_the_stream_with_no_path() {
+        let reg = mock_registry_with_codec_and_container();
+        let inner = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        let outer = mock_codec_encode(&inner);
+
+        let (chain, _src) = resolve_chain_deep(
+            &reg,
+            None,
+            Box::new(ReaderSource::new(io::Cursor::new(outer))),
+        )
+        .expect("resolve");
+
+        // Before this task the inner layer was Chain::Raw, because no path meant
+        // no extension to consult. The prefix of the DECODED stream now decides.
+        assert_eq!(
+            chain,
+            Chain::Codec {
+                codec: MOCK_CODEC,
+                inner: Box::new(Chain::Container {
+                    container: MOCK_CONTAINER
+                }),
+            },
+            "a container nested inside a codec must be found by peeking the decoded stream"
+        );
+    }
+
+    #[test]
+    fn nesting_beyond_the_depth_bound_is_a_typed_error_naming_the_depth() {
+        let reg = mock_registry_with_codec_and_container();
+        let mut bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        for _ in 0..MAX_CHAIN_DEPTH + 2 {
+            bytes = mock_codec_encode(&bytes);
+        }
+
+        // Not `.expect_err(..)`: the `Ok` side is `(Chain, Box<dyn Source>)`,
+        // and `Source` is not `Debug`, so `Result::expect_err`'s `T: Debug`
+        // bound can't be satisfied here — same reason as
+        // `a_source_that_claims_seekable_but_has_no_seek_view_errors_instead_of_panicking`
+        // above.
+        match resolve_chain_deep(
+            &reg,
+            None,
+            Box::new(ReaderSource::new(io::Cursor::new(bytes))),
+        ) {
+            Err(Error::ChainTooDeep { depth }) => assert_eq!(depth, MAX_CHAIN_DEPTH),
+            Err(other) => panic!("expected ChainTooDeep, got {other:?}"),
+            Ok(_) => panic!("nesting past the bound must be refused"),
         }
     }
 }

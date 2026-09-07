@@ -52,6 +52,11 @@ pub enum Error {
         /// The direction that was asked for and is not, e.g. "written".
         requested: &'static str,
     },
+
+    /// Nesting exceeded [`crate::probe::MAX_CHAIN_DEPTH`]. Names the bound so
+    /// the message is actionable rather than merely a refusal.
+    #[error("archive nesting exceeds the {depth}-layer limit")]
+    ChainTooDeep { depth: usize },
 }
 
 impl Error {
