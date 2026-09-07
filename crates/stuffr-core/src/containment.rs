@@ -17,6 +17,16 @@ use crate::error::{Error, Result};
 /// no code path that returns a sanitised path for a hostile name: the README's
 /// contract is "refused, not silently sanitised", and a caller that received a
 /// cleaned-up path would have no way to know it had been handed one.
+///
+/// `.` and `./` name the destination directory itself and are ACCEPTED,
+/// returning `dest` unchanged: `tar cf x.tar .` — the single most common way
+/// a tarball gets produced — emits `./` as its first entry, and refusing it
+/// would reject the majority of real-world tarballs at exit 7. Naming the
+/// destination cannot escape it, and escaping is the only thing this
+/// function exists to prevent. This is different from a name like `a/..`,
+/// which also nets to the destination but only after actually consuming a
+/// real component — see the `pushed_a_component` note below for why the two
+/// are told apart rather than collapsed onto one "ends up empty" check.
 pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
     if entry_name.is_empty() {
         return Err(Error::UnsafePath {
@@ -26,6 +36,15 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
     }
 
     let mut out = PathBuf::new();
+    // Tracks whether any real (`Normal`) component was ever pushed, as
+    // distinct from `out` being empty. `.` and `./` leave both false and
+    // empty — never having accumulated anything to pop, they are the
+    // destination itself. `a/..` leaves `out` empty too, but only after
+    // pushing `a` and then popping it away again; collapsing these two onto
+    // a single "is `out` empty at the end" check would silently start
+    // accepting that second shape, which is real traversal that happens to
+    // net to zero rather than a name for the destination.
+    let mut pushed_a_component = false;
     for comp in Path::new(entry_name).components() {
         match comp {
             // An absolute path or a Windows drive prefix ignores `dest`
@@ -51,15 +70,29 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
                     });
                 }
             }
-            Component::Normal(part) => out.push(part),
+            Component::Normal(part) => {
+                out.push(part);
+                pushed_a_component = true;
+            }
         }
     }
 
     if out.as_os_str().is_empty() {
-        return Err(Error::UnsafePath {
-            path: entry_name.to_string(),
-            reason: "entry resolves to the destination itself",
-        });
+        return if pushed_a_component {
+            // `a/..`, `a/b/../..`: a real component was consumed and then
+            // popped away again. Never produced by a real archiver (which
+            // emits bare `.`/`./` for the root, not this), so refusing it
+            // costs nothing in compatibility and keeps the traversal check
+            // from being second-guessed by a coincidental net-zero.
+            Err(Error::UnsafePath {
+                path: entry_name.to_string(),
+                reason: "path traversal nets back to the destination",
+            })
+        } else {
+            // `.` or `./`: nothing was ever pushed, so nothing was popped
+            // away either — this names `dest` itself, not an escape from it.
+            Ok(dest.to_path_buf())
+        };
     }
     Ok(dest.join(out))
 }
@@ -201,5 +234,49 @@ mod tests {
             super::check_symlink_target(dest, &dest.join("a/b/link"), "../../../etc/passwd")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn dot_and_dot_slash_name_the_destination_itself() {
+        // `tar cf x.tar .` emits `./` as its first entry — the single most
+        // common way a tarball gets produced. Refusing it would refuse the
+        // majority of real-world archives at exit 7, a security refusal, on
+        // completely benign input. `.` and `./` cannot escape `dest`; they
+        // name it.
+        let dest = Path::new("/tmp/out");
+        assert_eq!(super::safe_join(dest, ".").unwrap(), dest);
+        assert_eq!(super::safe_join(dest, "./").unwrap(), dest);
+    }
+
+    #[test]
+    fn a_trailing_dot_resolves_within_its_parent_not_to_the_destination() {
+        let dest = Path::new("/tmp/out");
+        assert_eq!(super::safe_join(dest, "sub/.").unwrap(), dest.join("sub"));
+    }
+
+    #[test]
+    fn empty_name_is_still_refused_even_though_dot_is_now_accepted() {
+        // An empty string is malformed, not merely redundant with `.` — it
+        // stays refused with its own reason.
+        let dest = Path::new("/tmp/out");
+        assert!(super::safe_join(dest, "").is_err());
+    }
+
+    #[test]
+    fn traversal_that_nets_to_empty_is_still_refused_not_confused_with_naming_the_destination() {
+        // The regression this change could plausibly introduce: accepting
+        // `.` must not widen into accepting anything that merely RESOLVES to
+        // empty. `..`, `./..` and `a/../..` all attempt to pop past what was
+        // ever pushed — refused exactly as before, by the same
+        // pop-fails-immediately path this change did not touch.
+        let dest = Path::new("/tmp/out");
+        assert!(super::safe_join(dest, "..").is_err());
+        assert!(super::safe_join(dest, "./..").is_err());
+        assert!(super::safe_join(dest, "a/../..").is_err());
+        // `a/..` is the subtler case: it never pops past zero, so the old
+        // "pop fails" guard does not catch it — it is refused only because
+        // a real component was pushed and then popped away again, which is
+        // exactly the distinction `pushed_a_component` exists to draw.
+        assert!(super::safe_join(dest, "a/..").is_err());
     }
 }
