@@ -5,11 +5,15 @@
 //! [`resolve_chain`] is the single-layer resolution: outer format only, with
 //! the inner layer decided from the path's remaining extensions when one is
 //! given ([`inner_from_path`]) and [`Chain::Raw`] otherwise. [`resolve_chain_deep`]
-//! closes that gap for the no-path case (stdin): when the outer layer is a
-//! codec and no path was given to consult, it decodes that layer, peeks
-//! [`PROBE_LEN`] of the *decoded* bytes, and resolves again — recursively,
-//! bounded by [`MAX_CHAIN_DEPTH`] so that re-probing a decoded stream cannot
-//! be turned into an unbounded decompression-nesting attack.
+//! closes that gap: whenever the outer layer is a codec and the inner layer
+//! is still [`Chain::Raw`] — no path at all (stdin), or a path whose
+//! extensions ran out — it decodes that layer, peeks [`PROBE_LEN`] of the
+//! *decoded* bytes, and resolves again — recursively, bounded by
+//! [`MAX_CHAIN_DEPTH`] on both routes, so that neither a piped stream nor a
+//! misleadingly-named file can turn re-probing a decoded stream into an
+//! unbounded decompression-nesting attack. Either way the source it returns
+//! is already decoded through every codec layer named in the resolved
+//! `Chain`, so a caller never has to guess which route produced it.
 
 use std::path::Path;
 
@@ -229,59 +233,83 @@ fn wrap_layers(layers: &[FormatId], innermost: Chain) -> Chain {
         })
 }
 
-/// [`resolve_chain`], but when the path is silent and the outer layer is a
-/// codec, keeps going: decodes that layer, peeks [`PROBE_LEN`] of the
-/// *decoded* bytes, and resolves again — closing the Phase 0 limitation
-/// where a codec on stdin always bottomed out at [`Chain::Raw`] purely for
-/// lack of an extension.
+/// Decodes `src` through every [`Chain::Codec`] layer named in `chain`,
+/// outermost first, so the returned source is positioned exactly where
+/// `chain`'s innermost entry (a [`Chain::Container`] or [`Chain::Raw`])
+/// begins. A chain with no codec layers at all (a bare container) hands
+/// `src` back untouched.
+fn decode_through_chain(
+    reg: &Registry,
+    chain: &Chain,
+    src: Box<dyn Source>,
+) -> Result<Box<dyn Source>> {
+    match chain {
+        Chain::Codec { codec, inner } => {
+            let decoded = reg
+                .require_codec(*codec)?
+                .decoder(src, &DecodeOpts::default())?;
+            decode_through_chain(reg, inner, decoded)
+        }
+        Chain::Container { .. } | Chain::Raw => Ok(src),
+    }
+}
+
+/// [`resolve_chain`], but when the outer layer is a codec whose inner the
+/// path left as [`Chain::Raw`] — whether because there was no path at all,
+/// or because the path's own extensions ran out before naming a container —
+/// keeps going: decodes that layer, peeks [`PROBE_LEN`] of the *decoded*
+/// bytes, and resolves again from the decoded bytes' own magic. Closes the
+/// Phase 0 limitation where a codec on stdin always bottomed out at Raw
+/// purely for lack of an extension.
 ///
-/// A path is still authoritative when given: peeling only ever triggers with
-/// `path: None`, so the existing extension-based route
-/// ([`inner_from_path`]) is untouched — this function defers to
-/// [`resolve_chain`] immediately whenever a path is present.
+/// The path still gets first say: `resolve_chain` runs once with it, and if
+/// that alone already resolves the full chain (a bare container, or a codec
+/// whose inner the extensions named directly — `.tar.gz`), peeking never
+/// happens. Peeking is what runs when the path is silent, or was not enough.
 ///
-/// Bounded by [`MAX_CHAIN_DEPTH`], because re-probing a *decoded* stream is
-/// exactly what makes unbounded nesting attackable: each layer is cheap to
-/// produce and expensive to expand. Exceeding the bound is a typed
+/// Bounded by [`MAX_CHAIN_DEPTH`] on **both** routes, because re-probing a
+/// *decoded* stream is exactly what makes unbounded nesting attackable: each
+/// layer is cheap to produce and expensive to expand. A path is a name, not
+/// a proof — `a.gz.gz.gz.gz.gz` is refused the same way piped bytes with the
+/// identical shape are, and exceeding the bound is a typed
 /// [`Error::ChainTooDeep`], never a panic and never a silent stop.
 ///
-/// Returns the resolved [`Chain`] alongside the [`Source`] positioned at the
-/// start of whatever layer that chain's innermost entry describes — already
-/// decoded past every codec this function peeled through, so a caller does
-/// not redo that work. A layer whose decoded prefix names nothing this
-/// registry knows falls back to [`Chain::Raw`], the same terminal answer
-/// [`resolve_chain`] itself gives for stdin — it is not escalated to an
-/// error, since the outer codec was still resolved correctly.
+/// Returns the resolved [`Chain`] alongside a [`Source`] **already decoded
+/// through every codec layer named in that `Chain`** — positioned exactly
+/// where the chain's innermost entry begins, ready to hand straight to a
+/// container or to read as raw bytes. This holds on both routes: a path
+/// that resolves in one step (no peeking needed) still gets its codec
+/// layers decoded before the source comes back, so a caller never has to
+/// ask whether the source it received happens to be raw or already decoded.
 pub fn resolve_chain_deep(
     reg: &Registry,
     path: Option<&Path>,
     src: Box<dyn Source>,
 ) -> Result<(Chain, Box<dyn Source>)> {
     let (prefix, src) = probe(src)?;
+    let chain = resolve_chain(reg, path, &prefix)?;
 
-    if path.is_some() {
-        let chain = resolve_chain(reg, path, &prefix)?;
-        return Ok((chain, src));
+    // Either a bare container, or a codec whose inner the path already named
+    // (e.g. `.tar.gz`) — the path (if any) is done contributing. Decode
+    // through whatever codec layers `chain` names and stop; there is nothing
+    // left to peek.
+    if !matches!(&chain, Chain::Codec { inner, .. } if matches!(inner.as_ref(), Chain::Raw)) {
+        let decoded = decode_through_chain(reg, &chain, src)?;
+        return Ok((chain, decoded));
     }
 
-    let mut prefix = prefix;
+    // The chain bottoms out at Raw. From here, only the decoded bytes' own
+    // magic decides — the path, if there was one, already had its say above
+    // and found nothing further.
+    let Chain::Codec { codec, .. } = chain else {
+        unreachable!("guarded above: chain is Chain::Codec with a Raw inner")
+    };
+    let mut layers: Vec<FormatId> = vec![codec];
+    let mut current_codec = codec;
     let mut src = src;
-    let mut layers: Vec<FormatId> = Vec::new();
     let mut depth = 1usize;
 
     loop {
-        let chain = match resolve_chain(reg, None, &prefix) {
-            Ok(chain) => chain,
-            Err(Error::UnknownFormat { .. }) => {
-                return Ok((wrap_layers(&layers, Chain::Raw), src));
-            }
-            Err(e) => return Err(e),
-        };
-
-        let Chain::Codec { codec, .. } = chain else {
-            return Ok((wrap_layers(&layers, chain), src));
-        };
-
         if depth >= MAX_CHAIN_DEPTH {
             return Err(Error::ChainTooDeep {
                 depth: MAX_CHAIN_DEPTH,
@@ -289,14 +317,26 @@ pub fn resolve_chain_deep(
         }
 
         let decoded = reg
-            .require_codec(codec)?
+            .require_codec(current_codec)?
             .decoder(src, &DecodeOpts::default())?;
         let (next_prefix, next_src) = probe(decoded)?;
-
-        layers.push(codec);
-        prefix = next_prefix;
-        src = next_src;
         depth += 1;
+
+        let next_chain = match resolve_chain(reg, None, &next_prefix) {
+            Ok(chain) => chain,
+            Err(Error::UnknownFormat { .. }) => {
+                return Ok((wrap_layers(&layers, Chain::Raw), next_src));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let Chain::Codec { codec: nested, .. } = next_chain else {
+            return Ok((wrap_layers(&layers, next_chain), next_src));
+        };
+
+        layers.push(nested);
+        current_codec = nested;
+        src = next_src;
     }
 }
 
@@ -890,5 +930,89 @@ mod tests {
             Err(other) => panic!("expected ChainTooDeep, got {other:?}"),
             Ok(_) => panic!("nesting past the bound must be refused"),
         }
+    }
+
+    #[test]
+    fn nesting_beyond_the_depth_bound_is_refused_via_the_path_route_too() {
+        // A path is a name, not a proof: `a.gz.gz.gz.gz.gz` must be refused
+        // exactly like the identical bytes arriving with no path at all.
+        // `mock_registry_with_codec_and_container` only ever exposes a
+        // single extension per format ("mock"), so a path naming it gives
+        // `inner_from_path` nothing to find a container with — the chain
+        // still bottoms out at Raw, and peeking (and the bound) must engage
+        // all the same.
+        let reg = mock_registry_with_codec_and_container();
+        let mut bytes = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        for _ in 0..MAX_CHAIN_DEPTH + 2 {
+            bytes = mock_codec_encode(&bytes);
+        }
+
+        match resolve_chain_deep(
+            &reg,
+            Some(Path::new("nested.mock")),
+            Box::new(ReaderSource::new(io::Cursor::new(bytes))),
+        ) {
+            Err(Error::ChainTooDeep { depth }) => assert_eq!(depth, MAX_CHAIN_DEPTH),
+            Err(other) => panic!("expected ChainTooDeep, got {other:?}"),
+            Ok(_) => panic!("nesting past the bound must be refused, path or no path"),
+        }
+    }
+
+    #[test]
+    fn the_returned_source_is_decoded_through_every_codec_layer_on_both_routes() {
+        // The defect this pins: the path route used to return the PRISTINE,
+        // undecoded source (resolve_chain alone tells you the shape, nothing
+        // decodes anything), while the no-path route returned the source
+        // already peeled past every codec layer. A caller of
+        // `resolve_chain_deep` cannot be expected to inspect `path.is_some()`
+        // itself to know which kind of source it was just handed — both
+        // routes must leave the source in the identical state: decoded
+        // through every codec layer named in the returned `Chain`, ready to
+        // hand straight to the container.
+        //
+        // "thing.mar.mock" mirrors `.tar.gz`: `inner_from_path` finds the
+        // container ("mar") one extension in from the codec ("mock"), so
+        // this path resolves the FULL chain in one `resolve_chain` call,
+        // with no peeking at all — the route this test must prove decodes
+        // its codec layer exactly as the peeling route does.
+        let reg = mock_registry_with_codec_and_container();
+        let inner = mock_archive_bytes(&[("a.txt", b"alpha")]);
+        let outer = mock_codec_encode(&inner);
+
+        let (chain_with_path, mut src_with_path) = resolve_chain_deep(
+            &reg,
+            Some(Path::new("thing.mar.mock")),
+            Box::new(ReaderSource::new(io::Cursor::new(outer.clone()))),
+        )
+        .expect("resolve with path");
+        let (chain_no_path, mut src_no_path) = resolve_chain_deep(
+            &reg,
+            None,
+            Box::new(ReaderSource::new(io::Cursor::new(outer))),
+        )
+        .expect("resolve without path");
+
+        let expected_chain = Chain::Codec {
+            codec: MOCK_CODEC,
+            inner: Box::new(Chain::Container {
+                container: MOCK_CONTAINER,
+            }),
+        };
+        assert_eq!(chain_with_path, expected_chain);
+        assert_eq!(chain_no_path, expected_chain);
+
+        let mut bytes_with_path = Vec::new();
+        src_with_path.read_to_end(&mut bytes_with_path).unwrap();
+        let mut bytes_no_path = Vec::new();
+        src_no_path.read_to_end(&mut bytes_no_path).unwrap();
+
+        assert_eq!(
+            bytes_with_path, inner,
+            "the path route must decode through the codec layer, not return raw bytes"
+        );
+        assert_eq!(
+            bytes_with_path, bytes_no_path,
+            "both routes must leave the source in the identical, already-decoded state"
+        );
     }
 }
