@@ -2801,3 +2801,66 @@ fn test_verb_passes_strict_fidelity_on_an_ordinary_tarball() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// An `st_mode`-shaped mode field must not read as "setuid was refused".
+///
+/// Apache Commons Compress writes `TarArchiveEntry.DEFAULT_FILE_MODE =
+/// 0100644` — the file-type bit `S_IFREG` still in it — which puts this shape
+/// in Java, Gradle and Maven tarballs. `0o100644 & !0o777` is `0o100000`,
+/// non-zero, so an unmasked check would report a dropped mode for EVERY entry
+/// of an entirely ordinary archive and fail `--strict-fidelity` on all of
+/// them, while the file itself lands at `0o644` exactly as it should. The
+/// permission apply was always right; only the warning was wrong.
+#[cfg(unix)]
+#[test]
+fn an_st_mode_shaped_header_mode_raises_no_warning() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_raw_tar(
+        &dir.join("commons.tar"),
+        &[Raw::ModedFile("a.txt", b"alpha", 0o100_644)],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert!(
+        out.status.success(),
+        "an st_mode-shaped mode field must not fail the gate, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("missing metadata"),
+        "nothing was lost, so nothing may be reported: {stderr}"
+    );
+    assert_eq!(
+        mode_of(&dest.join("a.txt")),
+        0o644,
+        "the permission bits apply; the type bits are not permissions"
+    );
+
+    // The setuid case must still be caught — the mask must not have widened
+    // into "ignore everything above 0o777".
+    let suid = write_raw_tar(
+        &dir.join("suid.tar"),
+        &[Raw::ModedFile("b.txt", b"beta", 0o104_755)],
+    );
+    let out = run_output(&[
+        "unpack",
+        suid.to_str().unwrap(),
+        "-C",
+        dir.join("suid-out").to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "setuid inside an st_mode-shaped field is still a dropped mode, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -225,10 +225,29 @@ argv[0]-dispatch into the same code, so `gzip`, `gunzip`, `zcat`, `bzip2`, `xz`,
 domain, so:
 
 - **Path containment.** Absolute paths, `..` traversal, and symlinks escaping the
-  destination are **refused, not silently sanitised**.
+  destination are **refused, not silently sanitised**. So is an entry whose path
+  runs *through* a symlink: `a/b/up -> ..` followed by `a/b/up/link -> ../..` is
+  contained when each name is resolved component-wise and still lands outside the
+  destination once the OS resolves it, so the extractor also refuses any entry
+  with a symlinked path component (libarchive's `SECURE_SYMLINKS` shape, refused
+  rather than quietly unlinked).
 - **Bomb limits.** Default caps on total output and expansion ratio, so a 42 KB
   zip that expands to 4.5 PB fails fast instead of filling the disk. The error
   names the entry that tripped it.
+
+**One window is deliberately still open, and it is worth stating plainly.** The
+symlinked-component check is the only containment check that consults the
+filesystem, and it is check-then-use: it `lstat`s an entry's ancestors and then
+writes through `File::create` (`O_WRONLY|O_CREAT|O_TRUNC`), `create_dir_all` and
+`symlink`, each of which follows a symlink it meets. Against a hostile *archive*
+the window is closed — extraction is single-threaded and sequential, and every
+symlink the archive creates has already been checked. Against a hostile archive
+**plus a concurrent local process with write access into the destination
+directory**, a component that turns into a symlink between the check and the
+write is followed. Closing it means resolving nothing by name — walking the
+destination with `openat(O_NOFOLLOW)` per component — which needs a `rustix` or
+`libc` dependency and a design cycle of its own. Extract untrusted archives into
+a directory nothing else can write to.
 
 ## Planned format coverage
 

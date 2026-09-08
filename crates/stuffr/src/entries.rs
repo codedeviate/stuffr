@@ -493,6 +493,18 @@ fn apply_metadata(handle: &std::fs::File, meta: &EntryMeta) -> MetaFields {
     let mut missing = MetaFields::default();
 
     if let Some(mode) = meta.mode {
+        // `EntryMeta::mode` carries the header's mode field as the container
+        // read it, and writers disagree about what belongs in there: Apache
+        // Commons Compress's `TarArchiveEntry.DEFAULT_FILE_MODE` is
+        // `0o100644` — an `st_mode`-shaped value with `S_IFREG` still in it —
+        // which puts it in Java, Gradle and Maven tarballs. Masking to the
+        // permission and special bits BEFORE deciding what was dropped is
+        // what stops `0o100644` reading as "setuid was refused" and failing
+        // `--strict-fidelity` on every entry of an entirely ordinary archive,
+        // while the file itself lands at 0o644 exactly as it should. Masked
+        // here rather than in one container so every container inherits it;
+        // the pack side masks identically, for the same reason (`mode_of`).
+        let mode = mode & 0o7777;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -759,9 +771,11 @@ fn normalize_for_match(s: &str) -> &str {
 ///
 /// [`safe_join`] and [`check_symlink_target`] are both lexical, which is what
 /// makes them filesystem-free, exhaustively testable and immune to a symlink
-/// appearing between the check and the write. The price is that neither can
-/// see a symlink standing in the middle of an entry's own path, and the two
-/// together do not close this:
+/// appearing between the check and the write — an immunity this function,
+/// which does touch the filesystem, does NOT inherit; see the TOCTOU section
+/// below. The price of being lexical is that neither can see a symlink
+/// standing in the middle of an entry's own path, and the two together do
+/// not close this:
 ///
 /// ```text
 /// a/b/           an ordinary directory
@@ -779,6 +793,32 @@ fn normalize_for_match(s: &str) -> &str {
 /// rather than quietly unlinked, per the README's contract. It also covers
 /// the case neither lexical check can reach at all — a hostile symlink
 /// planted inside `dest` by somebody else *before* extraction started.
+///
+/// # The TOCTOU window this leaves open
+///
+/// This is the only containment check in the tree that consults the
+/// filesystem, and it is check-then-use: it `symlink_metadata`s the
+/// ancestors and then the caller writes through `File::create`
+/// (`O_WRONLY|O_CREAT|O_TRUNC` — no `O_NOFOLLOW`, no `create_new`),
+/// `create_dir_all` and `symlink`, every one of which follows a symlink it
+/// meets. A component that becomes a symlink *between* this check and that
+/// write is followed.
+///
+/// Against a hostile **archive**, the window is closed: the extraction loop
+/// is single-threaded and sequential, so nothing runs between the check and
+/// the write, and every symlink the archive itself creates has already been
+/// through [`check_symlink_target`].
+///
+/// Against a hostile archive **plus a concurrent local process with write
+/// access into `dest`**, it is open, and this function does not claim
+/// otherwise. Closing it means never resolving a path by name at all —
+/// walking `dest` with `openat(O_NOFOLLOW)` per component and writing
+/// through the resulting descriptors — which needs a `rustix` or `libc`
+/// dependency this crate does not have and a design cycle of its own.
+/// Deferred deliberately, and stated rather than glossed: the lexical
+/// checks above really are immune to a symlink appearing between check and
+/// write, this one is not, and a reader must not carry the first claim over
+/// onto the second.
 ///
 /// The entry's OWN final component is exempt: a symlink entry is supposed to
 /// become a symlink, and something already sitting at that exact path is

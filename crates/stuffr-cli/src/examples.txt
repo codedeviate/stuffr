@@ -304,7 +304,12 @@ EXTRACTING AN ARCHIVE'S ENTRIES
         so only the 0o777 permission bits are restored — the same default
         tar and bsdtar apply for a non-root extraction.
       * a symlink's own mode and mtime, which cannot be set without
-        following the link on this platform.
+        following the link on this platform. Expect this one: it means
+        --strict-fidelity fails on essentially any tarball containing a
+        symlink at all. The gate firing there is honest rather than a bug —
+        the link's mtime genuinely was not reproduced — but it is why the
+        flag is opt-in, and why a caller who only wants "the data arrived"
+        should not reach for it.
       * a device node, fifo, socket or hardlink. There is no shape on disk
         for one here, so the entry is SKIPPED and named, never materialised
         as a regular file holding its supposed contents.
