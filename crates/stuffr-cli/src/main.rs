@@ -232,6 +232,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             max_ratio,
             no_sync,
             memory_limit,
+            strict_fidelity,
         } => {
             // -C is what asks for entry-aware extraction. It is a flag rather
             // than something inferred from the input because the decision has
@@ -249,7 +250,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     "{} -> {} bytes extracted into {dir} ({} fidelity)",
                     out.format, out.bytes_out, out.fidelity.rung
                 );
-                return Ok(());
+                return report_fidelity(&out.fidelity, strict_fidelity);
             }
             if !patterns.is_empty() {
                 return Err(stuffr::Error::Usage(format!(
@@ -294,7 +295,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             };
             let out = ops::decompress(input_of(&input), dst, &opts)?;
             eprintln!("{} -> {} bytes", out.format, out.bytes_out);
-            Ok(())
+            report_fidelity(&out.fidelity, strict_fidelity)
         }
         Command::Cat {
             input,
@@ -393,7 +394,11 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             json,
             max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
         ),
-        Command::Test { input, max_ratio } => {
+        Command::Test {
+            input,
+            max_ratio,
+            strict_fidelity,
+        } => {
             let out = entries::test(
                 input_of(&input),
                 max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
@@ -402,9 +407,37 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 "{} -> {} bytes verified ({} fidelity)",
                 out.format, out.bytes_out, out.fidelity.rung
             );
-            Ok(())
+            report_fidelity(&out.fidelity, strict_fidelity)
         }
     }
+}
+
+/// Prints what an operation approximated, and fails under --strict-fidelity.
+///
+/// The report is printed either way: a caller who did not ask for the gate
+/// still needs to be able to SEE that an entry's mode was dropped, and a
+/// caller who did needs to know which entries to look at — `FidelityDegraded`
+/// carries only a count.
+///
+/// Capped at ten lines: an archive of ten thousand symlinks would otherwise
+/// bury the summary line under ten thousand identical ones. The count in the
+/// header is the complete figure regardless.
+fn report_fidelity(report: &stuffr::FidelityReport, strict: bool) -> stuffr::Result<()> {
+    if !report.has_warnings() {
+        return Ok(());
+    }
+    const SHOWN: usize = 10;
+    eprintln!("stuffr: {} fidelity warning(s):", report.warnings.len());
+    for w in report.warnings.iter().take(SHOWN) {
+        eprintln!("  - {w}");
+    }
+    if let Some(rest) = report.warnings.len().checked_sub(SHOWN).filter(|n| *n > 0) {
+        eprintln!("  … and {rest} more");
+    }
+    if strict {
+        return Err(stuffr::Error::FidelityDegraded(report.warnings.len()));
+    }
+    Ok(())
 }
 
 /// The container an output names, if it names one at all — `--format tar`, or

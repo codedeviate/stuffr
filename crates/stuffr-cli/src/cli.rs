@@ -90,6 +90,12 @@ pub enum Command {
         /// directory are refused (exit 7), never silently sanitised.
         #[arg(short = 'C', long, value_name = "DIR")]
         directory: Option<String>,
+        /// Fail (exit 4) if anything was approximated or lost.
+        ///
+        /// On extraction that means an entry whose mode or mtime could not be
+        /// restored, or one skipped for having no shape on disk.
+        #[arg(long)]
+        strict_fidelity: bool,
         /// Output path. Defaults to INPUT with its extension removed.
         #[arg(short, long)]
         output: Option<String>,
@@ -172,5 +178,8 @@ pub enum Command {
         /// than this ratio (e.g. a `.tar.gz` bomb).
         #[arg(long)]
         max_ratio: Option<u64>,
+        /// Fail (exit 4) if the read approximated or lost anything.
+        #[arg(long)]
+        strict_fidelity: bool,
     },
 }

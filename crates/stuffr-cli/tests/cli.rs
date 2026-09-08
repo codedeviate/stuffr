@@ -1683,13 +1683,24 @@ fn a_legitimately_compressible_tar_gz_is_not_refused_at_the_default_ratio() {
 // containment has to refuse an archive somebody else wrote.
 // ---------------------------------------------------------------------
 
+/// The mtime every raw fixture entry carries, so a test can assert that
+/// extraction put it back rather than that it happens to be "recent".
+const FIXTURE_MTIME: u64 = 1_600_000_000;
+
 /// A tar entry whose name is written straight into the 100-byte header field,
 /// bypassing every validation `Builder::append_data`/`Header::set_path` would
 /// apply. `write_fixture_tar` cannot express these names at all.
-fn raw_header(name: &str, kind: tar::EntryType, link_target: Option<&str>, size: u64) -> Header {
+fn raw_header(
+    name: &str,
+    kind: tar::EntryType,
+    link_target: Option<&str>,
+    size: u64,
+    mode: u32,
+) -> Header {
     let mut header = Header::new_gnu();
     header.set_size(size);
-    header.set_mode(0o644);
+    header.set_mode(mode);
+    header.set_mtime(FIXTURE_MTIME);
     header.set_entry_type(kind);
     {
         let gnu = header.as_gnu_mut().expect("new_gnu is a GNU header");
@@ -1712,11 +1723,15 @@ fn raw_header(name: &str, kind: tar::EntryType, link_target: Option<&str>, size:
     header
 }
 
-/// One raw entry, described the way the hostile fixtures below need it.
+/// One raw entry, described the way the fixtures below need it.
 enum Raw<'a> {
     File(&'a str, &'a [u8]),
+    /// A file carrying an explicit mode, for the metadata tests.
+    ModedFile(&'a str, &'a [u8], u32),
     Dir(&'a str),
     Symlink(&'a str, &'a str),
+    /// A named pipe: `EntryKind::Other`, which has no shape on disk here.
+    Fifo(&'a str),
 }
 
 /// Writes an archive whose entry names have passed through no validation at
@@ -1726,15 +1741,35 @@ fn write_raw_tar(path: &Path, entries: &[Raw<'_>]) -> PathBuf {
     for entry in entries {
         match entry {
             Raw::File(name, data) => {
-                let header = raw_header(name, tar::EntryType::Regular, None, data.len() as u64);
+                let header = raw_header(
+                    name,
+                    tar::EntryType::Regular,
+                    None,
+                    data.len() as u64,
+                    0o644,
+                );
+                builder.append(&header, *data).unwrap();
+            }
+            Raw::ModedFile(name, data, mode) => {
+                let header = raw_header(
+                    name,
+                    tar::EntryType::Regular,
+                    None,
+                    data.len() as u64,
+                    *mode,
+                );
                 builder.append(&header, *data).unwrap();
             }
             Raw::Dir(name) => {
-                let header = raw_header(name, tar::EntryType::Directory, None, 0);
+                let header = raw_header(name, tar::EntryType::Directory, None, 0, 0o755);
                 builder.append(&header, std::io::empty()).unwrap();
             }
             Raw::Symlink(name, target) => {
-                let header = raw_header(name, tar::EntryType::Symlink, Some(target), 0);
+                let header = raw_header(name, tar::EntryType::Symlink, Some(target), 0, 0o777);
+                builder.append(&header, std::io::empty()).unwrap();
+            }
+            Raw::Fifo(name) => {
+                let header = raw_header(name, tar::EntryType::Fifo, None, 0, 0o644);
                 builder.append(&header, std::io::empty()).unwrap();
             }
         }
@@ -2536,5 +2571,233 @@ fn an_entry_written_through_a_symlinked_path_component_is_refused() {
     assert!(
         !dir.join("pwned.txt").exists(),
         "the entry escaped the destination through a symlinked path component"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Extraction fidelity.
+//
+// `--strict-fidelity` gates on `FidelityReport::has_warnings`, so a loss that
+// raises no warning is a loss the flag reports as success. These tests are
+// the difference between the warnings meaning something and being decoration.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn mtime_secs(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[cfg(unix)]
+#[test]
+fn extraction_restores_modes_and_mtimes_for_files_and_directories() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_raw_tar(
+        &dir.join("meta.tar"),
+        &[
+            Raw::Dir("sub/"),
+            Raw::ModedFile("sub/script.sh", b"#!/bin/sh\n", 0o750),
+            Raw::ModedFile("readonly.txt", b"ro", 0o400),
+        ],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(mode_of(&dest.join("sub/script.sh")), 0o750);
+    assert_eq!(mode_of(&dest.join("readonly.txt")), 0o400);
+    assert_eq!(mode_of(&dest.join("sub")), 0o755);
+    assert_eq!(mtime_secs(&dest.join("sub/script.sh")), FIXTURE_MTIME);
+    assert_eq!(mtime_secs(&dest.join("readonly.txt")), FIXTURE_MTIME);
+    // A directory's mtime is restored AFTER its children are written —
+    // creating one of them would otherwise bump it back to now.
+    assert_eq!(mtime_secs(&dest.join("sub")), FIXTURE_MTIME);
+
+    // Nothing was lost, so the gate passes.
+    let strict = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dir.join("strict").to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert!(
+        strict.status.success(),
+        "an extraction that lost nothing must pass --strict-fidelity, stderr: {}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_setuid_bit_is_not_restored_and_strict_fidelity_fails_on_the_loss() {
+    // An archive is untrusted input; honouring its setuid bit hands over a
+    // privilege-escalation primitive for free. Dropping it is a real
+    // difference from what the archive declared, so it is REPORTED — which is
+    // what makes `--strict-fidelity` able to see it.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_raw_tar(
+        &dir.join("setuid.tar"),
+        &[Raw::ModedFile("suid", b"payload", 0o4755)],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "the extraction itself succeeds, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        mode_of(&dest.join("suid")),
+        0o755,
+        "the setuid bit must not be restored"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("suid") && stderr.contains("mode"),
+        "the loss must be reported, naming the entry and the field: {stderr}"
+    );
+
+    let strict = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dir.join("strict").to_str().unwrap(),
+        "--force",
+        "--strict-fidelity",
+    ]);
+    assert_eq!(
+        strict.status.code(),
+        Some(4),
+        "a dropped mode must fail --strict-fidelity, stderr: {}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_entry_with_no_shape_on_disk_is_skipped_and_said_out_loud() {
+    // A fifo is `EntryKind::Other`. Writing it out as a regular file carrying
+    // its "contents" would materialise something the archive never held.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_raw_tar(
+        &dir.join("fifo.tar"),
+        &[Raw::File("a.txt", b"alpha"), Raw::Fifo("pipe")],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+    assert!(
+        std::fs::symlink_metadata(dest.join("pipe")).is_err(),
+        "a fifo entry must not become a regular file"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("skipped entry") && stderr.contains("pipe"),
+        "the skip must name the entry and why: {stderr}"
+    );
+
+    let strict = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dir.join("strict").to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(
+        strict.status.code(),
+        Some(4),
+        "a skipped entry must fail --strict-fidelity, stderr: {}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinks_own_mode_and_mtime_are_reported_as_lost() {
+    // `set_permissions` and `File::set_times` both follow a link, and there
+    // is no `lchmod`/`lutimes` in std — so the link's own metadata cannot be
+    // restored, and saying so is the whole job of the fidelity report.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_raw_tar(
+        &dir.join("link.tar"),
+        &[Raw::File("a.txt", b"alpha"), Raw::Symlink("link", "a.txt")],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("link") && stderr.contains("mtime"),
+        "the loss must name the entry and the field: {stderr}"
+    );
+    // The link itself still extracted — this is a fidelity report, not a
+    // refusal.
+    assert_eq!(
+        std::fs::read_link(dest.join("link")).unwrap(),
+        Path::new("a.txt")
+    );
+}
+
+#[test]
+fn test_verb_passes_strict_fidelity_on_an_ordinary_tarball() {
+    // The counterpart assertion to the four above: the flag is not simply
+    // "fail whenever it is given". A tar read approximates nothing.
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+    let out = run_output(&["test", archive.to_str().unwrap(), "--strict-fidelity"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

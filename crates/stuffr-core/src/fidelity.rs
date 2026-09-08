@@ -112,6 +112,18 @@ pub enum Fidelity {
     #[error("skipped encrypted entry `{entry}`")]
     EncryptedEntrySkipped { entry: String },
 
+    /// An entry this build cannot materialise, named along with why.
+    ///
+    /// Distinct from [`Self::MetadataIncomplete`], which is about an entry
+    /// that WAS written and lost some of its metadata: here the entry itself
+    /// is absent from the result. Extraction raises it for a device node,
+    /// fifo, socket or hardlink — [`crate::EntryKind::Other`], the honest
+    /// answer a container gives for an entry shape `EntryKind` has no variant
+    /// for yet. Writing one out as a regular file carrying its "contents"
+    /// would be a silent lie about what the archive held.
+    #[error("skipped entry `{entry}`: {reason}")]
+    EntrySkipped { entry: String, reason: &'static str },
+
     #[error("stream truncated at offset {at}")]
     TruncatedStream { at: u64 },
 }
@@ -276,6 +288,16 @@ mod tests {
             wasted_bytes: 41_943_040,
         };
         assert!(format!("{f}").contains("41943040"));
+
+        let f = Fidelity::EntrySkipped {
+            entry: "dev/null".into(),
+            reason: "device nodes, fifos and hardlinks are not created",
+        };
+        let s = format!("{f}");
+        assert!(
+            s.contains("dev/null") && s.contains("hardlinks"),
+            "a skip must say both which entry and why: {s}"
+        );
 
         let f = Fidelity::MetadataIncomplete {
             entry: "b.bin".into(),

@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
     ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, EntryKind,
-    EntryMeta, Error, FidelityReport, FormatId, OpenOpts, RATIO_FLOOR, RatioGuard, Registry,
-    Result, Rung, SeekRead, Source, SourceCaps, StreamPolicy, check_symlink_target, ladder,
-    resolve_chain_deep, safe_join,
+    EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts, RATIO_FLOOR,
+    RatioGuard, Registry, Result, Rung, SeekRead, Source, SourceCaps, StreamPolicy,
+    check_symlink_target, ladder, resolve_chain_deep, safe_join,
 };
 
 use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
@@ -320,6 +320,16 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
 
     let mut written = 0u64;
     let mut matched = 0u64;
+    // Accumulated rather than pushed straight onto the archive's own report:
+    // `ar.fidelity()` borrows `ar`, which `next_entry` needs mutably. Folded
+    // in once the loop is done — see the end of this function, and
+    // `Outcome::fidelity`, which is what `--strict-fidelity` reads.
+    let mut warnings: Vec<Fidelity> = Vec::new();
+    // Directory metadata is applied AFTER every entry has been written.
+    // Applying it inline would be wrong twice over: creating a child updates
+    // its parent's mtime, and a directory whose archived mode is read-only
+    // (0o555, say) could not be written into afterwards.
+    let mut deferred_dirs: Vec<(PathBuf, EntryMeta)> = Vec::new();
 
     while let Some(mut entry) = ar.next_entry()? {
         let meta = entry.meta().clone();
@@ -360,8 +370,17 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
                 // to a directory the caller named.
                 if target != dest {
                     replace_conflicting(&target, o.force)?;
+                    std::fs::create_dir_all(&target)?;
+                    deferred_dirs.push((target.clone(), meta.clone()));
+                } else {
+                    // The destination is the caller's own directory, named by
+                    // them — not something this extraction created. Re-moding
+                    // it is not extraction, and reporting it as a loss would
+                    // fail `--strict-fidelity` for every `tar cf x.tar .`
+                    // archive there is, which is the same reason `tar.rs`
+                    // raises no warning for a forward-only read.
+                    std::fs::create_dir_all(&target)?;
                 }
-                std::fs::create_dir_all(&target)?;
             }
             EntryKind::Symlink {
                 target: link_target,
@@ -374,23 +393,63 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
                 replace_conflicting(&target, o.force)?;
                 create_parent(&target)?;
                 create_symlink(link_target, &target)?;
+                // A symlink's own mode and mtime cannot be set through `std`:
+                // `set_permissions` and `File::set_times` both follow the
+                // link, and there is no `lchmod`/`lutimes` here (nor a `libc`
+                // dependency to reach one with). Whatever the entry declared
+                // is therefore lost, and saying so is the whole job of the
+                // fidelity report.
+                let missing = MetaFields {
+                    mtime: meta.mtime.is_some(),
+                    mode: meta.mode.is_some(),
+                    ..Default::default()
+                };
+                warn_metadata(&mut warnings, &meta.name, missing);
             }
-            // `EntryKind::File`, and `Other` (a hardlink, device or FIFO)
-            // written as a regular file carrying whatever payload the
-            // archive framed for it — the same direction `tar`'s own writer
-            // already maps `Other` in (`_ => EntryType::Regular`). The
-            // fidelity to recover is in `EntryKind`'s missing variants, not
-            // in this match. `_` rather than the two names because
-            // `EntryKind` is `#[non_exhaustive]`.
-            _ => {
+            EntryKind::File => {
                 replace_conflicting(&target, o.force)?;
                 create_parent(&target)?;
                 let mut out = std::fs::File::create(&target)?;
                 // Charged as data streams, not from the declared size.
                 written += copy_charging(entry.reader(), &mut out, &meta.name, &mut budget)?;
                 out.flush()?;
+                // Through the open handle rather than the path: an fd cannot
+                // be redirected by a symlink appearing underneath it.
+                let missing = apply_metadata(&out, &meta);
+                warn_metadata(&mut warnings, &meta.name, missing);
+            }
+            // `EntryKind::Other` — a device node, fifo, socket or hardlink,
+            // the honest answer `tar` gives for a shape `EntryKind` has no
+            // variant for yet. SKIPPED, and said out loud. Writing one out as
+            // a regular file carrying its "contents" would materialise
+            // something the archive never held: a 0-byte plain file where a
+            // character device was, or a broken copy of a hardlink's target.
+            // `_` rather than naming the variant because `EntryKind` is
+            // `#[non_exhaustive]`; anything added upstream is unknown to this
+            // loop and skipping it is the same honest answer.
+            _ => {
+                warnings.push(Fidelity::EntrySkipped {
+                    entry: meta.name.clone(),
+                    reason: "device nodes, fifos, sockets and hardlinks are not created",
+                });
             }
         }
+    }
+
+    // Now that nothing more will be created inside them.
+    for (path, meta) in &deferred_dirs {
+        let missing = match std::fs::File::open(path) {
+            Ok(handle) => apply_metadata(&handle, meta),
+            // The directory is there — it was just created — so a failure to
+            // reopen it is a metadata loss, not a reason to fail the
+            // extraction after the data is already on disk.
+            Err(_) => MetaFields {
+                mtime: meta.mtime.is_some(),
+                mode: meta.mode.is_some(),
+                ..Default::default()
+            },
+        };
+        warn_metadata(&mut warnings, &meta.name, missing);
     }
 
     // Patterns that select nothing must not report success: a typo'd name
@@ -399,12 +458,84 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
         return Err(Error::EntryNotFound(patterns.join(", ")));
     }
 
+    // The container's own report, plus everything writing to disk cost. This
+    // is what `--strict-fidelity` gates on, so a warning recorded anywhere
+    // else would be worse than none at all — it would look handled.
+    let mut fidelity = ar.fidelity().clone();
+    for w in warnings {
+        fidelity.warn(w);
+    }
+
     Ok(Outcome {
         bytes_in: 0,
         bytes_out: written,
         format,
-        fidelity: ar.fidelity().clone(),
+        fidelity,
     })
+}
+
+/// The permission bits extraction restores.
+///
+/// setuid, setgid and the sticky bit (`0o7000`) are deliberately NOT among
+/// them: an archive is untrusted input, and honouring a setuid bit out of one
+/// is a privilege-escalation primitive handed over for free — the same
+/// default `tar` and `bsdtar` apply for a non-root extraction. Dropping them
+/// is a real difference from what the archive declared, so it is REPORTED as
+/// a mode loss rather than quietly applied or quietly ignored.
+const RESTORED_MODE_BITS: u32 = 0o777;
+
+/// Restores what a written entry's own metadata can carry, returning the
+/// fields that could not be restored.
+///
+/// Takes the open handle rather than the path: an fd cannot be redirected by
+/// a symlink appearing underneath it between the write and this call.
+fn apply_metadata(handle: &std::fs::File, meta: &EntryMeta) -> MetaFields {
+    let mut missing = MetaFields::default();
+
+    if let Some(mode) = meta.mode {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if mode & !RESTORED_MODE_BITS != 0 {
+                missing.mode = true;
+            }
+            if handle
+                .set_permissions(std::fs::Permissions::from_mode(mode & RESTORED_MODE_BITS))
+                .is_err()
+            {
+                missing.mode = true;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = handle;
+            missing.mode = true;
+        }
+    }
+
+    if let Some(mtime) = meta.mtime
+        && handle
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .is_err()
+    {
+        missing.mtime = true;
+    }
+
+    missing
+}
+
+/// Records a metadata loss, if there was one.
+///
+/// `MetaFields` reads "true means absent", so an all-false value means
+/// everything the entry declared was restored and there is nothing to say.
+fn warn_metadata(warnings: &mut Vec<Fidelity>, entry: &str, missing: MetaFields) {
+    if missing == MetaFields::default() {
+        return;
+    }
+    warnings.push(Fidelity::MetadataIncomplete {
+        entry: entry.to_string(),
+        fields: missing,
+    });
 }
 
 /// Writes the payload of every entry matching `patterns` (all of them when
@@ -574,12 +705,19 @@ fn entry_name_for(path: &Path) -> Result<String> {
     Ok(name.to_string())
 }
 
-/// The unix mode bits, where the platform has them.
+/// The unix permission bits, where the platform has them.
+///
+/// Masked to `0o7777`: `Metadata::mode` carries the file-type bits too
+/// (`S_IFREG`, `0o100000`), and a tar header's mode field holds permissions
+/// alone — the type lives in its typeflag. Storing the raw value would write
+/// a mode no other tar tool would recognise, and would make extraction report
+/// a mode loss (see `RESTORED_MODE_BITS`) for every file stuffr packed
+/// itself.
 fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Some(md.mode())
+        Some(md.mode() & 0o7777)
     }
     #[cfg(not(unix))]
     {

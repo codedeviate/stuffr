@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr::entries::{self, ExtractOpts};
 use stuffr::ops::{Input, Output};
-use stuffr::{EntryKind, EntryMeta, Error, FormatId};
+use stuffr::{EntryKind, EntryMeta, Error, Fidelity, FormatId};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -36,6 +36,10 @@ struct Fixture<'a> {
     name: &'a str,
     kind: EntryKind,
     data: &'a [u8],
+    /// Set explicitly on every fixture: extraction restores an entry's mode,
+    /// so a directory left to `tar`'s default (0o644, no execute bit) would
+    /// extract into one nothing can be read out of afterwards.
+    mode: u32,
 }
 
 fn file<'a>(name: &'a str, data: &'a [u8]) -> Fixture<'a> {
@@ -43,6 +47,7 @@ fn file<'a>(name: &'a str, data: &'a [u8]) -> Fixture<'a> {
         name,
         kind: EntryKind::File,
         data,
+        mode: 0o644,
     }
 }
 
@@ -51,6 +56,7 @@ fn dir(name: &str) -> Fixture<'_> {
         name,
         kind: EntryKind::Dir,
         data: b"",
+        mode: 0o755,
     }
 }
 
@@ -61,6 +67,7 @@ fn symlink<'a>(name: &'a str, target: &str) -> Fixture<'a> {
             target: target.to_string(),
         },
         data: b"",
+        mode: 0o777,
     }
 }
 
@@ -80,6 +87,10 @@ fn write_tar(path: &Path, entries: &[Fixture<'_>]) -> PathBuf {
                     name: entry.name.to_string(),
                     size: Some(entry.data.len() as u64),
                     kind: entry.kind.clone(),
+                    mode: Some(entry.mode),
+                    mtime: Some(
+                        std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+                    ),
                     ..Default::default()
                 },
                 &mut data,
@@ -241,4 +252,59 @@ fn create_archive_stores_final_components_so_its_output_can_be_extracted_again()
     entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
     assert_eq!(std::fs::read(dest.join("one.txt")).unwrap(), b"first");
     assert_eq!(std::fs::read(dest.join("two.txt")).unwrap(), b"second");
+}
+
+#[test]
+fn what_extraction_could_not_restore_reaches_the_outcome_report() {
+    // `--strict-fidelity` gates on `Outcome::fidelity`, so a warning recorded
+    // anywhere else would be worse than none: it would look handled.
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("lossy.tar"),
+        &[file("a.txt", b"alpha"), symlink("link", "a.txt")],
+    );
+    let dest = root.join("out");
+
+    let outcome =
+        entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+
+    assert!(
+        outcome.fidelity.has_warnings(),
+        "a symlink's own mode and mtime cannot be restored, and that is a loss"
+    );
+    let named = outcome.fidelity.warnings.iter().any(|w| match w {
+        Fidelity::MetadataIncomplete { entry, fields } => entry == "link" && fields.mtime,
+        _ => false,
+    });
+    assert!(
+        named,
+        "the report must name the entry and the field: {:?}",
+        outcome.fidelity.warnings
+    );
+    // The file entry lost nothing, so it must NOT appear: a report that
+    // warned about everything would be as useless as one that warned about
+    // nothing.
+    let clean = outcome.fidelity.warnings.iter().any(|w| match w {
+        Fidelity::MetadataIncomplete { entry, .. } => entry == "a.txt",
+        _ => false,
+    });
+    assert!(!clean, "a fully restored entry must raise no warning");
+}
+
+#[test]
+fn an_archive_whose_metadata_is_fully_restored_reports_no_warnings() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("clean.tar"),
+        &[dir("sub/"), file("sub/a.txt", b"alpha")],
+    );
+    let dest = root.join("out");
+
+    let outcome =
+        entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+    assert!(
+        !outcome.fidelity.has_warnings(),
+        "nothing was lost, so --strict-fidelity must pass: {:?}",
+        outcome.fidelity.warnings
+    );
 }

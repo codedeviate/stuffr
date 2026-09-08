@@ -219,6 +219,13 @@ LISTING AND TESTING AN ARCHIVE
       damaged codec stream, so a script branches on "corrupt" the same way
       regardless of which command found it.
 
+  stuffr test backup.tar --strict-fidelity
+      Fails with exit 4 if the read approximated anything at all. A tar over
+      a pipe is NOT such a case: it lands on the forward-only rung, but tar
+      has no trailing index for a forward read to skip, so nothing is lost
+      and nothing is reported. The flag gates on what was lost, never on
+      the rung.
+
   stuffr list plain.txt.gz
       Fails: a bare codec stream is not an archive. The error names what
       the input actually resolved to (here, `gzip`) rather than a bare
@@ -281,6 +288,31 @@ EXTRACTING AN ARCHIVE'S ENTRIES
   appearing between the check and the write; the operating system resolves
   the same name through the link instead, and that difference is an escape
   on its own.
+
+  stuffr unpack backup.tar -C out/ --strict-fidelity
+      Extraction restores each entry's mode and mtime — a directory's after
+      its children are written, since creating one bumps its parent's mtime
+      back to now — and reports whatever it could NOT put back.
+      --strict-fidelity turns any such report into exit 4 instead of a
+      warning, for a caller that needs "everything, exactly" rather than
+      "the data". `stuffr test --strict-fidelity` gates the same way on a
+      read. Three things extraction deliberately does not reproduce, each
+      reported per entry rather than passed over in silence:
+
+      * setuid, setgid and the sticky bit. An archive is untrusted input and
+        honouring its setuid bit hands over a privilege escalation for free,
+        so only the 0o777 permission bits are restored — the same default
+        tar and bsdtar apply for a non-root extraction.
+      * a symlink's own mode and mtime, which cannot be set without
+        following the link on this platform.
+      * a device node, fifo, socket or hardlink. There is no shape on disk
+        for one here, so the entry is SKIPPED and named, never materialised
+        as a regular file holding its supposed contents.
+
+      Ownership (uid/gid) is not restored and not reported: reproducing it
+      needs privileges an extraction does not have, and warning per entry
+      would fail --strict-fidelity for every archive in existence, which
+      would make the flag useless rather than strict.
 
   stuffr unpack bomb.tar.gz -C out/ --max-ratio 100
       --max-ratio bounds extraction twice over — per entry, and against the
