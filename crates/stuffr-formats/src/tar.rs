@@ -63,38 +63,70 @@
 //!    zero block and never looks at what follows, so it cannot see a stream
 //!    that was cut inside the marker either.
 //!
-//!    [`TrailerWatch`] therefore counts what the source actually delivered,
-//!    and [`TarRead::verify_end_of_archive`] reads whatever follows the
-//!    marker and applies two rules, both CALIBRATED against reference tools
-//!    (macOS `bsdtar` 3.5.3 and Python's `tarfile`) on hand-cut fixtures
-//!    rather than chosen:
+//!    [`TrailerWatch`] therefore counts what the source delivers, and
+//!    [`TarRead::verify_end_of_archive`] asks one question AT TAR'S OWN STOP
+//!    POSITION — the position being the load-bearing part, since the same
+//!    question asked at end of stream is both too strict and too lax at
+//!    once, as an earlier version of this module was:
 //!
-//!    * The stream is a whole number of 512-byte blocks. A tar is
-//!      block-structured throughout, and a partial final block is what
-//!      `bsdtar` calls "Truncated tar archive" (exit 1).
-//!    * The last two blocks are entirely zero — the marker POSIX defines.
-//!      With the rule above this is exactly "the final 1024 bytes are
-//!      zeros". No marker at all is `bsdtar`'s "Damaged tar archive"; a lone
-//!      zero block is its "Truncated input file (needed 512 bytes, only 0
-//!      available)", and `tarfile` raises `ReadError` for both. This project
-//!      does not want to be the one tool that accepts them.
+//!    **Does a whole further 512-byte block exist?**
 //!
-//!    Concatenated tars (`cat a.tar b.tar`, which every tool reads as just
-//!    `a.tar`'s entries) still pass: the rules look at the end of the whole
-//!    stream, which is `b.tar`'s own marker.
+//!    That separates tar's two indistinguishable endings. tar returns
+//!    `Ok(None)` either having read one whole all-zero block — a marker, so
+//!    a second block follows — or having asked for a header and got nothing,
+//!    in which case `try_read_all` consumed NOTHING and the source is
+//!    exhausted, so no block follows. It is also what an entry whose
+//!    payload merely ends in zeros cannot forge: without this, an archive
+//!    with an all-zero payload tail and its marker removed reads back as
+//!    complete.
 //!
-//!    Being stricter than the crate carries a false-positive risk, so the
-//!    accept side is calibrated too, by
-//!    `every_reference_writer_is_accepted_including_its_empty_archive`:
-//!    `bsdtar`, GNU `tar` and Python `tarfile` each write an empty and a
-//!    one-entry archive, and all six must read back. The empty ones are the
-//!    tight cases, because they are nothing BUT a marker — and the three
-//!    writers disagree about padding, measured: `bsdtar` emits exactly 1024
-//!    bytes, GNU `tar` and `tarfile` pad to a 10240-byte record. A rule
-//!    slightly wrong about alignment, or about how many zero blocks it
-//!    demands, rejects one of them. Verified by mutation: demanding three
-//!    zero blocks instead of two fails that test on `bsdtar`'s empty
-//!    archive.
+//!    "The last block tar consumed was zeros" looks like a second rule and
+//!    is not one: on the route where it fails, the source is exhausted and
+//!    the question above already rejects. Mutation-checked — deleting it
+//!    left the suite green — so it survives only as the DIAGNOSIS that
+//!    phrases the error, which the tests assert.
+//!
+//!    Whatever follows the second block is ignored, as every tar tool
+//!    ignores it.
+//!
+//!    Both rules are MEASURED against three reference tools — macOS `bsdtar`
+//!    3.5.3, GNU `tar` (`gtar`) and Python's `tarfile` — on hand-cut
+//!    fixtures, on the accept side as much as the reject side, because a
+//!    refusal that fires on input every tool accepts is worse than no
+//!    refusal:
+//!
+//!    | fixture | the three tools | stuffr |
+//!    |---|---|---|
+//!    | complete | accept | accept |
+//!    | + 1 byte / 20 bytes / a 512-byte non-zero block of junk | accept | accept |
+//!    | + zero padding to a 10240-byte record | accept | accept |
+//!    | one zero block then a non-zero block | accept (GNU warns "A lone zero block") | accept |
+//!    | no marker at all | reject ("Damaged tar archive", `ReadError`) | reject |
+//!    | a lone zero block, then nothing | reject ("Truncated input file (needed 512 bytes, only 0 available)", `ReadError`) | reject |
+//!    | an all-zero payload tail with the marker removed | reject | reject |
+//!    | a partial second marker block | `bsdtar` and `tarfile` disagree with each other | reject |
+//!
+//!    Two deliberate departures, both recorded because they are the places
+//!    this module is not simply copying a reference:
+//!
+//!    * The question is whether a whole block EXISTS, not whether it is
+//!      zero. Demanding zeros rejects the "one zero block then a non-zero
+//!      block" row above, which all three tools accept — and rejecting it
+//!      buys nothing, since every entry in such an archive is intact and
+//!      readable.
+//!    * The last row is the one case where the tools do not agree with each
+//!      other: `bsdtar` calls a partial trailing block "Truncated tar
+//!      archive" in one shape and accepts it in another, and `tarfile`
+//!      accepts both. There is no structural difference between a partial
+//!      block of 511 zeros and one of 200, so no rule can accept one and
+//!      reject the other; conformance property 9 requires the archive cut
+//!      one byte short of its end to be caught, so both are rejected. No
+//!      writer produces a partial final block, so this is damage rather than
+//!      benign input.
+//!
+//!    Concatenated tars (`cat a.tar b.tar`, read as just `a.tar`'s entries
+//!    by every tool) pass: `a.tar`'s own marker satisfies both rules and
+//!    `b.tar` is part of the ignored tail.
 //!
 //! # `add` measures a payload whose size the caller did not declare
 //!
@@ -294,12 +326,13 @@ impl TrailerState {
 
     /// Consecutive zero bytes at the end of everything delivered so far.
     ///
-    /// Read together with a block-aligned total this is exact rather than a
-    /// heuristic: `>= 1024` with `delivered % 512 == 0` means the final two
-    /// blocks are entirely zero, which is precisely the marker. A payload
-    /// whose own tail happens to be zeros can push the count over only by
-    /// genuinely making those blocks zero — in which case the archive really
-    /// does end in two zero blocks, whatever wrote it.
+    /// This says nothing on its own, and an earlier version of this module
+    /// wrongly argued that it did. A run of 1024 or more can come entirely
+    /// from an entry whose PAYLOAD ends in zeros, so "the stream ends in two
+    /// zero blocks" is not evidence that an end-of-archive marker is
+    /// present. [`TarRead::verify_end_of_archive`] uses this only as half of
+    /// its rule (a), where the question is narrower and answerable: at tar's
+    /// own stop position, is the last block it read a zero one?
     fn trailing_zeros(&self) -> u64 {
         self.trailing_zeros.load(Ordering::Relaxed)
     }
@@ -380,42 +413,86 @@ impl Drop for TarRead {
 }
 
 impl TarRead {
-    /// Checks the marker tar itself never looks at. See the module doc's
-    /// point 4.2 for the two rules and how each was calibrated against
-    /// `bsdtar` and Python's `tarfile`.
+    /// Checks the marker tar itself never looks at, at tar's OWN stop
+    /// position. See the module doc's truncation section, item 2, for the
+    /// reference measurements behind it.
+    ///
+    /// The position is what makes this work, and getting it wrong the first
+    /// time produced a false positive and a false negative from one cause.
+    /// `self.trailer` is read BEFORE anything else is, so it describes
+    /// exactly what tar consumed and nothing more.
+    ///
+    /// There is exactly ONE condition here, and it is worth saying why,
+    /// because the obvious second one is unfalsifiable. tar reaches
+    /// `Ok(None)` by only two routes (`archive.rs`'s `next_entry` loop):
+    /// having read one whole all-zero block, or having asked for a header
+    /// and got nothing, in which case `try_read_all` returns `false`
+    /// consuming NOTHING and the source is by definition exhausted. So
+    /// "a whole further block exists" already separates them — on the second
+    /// route there is nothing left to read — and a rule that also demanded
+    /// "the last block tar consumed was zeros" could never be the condition
+    /// that rejected anything. Mutation-checked: deleting that condition
+    /// left the whole suite green, which is this project's own definition of
+    /// a check that cannot fail. It survives below as the DIAGNOSIS, used
+    /// only to phrase the error, and the tests assert the phrasing.
     fn verify_end_of_archive(&self) -> Result<()> {
-        self.read_tail()?;
-        let delivered = self.trailer.delivered();
-        if !delivered.is_multiple_of(BLOCK as u64) {
-            return Err(Error::Corrupt(format!(
-                "tar stream is {delivered} bytes, not a whole number of {BLOCK}-byte \
-                 blocks; the archive is truncated"
-            )));
+        let consumed = self.trailer.delivered();
+        // Best-effort, and knowingly fooled by an entry whose payload ends
+        // in zeros — which is exactly why it decides only wording. `consumed`
+        // is always a whole number of blocks at this point (tar reads headers
+        // a block at a time and skips payloads by their padded length), so
+        // the alignment term is an invariant, not a test.
+        let stopped_on_a_zero_block =
+            consumed.is_multiple_of(BLOCK as u64) && self.trailer.trailing_zeros() >= BLOCK as u64;
+
+        // A whole SECOND block must exist. This is the detection: it proves
+        // tar stopped because it read a marker, not because the stream ran
+        // out, and it is what an all-zero payload tail cannot forge.
+        //
+        // Existence, not content — see the module doc: demanding zeros here
+        // would reject two shapes `bsdtar`, GNU `tar` and Python `tarfile`
+        // all accept, and reject them for archives whose every entry is
+        // intact.
+        let mut second = [0u8; BLOCK];
+        let present = self.read_block(&mut second)?;
+        if present < BLOCK {
+            return Err(Error::Corrupt(if stopped_on_a_zero_block {
+                format!(
+                    "tar stream ends {present} bytes into the second block of its \
+                     end-of-archive marker, after {consumed} bytes; a tar terminates with \
+                     two whole {BLOCK}-byte blocks, so the archive is truncated"
+                )
+            } else {
+                format!(
+                    "tar stream ran out after {consumed} bytes with no end-of-archive \
+                     marker; a tar terminates with two zero blocks, so the archive is \
+                     truncated"
+                )
+            }));
         }
-        if self.trailer.trailing_zeros() < 2 * BLOCK as u64 {
-            return Err(Error::Corrupt(format!(
-                "tar stream of {delivered} bytes does not end in the two zero blocks that \
-                 mark the end of an archive; it is truncated"
-            )));
-        }
+
+        // Whatever follows is ignored, exactly as every tar tool ignores it:
+        // padding to a blocking factor, a concatenated archive, or junk.
+        // Nothing beyond this point can change the answer, which is why
+        // there is no drain here.
         Ok(())
     }
 
-    /// Reads whatever follows the first zero block, which is where tar stops.
-    ///
-    /// Not the extra pass it looks like: this container reads rather than
-    /// seeks its way past every entry (see the module doc), so the whole
-    /// stream is read either way — this only covers the trailing padding.
-    fn read_tail(&self) -> Result<()> {
+    /// Fills `buf` from the source, returning how many bytes were actually
+    /// available. Short only at end of stream.
+    fn read_block(&self, buf: &mut [u8]) -> Result<usize> {
         let mut source = self.source.lock().expect("tar source mutex poisoned");
-        let mut buf = [0u8; 8 * 1024];
-        loop {
-            let n = source.read(&mut buf).map_err(classify_tar_error)?;
-            if n == 0 {
-                return Ok(());
+        let mut filled = 0;
+        while filled < buf.len() {
+            match source
+                .read(&mut buf[filled..])
+                .map_err(classify_tar_error)?
+            {
+                0 => break,
+                n => filled += n,
             }
-            self.trailer.record(&buf[..n]);
         }
+        Ok(filled)
     }
 }
 
@@ -494,6 +571,15 @@ struct EntryPayload<'a> {
 
 impl Read for EntryPayload<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // `Read`'s contract: an empty buffer reads nothing and is not an
+        // error. Without this the short-read guard below cannot tell "the
+        // stream ended" from "you gave me nowhere to put bytes" and reports
+        // an intact archive as truncated. `io::copy` and `read_to_end` never
+        // pass an empty slice, so nothing in this tree trips it — a caller
+        // draining into a full fixed buffer would.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let n = self.entry.read(buf)?;
         if n == 0 && self.remaining > 0 {
             // tar's own reader is a `Take` over the source, so a stream that
@@ -1026,12 +1112,29 @@ mod tests {
             "the fixture's layout is what pins the cuts"
         );
 
+        // The third column is the DIAGNOSIS the error must carry. It is the
+        // only thing that exercises `stopped_on_a_zero_block`, which is not
+        // a detection condition (see `verify_end_of_archive`): asserting
+        // exit 5 alone would leave it unfalsifiable, as a mutation check
+        // showed it was.
         let cases = [
-            (2048usize, "no marker at all"),
-            (2560, "a lone zero block"),
-            (3071, "a marker one byte short of complete"),
+            (
+                2048usize,
+                "no marker at all",
+                "with no end-of-archive marker",
+            ),
+            (
+                2560,
+                "a lone zero block",
+                "ends 0 bytes into the second block",
+            ),
+            (
+                3071,
+                "a marker one byte short of complete",
+                "ends 511 bytes into the second block",
+            ),
         ];
-        for (cut, what) in cases {
+        for (cut, what, diagnosis) in cases {
             let mut ar = open(&full[..cut]);
             // Both entries read back intact — the damage is entirely in the
             // trailer, so nothing before it may be affected.
@@ -1048,6 +1151,11 @@ mod tests {
                 .next_entry()
                 .expect_err(&format!("{what} was accepted as a complete archive"));
             assert_eq!(err.exit_code(), 5, "{what}: {err}");
+            assert!(
+                err.to_string().contains(diagnosis),
+                "{what}: the error must say which ending it was — expected it to mention \
+                 {diagnosis:?}, got {err}"
+            );
         }
 
         // The whole marker present is accepted, so the rules above cannot be
@@ -1058,6 +1166,133 @@ mod tests {
             .expect("a complete archive must read")
             .is_some()
         {}
+    }
+
+    /// The false negative the review reproduced: an entry whose PAYLOAD ends
+    /// in zeros, with the marker entirely removed, used to read back as
+    /// clean and complete. The old rule looked at the end of the whole
+    /// stream, where a 1024-byte zero run is a 1024-byte zero run whoever
+    /// wrote it; the rule now looks at tar's stop position, where the
+    /// question is whether tar READ a marker block, and a payload tail
+    /// cannot answer yes.
+    ///
+    /// Both zero-tail lengths matter. At 1024 the old `trailing_zeros >=
+    /// 1024` test was satisfied outright, which is the reproduction; at 512
+    /// it was not, so that row confirms the new rule does not merely move
+    /// the threshold.
+    #[test]
+    fn an_all_zero_payload_tail_does_not_pass_for_a_missing_marker() {
+        for zeros in [512usize, 1024, 2048] {
+            let mut payload = b"real data then a hole: ".to_vec();
+            payload.resize(payload.len() + zeros, 0);
+            let full = build_tar(&[("sparse-ish.bin", &payload)]);
+
+            // Everything except the 1024-byte marker.
+            let headless = &full[..full.len() - 1024];
+            assert!(
+                headless.len().is_multiple_of(512),
+                "zeros={zeros}: the fixture must be block-aligned for this to be the \
+                 case under test rather than a misalignment"
+            );
+
+            let mut ar = open(headless);
+            let mut entry = ar
+                .next_entry()
+                .expect("the entry itself is intact")
+                .unwrap();
+            let mut got = Vec::new();
+            entry
+                .reader()
+                .read_to_end(&mut got)
+                .expect("the payload is complete; only the marker is gone");
+            assert_eq!(got, payload, "zeros={zeros}");
+            drop(entry);
+
+            let err = ar.next_entry().expect_err(&format!(
+                "zeros={zeros}: an archive with no end-of-archive marker was accepted \
+                 because its payload happened to end in zeros"
+            ));
+            assert_eq!(err.exit_code(), 5, "zeros={zeros}: {err}");
+        }
+    }
+
+    /// The accept side of the end-of-archive rules, pinned so a future
+    /// tightening cannot quietly start rejecting input every reference tool
+    /// reads. Measured against `bsdtar` 3.5.3, GNU `tar` and Python
+    /// `tarfile`: all three accept every fixture below, and an earlier
+    /// version of this module rejected the first four with
+    /// "…not a whole number of 512-byte blocks; the archive is truncated" —
+    /// a claim of truncation about a stream LONGER than the archive.
+    #[test]
+    fn trailing_bytes_after_a_complete_marker_are_ignored() {
+        let complete = build_tar(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+
+        let cases: [(&str, Vec<u8>); 6] = [
+            ("nothing", vec![]),
+            ("one byte", b"\n".to_vec()),
+            ("20 bytes of junk", vec![b'X'; 20]),
+            ("a whole block of junk", vec![b'X'; 512]),
+            ("a partial block of junk", vec![b'X'; 200]),
+            (
+                "zero padding to a 10240-byte record",
+                vec![0u8; 10240 - complete.len()],
+            ),
+        ];
+
+        for (what, tail) in cases {
+            let mut bytes = complete.clone();
+            bytes.extend_from_slice(&tail);
+            let got = read_back(&bytes);
+            assert_eq!(
+                got.len(),
+                2,
+                "{what}: trailing bytes after a complete marker must be ignored, not \
+                 reported as damage"
+            );
+            assert_eq!(got[0].0, "a.txt", "{what}");
+            assert_eq!(got[1].0, "b.txt", "{what}");
+        }
+
+        // One zero block followed by a NON-zero block. All three reference
+        // tools accept this (GNU `tar` warns "A lone zero block"), and every
+        // entry in it is intact — which is why rule (b) asks whether a
+        // second block exists rather than whether it is zero.
+        let mut lone_then_junk = complete[..complete.len() - 1024].to_vec();
+        lone_then_junk.extend_from_slice(&[0u8; 512]);
+        lone_then_junk.extend_from_slice(&[b'X'; 512]);
+        let got = read_back(&lone_then_junk);
+        assert_eq!(
+            got.len(),
+            2,
+            "a non-zero second block must not be treated as damage: every reference tool \
+             reads this archive whole"
+        );
+    }
+
+    /// `Read`'s contract: an empty buffer reads nothing and is not an error.
+    /// The short-read guard cannot distinguish "the stream ended" from "you
+    /// gave me nowhere to put bytes" on its own, so an intact archive used
+    /// to report itself truncated to a caller draining into a full buffer.
+    /// `io::copy` and `read_to_end` never pass an empty slice, which is why
+    /// nothing else in this tree noticed.
+    #[test]
+    fn reading_an_entry_into_an_empty_buffer_is_not_an_error() {
+        let bytes = build_tar(&[("a.txt", b"alpha")]);
+        let mut ar = open(&bytes);
+        let mut entry = ar.next_entry().unwrap().unwrap();
+
+        assert_eq!(
+            entry
+                .reader()
+                .read(&mut [])
+                .expect("an empty buffer must not error"),
+            0
+        );
+
+        // …and the entry is undisturbed by it.
+        let mut got = Vec::new();
+        entry.reader().read_to_end(&mut got).unwrap();
+        assert_eq!(&got[..], b"alpha");
     }
 
     /// Concatenated tars — `cat a.tar b.tar`, which every reference tool

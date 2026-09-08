@@ -169,23 +169,21 @@ WHAT THIS BUILD CAN DO
       ever support. A pure build (the default) has twelve rows: the eleven
       codecs gzip, zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma
       and lzip, plus the tar container — the KIND column tells them apart.
-      zstd's
-      row differs by which backend compiled in: a build with the `zstd-c`
-      feature (needs a C toolchain) shows `yes` in WRITE, using the real
-      `libzstd`; a pure-Rust build falls back to `ruzstd` instead, and shows
-      `weak` in WRITE — see "USING A WEAK FALLBACK ENCODER" below. Either
-      way the format still reads `.zst` unconditionally; only writing it
-      without the C backend needs the flag. xz's and lzma's rows do NOT have
-      this shape: both backends show `yes` in WRITE, never `weak` —
+      zstd's row differs by which backend compiled in: a build with the
+      `zstd-c` feature (needs a C toolchain) shows `yes` in WRITE, using the
+      real `libzstd`; a pure-Rust build falls back to `ruzstd` instead, and
+      shows `weak` in WRITE — see "USING A WEAK FALLBACK ENCODER" below.
+      Either way the format still reads `.zst` unconditionally; only writing
+      it without the C backend needs the flag. xz's and lzma's rows do NOT
+      have this shape: both backends show `yes` in WRITE, never `weak` —
       `--features c-backed` swaps the pure-Rust `lzma-rust2` backend for the
-      real `liblzma`, which is faster (see "COMPRESSING A FILE" above) but
-      not more capable. lzip's row is unaffected by `c-backed` entirely — it
-      has only ever had the one, pure-Rust `lzma-rust2` backend, so this
-      feature changes nothing about it, in either direction. All three
-      tiers (`pure`, `pure` plus `c-backed`, and any granular combination)
-      list all twelve formats — the ONLY capability difference the
-      `c-backed` feature makes anywhere in this matrix is zstd's WRITE
-      column, `weak` against `yes`.
+      real `liblzma`, which is faster (see "COMPRESSING A FILE" above) but not
+      more capable. lzip's row is unaffected by `c-backed` entirely — it has
+      only ever had the one, pure-Rust `lzma-rust2` backend, so this feature
+      changes nothing about it, in either direction. All three tiers (`pure`,
+      `pure` plus `c-backed`, and any granular combination) list all twelve
+      formats — the ONLY capability difference the `c-backed` feature makes
+      anywhere in this matrix is zstd's WRITE column, `weak` against `yes`.
 
       The PARALLEL column is truthful per build too, and independent of
       the WRITE column above: on the default (`pure`) tier it reads `yes`
@@ -343,19 +341,18 @@ EXIT CODES
 NOT YET
 
   A pure build (the default) has eleven codecs and one container: gzip,
-  zlib, deflate, bzip2,
-  brotli, lz4, snappy, zstd, xz, lzma and lzip. zstd's pure backend
-  (`ruzstd`) is a weak fallback (see "USING A WEAK FALLBACK ENCODER" above);
-  xz's and lzma's pure backends are not — both read and write full-ratio
-  output with no C toolchain, just slower than `--features c-backed`'s
-  `liblzma` (roughly 1.2-1.3x to encode, 2-2.2x to decode, measured on a
-  6.5 MB payload). `--features c-backed` upgrades all three: zstd to the
-  real `libzstd`, and xz/lzma to `liblzma` for speed. lzip has no such
-  upgrade path at all — it has exactly one backend (the same pure-Rust
-  `lzma-rust2` xz and lzma use), so `--features c-backed` changes nothing
-  about it, and there is no weak-fallback distinction for it either. `tar`
-  is the one archive container so far: it reads and writes, and `.tar.gz`
-  and `.tgz` resolve as tar over gzip, which `stuffr info` shows as the
-  chain. zip, cpio and ar are still to come, as are the entry-aware
-  subcommands. `stuffr formats` always tells you the truth about the build
-  you are actually running, whatever this page says.
+  zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma and lzip, plus
+  tar. zstd's pure backend (`ruzstd`) is a weak fallback (see "USING A WEAK
+  FALLBACK ENCODER" above); xz's and lzma's pure backends are not — both
+  read and write full-ratio output with no C toolchain, just slower than
+  `--features c-backed`'s `liblzma` (roughly 1.2-1.3x to encode, 2-2.2x to
+  decode, measured on a 6.5 MB payload). `--features c-backed` upgrades all
+  three: zstd to the real `libzstd`, and xz/lzma to `liblzma` for speed.
+  lzip has no such upgrade path at all — it has exactly one backend (the
+  same pure-Rust `lzma-rust2` xz and lzma use), so `--features c-backed`
+  changes nothing about it, and there is no weak-fallback distinction for it
+  either. `tar` is the one archive container so far: it reads and writes,
+  and `.tar.gz` and `.tgz` resolve as tar over gzip, which `stuffr info`
+  shows as the chain. zip, cpio and ar are still to come, as are the
+  entry-aware subcommands. `stuffr formats` always tells you the truth about
+  the build you are actually running, whatever this page says.
