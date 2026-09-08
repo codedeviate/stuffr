@@ -193,6 +193,17 @@ LISTING AND TESTING AN ARCHIVE
       refusal, so "oh, that's not a tar, it's just gzip" is diagnosable
       without inspecting the file by hand.
 
+  stuffr list bomb.tar.gz --max-ratio 100
+  stuffr test bomb.tar.gz --max-ratio 100
+      `list` and `test` both resolve the codec layer beneath the container
+      (gzip, for `.tar.gz`/`.tgz`) before the container ever sees a byte, so
+      that layer is bounded the same way `unpack`/`cat` already bound a
+      bare codec stream: past this multiple of the compressed input, the
+      read is refused at exit 6, naming the ratio, the limit and the flag.
+      Defaults to 10000, same as `unpack`/`cat` — raise it if a legitimate
+      archive is this compressible; a bare `.tar` (no codec layer at all)
+      is never affected, since nothing there is expanding.
+
 
 WHAT THIS BUILD CAN DO
 

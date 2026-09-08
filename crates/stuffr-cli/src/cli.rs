@@ -135,10 +135,18 @@ pub enum Command {
         /// Emit machine-readable JSON instead of one entry per line.
         #[arg(long)]
         json: bool,
+        /// Refuse a codec layer beneath the container expanding by more
+        /// than this ratio (e.g. a `.tar.gz` bomb).
+        #[arg(long)]
+        max_ratio: Option<u64>,
     },
     /// Verify every entry's integrity without extracting.
     Test {
         /// Archive path, or `-` for stdin.
         input: String,
+        /// Refuse a codec layer beneath the container expanding by more
+        /// than this ratio (e.g. a `.tar.gz` bomb).
+        #[arg(long)]
+        max_ratio: Option<u64>,
     },
 }

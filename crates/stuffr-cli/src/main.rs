@@ -304,9 +304,20 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             Ok(())
         }
         Command::Formats => print_formats(),
-        Command::List { input, json } => print_list(input_of(&input), json),
-        Command::Test { input } => {
-            let out = entries::test(input_of(&input))?;
+        Command::List {
+            input,
+            json,
+            max_ratio,
+        } => print_list(
+            input_of(&input),
+            json,
+            max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+        ),
+        Command::Test { input, max_ratio } => {
+            let out = entries::test(
+                input_of(&input),
+                max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+            )?;
             eprintln!(
                 "{} -> {} bytes verified ({} fidelity)",
                 out.format, out.bytes_out, out.fidelity.rung
@@ -333,9 +344,9 @@ fn entry_kind_str(kind: &stuffr::EntryKind) -> &'static str {
 /// `?` rather than `println!`, matching `print_formats`/`Info` above — the
 /// same reason: `println!` panics on a write error, which would defeat
 /// `run`'s `BrokenPipe`-to-success mapping for `stuffr list big.tar | head`.
-fn print_list(src: Input, json: bool) -> stuffr::Result<()> {
+fn print_list(src: Input, json: bool, max_ratio: u64) -> stuffr::Result<()> {
     use std::io::Write;
-    let entries = entries::list(src)?;
+    let entries = entries::list(src, max_ratio)?;
     let mut out = std::io::stdout();
     if json {
         let rows: Vec<serde_json::Value> = entries

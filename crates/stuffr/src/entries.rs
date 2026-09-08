@@ -1,8 +1,10 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use stuffr_core::{
-    ArchiveRead, Chain, EntryMeta, Error, FormatId, OpenOpts, RATIO_FLOOR, Registry, Result,
-    StreamPolicy, ladder, resolve_chain_deep,
+    ArchiveRead, Chain, Counting, EntryMeta, Error, FormatId, OpenOpts, RATIO_FLOOR, RatioGuard,
+    Registry, Result, SeekRead, Source, SourceCaps, StreamPolicy, ladder, resolve_chain_deep,
 };
 
 use crate::ops::{Input, Outcome};
@@ -86,14 +88,83 @@ impl ArchiveBudget {
     }
 }
 
-/// Opens `src`, resolving any codec layers above the container.
+/// Bounds the codec layer beneath a container the same way `ops::decompress`
+/// bounds a plain codec stream — `Counting` (wrapped around the raw input in
+/// [`open_archive`]) tallies compressed bytes going in, and this wraps the
+/// DECODED stream the container reads from, calling [`RatioGuard::record`]
+/// on every read. A small `bomb.tar.gz` is refused before the container
+/// (which has no ratio concept of its own — it just sees a byte stream) ever
+/// absorbs its output.
+///
+/// `caps()` and `as_seek()` are forwarded to `inner` unchanged, exactly like
+/// `Counting` — so an uncompressed, seekable `.tar` keeps `Rung::Exact`
+/// rather than being downgraded merely for passing through this wrapper.
+/// The cost: a caller that reaches `inner` through `as_seek()` bypasses this
+/// guard's `record()` check entirely. Accepted today because `tar` — the
+/// only registered container — never seeks its source; see `tar.rs`'s own
+/// module doc on why it always uses `entries()`, never `entries_with_seek()`.
+/// A future seekable container must not rely on this wrapper alone to bound
+/// it.
+struct RatioGuardedSource {
+    inner: Box<dyn Source>,
+    guard: RatioGuard,
+}
+
+impl RatioGuardedSource {
+    fn new(inner: Box<dyn Source>, consumed: Arc<AtomicU64>, max_ratio: u64) -> Self {
+        Self {
+            inner,
+            guard: RatioGuard::new(consumed, max_ratio),
+        }
+    }
+}
+
+impl std::io::Read for RatioGuardedSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        // `OutOfMemory` is the kind `Error::from_decode_io` maps to
+        // `Error::ResourceLimit` (exit 6), never `Corrupt` (exit 5) — the
+        // same convention `lzma_pure.rs` uses to surface a memory-limit
+        // refusal through a plain `io::Read`, reused here for a ratio
+        // refusal. `RatioGuard::record`'s own message (naming the ratio,
+        // the limit and `--max-ratio`) survives the round trip verbatim.
+        if let Err(Error::ResourceLimit(msg)) = self.guard.record(n) {
+            return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, msg));
+        }
+        Ok(n)
+    }
+}
+
+impl Source for RatioGuardedSource {
+    fn caps(&self) -> SourceCaps {
+        self.inner.caps()
+    }
+
+    fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
+        self.inner.as_seek()
+    }
+}
+
+/// Opens `src`, resolving any codec layers above the container and bounding
+/// them with `--max-ratio` — see [`RatioGuardedSource`].
 ///
 /// Shared by [`list`] and [`test`] so the two cannot drift on how they
 /// resolve a chain — the defect shape where a container flag is accepted but
 /// not honoured on one of two near-identical code paths.
-fn open_archive(registry: &Registry, src: Input) -> Result<(Box<dyn ArchiveRead>, FormatId)> {
+fn open_archive(
+    registry: &Registry,
+    src: Input,
+    max_ratio: u64,
+) -> Result<(Box<dyn ArchiveRead>, FormatId)> {
     let path = src.path().map(Path::to_path_buf);
-    let (chain, source) = resolve_chain_deep(registry, path.as_deref(), src.open()?)?;
+    // `Counting` wraps the RAW input, tallying compressed bytes as
+    // `resolve_chain_deep`'s own internal decode reads them — the same
+    // `Counting`/`RatioGuard` pair `ops::decompress` uses, just relocated:
+    // there the copy loop calls `record` explicitly, here `record` is called
+    // for whoever reads the returned source later, since a container pulls
+    // its own bytes rather than being driven by an explicit loop here.
+    let (counting, consumed) = Counting::new(src.open()?);
+    let (chain, source) = resolve_chain_deep(registry, path.as_deref(), Box::new(counting))?;
     // Kept for the error path: once the loop below has peeled layers, the
     // original chain is the only thing that can say what the input actually
     // was.
@@ -105,6 +176,11 @@ fn open_archive(registry: &Registry, src: Input) -> Result<(Box<dyn ArchiveRead>
     // would decode the same bytes twice, and would do so only on the pipe
     // path, making it a bug that appears exclusively when piping. Walk the
     // chain only to find which container to hand the source to.
+    //
+    // Wrapping unconditionally (even with zero codec layers, a bare `.tar`)
+    // is harmless: `consumed` and the guard's `produced` then advance in
+    // lockstep — see the module's own test for this.
+    let source: Box<dyn Source> = Box::new(RatioGuardedSource::new(source, consumed, max_ratio));
     let mut chain = &chain;
     loop {
         match chain {
@@ -136,8 +212,8 @@ fn open_archive(registry: &Registry, src: Input) -> Result<(Box<dyn ArchiveRead>
 }
 
 /// Lists every entry in an archive, extracting nothing.
-pub fn list(src: Input) -> Result<Vec<EntryMeta>> {
-    let (mut ar, _format) = open_archive(crate::registry(), src)?;
+pub fn list(src: Input, max_ratio: u64) -> Result<Vec<EntryMeta>> {
+    let (mut ar, _format) = open_archive(crate::registry(), src, max_ratio)?;
     let mut out = Vec::new();
     while let Some(entry) = ar.next_entry()? {
         out.push(entry.meta().clone());
@@ -150,8 +226,8 @@ pub fn list(src: Input) -> Result<Vec<EntryMeta>> {
 /// The data must actually be pulled: a `test` that only walked headers would
 /// pass on an archive whose payloads are corrupt, which is precisely the
 /// failure it exists to find.
-pub fn test(src: Input) -> Result<Outcome> {
-    let (mut ar, format) = open_archive(crate::registry(), src)?;
+pub fn test(src: Input, max_ratio: u64) -> Result<Outcome> {
+    let (mut ar, format) = open_archive(crate::registry(), src, max_ratio)?;
     let mut bytes = 0u64;
     while let Some(mut entry) = ar.next_entry()? {
         // `Error::from_decode_io`, not a bare `?`: a container's own
@@ -179,7 +255,69 @@ pub fn test(src: Input) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stuffr_core::DEFAULT_MAX_RATIO;
+    use stuffr_core::{DEFAULT_MAX_RATIO, ReaderSource};
+
+    #[test]
+    fn ratio_guarded_source_forwards_bytes_unchanged() {
+        let (counting, consumed) = Counting::new(Box::new(ReaderSource::new(
+            std::io::Cursor::new(b"0123456789".to_vec()),
+        )));
+        let mut guarded = RatioGuardedSource::new(Box::new(counting), consumed, DEFAULT_MAX_RATIO);
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut guarded, &mut out).unwrap();
+        assert_eq!(out, b"0123456789");
+    }
+
+    #[test]
+    fn ratio_guarded_source_forwards_capabilities_from_its_inner_source() {
+        // An uncompressed, seekable `.tar` must not be downgraded to
+        // forward-only merely for passing through this wrapper.
+        let (counting, consumed) = Counting::new(Box::new(ReaderSource::new(
+            std::io::Cursor::new(b"x".to_vec()),
+        )));
+        let guarded = RatioGuardedSource::new(Box::new(counting), consumed, DEFAULT_MAX_RATIO);
+        // `ReaderSource` models a pipe (not seekable); `Counting` and this
+        // wrapper both forward that unchanged rather than hardcoding either
+        // answer — this is the same property `Counting` itself is tested for.
+        assert!(!guarded.caps().seekable);
+    }
+
+    #[test]
+    fn ratio_guarded_source_refuses_pathological_expansion_as_a_resource_limit_not_corrupt() {
+        // Exercises the exact composition `open_archive` builds: `consumed`
+        // stays tiny while reads keep flowing, well past `RATIO_FLOOR`.
+        let consumed = Arc::new(AtomicU64::new(1));
+        let big = vec![b'x'; RATIO_FLOOR as usize + 1];
+        let mut guarded = RatioGuardedSource {
+            inner: Box::new(ReaderSource::new(std::io::Cursor::new(big))),
+            guard: RatioGuard::new(consumed, 10),
+        };
+        let mut buf = vec![0u8; RATIO_FLOOR as usize + 1];
+        let err = std::io::Read::read(&mut guarded, &mut buf).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::OutOfMemory,
+            "must be the kind Error::from_decode_io maps to ResourceLimit, not InvalidData"
+        );
+        let classified = Error::from_decode_io(err);
+        assert!(matches!(classified, Error::ResourceLimit(_)));
+        assert_eq!(classified.exit_code(), 6, "a bomb must exit 6, not 1 or 5");
+    }
+
+    #[test]
+    fn ratio_guarded_source_leaves_a_one_to_one_stream_unbounded() {
+        // Models the bare, uncompressed `.tar` case: every byte the guard
+        // sees was ALSO just tallied into `consumed` (no codec layer sits
+        // between them), so the ratio never exceeds ~1:1 regardless of how
+        // low `max_ratio` is set.
+        let (counting, consumed) = Counting::new(Box::new(ReaderSource::new(
+            std::io::Cursor::new(vec![b'x'; 4 * 1024 * 1024]),
+        )));
+        let mut guarded = RatioGuardedSource::new(Box::new(counting), consumed, 1);
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut guarded, &mut out).unwrap();
+        assert_eq!(out.len(), 4 * 1024 * 1024);
+    }
 
     #[test]
     fn one_absurdly_expanding_entry_is_refused_and_names_itself() {
