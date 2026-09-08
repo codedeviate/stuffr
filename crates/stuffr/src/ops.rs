@@ -701,8 +701,16 @@ impl Default for DecompressOpts {
 fn codec_for(reg: &Registry, path: Option<&Path>, prefix: &[u8]) -> Result<FormatId> {
     match stuffr_core::resolve_chain(reg, path, prefix)? {
         Chain::Codec { codec, .. } => Ok(codec),
-        Chain::Container { container } => Err(Error::Unsupported(format!(
-            "`{container}` is a container; this build has codecs only (containers arrive in Phase 2)"
+        // Not "containers arrive in Phase 2" any more — they are here, and
+        // this arm is now reached only by a caller that asked for a
+        // single-stream decode of something that turned out to hold entries.
+        // Name the flag that does what they meant: `Error::Usage` (exit 2),
+        // the same code `NotAnArchive` gives for pointing `list` at a bare
+        // codec stream — the identical mistake in the other direction.
+        Chain::Container { container } => Err(Error::Usage(format!(
+            "`{container}` is a container, not a codec: pass -C DIR to extract its \
+             entries into a directory, or name an entry to stream (`stuffr cat FILE \
+             ENTRY`). `stuffr list` and `stuffr test` read it without extracting."
         ))),
         Chain::Raw => Err(Error::UnknownFormat {
             seen: "no codec layer".into(),

@@ -1673,3 +1673,868 @@ fn a_legitimately_compressible_tar_gz_is_not_refused_at_the_default_ratio() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------
+// Entry-aware pack/unpack/cat.
+//
+// The hostile fixtures below are written with the RAW `tar` crate, bypassing
+// `Header::set_path` (which refuses `..` and absolute names outright), so
+// they carry names stuffr itself would never produce. That is the point:
+// containment has to refuse an archive somebody else wrote.
+// ---------------------------------------------------------------------
+
+/// A tar entry whose name is written straight into the 100-byte header field,
+/// bypassing every validation `Builder::append_data`/`Header::set_path` would
+/// apply. `write_fixture_tar` cannot express these names at all.
+fn raw_header(name: &str, kind: tar::EntryType, link_target: Option<&str>, size: u64) -> Header {
+    let mut header = Header::new_gnu();
+    header.set_size(size);
+    header.set_mode(0o644);
+    header.set_entry_type(kind);
+    {
+        let gnu = header.as_gnu_mut().expect("new_gnu is a GNU header");
+        let bytes = name.as_bytes();
+        assert!(
+            bytes.len() <= gnu.name.len(),
+            "raw fixture names must fit tar's 100-byte name field"
+        );
+        gnu.name[..bytes.len()].copy_from_slice(bytes);
+        if let Some(target) = link_target {
+            let bytes = target.as_bytes();
+            assert!(
+                bytes.len() <= gnu.linkname.len(),
+                "raw fixture link targets must fit tar's 100-byte linkname field"
+            );
+            gnu.linkname[..bytes.len()].copy_from_slice(bytes);
+        }
+    }
+    header.set_cksum();
+    header
+}
+
+/// One raw entry, described the way the hostile fixtures below need it.
+enum Raw<'a> {
+    File(&'a str, &'a [u8]),
+    Dir(&'a str),
+    Symlink(&'a str, &'a str),
+}
+
+/// Writes an archive whose entry names have passed through no validation at
+/// all — the shape stuffr must be able to refuse.
+fn write_raw_tar(path: &Path, entries: &[Raw<'_>]) -> PathBuf {
+    let mut builder = Builder::new(std::fs::File::create(path).unwrap());
+    for entry in entries {
+        match entry {
+            Raw::File(name, data) => {
+                let header = raw_header(name, tar::EntryType::Regular, None, data.len() as u64);
+                builder.append(&header, *data).unwrap();
+            }
+            Raw::Dir(name) => {
+                let header = raw_header(name, tar::EntryType::Directory, None, 0);
+                builder.append(&header, std::io::empty()).unwrap();
+            }
+            Raw::Symlink(name, target) => {
+                let header = raw_header(name, tar::EntryType::Symlink, Some(target), 0);
+                builder.append(&header, std::io::empty()).unwrap();
+            }
+        }
+    }
+    builder.finish().unwrap();
+    path.to_path_buf()
+}
+
+#[test]
+fn a_traversing_entry_is_refused_and_writes_nothing_outside_the_destination() {
+    let dir = tmp_dir();
+    let evil = dir.join("evil.tar");
+    // Written with the raw `tar` crate, NOT through stuffr — stuffr must be
+    // able to refuse archives it would never itself produce.
+    write_raw_tar(&evil, &[Raw::File("../escaped.txt", b"pwned")]);
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "a traversing entry must be refused as an unsafe path (exit 7), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("escaped.txt").exists(),
+        "the file escaped the destination"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("../escaped.txt"),
+        "the refusal must name the offending entry, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_absolute_entry_path_is_refused() {
+    let dir = tmp_dir();
+    let evil = dir.join("abs.tar");
+    // PID-qualified: a shared, fixed /tmp name left behind by one failing run
+    // would make every later run fail for the wrong reason.
+    let escape = std::env::temp_dir().join(format!("stuffr-abs-escape-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&escape);
+    write_raw_tar(&evil, &[Raw::File(escape.to_str().unwrap(), b"pwned")]);
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "an absolute entry name must be refused as an unsafe path (exit 7), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !escape.exists(),
+        "an absolute entry name wrote outside the destination: {}",
+        escape.display()
+    );
+}
+
+#[test]
+fn cat_streams_one_named_entry_from_a_pipe() {
+    let bytes = std::fs::read(write_fixture_tar(
+        &tmp_dir(),
+        &[("a.txt", b"alpha"), ("b.txt", b"beta")],
+    ))
+    .unwrap();
+    assert_eq!(run_with_stdin(&["cat", "-", "b.txt"], &bytes), "beta");
+}
+
+#[test]
+fn pack_collects_several_paths_into_one_archive() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("one.txt"), b"1").unwrap();
+    std::fs::write(dir.join("two.txt"), b"2").unwrap();
+    let out = dir.join("bundle.tar");
+    let packed = run_output(&[
+        "pack",
+        dir.join("one.txt").to_str().unwrap(),
+        dir.join("two.txt").to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+    ]);
+    assert!(
+        packed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let listed = String::from_utf8(run_output(&["list", out.to_str().unwrap()]).stdout).unwrap();
+    assert!(
+        listed.contains("one.txt") && listed.contains("two.txt"),
+        "both entries must be listed, got: {listed}"
+    );
+    // Stored under their basenames, not the absolute paths they came from:
+    // stuffr must not write an archive it would itself refuse at exit 7.
+    assert!(
+        !listed.contains(dir.to_str().unwrap()),
+        "absolute paths must not be stored as entry names, got: {listed}"
+    );
+}
+
+// --- Hostile cases beyond the brief ---------------------------------------
+
+#[test]
+fn a_symlink_whose_target_escapes_the_destination_is_refused_before_it_is_created() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let evil = write_raw_tar(
+        &dir.join("link.tar"),
+        &[Raw::Symlink("link", "../../etc/passwd")],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "an escaping symlink target must be refused (exit 7), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(dest.join("link")).is_err(),
+        "the symlink must not have been created at all"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("../../etc/passwd"),
+        "the refusal must name the offending target, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_entry_written_through_an_escaping_symlink_lands_nowhere() {
+    // The two-entry attack: entry 1's own PATH is perfectly contained, so
+    // only its TARGET can refuse it; entry 2 is then an ordinary contained
+    // name that the OS would resolve THROUGH the link. The link points at
+    // this test's own directory (outside the destination) so the escape has
+    // a checkable artifact rather than needing to inspect /etc.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let evil = write_raw_tar(
+        &dir.join("through.tar"),
+        &[
+            Raw::Symlink("evil", dir.to_str().unwrap()),
+            Raw::File("evil/pwned.txt", b"pwned"),
+        ],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "an absolute symlink target must be refused (exit 7), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("pwned.txt").exists(),
+        "the second entry was written through the symlink, outside the destination"
+    );
+    assert!(
+        std::fs::symlink_metadata(dest.join("evil")).is_err(),
+        "the symlink must not have been created"
+    );
+}
+
+#[test]
+fn a_symlink_chain_cannot_walk_out_of_the_destination() {
+    // Neither link's own path escapes, and neither target is absolute: the
+    // escape only exists once the two are followed together. `b`'s target is
+    // refused on its own terms, which is what keeps the chain from ever
+    // being walkable.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let evil = write_raw_tar(
+        &dir.join("chain.tar"),
+        &[
+            Raw::Symlink("a", "b"),
+            Raw::Symlink("b", "../.."),
+            Raw::File("a/pwned.txt", b"pwned"),
+        ],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "a chained symlink escape must be refused (exit 7), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("pwned.txt").exists() && !dir.parent().unwrap().join("pwned.txt").exists(),
+        "the chain wrote outside the destination"
+    );
+}
+
+#[test]
+fn a_traversal_buried_inside_a_deeper_path_is_refused() {
+    // `a/b/../../../escaped.txt` nets one level above the destination, but
+    // only after two real components have been pushed — the shape a
+    // "does the name start with ..?" check would wave straight through.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let evil = write_raw_tar(
+        &dir.join("deep.tar"),
+        &[Raw::File("a/b/../../../escaped.txt", b"pwned")],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "a buried traversal must be refused (exit 7), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("escaped.txt").exists(),
+        "the buried traversal escaped the destination"
+    );
+}
+
+#[test]
+fn a_directory_entry_that_escapes_the_destination_is_refused() {
+    // A directory entry creates a path without writing a byte of payload, so
+    // a containment check placed on the file-writing branch alone would miss
+    // it entirely.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let evil = write_raw_tar(&dir.join("dir.tar"), &[Raw::Dir("../escaped-dir/")]);
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "an escaping directory entry must be refused (exit 7), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("escaped-dir").exists(),
+        "the directory escaped the destination"
+    );
+}
+
+// --- Legitimate archives must still extract ------------------------------
+
+#[test]
+fn an_entry_named_dot_extracts_alongside_the_real_entries() {
+    // `.` names the destination itself and is accepted, not refused: this is
+    // the first entry `tar cf x.tar .` emits, and refusing it would turn a
+    // security refusal loose on the most common tarball there is.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_raw_tar(
+        &dir.join("dot.tar"),
+        &[Raw::Dir("./"), Raw::File("./a.txt", b"alpha")],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "a `./` entry must be accepted, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+}
+
+/// The `tar cf x.tar .` idiom, built by the SYSTEM tar rather than by the
+/// `tar` crate, extracted with stuffr and compared byte for byte. Three
+/// safety checks in this phase have each threatened to fire on benign input;
+/// this is the one that proves the containment check does not.
+#[test]
+fn a_system_tar_of_dot_extracts_cleanly() {
+    let Some(tar_bin) = which_tar() else {
+        eprintln!("system tar not found; skipping");
+        return;
+    };
+    let dir = tmp_dir();
+    let src = dir.join("src");
+    std::fs::create_dir_all(src.join("nested")).unwrap();
+    std::fs::write(src.join("top.txt"), b"top level").unwrap();
+    std::fs::write(src.join("nested/deep.txt"), b"nested payload").unwrap();
+
+    let archive = dir.join("dot.tar");
+    let status = Command::new(&tar_bin)
+        .arg("cf")
+        .arg(&archive)
+        .arg(".")
+        .current_dir(&src)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "the system tar failed to build the fixture"
+    );
+
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "`tar cf x.tar .` must extract cleanly, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(dest.join("top.txt")).unwrap(), b"top level");
+    assert_eq!(
+        std::fs::read(dest.join("nested/deep.txt")).unwrap(),
+        b"nested payload"
+    );
+}
+
+/// `tar.rs`'s own tests gate on the system tool the same way rather than
+/// failing a machine that has none.
+fn which_tar() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("tar"))
+        .find(|candidate| candidate.is_file())
+}
+
+// Symlink creation is unix-only, the way `ops_compress.rs` gates its own
+// symlink tests.
+#[cfg(unix)]
+#[test]
+fn extraction_writes_files_directories_and_contained_symlinks() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_raw_tar(
+        &dir.join("good.tar"),
+        &[
+            Raw::Dir("sub/"),
+            Raw::File("sub/a.txt", b"alpha"),
+            Raw::Symlink("sub/link", "a.txt"),
+        ],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dest.join("sub").is_dir());
+    assert_eq!(std::fs::read(dest.join("sub/a.txt")).unwrap(), b"alpha");
+    let link = std::fs::symlink_metadata(dest.join("sub/link")).unwrap();
+    assert!(
+        link.file_type().is_symlink(),
+        "a symlink entry must become a symlink"
+    );
+    assert_eq!(
+        std::fs::read_link(dest.join("sub/link")).unwrap(),
+        Path::new("a.txt")
+    );
+    // Following it stays inside the destination, which is why it was allowed.
+    assert_eq!(std::fs::read(dest.join("sub/link")).unwrap(), b"alpha");
+}
+
+#[test]
+fn extraction_selects_only_the_entries_a_pattern_names() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_fixture_tar(
+        &dir,
+        &[
+            ("a.txt", b"alpha"),
+            ("b.txt", b"beta"),
+            ("d/c.txt", b"gamma"),
+        ],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "b.txt",
+        "d",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dest.join("a.txt").exists(),
+        "an unmatched entry was extracted"
+    );
+    assert_eq!(std::fs::read(dest.join("b.txt")).unwrap(), b"beta");
+    // A pattern naming a directory selects everything beneath it.
+    assert_eq!(std::fs::read(dest.join("d/c.txt")).unwrap(), b"gamma");
+}
+
+#[test]
+fn a_pattern_matching_no_entry_is_a_usage_error_rather_than_a_silent_success() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dir.join("out").to_str().unwrap(),
+        "nosuch.txt",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "extracting nothing at all must not report success, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run_output(&["cat", archive.to_str().unwrap(), "nosuch.txt"]);
+    assert_eq!(out.status.code(), Some(2), "cat must agree with unpack");
+}
+
+#[test]
+fn extraction_refuses_an_existing_file_unless_force_is_given() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("a.txt"), b"mine").unwrap();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an existing file must be refused like every other output, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"mine");
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--force",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+}
+
+// Symlink creation is unix-only, the way `ops_compress.rs` gates its own
+// symlink tests.
+#[cfg(unix)]
+#[test]
+fn a_pre_existing_symlink_at_a_target_path_is_replaced_not_written_through() {
+    // `File::create` follows a symlink. Somebody who can plant
+    // `dest/a.txt -> outside` before extraction would otherwise redirect the
+    // entry's bytes there; --force removes what is in the way rather than
+    // writing through it.
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    let outside = dir.join("outside.txt");
+    std::fs::write(&outside, b"untouched").unwrap();
+    std::os::unix::fs::symlink(&outside, dest.join("a.txt")).unwrap();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--force",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"untouched",
+        "the entry was written through the pre-existing symlink"
+    );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+}
+
+#[test]
+fn extraction_of_a_corrupt_archive_exits_five_not_seven() {
+    // Corrupt, hostile and oversized must stay three distinguishable
+    // answers: a script branches on which one it got.
+    let dir = tmp_dir();
+    let good = write_fixture_tar(&dir, &[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+    let corrupt = corrupt_midway(&good);
+    let out = run_output(&[
+        "unpack",
+        corrupt.to_str().unwrap(),
+        "-C",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "a corrupt archive is exit 5, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn extraction_of_a_bomb_exits_six_at_a_tight_max_ratio() {
+    let dir = tmp_dir();
+    let bomb = write_bomb_tar_gz(&dir);
+    let out = run_output(&[
+        "unpack",
+        bomb.to_str().unwrap(),
+        "-C",
+        dir.join("out").to_str().unwrap(),
+        "--max-ratio",
+        "2",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "a bomb is a resource limit (exit 6), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn cat_streams_every_entry_a_pattern_names_and_bounds_the_ratio() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+    let out = run_output(&["cat", archive.to_str().unwrap(), "a.txt"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "alpha");
+
+    let bomb = write_bomb_tar_gz(&dir);
+    let out = run_output(&[
+        "cat",
+        bomb.to_str().unwrap(),
+        "bomb.bin",
+        "--max-ratio",
+        "2",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "cat must bound an entry the same way extraction does, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn an_archive_needs_a_destination_and_the_error_says_which_flag() {
+    // `unpack backup.tar` with no -C used to reach the single-stream decoder
+    // and report "containers arrive in Phase 2". It now names the flag that
+    // does what the user meant.
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+    let out = run_output(&["unpack", archive.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("-C") && stderr.contains("tar"),
+        "the error must name both the container and the flag, got: {stderr}"
+    );
+    assert!(
+        !dir.join("fixture").exists(),
+        "nothing may be written for a refused command"
+    );
+}
+
+#[test]
+fn pack_refuses_several_paths_when_the_output_is_not_a_container() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("one.txt"), b"1").unwrap();
+    std::fs::write(dir.join("two.txt"), b"2").unwrap();
+    let out = run_output(&[
+        "pack",
+        dir.join("one.txt").to_str().unwrap(),
+        dir.join("two.txt").to_str().unwrap(),
+        "-o",
+        dir.join("bundle.gz").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "a codec cannot hold two inputs, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("bundle.gz").exists(),
+        "a refused command must write nothing"
+    );
+}
+
+#[test]
+fn pack_into_a_container_round_trips_through_extraction() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("one.txt"), b"first").unwrap();
+    std::fs::write(dir.join("two.txt"), b"second").unwrap();
+    let archive = dir.join("bundle.tar");
+    let out = run_output(&[
+        "pack",
+        dir.join("one.txt").to_str().unwrap(),
+        dir.join("two.txt").to_str().unwrap(),
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(dest.join("one.txt")).unwrap(), b"first");
+    assert_eq!(std::fs::read(dest.join("two.txt")).unwrap(), b"second");
+}
+
+#[test]
+fn pack_refuses_two_inputs_that_would_share_one_entry_name() {
+    let dir = tmp_dir();
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::write(dir.join("a/same.txt"), b"1").unwrap();
+    std::fs::write(dir.join("b/same.txt"), b"2").unwrap();
+    let archive = dir.join("dup.tar");
+    let out = run_output(&[
+        "pack",
+        dir.join("a/same.txt").to_str().unwrap(),
+        dir.join("b/same.txt").to_str().unwrap(),
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "two entries with one name would make an archive that cannot be \
+         extracted without --force, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!archive.exists(), "a refused command must write nothing");
+}
+
+#[test]
+fn pack_of_a_directory_says_so_rather_than_writing_an_empty_archive() {
+    let dir = tmp_dir();
+    std::fs::create_dir_all(dir.join("tree")).unwrap();
+    let archive = dir.join("tree.tar");
+    let out = run_output(&[
+        "pack",
+        dir.join("tree").to_str().unwrap(),
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!archive.exists(), "a refused command must write nothing");
+}
+
+#[test]
+fn flags_that_the_container_path_cannot_honour_are_refused_not_ignored() {
+    // The tree's rule (see `threads_is_not_offered_on_decode_subcommands`):
+    // a flag that would be silently ignored is refused instead.
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+    let dest = dir.join("out");
+    for extra in [
+        vec!["--format", "gzip"],
+        vec!["--memory-limit", "64M"],
+        vec!["-o", "somewhere"],
+    ] {
+        let mut args = vec![
+            "unpack",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ];
+        args.extend_from_slice(&extra);
+        let out = run_output(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{}` must be refused alongside -C, stderr: {}",
+            extra.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The gap the two lexical checks cannot see on their own, demonstrated
+/// outside stuffr first (a shell reproduction is in the task report): every
+/// step below is contained COMPONENT-WISE from the destination, and the OS
+/// still resolves the last one outside it.
+///
+/// * `a/b/up -> ..` is contained: it resolves to `<dest>/a`.
+/// * `a/b/up/link -> ../..` resolves, component-wise from `<dest>`, to `a`
+///   — inside. Resolved by the OS through `up`, whose real parent is
+///   `<dest>/a`, it lands on `<dest>/..`: the directory holding `<dest>`.
+/// * `a/b/up/link/pwned.txt` is then an ordinary contained name written
+///   straight through it.
+///
+/// So an entry whose PATH COMPONENTS include an existing symlink is refused
+/// outright — the same defence libarchive's SECURE_SYMLINKS provides, and it
+/// closes the pre-existing-hostile-symlink case in the destination too.
+#[cfg(unix)]
+#[test]
+fn an_entry_written_through_a_symlinked_path_component_is_refused() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let evil = write_raw_tar(
+        &dir.join("component.tar"),
+        &[
+            Raw::Dir("a/b/"),
+            Raw::Symlink("a/b/up", ".."),
+            Raw::Symlink("a/b/up/link", "../.."),
+            Raw::File("a/b/up/link/pwned.txt", b"pwned"),
+        ],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "an entry resolving through a symlinked component must be refused (exit 7), \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !dir.join("pwned.txt").exists(),
+        "the entry escaped the destination through a symlinked path component"
+    );
+}

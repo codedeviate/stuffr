@@ -1,11 +1,11 @@
 //! The `stuffr` command.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 use stuffr::FormatId;
-use stuffr::entries;
+use stuffr::entries::{self, ExtractOpts};
 use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output};
 use stuffr_cli::cli::{Cli, Command};
 
@@ -129,7 +129,7 @@ fn parse_memory_limit(raw: Option<String>) -> stuffr::Result<Option<u64>> {
 fn dispatch(command: Command) -> stuffr::Result<()> {
     match command {
         Command::Pack {
-            input,
+            paths,
             output,
             format,
             level,
@@ -158,6 +158,45 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 turbo,
                 memory_limit,
             };
+
+            // A container output collects every path into one archive; a
+            // codec output compresses exactly one stream.
+            if let Some(container) = container_output(fmt, output.as_deref()) {
+                let inputs = pack_inputs(&paths)?;
+                let dst = match output {
+                    Some(o) => output_of(&o),
+                    // One path can still name its own archive
+                    // (`notes.txt` + `--format tar` -> `notes.txt.tar`);
+                    // several have no single name to derive from.
+                    None if inputs.len() == 1 => {
+                        Output::Path(ops::suggest_packed(&inputs[0], container)?)
+                    }
+                    None => {
+                        return Err(stuffr::Error::Usage(
+                            "collecting several paths into an archive needs an explicit                              -o NAME.tar"
+                                .into(),
+                        ));
+                    }
+                };
+                let out = entries::create_archive(&inputs, dst, container, &opts)?;
+                eprintln!(
+                    "{} entries -> {} ({} -> {} bytes, {} fidelity)",
+                    inputs.len(),
+                    out.format,
+                    out.bytes_in,
+                    out.bytes_out,
+                    out.fidelity.rung
+                );
+                return Ok(());
+            }
+
+            if paths.len() > 1 {
+                return Err(stuffr::Error::Usage(format!(
+                    "packing {} paths needs an output naming a container (`-o bundle.tar`,                      or --format tar); a codec compresses one stream and has nowhere to                      put a second. A container inside a codec (`bundle.tar.gz`) cannot be                      written in one step yet: pack the .tar, then pack that.",
+                    paths.len()
+                )));
+            }
+            let input = paths.into_iter().next().expect("clap requires one path");
             let dst = match output {
                 Some(o) => output_of(&o),
                 None => {
@@ -185,6 +224,8 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
         }
         Command::Unpack {
             input,
+            patterns,
+            directory,
             output,
             force,
             format,
@@ -192,6 +233,30 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             no_sync,
             memory_limit,
         } => {
+            // -C is what asks for entry-aware extraction. It is a flag rather
+            // than something inferred from the input because the decision has
+            // to be made before a byte is read: a pipe cannot be probed and
+            // then re-dispatched.
+            if let Some(dir) = directory {
+                refuse_unhonoured_extract_flags(output.is_some(), format.is_some(), memory_limit)?;
+                let opts = ExtractOpts {
+                    max_ratio: max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+                    force,
+                    ..Default::default()
+                };
+                let out = entries::extract(input_of(&input), Path::new(&dir), &patterns, &opts)?;
+                eprintln!(
+                    "{} -> {} bytes extracted into {dir} ({} fidelity)",
+                    out.format, out.bytes_out, out.fidelity.rung
+                );
+                return Ok(());
+            }
+            if !patterns.is_empty() {
+                return Err(stuffr::Error::Usage(format!(
+                    "`{}` names an archive entry; pass -C DIR to say where entries                      should be extracted to",
+                    patterns[0]
+                )));
+            }
             // Decode has no worker count to govern (multi-threaded decode is
             // out of scope this phase), but it does bound dictionary
             // allocation for the pure codecs that size a buffer from a value
@@ -233,10 +298,25 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
         }
         Command::Cat {
             input,
+            patterns,
             format,
             max_ratio,
             memory_limit,
         } => {
+            // Naming an entry is what asks for entry-aware streaming — the
+            // same "decide before reading a byte" reasoning as `unpack`'s -C.
+            if !patterns.is_empty() {
+                refuse_unhonoured_extract_flags(false, format.is_some(), memory_limit)?;
+                // The motivating case: `curl … | stuffr cat - log.txt`.
+                let mut out = std::io::stdout();
+                entries::cat(
+                    input_of(&input),
+                    &patterns,
+                    max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+                    &mut out,
+                )?;
+                return Ok(());
+            }
             // Same as `unpack`: bounds dictionary allocation for the pure
             // codecs; the CLI default is the bound, not unbounded.
             let memory_limit = Some(
@@ -325,6 +405,77 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             Ok(())
         }
     }
+}
+
+/// The container an output names, if it names one at all — `--format tar`, or
+/// an extension that resolves to a container (`-o bundle.tar`).
+///
+/// `None` means the output names a codec (or nothing yet), which is the
+/// single-stream path `pack` has always taken.
+fn container_output(fmt: Option<FormatId>, output: Option<&str>) -> Option<FormatId> {
+    let registry = stuffr::registry();
+    if let Some(id) = fmt {
+        // An explicit --format wins outright, exactly as it does for a codec.
+        return registry.container(id).map(|_| id);
+    }
+    let ext = Path::new(output?).extension()?.to_str()?;
+    let id = registry.by_extension(ext)?;
+    registry.container(id).map(|_| id)
+}
+
+/// The paths `pack` will store as entries.
+///
+/// `-` is refused here: a pipe has no name, and every entry in an archive
+/// needs one. The single-stream path still accepts it.
+fn pack_inputs(paths: &[String]) -> stuffr::Result<Vec<PathBuf>> {
+    if paths.iter().any(|p| p == "-") {
+        return Err(stuffr::Error::Usage(
+            "stdin has no name to store an entry under; name files instead of `-`".into(),
+        ));
+    }
+    Ok(paths.iter().map(PathBuf::from).collect())
+}
+
+/// Refuses the flags the entry-aware path cannot honour.
+///
+/// The tree's rule, already applied to `--threads` on the decode subcommands:
+/// a flag that would be silently accepted and ignored is refused instead.
+///
+/// `--no-sync` is deliberately NOT in this list. Extraction writes each entry
+/// straight to its final path with no fsync at all, so "skip the fsync" is
+/// already what happens — a flag asking for the behaviour you are getting
+/// cannot mislead anybody.
+fn refuse_unhonoured_extract_flags(
+    output: bool,
+    format: bool,
+    memory_limit: Option<String>,
+) -> stuffr::Result<()> {
+    if output {
+        return Err(stuffr::Error::Usage(
+            "-o writes one decoded stream to one file; -C extracts entries into a \
+             directory. Pass one or the other."
+                .into(),
+        ));
+    }
+    if format {
+        return Err(stuffr::Error::Usage(
+            "--format names a codec for a single-stream decode; entry-aware extraction \
+             detects the container (and any codec above it) from the archive itself"
+                .into(),
+        ));
+    }
+    if memory_limit.is_some() {
+        // Honest rather than reassuring: `open_archive` resolves the codec
+        // layer beneath a container through `resolve_chain_deep`, which uses
+        // `DecodeOpts::default()` and so carries no memory limit. Accepting
+        // the flag here would promise a bound that is not applied.
+        return Err(stuffr::Error::Usage(
+            "--memory-limit is not yet honoured for a container: the codec layer \
+             beneath one is bounded by --max-ratio only"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// The kind column `list` prints — `EntryKind` is `#[non_exhaustive]`, so a

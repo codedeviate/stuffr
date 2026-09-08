@@ -25,10 +25,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Compress a file.
+    /// Compress a file, or collect several into an archive.
     Pack {
-        /// Input path, or `-` for stdin.
-        input: String,
+        /// Input paths, or `-` for stdin.
+        ///
+        /// More than one path needs an output that names a CONTAINER (`-o
+        /// bundle.tar`, or `--format tar`): a codec compresses one stream and
+        /// has nowhere to put a second.
+        #[arg(required = true, num_args = 1.., value_name = "PATHS")]
+        paths: Vec<String>,
         /// Output path. Defaults to INPUT plus the format's extension.
         #[arg(short, long)]
         output: Option<String>,
@@ -69,10 +74,22 @@ pub enum Command {
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
     },
-    /// Decompress a file.
+    /// Decompress a file, or extract an archive's entries.
     Unpack {
         /// Input path, or `-` for stdin.
         input: String,
+        /// Entries to extract; every entry when none are given.
+        ///
+        /// An exact entry name, or a directory selecting everything beneath
+        /// it. Needs -C, which is what asks for entry-aware extraction.
+        #[arg(value_name = "PATTERNS")]
+        patterns: Vec<String>,
+        /// Extract the archive's entries into this directory.
+        ///
+        /// Absolute entry paths, `..` traversal and symlinks escaping this
+        /// directory are refused (exit 7), never silently sanitised.
+        #[arg(short = 'C', long, value_name = "DIR")]
+        directory: Option<String>,
         /// Output path. Defaults to INPUT with its extension removed.
         #[arg(short, long)]
         output: Option<String>,
@@ -95,10 +112,17 @@ pub enum Command {
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
     },
-    /// Decompress a file and write it to stdout.
+    /// Decompress a file, or stream an archive's entries, to stdout.
     Cat {
         /// Input path, or `-` for stdin.
         input: String,
+        /// Entries whose bytes to stream, in archive order.
+        ///
+        /// An exact entry name, or a directory selecting everything beneath
+        /// it. Naming one is what asks for entry-aware streaming; without
+        /// any, `cat` decodes the input as a single stream.
+        #[arg(value_name = "PATTERNS")]
+        patterns: Vec<String>,
         /// Use this format instead of detecting one. Required for formats with
         /// no magic bytes and no extension.
         #[arg(long)]

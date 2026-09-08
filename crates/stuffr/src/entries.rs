@@ -1,13 +1,17 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
-    ArchiveRead, Chain, Counting, EntryMeta, Error, FormatId, OpenOpts, RATIO_FLOOR, RatioGuard,
-    Registry, Result, SeekRead, Source, SourceCaps, StreamPolicy, ladder, resolve_chain_deep,
+    ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, EntryKind,
+    EntryMeta, Error, FidelityReport, FormatId, OpenOpts, RATIO_FLOOR, RatioGuard, Registry,
+    Result, Rung, SeekRead, Source, SourceCaps, StreamPolicy, check_symlink_target, ladder,
+    resolve_chain_deep, safe_join,
 };
 
-use crate::ops::{Input, Outcome};
+use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
 
 /// Bounds decoded output for one archive, per entry and in total.
 ///
@@ -252,6 +256,513 @@ pub fn test(src: Input, max_ratio: u64) -> Result<Outcome> {
     })
 }
 
+/// What [`extract`] may do beyond the defaults.
+#[derive(Clone, Debug)]
+pub struct ExtractOpts {
+    /// Expansion ratio past which an entry — or the archive's running total —
+    /// is refused. See [`ArchiveBudget`].
+    pub max_ratio: u64,
+    /// The archive's own compressed size, when it is known from somewhere
+    /// other than the input itself. Left `None`, [`extract`] reads it from
+    /// the input path's length, and a pipe (which cannot know it) leaves the
+    /// budget bounded by `RATIO_FLOOR` alone.
+    pub compressed_total: Option<u64>,
+    /// Replace a file or symlink already sitting at an entry's target path.
+    /// Without it an existing target is refused, the same contract
+    /// `pack`/`unpack` already apply to a single output file.
+    pub force: bool,
+}
+
+impl Default for ExtractOpts {
+    fn default() -> Self {
+        Self {
+            max_ratio: DEFAULT_MAX_RATIO,
+            compressed_total: None,
+            force: false,
+        }
+    }
+}
+
+/// Extracts entries matching `patterns` (all of them when empty) into `dest`.
+///
+/// **The ONLY containment call site in the tree.** No container performs the
+/// check — that is what container-harness property 12 protects, by requiring
+/// a container to report a hostile name *verbatim* so this loop still has
+/// something to refuse. Everything a hostile archive can do to a filesystem
+/// it does here or nowhere.
+///
+/// Three orderings inside the loop are load-bearing:
+///
+/// 1. [`safe_join`] runs **before any filesystem call for that entry**.
+///    Checking afterwards would already have created a file at the
+///    attacker's path even if the write were then refused.
+/// 2. [`check_symlink_target`] is handed the path `safe_join` produced, not
+///    the raw entry name — it derives the link's depth below `dest` from
+///    that path, so a raw name would make it measure the wrong depth.
+/// 3. The budget is charged from bytes **actually read**, not from the size
+///    the header declares. A header that under-declares its length would
+///    otherwise walk straight through the check it exists to satisfy.
+pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) -> Result<Outcome> {
+    // Before `src` is consumed by `open_archive`, which takes it by value.
+    let compressed_total = o.compressed_total.or_else(|| {
+        src.path()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+    });
+    let (mut ar, format) = open_archive(crate::registry(), src, o.max_ratio)?;
+    let mut budget = ArchiveBudget::new(compressed_total, o.max_ratio);
+
+    // The destination itself, once, up front: an archive of plain files
+    // names no directory entry to create it, and a destination that cannot
+    // be created should fail before any entry is read. This is not an
+    // entry's path — it is the one the caller typed.
+    std::fs::create_dir_all(dest)?;
+
+    let mut written = 0u64;
+    let mut matched = 0u64;
+
+    while let Some(mut entry) = ar.next_entry()? {
+        let meta = entry.meta().clone();
+        if !patterns.is_empty() && !matches_any(&meta.name, patterns) {
+            continue;
+        }
+        matched += 1;
+
+        // Containment BEFORE anything is created. Checking after opening the
+        // destination would already have created a file at an attacker's
+        // path even if the write were then refused.
+        let target = safe_join(dest, &meta.name)?;
+        // A post-condition on `safe_join`, not a second opinion: it returns
+        // either `dest` or `dest.join(..)`, so this cannot fire today.
+        // Asserting it anyway is what keeps `check_symlink_target`'s
+        // `parent.strip_prefix(dest).unwrap_or("")` fallback from silently
+        // MASKING a bug here — handed a `link_path` outside `dest`, that
+        // fallback measures the link as sitting directly under `dest`
+        // (stricter, so never an escape, but wrong) rather than complaining.
+        if !target.starts_with(dest) {
+            return Err(Error::UnsafePath {
+                path: meta.name.clone(),
+                reason: "resolved outside the destination",
+            });
+        }
+        // Still before any filesystem call for this entry — and the one
+        // check that has to look at the filesystem, because the two above
+        // are lexical and a lexical check cannot see a symlink standing in
+        // the middle of the entry's own path.
+        refuse_symlinked_ancestors(dest, &target, &meta.name)?;
+
+        match &meta.kind {
+            EntryKind::Dir => {
+                // `.` and `./` resolve to `dest` itself — the first entry
+                // `tar cf x.tar .` emits. The destination already exists, so
+                // this is a no-op rather than an error, and nothing at that
+                // path may be replaced: `dest` may legitimately BE a symlink
+                // to a directory the caller named.
+                if target != dest {
+                    replace_conflicting(&target, o.force)?;
+                }
+                std::fs::create_dir_all(&target)?;
+            }
+            EntryKind::Symlink {
+                target: link_target,
+            } => {
+                // The subtler escape: the link's own PATH is contained while
+                // its TARGET is not, and a later entry written "through" the
+                // link lands wherever it points. Refusing here aborts the
+                // whole extraction, so that later entry is never reached.
+                check_symlink_target(dest, &target, link_target)?;
+                replace_conflicting(&target, o.force)?;
+                create_parent(&target)?;
+                create_symlink(link_target, &target)?;
+            }
+            // `EntryKind::File`, and `Other` (a hardlink, device or FIFO)
+            // written as a regular file carrying whatever payload the
+            // archive framed for it — the same direction `tar`'s own writer
+            // already maps `Other` in (`_ => EntryType::Regular`). The
+            // fidelity to recover is in `EntryKind`'s missing variants, not
+            // in this match. `_` rather than the two names because
+            // `EntryKind` is `#[non_exhaustive]`.
+            _ => {
+                replace_conflicting(&target, o.force)?;
+                create_parent(&target)?;
+                let mut out = std::fs::File::create(&target)?;
+                // Charged as data streams, not from the declared size.
+                written += copy_charging(entry.reader(), &mut out, &meta.name, &mut budget)?;
+                out.flush()?;
+            }
+        }
+    }
+
+    // Patterns that select nothing must not report success: a typo'd name
+    // would otherwise look exactly like an archive that had nothing to give.
+    if !patterns.is_empty() && matched == 0 {
+        return Err(Error::EntryNotFound(patterns.join(", ")));
+    }
+
+    Ok(Outcome {
+        bytes_in: 0,
+        bytes_out: written,
+        format,
+        fidelity: ar.fidelity().clone(),
+    })
+}
+
+/// Writes the payload of every entry matching `patterns` (all of them when
+/// empty) to `dst`, in archive order.
+///
+/// No containment here, deliberately: `cat` opens no path at all. An entry's
+/// name is only ever compared against `patterns`, and its bytes go to `dst`
+/// — a hostile name has nowhere to point. The bomb budget still applies,
+/// since the motivating case (`curl … | stuffr cat - a.txt`) streams
+/// untrusted input of unknown size.
+pub fn cat(
+    src: Input,
+    patterns: &[String],
+    max_ratio: u64,
+    dst: &mut dyn Write,
+) -> Result<Outcome> {
+    let compressed_total = src
+        .path()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len());
+    let (mut ar, format) = open_archive(crate::registry(), src, max_ratio)?;
+    let mut budget = ArchiveBudget::new(compressed_total, max_ratio);
+    let mut written = 0u64;
+    let mut matched = 0u64;
+
+    while let Some(mut entry) = ar.next_entry()? {
+        let meta = entry.meta().clone();
+        if !patterns.is_empty() && !matches_any(&meta.name, patterns) {
+            continue;
+        }
+        matched += 1;
+        // A directory or symlink entry frames no payload, so this copies
+        // zero bytes for one rather than needing a case of its own.
+        written += copy_charging(entry.reader(), dst, &meta.name, &mut budget)?;
+    }
+
+    if !patterns.is_empty() && matched == 0 {
+        return Err(Error::EntryNotFound(patterns.join(", ")));
+    }
+    dst.flush()?;
+
+    Ok(Outcome {
+        bytes_in: 0,
+        bytes_out: written,
+        format,
+        fidelity: ar.fidelity().clone(),
+    })
+}
+
+/// Collects `paths` into a new `container` archive at `dst` — one entry each.
+///
+/// Every input is validated before the destination is touched, the same
+/// contract `Codec::check_encode_opts` gives the single-stream path: a
+/// rejected command costs nothing, with no temp file created and no existing
+/// file disturbed.
+pub fn create_archive(
+    paths: &[PathBuf],
+    dst: Output,
+    container: FormatId,
+    o: &CompressOpts,
+) -> Result<Outcome> {
+    let kind = crate::registry().require_container(container)?;
+
+    let mut planned: Vec<(String, std::fs::Metadata)> = Vec::with_capacity(paths.len());
+    let mut names = HashSet::new();
+    for path in paths {
+        let name = entry_name_for(path)?;
+        if !names.insert(name.clone()) {
+            return Err(Error::Usage(format!(
+                "two inputs would both be stored as entry `{name}`; an archive with \
+                 duplicate names cannot be extracted without --force"
+            )));
+        }
+        // `metadata`, which follows a symlink, not `symlink_metadata`: a path
+        // named on the command line is followed, so `stuffr pack
+        // link-to-notes.txt` stores the file it points at. Storing the link
+        // itself would let `pack` produce an archive `unpack` then refuses at
+        // exit 7 — stuffr must not write what it will not read.
+        let md = std::fs::metadata(path)?;
+        if md.is_dir() {
+            return Err(Error::Usage(format!(
+                "`{}` is a directory; this build packs named files only, so list \
+                 them individually",
+                path.display()
+            )));
+        }
+        if !md.is_file() {
+            return Err(Error::Usage(format!(
+                "`{}` is neither a file nor a directory; there is no entry shape \
+                 for it yet",
+                path.display()
+            )));
+        }
+        planned.push((name, md));
+    }
+
+    let opened = dst.create(o.force, o.sync)?;
+    let finish = opened.finish;
+    let (counted, bytes_out) = CountingWriter::new(opened.writer);
+    let archive = kind.create(
+        Box::new(counted),
+        &CreateOpts {
+            level: o.level,
+            ..Default::default()
+        },
+    )?;
+
+    // An immediately-invoked `FnOnce`, not the `let run = || …` shape the
+    // codec path uses: `ArchiveWrite::finish` consumes the writer, which a
+    // reusable closure cannot do.
+    let result = (move || -> Result<u64> {
+        let mut archive = archive;
+        let mut bytes_in = 0u64;
+        for ((name, md), path) in planned.iter().zip(paths) {
+            let mut file = std::fs::File::open(path)?;
+            archive.add(
+                &EntryMeta {
+                    name: name.clone(),
+                    size: Some(md.len()),
+                    mtime: md.modified().ok(),
+                    mode: mode_of(md),
+                    kind: EntryKind::File,
+                    ..Default::default()
+                },
+                &mut file,
+            )?;
+            bytes_in += md.len();
+        }
+        // Writes the container's trailer and flushes; the destination was
+        // handed over by value, so nothing else can flush it.
+        archive.finish()?;
+        Ok(bytes_in)
+    })();
+
+    match result {
+        Ok(bytes_in) => {
+            // Only now: every byte, trailer included, is written and flushed.
+            publish(finish)?;
+            Ok(Outcome {
+                bytes_in,
+                bytes_out: bytes_out.load(Ordering::Relaxed),
+                format: container,
+                // Every input is a real, seekable file — `entry_name_for`
+                // refuses a pipe, which has no name to store.
+                fidelity: FidelityReport::new(Rung::Exact),
+            })
+        }
+        Err(e) => {
+            discard(finish);
+            Err(e)
+        }
+    }
+}
+
+/// The entry name a command-line path is stored under: its final component.
+///
+/// Not the path as typed. `stuffr pack /etc/hosts -o x.tar` must not write an
+/// entry named `/etc/hosts`, because [`extract`] would refuse that archive at
+/// exit 7 — stuffr does not write what it will not read.
+fn entry_name_for(path: &Path) -> Result<String> {
+    let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        Error::Usage(format!(
+            "`{}` has no final path component to name an entry after",
+            path.display()
+        ))
+    })?;
+    Ok(name.to_string())
+}
+
+/// The unix mode bits, where the platform has them.
+fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(md.mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = md;
+        None
+    }
+}
+
+/// Whether `name` is selected by any of `patterns`.
+///
+/// An exact name, or a directory prefix: `docs` selects `docs/a.txt` as well
+/// as `docs/` itself. Deliberately not globbing — a shell already expands
+/// `*`, and a pattern language nobody asked for is a pattern language to get
+/// subtly wrong. A leading `./` and a trailing `/` are noise on either side:
+/// tar names its directory entries `sub/`, and `tar cf x.tar .` prefixes
+/// every name with `./`.
+fn matches_any(name: &str, patterns: &[String]) -> bool {
+    let name = normalize_for_match(name);
+    patterns.iter().any(|pattern| {
+        let pattern = normalize_for_match(pattern);
+        !pattern.is_empty()
+            && (name == pattern
+                || name
+                    .strip_prefix(pattern)
+                    .is_some_and(|rest| rest.starts_with('/')))
+    })
+}
+
+/// Strips the `./` prefix and trailing `/` that carry no meaning in a name.
+fn normalize_for_match(s: &str) -> &str {
+    let mut s = s;
+    while let Some(rest) = s.strip_prefix("./") {
+        s = rest;
+    }
+    s.trim_end_matches('/')
+}
+
+/// Refuses an entry whose path is written *through* an existing symlink.
+///
+/// [`safe_join`] and [`check_symlink_target`] are both lexical, which is what
+/// makes them filesystem-free, exhaustively testable and immune to a symlink
+/// appearing between the check and the write. The price is that neither can
+/// see a symlink standing in the middle of an entry's own path, and the two
+/// together do not close this:
+///
+/// ```text
+/// a/b/           an ordinary directory
+/// a/b/up -> ..   contained: resolves to <dest>/a
+/// a/b/up/link -> ../..
+///                contained component-wise from <dest> (it nets to `a`), but
+///                the OS resolves it through `up`, whose real parent is
+///                <dest>/a — so the link lands on <dest>/.., outside
+/// a/b/up/link/pwned.txt
+///                an ordinary contained name, written straight through it
+/// ```
+///
+/// Refusing any entry with a symlinked path component closes the whole
+/// class, in the same shape as libarchive's `SECURE_SYMLINKS`: refused
+/// rather than quietly unlinked, per the README's contract. It also covers
+/// the case neither lexical check can reach at all — a hostile symlink
+/// planted inside `dest` by somebody else *before* extraction started.
+///
+/// The entry's OWN final component is exempt: a symlink entry is supposed to
+/// become a symlink, and something already sitting at that exact path is
+/// [`replace_conflicting`]'s business, not this function's.
+fn refuse_symlinked_ancestors(dest: &Path, target: &Path, name: &str) -> Result<()> {
+    let Ok(relative) = target.strip_prefix(dest) else {
+        // Unreachable: the caller has just asserted `target.starts_with(dest)`.
+        return Err(Error::UnsafePath {
+            path: name.to_string(),
+            reason: "resolved outside the destination",
+        });
+    };
+    let mut ancestors: Vec<_> = relative.components().collect();
+    ancestors.pop();
+
+    let mut walked = dest.to_path_buf();
+    for component in ancestors {
+        walked.push(component);
+        if let Ok(md) = std::fs::symlink_metadata(&walked)
+            && md.file_type().is_symlink()
+        {
+            return Err(Error::UnsafePath {
+                path: name.to_string(),
+                reason: "a directory in this entry's path is a symlink",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuses — or, with `force`, removes — something already sitting at an
+/// entry's target path. Runs only AFTER containment, on a path [`safe_join`]
+/// produced.
+///
+/// Two jobs. The obvious one is applying `pack`/`unpack`'s existing "an
+/// existing output is refused unless --force" contract per entry. The second
+/// matters more: REMOVING what is in the way, rather than writing through
+/// it, is what stops a pre-existing symlink at the target path from
+/// redirecting the entry's bytes. `File::create` follows a symlink, so
+/// somebody who could plant `dest/x -> /etc/passwd` before extraction would
+/// otherwise have the payload land there.
+fn replace_conflicting(target: &Path, force: bool) -> Result<()> {
+    // `symlink_metadata`, not `metadata`: a dangling symlink still counts as
+    // something being there, and a symlink must report as a symlink rather
+    // than as whatever it points at. The same reasoning `Output::create`
+    // gives for the single-output path.
+    let Ok(md) = std::fs::symlink_metadata(target) else {
+        return Ok(());
+    };
+    if md.is_dir() {
+        // A real directory is written INTO — that is the ordinary shape of an
+        // archive carrying a directory and its contents — and is never
+        // removed, with or without --force: that would delete files the
+        // archive never mentioned.
+        return Ok(());
+    }
+    if !force {
+        return Err(Error::Usage(format!(
+            "{} already exists; pass --force to overwrite",
+            target.display()
+        )));
+    }
+    std::fs::remove_file(target)?;
+    Ok(())
+}
+
+/// Creates an entry's parent directories.
+fn create_parent(target: &Path) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+/// Creates a symlink at `at` pointing to `link_target`.
+///
+/// Unix-only: `stuffr` builds for macOS and Linux (see `containment.rs`), and
+/// a Windows symlink has to declare at creation time whether its target is a
+/// file or a directory — which an archive entry does not always say.
+fn create_symlink(link_target: &str, at: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(link_target, at)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (link_target, at);
+        Err(Error::Unsupported(
+            "this build cannot create symlinks; extract on a unix host".into(),
+        ))
+    }
+}
+
+/// Copies while charging the budget incrementally, so a bomb is refused
+/// mid-stream rather than after the disk has already filled.
+///
+/// The two error paths are deliberately not the same. A failed READ is the
+/// archive's fault and goes through [`Error::from_decode_io`], so a
+/// truncated entry payload reports as `Corrupt` (exit 5) and a refusal from
+/// the ratio guard beneath the container as `ResourceLimit` (exit 6). A
+/// failed WRITE is the destination's fault and stays `Error::Io`, which is
+/// what lets `stuffr cat … | head` map a `BrokenPipe` to a clean exit.
+fn copy_charging(
+    src: &mut dyn Read,
+    dst: &mut dyn Write,
+    entry: &str,
+    budget: &mut ArchiveBudget,
+) -> Result<u64> {
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = src.read(&mut buf).map_err(Error::from_decode_io)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        budget.charge(entry, n as u64)?;
+        dst.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +882,41 @@ mod tests {
             .charge("huge.bin", RATIO_FLOOR + 1)
             .expect_err("an unknown compressed size must still be bounded by the floor");
         assert!(matches!(err, Error::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn a_pattern_matches_an_exact_name_or_a_directory_beneath_it() {
+        let patterns = vec!["b.txt".to_string(), "docs".to_string()];
+        assert!(matches_any("b.txt", &patterns));
+        assert!(matches_any("docs", &patterns));
+        // A directory pattern takes everything under it, at any depth.
+        assert!(matches_any("docs/a.txt", &patterns));
+        assert!(matches_any("docs/deep/a.txt", &patterns));
+        // Not a prefix match on the raw string: `docsy` is a different name.
+        assert!(!matches_any("docsy/a.txt", &patterns));
+        assert!(!matches_any("a.txt", &patterns));
+        assert!(!matches_any("b.txt.bak", &patterns));
+    }
+
+    #[test]
+    fn a_pattern_ignores_the_leading_dot_slash_and_trailing_slash_tar_emits() {
+        // `tar cf x.tar .` names every entry `./a.txt`, and names directory
+        // entries with a trailing slash. Neither is something a user should
+        // have to type.
+        assert!(matches_any("./b.txt", &["b.txt".to_string()]));
+        assert!(matches_any("b.txt", &["./b.txt".to_string()]));
+        assert!(matches_any("docs/", &["docs".to_string()]));
+        assert!(matches_any("./docs/a.txt", &["docs/".to_string()]));
+    }
+
+    #[test]
+    fn an_empty_pattern_selects_nothing_rather_than_everything() {
+        // An empty string normalises to nothing, and "" is a prefix of every
+        // name: treated as a prefix it would quietly select the whole
+        // archive. Callers spell "everything" as an EMPTY LIST of patterns,
+        // which `extract` and `cat` check before they get here.
+        assert!(!matches_any("a.txt", &[String::new()]));
+        assert!(!matches_any("a.txt", &["./".to_string()]));
     }
 
     #[test]

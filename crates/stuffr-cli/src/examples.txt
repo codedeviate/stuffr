@@ -86,6 +86,29 @@ COMPRESSING A FILE
       code 2, the existing file left untouched, nothing written.
 
 
+COLLECTING FILES INTO AN ARCHIVE
+
+  stuffr pack one.txt two.txt -o bundle.tar
+      pack takes PATHS..., not a single path: an output naming a CONTAINER
+      (by extension, or with --format tar) collects every path into one
+      archive, one entry each. Each entry is stored under its path's final
+      component, so `stuffr pack /etc/hosts -o x.tar` writes an entry named
+      `hosts` — storing the absolute name would produce an archive stuffr
+      itself refuses to extract, at exit 7.
+
+  stuffr pack notes.txt --format tar
+      A single path still derives its own output name: notes.txt.tar.
+      Several paths have no one name to derive from, so they need -o.
+
+  Three things pack refuses, all before anything is written: more than one
+  path with a codec output (a codec compresses one stream and has nowhere
+  to put a second); two inputs whose final components collide (the archive
+  could not then be extracted without --force); and a directory — this
+  build packs named files only. Walking a directory tree is still to come,
+  as is writing a container inside a codec (`bundle.tar.gz`) in one step:
+  pack the .tar, then pack that.
+
+
 DECOMPRESSING
 
   stuffr unpack notes.txt.gz
@@ -132,6 +155,15 @@ STREAMING TO STDOUT
   stuffr cat data.bin --format gzip
       cat takes --format for the same reason, and --max-ratio to bound a
       decode that would otherwise stream an enormous file to stdout.
+
+  curl -s https://example.com/logs.tar | stuffr cat - app.log
+      Naming an entry makes cat entry-aware: it streams that entry's bytes
+      and nothing else, in archive order, to stdout — over a pipe, with no
+      seeking and nothing written to disk. Without an entry name cat decodes
+      its input as a single stream, so `stuffr cat backup.tar` is a usage
+      error (exit 2) that names what to do instead. --max-ratio bounds this
+      exactly as it bounds extraction below; --format and --memory-limit are
+      refused alongside an entry name rather than accepted and ignored.
 
 
 STDIN AND STDOUT VIA `-`
@@ -203,6 +235,64 @@ LISTING AND TESTING AN ARCHIVE
       Defaults to 10000, same as `unpack`/`cat` — raise it if a legitimate
       archive is this compressible; a bare `.tar` (no codec layer at all)
       is never affected, since nothing there is expanding.
+
+
+EXTRACTING AN ARCHIVE'S ENTRIES
+
+  stuffr unpack backup.tar -C out/
+      -C/--directory extracts every entry into out/, creating it if it does
+      not exist yet. -C is what asks for entry-aware extraction: without it
+      unpack decodes a single stream, so pointing it at a container is a
+      usage error (exit 2) naming this flag. It is a flag rather than
+      something inferred from the input because the decision has to be made
+      before a byte is read — a pipe cannot be probed and then reconsidered.
+
+  stuffr unpack backup.tar.gz -C out/ docs notes.txt
+      PATTERNS after the input select what to extract: an exact entry name,
+      or a directory selecting everything beneath it (`docs` takes
+      `docs/a.txt` with it). Deliberately no globbing — the shell already
+      expands `*`, and a pattern language nobody asked for is a pattern
+      language to get subtly wrong. A pattern matching no entry at all is a
+      usage error (exit 2), never a silent success.
+
+  stuffr unpack backup.tar -C out/ --force
+      An entry whose target path already holds a file or a symlink is
+      refused (exit 2) unless --force is given — the same contract pack and
+      unpack apply to a single output file. --force REPLACES what is in the
+      way rather than writing through it: a symlink already sitting at an
+      entry's path would otherwise redirect that entry's bytes wherever it
+      points. An existing directory is never removed either way; entries
+      are written into it.
+
+  Path containment is not optional and cannot be switched off. An entry
+  naming an absolute path, traversing above the destination with `..`, or a
+  symlink whose target resolves outside it, is REFUSED at exit 7 — never
+  silently sanitised into something safe, because a caller handed a
+  cleaned-up path has no way to know it was handed one. The refusal names
+  the offending entry verbatim and stops the extraction there, so a later
+  entry written "through" a hostile symlink is never reached. An entry
+  named `.` or `./` IS accepted: it names the destination directory itself,
+  and it is the first entry `tar cf x.tar .` emits.
+
+  An entry whose path runs THROUGH a symlink is refused too — a directory
+  component that is a link, whether an earlier entry created it or somebody
+  planted it in the destination beforehand. The two refusals above resolve
+  a name component-wise, which is what keeps them immune to a symlink
+  appearing between the check and the write; the operating system resolves
+  the same name through the link instead, and that difference is an escape
+  on its own.
+
+  stuffr unpack bomb.tar.gz -C out/ --max-ratio 100
+      --max-ratio bounds extraction twice over — per entry, and against the
+      archive's running total — charged from the bytes actually read rather
+      than the size an entry's header declares, since a header that
+      under-declares would otherwise walk straight through the check. Past
+      the limit the extraction is refused at exit 6, naming the entry.
+      --memory-limit is refused alongside -C rather than accepted and
+      ignored: for now the codec layer beneath a container is bounded by
+      --max-ratio only. --no-sync is accepted and does nothing — extraction
+      writes entries straight to their final paths, so there is no fsync
+      for it to skip.
 
 
 WHAT THIS BUILD CAN DO
@@ -374,8 +464,9 @@ EXIT CODES
   0  success
   1  general failure (i/o error, or anything not listed below)
   2  usage error (bad flag, missing -o, existing output without --force,
-     or list/test pointed at something that resolved to a bare codec
-     stream rather than an archive)
+     list/test pointed at something that resolved to a bare codec stream
+     rather than an archive, unpack/cat pointed at a container with
+     neither -C nor an entry name, or a pattern matching no entry)
   3  format not available in this build
   4  fidelity degraded under strict mode
   5  archive or stream is corrupt
@@ -399,8 +490,11 @@ NOT YET
   changes nothing about it, and there is no weak-fallback distinction for it
   either. `tar` is the one archive container so far: it reads and writes,
   and `.tar.gz` and `.tgz` resolve as tar over gzip, which `stuffr info`
-  shows as the chain. `list` and `test` are the first entry-aware
-  subcommands — reading entries without extracting them; `extract` (writing
-  them to disk) is still to come, along with zip, cpio and ar. `stuffr
+  shows as the chain. All four entry-aware
+  subcommands work on it: `list` and `test` read entries without extracting,
+  `unpack -C` writes them to disk under the containment rules above, and
+  `pack PATHS...` collects files into one. Still to come: zip, cpio and ar,
+  walking a directory tree on the pack side, and writing a container inside
+  a codec (`bundle.tar.gz`) in a single step. `stuffr
   formats` always tells you the truth about the build you are actually
   running, whatever this page says.

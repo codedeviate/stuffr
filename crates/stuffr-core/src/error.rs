@@ -74,6 +74,13 @@ impl Error {
         match self {
             Error::Usage(_) => 2,
             Error::NotAnArchive { .. } => 2,
+            // The caller named an entry the archive does not contain — the
+            // same shape as naming a format this build does not have, and
+            // the same answer `NotAnArchive` above gives for "you pointed
+            // this verb at the wrong thing". Explicit, not the wildcard
+            // below: `stuffr unpack a.tar -C out nosuch.txt` extracting
+            // nothing must be distinguishable from an i/o failure.
+            Error::EntryNotFound(_) => 2,
             Error::FormatNotEnabled(_) => 3,
             Error::CapabilityUnavailable { .. } => 3,
             Error::FidelityDegraded(_) => 4,
@@ -142,6 +149,7 @@ mod tests {
         );
         assert_eq!(Error::FidelityDegraded(2).exit_code(), 4);
         assert_eq!(Error::Corrupt("bad crc".into()).exit_code(), 5);
+        assert_eq!(Error::EntryNotFound("nosuch.txt".into()).exit_code(), 2);
         assert_eq!(Error::SpillLimitExceeded { limit: 42 }.exit_code(), 6);
         assert_eq!(Error::ResourceLimit("oom".into()).exit_code(), 6);
         assert_eq!(
