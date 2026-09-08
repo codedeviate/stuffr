@@ -76,4 +76,10 @@ lzma-rust2 = "0.20"
 # via `tar`'s own unpack path would bypass that gate entirely, so the feature
 # is not merely unused, it is one this project must not use.
 tar = { version = "0.4.46", default-features = false }
+# The simplest container in the tree: no trailer at all, so a reader knows
+# it has reached the end only because the underlying stream has (`ar 0.9.0`).
+ar = "0.9"
+# `newc` only — the crate ships no odc or CRC variant, so this container
+# declares exactly that rather than implying the others work.
+cpio = "0.4"
 clap = { version = "4", features = ["derive"] }

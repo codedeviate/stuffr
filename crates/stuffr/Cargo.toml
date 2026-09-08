@@ -29,12 +29,15 @@ lzma-c = ["stuffr-formats/lzma-c"]
 lzma-pure = ["stuffr-formats/lzma-pure"]
 lzip = ["stuffr-formats/lzip"]
 tar = ["stuffr-formats/tar"]
-# `tar` sits in this bundle rather than in a separate `containers` one, and
-# not because it is a codec — it is not. `pure` means "everything this build
-# can do without a C toolchain", which is the set the `purity` CI job walks
-# (`cargo tree --features pure | grep -E 'zstd-sys|liblzma-sys'`). Putting tar
-# here is what puts its dependency graph under that job.
-pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pure", "xz-pure", "lzma-pure", "lzip", "tar"]
+ar = ["stuffr-formats/ar"]
+cpio = ["stuffr-formats/cpio"]
+# `tar`, `ar` and `cpio` sit in this bundle rather than in a separate
+# `containers` one, and not because they are codecs — they are not. `pure`
+# means "everything this build can do without a C toolchain", which is the
+# set the `purity` CI job walks (`cargo tree --features pure | grep -E
+# 'zstd-sys|liblzma-sys'`). Neither the `ar` nor the `cpio` crate has a C
+# dependency, so putting them here is what puts their graphs under that job.
+pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pure", "xz-pure", "lzma-pure", "lzip", "tar", "ar", "cpio"]
 c-backed = ["zstd-c", "xz-c", "lzma-c"]
 legacy = []
 full = ["pure", "c-backed", "legacy"]

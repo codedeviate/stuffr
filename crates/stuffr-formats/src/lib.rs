@@ -14,10 +14,14 @@ mod xz_shared;
 #[cfg(any(feature = "zstd-c", feature = "zstd-pure"))]
 mod zstd_shared;
 
+#[cfg(feature = "ar")]
+pub mod ar;
 #[cfg(feature = "brotli")]
 pub mod brotli;
 #[cfg(feature = "bzip2")]
 pub mod bzip2;
+#[cfg(feature = "cpio")]
+pub mod cpio;
 #[cfg(feature = "deflate")]
 pub mod deflate;
 #[cfg(feature = "gzip")]
@@ -82,6 +86,14 @@ pub fn register_all(registry: &mut Registry) {
     // `tar.rs`'s `tar_gz_and_tgz_now_resolve_to_tar_over_gzip` pins that.
     #[cfg(feature = "tar")]
     registry.register_container(std::sync::Arc::new(tar::Tar), tar::meta());
+
+    // Batched with tar deliberately (Phase 2, Task 10): same streaming
+    // shape, small diffs. Neither is self-referential, so neither module
+    // needs tar's `unsafe`.
+    #[cfg(feature = "ar")]
+    registry.register_container(std::sync::Arc::new(ar::Ar), ar::meta());
+    #[cfg(feature = "cpio")]
+    registry.register_container(std::sync::Arc::new(cpio::CpioNewc), cpio::meta());
 
     // No mutual-exclusion dance here: unlike xz/lzma/zstd, LZIP has only
     // one backend, so there is nothing else it could collide with.

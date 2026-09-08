@@ -540,6 +540,99 @@ pub(crate) const LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF: &[ErrorKind] = &[
 #[cfg(feature = "tar")]
 pub(crate) const TAR_MALFORMED_AS_OTHER: &[ErrorKind] = &[ErrorKind::Other];
 
+/// The `InvalidData` + `UnexpectedEof` pair, measured against `ar 0.9.0`'s own
+/// source (`Header::read`, `Archive::read_global_header_if_necessary`).
+///
+/// `InvalidData` is what the crate constructs directly for every malformed
+/// FIELD it recognises: "Not an archive file (invalid global header)", every
+/// `parse_number` failure (a non-numeric size/timestamp/uid/gid/mode field),
+/// "invalid padding byte", and a BSD extended identifier whose declared
+/// length exceeds the entry's own size. `UnexpectedEof` is what it constructs
+/// for a genuine SHORT READ while filling a fixed-width field — the crate's
+/// own `Header::read` explicitly checks `error.kind() ==
+/// ErrorKind::UnexpectedEof` after a `read_exact` on the 60-byte entry header
+/// (and again for a BSD extended identifier) and raises its own
+/// `UnexpectedEof` naming what was being read; `read_global_header_if_necessary`
+/// propagates whatever kind `read_exact` itself produced for the 8-byte
+/// magic, which for a genuinely truncated stream is `UnexpectedEof` too (the
+/// default `Read::read_exact` manufactures that kind itself once the source
+/// returns `Ok(0)` before the buffer is full — this crate never overrides
+/// `read_exact`, so that manufacture is unaffected by anything wrapping the
+/// reader underneath it).
+///
+/// Every other fallible path in the crate's read side (`annotate`, used for
+/// any read failure that is NOT a clean `UnexpectedEof`) re-wraps with the
+/// ORIGINAL error's own kind preserved, never invented — so a genuine source
+/// failure (`PermissionDenied`, say) reaches this wrapper untouched, which is
+/// what property 10 depends on.
+///
+/// `ar::Entry::read` (the PAYLOAD side, once a header has parsed) raises
+/// neither kind, and raises nothing of its own at all: it is a bare
+/// length-limited proxy over the archive's own reader with no truncation
+/// check whatsoever — a stream that runs out mid-entry reports a clean `Ok(0)`
+/// exactly like `tar::Entry`'s `Take` does (see `tar.rs`'s module doc, point
+/// 3). `ar.rs`'s own `ArEntryPayload` supplies the missing check directly,
+/// the same way `tar.rs`'s `EntryPayload` does, rather than folding a kind
+/// this crate never raises on that path.
+///
+/// Gated `#[cfg(feature = "ar")]`: `ar.rs` is the only consumer, and a build
+/// without it would otherwise leave this constant unused and warning under
+/// `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how that class
+/// of mistake was caught once `make check` gained the pure-tier leg.
+#[cfg(feature = "ar")]
+pub(crate) const AR_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
+    &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
+
+/// The `InvalidData` + `UnexpectedEof` pair, measured against `cpio 0.4.1`'s
+/// `newc` module.
+///
+/// `InvalidData` is what the crate constructs directly for every malformed
+/// field: an unrecognised 6-byte magic, a hex field that is not valid UTF-8
+/// or not valid hex (`read_hex_u32`, all thirteen fixed-width header
+/// fields), a name that is not NUL-terminated, and a name whose bytes are not
+/// valid UTF-8. `UnexpectedEof` is what a genuine short read produces:
+/// `Reader::new` calls `read_exact` directly on the magic, on each of the
+/// thirteen 8-byte hex fields, on the name bytes and on the alignment padding
+/// — none of those call sites catch or rewrap the error, so a stream that
+/// runs out mid-header surfaces the kind `read_exact`'s own default
+/// implementation manufactures, unchanged, for the same structural reason
+/// `AR_MALFORMED_AS_INVALID_DATA_EOF`'s doc gives.
+///
+/// This is also what makes truncation detection at the FRAMING level simpler
+/// for cpio than for tar: reaching a clean end of archive requires actually
+/// PARSING a `TRAILER!!!` entry (`Entry::is_trailer`), and any attempt to
+/// parse a next header once the stream has genuinely run out short of one
+/// raises this same `UnexpectedEof` rather than a value indistinguishable
+/// from "no more entries" — unlike `tar::Archive`, `cpio::newc::Reader::new`
+/// has no route to return a clean `Ok` for a stream that stopped short of a
+/// trailer, so `cpio.rs` needs no end-of-archive marker check of its own.
+///
+/// `Reader`'s payload-reading `Read` impl, like `ar::Entry`'s, raises neither
+/// kind and raises nothing of its own: it limits every read to
+/// `file_size - bytes_read` and proxies the result unchanged, so a source
+/// that runs out mid-entry reports a clean `Ok(0)` with bytes still
+/// promised — the same silent-truncation shape `tar.rs`'s module doc
+/// describes, closed the same way: `cpio.rs`'s own `CpioEntryPayload` tracks
+/// the declared length itself rather than trusting the crate to notice.
+/// `Reader::finish`'s own internal `io::copy` of the unread remainder has the
+/// identical blind spot — `io::copy` stops cleanly on `Ok(0)` without
+/// comparing against how much was expected — which is why `cpio.rs` never
+/// relies on `finish()` to detect anything, only to recover the underlying
+/// reader for the next entry.
+///
+/// Every other fallible path in the crate propagates whatever kind the
+/// underlying reader itself produced, unrewrapped — so a genuine source
+/// failure reaches this wrapper untouched, satisfying property 10 the same
+/// way every other constant in this file does.
+///
+/// Gated `#[cfg(feature = "cpio")]`: `cpio.rs` is the only consumer, and a
+/// build without it would otherwise leave this constant unused and warning
+/// under `-D warnings` — see `ZSTD_MALFORMED_AS_OTHER_EOF`'s doc for how that
+/// class of mistake was caught once `make check` gained the pure-tier leg.
+#[cfg(feature = "cpio")]
+pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
+    &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],

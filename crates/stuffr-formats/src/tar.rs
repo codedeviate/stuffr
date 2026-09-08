@@ -183,9 +183,22 @@ const BLOCK: usize = 512;
 /// GNU extension entry ahead of it.
 const NAME_FIELD: usize = 100;
 
-/// The mode `add` writes when the caller does not say — `rw-r--r--`, what
-/// every tar tool defaults a regular file to.
+/// The mode `add` writes for a FILE entry when the caller does not say —
+/// `rw-r--r--`, what every tar tool defaults a regular file to. Also the mode
+/// of the synthetic GNU long-name extension header `set_header_field` emits,
+/// which is never a real file and has no `EntryKind` of its own to branch on.
 const DEFAULT_MODE: u32 = 0o644;
+
+/// The mode `add` writes for a DIRECTORY entry when the caller does not say.
+///
+/// `DEFAULT_MODE` alone used to cover directories too, and `0o644` has no
+/// owner-execute bit: a directory extracted with it is not traversable —
+/// `cd`, or any tool opening a file beneath it, fails outright — in every
+/// tool that respects the archived mode, not just this one. `0o755`,
+/// `rwxr-xr-x`, is what every tar tool defaults an unset directory mode to
+/// instead, matching `DEFAULT_MODE`'s own "what every tar tool defaults to"
+/// rationale one level up.
+const DEFAULT_DIR_MODE: u32 = 0o755;
 
 /// The reader handed to `tar::Archive`. Wraps the ladder's source only to
 /// watch for the end-of-archive marker; see the module doc's point 4.
@@ -683,7 +696,11 @@ impl ArchiveWrite for TarWrite {
         // having to care; ustar's 100-byte name limit would otherwise refuse
         // ordinary deep paths.
         let mut header = tar::Header::new_gnu();
-        header.set_mode(meta.mode.unwrap_or(DEFAULT_MODE));
+        let default_mode = match meta.kind {
+            EntryKind::Dir => DEFAULT_DIR_MODE,
+            _ => DEFAULT_MODE,
+        };
+        header.set_mode(meta.mode.unwrap_or(default_mode));
         header.set_uid(meta.uid.unwrap_or(0).into());
         header.set_gid(meta.gid.unwrap_or(0).into());
         header.set_mtime(meta.mtime.map(unix_seconds).unwrap_or(0));
@@ -1571,6 +1588,46 @@ mod tests {
                 target: "../target.txt".into()
             },
             "a symlink entry that lost its target would extract as an empty file"
+        );
+    }
+
+    /// `DEFAULT_MODE` (`0o644`) used to be applied to directory entries too:
+    /// no owner-execute bit, so a directory whose caller omitted a mode
+    /// extracted as one nothing could traverse into. A file entry with no
+    /// mode still gets `0o644` — only the directory default changed.
+    #[test]
+    fn a_directory_entry_with_no_mode_defaults_to_an_executable_one() {
+        let buf = SharedBuf::new();
+        let mut w = Tar
+            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .unwrap();
+
+        let mut dir = EntryMeta::file("d/");
+        dir.kind = EntryKind::Dir;
+        assert_eq!(dir.mode, None, "the point of this test");
+        w.add(&dir, &mut std::io::Cursor::new(&[][..])).unwrap();
+
+        let file = EntryMeta::file("f.txt");
+        assert_eq!(file.mode, None, "the point of this test");
+        w.add(&file, &mut std::io::Cursor::new(b"x".as_slice()))
+            .unwrap();
+
+        w.finish().unwrap();
+
+        let mut ar = open(&buf.contents());
+        let d = ar.next_entry().unwrap().unwrap();
+        assert_eq!(
+            d.meta().mode,
+            Some(DEFAULT_DIR_MODE),
+            "an unset directory mode must default to something traversable"
+        );
+        drop(d);
+
+        let f = ar.next_entry().unwrap().unwrap();
+        assert_eq!(
+            f.meta().mode,
+            Some(DEFAULT_MODE),
+            "a file's own default must be unaffected by the directory fix"
         );
     }
 

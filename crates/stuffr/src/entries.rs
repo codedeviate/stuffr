@@ -436,8 +436,16 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
         }
     }
 
-    // Now that nothing more will be created inside them.
-    for (path, meta) in &deferred_dirs {
+    // Now that nothing more will be created inside them. Reversed: a parent
+    // chmod'd to something without the execute bit (0o400, say) would
+    // otherwise be applied BEFORE its children's own metadata, and
+    // `File::open` needs execute permission on every ancestor to traverse
+    // into a child at all — the child would then be silently left at the
+    // umask default, reported as a missing mtime and mode it never lost.
+    // Reverse order is safe for mtime too: chmod or utimes on a child does
+    // not touch its parent's mtime, so applying children first cannot cause
+    // the parent to observe a stale timestamp.
+    for (path, meta) in deferred_dirs.iter().rev() {
         let missing = match std::fs::File::open(path) {
             Ok(handle) => apply_metadata(&handle, meta),
             // The directory is there — it was just created — so a failure to

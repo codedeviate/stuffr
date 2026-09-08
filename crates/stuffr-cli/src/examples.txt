@@ -108,6 +108,19 @@ COLLECTING FILES INTO AN ARCHIVE
   as is writing a container inside a codec (`bundle.tar.gz`) in one step:
   pack the .tar, then pack that.
 
+  stuffr pack one.txt two.txt -o bundle.ar
+  stuffr pack one.txt two.txt -o bundle.cpio
+      ar and cpio (newc only) collect files the same way tar does — pack
+      infers the container from -o's extension (.a or .ar for ar, .cpio for
+      cpio) or from --format. Both are simpler than tar: neither carries a
+      trailing index, a per-entry codec or a directory concept of its own
+      (ar has none at all; cpio's applies only when a caller sets one via
+      the library, since this build's directory walk does not exist yet
+      either way). cpio's per-entry size field is a hard 4 GiB (u32)
+      ceiling — an entry larger than that is refused outright, naming the
+      limit, never silently truncated to the wrong length. ar has no such
+      ceiling.
+
 
 DECOMPRESSING
 
@@ -232,6 +245,14 @@ LISTING AND TESTING AN ARCHIVE
       refusal, so "oh, that's not a tar, it's just gzip" is diagnosable
       without inspecting the file by hand.
 
+  stuffr list bundle.ar
+  stuffr test bundle.cpio
+      list, test, cat and unpack -C all work identically on ar and cpio:
+      each is a plain forward read, the same shape as tar's own. Neither
+      format has a trailing index to lose on a pipe, so `--strict-fidelity`
+      passes a piped ar or cpio archive for the same reason it passes a
+      piped tar.
+
   stuffr list bomb.tar.gz --max-ratio 100
   stuffr test bomb.tar.gz --max-ratio 100
       `list` and `test` both resolve the codec layer beneath the container
@@ -336,13 +357,14 @@ WHAT THIS BUILD CAN DO
 
   stuffr formats
       Lists the formats compiled into THIS binary, not everything stuffr will
-      ever support. A pure build (the default) has twelve rows: the eleven
+      ever support. A pure build (the default) has fourteen rows: the eleven
       codecs gzip, zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma
-      and lzip, plus the tar container — the KIND column tells them apart.
-      zstd's row differs by which backend compiled in: a build with the
-      `zstd-c` feature (needs a C toolchain) shows `yes` in WRITE, using the
-      real `libzstd`; a pure-Rust build falls back to `ruzstd` instead, and
-      shows `weak` in WRITE — see "USING A WEAK FALLBACK ENCODER" below.
+      and lzip, plus the tar, ar and cpio containers — the KIND column tells
+      codecs and containers apart. zstd's row differs by which backend is
+      compiled in: a build with the `zstd-c` feature (needs a C toolchain)
+      shows `yes` in WRITE, using the real `libzstd`; a pure-Rust build
+      falls back to `ruzstd` instead, and shows `weak` in WRITE — see
+      "USING A WEAK FALLBACK ENCODER" below.
       Either way the format still reads `.zst` unconditionally; only writing
       it without the C backend needs the flag. xz's and lzma's rows do NOT
       have this shape: both backends show `yes` in WRITE, never `weak` —
@@ -351,9 +373,10 @@ WHAT THIS BUILD CAN DO
       more capable. lzip's row is unaffected by `c-backed` entirely — it has
       only ever had the one, pure-Rust `lzma-rust2` backend, so this feature
       changes nothing about it, in either direction. All three tiers (`pure`,
-      `pure` plus `c-backed`, and any granular combination) list all twelve
-      formats — the ONLY capability difference the `c-backed` feature makes
-      anywhere in this matrix is zstd's WRITE column, `weak` against `yes`.
+      `pure` plus `c-backed`, and any granular combination) list all
+      fourteen formats — the ONLY capability difference the `c-backed`
+      feature makes anywhere in this matrix is zstd's WRITE column, `weak`
+      against `yes`.
 
       The PARALLEL column is truthful per build too, and independent of
       the WRITE column above: on the default (`pure`) tier it reads `yes`
@@ -361,7 +384,9 @@ WHAT THIS BUILD CAN DO
       `zstd` — `ruzstd` has no multi-threaded encoder to hand a worker
       count to. Adding `--features c-backed` flips `zstd` to `yes` as
       well, alongside its WRITE column becoming `yes`; it changes nothing
-      else in this column, on any tier.
+      else in this column, on any tier. All three containers — tar, ar and
+      cpio — always show `-` here: none of them parallelises anything, on
+      any tier.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -514,24 +539,33 @@ EXIT CODES
 
 NOT YET
 
-  A pure build (the default) has eleven codecs and one container: gzip,
+  A pure build (the default) has eleven codecs and three containers: gzip,
   zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma and lzip, plus
-  tar. zstd's pure backend (`ruzstd`) is a weak fallback (see "USING A WEAK
-  FALLBACK ENCODER" above); xz's and lzma's pure backends are not — both
-  read and write full-ratio output with no C toolchain, just slower than
-  `--features c-backed`'s `liblzma` (roughly 1.2-1.3x to encode, 2-2.2x to
-  decode, measured on a 6.5 MB payload). `--features c-backed` upgrades all
-  three: zstd to the real `libzstd`, and xz/lzma to `liblzma` for speed.
-  lzip has no such upgrade path at all — it has exactly one backend (the
-  same pure-Rust `lzma-rust2` xz and lzma use), so `--features c-backed`
-  changes nothing about it, and there is no weak-fallback distinction for it
-  either. `tar` is the one archive container so far: it reads and writes,
-  and `.tar.gz` and `.tgz` resolve as tar over gzip, which `stuffr info`
-  shows as the chain. All four entry-aware
-  subcommands work on it: `list` and `test` read entries without extracting,
-  `unpack -C` writes them to disk under the containment rules above, and
-  `pack PATHS...` collects files into one. Still to come: zip, cpio and ar,
-  walking a directory tree on the pack side, and writing a container inside
-  a codec (`bundle.tar.gz`) in a single step. `stuffr
-  formats` always tells you the truth about the build you are actually
-  running, whatever this page says.
+  tar, ar and cpio. zstd's pure backend (`ruzstd`) is a weak fallback (see
+  "USING A WEAK FALLBACK ENCODER" above); xz's and lzma's pure backends are
+  not — both read and write full-ratio output with no C toolchain, just
+  slower than `--features c-backed`'s `liblzma` (roughly 1.2-1.3x to
+  encode, 2-2.2x to decode, measured on a 6.5 MB payload). `--features
+  c-backed` upgrades all three: zstd to the real `libzstd`, and xz/lzma to
+  `liblzma` for speed. lzip has no such upgrade path at all — it has
+  exactly one backend (the same pure-Rust `lzma-rust2` xz and lzma use), so
+  `--features c-backed` changes nothing about it, and there is no
+  weak-fallback distinction for it either.
+
+  All three containers read and write, and all four entry-aware
+  subcommands work on each of them identically: `list` and `test` read
+  entries without extracting, `unpack -C` writes them to disk under the
+  containment rules above, and `pack PATHS...` collects files into one.
+  `.tar.gz` and `.tgz` resolve as tar over gzip, which `stuffr info` shows
+  as the chain — ar and cpio have no such codec-wrapped convention yet.
+  `ar` is the simplest of the three: no trailing index, no directory
+  concept, no multi-member concatenation convention. `cpio` is `newc`
+  (SVR4 "new ASCII") only — the crate this build uses does not implement
+  the older `odc` format or the CRC variant of `newc`, so neither is
+  offered, and its per-entry size field is a hard 4 GiB (u32) ceiling: an
+  entry larger than that is refused with a typed error naming the limit,
+  never silently written with the wrong framing. Still to come: zip,
+  walking a directory tree on the pack side, and writing a container
+  inside a codec (`bundle.tar.gz`) in a single step. `stuffr formats`
+  always tells you the truth about the build you are actually running,
+  whatever this page says.

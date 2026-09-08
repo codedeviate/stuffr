@@ -24,6 +24,8 @@ lzma-c = ["dep:liblzma"]
 lzma-pure = ["dep:lzma-rust2"]
 lzip = ["dep:lzma-rust2"]
 tar = ["dep:tar"]
+ar = ["dep:ar"]
+cpio = ["dep:cpio"]
 
 [dependencies]
 stuffr-core = { workspace = true }
@@ -37,6 +39,8 @@ ruzstd = { workspace = true, optional = true }
 liblzma = { workspace = true, optional = true }
 lzma-rust2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
+ar = { workspace = true, optional = true }
+cpio = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }

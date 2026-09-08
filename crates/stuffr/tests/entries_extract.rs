@@ -291,6 +291,53 @@ fn what_extraction_could_not_restore_reaches_the_outcome_report() {
     assert!(!clean, "a fully restored entry must raise no warning");
 }
 
+/// Directory metadata is applied in ARCHIVE order (parent before child, the
+/// order a real tar writer emits a tree in), which used to mean a parent
+/// chmod'd to something without the execute bit ran BEFORE its child was
+/// reopened to have its own metadata applied — and `File::open` needs execute
+/// permission on every ancestor to traverse into a child at all, so the child
+/// silently fell back to the umask default and was reported as having lost
+/// its mtime and mode, when nothing about the child itself was ever the
+/// problem. Applying children first (`deferred_dirs.iter().rev()`) fixes it.
+#[test]
+fn a_restrictive_parent_directory_does_not_block_its_childs_own_metadata() {
+    let root = tmp_dir();
+    let mut locked = dir("locked");
+    locked.mode = 0o400; // read-only, no execute: makes the parent untraversable
+    let child = dir("locked/child");
+    let archive = write_tar(&root.join("restrictive.tar"), &[locked, child]);
+    let dest = root.join("out");
+
+    let outcome =
+        entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+
+    assert!(
+        !outcome.fidelity.has_warnings(),
+        "both directories' metadata are fully restorable once children are handled first: {:?}",
+        outcome.fidelity.warnings
+    );
+
+    // Confirm the parent really did end up locked down, so this isn't just
+    // "the mode was never applied at all" passing vacuously.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dest.join("locked"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o400,
+            "the parent's own mode must have been applied"
+        );
+        // Restore execute so anything cleaning up the temp dir afterward can
+        // still traverse it.
+        std::fs::set_permissions(dest.join("locked"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+    }
+}
+
 #[test]
 fn an_archive_whose_metadata_is_fully_restored_reports_no_warnings() {
     let root = tmp_dir();
