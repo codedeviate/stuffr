@@ -1,10 +1,10 @@
 //! tar, via the `tar` crate — the first container in this tree, and the
 //! shape the three that follow (ar, cpio, zip) are expected to copy.
 //!
-//! Five things below are not obvious, and each is a decision this module
+//! Four things below are not obvious, and each is a decision this module
 //! makes rather than one the `tar` crate makes for it. The three later
-//! containers will meet the first two only if their crates have the same
-//! shape; they will meet the last three regardless.
+//! containers will meet the first only if their crates have the same shape;
+//! they will meet the other three regardless.
 //!
 //! # `TarRead` is self-referential, and that is the crate's doing
 //!
@@ -27,26 +27,15 @@
 //! `entries()` takes `&mut self` while the builder is handed `&Owner`, and
 //! would have been enough on its own if the dependent could escape.) So the
 //! plan's stated fallback is what is here: the archive is allocated with
-//! `Box::into_raw`, and reclaimed in `Drop`.
+//! `Box::into_raw`, and reclaimed in `Drop`. This module's only `unsafe` is
+//! that pair. Not taking the dependency also drops its licence question:
+//! `self_cell` is `Apache-2.0 OR GPL-2.0-only`, and the only crate added
+//! here is `tar`, which is `MIT OR Apache-2.0` like most of this tree.
 //!
 //! Raw rather than a `Box` kept in the struct on purpose: `Box` is a
 //! `noalias` pointer, so deriving a borrow from one and then MOVING the box
 //! — which building this struct does — is the aliasing hazard
 //! `Box::into_raw` sidesteps entirely.
-//!
-//! # `tar::Entry` is not `Send`, and `Entry::new` requires that it be
-//!
-//! `EntriesFields<'a>` holds `&'a Archive<dyn Read + 'a>`, whose
-//! `ArchiveInner` holds a `RefCell<R>`. `&T: Send` needs `T: Sync`, and
-//! `RefCell` is never `Sync`, so `tar::Entry` is `!Send` for ANY reader — it
-//! cannot be fixed by choosing a different `R`. `stuffr_core::Entry::new`
-//! takes `Box<dyn Read + Send + 'a>`, so the payload reader carries an
-//! `unsafe impl Send` with its argument spelled out on the type. The two
-//! alternatives were both worse: buffering each entry's payload defeats the
-//! streaming this container exists for (a 10 GB member in RAM), and reading
-//! the payload straight off a shared source handle instead of through tar
-//! silently corrupts GNU sparse entries, whose archive bytes are not the
-//! contiguous run the entry's size describes.
 //!
 //! # `entries()`, never `entries_with_seek()`, even on a seekable file
 //!
@@ -94,6 +83,19 @@
 //!    `a.tar`'s entries) still pass: the rules look at the end of the whole
 //!    stream, which is `b.tar`'s own marker.
 //!
+//!    Being stricter than the crate carries a false-positive risk, so the
+//!    accept side is calibrated too, by
+//!    `every_reference_writer_is_accepted_including_its_empty_archive`:
+//!    `bsdtar`, GNU `tar` and Python `tarfile` each write an empty and a
+//!    one-entry archive, and all six must read back. The empty ones are the
+//!    tight cases, because they are nothing BUT a marker — and the three
+//!    writers disagree about padding, measured: `bsdtar` emits exactly 1024
+//!    bytes, GNU `tar` and `tarfile` pad to a 10240-byte record. A rule
+//!    slightly wrong about alignment, or about how many zero blocks it
+//!    demands, rejects one of them. Verified by mutation: demanding three
+//!    zero blocks instead of two fails that test on `bsdtar`'s empty
+//!    archive.
+//!
 //! # `add` measures a payload whose size the caller did not declare
 //!
 //! `tar::Builder::append` writes the header first and pads from the number
@@ -104,15 +106,6 @@
 //! `add` buffers that entry and writes the real length. A size that IS
 //! declared is streamed and then verified; a mismatch is refused rather than
 //! written.
-//!
-//! # Licence note
-//!
-//! No `self_cell` dependency remains (see above), so the only crate this
-//! module adds is `tar`, which is MIT OR Apache-2.0. Had `self_cell` been
-//! used it would have been the first **GPL-2.0-only**-optional crate in the
-//! tree (`Apache-2.0 OR GPL-2.0-only`), taken under its Apache-2.0 option —
-//! lawful, and precedented by `lzma-rust2`, but worth recording. It is not
-//! in the graph.
 
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -121,8 +114,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Rung,
-    Source,
+    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Source,
 };
 
 use crate::normalize::{NormalizeDecodeErrors, TAR_MALFORMED_AS_OTHER};
@@ -174,18 +166,49 @@ impl Container for Tar {
         TAR
     }
 
+    /// Note what is NOT here: tar offers no random access at all, on any
+    /// source.
+    ///
+    /// `ContainerCaps` has no field for that — `needs_seek: false` says tar
+    /// does not *require* seeking, not that it can *use* it — so it is worth
+    /// stating where a reader meets the type. `by_index` refuses on every
+    /// source shape (see its own doc), and this module never calls
+    /// `tar::Archive::entries_with_seek`, which is the only thing seekability
+    /// would buy: it reaches the next header by SEEKING rather than reading,
+    /// and a seek past the end of a truncated file succeeds, after which the
+    /// header that is not there reads back as a clean end of archive. Trading
+    /// random access this format never had for truncation this format
+    /// otherwise hides is the right way round for an archive tool, but it is
+    /// a trade, and the next reader should learn it here rather than by
+    /// noticing that `entries_with_seek` is unused.
     fn caps(&self) -> ContainerCaps {
         ContainerCaps {
             read: true,
             write: true,
             // tar is natively streaming: entries carry their own headers and
-            // sizes inline, so a forward read is not degraded at all. This is
-            // the whole reason tar reaches Exact on a pipe where zip cannot.
+            // sizes inline, so a forward read yields the same data and the
+            // same metadata a seekable one does. That is what `forward_parse`
+            // claims, and why the ladder's `ForwardOnly` rung costs tar no
+            // fidelity warnings at all.
             forward_parse: true,
             ..Default::default()
         }
     }
 
+    /// The ladder's fidelity report is carried through UNCHANGED, which is
+    /// the whole of tar's rung story.
+    ///
+    /// A piped tar lands on `Rung::ForwardOnly` and stays there — the rung
+    /// describes the access path, and a pipe genuinely is not seekable, which
+    /// is what `Rung::Exact`'s own doc ("Input was seekable") and
+    /// `is_authoritative()` both promise. What a forward read did NOT cost is
+    /// recorded the other way: `caps().trailing_index` is false, so
+    /// `ladder::seed_report` adds no warnings, so `has_warnings()` is false
+    /// and `--strict-fidelity` (which gates on warnings, deliberately, for
+    /// exactly this case — see `FidelityReport::has_warnings`) passes a piped
+    /// tar. Promoting the rung to `Exact` here would instead tell a user via
+    /// `stuffr info` that random access was available, which `by_index`
+    /// establishes it never is.
     fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
         let Resolved { source, report, .. } = resolved;
         let seekable = source.caps().seekable;
@@ -225,7 +248,7 @@ impl Container for Tar {
         Ok(Box::new(TarRead {
             entries: Some(entries),
             archive,
-            report: exact_however_the_bytes_arrived(report),
+            report,
             seekable,
             source: shared,
             trailer,
@@ -238,31 +261,6 @@ impl Container for Tar {
             builder: Some(tar::Builder::new(dst)),
         }))
     }
-}
-
-/// Reports `Rung::Exact` whether the bytes arrived from a file or a pipe.
-///
-/// The ladder hands tar `Rung::ForwardOnly` for a non-seekable source,
-/// because that is the rung it placed the SOURCE on. For tar that would
-/// describe a fidelity loss that has not occurred: every field this container
-/// reports comes from a header stored inline, ahead of the data it describes,
-/// so a forward read consults exactly the same authoritative structures a
-/// seekable one does. Nothing is approximated and nothing is skipped — which
-/// is why `caps().trailing_index` is false and harness property 7, the rung
-/// honesty check, does not apply to tar.
-///
-/// The observable difference this makes is `FidelityReport::is_lossless`,
-/// which ANDs `rung.is_authoritative()` with "no warnings": left at
-/// `ForwardOnly` it would answer `false` for a piped tar that lost nothing.
-/// Note that `fidelity.rs`'s doc comment on `has_warnings` still says "a tar
-/// read from a pipe lands on `ForwardOnly`" as its worked example; that
-/// sentence and this function disagree, and the sentence is the one that
-/// should move.
-fn exact_however_the_bytes_arrived(mut report: FidelityReport) -> FidelityReport {
-    if report.rung == Rung::ForwardOnly {
-        report.rung = Rung::Exact;
-    }
-    report
 }
 
 /// Folds an error raised by `tar`'s own reader into this project's error
@@ -480,30 +478,12 @@ impl ArchiveRead for TarRead {
 
 /// One entry's payload, with the short-read guard tar itself does not have.
 ///
-/// # Safety of the `Send` assertion below
-///
-/// `tar::Entry` is `!Send` for one reason: it holds `&Archive<dyn Read>`, and
-/// `&T: Send` requires `T: Sync`, which `ArchiveInner`'s `RefCell` never is.
-/// That makes it unsound to have TWO threads touching one archive, which
-/// cannot happen here:
-///
-/// * `ArchiveRead::next_entry(&mut self)` returns `Entry<'_>` borrowing
-///   `self`, so for as long as this payload exists the `TarRead` it came from
-///   is exclusively borrowed — no other code, on any thread, can call a
-///   method on it, drop it, or ask it for a second entry.
-/// * `TarRead::entries` is inside that same exclusive borrow, so the
-///   iterator cannot be advanced while this payload is alive either.
-/// * The archive's own reader is `Box<dyn Source>`, and `Source: Read + Send`
-///   — the bytes underneath are themselves safe to touch from another thread.
-/// * tar borrows the `RefCell` only for the duration of a single `read`, so
-///   there is no outstanding borrow for a move to invalidate.
-///
-/// The assertion exists at all only because `stuffr_core::Entry::new`
-/// requires `Box<dyn Read + Send + 'a>`. Relaxing that bound in
-/// `stuffr-core` — an entry is read on the thread that asked for it, and
-/// nothing in the tree sends one anywhere — would delete this `unsafe`
-/// outright, and is the change to make if a second container ever needs the
-/// same assertion.
+/// Not `Send`, and it cannot be made so: it holds a `tar::Entry`, which holds
+/// `&Archive<dyn Read>` over a `RefCell`, and `&T: Send` requires `T: Sync`.
+/// This is the type that made `stuffr_core::Entry` drop the `Send` bound on
+/// its reader rather than have every container built on the `tar` crate
+/// assert `unsafe impl Send` for a property that is false — see `Entry`'s own
+/// doc in `archive.rs`.
 struct EntryPayload<'a> {
     entry: tar::Entry<'a, TrailerWatch>,
     /// Payload bytes the entry's own header promised and has not delivered.
@@ -511,9 +491,6 @@ struct EntryPayload<'a> {
     /// Kept for the error message: a corrupt archive should say WHICH entry.
     name: String,
 }
-
-// SAFETY: argued in full on the type's doc comment above.
-unsafe impl Send for EntryPayload<'_> {}
 
 impl Read for EntryPayload<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -878,18 +855,39 @@ mod tests {
         assert_container_conforms(&Tar, &meta());
     }
 
-    /// tar is natively streaming: it must reach Exact even on a pipe. This is
-    /// the property that distinguishes it from zip and the reason it is the
-    /// first container implemented.
+    /// The rung and the losses are two different questions, and a piped tar
+    /// answers them differently: it lands on `ForwardOnly` — a pipe is not
+    /// seekable, and that is all the rung claims — while losing NOTHING,
+    /// because tar has no trailing index for a forward read to skip. Both
+    /// halves are asserted here: the rung alone would miss the point, and so
+    /// would the warnings alone.
+    ///
+    /// The second half is the one with teeth. `--strict-fidelity` gates on
+    /// `has_warnings()`, not on the rung (see `FidelityReport::has_warnings`,
+    /// which uses this exact case as its worked example), so a warning raised
+    /// here would fail `stuffr test --strict-fidelity` for every tarball
+    /// arriving on a pipe — an error a script could do nothing about.
     #[test]
-    fn tar_reports_exact_even_on_a_non_seekable_source() {
+    fn tar_reports_forward_only_on_a_pipe_but_warns_about_nothing() {
         let bytes = build_tar(&[("a.txt", b"alpha")]);
         let ar = open_forward_only(&Tar, &bytes);
-        assert_eq!(ar.fidelity().rung, Rung::Exact);
+        assert_eq!(
+            ar.fidelity().rung,
+            Rung::ForwardOnly,
+            "a pipe is not seekable, and the rung describes the access path"
+        );
         assert!(
             !ar.fidelity().has_warnings(),
-            "a forward tar read loses nothing, so it must raise no fidelity warning"
+            "a forward tar read skips no authoritative structure, so it must raise no \
+             fidelity warning — --strict-fidelity gates on exactly this"
         );
+
+        // The seekable shape, for contrast: same absence of warnings, higher
+        // rung. Without this the assertion above could be passing because
+        // nothing ever reports Exact.
+        let seekable = open_seekable(&bytes);
+        assert_eq!(seekable.fidelity().rung, Rung::Exact);
+        assert!(!seekable.fidelity().has_warnings());
     }
 
     #[test]
@@ -1121,6 +1119,121 @@ mod tests {
         };
         assert_eq!(&find("a.txt").1[..], b"alpha");
         assert_eq!(find("sub/b.bin").1, vec![0xABu8; 5000]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The false-positive guard on the end-of-archive rules, which are
+    /// stricter than the `tar` crate's own: every reference writer available
+    /// must be accepted, and the EMPTY archive from each is the shape most
+    /// likely to look like a missing marker, since it is nothing BUT a
+    /// marker.
+    ///
+    /// Three writers, each skipped cleanly when absent, because they pad
+    /// differently and the difference is the point — measured on this
+    /// machine: `bsdtar` writes an empty archive as exactly 1024 bytes (the
+    /// bare marker, the tightest case these rules can face), while GNU `tar`
+    /// and Python `tarfile` both pad to a 10240-byte record. A rule that was
+    /// even slightly wrong about alignment or about how many zero blocks it
+    /// demands would reject one of these.
+    ///
+    /// This is the check Task 5's finding calls for: a refusal that fires on
+    /// ubiquitous benign input is worse than no refusal, because it trains
+    /// users to bypass the one control that matters.
+    #[test]
+    fn every_reference_writer_is_accepted_including_its_empty_archive() {
+        let dir = std::env::temp_dir().join(format!("stuffr-tar-writers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"alpha").unwrap();
+
+        let mut writers_tried = 0;
+
+        // `tar` is whichever the platform ships (bsdtar on macOS, GNU on the
+        // CI runner); `gtar` is GNU where a BSD one is the default. Both are
+        // listed so a machine with either or both covers as much as it can.
+        for bin in ["tar", "gtar"] {
+            let Some(tar_bin) = which(bin) else { continue };
+            writers_tried += 1;
+
+            let empty = dir.join(format!("{bin}-empty.tar"));
+            let status = std::process::Command::new(&tar_bin)
+                .arg("-cf")
+                .arg(&empty)
+                .args(["-T", "/dev/null"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "{bin} could not write an empty archive");
+            assert!(
+                read_back(&std::fs::read(&empty).unwrap()).is_empty(),
+                "{bin}'s empty archive must read back as zero entries, not an error"
+            );
+
+            let one = dir.join(format!("{bin}-one.tar"));
+            let status = std::process::Command::new(&tar_bin)
+                .arg("-cf")
+                .arg(&one)
+                .arg("-C")
+                .arg(&dir)
+                .arg("a.txt")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "{bin} could not write a one-entry archive"
+            );
+            let got = read_back(&std::fs::read(&one).unwrap());
+            assert!(
+                got.iter().any(|(n, d)| n == "a.txt" && d == b"alpha"),
+                "{bin}'s one-entry archive lost a.txt: {:?}",
+                got.iter().map(|(n, _)| n).collect::<Vec<_>>()
+            );
+        }
+
+        // Python's `tarfile`, the third independent implementation — and the
+        // one this project already uses as a reference arbiter in `gzip.rs`.
+        if let Some(python) = which("python3") {
+            writers_tried += 1;
+            let script = format!(
+                "import tarfile\n\
+                 tarfile.open({empty:?}, 'w').close()\n\
+                 t = tarfile.open({one:?}, 'w')\n\
+                 t.add({src:?}, arcname='a.txt')\n\
+                 t.close()\n",
+                empty = dir.join("python-empty.tar").to_str().unwrap(),
+                one = dir.join("python-one.tar").to_str().unwrap(),
+                src = dir.join("a.txt").to_str().unwrap(),
+            );
+            let out = std::process::Command::new(&python)
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "python tarfile could not write the fixtures: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+
+            let empty = std::fs::read(dir.join("python-empty.tar")).unwrap();
+            assert!(
+                read_back(&empty).is_empty(),
+                "python tarfile's empty archive ({} bytes) must read back as zero entries",
+                empty.len()
+            );
+            let got = read_back(&std::fs::read(dir.join("python-one.tar")).unwrap());
+            assert!(
+                got.iter().any(|(n, d)| n == "a.txt" && d == b"alpha"),
+                "python tarfile's one-entry archive lost a.txt: {:?}",
+                got.iter().map(|(n, _)| n).collect::<Vec<_>>()
+            );
+        }
+
+        assert!(
+            writers_tried > 0,
+            "no reference tar writer found at all — this test proved nothing, which is \
+             worth knowing rather than passing silently"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

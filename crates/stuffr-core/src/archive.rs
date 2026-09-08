@@ -143,13 +143,27 @@ impl EntryMeta {
 }
 
 /// One entry, borrowed from the archive it came from.
+///
+/// The reader is deliberately **not** `Send`. It was until Phase 2's first
+/// real container, and the bound was unsound to require: `tar::Entry` holds
+/// `&Archive<dyn Read>` over a `RefCell`, so it is `!Send` for any reader,
+/// and every container built on the `tar` crate would have had to assert
+/// `unsafe impl Send` for a property that is false — a lie that becomes UB
+/// the day anything actually sends one.
+///
+/// Nothing needs it. An entry borrows the archive it came from
+/// (`ArchiveRead::next_entry(&mut self) -> Entry<'_>`), so sending an entry
+/// to another thread would mean sending the archive with it, and no caller in
+/// this tree does either: entries are read on the thread that asked for
+/// them. Dropping the bound is strictly more permissive, so a container whose
+/// reader IS `Send` is unaffected.
 pub struct Entry<'a> {
     meta: EntryMeta,
-    reader: Box<dyn Read + Send + 'a>,
+    reader: Box<dyn Read + 'a>,
 }
 
 impl<'a> Entry<'a> {
-    pub fn new(meta: EntryMeta, reader: Box<dyn Read + Send + 'a>) -> Self {
+    pub fn new(meta: EntryMeta, reader: Box<dyn Read + 'a>) -> Self {
         Self { meta, reader }
     }
 
@@ -157,14 +171,14 @@ impl<'a> Entry<'a> {
         &self.meta
     }
 
-    pub fn reader(&mut self) -> &mut (dyn Read + Send + 'a) {
+    pub fn reader(&mut self) -> &mut (dyn Read + 'a) {
         &mut *self.reader
     }
 }
 
-/// Manual impl: `reader` is `Box<dyn Read + Send>`, which cannot derive
-/// `Debug`. Needed so `Result<Entry<'_>, Error>::unwrap_err()` type-checks in
-/// tests (`unwrap_err` requires the `Ok` side to be `Debug`).
+/// Manual impl: `reader` is `Box<dyn Read>`, which cannot derive `Debug`.
+/// Needed so `Result<Entry<'_>, Error>::unwrap_err()` type-checks in tests
+/// (`unwrap_err` requires the `Ok` side to be `Debug`).
 impl std::fmt::Debug for Entry<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Entry")
