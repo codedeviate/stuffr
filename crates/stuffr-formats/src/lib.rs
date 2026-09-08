@@ -88,8 +88,18 @@ pub fn register_all(registry: &mut Registry) {
     registry.register_container(std::sync::Arc::new(tar::Tar), tar::meta());
 
     // Batched with tar deliberately (Phase 2, Task 10): same streaming
-    // shape, small diffs. Neither is self-referential, so neither module
-    // needs tar's `unsafe`.
+    // shape, small diffs. The plan going in was that neither would need
+    // tar's `unsafe` — wrong for `ar`, right for `cpio`. `ar::Entry`'s own
+    // `Drop` impl (`lib.rs:851` in `ar` 0.9.0) eagerly drains any unread
+    // payload via `io::copy` into a sink the instant it runs, with no
+    // `finish()` and no lazy alternative anywhere in the crate's public
+    // API — conformance harness property 8 caught this directly, and
+    // `ar.rs` needs the identical `Box::into_raw`/`Box::from_raw`
+    // self-referential shape `tar.rs` uses, for this different reason. See
+    // `ar.rs`'s own module doc for the full argument and the measurement
+    // behind it. `cpio::newc::Reader` genuinely owns its reader outright
+    // and hands it back through an explicit `finish()` this project calls
+    // on its own schedule, so `cpio.rs` needs no `unsafe` at all.
     #[cfg(feature = "ar")]
     registry.register_container(std::sync::Arc::new(ar::Ar), ar::meta());
     #[cfg(feature = "cpio")]

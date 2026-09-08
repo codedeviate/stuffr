@@ -70,12 +70,18 @@
 //! realistic archive, so the read is small and constant-cost, and it does
 //! not touch the streaming property conformance property 8 checks — that
 //! property's own fixture is an ordinary FILE entry, never a symlink, so
-//! this path is never on its critical path. A hostile archive claiming an
-//! implausibly large symlink "target" is bounded the same way every other
-//! entry already is: `entries::open_archive` wraps the source in a
-//! `RatioGuardedSource` before any container ever sees a byte, so this read
-//! is charged against `--max-ratio` exactly like an ordinary payload read
-//! would be.
+//! this path is never on its critical path.
+//!
+//! A hostile archive claiming an implausibly large symlink "target" is
+//! refused outright by [`MAX_SYMLINK_TARGET_LEN`], checked BEFORE a single
+//! byte is read — deliberately not left to `--max-ratio`: `entries::
+//! open_archive` does wrap the source in a `RatioGuardedSource`, but that
+//! bounds decoded bytes against COMPRESSED ones, which is ~1:1 for a plain,
+//! uncompressed `.cpio` and so does not meaningfully bind an oversized
+//! target either way; containers also receive no `--memory-limit` at all
+//! (`OpenOpts` carries no such field). The explicit cap is what makes "this
+//! read is small and constant-cost" true unconditionally, not just for a
+//! well-formed archive.
 //!
 //! Real-world cpio payloads — initramfs images, RPM archives — are dense
 //! with symlinks, which is why this is a real requirement and not a
@@ -168,6 +174,14 @@ impl Container for CpioNewc {
 
     /// No trailing index, no per-entry codec, no solid blocks: entries carry
     /// their own headers and sizes inline, the same shape as tar and ar.
+    ///
+    /// Not reflected in any field here, because `ContainerCaps` has none for
+    /// it, but worth stating at the same place a caller checking this
+    /// format's capabilities would look: `newc`'s per-entry size field is
+    /// `u32` — a hard 4 GiB ceiling this format cannot express past. An
+    /// entry larger than that is refused by `add` with a typed error naming
+    /// the limit (see [`check_u32_size`]), never silently truncated to the
+    /// wrong length.
     fn caps(&self) -> ContainerCaps {
         ContainerCaps {
             read: true,
@@ -374,15 +388,37 @@ fn is_symlink_mode(mode: u32) -> bool {
     mode & MODE_TYPE_MASK == S_IFLNK
 }
 
+/// A generous ceiling well beyond any real platform's `PATH_MAX` (4096 on
+/// Linux, 1024 on macOS/BSD) — no legitimate symlink target comes anywhere
+/// near it. [`read_symlink_target`] refuses a declared target past this
+/// BEFORE reading a single byte, which is what makes the module doc's
+/// bounded-cost claim for the eager read hold unconditionally rather than
+/// resting only on `--max-ratio`: `RatioGuardedSource` bounds decoded bytes
+/// against COMPRESSED ones, which is ~1:1 for a plain, uncompressed
+/// `.cpio`, so it does not meaningfully bind here — and containers receive
+/// no `--memory-limit` at all (`OpenOpts` carries no such field). Without
+/// this cap, a hostile entry claiming an implausible `file_size` under an
+/// `S_IFLNK` mode could otherwise force an allocation of that size before
+/// any caller had asked to read anything.
+const MAX_SYMLINK_TARGET_LEN: u64 = 65_536;
+
 /// Reads a symlink entry's target out of its payload — see the module doc's
 /// "Symlinks" section for why this container reads it eagerly rather than
-/// deferring to the caller. Detects truncation itself: `cpio::newc::Reader`'s
-/// own `Read` impl has no truncation check of its own (see
-/// [`CpioEntryPayload`]'s doc), so a stream that runs out mid-target would
-/// otherwise report a shorter-than-declared target as if it were the whole
-/// thing.
+/// deferring to the caller. Refuses a declared length past
+/// [`MAX_SYMLINK_TARGET_LEN`] before reading anything, and otherwise detects
+/// truncation itself: `cpio::newc::Reader`'s own `Read` impl has no
+/// truncation check of its own (see [`CpioEntryPayload`]'s doc), so a
+/// stream that runs out mid-target would otherwise report a
+/// shorter-than-declared target as if it were the whole thing.
 fn read_symlink_target(reader: &mut cpio::newc::Reader<CpioSource>, name: &str) -> Result<String> {
     let declared = u64::from(reader.entry().file_size());
+    if declared > MAX_SYMLINK_TARGET_LEN {
+        return Err(Error::ResourceLimit(format!(
+            "entry `{name}` declares a symlink target of {declared} bytes, past the \
+             {MAX_SYMLINK_TARGET_LEN}-byte ceiling this container reads eagerly; no \
+             legitimate symlink target is this long"
+        )));
+    }
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).map_err(classify_cpio_error)?;
     if (buf.len() as u64) < declared {
@@ -544,6 +580,23 @@ mod tests {
         })
     }
 
+    /// Locates `bin` on `PATH`, panicking rather than silently skipping if
+    /// it is absent. CI always installs `cpio` (see the CI workflow's
+    /// `gate` and `msrv` jobs) and `find` ships everywhere, so an absence
+    /// here means only a contributor's own machine lacks it — and a silent
+    /// `return` in that case would report every cross-implementation test
+    /// in this file as PASSING having verified nothing at all, exactly the
+    /// shape Finding 8 (Phase 1e) warns against. Failing loudly beats
+    /// passing quietly.
+    fn require_bin(bin: &str) -> std::path::PathBuf {
+        which(bin).unwrap_or_else(|| {
+            panic!(
+                "no reference `{bin}` tool found on PATH — this test proved nothing, which is \
+                 worth knowing rather than passing silently"
+            )
+        })
+    }
+
     #[test]
     fn cpio_conforms() {
         assert_container_conforms(&CpioNewc, &meta());
@@ -678,6 +731,35 @@ mod tests {
             },
             "a symlink entry that lost its target would extract as an empty file"
         );
+    }
+
+    /// A symlink target past [`MAX_SYMLINK_TARGET_LEN`] is refused before a
+    /// single byte is read, not silently allocated. Written through this
+    /// container's own writer (which places no cap of its own on the WRITE
+    /// side — only the read-side eager buffer needs bounding) so the fixture
+    /// is a realistic, well-formed archive, not a hand-crafted one.
+    #[test]
+    fn a_symlink_target_past_the_length_ceiling_is_refused() {
+        let buf = SharedBuf::new();
+        let mut w = CpioNewc
+            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .unwrap();
+        let mut link = EntryMeta::file("mylink");
+        link.kind = EntryKind::Symlink {
+            target: "x".repeat((MAX_SYMLINK_TARGET_LEN + 1) as usize),
+        };
+        w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
+        w.finish().unwrap();
+
+        let mut ar = open(&buf.contents());
+        let err = ar
+            .next_entry()
+            .expect_err("an implausibly long symlink target must be refused");
+        assert!(
+            matches!(err, stuffr_core::Error::ResourceLimit(_)),
+            "got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 6, "a resource limit is exit 6, never 5");
     }
 
     /// `newc` has no field OTHER than the mode's own type bits to record
@@ -848,15 +930,14 @@ mod tests {
     }
 
     /// Cross-implementation arbiter: what stuffr writes must read back
-    /// through a real `cpio`. Skips cleanly when the tool is absent; CI
-    /// installs it explicitly (unlike `tar`/`ar`, `ubuntu-latest` does not
-    /// ship it — see the CI workflow) so this does not silently no-op there
-    /// (Phase 1e, Finding 8, repeating).
+    /// through a real `cpio`. CI installs it explicitly (unlike `tar`/`ar`,
+    /// `ubuntu-latest` does not ship it — see the CI workflow); a
+    /// contributor's machine lacking it fails this test loudly rather than
+    /// passing having verified nothing (Phase 1e, Finding 8, repeating) —
+    /// see `require_bin`.
     #[test]
     fn system_cpio_accepts_what_we_write() {
-        let Some(cpio_bin) = which("cpio") else {
-            return;
-        };
+        let cpio_bin = require_bin("cpio");
 
         // Built by hand rather than through `build_cpio`, which only ever
         // writes plain files: this also covers the symlink round trip in
@@ -929,12 +1010,8 @@ mod tests {
     /// `Other`, and not a file holding the target string as file contents.
     #[test]
     fn we_accept_a_symlink_system_cpio_writes() {
-        let Some(cpio_bin) = which("cpio") else {
-            return;
-        };
-        let Some(find_bin) = which("find") else {
-            return;
-        };
+        let cpio_bin = require_bin("cpio");
+        let find_bin = require_bin("find");
 
         let dir = std::env::temp_dir().join(format!(
             "stuffr-cpio-reverse-symlink-{}",
@@ -994,9 +1071,7 @@ mod tests {
     /// bytes), and must still be accepted.
     #[test]
     fn system_cpio_accepts_an_empty_archive_we_write() {
-        let Some(cpio_bin) = which("cpio") else {
-            return;
-        };
+        let cpio_bin = require_bin("cpio");
 
         let bytes = build_cpio(&[]);
         let mut child = std::process::Command::new(&cpio_bin)
@@ -1018,5 +1093,54 @@ mod tests {
             "an empty archive must list zero members: {:?}",
             String::from_utf8_lossy(&out.stdout)
         );
+    }
+
+    /// The reverse of the test above: this container must read `cpio`'s OWN
+    /// empty archive too, not just accept the one it wrote itself. Measured
+    /// directly on this machine (`bsdcpio` 3.5.3): `printf '' | cpio -o -H
+    /// newc` produces exactly 512 bytes — a bare `TRAILER!!!` header padded
+    /// out to a full block — against this container's own 124-byte
+    /// equivalent (110-byte header + 11-byte padded name + 3 bytes of
+    /// 4-byte alignment padding, no block padding at all). That gap is
+    /// exactly the shape that hid `bsdtar`'s zero-margin empty `.tar`
+    /// (1024 bytes, no slack) from Task 7 until a read-direction test was
+    /// added for tar too — see `tar.rs`'s
+    /// `every_reference_writer_is_accepted_including_its_empty_archive`.
+    #[test]
+    fn we_accept_an_empty_archive_system_cpio_writes() {
+        let cpio_bin = require_bin("cpio");
+
+        let mut child = std::process::Command::new(&cpio_bin)
+            .args(["-o", "-H", "newc"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // No input at all: an archive with zero entries.
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "system cpio could not write an empty archive: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let mut ar = open(&out.stdout);
+        assert!(
+            ar.next_entry()
+                .expect("bsdcpio's own empty archive must read back as zero entries, not an error")
+                .is_none(),
+            "an empty archive must have zero entries"
+        );
+    }
+
+    /// `require_bin` is what makes a missing reference tool a loud failure
+    /// rather than a silent skip — proven directly, on a name guaranteed
+    /// absent from `PATH`, rather than trusted by inspection alone.
+    #[test]
+    #[should_panic(expected = "no reference `this-binary-does-not-exist-xyz` tool found on PATH")]
+    fn require_bin_panics_rather_than_skips_silently() {
+        require_bin("this-binary-does-not-exist-xyz");
     }
 }

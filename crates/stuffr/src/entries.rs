@@ -436,16 +436,23 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
         }
     }
 
-    // Now that nothing more will be created inside them. Reversed: a parent
-    // chmod'd to something without the execute bit (0o400, say) would
-    // otherwise be applied BEFORE its children's own metadata, and
-    // `File::open` needs execute permission on every ancestor to traverse
-    // into a child at all — the child would then be silently left at the
-    // umask default, reported as a missing mtime and mode it never lost.
-    // Reverse order is safe for mtime too: chmod or utimes on a child does
+    // Now that nothing more will be created inside them. Sorted deepest
+    // path first: a parent chmod'd to something without the execute bit
+    // (0o400, say) would otherwise be applied BEFORE its children's own
+    // metadata, and `File::open` needs execute permission on every ancestor
+    // to traverse into a child at all — the child would then be silently
+    // left at the umask default, reported as a missing mtime and mode it
+    // never lost. Sorting by component count (rather than simply reversing
+    // `deferred_dirs`) is what makes this ORDER-INDEPENDENT: reversal alone
+    // only works because every real archive writer lists a parent before
+    // its children, and an archive that happened to list one out of order
+    // would silently reinstate the exact bug this fixes. Descending by
+    // depth is correct regardless of archive order, at the same one-line
+    // cost. Safe for mtime too, either way: chmod or utimes on a child does
     // not touch its parent's mtime, so applying children first cannot cause
     // the parent to observe a stale timestamp.
-    for (path, meta) in deferred_dirs.iter().rev() {
+    deferred_dirs.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    for (path, meta) in &deferred_dirs {
         let missing = match std::fs::File::open(path) {
             Ok(handle) => apply_metadata(&handle, meta),
             // The directory is there — it was just created — so a failure to

@@ -494,6 +494,22 @@ mod tests {
         })
     }
 
+    /// Locates `bin` on `PATH`, panicking rather than silently skipping if
+    /// it is absent. CI always installs it (`ar` ships via `binutils` on
+    /// `ubuntu-latest` unconditionally), so an absence here means only a
+    /// contributor's own machine lacks it — and a silent `return` in that
+    /// case would report every cross-implementation test in this file as
+    /// PASSING having verified nothing at all, exactly the shape Finding 8
+    /// (Phase 1e) warns against. Failing loudly beats passing quietly.
+    fn require_bin(bin: &str) -> std::path::PathBuf {
+        which(bin).unwrap_or_else(|| {
+            panic!(
+                "no reference `{bin}` tool found on PATH — this test proved nothing, which is \
+                 worth knowing rather than passing silently"
+            )
+        })
+    }
+
     #[test]
     fn ar_conforms() {
         assert_container_conforms(&Ar, &meta());
@@ -675,17 +691,19 @@ mod tests {
     }
 
     /// Cross-implementation arbiter: what stuffr writes must read back
-    /// through a real `ar`. Skips cleanly when the tool is absent; CI has
-    /// it unconditionally (`binutils` ships it on `ubuntu-latest`), so this
-    /// does not silently no-op there (Phase 1e, Finding 8).
+    /// through a real `ar`. CI has it unconditionally (`binutils` ships it
+    /// on `ubuntu-latest`); a contributor's machine lacking it fails this
+    /// test loudly rather than passing having verified nothing (Phase 1e,
+    /// Finding 8) — see `require_bin`.
     #[test]
     fn system_ar_accepts_what_we_write() {
-        let Some(ar_bin) = which("ar") else { return };
+        let ar_bin = require_bin("ar");
 
         let long_name: String = std::iter::repeat_n("segment-", 4).collect::<String>() + ".txt";
+        let spaced_name = "a name with spaces.txt";
         let bytes = build_ar(&[
             ("a.txt", b"alpha"),
-            ("a name with spaces.txt", b"\x00\xff\x00"),
+            (spaced_name, b"\x00\xff\x00"),
             (&long_name, b"deep"),
         ]);
         let path =
@@ -705,6 +723,11 @@ mod tests {
         let listing = String::from_utf8_lossy(&listed.stdout);
         assert!(listing.contains("a.txt"), "listing was {listing:?}");
         assert!(
+            listing.contains(spaced_name),
+            "system ar did not read back our space-containing BSD extended-name entry; \
+             listing was {listing:?}"
+        );
+        assert!(
             listing.contains(&long_name),
             "system ar did not read back our BSD extended-name entry; listing was {listing:?}"
         );
@@ -721,12 +744,70 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The arbiter in the other direction, mirroring `tar.rs`'s own
+    /// `we_accept_what_system_tar_writes`: `system_ar_accepts_what_we_write`
+    /// only proves our writer and our reader agree about archives WE
+    /// framed. A system `ar` writes its own header bytes, which is the
+    /// only independent evidence that this container's READ side, not just
+    /// its round trip, is correct.
+    #[test]
+    fn we_accept_what_system_ar_writes() {
+        let ar_bin = require_bin("ar");
+
+        let dir = std::env::temp_dir().join(format!("stuffr-ar-reverse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(dir.join("b.bin"), vec![0xABu8; 5000]).unwrap();
+
+        let archive = dir.join("made-by-system-ar.a");
+        // `-S`: do not build a ranlib-style symbol table. Measured directly
+        // on this machine: `ar rc` ALONE (no `-S`) silently produced a
+        // 96-byte archive containing ONLY an empty `__.SYMDEF SORTED`
+        // symbol table — both real files were dropped entirely, since
+        // macOS's `ar` invokes ranlib-like indexing on plain (non-object)
+        // files by default. `-S` is what makes this a plain archive of the
+        // two files, the shape every other `ar` (GNU included) writes by
+        // default.
+        let status = std::process::Command::new(&ar_bin)
+            .arg("rcS")
+            .arg(&archive)
+            .arg("a.txt")
+            .arg("b.bin")
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "system ar could not write the fixture");
+
+        let bytes = std::fs::read(&archive).unwrap();
+        let mut ar = open(&bytes);
+        let mut got = Vec::new();
+        while let Some(mut entry) = ar.next_entry().unwrap() {
+            let name = entry.meta().name.clone();
+            let mut data = Vec::new();
+            entry.reader().read_to_end(&mut data).unwrap();
+            got.push((name, data));
+        }
+        let find = |name: &str| {
+            got.iter().find(|(n, _)| n == name).unwrap_or_else(|| {
+                panic!(
+                    "{name} missing from {:?}",
+                    got.iter().map(|(n, _)| n).collect::<Vec<_>>()
+                )
+            })
+        };
+        assert_eq!(&find("a.txt").1[..], b"alpha");
+        assert_eq!(find("b.bin").1, vec![0xABu8; 5000]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The empty-archive case specifically: the system tool cannot WRITE one
     /// (`ar: no archive members specified` on this machine), but it must
     /// still READ one back as zero members — see the module doc.
     #[test]
     fn system_ar_accepts_an_empty_archive_we_write() {
-        let Some(ar_bin) = which("ar") else { return };
+        let ar_bin = require_bin("ar");
 
         let bytes = build_ar(&[]);
         let path = std::env::temp_dir().join(format!(
@@ -752,5 +833,14 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `require_bin` is what makes a missing reference tool a loud failure
+    /// rather than a silent skip — proven directly, on a name guaranteed
+    /// absent from `PATH`, rather than trusted by inspection alone.
+    #[test]
+    #[should_panic(expected = "no reference `this-binary-does-not-exist-xyz` tool found on PATH")]
+    fn require_bin_panics_rather_than_skips_silently() {
+        require_bin("this-binary-does-not-exist-xyz");
     }
 }

@@ -291,14 +291,17 @@ fn what_extraction_could_not_restore_reaches_the_outcome_report() {
     assert!(!clean, "a fully restored entry must raise no warning");
 }
 
-/// Directory metadata is applied in ARCHIVE order (parent before child, the
-/// order a real tar writer emits a tree in), which used to mean a parent
+/// Directory metadata used to be applied in ARCHIVE order (parent before
+/// child, the order a real tar writer emits a tree in), which meant a parent
 /// chmod'd to something without the execute bit ran BEFORE its child was
 /// reopened to have its own metadata applied — and `File::open` needs execute
 /// permission on every ancestor to traverse into a child at all, so the child
 /// silently fell back to the umask default and was reported as having lost
 /// its mtime and mode, when nothing about the child itself was ever the
-/// problem. Applying children first (`deferred_dirs.iter().rev()`) fixes it.
+/// problem. Fixed by sorting `deferred_dirs` deepest-path-first (by
+/// component count) rather than merely reversing archive order — see
+/// `an_out_of_order_archive_still_applies_children_before_their_parent`
+/// below for why reversal alone was not enough.
 #[test]
 fn a_restrictive_parent_directory_does_not_block_its_childs_own_metadata() {
     let root = tmp_dir();
@@ -333,6 +336,51 @@ fn a_restrictive_parent_directory_does_not_block_its_childs_own_metadata() {
         );
         // Restore execute so anything cleaning up the temp dir afterward can
         // still traverse it.
+        std::fs::set_permissions(dest.join("locked"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+    }
+}
+
+/// The reason sorting by depth replaced reversing archive order: `.rev()`
+/// only fixes the bug above because a real tar writer lists a parent before
+/// its children, so reversing encounter order happens to put children
+/// first. An archive that lists the CHILD directory before its parent (this
+/// fixture does exactly that) would make `.rev()` process the PARENT first
+/// again — reinstating the original bug for this one ordering. Sorting by
+/// component count is correct regardless of which order the archive lists
+/// them in.
+#[test]
+fn an_out_of_order_archive_still_applies_children_before_their_parent() {
+    let root = tmp_dir();
+    let mut locked = dir("locked");
+    locked.mode = 0o400; // read-only, no execute: makes the parent untraversable
+    let child = dir("locked/child");
+    // Child pushed BEFORE its parent — the encounter order `.rev()` alone
+    // would get wrong.
+    let archive = write_tar(&root.join("out-of-order.tar"), &[child, locked]);
+    let dest = root.join("out");
+
+    let outcome =
+        entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+
+    assert!(
+        !outcome.fidelity.has_warnings(),
+        "both directories' metadata must be restorable regardless of archive order: {:?}",
+        outcome.fidelity.warnings
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dest.join("locked"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o400,
+            "the parent's own mode must have been applied"
+        );
         std::fs::set_permissions(dest.join("locked"), std::fs::Permissions::from_mode(0o700))
             .unwrap();
     }
