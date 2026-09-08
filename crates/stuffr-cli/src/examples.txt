@@ -162,6 +162,38 @@ INSPECTING A STREAM WITHOUT DECODING IT
   was inferred from bytes it saw going by, not confirmed by looking back.
 
 
+LISTING AND TESTING AN ARCHIVE
+
+  stuffr list backup.tar
+      Prints one line per entry — size, then name — and extracts nothing at
+      all: no file is written, no directory created. `ls` is an alias for
+      `list`, for the muscle memory. Both work on `backup.tar.gz` and
+      `backup.tgz` exactly as they do on a bare `.tar`: the codec layer
+      (gzip) is resolved and decoded first, then `list` walks the tar
+      layer underneath it — on a real file or over a pipe (`stuffr list -`)
+      alike.
+
+  stuffr ls backup.tar.gz --json
+      `--json` emits a JSON array of `{name, kind, size}` objects instead of
+      one line per entry, for scripting. `kind` is `file`, `dir`, `symlink`
+      or `other`.
+
+  stuffr test backup.tar
+      Reads every entry's data all the way through — not just its header —
+      verifying integrity without writing anything to disk. A `test` that
+      only walked headers would pass on an archive whose payloads are
+      corrupt; this build actually pulls the bytes, into nowhere. Exits 5 on
+      a corrupt or truncated archive, the same code `unpack`/`cat` use for a
+      damaged codec stream, so a script branches on "corrupt" the same way
+      regardless of which command found it.
+
+  stuffr list plain.txt.gz
+      Fails: a bare codec stream is not an archive. The error names what
+      the input actually resolved to (here, `gzip`) rather than a bare
+      refusal, so "oh, that's not a tar, it's just gzip" is diagnosable
+      without inspecting the file by hand.
+
+
 WHAT THIS BUILD CAN DO
 
   stuffr formats
@@ -330,11 +362,14 @@ EXIT CODES
 
   0  success
   1  general failure (i/o error, or anything not listed below)
-  2  usage error (bad flag, missing -o, existing output without --force)
+  2  usage error (bad flag, missing -o, existing output without --force,
+     or list/test pointed at something that resolved to a bare codec
+     stream rather than an archive)
   3  format not available in this build
   4  fidelity degraded under strict mode
   5  archive or stream is corrupt
-  6  resource limit exceeded (e.g. --max-ratio or --memory-limit tripped)
+  6  resource limit exceeded (--max-ratio or --memory-limit tripped, or
+     archive nesting exceeded the depth stuffr will peel through)
   7  unsafe path refused
 
 
@@ -353,6 +388,8 @@ NOT YET
   changes nothing about it, and there is no weak-fallback distinction for it
   either. `tar` is the one archive container so far: it reads and writes,
   and `.tar.gz` and `.tgz` resolve as tar over gzip, which `stuffr info`
-  shows as the chain. zip, cpio and ar are still to come, as are the
-  entry-aware subcommands. `stuffr formats` always tells you the truth about
-  the build you are actually running, whatever this page says.
+  shows as the chain. `list` and `test` are the first entry-aware
+  subcommands — reading entries without extracting them; `extract` (writing
+  them to disk) is still to come, along with zip, cpio and ar. `stuffr
+  formats` always tells you the truth about the build you are actually
+  running, whatever this page says.

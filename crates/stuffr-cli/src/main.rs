@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 use stuffr::FormatId;
+use stuffr::entries;
 use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output};
 use stuffr_cli::cli::{Cli, Command};
 
@@ -62,13 +63,18 @@ fn main() -> ExitCode {
 /// Whether a command's output goes to stdout — the only case in which a
 /// `BrokenPipe` is the reader's decision rather than this program's failure.
 ///
-/// `Cat`, `Info` and `Formats` never write anywhere else. `Pack` and `Unpack`
-/// write to stdout only when `-o -` was passed explicitly; every other
-/// destination is a real file, where a `BrokenPipe` mid-write would mean
-/// something is actually wrong and must not be swallowed (see `run`).
+/// `Cat`, `Info`, `Formats` and `List` never write anywhere else — `List`
+/// prints one line per entry (or a JSON array) straight to stdout, the same
+/// early-closing-reader shape as `Cat` (e.g. `stuffr list big.tar | head`).
+/// `Pack` and `Unpack` write to stdout only when `-o -` was passed
+/// explicitly; every other destination is a real file, where a `BrokenPipe`
+/// mid-write would mean something is actually wrong and must not be
+/// swallowed (see `run`).
 fn destination_is_stdout(cmd: &Command) -> bool {
     match cmd {
-        Command::Cat { .. } | Command::Info { .. } | Command::Formats => true,
+        Command::Cat { .. } | Command::Info { .. } | Command::Formats | Command::List { .. } => {
+            true
+        }
         Command::Pack {
             output: Some(o), ..
         }
@@ -298,7 +304,60 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             Ok(())
         }
         Command::Formats => print_formats(),
+        Command::List { input, json } => print_list(input_of(&input), json),
+        Command::Test { input } => {
+            let out = entries::test(input_of(&input))?;
+            eprintln!(
+                "{} -> {} bytes verified ({} fidelity)",
+                out.format, out.bytes_out, out.fidelity.rung
+            );
+            Ok(())
+        }
     }
+}
+
+/// The kind column `list` prints — `EntryKind` is `#[non_exhaustive]`, so a
+/// future variant added upstream falls into the wildcard rather than failing
+/// to compile.
+fn entry_kind_str(kind: &stuffr::EntryKind) -> &'static str {
+    match kind {
+        stuffr::EntryKind::File => "file",
+        stuffr::EntryKind::Dir => "dir",
+        stuffr::EntryKind::Symlink { .. } => "symlink",
+        stuffr::EntryKind::Other => "other",
+        _ => "other",
+    }
+}
+
+/// `list`'s output. Written through `std::io::stdout()` and propagated with
+/// `?` rather than `println!`, matching `print_formats`/`Info` above — the
+/// same reason: `println!` panics on a write error, which would defeat
+/// `run`'s `BrokenPipe`-to-success mapping for `stuffr list big.tar | head`.
+fn print_list(src: Input, json: bool) -> stuffr::Result<()> {
+    use std::io::Write;
+    let entries = entries::list(src)?;
+    let mut out = std::io::stdout();
+    if json {
+        let rows: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "kind": entry_kind_str(&e.kind),
+                    "size": e.size,
+                })
+            })
+            .collect();
+        writeln!(out, "{}", serde_json::Value::Array(rows))?;
+    } else {
+        for e in &entries {
+            match e.size {
+                Some(n) => writeln!(out, "{n:>12}  {}", e.name)?,
+                None => writeln!(out, "{:>12}  {}", "-", e.name)?,
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolves a `--format` name against the registry.

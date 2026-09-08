@@ -57,6 +57,14 @@ pub enum Error {
     /// the message is actionable rather than merely a refusal.
     #[error("archive nesting exceeds the {depth}-layer limit")]
     ChainTooDeep { depth: usize },
+
+    /// The chain resolved to raw bytes with no container to open — e.g.
+    /// `list`/`test` pointed at a plain codec stream, or at a file whose
+    /// magic and extension both name none. Names what the input actually
+    /// resolved to (`chain.describe()`), so "unpack this .gz" is actionable
+    /// rather than a bare refusal.
+    #[error("{chain} is not an archive — it has no entries to list")]
+    NotAnArchive { chain: String },
 }
 
 impl Error {
@@ -65,11 +73,19 @@ impl Error {
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Usage(_) => 2,
+            Error::NotAnArchive { .. } => 2,
             Error::FormatNotEnabled(_) => 3,
             Error::CapabilityUnavailable { .. } => 3,
             Error::FidelityDegraded(_) => 4,
             Error::Corrupt(_) => 5,
-            Error::SpillLimitExceeded { .. } | Error::ResourceLimit(_) => 6,
+            // A nesting bound is a bound on WORK, the same family as the
+            // spill and ratio limits — never exit 5, so a refused nesting
+            // bomb stays distinguishable from a corrupt file. Explicit, not
+            // the wildcard below: falling through it would make a refused
+            // nesting bomb indistinguishable from an internal error.
+            Error::SpillLimitExceeded { .. }
+            | Error::ResourceLimit(_)
+            | Error::ChainTooDeep { .. } => 6,
             Error::UnsafePath { .. } => 7,
             _ => 1,
         }
@@ -155,6 +171,25 @@ mod tests {
         };
         assert!(e.to_string().contains("squashfs"));
         assert_eq!(e.exit_code(), 1);
+    }
+
+    #[test]
+    fn chain_too_deep_is_a_resource_limit_not_a_generic_failure() {
+        // A refused nesting bomb must be distinguishable from an internal
+        // error — falling through the wildcard to 1 would erase that.
+        assert_eq!(Error::ChainTooDeep { depth: 4 }.exit_code(), 6);
+    }
+
+    #[test]
+    fn not_an_archive_names_the_chain_and_is_a_usage_error() {
+        let e = Error::NotAnArchive {
+            chain: "gzip".into(),
+        };
+        assert!(
+            e.to_string().contains("gzip"),
+            "must name what the input resolved to: {e}"
+        );
+        assert_eq!(e.exit_code(), 2);
     }
 
     #[test]

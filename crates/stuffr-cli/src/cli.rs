@@ -127,4 +127,18 @@ pub enum Command {
     },
     /// List the formats this build contains.
     Formats,
+    /// List an archive's entries without extracting.
+    #[command(alias = "ls")]
+    List {
+        /// Archive path, or `-` for stdin.
+        input: String,
+        /// Emit machine-readable JSON instead of one entry per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify every entry's integrity without extracting.
+    Test {
+        /// Archive path, or `-` for stdin.
+        input: String,
+    },
 }

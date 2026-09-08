@@ -1,4 +1,11 @@
-use stuffr_core::{Error, RATIO_FLOOR, Result};
+use std::path::Path;
+
+use stuffr_core::{
+    ArchiveRead, Chain, EntryMeta, Error, FormatId, OpenOpts, RATIO_FLOOR, Registry, Result,
+    StreamPolicy, ladder, resolve_chain_deep,
+};
+
+use crate::ops::{Input, Outcome};
 
 /// Bounds decoded output for one archive, per entry and in total.
 ///
@@ -77,6 +84,96 @@ impl ArchiveBudget {
         }
         Ok(())
     }
+}
+
+/// Opens `src`, resolving any codec layers above the container.
+///
+/// Shared by [`list`] and [`test`] so the two cannot drift on how they
+/// resolve a chain — the defect shape where a container flag is accepted but
+/// not honoured on one of two near-identical code paths.
+fn open_archive(registry: &Registry, src: Input) -> Result<(Box<dyn ArchiveRead>, FormatId)> {
+    let path = src.path().map(Path::to_path_buf);
+    let (chain, source) = resolve_chain_deep(registry, path.as_deref(), src.open()?)?;
+    // Kept for the error path: once the loop below has peeled layers, the
+    // original chain is the only thing that can say what the input actually
+    // was.
+    let described = chain.describe();
+
+    // Do NOT decode here. `resolve_chain_deep` already guarantees `source` is
+    // positioned past every codec layer named in `chain` — on both the path
+    // and the pathless (piped) route — so calling a codec's decoder again
+    // would decode the same bytes twice, and would do so only on the pipe
+    // path, making it a bug that appears exclusively when piping. Walk the
+    // chain only to find which container to hand the source to.
+    let mut chain = &chain;
+    loop {
+        match chain {
+            Chain::Codec { inner, .. } => chain = inner,
+            Chain::Container { container } => {
+                let k = registry.require_container(*container)?;
+                // `ladder::resolve` takes FOUR arguments: the source, the
+                // format, the container's own caps, and the policy.
+                // `StreamPolicy::default()` is `Adaptive { allow_forward_only:
+                // true, .. }`, which is what keeps a piped archive off the
+                // disk.
+                let resolved =
+                    ladder::resolve(source, *container, k.caps(), &StreamPolicy::default())?;
+                return Ok((k.open(resolved, &OpenOpts::default())?, *container));
+            }
+            // Names what the input resolved to, so "unpack this .gz" is
+            // actionable rather than a bare refusal.
+            Chain::Raw => return Err(Error::NotAnArchive { chain: described }),
+            // `Chain` is `#[non_exhaustive]` and this crate is not its
+            // defining crate, so a fourth variant added upstream must fail
+            // loudly here rather than fail to compile silently-wrong.
+            _ => {
+                return Err(Error::Unsupported(
+                    "unrecognised chain shape; this build does not know how to open it".into(),
+                ));
+            }
+        }
+    }
+}
+
+/// Lists every entry in an archive, extracting nothing.
+pub fn list(src: Input) -> Result<Vec<EntryMeta>> {
+    let (mut ar, _format) = open_archive(crate::registry(), src)?;
+    let mut out = Vec::new();
+    while let Some(entry) = ar.next_entry()? {
+        out.push(entry.meta().clone());
+    }
+    Ok(out)
+}
+
+/// Reads every entry to the end, verifying integrity, writing nothing.
+///
+/// The data must actually be pulled: a `test` that only walked headers would
+/// pass on an archive whose payloads are corrupt, which is precisely the
+/// failure it exists to find.
+pub fn test(src: Input) -> Result<Outcome> {
+    let (mut ar, format) = open_archive(crate::registry(), src)?;
+    let mut bytes = 0u64;
+    while let Some(mut entry) = ar.next_entry()? {
+        // `Error::from_decode_io`, not a bare `?`: a container's own
+        // truncation/corruption detection on an entry's payload (e.g. tar's
+        // `EntryPayload::read`, which compares delivered bytes against the
+        // size its header declares) raises a raw `io::ErrorKind::InvalidData`.
+        // A bare `?` would wrap that as `Error::Io` (exit 1) instead of
+        // `Error::Corrupt` (exit 5) — the same classification `ops::decompress`
+        // already applies to its own decode loop.
+        let n =
+            std::io::copy(entry.reader(), &mut std::io::sink()).map_err(Error::from_decode_io)?;
+        bytes += n;
+    }
+    // `Outcome` is a plain four-field public struct with no constructors, so
+    // build it with a struct literal. Do NOT grow the public type for an
+    // entry count — that belongs in the fidelity report, not here.
+    Ok(Outcome {
+        bytes_in: 0,
+        bytes_out: bytes,
+        format,
+        fidelity: ar.fidelity().clone(),
+    })
 }
 
 #[cfg(test)]

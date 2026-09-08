@@ -1,5 +1,11 @@
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use tar::{Builder, Header};
 
 const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
 
@@ -1137,4 +1143,416 @@ fn the_binary_reports_its_version() {
     let out = Command::new(STUFFR).arg("--version").output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("0.1.0"), "--version must report 0.1.0, got: {s}");
+}
+
+// ---------------------------------------------------------------------
+// `list` and `test` (Task 8): fixtures and helpers.
+//
+// Fixtures are built with the `tar` and `flate2` crates directly rather
+// than through `stuffr pack`/a `stuffr-formats` writer — this build has no
+// way to CREATE a tar archive yet (that's a later task), and using an
+// independent generator means a read-side bug in `stuffr-formats::Tar`
+// cannot also be hiding in the fixture that exercises it.
+// ---------------------------------------------------------------------
+
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh, empty directory for one test. Real files on disk, not just
+/// bytes in memory, so `list_names_every_entry_and_extracts_nothing` can
+/// assert the filesystem is untouched afterwards.
+fn tmp_dir() -> PathBuf {
+    let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+    let mut p = std::env::temp_dir();
+    p.push(format!("stuffr-cli-archive-{}-{}", std::process::id(), n));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// Writes a GNU-format tar header for `name`/`data` into `builder`. Kept
+/// separate from callers so every fixture builder below sets exactly the
+/// same fields the same way.
+fn append_tar_entry<W: Write>(builder: &mut Builder<W>, name: &str, data: &[u8]) {
+    let mut header = Header::new_gnu();
+    header.set_size(data.len() as u64);
+    header.set_mode(0o644);
+    // `append_data` sets the path and recomputes the checksum itself, in
+    // that order — see `tar::Builder::append_data`'s own source.
+    builder.append_data(&mut header, name, data).unwrap();
+}
+
+/// A real tar archive, written to `dir/fixture.tar`.
+fn write_fixture_tar(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+    let path = dir.join("fixture.tar");
+    let mut builder = Builder::new(std::fs::File::create(&path).unwrap());
+    for (name, data) in entries {
+        append_tar_entry(&mut builder, name, data);
+    }
+    builder.finish().unwrap();
+    path
+}
+
+/// The same tar bytes, real-gzip-wrapped (via `flate2`) under `name` —
+/// `"fixture.tar.gz"` or `"fixture.tgz"` — exercising the exact shapes
+/// `resolve_chain_deep` must resolve as "tar over gzip".
+fn write_fixture_tar_gz(dir: &Path, name: &str, entries: &[(&str, &[u8])]) -> PathBuf {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = Builder::new(&mut tar_bytes);
+        for (n, data) in entries {
+            append_tar_entry(&mut builder, n, data);
+        }
+        builder.finish().unwrap();
+    }
+    let path = dir.join(name);
+    let mut enc = GzEncoder::new(
+        std::fs::File::create(&path).unwrap(),
+        Compression::default(),
+    );
+    enc.write_all(&tar_bytes).unwrap();
+    enc.finish().unwrap();
+    path
+}
+
+/// Gzip-wraps arbitrary bytes once — used to build a nesting-depth bomb.
+fn gzip_wrap(bytes: &[u8]) -> Vec<u8> {
+    let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(bytes).unwrap();
+    enc.finish().unwrap()
+}
+
+/// Truncates `good` to half its length: a real, structural corruption (a
+/// missing or partial end-of-archive marker), not a bit flip tar has no way
+/// to detect at all — it carries no payload checksum.
+fn corrupt_midway(good: &Path) -> PathBuf {
+    let bytes = std::fs::read(good).unwrap();
+    let cut = bytes.len() / 2;
+    let corrupt = good.with_file_name("corrupt.tar");
+    std::fs::write(&corrupt, &bytes[..cut]).unwrap();
+    corrupt
+}
+
+fn run(args: &[&str]) -> std::process::ExitStatus {
+    Command::new(STUFFR).args(args).status().unwrap()
+}
+
+fn run_output(args: &[&str]) -> std::process::Output {
+    Command::new(STUFFR).args(args).output().unwrap()
+}
+
+fn run_with_stdin_output(args: &[&str], input: &[u8]) -> std::process::Output {
+    let mut child = Command::new(STUFFR)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// The streaming premise applied to `list`/`test`: stdin, no seek.
+fn run_with_stdin(args: &[&str], input: &[u8]) -> String {
+    let out = run_with_stdin_output(args, input);
+    String::from_utf8(out.stdout).unwrap()
+}
+
+#[test]
+fn list_names_every_entry_and_extracts_nothing() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha"), ("b/c.bin", b"\x00\xff")]);
+    let out = run_output(&["list", archive.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("a.txt") && text.contains("b/c.bin"), "{text}");
+    // Nothing was written to the filesystem.
+    assert!(!dir.join("a.txt").exists(), "list must not extract");
+    assert!(!dir.join("b").exists(), "list must not extract");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ls_is_an_alias_for_list() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+    let out = run_output(&["ls", archive.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8(out.stdout).unwrap().contains("a.txt"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_json_reports_name_kind_and_size() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+    let out = run_output(&["list", "--json", archive.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"));
+    let rows = v.as_array().expect("a JSON array of entries");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "a.txt");
+    assert_eq!(rows[0]["kind"], "file");
+    assert_eq!(rows[0]["size"], 5);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_verb_exits_five_on_a_corrupt_archive_and_zero_on_a_good_one() {
+    let dir = tmp_dir();
+    let good = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
+    assert_eq!(run(&["test", good.to_str().unwrap()]).code(), Some(0));
+    let bad = corrupt_midway(&good);
+    assert_eq!(run(&["test", bad.to_str().unwrap()]).code(), Some(5));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_works_on_a_pipe() {
+    // The streaming premise applied to the new verb.
+    let dir = tmp_dir();
+    let bytes = std::fs::read(write_fixture_tar(&dir, &[("a.txt", b"alpha")])).unwrap();
+    let text = run_with_stdin(&["list", "-"], &bytes);
+    assert!(text.contains("a.txt"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The forward risk flagged for this task: `open_archive` must not decode a
+/// `.tar.gz`/`.tgz` layer twice, and `probe`'s peeking must not consume
+/// bytes it doesn't replay — either bug reports every real `.tar.gz` as
+/// "not a whole number of 512-byte blocks; the archive is truncated", which
+/// looks exactly like corruption and is not. Verified here with a REAL
+/// gzip (`flate2`) wrapping a REAL tar (`tar`), independent of
+/// `stuffr-formats`' own writers, on a file AND on a pipe, for both
+/// `.tar.gz` and `.tgz`.
+#[test]
+fn list_and_test_succeed_on_a_real_tar_gz_from_a_file() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar_gz(
+        &dir,
+        "fixture.tar.gz",
+        &[("a.txt", b"alpha"), ("b/c.bin", b"\x00\xff")],
+    );
+
+    let list_out = run_output(&["list", archive.to_str().unwrap()]);
+    assert!(
+        list_out.status.success(),
+        "list stderr: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let text = String::from_utf8(list_out.stdout).unwrap();
+    assert!(text.contains("a.txt") && text.contains("b/c.bin"), "{text}");
+
+    let test_out = run_output(&["test", archive.to_str().unwrap()]);
+    assert!(
+        test_out.status.success(),
+        "test stderr: {}",
+        String::from_utf8_lossy(&test_out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_and_test_succeed_on_a_real_tar_gz_over_a_pipe() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar_gz(&dir, "fixture.tar.gz", &[("a.txt", b"alpha")]);
+    let bytes = std::fs::read(&archive).unwrap();
+
+    let list_out = run_with_stdin_output(&["list", "-"], &bytes);
+    assert!(
+        list_out.status.success(),
+        "list stderr: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    assert!(
+        String::from_utf8(list_out.stdout)
+            .unwrap()
+            .contains("a.txt")
+    );
+
+    let test_out = run_with_stdin_output(&["test", "-"], &bytes);
+    assert!(
+        test_out.status.success(),
+        "test stderr: {}",
+        String::from_utf8_lossy(&test_out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_and_test_succeed_on_a_real_tgz_from_a_file() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar_gz(&dir, "fixture.tgz", &[("a.txt", b"alpha")]);
+
+    let list_out = run_output(&["list", archive.to_str().unwrap()]);
+    assert!(
+        list_out.status.success(),
+        "list stderr: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    assert!(
+        String::from_utf8(list_out.stdout)
+            .unwrap()
+            .contains("a.txt")
+    );
+
+    let test_out = run_output(&["test", archive.to_str().unwrap()]);
+    assert!(
+        test_out.status.success(),
+        "test stderr: {}",
+        String::from_utf8_lossy(&test_out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_and_test_succeed_on_a_real_tgz_over_a_pipe() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar_gz(&dir, "fixture.tgz", &[("a.txt", b"alpha")]);
+    let bytes = std::fs::read(&archive).unwrap();
+
+    let list_out = run_with_stdin_output(&["list", "-"], &bytes);
+    assert!(
+        list_out.status.success(),
+        "list stderr: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    assert!(
+        String::from_utf8(list_out.stdout)
+            .unwrap()
+            .contains("a.txt")
+    );
+
+    let test_out = run_with_stdin_output(&["test", "-"], &bytes);
+    assert!(
+        test_out.status.success(),
+        "test stderr: {}",
+        String::from_utf8_lossy(&test_out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A truncation strictly INSIDE a single entry's declared payload, well
+/// short of where any end-of-archive marker begins — the case `test`'s own
+/// explicit payload read (`entries.rs::test`) is designed to catch, via
+/// `Error::from_decode_io` reclassifying the raw `io::ErrorKind::InvalidData`
+/// tar's `EntryPayload::read` raises when delivered bytes fall short of the
+/// header's declared size (see that message below) — a bare `?` there would
+/// have surfaced as exit 1, not exit 5.
+///
+/// `list` (which never reads a payload) turns out to ALSO exit 5 here, but
+/// via a wholly different path and message: walking headers to completion
+/// forces the underlying `tar` crate to skip past this entry's unread
+/// payload before it can look for the next header, and that skip itself
+/// reports "unexpected EOF during skip". So the two verbs converge on the
+/// same outcome for tar's length-based corruption specifically — this test
+/// pins BOTH messages so a future change that silently drops either
+/// detection path is caught, without claiming `list` succeeds where it does
+/// not.
+#[test]
+fn test_catches_a_payload_truncation() {
+    let dir = tmp_dir();
+    let payload = vec![b'x'; 8192];
+    let full = write_fixture_tar(&dir, &[("big.bin", &payload)]);
+    let bytes = std::fs::read(&full).unwrap();
+    // One 512-byte header block, then a third of the way into the payload.
+    let cut = 512 + payload.len() / 3;
+    let truncated = dir.join("truncated.tar");
+    std::fs::write(&truncated, &bytes[..cut]).unwrap();
+
+    let test_out = run_output(&["test", truncated.to_str().unwrap()]);
+    assert_eq!(
+        test_out.status.code(),
+        Some(5),
+        "test reads the payload and must catch the truncation: {}",
+        String::from_utf8_lossy(&test_out.stderr)
+    );
+    let test_err = String::from_utf8_lossy(&test_out.stderr);
+    assert!(
+        test_err.contains("big.bin") && test_err.contains("short of the size"),
+        "must be tar's own per-entry short-read diagnosis, reclassified from a raw \
+         io::ErrorKind::InvalidData via Error::from_decode_io: {test_err}"
+    );
+
+    let list_out = run_output(&["list", truncated.to_str().unwrap()]);
+    assert_eq!(
+        list_out.status.code(),
+        Some(5),
+        "list also exits 5 here, via the tar crate's own header-skip detection, not via a \
+         payload read: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_refuses_a_plain_codec_stream_as_not_an_archive() {
+    let dir = tmp_dir();
+    let src = dir.join("notes.txt");
+    let gz = dir.join("notes.txt.gz");
+    std::fs::write(&src, b"just plain text, not an archive").unwrap();
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let out = run_output(&["list", gz.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("not an archive"), "{err}");
+    assert!(
+        err.contains("gzip"),
+        "must name what the input actually resolved to: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn list_refuses_nesting_past_the_depth_bound() {
+    let mut bytes = b"payload too shallow to be an archive".to_vec();
+    // MAX_CHAIN_DEPTH is 4; six gzip layers is comfortably past it.
+    for _ in 0..6 {
+        bytes = gzip_wrap(&bytes);
+    }
+    let out = run_with_stdin_output(&["list", "-"], &bytes);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("nesting"), "{err}");
 }

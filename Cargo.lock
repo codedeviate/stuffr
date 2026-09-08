@@ -564,8 +564,10 @@ name = "stuffr-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "flate2",
  "serde_json",
  "stuffr",
+ "tar",
 ]
 
 [[package]]
