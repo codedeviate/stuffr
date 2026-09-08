@@ -56,6 +56,50 @@
 //! emit a structurally valid archive framed with the wrong length —
 //! corruption this project generated itself, invisible until something else
 //! tried to read it back.
+//!
+//! # Symlinks: the one entry kind this module reads its own payload for
+//!
+//! Unlike tar's `linkname` header field, `newc` has nowhere to put a
+//! symlink's target except the entry's PAYLOAD — the mode field's `S_IFLNK`
+//! bits (`0o120000`) are the only signal that an entry even IS one.
+//! [`CpioRead::next_entry`] detects this from the header alone (before
+//! deciding what kind of reader to hand back) and, only for this one kind,
+//! reads the payload EAGERLY, right there, rather than deferring it to the
+//! caller the way every other entry's data is. This is deliberately narrow:
+//! a symlink target is bounded by the platform's `PATH_MAX` in every
+//! realistic archive, so the read is small and constant-cost, and it does
+//! not touch the streaming property conformance property 8 checks — that
+//! property's own fixture is an ordinary FILE entry, never a symlink, so
+//! this path is never on its critical path. A hostile archive claiming an
+//! implausibly large symlink "target" is bounded the same way every other
+//! entry already is: `entries::open_archive` wraps the source in a
+//! `RatioGuardedSource` before any container ever sees a byte, so this read
+//! is charged against `--max-ratio` exactly like an ordinary payload read
+//! would be.
+//!
+//! Real-world cpio payloads — initramfs images, RPM archives — are dense
+//! with symlinks, which is why this is a real requirement and not a
+//! nice-to-have: an extraction that skipped every one of them would be
+//! broken, not merely lossy.
+//!
+//! The mode field's type bits matter on the WRITE side too, for the same
+//! structural reason: `newc` has no OTHER way to record "this is a
+//! directory" or "this is a symlink", so [`ArchiveWrite::add`] normalises
+//! them in regardless of what the caller's own `EntryMeta::mode` carries —
+//! masking out whatever type bits (if any) were already there and OR-ing in
+//! the correct ones for `meta.kind`. A caller supplying a permission-only
+//! mode for a directory or a symlink (tar's own test fixtures do exactly
+//! this: `dir.mode = Some(0o750)`, no `S_IFDIR` bit at all — `tar` does not
+//! need one, since its typeflag byte already says what the entry is) would
+//! otherwise write a `newc` entry indistinguishable from a plain file to
+//! ANY cpio reader, this one included — not an internal inconsistency, a
+//! genuine interop defect, since the type bits are the only place `newc`
+//! carries this information at all. `EntryKind::File` is deliberately left
+//! unnormalised: property 11 requires an explicit file mode to round-trip
+//! VERBATIM, and doing so already produces a correct entry, since this
+//! format does not require the `S_IFREG` bit to identify a plain file (see
+//! `entry_kind`'s own doc — the absence of every OTHER type's bits is what
+//! decides `File`).
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -93,6 +137,23 @@ const DEFAULT_FILE_MODE: u32 = 0o100644;
 /// is the other format in this tree whose entries can legitimately be
 /// directories.
 const DEFAULT_DIR_MODE: u32 = 0o040755;
+
+/// The mode `add` writes for a SYMLINK entry when the caller does not say —
+/// `rwxrwxrwx` with the symlink type bits set: a symlink's own permission
+/// bits are conventionally ignored by every tool that follows one, so unlike
+/// files and directories there is no meaningful "restrictive" default to
+/// pick.
+const DEFAULT_SYMLINK_MODE: u32 = 0o120_777;
+
+/// The `S_IFMT` mask (`st_mode`'s top four bits): what's left after masking
+/// a mode with this is the permission/setuid/setgid/sticky bits alone.
+const MODE_TYPE_MASK: u32 = 0o170_000;
+
+/// `S_IFDIR`: the type bits `newc`'s mode field must carry for a directory.
+const S_IFDIR: u32 = 0o040_000;
+
+/// `S_IFLNK`: the type bits `newc`'s mode field must carry for a symlink.
+const S_IFLNK: u32 = 0o120_000;
 
 pub fn meta() -> FormatMeta {
     FormatMeta::container(CPIO, &["cpio"], CPIO_MAGIC)
@@ -174,7 +235,7 @@ impl ArchiveRead for CpioRead {
             CpioState::Ended => return Ok(None),
         };
 
-        let reader = cpio::newc::Reader::new(src).map_err(classify_cpio_error)?;
+        let mut reader = cpio::newc::Reader::new(src).map_err(classify_cpio_error)?;
         if reader.entry().is_trailer() {
             // The trailer's own file_size is always 0, so there is nothing
             // left to drain; `finish` only hands back a reader nothing more
@@ -184,9 +245,26 @@ impl ArchiveRead for CpioRead {
             return Ok(None);
         }
 
-        let meta = entry_meta(reader.entry());
-        let remaining = u64::from(reader.entry().file_size());
+        let mut meta = entry_meta(reader.entry());
         let name = meta.name.clone();
+
+        // A symlink's target lives in the PAYLOAD, not a header field — see
+        // the module doc's "Symlinks" section. Read it now, while `reader`
+        // is still in hand, rather than deferring to the caller the way
+        // every other entry's data is.
+        if is_symlink_mode(reader.entry().mode()) {
+            let target = read_symlink_target(&mut reader, &name)?;
+            let src = reader.finish().map_err(classify_cpio_error)?;
+            self.state = CpioState::Idle(src);
+            meta.kind = EntryKind::Symlink { target };
+            // The payload was already consumed above; nothing is left for a
+            // caller to read. `entries::extract` never calls `.reader()` for
+            // a Symlink entry (it uses `meta.kind`'s own target), the same
+            // convention tar's own Dir/Symlink entries already rely on.
+            return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
+        }
+
+        let remaining = u64::from(reader.entry().file_size());
         self.state = CpioState::Reading(reader);
 
         let payload = CpioEntryPayload {
@@ -264,29 +342,57 @@ impl Read for CpioEntryPayload<'_> {
     }
 }
 
-/// Which `EntryKind` a raw `st_mode`-shaped mode field describes.
+/// Which `EntryKind` a raw `st_mode`-shaped mode field describes, ASIDE from
+/// symlinks — `CpioRead::next_entry` checks [`is_symlink_mode`] itself,
+/// before this function is ever consulted, and overrides whatever it would
+/// have said (`Other`, below) with the real `EntryKind::Symlink { target }`
+/// once the payload has been read. This function's own `S_IFLNK` arm is
+/// therefore never the answer a caller actually sees; it stays in the match
+/// as the honest "not yet overridden" value rather than being silently
+/// folded into `File`.
 ///
-/// Only directories are distinguished from plain files: a symlink's target
-/// lives in cpio's PAYLOAD (there is no dedicated header field the way tar's
-/// `linkname` is one), so recognising one here would mean reading that
-/// payload eagerly at header-parse time — more than this streaming design
-/// takes on for a shape harness conformance does not exercise. Devices,
-/// FIFOs and sockets have no `EntryKind` variant to report at all yet (see
-/// `archive.rs`'s own note that Phase 2 adds them). All of these — symlink
-/// included, for now — read back as [`EntryKind::Other`], the same honest
-/// "skipped, not silently turned into a file" answer `tar.rs`'s
-/// `is_regular_file` gives its own unsupported types.
+/// Devices, FIFOs and sockets have no `EntryKind` variant to report at all
+/// yet (see `archive.rs`'s own note that Phase 2 adds them), and read back
+/// as [`EntryKind::Other`] — the same honest "skipped, not silently turned
+/// into a file" answer `tar.rs`'s `is_regular_file` gives its own
+/// unsupported types.
 ///
 /// Mode `0` (never set — a minimal or hand-built writer) falls through to
 /// `File` rather than `Other`: property 11's own fixture writes an explicit
 /// mode with no type bits at all, and a real caller doing the same expects a
 /// plain file back, not a skipped entry.
 fn entry_kind(mode: u32) -> EntryKind {
-    match mode & 0o170000 {
-        0o040000 => EntryKind::Dir,
-        0o010000 | 0o020000 | 0o060000 | 0o140000 | 0o120000 => EntryKind::Other,
+    match mode & MODE_TYPE_MASK {
+        S_IFDIR => EntryKind::Dir,
+        0o010000 | 0o020000 | 0o060000 | 0o140000 | S_IFLNK => EntryKind::Other,
         _ => EntryKind::File,
     }
+}
+
+/// Whether a raw `st_mode`-shaped field names a symlink (`S_IFLNK`).
+fn is_symlink_mode(mode: u32) -> bool {
+    mode & MODE_TYPE_MASK == S_IFLNK
+}
+
+/// Reads a symlink entry's target out of its payload — see the module doc's
+/// "Symlinks" section for why this container reads it eagerly rather than
+/// deferring to the caller. Detects truncation itself: `cpio::newc::Reader`'s
+/// own `Read` impl has no truncation check of its own (see
+/// [`CpioEntryPayload`]'s doc), so a stream that runs out mid-target would
+/// otherwise report a shorter-than-declared target as if it were the whole
+/// thing.
+fn read_symlink_target(reader: &mut cpio::newc::Reader<CpioSource>, name: &str) -> Result<String> {
+    let declared = u64::from(reader.entry().file_size());
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).map_err(classify_cpio_error)?;
+    if (buf.len() as u64) < declared {
+        return Err(Error::Corrupt(format!(
+            "entry `{name}` (a symlink) is {} bytes short of the target length its header \
+             declares; the archive is truncated",
+            declared - buf.len() as u64
+        )));
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn entry_meta(e: &cpio::newc::Entry) -> EntryMeta {
@@ -320,21 +426,43 @@ struct CpioWrite {
 
 impl ArchiveWrite for CpioWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
-        // Checked against the DECLARED size first, before a single byte is
-        // read or allocated, so a caller who already knows an entry is
-        // oversized is refused for free.
-        if let Some(size) = meta.size {
-            check_u32_size(&meta.name, size)?;
-        }
-
-        let mut buf = Vec::new();
-        data.read_to_end(&mut buf)?;
+        // A symlink's target IS its payload here — see the module doc's
+        // "Symlinks" section — so `data` is not consumed for one, the same
+        // "the caller's data reader is irrelevant for this kind" contract
+        // `tar.rs`'s own `add` applies to `EntryKind::Dir`/`Symlink` (there
+        // the target lives in the header instead, but the convention that
+        // `data` is ignored for these kinds is the same).
+        let buf = if let EntryKind::Symlink { target } = &meta.kind {
+            target.clone().into_bytes()
+        } else {
+            // Checked against the DECLARED size first, before a single byte
+            // is read or allocated, so a caller who already knows an entry
+            // is oversized is refused for free.
+            if let Some(size) = meta.size {
+                check_u32_size(&meta.name, size)?;
+            }
+            let mut buf = Vec::new();
+            data.read_to_end(&mut buf)?;
+            buf
+        };
         let size = check_u32_size(&meta.name, buf.len() as u64)?;
 
-        let mode = meta.mode.unwrap_or(match meta.kind {
-            EntryKind::Dir => DEFAULT_DIR_MODE,
-            _ => DEFAULT_FILE_MODE,
-        });
+        // `newc` has no field OTHER than the mode's own type bits to record
+        // "this is a directory" or "this is a symlink" — so, unlike
+        // `EntryKind::File` (left alone below; property 11 requires an
+        // explicit file mode to round-trip verbatim), a Dir or Symlink mode
+        // is normalised regardless of what the caller supplied, masking out
+        // whatever type bits (if any) were already there and OR-ing in the
+        // correct ones. See the module doc for why leaving this to the
+        // caller would be a real interop defect, not merely an internal
+        // inconsistency.
+        let mode = match &meta.kind {
+            EntryKind::Dir => (meta.mode.unwrap_or(DEFAULT_DIR_MODE) & !MODE_TYPE_MASK) | S_IFDIR,
+            EntryKind::Symlink { .. } => {
+                (meta.mode.unwrap_or(DEFAULT_SYMLINK_MODE) & !MODE_TYPE_MASK) | S_IFLNK
+            }
+            _ => meta.mode.unwrap_or(DEFAULT_FILE_MODE),
+        };
         let builder = cpio::newc::Builder::new(&meta.name)
             .mode(mode)
             .mtime(meta.mtime.map(unix_seconds).unwrap_or(0))
@@ -522,6 +650,84 @@ mod tests {
         assert_eq!(entry.meta().kind, EntryKind::Dir);
     }
 
+    /// A symlink's target lives in the payload, not a header field — see the
+    /// module doc's "Symlinks" section. This is the round trip the
+    /// coordinator's fix request is centred on.
+    #[test]
+    fn a_symlink_entry_round_trips_its_kind_and_target() {
+        let buf = SharedBuf::new();
+        let mut w = CpioNewc
+            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .unwrap();
+        let mut link = EntryMeta::file("mylink");
+        link.kind = EntryKind::Symlink {
+            target: "../escaped/target.txt".into(),
+        };
+        // Empty data: a symlink's target comes from `meta.kind`, never from
+        // the caller's data reader — mirrors `tar.rs`'s own test fixtures.
+        w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
+        w.finish().unwrap();
+
+        let mut ar = open(&buf.contents());
+        let entry = ar.next_entry().unwrap().unwrap();
+        assert_eq!(entry.meta().name, "mylink");
+        assert_eq!(
+            entry.meta().kind,
+            EntryKind::Symlink {
+                target: "../escaped/target.txt".into()
+            },
+            "a symlink entry that lost its target would extract as an empty file"
+        );
+    }
+
+    /// `newc` has no field OTHER than the mode's own type bits to record
+    /// "this is a directory" or "this is a symlink" (see the module doc) —
+    /// so a caller supplying a PERMISSION-ONLY mode (no `S_IFDIR`/`S_IFLNK`
+    /// bit at all, exactly what `entries_extract.rs`'s own tar fixtures use:
+    /// `dir.mode = Some(0o750)`, `symlink.mode = Some(0o777)`) must still
+    /// round-trip as the right kind, not silently misread as a plain file.
+    #[test]
+    fn a_directory_or_symlink_with_a_permission_only_mode_still_normalizes_the_type_bits() {
+        let buf = SharedBuf::new();
+        let mut w = CpioNewc
+            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .unwrap();
+
+        let mut dir = EntryMeta::file("d");
+        dir.kind = EntryKind::Dir;
+        dir.mode = Some(0o750); // no S_IFDIR bit
+        w.add(&dir, &mut std::io::Cursor::new(&[][..])).unwrap();
+
+        let mut link = EntryMeta::file("d/link");
+        link.kind = EntryKind::Symlink {
+            target: "target.txt".into(),
+        };
+        link.mode = Some(0o777); // no S_IFLNK bit
+        w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
+
+        w.finish().unwrap();
+
+        let mut ar = open(&buf.contents());
+        let d = ar.next_entry().unwrap().unwrap();
+        assert_eq!(d.meta().kind, EntryKind::Dir, "must not misread as a file");
+        assert_eq!(
+            d.meta().mode,
+            Some(S_IFDIR | 0o750),
+            "the caller's permission bits must survive alongside the normalised type bits"
+        );
+        drop(d);
+
+        let l = ar.next_entry().unwrap().unwrap();
+        assert_eq!(
+            l.meta().kind,
+            EntryKind::Symlink {
+                target: "target.txt".into()
+            },
+            "must not misread as a file"
+        );
+        assert_eq!(l.meta().mode, Some(S_IFLNK | 0o777));
+    }
+
     #[test]
     fn add_measures_the_payload_when_the_caller_does_not_declare_a_size() {
         let buf = SharedBuf::new();
@@ -652,9 +858,37 @@ mod tests {
             return;
         };
 
-        let bytes = build_cpio(&[("a.txt", b"alpha"), ("dir/b.bin", b"\x00\xff\x00")]);
+        // Built by hand rather than through `build_cpio`, which only ever
+        // writes plain files: this also covers the symlink round trip in
+        // the forward direction, per the coordinator's fix request.
+        let buf = SharedBuf::new();
+        let mut w = CpioNewc
+            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .unwrap();
+        w.add(
+            &EntryMeta::file("a.txt"),
+            &mut std::io::Cursor::new(b"alpha".as_slice()),
+        )
+        .unwrap();
+        w.add(
+            &EntryMeta::file("dir/b.bin"),
+            &mut std::io::Cursor::new(b"\x00\xff\x00".as_slice()),
+        )
+        .unwrap();
+        let mut link = EntryMeta::file("mylink");
+        link.kind = EntryKind::Symlink {
+            target: "a.txt".into(),
+        };
+        w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
+        w.finish().unwrap();
+        let bytes = buf.contents();
+
+        // Verbose listing (`-itv`), not plain `-it`: only the verbose form
+        // shows a symlink's leading `l` type and its `-> target` — plain
+        // `-it` prints names only and would pass even if the mode bits were
+        // wrong and the entry were misread as a regular file.
         let mut child = std::process::Command::new(&cpio_bin)
-            .args(["-it"])
+            .args(["-itv"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -675,6 +909,82 @@ mod tests {
         let listing = String::from_utf8_lossy(&out.stdout);
         assert!(listing.contains("a.txt"), "listing was {listing:?}");
         assert!(listing.contains("dir/b.bin"), "listing was {listing:?}");
+        let link_line = listing
+            .lines()
+            .find(|l| l.contains("mylink"))
+            .unwrap_or_else(|| panic!("mylink missing from listing: {listing:?}"));
+        assert!(
+            link_line.starts_with('l'),
+            "system cpio did not read our entry back as a symlink: {link_line:?}"
+        );
+        assert!(
+            link_line.contains("mylink -> a.txt"),
+            "system cpio's listing must show the target: {link_line:?}"
+        );
+    }
+
+    /// The reverse direction: a symlink `cpio` itself wrote (from a REAL
+    /// symlink on disk, via `find | cpio -o -H newc`) must read back through
+    /// this container as `EntryKind::Symlink` with the exact target — not
+    /// `Other`, and not a file holding the target string as file contents.
+    #[test]
+    fn we_accept_a_symlink_system_cpio_writes() {
+        let Some(cpio_bin) = which("cpio") else {
+            return;
+        };
+        let Some(find_bin) = which("find") else {
+            return;
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "stuffr-cpio-reverse-symlink-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("target.txt"), b"hello").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.join("mylink")).unwrap();
+
+        let find = std::process::Command::new(&find_bin)
+            .arg(".")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(find.status.success(), "find failed");
+
+        let mut child = std::process::Command::new(&cpio_bin)
+            .args(["-o", "-H", "newc"])
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&find.stdout).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "system cpio could not write the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let mut ar = open(&out.stdout);
+        let mut found = None;
+        while let Some(entry) = ar.next_entry().unwrap() {
+            if entry.meta().name.ends_with("mylink") {
+                found = Some(entry.meta().kind.clone());
+            }
+        }
+        assert_eq!(
+            found,
+            Some(EntryKind::Symlink {
+                target: "target.txt".into()
+            }),
+            "a symlink system cpio wrote must read back as EntryKind::Symlink with the right \
+             target, not Other or a file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The empty-archive case specifically, mirroring `ar.rs`'s equivalent:
