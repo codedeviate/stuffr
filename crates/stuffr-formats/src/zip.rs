@@ -100,8 +100,11 @@
 //! crate (`zstd-sys`), so it is reached only through `stuffr-formats/
 //! zip-zstd`, which the facade's `c-backed` bundle turns on. On the default
 //! tier a zstd-compressed zip ENTRY is refused as an
-//! [`Error::Unsupported`] naming `--features c-backed` — never as
-//! corruption, which would tell a user their perfectly good zip was damaged.
+//! [`Error::Unsupported`] naming `--features c-backed` — **exit 3**, "this
+//! build cannot do that", the same code `FormatNotEnabled` carries — never as
+//! corruption (exit 5), which would tell a user their perfectly good zip was
+//! damaged, and never as the generic exit 1 that would make an actionable
+//! refusal indistinguishable from an internal failure.
 //! Note the asymmetry that makes this worth spelling out: the pure tier reads
 //! a standalone `.zst` file fine, through `ruzstd`; it is only the in-zip
 //! method that is missing. Encrypted entries and the legacy pre-deflate
@@ -337,8 +340,8 @@ fn classify_zip_error(e: ZipError) -> Error {
         }
         // `ZipError` is `#[non_exhaustive]`. A variant added upstream is more
         // likely to be another "cannot read this" than damage, so it lands on
-        // `Unsupported` (exit 1) rather than silently claiming corruption
-        // (exit 5).
+        // `Unsupported` (exit 3, "this build cannot do that") rather than
+        // silently claiming corruption (exit 5).
         other => Error::Unsupported(other.to_string()),
     }
 }
@@ -949,10 +952,12 @@ fn method_for(codec: Option<FormatId>) -> Result<CompressionMethod> {
 /// zip validates the level inside `start_file`, which is halfway through
 /// `add`: the error would arrive after the archive had begun, and it arrives
 /// as `UnsupportedArchive("Unsupported compression level")` — an
-/// [`Error::Unsupported`] (exit 1) where every codec in this tree answers an
-/// out-of-range level with [`Error::Usage`] (exit 2). `stuffr pack a b -o
+/// [`Error::Unsupported`] (exit 3, "this build cannot do that") where every
+/// codec in this tree answers an out-of-range level with [`Error::Usage`]
+/// (exit 2, "you asked for the wrong thing"). A level outside a codec's range
+/// is the caller's mistake, not a missing capability, so `stuffr pack a b -o
 /// x.zip --level 99` should be the same class of mistake as `--level 0` on
-/// bzip2, and cost the same nothing.
+/// bzip2 — and cost the same nothing.
 ///
 /// Validated by DRY RUN rather than by a table of ranges copied out of zip:
 /// the ranges are computed from the backend crates' own
@@ -1906,6 +1911,11 @@ z.close()\n";
             .err()
             .expect("zip has no brotli method");
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(
+            err.exit_code(),
+            3,
+            "zip cannot express brotli — a capability limit, exit 3: {err}"
+        );
         assert!(
             buf.contents().is_empty(),
             "the refusal must cost nothing: nothing may have been written"
@@ -1962,6 +1972,16 @@ z.close()\n";
                 5,
                 "{rung}: exit 5 would claim the archive is corrupt"
             );
+            // Exit 3, "this build cannot do that" — the same code
+            // `FormatNotEnabled` carries. It was 1 until the fix round for
+            // this task: a refusal that tells the user exactly what to
+            // rebuild with should not share an exit code with an internal
+            // failure they can do nothing about.
+            assert_eq!(
+                err.exit_code(),
+                3,
+                "{rung}: a capability gap is exit 3, not a generic failure: {err}"
+            );
             let text = err.to_string();
             assert!(
                 text.contains("c-backed"),
@@ -1990,6 +2010,7 @@ z.close()\n";
             .err()
             .expect("the pure tier has no zstd zip method");
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 3, "a capability gap is exit 3: {err}");
         assert!(err.to_string().contains("c-backed"), "{err}");
     }
 
@@ -2066,8 +2087,11 @@ z.close()\n";
     }
 
     /// A level the entry codec does not have is a USAGE error (exit 2) and
-    /// costs nothing, rather than zip's own `Unsupported` (exit 1) raised
-    /// from inside `add` with the destination already open.
+    /// costs nothing, rather than zip's own `Unsupported` (exit 3) raised
+    /// from inside `add` with the destination already open. Exit 3 would not
+    /// be WRONG about the archive, but it is wrong about whose mistake it
+    /// was: an out-of-range level is the caller's, and every codec in this
+    /// tree answers it with exit 2.
     #[test]
     fn a_level_the_entry_codec_does_not_have_is_refused_before_anything_is_written() {
         let buf = SharedBuf::new();

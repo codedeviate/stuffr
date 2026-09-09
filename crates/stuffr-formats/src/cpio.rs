@@ -649,9 +649,11 @@ mod tests {
         );
         assert_eq!(
             err.exit_code(),
-            1,
-            "an unsupported-format limitation is a generic failure, not corruption or a \
-             resource limit"
+            3,
+            "a format's own expressiveness limit is exit 3 — \"this build cannot do that\" — \
+             never corruption (5), never a resource limit (6), and never a generic failure \
+             (1). It asserted 1 until Phase 2's Task 11, which was asserting the accident \
+             that `Error::Unsupported` fell through `exit_code`'s wildcard"
         );
     }
 
@@ -880,13 +882,18 @@ mod tests {
         )
         .unwrap();
         let mut seekable = CpioNewc.open(resolved, &OpenOpts::default()).unwrap();
+        let err = seekable
+            .by_index(0)
+            .expect_err("cpio has no index to index into");
         assert!(
-            matches!(
-                seekable.by_index(0),
-                Err(stuffr_core::Error::Unsupported(_))
-            ),
-            "a seekable source is not the problem — cpio has no index to index into"
+            matches!(err, stuffr_core::Error::Unsupported(_)),
+            "a seekable source is not the problem — cpio has no index to index into: {err:?}"
         );
+        // Exit 3, "this build cannot do that", not the generic 1 it reported
+        // until Phase 2's Task 11 gave `Error::Unsupported` an explicit arm.
+        // A caller asking for random access a format never had should be able
+        // to tell that answer from an internal failure.
+        assert_eq!(err.exit_code(), 3, "{err}");
     }
 
     /// A cut inside an entry's payload. `cpio::newc::Reader`'s own `Read`

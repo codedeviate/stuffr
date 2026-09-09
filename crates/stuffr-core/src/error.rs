@@ -83,6 +83,29 @@ impl Error {
             Error::EntryNotFound(_) => 2,
             Error::FormatNotEnabled(_) => 3,
             Error::CapabilityUnavailable { .. } => 3,
+            // Exit 3 is "this build cannot do that", and every raiser of
+            // `Unsupported` in this workspace is exactly that — a capability
+            // or expressiveness limit, never an internal failure:
+            //
+            // * tar's, ar's and cpio's `by_index` refusal on a seekable
+            //   source ("this container carries no entry index, by design").
+            // * cpio's 4 GiB per-entry ceiling, which is its `u32` size
+            //   field and not a bug.
+            // * zip's unsupported compression method — an encrypted entry, a
+            //   pre-deflate legacy method, or the pure tier's zstd gap, whose
+            //   message names `--features c-backed`.
+            // * a `Chain` variant added upstream that this build does not
+            //   know how to open, decode or describe.
+            // * `create_symlink` on a non-unix host.
+            //
+            // Explicit, not the wildcard below, and it did fall through it
+            // until Phase 2's Task 11: every one of those was reported as a
+            // generic failure, indistinguishable from an internal error, so a
+            // user told "rebuild with `--features c-backed`" got the same
+            // exit code as a panic-adjacent bug. That is the THIRD wrong code
+            // this wildcard has produced in this phase, after
+            // `ChainTooDeep` and `EntryNotFound`.
+            Error::Unsupported(_) => 3,
             Error::FidelityDegraded(_) => 4,
             Error::Corrupt(_) => 5,
             // A nesting bound is a bound on WORK, the same family as the
@@ -147,6 +170,10 @@ mod tests {
             Error::FormatNotEnabled(FormatId::new("zstd")).exit_code(),
             3
         );
+        assert_eq!(
+            Error::Unsupported("no zstd in this build".into()).exit_code(),
+            3
+        );
         assert_eq!(Error::FidelityDegraded(2).exit_code(), 4);
         assert_eq!(Error::Corrupt("bad crc".into()).exit_code(), 5);
         assert_eq!(Error::EntryNotFound("nosuch.txt".into()).exit_code(), 2);
@@ -179,6 +206,40 @@ mod tests {
         };
         assert!(e.to_string().contains("squashfs"));
         assert_eq!(e.exit_code(), 1);
+    }
+
+    #[test]
+    fn unsupported_is_a_capability_limit_not_a_generic_failure() {
+        // The three exit-3 variants say the same thing at different
+        // granularities — "this build cannot do that" — so they must not
+        // disagree on the code. `Unsupported` fell through the wildcard to 1
+        // until Phase 2's Task 11, which made a container's honest
+        // "rebuild with `--features c-backed`" indistinguishable from an
+        // internal error. See `exit_code`'s own comment for the full list of
+        // raisers and why every one of them belongs here.
+        let unsupported = Error::Unsupported(
+            "zip entry uses compression method 93 (zstd); rebuild with `--features c-backed`"
+                .into(),
+        );
+        assert_eq!(unsupported.exit_code(), 3);
+        assert_eq!(
+            Error::FormatNotEnabled(FormatId::new("zstd")).exit_code(),
+            3
+        );
+        assert_eq!(
+            Error::CapabilityUnavailable {
+                format: FormatId::new("lzma"),
+                available: "read as a zip entry",
+                requested: "written as one",
+            }
+            .exit_code(),
+            3
+        );
+        assert_ne!(
+            unsupported.exit_code(),
+            1,
+            "exit 1 is an internal failure; a capability limit is actionable and must be              distinguishable from one"
+        );
     }
 
     #[test]

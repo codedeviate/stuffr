@@ -1725,13 +1725,18 @@ mod tests {
         );
 
         let mut seekable = open_seekable(&bytes);
+        let err = seekable
+            .by_index(0)
+            .expect_err("tar has no index to index into");
         assert!(
-            matches!(
-                seekable.by_index(0),
-                Err(stuffr_core::Error::Unsupported(_))
-            ),
-            "a seekable source is not the problem — tar has no index to index into"
+            matches!(err, stuffr_core::Error::Unsupported(_)),
+            "a seekable source is not the problem — tar has no index to index into: {err:?}"
         );
+        // Exit 3, "this build cannot do that", not the generic 1 it reported
+        // until Phase 2's Task 11 gave `Error::Unsupported` an explicit arm.
+        // A caller asking for random access a format never had should be able
+        // to tell that answer from an internal failure.
+        assert_eq!(err.exit_code(), 3, "{err}");
     }
 
     /// Opens `bytes` from a real file, which is the only source shape that

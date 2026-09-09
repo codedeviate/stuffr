@@ -300,14 +300,16 @@ LISTING AND TESTING AN ARCHIVE
       ignores them.
 
   stuffr test encrypted.zip
-      Exit 1, not 5: an encrypted entry is a capability this build does
-      not have, not a damaged file, and the message says which. The same
-      answer covers a zstd-compressed zip ENTRY on a default build — the
-      one entry codec that needs a C toolchain, so the refusal names
-      `--features c-backed`. Note the asymmetry: a standalone .zst file
-      reads fine on every build; it is only zstd INSIDE a zip that needs
-      the flag. An LZMA zip entry is the reverse — readable everywhere,
-      writable nowhere, which reports as exit 3.
+      Exit 3, not 5: an encrypted entry is a capability this build does
+      not have, not a damaged file, and the message says which. Exit 3 is
+      "this build cannot do that" throughout — the same code you get for
+      naming a format the build was compiled without. The same answer
+      covers a zstd-compressed zip ENTRY on a default build: the one entry
+      codec that needs a C toolchain, so the refusal names `--features
+      c-backed`. Note the asymmetry there — a standalone .zst file reads
+      fine on every build; it is only zstd INSIDE a zip that needs the
+      flag. An LZMA zip entry is the reverse, readable everywhere and
+      writable nowhere, and reports as exit 3 too.
 
   stuffr list bomb.tar.gz --max-ratio 100
   stuffr test bomb.tar.gz --max-ratio 100
