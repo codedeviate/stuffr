@@ -85,6 +85,28 @@ pub enum Chain {
 }
 
 impl Chain {
+    /// The container this chain resolves to, if any, at ANY depth.
+    ///
+    /// `Some(tar)` for `tar over gzip` as well as for a bare `tar`: however
+    /// many codec layers sit above it, the entries live in a container, and a
+    /// caller that has not OPENED that container cannot speak for its
+    /// fidelity. That is the whole use — `ops::inspect` identifies a stream
+    /// WITHOUT decoding it, so it never opens the container and must not
+    /// report a fidelity conclusion it did not reach. See
+    /// `ops::Inspection::fidelity_evaluated`.
+    ///
+    /// The `_` arm covers [`Chain::Raw`] and anything added later: `Chain` is
+    /// `#[non_exhaustive]`, and "no container" is the right answer for a
+    /// shape this method does not recognise, since the caller's only use of
+    /// `Some` is to withhold a claim.
+    pub fn container(&self) -> Option<FormatId> {
+        match self {
+            Chain::Container { container } => Some(*container),
+            Chain::Codec { inner, .. } => inner.container(),
+            _ => None,
+        }
+    }
+
     /// Human-readable form, innermost first: `"tar over gzip"`.
     pub fn describe(&self) -> String {
         match self {
@@ -461,6 +483,36 @@ mod tests {
         let r = registry();
         let chain = resolve_chain(&r, Some(Path::new("mystery.tar")), b"no magic here").unwrap();
         assert_eq!(chain, Chain::Container { container: TAR });
+    }
+
+    /// `Chain::container` must see THROUGH codec layers, not only name a
+    /// bare container. `ops::inspect` uses it to decide whether it may report
+    /// a fidelity conclusion, and `backup.tar.gz` has a container it has not
+    /// opened just as surely as `backup.tar` does — a non-recursive version
+    /// would quietly re-introduce the false negative for every `.tar.gz`.
+    #[test]
+    fn chain_container_sees_through_codec_layers() {
+        let tar = FormatId::new("tar");
+        assert_eq!(Chain::Container { container: tar }.container(), Some(tar));
+        assert_eq!(
+            Chain::Codec {
+                codec: GZIP,
+                inner: Box::new(Chain::Container { container: tar }),
+            }
+            .container(),
+            Some(tar),
+            "tar over gzip still has a container nobody has opened"
+        );
+        assert_eq!(
+            Chain::Codec {
+                codec: GZIP,
+                inner: Box::new(Chain::Raw),
+            }
+            .container(),
+            None,
+            "a bare codec stream has no container, so an empty warning list is a real finding"
+        );
+        assert_eq!(Chain::Raw.container(), None);
     }
 
     #[test]

@@ -238,7 +238,8 @@ mod tests {
         assert_ne!(
             unsupported.exit_code(),
             1,
-            "exit 1 is an internal failure; a capability limit is actionable and must be              distinguishable from one"
+            "exit 1 is an internal failure; a capability limit is actionable and must be \
+             distinguishable from one"
         );
     }
 

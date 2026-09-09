@@ -148,6 +148,154 @@ fn info_reports_the_resolved_memory_limit() {
     let _ = std::fs::remove_file(&gz);
 }
 
+/// `info` must not report a fidelity conclusion it did not reach.
+///
+/// `inspect` identifies a stream WITHOUT decoding it — that is its documented
+/// contract — so it never opens the container and cannot know what a real
+/// read would have approximated. It printed "nothing approximated" anyway,
+/// which was harmless for tar, ar and cpio (a forward read of those really
+/// does approximate nothing) and a flat contradiction for zip, whose
+/// authoritative index is at the END of the stream: `stuffr test -` on the
+/// very same bytes reports two warnings.
+///
+/// The fix is to withhold the claim, not to make `info` open the archive.
+/// This test asserts both halves of that: `info` no longer claims, and
+/// `test` still does.
+#[test]
+fn info_on_a_piped_zip_does_not_claim_nothing_was_approximated() {
+    let dir = tmp("info-zip-fidelity");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let one = dir.join("one.txt");
+    std::fs::write(&one, b"payload").unwrap();
+    let zip = dir.join("bundle.zip");
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", one.to_str().unwrap(), "-o", zip.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bytes = std::fs::read(&zip).unwrap();
+
+    let text = info_over_stdin(&bytes);
+    assert!(
+        text.contains("forward-only"),
+        "the rung is still real and still reported: {text}"
+    );
+    assert!(
+        !text.contains("nothing approximated"),
+        "info has not opened the archive, so it must not claim this: {text}"
+    );
+    assert!(
+        text.contains("not evaluated"),
+        "the line must say the conclusion was withheld, not vanish: {text}"
+    );
+
+    // The other half: `test`, which DOES open the archive, still reports the
+    // two warnings. Without this the assertion above could be satisfied by
+    // having lost the warnings altogether.
+    let mut child = Command::new(STUFFR)
+        .args(["test", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&bytes).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("central/trailing index was never read")
+            && stderr.contains("entry count is unknown"),
+        "`test` opens the archive and must still report both losses: {stderr}"
+    );
+
+    // And on a real FILE the container is still not opened, so the same
+    // withholding applies — the rung differs, the claim does not.
+    let out = Command::new(STUFFR)
+        .args(["info", zip.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("exact"), "a file is read exactly: {text}");
+    assert!(
+        !text.contains("nothing approximated"),
+        "info does not open the archive on a file either: {text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other side of the same fix: a bare CODEC stream has no container to
+/// open, so its empty warning list is a genuine finding and `info` must go on
+/// reporting it. Without this, "withhold the claim" could have been
+/// implemented by withholding it everywhere.
+#[test]
+fn info_on_a_bare_codec_stream_still_reports_nothing_approximated() {
+    let src = tmp("info-codec-fidelity.txt");
+    let gz = tmp("info-codec-fidelity.txt.gz");
+    let _ = std::fs::remove_file(&gz);
+    std::fs::write(&src, b"payload").unwrap();
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", src.to_str().unwrap(), "--format", "gzip"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bytes = std::fs::read(&gz).unwrap();
+
+    for (what, text) in [
+        (
+            "a file",
+            String::from_utf8(
+                Command::new(STUFFR)
+                    .args(["info", gz.to_str().unwrap()])
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap(),
+        ),
+        ("a pipe", info_over_stdin(&bytes)),
+    ] {
+        assert!(
+            text.contains("nothing approximated"),
+            "{what}: a bare codec stream has no container to open, so this claim is real \
+             and must survive: {text}"
+        );
+        assert!(!text.contains("not evaluated"), "{what}: {text}");
+    }
+
+    // The JSON shape carries the same distinction, since `warnings: []` is
+    // ambiguous on its own.
+    let out = Command::new(STUFFR)
+        .args(["info", "--json", gz.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap())
+        .expect("info --json must be JSON");
+    assert_eq!(v["fidelity_evaluated"], true, "{v}");
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&gz);
+}
+
+/// Runs `stuffr info -` over `bytes` and returns its stdout.
+fn info_over_stdin(bytes: &[u8]) -> String {
+    let mut child = Command::new(STUFFR)
+        .args(["info", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "stuffr info - must succeed");
+    String::from_utf8(out.stdout).unwrap()
+}
+
 /// Together with `info_names_the_format_and_the_rung` (a file, "exact"),
 /// this proves the rung is COMPUTED from the source's seekability rather
 /// than hardcoded — neither test alone would catch a rung that was pinned

@@ -228,6 +228,15 @@ INSPECTING A STREAM WITHOUT DECODING IT
   stream can only be read once, so this is the tool telling you the format
   was inferred from bytes it saw going by, not confirmed by looking back.
 
+  The heading is literal: info does not decode, and it does not OPEN an
+  archive either. So when the input is a container it reports
+  `fidelity: not evaluated` rather than "nothing approximated" — it has not
+  looked, and for a zip on a pipe the answer really would be non-empty (run
+  `stuffr test` for that; see "LISTING AND TESTING" below). A bare codec
+  stream has no container to open, so there the empty answer is real and
+  info still says so. In `--json` the same distinction is the
+  `fidelity_evaluated` field, because `"warnings": []` cannot carry it.
+
 
 LISTING AND TESTING AN ARCHIVE
 

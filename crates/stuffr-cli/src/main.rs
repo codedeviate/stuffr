@@ -368,7 +368,20 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     Some(n) => writeln!(out, "size:     {n} bytes")?,
                     None => writeln!(out, "size:     unknown (stream)")?,
                 }
-                if i.fidelity.has_warnings() {
+                // Three cases, not two. `info` identifies a stream without
+                // decoding it, so for a container it has not opened there is
+                // nothing to report either way — and saying "nothing
+                // approximated" there was a false negative, contradicted by
+                // `stuffr test` on the very same bytes for a piped zip. The
+                // rung above is still real; only this conclusion is withheld.
+                // See `ops::Inspection::fidelity_evaluated`.
+                if !i.fidelity_evaluated {
+                    writeln!(
+                        out,
+                        "fidelity: not evaluated (info does not open the archive; \
+                         run `stuffr test` for that)"
+                    )?;
+                } else if i.fidelity.has_warnings() {
                     writeln!(out, "fidelity: {} warning(s)", i.fidelity.warnings.len())?;
                     for w in &i.fidelity.warnings {
                         writeln!(out, "  - {w}")?;

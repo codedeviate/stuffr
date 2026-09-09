@@ -841,6 +841,28 @@ pub struct Inspection {
     /// value by convention rather than by type would invite the two to drift.
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub fidelity: FidelityReport,
+    /// Whether `fidelity`'s WARNINGS mean anything.
+    ///
+    /// `fidelity.rung` is always real — it is the raw input's seekability,
+    /// which `inspect` genuinely knows. `fidelity.warnings` is a different
+    /// matter: `inspect` identifies a stream without decoding it, so when the
+    /// chain resolves to a container it never opens that container and cannot
+    /// know what a real read would have approximated. The list is empty
+    /// because nothing looked, not because nothing was lost.
+    ///
+    /// `false` for any chain naming a container at any depth (`zip`, `tar`,
+    /// `tar over gzip`); `true` for a bare codec stream, where there is no
+    /// container to open and the empty list is a genuine finding.
+    ///
+    /// This exists because the empty list was previously indistinguishable
+    /// from a real one, and zip is the first container for which that was a
+    /// LIE: `stuffr info -` on a piped zip printed "nothing approximated"
+    /// while `stuffr test -` on the same bytes reported two warnings. Harmless
+    /// for tar, ar and cpio, whose forward reads genuinely approximate
+    /// nothing. The fix is to withhold the claim, not to make `inspect` open
+    /// the archive — that would change both its documented contract and its
+    /// cost.
+    pub fidelity_evaluated: bool,
     /// Input size, when the source knows it. A pipe does not.
     pub bytes_in: Option<u64>,
     /// How the format above was decided.
@@ -898,10 +920,16 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
         }
     };
 
+    // Withheld rather than asserted for a container: this function has not
+    // opened one and so has not evaluated its warnings. See
+    // `Inspection::fidelity_evaluated`.
+    let fidelity_evaluated = chain.container().is_none();
+
     Ok(Inspection {
         format,
         chain: chain.describe(),
         fidelity: FidelityReport::new(rung),
+        fidelity_evaluated,
         bytes_in: caps.len,
         detected_by,
     })

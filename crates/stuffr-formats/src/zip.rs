@@ -189,6 +189,11 @@ const ZIP64_LOCATOR_FIXED: usize = 16;
 /// anything.
 const MAX_SYMLINK_TARGET_LEN: u64 = 65_536;
 
+/// Ceiling on the gap [`SpoolHandle::write`] will zero-fill after a seek past
+/// the end of its window. See that method for why the branch is unreachable
+/// and bounded anyway. 1 MiB is far above any real zip framing.
+const MAX_SPOOL_HOLE: usize = 1024 * 1024;
+
 /// The mode zip stores for a file entry when the caller declares none. zip's
 /// own `DEFAULT_FILE_PERMISSIONS`, and what every zip tool writes.
 const DEFAULT_FILE_MODE: u32 = 0o644;
@@ -348,9 +353,25 @@ fn classify_zip_error(e: ZipError) -> Error {
 
 /// Extra guidance for the `UnsupportedArchive` messages this module can
 /// actually meet, so the refusal says what to do next rather than only what
-/// went wrong. Matched on the message because `zip` carries no code for these.
+/// went wrong.
+///
+/// Matched on the message because `zip` carries no error code for these — but
+/// the encrypted arm compares against `ZipError::PASSWORD_REQUIRED`, the
+/// constant the crate EXPORTS for exactly this purpose (`result.rs:47`),
+/// rather than a substring of it. The first version of this function tested
+/// `msg.contains("Encrypted")` and was therefore **dead**: the message is
+/// "Password required to decrypt file" and contains no such word, so the hint
+/// written specifically for encrypted entries could never fire. Caught in
+/// review; `both_unsupported_hints_are_reachable` now covers both arms, since
+/// nothing else did.
+///
+/// The data-descriptor arm has no exported constant to compare against, so it
+/// stays a substring, narrowed to the distinctive part of the sentence. A
+/// wording change upstream costs the hint and nothing else — the refusal, its
+/// class and its exit code are unaffected — and that test fails loudly if it
+/// happens.
 fn unsupported_hint(msg: &str) -> &'static str {
-    if msg.contains("Encrypted") {
+    if msg == ZipError::PASSWORD_REQUIRED {
         return "; stuffr is built without zip's `aes-crypto` feature, so it cannot decrypt \
                 entries at all";
     }
@@ -932,16 +953,20 @@ fn method_for(codec: Option<FormatId>) -> Result<CompressionMethod> {
             #[cfg(not(feature = "zip-zstd"))]
             {
                 Err(Error::Unsupported(
+                    // NOT `lzma` in that list: the arm two up rejects it,
+                    // because zip's `lzma` feature is decode-only.
+                    // Recommending a codec this same function refuses would
+                    // send the caller straight into a second error.
                     "this build cannot write a zstd-compressed zip entry: zip's zstd support is \
                      the one entry codec that needs a C toolchain. Rebuild with `--features \
-                     c-backed`, or pick `deflate`, `bzip2`, `xz`, `lzma` or `store`"
+                     c-backed`, or pick `deflate`, `bzip2`, `xz` or `store`"
                         .into(),
                 ))
             }
         }
         other => Err(Error::Unsupported(format!(
-            "`{other}` is not a zip entry codec; zip stores entries with deflate, bzip2, xz, \
-             lzma, zstd or store"
+            "`{other}` is not a zip entry codec; this build writes zip entries with deflate, \
+             bzip2, xz or store (zstd needs `--features c-backed`; lzma is read-only)"
         ))),
     }
 }
@@ -1079,9 +1104,30 @@ impl Write for SpoolHandle {
         let off = usize::try_from(spool.pos - spool.base).map_err(|_| {
             io::Error::other("zip: spool window exceeds this platform's addressing")
         })?;
-        // A seek past the end followed by a write would leave a hole. zip
-        // never does that, and zero-filling is what a real file would do.
+        // A seek past the end followed by a write would leave a hole, and
+        // zero-filling it is what a real file would do. `ZipWriter` never
+        // does this — it only ever seeks BACK, to a header it already wrote —
+        // so the branch is unreachable in practice.
+        //
+        // Bounded anyway, because it is the one place in this module where an
+        // OFFSET turns into an allocation, and every other allocation here is
+        // explicitly capped (`MAX_SYMLINK_TARGET_LEN`, `skip`'s 4 KiB
+        // scratch). Without the cap, a seek to a large offset followed by one
+        // byte would try to allocate that offset. The bound is generous
+        // relative to real framing — a local header plus a name and extra
+        // fields is at most a few hundred KiB — so it cannot fire on
+        // legitimate output.
         if off > spool.buf.len() {
+            let hole = off - spool.buf.len();
+            if hole > MAX_SPOOL_HOLE {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "zip: refusing to zero-fill a {hole}-byte hole in the spool window; \
+                         the cap is {MAX_SPOOL_HOLE}"
+                    ),
+                ));
+            }
             spool.buf.resize(off, 0);
         }
         let end = off + data.len();
@@ -1837,6 +1883,122 @@ mod tests {
             let fwd = read_all_forward(&bytes).unwrap();
             assert_eq!(fwd[0].1, payload, "{id} did not round trip forward");
         }
+    }
+
+    /// Both `unsupported_hint` arms fire on the message `zip` ACTUALLY
+    /// raises, checked against the crate's own exported constant and its own
+    /// refusal path rather than against a message this module invented.
+    ///
+    /// The encrypted arm was **dead** on arrival: it tested
+    /// `msg.contains("Encrypted")`, and zip 8.6.0 raises
+    /// `ZipError::PASSWORD_REQUIRED` — "Password required to decrypt file" —
+    /// which contains no such word. Nothing covered it, which is why it went
+    /// unnoticed until review. This is the test that was missing.
+    #[test]
+    fn both_unsupported_hints_are_reachable() {
+        // Straight from the crate, so a wording change upstream moves this
+        // test's input too and the assertion still means what it says.
+        let encrypted = unsupported_hint(ZipError::PASSWORD_REQUIRED);
+        assert!(
+            encrypted.contains("aes-crypto"),
+            "the encrypted hint must fire on the message zip really raises, not on a word \
+             that never appears in it: {encrypted:?}"
+        );
+
+        // The data-descriptor message has no exported constant, so it is
+        // provoked through the real refusal path instead of quoted: a zip
+        // written with data descriptors, which `read_zipfile_from_stream`
+        // declines, is exactly what a pipe from another tool can carry.
+        let buf = SharedBuf::new();
+        let mut w = zip::ZipWriter::new_stream(buf.clone());
+        w.start_file("d.txt", SimpleFileOptions::DEFAULT)
+            .expect("start_file");
+        w.write_all(b"data descriptor payload").expect("write");
+        w.finish().expect("finish");
+        let err = read_all_forward(&buf.contents())
+            .expect_err("zip cannot read a data-descriptor entry forward");
+        let text = err.to_string();
+        assert!(
+            text.contains("data descriptor"),
+            "the data-descriptor hint must fire on the message zip really raises: {text}"
+        );
+        assert!(
+            matches!(err, Error::Unsupported(_)) && err.exit_code() == 3,
+            "a data-descriptor zip is a capability gap, not damage: {err:?}"
+        );
+
+        // And an unrelated message gets no hint, so the arms are selective
+        // rather than always-on.
+        assert_eq!(unsupported_hint("something else entirely"), "");
+    }
+
+    /// The zstd refusal must not recommend a codec this same function
+    /// rejects. It listed `lzma`, which the arm above it refuses because
+    /// zip's `lzma` feature is decode-only — so a caller following the advice
+    /// walked straight into a second error.
+    #[test]
+    fn no_refusal_recommends_a_codec_this_build_cannot_write() {
+        // `Vec::new` + `push` rather than a `vec![]` literal: the zstd
+        // refusal below is `cfg`'d out on the C-backed tier, and with a
+        // literal the binding's `mut` then becomes unnecessary there —
+        // `-D warnings` under `--all-features` rejects that.
+        let mut refusals = Vec::new();
+        refusals.push(
+            method_for(Some(FormatId::new("brotli")))
+                .expect_err("zip has no brotli method")
+                .to_string(),
+        );
+        #[cfg(not(feature = "zip-zstd"))]
+        refusals.push(
+            method_for(Some(FormatId::new("zstd")))
+                .expect_err("the pure tier cannot write zstd")
+                .to_string(),
+        );
+
+        for text in &refusals {
+            for codec in ["deflate", "bzip2", "xz", "store"] {
+                if text.contains(codec) {
+                    assert!(
+                        method_for(Some(FormatId::new(codec))).is_ok(),
+                        "`{codec}` is recommended by {text:?} but method_for refuses it"
+                    );
+                }
+            }
+            // The specific regression: `lzma` may appear only where the text
+            // says it is read-only, never as something to "pick".
+            if let Some(at) = text.find("or pick") {
+                assert!(
+                    !text[at..].contains("lzma"),
+                    "a suggestion list must not offer lzma, which is decode-only: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// The one place in the `Spool` where an offset becomes an allocation.
+    /// `ZipWriter` never seeks past the end, so this is unreachable through
+    /// the container — bounded anyway, for consistency with every other
+    /// allocation in this module.
+    #[test]
+    fn the_spool_refuses_to_zero_fill_an_unbounded_hole() {
+        let spool = Rc::new(RefCell::new(Spool::new(Box::new(SharedBuf::new()))));
+        let mut handle = SpoolHandle(Rc::clone(&spool));
+        handle.write_all(b"start").unwrap();
+
+        // Just inside the cap still works: the hole is legitimate framing as
+        // far as the window can tell.
+        handle.seek(SeekFrom::Start(MAX_SPOOL_HOLE as u64)).unwrap();
+        handle.write_all(b"x").unwrap();
+
+        // Past it is refused rather than allocated.
+        handle
+            .seek(SeekFrom::Start(4 * 1024 * 1024 * 1024))
+            .unwrap();
+        let err = handle
+            .write_all(b"x")
+            .expect_err("a 4 GiB hole must be refused, not allocated");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+        assert!(err.to_string().contains("zero-fill"), "{err}");
     }
 
     /// The one entry codec that is READ-only, and it is the crate's doing
