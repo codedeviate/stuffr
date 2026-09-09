@@ -26,6 +26,24 @@ lzip = ["dep:lzma-rust2"]
 tar = ["dep:tar"]
 ar = ["dep:ar"]
 cpio = ["dep:cpio"]
+# `dep:flate2` is load-bearing, not redundant with `gzip`/`zlib`/`deflate`.
+# zip declares flate2 with `default-features = false` and its
+# `deflate-flate2` feature adds no BACKEND feature, so a build of
+# `--features zip` alone would give flate2 no backend at all and trip its
+# own `compile_error!("You need to choose a zlib backend")` (flate2
+# 1.1.10, src/lib.rs:128). This line brings in the workspace's flate2
+# declaration, whose default features select `rust_backend` — the same
+# `miniz_oxide` backend `gzip.rs` already uses. See the `zip` dependency's
+# comment in the workspace manifest for why NOT `deflate-flate2-zlib-rs`.
+zip = ["dep:zip", "dep:time", "dep:flate2"]
+# Adds zstd to `zip` WITHOUT enabling the zip container itself — that is what
+# the `zip?/` weak-dependency syntax buys. The facade's `c-backed` bundle
+# turns this on, so a `c-backed` build that does not also ask for `pure` does
+# not silently acquire a zip container it never requested, while a build with
+# both gets zstd-compressed zip entries. Without it, the pure tier can read a
+# standalone `.zst` (via `ruzstd`) but not a zstd-compressed zip ENTRY, since
+# zip's `zstd` feature is the one that pulls `zstd-sys`.
+zip-zstd = ["zip?/zstd"]
 
 [dependencies]
 stuffr-core = { workspace = true }
@@ -41,6 +59,8 @@ lzma-rust2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 ar = { workspace = true, optional = true }
 cpio = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
+time = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }

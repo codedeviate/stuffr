@@ -42,6 +42,8 @@ pub mod tar;
 pub mod xz_c;
 #[cfg(feature = "xz-pure")]
 pub mod xz_pure;
+#[cfg(feature = "zip")]
+pub mod zip;
 #[cfg(feature = "zlib")]
 pub mod zlib;
 #[cfg(feature = "zstd-c")]
@@ -104,6 +106,16 @@ pub fn register_all(registry: &mut Registry) {
     registry.register_container(std::sync::Arc::new(ar::Ar), ar::meta());
     #[cfg(feature = "cpio")]
     registry.register_container(std::sync::Arc::new(cpio::CpioNewc), cpio::meta());
+
+    // The headline container of Phase 2, and the first with `trailing_index:
+    // true` — so the first for which conformance property 7 (a forward read
+    // must not claim `Rung::Exact`) does anything at all. It is also the
+    // first with `per_entry_codec: true`: an entry names its own compression
+    // method, and the one method this build cannot always supply is zstd,
+    // which needs `--features c-backed` (see `zip.rs`'s module doc and the
+    // `zip-zstd` feature's comment in Cargo.toml).
+    #[cfg(feature = "zip")]
+    registry.register_container(std::sync::Arc::new(zip::Zip), zip::meta());
 
     // No mutual-exclusion dance here: unlike xz/lzma/zstd, LZIP has only
     // one backend, so there is nothing else it could collide with.

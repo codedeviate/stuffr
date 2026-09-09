@@ -38,7 +38,15 @@ jobs:
       # but not `cpio`, so `system_cpio_accepts_what_we_write` would
       # otherwise silently no-op here too (Phase 1e's Finding 8, repeating —
       # Phase 2's Task 10 brief calls this out by name).
-      - run: sudo apt-get update && sudo apt-get install -y lzip cpio
+      # `zip` and `unzip` are named too, though `ubuntu-latest` already
+      # ships both: `zip.rs`'s cross-implementation tests go through
+      # `require_bin`, which PANICS rather than skipping, so an image change
+      # that dropped either would turn this job red with a confusing
+      # "reference tool missing" failure instead of installing it. Naming
+      # them here makes the dependency explicit and costs nothing when they
+      # are already present. (`python3` is not named: it is part of the base
+      # image and cannot be absent.)
+      - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip
       # The same command CONTRIBUTING.md tells a human to run — but NOT the
       # same toolchain, and not the same platform. The `rm` above puts this
       # job on current stable while `rust-toolchain.toml` keeps local runs on
@@ -65,7 +73,15 @@ jobs:
       - run: rm rust-toolchain.toml
       # See "gate"'s identical step: without this, lzip's and cpio's
       # reference-tool tests silently no-op on this runner too.
-      - run: sudo apt-get update && sudo apt-get install -y lzip cpio
+      # `zip` and `unzip` are named too, though `ubuntu-latest` already
+      # ships both: `zip.rs`'s cross-implementation tests go through
+      # `require_bin`, which PANICS rather than skipping, so an image change
+      # that dropped either would turn this job red with a confusing
+      # "reference tool missing" failure instead of installing it. Naming
+      # them here makes the dependency explicit and costs nothing when they
+      # are already present. (`python3` is not named: it is part of the base
+      # image and cannot be absent.)
+      - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip
       # rust-version claims 1.88 and this job is the only thing that checks it.
       # The floor was 1.85 through Phase 1d; it moved because holding it forced an
       # exact pin on a dependency, which blocked patch-level security fixes, and

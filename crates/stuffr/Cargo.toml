@@ -31,14 +31,23 @@ lzip = ["stuffr-formats/lzip"]
 tar = ["stuffr-formats/tar"]
 ar = ["stuffr-formats/ar"]
 cpio = ["stuffr-formats/cpio"]
-# `tar`, `ar` and `cpio` sit in this bundle rather than in a separate
+zip = ["stuffr-formats/zip"]
+# The four containers sit in this bundle rather than in a separate
 # `containers` one, and not because they are codecs — they are not. `pure`
 # means "everything this build can do without a C toolchain", which is the
 # set the `purity` CI job walks (`cargo tree --features pure | grep -E
-# 'zstd-sys|liblzma-sys'`). Neither the `ar` nor the `cpio` crate has a C
-# dependency, so putting them here is what puts their graphs under that job.
-pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pure", "xz-pure", "lzma-pure", "lzip", "tar", "ar", "cpio"]
-c-backed = ["zstd-c", "xz-c", "lzma-c"]
+# 'zstd-sys|liblzma-sys'`). None of the `ar`, `cpio` or `zip` crates has a C
+# dependency as this workspace configures it, so putting them here is what
+# puts their graphs under that job — and `zip` is the one that most needs
+# to be there, since its DEFAULT features do pull `zstd-sys` and the
+# workspace manifest's curated feature list is the only thing stopping it.
+pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pure", "xz-pure", "lzma-pure", "lzip", "tar", "ar", "cpio", "zip"]
+# `stuffr-formats/zip-zstd` rather than a `zip-zstd` passthrough of its own:
+# it uses the weak `zip?/zstd` syntax, so it adds zstd to the zip container
+# only when `zip` is ALSO enabled (which `pure` does) and never pulls the
+# container in on its own. This is the one capability difference `c-backed`
+# makes to a container: reading and writing a zstd-compressed zip entry.
+c-backed = ["zstd-c", "xz-c", "lzma-c", "stuffr-formats/zip-zstd"]
 legacy = []
 full = ["pure", "c-backed", "legacy"]
 serde = ["dep:serde", "stuffr-core/serde"]

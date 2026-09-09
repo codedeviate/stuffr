@@ -121,6 +121,28 @@ COLLECTING FILES INTO AN ARCHIVE
       limit, never silently truncated to the wrong length. ar has no such
       ceiling.
 
+  stuffr pack one.txt two.txt -o bundle.zip
+      zip collects files the same way, and is the first container here whose
+      INDEX is at the end of the file rather than beside each entry. Two
+      consequences worth knowing. Writing: a zip local header has to carry
+      each entry's CRC and compressed size, neither of which is known until
+      the entry has been compressed, so stuffr holds one entry in memory and
+      streams out everything before it — the archive is never buffered
+      whole, but a single huge entry does cost its own compressed size in
+      RAM. Reading: see "LISTING AND TESTING" below, because a zip on a
+      pipe is genuinely worth less than a zip in a file.
+      Entries are deflate-compressed by default. Directory entries carry
+      the trailing "/" the format identifies them by, and symlinks are
+      stored the way Info-ZIP stores them, so `unzip` restores them as
+      symlinks rather than as files holding a path.
+
+  stuffr pack one.txt two.txt -o bundle.zip --level 9
+      --level reaches a zip's entry compressor. deflate's range here is
+      1-9, NOT 0-9 like a bare `.gz`: zip's deflate writer has no "store"
+      level, so `--level 0` is a usage error (exit 2) naming the codec,
+      refused before the output is touched — the same shape as bzip2's
+      own missing level 0 under "COMPRESSING A FILE" above.
+
 
 DECOMPRESSING
 
@@ -252,6 +274,40 @@ LISTING AND TESTING AN ARCHIVE
       format has a trailing index to lose on a pipe, so `--strict-fidelity`
       passes a piped ar or cpio archive for the same reason it passes a
       piped tar.
+
+  stuffr test photos.zip --strict-fidelity
+  cat photos.zip | stuffr test - --strict-fidelity
+      The first succeeds and the second fails with exit 4, and that is the
+      whole point of the flag. A zip keeps its authoritative metadata in a
+      central directory at the END of the file: given a real file stuffr
+      reads it (`stuffr info` says rung "exact" — random access to any
+      entry, unix modes present, symlinks reported as symlinks), and given
+      a pipe it cannot, so it reads the inline local headers instead. That
+      yields the same DATA and a strict subset of the metadata — no modes,
+      no entry count, and a symlink indistinguishable from a small file
+      holding its target. Both losses are reported by name, which is why
+      --strict-fidelity fails here and passes on a piped tar: it gates on
+      what was lost, never on the rung. (`list`, `ls` and `cat` take no
+      such flag; `test` and `unpack` do.)
+
+  stuffr test archive.zip
+      Verifies every entry's CRC32 — zip carries one per entry, so
+      corruption is really detected rather than inferred. Exit 5 for a
+      damaged or truncated archive, including one cut anywhere inside its
+      central directory: a forward read stops at the index rather than
+      reading it, so stuffr checks that the index is whole itself. Bytes
+      appended AFTER a complete archive are ignored, as every zip tool
+      ignores them.
+
+  stuffr test encrypted.zip
+      Exit 1, not 5: an encrypted entry is a capability this build does
+      not have, not a damaged file, and the message says which. The same
+      answer covers a zstd-compressed zip ENTRY on a default build — the
+      one entry codec that needs a C toolchain, so the refusal names
+      `--features c-backed`. Note the asymmetry: a standalone .zst file
+      reads fine on every build; it is only zstd INSIDE a zip that needs
+      the flag. An LZMA zip entry is the reverse — readable everywhere,
+      writable nowhere, which reports as exit 3.
 
   stuffr list bomb.tar.gz --max-ratio 100
   stuffr test bomb.tar.gz --max-ratio 100

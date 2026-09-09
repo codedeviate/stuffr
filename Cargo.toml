@@ -82,4 +82,63 @@ ar = "0.9"
 # `newc` only — the crate ships no odc or CRC variant, so this container
 # declares exactly that rather than implying the others work.
 cpio = "0.4"
+# NOT `zip = "8.6"`. zip's default features include `zstd`, which pulls
+# `zstd-sys` — a C-compiling crate — into every graph that touches this
+# dependency, and the `purity` CI job fails the moment `zstd-sys` or
+# `liblzma-sys` appears in a default-feature build. The curated list below is
+# verified C-free: `deflate-flate2` routes deflate through `flate2` (already
+# here), `bzip2` through `libbz2-rs-sys` (pure Rust since bzip2 0.6),
+# `deflate64` and `ppmd` are pure-Rust decoders, and zip's `xz` and `lzma`
+# features both resolve to `lzma-rust2` — the same crate this tree's pure xz
+# and LZMA1 backends use, so no new licence (Apache-2.0, already reachable
+# from a default build). Worth stating precisely rather than as "no new
+# dependency", because it is not quite that: zip pins `lzma-rust2 ^0.16.1`
+# while this workspace is on 0.20, and 0.x versions are semver-incompatible,
+# so `cargo tree` shows BOTH 0.16.5 and 0.20.1 and both get compiled. That
+# is compile time and binary size, not a new licence or a new C toolchain
+# requirement; it resolves itself when zip catches up.
+#
+# `deflate-flate2` and NOT `deflate-flate2-zlib-rs`, which is the variant a
+# reading of zip's feature list suggests. The `-zlib-rs` suffix turns on
+# `flate2/zlib-rs`, and Cargo unifies features across the whole graph: it
+# would therefore switch `gzip.rs`, `zlib.rs` and `deflate.rs` — three
+# separately registered codecs with their own corruption sweeps, their own
+# measured `io::ErrorKind` behaviour recorded in `normalize.rs`, and a
+# reference-tool byte comparison — from `miniz_oxide` to `zlib-rs` as a side
+# effect of adding a CONTAINER. Verified against flate2 1.1.10's
+# `src/ffi/mod.rs:75`: the `miniz_oxide` module is compiled only under
+# `all(not(feature = "any_zlib"), feature = "miniz_oxide")`, and `zlib-rs`
+# implies `any_zlib`, so the swap is silent and total. Both variants are
+# equally C-free, so nothing about the `purity` job motivates the wider one.
+# Picking zlib-rs for this tree is a decision worth taking on its own merits;
+# it is not one to make by accident here.
+#
+# `aes-crypto` is deliberately ABSENT: this build cannot decrypt an
+# encrypted entry, and `zip.rs` reports that as an unsupported capability
+# rather than as corruption. Adding it would also add five crypto crates to
+# a default graph for a capability nothing here exposes yet.
+#
+# zip's `zstd` feature is reached only through `stuffr-formats/zip-zstd`,
+# which the `c-backed` bundle turns on — see that feature's own comment.
+zip = { version = "8.6", default-features = false, features = [
+    "deflate-flate2",
+    "bzip2",
+    "deflate64",
+    "xz",
+    "lzma",
+    "ppmd",
+    "time",
+] }
+# Already in the graph as `zip`'s own dependency (its `time` feature), and
+# named here only so `zip.rs` can reach the `TryFrom` impls between
+# `zip::DateTime` and `time::PrimitiveDateTime` in both directions: a zip
+# stores an MS-DOS civil (y, m, d, h, m, s) tuple while `EntryMeta::mtime` is
+# a `SystemTime`, so something has to do the calendar arithmetic. Hand-rolling
+# `days_from_civil`/`civil_from_days` here instead would put new
+# calendar-maths code in an archive container, which is the wrong place for
+# it. (`PrimitiveDateTime` and not `OffsetDateTime`: zip gates its
+# `OffsetDateTime` conversions behind a `deprecated-time` feature this build
+# does not enable.) `default-features = false` + `std` matches how zip
+# declares it, so the two unify to one build of one version.
+time = { version = "0.3", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }

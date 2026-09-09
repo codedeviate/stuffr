@@ -633,6 +633,46 @@ pub(crate) const AR_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
     &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
 
+/// The `InvalidInput` + `UnexpectedEof` pair again, measured against `zip`'s
+/// own payload readers — which are several, because a zip entry names its own
+/// codec, so this constant has to cover all of them at once rather than one
+/// backend.
+///
+/// Deliberately its own constant rather than a reuse of
+/// [`MALFORMED_AS_INVALID_INPUT_EOF`] above, whose doc pins that name to
+/// "flate2 and bzip2 measured directly". The KINDS coincide; the measurement
+/// is a different one, over a different set of readers, and a future change
+/// to either should not silently move the other:
+///
+/// * Every entry's payload passes through `zip::crc32::Crc32Reader`, which
+///   raises `InvalidData` ("Invalid checksum") at end of stream when the
+///   bytes delivered do not hash to the crc32 the entry's own header
+///   declares. That is what detects a `Stored` entry cut mid-payload, where
+///   the inner `Take` reports a clean `Ok(0)`. `InvalidData` needs no folding
+///   — `Error::from_decode_io` already classifies it as `Corrupt` — and is
+///   absent from the list for that reason; it is named here because it is the
+///   reason the list does NOT need to cover the stored case.
+/// * A `Deflated` entry decodes through `flate2`, which raises
+///   `UnexpectedEof` for a stream that runs out mid-member and `InvalidInput`
+///   for corrupted deflate data — the identical pair measured for gzip.
+/// * A `Bzip2` entry decodes through the `bzip2` crate over
+///   `libbz2-rs-sys`, measured in this tree as the same pair.
+/// * `Xz` and `Lzma` entries decode through `lzma-rust2`, the backend
+///   `xz_pure.rs` and `lzma_pure.rs` already fold onto `InvalidData` from the
+///   same kinds.
+///
+/// A genuine source failure still reaches this wrapper untouched: `Crc32Reader`
+/// and `Decompressor` both propagate an error their inner reader produced with
+/// its own kind, and neither manufactures `InvalidInput` or `UnexpectedEof` on
+/// its own behalf — which is what conformance property 10 checks.
+///
+/// Gated `#[cfg(feature = "zip")]` for the same reason cpio's constant above
+/// is: an ungated `pub(crate) const` with no consumer warns under `-D
+/// warnings` on the tier that compiles it.
+#[cfg(feature = "zip")]
+pub(crate) const ZIP_MALFORMED_AS_INVALID_INPUT_EOF: &[ErrorKind] =
+    &[ErrorKind::InvalidInput, ErrorKind::UnexpectedEof];
+
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],
