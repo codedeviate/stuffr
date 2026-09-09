@@ -369,12 +369,15 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     None => writeln!(out, "size:     unknown (stream)")?,
                 }
                 // Three cases, not two. `info` identifies a stream without
-                // decoding it, so for a container it has not opened there is
-                // nothing to report either way — and saying "nothing
-                // approximated" there was a false negative, contradicted by
-                // `stuffr test` on the very same bytes for a piped zip. The
-                // rung above is still real; only this conclusion is withheld.
-                // See `ops::Inspection::fidelity_evaluated`.
+                // decoding it, so where a forward read of the container COULD
+                // have approximated something it has not looked and must not
+                // say — asserting "nothing approximated" there was a false
+                // positive, contradicted by `stuffr test` on the very same
+                // bytes for a piped zip. Withholding it for every container
+                // instead would be a false NEGATIVE, since a forward read of
+                // a tar genuinely loses nothing; the rule is narrowed to the
+                // cases where loss is possible. The rung above is real in all
+                // three. See `ops::Inspection::fidelity_evaluated`.
                 if !i.fidelity_evaluated {
                     writeln!(
                         out,

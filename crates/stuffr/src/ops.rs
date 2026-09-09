@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::governor::detect_cpu_budget;
 use stuffr_core::{
-    BudgetInputs, Chain, Counting, CountingWriter, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts,
-    Error, FidelityReport, FileSource, FormatId, FormatKind, Governor, RatioGuard, ReaderSource,
-    Registry, Result, Rung, Source, default_memory_limit,
+    BudgetInputs, Chain, ContainerCaps, Counting, CountingWriter, DEFAULT_MAX_RATIO, DecodeOpts,
+    EncodeOpts, Error, FidelityReport, FileSource, FormatId, FormatKind, Governor, RatioGuard,
+    ReaderSource, Registry, Result, Rung, Source, default_memory_limit,
 };
 
 /// Per-process counter mixed into the temp file name alongside the pid, so
@@ -850,18 +850,29 @@ pub struct Inspection {
     /// know what a real read would have approximated. The list is empty
     /// because nothing looked, not because nothing was lost.
     ///
-    /// `false` for any chain naming a container at any depth (`zip`, `tar`,
-    /// `tar over gzip`); `true` for a bare codec stream, where there is no
-    /// container to open and the empty list is a genuine finding.
+    /// `false` only when a forward read of THIS container could actually
+    /// have lost something — a non-authoritative rung AND a container
+    /// declaring `trailing_index`. See
+    /// [`fidelity_is_knowable_without_opening`] for the full rule and for
+    /// which `ContainerCaps` flags count.
+    ///
+    /// So, concretely: `false` for a piped zip; `true` for a seekable zip
+    /// (the central directory WAS read), for tar, ar and cpio piped or not
+    /// (no trailing index to miss), and for a bare codec stream (no
+    /// container at all).
     ///
     /// This exists because the empty list was previously indistinguishable
     /// from a real one, and zip is the first container for which that was a
     /// LIE: `stuffr info -` on a piped zip printed "nothing approximated"
-    /// while `stuffr test -` on the same bytes reported two warnings. Harmless
-    /// for tar, ar and cpio, whose forward reads genuinely approximate
-    /// nothing. The fix is to withhold the claim, not to make `inspect` open
-    /// the archive — that would change both its documented contract and its
-    /// cost.
+    /// while `stuffr test -` on the same bytes reported two warnings. The fix
+    /// is to withhold the claim, not to make `inspect` open the archive —
+    /// that would change both its documented contract and its cost.
+    ///
+    /// The first version of the fix withheld it for EVERY container, which
+    /// merely inverted the dishonesty: "not evaluated" on a `.tar` is a false
+    /// negative, since a forward read of a tar really does approximate
+    /// nothing. Narrowing it is fix round 3, and the four cases above are
+    /// each pinned by a test.
     pub fidelity_evaluated: bool,
     /// Input size, when the source knows it. A pipe does not.
     pub bytes_in: Option<u64>,
@@ -920,10 +931,7 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
         }
     };
 
-    // Withheld rather than asserted for a container: this function has not
-    // opened one and so has not evaluated its warnings. See
-    // `Inspection::fidelity_evaluated`.
-    let fidelity_evaluated = chain.container().is_none();
+    let fidelity_evaluated = fidelity_is_knowable_without_opening(registry, &chain, rung);
 
     Ok(Inspection {
         format,
@@ -933,6 +941,79 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
         bytes_in: caps.len,
         detected_by,
     })
+}
+
+/// Whether `inspect` can honestly say a read would approximate nothing,
+/// WITHOUT opening the archive to find out.
+///
+/// Two things have to be true, and getting either wrong produces dishonest
+/// output — this predicate has now been wrong in both directions:
+///
+/// 1. **The rung must not be authoritative.** On a seekable source a
+///    container reads its own structures, so there is nothing for a forward
+///    read to have missed. `is_authoritative()` rather than `== Exact`
+///    because [`crate::Rung::Spilled`] is authoritative too — `inspect`
+///    never spills today, so the two coincide here, but the reason this
+///    withholds is "the format's own structures were not read", not "the
+///    input was not a file".
+/// 2. **The container must declare a capability that implies a forward read
+///    loses something.** Looked up from the registry's [`ContainerCaps`], so
+///    this still opens nothing and `inspect`'s "identifies a stream without
+///    decoding it" contract is untouched.
+///
+/// # Which `ContainerCaps` flags imply a possible forward-read loss
+///
+/// **`trailing_index` is the only one today**, and it is the only one whose
+/// loss is unconditional: the authoritative metadata is at the END of the
+/// stream, so a forward read has demonstrably not consulted it — which is
+/// exactly what `ladder::seed_report` warns about, and why `zip` is the only
+/// container in this build for which a forward read approximates anything.
+/// tar, ar and cpio all declare it `false` and carry every entry's metadata
+/// inline, so "nothing approximated" is TRUE for them, piped or not, and
+/// withholding it there was a false negative (fix round 3).
+///
+/// The other three flags are deliberately NOT included, and a future
+/// container declaring one should come here and reconsider rather than
+/// inherit a predicate silently tuned to zip:
+///
+/// * `solid` — reaching entry N decodes 1..N. That is wasted WORK
+///   (`Fidelity::SolidBlockFullyDecoded`), not lost metadata, and it costs
+///   the same on a seekable source. Nothing is approximated, so it does not
+///   belong here as things stand — but a solid format that also placed its
+///   metadata at the end would, via `trailing_index`.
+/// * `degraded_parse` — a container reaching [`crate::Rung::Degraded`]
+///   yields partial results by construction, which is a loss. It is absent
+///   because the RUNG already says so and `inspect` never produces
+///   `Degraded` (it reports only `Exact` or `ForwardOnly`, from the source's
+///   seekability). A caller that starts producing `Degraded` from `inspect`
+///   must add it.
+/// * `needs_seek` — such a container cannot be read forward AT ALL; the
+///   ladder spills instead, reaching an authoritative rung, so condition 1
+///   already excludes it.
+fn fidelity_is_knowable_without_opening(registry: &Registry, chain: &Chain, rung: Rung) -> bool {
+    if rung.is_authoritative() {
+        return true;
+    }
+    let Some(container) = chain.container() else {
+        // A bare codec stream: no container to open, so the empty warning
+        // list is a genuine finding rather than an absence of looking.
+        return true;
+    };
+    // A container this build does not have cannot be opened by anything, so
+    // there is no claim to withhold — and `resolve_chain` would not have
+    // named it. `false` would be the safe answer either way.
+    let Some(container) = registry.container(container) else {
+        return true;
+    };
+    !implies_forward_read_loss(container.caps())
+}
+
+/// Whether a forward read of a container with these capabilities may
+/// approximate something. See
+/// [`fidelity_is_knowable_without_opening`]'s own doc for the full argument,
+/// including why the other three `ContainerCaps` flags are not here.
+fn implies_forward_read_loss(caps: ContainerCaps) -> bool {
+    caps.trailing_index
 }
 
 /// The extension a format's output should carry, e.g. `"gz"` for gzip.

@@ -148,6 +148,111 @@ fn info_reports_the_resolved_memory_limit() {
     let _ = std::fs::remove_file(&gz);
 }
 
+/// The whole `info` fidelity rule, all four cases in one place, because the
+/// discrimination is TWO-dimensional: it turns on the rung AND on whether the
+/// container has anything to lose on a forward read.
+///
+/// This test exists because the first version of the fix was one-dimensional
+/// — it withheld the claim for every container — which merely inverted the
+/// dishonesty: "not evaluated" on a `.tar` is a false NEGATIVE, since a
+/// forward read of a tar approximates nothing at all. Nothing pinned tar's
+/// `info` text, which is exactly how the widening slipped through, so all
+/// four cases are pinned here now.
+#[test]
+fn info_withholds_the_fidelity_claim_only_where_a_forward_read_could_lose_something() {
+    let dir = tmp("info-fidelity-matrix");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let one = dir.join("one.txt");
+    std::fs::write(&one, b"payload").unwrap();
+
+    // Built through the CLI so these are the same archives a user gets.
+    let mut archives = Vec::new();
+    for (ext, has_trailing_index) in [("zip", true), ("tar", false), ("cpio", false), ("a", false)]
+    {
+        let path = dir.join(format!("bundle.{ext}"));
+        assert!(
+            Command::new(STUFFR)
+                .args(["pack", one.to_str().unwrap(), "-o", path.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success(),
+            "packing a .{ext} must succeed"
+        );
+        archives.push((ext, path, has_trailing_index));
+    }
+
+    for (ext, path, has_trailing_index) in &archives {
+        let bytes = std::fs::read(path).unwrap();
+
+        // (a) SEEKABLE: the container reads its own structures whatever they
+        //     are, so nothing is lost and the claim is true for every format
+        //     here — zip included.
+        let text = String::from_utf8(
+            Command::new(STUFFR)
+                .args(["info", path.to_str().unwrap()])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(text.contains("exact"), ".{ext} from a file: {text}");
+        assert!(
+            text.contains("nothing approximated"),
+            ".{ext} from a FILE was read exactly — the claim is true and must be made: {text}"
+        );
+
+        // (b) PIPED: now it depends on the format. Only a trailing index can
+        //     be missed by a forward read.
+        let text = info_over_stdin(&bytes);
+        assert!(text.contains("forward-only"), ".{ext} on a pipe: {text}");
+        if *has_trailing_index {
+            assert!(
+                text.contains("not evaluated"),
+                ".{ext} keeps its index at the END of the stream, so a forward read may well \
+                 have approximated something and info has not looked: {text}"
+            );
+            assert!(!text.contains("nothing approximated"), ".{ext}: {text}");
+        } else {
+            assert!(
+                text.contains("nothing approximated"),
+                ".{ext} carries every entry's metadata inline, so a forward read loses \
+                 NOTHING — withholding the claim here is a false negative: {text}"
+            );
+            assert!(!text.contains("not evaluated"), ".{ext}: {text}");
+        }
+
+        // And the ground truth for the `else` branch above, from the command
+        // that DOES open the archive: a piped tar/cpio/ar really does report
+        // no warnings, so "nothing approximated" is not merely convenient.
+        let mut child = Command::new(STUFFR)
+            .args(["test", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&bytes).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if *has_trailing_index {
+            assert!(
+                stderr.contains("fidelity warning"),
+                ".{ext} on a pipe must really have warnings, or info would be right to \
+                 claim none: {stderr}"
+            );
+        } else {
+            assert!(
+                out.status.success() && !stderr.contains("fidelity warning"),
+                ".{ext} on a pipe must really have NO warnings, which is what makes info's \
+                 claim true: {stderr}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `info` must not report a fidelity conclusion it did not reach.
 ///
 /// `inspect` identifies a stream WITHOUT decoding it — that is its documented
@@ -211,8 +316,11 @@ fn info_on_a_piped_zip_does_not_claim_nothing_was_approximated() {
         "`test` opens the archive and must still report both losses: {stderr}"
     );
 
-    // And on a real FILE the container is still not opened, so the same
-    // withholding applies — the rung differs, the claim does not.
+    // A real FILE is the other side of the rule and was WRONG in round 2:
+    // the rung is `exact`, so a zip read from a file consults its central
+    // directory and loses nothing. The claim is true there and must be made.
+    // `info_withholds_the_fidelity_claim_only_where_a_forward_read_could_lose_something`
+    // covers the full matrix; this keeps the contrast next to the defect.
     let out = Command::new(STUFFR)
         .args(["info", zip.to_str().unwrap()])
         .output()
@@ -220,8 +328,8 @@ fn info_on_a_piped_zip_does_not_claim_nothing_was_approximated() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("exact"), "a file is read exactly: {text}");
     assert!(
-        !text.contains("nothing approximated"),
-        "info does not open the archive on a file either: {text}"
+        text.contains("nothing approximated"),
+        "a seekable zip reads its central directory, so nothing is approximated: {text}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
