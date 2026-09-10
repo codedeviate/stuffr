@@ -272,6 +272,18 @@ destination with `openat(O_NOFOLLOW)` per component — which needs a `rustix` o
 `libc` dependency and a design cycle of its own. Extract untrusted archives into
 a directory nothing else can write to.
 
+**A second thing worth stating plainly: entry-aware extraction is not atomic.**
+A single-stream decode (`stuffr unpack a.gz -o out`) publishes through
+temp-file-plus-rename, so a refused decode leaves no partial file — asserted
+by name in its tests. `stuffr unpack a.tar -C out/` writes each entry straight
+to its final path, so a refusal partway through leaves the entries that already
+completed plus one partially-written file. The refusal itself is correct and
+the exit code is right; the destination is simply not rolled back. Making it
+atomic means staging the tree and moving it into place, which needs a temp
+directory on the destination's filesystem and an answer for a tree larger than
+the free space — its own cycle. Until then: extract into a fresh directory you
+can delete, and check the exit code before trusting the contents.
+
 ## Planned format coverage
 
 Read and write symmetry wherever it is technically possible.

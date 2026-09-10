@@ -108,6 +108,14 @@ COLLECTING FILES INTO AN ARCHIVE
   as is writing a container inside a codec (`bundle.tar.gz`) in one step:
   pack the .tar, then pack that.
 
+  A fourth refusal, for the same reason the extract side refuses flags it
+  cannot honour: --threads, --turbo and --allow-weak-encoder are all
+  refused (exit 2) when the output names a container. None of the four
+  containers compresses anything itself, so there is no encoder for those
+  flags to reach; accepting them and silently dropping them would promise
+  behaviour that never happens. They stay available on the single-stream
+  codec path, which really does honour them.
+
   stuffr pack one.txt two.txt -o bundle.ar
   stuffr pack one.txt two.txt -o bundle.cpio
       ar and cpio (newc only) collect files the same way tar does — pack
@@ -197,8 +205,11 @@ STREAMING TO STDOUT
       seeking and nothing written to disk. Without an entry name cat decodes
       its input as a single stream, so `stuffr cat backup.tar` is a usage
       error (exit 2) that names what to do instead. --max-ratio bounds this
-      exactly as it bounds extraction below; --format and --memory-limit are
-      refused alongside an entry name rather than accepted and ignored.
+      exactly as it bounds extraction below, and --memory-limit bounds the
+      codec layer beneath the container (see "EXTRACTING AN ARCHIVE" below).
+      --format is refused alongside an entry name rather than accepted and
+      ignored: entry-aware streaming detects the container, and any codec
+      above it, from the archive itself.
 
 
 STDIN AND STDOUT VIA `-`
@@ -230,15 +241,30 @@ INSPECTING A STREAM WITHOUT DECODING IT
 
   The heading is literal: info does not decode, and it does not OPEN an
   archive either. So it reports `fidelity: not evaluated` instead of
-  "nothing approximated" in exactly one case — where a forward read of that
-  container could genuinely have lost something and info has not looked.
-  Today that means a zip on a pipe, whose index sits at the end of the
-  file (run `stuffr test` for the real answer; see "LISTING AND TESTING"
-  below). Everywhere else the claim is true and info still makes it: a
-  seekable zip read its central directory, a tar, ar or cpio has no
-  trailing index to miss piped or not, and a bare codec stream has no
+  "nothing approximated" wherever a forward read of that container could
+  genuinely have lost something and info has not looked. Today that means
+  zip, the only container here that keeps its index at the END of the
+  stream, whenever that zip will not be read authoritatively (run `stuffr
+  test` for the real answer; see "LISTING AND TESTING" below). Two shapes
+  qualify:
+
+    * a zip on a pipe, and
+    * a zip under a codec — `bundle.zip.gz` — however seekable the FILE
+      is. The rung reported is the raw input's, and a seekable file says
+      nothing about a container read out of a gzip decoder: that decoder
+      is forward-only by construction, and `stuffr test bundle.zip.gz
+      --strict-fidelity` on the same bytes exits 4 with two warnings.
+
+  Everywhere else the claim is true and info still makes it: a seekable
+  bare zip read its central directory, a tar, ar or cpio has no trailing
+  index to miss piped, wrapped or not, and a bare codec stream has no
   container at all. In `--json` the same distinction is the
   `fidelity_evaluated` field, because `"warnings": []` cannot carry it.
+
+  One limit worth knowing: on a PIPE with no filename, info resolves only
+  the outer layer. `cat bundle.zip.gz | stuffr info -` reports `chain:
+  gzip`, because seeing the zip inside would mean running the decoder,
+  which info does not do. It reports honestly on what it identified.
 
 
 LISTING AND TESTING AN ARCHIVE
@@ -274,10 +300,16 @@ LISTING AND TESTING AN ARCHIVE
       the rung.
 
   stuffr list plain.txt.gz
-      Fails: a bare codec stream is not an archive. The error names what
-      the input actually resolved to (here, `gzip`) rather than a bare
-      refusal, so "oh, that's not a tar, it's just gzip" is diagnosable
-      without inspecting the file by hand.
+  stuffr list plain.txt
+      Both fail with exit 2, because both are the same mistake: you pointed
+      an entry-aware verb at something that has no entries. The first is a
+      bare codec stream, and the error names what the input actually
+      resolved to (here, `gzip`) rather than a bare refusal, so "oh, that's
+      not a tar, it's just gzip" is diagnosable without inspecting the file
+      by hand. The second is a file of no recognised format at all, and the
+      error prints its leading bytes. A file whose format is AMBIGUOUS is
+      exit 2 as well, and its message names the candidates and tells you to
+      pass --format.
 
   stuffr list bundle.ar
   stuffr test bundle.cpio
@@ -286,6 +318,15 @@ LISTING AND TESTING AN ARCHIVE
       format has a trailing index to lose on a pipe, so `--strict-fidelity`
       passes a piped ar or cpio archive for the same reason it passes a
       piped tar.
+
+  stuffr list legacy.cpio
+      Exit 3, not 5, if that archive is `odc` (magic 070707) or the CRC
+      variant of `newc` (magic 070702). Both are perfectly valid cpio
+      archives that this build cannot read — the crate it uses implements
+      `newc` (070701) alone — so they are recognised by magic and refused
+      as a capability limit, naming the variant and how to convert it.
+      Calling an intact file corrupt would be a lie; exit 5 is reserved for
+      damage. Bytes that are not cpio at all are still exit 5.
 
   stuffr test photos.zip --strict-fidelity
   cat photos.zip | stuffr test - --strict-fidelity
@@ -334,6 +375,24 @@ LISTING AND TESTING AN ARCHIVE
       archive is this compressible; a bare `.tar` (no codec layer at all)
       is never affected, since nothing there is expanding.
 
+      `test` bounds each ENTRY's decoded payload too, exactly as `cat` and
+      `unpack -C` do — the same per-entry and running-total pair, charged
+      from bytes actually read. All four entry-aware verbs refuse the same
+      bomb at the same ratio; the verb you reach for to inspect an
+      untrusted archive is not the lenient one.
+
+  stuffr list bundle.tar.lz --memory-limit 512M
+  stuffr test bundle.tar.lz --memory-limit 512M
+      --memory-limit is the OTHER bound, and --max-ratio cannot stand in
+      for it: the pure xz, lzma and lzip decoders size a dictionary from a
+      value the file declares in its own header, before producing a single
+      byte of output, and --max-ratio counts output bytes. So a crafted
+      131-byte .tar.lz declaring a 512 MiB dictionary sails past any ratio
+      and is refused at exit 6 by this bound alone. On by default at 25% of
+      available RAM (cgroup-aware) for `list`, `test`, `cat` and
+      `unpack -C` alike — "reads nothing and extracts nothing" was never
+      true of the codec layer above the container.
+
 
 EXTRACTING AN ARCHIVE'S ENTRIES
 
@@ -371,6 +430,14 @@ EXTRACTING AN ARCHIVE'S ENTRIES
   entry written "through" a hostile symlink is never reached. An entry
   named `.` or `./` IS accepted: it names the destination directory itself,
   and it is the first entry `tar cf x.tar .` emits.
+
+  A symlink whose target resolves TO the destination is accepted too, for
+  the same reason: `sub/top -> ..` points at the extraction root, and the
+  root is inside the root. One step further out (`sub/top -> ../..`) is an
+  escape and is refused. Note the asymmetry with entry names, which is
+  deliberate: an entry NAMED `sub/..` is refused, because no real archiver
+  emits one and a name that pops back to the destination is more likely an
+  attack than an intent.
 
   An entry whose path runs THROUGH a symlink is refused too — a directory
   component that is a link, whether an earlier entry created it or somebody
@@ -415,22 +482,44 @@ EXTRACTING AN ARCHIVE'S ENTRIES
       archive's running total — charged from the bytes actually read rather
       than the size an entry's header declares, since a header that
       under-declares would otherwise walk straight through the check. Past
-      the limit the extraction is refused at exit 6, naming the entry.
-      --memory-limit is refused alongside -C rather than accepted and
-      ignored: for now the codec layer beneath a container is bounded by
-      --max-ratio only. --no-sync is accepted and does nothing — extraction
-      writes entries straight to their final paths, so there is no fsync
-      for it to skip.
+      the limit the extraction is refused at exit 6, naming the entry. The
+      identical bound applies to `list`, `test` and `cat`, so the verb you
+      reach for to INSPECT an untrusted archive is no less bounded than the
+      one that writes it to disk.
+
+      --no-sync is accepted and does nothing — extraction writes entries
+      straight to their final paths, so there is no fsync for it to skip.
+
+      Extraction is NOT atomic, and this is the one place the two paths
+      differ. A single-stream decode (`stuffr unpack a.gz -o out`) writes to
+      a temp file and renames it into place, so a refused decode leaves no
+      partial file at all. An entry-aware extraction writes each entry
+      straight to its final path, so a refusal partway through — a bomb, an
+      unsafe path, a corrupt entry — leaves whatever entries already
+      completed, plus a partially-written one. Extract untrusted archives
+      into a fresh directory you can delete, and check the exit code before
+      trusting the contents.
+
+  stuffr unpack bundle.tar.lz -C out/ --memory-limit 512M
+      --memory-limit bounds the codec layer BENEATH the container, which
+      --max-ratio cannot see: the pure xz, lzma and lzip decoders size a
+      dictionary from a value the file declares in its own header, before
+      producing any output, and --max-ratio counts output bytes. A crafted
+      131-byte .tar.lz declaring a 512 MiB dictionary is refused at exit 6
+      rather than allocating for it. Defaults to 25% of available RAM
+      (cgroup-aware) on `list`, `test`, `cat` and `unpack -C` alike — the
+      bound is on by default, since a bound that defaults off closes
+      nothing. Raise it to decode a file that genuinely needs more.
 
 
 WHAT THIS BUILD CAN DO
 
   stuffr formats
       Lists the formats compiled into THIS binary, not everything stuffr will
-      ever support. A pure build (the default) has fourteen rows: the eleven
+      ever support. A pure build (the default) has fifteen rows: the eleven
       codecs gzip, zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma
-      and lzip, plus the tar, ar and cpio containers — the KIND column tells
-      codecs and containers apart. zstd's row differs by which backend is
+      and lzip, plus the tar, ar, cpio and zip containers — the KIND column
+      tells codecs and containers apart. zstd's row differs by which backend is
       compiled in: a build with the `zstd-c` feature (needs a C toolchain)
       shows `yes` in WRITE, using the real `libzstd`; a pure-Rust build
       falls back to `ruzstd` instead, and shows `weak` in WRITE — see
@@ -444,7 +533,7 @@ WHAT THIS BUILD CAN DO
       only ever had the one, pure-Rust `lzma-rust2` backend, so this feature
       changes nothing about it, in either direction. All three tiers (`pure`,
       `pure` plus `c-backed`, and any granular combination) list all
-      fourteen formats — the ONLY capability difference the `c-backed`
+      fifteen formats — the ONLY capability difference the `c-backed`
       feature makes anywhere in this matrix is zstd's WRITE column, `weak`
       against `yes`.
 
@@ -454,8 +543,8 @@ WHAT THIS BUILD CAN DO
       `zstd` — `ruzstd` has no multi-threaded encoder to hand a worker
       count to. Adding `--features c-backed` flips `zstd` to `yes` as
       well, alongside its WRITE column becoming `yes`; it changes nothing
-      else in this column, on any tier. All three containers — tar, ar and
-      cpio — always show `-` here: none of them parallelises anything, on
+      else in this column, on any tier. All four containers — tar, ar, cpio
+      and zip — always show `-` here: none of them parallelises anything, on
       any tier.
 
 
@@ -597,8 +686,11 @@ EXIT CODES
   1  general failure (i/o error, or anything not listed below)
   2  usage error (bad flag, missing -o, existing output without --force,
      list/test pointed at something that resolved to a bare codec stream
-     rather than an archive, unpack/cat pointed at a container with
-     neither -C nor an entry name, or a pattern matching no entry)
+     rather than an archive, an input whose format could not be detected
+     at all or was ambiguous, unpack/cat pointed at a container with
+     neither -C nor an entry name, or a pattern matching no entry) — every
+     one of these is "you pointed the command at the wrong thing", and
+     they all share the one code
   3  format not available in this build
   4  fidelity degraded under strict mode
   5  archive or stream is corrupt
@@ -609,9 +701,9 @@ EXIT CODES
 
 NOT YET
 
-  A pure build (the default) has eleven codecs and three containers: gzip,
+  A pure build (the default) has eleven codecs and four containers: gzip,
   zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma and lzip, plus
-  tar, ar and cpio. zstd's pure backend (`ruzstd`) is a weak fallback (see
+  tar, ar, cpio and zip. zstd's pure backend (`ruzstd`) is a weak fallback (see
   "USING A WEAK FALLBACK ENCODER" above); xz's and lzma's pure backends are
   not — both read and write full-ratio output with no C toolchain, just
   slower than `--features c-backed`'s `liblzma` (roughly 1.2-1.3x to
@@ -622,20 +714,27 @@ NOT YET
   `--features c-backed` changes nothing about it, and there is no
   weak-fallback distinction for it either.
 
-  All three containers read and write, and all four entry-aware
+  All four containers read and write, and all four entry-aware
   subcommands work on each of them identically: `list` and `test` read
   entries without extracting, `unpack -C` writes them to disk under the
   containment rules above, and `pack PATHS...` collects files into one.
   `.tar.gz` and `.tgz` resolve as tar over gzip, which `stuffr info` shows
-  as the chain — ar and cpio have no such codec-wrapped convention yet.
-  `ar` is the simplest of the three: no trailing index, no directory
-  concept, no multi-member concatenation convention. `cpio` is `newc`
-  (SVR4 "new ASCII") only — the crate this build uses does not implement
-  the older `odc` format or the CRC variant of `newc`, so neither is
-  offered, and its per-entry size field is a hard 4 GiB (u32) ceiling: an
-  entry larger than that is refused with a typed error naming the limit,
-  never silently written with the wrong framing. Still to come: zip,
-  walking a directory tree on the pack side, and writing a container
-  inside a codec (`bundle.tar.gz`) in a single step. `stuffr formats`
-  always tells you the truth about the build you are actually running,
-  whatever this page says.
+  as the chain — ar, cpio and zip have no such codec-wrapped convention of
+  their own, though any of them wrapped in a codec still resolves the same
+  way from its extensions (`bundle.zip.gz`). `ar` is the simplest of the
+  four: no trailing index, no directory concept, no multi-member
+  concatenation convention. `zip` is the only one with a trailing index,
+  which is why it is the only one whose forward read approximates anything
+  — see "IDENTIFYING A STREAM" above. `cpio` is `newc` (SVR4 "new ASCII")
+  only: the crate this build uses does not implement the older `odc`
+  format (magic 070707) or the CRC variant of `newc` (magic 070702).
+  Pointing stuffr at either is exit 3, not 5 — both are recognised by
+  magic and refused with a message naming the variant and how to convert
+  it, because an intact archive in a variant this build cannot read is a
+  capability limit, not a damaged file. cpio's per-entry size field is
+  also a hard 4 GiB (u32) ceiling: an entry larger than that is refused
+  with a typed error naming the limit, never silently written with the
+  wrong framing. Still to come: walking a directory tree on the pack side,
+  and writing a container inside a codec (`bundle.tar.gz`) in a single
+  step. `stuffr formats` always tells you the truth about the build you
+  are actually running, whatever this page says.

@@ -928,6 +928,141 @@ fn examples_page_covers_every_format_and_flag() {
     }
 }
 
+/// The Phase 2 final review's I4: `examples_page_covers_every_format_and_flag`
+/// above passed a page that still described a THREE-container build with
+/// "fourteen rows", "all fourteen formats", "All three containers — tar, ar
+/// and cpio", "eleven codecs and three containers" and "Still to come:
+/// **zip**" — because the substring "zip" appears elsewhere on the page and
+/// a mention was all it checked. This is the one document a user reads, so
+/// a mention is not enough.
+///
+/// Three classes of staleness, each derived from the registry rather than
+/// hard-coded, so adding a format in a later phase fails this test until
+/// the page is updated:
+///
+/// 1. A "still to come" claim about a format that is REGISTERED.
+/// 2. A written-out count of formats or containers that does not match the
+///    registry's own.
+/// 3. A registered container missing from the containers sentence.
+#[test]
+fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
+    let out = Command::new(STUFFR).arg("--examples").output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+
+    let rows = stuffr::registry().matrix();
+    let containers: Vec<&str> = rows
+        .iter()
+        .filter(|r| stuffr::registry().container(r.id).is_some())
+        .map(|r| r.id.as_str())
+        .collect();
+    let codecs: Vec<&str> = rows
+        .iter()
+        .filter(|r| stuffr::registry().container(r.id).is_none())
+        .map(|r| r.id.as_str())
+        .collect();
+
+    // (1) No "still to come" line may name a format this build registers.
+    // Checked per SENTENCE, so "still to come: walking a directory tree"
+    // sitting in the same paragraph as the word "zip" does not trip it.
+    for sentence in text.split(['.', '\n']) {
+        let lower = sentence.to_lowercase();
+        if !(lower.contains("still to come") || lower.contains("not yet supported")) {
+            continue;
+        }
+        for id in rows.iter().map(|r| r.id.as_str()) {
+            assert!(
+                !sentence.contains(id),
+                "the page says `{id}` is still to come, but this build registers it: \
+                 {sentence:?}"
+            );
+        }
+    }
+
+    // (2) Any written-out count applied to "formats", "rows" or
+    //     "containers" must be the real one.
+    const NUMBERS: &[(&str, usize)] = &[
+        ("one", 1),
+        ("two", 2),
+        ("three", 3),
+        ("four", 4),
+        ("five", 5),
+        ("six", 6),
+        ("seven", 7),
+        ("eight", 8),
+        ("nine", 9),
+        ("ten", 10),
+        ("eleven", 11),
+        ("twelve", 12),
+        ("thirteen", 13),
+        ("fourteen", 14),
+        ("fifteen", 15),
+        ("sixteen", 16),
+        ("seventeen", 17),
+        ("eighteen", 18),
+        ("nineteen", 19),
+        ("twenty", 20),
+    ];
+    // Whitespace-normalised: the page wraps, so a count and its noun
+    // split across a line break must still read as one phrase.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let words: Vec<&str> = flat.split(' ').collect();
+    for pair in words.windows(2) {
+        let (word, next) = (
+            pair[0].trim_matches(|c: char| !c.is_alphanumeric()),
+            pair[1],
+        );
+        let Some((_, value)) = NUMBERS.iter().find(|(w, _)| *w == word.to_lowercase()) else {
+            continue;
+        };
+        let noun = next
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
+        let expected = match noun.as_str() {
+            "formats" | "rows" => rows.len(),
+            "containers" => containers.len(),
+            "codecs" => codecs.len(),
+            _ => continue,
+        };
+        assert_eq!(
+            *value, expected,
+            "the page says `{word} {noun}`, but this build has {expected} — the counts \
+             on this page are what a user trusts before running `stuffr formats`"
+        );
+    }
+
+    // (3) At least one sentence must both COUNT the containers and NAME
+    //     every one of them. Matched as whole words, not substrings —
+    //     `ar` occurs inside dozens of ordinary words, which is exactly
+    //     the weakness that let "Still to come: zip" survive on a page
+    //     that had already shipped zip.
+    let counting_sentences: Vec<&str> = flat
+        .split(". ")
+        .filter(|sentence| {
+            let l = sentence.to_lowercase();
+            NUMBERS
+                .iter()
+                .any(|(w, _)| l.contains(&format!("{w} containers")))
+        })
+        .collect();
+    assert!(
+        !counting_sentences.is_empty(),
+        "the page must state how many containers this build has"
+    );
+    let names_them_all = counting_sentences.iter().any(|sentence| {
+        containers.iter().all(|id| {
+            sentence
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| word == *id)
+        })
+    });
+    assert!(
+        names_them_all,
+        "no sentence both counts the containers and names every one of them \
+         ({containers:?}); the counting sentences are {counting_sentences:?}"
+    );
+}
+
 /// Pins ONE documented claim end-to-end rather than all of them: the page's
 /// very first example, run verbatim in its own directory. `--examples`'
 /// header claims "Everything below runs against this build as shown" —
