@@ -115,6 +115,37 @@ jobs:
       - run: cargo build --workspace --no-default-features --features c-backed
       - run: cargo test --workspace --no-default-features --features c-backed
 
+  miri:
+    name: miri (the two unsafe regions)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml pins 1.95 for local development, which would
+      # otherwise make the nightly selection above inert (see "gate"'s
+      # identical step). Miri only exists on nightly.
+      - run: rm rust-toolchain.toml
+      # `tar.rs` and `ar.rs` hold the workspace's only two `unsafe` regions:
+      # a self-referential struct each, an owning box leaked with
+      # `Box::into_raw` so a borrowed iterator can live beside the archive it
+      # borrows from, reclaimed in `Drop`. Both are Miri-clean under Stacked
+      # Borrows and Tree Borrows, and until this job existed nothing
+      # protected that fact against a refactor. See CONTRIBUTING.md's
+      # "`unsafe`" section for the policy this enforces.
+      #
+      # NOT part of the `gate` job: Miri is 10-50x slower than a native run
+      # and `make check` is meant to be run after every edit. Separate job,
+      # same PR.
+      #
+      # No `apt-get` step, unlike `gate`: `make miri` skips every
+      # subprocess-based interop test by name, because Miri cannot spawn a
+      # process at all. Installing the reference tools here would buy
+      # nothing.
+      - run: make miri
+
   purity:
     name: purity (pure pulls in no C-compiling crate)
     runs-on: ubuntu-latest

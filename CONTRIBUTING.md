@@ -194,6 +194,50 @@ and a change that breaks either needs a design decision, not a patch:
    because callers need to `match` on `NotSeekable` and `FormatNotEnabled` to
    implement fallbacks. A boxed error would make that impossible.
 
+## `unsafe`
+
+The tree contains `unsafe` in exactly **two** places, both introduced in
+Phase 2 and both the same shape:
+
+| File | What | Why |
+|---|---|---|
+| `crates/stuffr-formats/src/tar.rs` | `Box::into_raw` / `&mut *ptr` / `Box::from_raw` in `TarRead` | `tar::Archive<R>` hands out `Entry<'a>` borrowing the archive; the `ArchiveRead` trait needs the archive and the entry in one struct |
+| `crates/stuffr-formats/src/ar.rs` | the same trio in `ArRead` | `ar::Archive<R>`, same self-referential shape |
+
+Each is a **self-referential struct**: an owning box leaked to a raw pointer
+so a borrowed iterator can live beside the thing it borrows from, reclaimed
+in `Drop`. There is no other `unsafe` anywhere in the workspace, and adding
+a third place is a design decision, not a patch — reach for an owning API
+(the way `cpio.rs` does, with a plain state enum and no `unsafe` at all)
+before reaching for a raw pointer.
+
+Rules for touching either region:
+
+1. **Every `unsafe` block carries a `SAFETY:` comment** stating the
+   invariant that makes it sound and what would break it. A block without
+   one does not go in.
+2. **Miri must pass before and after any change to those regions**, under
+   both aliasing models. Both are Miri-clean today and nothing else
+   protected that fact:
+
+   ```
+   make miri
+   ```
+
+   which runs `cargo miri test` for `stuffr-formats` under Stacked Borrows
+   and again under Tree Borrows. CI runs the same job (`miri`), so a
+   regression is caught even if a contributor forgets.
+3. **Miri cannot spawn processes**, so the cross-implementation tests that
+   shell out to `tar`, `ar`, `cpio`, `zip`/`unzip` and `lzip` are excluded
+   from the Miri run by name (`--skip system_ --skip we_accept_`). Those
+   tests exercise interop, not aliasing, and they are covered by the
+   ordinary `make check`. Do not "fix" a Miri failure by widening that skip
+   list to cover a test that really does exercise the pointer regions.
+4. `make miri` is **not** part of `make check`. Miri is 10-50x slower than
+   a native run, and the gate is already 35-60s; running it on every edit
+   would change how the gate is used. Run it when you touch `tar.rs`'s or
+   `ar.rs`'s pointer handling, and let CI run it the rest of the time.
+
 ## Testing
 
 Test-driven: write the failing test, watch it fail for the reason you expect,

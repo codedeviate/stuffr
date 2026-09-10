@@ -6,7 +6,7 @@
 
 CARGO ?= cargo
 
-.PHONY: help check fmt fmt-check lint test test-pure release hooks clean
+.PHONY: help check fmt fmt-check lint test test-pure release miri hooks clean
 
 help:
 	@echo 'stuffr development targets:'
@@ -16,6 +16,7 @@ help:
 	@echo '  make test     full test suite with all features'
 	@echo '  make test-pure  the default (pure) tier, where no C backend wins'
 	@echo '  make release  optimised build, plus the no-default-features check'
+	@echo '  make miri     Miri over the two unsafe regions (tar.rs, ar.rs)'
 	@echo '  make hooks    install the commit-msg hook (once per clone)'
 	@echo '  make clean    remove build artefacts'
 
@@ -55,6 +56,63 @@ release:
 	$(CARGO) build --release --workspace
 	$(CARGO) build -p stuffr-core --no-default-features
 	$(CARGO) build -p stuffr-formats --no-default-features
+
+# NOT part of `check`, deliberately: Miri is 10-50x slower than a native run
+# and the gate is already 35-60s. Run it when you touch the self-referential
+# pointer handling in `tar.rs` or `ar.rs` — the workspace's only two `unsafe`
+# regions — and let the CI `miri` job run it the rest of the time.
+#
+# Scoped to those two modules' own tests rather than the whole crate. That is
+# not a coverage compromise: nothing outside them contains `unsafe`, and the
+# pure codecs' decode loops under Miri cost minutes each for no aliasing
+# information at all.
+#
+# Exactly the two format features, NOT --all-features: `xz-c`, `lzma-c` and
+# `zstd-c` link liblzma and libzstd, and Miri cannot execute foreign
+# functions. `stuffr-formats`' default feature set is EMPTY, so naming the
+# two is also what makes these modules compile at all.
+#
+# Both aliasing models, because they disagree: Stacked Borrows is the stricter
+# and older one, Tree Borrows the newer model that accepts some patterns SB
+# rejects. Passing one is not passing the other, and both regions are clean
+# under both today.
+#
+# The `--skip`s are a Miri limitation, not a coverage choice: Miri cannot
+# spawn a process, so every cross-implementation test that shells out to
+# `tar`, `ar` or `bsdtar` aborts under it. Those tests exercise interop
+# rather than aliasing and are covered by `make test`. Do not widen this list
+# to silence a Miri failure in a test that really does exercise the pointer
+# regions — that failure is the bug.
+# Every test in tar.rs/ar.rs that spawns a reference tool, by name. Keep
+# this list exact rather than broad: a wildcard that happened to cover a
+# pointer-exercising test would hide exactly the failure this target exists
+# to find. `cargo miri test` fails hard on the first unsupported operation,
+# so a newly added subprocess test shows up as a loud Miri failure and is
+# added here deliberately.
+MIRI_SKIP = --skip system_tar_ --skip we_accept_what_system_tar_ \
+            --skip every_reference_writer_ --skip system_ar_ \
+            --skip we_accept_what_system_ar_ --skip require_bin
+# `-Zmiri-disable-isolation` because several of these tests write a real temp
+# file (tar's `by_index` test needs a genuinely seekable source, which a
+# Cursor is not, as far as `FileSource` is concerned). Isolation is Miri's
+# default and it makes any `std::fs` call an unsupported-operation error, not
+# a UB finding — turning it off changes nothing about the aliasing checks
+# this target exists for.
+MIRIFLAGS_BASE = -Zmiri-disable-isolation
+# One filter, not two. libtest matches a filter as a SUBSTRING, and
+# `tar::tests` contains `ar::tests` — so this single filter selects both
+# modules and nothing else, and running them separately would just run tar's
+# twice. Written as `ar::tests` with this comment rather than as a clever
+# one-liner, because the coincidence is the sort of thing that gets
+# "corrected" into a filter that silently stops covering tar.
+MIRI_FILTER = ar::tests
+miri:
+	MIRIFLAGS='$(MIRIFLAGS_BASE) -Zmiri-tree-borrows' \
+	  $(CARGO) +nightly miri test -p stuffr-formats --lib --features tar,ar \
+	  -- $(MIRI_FILTER) $(MIRI_SKIP)
+	MIRIFLAGS='$(MIRIFLAGS_BASE)' \
+	  $(CARGO) +nightly miri test -p stuffr-formats --lib --features tar,ar \
+	  -- $(MIRI_FILTER) $(MIRI_SKIP)
 
 hooks:
 	git config core.hooksPath .githooks
