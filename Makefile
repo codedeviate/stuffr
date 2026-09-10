@@ -106,13 +106,36 @@ MIRIFLAGS_BASE = -Zmiri-disable-isolation
 # one-liner, because the coincidence is the sort of thing that gets
 # "corrected" into a filter that silently stops covering tar.
 MIRI_FILTER = ar::tests
+# A floor on the test count, because everything above can fail OPEN. libtest
+# exits 0 when a filter matches nothing, so the substring coincidence the
+# filter depends on — or one too many entries in the skip list — would leave
+# this target green while covering neither `unsafe` region, which is the one
+# failure mode it exists to prevent. A floor rather than an exact count, so
+# adding a test does not churn the Makefile; raise it when the real number
+# moves well past it.
+MIRI_MIN_TESTS = 28
 miri:
-	MIRIFLAGS='$(MIRIFLAGS_BASE) -Zmiri-tree-borrows' \
-	  $(CARGO) +nightly miri test -p stuffr-formats --lib --features tar,ar \
-	  -- $(MIRI_FILTER) $(MIRI_SKIP)
-	MIRIFLAGS='$(MIRIFLAGS_BASE)' \
-	  $(CARGO) +nightly miri test -p stuffr-formats --lib --features tar,ar \
-	  -- $(MIRI_FILTER) $(MIRI_SKIP)
+	@set -e; \
+	tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT INT TERM; \
+	for flags in '$(MIRIFLAGS_BASE) -Zmiri-tree-borrows' '$(MIRIFLAGS_BASE)'; do \
+	  echo "==> MIRIFLAGS=$$flags"; \
+	  if MIRIFLAGS="$$flags" $(CARGO) +nightly miri test -p stuffr-formats --lib \
+	      --features tar,ar -- $(MIRI_FILTER) $(MIRI_SKIP) > "$$tmp" 2>&1; then \
+	    cat "$$tmp"; \
+	  else \
+	    cat "$$tmp"; exit 1; \
+	  fi; \
+	  n=$$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' "$$tmp" | head -1); \
+	  if [ -z "$$n" ] || [ "$$n" -lt $(MIRI_MIN_TESTS) ]; then \
+	    echo "make miri: $${n:-0} tests ran, expected at least $(MIRI_MIN_TESTS)." >&2; \
+	    echo "  The filter '$(MIRI_FILTER)' relies on 'tar::tests' containing" >&2; \
+	    echo "  'ar::tests'. A module rename breaks that silently, and libtest" >&2; \
+	    echo "  exits 0 on a filter that matches nothing." >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "==> $$n tests passed under MIRIFLAGS=$$flags"; \
+	done
 
 hooks:
 	git config core.hooksPath .githooks

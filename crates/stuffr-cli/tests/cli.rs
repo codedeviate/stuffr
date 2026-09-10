@@ -3380,15 +3380,29 @@ fn craft_a_tar_lz_declaring_a_huge_dictionary(tag: &str) -> (PathBuf, PathBuf) {
 ///
 /// `--max-ratio` cannot substitute: it counts decoded OUTPUT bytes and the
 /// allocation precedes any output. Only `DecodeOpts::memory_limit` sees it.
+///
+/// Every invocation passes `--memory-limit` EXPLICITLY. Relying on the
+/// default would make the test host-dependent and green only by accident:
+/// `default_memory_limit()` is 25% of available RAM, which is the 256 MiB
+/// floor on macOS (no `/proc/meminfo`) but roughly 3.5 GiB on a 16 GB Linux
+/// CI runner — comfortably above the 512 MiB this fixture declares, so all
+/// four verbs would exit 0 and the assertion would fail on every Linux job.
+/// Measured directly: `stuffr list crafted.tar.lz --memory-limit 3500M`
+/// exits 0. 0x1D is lzip's LARGEST coded dictionary, so the fixture cannot
+/// be made hungrier to compensate. `cli.rs`'s
+/// `info_reports_the_resolved_memory_limit` states the same convention.
 #[test]
 fn a_container_under_a_codec_declaring_a_huge_dictionary_is_refused_on_every_verb() {
     let (_legit, crafted) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-refuse");
     let path = crafted.to_str().unwrap();
+    // Below the fixture's 512 MiB declaration, above what the legitimate
+    // sibling needs — see `a_legitimate_archive_of_the_same_size_still_works_on_every_verb`.
+    const LIMIT: &str = "64M";
 
     for args in [
-        vec!["list", path],
-        vec!["test", path],
-        vec!["cat", path, "a.txt"],
+        vec!["list", path, "--memory-limit", LIMIT],
+        vec!["test", path, "--memory-limit", LIMIT],
+        vec!["cat", path, "a.txt", "--memory-limit", LIMIT],
     ] {
         let out = Command::new(STUFFR).args(&args).output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -3407,7 +3421,15 @@ fn a_container_under_a_codec_declaring_a_huge_dictionary_is_refused_on_every_ver
 
     // The single-stream path already did this; it must keep doing it.
     let out = Command::new(STUFFR)
-        .args(["unpack", path, "-o", "/dev/null", "--force"])
+        .args([
+            "unpack",
+            path,
+            "-o",
+            "/dev/null",
+            "--force",
+            "--memory-limit",
+            LIMIT,
+        ])
         .output()
         .unwrap();
     assert_eq!(
@@ -3419,7 +3441,7 @@ fn a_container_under_a_codec_declaring_a_huge_dictionary_is_refused_on_every_ver
 
     // And over a pipe, where there is no path to resolve the chain from.
     let mut child = Command::new(STUFFR)
-        .args(["list", "-"])
+        .args(["list", "-", "--memory-limit", LIMIT])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3450,7 +3472,15 @@ fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
         "the two fixtures must differ only in that one byte"
     );
 
-    let out = Command::new(STUFFR).args(["list", path]).output().unwrap();
+    // The SAME explicit limit its crafted sibling is refused at, so the pair
+    // proves the bound discriminates on the declaration rather than refusing
+    // everything — and so neither half depends on the host's RAM.
+    const LIMIT: &str = "64M";
+
+    let out = Command::new(STUFFR)
+        .args(["list", path, "--memory-limit", LIMIT])
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -3461,7 +3491,10 @@ fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
         "list must still show the entry"
     );
 
-    let out = Command::new(STUFFR).args(["test", path]).output().unwrap();
+    let out = Command::new(STUFFR)
+        .args(["test", path, "--memory-limit", LIMIT])
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -3469,7 +3502,7 @@ fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
     );
 
     let out = Command::new(STUFFR)
-        .args(["cat", path, "a.txt"])
+        .args(["cat", path, "a.txt", "--memory-limit", LIMIT])
         .output()
         .unwrap();
     assert!(out.status.success());
@@ -3478,7 +3511,14 @@ fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
     let dest = tmp("c1-allow-dest");
     let _ = std::fs::remove_dir_all(&dest);
     let out = Command::new(STUFFR)
-        .args(["unpack", path, "-C", dest.to_str().unwrap()])
+        .args([
+            "unpack",
+            path,
+            "-C",
+            dest.to_str().unwrap(),
+            "--memory-limit",
+            LIMIT,
+        ])
         .output()
         .unwrap();
     assert!(
@@ -3832,6 +3872,125 @@ fn every_entry_aware_verb_applies_the_same_expansion_bound() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// The Phase 2 re-review's second finding: the pipe path refused every real
+/// archive.
+///
+/// `ArchiveBudget::ceiling` returned a flat `RATIO_FLOOR` (1 MiB) whenever
+/// the compressed total was unknown, which is always true of a pipe — so
+/// `cat photos.zip | stuffr test -` refused any archive over a megabyte, and
+/// `--max-ratio`, the flag the refusal names, could not raise it. The
+/// examples page documents that exact invocation. `test` acquired the defect
+/// when it gained a budget; `cat` and `unpack -C` had carried it since the
+/// budget was introduced.
+///
+/// The fix gives the ratio a denominator on a pipe: bytes actually pulled so
+/// far, which `open_archive`'s `Counting` wrapper already tallies. All three
+/// assertions below are needed — one that a real archive passes, one that a
+/// bomb is still refused, and one that raising the flag now changes the
+/// outcome, which is what proves the flag reaches this path at all.
+#[test]
+fn a_piped_archive_larger_than_the_ratio_floor_is_not_refused() {
+    let dir = tmp_dir();
+    // Incompressible, so no codec layer can mask the size, and comfortably
+    // past the 1 MiB floor.
+    let payload: Vec<u8> = (0..3u32 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let src = dir.join("big.bin");
+    std::fs::write(&src, &payload).unwrap();
+    let archive = dir.join("big.tar");
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "-o",
+                archive.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bytes = std::fs::read(&archive).unwrap();
+    assert!(
+        bytes.len() as u64 > stuffr::RATIO_FLOOR,
+        "the fixture must exceed the floor or this test proves nothing"
+    );
+
+    // Feed stdin from a THREAD, never inline. `stuffr cat - big.bin` writes
+    // the 3 MB entry straight back to stdout, and an inline `write_all` here
+    // deadlocks the moment that fills the 64 KB pipe buffer: the child blocks
+    // writing stdout while this process blocks writing stdin, and neither
+    // moves. `wait_with_output` drains stdout and stderr concurrently, so the
+    // writer only needs to be off this thread. (Learned the hard way — this
+    // hung the gate for 26 minutes.)
+    let piped = |args: &[&str], input: &[u8]| {
+        let mut child = Command::new(STUFFR)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut sin = child.stdin.take().unwrap();
+        let data = input.to_vec();
+        // A refusal closes the pipe early, so a broken pipe is an expected
+        // outcome here rather than a test failure.
+        let writer = std::thread::spawn(move || {
+            let _ = sin.write_all(&data);
+        });
+        let out = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        out
+    };
+
+    let dest = dir.join("out");
+    for args in [
+        vec!["test", "-"],
+        vec!["cat", "-", "big.bin"],
+        vec!["unpack", "-", "-C", dest.to_str().unwrap()],
+    ] {
+        let out = piped(&args, &bytes);
+        assert!(
+            out.status.success(),
+            "`stuffr {}` over a pipe must not refuse a {}-byte archive; stderr: {}",
+            args.join(" "),
+            bytes.len(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The bound is still real over a pipe. Same fixture shape as
+    // `every_entry_aware_verb_applies_the_same_expansion_bound`, piped.
+    let zeros = vec![0u8; 8 * 1024 * 1024];
+    let zsrc = dir.join("zeros.bin");
+    std::fs::write(&zsrc, &zeros).unwrap();
+    let bomb = dir.join("bomb.zip");
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", zsrc.to_str().unwrap(), "-o", bomb.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bomb_bytes = std::fs::read(&bomb).unwrap();
+
+    let piped_test = |extra: &[&str]| {
+        let mut argv = vec!["test", "-"];
+        argv.extend_from_slice(extra);
+        piped(&argv, &bomb_bytes)
+    };
+
+    assert_eq!(
+        piped_test(&["--max-ratio", "10"]).status.code(),
+        Some(6),
+        "a bomb piped in must still be refused"
+    );
+    assert!(
+        piped_test(&["--max-ratio", "100000"]).status.success(),
+        "raising --max-ratio must change the outcome on a pipe — that is what \
+         proves the flag reaches this path rather than being parsed and dropped"
+    );
 }
 
 /// The Phase 2 final review's I6, at the exit-code boundary a user sees.
