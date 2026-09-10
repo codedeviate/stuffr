@@ -2762,14 +2762,15 @@ fn pack_of_a_directory_says_so_rather_than_writing_an_empty_archive() {
 fn flags_that_the_container_path_cannot_honour_are_refused_not_ignored() {
     // The tree's rule (see `threads_is_not_offered_on_decode_subcommands`):
     // a flag that would be silently ignored is refused instead.
+    //
+    // `--memory-limit` used to be in this list and no longer is: the Phase 2
+    // final review's C1 threaded it through container resolution, so it is
+    // now honoured rather than refused — see
+    // `memory_limit_is_honoured_rather_than_refused_on_the_container_path`.
     let dir = tmp_dir();
     let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha")]);
     let dest = dir.join("out");
-    for extra in [
-        vec!["--format", "gzip"],
-        vec!["--memory-limit", "64M"],
-        vec!["-o", "somewhere"],
-    ] {
+    for extra in [vec!["--format", "gzip"], vec!["-o", "somewhere"]] {
         let mut args = vec![
             "unpack",
             archive.to_str().unwrap(),
@@ -2786,6 +2787,65 @@ fn flags_that_the_container_path_cannot_honour_are_refused_not_ignored() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// The same rule, applied to the PACK side, which had it backwards.
+///
+/// `entries::create_archive` builds `CreateOpts { level, ..Default::default() }`
+/// — it hands the container no governor, no worker count and no weak-encoder
+/// consent, because none of the four registered containers compresses
+/// anything itself. So `--threads`, `--turbo` and `--allow-weak-encoder`
+/// were accepted and silently dropped: precisely what the extract side above
+/// refuses. Consistency, not new capability.
+#[test]
+fn pack_flags_the_container_path_cannot_honour_are_refused_not_ignored() {
+    let dir = tmp_dir();
+    let src = dir.join("a.txt");
+    std::fs::write(&src, b"alpha").unwrap();
+    let archive = dir.join("bundle.tar");
+    for extra in [
+        vec!["--threads", "4"],
+        vec!["--turbo"],
+        vec!["--allow-weak-encoder"],
+    ] {
+        let mut args = vec![
+            "pack",
+            src.to_str().unwrap(),
+            "-o",
+            archive.to_str().unwrap(),
+        ];
+        args.extend_from_slice(&extra);
+        let out = run_output(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`{}` must be refused on the container pack path, stderr: {}",
+            extra.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !archive.exists(),
+            "a refused command must write nothing: {}",
+            extra.join(" ")
+        );
+    }
+
+    // The same flags stay ACCEPTED on the single-stream codec path, which
+    // genuinely honours them — the refusal above must not have leaked.
+    let out = run_output(&[
+        "pack",
+        src.to_str().unwrap(),
+        "--format",
+        "gzip",
+        "--threads",
+        "2",
+        "--force",
+    ]);
+    assert!(
+        out.status.success(),
+        "the codec path still honours --threads, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// The gap the two lexical checks cannot see on their own, demonstrated
@@ -3126,4 +3186,217 @@ fn an_st_mode_shaped_header_mode_raises_no_warning() {
         "setuid inside an st_mode-shaped field is still a dropped mode, stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Builds a `.tar.lz` and returns `(legitimate, crafted)`.
+///
+/// `crafted` differs from `legitimate` in exactly ONE byte: lzip's header
+/// byte 5, the coded dictionary size, forced to `0x1D` — 512 MiB. The
+/// payload is untouched and still decodes, so anything the crafted file
+/// costs comes purely from the DECLARATION, which is what makes it the
+/// right probe for a pre-output allocation guard.
+fn craft_a_tar_lz_declaring_a_huge_dictionary(tag: &str) -> (PathBuf, PathBuf) {
+    let dir = tmp(tag);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let tar_path = dir.join("bundle.tar");
+    write_raw_tar(
+        &tar_path,
+        &[Raw::File("a.txt", b"hello from inside the tar")],
+    );
+
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "pack",
+                tar_path.to_str().unwrap(),
+                "--format",
+                "lzip",
+                "--force"
+            ])
+            .status()
+            .unwrap()
+            .success(),
+        "packing the fixture must succeed"
+    );
+    let legit = dir.join("bundle.tar.lz");
+
+    let mut bytes = std::fs::read(&legit).unwrap();
+    assert_eq!(&bytes[..4], b"LZIP", "fixture must really be lzip");
+    // Byte 5 is lzip's coded dictionary size. 0x1D asks for 512 MiB.
+    bytes[5] = 0x1D;
+    let crafted = dir.join("crafted.tar.lz");
+    std::fs::write(&crafted, &bytes).unwrap();
+
+    (legit, crafted)
+}
+
+/// The Phase 2 final review's C1, pinned on every entry-aware verb.
+///
+/// `entries::open_archive` resolved the codec layer beneath a container
+/// through `resolve_chain_deep`, which built each decoder from
+/// `DecodeOpts::default()` — `memory_limit: None`, i.e. unbounded. So a
+/// 336-byte `.tar.lz` whose header declares a 512 MiB dictionary drove
+/// 182 MB peak RSS through `list` and 307 MB through `test`, both exiting 0,
+/// while single-stream `unpack` of the identical bytes refused it at exit 6
+/// in 1.7 MB. That is the denial of service Phase 1f closed, reopened behind
+/// `list` — the verb advertised as reading nothing and extracting nothing.
+///
+/// `--max-ratio` cannot substitute: it counts decoded OUTPUT bytes and the
+/// allocation precedes any output. Only `DecodeOpts::memory_limit` sees it.
+#[test]
+fn a_container_under_a_codec_declaring_a_huge_dictionary_is_refused_on_every_verb() {
+    let (_legit, crafted) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-refuse");
+    let path = crafted.to_str().unwrap();
+
+    for args in [
+        vec!["list", path],
+        vec!["test", path],
+        vec!["cat", path, "a.txt"],
+    ] {
+        let out = Command::new(STUFFR).args(&args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "`stuffr {}` must refuse a 512 MiB dictionary declaration at exit 6, \
+             not allocate for it; stderr: {stderr}",
+            args.join(" ")
+        );
+        assert!(
+            stderr.contains("memory-limit"),
+            "the refusal must name the flag that raises it; stderr: {stderr}"
+        );
+    }
+
+    // The single-stream path already did this; it must keep doing it.
+    let out = Command::new(STUFFR)
+        .args(["unpack", path, "-o", "/dev/null", "--force"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "the single-stream path's existing refusal must be unchanged; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And over a pipe, where there is no path to resolve the chain from.
+    let mut child = Command::new(STUFFR)
+        .args(["list", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let bytes = std::fs::read(&crafted).unwrap();
+    child.stdin.take().unwrap().write_all(&bytes).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "a piped crafted archive must be refused too; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The other half of C1, and the one that catches an over-broad fix: a
+/// LEGITIMATE archive of the same size, differing in that one header byte,
+/// must still work on every verb. A guard that refused this would be a
+/// worse defect than the one it closed.
+#[test]
+fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
+    let (legit, crafted) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-allow");
+    let path = legit.to_str().unwrap();
+    assert_eq!(
+        std::fs::metadata(&legit).unwrap().len(),
+        std::fs::metadata(&crafted).unwrap().len(),
+        "the two fixtures must differ only in that one byte"
+    );
+
+    let out = Command::new(STUFFR).args(["list", path]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("a.txt"),
+        "list must still show the entry"
+    );
+
+    let out = Command::new(STUFFR).args(["test", path]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(STUFFR)
+        .args(["cat", path, "a.txt"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"hello from inside the tar");
+
+    let dest = tmp("c1-allow-dest");
+    let _ = std::fs::remove_dir_all(&dest);
+    let out = Command::new(STUFFR)
+        .args(["unpack", path, "-C", dest.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dest.join("a.txt").exists());
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+/// `--memory-limit` is now ACCEPTED and honoured on the entry-aware paths,
+/// where it used to be refused at exit 2 with "not yet honoured for a
+/// container". Raising it past the declaration lets the crafted archive
+/// through, which is the proof the flag actually reaches the decoder rather
+/// than being parsed and dropped.
+#[test]
+fn memory_limit_is_honoured_rather_than_refused_on_the_container_path() {
+    let (_legit, crafted) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-flag");
+    let path = crafted.to_str().unwrap();
+
+    for args in [
+        vec!["list", path, "--memory-limit", "1G"],
+        vec!["test", path, "--memory-limit", "1G"],
+        vec!["cat", path, "a.txt", "--memory-limit", "1G"],
+    ] {
+        let out = Command::new(STUFFR).args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "`stuffr {}` must succeed once the limit is raised past the declaration; \
+             stderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let dest = tmp("c1-flag-dest");
+    let _ = std::fs::remove_dir_all(&dest);
+    let out = Command::new(STUFFR)
+        .args([
+            "unpack",
+            path,
+            "-C",
+            dest.to_str().unwrap(),
+            "--memory-limit",
+            "1G",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "unpack -C must accept --memory-limit rather than refusing it; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dest);
 }

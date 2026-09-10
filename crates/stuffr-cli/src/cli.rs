@@ -169,6 +169,14 @@ pub enum Command {
         /// than this ratio (e.g. a `.tar.gz` bomb).
         #[arg(long)]
         max_ratio: Option<u64>,
+        /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
+        ///
+        /// Bounds the codec layer beneath the container, which `--max-ratio`
+        /// cannot see: a pure xz/lzma/lzip decoder sizes its dictionary from
+        /// a value the file declares in its own header, before producing any
+        /// output. Defaults to 25% of available RAM, honouring cgroup limits.
+        #[arg(long, value_name = "SIZE")]
+        memory_limit: Option<String>,
     },
     /// Verify every entry's integrity without extracting.
     Test {
@@ -178,6 +186,14 @@ pub enum Command {
         /// than this ratio (e.g. a `.tar.gz` bomb).
         #[arg(long)]
         max_ratio: Option<u64>,
+        /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
+        ///
+        /// Bounds the codec layer beneath the container, which `--max-ratio`
+        /// cannot see: a pure xz/lzma/lzip decoder sizes its dictionary from
+        /// a value the file declares in its own header, before producing any
+        /// output. Defaults to 25% of available RAM, honouring cgroup limits.
+        #[arg(long, value_name = "SIZE")]
+        memory_limit: Option<String>,
         /// Fail (exit 4) if the read approximated or lost anything.
         #[arg(long)]
         strict_fidelity: bool,

@@ -115,11 +115,18 @@ Wanted, not scheduled.
   most of the "don't wreck the server" problem.
 - **`ionice` / I/O priority** alongside `--nice`.
 - **Per-invocation budget persistence** — remember a good budget per machine.
-- **`--memory-limit` reaching the codec layer beneath a container.** Phase 2's
-  `resolve_chain_deep` (the container-aware chain resolver) takes no options,
-  so a codec sitting under a container is bounded only by `--max-ratio`
-  today, not by `--memory-limit` the way a bare codec stream is. Fixing it
-  means threading `DecodeOpts` through container resolution.
+- ~~**`--memory-limit` reaching the codec layer beneath a container.**~~
+  **Done** — closed by the Phase 2 final review (finding C1). This note used
+  to say the layer was "bounded only by `--max-ratio` today", which was
+  factually wrong and dangerously so: `--max-ratio` counts decoded OUTPUT
+  bytes, and the allocation it needed to bound (a pure xz/lzma/lzip
+  dictionary, sized from a value the file declares in its own header)
+  happens BEFORE any output exists, so that flag could never see it. The
+  layer was in fact bounded by nothing at all, and a 336-byte `.tar.lz`
+  declaring a 512 MiB dictionary drove hundreds of MB of RSS through
+  `list`, `test` and `cat`, all exiting 0. `resolve_chain_deep_with` now
+  takes `DecodeOpts`, and `--memory-limit` is accepted and honoured on
+  `list`, `test`, `cat` and `unpack -C`.
 
 ## Formats — codecs
 

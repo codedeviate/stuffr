@@ -239,11 +239,15 @@ fn create_archive_stores_final_components_so_its_output_can_be_extracted_again()
     .unwrap();
     assert_eq!(outcome.bytes_in, 11);
 
-    let names: Vec<String> = entries::list(Input::Path(archive.clone()), stuffr::DEFAULT_MAX_RATIO)
-        .unwrap()
-        .into_iter()
-        .map(|e| e.name)
-        .collect();
+    let names: Vec<String> = entries::list(
+        Input::Path(archive.clone()),
+        stuffr::DEFAULT_MAX_RATIO,
+        None,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|e| e.name)
+    .collect();
     assert_eq!(names, vec!["one.txt".to_string(), "two.txt".to_string()]);
 
     // The round trip is the point: `pack` must not be able to write an

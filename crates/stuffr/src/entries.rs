@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
-    ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, EntryKind,
-    EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts, RATIO_FLOOR,
-    RatioGuard, Registry, Result, Rung, SeekRead, Source, SourceCaps, StreamPolicy,
-    check_symlink_target, ladder, resolve_chain_deep, safe_join,
+    ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts,
+    EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts,
+    RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Source, SourceCaps, StreamPolicy,
+    check_symlink_target, ladder, resolve_chain_deep_with, safe_join,
 };
 
 use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
@@ -159,6 +159,7 @@ fn open_archive(
     registry: &Registry,
     src: Input,
     max_ratio: u64,
+    memory_limit: Option<u64>,
 ) -> Result<(Box<dyn ArchiveRead>, FormatId)> {
     let path = src.path().map(Path::to_path_buf);
     // `Counting` wraps the RAW input, tallying compressed bytes as
@@ -168,7 +169,19 @@ fn open_archive(
     // for whoever reads the returned source later, since a container pulls
     // its own bytes rather than being driven by an explicit loop here.
     let (counting, consumed) = Counting::new(src.open()?);
-    let (chain, source) = resolve_chain_deep(registry, path.as_deref(), Box::new(counting))?;
+    // `resolve_chain_deep_with`, NOT `resolve_chain_deep`: the plain spelling
+    // defaults `DecodeOpts`, which leaves `memory_limit: None`, which is
+    // unbounded. That is the whole reason a 131-byte `.tar.lz` declaring a
+    // 512 MiB dictionary drove 538 MB peak RSS through `list`/`test`/`cat`
+    // while single-stream `unpack` of the same bytes refused at exit 6 in
+    // 2.6 MB: `--max-ratio` counts decoded OUTPUT bytes and the allocation
+    // precedes any output, so only this bound can see it.
+    let opts = DecodeOpts {
+        memory_limit,
+        ..Default::default()
+    };
+    let (chain, source) =
+        resolve_chain_deep_with(registry, path.as_deref(), Box::new(counting), &opts)?;
     // Kept for the error path: once the loop below has peeled layers, the
     // original chain is the only thing that can say what the input actually
     // was.
@@ -216,8 +229,15 @@ fn open_archive(
 }
 
 /// Lists every entry in an archive, extracting nothing.
-pub fn list(src: Input, max_ratio: u64) -> Result<Vec<EntryMeta>> {
-    let (mut ar, _format) = open_archive(crate::registry(), src, max_ratio)?;
+///
+/// `memory_limit` bounds the codec layer beneath the container — see
+/// [`open_archive`]. `None` is unbounded, the library default; the CLI
+/// always resolves a value. "Reads nothing and extracts nothing" is only
+/// true of the ENTRIES: reaching the container's first header still decodes
+/// whatever codec sits above it, so this verb is as exposed to a crafted
+/// dictionary declaration as `unpack` is.
+pub fn list(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Vec<EntryMeta>> {
+    let (mut ar, _format) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     let mut out = Vec::new();
     while let Some(entry) = ar.next_entry()? {
         out.push(entry.meta().clone());
@@ -230,19 +250,36 @@ pub fn list(src: Input, max_ratio: u64) -> Result<Vec<EntryMeta>> {
 /// The data must actually be pulled: a `test` that only walked headers would
 /// pass on an archive whose payloads are corrupt, which is precisely the
 /// failure it exists to find.
-pub fn test(src: Input, max_ratio: u64) -> Result<Outcome> {
-    let (mut ar, format) = open_archive(crate::registry(), src, max_ratio)?;
+pub fn test(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Outcome> {
+    // Before `src` is consumed by `open_archive`, which takes it by value —
+    // the same ordering `extract` and `cat` already use.
+    let compressed_total = src
+        .path()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len());
+    let (mut ar, format) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
+    // `test` built no budget at all until the Phase 2 final review: a
+    // 204 KB zip holding one 200 MB entry verified clean at exit 0 under
+    // `--max-ratio 10`, while `cat` and `unpack` of the identical file
+    // refused it at exit 6. `test` is precisely the verb reached for to
+    // inspect an UNTRUSTED archive, so it must be the strictest of the
+    // three, not the only unbounded one. `entries_test_matches_cat_and_unpack`
+    // in `crates/stuffr-cli/tests/cli.rs` pins the parity.
+    let mut budget = ArchiveBudget::new(compressed_total, max_ratio);
     let mut bytes = 0u64;
     while let Some(mut entry) = ar.next_entry()? {
-        // `Error::from_decode_io`, not a bare `?`: a container's own
-        // truncation/corruption detection on an entry's payload (e.g. tar's
-        // `EntryPayload::read`, which compares delivered bytes against the
-        // size its header declares) raises a raw `io::ErrorKind::InvalidData`.
-        // A bare `?` would wrap that as `Error::Io` (exit 1) instead of
-        // `Error::Corrupt` (exit 5) — the same classification `ops::decompress`
-        // already applies to its own decode loop.
-        let n =
-            std::io::copy(entry.reader(), &mut std::io::sink()).map_err(Error::from_decode_io)?;
+        let name = entry.meta().name.clone();
+        // Charged from bytes ACTUALLY read, never from the size the header
+        // declares — the same rule `extract` documents, and for the same
+        // reason: a header that under-declares its length would otherwise
+        // walk straight through the check.
+        //
+        // `copy_charging` applies `Error::from_decode_io` to the copy, which
+        // is what keeps a container's own truncation/corruption detection on
+        // an entry payload (e.g. tar's `EntryPayload::read`, comparing
+        // delivered bytes against the declared size) reporting as
+        // `Error::Corrupt` (exit 5) rather than `Error::Io` (exit 1).
+        let n = copy_charging(entry.reader(), &mut std::io::sink(), &name, &mut budget)?;
         bytes += n;
     }
     // `Outcome` is a plain four-field public struct with no constructors, so
@@ -271,6 +308,10 @@ pub struct ExtractOpts {
     /// Without it an existing target is refused, the same contract
     /// `pack`/`unpack` already apply to a single output file.
     pub force: bool,
+    /// Bounds the codec layer beneath the container — see [`open_archive`].
+    /// `None` is unbounded, the library default; the CLI always resolves a
+    /// value.
+    pub memory_limit: Option<u64>,
 }
 
 impl Default for ExtractOpts {
@@ -279,11 +320,30 @@ impl Default for ExtractOpts {
             max_ratio: DEFAULT_MAX_RATIO,
             compressed_total: None,
             force: false,
+            memory_limit: None,
         }
     }
 }
 
 /// Extracts entries matching `patterns` (all of them when empty) into `dest`.
+///
+/// # Not atomic, unlike the single-stream path
+///
+/// `ops::decompress` publishes through temp-file-plus-rename, so a refused
+/// decode leaves no partial file at all — a property its own tests assert
+/// by name. This function has no equivalent: each entry is written straight
+/// to its final path, so a refusal partway through (a bomb tripping
+/// [`ArchiveBudget`], an unsafe path, a corrupt payload) leaves whatever
+/// entries already completed on disk, plus one partially-written file.
+///
+/// Documented rather than fixed, deliberately. Making extraction atomic
+/// means staging the whole tree somewhere and moving it into place, which
+/// needs a temp directory on the destination's own filesystem, a rename
+/// strategy for an existing `dest`, and an answer for a destination larger
+/// than the free space — a design decision, not a patch. Until then the
+/// honest advice, which `--examples` also gives, is: extract untrusted
+/// archives into a fresh directory you can delete, and check the exit code
+/// before trusting the contents.
 ///
 /// **The ONLY containment call site in the tree.** No container performs the
 /// check — that is what container-harness property 12 protects, by requiring
@@ -309,7 +369,7 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
             .and_then(|p| std::fs::metadata(p).ok())
             .map(|m| m.len())
     });
-    let (mut ar, format) = open_archive(crate::registry(), src, o.max_ratio)?;
+    let (mut ar, format) = open_archive(crate::registry(), src, o.max_ratio, o.memory_limit)?;
     let mut budget = ArchiveBudget::new(compressed_total, o.max_ratio);
 
     // The destination itself, once, up front: an archive of plain files
@@ -577,13 +637,14 @@ pub fn cat(
     src: Input,
     patterns: &[String],
     max_ratio: u64,
+    memory_limit: Option<u64>,
     dst: &mut dyn Write,
 ) -> Result<Outcome> {
     let compressed_total = src
         .path()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
-    let (mut ar, format) = open_archive(crate::registry(), src, max_ratio)?;
+    let (mut ar, format) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     let mut budget = ArchiveBudget::new(compressed_total, max_ratio);
     let mut written = 0u64;
     let mut matched = 0u64;

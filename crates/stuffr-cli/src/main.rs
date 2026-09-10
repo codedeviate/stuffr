@@ -162,6 +162,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // A container output collects every path into one archive; a
             // codec output compresses exactly one stream.
             if let Some(container) = container_output(fmt, output.as_deref()) {
+                refuse_unhonoured_pack_flags(&opts)?;
                 let inputs = pack_inputs(&paths)?;
                 let dst = match output {
                     Some(o) => output_of(&o),
@@ -239,10 +240,19 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // to be made before a byte is read: a pipe cannot be probed and
             // then re-dispatched.
             if let Some(dir) = directory {
-                refuse_unhonoured_extract_flags(output.is_some(), format.is_some(), memory_limit)?;
+                refuse_unhonoured_extract_flags(output.is_some(), format.is_some())?;
                 let opts = ExtractOpts {
                     max_ratio: max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
                     force,
+                    // Honoured now, not refused: `open_archive` threads it
+                    // into `resolve_chain_deep_with`, so the codec layer
+                    // beneath the container gets the same bound the
+                    // single-stream path has always had. As there, the CLI
+                    // default is the bound rather than unbounded.
+                    memory_limit: Some(
+                        parse_memory_limit(memory_limit)?
+                            .unwrap_or_else(stuffr::default_memory_limit),
+                    ),
                     ..Default::default()
                 };
                 let out = entries::extract(input_of(&input), Path::new(&dir), &patterns, &opts)?;
@@ -307,13 +317,18 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // Naming an entry is what asks for entry-aware streaming — the
             // same "decide before reading a byte" reasoning as `unpack`'s -C.
             if !patterns.is_empty() {
-                refuse_unhonoured_extract_flags(false, format.is_some(), memory_limit)?;
+                refuse_unhonoured_extract_flags(false, format.is_some())?;
+                // Honoured now, not refused — see `unpack -C` above.
+                let memory_limit = Some(
+                    parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit),
+                );
                 // The motivating case: `curl … | stuffr cat - log.txt`.
                 let mut out = std::io::stdout();
                 entries::cat(
                     input_of(&input),
                     &patterns,
                     max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+                    memory_limit,
                     &mut out,
                 )?;
                 return Ok(());
@@ -405,19 +420,35 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             input,
             json,
             max_ratio,
-        } => print_list(
-            input_of(&input),
-            json,
-            max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
-        ),
+            memory_limit,
+        } => {
+            // `list` advertises reading nothing and extracting nothing, but
+            // reaching the container's first header still decodes whatever
+            // codec sits above it — so it needs the same bound every other
+            // decoding verb has, defaulted the same way.
+            let memory_limit = Some(
+                parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit),
+            );
+            print_list(
+                input_of(&input),
+                json,
+                max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+                memory_limit,
+            )
+        }
         Command::Test {
             input,
             max_ratio,
+            memory_limit,
             strict_fidelity,
         } => {
+            let memory_limit = Some(
+                parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit),
+            );
             let out = entries::test(
                 input_of(&input),
                 max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
+                memory_limit,
             )?;
             eprintln!(
                 "{} -> {} bytes verified ({} fidelity)",
@@ -494,11 +525,7 @@ fn pack_inputs(paths: &[String]) -> stuffr::Result<Vec<PathBuf>> {
 /// straight to its final path with no fsync at all, so "skip the fsync" is
 /// already what happens — a flag asking for the behaviour you are getting
 /// cannot mislead anybody.
-fn refuse_unhonoured_extract_flags(
-    output: bool,
-    format: bool,
-    memory_limit: Option<String>,
-) -> stuffr::Result<()> {
+fn refuse_unhonoured_extract_flags(output: bool, format: bool) -> stuffr::Result<()> {
     if output {
         return Err(stuffr::Error::Usage(
             "-o writes one decoded stream to one file; -C extracts entries into a \
@@ -513,14 +540,40 @@ fn refuse_unhonoured_extract_flags(
                 .into(),
         ));
     }
-    if memory_limit.is_some() {
-        // Honest rather than reassuring: `open_archive` resolves the codec
-        // layer beneath a container through `resolve_chain_deep`, which uses
-        // `DecodeOpts::default()` and so carries no memory limit. Accepting
-        // the flag here would promise a bound that is not applied.
+    Ok(())
+}
+
+/// Refuses the flags the container `pack` path cannot honour.
+///
+/// `entries::create_archive` builds `CreateOpts { level, ..Default::default() }`
+/// — no governor, no worker count, no weak-encoder consent — because none of
+/// the four registered containers compresses anything itself. Accepting
+/// `--threads`, `--turbo` or `--allow-weak-encoder` there and silently
+/// dropping them is the exact shape `refuse_unhonoured_extract_flags` above
+/// exists to prevent, and the extract side already refuses rather than
+/// accepts. `--memory-limit` is deliberately NOT here: it is honoured on
+/// every decode path, and on the container pack path it is simply inert in
+/// the same way `--no-sync` is (nothing allocates a dictionary), so it costs
+/// nothing to accept.
+fn refuse_unhonoured_pack_flags(opts: &CompressOpts) -> stuffr::Result<()> {
+    if opts.threads.is_some() {
         return Err(stuffr::Error::Usage(
-            "--memory-limit is not yet honoured for a container: the codec layer \
-             beneath one is bounded by --max-ratio only"
+            "--threads governs a codec's parallel encoder; no container in this build \
+             compresses anything itself, so there is no worker count to hand it"
+                .into(),
+        ));
+    }
+    if opts.turbo {
+        return Err(stuffr::Error::Usage(
+            "--turbo lifts the CPU cap for a codec's parallel encoder; no container in \
+             this build compresses anything itself"
+                .into(),
+        ));
+    }
+    if opts.allow_weak_encoder {
+        return Err(stuffr::Error::Usage(
+            "--allow-weak-encoder consents to a codec's fallback encoder; no container \
+             in this build compresses anything itself"
                 .into(),
         ));
     }
@@ -544,9 +597,14 @@ fn entry_kind_str(kind: &stuffr::EntryKind) -> &'static str {
 /// `?` rather than `println!`, matching `print_formats`/`Info` above — the
 /// same reason: `println!` panics on a write error, which would defeat
 /// `run`'s `BrokenPipe`-to-success mapping for `stuffr list big.tar | head`.
-fn print_list(src: Input, json: bool, max_ratio: u64) -> stuffr::Result<()> {
+fn print_list(
+    src: Input,
+    json: bool,
+    max_ratio: u64,
+    memory_limit: Option<u64>,
+) -> stuffr::Result<()> {
     use std::io::Write;
-    let entries = entries::list(src, max_ratio)?;
+    let entries = entries::list(src, max_ratio, memory_limit)?;
     let mut out = std::io::stdout();
     if json {
         let rows: Vec<serde_json::Value> = entries

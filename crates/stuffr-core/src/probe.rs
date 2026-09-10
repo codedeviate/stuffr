@@ -264,13 +264,12 @@ fn decode_through_chain(
     reg: &Registry,
     chain: &Chain,
     src: Box<dyn Source>,
+    opts: &DecodeOpts,
 ) -> Result<Box<dyn Source>> {
     match chain {
         Chain::Codec { codec, inner } => {
-            let decoded = reg
-                .require_codec(*codec)?
-                .decoder(src, &DecodeOpts::default())?;
-            decode_through_chain(reg, inner, decoded)
+            let decoded = reg.require_codec(*codec)?.decoder(src, opts)?;
+            decode_through_chain(reg, inner, decoded, opts)
         }
         Chain::Container { .. } | Chain::Raw => Ok(src),
     }
@@ -308,6 +307,31 @@ pub fn resolve_chain_deep(
     path: Option<&Path>,
     src: Box<dyn Source>,
 ) -> Result<(Chain, Box<dyn Source>)> {
+    resolve_chain_deep_with(reg, path, src, &DecodeOpts::default())
+}
+
+/// [`resolve_chain_deep`], but with the [`DecodeOpts`] every codec layer's
+/// decoder is built from spelled out by the caller instead of defaulted.
+///
+/// This exists because [`DecodeOpts::memory_limit`] is the ONLY guard that
+/// can see a pure codec's pre-output dictionary allocation — the one sized
+/// from a value the file declares in its own header, before a single decoded
+/// byte exists. `--max-ratio` counts decoded output bytes and so cannot see
+/// it at all. Resolving a chain builds a decoder per codec layer, so a
+/// resolver that defaults its opts leaves every entry-aware verb (`list`,
+/// `test`, `cat`, `unpack -C`) unbounded against a crafted `.tar.lz` whose
+/// header declares a 512 MiB dictionary, while the single-stream path
+/// refuses the same bytes at exit 6.
+///
+/// `resolve_chain_deep` remains as the "library default" spelling —
+/// unbounded, matching `DecodeOpts::default()` everywhere else — but no CLI
+/// path should use it: the CLI always has a resolved limit to pass.
+pub fn resolve_chain_deep_with(
+    reg: &Registry,
+    path: Option<&Path>,
+    src: Box<dyn Source>,
+    opts: &DecodeOpts,
+) -> Result<(Chain, Box<dyn Source>)> {
     let (prefix, src) = probe(src)?;
     let chain = resolve_chain(reg, path, &prefix)?;
 
@@ -316,7 +340,7 @@ pub fn resolve_chain_deep(
     // through whatever codec layers `chain` names and stop; there is nothing
     // left to peek.
     if !matches!(&chain, Chain::Codec { inner, .. } if matches!(inner.as_ref(), Chain::Raw)) {
-        let decoded = decode_through_chain(reg, &chain, src)?;
+        let decoded = decode_through_chain(reg, &chain, src, opts)?;
         return Ok((chain, decoded));
     }
 
@@ -338,9 +362,7 @@ pub fn resolve_chain_deep(
             });
         }
 
-        let decoded = reg
-            .require_codec(current_codec)?
-            .decoder(src, &DecodeOpts::default())?;
+        let decoded = reg.require_codec(current_codec)?.decoder(src, opts)?;
         let (next_prefix, next_src) = probe(decoded)?;
         depth += 1;
 
