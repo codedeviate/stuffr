@@ -307,9 +307,11 @@
 //! Two independent checks, at two different layers, and neither subsumes the
 //! other.
 //!
-//! **The reference `lzip` 1.26 tool**, run directly (skipped cleanly, not
-//! failed, on a machine without it — see `which_lzip`, the same shape
-//! `xz_pure.rs`'s `which_xz` uses): [`the_system_lzip_tool_accepts_what_this_writes`]
+//! **The reference `lzip` 1.26 tool**, run directly (via `require_lzip`,
+//! which panics rather than skipping if it is absent — the same convention
+//! `ar.rs`, `cpio.rs` and `zip.rs` use through their own `require_bin`; CI
+//! installs `lzip` explicitly for exactly this reason):
+//! [`the_system_lzip_tool_accepts_what_this_writes`]
 //! writes with this codec and confirms `lzip -t` and `lzip -dc` both accept
 //! it and decode it byte-for-byte; [`this_codec_decodes_what_the_system_lzip_tool_writes`]
 //! is the reverse direction, decoding a member the reference tool produced;
@@ -1769,16 +1771,29 @@ mod tests {
     // --- Reference `lzip` binary interop — see the module doc's
     // "Cross-implementation validation" section.
 
-    /// Finds the `lzip` binary on `PATH` without shelling out to `which` —
-    /// same shape `xz_pure.rs`'s `which_xz` uses, for the same reason:
-    /// returns `None` rather than panicking, so the interop tests below skip
-    /// cleanly on a machine with no `lzip` installed instead of failing the
-    /// whole suite.
+    /// Finds the `lzip` binary on `PATH` without shelling out to `which`.
     fn which_lzip() -> Option<std::path::PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path).find_map(|dir| {
             let candidate = dir.join("lzip");
             candidate.is_file().then_some(candidate)
+        })
+    }
+
+    /// Locates `lzip` on `PATH`, panicking rather than silently skipping if
+    /// it is absent — the same convention `ar.rs`, `cpio.rs` and `zip.rs`
+    /// use via their own `require_bin`. CI installs `lzip` explicitly (it is
+    /// not on the base image the way `xz` is), so an absence here means only
+    /// a contributor's own machine lacks it, and a silent `return` in that
+    /// case would report every interop test in this file as PASSING having
+    /// verified nothing at all — the shape Finding 8 (Phase 1e) warns
+    /// against. Failing loudly beats passing quietly.
+    fn require_lzip() -> std::path::PathBuf {
+        which_lzip().unwrap_or_else(|| {
+            panic!(
+                "no reference `lzip` tool found on PATH — this test proved nothing, which is \
+                 worth knowing rather than passing silently"
+            )
         })
     }
 
@@ -1794,9 +1809,7 @@ mod tests {
     /// above already covers that).
     #[test]
     fn the_system_lzip_tool_accepts_our_parallel_output() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
         use std::sync::Arc;
         use stuffr_core::testing::incompressible;
         let plain = incompressible(2 * 1024 * 1024);
@@ -1851,9 +1864,7 @@ mod tests {
     /// correctly decoded by the reference tool, not just by itself.
     #[test]
     fn the_system_lzip_tool_accepts_what_this_writes() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
         let plain = b"interop payload, written by this codec ".repeat(4096);
         let packed = compress(&plain);
         let path = std::env::temp_dir().join("stuffr-lzip-interop-ours.lz");
@@ -1892,9 +1903,7 @@ mod tests {
     /// readable by this codec, not just the reverse.
     #[test]
     fn this_codec_decodes_what_the_system_lzip_tool_writes() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
         let plain = b"the system lzip tool wrote this, lzma-rust2 must read it back ".repeat(4096);
         let src_path = std::env::temp_dir().join("stuffr-lzip-interop-theirs-src.bin");
         std::fs::write(&src_path, &plain).unwrap();
@@ -1926,9 +1935,7 @@ mod tests {
     /// above.
     #[test]
     fn the_system_lzip_tool_agrees_on_a_two_member_concatenation() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
         let first = b"first member, written by the reference tool ".repeat(2048);
         let second = b"second member, written by the reference tool ".repeat(2048);
 
@@ -2017,9 +2024,7 @@ mod tests {
     /// installed, same as every other reference-tool test in this module.
     #[test]
     fn trailing_data_after_a_valid_member_matches_the_reference_tool() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
 
         let plain = b"trailing-data classification payload, repeated a bit ".repeat(64);
         let base = compress(&plain);
@@ -2093,9 +2098,7 @@ mod tests {
     /// codec's own reading of `lzip.h` — see the module doc.
     #[test]
     fn the_two_trailing_data_rules_are_genuinely_different() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
 
         let plain = b"xzip divergence payload, repeated a bit ".repeat(64);
         let base = compress(&plain);
@@ -2143,9 +2146,7 @@ mod tests {
     /// forgiveness for the very first member. Judged by the reference tool.
     #[test]
     fn a_lone_valid_looking_header_with_no_body_is_rejected_as_the_first_member() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
         let lone_header: Vec<u8> = vec![b'L', b'Z', b'I', b'P', 1, 0x0c];
         assert!(
             !reference_accepts(&lzip, &lone_header),
@@ -2167,9 +2168,7 @@ mod tests {
     /// the reference tool, per that review's own standard.
     #[test]
     fn a_corrupted_header_after_one_empty_member_is_rejected_not_silently_dropped() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
 
         let real = compress(&b"a real, non-empty member, repeated a bit ".repeat(64));
         let empty = compress(b""); // legal LZIP: a genuinely empty-content member
@@ -2202,9 +2201,7 @@ mod tests {
     /// here.
     #[test]
     fn a_corrupted_header_after_two_empty_members_is_rejected_not_silently_dropped() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
 
         let real = compress(&b"a real, non-empty member, repeated a bit ".repeat(64));
         let empty = compress(b"");
@@ -2268,9 +2265,7 @@ mod tests {
     /// `lzip` is not on `PATH`.
     #[test]
     fn a_real_small_file_shrinks_its_declared_dictionary() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
         let src_path = std::env::temp_dir().join("stuffr-lzip-preflight-shrink-src.bin");
         std::fs::write(&src_path, b"hello world").unwrap();
         let out = std::process::Command::new(&lzip)
@@ -2390,9 +2385,7 @@ mod tests {
     /// is not on `PATH`.
     #[test]
     fn the_reference_tool_still_accepts_what_we_now_refuse() {
-        let Some(lzip) = which_lzip() else {
-            return;
-        };
+        let lzip = require_lzip();
 
         let mut packed = compress(b"hello world");
         packed[5] = 0x1d; // declares 1 << 29 = 512 MiB

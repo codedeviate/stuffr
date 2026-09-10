@@ -9,17 +9,35 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 1 complete at `0.1.0` — eleven codecs, three of them
-> parallel on request, and a default build that needs no C toolchain to read
-> *or write* xz, LZMA1 or LZIP.** `stuffr pack`, `unpack`, `cat`, `info` and
-> `formats` all work, on files and through pipes, and
-> `curl … | stuffr cat - | grep pattern` runs. `stuffr formats` lists `brotli`,
-> `bzip2`, `deflate`, `gzip`, `lz4`, `lzip`, `lzma`, `snappy`, `xz`, `zlib` and
-> `zstd`, each proven against the conformance harness Phase 1c introduced and
-> later cycles grew to twelve properties, and then proven to coexist. 488
-> tests under `--all-features`, 422 on the default tier — a different set, not
+> **Status: Phase 2 complete at `0.2.0` — eleven codecs and four containers,
+> three of the codecs parallel on request, and a default build that needs
+> no C toolchain to read *or write* xz, LZMA1 or LZIP.** `stuffr pack`,
+> `unpack`, `cat`, `info`, `list`, `test` and `formats` all work, on files
+> and through pipes, and `curl … | stuffr cat - | grep pattern` runs.
+> `stuffr formats` lists codecs `brotli`, `bzip2`, `deflate`, `gzip`, `lz4`,
+> `lzip`, `lzma`, `snappy`, `xz`, `zlib`, `zstd` and containers `ar`, `cpio`,
+> `tar`, `zip` (`zip64` included) — each codec proven against the
+> conformance harness Phase 1c introduced and later cycles grew to twelve
+> properties, each container proven against the analogous
+> container-conformance harness, and then proven to coexist. **688** tests
+> under `--all-features`, **623** on the default tier — a different set, not
 > a subset, because the two tiers select different backends. Clean across
 > build, clippy and fmt.
+>
+> **Containers bring sharp edges worth knowing before they read as bugs.**
+> zip 8.6.0 cannot forward-read entries written with data descriptors —
+> exactly what many tools emit when streaming a zip *to* a pipe — so stuffr
+> reports that as `Unsupported` (exit 3, with a hint), never as corruption:
+> stuffr forward-reads an ordinary zip but not one another tool streamed to
+> a pipe, which bears directly on this milestone's own name. The pure tier
+> cannot read a zstd-compressed zip entry (`--features c-backed` closes it,
+> because zip's `zstd` entry codec is the one that pulls in a C-compiling
+> crate). `cpio` is `newc` only — not odc, not crc. `--strict-fidelity`
+> fails on essentially any tarball containing a symlink, because a
+> symlink's mtime cannot be restored without following the link. `pack`
+> does not walk directories, and `pack -o bundle.tar.gz` in one step is
+> refused — composing a container on top of a codec on write would lose
+> the codec's trailer, so the fix is to pack the `.tar`, then pack that.
 >
 > **The build tiers, and what actually differs between them:**
 >
@@ -107,8 +125,9 @@ read list.
 > multi-member case against the reference `lzip` 1.26 tool directly, in both
 > directions.
 >
-> **Not yet: containers.** `tar`, `zip` and the rest are Phase 2. Nothing in
-> the matrix below beyond the eleven codecs above is implemented.
+> **Not yet: `7z`, squashfs, ISO 9660, MS CAB and RAR.** Those five
+> containers are deferred past Phase 2, each needing its own cycle — see
+> [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md).
 >
 > Already true and enforced for every codec: decoding is incremental rather
 > than read-to-end, corruption is distinguishable from a full disk, truncation
@@ -199,9 +218,13 @@ OOM killer.
 
 ## Planned CLI
 
-*Phase 1 and later. `pack`, `unpack`, `cat`, `info` and `formats` work today,
-for the eleven codecs `stuffr formats` lists; `list`, `test`, `convert` and
-`install-links`, and every container, are not implemented yet.*
+*Phase 2 and later. `pack`, `unpack`, `cat`, `info`, `formats`, `list` and
+`test` all work today, across the eleven codecs and four containers
+(`ar`, `cpio`, `tar`, `zip`/`zip64`) `stuffr formats` lists — `pack`/`unpack`/
+`cat` are entry-aware for every container, with extraction-time path
+containment and bomb limits on by default. `convert` and `install-links`
+are not implemented yet, and `pack` neither walks directories nor composes a
+container on top of a codec in one step (see the status note above).*
 
 ```
 stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
@@ -253,8 +276,8 @@ a directory nothing else can write to.
 
 Read and write symmetry wherever it is technically possible.
 
-- **Modern codecs:** zstd, xz/LZMA2, LZMA1, LZIP, brotli, lz4, snappy, gzip/zlib/deflate, bzip2
-- **Containers:** tar, cpio, ar, zip/zip64, 7z, squashfs, ISO 9660, MS CAB, RAR *(read only)*
+- **Modern codecs:** zstd, xz/LZMA2, LZMA1, LZIP, brotli, lz4, snappy, gzip/zlib/deflate, bzip2 *(all implemented, Phase 1)*
+- **Containers:** tar, cpio *(`newc` only)*, ar, zip/zip64 *(all implemented, Phase 2)*; 7z, squashfs, ISO 9660, MS CAB, RAR *(read only)* remain — each deferred to its own cycle, see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)
 - **Plain storage:** collecting and compressing are separate axes — tar, cpio, ar, zip-stored and 7z-copy all give you a container with no compression
 - **Legacy:** LHA/LZH, Unix `compress` `.Z`, `pack` `.z`, ARC, ARJ, ZOO, StuffIt `.sit` *(older methods)*, LZX
 
@@ -278,8 +301,8 @@ remains decode-only for licence reasons, not effort.
 
 | Feature | Contents |
 |---|---|
-| `pure` *(default)* | everything with a pure-Rust implementation — all eleven codecs, including read+write xz, LZMA1 and LZIP |
-| `c-backed` | `zstd-sys` and `liblzma`, both vendored and built statically; later `unrar` (decode) |
+| `pure` *(default)* | everything with a pure-Rust implementation — all eleven codecs, including read+write xz, LZMA1 and LZIP, plus all four containers |
+| `c-backed` | `zstd-sys` and `liblzma`, both vendored and built statically; also the one entry codec inside `zip` that needs a C-compiling crate (see below); later `unrar` (decode) |
 | `legacy` | the historical format set |
 | `full` | all of the above |
 
@@ -289,6 +312,18 @@ liblzma. Both dependencies vendor their own C source: `zstd` does by default, an
 specifically so it never falls back to linking a system library via pkg-config,
 which would succeed on a developer machine and fail on a clean one. A CI job
 checks that the `pure` graph contains neither `zstd-sys` nor `liblzma-sys`.
+
+**The `pure`/`c-backed` split now reaches one container, not only codecs:**
+reading *or* writing a `zip` entry compressed with zstd needs `--features
+c-backed`; the pure tier refuses both directions as `Unsupported` (exit 3),
+because the `zip` crate's own `zstd` feature is the one path into a
+C-compiling dependency (`zstd-sys`). Every other entry codec `zip`
+supports — store, deflate, bzip2, LZMA, xz — reads and writes on the pure
+tier. This is a real orthogonality gap: `zip`'s own per-entry codec set is
+not routed through stuffr's own codec registry, so it does not inherit
+stuffr's pure/c-backed split codec-by-codec the way the top-level formats
+do (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md) for the wishlist item to fix
+this).
 
 There is also one granular feature per format, so a dependent can take
 `stuffr = { default-features = false, features = ["zip", "zstd"] }` and compile
@@ -334,7 +369,11 @@ two are worth naming.
 **Apache-2.0**. It is the first non-MIT dependency in a *default* build — until
 Phase 1e, only the opt-in `c-backed` tier carried a licence caveat. Apache-2.0 is
 permissive and compatible, but a downstream consumer auditing licences should
-know it is there without having to read the lockfile.
+know it is there without having to read the lockfile. Since Phase 2, two
+versions of it build side by side — this project's own 0.20.1, and 0.16.5
+pulled in transitively by the `zip` dependency (pinned `^0.16.1`) for its own
+LZMA entry support. No new crate and no new licence, just a real duplicate in
+the tree (`cargo tree -p stuffr --all-features -i lzma-rust2` shows both).
 
 The `unrar` feature, if enabled, links a library whose upstream license permits
 decompression only and forbids using the source to build a RAR compressor. A

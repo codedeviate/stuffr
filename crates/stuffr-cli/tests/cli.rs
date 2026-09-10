@@ -1396,9 +1396,16 @@ fn threads_is_not_offered_on_decode_subcommands() {
 
 #[test]
 fn the_binary_reports_its_version() {
+    // `CARGO_PKG_VERSION` resolves to this crate's own version at compile
+    // time, so this checks "the binary reports its own version" rather than
+    // one number that goes stale at the next bump — a hardcoded literal
+    // here was the fifth site a version bump had to touch, discovered only
+    // when Phase 2's 0.2.0 bump made this test fail; this formulation needs
+    // no manual edit at any future bump.
+    let want = env!("CARGO_PKG_VERSION");
     let out = Command::new(STUFFR).arg("--version").output().unwrap();
     let s = String::from_utf8_lossy(&out.stdout);
-    assert!(s.contains("0.1.0"), "--version must report 0.1.0, got: {s}");
+    assert!(s.contains(want), "--version must report {want}, got: {s}");
 }
 
 // ---------------------------------------------------------------------

@@ -12,7 +12,7 @@ name = "stuffr"
 path = "src/main.rs"
 
 [dependencies]
-stuffr = { path = "../stuffr", version = "0.1.0", features = ["serde"] }
+stuffr = { path = "../stuffr", version = "0.2.0", features = ["serde"] }
 clap = { workspace = true }
 serde_json = "1"
 

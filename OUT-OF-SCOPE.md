@@ -115,6 +115,11 @@ Wanted, not scheduled.
   most of the "don't wreck the server" problem.
 - **`ionice` / I/O priority** alongside `--nice`.
 - **Per-invocation budget persistence** — remember a good budget per machine.
+- **`--memory-limit` reaching the codec layer beneath a container.** Phase 2's
+  `resolve_chain_deep` (the container-aware chain resolver) takes no options,
+  so a codec sitting under a container is bounded only by `--max-ratio`
+  today, not by `--memory-limit` the way a bare codec stream is. Fixing it
+  means threading `DecodeOpts` through container resolution.
 
 ## Formats — codecs
 
@@ -126,6 +131,24 @@ Wanted, not scheduled.
 
 ## Formats — containers
 
+- **7z, MS CAB, squashfs, ISO 9660 and RAR** — deferred from Phase 2's
+  original scope. Each needs its own design cycle: 7z's solid blocks and
+  index layout, squashfs and ISO's random-access filesystem-image shape, and
+  RAR's read-only licence constraint (already permanent, see Part 1) are
+  each a different problem from the four containers Phase 2 shipped.
+- **Route `zip`'s per-entry codecs through stuffr's own codec registry**,
+  rather than through the `zip` crate's bundled ones. This closes the
+  pure-tier zstd-in-zip gap (`README.md`'s Build tiers section) and restores
+  strict codec/container orthogonality — right now `zip` is the one format
+  where the container and its codecs are not independently swappable.
+- **cpio `odc` and `crc` variants.** Phase 2 shipped `newc` only.
+- **Compose container-over-codec on write**, so `pack -o bundle.tar.gz`
+  works in one step. Needs the `ArchiveWrite`/codec `Sink` composition
+  problem solved — today `ArchiveWrite::finish` cannot finish a codec
+  `Sink`, so `pack` refuses the combination rather than silently emitting a
+  truncated archive.
+- **`pack` walking directories**, so a directory path collects its contents
+  into the archive rather than needing every file named explicitly.
 - **Package formats as recognised profiles** — `.deb` (ar), `.rpm` (cpio),
   `.apk`/`.jar`/`.whl` (zip). Mechanically already readable; the value is
   *metadata awareness* (show the control file, the spec, the manifest) rather
@@ -146,6 +169,12 @@ Wanted, not scheduled.
 - Better `stuffr info` output: entropy estimate, "this is already compressed, don't
   bother" advice
 - `tar` compat symlink (see Part 1 for why it is not in v1)
+- **A structured `Chain` type for `info --json`.** Today `info` reports the
+  resolved chain as prose; a typed, serialisable `Chain` (container, codec,
+  and how they stack) would let `--fidelity=json` consumers walk it
+  programmatically instead of parsing text, and the cross-container
+  `convert` below would consume the same type to plan its own reads and
+  writes.
 - `stuffr convert IN OUT`, taking the destination as a second positional and
   inferring both formats from the filenames, alongside the `convert IN -o OUT`
   already planned for Phase 5. Wanted for the case that prompted it: an archive
@@ -156,8 +185,10 @@ Wanted, not scheduled.
   conflated. That one is codec-level recompression with the container held
   fixed (`.tar.gz` → `.tar.zst`), which the streaming design already supports.
   Crossing *container* formats means reading entries out of one container and
-  writing them into another, so it cannot land before Phase 2 puts containers
-  in the tree at all. A `.zip` destination also carries its own constraint:
+  writing them into another, so it could not land before containers were in
+  the tree at all — Phase 2 has now put them there, but this is still
+  unscheduled work of its own. A `.zip` destination also carries its own
+  constraint:
   the central directory needs per-entry sizes the stream has not produced yet,
   which is the same tension the ZIP-on-a-pipe contract test exists to pin
   down — so "without staging to disk" may not survive for every format pair,

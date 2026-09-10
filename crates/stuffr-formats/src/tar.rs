@@ -1392,6 +1392,16 @@ mod tests {
     /// This is the check Task 5's finding calls for: a refusal that fires on
     /// ubiquitous benign input is worse than no refusal, because it trains
     /// users to bypass the one control that matters.
+    ///
+    /// **Deliberately not `require_bin`.** `lzip.rs`, `ar.rs`, `cpio.rs` and
+    /// `zip.rs` each require exactly one named reference tool and panic if
+    /// it is absent, because each proves compatibility against a single
+    /// authority. This test's authority is plural by design — it wants
+    /// every writer it can find, specifically *because* they disagree on
+    /// padding — so it counts `writers_tried` and only asserts that at
+    /// least one ran, rather than naming one tool as mandatory. The two
+    /// conventions coexist on purpose; this is not the same inconsistency
+    /// `lzip.rs` used to have.
     #[test]
     fn every_reference_writer_is_accepted_including_its_empty_archive() {
         let dir = std::env::temp_dir().join(format!("stuffr-tar-writers-{}", std::process::id()));
