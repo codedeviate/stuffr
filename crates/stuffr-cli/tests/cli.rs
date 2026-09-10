@@ -3400,3 +3400,489 @@ fn memory_limit_is_honoured_rather_than_refused_on_the_container_path() {
     );
     let _ = std::fs::remove_dir_all(&dest);
 }
+
+/// The Phase 2 final review's I1, end to end.
+///
+/// `sub/top -> ..` points at the extraction root. bsdtar and GNU tar both
+/// extract it; stuffr aborted the whole extraction at exit 7 with "unsafe
+/// entry path `sub/..` refused: path traversal nets back to the
+/// destination" — naming a path that is not an entry in the archive, so the
+/// user could not find it. `dest` is inside `dest`; there is no escape here.
+#[test]
+fn a_symlink_pointing_at_the_extraction_root_is_extracted_not_refused() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let archive = write_raw_tar(
+        &dir.join("root-link.tar"),
+        &[
+            Raw::Dir("sub"),
+            Raw::Symlink("sub/top", ".."),
+            Raw::File("sub/a.txt", b"alpha"),
+        ],
+    );
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "a symlink netting to the destination is contained, not an escape; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let link = dest.join("sub/top");
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "the symlink must have been created"
+    );
+    assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(".."));
+    assert!(dest.join("sub/a.txt").exists(), "extraction must not abort");
+}
+
+/// The regression guard for the test above: one step further out is still
+/// an escape, and must still exit 7 with the entry's OWN target named.
+#[test]
+fn a_symlink_one_step_past_the_extraction_root_is_still_refused() {
+    for (tag, target) in [
+        ("i1-two-up", "../.."),
+        ("i1-deep", "../../../etc"),
+        ("i1-mixed", "../sub/../.."),
+    ] {
+        let dir = tmp_dir();
+        let dest = dir.join(tag);
+        let archive = write_raw_tar(
+            &dir.join(format!("{tag}.tar")),
+            &[Raw::Dir("sub"), Raw::Symlink("sub/top", target)],
+        );
+        let out = run_output(&[
+            "unpack",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(7),
+            "`{target}` escapes and must still be refused, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            stderr.contains(target),
+            "the refusal must name the archive's own target `{target}`, got: {stderr}"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest.join("sub/top")).is_err(),
+            "the symlink must not have been created"
+        );
+    }
+}
+
+/// The Phase 2 final review's I2, across the third dimension round 3
+/// missed: container × WRAPPED-IN-A-CODEC × source shape.
+///
+/// `fidelity_is_knowable_without_opening` returned `true` as soon as the
+/// rung was authoritative — but the rung is the RAW INPUT's seekability,
+/// which says nothing about a container reached through a decoder.
+/// `bundle.zip.gz` on disk is a seekable file, so `info` printed
+/// `rung: exact / fidelity: nothing approximated`, while `stuffr test
+/// bundle.zip.gz --strict-fidelity` on the same bytes reported
+/// `TrailingIndexUnread` and `EntryCountUnknown` and exited 4.
+///
+/// Every cell is checked against ground truth from `test`, which actually
+/// opens the archive — so the assertions cannot drift into merely agreeing
+/// with the predicate.
+#[test]
+fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() {
+    let dir = tmp("info-codec-wrapped-matrix");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let one = dir.join("one.txt");
+    std::fs::write(&one, b"payload").unwrap();
+
+    for (ext, has_trailing_index) in [("zip", true), ("tar", false), ("cpio", false), ("a", false)]
+    {
+        let bare = dir.join(format!("bundle.{ext}"));
+        assert!(
+            Command::new(STUFFR)
+                .args(["pack", one.to_str().unwrap(), "-o", bare.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success(),
+            "packing a .{ext} must succeed"
+        );
+        // A container inside a codec cannot be written in one step, so
+        // this is the documented two-step: pack the container, pack that.
+        assert!(
+            Command::new(STUFFR)
+                .args([
+                    "pack",
+                    bare.to_str().unwrap(),
+                    "--format",
+                    "gzip",
+                    "--force"
+                ])
+                .status()
+                .unwrap()
+                .success(),
+            "wrapping the .{ext} in gzip must succeed"
+        );
+        let wrapped = dir.join(format!("bundle.{ext}.gz"));
+        let bytes = std::fs::read(&wrapped).unwrap();
+
+        // Ground truth first, from the verb that opens the archive.
+        let strict = Command::new(STUFFR)
+            .args(["test", wrapped.to_str().unwrap(), "--strict-fidelity"])
+            .output()
+            .unwrap();
+        let strict_err = String::from_utf8_lossy(&strict.stderr).to_string();
+        let really_loses = !strict.status.success();
+        assert_eq!(
+            really_loses, has_trailing_index,
+            ".{ext}.gz: only a trailing index can be missed by a forward read; \
+             stderr: {strict_err}"
+        );
+
+        // (a) A SEEKABLE FILE, where the path's extensions name the whole
+        //     chain (`bundle.zip.gz` -> zip over gzip). This is the cell
+        //     I2 reported: `rung: exact`, because the FILE is seekable,
+        //     over a container that is not read from that file at all.
+        let text = String::from_utf8(
+            Command::new(STUFFR)
+                .args(["info", wrapped.to_str().unwrap()])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            text.contains("exact"),
+            ".{ext}.gz from a file: the rung is real and unchanged: {text}"
+        );
+        assert!(
+            text.contains(ext),
+            ".{ext}.gz from a file must resolve the whole chain: {text}"
+        );
+        if has_trailing_index {
+            assert!(
+                text.contains("not evaluated"),
+                ".{ext}.gz from a file: the zip is read out of a gzip decoder, which is \
+                 forward-only however seekable the FILE is — `test` on these very bytes \
+                 exits 4. info has not looked and must not claim: {text}"
+            );
+            assert!(!text.contains("nothing approximated"), "{text}");
+        } else {
+            assert!(
+                text.contains("nothing approximated"),
+                ".{ext}.gz from a file carries every entry's metadata inline, so a forward \
+                 read loses nothing — withholding here would be a false negative, the \
+                 round-3 defect repeating: {text}"
+            );
+            assert!(!text.contains("not evaluated"), "{text}");
+        }
+
+        // (b) A PIPE with no path. `inspect` resolves the chain with the
+        //     SHALLOW `resolve_chain` — it identifies a stream without
+        //     decoding it, and seeing the zip inside would mean running the
+        //     gzip decoder. With no path to read extensions from, there is
+        //     nothing to name the inner layer, so the chain bottoms out at
+        //     the codec and `info` reports on the codec alone. That is a
+        //     documented limit of `info`, not the I2 defect: the claim it
+        //     makes is about what it identified. Pinned so the two cells
+        //     cannot be confused for one another later.
+        let text = info_over_stdin(&bytes);
+        assert!(text.contains("forward-only"), ".{ext}.gz on a pipe: {text}");
+        assert!(
+            text.contains("chain:    gzip"),
+            ".{ext}.gz on a pipe resolves to the codec alone — info does not decode to \
+             look inside: {text}"
+        );
+
+        // And the codec-wrapped verdict must not have leaked onto the BARE
+        // container: a seekable bare zip still reads its central directory.
+        let text = String::from_utf8(
+            Command::new(STUFFR)
+                .args(["info", bare.to_str().unwrap()])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            text.contains("nothing approximated"),
+            "a bare seekable .{ext} is unaffected by the codec-wrapped rule: {text}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The Phase 2 final review's I3: `entries::test` built no `ArchiveBudget`
+/// at all, so a 204 KB zip holding one 200 MB entry verified clean at exit
+/// 0 under `--max-ratio 10` while `cat` and `unpack` of the identical file
+/// refused it at exit 6. `test` is the verb reached for to inspect an
+/// UNTRUSTED archive; it must not be the only unbounded one.
+#[test]
+fn every_entry_aware_verb_applies_the_same_expansion_bound() {
+    let dir = tmp_dir();
+    // Highly compressible, and large enough that a ratio of 10 cannot cover
+    // it while staying quick to build.
+    let payload = vec![0u8; 8 * 1024 * 1024];
+    let big = dir.join("big.bin");
+    std::fs::write(&big, &payload).unwrap();
+    let bomb = dir.join("bomb.zip");
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", big.to_str().unwrap(), "-o", bomb.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let compressed = std::fs::metadata(&bomb).unwrap().len();
+    assert!(
+        compressed * 10 < payload.len() as u64,
+        "the fixture must actually exceed a ratio of 10 ({compressed} compressed)"
+    );
+
+    let dest = dir.join("out");
+    for args in [
+        vec!["test", bomb.to_str().unwrap(), "--max-ratio", "10"],
+        vec![
+            "cat",
+            bomb.to_str().unwrap(),
+            "big.bin",
+            "--max-ratio",
+            "10",
+        ],
+        vec![
+            "unpack",
+            bomb.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+            "--max-ratio",
+            "10",
+        ],
+    ] {
+        let out = Command::new(STUFFR).args(&args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "`stuffr {}` must refuse the same bomb the other verbs refuse; stderr: {}",
+            args[0],
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The other half: the default ratio still lets the same archive through
+    // on all three, so the new bound is not simply refusing everything.
+    let _ = std::fs::remove_dir_all(&dest);
+    for args in [
+        vec!["test", bomb.to_str().unwrap()],
+        vec!["cat", bomb.to_str().unwrap(), "big.bin"],
+        vec![
+            "unpack",
+            bomb.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ],
+    ] {
+        let out = Command::new(STUFFR).args(&args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "`stuffr {}` must still accept a legitimate archive under the default ratio; \
+             stderr: {}",
+            args[0],
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The Phase 2 final review's I6, at the exit-code boundary a user sees.
+///
+/// A valid `odc` cpio archive reported `archive is corrupt: Invalid magic
+/// number` at exit 5 — telling the user their intact file was damaged.
+#[test]
+fn a_valid_odc_cpio_archive_reports_a_capability_limit_not_corruption() {
+    let dir = tmp_dir();
+    // A real `newc` archive with only its magic rewritten to odc's, so the
+    // classification is provably decided on the magic. `cpio.rs`'s own
+    // `a_real_odc_archive_from_system_cpio_is_unsupported_not_corrupt`
+    // proves that magic is what the reference tool actually emits.
+    let src = dir.join("f.txt");
+    std::fs::write(&src, b"payload").unwrap();
+    let newc = dir.join("archive.cpio");
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", src.to_str().unwrap(), "-o", newc.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut bytes = std::fs::read(&newc).unwrap();
+    assert_eq!(&bytes[..6], b"070701");
+    bytes[..6].copy_from_slice(b"070707");
+    let odc = dir.join("odc.cpio");
+    std::fs::write(&odc, &bytes).unwrap();
+
+    let out = Command::new(STUFFR)
+        .args(["list", odc.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "an intact archive in an unreadable variant is a capability limit, \
+         not damage; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("odc"),
+        "the message must name the variant: {stderr}"
+    );
+    assert!(
+        !stderr.contains("corrupt"),
+        "the message must not suggest damage: {stderr}"
+    );
+
+    // The neighbour it must not have swallowed: a genuinely damaged newc
+    // archive is still exit 5.
+    let mut broken = std::fs::read(&newc).unwrap();
+    broken.truncate(30);
+    let cut = dir.join("cut.cpio");
+    std::fs::write(&cut, &broken).unwrap();
+    let out = Command::new(STUFFR)
+        .args(["list", cut.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "a truncated archive really is damaged; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// "You pointed the verb at the wrong file" must be ONE exit code.
+///
+/// `stuffr list plain.txt.gz` (a codec stream, `NotAnArchive`) exited 2
+/// while `stuffr list plain.txt` (no format at all, `UnknownFormat`) exited
+/// 1 — an internal failure — for the same class of mistake.
+#[test]
+fn pointing_a_verb_at_the_wrong_file_always_exits_two() {
+    let dir = tmp_dir();
+
+    let plain = dir.join("plain.txt");
+    std::fs::write(&plain, b"just some text, no format at all").unwrap();
+    let gz = dir.join("plain.txt.gz");
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "pack",
+                plain.to_str().unwrap(),
+                "--format",
+                "gzip",
+                "-o",
+                gz.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    for (label, path) in [
+        ("a codec stream, which is not an archive", &gz),
+        ("a file of no recognised format", &plain),
+    ] {
+        let out = Command::new(STUFFR)
+            .args(["list", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{label}: both are the caller pointing `list` at the wrong file, \
+             so both are exit 2; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The Phase 2 final review's I5: three multi-line string literals in
+/// `main.rs` had been collapsed with their continuation indentation left
+/// in, so users saw runs of 22-30 spaces mid-sentence:
+///
+/// ```text
+/// stuffr: usage error: packing 2 paths needs an output naming a container
+/// (`-o bundle.tar`,                      or --format tar); a codec …
+/// ```
+///
+/// All three were on new container paths and nothing asserted on any of
+/// them. Asserted structurally rather than by exact text, so rewording a
+/// message does not break the test but re-introducing the defect does.
+#[test]
+fn no_cli_message_contains_a_run_of_collapsed_indentation() {
+    let dir = tmp_dir();
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, b"alpha").unwrap();
+    std::fs::write(&b, b"beta").unwrap();
+    let archive = write_fixture_tar(&dir, &[("x.txt", b"x")]);
+
+    let cases: Vec<Vec<String>> = vec![
+        // "packing N paths needs an output naming a container…"
+        vec![
+            "pack".into(),
+            a.to_str().unwrap().into(),
+            b.to_str().unwrap().into(),
+        ],
+        // "collecting several paths into an archive needs an explicit -o…"
+        vec![
+            "pack".into(),
+            a.to_str().unwrap().into(),
+            b.to_str().unwrap().into(),
+            "--format".into(),
+            "tar".into(),
+        ],
+        // "`x.txt` names an archive entry; pass -C DIR…"
+        vec![
+            "unpack".into(),
+            archive.to_str().unwrap().into(),
+            "x.txt".into(),
+        ],
+    ];
+
+    for args in cases {
+        let out = Command::new(STUFFR).args(&args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`stuffr {}` must be a usage error; stderr: {stderr}",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.contains("   "),
+            "a CLI message must not carry a run of collapsed continuation \
+             indentation; `stuffr {}` printed: {stderr:?}",
+            args.join(" ")
+        );
+        assert!(
+            !stderr.trim().is_empty(),
+            "and it must actually say something: {stderr:?}"
+        );
+    }
+
+    // The exact shape of the worst one, pinned so a reworded message that
+    // re-collapses is still caught by a human reading the failure.
+    let out = Command::new(STUFFR)
+        .args(["pack", a.to_str().unwrap(), b.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        stderr.contains("`-o bundle.tar`, or --format tar"),
+        "the phrase either side of the old collapse must read as one sentence: {stderr:?}"
+    );
+}

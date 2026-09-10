@@ -45,37 +45,12 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
     // accepting that second shape, which is real traversal that happens to
     // net to zero rather than a name for the destination.
     let mut pushed_a_component = false;
-    for comp in Path::new(entry_name).components() {
-        match comp {
-            // An absolute path or a Windows drive prefix ignores `dest`
-            // entirely — the classic "tar bomb writes to /etc" shape.
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(Error::UnsafePath {
-                    path: entry_name.to_string(),
-                    reason: "absolute path",
-                });
-            }
-            // `./` is noise, not an attack.
-            Component::CurDir => {}
-            // Pop only within what we have accumulated. `a/../b` is fine;
-            // `../b` and `a/../../b` are not. Comparing against the
-            // accumulated depth rather than canonicalising is what keeps this
-            // filesystem-independent — and immune to a symlink that appears
-            // between the check and the write.
-            Component::ParentDir => {
-                if !out.pop() {
-                    return Err(Error::UnsafePath {
-                        path: entry_name.to_string(),
-                        reason: "path traversal above the destination",
-                    });
-                }
-            }
-            Component::Normal(part) => {
-                out.push(part);
-                pushed_a_component = true;
-            }
+    walk_within(&mut out, &mut pushed_a_component, Path::new(entry_name)).map_err(|reason| {
+        Error::UnsafePath {
+            path: entry_name.to_string(),
+            reason,
         }
-    }
+    })?;
 
     if out.as_os_str().is_empty() {
         return if pushed_a_component {
@@ -84,6 +59,10 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
             // emits bare `.`/`./` for the root, not this), so refusing it
             // costs nothing in compatibility and keeps the traversal check
             // from being second-guessed by a coincidental net-zero.
+            //
+            // This rule is about ENTRY NAMES specifically, which is why
+            // `check_symlink_target` below does not go through this
+            // function any more — see its own doc.
             Err(Error::UnsafePath {
                 path: entry_name.to_string(),
                 reason: "path traversal nets back to the destination",
@@ -97,24 +76,105 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
     Ok(dest.join(out))
 }
 
+/// Walks `path`'s components onto `out`, popping for each `..`.
+///
+/// The single component-classification loop both public functions share, so
+/// there is exactly ONE place that decides what `..`, `.`, a root and a
+/// normal component mean. Returns the refusal `reason` rather than a full
+/// `Error`, because the two callers name different things in the error's
+/// `path` field: `safe_join` names the entry, `check_symlink_target` names
+/// the TARGET — never the composed string, which is not something the user
+/// can find in their archive.
+///
+/// Operates on `Path` components rather than a re-joined string, so nothing
+/// round-trips through `to_string_lossy` on the way. A lossy conversion was
+/// never a bypass here (`.`, `..` and `/` are ASCII and survive it) but it
+/// could mangle a non-UTF-8 target into a DIFFERENT contained name, and
+/// there is no reason to keep it now that the composition is component-wise.
+fn walk_within(
+    out: &mut PathBuf,
+    pushed_a_component: &mut bool,
+    path: &Path,
+) -> std::result::Result<(), &'static str> {
+    for comp in path.components() {
+        match comp {
+            // An absolute path or a Windows drive prefix ignores `dest`
+            // entirely — the classic "tar bomb writes to /etc" shape.
+            Component::RootDir | Component::Prefix(_) => return Err("absolute path"),
+            // `./` is noise, not an attack.
+            Component::CurDir => {}
+            // Pop only within what we have accumulated. `a/../b` is fine;
+            // `../b` and `a/../../b` are not. Comparing against the
+            // accumulated depth rather than canonicalising is what keeps this
+            // filesystem-independent — and immune to a symlink that appears
+            // between the check and the write.
+            Component::ParentDir => {
+                if !out.pop() {
+                    return Err("path traversal above the destination");
+                }
+            }
+            Component::Normal(part) => {
+                out.push(part);
+                *pushed_a_component = true;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a symlink whose target would resolve outside `dest`.
 ///
 /// The subtler escape: the link's own PATH can be perfectly contained while
 /// its target is not, and a later entry written through that link lands
 /// wherever it points. The target is resolved relative to the link's parent,
 /// which is how the OS will resolve it.
+///
+/// # Why this does not call `safe_join`
+///
+/// It used to: it composed `rel.join(target)` into a string and handed that
+/// to `safe_join`, which meant a symlink target inherited a refusal written
+/// for entry NAMES. `safe_join` refuses a name that nets back to `dest`
+/// after consuming a real component (`a/..`), on the reasoning that no real
+/// archiver emits one. That reasoning does not carry over: `sub/top -> ..`
+/// is an ordinary symlink pointing at the extraction root, which bsdtar and
+/// GNU tar both extract without comment, and `dest` is trivially inside
+/// `dest`. stuffr aborted the whole extraction at exit 7 — naming a path
+/// (`sub/..`) that is not an entry in the archive at all, so the user could
+/// not find it.
+///
+/// The component walk is shared ([`walk_within`]); only the net-to-`dest`
+/// verdict differs, which is the whole point. Every genuine escape is still
+/// refused by the same walk: an absolute target, and any `..` run deeper
+/// than the link's own depth below `dest`.
 pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Result<()> {
-    if Path::new(target).is_absolute() {
+    let target_path = Path::new(target);
+    // Checked before the walk purely so the reason names symlinks — the
+    // walk's own `RootDir` arm would refuse it anyway.
+    if target_path.is_absolute() {
         return Err(Error::UnsafePath {
             path: target.to_string(),
             reason: "absolute symlink target",
         });
     }
+
     let parent = link_path.parent().unwrap_or(dest);
     let rel = parent.strip_prefix(dest).unwrap_or(Path::new(""));
-    // Re-use the same decision rather than a parallel one: two containment
-    // implementations would be two chances to differ.
-    safe_join(dest, &rel.join(target).to_string_lossy())?;
+
+    let mut out = PathBuf::new();
+    let mut pushed = false;
+    // `rel` came out of `safe_join`, so it holds only `Normal` components
+    // and cannot fail — walked rather than asserted so the depth it
+    // contributes is computed by the same code that consumes it.
+    walk_within(&mut out, &mut pushed, rel).map_err(|reason| Error::UnsafePath {
+        path: target.to_string(),
+        reason,
+    })?;
+    walk_within(&mut out, &mut pushed, target_path).map_err(|reason| Error::UnsafePath {
+        path: target.to_string(),
+        reason,
+    })?;
+    // No net-to-`dest` check here, deliberately: `out` being empty means the
+    // target resolves to `dest` itself, which is contained.
     Ok(())
 }
 
@@ -219,6 +279,70 @@ mod tests {
         // different `/`-separated position: each segment is classified on
         // its own regardless of what a sibling segment contains.
         assert!(super::safe_join(dest, "a\0/../../etc/passwd").is_err());
+    }
+
+    /// The Phase 2 final review's I1. `sub/top -> ..` is a symlink pointing
+    /// at the extraction root: contained, since `dest` is inside `dest`, and
+    /// both bsdtar and GNU tar extract it without comment. It was refused
+    /// (exit 7, aborting the whole extraction) because
+    /// `check_symlink_target` composed `sub/..` and handed it to
+    /// `safe_join`, inheriting a rule written for entry NAMES — and the path
+    /// the refusal named, `sub/..`, is not an entry in the archive, so there
+    /// was nothing for the user to go and look at.
+    #[test]
+    fn a_symlink_target_that_resolves_to_the_destination_itself_is_contained() {
+        let dest = Path::new("/tmp/out");
+        // One level deep, netting exactly to `dest`.
+        assert!(super::check_symlink_target(dest, &dest.join("sub/top"), "..").is_ok());
+        // Two levels deep, netting exactly to `dest`.
+        assert!(super::check_symlink_target(dest, &dest.join("a/b/top"), "../..").is_ok());
+        // Down and back up again, netting to `dest`.
+        assert!(super::check_symlink_target(dest, &dest.join("sub/top"), "../sub/..").is_ok());
+        // A link directly under `dest` pointing at `dest`.
+        assert!(super::check_symlink_target(dest, &dest.join("here"), ".").is_ok());
+        // And the sibling shapes that already worked must keep working.
+        assert!(super::check_symlink_target(dest, &dest.join("sub/self"), "../sub").is_ok());
+    }
+
+    /// The regression the fix above could plausibly introduce, pinned
+    /// separately: accepting a net-to-`dest` TARGET must not widen into
+    /// accepting one that goes a single step further.
+    #[test]
+    fn a_symlink_target_one_step_past_the_destination_is_still_refused() {
+        let dest = Path::new("/tmp/out");
+        for (link, target) in [
+            (dest.join("sub/top"), "../.."),
+            (dest.join("top"), ".."),
+            (dest.join("a/b/top"), "../../.."),
+            (dest.join("sub/top"), "../../etc/passwd"),
+            (dest.join("sub/top"), "../sub/../.."),
+            (dest.join("sub/top"), "/etc/passwd"),
+        ] {
+            let err = super::check_symlink_target(dest, &link, target)
+                .expect_err("{target} from {link:?} must be refused");
+            match err {
+                // The refusal names the TARGET the archive actually
+                // contains, never the composed path — which the user has no
+                // way to find. That was half of I1.
+                Error::UnsafePath { path, .. } => assert_eq!(
+                    path, target,
+                    "the refusal must name the archive's own target string"
+                ),
+                other => panic!("expected UnsafePath for {target}, got {other:?}"),
+            }
+        }
+    }
+
+    /// `safe_join`'s own net-to-destination rule is untouched by I1's fix:
+    /// an ENTRY NAME that pops back to the destination is still refused.
+    /// The two functions now disagree on purpose, and that is the fix.
+    #[test]
+    fn an_entry_name_that_nets_to_the_destination_is_still_refused_after_the_symlink_fix() {
+        let dest = Path::new("/tmp/out");
+        assert!(super::safe_join(dest, "sub/..").is_err());
+        assert!(super::safe_join(dest, "a/b/../..").is_err());
+        // While the same string as a symlink TARGET is fine.
+        assert!(super::check_symlink_target(dest, &dest.join("sub/top"), "..").is_ok());
     }
 
     #[test]

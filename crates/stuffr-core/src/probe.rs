@@ -656,7 +656,14 @@ mod tests {
             msg.contains("alpha") && msg.contains("beta"),
             "must name the candidates: {msg}"
         );
-        assert_eq!(err.exit_code(), 1);
+        // Exit 2, not 1. The message says "Pass `--format` to choose" —
+        // actionable advice, so this is the caller pointing stuffr at
+        // something it cannot resolve alone, the same class as
+        // `UnknownFormat` and `NotAnArchive`. It fell through
+        // `exit_code`'s wildcard to 1 (an internal failure) until the
+        // Phase 2 final review; see `error.rs`'s
+        // `pointing_a_verb_at_the_wrong_file_is_always_exit_two`.
+        assert_eq!(err.exit_code(), 2);
     }
 
     #[test]

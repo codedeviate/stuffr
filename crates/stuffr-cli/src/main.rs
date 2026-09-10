@@ -174,7 +174,8 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     }
                     None => {
                         return Err(stuffr::Error::Usage(
-                            "collecting several paths into an archive needs an explicit                              -o NAME.tar"
+                            "collecting several paths into an archive needs an explicit \
+                             -o NAME.tar"
                                 .into(),
                         ));
                     }
@@ -193,7 +194,10 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
 
             if paths.len() > 1 {
                 return Err(stuffr::Error::Usage(format!(
-                    "packing {} paths needs an output naming a container (`-o bundle.tar`,                      or --format tar); a codec compresses one stream and has nowhere to                      put a second. A container inside a codec (`bundle.tar.gz`) cannot be                      written in one step yet: pack the .tar, then pack that.",
+                    "packing {} paths needs an output naming a container (`-o bundle.tar`, \
+                     or --format tar); a codec compresses one stream and has nowhere to \
+                     put a second. A container inside a codec (`bundle.tar.gz`) cannot be \
+                     written in one step yet: pack the .tar, then pack that.",
                     paths.len()
                 )));
             }
@@ -264,7 +268,8 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             }
             if !patterns.is_empty() {
                 return Err(stuffr::Error::Usage(format!(
-                    "`{}` names an archive entry; pass -C DIR to say where entries                      should be extracted to",
+                    "`{}` names an archive entry; pass -C DIR to say where entries \
+                     should be extracted to",
                     patterns[0]
                 )));
             }

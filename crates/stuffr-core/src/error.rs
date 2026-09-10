@@ -81,6 +81,15 @@ impl Error {
             // below: `stuffr unpack a.tar -C out nosuch.txt` extracting
             // nothing must be distinguishable from an i/o failure.
             Error::EntryNotFound(_) => 2,
+            // The same shape again, and the fourth wrong code this
+            // wildcard has produced. `stuffr list plain.txt.gz` (not an
+            // archive) exited 2; `stuffr list plain.txt` (no format at all)
+            // exited 1, as if stuffr had failed rather than the caller
+            // having pointed a verb at the wrong file. `AmbiguousFormat`'s
+            // own message literally says "Pass `--format` to choose" —
+            // actionable advice with an exit code that says "internal
+            // failure". Both are usage, both are 2.
+            Error::UnknownFormat { .. } | Error::AmbiguousFormat { .. } => 2,
             Error::FormatNotEnabled(_) => 3,
             Error::CapabilityUnavailable { .. } => 3,
             // Exit 3 is "this build cannot do that", and every raiser of
@@ -270,5 +279,49 @@ mod tests {
             seen: "1f 8b 08".into(),
         };
         assert!(e.to_string().contains("1f 8b 08"));
+    }
+
+    /// "You pointed the verb at the wrong file" is one answer, not three.
+    ///
+    /// `NotAnArchive` already exited 2. `UnknownFormat` and
+    /// `AmbiguousFormat` fell through the wildcard to 1 — an internal
+    /// failure — so `stuffr list plain.txt.gz` exited 2 and `stuffr list
+    /// plain.txt` exited 1 for the same class of mistake. Explicit arms,
+    /// not the wildcard: that wildcard has now produced a wrong code four
+    /// times in this phase.
+    #[test]
+    fn pointing_a_verb_at_the_wrong_file_is_always_exit_two() {
+        assert_eq!(
+            Error::UnknownFormat {
+                seen: "de ad be ef".into()
+            }
+            .exit_code(),
+            2,
+            "an undetectable format is the caller's mistake, not an internal failure"
+        );
+        let ambiguous = Error::AmbiguousFormat {
+            candidates: "lzma, lzip".into(),
+        };
+        assert_eq!(
+            ambiguous.exit_code(),
+            2,
+            "a message that says `Pass --format to choose` is actionable, so exit 2"
+        );
+        assert!(
+            ambiguous.to_string().contains("--format"),
+            "and it must keep saying so: {ambiguous}"
+        );
+        // The neighbour they must agree with.
+        assert_eq!(
+            Error::NotAnArchive {
+                chain: "gzip".into()
+            }
+            .exit_code(),
+            2
+        );
+        // And the codes they must NOT collide with: a build-capability
+        // limit is still 3, a damaged file still 5.
+        assert_eq!(Error::Unsupported("no".into()).exit_code(), 3);
+        assert_eq!(Error::Corrupt("bad".into()).exit_code(), 5);
     }
 }

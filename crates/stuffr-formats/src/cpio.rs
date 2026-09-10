@@ -113,6 +113,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
     Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Source,
+    probe,
 };
 
 use crate::normalize::CPIO_MALFORMED_AS_INVALID_DATA_EOF;
@@ -191,6 +192,13 @@ impl Container for CpioNewc {
         }
     }
 
+    /// Reads no byte of `resolved`, deliberately. The magic check that
+    /// [`refuse_a_recognised_variant_this_crate_cannot_read`] performs
+    /// happens on the first [`CpioRead::next_entry`] instead, because
+    /// container-harness property 10 requires a source error to surface as
+    /// itself from a READ rather than from `open` — a container that opens
+    /// eagerly turns a bad disk into an open failure and fails that
+    /// property.
     fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
         let Resolved { source, report, .. } = resolved;
         let seekable = source.caps().seekable;
@@ -198,12 +206,56 @@ impl Container for CpioNewc {
             state: CpioState::Idle(source),
             report,
             seekable,
+            magic_checked: false,
         }))
     }
 
     fn create(&self, dst: Box<dyn Write + Send>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
         Ok(Box::new(CpioWrite { dst: Some(dst) }))
     }
+}
+
+/// The cpio variants this build RECOGNISES but cannot read, by magic.
+///
+/// The `cpio` crate implements `newc` (`070701`) alone. Point stuffr at a
+/// perfectly valid `odc` archive — `find . -type f | cpio -o -H odc`, the
+/// portable format POSIX standardised — and the crate rejected the magic
+/// with "Invalid magic number", which `classify_cpio_error` folded onto
+/// [`Error::Corrupt`]: exit 5, telling the user their intact file was
+/// damaged.
+///
+/// That contradicts the doctrine Task 11 established and `examples.txt`
+/// states: exit 3, not 5, for a capability this build does not have. So
+/// both siblings are named here and refused as [`Error::Unsupported`] (exit
+/// 3) with a message naming the variant, before the crate's own parser gets
+/// a chance to call them broken.
+///
+/// Only variants that are genuinely cpio are listed. Anything else — bytes
+/// that are not cpio at all — falls through to the crate and is reported as
+/// corrupt, which is the right answer for it.
+const RECOGNISED_UNREADABLE_VARIANTS: &[(&[u8], &str)] = &[
+    (b"070707", "odc (POSIX \"old character\"/portable ASCII)"),
+    (b"070702", "newc-crc (the CRC variant of new ASCII)"),
+];
+
+/// Refuses a cpio variant this build recognises but cannot read.
+///
+/// See [`RECOGNISED_UNREADABLE_VARIANTS`]. A prefix shorter than six bytes
+/// matches nothing and falls through: a stream that short is not a cpio
+/// header of any variant, and the crate's own truncation handling is the
+/// right place to say so.
+fn refuse_a_recognised_variant_this_crate_cannot_read(prefix: &[u8]) -> Result<()> {
+    for (magic, name) in RECOGNISED_UNREADABLE_VARIANTS {
+        if prefix.starts_with(magic) {
+            return Err(Error::Unsupported(format!(
+                "this is a valid cpio archive in the {name} variant, magic `{}` — \
+                 not a damaged one. This build reads `newc` (magic `070701`) only. \
+                 Convert it with `cpio -i < old.cpio | cpio -o -H newc > new.cpio`.",
+                String::from_utf8_lossy(magic)
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Folds an error raised by the `cpio` crate's own reader into this
@@ -236,6 +288,11 @@ struct CpioRead {
     state: CpioState,
     report: FidelityReport,
     seekable: bool,
+    /// Whether the one-time variant check has run. The state machine
+    /// returns to [`CpioState::Idle`] between entries (and after a symlink,
+    /// whose payload is consumed eagerly), so "am I in `Idle`" cannot stand
+    /// in for "is this the first entry".
+    magic_checked: bool,
 }
 
 impl ArchiveRead for CpioRead {
@@ -247,6 +304,21 @@ impl ArchiveRead for CpioRead {
             CpioState::Idle(src) => src,
             CpioState::Reading(reader) => reader.finish().map_err(classify_cpio_error)?,
             CpioState::Ended => return Ok(None),
+        };
+
+        // Once, before the crate's own parser sees byte zero. Peeking is
+        // non-consuming: a seekable source is read and rewound, a pipe is
+        // wrapped in a replaying `PeekSource`, so the reader below still
+        // sees byte zero either way. A read failure here propagates as
+        // `Error::Io` — property 10's source-error passthrough — rather
+        // than being mistaken for a variant refusal.
+        let src = if self.magic_checked {
+            src
+        } else {
+            let (prefix, src) = probe(src)?;
+            refuse_a_recognised_variant_this_crate_cannot_read(&prefix)?;
+            self.magic_checked = true;
+            src
         };
 
         let mut reader = cpio::newc::Reader::new(src).map_err(classify_cpio_error)?;
@@ -613,6 +685,112 @@ mod tests {
         let m = meta();
         assert_eq!(m.id, CPIO);
         assert_eq!(m.extensions, &["cpio"]);
+    }
+
+    /// The Phase 2 final review's I6.
+    ///
+    /// `find . -type f | cpio -o -H odc` produces a perfectly valid archive
+    /// with magic `070707`. The `cpio` crate rejects that magic, and the
+    /// rejection landed on `Error::Corrupt` — exit 5, telling a user their
+    /// intact file was damaged. Exit 3 is the doctrine for "a capability
+    /// this build does not have", and both recognised siblings now take it.
+    #[test]
+    fn a_recognised_cpio_variant_this_build_cannot_read_is_unsupported_not_corrupt() {
+        // A real `newc` archive with only its magic rewritten, so the
+        // refusal is provably decided on the magic rather than on anything
+        // else being malformed.
+        for (magic, expect_in_message) in [(b"070707", "odc"), (b"070702", "newc-crc")] {
+            let mut bytes = build_cpio(&[("a.txt", b"alpha")]);
+            bytes[..6].copy_from_slice(magic);
+
+            // Surfaced from the first `next_entry`, not from `open`:
+            // `open` reads no byte, so that container-harness property 10
+            // (a source error passes through as itself, from a READ) still
+            // holds. See `CpioNewc::open`'s own doc.
+            let mut ar = open(&bytes);
+            let err = ar
+                .next_entry()
+                .expect_err("a variant this build cannot read must be refused");
+
+            assert!(
+                matches!(err, Error::Unsupported(_)),
+                "a valid archive in an unreadable variant is a capability limit \
+                 (exit 3), not a damaged file (exit 5); got {err:?}"
+            );
+            assert_eq!(err.exit_code(), 3, "the doctrine is exit 3");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expect_in_message),
+                "the message must name the variant, got: {msg}"
+            );
+            assert!(
+                !msg.contains("corrupt") && !msg.contains("Invalid magic"),
+                "the message must not suggest damage, got: {msg}"
+            );
+        }
+    }
+
+    /// The regression guard for the test above: bytes that are NOT cpio at
+    /// all, and a `newc` archive that is genuinely damaged, must both stay
+    /// `Corrupt` (exit 5). Widening the variant check into "anything the
+    /// parser dislikes is unsupported" would be a worse defect than I6.
+    #[test]
+    fn genuinely_broken_input_is_still_corrupt_not_unsupported() {
+        // Right magic, truncated body.
+        let mut bytes = build_cpio(&[("a.txt", b"alpha")]);
+        bytes.truncate(20);
+        let mut ar = open(&bytes);
+        let err = ar
+            .next_entry()
+            .expect_err("a truncated newc archive must fail");
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "a truncated archive is damaged, not a capability limit: {err:?}"
+        );
+
+        // Not cpio at all, but routed here by extension.
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(
+            b"this is definitely not a cpio archive".to_vec(),
+        )));
+        let resolved = stuffr_core::resolve(
+            src,
+            CPIO,
+            CpioNewc.caps(),
+            &stuffr_core::StreamPolicy::default(),
+        )
+        .expect("resolve");
+        let mut ar = CpioNewc
+            .open(resolved, &OpenOpts::default())
+            .expect("open must not pre-judge unknown bytes");
+        let err = ar.next_entry().expect_err("must fail");
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "bytes that are not cpio at all are corrupt for this container: {err:?}"
+        );
+    }
+
+    /// A short stream must not be mistaken for a variant refusal — the
+    /// prefix check has to tolerate fewer than six bytes and fall through
+    /// to the crate's own truncation handling.
+    #[test]
+    fn a_stream_shorter_than_the_magic_falls_through_to_the_truncation_path() {
+        for bytes in [b"".to_vec(), b"07".to_vec(), b"07070".to_vec()] {
+            let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
+            let resolved = stuffr_core::resolve(
+                src,
+                CPIO,
+                CpioNewc.caps(),
+                &stuffr_core::StreamPolicy::default(),
+            )
+            .expect("resolve");
+            let mut ar = CpioNewc
+                .open(resolved, &OpenOpts::default())
+                .expect("a short stream is not a variant refusal");
+            let err = ar.next_entry().expect_err("must fail as truncated");
+            assert_eq!(err.exit_code(), 5, "got {err:?}");
+        }
     }
 
     #[test]
@@ -1139,6 +1317,50 @@ mod tests {
                 .expect("bsdcpio's own empty archive must read back as zero entries, not an error")
                 .is_none(),
             "an empty archive must have zero entries"
+        );
+    }
+
+    /// I6 against a REAL `odc` archive, written by the system tool rather
+    /// than by patching a magic constant this test also asserts.
+    ///
+    /// The unit test above proves the classification; this proves the magic
+    /// `070707` is genuinely what `cpio -o -H odc` emits, so the two cannot
+    /// agree with each other while both being wrong about the format.
+    #[test]
+    fn a_real_odc_archive_from_system_cpio_is_unsupported_not_corrupt() {
+        let cpio_bin = require_bin("cpio");
+
+        let mut child = std::process::Command::new(&cpio_bin)
+            .args(["-o", "-H", "odc"])
+            .current_dir(std::env::temp_dir())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        // An empty archive is enough: the magic is in the trailer header
+        // too, and this needs no file on disk to exist.
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "system cpio could not write an odc archive: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            &out.stdout[..6],
+            b"070707",
+            "the reference tool's own odc magic must be what this build refuses on"
+        );
+
+        let mut ar = open(&out.stdout);
+        let err = ar
+            .next_entry()
+            .expect_err("a valid odc archive must be refused, not read");
+        assert_eq!(
+            err.exit_code(),
+            3,
+            "an intact archive in an unreadable variant is exit 3, never 5: {err:?}"
         );
     }
 

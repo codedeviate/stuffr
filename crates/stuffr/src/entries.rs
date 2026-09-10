@@ -104,11 +104,20 @@ impl ArchiveBudget {
 /// `Counting` — so an uncompressed, seekable `.tar` keeps `Rung::Exact`
 /// rather than being downgraded merely for passing through this wrapper.
 /// The cost: a caller that reaches `inner` through `as_seek()` bypasses this
-/// guard's `record()` check entirely. Accepted today because `tar` — the
-/// only registered container — never seeks its source; see `tar.rs`'s own
-/// module doc on why it always uses `entries()`, never `entries_with_seek()`.
-/// A future seekable container must not rely on this wrapper alone to bound
-/// it.
+/// guard's `record()` check entirely, and that is no longer hypothetical.
+/// Of the four registered containers, tar, ar and cpio never seek their
+/// source (see `tar.rs`'s module doc on why it always uses `entries()`,
+/// never `entries_with_seek()`), but `zip.rs`'s `SeekAdapter` DOES call
+/// `as_seek()` — so a seekable zip reads through the inner source directly
+/// and this wrapper's ratio check never fires for it.
+///
+/// That is bounded elsewhere rather than left open: a seekable zip is a
+/// real file whose codec layer, if any, is bounded by
+/// [`DecodeOpts::memory_limit`] (threaded through
+/// `resolve_chain_deep_with`, see [`open_archive`]), and every entry's
+/// decoded payload is charged against [`ArchiveBudget`] by the verb that
+/// reads it. A future seekable container must not rely on this wrapper
+/// alone to bound it.
 struct RatioGuardedSource {
     inner: Box<dyn Source>,
     guard: RatioGuard,

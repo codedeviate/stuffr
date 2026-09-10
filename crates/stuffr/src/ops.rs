@@ -851,15 +851,17 @@ pub struct Inspection {
     /// because nothing looked, not because nothing was lost.
     ///
     /// `false` only when a forward read of THIS container could actually
-    /// have lost something — a non-authoritative rung AND a container
-    /// declaring `trailing_index`. See
+    /// have lost something — a container declaring `trailing_index` that
+    /// will NOT be read authoritatively. See
     /// [`fidelity_is_knowable_without_opening`] for the full rule and for
     /// which `ContainerCaps` flags count.
     ///
-    /// So, concretely: `false` for a piped zip; `true` for a seekable zip
-    /// (the central directory WAS read), for tar, ar and cpio piped or not
-    /// (no trailing index to miss), and for a bare codec stream (no
-    /// container at all).
+    /// So, concretely: `false` for a piped zip, and for a zip under a codec
+    /// (`bundle.zip.gz`) however seekable the file on disk is — the zip is
+    /// read out of a decoder, not out of the file. `true` for a seekable
+    /// bare zip (the central directory WAS read), for tar, ar and cpio
+    /// piped, wrapped or not (no trailing index to miss), and for a bare
+    /// codec stream (no container at all).
     ///
     /// This exists because the empty list was previously indistinguishable
     /// from a real one, and zip is the first container for which that was a
@@ -871,8 +873,15 @@ pub struct Inspection {
     /// The first version of the fix withheld it for EVERY container, which
     /// merely inverted the dishonesty: "not evaluated" on a `.tar` is a false
     /// negative, since a forward read of a tar really does approximate
-    /// nothing. Narrowing it is fix round 3, and the four cases above are
-    /// each pinned by a test.
+    /// nothing. Narrowing it was fix round 3.
+    ///
+    /// Round 4 (the Phase 2 final review's I2) closed the case round 3 let
+    /// through: the rung it consulted is the RAW INPUT's, which says nothing
+    /// about a container sitting under a codec. `stuffr info bundle.zip.gz`
+    /// printed "rung: exact / fidelity: nothing approximated" while `stuffr
+    /// test bundle.zip.gz --strict-fidelity` on the same bytes reported two
+    /// warnings and exited 4. Every case above is pinned by a test, across
+    /// container × wrapped-in-a-codec × source shape.
     pub fidelity_evaluated: bool,
     /// Input size, when the source knows it. A pipe does not.
     pub bytes_in: Option<u64>,
@@ -949,13 +958,21 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
 /// Two things have to be true, and getting either wrong produces dishonest
 /// output — this predicate has now been wrong in both directions:
 ///
-/// 1. **The rung must not be authoritative.** On a seekable source a
-///    container reads its own structures, so there is nothing for a forward
-///    read to have missed. `is_authoritative()` rather than `== Exact`
-///    because [`crate::Rung::Spilled`] is authoritative too — `inspect`
-///    never spills today, so the two coincide here, but the reason this
-///    withholds is "the format's own structures were not read", not "the
-///    input was not a file".
+/// 1. **The container must not be read authoritatively.** On a seekable
+///    source a container reads its own structures, so there is nothing for
+///    a forward read to have missed. `is_authoritative()` rather than
+///    `== Exact` because [`crate::Rung::Spilled`] is authoritative too —
+///    `inspect` never spills today, so the two coincide here, but the reason
+///    this withholds is "the format's own structures were not read", not
+///    "the input was not a file".
+///
+///    The rung alone does NOT settle this, and reading it as if it did was
+///    the I2 defect: `rung` is the seekability of the RAW INPUT, and a
+///    container reached through a `Chain::Codec` layer is read out of a
+///    decoder rather than out of that input. `bundle.zip.gz` on disk has
+///    `rung: exact` and a forward-only zip inside it. So the authoritative
+///    rung only counts when the container is reached directly — see
+///    [`reaches_container_through_a_codec`].
 /// 2. **The container must declare a capability that implies a forward read
 ///    loses something.** Looked up from the registry's [`ContainerCaps`], so
 ///    this still opens nothing and `inspect`'s "identifies a stream without
@@ -991,9 +1008,6 @@ pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
 ///   ladder spills instead, reaching an authoritative rung, so condition 1
 ///   already excludes it.
 fn fidelity_is_knowable_without_opening(registry: &Registry, chain: &Chain, rung: Rung) -> bool {
-    if rung.is_authoritative() {
-        return true;
-    }
     let Some(container) = chain.container() else {
         // A bare codec stream: no container to open, so the empty warning
         // list is a genuine finding rather than an absence of looking.
@@ -1005,7 +1019,34 @@ fn fidelity_is_knowable_without_opening(registry: &Registry, chain: &Chain, rung
     let Some(container) = registry.container(container) else {
         return true;
     };
-    !implies_forward_read_loss(container.caps())
+    if !implies_forward_read_loss(container.caps()) {
+        // tar, ar, cpio: nothing at the end to miss, on any source shape.
+        return true;
+    }
+    // Condition 1, and note what it is asked about. `rung` is the RAW
+    // INPUT's seekability, which is only the same thing as "the container
+    // will be read authoritatively" when the container is reached DIRECTLY.
+    // Put a codec layer in between and it stops being: `bundle.zip.gz` on
+    // disk is a seekable file, so `rung` is `Exact`, but the zip inside is
+    // read out of a gzip decoder, which is forward-only by construction —
+    // `stuffr test bundle.zip.gz --strict-fidelity` reports
+    // `TrailingIndexUnread` and `EntryCountUnknown` and exits 4 on the very
+    // bytes `info` was calling "nothing approximated".
+    rung.is_authoritative() && !reaches_container_through_a_codec(chain)
+}
+
+/// Whether `chain` reaches its container through at least one
+/// [`Chain::Codec`] layer.
+///
+/// The outer layer is enough to decide it: `chain.container()` has already
+/// established that a container is in there somewhere, so if the OUTERMOST
+/// layer is a codec, the container is beneath it. What matters is not how
+/// many codecs there are but whether there is one at all — a single decoder
+/// between the source and the container already erases the source's
+/// seekability, and `ladder::resolve` cannot restore it without spilling
+/// (which `inspect` never does, because it never opens the container).
+fn reaches_container_through_a_codec(chain: &Chain) -> bool {
+    matches!(chain, Chain::Codec { .. })
 }
 
 /// Whether a forward read of a container with these capabilities may
