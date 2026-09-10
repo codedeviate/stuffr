@@ -31,7 +31,7 @@
 //! true for every piped input regardless of what a real read would do, and
 //! its `warnings` are unconditionally empty for a container whose forward
 //! read could lose something (`fidelity_evaluated: false`). Using it here
-//! would make assertions 2, 4 and 5 vacuous — `rung` would read
+//! would make assertions 2 and 5 vacuous — `rung` would read
 //! `ForwardOnly` even for a container that silently spills to a temp file,
 //! since `info` never asks the container anything at all — and assertion 6
 //! could never see a real warning.
@@ -396,8 +396,12 @@ fn read_over_a_real_pipe(bytes: &[u8]) -> Observed {
 // ---------------------------------------------------------------------------
 
 /// Reads the SAME zip twice — once from a real file, once over a real OS
-/// pipe — and compares. Six assertions, each of which a plausible-but-wrong
-/// implementation would fail.
+/// pipe — and compares. Five assertions, each of which a plausible-but-wrong
+/// implementation would fail and each independently killable by mutation
+/// (see the numbered comments below and the task report's mutation table —
+/// a sixth, "`piped.rung != Exact`", was tried and removed: it cannot fail
+/// without the `== Rung::ForwardOnly` equality below it failing first, so it
+/// was decoration rather than a second, independent check).
 #[test]
 fn the_same_zip_read_seekably_and_over_a_pipe_agrees_on_data_and_differs_on_rung() {
     let bytes = fixture_zip(&[
@@ -431,9 +435,19 @@ fn the_same_zip_read_seekably_and_over_a_pipe_agrees_on_data_and_differs_on_rung
         "entry DATA must be byte-identical between the two reads"
     );
 
-    // 4: honesty. Claiming Exact off local headers would pass a naive round
-    //    trip while lying about fidelity.
-    assert_ne!(piped.rung, Rung::Exact);
+    // (No separate "honesty" assertion here — a prior version of this test
+    // had `assert_ne!(piped.rung, Rung::Exact)` at this point, checking the
+    // module doc's "claiming Exact off local headers would pass a naive
+    // round trip while lying about fidelity" concern. It is REMOVED, not
+    // merely reordered: mutation-checking it (see the report) showed it
+    // cannot fail independently of the `assert_eq!(piped.rung,
+    // Rung::ForwardOnly)` two assertions up — that equality already rules
+    // out every wrong value `piped.rung` could hold, `Exact` included, so
+    // any mutation that would have tripped this one trips that one first.
+    // Re-adding a bare inequality against `Exact` here would be decoration,
+    // not a second, independent check; if that equality is ever weakened
+    // (e.g. to `is_authoritative()` instead of an exact match), THIS is
+    // where an explicit `!= Exact` would start earning its keep again.)
 
     // 5: no spill. Spilled is honest but DIFFERENT — conflating them would let
     //    a disk-consuming implementation pass as streaming. This is a
