@@ -22,6 +22,10 @@ use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
 pub struct ArchiveBudget {
     /// `None` for a pipe, which does not know its own size.
     compressed_total: Option<u64>,
+    /// Running tally of compressed bytes pulled from the input, when one is
+    /// available. This is what lets `--max-ratio` mean something on a pipe:
+    /// the total is unknown, but the amount consumed SO FAR is not.
+    consumed: Option<Arc<AtomicU64>>,
     max_ratio: u64,
     decoded_so_far: u64,
 }
@@ -30,9 +34,21 @@ impl ArchiveBudget {
     pub fn new(compressed_total: Option<u64>, max_ratio: u64) -> Self {
         Self {
             compressed_total,
+            consumed: None,
             max_ratio,
             decoded_so_far: 0,
         }
+    }
+
+    /// Attaches the input's running compressed-byte tally, from
+    /// [`open_archive`].
+    ///
+    /// Only affects the unknown-size (pipe) path; with a known
+    /// `compressed_total` the ratio already has a denominator.
+    #[must_use]
+    pub fn tracking(mut self, consumed: Arc<AtomicU64>) -> Self {
+        self.consumed = Some(consumed);
+        self
     }
 
     /// The absolute output ceiling.
@@ -43,11 +59,21 @@ impl ArchiveBudget {
     /// falls back to `u64::MAX`, the permissive direction; a wrapping product
     /// would instead yield a tiny ceiling that rejects legitimate archives.
     ///
-    /// For an unknown size (a pipe): the floor is the whole budget. This must
-    /// NOT fall through to the overflow fallback — that is what made the pipe
-    /// path unbounded. A pipe is where untrusted input of unknown size
-    /// arrives, and the budget must still bound output rather than becoming
-    /// unlimited.
+    /// For an unknown size (a pipe): the ratio is applied against the bytes
+    /// pulled from the input SO FAR, which [`open_archive`]'s `Counting`
+    /// wrapper tallies. This must NOT fall through to the overflow fallback —
+    /// that is what made the pipe path unbounded. But a flat `RATIO_FLOOR`
+    /// was the opposite error: it refused any piped archive over 1 MiB and
+    /// `--max-ratio`, which the refusal names, could not raise it, so the
+    /// documented `cat photos.zip | stuffr test -` broke on any real archive.
+    /// A running denominator still bounds a bomb — an 8 KB zip holding an
+    /// 8 MB entry is refused at `--max-ratio 10`, measured — without bounding
+    /// the archive's SIZE, which is what the floor was doing. It gives the
+    /// pipe exactly the seekable path's behaviour: at the default ratio both
+    /// admit that same zip, and both refuse it at 10.
+    ///
+    /// With no tally attached the floor still applies, because a budget with
+    /// neither a total nor a running count has no denominator at all.
     #[allow(clippy::manual_saturating_arithmetic)]
     fn ceiling(&self) -> u64 {
         match self.compressed_total {
@@ -59,10 +85,19 @@ impl ArchiveBudget {
                 .checked_mul(self.max_ratio)
                 .unwrap_or(u64::MAX)
                 .max(RATIO_FLOOR),
-            // Unknown size (a pipe): the floor is the whole budget. This must NOT
-            // share the overflow fallback above — that is what made the pipe path
-            // unbounded.
-            None => RATIO_FLOOR,
+            // Unknown size (a pipe): apply the ratio to what has actually been
+            // read so far. Shares the known-size arm's overflow fallback and
+            // floor, and for the same reasons; what it must NOT do is ignore
+            // `max_ratio`, which is the flag its own refusal tells the user to
+            // raise.
+            None => match &self.consumed {
+                Some(c) => c
+                    .load(Ordering::Relaxed)
+                    .checked_mul(self.max_ratio)
+                    .unwrap_or(u64::MAX)
+                    .max(RATIO_FLOOR),
+                None => RATIO_FLOOR,
+            },
         }
     }
 
@@ -164,12 +199,16 @@ impl Source for RatioGuardedSource {
 /// Shared by [`list`] and [`test`] so the two cannot drift on how they
 /// resolve a chain — the defect shape where a container flag is accepted but
 /// not honoured on one of two near-identical code paths.
+///
+/// Returns the running compressed-byte tally alongside the archive:
+/// [`ArchiveBudget`] needs it to give `--max-ratio` a denominator on a pipe,
+/// where the total size is unknowable up front.
 fn open_archive(
     registry: &Registry,
     src: Input,
     max_ratio: u64,
     memory_limit: Option<u64>,
-) -> Result<(Box<dyn ArchiveRead>, FormatId)> {
+) -> Result<(Box<dyn ArchiveRead>, FormatId, Arc<AtomicU64>)> {
     let path = src.path().map(Path::to_path_buf);
     // `Counting` wraps the RAW input, tallying compressed bytes as
     // `resolve_chain_deep`'s own internal decode reads them — the same
@@ -206,7 +245,11 @@ fn open_archive(
     // Wrapping unconditionally (even with zero codec layers, a bare `.tar`)
     // is harmless: `consumed` and the guard's `produced` then advance in
     // lockstep — see the module's own test for this.
-    let source: Box<dyn Source> = Box::new(RatioGuardedSource::new(source, consumed, max_ratio));
+    let source: Box<dyn Source> = Box::new(RatioGuardedSource::new(
+        source,
+        Arc::clone(&consumed),
+        max_ratio,
+    ));
     let mut chain = &chain;
     loop {
         match chain {
@@ -220,7 +263,11 @@ fn open_archive(
                 // disk.
                 let resolved =
                     ladder::resolve(source, *container, k.caps(), &StreamPolicy::default())?;
-                return Ok((k.open(resolved, &OpenOpts::default())?, *container));
+                return Ok((
+                    k.open(resolved, &OpenOpts::default())?,
+                    *container,
+                    consumed,
+                ));
             }
             // Names what the input resolved to, so "unpack this .gz" is
             // actionable rather than a bare refusal.
@@ -246,7 +293,8 @@ fn open_archive(
 /// whatever codec sits above it, so this verb is as exposed to a crafted
 /// dictionary declaration as `unpack` is.
 pub fn list(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Vec<EntryMeta>> {
-    let (mut ar, _format) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
+    let (mut ar, _format, _consumed) =
+        open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     let mut out = Vec::new();
     while let Some(entry) = ar.next_entry()? {
         out.push(entry.meta().clone());
@@ -266,15 +314,18 @@ pub fn test(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Out
         .path()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
-    let (mut ar, format) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
+    let (mut ar, format, consumed) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     // `test` built no budget at all until the Phase 2 final review: a
     // 204 KB zip holding one 200 MB entry verified clean at exit 0 under
     // `--max-ratio 10`, while `cat` and `unpack` of the identical file
     // refused it at exit 6. `test` is precisely the verb reached for to
     // inspect an UNTRUSTED archive, so it must be the strictest of the
-    // three, not the only unbounded one. `entries_test_matches_cat_and_unpack`
-    // in `crates/stuffr-cli/tests/cli.rs` pins the parity.
-    let mut budget = ArchiveBudget::new(compressed_total, max_ratio);
+    // three, not the only unbounded one.
+    // `every_entry_aware_verb_applies_the_same_expansion_bound` in
+    // `crates/stuffr-cli/tests/cli.rs` pins the parity, and
+    // `a_piped_archive_larger_than_the_ratio_floor_is_not_refused` pins that
+    // the bound this gained does not refuse ordinary piped archives.
+    let mut budget = ArchiveBudget::new(compressed_total, max_ratio).tracking(consumed);
     let mut bytes = 0u64;
     while let Some(mut entry) = ar.next_entry()? {
         let name = entry.meta().name.clone();
@@ -378,8 +429,9 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
             .and_then(|p| std::fs::metadata(p).ok())
             .map(|m| m.len())
     });
-    let (mut ar, format) = open_archive(crate::registry(), src, o.max_ratio, o.memory_limit)?;
-    let mut budget = ArchiveBudget::new(compressed_total, o.max_ratio);
+    let (mut ar, format, consumed) =
+        open_archive(crate::registry(), src, o.max_ratio, o.memory_limit)?;
+    let mut budget = ArchiveBudget::new(compressed_total, o.max_ratio).tracking(consumed);
 
     // The destination itself, once, up front: an archive of plain files
     // names no directory entry to create it, and a destination that cannot
@@ -653,8 +705,8 @@ pub fn cat(
         .path()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| m.len());
-    let (mut ar, format) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
-    let mut budget = ArchiveBudget::new(compressed_total, max_ratio);
+    let (mut ar, format, consumed) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
+    let mut budget = ArchiveBudget::new(compressed_total, max_ratio).tracking(consumed);
     let mut written = 0u64;
     let mut matched = 0u64;
 
@@ -1145,6 +1197,57 @@ mod tests {
             .charge("huge.bin", RATIO_FLOOR + 1)
             .expect_err("an unknown compressed size must still be bounded by the floor");
         assert!(matches!(err, Error::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn a_running_tally_gives_max_ratio_a_denominator_on_a_pipe() {
+        // The floor ALONE was the Phase 2 re-review's second finding: it
+        // refused any piped archive over 1 MiB, and `--max-ratio` — the flag
+        // the refusal names — could not raise it, so `cat photos.zip | stuffr
+        // test -` broke on any real archive. With a running tally the ratio
+        // has a denominator even though the total is unknown.
+        let consumed = Arc::new(AtomicU64::new(0));
+        let mut b = ArchiveBudget::new(None, DEFAULT_MAX_RATIO).tracking(Arc::clone(&consumed));
+
+        // 3 MiB pulled from the pipe: far past the floor, and legitimate.
+        consumed.store(3 * 1024 * 1024, Ordering::Relaxed);
+        b.charge("big.bin", 3 * 1024 * 1024)
+            .expect("a 1:1 archive must not be refused merely for exceeding the floor");
+
+        // The bound is still real: at the same tally, the ratio still bites.
+        let mut b = ArchiveBudget::new(None, DEFAULT_MAX_RATIO).tracking(Arc::clone(&consumed));
+        let err = b
+            .charge("bomb.bin", 3 * 1024 * 1024 * DEFAULT_MAX_RATIO + 1)
+            .expect_err("the ratio must still bound a pipe");
+        assert!(matches!(err, Error::ResourceLimit(_)));
+    }
+
+    #[test]
+    fn the_pipe_ceiling_tracks_the_tally_rather_than_being_fixed_at_open() {
+        // The ceiling is read at charge time, not captured when the budget is
+        // built — otherwise every piped archive would be judged against a
+        // tally of zero, which is the floor again by another route.
+        let consumed = Arc::new(AtomicU64::new(0));
+        let mut b = ArchiveBudget::new(None, DEFAULT_MAX_RATIO).tracking(Arc::clone(&consumed));
+        assert!(
+            b.charge("a", RATIO_FLOOR + 1).is_err(),
+            "with nothing yet read the floor is the whole budget"
+        );
+
+        let mut b = ArchiveBudget::new(None, DEFAULT_MAX_RATIO).tracking(Arc::clone(&consumed));
+        consumed.store(1024, Ordering::Relaxed);
+        assert!(
+            b.charge("a", RATIO_FLOOR + 1).is_ok(),
+            "once 1 KiB has been read the ratio allows far more than the floor"
+        );
+    }
+
+    #[test]
+    fn a_pipe_with_no_tally_attached_still_falls_back_to_the_floor() {
+        // `tracking` is what a caller attaches; a budget built without one has
+        // no denominator at all, and must not become unlimited.
+        let mut b = ArchiveBudget::new(None, DEFAULT_MAX_RATIO);
+        assert!(b.charge("huge.bin", RATIO_FLOOR + 1).is_err());
     }
 
     #[test]
