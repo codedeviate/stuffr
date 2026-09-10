@@ -77,7 +77,7 @@ fn write_tar(path: &Path, entries: &[Fixture<'_>]) -> PathBuf {
     let container = stuffr::registry().require_container(tar).unwrap();
     let file = std::fs::File::create(path).unwrap();
     let mut archive = container
-        .create(Box::new(file), &Default::default())
+        .create(stuffr::PlainSink::new(Box::new(file)), &Default::default())
         .unwrap();
     for entry in entries {
         let mut data = entry.data;
@@ -97,7 +97,7 @@ fn write_tar(path: &Path, entries: &[Fixture<'_>]) -> PathBuf {
             )
             .unwrap();
     }
-    archive.finish().unwrap();
+    archive.finish().unwrap().finish().unwrap();
     path.to_path_buf()
 }
 

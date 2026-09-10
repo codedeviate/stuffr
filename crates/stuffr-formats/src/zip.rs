@@ -117,8 +117,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
-    Error, Fidelity, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result,
-    Rung, SeekRead, Source,
+    Error, Fidelity, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, PlainSink,
+    Resolved, Result, Rung, SeekRead, Sink, Source,
 };
 use zip::CompressionMethod;
 use zip::result::ZipError;
@@ -281,7 +281,7 @@ impl Container for Zip {
         }))
     }
 
-    fn create(&self, dst: Box<dyn Write + Send>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+    fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
         // Validated before a single byte is written, the way `Codec::
         // check_encode_opts` is called before `ops` touches the filesystem: a
         // caller naming an entry codec this build cannot produce, or a level
@@ -1022,14 +1022,14 @@ fn check_level(method: CompressionMethod, level: Option<i32>) -> Result<()> {
 /// handed to `dst` and can no longer be rewritten — a seek there is refused
 /// rather than silently ignored.
 struct Spool {
-    dst: Box<dyn Write + Send>,
+    dst: Box<dyn Sink>,
     buf: Vec<u8>,
     base: u64,
     pos: u64,
 }
 
 impl Spool {
-    fn new(dst: Box<dyn Write + Send>) -> Self {
+    fn new(dst: Box<dyn Sink>) -> Self {
         Self {
             dst,
             buf: Vec::new(),
@@ -1084,6 +1084,16 @@ impl Spool {
 
     fn flush_destination(&mut self) -> io::Result<()> {
         self.dst.flush()
+    }
+
+    /// Hands the real destination back, leaving a placeholder behind.
+    ///
+    /// Deliberately NOT `Rc::try_unwrap(self.spool)`: [`SpoolHandle`] shares
+    /// that `Rc`, so an unwrap depends on drop order and would fail at
+    /// runtime the moment a handle outlives the writer by one step. A swap
+    /// has no such dependency.
+    fn take_destination(&mut self) -> Box<dyn Sink> {
+        std::mem::replace(&mut self.dst, PlainSink::new(Box::new(std::io::sink())))
     }
 }
 
@@ -1305,26 +1315,30 @@ impl ArchiveWrite for ZipWrite {
     }
 
     /// Writes the central directory and the end-of-central-directory record,
-    /// commits the window and flushes.
+    /// commits the window, then returns the destination.
     ///
     /// Never via `Drop`: `impl<W: Write + Seek> Drop for ZipWriter<W>`
     /// finalizes the archive and writes any failure to STDERR, so relying on
     /// it loses the error entirely — the hazard conformance property 4 asserts
     /// against. `ZipWriter::finish` here consumes the writer, after which its
     /// `Drop` sees a closed archive and does nothing.
-    fn finish(mut self: Box<Self>) -> Result<()> {
+    ///
+    /// The destination is returned, not finished: the caller owns completion,
+    /// because a codec layer beneath us has its own trailer still to write.
+    /// The `flush_destination` here is the window's own, not the sink's
+    /// completion — it pushes the committed bytes on rather than closing
+    /// anything.
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn Sink>> {
         let writer = self
             .inner
             .take()
             .ok_or_else(|| Error::Usage("zip writer finished twice".into()))?;
         writer.finish().map_err(classify_zip_error)?;
         // Only now does the destination see anything it has not seen already.
-        // The caller handed it over by value at `Container::create` and has no
-        // other handle left to flush it, so that is done here.
         let mut spool = self.spool.borrow_mut();
         spool.commit_all()?;
         spool.flush_destination()?;
-        Ok(())
+        Ok(spool.take_destination())
     }
 }
 
@@ -1355,11 +1369,13 @@ mod tests {
 
     fn build_with(opts: &CreateOpts, entries: &[(EntryMeta, &[u8])]) -> Vec<u8> {
         let buf = SharedBuf::new();
-        let mut w = Zip.create(Box::new(buf.clone()), opts).expect("create");
+        let mut w = Zip
+            .create(PlainSink::new(Box::new(buf.clone())), opts)
+            .expect("create");
         for (meta, data) in entries {
             w.add(meta, &mut io::Cursor::new(*data)).expect("add");
         }
-        w.finish().expect("finish");
+        w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
     }
 
@@ -1981,7 +1997,9 @@ mod tests {
     /// allocation in this module.
     #[test]
     fn the_spool_refuses_to_zero_fill_an_unbounded_hole() {
-        let spool = Rc::new(RefCell::new(Spool::new(Box::new(SharedBuf::new()))));
+        let spool = Rc::new(RefCell::new(Spool::new(PlainSink::new(Box::new(
+            SharedBuf::new(),
+        )))));
         let mut handle = SpoolHandle(Rc::clone(&spool));
         handle.write_all(b"start").unwrap();
 
@@ -2064,7 +2082,7 @@ z.close()\n";
         let buf = SharedBuf::new();
         let err = Zip
             .create(
-                Box::new(buf.clone()),
+                PlainSink::new(Box::new(buf.clone())),
                 &CreateOpts {
                     entry_codec: Some(FormatId::new("brotli")),
                     ..Default::default()
@@ -2163,7 +2181,7 @@ z.close()\n";
         let buf = SharedBuf::new();
         let err = Zip
             .create(
-                Box::new(buf),
+                PlainSink::new(Box::new(buf)),
                 &CreateOpts {
                     entry_codec: Some(FormatId::new("zstd")),
                     ..Default::default()
@@ -2206,7 +2224,10 @@ z.close()\n";
     fn the_writer_does_not_buffer_the_whole_archive() {
         let buf = SharedBuf::new();
         let mut w = Zip
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let first = vec![b'1'; 64 * 1024];
         w.add(
@@ -2228,7 +2249,7 @@ z.close()\n";
             mid > 0,
             "starting the second entry settles the first, which must then be handed over"
         );
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
         let total = buf.contents().len();
         assert!(
             mid < total,
@@ -2259,7 +2280,7 @@ z.close()\n";
         let buf = SharedBuf::new();
         let err = Zip
             .create(
-                Box::new(buf.clone()),
+                PlainSink::new(Box::new(buf.clone())),
                 &CreateOpts {
                     level: Some(99),
                     ..Default::default()
@@ -2299,7 +2320,9 @@ z.close()\n";
     #[test]
     fn a_declared_size_that_disagrees_with_the_data_is_refused() {
         let buf = SharedBuf::new();
-        let mut w = Zip.create(Box::new(buf), &CreateOpts::default()).unwrap();
+        let mut w = Zip
+            .create(PlainSink::new(Box::new(buf)), &CreateOpts::default())
+            .unwrap();
         let mut meta_in = EntryMeta::file("wrong.bin");
         meta_in.size = Some(99);
         let err = w
@@ -2314,7 +2337,9 @@ z.close()\n";
     /// `Spool` invariant enforced rather than assumed.
     #[test]
     fn the_spool_refuses_a_seek_below_what_it_has_already_committed() {
-        let spool = Rc::new(RefCell::new(Spool::new(Box::new(SharedBuf::new()))));
+        let spool = Rc::new(RefCell::new(Spool::new(PlainSink::new(Box::new(
+            SharedBuf::new(),
+        )))));
         let mut handle = SpoolHandle(Rc::clone(&spool));
         handle.write_all(b"0123456789").unwrap();
         spool.borrow_mut().commit_upto(6).unwrap();

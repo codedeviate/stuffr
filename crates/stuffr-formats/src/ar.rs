@@ -91,7 +91,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Source,
+    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Sink,
+    Source,
 };
 
 use crate::normalize::{AR_MALFORMED_AS_INVALID_DATA_EOF, NormalizeDecodeErrors};
@@ -158,7 +159,7 @@ impl Container for Ar {
         }))
     }
 
-    fn create(&self, dst: Box<dyn Write + Send>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+    fn create(&self, dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
         Ok(Box::new(ArWrite {
             inner: Some(ar::Builder::new(dst)),
             wrote_any: false,
@@ -357,7 +358,7 @@ fn entry_meta(header: &ar::Header) -> EntryMeta {
 
 struct ArWrite {
     /// `None` once `finish` has consumed it.
-    inner: Option<ar::Builder<Box<dyn Write + Send>>>,
+    inner: Option<ar::Builder<Box<dyn Sink>>>,
     /// Whether `add` was ever called. `ar::Builder` writes the global header
     /// lazily, on the first `append` — with zero entries that never
     /// happens, and the archive would be zero bytes rather than the 8-byte
@@ -366,7 +367,7 @@ struct ArWrite {
 }
 
 impl ArWrite {
-    fn builder(&mut self) -> Result<&mut ar::Builder<Box<dyn Write + Send>>> {
+    fn builder(&mut self) -> Result<&mut ar::Builder<Box<dyn Sink>>> {
         self.inner
             .as_mut()
             .ok_or_else(|| Error::Usage("ar writer used after finish()".into()))
@@ -398,7 +399,10 @@ impl ArchiveWrite for ArWrite {
     /// doing here that `ar::Builder` will not do on its own is writing the
     /// global header for a ZERO-entry archive, since `Builder::append` is
     /// the only place that header is written and `append` was never called.
-    fn finish(mut self: Box<Self>) -> Result<()> {
+    ///
+    /// The destination is returned, not finished: the caller owns completion,
+    /// because a codec layer beneath us has its own trailer still to write.
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn Sink>> {
         let builder = self
             .inner
             .take()
@@ -407,8 +411,7 @@ impl ArchiveWrite for ArWrite {
         if !self.wrote_any {
             dst.write_all(GLOBAL_HEADER)?;
         }
-        dst.flush()?;
-        Ok(())
+        Ok(dst)
     }
 }
 
@@ -462,18 +465,23 @@ fn unix_seconds(t: SystemTime) -> u64 {
 mod tests {
     use super::*;
     use stuffr_core::testing::{SharedBuf, assert_container_conforms, open_forward_only};
-    use stuffr_core::{ArchiveRead, CreateOpts, EntryMeta, OpenOpts, ReaderSource, Source};
+    use stuffr_core::{
+        ArchiveRead, CreateOpts, EntryMeta, OpenOpts, PlainSink, ReaderSource, Source,
+    };
 
     fn build_ar(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let buf = SharedBuf::new();
         let mut w = Ar
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .expect("create");
         for (name, data) in entries {
             w.add(&EntryMeta::file(*name), &mut std::io::Cursor::new(*data))
                 .expect("add");
         }
-        w.finish().expect("finish");
+        w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
     }
 
@@ -594,7 +602,10 @@ mod tests {
     fn add_measures_the_payload_when_the_caller_does_not_declare_a_size() {
         let buf = SharedBuf::new();
         let mut w = Ar
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let meta = EntryMeta::file("unknown-length.bin");
         assert_eq!(meta.size, None, "the point of this test");
@@ -603,7 +614,7 @@ mod tests {
             &mut std::io::Cursor::new(&b"twenty-two bytes long!"[..]),
         )
         .unwrap();
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let mut entry = ar.next_entry().unwrap().unwrap();

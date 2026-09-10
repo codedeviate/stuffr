@@ -17,13 +17,14 @@
 //! 3. Round trip, checked with zero, one, and two entries — zero first,
 //!    because that is where a container most often breaks: a structure with
 //!    no entries still needs its header and trailer written.
-//! 4. `finish()` flushes the underlying writer and surfaces a write error
-//!    that `Drop` would otherwise swallow. `ArchiveWrite::finish` takes the
-//!    destination by value (via `Container::create`), so once a caller has
-//!    handed it over, `finish` is the last code with a handle to it — pointed
-//!    at a real hazard: a container relying on `Drop` to flush loses any
-//!    error entirely (`zip`'s own `Drop` finalizes and writes failures to
-//!    stderr).
+//! 4. The completion path flushes the underlying writer and surfaces a write
+//!    error that `Drop` would otherwise swallow. `ArchiveWrite::finish` no
+//!    longer flushes: it writes the container's trailer and HANDS THE
+//!    DESTINATION BACK, so the harness chains `Sink::finish` onto it, which
+//!    is exactly the pair a real caller runs. Between them they are the last
+//!    code with a handle to the destination — pointed at a real hazard: a
+//!    container relying on `Drop` to flush loses any error entirely (`zip`'s
+//!    own `Drop` finalizes and writes failures to stderr).
 //! 5. Forward parse from a genuinely non-seekable source — the streaming
 //!    premise itself. The source's `Seek` capability is erased at the type
 //!    level, not merely reported `false`, so an implementation cannot quietly
@@ -68,7 +69,7 @@ use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::archive::{ArchiveRead, Container, CreateOpts, EntryMeta, OpenOpts};
+use crate::archive::{ArchiveRead, Container, CreateOpts, EntryMeta, OpenOpts, PlainSink};
 use crate::error::Result;
 use crate::fidelity::Rung;
 use crate::format::FormatMeta;
@@ -80,9 +81,10 @@ use crate::source::{ReaderSource, SeekRead, Source, SourceCaps};
 /// One type serves both property 3's ordinary destination
 /// (`CaptureWriter::new`, read back via `contents()` once `finish()` has
 /// consumed it) and property 4's failing one (`CaptureWriter::failing_after`)
-/// — `Container::create` takes the destination by value and
-/// `ArchiveWrite::finish` consumes it, so nothing is left holding the bytes
-/// unless the writer itself shares a handle to them.
+/// — `Container::create` takes the destination by value, and although
+/// `ArchiveWrite::finish` now hands a `Sink` back rather than dropping it,
+/// the harness finishes that immediately, so nothing is left holding the
+/// bytes unless the writer itself shares a handle to them.
 #[derive(Clone)]
 struct CaptureWriter {
     buf: Arc<Mutex<Vec<u8>>>,
@@ -159,7 +161,10 @@ fn build(container: &dyn Container, entries: &[(&str, &[u8])]) -> Vec<u8> {
     let id = container.id();
     let cap = CaptureWriter::new();
     let mut w = container
-        .create(Box::new(cap.clone()), &CreateOpts::default())
+        .create(
+            PlainSink::new(Box::new(cap.clone())),
+            &CreateOpts::default(),
+        )
         .unwrap_or_else(|e| panic!("conformance[{id}] create: {e}"));
     for (name, data) in entries {
         let meta = EntryMeta::file(*name);
@@ -167,7 +172,9 @@ fn build(container: &dyn Container, entries: &[(&str, &[u8])]) -> Vec<u8> {
             .unwrap_or_else(|e| panic!("conformance[{id}] add({name}): {e}"));
     }
     w.finish()
-        .unwrap_or_else(|e| panic!("conformance[{id}] finish: {e}"));
+        .unwrap_or_else(|e| panic!("conformance[{id}] finish: {e}"))
+        .finish()
+        .unwrap_or_else(|e| panic!("conformance[{id}] finish (sink): {e}"));
     cap.contents()
 }
 
@@ -403,14 +410,19 @@ fn build_with_meta(container: &dyn Container, entries: &[(EntryMeta, &[u8])]) ->
     let id = container.id();
     let cap = CaptureWriter::new();
     let mut w = container
-        .create(Box::new(cap.clone()), &CreateOpts::default())
+        .create(
+            PlainSink::new(Box::new(cap.clone())),
+            &CreateOpts::default(),
+        )
         .unwrap_or_else(|e| panic!("conformance[{id}] create: {e}"));
     for (meta, data) in entries {
         w.add(meta, &mut io::Cursor::new(*data))
             .unwrap_or_else(|e| panic!("conformance[{id}] add({}): {e}", meta.name));
     }
     w.finish()
-        .unwrap_or_else(|e| panic!("conformance[{id}] finish: {e}"));
+        .unwrap_or_else(|e| panic!("conformance[{id}] finish: {e}"))
+        .finish()
+        .unwrap_or_else(|e| panic!("conformance[{id}] finish (sink): {e}"));
     cap.contents()
 }
 
@@ -515,13 +527,16 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
         //    writes failures to stderr, losing them.
         let mut w = container
             .create(
-                Box::new(CaptureWriter::failing_after(0)),
+                PlainSink::new(Box::new(CaptureWriter::failing_after(0))),
                 &CreateOpts::default(),
             )
             .unwrap_or_else(|e| panic!("conformance[{id}] create: {e}"));
         let meta_e = EntryMeta::file("a.txt");
         let added = w.add(&meta_e, &mut io::Cursor::new(b"alpha".as_slice()));
-        let finished = w.finish();
+        // Chained: the container hands the destination back rather than
+        // completing it, so the completion path property 4 is about now ends
+        // at `Sink::finish` — an error surfacing there is the same error.
+        let finished = w.finish().and_then(|sink| sink.finish());
         assert!(
             added.is_err() || finished.is_err(),
             "conformance[{id}] property 4: a destination that fails every write produced \
@@ -800,7 +815,7 @@ mod tests {
 #[cfg(test)]
 mod broken_containers {
     use super::*;
-    use crate::archive::{ArchiveRead, ArchiveWrite, Entry};
+    use crate::archive::{ArchiveRead, ArchiveWrite, Entry, Sink};
     use crate::fidelity::FidelityReport;
     use crate::format::{ContainerCaps, FormatId};
     use crate::ladder::Resolved;
@@ -821,11 +836,7 @@ mod broken_containers {
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             FramedMockContainer.open(resolved, o)
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             FramedMockContainer.create(dst, o)
         }
     }
@@ -849,12 +860,14 @@ mod broken_containers {
             self.count += 1;
             self.inner.add(meta, data)
         }
-        fn finish(self: Box<Self>) -> Result<()> {
+        fn finish(self: Box<Self>) -> Result<Box<dyn Sink>> {
             if self.count == 0 {
                 // BUG: no entries means no trailer either — the whole
                 // structure the reader needs to find is simply never
-                // written.
-                return Ok(());
+                // written. `self.inner` is dropped unfinished, so the real
+                // destination never sees the trailer; the placeholder handed
+                // back keeps the signature honest without writing anything.
+                return Ok(PlainSink::new(Box::new(std::io::sink())));
             }
             self.inner.finish()
         }
@@ -870,11 +883,7 @@ mod broken_containers {
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             FramedMockContainer.open(resolved, o)
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             Ok(Box::new(EmptyBrokenWrite {
                 inner: FramedMockContainer.create(dst, o)?,
                 count: 0,
@@ -902,10 +911,11 @@ mod broken_containers {
             let _ = self.inner.add(meta, data);
             Ok(())
         }
-        fn finish(self: Box<Self>) -> Result<()> {
-            // BUG: same, for the trailer write.
+        fn finish(self: Box<Self>) -> Result<Box<dyn Sink>> {
+            // BUG: same, for the trailer write — and for the destination's
+            // own completion, since what is handed back here writes nowhere.
             let _ = self.inner.finish();
-            Ok(())
+            Ok(PlainSink::new(Box::new(std::io::sink())))
         }
     }
 
@@ -919,11 +929,7 @@ mod broken_containers {
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             FramedMockContainer.open(resolved, o)
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             Ok(Box::new(SwallowsErrorWrite {
                 inner: FramedMockContainer.create(dst, o)?,
             }))
@@ -972,11 +978,7 @@ mod broken_containers {
                 inner: FramedMockContainer.open(resolved, o)?,
             }))
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             FramedMockContainer.create(dst, o)
         }
     }
@@ -1029,11 +1031,7 @@ mod broken_containers {
                 report: FidelityReport::exact(),
             }))
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             FramedMockContainer.create(dst, o)
         }
     }
@@ -1074,11 +1072,7 @@ mod broken_containers {
                 o,
             )
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             FramedMockContainer.create(dst, o)
         }
     }
@@ -1123,11 +1117,7 @@ mod broken_containers {
                 inner: FramedMockContainer.open(resolved, o)?,
             }))
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             FramedMockContainer.create(dst, o)
         }
     }
@@ -1223,11 +1213,7 @@ mod broken_containers {
                 done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }))
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             FramedMockContainer.create(dst, o)
         }
     }
@@ -1277,11 +1263,7 @@ mod broken_containers {
                 inner: FramedMockContainer.open(resolved, o)?,
             }))
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             FramedMockContainer.create(dst, o)
         }
     }
@@ -1317,7 +1299,7 @@ mod broken_containers {
                 .to_string();
             self.inner.add(&sanitised, data)
         }
-        fn finish(self: Box<Self>) -> Result<()> {
+        fn finish(self: Box<Self>) -> Result<Box<dyn Sink>> {
             self.inner.finish()
         }
     }
@@ -1332,11 +1314,7 @@ mod broken_containers {
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             FramedMockContainer.open(resolved, o)
         }
-        fn create(
-            &self,
-            dst: Box<dyn Write + Send>,
-            o: &CreateOpts,
-        ) -> Result<Box<dyn ArchiveWrite>> {
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             Ok(Box::new(SanitisesWrite {
                 inner: FramedMockContainer.create(dst, o)?,
             }))

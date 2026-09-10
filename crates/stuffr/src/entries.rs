@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use stuffr_core::{
     ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts,
     EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts,
-    RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Source, SourceCaps, StreamPolicy,
-    check_symlink_target, ladder, resolve_chain_deep_with, safe_join,
+    PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Source, SourceCaps,
+    StreamPolicy, check_symlink_target, ladder, resolve_chain_deep_with, safe_join,
 };
 
 use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
@@ -785,7 +785,7 @@ pub fn create_archive(
     let finish = opened.finish;
     let (counted, bytes_out) = CountingWriter::new(opened.writer);
     let archive = kind.create(
-        Box::new(counted),
+        PlainSink::new(Box::new(counted)),
         &CreateOpts {
             level: o.level,
             ..Default::default()
@@ -813,9 +813,11 @@ pub fn create_archive(
             )?;
             bytes_in += md.len();
         }
-        // Writes the container's trailer and flushes; the destination was
-        // handed over by value, so nothing else can flush it.
-        archive.finish()?;
+        // Writes the container's trailer and hands the destination back;
+        // finishing it — flushing here, a codec trailer once Task 2 wires
+        // composition — is the caller's job, done once, at the outermost
+        // layer.
+        archive.finish()?.finish()?;
         Ok(bytes_in)
     })();
 

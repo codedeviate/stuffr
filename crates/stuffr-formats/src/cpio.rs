@@ -112,8 +112,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Source,
-    probe,
+    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Sink,
+    Source, probe,
 };
 
 use crate::normalize::CPIO_MALFORMED_AS_INVALID_DATA_EOF;
@@ -210,7 +210,7 @@ impl Container for CpioNewc {
         }))
     }
 
-    fn create(&self, dst: Box<dyn Write + Send>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+    fn create(&self, dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
         Ok(Box::new(CpioWrite { dst: Some(dst) }))
     }
 }
@@ -529,7 +529,7 @@ fn check_u32_size(name: &str, size: u64) -> Result<u32> {
 
 struct CpioWrite {
     /// `None` once `finish` has consumed it.
-    dst: Option<Box<dyn Write + Send>>,
+    dst: Option<Box<dyn Sink>>,
 }
 
 impl ArchiveWrite for CpioWrite {
@@ -588,16 +588,17 @@ impl ArchiveWrite for CpioWrite {
     }
 
     /// Writes the `TRAILER!!!` entry that terminates a `newc` archive, then
-    /// flushes. Never via `Drop` — see `tar.rs`'s own `finish` doc for why
-    /// that is the one path a caller may rely on.
-    fn finish(mut self: Box<Self>) -> Result<()> {
+    /// returns the destination. Never via `Drop` — see `tar.rs`'s own
+    /// `finish` doc for why that is the one path a caller may rely on.
+    ///
+    /// The destination is returned, not finished: the caller owns completion,
+    /// because a codec layer beneath us has its own trailer still to write.
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn Sink>> {
         let dst = self
             .dst
             .take()
             .ok_or_else(|| Error::Usage("cpio writer finished twice".into()))?;
-        let mut dst = cpio::newc::trailer(dst)?;
-        dst.flush()?;
-        Ok(())
+        Ok(cpio::newc::trailer(dst)?)
     }
 }
 
@@ -616,18 +617,21 @@ fn unix_seconds(t: SystemTime) -> u32 {
 mod tests {
     use super::*;
     use stuffr_core::testing::{SharedBuf, assert_container_conforms, open_forward_only};
-    use stuffr_core::{ArchiveRead, CreateOpts, OpenOpts, ReaderSource, Source};
+    use stuffr_core::{ArchiveRead, CreateOpts, OpenOpts, PlainSink, ReaderSource, Source};
 
     fn build_cpio(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let buf = SharedBuf::new();
         let mut w = CpioNewc
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .expect("create");
         for (name, data) in entries {
             w.add(&EntryMeta::file(*name), &mut std::io::Cursor::new(*data))
                 .expect("add");
         }
-        w.finish().expect("finish");
+        w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
     }
 
@@ -837,7 +841,10 @@ mod tests {
 
     fn add_entry_of_declared_size(size: u64) -> Result<()> {
         let mut w = CpioNewc
-            .create(Box::new(SharedBuf::new()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(SharedBuf::new())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let mut meta = EntryMeta::file("huge.bin");
         meta.size = Some(size);
@@ -852,13 +859,16 @@ mod tests {
     fn an_explicit_mode_with_no_type_bits_still_reads_back_as_a_file() {
         let buf = SharedBuf::new();
         let mut w = CpioNewc
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let mut meta = EntryMeta::file("m.txt");
         meta.mode = Some(0o640);
         w.add(&meta, &mut std::io::Cursor::new(b"m".as_slice()))
             .unwrap();
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let entry = ar.next_entry().unwrap().unwrap();
@@ -870,12 +880,15 @@ mod tests {
     fn a_directory_entry_with_no_mode_defaults_to_an_executable_one() {
         let buf = SharedBuf::new();
         let mut w = CpioNewc
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let mut dir = EntryMeta::file("d");
         dir.kind = EntryKind::Dir;
         w.add(&dir, &mut std::io::Cursor::new(&[][..])).unwrap();
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let entry = ar.next_entry().unwrap().unwrap();
@@ -890,7 +903,10 @@ mod tests {
     fn a_symlink_entry_round_trips_its_kind_and_target() {
         let buf = SharedBuf::new();
         let mut w = CpioNewc
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let mut link = EntryMeta::file("mylink");
         link.kind = EntryKind::Symlink {
@@ -899,7 +915,7 @@ mod tests {
         // Empty data: a symlink's target comes from `meta.kind`, never from
         // the caller's data reader — mirrors `tar.rs`'s own test fixtures.
         w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let entry = ar.next_entry().unwrap().unwrap();
@@ -922,14 +938,17 @@ mod tests {
     fn a_symlink_target_past_the_length_ceiling_is_refused() {
         let buf = SharedBuf::new();
         let mut w = CpioNewc
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let mut link = EntryMeta::file("mylink");
         link.kind = EntryKind::Symlink {
             target: "x".repeat((MAX_SYMLINK_TARGET_LEN + 1) as usize),
         };
         w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let err = ar
@@ -952,7 +971,10 @@ mod tests {
     fn a_directory_or_symlink_with_a_permission_only_mode_still_normalizes_the_type_bits() {
         let buf = SharedBuf::new();
         let mut w = CpioNewc
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
 
         let mut dir = EntryMeta::file("d");
@@ -967,7 +989,7 @@ mod tests {
         link.mode = Some(0o777); // no S_IFLNK bit
         w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
 
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let d = ar.next_entry().unwrap().unwrap();
@@ -994,7 +1016,10 @@ mod tests {
     fn add_measures_the_payload_when_the_caller_does_not_declare_a_size() {
         let buf = SharedBuf::new();
         let mut w = CpioNewc
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let meta = EntryMeta::file("unknown-length.bin");
         assert_eq!(meta.size, None, "the point of this test");
@@ -1003,7 +1028,7 @@ mod tests {
             &mut std::io::Cursor::new(&b"twenty-two bytes long!"[..]),
         )
         .unwrap();
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let mut entry = ar.next_entry().unwrap().unwrap();
@@ -1129,7 +1154,10 @@ mod tests {
         // the forward direction, per the coordinator's fix request.
         let buf = SharedBuf::new();
         let mut w = CpioNewc
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         w.add(
             &EntryMeta::file("a.txt"),
@@ -1146,7 +1174,7 @@ mod tests {
             target: "a.txt".into(),
         };
         w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
         let bytes = buf.contents();
 
         // Verbose listing (`-itv`), not plain `-it`: only the verbose form

@@ -229,7 +229,7 @@ impl Container for MockContainer {
         }))
     }
 
-    fn create(&self, dst: Box<dyn Write + Send>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+    fn create(&self, dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
         Ok(Box::new(MockArchiveWrite {
             dst,
             offsets: Vec::new(),
@@ -307,7 +307,7 @@ impl ArchiveRead for MockArchiveRead {
 }
 
 pub struct MockArchiveWrite {
-    dst: Box<dyn Write + Send>,
+    dst: Box<dyn Sink>,
     offsets: Vec<u64>,
     written: u64,
 }
@@ -328,7 +328,7 @@ impl ArchiveWrite for MockArchiveWrite {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> Result<()> {
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn Sink>> {
         self.dst.write_all(b"MI")?;
         self.dst
             .write_all(&(self.offsets.len() as u32).to_le_bytes())?;
@@ -336,8 +336,9 @@ impl ArchiveWrite for MockArchiveWrite {
             self.dst.write_all(&o.to_le_bytes())?;
         }
         self.dst.write_all(b"MEND")?;
-        self.dst.flush()?;
-        Ok(())
+        // Returned, not finished: completion belongs to the caller, once, at
+        // the outermost layer.
+        Ok(self.dst)
     }
 }
 
@@ -396,13 +397,13 @@ impl Container for FramedMockContainer {
         }))
     }
 
-    fn create(&self, dst: Box<dyn Write + Send>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+    fn create(&self, dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
         Ok(Box::new(FramedArchiveWrite { dst }))
     }
 }
 
 struct FramedArchiveWrite {
-    dst: Box<dyn Write + Send>,
+    dst: Box<dyn Sink>,
 }
 
 impl ArchiveWrite for FramedArchiveWrite {
@@ -418,10 +419,9 @@ impl ArchiveWrite for FramedArchiveWrite {
         Ok(())
     }
 
-    fn finish(mut self: Box<Self>) -> Result<()> {
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn Sink>> {
         self.dst.write_all(b"FZ")?;
-        self.dst.flush()?;
-        Ok(())
+        Ok(self.dst)
     }
 }
 
@@ -539,8 +539,9 @@ impl ArchiveRead for FramedArchiveRead {
 
 /// A `'static`, cloneable in-memory sink.
 ///
-/// `Codec::encoder` and `Container::create` take `Box<dyn Write + Send>`, which
-/// is implicitly `+ 'static`, so a test cannot hand them `&mut local_vec`.
+/// `Codec::encoder` takes `Box<dyn Write + Send>` and `Container::create` a
+/// `Box<dyn Sink>` (a `SharedBuf` reaches that through [`crate::PlainSink`]),
+/// both implicitly `+ 'static`, so a test cannot hand them `&mut local_vec`.
 /// Cloning a `SharedBuf` gives the test a handle on whatever the writer wrote.
 #[derive(Clone, Default)]
 pub struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -694,11 +695,14 @@ mod tests {
         let sink = SharedBuf::new();
         {
             let mut w = MockContainer
-                .create(Box::new(sink.clone()), &CreateOpts::default())
+                .create(
+                    crate::archive::PlainSink::new(Box::new(sink.clone())),
+                    &CreateOpts::default(),
+                )
                 .unwrap();
             w.add(&EntryMeta::file("only.txt"), &mut &b"hello"[..])
                 .unwrap();
-            w.finish().unwrap();
+            w.finish().unwrap().finish().unwrap();
         }
         let buf = sink.contents();
         let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(buf)));

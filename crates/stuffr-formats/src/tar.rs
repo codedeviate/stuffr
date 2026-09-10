@@ -139,14 +139,15 @@
 //! declared is streamed and then verified; a mismatch is refused rather than
 //! written.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Source,
+    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Sink,
+    Source,
 };
 
 use crate::normalize::{NormalizeDecodeErrors, TAR_MALFORMED_AS_OTHER};
@@ -301,7 +302,7 @@ impl Container for Tar {
         }))
     }
 
-    fn create(&self, dst: Box<dyn Write + Send>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+    fn create(&self, dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
         Ok(Box::new(TarWrite {
             builder: Some(tar::Builder::new(dst)),
         }))
@@ -677,11 +678,11 @@ fn entry_meta(entry: &tar::Entry<'_, TrailerWatch>) -> EntryMeta {
 struct TarWrite {
     /// `None` once `finish` has consumed it. `Option` rather than a
     /// consuming call chain because `ArchiveWrite::add` takes `&mut self`.
-    builder: Option<tar::Builder<Box<dyn Write + Send>>>,
+    builder: Option<tar::Builder<Box<dyn Sink>>>,
 }
 
 impl TarWrite {
-    fn builder(&mut self) -> Result<&mut tar::Builder<Box<dyn Write + Send>>> {
+    fn builder(&mut self) -> Result<&mut tar::Builder<Box<dyn Sink>>> {
         self.builder
             .as_mut()
             .ok_or_else(|| Error::Usage("tar writer used after finish()".into()))
@@ -780,7 +781,8 @@ impl ArchiveWrite for TarWrite {
         }
     }
 
-    /// Writes the two zero blocks that terminate a tar, then flushes.
+    /// Writes the two zero blocks that terminate a tar, then returns the
+    /// destination.
     ///
     /// Never via `Drop`: `tar::Builder`'s own `Drop` finishes the archive and
     /// discards any error, which is the hazard harness property 4 exists to
@@ -788,17 +790,15 @@ impl ArchiveWrite for TarWrite {
     /// terminated archive — that is tar's behaviour, not this module's — but
     /// nothing reports whether it worked, so `finish` is the only path a
     /// caller may rely on.
-    fn finish(mut self: Box<Self>) -> Result<()> {
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn Sink>> {
         let builder = self
             .builder
             .take()
             .ok_or_else(|| Error::Usage("tar writer finished twice".into()))?;
         // `into_inner` writes the trailer, then hands the destination back.
-        // The caller gave it to us by value at `Container::create` and has no
-        // other handle left to flush it, so that is done here.
-        let mut dst = builder.into_inner()?;
-        dst.flush()?;
-        Ok(())
+        // Do NOT flush or finish it here: the caller owns completion, because
+        // a codec layer beneath us has its own trailer still to write.
+        Ok(builder.into_inner()?)
     }
 }
 
@@ -828,7 +828,7 @@ impl Field {
 /// pair, which is unreachable from outside the crate, and is what lets this
 /// container store a name tar's public API refuses (see `add`).
 fn set_header_field(
-    builder: &mut tar::Builder<Box<dyn Write + Send>>,
+    builder: &mut tar::Builder<Box<dyn Sink>>,
     header: &mut tar::Header,
     field: Field,
     value: &[u8],
@@ -904,8 +904,8 @@ mod tests {
     use super::*;
     use stuffr_core::testing::{SharedBuf, assert_container_conforms, open_forward_only};
     use stuffr_core::{
-        ArchiveRead, CreateOpts, EntryKind, EntryMeta, OpenOpts, ReaderSource, Rung, Source,
-        StreamPolicy,
+        ArchiveRead, CreateOpts, EntryKind, EntryMeta, OpenOpts, PlainSink, ReaderSource, Rung,
+        Source, StreamPolicy,
     };
 
     /// Writes `entries` through `Tar` itself and returns the archive bytes —
@@ -913,13 +913,16 @@ mod tests {
     fn build_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let buf = SharedBuf::new();
         let mut w = Tar
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .expect("create");
         for (name, data) in entries {
             w.add(&EntryMeta::file(*name), &mut std::io::Cursor::new(*data))
                 .expect("add");
         }
-        w.finish().expect("finish");
+        w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
     }
 
@@ -1567,7 +1570,10 @@ mod tests {
     fn directory_and_symlink_entries_round_trip_their_kind_and_target() {
         let buf = SharedBuf::new();
         let mut w = Tar
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
 
         let mut dir = EntryMeta::file("d/");
@@ -1581,7 +1587,7 @@ mod tests {
         };
         w.add(&link, &mut std::io::Cursor::new(&[][..])).unwrap();
 
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let first = ar.next_entry().unwrap().unwrap();
@@ -1609,7 +1615,10 @@ mod tests {
     fn a_directory_entry_with_no_mode_defaults_to_an_executable_one() {
         let buf = SharedBuf::new();
         let mut w = Tar
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
 
         let mut dir = EntryMeta::file("d/");
@@ -1622,7 +1631,7 @@ mod tests {
         w.add(&file, &mut std::io::Cursor::new(b"x".as_slice()))
             .unwrap();
 
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let mut ar = open(&buf.contents());
         let d = ar.next_entry().unwrap().unwrap();
@@ -1681,7 +1690,10 @@ mod tests {
     fn add_measures_the_payload_when_the_caller_does_not_declare_a_size() {
         let buf = SharedBuf::new();
         let mut w = Tar
-            .create(Box::new(buf.clone()), &CreateOpts::default())
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
             .unwrap();
         let meta = EntryMeta::file("unknown-length.bin");
         assert_eq!(meta.size, None, "the point of this test");
@@ -1690,7 +1702,7 @@ mod tests {
             &mut std::io::Cursor::new(&b"twenty-two bytes long!"[..]),
         )
         .unwrap();
-        w.finish().unwrap();
+        w.finish().unwrap().finish().unwrap();
 
         let got = read_back(&buf.contents());
         assert_eq!(got.len(), 1);
@@ -1707,7 +1719,10 @@ mod tests {
         for (declared, data) in [(99u64, &b"short"[..]), (2u64, &b"longer"[..])] {
             let buf = SharedBuf::new();
             let mut w = Tar
-                .create(Box::new(buf.clone()), &CreateOpts::default())
+                .create(
+                    PlainSink::new(Box::new(buf.clone())),
+                    &CreateOpts::default(),
+                )
                 .unwrap();
             let mut meta = EntryMeta::file("liar.bin");
             meta.size = Some(declared);

@@ -24,7 +24,7 @@ pub mod testing;
 
 pub use archive::{
     ArchiveRead, ArchiveWrite, Codec, Container, CreateOpts, DecodeOpts, EncodeOpts, Entry,
-    EntryKind, EntryMeta, OpenOpts, Sink,
+    EntryKind, EntryMeta, OpenOpts, PlainSink, Sink,
 };
 pub use containment::{check_symlink_target, safe_join};
 pub use error::{Error, Result};

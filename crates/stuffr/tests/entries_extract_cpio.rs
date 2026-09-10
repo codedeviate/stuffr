@@ -35,7 +35,7 @@ fn write_cpio(path: &std::path::Path, entries: &[(&str, EntryKind, &[u8])]) -> P
     let container = stuffr::registry().require_container(cpio).unwrap();
     let file = std::fs::File::create(path).unwrap();
     let mut archive = container
-        .create(Box::new(file), &Default::default())
+        .create(stuffr::PlainSink::new(Box::new(file)), &Default::default())
         .unwrap();
     for (name, kind, data) in entries {
         let mut cursor = *data;
@@ -56,7 +56,7 @@ fn write_cpio(path: &std::path::Path, entries: &[(&str, EntryKind, &[u8])]) -> P
             )
             .unwrap();
     }
-    archive.finish().unwrap();
+    archive.finish().unwrap().finish().unwrap();
     path.to_path_buf()
 }
 

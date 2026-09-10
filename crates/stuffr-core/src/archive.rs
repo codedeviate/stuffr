@@ -201,6 +201,40 @@ pub trait Sink: Write + Send {
     fn finish(self: Box<Self>) -> Result<()>;
 }
 
+/// A [`Sink`] over a destination that needs no trailer — an uncompressed file.
+///
+/// Exists so `Container::create` can take a `Box<dyn Sink>` uniformly. A
+/// composed write never constructs one: there the codec's own `Sink` IS the
+/// container's destination. `finish` flushes, which is exactly what all four
+/// containers used to do by hand at the end of their own `finish`.
+pub struct PlainSink(Box<dyn Write + Send>);
+
+impl PlainSink {
+    /// Returns the boxed trait object rather than `Self` on purpose: every
+    /// call site wants a `Box<dyn Sink>`, and handing back `Self` would make
+    /// each of them re-box it.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new(w: Box<dyn Write + Send>) -> Box<dyn Sink> {
+        Box::new(Self(w))
+    }
+}
+
+impl Write for PlainSink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Sink for PlainSink {
+    fn finish(mut self: Box<Self>) -> Result<()> {
+        self.0.flush()?;
+        Ok(())
+    }
+}
+
 /// A byte-stream transform. Knows nothing about files, names, or entries.
 pub trait Codec: Send + Sync {
     fn id(&self) -> FormatId;
@@ -237,7 +271,13 @@ pub trait Container: Send + Sync {
     /// from the ladder's rather than re-deriving the same facts.
     fn open(&self, resolved: crate::ladder::Resolved, o: &OpenOpts)
     -> Result<Box<dyn ArchiveRead>>;
-    fn create(&self, dst: Box<dyn Write + Send>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>>;
+    /// Creates an archive writing into `dst`.
+    ///
+    /// Takes a [`Sink`] rather than a bare `Write` so a container over a codec
+    /// composes: the codec's own `Sink` is handed straight in, and
+    /// [`ArchiveWrite::finish`] gives it back so the caller can finish it.
+    /// Passing a bare file means wrapping it in [`PlainSink`].
+    fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>>;
 }
 
 pub trait ArchiveRead {
@@ -253,5 +293,57 @@ pub trait ArchiveRead {
 
 pub trait ArchiveWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()>;
-    fn finish(self: Box<Self>) -> Result<()>;
+    /// Writes the container's trailer and returns the destination.
+    ///
+    /// Returning it is what makes container-over-codec possible: the caller
+    /// still holds a `Sink` afterwards and can finish the codec layer, which
+    /// writes ITS trailer. Dropping the destination here — what this used to
+    /// do — silently truncated every composed archive.
+    ///
+    /// Implementors must NOT call `finish` on the returned sink. Finishing is
+    /// the caller's, once, at the outermost layer.
+    fn finish(self: Box<Self>) -> Result<Box<dyn Sink>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_sink_flushes_its_destination_on_finish() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Rec {
+            flushed: bool,
+            bytes: Vec<u8>,
+        }
+        struct W(Arc<Mutex<Rec>>);
+        impl Write for W {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().bytes.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.0.lock().unwrap().flushed = true;
+                Ok(())
+            }
+        }
+
+        let rec = Arc::new(Mutex::new(Rec::default()));
+        let mut sink = PlainSink::new(Box::new(W(Arc::clone(&rec))));
+        sink.write_all(b"payload").unwrap();
+        assert!(
+            !rec.lock().unwrap().flushed,
+            "finish has not been called yet"
+        );
+        sink.finish().unwrap();
+
+        let r = rec.lock().unwrap();
+        assert!(
+            r.flushed,
+            "PlainSink::finish must flush — a buffered destination loses its tail otherwise"
+        );
+        assert_eq!(r.bytes, b"payload");
+    }
 }
