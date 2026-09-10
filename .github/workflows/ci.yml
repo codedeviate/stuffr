@@ -113,6 +113,22 @@ jobs:
       # setup exists to catch. If this job ever fails for a missing system
       # library, that is the bug, not the runner.
       - run: cargo build --workspace --no-default-features --features c-backed
+      # Reference TOOLS, installed deliberately after the build above and
+      # never before it. The build is what proves the no-system-library
+      # property — linking happens there — so the guard the comment above
+      # describes is fully intact at the moment it matters. What follows is
+      # `cargo test`, and `lzip.rs`, `cpio.rs` and `zip.rs` each require a
+      # named reference binary through a panicking `require_bin`/
+      # `require_lzip`: absent, they fail loudly rather than proving nothing.
+      # None of these packages ships a `liblzma` pkg-config file, so none can
+      # mask the pkg-config regression this job exists to catch.
+      #
+      # This job went red on the v0.2.0 push for exactly this: Phase 2 turned
+      # lzip's silent skip into a hard requirement on the stated grounds that
+      # "CI already installs lzip unconditionally" — which was checked against
+      # `gate` and `msrv`, both of which do, and not against this job, which
+      # did not. 11 lzip tests panicked.
+      - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip
       - run: cargo test --workspace --no-default-features --features c-backed
 
   miri:
