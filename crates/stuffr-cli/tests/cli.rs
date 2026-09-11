@@ -4469,17 +4469,23 @@ fn a_format_flag_contradicting_the_output_name_is_refused_before_anything_is_wri
     }
 }
 
-/// The composed container path refuses `--threads`, so it must not honour
-/// `STUFFR_THREADS` either — the environment cannot be allowed to succeed at
-/// what the flag is refused for.
+/// Phase 2c used to hardcode the composed path's governor to `None`
+/// specifically so `STUFFR_THREADS` could not succeed at what `--threads`
+/// was refused for (no container compressed anything itself, so there was
+/// genuinely nothing to hand a worker count to). Now that
+/// `refuse_unhonoured_pack_flags` only refuses these where the resolved
+/// chain has NO codec layer, `-o out.tar.xz` names a real codec underneath
+/// the container, and `entries::create_archive` builds its governor from
+/// `ops::resolved_budget(o)` exactly as the single-stream path does —
+/// which means `STUFFR_THREADS` is consulted here now, precisely because
+/// `--threads` is honoured here now. The two must not drift apart again.
 ///
-/// This is the reproducibility promise, and xz is the format that would break
-/// it: a multi-threaded encode splits the input per worker, so the same input
-/// and the same flags produce DIFFERENT bytes. Measured before the fix on
-/// 32 MB: 26013588 bytes single-threaded against 25997368 with
-/// `STUFFR_THREADS=4`, at 195% CPU.
+/// This is the reproducibility promise working the other way: a
+/// multi-threaded xz encode splits the input per worker, so the same input
+/// and the same flags now produce DIFFERENT bytes under a different
+/// `STUFFR_THREADS` — where before the fix they were, wrongly, identical.
 #[test]
-fn the_composed_path_ignores_stuffr_threads_because_it_refuses_threads() {
+fn the_composed_path_honours_stuffr_threads_now_that_a_codec_is_present() {
     let dir = tmp_dir();
     let src = dir.join("big.txt");
     // Compressible but not trivially so, and large enough that xz would
@@ -4515,15 +4521,18 @@ fn the_composed_path_ignores_stuffr_threads_because_it_refuses_threads() {
             String::from_utf8_lossy(&o.stderr)
         );
     }
-    assert_eq!(
+    assert_ne!(
         std::fs::read(&plain).unwrap(),
         std::fs::read(&env).unwrap(),
-        "STUFFR_THREADS changed the bytes on a path that refuses --threads; same \
-         input plus same flags must mean same output"
+        "STUFFR_THREADS=4 must now change the bytes on a composed write with a codec \
+         layer, the same way it already does on a single-stream one; identical bytes \
+         here means the governor silently went back to None"
     );
 
-    // And the flag it mirrors is still refused, so the two stay consistent.
-    let refused = Command::new(STUFFR)
+    // And the flag it mirrors is honoured directly too, not just the
+    // variable behind it — the two stay consistent by construction, but
+    // both are worth asserting since either could regress independently.
+    let flagged = Command::new(STUFFR)
         .args([
             "pack",
             src.to_str().unwrap(),
@@ -4534,8 +4543,107 @@ fn the_composed_path_ignores_stuffr_threads_because_it_refuses_threads() {
         ])
         .output()
         .unwrap();
-    assert_eq!(refused.status.code(), Some(2));
+    assert!(
+        flagged.status.success(),
+        "--threads must be honoured where a codec is present: {}",
+        String::from_utf8_lossy(&flagged.stderr)
+    );
 }
+
+/// Phase 2's minor 4 refused --threads whenever the output named a container,
+/// reasoning that no container compresses anything itself. Composition makes
+/// that false: `-o out.tar.xz` HAS a codec layer, and xz encodes in parallel.
+#[test]
+fn encoder_flags_are_refused_only_where_there_is_no_codec_to_honour_them() {
+    let dir = tmp_dir();
+    let src = dir.join("notes.txt");
+    std::fs::write(&src, b"payload\n").unwrap();
+
+    // Bare container: still refused, still exit 2.
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            src.to_str().unwrap(),
+            "-o",
+            dir.join("a.tar").to_str().unwrap(),
+            "--threads",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        st.status.code(),
+        Some(2),
+        "a bare container has no codec to hand threads to"
+    );
+
+    // Container over codec: accepted.
+    let out = dir.join("b.tar.gz");
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--threads",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "a composed write HAS a codec: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    assert!(
+        Command::new("gunzip")
+            .args(["-t", out.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // --level likewise reaches the codec layer.
+    let out = dir.join("c.tar.gz");
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap(),
+                "--level",
+                "1",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("gunzip")
+            .args(["-t", out.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // And the single-stream codec path is untouched.
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "-o",
+                dir.join("d.gz").to_str().unwrap(),
+                "--threads",
+                "2",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 // ---------------------------------------------------------------------
 // Phase 2c: `pack` walks a directory tree, and says what walking it lost.
 // ---------------------------------------------------------------------
@@ -4904,5 +5012,97 @@ fn a_trailing_slash_on_a_packed_directory_is_noise() {
     assert!(
         text.contains("proj/src/main.rs"),
         "entries must sit under `proj/`, not under an empty name: {text}"
+    );
+}
+
+/// `stuffr pack . -o backup.tar` — `examples.txt`'s own headline idiom for
+/// the directory walk — writes `backup.tar` INSIDE the directory it is
+/// walking. The first run has nothing to exclude (`backup.tar` does not
+/// exist until this command creates it), but a `--force` re-run walks a
+/// directory that now contains the PREVIOUS run's archive; left unhandled
+/// that nests the old archive inside the new one and the file grows on
+/// every run. GNU tar's answer to the identical shape is `file is the
+/// archive; not dumped`.
+#[test]
+fn pack_excludes_its_own_output_from_the_walk() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"a").unwrap();
+
+    // First run: `backup.tar` does not exist yet, so there is nothing for
+    // the walk to exclude, and the archive holds exactly `a.txt`.
+    let st = Command::new(STUFFR)
+        .current_dir(&root)
+        .args(["pack", ".", "-o", "backup.tar"])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let out = root.join("backup.tar");
+    let first_len = std::fs::metadata(&out).unwrap().len();
+
+    // Second run, `--force`: `backup.tar` now exists INSIDE the directory
+    // being walked. If it were not excluded, this would nest the first
+    // run's archive inside the second and the file would grow; if it were
+    // silently dropped with no warning, `stderr` would say nothing about it.
+    let st = Command::new(STUFFR)
+        .current_dir(&root)
+        .args(["pack", ".", "-o", "backup.tar", "--force"])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    // The DROPPED ENTRY'S NAME, not the word "fidelity" — the pack summary
+    // line prints "... exact fidelity)" on every successful pack regardless
+    // of warnings, so asserting on that word alone would pass even with the
+    // whole warnings vector deleted.
+    let err = String::from_utf8_lossy(&st.stderr);
+    assert!(
+        err.contains("proj/backup.tar"),
+        "it must SAY WHAT it excluded, by name; stderr: {err}"
+    );
+    let second_len = std::fs::metadata(&out).unwrap().len();
+    assert_eq!(
+        first_len, second_len,
+        "a --force re-run must not nest the previous archive inside the new one"
+    );
+
+    let listed = run_output(&["list", out.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        !text.contains("backup.tar"),
+        "the archive must not contain an entry naming itself: {text}"
+    );
+    assert!(
+        text.contains("proj/a.txt"),
+        "everything else in the directory is still stored: {text}"
+    );
+
+    // And a THIRD run, `--force --strict-fidelity`, turns that same
+    // exclusion into a refusal, exactly as strict fidelity does for every
+    // other thing the walk cannot store.
+    let st3 = Command::new(STUFFR)
+        .current_dir(&root)
+        .args([
+            "pack",
+            ".",
+            "-o",
+            "backup.tar",
+            "--force",
+            "--strict-fidelity",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        st3.status.code(),
+        Some(4),
+        "strict fidelity must exit 4 when the walk had to exclude the archive itself"
     );
 }

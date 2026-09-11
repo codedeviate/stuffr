@@ -163,7 +163,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // A container output collects every path into one archive; a
             // codec output compresses exactly one stream.
             if let Some((container, codec)) = resolve_pack_chain(fmt, output.as_deref())? {
-                refuse_unhonoured_pack_flags(&opts)?;
+                refuse_unhonoured_pack_flags(&opts, codec.is_some())?;
                 let inputs = pack_inputs(&paths)?;
                 let dst = match output {
                     Some(o) => output_of(&o),
@@ -612,19 +612,33 @@ fn refuse_unhonoured_extract_flags(output: bool, format: bool) -> stuffr::Result
     Ok(())
 }
 
-/// Refuses the flags the container `pack` path cannot honour.
+/// Refuses encoder flags only where the resolved chain has no codec layer to
+/// hand them to.
 ///
-/// `entries::create_archive` builds `CreateOpts { level, ..Default::default() }`
-/// — no governor, no worker count, no weak-encoder consent — because none of
-/// the four registered containers compresses anything itself. Accepting
-/// `--threads`, `--turbo` or `--allow-weak-encoder` there and silently
-/// dropping them is the exact shape `refuse_unhonoured_extract_flags` above
-/// exists to prevent, and the extract side already refuses rather than
-/// accepts. `--memory-limit` is deliberately NOT here: it is honoured on
-/// every decode path, and on the container pack path it is simply inert in
+/// Phase 2 refused these for any container output, correctly at the time:
+/// none of the four registered containers compresses anything itself, so
+/// there was genuinely nothing to hand a worker count, a CPU-cap lift or a
+/// weak-encoder consent to. Accepting them there and silently dropping them
+/// is the exact shape `refuse_unhonoured_extract_flags` above exists to
+/// prevent.
+///
+/// Phase 2c makes `-o out.tar.xz` a real composed write with a codec layer
+/// underneath the container, and that codec DOES honour a worker count —
+/// `entries::create_archive` now builds its `EncodeOpts.governor` from
+/// `ops::resolved_budget(o)` exactly as the single-stream path does. An
+/// unconditional refusal would now reject a legitimate command, the shape
+/// this project has hit repeatedly. `has_codec` is `resolve_pack_chain`'s
+/// second tuple element: `Some` means the chain has a codec above the
+/// container, `None` means a bare container with nothing to compress it.
+///
+/// `--memory-limit` is deliberately NOT here, in either case: it is honoured
+/// on every decode path, and on a bare container pack it is simply inert in
 /// the same way `--no-sync` is (nothing allocates a dictionary), so it costs
 /// nothing to accept.
-fn refuse_unhonoured_pack_flags(opts: &CompressOpts) -> stuffr::Result<()> {
+fn refuse_unhonoured_pack_flags(opts: &CompressOpts, has_codec: bool) -> stuffr::Result<()> {
+    if has_codec {
+        return Ok(());
+    }
     if opts.threads.is_some() {
         return Err(stuffr::Error::Usage(
             "--threads governs a codec's parallel encoder; no container in this build \

@@ -765,6 +765,17 @@ pub fn cat(
 /// symlinks), any entry whose ownership was never learned, and a summary of
 /// hardlinks that will extract as independent copies. `--strict-fidelity`
 /// turns any of them into exit 4, exactly as it does on the read side.
+///
+/// # Excluding the output from its own walk
+///
+/// `stuffr pack . -o backup.tar` walks `.`, which — the first time `--force`
+/// re-runs the same command — already contains `backup.tar` from the
+/// previous run. Left unhandled, every run nests the last one inside the
+/// new one and the file grows without bound; GNU tar's answer to the same
+/// shape is `file is the archive; not dumped`, and this is that same
+/// refusal applied per-file rather than at the top. See [`canonical_output_path`]
+/// and [`is_output_file`] for how the comparison is made honest against
+/// relative walk paths and a destination that does not exist yet.
 pub fn create_archive(
     paths: &[PathBuf],
     dst: Output,
@@ -790,25 +801,26 @@ pub fn create_archive(
             }
             let encode = EncodeOpts {
                 level: o.level,
-                // Deliberately `None`, NOT `ops::resolved_budget(o)`.
+                // `ops::resolved_budget(o)`, matching the single-stream path.
                 //
-                // The CLI refuses `--threads`, `--turbo` and
-                // `--allow-weak-encoder` whenever the output names a
-                // container (`refuse_unhonoured_pack_flags`), but
-                // `resolved_budget` also consults `STUFFR_THREADS`, which no
-                // flag check can see. Building a governor from it here would
-                // make the environment succeed at exactly what the flag is
-                // refused for, and — because xz and lzip split their input
-                // per worker — `STUFFR_THREADS=4 stuffr pack big -o x.tar.xz`
-                // would emit different bytes from the same command without
-                // it. The reproducibility promise is same input + same flags
-                // + same environment; a path that refuses the flag must not
-                // honour the variable behind it.
+                // Phase 2c used to hardcode `None` here: the CLI refused
+                // `--threads`, `--turbo` and `--allow-weak-encoder` whenever
+                // the output named a container, so building a governor from
+                // `STUFFR_THREADS` alone (which no flag check can see) would
+                // have let the environment succeed at exactly what the flag
+                // was refused for — and, because xz and lzip split their
+                // input per worker, `STUFFR_THREADS=4 stuffr pack big -o
+                // x.tar.xz` would have emitted different bytes from the same
+                // command without it.
                 //
-                // When the refusal becomes conditional on a codec being
-                // present, this becomes `ops::resolved_budget(o)` in the same
-                // change, so the two stay consistent.
-                governor: None,
+                // Now that `refuse_unhonoured_pack_flags` only refuses these
+                // where the resolved chain has NO codec layer, a composed
+                // write with a codec is exactly the case `resolved_budget`
+                // exists for, and the reproducibility promise (same input +
+                // same flags + same environment) holds the same way it does
+                // on the single-stream path: `STUFFR_THREADS` is consulted
+                // here precisely because `--threads` is now honoured here.
+                governor: crate::ops::resolved_budget(o),
                 ..Default::default()
             };
             c.check_encode_opts(&encode)?;
@@ -816,6 +828,14 @@ pub fn create_archive(
         }
         None => None,
     };
+
+    // Resolved once, before the walk, so every file it finds can be checked
+    // against it: a re-run of `stuffr pack . -o backup.tar --force` must not
+    // walk `backup.tar` back into the new `backup.tar`, the way GNU tar
+    // refuses with `file is the archive; not dumped`. Read-only (a `stat` of
+    // the parent, nothing more), so it costs nothing against the "every
+    // input validated before the destination is touched" contract above.
+    let dst_canonical = canonical_output_path(&dst);
 
     let mut plan: Vec<crate::walk::WalkItem> = Vec::with_capacity(paths.len());
     let mut names = HashSet::new();
@@ -840,7 +860,29 @@ pub fn create_archive(
                 path.display()
             )));
         }
-        for item in crate::walk::walk(path, &name)? {
+        for mut item in crate::walk::walk(path, &name)? {
+            // The walk found the archive `pack` is about to write. Storing
+            // it would nest a growing copy of the previous run inside the
+            // new one every time `--force` re-runs the same command — safe
+            // (the whole plan, this item included, is built before the
+            // destination is even opened), but a monotonically growing
+            // archive is still a bug, and the flagship example in
+            // `examples.txt` is exactly this shape (`stuffr pack . -o
+            // backup.tar`). Recast as a `Skipped` item rather than dropped
+            // outright, so it still gets a fidelity warning naming it, the
+            // same way every other thing the walk cannot store does; and
+            // `link_id` is cleared so it does not inflate the hardlink
+            // summary for an entry that was never going to be written.
+            if let crate::walk::ItemSource::File(p) = &item.source
+                && is_output_file(p, dst_canonical.as_deref())
+            {
+                item.source = crate::walk::ItemSource::Skipped {
+                    reason: "is the archive being written; storing it would nest a \
+                             growing copy of the previous run inside this one"
+                        .into(),
+                };
+                item.link_id = None;
+            }
             // A skipped item claims no name, deliberately. It is never
             // written, and `meta.name` for one may carry U+FFFD where the
             // real name was undecodable — two different names can render
@@ -1010,6 +1052,53 @@ pub fn create_archive(
             Err(e)
         }
     }
+}
+
+/// The archive's own destination, canonicalized, so [`is_output_file`] can
+/// tell when a walked file IS the archive `create_archive` is about to write.
+///
+/// `dst` need not exist yet — this runs before `Output::create` touches the
+/// filesystem at all, which is the point of validating every input before the
+/// destination is touched — so only the PARENT is canonicalized (resolving
+/// `..`, `.` and any symlinks in it) and the file name is joined back on
+/// afterwards. That gives the same answer `Path::canonicalize` would once the
+/// file exists, without requiring that it already does. Mirrors the
+/// parent-vs-"." handling `Output::create` itself uses for the same reason.
+///
+/// `Output::Stdout`, and a parent that cannot itself be resolved yet (a typo,
+/// or a destination under a directory that does not exist), both return
+/// `None`: there is nothing to compare walked files against, and
+/// `Output::create` reports the real problem moments later with a clearer
+/// message than a silent skip-everything here would.
+fn canonical_output_path(dst: &Output) -> Option<PathBuf> {
+    let Output::Path(p) = dst else {
+        return None;
+    };
+    let parent = match p.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let file_name = p.file_name()?;
+    Some(parent.canonicalize().ok()?.join(file_name))
+}
+
+/// Whether the walked file at `candidate` IS the archive being written.
+///
+/// Compares canonical paths, not strings: `stuffr pack . -o backup.tar`
+/// walks with paths relative to `.`, while `backup.tar` names the very same
+/// file through a different-looking path the moment a symlinked parent or a
+/// `..` component is involved — and the reverse (a relative destination,
+/// absolute walk paths) is just as easy to construct. `candidate` was
+/// stat'ed by the walk moments before this runs, so `canonicalize` should
+/// succeed; if it somehow does not (a race with something removing the
+/// file), this reports "not the output" rather than propagating that as an
+/// error here — the file is about to be opened for real a few lines later,
+/// where a genuine problem surfaces on its own with a clearer message.
+fn is_output_file(candidate: &Path, dst_canonical: Option<&Path>) -> bool {
+    let Some(dst) = dst_canonical else {
+        return false;
+    };
+    candidate.canonicalize().is_ok_and(|c| c == dst)
 }
 
 /// Says so when an entry is about to be written with no ownership.

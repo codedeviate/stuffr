@@ -154,6 +154,13 @@ COLLECTING FILES INTO AN ARCHIVE
       no final component made it do) was a bug, not a rule. A trailing slash
       is noise: `pack proj/` and `pack proj` are the same command.
 
+      `backup.tar` itself is excluded from the walk, so re-running this
+      exact command with --force does not nest the previous archive inside
+      the new one — GNU tar's `file is the archive; not dumped` for the
+      identical shape. The exclusion is named in a fidelity warning, the
+      same as anything else the walk declines to store, and --strict-fidelity
+      turns it into exit 4 like any other.
+
       stuffr pack proj -o proj.a
       `ar` has no directory and no symlink concept at all, so those entries
       are DROPPED rather than written as zero-byte regular files — which
