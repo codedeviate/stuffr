@@ -5629,34 +5629,58 @@ fn packing_the_same_tree_twice_produces_identical_bytes() {
 /// The point of the outcome temp-then-rename, and of finishing the whole chain
 /// BEFORE `publish`. Two failures, at the two points a pack can fail:
 ///
-/// 1. AFTER the destination is opened — an unreadable file inside the tree
-///    being walked, which fails at `File::open` in the middle of the write
-///    loop, with a temp file already on disk holding a partial archive.
+/// 1. AFTER the destination is opened, from inside the write loop, with
+///    earlier entries already in the temp file — the only state `discard`
+///    exists to clean up.
 /// 2. BEFORE it is opened at all — a destination directory that cannot be
 ///    written, which fails in `Output::create`.
 ///
-/// Only (1) exercises the `discard` path, and it is the one that would go red
-/// if the error arm published instead of discarding.
+/// Only (1) exercises the `discard` arm, and the distinction is not
+/// theoretical: the read-only-directory mechanism used for (1) in the first
+/// round looked obviously correct and failed inside `Output::create`, before
+/// `finish` existed at all, so `discard` was structurally unreachable and the
+/// property tested nothing. That is why (1) is now driven by a container
+/// REFUSING an entry the destination has already begun to hold, and why the
+/// report records the `discard(finish)` -> `publish(finish)` mutation that
+/// proves this one does reach it.
+///
+/// The refusal is cpio's 4 GiB `u32` size field, reached with a SPARSE file:
+/// `check_u32_size` runs "before a single byte is read or allocated" (its own
+/// comment), so this costs no disk and no time. Every other candidate needs a
+/// race — a file truncated between the walk's `stat` and the write would do
+/// it, but nothing outside the process can schedule that window, and a test
+/// that only fails when it loses a race is worse than no test.
 #[cfg(unix)]
 #[test]
 fn a_failed_write_never_replaces_an_existing_archive() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let dir = tmp_dir();
     let root = dir.join("proj");
     std::fs::create_dir(&root).unwrap();
+    // Sorted first, so it is written into the temp file BEFORE the entry that
+    // fails — without an entry already written, `discard` would have nothing
+    // to clean up and this property would be about `create` again.
     std::fs::write(root.join("a.txt"), b"alpha").unwrap();
-    let unreadable = root.join("b.txt");
-    std::fs::write(&unreadable, b"beta").unwrap();
-    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
-    // Loud rather than skipped: running as root makes the file readable and
-    // this test would then prove nothing at all while passing.
+
+    let big = root.join("zbig.bin");
+    let f = std::fs::File::create(&big).unwrap();
+    f.set_len(u64::from(u32::MAX) + 1).unwrap();
+    drop(f);
+    let md = std::fs::metadata(&big).unwrap();
     assert!(
-        std::fs::File::open(&unreadable).is_err(),
-        "this test needs a non-root user; the unreadable file is still readable"
+        md.len() > u64::from(u32::MAX),
+        "the premise: the entry must exceed cpio's u32 size field"
+    );
+    assert!(
+        md.blocks() * 512 < md.len(),
+        "this filesystem did not make the fixture sparse ({} blocks for {} bytes); a \
+         non-sparse one would write 4 GiB to disk here",
+        md.blocks(),
+        md.len()
     );
 
-    let out = dir.join("existing.tar");
+    let out = dir.join("existing.cpio");
     std::fs::write(&out, b"PRECIOUS EXISTING CONTENT").unwrap();
 
     let st = Command::new(STUFFR)
@@ -5669,9 +5693,11 @@ fn a_failed_write_never_replaces_an_existing_archive() {
         ])
         .output()
         .unwrap();
-    assert!(
-        !st.status.success(),
-        "a file the walk cannot read must fail the pack, not be silently skipped"
+    assert_eq!(
+        st.status.code(),
+        Some(3),
+        "an entry this container cannot express is a capability limit, exit 3; stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
     );
     assert_eq!(
         std::fs::read(&out).unwrap(),
@@ -5687,7 +5713,7 @@ fn a_failed_write_never_replaces_an_existing_archive() {
     siblings.sort();
     assert_eq!(
         siblings,
-        vec!["existing.tar".to_string(), "proj".to_string()],
+        vec!["existing.cpio".to_string(), "proj".to_string()],
         "a failed pack must leave no temp file behind"
     );
 
@@ -5709,14 +5735,96 @@ fn a_failed_write_never_replaces_an_existing_archive() {
         ])
         .output()
         .unwrap();
-    assert!(
-        !st.status.success(),
-        "writing into a read-only directory must fail"
+    assert_eq!(
+        st.status.code(),
+        Some(1),
+        "a destination that cannot be created is an i/o failure, exit 1; stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
     );
     assert!(!target.exists(), "a failed pack must publish nothing");
 
     // Restored before the harness's own cleanup walks the tree.
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// An unreadable FILE is a warning, not a failure — the ruling that makes the
+/// walk consistent with itself.
+///
+/// `walk.rs`'s `descend` already skips a directory it cannot list, on the
+/// stated grounds that "backing up a home directory with one root-owned
+/// subdirectory in it is the ordinary case", and R9 chose skip-plus-warning
+/// for the analogous case. An unreadable file was never ruled on and, until
+/// this, propagated with a bare `?`: one unreadable file in a home directory
+/// aborted `stuffr pack ~ -o backup.tar` and produced nothing at all.
+///
+/// Skipping is not silent. The entry is named, and `--strict-fidelity` turns
+/// it into exit 4, the same as every other loss.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_file_is_skipped_with_a_warning_rather_than_failing_the_pack() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"alpha").unwrap();
+    let unreadable = root.join("secret.txt");
+    std::fs::write(&unreadable, b"beta").unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Loud rather than skipped: running as root makes the file readable, and
+    // this test would then pass having proved nothing at all.
+    assert!(
+        std::fs::File::open(&unreadable).is_err(),
+        "this test needs a non-root user; the unreadable file is still readable"
+    );
+
+    let out = dir.join("backup.tar");
+    let st = Command::new(STUFFR)
+        .args(["pack", root.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "one unreadable file must not lose the whole backup: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&st.stderr);
+    // The entry's NAME, not the word "fidelity": the pack summary prints
+    // "... exact fidelity)" on every successful pack, warnings or none, so
+    // asserting on that word would pass with the whole warnings vector gone.
+    assert!(
+        stderr.contains("proj/secret.txt"),
+        "it must SAY WHAT it skipped, by name; stderr: {stderr}"
+    );
+
+    // And the rest of the tree really is in there.
+    let listed = run_output(&["list", out.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(text.contains("proj/a.txt"), "{text}");
+    assert!(
+        !text.contains("secret.txt"),
+        "an entry that could not be read must not be written as an empty one: {text}"
+    );
+
+    // Strict fidelity is what turns the loss into a refusal.
+    let strict = dir.join("strict.tar");
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            root.to_str().unwrap(),
+            "-o",
+            strict.to_str().unwrap(),
+            "--strict-fidelity",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        st.status.code(),
+        Some(4),
+        "strict fidelity must refuse a pack that skipped a file; stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
     std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
@@ -5904,12 +6012,20 @@ fn first_space_run(text: &str) -> Option<usize> {
 }
 
 /// Whether a run of spaces is a deliberate COLUMN, not a collapsed
-/// continuation: everything before it on its own line is a plain label ending
-/// in a colon, which is `stuffr info`'s output shape (`format:   gzip`) and
-/// the `/proc/meminfo` fixture's.
+/// continuation: everything before it on its own line is a ONE-WORD label
+/// ending in a colon, which is `stuffr info`'s output shape (`format:   gzip`)
+/// and the `/proc/meminfo` fixture's (`MemAvailable:    1048576 kB`).
 ///
 /// Anything else — the historical defect's `` (`-o bundle.tar`, `` — is prose,
 /// and prose never needs three spaces in a row.
+///
+/// The single-word rule is load-bearing, not tidiness. An earlier version
+/// allowed any label of alphanumerics and SPACES, which exempted a whole prose
+/// clause that happened to end in a colon —
+/// `"stuffr cannot do this:                    try force"` passed it — and
+/// messages in this tree routinely end a clause with a colon before a list.
+/// One word still admits all seven exemptions the workspace actually has
+/// (`format:`, `chain:`, `rung:`, `size:` twice, `memory:`, `MemTotal:`).
 fn is_column_label(prefix: &str) -> bool {
     let tail = prefix
         .rsplit('\n')
@@ -5921,9 +6037,10 @@ fn is_column_label(prefix: &str) -> bool {
     match tail.strip_suffix(':') {
         Some(label) => {
             !label.is_empty()
+                && !label.contains(' ')
                 && label
                     .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == ' ' || ch == '_' || ch == '-')
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
         }
         None => false,
     }
@@ -5985,6 +6102,25 @@ fn no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation() 
         is_column_label(&found[0].1[..at]),
         "a deliberate column label must not be reported as a collapse"
     );
+
+    // The exemption must not widen back into prose. A whole clause ending in a
+    // colon is the historical defect verbatim — messages here routinely end a
+    // clause with a colon before a list — and an exemption that allowed spaces
+    // in the label let exactly this through.
+    let colon_prose = "fn f() { err(\"stuffr cannot do this:                    try force\"); }";
+    let found = rust_string_literals(colon_prose);
+    assert_eq!(found.len(), 1);
+    let at = first_space_run(&found[0].1).expect("the run is there");
+    assert!(
+        !is_column_label(&found[0].1[..at]),
+        "a prose clause ending in a colon is not a column label: {:?}",
+        found[0].1
+    );
+
+    // The two shapes either side of the one-word rule, so its boundary is
+    // pinned rather than incidental.
+    assert!(is_column_label("MemAvailable:"));
+    assert!(!is_column_label("two words:"));
 
     let quoted_char = "fn f() { let q = '\"'; err(\"a   collapse\"); }";
     let found = rust_string_literals(quoted_char);

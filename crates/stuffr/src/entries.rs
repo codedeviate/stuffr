@@ -762,9 +762,10 @@ pub fn cat(
 /// and there is no ladder on the write side — but the warnings are real:
 /// anything the walk met and could not store (see [`crate::walk::ItemSource`]),
 /// anything this container has no shape for (`ar` has neither directories nor
-/// symlinks), any entry whose ownership was never learned, and a summary of
-/// hardlinks that will extract as independent copies. `--strict-fidelity`
-/// turns any of them into exit 4, exactly as it does on the read side.
+/// symlinks), any file that could not be OPENED when its turn came, any entry
+/// whose ownership was never learned, and a summary of hardlinks that will
+/// extract as independent copies. `--strict-fidelity` turns any of them into
+/// exit 4, exactly as it does on the read side.
 ///
 /// # Excluding the output from its own walk
 ///
@@ -943,11 +944,37 @@ pub fn create_archive(
         let mut warnings = Vec::new();
         for item in &plan {
             match &item.source {
-                crate::walk::ItemSource::File(p) => {
-                    let mut file = std::fs::File::open(p)?;
-                    archive.add(&item.meta, &mut file)?;
-                    bytes_in += item.meta.size.unwrap_or(0);
-                }
+                // A file the walk named and this process cannot OPEN is a
+                // warning, never a failure — the same ruling `walk.rs`'s
+                // `descend` already applies to a directory that cannot be
+                // listed, and R9's answer for the analogous case.
+                //
+                // It used to be a bare `?`, which meant `stuffr pack ~ -o
+                // backup.tar` aborted over one unreadable file in a home
+                // directory and produced nothing at all. Losing one named
+                // file is strictly better than losing the whole backup, and
+                // this is not silent: the entry is named in the fidelity
+                // report and `--strict-fidelity` refuses on it, exactly as it
+                // does for every other thing the walk met and could not
+                // store. The asymmetry — unreadable DIRECTORY skipped,
+                // unreadable FILE fatal — was introduced by Phase 2c's walk
+                // and was never ruled on.
+                //
+                // Only `open` is forgiven. An error part-way THROUGH the
+                // payload still propagates: by then the container has a
+                // half-written entry whose header declares a length the
+                // stream will not deliver, and there is no honest way to
+                // finish that archive.
+                crate::walk::ItemSource::File(p) => match std::fs::File::open(p) {
+                    Ok(mut file) => {
+                        archive.add(&item.meta, &mut file)?;
+                        bytes_in += item.meta.size.unwrap_or(0);
+                    }
+                    Err(e) => warnings.push(Fidelity::EntrySkipped {
+                        entry: item.meta.name.clone(),
+                        reason: format!("could not be opened ({e}); it is not stored"),
+                    }),
+                },
                 // No payload: a directory has none, and a symlink's target
                 // lives in the container's own header (or, for cpio and zip,
                 // is written by the container from `EntryKind::Symlink`). The
