@@ -110,7 +110,12 @@ COLLECTING FILES INTO AN ARCHIVE
       container's trailer and the codec's trailer in that order — nothing
       is staged through a temporary file. --format names the CONTAINER
       only, so `--format tar -o bundle.tar.gz` resolves to the same chain
-      rather than to a bare tar under a misleading name.
+      rather than to a bare tar under a misleading name. When --format and
+      the name name DIFFERENT containers (`--format zip -o x.tar.gz`) pack
+      refuses at exit 2 rather than picking one: the bytes would be valid
+      gzip, so pack would exit 0 and `stuffr list` on that same path would
+      then exit 5 calling stuffr's own output corrupt — a reader takes the
+      outer layer from the magic and the container from the name.
 
   Three things pack refuses, all before anything is written: more than one
   path with a codec output (a codec compresses one stream and has nowhere
@@ -123,8 +128,13 @@ COLLECTING FILES INTO AN ARCHIVE
   refused (exit 2) when the output names a container. Accepting them and
   silently dropping them would promise behaviour that never happens. They
   stay available on the single-stream codec path, which really does honour
-  them. (A composed output does reach a real encoder, so the refusal is
-  stricter than it needs to be there; relaxing it is its own change.)
+  them. STUFFR_THREADS is ignored on the container path for the same
+  reason — the environment must not quietly succeed at what the flag is
+  refused for, and a parallel xz or lzip encode splits its input per
+  worker, so honouring it would make the same command emit different
+  bytes. (A composed output does reach a real encoder, so the refusal is
+  stricter than it needs to be there; relaxing it is its own change, and
+  will lift both halves together.)
 
   stuffr pack one.txt two.txt -o bundle.ar
   stuffr pack one.txt two.txt -o bundle.cpio

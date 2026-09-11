@@ -4373,3 +4373,155 @@ fn a_zip_round_trips_bare_and_inside_a_codec() {
         );
     }
 }
+
+/// `--format` and the output's own name are two sources of truth about the
+/// container, and they can disagree. Writing the file anyway is worse than
+/// refusing: the bytes are valid gzip, so `pack` exits 0 and `list` on the
+/// very same path then exits 5 — stuffr calling its own output corrupt, at
+/// the exit code that publicly means "these bytes are damaged".
+///
+/// Measured at the commit that introduced composition:
+/// `pack notes.txt --format zip -o x.tar.gz` wrote a zip inside gzip under a
+/// `.tar.gz` name, `stuffr info` reported "tar over gzip", and `stuffr list`
+/// exited 5.
+#[test]
+fn a_format_flag_contradicting_the_output_name_is_refused_before_anything_is_written() {
+    let dir = tmp_dir();
+    let src = dir.join("notes.txt");
+    std::fs::write(&src, b"payload\n").unwrap();
+
+    for (fmt, name) in [
+        ("zip", "x.tar.gz"),
+        ("tar", "x.zip.gz"),
+        ("tar", "x.cpio"),
+        ("cpio", "x.tgz"),
+    ] {
+        let out = dir.join(name);
+        let o = Command::new(STUFFR)
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "--format",
+                fmt,
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            o.status.code(),
+            Some(2),
+            "--format {fmt} -o {name} must be a usage error, not a written file"
+        );
+        let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+        assert!(
+            stderr.contains(fmt) && stderr.contains(name),
+            "the message must name both sides of the contradiction: {stderr:?}"
+        );
+        // "before anything is written" is the whole point of exit 2 here.
+        assert!(!out.exists(), "--format {fmt} -o {name} left a file behind");
+    }
+
+    // The agreeing spellings are untouched, including the one where the name
+    // carries only a codec and --format supplies the container.
+    for (fmt, name) in [("tar", "ok.tar.gz"), ("tar", "ok.gz"), ("zip", "ok.zip.gz")] {
+        let out = dir.join(name);
+        let o = Command::new(STUFFR)
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "--format",
+                fmt,
+                "-o",
+                out.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "--format {fmt} -o {name} must still work: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let l = Command::new(STUFFR)
+            .args(["list", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            l.status.success(),
+            "stuffr must be able to read back what it wrote to {name}: {}",
+            String::from_utf8_lossy(&l.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&l.stdout).contains("notes.txt"),
+            "{name}"
+        );
+    }
+}
+
+/// The composed container path refuses `--threads`, so it must not honour
+/// `STUFFR_THREADS` either — the environment cannot be allowed to succeed at
+/// what the flag is refused for.
+///
+/// This is the reproducibility promise, and xz is the format that would break
+/// it: a multi-threaded encode splits the input per worker, so the same input
+/// and the same flags produce DIFFERENT bytes. Measured before the fix on
+/// 32 MB: 26013588 bytes single-threaded against 25997368 with
+/// `STUFFR_THREADS=4`, at 195% CPU.
+#[test]
+fn the_composed_path_ignores_stuffr_threads_because_it_refuses_threads() {
+    let dir = tmp_dir();
+    let src = dir.join("big.txt");
+    // Compressible but not trivially so, and large enough that xz would
+    // really split it across workers.
+    let mut data = Vec::with_capacity(4 << 20);
+    let mut x: u32 = 0x1234_5678;
+    while data.len() < (4 << 20) {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        data.extend_from_slice(format!("line {} of the corpus\n", x >> 16).as_bytes());
+    }
+    std::fs::write(&src, &data).unwrap();
+
+    let plain = dir.join("plain.tar.xz");
+    let env = dir.join("env.tar.xz");
+    for (out, threads) in [(&plain, None), (&env, Some("4"))] {
+        let mut cmd = Command::new(STUFFR);
+        cmd.args([
+            "pack",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--level",
+            "1",
+        ]);
+        match threads {
+            Some(n) => cmd.env("STUFFR_THREADS", n),
+            None => cmd.env_remove("STUFFR_THREADS"),
+        };
+        let o = cmd.output().unwrap();
+        assert!(
+            o.status.success(),
+            "pack failed: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    }
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&env).unwrap(),
+        "STUFFR_THREADS changed the bytes on a path that refuses --threads; same \
+         input plus same flags must mean same output"
+    );
+
+    // And the flag it mirrors is still refused, so the two stay consistent.
+    let refused = Command::new(STUFFR)
+        .args([
+            "pack",
+            src.to_str().unwrap(),
+            "-o",
+            dir.join("flag.tar.xz").to_str().unwrap(),
+            "--threads",
+            "4",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+}

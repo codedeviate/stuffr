@@ -772,7 +772,25 @@ pub fn create_archive(
             }
             let encode = EncodeOpts {
                 level: o.level,
-                governor: crate::ops::resolved_budget(o),
+                // Deliberately `None`, NOT `ops::resolved_budget(o)`.
+                //
+                // The CLI refuses `--threads`, `--turbo` and
+                // `--allow-weak-encoder` whenever the output names a
+                // container (`refuse_unhonoured_pack_flags`), but
+                // `resolved_budget` also consults `STUFFR_THREADS`, which no
+                // flag check can see. Building a governor from it here would
+                // make the environment succeed at exactly what the flag is
+                // refused for, and — because xz and lzip split their input
+                // per worker — `STUFFR_THREADS=4 stuffr pack big -o x.tar.xz`
+                // would emit different bytes from the same command without
+                // it. The reproducibility promise is same input + same flags
+                // + same environment; a path that refuses the flag must not
+                // honour the variable behind it.
+                //
+                // When the refusal becomes conditional on a codec being
+                // present, this becomes `ops::resolved_budget(o)` in the same
+                // change, so the two stay consistent.
+                governor: None,
                 ..Default::default()
             };
             c.check_encode_opts(&encode)?;

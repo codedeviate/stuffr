@@ -161,7 +161,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
 
             // A container output collects every path into one archive; a
             // codec output compresses exactly one stream.
-            if let Some((container, codec)) = resolve_pack_chain(fmt, output.as_deref()) {
+            if let Some((container, codec)) = resolve_pack_chain(fmt, output.as_deref())? {
                 refuse_unhonoured_pack_flags(&opts)?;
                 let inputs = pack_inputs(&paths)?;
                 let dst = match output {
@@ -507,27 +507,54 @@ fn report_fidelity(report: &stuffr::FidelityReport, strict: bool) -> stuffr::Res
 /// rejects. `chain_for_new_path` reads the whole chain, and shares its
 /// extension table with the read side so `.tar.gz` cannot mean one thing to
 /// `pack` and another to `list`.
+///
+/// `Err` is the case where the two sources of truth CONTRADICT each other:
+/// `--format zip -o x.tar.gz` asks for a zip inside gzip under a name
+/// promising a tar. Writing it is worse than refusing — the file is perfectly
+/// good gzip, so `pack` exits 0 and `list` on the very same path then exits 5
+/// calling stuffr's own output corrupt, because reading resolves the outer
+/// layer by magic and the inner one by name. Exit 2 before anything is
+/// written is the only honest answer.
 fn resolve_pack_chain(
     fmt: Option<FormatId>,
     output: Option<&str>,
-) -> Option<(FormatId, Option<FormatId>)> {
+) -> stuffr::Result<Option<(FormatId, Option<FormatId>)>> {
     let registry = stuffr::registry();
 
     // An explicit --format names the CONTAINER; any codec still comes from
     // the output's name, so `--format tar -o x.gz` is tar over gzip.
     if let Some(id) = fmt {
-        registry.container(id)?;
-        let codec = output
-            .map(Path::new)
-            .map(|p| stuffr::chain_for_new_path(registry, p))
-            .and_then(|c| c.outermost_codec());
-        return Some((id, codec));
+        if registry.container(id).is_none() {
+            return Ok(None);
+        }
+        let chain = output.map(|o| stuffr::chain_for_new_path(registry, Path::new(o)));
+        if let Some(chain) = &chain
+            && let Some(named) = chain.container()
+            && named != id
+        {
+            let out = output.unwrap_or_default();
+            return Err(stuffr::Error::Usage(format!(
+                "--format {id} asks for a {id} archive, but the output name `{out}` says \
+                 {named}. Writing it would exit 0 and leave a file `stuffr list` \
+                 then calls corrupt, because a reader takes the container from \
+                 the name. Rename the output, or drop --format and let the name \
+                 decide."
+            )));
+        }
+        let codec = chain.and_then(|c| c.outermost_codec());
+        return Ok(Some((id, codec)));
     }
 
-    // Otherwise the output name carries the whole chain.
-    let chain = stuffr::chain_for_new_path(registry, Path::new(output?));
-    let container = chain.container()?;
-    Some((container, chain.outermost_codec()))
+    // Otherwise the output name carries the whole chain, and the two cannot
+    // disagree because there is only one of them.
+    let Some(output) = output else {
+        return Ok(None);
+    };
+    let chain = stuffr::chain_for_new_path(registry, Path::new(output));
+    match chain.container() {
+        Some(container) => Ok(Some((container, chain.outermost_codec()))),
+        None => Ok(None),
+    }
 }
 
 /// The paths `pack` will store as entries.
