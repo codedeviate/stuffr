@@ -634,6 +634,57 @@ mod tests {
         }
     }
 
+    /// The DIRECTORY half of the same rule, and the half the decision at the
+    /// top of `walk` is actually about: an undecodable name on a directory
+    /// takes its whole subtree with it, because naming its children would mean
+    /// writing U+FFFD into the archive as if it were the real parent's name —
+    /// and every one of those names would then be wrong.
+    ///
+    /// `a_non_utf8_filename_is_skipped_not_fatal` above creates a bad-named
+    /// FILE, so the `continue` runs but nothing proves a subtree was dropped
+    /// rather than mis-named. This fixture puts a readable, perfectly ordinary
+    /// file INSIDE the undecodable directory, and asserts it is absent.
+    ///
+    /// Linux only, for the same measured reason as its sibling: APFS enforces
+    /// UTF-8 filenames and rejects `b"bad\xff"` at the syscall with `EILSEQ`
+    /// (errno 92), so the fixture cannot be built on macOS at all. A `cfg`
+    /// rather than a runtime skip, so it always runs on CI's Linux runners
+    /// instead of being able to fail open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_undecodable_directory_takes_its_whole_subtree_with_it() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path();
+        let bad_dir = r.join("proj").join(std::ffi::OsStr::from_bytes(b"bad\xff"));
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        std::fs::write(bad_dir.join("inner.txt"), b"inner").unwrap();
+        std::fs::write(r.join("proj/good.txt"), b"good").unwrap();
+
+        let items = walk(&r.join("proj"), "proj").expect("one odd name must not fail the walk");
+        let names = names(&items);
+        assert!(
+            names.iter().any(|n| n == "proj/good.txt"),
+            "the rest of the tree must still be packed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("inner.txt")),
+            "nothing below an undecodable directory may be named, under U+FFFD or \
+             otherwise — every such name would be wrong at its parent component: {names:?}"
+        );
+        let bad = items
+            .iter()
+            .find(|i| i.meta.name.contains('\u{FFFD}'))
+            .expect("the undecodable directory must still be reported");
+        match &bad.source {
+            ItemSource::Skipped { reason } => assert!(
+                reason.contains("nor anything"),
+                "the reason must say the subtree went with it: {reason}"
+            ),
+            _ => panic!("an undecodable directory must be skipped, not stored"),
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_non_utf8_symlink_target_is_skipped_never_lossily_substituted() {

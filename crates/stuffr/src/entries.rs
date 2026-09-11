@@ -1714,4 +1714,49 @@ mod tests {
              about a field it never had is noise"
         );
     }
+
+    /// The three decisions [`is_output_file`] makes, the third of which is a
+    /// TOCTOU fallback no end-to-end test can schedule.
+    ///
+    /// The race itself — a file the walk stat'ed moments ago disappearing
+    /// before this `canonicalize` runs — needs an injection point the function
+    /// does not have, and a test that tried to win it by timing would be a
+    /// test that passes when it loses. The DECISION it encodes is a pure
+    /// function of a path that cannot be canonicalized, and that is testable
+    /// directly: report "not the output" rather than propagate, because the
+    /// file is opened for real a few lines later, where a genuine problem
+    /// surfaces with a clearer message than a naming complaint here.
+    ///
+    /// The middle case is not decoration: without it, a function returning
+    /// `false` unconditionally would satisfy the other two.
+    #[test]
+    fn a_candidate_that_cannot_be_canonicalized_is_not_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("backup.tar");
+        std::fs::write(&archive, b"pretend archive").unwrap();
+        let canonical = archive.canonicalize().unwrap();
+
+        assert!(
+            is_output_file(&archive, Some(&canonical)),
+            "the archive itself IS the output; without this the test below passes \
+             against a function that always says false"
+        );
+
+        let vanished = dir.path().join("deleted-between-stat-and-here.txt");
+        assert!(
+            !vanished.exists(),
+            "the premise: this path really cannot be canonicalized"
+        );
+        assert!(
+            !is_output_file(&vanished, Some(&canonical)),
+            "a candidate that cannot be resolved is not the output — it is not an \
+             error here either"
+        );
+
+        assert!(
+            !is_output_file(&archive, None),
+            "with no destination to compare against (stdout, or a parent that does \
+             not resolve) nothing can be the output"
+        );
+    }
 }

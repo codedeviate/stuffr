@@ -4126,6 +4126,13 @@ fn pointing_a_verb_at_the_wrong_file_always_exits_two() {
 /// All three were on new container paths and nothing asserted on any of
 /// them. Asserted structurally rather than by exact text, so rewording a
 /// message does not break the test but re-introducing the defect does.
+///
+/// These three cases are RENDERED evidence — real stderr from a real process —
+/// and they are deliberately kept, but they are no longer the guard: three
+/// hardcoded invocations could not cover a message a later task adds, and in
+/// Phase 2c exactly that happened. See
+/// `no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation`
+/// for the enumeration nothing can escape.
 #[test]
 fn no_cli_message_contains_a_run_of_collapsed_indentation() {
     let dir = tmp_dir();
@@ -4865,28 +4872,56 @@ fn packing_a_directory_into_a_container_that_cannot_hold_it_warns_rather_than_re
 
 /// The flag must not fire on a clean pack. A gate that always trips is a gate
 /// nobody leaves on.
+///
+/// The tree carries a SYMLINK, and that is the case worth pinning rather than
+/// an afterthought: `README.md:35` records that `--strict-fidelity` "fails on
+/// essentially any tarball containing a symlink" on the READ side, because a
+/// symlink's mtime cannot be restored without following the link (`std` has no
+/// `lutimes`). The write side has no such limit — tar stores the link, target
+/// and all, and loses nothing — so the two sides disagree about the same tree
+/// on purpose, and this is the half most likely to be "fixed" into a refusal
+/// by someone reading only the README.
 #[test]
 fn strict_fidelity_passes_on_a_pack_that_lost_nothing() {
     let dir = tmp_dir();
     let root = dir.join("proj");
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("main.rs", root.join("src/alias.rs")).unwrap();
 
+    let archive = dir.join("clean.tar");
     let st = Command::new(STUFFR)
         .args([
             "pack",
             root.to_str().unwrap(),
             "-o",
-            dir.join("clean.tar").to_str().unwrap(),
+            archive.to_str().unwrap(),
             "--strict-fidelity",
         ])
         .output()
         .unwrap();
     assert!(
         st.status.success(),
-        "an ordinary tree into tar loses nothing: {}",
+        "an ordinary tree into tar loses nothing, symlink included: {}",
         String::from_utf8_lossy(&st.stderr)
     );
+
+    // And the symlink really is IN there, as a link. Without this the test
+    // above would pass just as happily against a walk that dropped it —
+    // strict fidelity cannot complain about an entry nobody tried to store.
+    #[cfg(unix)]
+    {
+        let listed = Command::new("tar")
+            .args(["tvf", archive.to_str().unwrap()])
+            .output()
+            .expect("the system `tar` is this test's reference authority");
+        let text = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            text.contains("alias.rs -> main.rs"),
+            "the symlink must be stored as a link, not dropped or copied: {text}"
+        );
+    }
 }
 
 /// The walk names entries beneath the root's own final component, so two
@@ -5104,5 +5139,1002 @@ fn pack_excludes_its_own_output_from_the_walk() {
         st3.status.code(),
         Some(4),
         "strict fidelity must exit 4 when the walk had to exclude the archive itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2c, Task 6: the properties that would otherwise pass while being
+// structurally unable to fail.
+// ---------------------------------------------------------------------------
+
+/// Locates `bin` on `PATH`.
+///
+/// A local copy rather than a shared helper, matching this tree's existing
+/// convention: `ar.rs`, `cpio.rs`, `zip.rs` and `zip_on_a_pipe.rs` each carry
+/// their own. That four-copy situation was examined in Phase 2 and accepted
+/// deliberately; extracting a shared test helper is a tree-wide refactor, not
+/// something to smuggle into a testing task.
+fn which(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(bin);
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+/// Locates `bin` on `PATH`, panicking rather than silently skipping if it is
+/// absent. CI installs every tool named here (`tar` and `ar` ship with the
+/// image; `.github/workflows/ci.yml` installs `cpio`, `zip` and `unzip` on all
+/// three test jobs), so an absence means only a contributor's own machine
+/// lacks it — and a silent `return` would report a cross-implementation test
+/// as PASSING having verified nothing at all.
+fn require_bin(bin: &str) -> PathBuf {
+    which(bin).unwrap_or_else(|| {
+        panic!(
+            "no reference `{bin}` tool found on PATH — this test proved nothing, which is \
+             worth knowing rather than passing silently"
+        )
+    })
+}
+
+/// The permission bits only. The file-type bits are not what any container
+/// carries in its mode field, and comparing them would fail on the kind rather
+/// than on the permissions.
+#[cfg(unix)]
+fn perm_bits(md: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    md.permissions().mode() & 0o7777
+}
+
+/// A tree fixture whose every distinguishable fact is one a container is
+/// expected to carry: a nested directory, an EMPTY directory (which only a
+/// directory entry can preserve), a symlink, and two files with DIFFERENT
+/// modes.
+///
+/// Every mode is `0o600`/`0o700` deliberately: extraction tools mask restored
+/// permissions with the process umask, so a fixture using `0o644`/`0o755`
+/// compares equal under umask 022 and unequal under umask 077. These two have
+/// no bits any umask can clear, which makes the comparison umask-independent
+/// rather than passing on this machine's umask alone.
+#[cfg(unix)]
+fn build_reference_tree(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::create_dir(root.join("empty")).unwrap();
+    std::fs::write(root.join("a.txt"), b"alpha").unwrap();
+    std::fs::write(root.join("sub/b.bin"), b"\x00\xff\x00beta").unwrap();
+    std::os::unix::fs::symlink("a.txt", root.join("link")).unwrap();
+    for (p, mode) in [
+        (root.to_path_buf(), 0o700),
+        (root.join("sub"), 0o700),
+        (root.join("empty"), 0o700),
+        (root.join("a.txt"), 0o600),
+        (root.join("sub/b.bin"), 0o600),
+    ] {
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+}
+
+/// Everything under `root`, relative, sorted: name, kind, mode, and the file's
+/// own bytes or the link's own target.
+///
+/// NOT just names — the whole point of the cross-implementation property is
+/// that two tools agree about the CONTENTS of a tree, and a comparison of
+/// names alone passes against an extractor that produced empty files with the
+/// wrong modes.
+///
+/// A symlink's mode is deliberately omitted: `std` cannot restore one (no
+/// `lchmod`), which is the same limitation `README.md` records for mtime, and
+/// every tool here leaves it at the platform default.
+#[cfg(unix)]
+fn tree_snapshot(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let rel = path.strip_prefix(root).unwrap().display().to_string();
+            let md = std::fs::symlink_metadata(&path).unwrap();
+            if md.is_symlink() {
+                out.push(format!(
+                    "{rel}: symlink -> {}",
+                    std::fs::read_link(&path).unwrap().display()
+                ));
+            } else if md.is_dir() {
+                out.push(format!("{rel}: dir mode {:o}", perm_bits(&md)));
+                stack.push(path);
+            } else {
+                out.push(format!(
+                    "{rel}: file mode {:o} bytes {:?}",
+                    perm_bits(&md),
+                    std::fs::read(&path).unwrap()
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Runs a reference tool, with `COPYFILE_DISABLE=1` set unconditionally.
+///
+/// That variable is macOS's: bsdtar stores every file's extended attributes as
+/// a companion `._name` AppleDouble entry, and macOS puts a
+/// `com.apple.provenance` xattr on ordinary files, so a tree written by the
+/// system tar comes back with a `._` sibling for every entry and the
+/// comparison below fails for a reason that has nothing to do with stuffr.
+/// Linux's tar ignores the variable, so setting it always costs nothing and
+/// keeps the two platforms running the same command.
+fn run_tool(bin: &Path, args: &[&std::ffi::OsStr], cwd: &Path, stdin: &[u8]) -> Vec<u8> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .current_dir(cwd)
+        .env("COPYFILE_DISABLE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "reference tool {} {:?} failed: {}",
+        bin.display(),
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+}
+
+/// `OsStr` borrow, so `run_tool`'s argument list can mix `&str` and `&Path`.
+fn os(s: &impl AsRef<std::ffi::OsStr>) -> &std::ffi::OsStr {
+    s.as_ref()
+}
+
+fn pack_ok(args: &[&std::ffi::OsStr]) -> String {
+    let out = Command::new(STUFFR)
+        .arg("pack")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stuffr pack {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stderr).to_string()
+}
+
+fn unpack_ok(archive: &Path, dest: &Path) {
+    let out = Command::new(STUFFR)
+        .args([
+            std::ffi::OsStr::new("unpack"),
+            archive.as_ref(),
+            std::ffi::OsStr::new("-C"),
+            dest.as_ref(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stuffr unpack {} failed: {}",
+        archive.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Property 1 — cross-implementation, BOTH directions, per container.
+///
+/// "The system tool reads what we write" and "we read what it writes" are
+/// different claims; Phase 2's tar work proved it. Reference tools are
+/// required, never skipped: a silent skip proves nothing.
+///
+/// Compared as whole TREES — names, contents, modes and symlink targets — and
+/// through the CLI, which is what makes this new coverage rather than a second
+/// copy of `tar.rs`'s and `ar.rs`'s own byte-level cross-implementation tests:
+/// those build archives in memory and never walk a directory.
+///
+/// `ar` gets its documented DEGRADATION asserted instead of a faithful round
+/// trip, because it has no directory and no symlink entries. `cpio` (newc) is
+/// in the faithful group on measurement, not on assumption: it carries
+/// directories, symlinks and modes, and both directions are checked below.
+#[cfg(unix)]
+#[test]
+fn every_container_round_trips_a_tree_against_its_reference_tool() {
+    let tar_bin = require_bin("tar");
+    let zip_bin = require_bin("zip");
+    let unzip_bin = require_bin("unzip");
+    let cpio_bin = require_bin("cpio");
+    let ar_bin = require_bin("ar");
+
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    let root = tree.join("proj");
+    build_reference_tree(&root);
+    let want = tree_snapshot(&root);
+
+    // The fixture itself, asserted rather than assumed: every comparison below
+    // is only as strong as what the tree actually contains, and a fixture that
+    // silently lost its symlink would make four of the eight comparisons
+    // prove nothing.
+    assert_eq!(
+        want,
+        vec![
+            "a.txt: file mode 600 bytes [97, 108, 112, 104, 97]".to_string(),
+            "empty: dir mode 700".to_string(),
+            "link: symlink -> a.txt".to_string(),
+            "sub/b.bin: file mode 600 bytes [0, 255, 0, 98, 101, 116, 97]".to_string(),
+            "sub: dir mode 700".to_string(),
+        ],
+        "the fixture must carry a nested dir, an EMPTY dir, a symlink and two \
+         differently-named files, or the comparisons below prove less than they claim"
+    );
+
+    // ---- tar: stuffr writes, the system tar reads ----
+    let out_tar = dir.join("out.tar");
+    pack_ok(&[os(&root), os(&"-o"), os(&out_tar)]);
+    let back = dir.join("back-tar");
+    std::fs::create_dir(&back).unwrap();
+    run_tool(
+        &tar_bin,
+        &[os(&"-xf"), os(&out_tar), os(&"-C"), os(&back)],
+        &dir,
+        b"",
+    );
+    assert_eq!(
+        tree_snapshot(&back.join("proj")),
+        want,
+        "the system tar read our tar back as a different tree"
+    );
+
+    // ---- tar: the system tar writes, stuffr reads ----
+    let ref_tar = dir.join("ref.tar");
+    run_tool(
+        &tar_bin,
+        &[os(&"-cf"), os(&ref_tar), os(&"proj")],
+        &tree,
+        b"",
+    );
+    let back = dir.join("back-ref-tar");
+    unpack_ok(&ref_tar, &back);
+    assert_eq!(
+        tree_snapshot(&back.join("proj")),
+        want,
+        "we read a tar the system tar wrote as a different tree"
+    );
+
+    // ---- zip: stuffr writes, unzip reads ----
+    let out_zip = dir.join("out.zip");
+    pack_ok(&[os(&root), os(&"-o"), os(&out_zip)]);
+    let back = dir.join("back-zip");
+    run_tool(
+        &unzip_bin,
+        &[os(&"-q"), os(&out_zip), os(&"-d"), os(&back)],
+        &dir,
+        b"",
+    );
+    assert_eq!(
+        tree_snapshot(&back.join("proj")),
+        want,
+        "unzip read our zip back as a different tree"
+    );
+
+    // ---- zip: the system zip writes, stuffr reads ----
+    // `-y` stores symlinks as symlinks rather than following them; without it
+    // the reverse direction would compare a copy of `a.txt` against a link and
+    // fail for the fixture's reason rather than ours.
+    let ref_zip = dir.join("ref.zip");
+    run_tool(
+        &zip_bin,
+        &[os(&"-qry"), os(&ref_zip), os(&"proj")],
+        &tree,
+        b"",
+    );
+    let back = dir.join("back-ref-zip");
+    unpack_ok(&ref_zip, &back);
+    assert_eq!(
+        tree_snapshot(&back.join("proj")),
+        want,
+        "we read a zip the system zip wrote as a different tree"
+    );
+
+    // ---- cpio: stuffr writes, the system cpio reads ----
+    let out_cpio = dir.join("out.cpio");
+    pack_ok(&[os(&root), os(&"-o"), os(&out_cpio)]);
+    let back = dir.join("back-cpio");
+    std::fs::create_dir(&back).unwrap();
+    run_tool(
+        &cpio_bin,
+        &[os(&"-i"), os(&"-d"), os(&"--quiet")],
+        &back,
+        &std::fs::read(&out_cpio).unwrap(),
+    );
+    assert_eq!(
+        tree_snapshot(&back.join("proj")),
+        want,
+        "the system cpio read our cpio back as a different tree"
+    );
+
+    // ---- cpio: the system cpio writes, stuffr reads ----
+    // The name list comes from this test rather than from `find`, so no shell
+    // and no second traversal implementation is involved.
+    let names = b"proj\nproj/a.txt\nproj/empty\nproj/link\nproj/sub\nproj/sub/b.bin\n";
+    let ref_cpio_bytes = run_tool(
+        &cpio_bin,
+        &[os(&"-o"), os(&"--format=newc"), os(&"--quiet")],
+        &tree,
+        names,
+    );
+    let ref_cpio = dir.join("ref.cpio");
+    std::fs::write(&ref_cpio, &ref_cpio_bytes).unwrap();
+    let back = dir.join("back-ref-cpio");
+    unpack_ok(&ref_cpio, &back);
+    assert_eq!(
+        tree_snapshot(&back.join("proj")),
+        want,
+        "we read a cpio the system cpio wrote as a different tree"
+    );
+
+    // ---- ar: the documented degradation, both directions ----
+    //
+    // `ar` has no directory and no symlink entries at all, so a faithful tree
+    // round trip is not the property — what it must do is store the regular
+    // files, drop the rest, and SAY SO. Asserted against the system `ar`'s own
+    // listing, not against our reader.
+    let out_ar = dir.join("out.a");
+    let stderr = pack_ok(&[os(&root), os(&"-o"), os(&out_ar)]);
+    for dropped in ["proj/empty", "proj/link", "proj/sub"] {
+        assert!(
+            stderr.contains(dropped),
+            "`ar` dropping `{dropped}` must be named in the fidelity report; stderr: {stderr}"
+        );
+    }
+    let listed = run_tool(&ar_bin, &[os(&"t"), os(&out_ar)], &dir, b"");
+    let mut members: Vec<String> = String::from_utf8_lossy(&listed)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    members.sort();
+    assert_eq!(
+        members,
+        vec!["proj/a.txt".to_string(), "proj/sub/b.bin".to_string()],
+        "the system ar must list exactly the regular files, and nothing standing in for \
+         the directories or the symlink"
+    );
+
+    // And the other direction. `rcS` rather than `rc`: macOS's `ar` runs a
+    // ranlib-style index over plain files by default and then silently emits
+    // an archive holding ONLY an empty `__.SYMDEF SORTED` — measured, and
+    // already documented in `ar.rs`'s own `we_accept_what_system_ar_writes`.
+    let ref_ar = dir.join("ref.a");
+    run_tool(
+        &ar_bin,
+        &[os(&"rcS"), os(&ref_ar), os(&"a.txt")],
+        &root,
+        b"",
+    );
+    let back = dir.join("back-ref-ar");
+    unpack_ok(&ref_ar, &back);
+    assert_eq!(
+        std::fs::read(back.join("a.txt")).unwrap(),
+        b"alpha",
+        "we read an ar the system ar wrote as different bytes"
+    );
+}
+
+/// Property 2 — the same tree packed twice is byte-identical, AND the entries
+/// are in sorted order.
+///
+/// The two halves are not the same claim, and the second is the one that
+/// needed adding. Byte-identity alone asserts DETERMINISM, not ordering:
+/// `read_dir` is stable within a filesystem, so deleting the sort in
+/// `walk.rs` entirely leaves two consecutive packs byte-identical and this
+/// property green — measured, by deleting it (see `walk.rs`'s own
+/// `each_directory_level_is_sorted_regardless_of_readdir_order`, which exists
+/// for exactly this reason). So the archive's own entry ORDER is asserted
+/// here too, against a fixture created in reverse-alphabetical order so that
+/// readdir order and sorted order provably differ.
+///
+/// Byte-identity is still worth its half: it is what pins the composed
+/// container-inside-codec path, where a codec could introduce a timestamp of
+/// its own.
+#[test]
+fn packing_the_same_tree_twice_produces_identical_bytes() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    // Created in reverse-alphabetical order, so a filesystem that hands back
+    // creation order (tmpfs, ext4 for a small directory) is provably not
+    // handing back sorted order. The premise is asserted below rather than
+    // assumed, because a filesystem that DID sort would make the ordering
+    // half of this test unable to fail.
+    for n in ["z.txt", "m.txt", "a.txt"] {
+        std::fs::write(root.join(n), n.as_bytes()).unwrap();
+    }
+    std::fs::write(root.join("b/inner.txt"), b"inner").unwrap();
+
+    let readdir_order: Vec<String> = std::fs::read_dir(&root)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    let mut sorted = readdir_order.clone();
+    sorted.sort();
+    assert_ne!(
+        readdir_order, sorted,
+        "this filesystem hands back directory entries already sorted, so the ordering \
+         assertion below could not fail; the fixture needs a name order this filesystem \
+         does not reproduce"
+    );
+
+    let listing = dir.join("order.tar");
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            root.to_str().unwrap(),
+            "-o",
+            listing.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let listed = run_output(&["list", listing.to_str().unwrap()]);
+    let names: Vec<String> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .map(|l| l.split_whitespace().last().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "proj",
+            "proj/a.txt",
+            "proj/b",
+            "proj/b/inner.txt",
+            "proj/m.txt",
+            "proj/z.txt",
+        ],
+        "entries must be written in sorted, depth-first order — `readdir` order was {readdir_order:?}"
+    );
+
+    for ext in ["tar", "tar.gz", "zip"] {
+        let one = dir.join(format!("one.{ext}"));
+        let two = dir.join(format!("two.{ext}"));
+        for out in [&one, &two] {
+            let st = Command::new(STUFFR)
+                .args(["pack", root.to_str().unwrap(), "-o", out.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(
+                st.status.success(),
+                "stderr: {}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+        }
+        assert_eq!(
+            std::fs::read(&one).unwrap(),
+            std::fs::read(&two).unwrap(),
+            "the same tree must pack to the same `.{ext}` bytes; readdir order is not stable"
+        );
+    }
+}
+
+/// Property 3 — a failed write must leave the destination unpublished, and
+/// must not take an existing archive at that path down with it.
+///
+/// The point of the outcome temp-then-rename, and of finishing the whole chain
+/// BEFORE `publish`. Two failures, at the two points a pack can fail:
+///
+/// 1. AFTER the destination is opened — an unreadable file inside the tree
+///    being walked, which fails at `File::open` in the middle of the write
+///    loop, with a temp file already on disk holding a partial archive.
+/// 2. BEFORE it is opened at all — a destination directory that cannot be
+///    written, which fails in `Output::create`.
+///
+/// Only (1) exercises the `discard` path, and it is the one that would go red
+/// if the error arm published instead of discarding.
+#[cfg(unix)]
+#[test]
+fn a_failed_write_never_replaces_an_existing_archive() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"alpha").unwrap();
+    let unreadable = root.join("b.txt");
+    std::fs::write(&unreadable, b"beta").unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Loud rather than skipped: running as root makes the file readable and
+    // this test would then prove nothing at all while passing.
+    assert!(
+        std::fs::File::open(&unreadable).is_err(),
+        "this test needs a non-root user; the unreadable file is still readable"
+    );
+
+    let out = dir.join("existing.tar");
+    std::fs::write(&out, b"PRECIOUS EXISTING CONTENT").unwrap();
+
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            root.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !st.status.success(),
+        "a file the walk cannot read must fail the pack, not be silently skipped"
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"PRECIOUS EXISTING CONTENT",
+        "a pack that failed mid-write must not have replaced the archive already there"
+    );
+    // Nothing half-written left behind either: the destination directory holds
+    // exactly what it held before, plus nothing.
+    let mut siblings: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    siblings.sort();
+    assert_eq!(
+        siblings,
+        vec!["existing.tar".to_string(), "proj".to_string()],
+        "a failed pack must leave no temp file behind"
+    );
+
+    // The second failure point: the destination cannot be created at all.
+    let ro = dir.join("readonly");
+    std::fs::create_dir(&ro).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+    assert!(
+        std::fs::File::create(ro.join("probe")).is_err(),
+        "this test needs a non-root user; the read-only directory is still writable"
+    );
+    let target = ro.join("out.tar");
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            root.join("a.txt").to_str().unwrap(),
+            "-o",
+            target.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !st.status.success(),
+        "writing into a read-only directory must fail"
+    );
+    assert!(!target.exists(), "a failed pack must publish nothing");
+
+    // Restored before the harness's own cleanup walks the tree.
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The collapsed-indentation guard, enumerated structurally.
+// ---------------------------------------------------------------------------
+
+/// Every `.rs` file under the workspace's `crates/*/src/`.
+///
+/// Discovered by walking, not listed: a message added by a future task in a
+/// file that does not exist yet is exactly the case the hardcoded version of
+/// this guard could not cover.
+///
+/// `CARGO_MANIFEST_DIR` bakes an absolute path at compile time, the same
+/// hazard `CARGO_BIN_EXE_stuffr` already carries at the top of this file — if
+/// the repository is moved, `cargo clean -p stuffr-cli` is the fix for both
+/// (see `CLAUDE.md`).
+fn workspace_source_files() -> Vec<PathBuf> {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut out = Vec::new();
+    let mut stack: Vec<PathBuf> = std::fs::read_dir(crates)
+        .unwrap()
+        .map(|e| e.unwrap().path().join("src"))
+        .filter(|p| p.is_dir())
+        .collect();
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every Rust string literal in `src`, as the compiler will see it: `\` at
+/// end of line strips the newline AND the next line's leading whitespace, so a
+/// literal written with that continuation contains no indentation at all,
+/// while one that lost its `\` carries the indentation into the message.
+///
+/// Comments, char literals and lifetimes are skipped so that a `"` inside one
+/// cannot desynchronise the scan. Raw strings are included: they cannot use
+/// `\`-continuation, so a multi-line one carries its indentation too.
+fn rust_string_literals(src: &str) -> Vec<(usize, String)> {
+    let c: Vec<char> = src.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut line = 1usize;
+    while i < c.len() {
+        if c[i] == '\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if c[i] == '/' && c.get(i + 1) == Some(&'/') {
+            while i < c.len() && c[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+            let mut depth = 1usize;
+            i += 2;
+            while i < c.len() && depth > 0 {
+                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    if c[i] == '\n' {
+                        line += 1;
+                    }
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // A char literal (`'a'`, `'\''`, `'"'`) or a lifetime (`'a`). Telling
+        // them apart matters: treating `'"'` as a lifetime would leave the
+        // scan inside a string it never entered.
+        if c[i] == '\'' {
+            if c.get(i + 1) == Some(&'\\') {
+                let mut j = i + 2;
+                while j < c.len() && c[j] != '\'' {
+                    j += 1;
+                }
+                i = j + 1;
+                continue;
+            }
+            if c.get(i + 2) == Some(&'\'') {
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        // A raw string, optionally byte: `r"…"`, `r#"…"#`, `br##"…"##`.
+        let ident_before = i > 0 && (c[i - 1].is_alphanumeric() || c[i - 1] == '_');
+        if (c[i] == 'r' || c[i] == 'b') && !ident_before {
+            let mut j = i;
+            if c[j] == 'b' {
+                j += 1;
+            }
+            if c.get(j) == Some(&'r') {
+                j += 1;
+                let mut hashes = 0usize;
+                while c.get(j) == Some(&'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if c.get(j) == Some(&'"') {
+                    let start_line = line;
+                    j += 1;
+                    let mut text = String::new();
+                    loop {
+                        if j >= c.len() {
+                            break;
+                        }
+                        if c[j] == '"' && c[j + 1..].iter().take(hashes).all(|h| *h == '#') {
+                            j += 1 + hashes;
+                            break;
+                        }
+                        if c[j] == '\n' {
+                            line += 1;
+                        }
+                        text.push(c[j]);
+                        j += 1;
+                    }
+                    out.push((start_line, text));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        if c[i] == '"' {
+            let start_line = line;
+            let mut text = String::new();
+            let mut j = i + 1;
+            while j < c.len() && c[j] != '"' {
+                if c[j] == '\\' && c.get(j + 1) == Some(&'\n') {
+                    // The continuation rustc applies, and the whole reason a
+                    // correctly-written message carries no indentation.
+                    line += 1;
+                    j += 2;
+                    while matches!(c.get(j), Some(' ' | '\t' | '\r' | '\n')) {
+                        if c[j] == '\n' {
+                            line += 1;
+                        }
+                        j += 1;
+                    }
+                    continue;
+                }
+                if c[j] == '\\' {
+                    text.push(c[j]);
+                    if let Some(&e) = c.get(j + 1) {
+                        text.push(e);
+                    }
+                    j += 2;
+                    continue;
+                }
+                if c[j] == '\n' {
+                    line += 1;
+                }
+                text.push(c[j]);
+                j += 1;
+            }
+            out.push((start_line, text));
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The byte offset of the first run of three or more spaces in `text`, if any.
+fn first_space_run(text: &str) -> Option<usize> {
+    text.as_bytes().windows(3).position(|w| w == b"   ")
+}
+
+/// Whether a run of spaces is a deliberate COLUMN, not a collapsed
+/// continuation: everything before it on its own line is a plain label ending
+/// in a colon, which is `stuffr info`'s output shape (`format:   gzip`) and
+/// the `/proc/meminfo` fixture's.
+///
+/// Anything else — the historical defect's `` (`-o bundle.tar`, `` — is prose,
+/// and prose never needs three spaces in a row.
+fn is_column_label(prefix: &str) -> bool {
+    let tail = prefix
+        .rsplit('\n')
+        .next()
+        .unwrap_or(prefix)
+        .rsplit("\\n")
+        .next()
+        .unwrap_or(prefix);
+    match tail.strip_suffix(':') {
+        Some(label) => {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == ' ' || ch == '_' || ch == '-')
+        }
+        None => false,
+    }
+}
+
+/// Phase 2's final review found three multi-line literals in `main.rs`
+/// collapsed with their continuation indentation left in, so users saw runs of
+/// 22-30 spaces mid-sentence:
+///
+/// ```text
+/// stuffr: usage error: packing 2 paths needs an output naming a container
+/// (`-o bundle.tar`,                      or --format tar); a codec …
+/// ```
+///
+/// The guard written then enumerated three hardcoded invocations, and in Phase
+/// 2c it failed to catch the identical defect recurring, because the new
+/// message was not one of its three. This is the same guard enumerated from
+/// something a future task cannot escape: every string literal in every
+/// source file of every crate, discovered by walking the tree, whether or not
+/// any test ever reaches the code that prints it.
+///
+/// The mechanism is the one that produced the defect twice: a heredoc (or any
+/// other editor) eating the `\` that ends a continued line leaves the next
+/// line's indentation INSIDE the literal, and `cargo fmt` then folds the whole
+/// thing onto one line. Neither the compiler nor the gate sees anything wrong;
+/// only running the binary does.
+#[test]
+fn no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation() {
+    // The scanner is tested before it is trusted. Without this, a scanner that
+    // silently found no literals at all would report the whole workspace
+    // clean — the exact shape of defect this test exists to catch.
+    let defective = "fn f() { err(\"packing paths needs a container (`-o bundle.tar`,                      or --format tar)\"); }";
+    let found = rust_string_literals(defective);
+    assert_eq!(
+        found.len(),
+        1,
+        "the scanner must find the literal: {found:?}"
+    );
+    assert!(
+        first_space_run(&found[0].1).is_some_and(|at| !is_column_label(&found[0].1[..at])),
+        "the scanner must flag the historical defect: {:?}",
+        found[0].1
+    );
+
+    let continued = "fn f() { err(\"packing paths needs a container \\\n                     (`-o bundle.tar`, or --format tar)\"); }";
+    let found = rust_string_literals(continued);
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        found[0].1, "packing paths needs a container (`-o bundle.tar`, or --format tar)",
+        "a `\\`-continued literal carries no indentation, and the scanner must apply that \
+         rule rather than report the source text"
+    );
+    assert!(first_space_run(&found[0].1).is_none());
+
+    let aligned = "fn f() { println!(\"format:   {}\", x); }";
+    let found = rust_string_literals(aligned);
+    let at = first_space_run(&found[0].1).expect("the column really is three spaces");
+    assert!(
+        is_column_label(&found[0].1[..at]),
+        "a deliberate column label must not be reported as a collapse"
+    );
+
+    let quoted_char = "fn f() { let q = '\"'; err(\"a   collapse\"); }";
+    let found = rust_string_literals(quoted_char);
+    assert_eq!(
+        found.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>(),
+        vec!["a   collapse"],
+        "a `\"` inside a char literal must not desynchronise the scan"
+    );
+
+    // And now the workspace itself.
+    let files = workspace_source_files();
+    assert!(
+        files.len() > 20,
+        "the walk found only {} source files, which is not this workspace: {files:?}",
+        files.len()
+    );
+    assert!(
+        files.iter().any(|p| p.ends_with("stuffr-cli/src/main.rs")),
+        "the walk must reach the crate every user-facing message is printed from"
+    );
+
+    let mut scanned = 0usize;
+    let mut offenders = Vec::new();
+    for file in &files {
+        let src = std::fs::read_to_string(file).unwrap();
+        for (line, text) in rust_string_literals(&src) {
+            scanned += 1;
+            let Some(at) = first_space_run(&text) else {
+                continue;
+            };
+            if is_column_label(&text[..at]) {
+                continue;
+            }
+            offenders.push(format!("{}:{line}: {text:?}", file.display()));
+        }
+    }
+    assert!(
+        scanned > 1000,
+        "only {scanned} literals scanned, which is not this workspace"
+    );
+    assert!(
+        offenders.is_empty(),
+        "a string literal carries a run of three or more spaces, which reaches the user as \
+         collapsed continuation indentation mid-sentence. Re-join the sentence and end each \
+         continued line with `\\` (which strips the newline AND the next line's indentation); \
+         a deliberate column is written `label:   value`. Offenders:\n{}",
+        offenders.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Three branches of `entries.rs` that were verified by reading, not by test.
+// ---------------------------------------------------------------------------
+
+/// `/` has no final component to name an entry after, and the refusal is a
+/// usage error — not an `Io` error, and not an archive named `/`, which
+/// `unpack` would then refuse at exit 7.
+#[test]
+fn packing_the_filesystem_root_is_a_usage_error_that_says_why() {
+    let dir = tmp_dir();
+    let out = dir.join("root.tar");
+    let st = Command::new(STUFFR)
+        .args(["pack", "/", "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        st.status.code(),
+        Some(2),
+        "packing `/` is the caller's mistake, not an i/o failure; stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&st.stderr);
+    assert!(
+        stderr.contains("no final path component"),
+        "the message must say what is wrong with `/`: {stderr}"
+    );
+    assert!(
+        !out.exists(),
+        "the refusal happens before the destination is opened"
+    );
+}
+
+/// A path ending in `..` that does not exist fails as the `Io` error it is
+/// (exit 1), not as a naming complaint.
+///
+/// `entry_name_for` reaches `canonicalize` for any path whose final component
+/// is `.` or `..`, and that call is what reports a missing path here — a
+/// deliberate exit-code decision (`Usage` before Phase 2c) with nothing
+/// pinning it.
+#[test]
+fn a_nonexistent_dotdot_path_is_reported_as_an_io_error() {
+    let dir = tmp_dir();
+    let out = dir.join("dd.tar");
+    let missing = dir.join("nosuch/..");
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            missing.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        st.status.code(),
+        Some(1),
+        "a path that does not exist is an i/o error, whatever its final component; \
+         stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    assert!(!out.exists());
+}
+
+/// `pack .` from a SYMLINKED working directory names entries after the
+/// directory the link resolves to, not after the link.
+///
+/// Surprising the first time it happens (`cd proj && stuffr pack .` writes
+/// `real/…`), and correct: `Path::file_name` gives `None` for `.`, so the name
+/// comes from `canonicalize`, which resolves every symlink in the path. Pinned
+/// because the obvious "fix" — using the shell's `$PWD` or the un-resolved cwd
+/// — would silently change every such archive's entry names.
+#[cfg(unix)]
+#[test]
+fn pack_of_dot_from_a_symlinked_directory_names_entries_after_the_real_one() {
+    let dir = tmp_dir();
+    std::fs::create_dir_all(dir.join("real/src")).unwrap();
+    std::fs::write(dir.join("real/src/main.rs"), b"fn main() {}").unwrap();
+    std::os::unix::fs::symlink("real", dir.join("proj")).unwrap();
+
+    let out = dir.join("sym.tar");
+    let st = Command::new(STUFFR)
+        .current_dir(dir.join("proj"))
+        .args(["pack", ".", "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let listed = run_output(&["list", out.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        text.contains("real/src/main.rs"),
+        "`.` resolves through the symlink, so entries sit under the real directory's \
+         name: {text}"
+    );
+    assert!(
+        !text.contains("proj/"),
+        "nothing may be named after the link itself: {text}"
     );
 }

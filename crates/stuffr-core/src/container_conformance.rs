@@ -1,11 +1,11 @@
-//! Container conformance: one call per container, twelve properties.
+//! Container conformance: one call per container, thirteen properties.
 //!
 //! The codec equivalent (`conformance.rs`) caught defects at codec two rather
 //! than codec nine. Containers vary structurally more than codecs, not less,
 //! so the same method applies. Properties skip on EVIDENCE — `ContainerCaps`
 //! and measurement — never on trust, exactly as the codec harness does.
 //!
-//! Twelve properties, one function.
+//! Thirteen properties, one function.
 //!
 //! 1. Identity: `Container::id()` must agree with the `FormatMeta` it is
 //!    registered under, or a mismatched registration is completely silent —
@@ -64,6 +64,18 @@
 //!     happens once, at the ops layer, in a later task. A container that
 //!     helpfully rewrote `../../etc/passwd` would destroy the evidence that
 //!     refusal depends on.
+//! 13. `ContainerCaps::stores_dirs` and `stores_symlinks` are BEHAVIOUR, not
+//!     a claim: a container declaring either must write an entry of that kind
+//!     and read it back as that kind. Until this existed the two fields were
+//!     taken on trust, which departs from `CodecCaps::detects_corruption` —
+//!     verified by the codec harness rather than believed — and left nothing
+//!     failing if a container claimed `stores_dirs: true` and wrote a
+//!     zero-byte regular file instead. That is precisely the `ar` failure
+//!     mode the fields exist to describe, and `entries.rs` branches on them
+//!     to decide between writing an entry and warning that it cannot: a false
+//!     claim there produces a directory-shaped FILE, after which every entry
+//!     beneath it is unextractable. Skipped on evidence like every other
+//!     property here — a container claiming neither is asked for neither.
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -458,6 +470,57 @@ fn read_all_meta(container: &dyn Container, bytes: &[u8]) -> Vec<EntryMeta> {
     out
 }
 
+/// Like [`read_all_meta`], but over a SEEKABLE source.
+///
+/// Property 13 needs this and the other read helpers do not. Every one of them
+/// hands the container a [`ReaderSource`], which has no `Seek` to fall back on
+/// at the type level — deliberately, because most properties here are about
+/// the streaming premise. But `stores_symlinks` is a claim about what the
+/// ARCHIVE records, and zip records a symlink's `S_IFLNK` in the central
+/// directory's external attributes, which a forward read never reaches: zip's
+/// own module doc says a piped read cannot see symlinks at all, and that is
+/// the format's limitation, not a false capability claim. Reading back the way
+/// a real caller reads a file on disk is what makes the property test the
+/// claim rather than the source.
+///
+/// Seekable in MEMORY (`SpillPolicy::Memory`) rather than through a temp file,
+/// so the harness still touches no filesystem.
+fn read_all_meta_seekable(container: &dyn Container, bytes: &[u8]) -> Vec<EntryMeta> {
+    let id = container.id();
+    let forward: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes.to_vec())));
+    let seekable = crate::source::SpillSource::materialize(
+        forward,
+        &crate::source::SpillPolicy::Memory {
+            cap: 64 * 1024 * 1024,
+        },
+    )
+    .unwrap_or_else(|e| panic!("conformance[{id}] materialize: {e}"));
+    let resolved = crate::resolve(
+        Box::new(seekable),
+        container.id(),
+        container.caps(),
+        &crate::StreamPolicy::default(),
+    )
+    .unwrap_or_else(|e| panic!("conformance[{id}] resolve (seekable): {e}"));
+    let mut ar = container
+        .open(resolved, &OpenOpts::default())
+        .unwrap_or_else(|e| panic!("conformance[{id}] open (seekable): {e}"));
+    let mut out = Vec::new();
+    while let Some(mut entry) = ar
+        .next_entry()
+        .unwrap_or_else(|e| panic!("conformance[{id}] next_entry (seekable): {e}"))
+    {
+        let meta = entry.meta().clone();
+        let mut data = Vec::new();
+        entry
+            .reader()
+            .read_to_end(&mut data)
+            .unwrap_or_else(|e| panic!("conformance[{id}] entry read (seekable): {e}"));
+        out.push(meta);
+    }
+    out
+}
+
 pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
     let id = container.id();
     let caps = container.caps();
@@ -758,6 +821,77 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 );
             }
         }
+
+        // 13. `stores_dirs`/`stores_symlinks` are behaviour, not a claim.
+        //     `entries.rs` writes a directory or a symlink entry when the flag
+        //     is set and warns that it cannot when it is not, so a false claim
+        //     silently produces a directory-shaped regular FILE — `ar`'s
+        //     failure mode, and the reason these fields exist.
+        //
+        //     The NAME is deliberately not asserted: zip appends a trailing
+        //     `/` to a directory entry by convention, which is the container
+        //     being correct rather than altering anything. The kind is what
+        //     the flag claims, and for a symlink the target too — a link whose
+        //     target did not survive points somewhere else on extraction,
+        //     which is a loss no `EntryKind` comparison alone would catch.
+        //
+        //     Empty data, because that is exactly what `entries.rs` hands a
+        //     container for these two kinds: a directory has no payload, and a
+        //     symlink's target lives in `EntryMeta`, not in the reader.
+        if caps.write {
+            if caps.stores_dirs {
+                let mut meta_in = EntryMeta::file("d");
+                meta_in.kind = crate::archive::EntryKind::Dir;
+                meta_in.mode = Some(0o755);
+                let bytes = build_with_meta(container, &[(meta_in, &[][..])]);
+                let got = read_all_meta_seekable(container, &bytes);
+                assert_eq!(
+                    got.len(),
+                    1,
+                    "conformance[{id}] property 13 (directories): a directory entry was \
+                     written but {} entries read back",
+                    got.len()
+                );
+                assert_eq!(
+                    got[0].kind,
+                    crate::archive::EntryKind::Dir,
+                    "conformance[{id}] property 13 (directories): caps claim stores_dirs, \
+                     but a directory entry read back as {:?}. A directory written as a \
+                     regular file makes every entry beneath it unextractable — its parent \
+                     is a file",
+                    got[0].kind
+                );
+            }
+            if caps.stores_symlinks {
+                let mut meta_in = EntryMeta::file("l");
+                meta_in.kind = crate::archive::EntryKind::Symlink {
+                    target: "a.txt".into(),
+                };
+                let bytes = build_with_meta(container, &[(meta_in, &[][..])]);
+                let got = read_all_meta_seekable(container, &bytes);
+                assert_eq!(
+                    got.len(),
+                    1,
+                    "conformance[{id}] property 13 (symlinks): a symlink entry was written \
+                     but {} entries read back",
+                    got.len()
+                );
+                match &got[0].kind {
+                    crate::archive::EntryKind::Symlink { target } => assert_eq!(
+                        target, "a.txt",
+                        "conformance[{id}] property 13 (symlinks): the link came back \
+                         pointing at {target:?}, so the restored link would point \
+                         somewhere else"
+                    ),
+                    other => panic!(
+                        "conformance[{id}] property 13 (symlinks): caps claim \
+                         stores_symlinks, but a symlink entry read back as {other:?}. \
+                         Stored as a regular file, the target text becomes the file's \
+                         contents"
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -801,7 +935,7 @@ mod tests {
     use crate::testing::{FramedMockContainer, framed_container_meta};
 
     #[test]
-    fn a_well_behaved_container_satisfies_properties_one_to_twelve() {
+    fn a_well_behaved_container_satisfies_properties_one_to_thirteen() {
         assert_container_conforms(&FramedMockContainer, &framed_container_meta());
     }
 }
@@ -1324,5 +1458,77 @@ mod broken_containers {
     #[test]
     fn property_twelve_catches_a_container_that_sanitises_hostile_names() {
         assert_panics_naming(&Sanitises, &framed_container_meta(), "property 12");
+    }
+
+    /// Property 13's two halves need two doubles, not one: a container that
+    /// claimed both and stored neither would fire on directories and leave the
+    /// symlink half never executed — the shape a single shared double has
+    /// produced before (Phase 1f's R6).
+    ///
+    /// Neither double breaks anything. `FramedMockContainer` reconstructs
+    /// every entry as `EntryMeta::file(name)` on the way back, which is
+    /// exactly the honest behaviour of a wire format with no kind field; all
+    /// these add is the FALSE CLAIM in `caps()`, which is the defect property
+    /// 13 exists to catch.
+    struct ClaimsDirs;
+
+    impl Container for ClaimsDirs {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                // BUG: the wire format has no directory entry at all, and a
+                // directory handed to it lands as a zero-byte regular file.
+                stores_dirs: true,
+                ..FramedMockContainer.caps()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            FramedMockContainer.open(resolved, o)
+        }
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    #[test]
+    fn property_thirteen_catches_a_false_stores_dirs_claim() {
+        assert_panics_naming(
+            &ClaimsDirs,
+            &framed_container_meta(),
+            "property 13 (directories)",
+        );
+    }
+
+    struct ClaimsSymlinks;
+
+    impl Container for ClaimsSymlinks {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                // BUG: same claim, for links. A link stored as a regular file
+                // materialises its target text as the file's contents.
+                stores_symlinks: true,
+                ..FramedMockContainer.caps()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            FramedMockContainer.open(resolved, o)
+        }
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    #[test]
+    fn property_thirteen_catches_a_false_stores_symlinks_claim() {
+        assert_panics_naming(
+            &ClaimsSymlinks,
+            &framed_container_meta(),
+            "property 13 (symlinks)",
+        );
     }
 }
