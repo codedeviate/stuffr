@@ -176,12 +176,55 @@ Wanted, not scheduled.
 - Better `stuffr info` output: entropy estimate, "this is already compressed, don't
   bother" advice
 - `tar` compat symlink (see Part 1 for why it is not in v1)
-- **A structured `Chain` type for `info --json`.** Today `info` reports the
-  resolved chain as prose; a typed, serialisable `Chain` (container, codec,
-  and how they stack) would let `--fidelity=json` consumers walk it
-  programmatically instead of parsing text, and the cross-container
-  `convert` below would consume the same type to plan its own reads and
-  writes.
+- **`stere`** (<https://crates.io/crates/stere>, source at `../stere`), a
+  structure-aware searchable archive format for log files, developed in-house.
+  It splits input into independently decodable blocks, extracts message
+  templates into integer and string columns, and carries an archive-wide
+  dictionary, trigram block filters and timestamp pruning. Magic is `STERE\0`
+  at the head with a `STERETLR` trailer; round-trip is byte-exact.
+
+  **Scope, decided:** `create` and `unpack` only. `stere grep` and the
+  trigram/timestamp filters are deliberately NOT in scope — the `Container`
+  trait knows about entries and nothing about searching inside them, and
+  growing it a search capability is a design cycle that this does not need.
+  stuffr would read and write stere archives; `stere` itself remains the tool
+  for searching them. That is the whole goal here: widen format support so a
+  stere archive is not a file stuffr has to refuse.
+
+  It registers as a `FormatKind::Container`, and two parts fit stuffr's
+  existing shapes without new machinery: a trailing index puts it in the same
+  fidelity family as zip, which Phase 2 already built (`trailing_index`,
+  `TrailingIndexUnread`), and per-block codecs map onto `EntryMeta::codec`.
+
+  Three constraints remain, and none is a blocker:
+
+  1. **MSRV, containable.** stere declares `rust-version = "1.95"` against
+     stuffr's `1.88`. That sounds like a seven-version jump to the support
+     floor, and it is not: `rust-toolchain.toml` already pins **1.95** for
+     local development, and an optional `stere` feature kept out of `pure`
+     leaves a default build's graph — and therefore its floor — untouched,
+     exactly as `c-backed` does for the C crates. The real cost is one CI
+     edit: the `msrv (1.88)` job runs `cargo build/test --workspace
+     --all-features`, which would pull stere in at 1.88 and fail. That job
+     needs an explicit feature list rather than `--all-features` before
+     stere can be added to `full`.
+  2. **Purity.** stere pins `zstd = "0.13"`, which is `zstd-sys` and a C
+     compiler, so it belongs under `c-backed`. The `purity` CI job greps the
+     pure graph for `zstd-sys` and fails if it appears, which already
+     enforces this. Worth checking first: stuffr's own default zstd is
+     `ruzstd`, pure, so a `full` build would contain two zstd
+     implementations — not a conflict, but it should be a deliberate one.
+  3. **It memory-maps.** `stere-core/src/reader.rs` does
+     `unsafe { Mmap::map(&file) }`, so it needs a real seekable file and
+     cannot read a pipe. The stream ladder exists precisely for this: stere
+     declares `Rung::Exact` only, and `Spilled` stages a piped archive to
+     disk first. No new machinery, but measure the spill cost before
+     promising it — a log archive is exactly the thing someone pipes.
+
+  Wanted because it is ours, and because with `grep` out of scope the
+  remaining work is an ordinary container registration plus one CI edit.
+  Not scheduled only because the phases ahead of it are.
+
 - `stuffr convert IN OUT`, taking the destination as a second positional and
   inferring both formats from the filenames, alongside the `convert IN -o OUT`
   already planned for Phase 5. Wanted for the case that prompted it: an archive
