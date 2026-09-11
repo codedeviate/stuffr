@@ -187,14 +187,33 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 // named directory is a whole tree. Saying "paths" rather than
                 // "entries" is the one-word fix; the entry count is not on
                 // `Outcome` and is not worth a field there.
+                // NOT `out.fidelity.rung`. `Rung` describes the adaptive READ
+                // ladder; on the write side `entries::create_archive` sets it
+                // to the constant `Rung::Exact`, so printing it made
+                // `pack proj -o out.ar` announce "exact fidelity" and then
+                // name four losses on the next four lines. A count of what
+                // was actually lost is the one number here that is true, and
+                // it agrees with the list `report_fidelity` prints below it.
+                let losses = out.fidelity.warnings.len();
                 eprintln!(
-                    "{} path(s) -> {} ({} -> {} bytes, {} fidelity)",
+                    "{} path(s) -> {} ({} -> {} bytes, {})",
                     inputs.len(),
                     out.format,
                     out.bytes_in,
                     out.bytes_out,
-                    out.fidelity.rung
+                    match losses {
+                        0 => "no fidelity loss".to_string(),
+                        n => format!("{n} fidelity loss(es)"),
+                    }
                 );
+                // Said every run, and deliberately NOT routed through
+                // `report_fidelity`: a note is something stuffr did correctly
+                // that the user should know about, not something they lost,
+                // so it must not reach the --strict-fidelity gate. See
+                // `Outcome::notes`.
+                for note in &out.notes {
+                    eprintln!("stuffr: note: {note}");
+                }
                 // The same call the read side makes, not a second printer:
                 // pack's fidelity report now carries real warnings (what the
                 // walk could not store, what this container has no shape

@@ -133,6 +133,42 @@ pub enum Fidelity {
     #[error("skipped entry `{entry}`: {reason}")]
     EntrySkipped { entry: String, reason: String },
 
+    /// A file that changed length between the moment its size was recorded
+    /// and the moment its bytes were read, stored at the length its header
+    /// already declares.
+    ///
+    /// Distinct from [`Self::EntrySkipped`]: the entry IS in the archive, and
+    /// the archive is structurally valid. What was lost is the tail of a file
+    /// that grew, or the tail of a file that shrank — replaced by zeros,
+    /// because the entry header was written before the payload was read and a
+    /// container cannot un-write it. Refusing instead would throw away the
+    /// whole archive over one file that a live system happened to touch,
+    /// which is what `pack ~ -o backup.tar` over a running home directory does
+    /// routinely; GNU tar prints `file changed as we read it` and continues,
+    /// and this is the same bargain, with the loss named rather than printed
+    /// and forgotten.
+    ///
+    /// `--strict-fidelity` still refuses on it, which is the half of the
+    /// bargain that keeps it honest.
+    #[error(
+        "entry `{entry}` changed size while it was being read: its header declares \
+         {declared} bytes, {fixup}"
+    )]
+    EntrySizeChanged {
+        entry: String,
+        /// The length written into the entry header, from the walk's `stat`.
+        declared: u64,
+        /// What the file actually supplied and what was done about it.
+        ///
+        /// Prose rather than a second `u64` because the two directions know
+        /// different things: a file that shrank supplies an exact count, while
+        /// a file that grew is only known to have had *more* — measuring how
+        /// much more would mean reading a tail that is deliberately not being
+        /// stored. A field that could name the figure in one case and not the
+        /// other would have to lie in one of them.
+        fixup: String,
+    },
+
     #[error("stream truncated at offset {at}")]
     TruncatedStream { at: u64 },
 }

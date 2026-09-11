@@ -350,6 +350,7 @@ pub fn test(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Out
         bytes_out: bytes,
         format,
         fidelity: ar.fidelity().clone(),
+        notes: Vec::new(),
     })
 }
 
@@ -607,6 +608,7 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
         bytes_out: written,
         format,
         fidelity,
+        notes: Vec::new(),
     })
 }
 
@@ -731,6 +733,7 @@ pub fn cat(
         bytes_out: written,
         format,
         fidelity: ar.fidelity().clone(),
+        notes: Vec::new(),
     })
 }
 
@@ -840,6 +843,8 @@ pub fn create_archive(
 
     let mut plan: Vec<crate::walk::WalkItem> = Vec::with_capacity(paths.len());
     let mut names = HashSet::new();
+    // Told, never counted. See `Outcome::notes`.
+    let mut notes: Vec<String> = Vec::new();
     for path in paths {
         let name = entry_name_for(path)?;
         // `metadata`, which follows a symlink, not `symlink_metadata`: a path
@@ -861,7 +866,7 @@ pub fn create_archive(
                 path.display()
             )));
         }
-        for mut item in crate::walk::walk(path, &name)? {
+        for item in crate::walk::walk(path, &name)? {
             // The walk found the archive `pack` is about to write. Storing
             // it would nest a growing copy of the previous run inside the
             // new one every time `--force` re-runs the same command — safe
@@ -869,20 +874,27 @@ pub fn create_archive(
             // destination is even opened), but a monotonically growing
             // archive is still a bug, and the flagship example in
             // `examples.txt` is exactly this shape (`stuffr pack . -o
-            // backup.tar`). Recast as a `Skipped` item rather than dropped
-            // outright, so it still gets a fidelity warning naming it, the
-            // same way every other thing the walk cannot store does; and
-            // `link_id` is cleared so it does not inflate the hardlink
-            // summary for an entry that was never going to be written.
+            // backup.tar`).
+            //
+            // A NOTE, not a fidelity warning, and not part of the plan.
+            // Phase 2c recast it as a `Skipped` item so it would be named the
+            // way everything else the walk cannot store is named — and that
+            // put it on the `--strict-fidelity` gate, where
+            // `pack proj -o proj/backup.tar --force --strict-fidelity` exited
+            // 0 on the first run and **4 on every run after**, forever, on an
+            // archive that had lost nothing the user wanted. A fidelity
+            // warning means "you lost something you asked for"; this is
+            // stuffr correctly declining to put a file inside itself, which
+            // is not a loss at all. The user is still told, on stderr, every
+            // run — see `Outcome::notes`.
             if let crate::walk::ItemSource::File(p) = &item.source
                 && is_output_file(p, dst_canonical.as_deref())
             {
-                item.source = crate::walk::ItemSource::Skipped {
-                    reason: "is the archive being written; storing it would nest a \
-                             growing copy of the previous run inside this one"
-                        .into(),
-                };
-                item.link_id = None;
+                notes.push(format!(
+                    "`{}` is the archive being written and is not stored inside itself",
+                    item.meta.name
+                ));
+                continue;
             }
             // A skipped item claims no name, deliberately. It is never
             // written, and `meta.name` for one may carry U+FFFD where the
@@ -966,9 +978,38 @@ pub fn create_archive(
                 // stream will not deliver, and there is no honest way to
                 // finish that archive.
                 crate::walk::ItemSource::File(p) => match std::fs::File::open(p) {
-                    Ok(mut file) => {
-                        archive.add(&item.meta, &mut file)?;
-                        bytes_in += item.meta.size.unwrap_or(0);
+                    Ok(file) => {
+                        // Never the bare `File`. The entry header carrying
+                        // this file's length was written from the walk's
+                        // `stat`, and a live filesystem may have changed the
+                        // file in between — so the payload is framed to the
+                        // length already promised rather than to whatever the
+                        // file now holds. See `ExactLength`, and
+                        // `Fidelity::EntrySizeChanged` for why this is a
+                        // warning and not a refusal.
+                        match item.meta.size {
+                            Some(declared) => {
+                                let mut sized = ExactLength::new(file, declared);
+                                archive.add(&item.meta, &mut sized)?;
+                                bytes_in += sized.real;
+                                if let Some(w) = sized.warning(&item.meta.name) {
+                                    warnings.push(w);
+                                }
+                            }
+                            // No length was recorded, so nothing was promised
+                            // and there is nothing to hold the payload to:
+                            // the container measures it itself, and
+                            // `bytes_in` gains nothing because nothing here
+                            // knows what it read. The walk always records a
+                            // length for a regular file, so this is reachable
+                            // only through a caller that built a plan by hand
+                            // — and it is what the code did for every entry
+                            // before this.
+                            None => {
+                                let mut file = file;
+                                archive.add(&item.meta, &mut file)?;
+                            }
+                        }
                     }
                     Err(e) => warnings.push(Fidelity::EntrySkipped {
                         entry: item.meta.name.clone(),
@@ -1072,12 +1113,132 @@ pub fn create_archive(
                     rung: Rung::Exact,
                     warnings,
                 },
+                notes,
             })
         }
         Err(e) => {
             discard(finish);
             Err(e)
         }
+    }
+}
+
+/// Delivers **exactly** the number of bytes an entry's header already
+/// declared, whatever the file underneath now holds.
+///
+/// A container writes the entry header — the declared length included — before
+/// it reads a byte of the payload, and the length it writes comes from the
+/// walk's `stat`, which happened earlier still: on a large tree, the whole
+/// write is that window. A file a live system truncates or appends to inside
+/// it therefore arrives at the container with the wrong number of bytes, and
+/// the container has no way to go back and rewrite a header it has already
+/// streamed out. Before this existed, `tar.rs` refused
+/// (`entry ... declared a size of N bytes but supplied M`), which aborted the
+/// entire pack and left **no archive at all** — losing a whole backup over one
+/// file that something happened to touch.
+///
+/// So the promise is kept instead of broken:
+///
+/// * the file **shrank** — the shortfall is padded with zeros, so the entry is
+///   the length its header claims and every entry after it stays correctly
+///   framed;
+/// * the file **grew** — the excess is not read, and the payload stops at the
+///   declared length.
+///
+/// Either way a [`Fidelity::EntrySizeChanged`] warning names the entry and both
+/// numbers, so `--strict-fidelity` still refuses and a quiet run still says
+/// what happened. This is GNU tar's `file changed as we read it` bargain: the
+/// archive is structurally valid and complete, and one entry's tail is known
+/// to be approximate.
+///
+/// Deliberately NOT a substitute for `tar.rs`'s own check, which stays as a
+/// last line of defence for any other caller that builds a plan by hand.
+struct ExactLength<R> {
+    inner: R,
+    /// Bytes still owed to the container to satisfy the declared length.
+    remaining: u64,
+    /// Bytes that genuinely came out of the file.
+    real: u64,
+    /// Bytes invented (zeros) to make up a shortfall.
+    padded: u64,
+    /// Whether the file still had data left once the declared length was met.
+    grew: bool,
+}
+
+impl<R: Read> ExactLength<R> {
+    fn new(inner: R, declared: u64) -> Self {
+        Self {
+            inner,
+            remaining: declared,
+            real: 0,
+            padded: 0,
+            grew: false,
+        }
+    }
+
+    /// The warning this entry earned, if it earned one. `None` is the
+    /// overwhelmingly common case: a file nothing touched pads nothing and
+    /// grows not at all.
+    fn warning(&self, entry: &str) -> Option<Fidelity> {
+        let declared = self.real + self.padded;
+        if self.padded > 0 {
+            return Some(Fidelity::EntrySizeChanged {
+                entry: entry.to_string(),
+                declared,
+                fixup: format!(
+                    "the file supplied only {}; the missing {} byte(s) were padded with \
+                     zeros so the archive stays correctly framed",
+                    self.real, self.padded
+                ),
+            });
+        }
+        if self.grew {
+            return Some(Fidelity::EntrySizeChanged {
+                entry: entry.to_string(),
+                declared,
+                fixup: "the file grew past that length while it was being read, and the \
+                        excess is not stored"
+                    .into(),
+            });
+        }
+        None
+    }
+}
+
+impl<R: Read> Read for ExactLength<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            // The declared length is satisfied. One byte is read past it, and
+            // discarded, purely so a file that GREW can be reported rather
+            // than silently clipped — `Read` gives no other way to ask
+            // "is there more?". Once, not per call: `grew` latches.
+            if !self.grew {
+                let mut probe = [0u8; 1];
+                if self.inner.read(&mut probe)? > 0 {
+                    self.grew = true;
+                }
+            }
+            return Ok(0);
+        }
+        let cap = usize::try_from(self.remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let n = self.inner.read(&mut buf[..cap])?;
+        if n == 0 {
+            // EOF short of what was promised. Hand back zeros rather than
+            // ending the payload early: ending it early is precisely the
+            // mis-framing the container cannot survive.
+            buf[..cap].fill(0);
+            self.remaining -= cap as u64;
+            self.padded += cap as u64;
+            return Ok(cap);
+        }
+        self.remaining -= n as u64;
+        self.real += n as u64;
+        Ok(n)
     }
 }
 
@@ -1206,26 +1367,55 @@ fn ownership_warning(source: &crate::walk::ItemSource, meta: &EntryMeta) -> Opti
 /// `/` itself still has no name to store, and still refuses — with the
 /// resolved path in the message, since the typed one may not show why.
 fn entry_name_for(path: &Path) -> Result<String> {
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        return Ok(name.to_string());
+    if let Some(name) = path.file_name() {
+        // Two different failures, and they used to share one message. A path
+        // whose final component is not valid UTF-8 HAS a final component — it
+        // simply cannot be spelled as text, which is what an entry name is —
+        // and reporting it as "no final path component" sent the reader
+        // looking for a naming bug that was not there. `walk.rs` already
+        // names UTF-8 as the cause for the same input found inside a tree;
+        // this is the same diagnosis for one named on the command line. The
+        // verdict still differs, and deliberately: the walk skips with a
+        // warning because an incidental find should not fail a backup, while
+        // a path the user typed is a request, and silently packing a U+FFFD
+        // substitute for it is the lossy rename neither side will do.
+        return match name.to_str() {
+            Some(n) => Ok(n.to_string()),
+            None => Err(undecodable_entry_name(path, name)),
+        };
     }
     // `.`, `..`, `proj/..`, `../..` — see the doc comment. `canonicalize`
     // needs the path to exist, which it must: `create_archive` stats it
     // immediately after this, so a missing path fails either way, and here
     // it fails as the `Io` error it is rather than as a naming complaint.
     let resolved = std::fs::canonicalize(path)?;
-    resolved
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.to_string())
-        .ok_or_else(|| {
-            Error::Usage(format!(
-                "`{}` resolves to `{}`, which has no final path component to name \
-                 an entry after",
-                path.display(),
-                resolved.display()
-            ))
-        })
+    let Some(name) = resolved.file_name() else {
+        // The genuine article — `/` and nothing else.
+        return Err(Error::Usage(format!(
+            "`{}` resolves to `{}`, which has no final path component to name \
+             an entry after",
+            path.display(),
+            resolved.display()
+        )));
+    };
+    match name.to_str() {
+        Some(n) => Ok(n.to_string()),
+        None => Err(undecodable_entry_name(&resolved, name)),
+    }
+}
+
+/// The refusal for a path whose final component cannot be spelled as text.
+///
+/// Shared by both arms of [`entry_name_for`] so the typed path and the
+/// resolved one give the same diagnosis; `{name:?}` renders the raw `OsStr`
+/// with its undecodable bytes escaped, which is the only faithful rendering
+/// there is.
+fn undecodable_entry_name(path: &Path, name: &std::ffi::OsStr) -> Error {
+    Error::Usage(format!(
+        "`{}` has a final path component whose name is not valid UTF-8 ({name:?}); an \
+         entry name is text, and storing it under a lossy substitute would rename it",
+        path.display()
+    ))
 }
 
 /// The unix permission bits, where the platform has them.
@@ -1797,5 +1987,136 @@ mod tests {
             "with no destination to compare against (stdout, or a parent that does \
              not resolve) nothing can be the output"
         );
+    }
+
+    /// A reader that yields `bytes` and then EOF, in chunks of at most
+    /// `chunk` — so the padding path is exercised across several `read`
+    /// calls rather than only on a single convenient one.
+    struct Chunked {
+        bytes: Vec<u8>,
+        at: usize,
+        chunk: usize,
+    }
+
+    impl std::io::Read for Chunked {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.chunk.min(buf.len()).min(self.bytes.len() - self.at);
+            buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    fn drain(mut r: impl Read) -> Vec<u8> {
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    /// Finding 1. A file the walk stat'd at 16 bytes, truncated to 4 before
+    /// its payload was read: the container has already written a header
+    /// saying 16, so 16 is what must come out.
+    #[test]
+    fn a_file_that_shrank_is_padded_to_the_length_its_header_declares() {
+        let src = Chunked {
+            bytes: b"abcd".to_vec(),
+            at: 0,
+            chunk: 3,
+        };
+        let mut sized = ExactLength::new(src, 16);
+        let got = drain(&mut sized);
+
+        assert_eq!(
+            got.len(),
+            16,
+            "the payload MUST be the declared length; anything else mis-frames \
+             every entry after it"
+        );
+        assert_eq!(&got[..4], b"abcd", "the real bytes come first, unaltered");
+        assert!(
+            got[4..].iter().all(|b| *b == 0),
+            "the shortfall is zeros, not stale buffer contents: {got:?}"
+        );
+
+        let w = sized
+            .warning("proj/zzz.bin")
+            .expect("a shrink must be reported");
+        let text = w.to_string();
+        assert!(
+            text.contains("proj/zzz.bin") && text.contains("16") && text.contains("4"),
+            "the warning must name the entry and BOTH lengths: {text}"
+        );
+        assert!(
+            text.contains("padded with zeros"),
+            "and say what was done about it: {text}"
+        );
+    }
+
+    /// The other direction: a file appended to between the stat and the read.
+    /// The excess cannot go into an entry whose length is already committed,
+    /// so the payload stops — and says so.
+    #[test]
+    fn a_file_that_grew_stops_at_the_length_its_header_declares() {
+        let src = Chunked {
+            bytes: b"abcdefghij".to_vec(),
+            at: 0,
+            chunk: 4,
+        };
+        let mut sized = ExactLength::new(src, 6);
+        let got = drain(&mut sized);
+
+        assert_eq!(got, b"abcdef", "the payload stops at the declared length");
+
+        let w = sized
+            .warning("proj/growing.log")
+            .expect("growth must be reported");
+        let text = w.to_string();
+        assert!(
+            text.contains("proj/growing.log") && text.contains('6'),
+            "the warning must name the entry and the declared length: {text}"
+        );
+        assert!(
+            text.contains("grew") && text.contains("not stored"),
+            "and say the excess was dropped: {text}"
+        );
+    }
+
+    /// The overwhelmingly common case. A warning here would put every
+    /// ordinary pack on the --strict-fidelity gate.
+    #[test]
+    fn a_file_that_did_not_change_earns_no_warning() {
+        let src = Chunked {
+            bytes: b"abcdef".to_vec(),
+            at: 0,
+            chunk: 4,
+        };
+        let mut sized = ExactLength::new(src, 6);
+        assert_eq!(drain(&mut sized), b"abcdef");
+        assert!(
+            sized.warning("proj/quiet.txt").is_none(),
+            "a file nothing touched must be silent"
+        );
+    }
+
+    /// `grew` latches: the one-byte probe past the declared length must not
+    /// consume a byte per call, and repeated reads at EOF must stay `Ok(0)`.
+    #[test]
+    fn the_growth_probe_runs_once_and_reads_stay_empty() {
+        let src = Chunked {
+            bytes: b"abcdefgh".to_vec(),
+            at: 0,
+            chunk: 8,
+        };
+        let mut sized = ExactLength::new(src, 2);
+        assert_eq!(drain(&mut sized), b"ab");
+        let mut buf = [0u8; 4];
+        for _ in 0..3 {
+            assert_eq!(
+                sized.read(&mut buf).unwrap(),
+                0,
+                "past the declared length there is nothing left to hand over"
+            );
+        }
+        assert!(sized.warning("x").is_some());
     }
 }

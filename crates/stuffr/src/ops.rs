@@ -501,6 +501,19 @@ pub struct Outcome {
     pub bytes_out: u64,
     pub format: FormatId,
     pub fidelity: FidelityReport,
+    /// Things the caller should be TOLD but which cost no fidelity — so
+    /// deliberately not `fidelity.warnings`, because that list is the
+    /// `--strict-fidelity` gate and everything on it means "you lost
+    /// something you asked for".
+    ///
+    /// One member today: `pack . -o backup.tar` declining to walk
+    /// `backup.tar` back into itself. That is stuffr being correct, not
+    /// stuffr losing anything — yet as a fidelity warning it made
+    /// `--strict-fidelity` exit 4 on **every run after the first**, on an
+    /// archive that had lost nothing the user wanted, which is exactly the
+    /// combination `examples.txt` advertises for a nightly backup. A gate
+    /// that fails on a correct run is a gate nobody keeps.
+    pub notes: Vec<String>,
 }
 
 /// The build's one codec, or a usage error naming what to do about zero.
@@ -582,6 +595,40 @@ pub fn compress_with(
     dst: Output,
     o: &CompressOpts,
 ) -> Result<Outcome> {
+    // A directory is a legitimate input to `pack` since Phase 2c — but only
+    // on the container path, which composes a tree into entries. This is the
+    // single-stream codec path, and a codec has no entries: one stream, no
+    // names, no structure.
+    //
+    // Explicit, because the wildcard's answer was wrong and unexplained.
+    // `File::open` on a directory SUCCEEDS on unix and fails at the first
+    // `read` with `EISDIR`, so `stuffr pack proj -o proj.gz` reported
+    // `stuffr: i/o error: Is a directory (os error 21)` at exit 1 — as if
+    // stuffr had failed, rather than the caller having asked for something a
+    // codec cannot do, and with no hint that `-o proj.tar.gz` is the answer.
+    // `Error::exit_code`'s own doc records two earlier corrections of exactly
+    // this `_ => 1` leak; this is the third, and the first one Phase 2c
+    // introduced by making a directory legal somewhere else.
+    if let Input::Path(p) = &src
+        && p.is_dir()
+    {
+        // The suggestion uses the directory's own final component, not the
+        // path as typed: `-o proj.tar.gz` is something a reader can act on,
+        // where the same absolute path repeated three times in one sentence
+        // is not.
+        let stem = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("bundle")
+            .to_string();
+        return Err(Error::Usage(format!(
+            "`{}` is a directory, and a codec compresses one stream: it has no entries \
+             to put a tree in. An output whose extension names a container writes both \
+             layers in one step — `-o {stem}.tar.gz`, or `-o {stem}.tar` for no \
+             compression.",
+            p.display()
+        )));
+    }
     let format = choose_format(registry, &dst, o.format)?;
     let codec = registry.require_encoder(format)?;
 
@@ -649,6 +696,7 @@ pub fn compress_with(
                 bytes_out: written.load(Ordering::Relaxed),
                 format,
                 fidelity: FidelityReport::new(rung),
+                notes: Vec::new(),
             })
         }
         Err(e) => {
@@ -797,6 +845,7 @@ pub fn decompress_with(
                 bytes_out: guard.produced(),
                 format,
                 fidelity: FidelityReport::new(rung),
+                notes: Vec::new(),
             })
         }
         Err(e) => {
