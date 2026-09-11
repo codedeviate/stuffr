@@ -551,6 +551,18 @@ impl ArchiveWrite for CpioWrite {
             // Checked against the DECLARED size first, before a single byte
             // is read or allocated, so a caller who already knows an entry
             // is oversized is refused for free.
+            //
+            // That ordering is LOAD-BEARING OUTSIDE THIS FILE, so do not
+            // fold this check into the one below on the grounds that the two
+            // look redundant: `cli.rs`'s
+            // `a_failed_write_never_replaces_an_existing_archive` (Phase 2c
+            // property 3) drives the only mid-write failure in the suite
+            // through it, using a 4 GiB SPARSE file. Refusing off `meta.size`
+            // costs no disk and no time; refusing only after `read_to_end`
+            // would materialise 4 GiB and make that test unrunnable, and the
+            // property it pins — a failed pack leaves the existing archive
+            // intact — would silently stop being tested. Move the check and
+            // that test needs a new mechanism first.
             if let Some(size) = meta.size {
                 check_u32_size(&meta.name, size)?;
             }

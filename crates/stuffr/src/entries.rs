@@ -1121,6 +1121,13 @@ fn canonical_output_path(dst: &Output) -> Option<PathBuf> {
 /// file), this reports "not the output" rather than propagating that as an
 /// error here — the file is about to be opened for real a few lines later,
 /// where a genuine problem surfaces on its own with a clearer message.
+///
+/// That fallback is a check-then-use window, and it is accepted on the
+/// precedent [`refuse_symlinked_ancestors`] set and documented at length —
+/// the tree's other filesystem check whose answer can go stale between the
+/// look and the write. What it risks here is much smaller than there: the
+/// worst case is the archive packing itself as an entry, not a write escaping
+/// its destination.
 fn is_output_file(candidate: &Path, dst_canonical: Option<&Path>) -> bool {
     let Some(dst) = dst_canonical else {
         return false;
@@ -1165,9 +1172,14 @@ fn ownership_warning(source: &crate::walk::ItemSource, meta: &EntryMeta) -> Opti
 ///
 /// # `.` and `..` resolve rather than refuse
 ///
-/// [`Path::file_name`] returns `None` for `.`, `..`, and for any path ending
-/// in one of them (`proj/.`, `../..`) — it discards those components rather
-/// than naming them. Refusing there made `stuffr pack . -o x.tar` exit 2, and
+/// [`Path::file_name`] returns `None` for `.`, for `..`, and for any path
+/// whose LAST component is `..` (`proj/..`, `../..`) — those are not names,
+/// and it will not invent one. A trailing `.` is a different case and needs
+/// no fallback: [`Path::components`] normalises away a non-leading `CurDir`,
+/// so `proj/.` and `./proj/.` both yield `Some("proj")` and take the fast
+/// path above. (Measured, because the two read alike: `proj/.` gives
+/// `Some("proj")`, `proj/..` gives `None`.) Refusing on the `None` cases made
+/// `stuffr pack . -o x.tar` exit 2, and
 /// that is the single most common archiving idiom there is: `tar cf x.tar .`
 /// is what every tutorial teaches, so it is the likeliest first thing anyone
 /// types at the directory walk this phase added. It is also the write-side
@@ -1197,7 +1209,7 @@ fn entry_name_for(path: &Path) -> Result<String> {
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         return Ok(name.to_string());
     }
-    // `.`, `..`, `proj/.`, `../..` — see the doc comment. `canonicalize`
+    // `.`, `..`, `proj/..`, `../..` — see the doc comment. `canonicalize`
     // needs the path to exist, which it must: `create_archive` stats it
     // immediately after this, so a missing path fails either way, and here
     // it fails as the `Io` error it is rather than as a naming complaint.

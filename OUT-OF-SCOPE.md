@@ -149,13 +149,6 @@ Wanted, not scheduled.
   strict codec/container orthogonality — right now `zip` is the one format
   where the container and its codecs are not independently swappable.
 - **cpio `odc` and `crc` variants.** Phase 2 shipped `newc` only.
-- **Compose container-over-codec on write**, so `pack -o bundle.tar.gz`
-  works in one step. Needs the `ArchiveWrite`/codec `Sink` composition
-  problem solved — today `ArchiveWrite::finish` cannot finish a codec
-  `Sink`, so `pack` refuses the combination rather than silently emitting a
-  truncated archive.
-- **`pack` walking directories**, so a directory path collects its contents
-  into the archive rather than needing every file named explicitly.
 - **Package formats as recognised profiles** — `.deb` (ar), `.rpm` (cpio),
   `.apk`/`.jar`/`.whl` (zip). Mechanically already readable; the value is
   *metadata awareness* (show the control file, the spec, the manifest) rather
@@ -165,6 +158,30 @@ Wanted, not scheduled.
   `.BH`, `.PAK`, `.SQZ`, `.UC2`, `.HA`, `.YZ1`, `.PMA`
 - WIM, DMG (as distribution formats rather than disk images)
 - WARC, and `.tar.zst` variants with sidecar indexes
+
+## Packing
+
+Phase 2c gave `pack` a directory walk and one-step container-over-codec
+composition. Three gaps it left open, each because closing it is a design
+question rather than an omission:
+
+- **Hardlink deduplication.** Two names for one inode currently pack as two
+  independent files, with a fidelity warning saying so. Storing the second as
+  a link needs three things, not one: an inode→first-name map held across the
+  whole walk, an `EntryKind::Hardlink` that does not exist yet (`EntryKind` is
+  `File`/`Dir`/`Symlink`/`Other` today), and a per-container capability bit
+  beside `stores_dirs`/`stores_symlinks`, since `zip` and `ar` have no
+  hardlink concept to write it into.
+- **mtime normalisation for cross-machine reproducibility.** The same tree
+  packs to the same bytes on one machine; it does not across two, because the
+  entries carry real mtimes. A `--mtime`/`SOURCE_DATE_EPOCH` clamp would fix
+  that, and it trades away fidelity to do it — which of the two is the default
+  is exactly the decision that needs a spec.
+- **`--exclude` and ignore-file filtering.** No way to leave `target/` or
+  `.git/` out of a walk. Deferred because the interesting part is not the flag
+  but the pattern dialect (glob vs. path-anchored, `.gitignore` semantics,
+  whether an excluded entry is a fidelity warning or silent), and picking one
+  casually is how a tool ends up with three.
 
 ## Ergonomics
 

@@ -5650,6 +5650,15 @@ fn packing_the_same_tree_twice_produces_identical_bytes() {
 /// race — a file truncated between the walk's `stat` and the write would do
 /// it, but nothing outside the process can schedule that window, and a test
 /// that only fails when it loses a race is worse than no test.
+///
+/// **This test is therefore coupled to that ordering**, which is the sort of
+/// coupling a later refactor breaks without noticing: if `CpioWrite::add`
+/// ever stops checking the DECLARED size and checks only the buffered one,
+/// this test starts reading 4 GiB off a sparse file before it fails — slow
+/// enough to look like a hang, and on a filesystem without sparse support it
+/// would not run at all. `cpio.rs` carries the matching note at the check.
+/// Anything that moves it needs a new mechanism for reaching a mid-write
+/// failure cheaply, not a faster machine.
 #[cfg(unix)]
 #[test]
 fn a_failed_write_never_replaces_an_existing_archive() {

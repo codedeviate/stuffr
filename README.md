@@ -9,7 +9,7 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 2 complete at `0.2.0` — eleven codecs and four containers,
+> **Status: Phase 2c complete at `0.3.0` — eleven codecs and four containers,
 > three of the codecs parallel on request, and a default build that needs
 > no C toolchain to read *or write* xz, LZMA1 or LZIP.** `stuffr pack`,
 > `unpack`, `cat`, `info`, `list`, `test` and `formats` all work, on files
@@ -19,8 +19,8 @@ read list.
 > `tar`, `zip` (`zip64` included) — each codec proven against the
 > conformance harness Phase 1c introduced and later cycles grew to twelve
 > properties, each container proven against the analogous
-> container-conformance harness, and then proven to coexist. **688** tests
-> under `--all-features`, **623** on the default tier — a different set, not
+> container-conformance harness, and then proven to coexist. **771** tests
+> under `--all-features`, **706** on the default tier — a different set, not
 > a subset, because the two tiers select different backends. Clean across
 > build, clippy and fmt.
 >
@@ -40,7 +40,14 @@ read list.
 > `stuffr pack proj -o backup.tar.gz` is a single command. What the walk
 > cannot store it names in a fidelity warning rather than dropping
 > silently — a socket, an undecodable name, a directory it may not list,
-> or a directory or symlink handed to `ar`, which has neither.
+> a file it may not open, or a directory or symlink handed to `ar`, which
+> has neither. **A permission error inside a walked tree is a warning, not
+> a failure:** one unreadable file or subdirectory is skipped, named in the
+> report, and the pack still exits 0, because losing a whole backup over
+> one file in a home directory is worse than losing that file. Pass
+> `--strict-fidelity` to make any such loss exit 4 instead — the archive is
+> still written and kept, exactly as `unpack -C --strict-fidelity` keeps
+> what it extracted; the exit code is the verdict, not the file's absence.
 >
 > **The build tiers, and what actually differs between them:**
 >

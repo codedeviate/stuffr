@@ -111,11 +111,11 @@ COLLECTING FILES INTO AN ARCHIVE
       is staged through a temporary file. --format names the CONTAINER
       only, so `--format tar -o bundle.tar.gz` resolves to the same chain
       rather than to a bare tar under a misleading name. When --format and
-      the name name DIFFERENT containers (`--format zip -o x.tar.gz`) pack
-      refuses at exit 2 rather than picking one: the bytes would be valid
-      gzip, so pack would exit 0 and `stuffr list` on that same path would
-      then exit 5 calling stuffr's own output corrupt — a reader takes the
-      outer layer from the magic and the container from the name.
+      the -o name disagree about the CONTAINER (`--format zip -o x.tar.gz`)
+      pack refuses at exit 2 rather than picking one: the bytes would be
+      valid gzip, so pack would exit 0 and `stuffr list` on that same path
+      would then exit 5 calling stuffr's own output corrupt — a reader takes
+      the outer layer from the magic and the container from the name.
 
   stuffr pack proj -o backup.tar
   stuffr pack proj -o backup.tar.gz
@@ -137,12 +137,18 @@ COLLECTING FILES INTO AN ARCHIVE
       What the walk cannot store, it names rather than swallowing: a
       socket, fifo or device node; a filename or symlink target that is not
       valid UTF-8 (storing a lossy substitute would silently write a
-      different name, or point a restored link elsewhere); and a directory
-      it is not allowed to list — one root-owned subdirectory must not fail
-      a whole backup, so the directory itself is stored, its contents are
-      not, and the reason says so. Hardlinks are reported too: no container
-      here writes a hardlink entry, so two names for one inode extract as
-      two independent files.
+      different name, or point a restored link elsewhere); a directory it is
+      not allowed to LIST, which is stored while its contents are not; and a
+      file it is not allowed to OPEN, which is not stored at all. Neither
+      permission case fails the pack: one unreadable file in a home
+      directory must not cost the whole backup, and losing that one file
+      beats losing all of them. Nothing here is silent — each is named in
+      the fidelity report, and --strict-fidelity turns any of them into exit
+      4. Only `open` is forgiven; an error part-way THROUGH a payload still
+      fails the archive, because the entry's header has by then declared a
+      length the stream will not deliver. Hardlinks are reported too: no
+      container here writes a hardlink entry, so two names for one inode
+      extract as two independent files.
 
   stuffr pack . -o backup.tar
       `.` and `..` work, and are named the way every other path is: by the
@@ -161,7 +167,7 @@ COLLECTING FILES INTO AN ARCHIVE
       same as anything else the walk declines to store, and --strict-fidelity
       turns it into exit 4 like any other.
 
-      stuffr pack proj -o proj.a
+  stuffr pack proj -o proj.a
       `ar` has no directory and no symlink concept at all, so those entries
       are DROPPED rather than written as zero-byte regular files — which
       would make everything beneath them unextractable, the parent being a
@@ -176,6 +182,16 @@ COLLECTING FILES INTO AN ARCHIVE
   command line that is neither a file nor a directory — a fifo or socket
   has no entry shape, and naming one is a request, not an incidental find
   inside a walk.
+
+  --strict-fidelity is NOT one of those refusals, and the difference is the
+  point: a refusal is a pre-flight check that writes nothing, while
+  --strict-fidelity is a verdict on an archive that HAS been written. The
+  archive is complete, valid, and LEFT ON DISK; exit 4 says only that
+  something the walk met could not be stored in it. Deleting it would throw
+  a whole good backup away over one unreadable file, which is exactly what
+  making that skip a warning was for — and it is the same contract the read
+  side keeps, where `unpack -C --strict-fidelity` exits 4 with the extracted
+  files still there. So read the exit code; do not read the file's absence.
 
   A fourth refusal, for the same reason the extract side refuses flags it
   cannot honour: --threads, --turbo and --allow-weak-encoder are all
