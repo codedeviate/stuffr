@@ -144,11 +144,19 @@ COLLECTING FILES INTO AN ARCHIVE
       directory must not cost the whole backup, and losing that one file
       beats losing all of them. Nothing here is silent — each is named in
       the fidelity report, and --strict-fidelity turns any of them into exit
-      4. Only `open` is forgiven; an error part-way THROUGH a payload still
-      fails the archive, because the entry's header has by then declared a
-      length the stream will not deliver. Hardlinks are reported too: no
-      container here writes a hardlink entry, so two names for one inode
-      extract as two independent files.
+      4. An i/o ERROR part-way through a payload still fails the archive:
+      there is no honest way to finish an entry whose bytes stopped coming.
+      A file that merely CHANGED SIZE under the walk is different, and is
+      now forgiven too — a live system truncates and appends to files while
+      a backup runs, and the entry's header was written from a `stat` that
+      happened earlier. A file that shrank is padded with zeros to the
+      length its header declares; one that grew stops there. Either way the
+      archive stays correctly framed and valid, the entry is named in a
+      fidelity warning with both lengths, and --strict-fidelity still
+      refuses. GNU tar's `file changed as we read it` is the same bargain;
+      before this, one touched file aborted the pack and left no archive at
+      all. Hardlinks are reported too: no container here writes a hardlink
+      entry, so two names for one inode extract as two independent files.
 
   stuffr pack . -o backup.tar
       `.` and `..` work, and are named the way every other path is: by the
@@ -163,9 +171,13 @@ COLLECTING FILES INTO AN ARCHIVE
       `backup.tar` itself is excluded from the walk, so re-running this
       exact command with --force does not nest the previous archive inside
       the new one — GNU tar's `file is the archive; not dumped` for the
-      identical shape. The exclusion is named in a fidelity warning, the
-      same as anything else the walk declines to store, and --strict-fidelity
-      turns it into exit 4 like any other.
+      identical shape. It is reported on stderr every run, as a NOTE rather
+      than a fidelity warning, and --strict-fidelity does NOT fire on it: a
+      fidelity warning means something you asked for was lost, and stuffr
+      declining to put a file inside itself is not that. So
+      `pack . -o backup.tar --force --strict-fidelity` in a nightly job
+      stays at exit 0 run after run, and still exits 4 the moment anything
+      real is lost.
 
   stuffr pack proj -o proj.a
       `ar` has no directory and no symlink concept at all, so those entries
@@ -194,17 +206,31 @@ COLLECTING FILES INTO AN ARCHIVE
   files still there. So read the exit code; do not read the file's absence.
 
   A fourth refusal, for the same reason the extract side refuses flags it
-  cannot honour: --threads, --turbo and --allow-weak-encoder are all
-  refused (exit 2) when the output names a container. Accepting them and
-  silently dropping them would promise behaviour that never happens. They
-  stay available on the single-stream codec path, which really does honour
-  them. STUFFR_THREADS is ignored on the container path for the same
-  reason — the environment must not quietly succeed at what the flag is
-  refused for, and a parallel xz or lzip encode splits its input per
-  worker, so honouring it would make the same command emit different
-  bytes. (A composed output does reach a real encoder, so the refusal is
-  stricter than it needs to be there; relaxing it is its own change, and
-  will lift both halves together.)
+  cannot honour: --threads, --turbo and --allow-weak-encoder are refused
+  (exit 2) only where the resolved chain has NO codec layer to give them
+  to. A bare container is that case. `-o bundle.tar` compresses nothing,
+  so there is no worker count to hand over, no CPU cap to lift and no
+  fallback encoder to consent to, and accepting the flag there would
+  promise behaviour that never happens.
+
+  A composed output is NOT that case and is not refused. `-o backup.tar.xz`
+  really does reach xz's parallel encoder:
+
+      stuffr pack proj -o backup.tar.xz --threads 4     # honoured, exit 0
+      stuffr pack proj -o backup.tar    --threads 4     # refused, exit 2
+
+  STUFFR_THREADS is read on that same composed path, and deliberately: the
+  environment is consulted exactly where the flag is honoured, never where
+  it is refused. --level reaches the codec layer there too.
+
+  What that costs is worth knowing rather than being surprised by. A
+  parallel xz or lzip encode splits its input per worker, so asking for
+  threads changes the bytes: `--threads 4` and no --threads at all produce
+  two different, equally valid archives from the same tree. The
+  reproducibility promise is the same one `stuffr info` states — same
+  input + same flags + same environment — and omitting every threading
+  flag builds no governor at all, so a plain `stuffr pack proj -o
+  backup.tar.xz` is byte-for-byte repeatable.
 
   stuffr pack one.txt two.txt -o bundle.ar
   stuffr pack one.txt two.txt -o bundle.cpio

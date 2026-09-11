@@ -44,10 +44,18 @@ read list.
 > has neither. **A permission error inside a walked tree is a warning, not
 > a failure:** one unreadable file or subdirectory is skipped, named in the
 > report, and the pack still exits 0, because losing a whole backup over
-> one file in a home directory is worse than losing that file. Pass
+> one file in a home directory is worse than losing that file. **A file
+> that changes size under the walk is the same bargain:** the entry header
+> was written from an earlier `stat`, so a file that shrank is padded with
+> zeros to the length it promised and one that grew stops there, with the
+> discrepancy named — GNU tar's `file changed as we read it`, where before
+> it aborted the pack and produced nothing. Pass
 > `--strict-fidelity` to make any such loss exit 4 instead — the archive is
 > still written and kept, exactly as `unpack -C --strict-fidelity` keeps
 > what it extracted; the exit code is the verdict, not the file's absence.
+> Excluding the output from its own walk is reported but is deliberately
+> NOT one of those losses, so a nightly
+> `pack . -o backup.tar --force --strict-fidelity` stays green.
 >
 > **The build tiers, and what actually differs between them:**
 >

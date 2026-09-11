@@ -182,6 +182,25 @@ question rather than an omission:
   but the pattern dialect (glob vs. path-anchored, `.gitignore` semantics,
   whether an excluded entry is a fidelity warning or silent), and picking one
   casually is how a tool ends up with three.
+- **The write-side plan is materialised whole, and is unbounded.**
+  `entries.rs`'s `create_archive` walks every named path to completion and
+  holds the entire result in memory — a `Vec<WalkItem>` plus a `HashSet` of
+  every entry name for the duplicate check — before a single byte of the
+  archive is written. `WalkItem` is 192 bytes measured, and each one also owns
+  its entry name on the heap, the entry's full source `PathBuf`, and a second
+  copy of the name in the `HashSet`: call it 400 bytes an entry. A
+  million-file tree therefore costs a few hundred MB of RSS before the
+  destination is even opened, and `--memory-limit` does not see it (that flag
+  bounds the codec's worker count on encode and its allocation on decode, not
+  this).
+  It is deliberate and load-bearing today rather than merely unnoticed: the
+  whole plan existing up front is what lets every input be validated before
+  the destination is touched, what lets the output be recognised and excluded
+  from its own walk, and what makes the duplicate-name refusal a pre-flight
+  check instead of a failure halfway through a written archive. Streaming the
+  walk would have to give up or re-engineer each of those, which is a design
+  question, not an optimisation — and the bound that matters (name
+  collisions) needs a set of names whatever the traversal looks like.
 
 ## Ergonomics
 
@@ -193,6 +212,13 @@ question rather than an omission:
 - Better `stuffr info` output: entropy estimate, "this is already compressed, don't
   bother" advice
 - `tar` compat symlink (see Part 1 for why it is not in v1)
+- **A structured `Chain` type for `info --json`.** Today `info` reports the
+  resolved chain as prose; a typed, serialisable `Chain` (container, codec,
+  and how they stack) would let `--fidelity=json` consumers walk it
+  programmatically instead of parsing text, and the cross-container
+  `convert` below would consume the same type to plan its own reads and
+  writes. (Deleted by accident in `5715b8b`, which added the `stere` entry
+  immediately below it; restored by the Phase 2c final review.)
 - **`stere`** (<https://crates.io/crates/stere>, source at `../stere`), a
   structure-aware searchable archive format for log files, developed in-house.
   It splits input into independently decodable blocks, extracts message
