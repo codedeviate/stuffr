@@ -35,7 +35,8 @@ pub use format::{
 pub use governor::{BudgetInputs, Governor, LeaseSet, default_memory_limit, resolve_workers};
 pub use ladder::{Resolved, StreamPolicy, resolve};
 pub use probe::{
-    Chain, PROBE_LEN, probe, resolve_chain, resolve_chain_deep, resolve_chain_deep_with,
+    Chain, PROBE_LEN, chain_for_new_path, probe, resolve_chain, resolve_chain_deep,
+    resolve_chain_deep_with,
 };
 pub use registry::{FormatRow, Registry};
 pub use size::format_size;

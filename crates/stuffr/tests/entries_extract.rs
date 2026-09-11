@@ -234,6 +234,7 @@ fn create_archive_stores_final_components_so_its_output_can_be_extracted_again()
         &[src.join("one.txt"), src.join("two.txt")],
         Output::Path(archive.clone()),
         FormatId::new("tar"),
+        None,
         &Default::default(),
     )
     .unwrap();

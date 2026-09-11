@@ -161,7 +161,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
 
             // A container output collects every path into one archive; a
             // codec output compresses exactly one stream.
-            if let Some(container) = container_output(fmt, output.as_deref()) {
+            if let Some((container, codec)) = resolve_pack_chain(fmt, output.as_deref()) {
                 refuse_unhonoured_pack_flags(&opts)?;
                 let inputs = pack_inputs(&paths)?;
                 let dst = match output {
@@ -180,7 +180,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                         ));
                     }
                 };
-                let out = entries::create_archive(&inputs, dst, container, &opts)?;
+                let out = entries::create_archive(&inputs, dst, container, codec, &opts)?;
                 eprintln!(
                     "{} entries -> {} ({} -> {} bytes, {} fidelity)",
                     inputs.len(),
@@ -196,8 +196,8 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 return Err(stuffr::Error::Usage(format!(
                     "packing {} paths needs an output naming a container (`-o bundle.tar`, \
                      or --format tar); a codec compresses one stream and has nowhere to \
-                     put a second. A container inside a codec (`bundle.tar.gz`) cannot be \
-                     written in one step yet: pack the .tar, then pack that.",
+                     put a second. A container INSIDE a codec does work in one step — \
+                     `-o bundle.tar.gz` and `-o bundle.tgz` both name a container.",
                     paths.len()
                 )));
             }
@@ -492,20 +492,42 @@ fn report_fidelity(report: &stuffr::FidelityReport, strict: bool) -> stuffr::Res
     Ok(())
 }
 
-/// The container an output names, if it names one at all — `--format tar`, or
-/// an extension that resolves to a container (`-o bundle.tar`).
+/// The `(container, codec)` pair a pack output names, if it names a container
+/// at all — `--format tar`, or an extension chain that resolves to one
+/// (`-o bundle.tar`, `-o bundle.tar.gz`, `-o bundle.tgz`).
 ///
 /// `None` means the output names a codec (or nothing yet), which is the
 /// single-stream path `pack` has always taken.
-fn container_output(fmt: Option<FormatId>, output: Option<&str>) -> Option<FormatId> {
+///
+/// `Path::extension()` is NOT enough, and was the bug: for `x.tar.gz` it
+/// returns `"gz"`, so the whole command took the single-stream codec path and
+/// the `.tar` was never honoured — v0.2.0 wrote a plain gzip under a name
+/// promising a tar, at exit 0. With an explicit `--format tar` the mirror
+/// image happened: an uncompressed tar named `.tar.gz`, which `gunzip`
+/// rejects. `chain_for_new_path` reads the whole chain, and shares its
+/// extension table with the read side so `.tar.gz` cannot mean one thing to
+/// `pack` and another to `list`.
+fn resolve_pack_chain(
+    fmt: Option<FormatId>,
+    output: Option<&str>,
+) -> Option<(FormatId, Option<FormatId>)> {
     let registry = stuffr::registry();
+
+    // An explicit --format names the CONTAINER; any codec still comes from
+    // the output's name, so `--format tar -o x.gz` is tar over gzip.
     if let Some(id) = fmt {
-        // An explicit --format wins outright, exactly as it does for a codec.
-        return registry.container(id).map(|_| id);
+        registry.container(id)?;
+        let codec = output
+            .map(Path::new)
+            .map(|p| stuffr::chain_for_new_path(registry, p))
+            .and_then(|c| c.outermost_codec());
+        return Some((id, codec));
     }
-    let ext = Path::new(output?).extension()?.to_str()?;
-    let id = registry.by_extension(ext)?;
-    registry.container(id).map(|_| id)
+
+    // Otherwise the output name carries the whole chain.
+    let chain = stuffr::chain_for_new_path(registry, Path::new(output?));
+    let container = chain.container()?;
+    Some((container, chain.outermost_codec()))
 }
 
 /// The paths `pack` will store as entries.

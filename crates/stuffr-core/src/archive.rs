@@ -197,6 +197,15 @@ impl std::fmt::Debug for Entry<'_> {
 /// unbuffered destination (a plain `File`) but loses the tail of the stream
 /// on a buffered one: notably stdout's `LineWriter`, which only auto-flushes
 /// on `\n` and may see none in a long run of binary output.
+///
+/// `#[must_use]` on the trait, so a `Box<dyn Sink>` that is produced and then
+/// dropped without `finish` is a warning rather than a silent truncation.
+/// `ArchiveWrite::finish` returns one precisely so the layer beneath can be
+/// finished next; `archive.finish()?;` on its own compiles perfectly well and
+/// loses every trailer below the container — the exact defect Phase 2c
+/// exists to fix, reintroduced by a line that looks finished.
+#[must_use = "a Sink must be completed with `finish`; dropping it skips the \
+              trailer and the flush, truncating the output"]
 pub trait Sink: Write + Send {
     fn finish(self: Box<Self>) -> Result<()>;
 }

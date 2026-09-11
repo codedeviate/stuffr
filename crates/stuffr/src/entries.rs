@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
     ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts,
-    EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts,
-    PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Source, SourceCaps,
-    StreamPolicy, check_symlink_target, ladder, resolve_chain_deep_with, safe_join,
+    EncodeOpts, EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields,
+    OpenOpts, PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source,
+    SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain_deep_with, safe_join,
 };
 
 use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
@@ -734,19 +734,52 @@ pub fn cat(
     })
 }
 
-/// Collects `paths` into a new `container` archive at `dst` — one entry each.
+/// Collects `paths` into a new `container` archive at `dst` — one entry each,
+/// optionally inside `codec`.
+///
+/// `codec` is what makes `bundle.tar.gz` writable in one step: the codec's own
+/// `Sink` becomes the container's destination, so the container writes its
+/// entries and trailer THROUGH the encoder, and one `finish` at each layer
+/// closes both in the right order. `None` writes a bare container.
 ///
 /// Every input is validated before the destination is touched, the same
 /// contract `Codec::check_encode_opts` gives the single-stream path: a
 /// rejected command costs nothing, with no temp file created and no existing
-/// file disturbed.
+/// file disturbed. The codec's own option checks run there too, for the same
+/// reason.
 pub fn create_archive(
     paths: &[PathBuf],
     dst: Output,
     container: FormatId,
+    codec: Option<FormatId>,
     o: &CompressOpts,
 ) -> Result<Outcome> {
     let kind = crate::registry().require_container(container)?;
+
+    // Resolved, checked and consented to BEFORE the destination is opened —
+    // the same order `ops::compress_with` uses, so a rejected level or an
+    // unconsented weak encoder costs nothing on either path.
+    let encoder = match codec {
+        Some(id) => {
+            let c = crate::registry().require_encoder(id)?;
+            if c.caps().weak_encoder && !o.allow_weak_encoder {
+                return Err(Error::Usage(format!(
+                    "`{id}` in this build has only a weak encoder: it produces valid \
+                     output with a markedly worse ratio, and buffers the whole input in \
+                     memory. Pass --allow-weak-encoder to use it anyway, or rebuild with \
+                     --features c-backed for the real encoder."
+                )));
+            }
+            let encode = EncodeOpts {
+                level: o.level,
+                governor: crate::ops::resolved_budget(o),
+                ..Default::default()
+            };
+            c.check_encode_opts(&encode)?;
+            Some((c, encode))
+        }
+        None => None,
+    };
 
     let mut planned: Vec<(String, std::fs::Metadata)> = Vec::with_capacity(paths.len());
     let mut names = HashSet::new();
@@ -783,9 +816,23 @@ pub fn create_archive(
 
     let opened = dst.create(o.force, o.sync)?;
     let finish = opened.finish;
+    // `CountingWriter` is innermost, closest to the file, so `bytes_out`
+    // counts the bytes that actually land on disk — compressed, when there is
+    // a codec.
     let (counted, bytes_out) = CountingWriter::new(opened.writer);
+
+    // The sink chain, innermost first. With a codec the codec's own `Sink` IS
+    // the container's destination — never wrapped in `PlainSink`, which would
+    // compile (a `Box<dyn Sink>` is `Write + Send`) and then flush instead of
+    // finishing, dropping the codec's trailer: the very bug this composes to
+    // fix. `PlainSink` is for the bare-container case only.
+    let sink: Box<dyn Sink> = match encoder {
+        Some((c, encode)) => c.encoder(Box::new(counted), &encode)?,
+        None => PlainSink::new(Box::new(counted)),
+    };
+
     let archive = kind.create(
-        PlainSink::new(Box::new(counted)),
+        sink,
         &CreateOpts {
             level: o.level,
             ..Default::default()
@@ -813,11 +860,12 @@ pub fn create_archive(
             )?;
             bytes_in += md.len();
         }
-        // Writes the container's trailer and hands the destination back;
-        // finishing it — flushing here, a codec trailer once Task 2 wires
-        // composition — is the caller's job, done once, at the outermost
-        // layer.
-        archive.finish()?.finish()?;
+        // Container trailer first, then the layer beneath it. `finish` hands
+        // the sink back precisely so this second call is possible; dropping
+        // it is what truncated every composed archive before Phase 2c, and is
+        // why `Sink` is `#[must_use]`.
+        let sink = archive.finish()?;
+        sink.finish()?;
         Ok(bytes_in)
     })();
 

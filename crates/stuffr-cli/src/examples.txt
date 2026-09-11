@@ -100,21 +100,31 @@ COLLECTING FILES INTO AN ARCHIVE
       A single path still derives its own output name: notes.txt.tar.
       Several paths have no one name to derive from, so they need -o.
 
+  stuffr pack one.txt two.txt -o bundle.tar.gz
+  stuffr pack one.txt two.txt -o bundle.tgz
+      A container INSIDE a codec, written in one step. -o names the whole
+      chain: the container comes from the inner extension and the codec
+      from the outer one, with the compound spellings (.tgz, .txz, .tbz2,
+      .tzst) read as the aliases they are. The codec's sink IS the
+      container's destination, so a single pass writes the entries, the
+      container's trailer and the codec's trailer in that order — nothing
+      is staged through a temporary file. --format names the CONTAINER
+      only, so `--format tar -o bundle.tar.gz` resolves to the same chain
+      rather than to a bare tar under a misleading name.
+
   Three things pack refuses, all before anything is written: more than one
   path with a codec output (a codec compresses one stream and has nowhere
   to put a second); two inputs whose final components collide (the archive
   could not then be extracted without --force); and a directory — this
-  build packs named files only. Walking a directory tree is still to come,
-  as is writing a container inside a codec (`bundle.tar.gz`) in one step:
-  pack the .tar, then pack that.
+  build packs named files only. Walking a directory tree is still to come.
 
   A fourth refusal, for the same reason the extract side refuses flags it
   cannot honour: --threads, --turbo and --allow-weak-encoder are all
-  refused (exit 2) when the output names a container. None of the four
-  containers compresses anything itself, so there is no encoder for those
-  flags to reach; accepting them and silently dropping them would promise
-  behaviour that never happens. They stay available on the single-stream
-  codec path, which really does honour them.
+  refused (exit 2) when the output names a container. Accepting them and
+  silently dropping them would promise behaviour that never happens. They
+  stay available on the single-stream codec path, which really does honour
+  them. (A composed output does reach a real encoder, so the refusal is
+  stricter than it needs to be there; relaxing it is its own change.)
 
   stuffr pack one.txt two.txt -o bundle.ar
   stuffr pack one.txt two.txt -o bundle.cpio

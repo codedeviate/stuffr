@@ -107,6 +107,22 @@ impl Chain {
         }
     }
 
+    /// The outermost codec, if any — the layer a writer must create FIRST,
+    /// because the container writes into it.
+    ///
+    /// Deliberately only the outermost, and deliberately NOT recursive the
+    /// way [`Chain::container`] is: a write-side chain is at most one codec
+    /// deep. `MAX_CHAIN_DEPTH` bounds the READ side, where deeper nesting is
+    /// a hostile-input concern rather than a shape stuffr emits, and a
+    /// recursive answer here would let a caller silently write only the
+    /// innermost of several codecs.
+    pub fn outermost_codec(&self) -> Option<FormatId> {
+        match self {
+            Chain::Codec { codec, .. } => Some(*codec),
+            _ => None,
+        }
+    }
+
     /// Human-readable form, innermost first: `"tar over gzip"`.
     pub fn describe(&self) -> String {
         match self {
@@ -176,6 +192,57 @@ fn inner_from_path(reg: &Registry, path: Option<&Path>, outer: FormatId) -> Chai
         return Chain::Container { container: id };
     }
     Chain::Raw
+}
+
+/// The codec a `.tgz`-style compound extension names — "t" + the codec's own
+/// extension, meaning "tar inside <codec>".
+///
+/// Needed only on the write side. The read side takes the outer codec from
+/// the magic bytes and never has to parse `tgz` at all; a file being created
+/// has no magic, so the name is the only evidence there is. No codec
+/// registers its own compound alias and none should — `tar::meta` spells out
+/// why registering `tgz` on tar would make a `.tgz` resolve to a bare tar —
+/// so the suffix is stripped here instead, the same way `inner_from_path`
+/// strips it when deciding what is inside.
+fn compound_alias(reg: &Registry, ext: &str) -> Option<FormatId> {
+    let stripped = ext.strip_prefix(['t', 'T'])?;
+    if stripped.is_empty() {
+        return None;
+    }
+    let id = reg.by_extension(stripped)?;
+    // A container never sits inside itself: `.tar` is resolved by the direct
+    // lookup above, and anything reached through the alias must be a codec.
+    reg.container(id).is_none().then_some(id)
+}
+
+/// The chain an OUTPUT path names, from its extensions alone.
+///
+/// The write-side twin of [`resolve_chain`], which cannot serve here: that one
+/// sniffs magic bytes, and a file about to be created has none. Shares
+/// `inner_from_path` with the read side deliberately — a second, write-side
+/// extension table would drift, and `.tar.gz` resolving one way for reading
+/// and another for writing is the whole class of bug this exists to prevent.
+///
+/// Never fails: an unknown or absent extension is [`Chain::Raw`], which every
+/// caller already has to handle.
+pub fn chain_for_new_path(reg: &Registry, path: &Path) -> Chain {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return Chain::Raw;
+    };
+    let Some(outer) = reg.by_extension(ext).or_else(|| compound_alias(reg, ext)) else {
+        return Chain::Raw;
+    };
+    // `x.tar` — a container with nothing above it.
+    if reg.container(outer).is_some() {
+        return Chain::Container { container: outer };
+    }
+    // `outer` is a codec. `x.tar.gz` and `x.tgz` both name a container inside
+    // it; `x.gz` names nothing, and resolves to a bare codec over Raw.
+    let inner = inner_from_path(reg, Some(path), outer);
+    Chain::Codec {
+        codec: outer,
+        inner: Box::new(inner),
+    }
 }
 
 /// Turns a path and/or a probed prefix into a concrete pipeline.
@@ -424,6 +491,42 @@ mod tests {
             FormatMeta::container(TAR, &["tar"], TAR_MAGIC),
         );
         r
+    }
+
+    /// `registry()` above registers the mock codec under BOTH `gz` and `tgz`,
+    /// and the mock container under `tar` — exactly the shape the compound
+    /// alias needs, so no new fixture is required here.
+    #[test]
+    fn an_output_path_resolves_to_the_chain_its_name_promises() {
+        let reg = registry();
+        let c = |p: &str| chain_for_new_path(&reg, Path::new(p)).describe();
+        assert_eq!(c("x.tar"), "tar");
+        assert_eq!(c("x.gz"), "gzip");
+        assert_eq!(c("x.tar.gz"), "tar over gzip");
+        assert_eq!(
+            c("x.tgz"),
+            "tar over gzip",
+            "the compound alias must resolve too"
+        );
+        assert_eq!(c("x.TAR.GZ"), "tar over gzip", "extensions are caseless");
+        assert_eq!(c("x.txt"), "raw");
+        assert_eq!(c("x"), "raw");
+    }
+
+    /// The pair a writer actually consumes: the container to create, and the
+    /// codec to create FIRST because the container writes into it.
+    #[test]
+    fn the_outermost_codec_is_the_layer_a_writer_creates_first() {
+        let reg = registry();
+        let pair = |p: &str| {
+            let c = chain_for_new_path(&reg, Path::new(p));
+            (c.container(), c.outermost_codec())
+        };
+        assert_eq!(pair("x.tar"), (Some(TAR), None));
+        assert_eq!(pair("x.gz"), (None, Some(GZIP)));
+        assert_eq!(pair("x.tar.gz"), (Some(TAR), Some(GZIP)));
+        assert_eq!(pair("x.tgz"), (Some(TAR), Some(GZIP)));
+        assert_eq!(pair("x.txt"), (None, None));
     }
 
     #[test]

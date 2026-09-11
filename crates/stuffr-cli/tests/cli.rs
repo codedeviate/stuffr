@@ -4180,3 +4180,196 @@ fn no_cli_message_contains_a_run_of_collapsed_indentation() {
         "the phrase either side of the old collapse must read as one sentence: {stderr:?}"
     );
 }
+
+/// The Phase 2c headline: a container over a codec, written in one step.
+///
+/// The trailer is checked with the SYSTEM tool, not our own reader. The whole
+/// bug this phase fixes is a codec trailer that never got written, and our own
+/// decoder may be lenient about a missing one — so asserting with `stuffr
+/// list` could pass against the very defect under repair.
+#[test]
+fn a_container_over_a_codec_is_written_in_one_step() {
+    let dir = tmp_dir();
+    let src = dir.join("notes.txt");
+    std::fs::write(&src, b"hello from inside the tar\n").unwrap();
+    let out = dir.join("bundle.tar.gz");
+
+    let st = Command::new(STUFFR)
+        .args(["pack", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    // 1. It really is gzip, and the trailer is intact: `gunzip -t` verifies
+    //    the CRC32 and ISIZE that the old code never wrote.
+    let t = Command::new("gunzip")
+        .args(["-t", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        t.status.success(),
+        "gunzip -t rejected it: {}",
+        String::from_utf8_lossy(&t.stderr)
+    );
+
+    // 2. It really is a tar inside, per the system tar.
+    let l = Command::new("tar")
+        .args(["tzf", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        l.status.success(),
+        "tar tzf failed: {}",
+        String::from_utf8_lossy(&l.stderr)
+    );
+    assert!(String::from_utf8_lossy(&l.stdout).contains("notes.txt"));
+
+    // 3. And stuffr reads back what it wrote.
+    let r = Command::new(STUFFR)
+        .args(["list", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    assert!(String::from_utf8_lossy(&r.stdout).contains("notes.txt"));
+}
+
+/// v0.2.0 wrote the wrong format, silently, in three different ways. Each
+/// line here failed against that binary.
+#[test]
+fn a_dot_tar_dot_gz_output_is_never_silently_the_wrong_format() {
+    let dir = tmp_dir();
+    let src = dir.join("notes.txt");
+    std::fs::write(&src, b"payload\n").unwrap();
+
+    // Every spelling that means "tar inside gzip".
+    for (name, extra) in [
+        ("a.tar.gz", vec![]),
+        ("b.tgz", vec![]),
+        ("c.tar.gz", vec!["--format", "tar"]),
+    ] {
+        let out = dir.join(name);
+        let mut args = vec!["pack", src.to_str().unwrap(), "-o", out.to_str().unwrap()];
+        args.extend(extra);
+        let st = Command::new(STUFFR).args(&args).output().unwrap();
+        assert!(
+            st.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+
+        // Must be gzip with a valid trailer...
+        let t = Command::new("gunzip")
+            .args(["-t", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            t.status.success(),
+            "{name} is not valid gzip: {}",
+            String::from_utf8_lossy(&t.stderr)
+        );
+        // ...and a tar inside. v0.2.0 produced one or the other, never both.
+        let l = Command::new("tar")
+            .args(["tzf", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            l.status.success(),
+            "{name} has no tar inside: {}",
+            String::from_utf8_lossy(&l.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&l.stdout).contains("notes.txt"),
+            "{name}"
+        );
+    }
+}
+
+/// The neighbours must not regress: a codec-only output still takes the
+/// single-stream path, and a container-only output still takes the bare path.
+#[test]
+fn a_codec_only_or_container_only_output_is_unaffected() {
+    let dir = tmp_dir();
+    let src = dir.join("notes.txt");
+    std::fs::write(&src, b"payload\n").unwrap();
+
+    let gz = dir.join("plain.gz");
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", src.to_str().unwrap(), "-o", gz.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    // A bare codec output is NOT a tar — decompressing gives the file itself.
+    let out = Command::new("gunzip")
+        .args(["-c", gz.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.stdout, b"payload\n");
+
+    let tar = dir.join("plain.tar");
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", src.to_str().unwrap(), "-o", tar.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let l = Command::new("tar")
+        .args(["tf", tar.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&l.stdout).contains("notes.txt"));
+}
+
+/// A zip inside a codec: the shape that would have shown the stray
+/// `flush_destination` in `ZipWrite::finish`, which emitted a `Z_SYNC_FLUSH`
+/// empty stored block into the gzip stream before the trailer. And a bare
+/// zip must still round-trip after that call was removed.
+#[test]
+fn a_zip_round_trips_bare_and_inside_a_codec() {
+    let dir = tmp_dir();
+    let src = dir.join("notes.txt");
+    std::fs::write(&src, b"zip payload\n").unwrap();
+
+    for name in ["bare.zip", "wrapped.zip.gz"] {
+        let out = dir.join(name);
+        let st = Command::new(STUFFR)
+            .args(["pack", src.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            st.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        if name.ends_with(".gz") {
+            let t = Command::new("gunzip")
+                .args(["-t", out.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(
+                t.status.success(),
+                "{name} is not valid gzip: {}",
+                String::from_utf8_lossy(&t.stderr)
+            );
+        }
+        let r = Command::new(STUFFR)
+            .args(["list", out.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            r.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&r.stdout).contains("notes.txt"),
+            "{name}"
+        );
+    }
+}

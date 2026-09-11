@@ -1325,9 +1325,13 @@ impl ArchiveWrite for ZipWrite {
     ///
     /// The destination is returned, not finished: the caller owns completion,
     /// because a codec layer beneath us has its own trailer still to write.
-    /// The `flush_destination` here is the window's own, not the sink's
-    /// completion — it pushes the committed bytes on rather than closing
-    /// anything.
+    /// `commit_all` has already pushed every byte down with `write_all`, and
+    /// there is deliberately no flush of the destination here — tar, ar and
+    /// cpio dropped theirs when `Sink` became the write-side currency, and a
+    /// flush on a codec sink is not free: `GzEncoder::flush` emits a
+    /// `Z_SYNC_FLUSH` empty stored block and liblzma's emits `LZMA_SYNC_FLUSH`,
+    /// closing a block early and costing real ratio on `pack -o x.zip.xz`.
+    /// `Sink::finish`, which the caller now owns, flushes.
     fn finish(mut self: Box<Self>) -> Result<Box<dyn Sink>> {
         let writer = self
             .inner
@@ -1337,7 +1341,6 @@ impl ArchiveWrite for ZipWrite {
         // Only now does the destination see anything it has not seen already.
         let mut spool = self.spool.borrow_mut();
         spool.commit_all()?;
-        spool.flush_destination()?;
         Ok(spool.take_destination())
     }
 }
