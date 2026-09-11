@@ -9,6 +9,7 @@ pub use stuffr_core::*;
 
 pub mod entries;
 pub mod ops;
+mod walk;
 
 /// Builds a registry containing every format this build was compiled with.
 fn build_registry() -> stuffr_core::Registry {

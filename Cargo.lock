@@ -689,6 +689,7 @@ dependencies = [
  "stuffr",
  "stuffr-core",
  "stuffr-formats",
+ "tempfile",
 ]
 
 [[package]]

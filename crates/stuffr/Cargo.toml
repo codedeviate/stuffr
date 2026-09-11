@@ -69,3 +69,4 @@ serde = { workspace = true, optional = true }
 # own tests without making either a default for library consumers.
 stuffr = { path = ".", features = ["serde", "testing"] }
 serde_json = "1"
+tempfile = { workspace = true }

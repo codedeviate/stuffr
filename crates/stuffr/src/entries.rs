@@ -930,7 +930,7 @@ fn entry_name_for(path: &Path) -> Result<String> {
 /// a mode no other tar tool would recognise, and would make extraction report
 /// a mode loss (see `RESTORED_MODE_BITS`) for every file stuffr packed
 /// itself.
-fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
+pub(crate) fn mode_of(md: &std::fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
