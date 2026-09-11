@@ -4725,9 +4725,15 @@ fn packing_a_directory_into_a_container_that_cannot_hold_it_warns_rather_than_re
         String::from_utf8_lossy(&st.stderr)
     );
     let err = String::from_utf8_lossy(&st.stderr);
+    // The DROPPED ENTRY'S NAME, not the word "fidelity". The pack summary
+    // line prints "... exact fidelity)" on every successful pack, warnings
+    // or none, so an assertion on that word passes against an implementation
+    // with the whole warnings vector deleted — which is exactly what it was
+    // before this was caught. Naming `proj/sub` is the property this test
+    // claims to test.
     assert!(
-        err.contains("fidelity"),
-        "it must SAY what it dropped; stderr: {err}"
+        err.contains("proj/sub"),
+        "it must SAY WHAT it dropped, by name; stderr: {err}"
     );
 
     // And --strict-fidelity turns that into a refusal, as it does on read.
@@ -4805,5 +4811,98 @@ fn two_directories_with_the_same_final_component_are_refused_before_writing() {
     assert!(
         !out.exists(),
         "nothing may be written: the refusal happens before the destination is opened"
+    );
+}
+/// `stuffr pack . -o x.tar` — the single most common archiving idiom there
+/// is, and what `tar cf x.tar .` teaches. `Path::file_name` returns `None`
+/// for `.`, which used to make this exit 2 at the naming step, before the
+/// walk this phase added ever ran.
+#[test]
+fn pack_of_dot_names_entries_after_the_directory_it_resolves_to() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+
+    let out = dir.join("dot.tar");
+    let st = Command::new(STUFFR)
+        .current_dir(&root)
+        .args(["pack", ".", "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "`pack .` must work: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let listed = run_output(&["list", out.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        text.contains("proj/src/main.rs"),
+        "`.` resolves to its canonical final component, so entries sit under \
+         `proj/` exactly as `pack ../proj` would name them: {text}"
+    );
+}
+
+/// The same rule one level up. `..` from `proj/src` is `proj`, so the entries
+/// are named the same way `pack proj` names them — the final-component rule
+/// applied consistently rather than a special case bolted onto `.`.
+#[test]
+fn pack_of_dotdot_names_entries_after_the_parent_it_resolves_to() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+
+    let out = dir.join("dotdot.tar");
+    let st = Command::new(STUFFR)
+        .current_dir(root.join("src"))
+        .args(["pack", "..", "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "`pack ..` must work: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let listed = run_output(&["list", out.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        text.contains("proj/src/main.rs"),
+        "`..` must name entries after the directory it resolves to: {text}"
+    );
+}
+
+/// A trailing slash is noise, and `Path::file_name` already reads `proj/` as
+/// `proj`. Pinned anyway: a hand-rolled "split on `/`, take the last" — the
+/// obvious way to rewrite this function — yields an EMPTY name here, and an
+/// archive of entries named `/src/main.rs` is one stuffr itself refuses to
+/// extract at exit 7.
+#[test]
+fn a_trailing_slash_on_a_packed_directory_is_noise() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+
+    let out = dir.join("slash.tar");
+    let with_slash = format!("{}/", root.to_str().unwrap());
+    let st = Command::new(STUFFR)
+        .args(["pack", &with_slash, "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "a trailing slash must not change anything: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let listed = run_output(&["list", out.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        text.contains("proj/src/main.rs"),
+        "entries must sit under `proj/`, not under an empty name: {text}"
     );
 }

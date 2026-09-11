@@ -1046,14 +1046,58 @@ fn ownership_warning(source: &crate::walk::ItemSource, meta: &EntryMeta) -> Opti
 /// Not the path as typed. `stuffr pack /etc/hosts -o x.tar` must not write an
 /// entry named `/etc/hosts`, because [`extract`] would refuse that archive at
 /// exit 7 — stuffr does not write what it will not read.
+///
+/// # `.` and `..` resolve rather than refuse
+///
+/// [`Path::file_name`] returns `None` for `.`, `..`, and for any path ending
+/// in one of them (`proj/.`, `../..`) — it discards those components rather
+/// than naming them. Refusing there made `stuffr pack . -o x.tar` exit 2, and
+/// that is the single most common archiving idiom there is: `tar cf x.tar .`
+/// is what every tutorial teaches, so it is the likeliest first thing anyone
+/// types at the directory walk this phase added. It is also the write-side
+/// twin of a bug Phase 2 already spent a fix round on — a bare `.` entry,
+/// which `tar cf x.tar .` emits, was refused on extraction at exit 7.
+///
+/// So a path whose final component is not a name is CANONICALISED, and the
+/// name comes from the result: packing `.` from `/home/me/proj` writes
+/// `proj/…`, and `..` from `/home/me/proj/src` writes `proj/…`. That is the
+/// same final-component rule applied consistently, not a special case — this
+/// project chose that rule over storing a directory's contents unprefixed,
+/// and `.` is not an exception to it.
+///
+/// Canonicalisation happens ONLY on that fallback. A path that already has a
+/// final component keeps it verbatim, which is what preserves the rule that a
+/// symlink NAMED on the command line is stored under the link's own name
+/// while its target's contents are packed — resolving unconditionally would
+/// silently rename such an entry to its target.
+///
+/// A trailing slash needs nothing: `Path::file_name` already reads `proj/` as
+/// `proj`. The test pins that, because a hand-rolled "split on `/` and take
+/// the last" would yield an empty name instead.
+///
+/// `/` itself still has no name to store, and still refuses — with the
+/// resolved path in the message, since the typed one may not show why.
 fn entry_name_for(path: &Path) -> Result<String> {
-    let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
-        Error::Usage(format!(
-            "`{}` has no final path component to name an entry after",
-            path.display()
-        ))
-    })?;
-    Ok(name.to_string())
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        return Ok(name.to_string());
+    }
+    // `.`, `..`, `proj/.`, `../..` — see the doc comment. `canonicalize`
+    // needs the path to exist, which it must: `create_archive` stats it
+    // immediately after this, so a missing path fails either way, and here
+    // it fails as the `Io` error it is rather than as a naming complaint.
+    let resolved = std::fs::canonicalize(path)?;
+    resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_string())
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "`{}` resolves to `{}`, which has no final path component to name \
+                 an entry after",
+                path.display(),
+                resolved.display()
+            ))
+        })
 }
 
 /// The unix permission bits, where the platform has them.
@@ -1495,5 +1539,90 @@ mod tests {
         let mut b = ArchiveBudget::new(Some(u64::MAX / 2), DEFAULT_MAX_RATIO);
         let large_charge = u64::MAX / 3;
         assert!(b.charge("large.bin", large_charge).is_ok());
+    }
+    /// `ownership_warning` in isolation, because on unix nothing can reach
+    /// its `Some` branch: `walk::ids_of` returns `(Some, Some)`
+    /// unconditionally there, and there is no non-unix CI leg. Closing
+    /// carried finding 2 by adding a setter for `MetaFields::uid_gid` that
+    /// no supported platform ever executes and no test ever observes would
+    /// only have moved the finding, not answered it.
+    ///
+    /// It is a pure function over borrowed arguments, so four assertions pin
+    /// it permanently. The failure they exist to catch: someone later adds a
+    /// path that learns a uid but not a gid, changes the `&&` to `||` to
+    /// "simplify" it, and nothing notices that an entry with half its
+    /// ownership now reports none lost.
+    fn meta_with(uid: Option<u32>, gid: Option<u32>) -> EntryMeta {
+        EntryMeta {
+            name: "proj/notes.txt".into(),
+            uid,
+            gid,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_entry_with_no_ownership_reports_the_uid_gid_loss() {
+        let w = ownership_warning(&crate::walk::ItemSource::Dir, &meta_with(None, None))
+            .expect("an entry written with no ids asserts root:root, which is a loss");
+        match w {
+            Fidelity::MetadataIncomplete { entry, fields } => {
+                assert_eq!(entry, "proj/notes.txt", "the warning must name the entry");
+                assert!(
+                    fields.uid_gid,
+                    "`MetaFields::uid_gid` is the field for this, and must be the one set"
+                );
+                assert_eq!(
+                    fields.missing(),
+                    vec!["uid_gid"],
+                    "and the ONLY one: nothing else was lost here"
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_entry_that_knows_both_ids_reports_nothing() {
+        assert!(
+            ownership_warning(
+                &crate::walk::ItemSource::Dir,
+                &meta_with(Some(501), Some(20))
+            )
+            .is_none(),
+            "the unix case: a warning here would fire on every entry of every pack"
+        );
+    }
+
+    #[test]
+    fn half_an_ownership_is_still_a_loss() {
+        // The `&&`-versus-`||` question, pinned. A uid with no gid still
+        // reaches the container as `gid.unwrap_or(0)` — group root — so it
+        // is a loss, and an implementation that only warns when BOTH are
+        // absent would miss it.
+        assert!(
+            ownership_warning(&crate::walk::ItemSource::Dir, &meta_with(Some(501), None)).is_some(),
+            "a known uid does not make an unknown gid harmless"
+        );
+        assert!(
+            ownership_warning(&crate::walk::ItemSource::Dir, &meta_with(None, Some(20))).is_some(),
+            "nor the other way round"
+        );
+    }
+
+    #[test]
+    fn a_skipped_entry_reports_no_ownership_loss_because_it_was_never_written() {
+        assert!(
+            ownership_warning(
+                &crate::walk::ItemSource::Skipped {
+                    reason: "not a regular file".into()
+                },
+                &meta_with(None, None),
+            )
+            .is_none(),
+            "an entry that was not written cannot have lost its ownership; it \
+             already carries its own EntrySkipped warning, and a second one \
+             about a field it never had is noise"
+        );
     }
 }
