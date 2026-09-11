@@ -2873,8 +2873,13 @@ fn pack_refuses_two_inputs_that_would_share_one_entry_name() {
     assert!(!archive.exists(), "a refused command must write nothing");
 }
 
+/// Was `pack_of_a_directory_says_so_rather_than_writing_an_empty_archive`,
+/// which asserted exit 2 on a directory. Phase 2c walks it instead, so the
+/// property worth keeping is the one the old name was really about: a
+/// directory must not silently produce an archive with nothing in it. An
+/// EMPTY directory is still one real entry.
 #[test]
-fn pack_of_a_directory_says_so_rather_than_writing_an_empty_archive() {
+fn pack_of_an_empty_directory_stores_the_directory_itself() {
     let dir = tmp_dir();
     std::fs::create_dir_all(dir.join("tree")).unwrap();
     let archive = dir.join("tree.tar");
@@ -2886,11 +2891,17 @@ fn pack_of_a_directory_says_so_rather_than_writing_an_empty_archive() {
     ]);
     assert_eq!(
         out.status.code(),
-        Some(2),
+        Some(0),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(!archive.exists(), "a refused command must write nothing");
+
+    let listed = run_output(&["list", archive.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        text.contains("tree"),
+        "the directory itself must be an entry, not an empty archive: {text}"
+    );
 }
 
 #[test]
@@ -4524,4 +4535,275 @@ fn the_composed_path_ignores_stuffr_threads_because_it_refuses_threads() {
         .output()
         .unwrap();
     assert_eq!(refused.status.code(), Some(2));
+}
+// ---------------------------------------------------------------------
+// Phase 2c: `pack` walks a directory tree, and says what walking it lost.
+// ---------------------------------------------------------------------
+
+#[test]
+fn pack_walks_a_directory_and_round_trips_it() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir(root.join("empty")).unwrap();
+    std::fs::write(root.join("README.md"), b"readme").unwrap();
+    std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+
+    let out = dir.join("p.tar");
+    let st = Command::new(STUFFR)
+        .args(["pack", root.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let back = dir.join("back");
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "unpack",
+                out.to_str().unwrap(),
+                "-C",
+                back.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    assert_eq!(
+        std::fs::read(back.join("proj/README.md")).unwrap(),
+        b"readme"
+    );
+    assert_eq!(
+        std::fs::read(back.join("proj/src/main.rs")).unwrap(),
+        b"fn main() {}"
+    );
+    assert!(
+        back.join("proj/empty").is_dir(),
+        "an empty directory must survive the round trip"
+    );
+}
+
+/// A directory INSIDE a codec, in one command — the milestone's own headline
+/// (`stuffr pack proj -o backup.tar.gz`), which needs the walk and the
+/// composed write together.
+#[test]
+fn pack_walks_a_directory_into_a_container_inside_a_codec() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+
+    let out = dir.join("backup.tar.gz");
+    let st = Command::new(STUFFR)
+        .args(["pack", root.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let back = dir.join("back");
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "unpack",
+                out.to_str().unwrap(),
+                "-C",
+                back.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(back.join("proj/src/main.rs")).unwrap(),
+        b"fn main() {}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_stores_a_symlink_inside_a_directory_rather_than_following_it() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("real.txt"), b"real").unwrap();
+    std::os::unix::fs::symlink("real.txt", root.join("link.txt")).unwrap();
+
+    let out = dir.join("p.tar");
+    assert!(
+        Command::new(STUFFR)
+            .args(["pack", root.to_str().unwrap(), "-o", out.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // The system tar must agree it is a link, not a second copy. Its absence
+    // panics rather than skipping: the repo's reference-tool convention (see
+    // `lzip.rs`'s `require_lzip`) is that failing loudly beats proving
+    // nothing, and CI installs tar unconditionally.
+    let l = Command::new("tar")
+        .args(["tvf", out.to_str().unwrap()])
+        .output()
+        .expect("the system `tar` is this test's reference authority");
+    let text = String::from_utf8_lossy(&l.stdout);
+    assert!(
+        text.contains("link.txt -> real.txt"),
+        "tar tvf said: {text}"
+    );
+}
+
+/// The opposite rule, and the reason the two must not be unified: a symlink
+/// NAMED on the command line is followed, because storing the link itself
+/// would let `pack` write an archive `unpack` then refuses at exit 7.
+#[cfg(unix)]
+#[test]
+fn pack_follows_a_symlink_named_on_the_command_line() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("real.txt"), b"real").unwrap();
+    std::os::unix::fs::symlink("real.txt", dir.join("link.txt")).unwrap();
+
+    let out = dir.join("named.tar");
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "pack",
+                dir.join("link.txt").to_str().unwrap(),
+                "-o",
+                out.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let back = dir.join("back");
+    assert!(
+        Command::new(STUFFR)
+            .args([
+                "unpack",
+                out.to_str().unwrap(),
+                "-C",
+                back.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(back.join("link.txt")).unwrap(),
+        b"real",
+        "a named symlink is followed, so the entry holds the target's bytes"
+    );
+}
+
+#[test]
+fn packing_a_directory_into_a_container_that_cannot_hold_it_warns_rather_than_refusing() {
+    // `ar` has no directory concept at all. Refusing would be the tenth
+    // instance of this project's signature defect; warning is honest.
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/a.txt"), b"a").unwrap();
+
+    let out = dir.join("p.a");
+    let st = Command::new(STUFFR)
+        .args(["pack", root.to_str().unwrap(), "-o", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "must not refuse: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let err = String::from_utf8_lossy(&st.stderr);
+    assert!(
+        err.contains("fidelity"),
+        "it must SAY what it dropped; stderr: {err}"
+    );
+
+    // And --strict-fidelity turns that into a refusal, as it does on read.
+    let out2 = dir.join("p2.a");
+    let st2 = Command::new(STUFFR)
+        .args([
+            "pack",
+            root.to_str().unwrap(),
+            "-o",
+            out2.to_str().unwrap(),
+            "--strict-fidelity",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        st2.status.code(),
+        Some(4),
+        "strict fidelity must exit 4 on the write side too"
+    );
+}
+
+/// The flag must not fire on a clean pack. A gate that always trips is a gate
+/// nobody leaves on.
+#[test]
+fn strict_fidelity_passes_on_a_pack_that_lost_nothing() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            root.to_str().unwrap(),
+            "-o",
+            dir.join("clean.tar").to_str().unwrap(),
+            "--strict-fidelity",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "an ordinary tree into tar loses nothing: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+}
+
+/// The walk names entries beneath the root's own final component, so two
+/// directories with the same name collide before anything is written — the
+/// same rule two identically-named files have always had.
+#[test]
+fn two_directories_with_the_same_final_component_are_refused_before_writing() {
+    let dir = tmp_dir();
+    std::fs::create_dir_all(dir.join("a/proj")).unwrap();
+    std::fs::create_dir_all(dir.join("b/proj")).unwrap();
+    std::fs::write(dir.join("a/proj/x.txt"), b"x").unwrap();
+    std::fs::write(dir.join("b/proj/y.txt"), b"y").unwrap();
+
+    let out = dir.join("dup.tar");
+    let st = Command::new(STUFFR)
+        .args([
+            "pack",
+            dir.join("a/proj").to_str().unwrap(),
+            dir.join("b/proj").to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        st.status.code(),
+        Some(2),
+        "a name collision is a usage error"
+    );
+    assert!(
+        !out.exists(),
+        "nothing may be written: the refusal happens before the destination is opened"
+    );
 }

@@ -188,6 +188,11 @@ impl Container for CpioNewc {
             read: true,
             write: true,
             forward_parse: true,
+            // Through the mode's `S_IFMT` type bits, which `add` normalises
+            // for both kinds rather than trusting a caller's mode — see its
+            // comment. A symlink's target is its payload.
+            stores_dirs: true,
+            stores_symlinks: true,
             ..Default::default()
         }
     }

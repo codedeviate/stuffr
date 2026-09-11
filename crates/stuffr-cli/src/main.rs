@@ -139,6 +139,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             threads,
             turbo,
             memory_limit,
+            strict_fidelity,
         } => {
             // Parsing (and thus validating) `--memory-limit` here, ahead of
             // `ops::resolved_budget`, is deliberate: a malformed value must
@@ -181,15 +182,25 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     }
                 };
                 let out = entries::create_archive(&inputs, dst, container, codec, &opts)?;
+                // `inputs.len()` is the number of paths NAMED, which since
+                // Phase 2c is no longer the number of entries written: one
+                // named directory is a whole tree. Saying "paths" rather than
+                // "entries" is the one-word fix; the entry count is not on
+                // `Outcome` and is not worth a field there.
                 eprintln!(
-                    "{} entries -> {} ({} -> {} bytes, {} fidelity)",
+                    "{} path(s) -> {} ({} -> {} bytes, {} fidelity)",
                     inputs.len(),
                     out.format,
                     out.bytes_in,
                     out.bytes_out,
                     out.fidelity.rung
                 );
-                return Ok(());
+                // The same call the read side makes, not a second printer:
+                // pack's fidelity report now carries real warnings (what the
+                // walk could not store, what this container has no shape
+                // for), and --strict-fidelity turns them into exit 4 here
+                // exactly as it does for `unpack -C` and `test`.
+                return report_fidelity(&out.fidelity, strict_fidelity);
             }
 
             if paths.len() > 1 {
@@ -225,7 +236,11 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 "{} -> {} ({} -> {} bytes, {} fidelity)",
                 input, out.format, out.bytes_in, out.bytes_out, out.fidelity.rung
             );
-            Ok(())
+            // Honoured on the single-stream path too, rather than accepted
+            // and ignored — the tree's rule for a flag that would otherwise
+            // mislead. A codec encode loses nothing today, so this reports
+            // nothing today; a codec that ever does will be heard.
+            report_fidelity(&out.fidelity, strict_fidelity)
         }
         Command::Unpack {
             input,

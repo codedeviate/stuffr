@@ -120,9 +120,18 @@ pub enum Fidelity {
     /// fifo, socket or hardlink — [`crate::EntryKind::Other`], the honest
     /// answer a container gives for an entry shape `EntryKind` has no variant
     /// for yet. Writing one out as a regular file carrying its "contents"
-    /// would be a silent lie about what the archive held.
+    /// would be a silent lie about what the archive held. The write side
+    /// raises it too, for something met on disk that no container here can
+    /// store — a socket, an undecodable name, a directory being packed into
+    /// `ar`.
+    ///
+    /// `reason` is an owned `String` rather than a `&'static str` because the
+    /// write side's reasons carry runtime detail — the failing errno, the
+    /// container's own name, the undecodable bytes — and a reason that cannot
+    /// name the particular thing that went wrong is a reason the user cannot
+    /// act on.
     #[error("skipped entry `{entry}`: {reason}")]
-    EntrySkipped { entry: String, reason: &'static str },
+    EntrySkipped { entry: String, reason: String },
 
     #[error("stream truncated at offset {at}")]
     TruncatedStream { at: u64 },
@@ -291,7 +300,7 @@ mod tests {
 
         let f = Fidelity::EntrySkipped {
             entry: "dev/null".into(),
-            reason: "device nodes, fifos and hardlinks are not created",
+            reason: "device nodes, fifos and hardlinks are not created".into(),
         };
         let s = format!("{f}");
         assert!(

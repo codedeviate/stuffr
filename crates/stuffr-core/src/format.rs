@@ -162,6 +162,19 @@ pub struct ContainerCaps {
     pub per_entry_codec: bool,
     /// Random access is required even to enumerate (squashfs, iso).
     pub needs_seek: bool,
+    /// A directory can be recorded AS a directory, rather than as an empty
+    /// regular file that happens to share its name.
+    ///
+    /// `ar` is the counter-example and the reason this field exists: its
+    /// format has no directory concept at all, so writing one produces a
+    /// zero-byte *file* named `proj/sub` — after which an entry named
+    /// `proj/sub/a.txt` cannot be extracted, because its parent is a file.
+    /// A writer that cannot store the kind is expected to be told so by its
+    /// caller and warn, rather than emit the lie.
+    pub stores_dirs: bool,
+    /// A symlink can be recorded as a link, target and all, rather than as a
+    /// regular file carrying the target text as its contents.
+    pub stores_symlinks: bool,
 }
 
 /// A magic-byte rule. Detection matches these against a bounded prefix.
@@ -234,6 +247,8 @@ impl ContainerCaps {
             solid: false,
             per_entry_codec: false,
             needs_seek: false,
+            stores_dirs: false,
+            stores_symlinks: false,
         }
     }
 

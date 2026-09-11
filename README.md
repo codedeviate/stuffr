@@ -35,8 +35,12 @@ read list.
 > crate). `cpio` is `newc` only — not odc, not crc. `--strict-fidelity`
 > fails on essentially any tarball containing a symlink, because a
 > symlink's mtime cannot be restored without following the link. `pack`
-> does not walk directories, though `pack -o bundle.tar.gz` (and
-> `bundle.tgz`) now writes the container inside the codec in one pass.
+> now walks a directory tree, and `pack -o bundle.tar.gz` (and
+> `bundle.tgz`) writes the container inside the codec in one pass, so
+> `stuffr pack proj -o backup.tar.gz` is a single command. What the walk
+> cannot store it names in a fidelity warning rather than dropping
+> silently — a socket, an undecodable name, a directory it may not list,
+> or a directory or symlink handed to `ar`, which has neither.
 >
 > **The build tiers, and what actually differs between them:**
 >
@@ -222,9 +226,8 @@ OOM killer.
 (`ar`, `cpio`, `tar`, `zip`/`zip64`) `stuffr formats` lists — `pack`/`unpack`/
 `cat` are entry-aware for every container, with extraction-time path
 containment and bomb limits on by default. `convert` and `install-links`
-are not implemented yet, and `pack` does not walk directories (see the status
-note above). `pack -o bundle.tar.gz` composes a container on top of a codec in
-one pass.*
+are not implemented yet. `pack` walks a directory tree, and
+`pack -o bundle.tar.gz` composes a container on top of a codec in one pass.*
 
 ```
 stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...

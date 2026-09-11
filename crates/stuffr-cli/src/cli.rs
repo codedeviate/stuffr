@@ -73,6 +73,14 @@ pub enum Command {
         /// available RAM, honouring cgroup limits.
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
+        /// Fail (exit 4) if anything was approximated or lost.
+        ///
+        /// On the pack side that means something the walk met and could not
+        /// store — a socket, an undecodable name, an unreadable directory —
+        /// or an entry shape this container has none of, such as a directory
+        /// or a symlink in an `ar`.
+        #[arg(long)]
+        strict_fidelity: bool,
     },
     /// Decompress a file, or extract an archive's entries.
     Unpack {

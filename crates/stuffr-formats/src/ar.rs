@@ -135,6 +135,14 @@ impl Container for Ar {
     /// module doc: this format has no structure at all beyond one header per
     /// entry, so a forward read loses nothing a seekable one would have
     /// offered.
+    ///
+    /// `stores_dirs` and `stores_symlinks` stay false, and that is the whole
+    /// of what `ar` cannot do that the other three containers can: it has no
+    /// kind field at all, so every entry is a regular file. A caller packing
+    /// a walked directory tree is expected to consult these and warn rather
+    /// than hand `add` a directory, which would land as a zero-byte *file*
+    /// under the directory's name and make every entry beneath it
+    /// unextractable.
     fn caps(&self) -> ContainerCaps {
         ContainerCaps {
             read: true,

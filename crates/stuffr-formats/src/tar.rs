@@ -237,6 +237,12 @@ impl Container for Tar {
             // claims, and why the ladder's `ForwardOnly` rung costs tar no
             // fidelity warnings at all.
             forward_parse: true,
+            // A typeflag of its own for each: `Directory` and `Symlink`, with
+            // the link target in the header's `linkname` field. `add` writes
+            // both (see its `EntryType` match), so a walked tree keeps its
+            // shape.
+            stores_dirs: true,
+            stores_symlinks: true,
             ..Default::default()
         }
     }

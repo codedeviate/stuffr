@@ -117,11 +117,48 @@ COLLECTING FILES INTO AN ARCHIVE
       then exit 5 calling stuffr's own output corrupt — a reader takes the
       outer layer from the magic and the container from the name.
 
+  stuffr pack proj -o backup.tar
+  stuffr pack proj -o backup.tar.gz
+      A DIRECTORY is walked: every file, subdirectory and symlink under it
+      becomes an entry, named beneath the directory's own final component
+      (proj/src/main.rs, not the path as typed). Depth-first, with each
+      level sorted by name, so the same tree produces the same bytes twice
+      — readdir order is filesystem-dependent and is not alphabetical. An
+      empty directory is a real entry and survives the round trip.
+
+      Two symlink rules, opposites on purpose, both of them tar's: a link
+      NAMED on the command line is FOLLOWED (`stuffr pack link-to-notes.txt`
+      stores the file it points at, because storing the link itself would
+      produce an archive `stuffr unpack` refuses at exit 7), while a link
+      found INSIDE the walk is stored AS a link and never followed. That
+      second rule is also why there is no cycle detection: a loop cannot be
+      entered in the first place.
+
+      What the walk cannot store, it names rather than swallowing: a
+      socket, fifo or device node; a filename or symlink target that is not
+      valid UTF-8 (storing a lossy substitute would silently write a
+      different name, or point a restored link elsewhere); and a directory
+      it is not allowed to list — one root-owned subdirectory must not fail
+      a whole backup, so the directory itself is stored, its contents are
+      not, and the reason says so. Hardlinks are reported too: no container
+      here writes a hardlink entry, so two names for one inode extract as
+      two independent files.
+
+      stuffr pack proj -o proj.a
+      `ar` has no directory and no symlink concept at all, so those entries
+      are DROPPED rather than written as zero-byte regular files — which
+      would make everything beneath them unextractable, the parent being a
+      file. The files themselves are stored, and each dropped entry is
+      named in a fidelity warning. --strict-fidelity turns any of these
+      into exit 4, on the write side exactly as it does on the read side.
+
   Three things pack refuses, all before anything is written: more than one
   path with a codec output (a codec compresses one stream and has nowhere
   to put a second); two inputs whose final components collide (the archive
-  could not then be extracted without --force); and a directory — this
-  build packs named files only. Walking a directory tree is still to come.
+  could not then be extracted without --force); and a path NAMED on the
+  command line that is neither a file nor a directory — a fifo or socket
+  has no entry shape, and naming one is a request, not an incidental find
+  inside a walk.
 
   A fourth refusal, for the same reason the extract side refuses flags it
   cannot honour: --threads, --turbo and --allow-weak-encoder are all
@@ -141,10 +178,10 @@ COLLECTING FILES INTO AN ARCHIVE
       ar and cpio (newc only) collect files the same way tar does — pack
       infers the container from -o's extension (.a or .ar for ar, .cpio for
       cpio) or from --format. Both are simpler than tar: neither carries a
-      trailing index, a per-entry codec or a directory concept of its own
-      (ar has none at all; cpio's applies only when a caller sets one via
-      the library, since this build's directory walk does not exist yet
-      either way). cpio's per-entry size field is a hard 4 GiB (u32)
+      trailing index or a per-entry codec, and they differ on directories:
+      cpio records one through its mode's type bits, ar has no directory
+      concept at all and drops the entry with a warning (see above). cpio's
+      per-entry size field is a hard 4 GiB (u32)
       ceiling — an entry larger than that is refused outright, naming the
       limit, never silently truncated to the wrong length. ar has no such
       ceiling.
@@ -754,7 +791,8 @@ NOT YET
   capability limit, not a damaged file. cpio's per-entry size field is
   also a hard 4 GiB (u32) ceiling: an entry larger than that is refused
   with a typed error naming the limit, never silently written with the
-  wrong framing. Still to come: walking a directory tree on the pack side,
-  and writing a container inside a codec (`bundle.tar.gz`) in a single
-  step. `stuffr formats` always tells you the truth about the build you
-  are actually running, whatever this page says.
+  wrong framing. Walking a directory tree and writing a container inside a
+  codec (`bundle.tar.gz`) both work in a single command now — see
+  "COLLECTING FILES INTO AN ARCHIVE" above. `stuffr formats` always tells
+  you the truth about the build you are actually running, whatever this
+  page says.

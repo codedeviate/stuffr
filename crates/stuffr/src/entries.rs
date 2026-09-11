@@ -551,7 +551,7 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
             _ => {
                 warnings.push(Fidelity::EntrySkipped {
                     entry: meta.name.clone(),
-                    reason: "device nodes, fifos, sockets and hardlinks are not created",
+                    reason: "device nodes, fifos, sockets and hardlinks are not created".into(),
                 });
             }
         }
@@ -734,8 +734,15 @@ pub fn cat(
     })
 }
 
-/// Collects `paths` into a new `container` archive at `dst` — one entry each,
-/// optionally inside `codec`.
+/// Collects `paths` into a new `container` archive at `dst`, optionally
+/// inside `codec`.
+///
+/// A named file becomes one entry; a named DIRECTORY becomes its whole tree,
+/// walked by [`crate::walk`] and named beneath the directory's own final
+/// component. Both go through the same walk, so a file packed on its own and
+/// the same file packed as part of its parent carry identical metadata —
+/// ownership included, which is what an earlier hand-built `EntryMeta` here
+/// silently dropped while still reporting `Rung::Exact`.
 ///
 /// `codec` is what makes `bundle.tar.gz` writable in one step: the codec's own
 /// `Sink` becomes the container's destination, so the container writes its
@@ -747,6 +754,17 @@ pub fn cat(
 /// rejected command costs nothing, with no temp file created and no existing
 /// file disturbed. The codec's own option checks run there too, for the same
 /// reason.
+///
+/// # What the returned report carries
+///
+/// The `Outcome`'s `fidelity` is no longer a hardcoded `Rung::Exact` with an
+/// empty warning list. The rung stays `Exact` — it describes a READ ladder,
+/// and there is no ladder on the write side — but the warnings are real:
+/// anything the walk met and could not store (see [`crate::walk::ItemSource`]),
+/// anything this container has no shape for (`ar` has neither directories nor
+/// symlinks), any entry whose ownership was never learned, and a summary of
+/// hardlinks that will extract as independent copies. `--strict-fidelity`
+/// turns any of them into exit 4, exactly as it does on the read side.
 pub fn create_archive(
     paths: &[PathBuf],
     dst: Output,
@@ -799,37 +817,48 @@ pub fn create_archive(
         None => None,
     };
 
-    let mut planned: Vec<(String, std::fs::Metadata)> = Vec::with_capacity(paths.len());
+    let mut plan: Vec<crate::walk::WalkItem> = Vec::with_capacity(paths.len());
     let mut names = HashSet::new();
     for path in paths {
         let name = entry_name_for(path)?;
-        if !names.insert(name.clone()) {
-            return Err(Error::Usage(format!(
-                "two inputs would both be stored as entry `{name}`; an archive with \
-                 duplicate names cannot be extracted without --force"
-            )));
-        }
         // `metadata`, which follows a symlink, not `symlink_metadata`: a path
         // named on the command line is followed, so `stuffr pack
         // link-to-notes.txt` stores the file it points at. Storing the link
         // itself would let `pack` produce an archive `unpack` then refuses at
-        // exit 7 — stuffr must not write what it will not read.
+        // exit 7 — stuffr must not write what it will not read. `walk` stats
+        // its root the same way, for the same reason; this stat exists only
+        // so a NAMED socket or fifo is still a usage error rather than an
+        // archive with nothing in it. Inside a walk such a thing is an
+        // incidental find and is skipped with a warning; named on the command
+        // line it is what the user asked for, and there is no entry shape for
+        // it.
         let md = std::fs::metadata(path)?;
-        if md.is_dir() {
-            return Err(Error::Usage(format!(
-                "`{}` is a directory; this build packs named files only, so list \
-                 them individually",
-                path.display()
-            )));
-        }
-        if !md.is_file() {
+        if !md.is_dir() && !md.is_file() {
             return Err(Error::Usage(format!(
                 "`{}` is neither a file nor a directory; there is no entry shape \
                  for it yet",
                 path.display()
             )));
         }
-        planned.push((name, md));
+        for item in crate::walk::walk(path, &name)? {
+            // A skipped item claims no name, deliberately. It is never
+            // written, and `meta.name` for one may carry U+FFFD where the
+            // real name was undecodable — two different names can render
+            // identically, so letting them into this set would refuse a pack
+            // over a collision that does not exist in the archive.
+            if matches!(item.source, crate::walk::ItemSource::Skipped { .. }) {
+                plan.push(item);
+                continue;
+            }
+            if !names.insert(item.meta.name.clone()) {
+                return Err(Error::Usage(format!(
+                    "two inputs would both be stored as entry `{}`; an archive with \
+                     duplicate names cannot be extracted without --force",
+                    item.meta.name
+                )));
+            }
+            plan.push(item);
+        }
     }
 
     let opened = dst.create(o.force, o.sync)?;
@@ -857,47 +886,123 @@ pub fn create_archive(
         },
     )?;
 
+    // Read once, outside the closure: what this container can and cannot
+    // represent decides whether a directory or symlink is written or warned
+    // about, and asking per entry would ask the same question thousands of
+    // times over a real tree.
+    let caps = kind.caps();
+
     // An immediately-invoked `FnOnce`, not the `let run = || …` shape the
     // codec path uses: `ArchiveWrite::finish` consumes the writer, which a
     // reusable closure cannot do.
-    let result = (move || -> Result<u64> {
+    let result = (move || -> Result<(u64, Vec<Fidelity>)> {
         let mut archive = archive;
         let mut bytes_in = 0u64;
-        for ((name, md), path) in planned.iter().zip(paths) {
-            let mut file = std::fs::File::open(path)?;
-            archive.add(
-                &EntryMeta {
-                    name: name.clone(),
-                    size: Some(md.len()),
-                    mtime: md.modified().ok(),
-                    mode: mode_of(md),
-                    kind: EntryKind::File,
-                    ..Default::default()
-                },
-                &mut file,
-            )?;
-            bytes_in += md.len();
+        let mut warnings = Vec::new();
+        for item in &plan {
+            match &item.source {
+                crate::walk::ItemSource::File(p) => {
+                    let mut file = std::fs::File::open(p)?;
+                    archive.add(&item.meta, &mut file)?;
+                    bytes_in += item.meta.size.unwrap_or(0);
+                }
+                // No payload: a directory has none, and a symlink's target
+                // lives in the container's own header (or, for cpio and zip,
+                // is written by the container from `EntryKind::Symlink`). The
+                // reader handed over is not consumed either way — the
+                // convention `tar.rs`, `cpio.rs` and `zip.rs` all document.
+                //
+                // A container with no shape for the kind is NOT asked to
+                // write one. `ar` would land a directory as a zero-byte
+                // regular file under the directory's name, after which every
+                // entry beneath it is unextractable — its parent is a file.
+                // Warning and moving on keeps the archive's contents correct
+                // and says what was dropped, which is the whole point of a
+                // fidelity report; refusing would be the tenth instance of
+                // this project's signature defect.
+                crate::walk::ItemSource::Dir => {
+                    if caps.stores_dirs {
+                        archive.add(&item.meta, &mut std::io::empty())?;
+                    } else {
+                        warnings.push(Fidelity::EntrySkipped {
+                            entry: item.meta.name.clone(),
+                            reason: format!(
+                                "`{container}` has no directory entries, so the directory \
+                                 itself is not stored; everything inside it still is, and \
+                                 extraction recreates the parents it needs"
+                            ),
+                        });
+                    }
+                }
+                crate::walk::ItemSource::Symlink => {
+                    if caps.stores_symlinks {
+                        archive.add(&item.meta, &mut std::io::empty())?;
+                    } else {
+                        warnings.push(Fidelity::EntrySkipped {
+                            entry: item.meta.name.clone(),
+                            reason: format!(
+                                "`{container}` has no symlink entries; storing it as a \
+                                 regular file would materialise the link's target text as \
+                                 that file's contents"
+                            ),
+                        });
+                    }
+                }
+                // NEVER written. `meta.name` here deliberately carries lossy
+                // U+FFFD text where the real name could not be decoded, and
+                // writing it would reintroduce exactly the silent-substitution
+                // defect the walk exists to avoid.
+                crate::walk::ItemSource::Skipped { reason } => {
+                    warnings.push(Fidelity::EntrySkipped {
+                        entry: item.meta.name.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+            }
+            if let Some(w) = ownership_warning(&item.source, &item.meta) {
+                warnings.push(w);
+            }
         }
+
+        // One summary line, not one per entry: see `hardlink_count`'s doc for
+        // what it does and does not count.
+        let linked = crate::walk::hardlink_count(&plan);
+        if linked > 0 {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: format!("{linked} entries"),
+                reason: "hardlinked to each other; stored as independent copies, so \
+                         extraction will not share their inodes"
+                    .into(),
+            });
+        }
+
         // Container trailer first, then the layer beneath it. `finish` hands
         // the sink back precisely so this second call is possible; dropping
         // it is what truncated every composed archive before Phase 2c, and is
         // why `Sink` is `#[must_use]`.
         let sink = archive.finish()?;
         sink.finish()?;
-        Ok(bytes_in)
+        Ok((bytes_in, warnings))
     })();
 
     match result {
-        Ok(bytes_in) => {
+        Ok((bytes_in, warnings)) => {
             // Only now: every byte, trailer included, is written and flushed.
             publish(finish)?;
             Ok(Outcome {
                 bytes_in,
                 bytes_out: bytes_out.load(Ordering::Relaxed),
                 format: container,
-                // Every input is a real, seekable file — `entry_name_for`
-                // refuses a pipe, which has no name to store.
-                fidelity: FidelityReport::new(Rung::Exact),
+                fidelity: FidelityReport {
+                    // `Rung` describes the adaptive READ ladder, which has no
+                    // write-side counterpart: every input here is a real,
+                    // seekable file (`entry_name_for` refuses a pipe, which
+                    // has no name to store). The warnings are where a write's
+                    // losses are recorded, and `is_lossless` already accounts
+                    // for both halves.
+                    rung: Rung::Exact,
+                    warnings,
+                },
             })
         }
         Err(e) => {
@@ -905,6 +1010,35 @@ pub fn create_archive(
             Err(e)
         }
     }
+}
+
+/// Says so when an entry is about to be written with no ownership.
+///
+/// `MetaFields::uid_gid` is the field for exactly this and, until now, was set
+/// nowhere in the workspace — the ladder could describe an ownership loss and
+/// nothing ever did. It matters because `None` here does not reach the archive
+/// as "unknown": `tar.rs`, `ar.rs` and `cpio.rs` all write
+/// `meta.uid.unwrap_or(0)`, so an entry with no ids asserts `root:root`, and
+/// an archive that asserts the wrong owner while reporting exact fidelity is
+/// lying twice.
+///
+/// On unix the walk always learns both, so this fires for nothing; it is the
+/// non-unix build (and any future entry source with no ids) that needs it.
+/// Skipped items are excluded — an entry that was not written cannot have lost
+/// its ownership.
+fn ownership_warning(source: &crate::walk::ItemSource, meta: &EntryMeta) -> Option<Fidelity> {
+    if matches!(source, crate::walk::ItemSource::Skipped { .. })
+        || (meta.uid.is_some() && meta.gid.is_some())
+    {
+        return None;
+    }
+    Some(Fidelity::MetadataIncomplete {
+        entry: meta.name.clone(),
+        fields: MetaFields {
+            uid_gid: true,
+            ..Default::default()
+        },
+    })
 }
 
 /// The entry name a command-line path is stored under: its final component.

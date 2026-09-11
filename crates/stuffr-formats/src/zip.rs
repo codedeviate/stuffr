@@ -226,6 +226,14 @@ impl Container for Zip {
             // Every entry names its own compression method, and they may
             // differ within one archive. `EntryMeta::codec` reports it.
             per_entry_codec: true,
+            // Measured, not assumed: zip 8.6.0's `ZipWriter::add_directory`
+            // appends the trailing `/` and ORs `S_IFDIR` into the mode, and
+            // `add_symlink` (write.rs:1822) ORs `ffi::S_IFLNK` into the
+            // external attributes, forces `Stored` and writes the target as
+            // the entry's payload. So zip stores both kinds natively and
+            // neither costs a fidelity warning.
+            stores_dirs: true,
+            stores_symlinks: true,
             ..Default::default()
         }
     }
