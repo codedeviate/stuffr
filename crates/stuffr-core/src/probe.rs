@@ -170,14 +170,13 @@ fn inner_from_path(reg: &Registry, path: Option<&Path>, outer: FormatId) -> Chai
     let exts = extensions(path);
 
     // `.tgz` and friends: one extension meaning "tar inside <codec>", spelled
-    // as "t" + the codec's own extension. The lookup uses the STRIPPED suffix,
-    // not the whole string — checking the whole string would only work if every
-    // codec also registered its compound alias, and one that forgot would
-    // silently resolve `.tbz2` to Raw instead of tar-over-bzip2.
+    // as "t" + the codec's own extension. Resolved through the SAME
+    // [`compound_alias`] the write side uses, never a second copy of the strip
+    // rule — the copy is how `.tbz` came to mean tar-over-bzip2 when reading
+    // and a bare gzip when writing, which is the exact defect class
+    // `chain_for_new_path` shares this function to prevent.
     if let Some(last) = exts.last()
-        && let Some(stripped) = last.strip_prefix('t')
-        && !stripped.is_empty()
-        && reg.by_extension(stripped) == Some(outer)
+        && compound_alias(reg, last) == Some(outer)
         && let Some(id) = reg.by_extension("tar")
         && reg.container(id).is_some()
     {
@@ -202,18 +201,64 @@ fn inner_from_path(reg: &Registry, path: Option<&Path>, outer: FormatId) -> Chai
 /// has no magic, so the name is the only evidence there is. No codec
 /// registers its own compound alias and none should — `tar::meta` spells out
 /// why registering `tgz` on tar would make a `.tgz` resolve to a bare tar —
-/// so the suffix is stripped here instead, the same way `inner_from_path`
-/// strips it when deciding what is inside.
+/// so the suffix is stripped here instead, and `inner_from_path` calls this
+/// same function when deciding what is inside.
+///
+/// # `.tlz` means tar-over-**lzip** here, and that is a decision
+///
+/// The strip rule sends `.tlz` to `lz`, which lzip registers, so stuffr reads
+/// and writes `.tlz` as `tar.lz` — lzip. **GNU tar and libarchive both read
+/// `.tlz` as `tar.lzma`** (LZMA1, the `.lzma` alone-format), so an archive
+/// stuffr writes as `.tlz` will not open in GNU tar, and one GNU tar wrote
+/// will not open here.
+///
+/// It is left as it is, deliberately and for now: `lzip` is the format
+/// actually worth writing of the two (it carries a CRC and a recognised
+/// magic, where `.lzma` has neither), the spelling is genuinely contested
+/// rather than settled — `.tlz` predates lzip and both readings are in the
+/// wild — and changing it would silently reinterpret existing files. What is
+/// NOT acceptable is that the answer was an accident of which extension
+/// happened to be registered; it is written down here so the next change to
+/// it is a decision rather than a side effect. If it is ever revisited, the
+/// honest options are to refuse `.tlz` outright as ambiguous, or to add it to
+/// [`COMPOUND_SPELLINGS`] pointing at `lzma`.
 fn compound_alias(reg: &Registry, ext: &str) -> Option<FormatId> {
     let stripped = ext.strip_prefix(['t', 'T'])?;
     if stripped.is_empty() {
         return None;
     }
-    let id = reg.by_extension(stripped)?;
+    let stripped = stripped.to_ascii_lowercase();
+    let spelling = COMPOUND_SPELLINGS
+        .iter()
+        .find(|(alias, _)| *alias == stripped)
+        .map_or(stripped.as_str(), |(_, real)| *real);
+    let id = reg.by_extension(spelling)?;
     // A container never sits inside itself: `.tar` is resolved by the direct
     // lookup above, and anything reached through the alias must be a codec.
     reg.container(id).is_none().then_some(id)
 }
+
+/// The compound spellings whose remainder after the `t` is NOT the codec's
+/// own registered extension, and what it really means.
+///
+/// Without this table the strip rule simply fails to find a codec and the
+/// whole name resolves to [`Chain::Raw`] — which on the write side is not a
+/// refusal but a silent fallback to `default_format()`, so **`stuffr pack
+/// notes.txt -o f.tbz` wrote a gzip stream, with no tar inside it, at exit
+/// 0.** A name promising one thing and bytes that are another, reported as
+/// success, is the defect class the write-side chain resolution exists to
+/// close, and `.tbz` was its last surviving member.
+///
+/// The table lives here rather than in the registry ON PURPOSE. Registering
+/// `bz` as an extension of bzip2 would fix `.tbz` and simultaneously make a
+/// plain `.bz` writable — and `.bz` is **bzip1**, a different, obsolete
+/// format this build cannot produce. The alias is only ever consulted in the
+/// `t`-prefixed compound position, so `stuffr pack notes.txt -o f.bz` still
+/// finds no format for `bz` and behaves exactly as it did.
+///
+/// GNU tar and libarchive both read `.tbz` as `tar.bz2`; `.tbz2` needs no
+/// entry, because stripping its `t` already yields bzip2's registered `bz2`.
+const COMPOUND_SPELLINGS: &[(&str, &str)] = &[("bz", "bz2")];
 
 /// The chain an OUTPUT path names, from its extensions alone.
 ///
@@ -511,6 +556,71 @@ mod tests {
         assert_eq!(c("x.TAR.GZ"), "tar over gzip", "extensions are caseless");
         assert_eq!(c("x.txt"), "raw");
         assert_eq!(c("x"), "raw");
+    }
+
+    /// Finding 4 of the Phase 2c final review. `bzip2` registers `bz2` and
+    /// nothing else, so stripping `.tbz`'s `t` looked up `bz`, found no
+    /// format, and resolved the whole name to [`Chain::Raw`] — which on the
+    /// write side is not a refusal but a silent fall back to the default
+    /// codec, so `-o f.tbz` wrote a gzip with no tar inside it at exit 0.
+    ///
+    /// The registry is deliberately the one place NOT fixed: `.bz` is bzip1.
+    #[test]
+    fn tbz_means_tar_over_bzip2_without_making_plain_bz_writable() {
+        const BZIP2: FormatId = FormatId::new("bzip2");
+        const BZIP2_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: b"BZh",
+            format: BZIP2,
+        }];
+        let mut reg = Registry::new();
+        // `bz2` ONLY — the real bzip2 codec's whole extension list.
+        reg.register_codec(
+            Arc::new(MockCodec),
+            FormatMeta::codec(BZIP2, &["bz2"], BZIP2_MAGIC),
+        );
+        reg.register_container(
+            Arc::new(MockContainer),
+            FormatMeta::container(TAR, &["tar"], TAR_MAGIC),
+        );
+
+        let c = |p: &str| chain_for_new_path(&reg, Path::new(p)).describe();
+        assert_eq!(
+            c("f.tbz"),
+            "tar over bzip2",
+            "GNU tar and libarchive both read .tbz as tar.bz2"
+        );
+        assert_eq!(c("f.TBZ"), "tar over bzip2", "and extensions are caseless");
+        assert_eq!(
+            c("f.tbz2"),
+            "tar over bzip2",
+            "the spelling that always worked must keep working"
+        );
+        assert_eq!(
+            c("f.tar.bz2"),
+            "tar over bzip2",
+            "and so must the long form"
+        );
+
+        // The half that says WHERE the fix lives. `bz` is bzip1, a different
+        // and obsolete format: registering it on bzip2 would have fixed
+        // `.tbz` and simultaneously made `-o f.bz` write a bzip2 stream under
+        // a name that promises bzip1.
+        assert_eq!(
+            c("f.bz"),
+            "raw",
+            "`bz` must resolve to nothing outside the t-prefixed compound form"
+        );
+
+        // The READ side resolves the same name through the same function —
+        // that sharing is the point, and a second write-side table is what
+        // would let `.tbz` mean one thing to `pack` and another to `list`.
+        let chain = resolve_chain(&reg, Some(Path::new("f.tbz")), b"BZh\0").unwrap();
+        assert_eq!(
+            chain.describe(),
+            "tar over bzip2",
+            "reading a .tbz must agree with writing one"
+        );
     }
 
     /// The pair a writer actually consumes: the container to create, and the
