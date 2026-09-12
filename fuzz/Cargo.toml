@@ -1,0 +1,20 @@
+[package]
+name = "stuffr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+stuffr = { path = "../crates/stuffr", features = ["testing"] }
+stuffr-core = { path = "../crates/stuffr-core", features = ["testing"] }
+
+[[bin]]
+name = "smoke"
+path = "fuzz_targets/smoke.rs"
+test = false
+doc = false
+bench = false
