@@ -5750,6 +5750,25 @@ fn every_container_round_trips_a_tree_against_its_reference_tool() {
     );
 
     // ---- cpio: stuffr writes, the system cpio reads ----
+    //
+    // This direction is PLATFORM-DEPENDENT in what it can prove, and that is
+    // not fixable from here. `newc` records an entry's kind only in its mode
+    // field's `S_IFMT` bits; GNU cpio 2.15 refuses an entry carrying none
+    // with `unknown file type`, skips it and exits 0 anyway, while bsdcpio
+    // (libarchive — what macOS ships as `cpio`) infers a regular file and
+    // extracts the archive whole. So when `require_bin("cpio")` resolves to
+    // GNU cpio this comparison catches a missing `S_IFREG`, and when it
+    // resolves to bsdcpio it cannot: the tree comes back identical either
+    // way. That is exactly how the 0.2.0 defect survived a phase of
+    // macOS-only review, red on CI's Linux runners at the first push.
+    //
+    // Preferring a GNU cpio is not a portable fix either — Homebrew's is
+    // keg-only and not on PATH under any name. The portable proof lives
+    // where the format knowledge is, as a byte-level assertion on the header
+    // this test cannot see: `cpio.rs`'s
+    // `a_permission_only_file_mode_gains_the_regular_file_type_bits`. What
+    // remains valuable HERE is the other direction and the whole-tree
+    // comparison against whichever real tool is installed.
     let out_cpio = dir.join("out.cpio");
     pack_ok(&[os(&root), os(&"-o"), os(&out_cpio)]);
     let back = dir.join("back-cpio");

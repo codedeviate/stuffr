@@ -100,12 +100,32 @@
 //! otherwise write a `newc` entry indistinguishable from a plain file to
 //! ANY cpio reader, this one included — not an internal inconsistency, a
 //! genuine interop defect, since the type bits are the only place `newc`
-//! carries this information at all. `EntryKind::File` is deliberately left
-//! unnormalised: property 11 requires an explicit file mode to round-trip
-//! VERBATIM, and doing so already produces a correct entry, since this
-//! format does not require the `S_IFREG` bit to identify a plain file (see
-//! `entry_kind`'s own doc — the absence of every OTHER type's bits is what
-//! decides `File`).
+//! carries this information at all.
+//!
+//! `EntryKind::File` gets the same treatment, but only where there is
+//! nothing to overwrite. Until 0.3.1 it was left alone entirely, on the
+//! reasoning that THIS reader does not need `S_IFREG` to recognise a plain
+//! file (see `entry_kind`'s own doc — the absence of every OTHER type's bits
+//! is what decides `File`). That reasoning was sound about this reader and
+//! wrong about the format: GNU cpio 2.15 refuses a type-bit-less entry with
+//! `unknown file type`, skips it, and exits 0 anyway, so every regular file
+//! in a stuffr-written cpio vanished on extraction — silently, with a
+//! success status. And `entries.rs`'s `mode_of` masks a walked file's mode
+//! to `0o7777` on purpose (tar's header field wants permissions alone), so
+//! EVERY file packed from disk arrived here type-bit-less. bsdcpio
+//! (libarchive), which is what macOS ships, infers a regular file and
+//! extracts the archive whole — which is why the defect shipped.
+//!
+//! So the file arm ORs `S_IFREG` into a permission-only mode and leaves a
+//! mode that already carries type bits exactly as given. The verbatim half
+//! is load-bearing: the container-conformance harness's property 11 requires
+//! a reported mode to survive a round trip unaltered, and this container
+//! reports the raw `newc` mode field. Property 11's own fixture writes a
+//! permission-only `0o640`, which now reads back as `0o100640`, so the
+//! harness was taught the one transformation a container may legitimately
+//! make to a mode — folding in the type bits the format demands — and still
+//! fails any container that touches a permission bit or overwrites type bits
+//! a caller supplied.
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -161,6 +181,18 @@ const S_IFDIR: u32 = 0o040_000;
 
 /// `S_IFLNK`: the type bits `newc`'s mode field must carry for a symlink.
 const S_IFLNK: u32 = 0o120_000;
+
+/// `S_IFREG`: the type bits `newc`'s mode field must carry for a plain file.
+///
+/// This reader does not NEED them — [`entry_kind`] answers `File` for the
+/// absence of every other type's bits — but GNU cpio does, and the tolerance
+/// is not shared: GNU cpio 2.15 refuses an entry whose mode carries no type
+/// bits with `unknown file type`, skips it, and still exits 0, so a stuffr
+/// archive extracted by it silently loses every regular file. bsdcpio
+/// (libarchive) infers a regular file and extracts the same archive whole,
+/// which is why this survived a whole phase of macOS-only verification. See
+/// [`ArchiveWrite::add`]'s mode normalisation.
+const S_IFREG: u32 = 0o100_000;
 
 pub fn meta() -> FormatMeta {
     FormatMeta::container(CPIO, &["cpio"], CPIO_MAGIC)
@@ -573,21 +605,67 @@ impl ArchiveWrite for CpioWrite {
         let size = check_u32_size(&meta.name, buf.len() as u64)?;
 
         // `newc` has no field OTHER than the mode's own type bits to record
-        // "this is a directory" or "this is a symlink" — so, unlike
-        // `EntryKind::File` (left alone below; property 11 requires an
-        // explicit file mode to round-trip verbatim), a Dir or Symlink mode
-        // is normalised regardless of what the caller supplied, masking out
-        // whatever type bits (if any) were already there and OR-ing in the
-        // correct ones. See the module doc for why leaving this to the
-        // caller would be a real interop defect, not merely an internal
-        // inconsistency.
+        // what an entry IS, so a Dir or a Symlink mode is normalised
+        // regardless of what the caller supplied: mask out whatever type
+        // bits (if any) were already there, OR in the correct ones. See the
+        // module doc for why leaving this to the caller would be a real
+        // interop defect, not merely an internal inconsistency.
+        //
+        // `EntryKind::File` is normalised too, but CONSERVATIVELY, and the
+        // difference is deliberate: a mode that already carries type bits is
+        // passed through verbatim, and only a permission-only mode (no
+        // `S_IFMT` bits at all — which is exactly what `entries.rs`'s
+        // `mode_of` produces, since tar's header wants permissions alone)
+        // has `S_IFREG` OR-ed in. Overwriting the type bits here the way the
+        // two arms above do would relabel a caller's explicit `0o100644` and
+        // break the round-trip this format's own reader relies on; leaving
+        // them absent is what shipped in 0.2.0, and GNU cpio drops every
+        // such entry with `unknown file type` at exit 0 (see `S_IFREG`).
+        //
+        // The `_` arm — `EntryKind::Other`, plus any variant `EntryKind`
+        // grows later, since it is `#[non_exhaustive]` — deliberately gets
+        // NEITHER treatment. `Other` is the one kind that does not say what
+        // it is: a char device, a block device, a fifo, a socket and a
+        // hardlink all arrive as it, so there are no correct type bits to
+        // synthesise and forcing `S_IFREG` would relabel a device node as a
+        // plain file — the same silent misrepresentation `entries.rs`
+        // refuses to make when it SKIPS an `Other` entry on extraction
+        // rather than materialising a 0-byte file where a device was.
+        // Whatever the caller supplied is the only information available, so
+        // it is written through untouched. stuffr's own pack never reaches
+        // this arm: `walk.rs` marks every such item `ItemSource::Skipped`
+        // before a plan is built, so only a hand-built plan can.
         let mode = match &meta.kind {
             EntryKind::Dir => (meta.mode.unwrap_or(DEFAULT_DIR_MODE) & !MODE_TYPE_MASK) | S_IFDIR,
             EntryKind::Symlink { .. } => {
                 (meta.mode.unwrap_or(DEFAULT_SYMLINK_MODE) & !MODE_TYPE_MASK) | S_IFLNK
             }
+            EntryKind::File => {
+                let mode = meta.mode.unwrap_or(DEFAULT_FILE_MODE);
+                if mode & MODE_TYPE_MASK == 0 {
+                    mode | S_IFREG
+                } else {
+                    mode
+                }
+            }
             _ => meta.mode.unwrap_or(DEFAULT_FILE_MODE),
         };
+        // Every entry goes out with `ino = 0`, `dev = 0` and `nlink = 1` —
+        // the `cpio` crate's `Builder` defaults, left alone deliberately.
+        // GNU cpio keys hardlink detection on `(dev, ino)`, so entries
+        // sharing `(0, 0)` looks alarming, and is inert: its `copyin`
+        // consults that pair only for an entry declaring `nlink > 1`, and
+        // nothing here ever declares one. Measured, not reasoned about — a
+        // 42-entry archive, every entry `(0, 0)`, extracts under GNU cpio
+        // 2.15 as 42 independent files with the right contents and a link
+        // count of 1 each. bsdcpio agrees.
+        //
+        // The condition is what matters if this ever changes: no container
+        // in this tree writes a hardlink entry (see `walk.rs`'s
+        // `hardlink_count`, which raises a fidelity warning saying so), so
+        // `nlink` stays 1 and `ino` stays inert. Write a real hardlink entry
+        // and `ino` must become unique per inode FIRST, or GNU cpio will
+        // coalesce every entry in the archive into one file.
         let builder = cpio::newc::Builder::new(&meta.name)
             .mode(mode)
             .mtime(meta.mtime.map(unix_seconds).unwrap_or(0))
@@ -868,10 +946,79 @@ mod tests {
         w.add(&meta, &mut std::io::empty())
     }
 
+    /// Writes one entry and hands back the raw `mode` field of its header,
+    /// straight out of the bytes — not what this container's own reader
+    /// makes of them. The interop defect this pins is invisible to any
+    /// reader tolerant enough to infer the kind (ours, and bsdcpio's), so
+    /// the bytes are the only place it can be seen portably.
+    fn written_mode(meta: &EntryMeta) -> u32 {
+        let buf = SharedBuf::new();
+        let mut w = CpioNewc
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .unwrap();
+        w.add(meta, &mut std::io::Cursor::new(b"m".as_slice()))
+            .unwrap();
+        w.finish().unwrap().finish().unwrap();
+
+        // `newc`'s header is fixed-width ASCII hex: a six-byte magic, then
+        // thirteen eight-byte fields of which `mode` is the second.
+        let bytes = buf.contents();
+        assert_eq!(&bytes[..6], b"070701", "not a newc header");
+        let field = std::str::from_utf8(&bytes[6 + 8..6 + 16]).expect("ascii hex");
+        u32::from_str_radix(field, 16).expect("hex mode")
+    }
+
+    /// The 0.2.0 interop defect, pinned at the byte level so it fails on
+    /// every platform.
+    ///
+    /// `entries.rs`'s `mode_of` masks a walked file's mode to `0o7777`, so
+    /// EVERY file packed from disk reaches this container with no `S_IFMT`
+    /// bits at all — and `newc` has no other field naming the kind. GNU cpio
+    /// 2.15 answers `unknown file type` to such an entry, SKIPS it, and
+    /// still exits 0, so `stuffr pack -o x.cpio` followed by GNU `cpio -i`
+    /// lost every regular file and reported success. bsdcpio — what macOS
+    /// ships, and what `system_cpio_accepts_what_we_write` below therefore
+    /// exercises — infers a regular file and extracts the same archive
+    /// whole, which is why this shipped and why a reference-tool test alone
+    /// could not be trusted to catch it.
+    #[test]
+    fn a_permission_only_file_mode_gains_the_regular_file_type_bits() {
+        let mut meta = EntryMeta::file("m.txt");
+        meta.mode = Some(0o640);
+        assert_eq!(
+            written_mode(&meta),
+            0o100_640,
+            "a file written with a permission-only mode must carry S_IFREG on the wire"
+        );
+    }
+
+    /// The other half, and the reason the file arm ORs rather than masking
+    /// and replacing the way the Dir and Symlink arms do: a mode that
+    /// already names its kind is written through untouched.
+    #[test]
+    fn an_explicit_st_mode_shaped_file_mode_is_written_verbatim() {
+        let mut meta = EntryMeta::file("m.txt");
+        meta.mode = Some(0o100_644);
+        assert_eq!(written_mode(&meta), 0o100_644);
+
+        // Including one whose type bits are NOT a regular file's. `Other` is
+        // the kind that cannot say what it is — see `add`'s own comment —
+        // and the `_` arm must not relabel it.
+        let mut dev = EntryMeta::file("c");
+        dev.kind = EntryKind::Other;
+        dev.mode = Some(0o020_644);
+        assert_eq!(written_mode(&dev), 0o020_644);
+    }
+
     /// A mode with no `S_IFMT` type bits at all (a caller-supplied mode with
     /// none set, as opposed to this container's own defaulted one) must
     /// still read back as a plain file — see `entry_kind`'s own doc for why
-    /// `Other` would be the wrong answer here.
+    /// `Other` would be the wrong answer here. It reads back as `0o100640`
+    /// rather than the `0o640` written, because `add` folds `S_IFREG` in;
+    /// the permission bits are what must survive, and do.
     #[test]
     fn an_explicit_mode_with_no_type_bits_still_reads_back_as_a_file() {
         let buf = SharedBuf::new();
@@ -889,7 +1036,7 @@ mod tests {
 
         let mut ar = open(&buf.contents());
         let entry = ar.next_entry().unwrap().unwrap();
-        assert_eq!(entry.meta().mode, Some(0o640));
+        assert_eq!(entry.meta().mode, Some(0o100_640));
         assert_eq!(entry.meta().kind, EntryKind::File);
     }
 

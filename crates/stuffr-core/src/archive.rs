@@ -174,6 +174,25 @@ impl<'a> Entry<'a> {
     pub fn reader(&mut self) -> &mut (dyn Read + 'a) {
         &mut *self.reader
     }
+
+    /// Takes the payload reader out, leaving the metadata behind — the one
+    /// way to rebuild an `Entry` with different metadata over the SAME,
+    /// still-streaming reader.
+    ///
+    /// `#[cfg(test)]` and `pub(crate)` on purpose: no container needs it,
+    /// and nothing outside this crate should be rewriting an entry's
+    /// metadata between the container that read it and the caller that acts
+    /// on it. It exists for `container_conformance`'s property 11 doubles,
+    /// which have to report a mode the framed mock's wire format does not
+    /// carry while still satisfying property 8 — buffering the payload to
+    /// fake one would trip the incrementality property first and the double
+    /// would then prove the wrong thing. Not `pub`: widening the visibility
+    /// to silence the dead-code lint would ship a metadata-rewriting hook to
+    /// every caller for a test's convenience.
+    #[cfg(test)]
+    pub(crate) fn into_reader(self) -> Box<dyn Read + 'a> {
+        self.reader
+    }
 }
 
 /// Manual impl: `reader` is `Box<dyn Read>`, which cannot derive `Debug`.

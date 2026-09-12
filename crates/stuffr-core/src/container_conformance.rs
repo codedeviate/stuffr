@@ -57,7 +57,11 @@
 //! 11. Metadata survives to the declared fidelity. Only fields the container
 //!     actually reports are checked; a container that does not claim to
 //!     carry a field is free to drop it, but one that reports a value must
-//!     report the value that was written, not an altered one.
+//!     report the value that was written, not an altered one. The one
+//!     exception, and it is narrow: a format that records the entry kind in
+//!     the mode field itself (cpio `newc` has nowhere else to put it) may
+//!     fold `S_IFREG` into the permission-only mode the fixture writes. The
+//!     permission bits are still compared exactly.
 //! 12. Hostile entry names (path traversal, absolute paths) survive
 //!     VERBATIM. A deliberate INVERSION of the usual instinct: the project's
 //!     non-negotiable is "refused, not silently sanitised", and refusal
@@ -86,6 +90,20 @@ use crate::error::Result;
 use crate::fidelity::Rung;
 use crate::format::FormatMeta;
 use crate::source::{ReaderSource, SeekRead, Source, SourceCaps};
+
+/// `S_IFMT`: the four top bits of a unix `st_mode` that name the entry's
+/// KIND. Property 11 uses it to separate "the container folded in the type
+/// bits its format demands", which is allowed, from "the container changed
+/// what the entry may be done with", which is not.
+const MODE_TYPE_MASK: u32 = 0o170_000;
+
+/// Everything `MODE_TYPE_MASK` does not cover: permissions, setuid, setgid
+/// and the sticky bit. Property 11 compares these EXACTLY.
+const MODE_PERMISSION_MASK: u32 = 0o7777;
+
+/// `S_IFREG`: the type bits naming a plain file, the only ones property 11's
+/// fixture — a plain file — permits a container to add.
+const S_IFREG: u32 = 0o100_000;
 
 /// A `'static`, cloneable in-memory destination that can also be told to fail
 /// every write once a byte budget is exhausted.
@@ -785,6 +803,28 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
         // 11. Metadata survives to the declared fidelity. Only fields the
         //     container claims to carry are checked; approximation is allowed
         //     on a lossy rung, silent LOSS on an exact one is not.
+        //
+        //     The fixture's mode is PERMISSION-ONLY (`0o640`, no `S_IFMT`
+        //     type bits), which is what `entries.rs`'s `mode_of` hands every
+        //     container — it masks to `0o7777` because tar's header field
+        //     wants permissions alone. A container whose format records the
+        //     entry kind IN the mode field (cpio `newc` has nowhere else to
+        //     put it) must therefore be allowed to fold the type bits back
+        //     in, and `S_IFREG` here, since the fixture is a plain file.
+        //     That is the ONE transformation permitted: the permission bits
+        //     are compared exactly, so a container that quietly widens
+        //     `0o640` to `0o644` still fails, and the type bits may only
+        //     become `S_IFREG` — relabelling the entry as a directory,
+        //     symlink or device still fails.
+        //
+        //     This was not always so, and the reason is worth keeping: the
+        //     property used to demand the mode come back BIT-IDENTICAL,
+        //     which read as strict and in fact pinned cpio's own interop
+        //     defect in place. stuffr's cpio wrote every regular file with
+        //     no type bits at all, GNU cpio 2.15 answers `unknown file type`
+        //     to that, skips the entry, and exits 0 — so an extraction lost
+        //     every file it was asked for and said it succeeded. A property
+        //     that forbids the fix is worse than no property.
         if caps.write {
             let mut meta_in = EntryMeta::file("m.txt");
             meta_in.mode = Some(0o640);
@@ -794,10 +834,25 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 got[0].name, meta_in.name,
                 "conformance[{id}] property 11: entry name not preserved"
             );
-            if got[0].mode.is_some() {
+            if let Some(got_mode) = got[0].mode {
+                let want = meta_in.mode.expect("the fixture sets a mode");
                 assert_eq!(
-                    got[0].mode, meta_in.mode,
-                    "conformance[{id}] property 11: mode reported but altered"
+                    got_mode & MODE_PERMISSION_MASK,
+                    want & MODE_PERMISSION_MASK,
+                    "conformance[{id}] property 11: mode reported but altered — wrote \
+                     {want:#o}, read back {got_mode:#o}, and the permission bits \
+                     differ. Folding in the file-type bits a format needs is allowed; \
+                     changing what the entry may be DONE with is not"
+                );
+                let type_bits = got_mode & MODE_TYPE_MASK;
+                assert!(
+                    type_bits == 0 || type_bits == S_IFREG,
+                    "conformance[{id}] property 11: mode reported but altered — wrote \
+                     {want:#o} for a plain FILE, read back {got_mode:#o}, whose type \
+                     bits are {type_bits:#o}. A container may add S_IFREG \
+                     ({S_IFREG:#o}) where its format records the kind in the mode \
+                     field, and may leave the field as given; it may not relabel the \
+                     entry as some other kind"
                 );
             }
         }
@@ -1529,6 +1584,92 @@ mod broken_containers {
             &ClaimsSymlinks,
             &framed_container_meta(),
             "property 13 (symlinks)",
+        );
+    }
+
+    /// Property 11 had no double at all until the cpio `S_IFREG` fix, which
+    /// is how it came to be RELAXED without anybody able to see what the
+    /// relaxation cost. The two below pin both halves of the relaxed rule.
+    ///
+    /// Both need a mode on the way back, and `FramedMockContainer`'s wire
+    /// format carries none — it honestly reconstructs `EntryMeta::file(name)`
+    /// — so each overlays one onto the entries the mock produces. The overlay
+    /// keeps the mock's own streaming reader (`Entry::into_reader`) rather
+    /// than buffering the payload to fake one: a buffering double would trip
+    /// property 8 (incrementality), which runs first, and `assert_panics_naming`
+    /// would then pass on the wrong property.
+    struct ModeOverlayRead {
+        inner: Box<dyn ArchiveRead>,
+        /// Applied to every entry's mode on the way out.
+        overlay: fn(u32) -> u32,
+    }
+
+    impl ArchiveRead for ModeOverlayRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            let overlay = self.overlay;
+            let Some(entry) = self.inner.next_entry()? else {
+                return Ok(None);
+            };
+            let mut meta = entry.meta().clone();
+            // The mock reports no mode, so the double supplies the one the
+            // harness wrote and then damages it — which is exactly what a
+            // real container that mishandled the field would look like.
+            meta.mode = Some(overlay(meta.mode.unwrap_or(0o640)));
+            Ok(Some(Entry::new(meta, entry.into_reader())))
+        }
+
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    struct ModeOverlay(fn(u32) -> u32);
+
+    impl Container for ModeOverlay {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            FramedMockContainer.caps()
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(ModeOverlayRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+                overlay: self.0,
+            }))
+        }
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    /// The half the property was originally written for, and the half the
+    /// relaxation must not have cost: a container that reports `0o644` where
+    /// `0o640` was written has silently granted the group a read it never
+    /// had. Permission bits are compared EXACTLY.
+    #[test]
+    fn property_eleven_catches_a_container_that_alters_the_permission_bits() {
+        assert_panics_naming(
+            &ModeOverlay(|mode| (mode & !0o007) | 0o004),
+            &framed_container_meta(),
+            "property 11",
+        );
+    }
+
+    /// The half the relaxation added: `S_IFREG` may be folded in, and
+    /// NOTHING else may. A container reporting `S_IFDIR` over a plain file
+    /// has relabelled the entry's kind — the defect cpio's own Dir/Symlink
+    /// normalisation exists to prevent, in the opposite direction.
+    #[test]
+    fn property_eleven_catches_a_container_that_relabels_the_entrys_kind() {
+        assert_panics_naming(
+            &ModeOverlay(|mode| (mode & !0o170_000) | 0o040_000),
+            &framed_container_meta(),
+            "property 11",
         );
     }
 }
