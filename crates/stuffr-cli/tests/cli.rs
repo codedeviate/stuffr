@@ -5811,6 +5811,17 @@ fn every_container_round_trips_a_tree_against_its_reference_tool() {
     // round trip is not the property — what it must do is store the regular
     // files, drop the rest, and SAY SO. Asserted against the system `ar`'s own
     // listing, not against our reader.
+    //
+    // The member NAMES below are platform-dependent in the same way the cpio
+    // comparison above is, and for a sibling reason. In the GNU variant a
+    // short name is stored with `/` as its terminator, so GNU `ar` truncates
+    // an inline `proj/a.txt` to `proj` — and `proj/sub/b.bin` to `proj` as
+    // well, two members with one name. macOS's `ar` reads the 16-byte field
+    // whole and cannot see it. `ar.rs`'s `write_safe_identifier` forces any
+    // `/`-bearing name into the BSD extended form, which BOTH tools read back
+    // verbatim (measured against GNU ar 2.47 and BSD ar), so the expectation
+    // below is true of either. The portable proof that it stays that way is
+    // `ar.rs`'s `a_name_containing_a_slash_is_never_stored_inline`.
     let out_ar = dir.join("out.a");
     let stderr = pack_ok(&[os(&root), os(&"-o"), os(&out_ar)]);
     for dropped in ["proj/empty", "proj/link", "proj/sub"] {

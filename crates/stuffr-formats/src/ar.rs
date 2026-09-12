@@ -424,7 +424,8 @@ impl ArchiveWrite for ArWrite {
 }
 
 /// Forces the BSD extended (`#1/N`) identifier form for a short name that
-/// would otherwise collide with `ar`'s OWN GNU-variant reserved syntax.
+/// would otherwise collide with the GNU variant's reserved syntax — which
+/// means ANY name containing a `/`, anywhere in it.
 ///
 /// `Header::read` infers which of the three variants (common, BSD, GNU) it
 /// is looking at header by header, and a name in the plain 16-byte field
@@ -439,6 +440,38 @@ impl ArchiveWrite for ArWrite {
 /// has the mirror problem (GNU's own convention for a bare directory name),
 /// silently dropping the trailing slash instead of erroring.
 ///
+/// # An INTERIOR `/` is just as ambiguous, and only another tool can see it
+///
+/// That was the original predicate, and it was too narrow, because `ar`'s
+/// own reader is not the only reader. In the GNU variant a short name is
+/// stored `name/`, with `/` as the TERMINATOR, so a GNU reader stops at the
+/// first `/` in the 16-byte field whether or not the name also begins or
+/// ends with one. The `ar` crate happens not to (its GNU branch is entered
+/// only on a leading or trailing `/`, so it reads `proj/a.txt` back whole),
+/// which is exactly why a phase of macOS-only review missed this: the system
+/// `ar` on macOS agrees with us, and CI's GNU `ar` does not. Measured
+/// directly, on a two-entry archive this module wrote with `proj/a.txt` and
+/// `proj/sub/b.bin` inline in the 16-byte field:
+///
+/// ```text
+/// BSD ar (macOS)          GNU ar 2.47
+/// proj/a.txt              proj
+/// proj/sub/b.bin          proj      <- and now the two members COLLIDE
+/// ```
+///
+/// So `pack` on any nested tree produced an archive GNU `ar` listed as N
+/// copies of the top-level directory name. Since `pack` names every entry
+/// beneath the walked directory's own final component, essentially every
+/// multi-file `ar` this project writes was affected.
+///
+/// The fix is the same lever, with the predicate widened to `contains`.
+/// Both alternatives were measured before choosing it. A GNU long-name
+/// table (`//` plus `/offset` references) is read back whole by GNU `ar` —
+/// and by BSD `ar` as the literal member names `//`, `/0` and `/12`, which
+/// is worse than the bug. The BSD extended form round-trips VERBATIM
+/// through both tools, so it is the only encoding that is portable in the
+/// sense that matters here.
+///
 /// `Header::write`'s own choice between the short and BSD-extended forms is
 /// unconditional on the name's CONTENT — only its length (`> 16`) or the
 /// presence of a space — so there is no lever to request the extended form
@@ -452,9 +485,12 @@ impl ArchiveWrite for ArWrite {
 /// parsing already strips ALL trailing NUL bytes from what it reads back
 /// (both the crate's own 4-byte alignment padding and these), which is what
 /// makes the round trip exact rather than merely close.
+///
+/// A name LONGER than 16 bytes needs nothing from this function: the crate
+/// already writes it in the extended form on length alone, and a GNU reader
+/// never sees a `/`-bearing 16-byte field for it.
 fn write_safe_identifier(mut identifier: Vec<u8>) -> Vec<u8> {
-    let ambiguous = identifier.starts_with(b"/") || identifier.ends_with(b"/");
-    if ambiguous && identifier.len() <= 16 {
+    if identifier.contains(&b'/') && identifier.len() <= 16 {
         identifier.resize(17, 0);
     }
     identifier
@@ -606,6 +642,78 @@ mod tests {
         }
     }
 
+    /// The PORTABLE proof that an interior `/` is forced out of the inline
+    /// 16-byte field, asserted on the bytes because no reader on this
+    /// machine can see the defect.
+    ///
+    /// In the GNU variant a short name is stored with `/` as its
+    /// TERMINATOR, so GNU `ar` truncates an inline `proj/a.txt` to `proj`
+    /// and an inline `proj/sub/b.bin` to `proj` as well — two members with
+    /// one name. The `ar` crate's own reader enters its GNU branch only on
+    /// a LEADING or trailing `/`, and macOS's system `ar` agrees with it,
+    /// so both this module's round trip and `cli.rs`'s reference-tool
+    /// comparison came back clean on macOS while CI's GNU `ar` went red.
+    /// Exactly the shape of `cpio.rs`'s missing `S_IFREG`, and answered the
+    /// same way: assert the header bytes, where the format knowledge is.
+    #[test]
+    fn a_name_containing_a_slash_is_never_stored_inline() {
+        let bytes = build_ar(&[("proj/a.txt", b"alpha"), ("proj/sub/b.bin", b"beta")]);
+
+        // The first entry's 16-byte identifier field sits immediately after
+        // the global header. `#1/` is the BSD extended form's marker, and a
+        // field beginning with it carries no `/`-terminated name for a GNU
+        // reader to truncate.
+        let field = &bytes[GLOBAL_HEADER.len()..GLOBAL_HEADER.len() + 16];
+        assert!(
+            field.starts_with(b"#1/"),
+            "a `/`-bearing name must be forced into the BSD extended form, not \
+             written inline; identifier field was {:?}",
+            String::from_utf8_lossy(field)
+        );
+
+        // And no inline, space-padded field anywhere in the archive carries
+        // either path — the shape GNU `ar` truncates. Built rather than
+        // written as a literal: a literal would carry a run of spaces, which
+        // `cli.rs`'s workspace-wide message lint refuses.
+        for name in ["proj/a.txt", "proj/sub/b.bin"] {
+            let mut inline = name.as_bytes().to_vec();
+            inline.resize(16, b' ');
+            assert!(
+                !bytes.windows(16).any(|w| w == inline),
+                "`{name}` is stored inline in a 16-byte field, which GNU ar reads as `proj`"
+            );
+        }
+
+        // Still exact through our own reader, which is what the extended
+        // form has to buy without costing.
+        let mut ar = open(&bytes);
+        let mut names = Vec::new();
+        while let Some(entry) = ar.next_entry().unwrap() {
+            names.push(entry.meta().name.clone());
+        }
+        assert_eq!(names, vec!["proj/a.txt", "proj/sub/b.bin"]);
+    }
+
+    /// A name longer than 16 bytes already gets the extended form from
+    /// `Header::write` on length alone, so `write_safe_identifier` must not
+    /// pad it — and a name with no `/` at all must stay inline, or every
+    /// ordinary archive this module writes grows a needless extended header.
+    #[test]
+    fn write_safe_identifier_pads_only_what_needs_it() {
+        assert_eq!(write_safe_identifier(b"a.txt".to_vec()), b"a.txt".to_vec());
+        assert_eq!(
+            write_safe_identifier(b"proj/a.txt".to_vec()),
+            b"proj/a.txt\0\0\0\0\0\0\0".to_vec(),
+        );
+        let long = b"a-very-long-directory-name/inside.txt".to_vec();
+        assert_eq!(write_safe_identifier(long.clone()), long);
+        // Exactly 16 bytes with a `/` is the boundary the crate would still
+        // write inline, so it is padded.
+        let sixteen = b"proj/aaaaaaa.txt".to_vec();
+        assert_eq!(sixteen.len(), 16, "the point of this case");
+        assert_eq!(write_safe_identifier(sixteen).len(), 17);
+    }
+
     #[test]
     fn add_measures_the_payload_when_the_caller_does_not_declare_a_size() {
         let buf = SharedBuf::new();
@@ -725,9 +833,16 @@ mod tests {
 
         let long_name: String = std::iter::repeat_n("segment-", 4).collect::<String>() + ".txt";
         let spaced_name = "a name with spaces.txt";
+        // Short enough that `Header::write` would store it inline, and
+        // `/`-bearing, which is what GNU `ar` truncates at the first `/`.
+        // Whether THIS assertion can fail depends on which `ar` is on PATH
+        // (macOS's cannot see the defect); the portable proof is
+        // `a_name_containing_a_slash_is_never_stored_inline`.
+        let path_name = "proj/sub/b.bin";
         let bytes = build_ar(&[
             ("a.txt", b"alpha"),
             (spaced_name, b"\x00\xff\x00"),
+            (path_name, b"deep"),
             (&long_name, b"deep"),
         ]);
         let path =
@@ -754,6 +869,11 @@ mod tests {
         assert!(
             listing.contains(&long_name),
             "system ar did not read back our BSD extended-name entry; listing was {listing:?}"
+        );
+        assert!(
+            listing.contains(path_name),
+            "system ar truncated our `/`-bearing name — the GNU variant reads `/` as a \
+             short name's terminator; listing was {listing:?}"
         );
 
         let printed = std::process::Command::new(&ar_bin)
