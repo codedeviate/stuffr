@@ -31,6 +31,32 @@
 //! `by_index` on the forward reader is `Err(NotSeekable)`, never a re-scan
 //! billed as random access.
 //!
+//! # The SEEKABLE reader has to check the declared COUNT itself
+//!
+//! Reaching the central directory is not the same as reaching every record in
+//! it. `zip::ZipArchive` stores what it parsed in an `IndexMap` keyed by the
+//! raw file name, so two central-directory records naming the same path — at
+//! two different local-header offsets, which is a real and well-formed shape —
+//! collapse into one, and `len()` reports the number of distinct NAMES rather
+//! than the number of records. Measured on a zip `unzip -t` reads whole:
+//! `len()` returns 6 for an 8-record archive, and nothing in the crate's API
+//! says so. The crate keeps the LAST record's data at the FIRST record's index.
+//!
+//! Left alone, that is the one failure mode this tool exists to rule out:
+//! `list` printing six rows and `test` announcing "exact fidelity" over an
+//! archive two of whose entries no caller can reach. So [`read_declared_index`]
+//! parses the end-of-central-directory record directly — the crate exposes no
+//! accessor for the count, `mod spec` being private and
+//! `CentralDirectoryInfo::number_of_files` `pub(crate)` — and
+//! [`note_unreachable_records`] raises [`Fidelity::EntryCountMismatch`] naming
+//! both figures whenever the enumeration falls short. `--strict-fidelity` then
+//! refuses it at exit 4.
+//!
+//! **Declared, not recovered.** Reading the shadowed records would mean
+//! re-implementing the central-directory parse this module deliberately
+//! delegates. Naming the shortfall is what a caller needs in order to know the
+//! result is partial; reaching it is a different and much larger job.
+//!
 //! # The forward reader has to check the trailing structure ITSELF
 //!
 //! Measured, not assumed. `read_zipfile_from_stream` stops the moment it sees
@@ -245,9 +271,23 @@ impl Container for Zip {
             // Authoritative: the central directory carries real metadata and
             // enables `by_index`. Reached for `Rung::Exact` (a file) and for
             // `Rung::Spilled` (a pipe the ladder spooled), both of which are
-            // authoritative and neither of which loses anything, so the
-            // report is carried through unchanged.
-            let archive = zip::ZipArchive::new(SeekAdapter(source)).map_err(classify_zip_error)?;
+            // authoritative and neither of which loses anything — so the
+            // ACCESS PATH costs nothing, and the report's rung is carried
+            // through unchanged.
+            //
+            // The archive's own contents can still cost something, and this
+            // is the one rung that can prove it. `ZipArchive` collapses
+            // records that share a name, so an exact read of an 8-record
+            // archive can hand back 6 entries and, before this, said nothing
+            // at all — `list` printed six rows and `test` reported "exact
+            // fidelity". Read the declared count from the EOCD BEFORE the
+            // source is moved into the archive (nothing gets it back out
+            // afterwards) and hold the enumeration to it.
+            let mut adapter = SeekAdapter(source);
+            let declared = read_declared_index(&mut adapter);
+            let archive = zip::ZipArchive::new(adapter).map_err(classify_zip_error)?;
+            let mut report = report;
+            note_unreachable_records(&mut report, &archive, declared);
             return Ok(Box::new(ZipIndexed {
                 archive,
                 report,
@@ -447,6 +487,187 @@ impl Seek for SeekAdapter {
             .ok_or_else(|| io::Error::other("zip: source reported seekable but cannot seek"))?;
         seek.seek(pos)
     }
+}
+
+/// What the archive's own end-of-central-directory record DECLARES.
+///
+/// Read independently of the `zip` crate, because the crate exposes no
+/// accessor for it: `CentralDirectoryInfo::number_of_files` is `pub(crate)`,
+/// `mod spec` — where the EOCD structs with their `pub` fields live — is a
+/// private module, and `ZipArchiveMetadata` carries only the collapsed map.
+/// `ZipArchive::len()` is therefore the only count the crate will hand back,
+/// and it is not the declared one.
+///
+/// That distinction is the whole point of this struct. `ZipArchive` stores
+/// its records in an `IndexMap` keyed by the raw file name
+/// (`read/zip_archive.rs`'s `SharedBuilder::build`), so two central-directory
+/// records naming the same path at different local-header offsets collapse
+/// into one — the LAST record's data, at the FIRST record's index. `len()`
+/// then reports the number of distinct NAMES, and every reader above it
+/// enumerates fewer entries than the archive holds with no indication that
+/// anything was dropped. Measured on a real 8-record archive that `unzip -t`
+/// reads whole: `len()` returns 6.
+struct DeclaredIndex {
+    /// Total records across the archive: the EOCD's field at offset 10.
+    ///
+    /// Deliberately the archive TOTAL rather than the on-this-disk count at
+    /// offset 8 that `zip` itself reads. A single-disk archive — the only
+    /// kind this crate will open at all, since it refuses a central directory
+    /// on another disk — must declare the same number in both, so holding the
+    /// reader to the total is a check rather than a restatement.
+    entries: u64,
+    /// Offset of the central directory, relative to the start of the archive.
+    ///
+    /// Carried only to confirm that the record found here is the same one the
+    /// `zip` crate itself parsed. See [`note_unreachable_records`].
+    cd_offset: u64,
+}
+
+/// Ceiling on the backwards EOCD search: the record is 22 bytes and the only
+/// thing that may follow it is its own comment, whose length is a `u16`.
+const MAX_EOCD_SEARCH: u64 = 22 + u16::MAX as u64;
+/// Bytes of a whole end-of-central-directory record, signature included.
+const END_OF_CENTRAL_DIR_TOTAL: usize = 4 + END_OF_CENTRAL_DIR_FIXED;
+/// Bytes of a whole zip64 EOCD locator, signature included.
+const ZIP64_LOCATOR_TOTAL: usize = 4 + ZIP64_LOCATOR_FIXED;
+
+fn le16(b: &[u8]) -> u16 {
+    u16::from_le_bytes([b[0], b[1]])
+}
+
+fn le32(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+}
+
+fn le64(b: &[u8]) -> u64 {
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+
+/// Reads the declared record count, or `None` when it cannot be read with
+/// certainty.
+///
+/// `None` rather than a guess, everywhere, and that asymmetry is deliberate:
+/// the only thing this feeds is a fidelity WARNING, and a warning raised on a
+/// number this function was not sure of would be exactly the kind of
+/// over-claim the warning exists to prevent. Staying silent leaves the
+/// behaviour identical to what it was before; guessing does not.
+fn read_declared_index<R: Read + Seek>(r: &mut R) -> Option<DeclaredIndex> {
+    let end = r.seek(SeekFrom::End(0)).ok()?;
+    let window = end.min(MAX_EOCD_SEARCH);
+    if window < END_OF_CENTRAL_DIR_TOTAL as u64 {
+        return None;
+    }
+    r.seek(SeekFrom::Start(end - window)).ok()?;
+    let mut tail = vec![0u8; usize::try_from(window).ok()?];
+    r.read_exact(&mut tail).ok()?;
+
+    // Backwards, and only a signature whose declared comment length runs
+    // EXACTLY to the end of the file is accepted. A bare backwards search for
+    // `PK\x05\x06` is a heuristic — those four bytes occur inside file
+    // comments and inside stored payloads, which is the whole reason the
+    // forward reader parses framing instead — while agreement between the
+    // declared comment length and the bytes actually remaining is a check.
+    let at = (0..=tail.len() - END_OF_CENTRAL_DIR_TOTAL)
+        .rev()
+        .find(|&i| {
+            tail[i..i + 4] == SIG_END_OF_CENTRAL_DIR
+                && i + END_OF_CENTRAL_DIR_TOTAL + le16(&tail[i + 20..]) as usize == tail.len()
+        })?;
+
+    let entries = le16(&tail[at + 10..]);
+    let cd_offset = le32(&tail[at + 16..]);
+    if entries != u16::MAX && cd_offset != u32::MAX {
+        return Some(DeclaredIndex {
+            entries: u64::from(entries),
+            cd_offset: u64::from(cd_offset),
+        });
+    }
+    // Either field saturated: the real values live in the zip64 record, and
+    // the locator that points at it sits immediately before this one.
+    read_zip64_declared_index(r, &tail, at)
+}
+
+/// The zip64 escape hatch, reached when the 16-bit count or the 32-bit offset
+/// in the plain EOCD has saturated.
+///
+/// Known limitation, stated rather than papered over: the locator stores the
+/// zip64 record's offset RELATIVE to the start of the archive, and this reads
+/// it as an absolute file offset. A zip64 archive with data prepended to it —
+/// a self-extracting stub — therefore lands on the wrong bytes, the signature
+/// check below fails, and this returns `None`. That costs a warning on an
+/// archive that is both zip64 AND prepended AND holds shadowed records; it
+/// never produces a wrong one, which is the direction that matters. Resolving
+/// the archive offset properly would mean reading it from a `ZipArchive` that
+/// does not exist yet at this point in [`Container::open`].
+fn read_zip64_declared_index<R: Read + Seek>(
+    r: &mut R,
+    tail: &[u8],
+    eocd_at: usize,
+) -> Option<DeclaredIndex> {
+    let locator_at = eocd_at.checked_sub(ZIP64_LOCATOR_TOTAL)?;
+    if tail[locator_at..locator_at + 4] != SIG_ZIP64_LOCATOR {
+        return None;
+    }
+    let record_at = le64(&tail[locator_at + 8..]);
+
+    r.seek(SeekFrom::Start(record_at)).ok()?;
+    // Through the total-entries field at offset 32 and the central-directory
+    // offset at 48; the extensible data sector that may follow is not read.
+    let mut fixed = [0u8; 56];
+    r.read_exact(&mut fixed).ok()?;
+    if fixed[..4] != SIG_ZIP64_END {
+        return None;
+    }
+    Some(DeclaredIndex {
+        entries: le64(&fixed[32..]),
+        cd_offset: le64(&fixed[48..]),
+    })
+}
+
+/// Records the shortfall between what the index declares and what the reader
+/// could enumerate, when there is one.
+///
+/// Two guards stand between a disagreement and a warning, because a false
+/// fidelity warning on a healthy archive would be worse than the silence it
+/// replaces:
+///
+/// 1. The declared record must have been read with certainty at all
+///    ([`read_declared_index`] returns `None` otherwise).
+/// 2. It must be the SAME record `zip` itself used. `ZipArchive::
+///    get_metadata` retries against progressively earlier EOCD records when
+///    one fails to parse, so the last plausible record in the file is not
+///    necessarily the one the archive was built from. `central_directory_
+///    start()` and `offset()` are both public and together say exactly where
+///    the crate's chosen record pointed; requiring that to agree with this
+///    one's own `cd_offset` makes the comparison apples to apples.
+///
+/// Only a shortfall is reported. The opposite direction is unreachable —
+/// `read_central_header` pushes exactly `number_of_files` records and
+/// propagates any parse failure, so the collapsed map can never hold more
+/// names than the archive declared records — and a branch that cannot fire is
+/// not worth a message nobody will ever read.
+fn note_unreachable_records(
+    report: &mut FidelityReport,
+    archive: &zip::ZipArchive<SeekAdapter>,
+    declared: Option<DeclaredIndex>,
+) {
+    let Some(declared) = declared else { return };
+    if declared.cd_offset.checked_add(archive.offset()) != Some(archive.central_directory_start()) {
+        return;
+    }
+    let enumerated = archive.len() as u64;
+    let Some(shadowed) = declared.entries.checked_sub(enumerated).filter(|n| *n > 0) else {
+        return;
+    };
+    report.warn(Fidelity::EntryCountMismatch {
+        format: ZIP,
+        declared: declared.entries,
+        enumerated,
+        reason: format!(
+            "{shadowed} record(s) repeat a name already in the index and are shadowed by \
+             it; only the last record under each name can be read"
+        ),
+    });
 }
 
 struct ZipIndexed {
@@ -1585,6 +1806,190 @@ mod tests {
             2,
             "each loss is reported once, not twice: {:?}",
             report.warnings
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // A record the index declares but the reader cannot reach
+    // -----------------------------------------------------------------------
+
+    /// Appends a verbatim copy of the archive's FIRST central-directory record
+    /// and bumps the declared count, producing a zip whose index holds one
+    /// more record than it has distinct names.
+    ///
+    /// Forged at the byte level rather than written with `Zip.create`, because
+    /// `ZipWriter` will not produce this shape — which is the point: the file
+    /// that motivated this arrived from somewhere else. `unzip -t` reads its
+    /// real-world equivalent without complaint, and so must this; the archive
+    /// is well-formed, it merely names one path twice.
+    ///
+    /// The copy points at the same local header as the original, which the
+    /// original names at a different offset. That difference does not matter
+    /// to what is being tested: `ZipArchive` keys its map on the NAME, so any
+    /// two records sharing one collapse the same way.
+    fn with_shadowed_record(bytes: &[u8]) -> Vec<u8> {
+        // `build_zip` writes no archive comment, so the EOCD is the last 22.
+        let eocd = bytes.len() - END_OF_CENTRAL_DIR_TOTAL;
+        assert_eq!(bytes[eocd..eocd + 4], SIG_END_OF_CENTRAL_DIR, "no EOCD");
+        let entries = le16(&bytes[eocd + 10..]);
+        let cd_size = le32(&bytes[eocd + 12..]) as usize;
+        let cd_at = le32(&bytes[eocd + 16..]) as usize;
+
+        let cd = &bytes[cd_at..cd_at + cd_size];
+        assert_eq!(cd[..4], SIG_CENTRAL_HEADER, "no central directory");
+        // 46 fixed bytes, then the three variable-length fields at 28/30/32.
+        let first =
+            46 + le16(&cd[28..]) as usize + le16(&cd[30..]) as usize + le16(&cd[32..]) as usize;
+
+        let mut out = bytes[..cd_at + cd_size].to_vec();
+        out.extend_from_slice(&cd[..first]);
+        let mut tail = bytes[eocd..].to_vec();
+        tail[8..10].copy_from_slice(&(entries + 1).to_le_bytes());
+        tail[10..12].copy_from_slice(&(entries + 1).to_le_bytes());
+        tail[12..16].copy_from_slice(&((cd_size + first) as u32).to_le_bytes());
+        out.extend_from_slice(&tail);
+        out
+    }
+
+    fn count_mismatch(report: &FidelityReport) -> Option<(u64, u64)> {
+        report.warnings.iter().find_map(|w| match w {
+            Fidelity::EntryCountMismatch {
+                declared,
+                enumerated,
+                ..
+            } => Some((*declared, *enumerated)),
+            _ => None,
+        })
+    }
+
+    /// The defect this exists for. `ZipArchive` collapses records that share a
+    /// name, so an archive declaring three holds back one — and before this,
+    /// an exact read reported the two survivors and claimed it had lost
+    /// nothing, which is the one thing this tool must never do.
+    #[test]
+    fn an_index_that_declares_more_records_than_are_reachable_is_reported() {
+        let bytes = with_shadowed_record(&build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta")]));
+        let ar = open_seekable(&bytes);
+        let report = ar.fidelity();
+
+        assert_eq!(
+            count_mismatch(report),
+            Some((3, 2)),
+            "both numbers must be named: {:?}",
+            report.warnings
+        );
+        assert!(
+            report.has_warnings(),
+            "--strict-fidelity must fail an archive that was only partly enumerated"
+        );
+        assert!(
+            !report.is_lossless(),
+            "a read that could not reach every record is not lossless, whatever rung it landed on"
+        );
+        // The rung is untouched: the ACCESS PATH really was exact. What is
+        // lost is in the archive's own index, not in how it was reached.
+        assert_eq!(report.rung, Rung::Exact);
+    }
+
+    /// The other half, and the one that would catch a guard that fires on
+    /// everything: an ordinary archive must gain no warning at all.
+    #[test]
+    fn an_ordinary_zip_gains_no_count_warning() {
+        let bytes = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta"), ("c.txt", b"c")]);
+        let ar = open_seekable(&bytes);
+        assert_eq!(count_mismatch(ar.fidelity()), None);
+        assert!(
+            ar.fidelity().is_lossless(),
+            "an exact read of a well-formed zip loses nothing: {:?}",
+            ar.fidelity().warnings
+        );
+    }
+
+    /// An empty zip is a bare EOCD declaring zero records, and zero reachable
+    /// records is not a shortfall. The boundary the subtraction sits on.
+    #[test]
+    fn an_empty_zip_declares_nothing_and_loses_nothing() {
+        let bytes = build_zip(&[]);
+        let ar = open_seekable(&bytes);
+        assert_eq!(count_mismatch(ar.fidelity()), None);
+        assert!(ar.fidelity().is_lossless());
+    }
+
+    /// Builds a zip whose archive comment is `decoy` followed by `padding`
+    /// bytes of filler, leaving the real EOCD intact ahead of it.
+    fn with_archive_comment(clean: &[u8], decoy: &[u8], padding: usize) -> Vec<u8> {
+        let mut bytes = clean.to_vec();
+        let eocd = bytes.len() - END_OF_CENTRAL_DIR_TOTAL;
+        let comment_len = decoy.len() + padding;
+        bytes[eocd + 20..eocd + 22].copy_from_slice(&(comment_len as u16).to_le_bytes());
+        bytes.extend_from_slice(decoy);
+        bytes.extend(std::iter::repeat_n(b'.', padding));
+        bytes
+    }
+
+    /// A plausible-looking end-of-central-directory record claiming `entries`.
+    fn decoy_record(entries: u16) -> Vec<u8> {
+        let mut d = SIG_END_OF_CENTRAL_DIR.to_vec();
+        d.extend_from_slice(&[0u8; END_OF_CENTRAL_DIR_FIXED]);
+        d[8..10].copy_from_slice(&entries.to_le_bytes());
+        d[10..12].copy_from_slice(&entries.to_le_bytes());
+        d
+    }
+
+    /// `PK\x05\x06` INSIDE an archive comment must not be mistaken for the
+    /// record itself — the exact ambiguity that makes a bare backwards search
+    /// a heuristic, and why [`read_declared_index`] requires the declared
+    /// comment length to run to the end of the file. Bytes follow this decoy,
+    /// and it claims a zero-length comment, so the two disagree and it is
+    /// rejected.
+    ///
+    /// Asserted against `read_declared_index` directly, not through a
+    /// warning: `note_unreachable_records` independently refuses a record
+    /// whose `cd_offset` is not the one `zip` itself used, so a naive search
+    /// that swallowed this decoy would still raise no warning — and a test
+    /// that only checked the warning would pass against the very bug it
+    /// names. Measured: written that way first, it did.
+    #[test]
+    fn a_decoy_signature_inside_the_archive_comment_does_not_become_the_record() {
+        let clean = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        let bytes = with_archive_comment(&clean, &decoy_record(99), 8);
+
+        assert_eq!(
+            read_declared_index(&mut io::Cursor::new(bytes.clone())).map(|d| d.entries),
+            Some(2),
+            "the record found must be the real one, not the decoy claiming 99"
+        );
+        assert_eq!(count_mismatch(open_seekable(&bytes).fidelity()), None);
+    }
+
+    /// The second guard, and the one that carries the case the first cannot.
+    ///
+    /// A decoy placed at the very END of the file, declaring a zero-length
+    /// comment, is structurally indistinguishable from a real record: it
+    /// satisfies the length agreement above, and `read_declared_index` really
+    /// does return its count — asserted here so the limitation is recorded
+    /// rather than assumed away. What stops a false warning is that
+    /// `note_unreachable_records` requires the record's own `cd_offset` to be
+    /// the one `ZipArchive` parsed, which this decoy's zero is not.
+    ///
+    /// Not a contrived shape. `ZipArchive::get_metadata` retries against
+    /// progressively earlier records when one fails to parse, so "the last
+    /// plausible record in the file" and "the record the archive was built
+    /// from" are genuinely two different things.
+    #[test]
+    fn a_record_zip_did_not_use_cannot_raise_a_warning() {
+        let clean = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        let bytes = with_archive_comment(&clean, &decoy_record(99), 0);
+
+        assert_eq!(
+            read_declared_index(&mut io::Cursor::new(bytes.clone())).map(|d| d.entries),
+            Some(99),
+            "the search cannot tell this one apart; that is what the second guard is for"
+        );
+        assert_eq!(
+            count_mismatch(open_seekable(&bytes).fidelity()),
+            None,
+            "99 vs 2 would be a false fidelity warning on a healthy archive"
         );
     }
 

@@ -5259,6 +5259,167 @@ fn pack_refuses_when_the_only_input_is_the_output_and_leaves_it_untouched() {
     );
 }
 
+/// The same hole one step further in, measured through the binary: the shape
+/// the refusal above was written FOR and did not reach.
+///
+/// A nightly job pointed at the directory its archive lives in. Last night's
+/// archive is the directory's only member, the walk correctly leaves it out,
+/// and `/backups`'s own directory entry keeps the plan non-empty — so the
+/// guard did not fire, and a good archive was replaced by a 1536-byte shell
+/// holding one directory entry, at exit 0, with `--strict-fidelity` calling
+/// it clean. Measured on `70ca649`:
+///
+/// ```text
+/// $ stuffr pack nb -o nb/nightly.tar --force --strict-fidelity
+/// 1 path(s) -> tar (0 -> 1536 bytes, no fidelity loss)
+/// stuffr: note: `nb/nightly.tar` is the archive being written …
+/// exit=0   contains: nb
+/// ```
+///
+/// The byte-identity assertion is the one that matters: an exit code alone
+/// would not distinguish refusing from writing the shell and then complaining.
+#[test]
+fn pack_refuses_a_nightly_over_a_directory_holding_only_its_own_archive() {
+    let dir = tmp_dir();
+    let root = dir.join("backups");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(dir.join("data.txt"), b"last night's data").unwrap();
+
+    // A healthy archive of something else, sitting in `backups`.
+    let st = Command::new(STUFFR)
+        .current_dir(&dir)
+        .args(["pack", "data.txt", "-o", "backups/nightly.tar"])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let archive = root.join("nightly.tar");
+    let before = std::fs::read(&archive).unwrap();
+
+    // Tonight: the job is pointed at the directory instead.
+    let st = Command::new(STUFFR)
+        .current_dir(&dir)
+        .args([
+            "pack",
+            "backups",
+            "-o",
+            "backups/nightly.tar",
+            "--force",
+            "--strict-fidelity",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&st.stderr);
+    assert_eq!(
+        st.status.code(),
+        Some(2),
+        "a plan reduced to the directory the output was removed from is a usage \
+         refusal, not an archive of one empty directory: {err}"
+    );
+    assert!(
+        err.contains("No archive was written") && err.contains("is unchanged"),
+        "the refusal must say plainly that the destination survives: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        before,
+        "last night's archive must be byte-identical, not replaced by a shell"
+    );
+}
+
+/// The read-side half of the same session: `stuffr test` on a zip whose index
+/// declares more records than the reader can reach.
+///
+/// `ZipArchive` collapses central-directory records that share a name, so a
+/// real 8-record archive that `unzip -t` reads whole enumerated 6 entries and
+/// reported "exact fidelity" at exit 0 — under `--strict-fidelity`, the
+/// strongest gate this tool has. The fixture is built here rather than
+/// depending on that file, and `zip` itself will not write this shape, so the
+/// central directory is forged: a verbatim copy of the first record appended
+/// to the index, with the declared count bumped to match.
+#[test]
+fn test_reports_a_zip_whose_index_declares_more_records_than_are_reachable() {
+    let dir = tmp_dir();
+    let src = dir.join("a.txt");
+    std::fs::write(&src, b"alpha").unwrap();
+    let zip_path = dir.join("dup.zip");
+    let st = Command::new(STUFFR)
+        .current_dir(&dir)
+        .args(["pack", "a.txt", "-o", "dup.zip"])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    // A clean archive must gain nothing, or the assertions below prove only
+    // that `test` prints warnings.
+    let st = Command::new(STUFFR)
+        .args(["test", zip_path.to_str().unwrap(), "--strict-fidelity"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&st.stderr);
+    assert_eq!(st.status.code(), Some(0), "a clean zip is clean: {err}");
+    assert!(err.contains("exact fidelity"), "and still says so: {err}");
+
+    // Forge a second central-directory record naming the same entry.
+    let mut bytes = std::fs::read(&zip_path).unwrap();
+    let eocd = bytes.len() - 22;
+    assert_eq!(&bytes[eocd..eocd + 4], b"PK\x05\x06", "no EOCD");
+    let le16 = |b: &[u8]| u16::from_le_bytes([b[0], b[1]]);
+    let cd_size = u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_at = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let cd = bytes[cd_at..cd_at + cd_size].to_vec();
+    let first = 46 + le16(&cd[28..]) as usize + le16(&cd[30..]) as usize + le16(&cd[32..]) as usize;
+    let entries = le16(&bytes[eocd + 10..]);
+
+    let mut out = bytes[..cd_at + cd_size].to_vec();
+    out.extend_from_slice(&cd[..first]);
+    let tail = &mut bytes[eocd..];
+    tail[8..10].copy_from_slice(&(entries + 1).to_le_bytes());
+    tail[10..12].copy_from_slice(&(entries + 1).to_le_bytes());
+    tail[12..16].copy_from_slice(&((cd_size + first) as u32).to_le_bytes());
+    out.extend_from_slice(tail);
+    let forged = dir.join("shadowed.zip");
+    std::fs::write(&forged, &out).unwrap();
+
+    let st = Command::new(STUFFR)
+        .args(["test", forged.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&st.stderr);
+    assert_eq!(
+        st.status.code(),
+        Some(0),
+        "a shadowed record is a fidelity loss, not corruption: {err}"
+    );
+    assert!(
+        err.contains("declares 2") && err.contains("only 1"),
+        "the warning must name both counts: {err}"
+    );
+    assert!(
+        !err.contains("exact fidelity"),
+        "a read that reached one of two records must not announce exact \
+         fidelity: {err}"
+    );
+
+    let st = Command::new(STUFFR)
+        .args(["test", forged.to_str().unwrap(), "--strict-fidelity"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        st.status.code(),
+        Some(4),
+        "--strict-fidelity must refuse it: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2c, Task 6: the properties that would otherwise pass while being
 // structurally unable to fail.

@@ -103,6 +103,41 @@ pub enum Fidelity {
     #[error("total entry count is unknown without the trailing index")]
     EntryCountUnknown,
 
+    /// The archive's own index declares more records than the reader was able
+    /// to enumerate, so entries exist in the file that no caller can reach.
+    ///
+    /// Distinct from [`Self::EntryCountUnknown`], which is the forward reader
+    /// admitting it never saw a count at all. Here the count WAS read, from
+    /// the format's authoritative structure, and it disagrees with what came
+    /// back — the strongest evidence available that a read is incomplete, and
+    /// the one a seekable `Rung::Exact` read would otherwise have no way to
+    /// express. Without it a partial enumeration is indistinguishable from a
+    /// complete one, which is the failure this variant exists to prevent:
+    /// listing six of eight records and calling it exact fidelity.
+    ///
+    /// Raised, not recovered. Reaching the shadowed records would mean
+    /// re-parsing the index by hand; naming the shortfall is what the caller
+    /// needs in order to know not to trust the result, and
+    /// `--strict-fidelity` turns it into exit 4.
+    ///
+    /// `reason` is an owned `String` for the same reason
+    /// [`Self::EntrySkipped`]'s is: the cause is specific to the container
+    /// and the reader, and a shortfall that cannot say WHY is one the user
+    /// cannot act on.
+    #[error(
+        "`{format}` index declares {declared} entries but only {enumerated} are \
+         reachable: {reason}"
+    )]
+    EntryCountMismatch {
+        format: FormatId,
+        /// What the archive's own index says it holds.
+        declared: u64,
+        /// What the reader was actually able to enumerate.
+        enumerated: u64,
+        /// Why the two differ, in terms the caller can act on.
+        reason: String,
+    },
+
     #[error("entry `{entry}` is missing metadata: {}", fields.missing().join(", "))]
     MetadataIncomplete { entry: String, fields: MetaFields },
 
@@ -342,6 +377,19 @@ mod tests {
         assert!(
             s.contains("dev/null") && s.contains("hardlinks"),
             "a skip must say both which entry and why: {s}"
+        );
+
+        let f = Fidelity::EntryCountMismatch {
+            format: FormatId::new("zip"),
+            declared: 8,
+            enumerated: 6,
+            reason: "records sharing a name collapse into one".into(),
+        };
+        let s = format!("{f}");
+        assert!(
+            s.contains('8') && s.contains('6') && s.contains("sharing a name"),
+            "a shortfall must name BOTH counts and the cause, or the caller \
+             cannot tell how much is missing or why: {s}"
         );
 
         let f = Fidelity::MetadataIncomplete {

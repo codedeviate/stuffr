@@ -256,12 +256,36 @@ fn parse_test_report(stderr: &str) -> TestReport {
     let summary = lines
         .next()
         .unwrap_or_else(|| panic!("`stuffr test` printed no summary line at all: {stderr:?}"));
-    // "{format} -> {n} bytes verified ({rung} fidelity)"
-    let rung_word = summary
-        .rsplit('(')
-        .next()
-        .and_then(|tail| tail.strip_suffix(" fidelity)"))
+    // Two shapes, because the summary line must not announce "exact fidelity"
+    // over a report that carries losses (the ruling `pack`'s own summary line
+    // already followed, extended to `test` when zip gained a way for an EXACT
+    // read to lose something — an index that shadows its own records):
+    //
+    //   clean: "{format} -> {n} bytes verified ({rung} fidelity)"
+    //   lossy: "{format} -> {n} bytes verified ({rung} access, {k} fidelity loss(es))"
+    //
+    // The rung is in both, and is what this parses. Which shape appeared is
+    // then checked against `warnings` below, so the two cannot drift apart.
+    // `split_once`, not `rsplit_once`: the lossy shape ends in "loss(es))",
+    // so the LAST open paren is inside the count, not the one that opens the
+    // parenthetical. No format name contains a paren, so the first one is
+    // always the right one.
+    let inside = summary
+        .split_once('(')
+        .and_then(|(_, tail)| tail.strip_suffix(')'))
         .unwrap_or_else(|| panic!("could not find a rung in the summary line: {summary:?}"));
+    let (rung_word, summary_claims_loss) = match inside.strip_suffix(" fidelity") {
+        Some(rung) => (rung, false),
+        None => (
+            inside
+                .split_once(" access, ")
+                .map(|(rung, _)| rung)
+                .unwrap_or_else(|| {
+                    panic!("could not find a rung in the summary line: {summary:?}")
+                }),
+            true,
+        ),
+    };
     let rung = match rung_word {
         "exact" => Rung::Exact,
         "forward-only" => Rung::ForwardOnly,
@@ -280,6 +304,12 @@ fn parse_test_report(stderr: &str) -> TestReport {
         // enough warnings to hit the ten-line cap, and the header's count is
         // redundant with `warnings.len()` once every bullet has been parsed.
     }
+    assert_eq!(
+        summary_claims_loss,
+        !warnings.is_empty(),
+        "the summary line and the warning list must agree about whether \
+         anything was lost: {stderr:?}"
+    );
     TestReport { rung, warnings }
 }
 

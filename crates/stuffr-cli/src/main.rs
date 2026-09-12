@@ -489,9 +489,25 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
                 memory_limit,
             )?;
+            // The rung is worth printing here, unlike on the write side where
+            // it is a constant — a read really did land on one of four rungs,
+            // and which one it was is diagnostic. What it must not do is
+            // stand in for the LOSS. "exact fidelity" describes the access
+            // path, and an exact read of a zip whose index shadows two of its
+            // own records loses those two records anyway, so announcing
+            // "exact fidelity" on a report that carries warnings makes
+            // exactly the claim this tool exists not to make. Same ruling
+            // `pack`'s summary line already carries, for the same reason: when
+            // something was lost, the honest number is how much.
+            let losses = out.fidelity.warnings.len();
             eprintln!(
-                "{} -> {} bytes verified ({} fidelity)",
-                out.format, out.bytes_out, out.fidelity.rung
+                "{} -> {} bytes verified ({})",
+                out.format,
+                out.bytes_out,
+                match losses {
+                    0 => format!("{} fidelity", out.fidelity.rung),
+                    n => format!("{} access, {n} fidelity loss(es)", out.fidelity.rung),
+                }
             );
             report_fidelity(&out.fidelity, strict_fidelity)
         }
