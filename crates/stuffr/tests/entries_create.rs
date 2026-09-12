@@ -430,6 +430,131 @@ fn an_empty_directory_still_packs_and_keeps_its_own_entry() {
     );
 }
 
+/// The shape the empty-plan guard was built for and did not cover.
+///
+/// A nightly job packing the directory its own archive lives in: `pack
+/// /backups -o /backups/nightly.tar --force`. Last night's archive is the
+/// directory's only member, the walk correctly leaves it out, and the plan is
+/// left holding exactly one item — `/backups`'s own directory entry. That kept
+/// the plan non-empty, so the first guard never fired, and a healthy 2560-byte
+/// archive was replaced by a 1536-byte shell containing one directory entry,
+/// at exit 0, with `--strict-fidelity` reporting no loss. Measured on
+/// `70ca649`.
+///
+/// The refusal must land before `dst.create`, so the assertion that matters
+/// most is the last one: the archive is not merely reported on, it is
+/// byte-identical afterwards.
+#[test]
+fn a_nightly_pack_whose_directory_holds_only_its_own_archive_is_refused() {
+    let dir = tmp_dir();
+    let src = dir.join("proj");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"real content").unwrap();
+
+    let backups = dir.join("backups");
+    std::fs::create_dir(&backups).unwrap();
+    let out = backups.join("nightly.tar");
+
+    // Last night: a real archive of something else entirely.
+    entries::create_archive(
+        &[src],
+        Output::Path(out.clone()),
+        tar(),
+        None,
+        &CompressOpts::default(),
+    )
+    .unwrap();
+    let before = std::fs::read(&out).unwrap();
+    assert!(
+        before.len() > 1536,
+        "the fixture must be a real archive, not a shell: {} bytes",
+        before.len()
+    );
+
+    // Tonight: somebody points the same job at the backups directory.
+    let opts = CompressOpts {
+        force: true,
+        ..Default::default()
+    };
+    let err = entries::create_archive(&[backups], Output::Path(out.clone()), tar(), None, &opts)
+        .unwrap_err();
+
+    assert!(
+        matches!(err, stuffr::Error::Usage(_)),
+        "a plan holding only the directory the output was removed from must be a \
+         usage refusal (exit 2), not an archive of one empty directory: {err}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nothing to pack") && msg.contains("nightly.tar"),
+        "the refusal must name the cause and the destination: {msg}"
+    );
+    assert!(
+        msg.contains("No archive was written") && msg.contains("is unchanged"),
+        "and must say plainly that the destination survives: {msg}"
+    );
+
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        before,
+        "refusing before `dst.create` is the entire point: last night's archive \
+         must be byte-identical, not replaced by a shell"
+    );
+}
+
+/// The conjunction's second half, and the test that would catch a guard
+/// widened into "refuse whenever the output was excluded".
+///
+/// A directory holding a symlink and last night's archive loses the archive
+/// from its plan, exactly as the case above does — but a symlink is real
+/// content, its target is what gets stored, and an archive of symlinks is a
+/// legitimate thing to want. Only a plan reduced to pure structure is a shell.
+#[test]
+fn a_tree_whose_only_content_is_a_symlink_still_packs_with_the_output_excluded() {
+    let dir = tmp_dir();
+    let root = dir.join("links");
+    std::fs::create_dir(&root).unwrap();
+    std::os::unix::fs::symlink("/etc/hosts", root.join("link")).unwrap();
+
+    let out = root.join("arch.tar");
+    let opts = CompressOpts {
+        force: true,
+        ..Default::default()
+    };
+    // Run 1 has no archive to exclude yet; run 2 is the one under test.
+    entries::create_archive(
+        std::slice::from_ref(&root),
+        Output::Path(out.clone()),
+        tar(),
+        None,
+        &opts,
+    )
+    .unwrap();
+    let report = entries::create_archive(
+        std::slice::from_ref(&root),
+        Output::Path(out.clone()),
+        tar(),
+        None,
+        &opts,
+    )
+    .expect("a symlink is content; this plan is not a shell");
+    assert_eq!(
+        report.notes.len(),
+        1,
+        "the output was still excluded, and still said so: {:?}",
+        report.notes
+    );
+
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|e| matches!(e.kind, EntryKind::Symlink { .. })),
+        "the symlink must actually be in the archive: {:?}",
+        listed.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+}
+
 /// The self-exclusion path the guard must NOT disturb: a directory with real
 /// files in it, whose output lands inside itself. The output is excluded, the
 /// note is raised, the pack succeeds, and — per the Phase 2c ruling — the

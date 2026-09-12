@@ -781,19 +781,31 @@ pub fn cat(
 /// and [`is_output_file`] for how the comparison is made honest against
 /// relative walk paths and a destination that does not exist yet.
 ///
-/// # A plan with nothing in it is refused
+/// # A plan that would write nothing worth having is refused
 ///
-/// If, once the walk is done, the plan holds no item this container could
-/// store — every path named was the output itself, or every path named was
-/// skipped — this returns [`Error::Usage`] instead of writing an empty
-/// archive. `pack backup.tar -o backup.tar --force` is the shape: it used to
-/// replace a good archive with an empty 1024-byte one at exit 0, and
-/// `--strict-fidelity` passed it, because a self-exclusion is (correctly) a
-/// note rather than a fidelity warning. The refusal lands before `dst.create`,
-/// so the existing archive is not merely reported on — it is never opened.
+/// Two shapes, both returning [`Error::Usage`] before `dst.create`, so an
+/// archive already sitting at the destination is never even opened:
 ///
-/// An empty DIRECTORY is not this case: its own entry is in the plan and the
-/// pack succeeds.
+/// 1. **The plan holds no storable item at all** — every path named was the
+///    output itself, or every path named was skipped.
+///    `pack backup.tar -o backup.tar --force` is the shape.
+/// 2. **The plan holds nothing with contents, and the output was excluded
+///    from it.** `pack /backups -o /backups/nightly.tar --force` over a
+///    directory whose only member is last night's archive: the plan is not
+///    empty — `/backups`'s own directory entry is in it — so the first guard
+///    does not fire, and a healthy archive is replaced by a shell holding one
+///    directory entry, at exit 0, with `--strict-fidelity` reporting it
+///    clean.
+///
+/// Both used to pass. A fidelity warning could not have fixed either: by the
+/// time one could be raised the good archive has already been replaced, and
+/// the replacement IS the harm. A self-exclusion is also (correctly) a note
+/// rather than a warning, so it never reached the strict gate at all.
+///
+/// An empty DIRECTORY is neither case: its own entry is in the plan, nothing
+/// was excluded from that plan, and the pack succeeds. That is the whole
+/// weight the second guard's conjunction carries — the two plans are
+/// otherwise identical.
 pub fn create_archive(
     paths: &[PathBuf],
     dst: Output,
@@ -859,6 +871,9 @@ pub fn create_archive(
     let mut names = HashSet::new();
     // Told, never counted. See `Outcome::notes`.
     let mut notes: Vec<String> = Vec::new();
+    // Whether the walk met the archive being written and left it out. The
+    // guard below needs this as a fact rather than as an inference.
+    let mut excluded_output = false;
     for path in paths {
         let name = entry_name_for(path)?;
         // `metadata`, which follows a symlink, not `symlink_metadata`: a path
@@ -904,6 +919,13 @@ pub fn create_archive(
             if let crate::walk::ItemSource::File(p) = &item.source
                 && is_output_file(p, dst_canonical.as_deref())
             {
+                // Tracked separately from `notes` rather than inferred from
+                // it: `notes` is a channel for anything worth telling the
+                // user, and the guard below turns this particular exclusion
+                // into a REFUSAL. Reading a refusal out of "is the note list
+                // non-empty" would make the next note anybody adds here
+                // silently change when a pack is refused.
+                excluded_output = true;
                 notes.push(format!(
                     "`{}` is the archive being written and is not stored inside itself",
                     item.meta.name
@@ -953,10 +975,39 @@ pub fn create_archive(
     // the test asserts the empty-directory case explicitly: making this guard
     // fire on legitimate input would be the eleventh instance of this
     // project's signature defect.
-    if !plan
+    //
+    // **The directory entry is not enough, when the output was excluded.**
+    // Counting any storable item left the motivating shape unprotected, and
+    // it is the one that matters: `pack /backups -o /backups/nightly.tar
+    // --force --strict-fidelity` over a directory whose only member is last
+    // night's archive produces a plan holding exactly one item — `/backups`
+    // itself — so the plan is not empty, the guard did not fire, and a
+    // healthy archive was replaced by a 1536-byte shell containing one
+    // directory entry, at exit 0, with `--strict-fidelity` calling it clean.
+    // Measured on `70ca649`, not reasoned about.
+    //
+    // What separates that from `pack empty-dir -o x.tar`, which must keep
+    // succeeding, is not the plan's contents — both plans hold one directory
+    // entry and nothing else — but whether anything was TAKEN OUT of it. An
+    // empty directory excluded nothing; the nightly job excluded the very
+    // archive it is about to overwrite. So the predicate is a conjunction:
+    // nothing with contents survived AND the output was one of the things
+    // that did not.
+    //
+    // "With contents" rather than "a regular file": a symlink is real
+    // content, its target is stored, and an archive of symlinks is a
+    // legitimate thing to want. Only a directory entry is pure structure —
+    // an archive holding nothing else is a shell whatever it declares.
+    let nothing_with_contents = !plan.iter().any(|i| {
+        matches!(
+            i.source,
+            crate::walk::ItemSource::File(_) | crate::walk::ItemSource::Symlink
+        )
+    });
+    let nothing_storable = !plan
         .iter()
-        .any(|i| !matches!(i.source, crate::walk::ItemSource::Skipped { .. }))
-    {
+        .any(|i| !matches!(i.source, crate::walk::ItemSource::Skipped { .. }));
+    if nothing_storable || (nothing_with_contents && excluded_output) {
         // Two ways to arrive, wanting different advice, so the message names
         // which one happened rather than reporting a bare "nothing to pack".
         //
@@ -974,7 +1025,16 @@ pub fn create_archive(
         // measuring the named-fifo refusal that
         // `a_named_socket_is_still_a_usage_error_rather_than_an_empty_archive`
         // already owns — and was deleted rather than kept as decoration.
-        let cause = if !notes.is_empty() {
+        let cause = if excluded_output && !nothing_storable {
+            // The tightened case: directory entries survived, but the only
+            // thing with contents was the archive itself. Says what would have
+            // been written, because "nothing to pack" alone would read as
+            // wrong to someone looking at a directory that visibly exists.
+            "the only file found is the archive being written, which is not \
+             stored inside itself; what is left would be an archive of empty \
+             directories, replacing one that is not"
+                .to_string()
+        } else if excluded_output {
             // Deliberately does NOT repeat the destination here: the sentence
             // that follows already names it, and a long absolute path printed
             // twice in one line is harder to read, not more informative.
