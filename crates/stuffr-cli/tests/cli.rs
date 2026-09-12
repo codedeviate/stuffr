@@ -9,9 +9,33 @@ use tar::{Builder, Header};
 
 const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
 
+/// A token unique to THIS test-binary run, mixed into every temp path below.
+///
+/// `{pid}-{something}` was NOT unique enough, and the failure it caused reads
+/// exactly like a code defect. These directories are never removed on a
+/// failing path, PIDs are reused within a day, and a later run landing on a
+/// recycled PID then inherits its predecessor's directories *with their
+/// contents in them* — so five unrelated tests failed with "already exists"
+/// against 4436 leftovers, and deleting the leftovers turned the gate green
+/// with no code change at all. A false red that costs a session.
+///
+/// `RandomState` is the dependency-free source of per-process randomness in
+/// `std`: its hasher keys are seeded from the OS, so two concurrent or
+/// consecutive runs cannot agree on this token however their PIDs land. It
+/// makes the name collision-proof rather than merely unlikely, which is the
+/// property that matters — a teardown would still leave the window open for
+/// a run that crashes or is interrupted.
+static RUN_TOKEN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    use std::hash::{BuildHasher, Hasher};
+    let n = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!("{}-{n:016x}", std::process::id())
+});
+
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("stuffr-cli-{}-{}", std::process::id(), name));
+    p.push(format!("stuffr-cli-{}-{name}", &*RUN_TOKEN));
     p
 }
 
@@ -1558,10 +1582,17 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 /// A fresh, empty directory for one test. Real files on disk, not just
 /// bytes in memory, so `list_names_every_entry_and_extracts_nothing` can
 /// assert the filesystem is untouched afterwards.
+///
+/// Named from [`RUN_TOKEN`] rather than `{pid}-{counter}`, and the word
+/// "fresh" in the sentence above is why — see that constant for the false red
+/// the old name produced. `create_dir_all` is deliberately kept (rather than
+/// `create_dir`, which would refuse an existing path): with a random token the
+/// path cannot pre-exist, so a refusal would only ever fire on a genuine
+/// filesystem fault and `create_dir_all` reports that just as loudly.
 fn tmp_dir() -> PathBuf {
     let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("stuffr-cli-archive-{}-{}", std::process::id(), n));
+    p.push(format!("stuffr-cli-archive-{}-{n}", &*RUN_TOKEN));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
@@ -6823,4 +6854,58 @@ fn the_pack_summary_counts_losses_rather_than_claiming_exact_fidelity() {
         stderr.contains("no fidelity loss"),
         "a lossless pack must say so: {stderr}"
     );
+}
+
+// ---------------------------------------------------------------------
+// The test suite's own temp directories.
+// ---------------------------------------------------------------------
+
+/// `tmp_dir()` named its directories `stuffr-cli-archive-{pid}-{counter}`,
+/// never removed them on a failing path, and so accumulated thousands of
+/// them. PIDs are reused, so a later run landing on a recycled PID inherited
+/// its predecessor's directories WITH CONTENTS, and five unrelated tests
+/// failed with "already exists" — a red gate that went green again when the
+/// leftovers were deleted, with no code change at all.
+///
+/// The fix is a random component no other run can reproduce. What this test
+/// pins is precisely that: the part of the name that is not derivable from
+/// the pid and the counter must exist. Under the old scheme the whole name
+/// was derivable, and the tail below was the counter's digits alone.
+#[test]
+fn a_temp_directory_name_is_not_reproducible_from_the_pid_and_a_counter() {
+    let dir = tmp_dir();
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "a fresh temp directory must be empty — inheriting one with contents \
+         in it is the whole failure this guards against"
+    );
+
+    let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+    let derivable = format!("stuffr-cli-archive-{}-", std::process::id());
+    let tail = name
+        .strip_prefix(&derivable)
+        .unwrap_or_else(|| panic!("unexpected temp directory name: {name}"));
+    assert!(
+        tail.contains('-') && !tail.chars().all(|c| c.is_ascii_digit()),
+        "everything after the pid was the counter alone, so a second run on a \
+         recycled pid reproduced this name exactly: {name}"
+    );
+
+    // `tmp()` shares the same token, and had the same weakness: its old name
+    // was `stuffr-cli-{pid}-{name}` exactly, every character of it derivable
+    // by any other run that landed on the same pid.
+    let other = tmp("token-check");
+    let other_name = other.file_name().unwrap().to_string_lossy().into_owned();
+    assert_ne!(
+        other_name,
+        format!("stuffr-cli-{}-token-check", std::process::id()),
+        "tmp() must carry the run token too"
+    );
+    assert!(
+        other_name.ends_with("-token-check"),
+        "…and must still end in the caller's own name: {other_name}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
