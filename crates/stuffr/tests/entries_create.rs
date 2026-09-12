@@ -302,3 +302,191 @@ fn a_fifo_inside_the_walk_is_reported_and_never_becomes_an_entry() {
         "what was dropped must be named: {text:?}"
     );
 }
+
+/// The empty-plan refusal, and the whole reason it is a refusal rather than a
+/// warning: **the archive already on disk must survive byte for byte.**
+///
+/// Phase 2c excluded the output from its own walk (right — otherwise a
+/// `--force` re-run nests each previous archive inside the next) and recast
+/// that exclusion as a note rather than a fidelity warning (also right — a
+/// nightly `--strict-fidelity` job must not go red forever over stuffr
+/// declining to put a file inside itself). Together they opened this: `stuffr
+/// pack backup.tar -o backup.tar --force --strict-fidelity` replaced a good
+/// archive with an empty 1024-byte one and reported it clean at exit 0.
+///
+/// `create_archive` builds the entire plan before `dst.create` opens the
+/// destination, so refusing at the end of the plan means no temp file, no
+/// rename, and the existing file untouched. A warning would have left the
+/// empty archive in place, which is the actual harm — so the byte-identity
+/// assertion below, not the error type, is what this test is for.
+#[test]
+fn packing_only_the_output_into_itself_refuses_and_leaves_the_archive_intact() {
+    let dir = tmp_dir();
+    let src = dir.join("notes.txt");
+    std::fs::write(&src, b"last night's data").unwrap();
+
+    // Run 1: an ordinary, healthy archive.
+    let out = dir.join("backup.tar");
+    entries::create_archive(
+        &[src],
+        Output::Path(out.clone()),
+        tar(),
+        None,
+        &CompressOpts::default(),
+    )
+    .unwrap();
+    let before = std::fs::read(&out).unwrap();
+    assert!(
+        before.len() > 1024,
+        "the fixture must be a real archive, not an empty one: {} bytes",
+        before.len()
+    );
+
+    // Run 2: the only path named IS the archive being written.
+    let opts = CompressOpts {
+        force: true,
+        ..Default::default()
+    };
+    let err = entries::create_archive(
+        std::slice::from_ref(&out),
+        Output::Path(out.clone()),
+        tar(),
+        None,
+        &opts,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(err, stuffr::Error::Usage(_)),
+        "an empty plan must be a usage refusal (exit 2), not a written archive: {err}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nothing to pack") && msg.contains("backup.tar"),
+        "the refusal must name the cause and the destination: {msg}"
+    );
+    assert!(
+        msg.contains("not stored inside itself"),
+        "and must say WHICH of the two ways to get here happened: {msg}"
+    );
+
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        before,
+        "refusing before `dst.create` is the entire point: the existing archive \
+         must be byte-identical, not replaced by an empty one"
+    );
+}
+
+/// The obvious way to make the empty-plan guard fire on legitimate input, and
+/// the reason it counts plan ITEMS rather than payload bytes.
+///
+/// An empty directory is not an empty plan: the directory's own entry is real,
+/// it is what extraction recreates, and `pack empty-dir -o x.tar` has always
+/// succeeded. Checked explicitly because getting this wrong would be the
+/// eleventh instance of this project's signature defect — a guard that
+/// refuses healthy input.
+///
+/// Distinct from `an_empty_directory_reaches_the_archive_as_a_directory_entry`
+/// above, which packs `proj` CONTAINING an empty directory: that plan carries
+/// `proj`'s own entry and its child's, so it could never be barren. The guard
+/// is only stressed when the empty directory is the walk's root and its single
+/// entry is the entire plan.
+#[test]
+fn an_empty_directory_still_packs_and_keeps_its_own_entry() {
+    let dir = tmp_dir();
+    let empty = dir.join("empty-dir");
+    std::fs::create_dir(&empty).unwrap();
+
+    let out = dir.join("x.tar");
+    let report = entries::create_archive(
+        &[empty],
+        Output::Path(out.clone()),
+        tar(),
+        None,
+        &CompressOpts::default(),
+    )
+    .unwrap();
+    assert!(
+        report.fidelity.is_lossless(),
+        "an empty directory loses nothing: {:?}",
+        report.fidelity.warnings
+    );
+
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let names: Vec<String> = listed
+        .iter()
+        .map(|e| e.name.trim_end_matches('/').to_string())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["empty-dir".to_string()],
+        "the directory's own entry is the archive's whole content"
+    );
+    assert!(
+        matches!(listed[0].kind, EntryKind::Dir),
+        "and it is stored as a directory: {:?}",
+        listed[0].kind
+    );
+}
+
+/// The self-exclusion path the guard must NOT disturb: a directory with real
+/// files in it, whose output lands inside itself. The output is excluded, the
+/// note is raised, the pack succeeds, and — per the Phase 2c ruling — the
+/// report stays lossless so `--strict-fidelity` holds at exit 0 run after run.
+#[test]
+fn excluding_the_output_from_a_tree_that_has_other_files_still_packs() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"a").unwrap();
+
+    let out = root.join("backup.tar");
+    // Run 1 has no archive to exclude yet; run 2 is the one under test.
+    let opts = CompressOpts {
+        force: true,
+        ..Default::default()
+    };
+    entries::create_archive(
+        std::slice::from_ref(&root),
+        Output::Path(out.clone()),
+        tar(),
+        None,
+        &opts,
+    )
+    .unwrap();
+    let report = entries::create_archive(
+        std::slice::from_ref(&root),
+        Output::Path(out.clone()),
+        tar(),
+        None,
+        &opts,
+    )
+    .unwrap();
+
+    assert!(
+        report.notes.iter().any(|n| n.contains("backup.tar")),
+        "the exclusion is still told, on every run: {:?}",
+        report.notes
+    );
+    assert!(
+        report.fidelity.is_lossless(),
+        "a self-exclusion is not a fidelity loss, so --strict-fidelity stays at \
+         exit 0: {:?}",
+        report.fidelity.warnings
+    );
+
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let names: Vec<String> = listed
+        .iter()
+        .map(|e| e.name.trim_end_matches('/').to_string())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "proj/a.txt"),
+        "the real file is packed: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n == "proj/backup.tar"),
+        "and the archive is not inside itself: {names:?}"
+    );
+}

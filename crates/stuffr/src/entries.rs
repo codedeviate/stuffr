@@ -780,6 +780,20 @@ pub fn cat(
 /// refusal applied per-file rather than at the top. See [`canonical_output_path`]
 /// and [`is_output_file`] for how the comparison is made honest against
 /// relative walk paths and a destination that does not exist yet.
+///
+/// # A plan with nothing in it is refused
+///
+/// If, once the walk is done, the plan holds no item this container could
+/// store — every path named was the output itself, or every path named was
+/// skipped — this returns [`Error::Usage`] instead of writing an empty
+/// archive. `pack backup.tar -o backup.tar --force` is the shape: it used to
+/// replace a good archive with an empty 1024-byte one at exit 0, and
+/// `--strict-fidelity` passed it, because a self-exclusion is (correctly) a
+/// note rather than a fidelity warning. The refusal lands before `dst.create`,
+/// so the existing archive is not merely reported on — it is never opened.
+///
+/// An empty DIRECTORY is not this case: its own entry is in the plan and the
+/// pack succeeds.
 pub fn create_archive(
     paths: &[PathBuf],
     dst: Output,
@@ -914,6 +928,80 @@ pub fn create_archive(
             }
             plan.push(item);
         }
+    }
+
+    // Nothing at all would be written, so refuse — and refuse HERE, one line
+    // before `dst.create`, which is the entire benefit. The plan is complete,
+    // no temp file has been opened, no rename can happen, and an archive
+    // already sitting at `dst` survives byte for byte.
+    //
+    // The shape that made this urgent: `stuffr pack /backups -o
+    // /backups/nightly.tar --force --strict-fidelity` in a nightly job, over
+    // a directory whose only member is last night's archive. Excluding the
+    // output from its own walk is correct, and recasting that exclusion as a
+    // note rather than a fidelity warning is correct, but together they let a
+    // healthy 2 KiB archive be replaced by an empty 1 KiB one at exit 0 —
+    // with `--strict-fidelity`, the strongest gate this tool has, reporting
+    // it clean. A warning could not fix that: by the time one could be
+    // raised, the empty archive has already replaced the good one, and that
+    // replacement IS the harm.
+    //
+    // An empty DIRECTORY is deliberately NOT this case. `pack empty-dir -o
+    // x.tar` still carries the directory's own entry in the plan and still
+    // succeeds. The plan is barren only when every walked item is either the
+    // output itself or something the walk could not store — which is also why
+    // the test asserts the empty-directory case explicitly: making this guard
+    // fire on legitimate input would be the eleventh instance of this
+    // project's signature defect.
+    if !plan
+        .iter()
+        .any(|i| !matches!(i.source, crate::walk::ItemSource::Skipped { .. }))
+    {
+        // Two ways to arrive, wanting different advice, so the message names
+        // which one happened rather than reporting a bare "nothing to pack".
+        //
+        // Only the FIRST is reachable today, and the other two are honest
+        // defence rather than tested behaviour — said plainly here because an
+        // untestable branch that looks tested is worse than no branch. Two
+        // gates above make them unreachable: a path named on the command line
+        // is refused unless `metadata` says file or directory, and `walk`
+        // always emits its root as the first item, which `item_for` types as
+        // `File` or `Dir` from that same stat. So every named path contributes
+        // at least one storable item unless it IS the output. An all-`Skipped`
+        // plan would need a walk that can skip its own root; if one is ever
+        // written, the message below is already right. The first attempt at a
+        // test for it passed with the guard removed entirely — it was
+        // measuring the named-fifo refusal that
+        // `a_named_socket_is_still_a_usage_error_rather_than_an_empty_archive`
+        // already owns — and was deleted rather than kept as decoration.
+        let cause = if !notes.is_empty() {
+            // Deliberately does NOT repeat the destination here: the sentence
+            // that follows already names it, and a long absolute path printed
+            // twice in one line is harder to read, not more informative.
+            "every path named is the archive being written, which is not stored \
+             inside itself"
+                .to_string()
+        } else if plan.is_empty() {
+            "no input paths were given".to_string()
+        } else {
+            let listed = plan
+                .iter()
+                .filter_map(|i| match &i.source {
+                    crate::walk::ItemSource::Skipped { reason } => {
+                        Some(format!("`{}`: {reason}", i.meta.name))
+                    }
+                    _ => None,
+                })
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!("every path named was skipped ({listed})")
+        };
+        return Err(Error::Usage(format!(
+            "nothing to pack: {cause}. No archive was written, so `{}` is \
+             unchanged",
+            output_name(&dst)
+        )));
     }
 
     let opened = dst.create(o.force, o.sync)?;
@@ -1239,6 +1327,20 @@ impl<R: Read> Read for ExactLength<R> {
         self.remaining -= n as u64;
         self.real += n as u64;
         Ok(n)
+    }
+}
+
+/// How to name the destination in a message, before it exists.
+///
+/// Deliberately the path AS THE USER WROTE IT, not the canonical form
+/// [`canonical_output_path`] builds: a message saying `nightly.tar` is
+/// unchanged is read against the command that was typed, and an absolute
+/// resolved path with every symlink expanded is harder to match against it,
+/// not easier.
+fn output_name(dst: &Output) -> String {
+    match dst {
+        Output::Path(p) => p.display().to_string(),
+        Output::Stdout => "-".to_string(),
     }
 }
 

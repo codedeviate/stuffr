@@ -187,13 +187,30 @@ COLLECTING FILES INTO AN ARCHIVE
       named in a fidelity warning. --strict-fidelity turns any of these
       into exit 4, on the write side exactly as it does on the read side.
 
-  Three things pack refuses, all before anything is written: more than one
+  Four things pack refuses, all before anything is written: more than one
   path with a codec output (a codec compresses one stream and has nowhere
   to put a second); two inputs whose final components collide (the archive
-  could not then be extracted without --force); and a path NAMED on the
+  could not then be extracted without --force); a path NAMED on the
   command line that is neither a file nor a directory — a fifo or socket
   has no entry shape, and naming one is a request, not an incidental find
-  inside a walk.
+  inside a walk; and a plan that would hold no entries at all.
+
+  That last one is exit 2, and it exists because of the exclusion rule two
+  paragraphs above. `stuffr pack backup.tar -o backup.tar --force` names
+  only the archive being written, so the walk excludes it, nothing is left,
+  and pack used to replace a good archive with an empty 1024-byte one at
+  exit 0 — with --strict-fidelity passing, since a self-exclusion is a note
+  and not a fidelity loss. The refusal happens while the plan is still
+  being built, before the destination is opened at all, so an archive
+  already there is not overwritten, not truncated, not touched. The message
+  names the cause rather than just saying there was nothing to do.
+
+  An empty DIRECTORY is not that case and still packs:
+
+      stuffr pack empty-dir -o x.tar        # exit 0; x.tar holds empty-dir/
+
+  The directory's own entry is real — lose it and the tree does not come
+  back the shape it went in — so the plan is not empty and nothing refuses.
 
   --strict-fidelity is NOT one of those refusals, and the difference is the
   point: a refusal is a pre-flight check that writes nothing, while
@@ -205,7 +222,7 @@ COLLECTING FILES INTO AN ARCHIVE
   side keeps, where `unpack -C --strict-fidelity` exits 4 with the extracted
   files still there. So read the exit code; do not read the file's absence.
 
-  A fourth refusal, for the same reason the extract side refuses flags it
+  A fifth refusal, for the same reason the extract side refuses flags it
   cannot honour: --threads, --turbo and --allow-weak-encoder are refused
   (exit 2) only where the resolved chain has NO codec layer to give them
   to. A bare container is that case. `-o bundle.tar` compresses nothing,

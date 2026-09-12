@@ -5187,6 +5187,78 @@ fn pack_excludes_its_own_output_from_the_walk() {
     );
 }
 
+/// The hole the two rulings above left between them, measured through the
+/// binary rather than the library.
+///
+/// Excluding the output from its own walk is right; recasting that exclusion
+/// from a fidelity warning to a note is right. Together they meant that when
+/// the output was the ONLY thing named, `pack` walked nothing, wrote an empty
+/// 1024-byte tar over a healthy one, and `--strict-fidelity` — the strongest
+/// gate this tool has — reported it clean at exit 0.
+///
+/// It is now `Error::Usage`, exit 2, raised while the plan is still being
+/// built and before `dst.create` opens anything. That ordering is the whole
+/// benefit and is what the byte-identity assertion below pins: a warning
+/// would have let the empty archive replace the good one first, which is the
+/// actual harm. Exit code alone would not have caught it.
+#[test]
+fn pack_refuses_when_the_only_input_is_the_output_and_leaves_it_untouched() {
+    let dir = tmp_dir();
+    let root = dir.join("backups");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("data.txt"), b"last night's data").unwrap();
+
+    // A healthy archive, written the ordinary way.
+    let st = Command::new(STUFFR)
+        .current_dir(&root)
+        .args(["pack", "data.txt", "-o", "backup.tar"])
+        .output()
+        .unwrap();
+    assert!(
+        st.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    let archive = root.join("backup.tar");
+    let before = std::fs::read(&archive).unwrap();
+    assert!(
+        before.len() > 1024,
+        "the fixture must be a real archive, not an empty one: {} bytes",
+        before.len()
+    );
+
+    // The reproduction, verbatim.
+    let st = Command::new(STUFFR)
+        .current_dir(&root)
+        .args([
+            "pack",
+            "backup.tar",
+            "-o",
+            "backup.tar",
+            "--force",
+            "--strict-fidelity",
+        ])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&st.stderr);
+    assert_eq!(
+        st.status.code(),
+        Some(2),
+        "an empty plan is a usage refusal, not a successful empty archive: {err}"
+    );
+    assert!(
+        err.contains("nothing to pack") && err.contains("backup.tar"),
+        "the refusal must name the cause and the destination: {err}"
+    );
+
+    assert_eq!(
+        std::fs::read(&archive).unwrap(),
+        before,
+        "refusing before the destination is opened means no temp file and no \
+         rename, so the existing archive must be byte-identical"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2c, Task 6: the properties that would otherwise pass while being
 // structurally unable to fail.
