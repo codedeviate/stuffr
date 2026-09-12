@@ -35,7 +35,7 @@ static RUN_TOKEN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
 
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
-    p.push(format!("stuffr-cli-{}-{name}", &*RUN_TOKEN));
+    p.push(format!("stuffr-cli-{}-{name}", *RUN_TOKEN));
     p
 }
 
@@ -1592,7 +1592,7 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 fn tmp_dir() -> PathBuf {
     let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
-    p.push(format!("stuffr-cli-archive-{}-{n}", &*RUN_TOKEN));
+    p.push(format!("stuffr-cli-archive-{}-{n}", *RUN_TOKEN));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
