@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["compression", "archive", "gzip", "zstd", "tar"]
+categories = ["compression", "encoding", "filesystem"]
+readme = "README.md"
 
 [features]
 default = []

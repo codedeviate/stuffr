@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["compression", "archive", "cli", "unzip", "extract"]
+categories = ["command-line-utilities", "compression"]
+readme = "README.md"
 
 [[bin]]
 name = "stuffr"

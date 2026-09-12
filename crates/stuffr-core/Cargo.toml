@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["compression", "archive", "streaming", "codec", "traits"]
+categories = ["compression", "encoding"]
+readme = "README.md"
 
 [features]
 default = []

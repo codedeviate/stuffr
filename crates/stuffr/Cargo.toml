@@ -1,11 +1,14 @@
 [package]
 name = "stuffr"
 version.workspace = true
-description = "Universal compression and archive toolkit (library for the stuffr command)"
+description = "Universal compression and archive toolkit — the library crate. The `stuffr` command line tool is `cargo install stuffr-cli`."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["compression", "decompression", "archive", "zip", "tar"]
+categories = ["compression", "encoding", "filesystem"]
+readme = "README.md"
 
 [features]
 default = ["pure"]

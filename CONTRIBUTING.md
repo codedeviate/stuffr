@@ -100,7 +100,7 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.0.z` | Phase 0 — core abstractions, validated against mock formats. No real formats. |
 | `0.1.0` | Phase 1 — the modern codecs, parallel encode and the thread governor. Streams and single files, no containers. |
 | `0.2.0` | Phase 2 — containers, and the ZIP-on-a-pipe contract test. |
-| `0.3.0` | Phase 2c — write-side composition and directory walking. The read/write symmetry claim becomes true for archives. |
+| `0.3.0` | Phase 2c and its follow-ups — write-side composition (`pack -o bundle.tar.gz` in one pass) and directory walking, so the read/write symmetry claim becomes true for archives; plus entry selection by index (`list`'s index column, `cat --index`, `unpack --index`), `list` reporting fidelity and gaining `--strict-fidelity`, the declaration of zip central-directory records shadowed by a duplicate name, and the guard refusing a pack that would replace a good archive with an empty one. |
 | `0.4.0` | Phases 3–4 — legacy read and write, fuzzed. |
 | `0.5.x` | Phase 5 — compatibility symlinks, `convert`, polish. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
@@ -119,6 +119,13 @@ every dependent as compatible. So Phase 2c took `0.3.0` — a milestone that had
 been promised to legacy read/write — and everything below it shifted down one.
 A milestone is still a deliberate act; this is the case where the compatibility
 rules, rather than the plan, decide which number it gets.
+
+The `0.3.0` **row** was then widened, though its number was not. Work kept
+landing after the bump and before the first crates.io publication — entry
+selection by index, `list`'s fidelity reporting, the zip shadowed-record
+declaration, the empty-plan guard — and since nothing had shipped, the honest
+move was to redefine what `0.3.0` contains rather than to let the first release
+notes describe a subset of what the tag actually carries.
 
 After 1.0, normal semver applies: breaking changes to any public API in
 `stuffr-core` or the `stuffr` facade require a major bump.

@@ -19,10 +19,25 @@ read list.
 > `tar`, `zip` (`zip64` included) — each codec proven against the
 > conformance harness Phase 1c introduced and later cycles grew to twelve
 > properties, each container proven against the analogous
-> container-conformance harness, and then proven to coexist. **771** tests
-> under `--all-features`, **706** on the default tier — a different set, not
+> container-conformance harness, and then proven to coexist. **811** tests
+> under `--all-features`, **746** on the default tier — a different set, not
 > a subset, because the two tiers select different backends. Clean across
 > build, clippy and fmt.
+>
+> **`0.3.0` carries more than the write-side composition it was bumped for.**
+> Entries can be reached by **index**: `stuffr list`'s first column is the
+> entry's 0-based position in archive order, and `cat --index N` and `unpack
+> --index N -C DIR` select by it (repeatable, mutually exclusive with
+> PATTERNS). `list` now reports fidelity the way `test` and `unpack -C`
+> already did — it used to drop the report and print rows in silence — and
+> takes `--strict-fidelity`, gating at exit 4. That matters most on a zip
+> whose central directory holds records **shadowed by a duplicate name**: the
+> `zip` crate collapses them, so an 8-record file enumerates 6 entries, and
+> stuffr now parses the EOCD's declared count itself and raises a fidelity
+> warning naming both figures rather than announcing exact fidelity. And a
+> `pack` whose plan would replace a good archive with an empty shell is
+> **refused** (exit 2) one line before the destination is created, so the
+> existing archive stays byte-identical.
 >
 > **Containers bring sharp edges worth knowing before they read as bugs.**
 > zip 8.6.0 cannot forward-read entries written with data descriptors —
@@ -153,6 +168,41 @@ read list.
 > is fsynced before it is published and never destroys an existing file on
 > failure, and `stuffr-core` carries zero format dependencies.
 
+## Installation
+
+The binary is `stuffr`; the package that builds it is **`stuffr-cli`**:
+
+```sh
+cargo install stuffr-cli        # installs the `stuffr` binary
+```
+
+**`cargo install stuffr` does not work** — it fails with "no binaries".
+`stuffr` is the *library* crate and has no binary target; the command lives in
+`stuffr-cli`. This is the same split as ripgrep's `ripgrep` package and `rg`
+command, and it is the one thing about this project most likely to waste
+somebody's first five minutes.
+
+The default build is pure Rust and needs no C toolchain. To link the two
+vendored, statically built C backends instead — a faster xz/LZMA1 encoder and a
+strong zstd encoder:
+
+```sh
+cargo install stuffr-cli --features c-backed    # needs a C compiler, nothing else
+```
+
+Using it as a library instead:
+
+```sh
+cargo add stuffr                # the facade; re-exports stuffr-core + stuffr-formats
+```
+
+| Crate | What it is |
+|---|---|
+| [`stuffr-cli`](https://crates.io/crates/stuffr-cli) | the `stuffr` command — **this is the `cargo install` target** |
+| [`stuffr`](https://crates.io/crates/stuffr) | the library facade — the `cargo add` target |
+| [`stuffr-formats`](https://crates.io/crates/stuffr-formats) | codec and container implementations |
+| [`stuffr-core`](https://crates.io/crates/stuffr-core) | traits, stream ladder, fidelity, governor, registry — zero format dependencies |
+
 ## Why another one
 
 Three specific gaps, rather than a general wish for tidiness.
@@ -246,9 +296,9 @@ are not implemented yet. `pack` walks a directory tree, and
 
 ```
 stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
-stuffr unpack   [-C dir] ARCHIVE [PATTERNS...]
-stuffr list     ARCHIVE                    # alias: ls
-stuffr cat      ARCHIVE [PATTERNS...]      # streams entry data; works on a pipe
+stuffr unpack   [-C dir] ARCHIVE [PATTERNS... | --index N...]
+stuffr list     ARCHIVE                    # alias: ls; first column is the index
+stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a pipe
 stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
 stuffr formats                             # capability matrix for THIS build
 stuffr test     ARCHIVE                    # integrity check, no extraction

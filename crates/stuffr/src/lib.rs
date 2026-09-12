@@ -3,6 +3,10 @@
 //!
 //! Re-exports [`stuffr_core`] and owns the feature taxonomy: `pure` (default),
 //! `c-backed`, `legacy`, `full`, plus one granular feature per format.
+//!
+//! **This crate has no binary.** `cargo install stuffr` fails with "no
+//! binaries"; the `stuffr` command lives in the `stuffr-cli` package, so the
+//! working spelling is `cargo install stuffr-cli`.
 
 pub use stuffr_core as core;
 pub use stuffr_core::*;
