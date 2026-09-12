@@ -68,6 +68,35 @@ pub enum Error {
 }
 
 impl Error {
+    /// "Entry number `index` does not exist; here is what does."
+    ///
+    /// One constructor rather than a `format!` at each raiser, because there
+    /// are two routes to an out-of-range index and they must report it
+    /// IDENTICALLY: a container's own [`crate::ArchiveRead::by_index`] finds
+    /// it immediately (zip, which has a central directory to check against),
+    /// while a caller counting a forward walk finds it only at the end of the
+    /// archive (tar, ar, cpio, and anything on a pipe). A script that could
+    /// tell those apart from the message would be reading an implementation
+    /// detail of the source it was handed.
+    ///
+    /// [`Self::EntryNotFound`] rather than [`Self::Usage`] because the variant
+    /// exists for exactly this — "you named an entry this archive does not
+    /// have" — and carries the same exit code, 2. The payload is shaped to
+    /// read inside that variant's own `entry \`{0}\` not found` wording.
+    ///
+    /// Indices are 0-based throughout, so the valid range is stated
+    /// explicitly rather than left to be derived from the count: `0-5` is
+    /// harder to get wrong than "6 entries" is.
+    pub fn entry_index_out_of_range(index: usize, entries: usize) -> Self {
+        Error::EntryNotFound(match entries {
+            0 => format!("#{index} (this archive has no entries)"),
+            n => format!(
+                "#{index} (valid indices are 0-{} in this {n}-entry archive)",
+                n - 1
+            ),
+        })
+    }
+
     /// Maps to the process exit code, per the spec's table. Lives here rather
     /// than in the CLI so it is unit-testable without a process spawn.
     pub fn exit_code(&self) -> i32 {
@@ -195,6 +224,27 @@ mod tests {
             }
             .exit_code(),
             7
+        );
+    }
+
+    /// The refusal has to say what IS valid, not merely that the asked-for
+    /// index is not — and the zero-entry case must not underflow its way to
+    /// "valid indices are 0-18446744073709551615".
+    #[test]
+    fn an_out_of_range_index_names_the_valid_range_and_survives_an_empty_archive() {
+        let e = Error::entry_index_out_of_range(9, 6);
+        assert_eq!(e.exit_code(), 2);
+        let text = e.to_string();
+        assert!(text.contains("#9"), "{text}");
+        assert!(
+            text.contains("0-5"),
+            "the valid range must be stated, not left to be derived: {text}"
+        );
+
+        let empty = Error::entry_index_out_of_range(0, 0).to_string();
+        assert!(
+            empty.contains("no entries") && !empty.contains("0-1844"),
+            "an empty archive must not underflow into a nonsense range: {empty}"
         );
     }
 

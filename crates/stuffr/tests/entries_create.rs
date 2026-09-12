@@ -59,7 +59,9 @@ fn a_named_file_carries_its_ownership_into_the_archive() {
     )
     .unwrap();
 
-    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None)
+        .unwrap()
+        .0;
     let e = listed
         .iter()
         .find(|e| e.name == "notes.txt")
@@ -100,7 +102,9 @@ fn a_walked_file_and_a_named_file_agree_about_ownership() {
     )
     .unwrap();
 
-    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None)
+        .unwrap()
+        .0;
     let e = listed
         .iter()
         .find(|e| e.name == "proj/notes.txt")
@@ -127,7 +131,9 @@ fn an_empty_directory_reaches_the_archive_as_a_directory_entry() {
     )
     .unwrap();
 
-    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None)
+        .unwrap()
+        .0;
     let e = listed
         .iter()
         .find(|e| e.name.trim_end_matches('/') == "proj/empty")
@@ -174,7 +180,9 @@ fn a_directory_packed_into_ar_is_reported_rather_than_written_as_a_file() {
         "each dropped directory must be named: {named:?}"
     );
 
-    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None)
+        .unwrap()
+        .0;
     let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(
         names,
@@ -277,7 +285,9 @@ fn a_fifo_inside_the_walk_is_reported_and_never_becomes_an_entry() {
     )
     .unwrap();
 
-    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None)
+        .unwrap()
+        .0;
     let names: Vec<String> = listed
         .iter()
         .map(|e| e.name.trim_end_matches('/').to_string())
@@ -413,7 +423,9 @@ fn an_empty_directory_still_packs_and_keeps_its_own_entry() {
         report.fidelity.warnings
     );
 
-    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None)
+        .unwrap()
+        .0;
     let names: Vec<String> = listed
         .iter()
         .map(|e| e.name.trim_end_matches('/').to_string())
@@ -545,7 +557,9 @@ fn a_tree_whose_only_content_is_a_symlink_still_packs_with_the_output_excluded()
         report.notes
     );
 
-    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None)
+        .unwrap()
+        .0;
     assert!(
         listed
             .iter()
@@ -601,7 +615,9 @@ fn excluding_the_output_from_a_tree_that_has_other_files_still_packs() {
         report.fidelity.warnings
     );
 
-    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    let listed = entries::list(Input::Path(out), stuffr::DEFAULT_MAX_RATIO, None)
+        .unwrap()
+        .0;
     let names: Vec<String> = listed
         .iter()
         .map(|e| e.name.trim_end_matches('/').to_string())

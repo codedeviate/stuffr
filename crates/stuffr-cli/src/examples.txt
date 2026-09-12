@@ -342,7 +342,9 @@ STREAMING TO STDOUT
       codec layer beneath the container (see "EXTRACTING AN ARCHIVE" below).
       --format is refused alongside an entry name rather than accepted and
       ignored: entry-aware streaming detects the container, and any codec
-      above it, from the archive itself.
+      above it, from the archive itself. `--index N` asks for the same
+      entry-aware streaming by POSITION rather than by name — see --index
+      under "EXTRACTING AN ARCHIVE'S ENTRIES" below.
 
 
 STDIN AND STDOUT VIA `-`
@@ -403,18 +405,36 @@ INSPECTING A STREAM WITHOUT DECODING IT
 LISTING AND TESTING AN ARCHIVE
 
   stuffr list backup.tar
-      Prints one line per entry — size, then name — and extracts nothing at
-      all: no file is written, no directory created. `ls` is an alias for
-      `list`, for the muscle memory. Both work on `backup.tar.gz` and
-      `backup.tgz` exactly as they do on a bare `.tar`: the codec layer
+      Prints one line per entry — index, size, then name — and extracts
+      nothing at all: no file is written, no directory created. `ls` is an
+      alias for `list`, for the muscle memory. Both work on `backup.tar.gz`
+      and `backup.tgz` exactly as they do on a bare `.tar`: the codec layer
       (gzip) is resolved and decoded first, then `list` walks the tar
       layer underneath it — on a real file or over a pipe (`stuffr list -`)
       alike.
 
+      The first column is the entry's position in ARCHIVE ORDER, counting
+      from 0, and it is what `cat --index` and `unpack --index` select by
+      (see --index under "EXTRACTING AN ARCHIVE'S ENTRIES" below). One
+      forward walk
+      produces both the listing and the numbering, so `list` and `--index`
+      cannot disagree about which entry is which.
+
   stuffr ls backup.tar.gz --json
-      `--json` emits a JSON array of `{name, kind, size}` objects instead of
-      one line per entry, for scripting. `kind` is `file`, `dir`, `symlink`
-      or `other`.
+      `--json` emits a JSON array of `{index, name, kind, size}` objects
+      instead of one line per entry, for scripting. `kind` is `file`, `dir`,
+      `symlink` or `other`, and `index` is the same 0-based archive position
+      the human listing prints.
+
+  stuffr list photos.zip --strict-fidelity
+      `list` reports what the read approximated or lost, on stderr, and
+      --strict-fidelity turns any such report into exit 4 — the same
+      contract `test` and `unpack -C` already had, through the same printer.
+      It matters most on exactly the archive whose LISTING is incomplete: a
+      zip whose central directory holds 8 records under 6 distinct names
+      lists six entries, and the two shadowed records are unreachable. Before
+      this, `stuffr test` said so and `stuffr list` — the verb you reach for
+      first — printed those six lines and stayed silent.
 
   stuffr test backup.tar
       Reads every entry's data all the way through — not just its header —
@@ -473,8 +493,10 @@ LISTING AND TESTING AN ARCHIVE
       no entry count, and a symlink indistinguishable from a small file
       holding its target. Both losses are reported by name, which is why
       --strict-fidelity fails here and passes on a piped tar: it gates on
-      what was lost, never on the rung. (`list`, `ls` and `cat` take no
-      such flag; `test` and `unpack` do.)
+      what was lost, never on the rung. (`list`/`ls`, `test` and `unpack`
+      all take the flag; `cat` does not, because its output IS the data and
+      a caller piping it somewhere wants the bytes or an error, not a
+      verdict on metadata.)
 
   stuffr test archive.zip
       Verifies every entry's CRC32 — zip carries one per entry, so
@@ -544,6 +566,37 @@ EXTRACTING AN ARCHIVE'S ENTRIES
       expands `*`, and a pattern language nobody asked for is a pattern
       language to get subtly wrong. A pattern matching no entry at all is a
       usage error (exit 2), never a silent success.
+
+  stuffr cat notion.zip --index 2 > notion-api.sh
+  stuffr unpack notion.zip -C out/ --index 2
+      --index selects an entry by POSITION instead of by name — the 0-based
+      number `stuffr list` prints in its first column, counting in archive
+      order. It is repeatable (`--index 0 --index 3`), and it is how you
+      reach an entry whose name you cannot usefully type:
+
+      * a zip whose central directory holds two records under one name, so
+        naming it can only ever reach one of them;
+      * `Makefile` and `makefile` from a case-sensitive filesystem, on a
+        case-insensitive one;
+      * any name your shell would fight you over.
+
+      Entries come out in archive order however the flags were ordered, and
+      a repeated index selects its entry once — the same contract PATTERNS
+      have. An index past the end is a usage error (exit 2) naming the
+      archive's real entry count, never a silent empty result.
+
+      --index and PATTERNS are two ways of saying the same thing, so passing
+      both is a usage error (exit 2) rather than a guess at whether you
+      meant the union or the intersection. On `unpack`, --index needs -C for
+      exactly the reason a pattern does: it selects entries, and without -C
+      there is nowhere for entries to go.
+
+      It works over a pipe too (`cat notion.zip | stuffr cat - --index 2`),
+      because the position is counted during the ordinary forward walk. On a
+      real file a container that HAS an index — zip is the only one here —
+      jumps straight to the entry instead; tar, ar and cpio are sequential
+      formats with no index to jump with, so they always count. Both routes
+      deliver the same bytes, which is the property the tests pin.
 
   stuffr unpack backup.tar -C out/ --force
       An entry whose target path already holds a file or a symlink is

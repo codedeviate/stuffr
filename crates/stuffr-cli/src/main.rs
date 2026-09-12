@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 use stuffr::FormatId;
-use stuffr::entries::{self, ExtractOpts};
+use stuffr::entries::{self, ExtractOpts, Selection};
 use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output};
 use stuffr_cli::cli::{Cli, Command};
 
@@ -264,6 +264,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
         Command::Unpack {
             input,
             patterns,
+            index,
             directory,
             output,
             force,
@@ -273,11 +274,13 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             memory_limit,
             strict_fidelity,
         } => {
+            let named_entries = !patterns.is_empty() || !index.is_empty();
             // -C is what asks for entry-aware extraction. It is a flag rather
             // than something inferred from the input because the decision has
             // to be made before a byte is read: a pipe cannot be probed and
             // then re-dispatched.
             if let Some(dir) = directory {
+                let selection = selection_of(patterns, index)?;
                 refuse_unhonoured_extract_flags(output.is_some(), format.is_some())?;
                 let opts = ExtractOpts {
                     max_ratio: max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
@@ -293,18 +296,25 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                     ),
                     ..Default::default()
                 };
-                let out = entries::extract(input_of(&input), Path::new(&dir), &patterns, &opts)?;
+                let out = entries::extract(input_of(&input), Path::new(&dir), &selection, &opts)?;
                 eprintln!(
                     "{} -> {} bytes extracted into {dir} ({} fidelity)",
                     out.format, out.bytes_out, out.fidelity.rung
                 );
                 return report_fidelity(&out.fidelity, strict_fidelity);
             }
-            if !patterns.is_empty() {
+            if named_entries {
+                // `--index 6` needs the same refusal a pattern gets, and for
+                // the same reason: it selects entries, and without -C there is
+                // nowhere for entries to go. Naming the selector the user
+                // actually typed keeps the message actionable.
+                let named = match patterns.first() {
+                    Some(p) => format!("`{p}`"),
+                    None => format!("`--index {}`", index[0]),
+                };
                 return Err(stuffr::Error::Usage(format!(
-                    "`{}` names an archive entry; pass -C DIR to say where entries \
-                     should be extracted to",
-                    patterns[0]
+                    "{named} names an archive entry; pass -C DIR to say where entries \
+                     should be extracted to"
                 )));
             }
             // Decode has no worker count to govern (multi-threaded decode is
@@ -349,13 +359,16 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
         Command::Cat {
             input,
             patterns,
+            index,
             format,
             max_ratio,
             memory_limit,
         } => {
             // Naming an entry is what asks for entry-aware streaming — the
             // same "decide before reading a byte" reasoning as `unpack`'s -C.
-            if !patterns.is_empty() {
+            // `--index 6` says it just as explicitly as a name does.
+            if !patterns.is_empty() || !index.is_empty() {
+                let selection = selection_of(patterns, index)?;
                 refuse_unhonoured_extract_flags(false, format.is_some())?;
                 // Honoured now, not refused — see `unpack -C` above.
                 let memory_limit = Some(
@@ -365,7 +378,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 let mut out = std::io::stdout();
                 entries::cat(
                     input_of(&input),
-                    &patterns,
+                    &selection,
                     max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
                     memory_limit,
                     &mut out,
@@ -460,6 +473,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             json,
             max_ratio,
             memory_limit,
+            strict_fidelity,
         } => {
             // `list` advertises reading nothing and extracting nothing, but
             // reaching the container's first header still decodes whatever
@@ -473,6 +487,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 json,
                 max_ratio.unwrap_or(stuffr::DEFAULT_MAX_RATIO),
                 memory_limit,
+                strict_fidelity,
             )
         }
         Command::Test {
@@ -715,20 +730,44 @@ fn entry_kind_str(kind: &stuffr::EntryKind) -> &'static str {
 /// `?` rather than `println!`, matching `print_formats`/`Info` above — the
 /// same reason: `println!` panics on a write error, which would defeat
 /// `run`'s `BrokenPipe`-to-success mapping for `stuffr list big.tar | head`.
+///
+/// # The index column
+///
+/// The first column is the entry's 0-based position in archive order. It is
+/// simply the position in the `Vec` `entries::list` returned, which that
+/// function fills from one forward walk — the same walk `--index` counts. So
+/// `list` and `cat --index`/`unpack --index` cannot disagree about what
+/// entry 6 is; there is only one enumeration and both read it.
+///
+/// # The fidelity report
+///
+/// Printed through `report_fidelity`, the same call `test` and `unpack -C`
+/// make, rather than a second printer here. `list` dropped the report
+/// entirely until this was added: on a zip whose central directory holds 8
+/// records under 6 names, `stuffr test` warned that 2 were shadowed while
+/// `stuffr list` printed 6 rows and said nothing — the verb a user reaches
+/// for first, silent about the one way its own output was incomplete.
+///
+/// Warnings go to stderr AFTER the listing goes to stdout, so `stuffr list a
+/// | head` is unaffected by them and a redirected listing keeps the warning
+/// visible on the terminal.
 fn print_list(
     src: Input,
     json: bool,
     max_ratio: u64,
     memory_limit: Option<u64>,
+    strict_fidelity: bool,
 ) -> stuffr::Result<()> {
     use std::io::Write;
-    let entries = entries::list(src, max_ratio, memory_limit)?;
+    let (entries, outcome) = entries::list(src, max_ratio, memory_limit)?;
     let mut out = std::io::stdout();
     if json {
         let rows: Vec<serde_json::Value> = entries
             .iter()
-            .map(|e| {
+            .enumerate()
+            .map(|(i, e)| {
                 serde_json::json!({
+                    "index": i,
                     "name": e.name,
                     "kind": entry_kind_str(&e.kind),
                     "size": e.size,
@@ -737,14 +776,44 @@ fn print_list(
             .collect();
         writeln!(out, "{}", serde_json::Value::Array(rows))?;
     } else {
-        for e in &entries {
+        for (i, e) in entries.iter().enumerate() {
             match e.size {
-                Some(n) => writeln!(out, "{n:>12}  {}", e.name)?,
-                None => writeln!(out, "{:>12}  {}", "-", e.name)?,
+                Some(n) => writeln!(out, "{i:>5}  {n:>12}  {}", e.name)?,
+                None => writeln!(out, "{i:>5}  {:>12}  {}", "-", e.name)?,
             }
         }
     }
-    Ok(())
+    out.flush()?;
+    report_fidelity(&outcome.fidelity, strict_fidelity)
+}
+
+/// The one selector a read verb acts on, built from the two spellings a user
+/// can type.
+///
+/// `--index` and PATTERNS are **mutually exclusive**, not combinable. They
+/// are two ways of saying "which entries", and a command that says it both
+/// ways has no meaning anybody would agree on: is `unpack a.zip README
+/// --index 3` the union (two entries) or the intersection (README, but only
+/// if it happens to sit at 3)? Either reading silently does something the
+/// user did not mean half the time. Exit 2, before a byte is read, is the
+/// only answer that cannot be wrong.
+///
+/// Refused here rather than with clap's own `conflicts_with` so the message
+/// is stuffr-shaped and says WHY, the same way
+/// `refuse_unhonoured_extract_flags` does; and below this function the
+/// ambiguity is unrepresentable, because `stuffr::entries::Selection` has no
+/// variant that can hold both.
+fn selection_of(patterns: Vec<String>, index: Vec<usize>) -> stuffr::Result<Selection> {
+    match (patterns.is_empty(), index.is_empty()) {
+        (true, true) => Ok(Selection::All),
+        (false, true) => Ok(Selection::Names(patterns)),
+        (true, false) => Ok(Selection::Indices(index)),
+        (false, false) => Err(stuffr::Error::Usage(
+            "--index and entry patterns are two ways of choosing the same thing; \
+             pass one or the other, not both"
+                .into(),
+        )),
+    }
 }
 
 /// Resolves a `--format` name against the registry.

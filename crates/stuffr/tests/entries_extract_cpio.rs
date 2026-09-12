@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use stuffr::entries::{self, ExtractOpts};
+use stuffr::entries::{self, ExtractOpts, Selection};
 use stuffr::ops::Input;
 use stuffr::{EntryKind, EntryMeta, Error, FormatId};
 
@@ -78,8 +78,13 @@ fn a_cpio_symlink_extracts_as_a_real_symlink() {
     );
     let dest = root.join("out");
 
-    entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default())
-        .expect("a same-directory symlink target must be accepted");
+    entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .expect("a same-directory symlink target must be accepted");
 
     let meta = std::fs::symlink_metadata(dest.join("mylink"))
         .expect("mylink must exist as a real symlink");
@@ -118,8 +123,13 @@ fn an_escaping_cpio_symlink_target_is_refused_before_the_link_exists() {
     );
     let dest = root.join("out");
 
-    let err = entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default())
-        .expect_err("an escaping symlink target must be refused");
+    let err = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .expect_err("an escaping symlink target must be refused");
     assert!(matches!(err, Error::UnsafePath { .. }), "got {err:?}");
     assert!(
         std::fs::symlink_metadata(dest.join("link")).is_err(),

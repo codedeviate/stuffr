@@ -6857,6 +6857,423 @@ fn the_pack_summary_counts_losses_rather_than_claiming_exact_fidelity() {
 }
 
 // ---------------------------------------------------------------------
+// Selecting entries by index.
+//
+// `ArchiveRead::by_index` existed and was implemented on all four
+// containers from Phase 2 onward with no call site above the container
+// layer at all — built and dormant, the same shape `UnsafePath` and
+// `ContainerCaps` were in earlier phases. These tests are the contract for
+// the surface that finally reaches it.
+//
+// Index is 0-based and counts in ARCHIVE ORDER: the order `next_entry`
+// yields, which is the order `list` prints. `list`'s first column and
+// `--index` therefore read one enumeration, and the first test here is the
+// one that keeps them from drifting apart.
+// ---------------------------------------------------------------------
+
+/// Builds a zip through `stuffr pack` itself. There is no `zip` dev-dependency
+/// here (unlike `tar`/`flate2`), and for these tests that is fine: the point
+/// is not to validate stuffr's zip WRITER but to have an archive whose
+/// container carries a real central directory, which is what puts `--index`
+/// on its random-access route.
+fn write_zip_via_pack(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut paths = Vec::new();
+    for (name, data) in entries {
+        let p = src.join(name);
+        std::fs::write(&p, data).unwrap();
+        paths.push(p);
+    }
+    let zip = dir.join("bundle.zip");
+    let mut args: Vec<String> = vec!["pack".into()];
+    args.extend(paths.iter().map(|p| p.to_string_lossy().into_owned()));
+    args.push("-o".into());
+    args.push(zip.to_string_lossy().into_owned());
+    let out = Command::new(STUFFR).args(&args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "building the zip fixture failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    zip
+}
+
+/// The index column and `--index` must name the same entry, because a user
+/// reads the first and types the second. Checked for EVERY row rather than
+/// one, so an off-by-one that happens to be invisible at position 0 still
+/// fails.
+#[test]
+fn the_index_list_prints_is_the_index_cat_selects_by() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(
+        &dir,
+        &[
+            ("a.txt", b"alpha"),
+            ("b.txt", b"bravo"),
+            ("c.txt", b"charlie"),
+        ],
+    );
+    let listing =
+        String::from_utf8(run_output(&["list", archive.to_str().unwrap()]).stdout).unwrap();
+    let rows: Vec<&str> = listing.lines().collect();
+    assert_eq!(rows.len(), 3, "{listing}");
+
+    for (want_index, (_, payload)) in [
+        ("a.txt", &b"alpha"[..]),
+        ("b.txt", &b"bravo"[..]),
+        ("c.txt", &b"charlie"[..]),
+    ]
+    .iter()
+    .enumerate()
+    {
+        // The first column of the listing is the number `--index` takes.
+        let printed = rows[want_index].split_whitespace().next().unwrap();
+        assert_eq!(
+            printed,
+            want_index.to_string(),
+            "list's first column must be the 0-based archive position: {listing}"
+        );
+        let out = run_output(&[
+            "cat",
+            archive.to_str().unwrap(),
+            "--index",
+            &want_index.to_string(),
+        ]);
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            out.stdout, *payload,
+            "row {want_index} of the listing and `--index {want_index}` must be \
+             the same entry"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The property the two-route implementation rests on, at the level a user
+/// meets it: a zip on a real file is reached through its central directory,
+/// the same zip on a pipe is reached by counting the forward walk, and the
+/// two must hand back the same bytes.
+///
+/// Compared against the ORIGINAL content as well as against each other —
+/// two routes wrong in the same direction would agree with each other
+/// perfectly and both be wrong.
+#[test]
+fn index_selection_agrees_between_a_seekable_zip_and_the_same_zip_on_a_pipe() {
+    let dir = tmp_dir();
+    let payloads: [&[u8]; 4] = [b"first", b"second!!", b"third:::", b"fourth"];
+    let zip = write_zip_via_pack(
+        &dir,
+        &[
+            ("one.txt", payloads[0]),
+            ("two.txt", payloads[1]),
+            ("three.txt", payloads[2]),
+            ("four.txt", payloads[3]),
+        ],
+    );
+    let bytes = std::fs::read(&zip).unwrap();
+
+    for (i, payload) in payloads.iter().enumerate() {
+        let n = i.to_string();
+        let seekable = run_output(&["cat", zip.to_str().unwrap(), "--index", &n]);
+        assert!(
+            seekable.status.success(),
+            "index {n} on a file: {}",
+            String::from_utf8_lossy(&seekable.stderr)
+        );
+        let piped = run_with_stdin_output(&["cat", "-", "--index", &n], &bytes);
+        assert!(
+            piped.status.success(),
+            "index {n} on a pipe: {}",
+            String::from_utf8_lossy(&piped.stderr)
+        );
+
+        assert_eq!(
+            seekable.stdout, piped.stdout,
+            "the random-access and counted routes disagreed at index {n}"
+        );
+        assert_eq!(
+            seekable.stdout,
+            payload.to_vec(),
+            "index {n} did not reach the entry the archive was built with"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Repeatable, delivered in archive order however the flags were ordered,
+/// and a repeat selects its entry once. That contract is what lets the two
+/// routes above agree at all: the counted route can only ever produce
+/// archive order.
+#[test]
+fn repeated_index_flags_are_deduplicated_and_delivered_in_archive_order() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(
+        &dir,
+        &[
+            ("a.txt", b"alpha"),
+            ("b.txt", b"bravo"),
+            ("c.txt", b"charlie"),
+        ],
+    );
+    let out = run_output(&[
+        "cat",
+        archive.to_str().unwrap(),
+        "--index",
+        "2",
+        "--index",
+        "0",
+        "--index",
+        "2",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, b"alphacharlie",
+        "archive order, once each — not typed order, and not twice"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An index past the end is the caller's mistake, so exit 2 and say how many
+/// entries there actually are. Pinned on both routes, since each discovers
+/// the overrun at a different moment.
+#[test]
+fn an_index_past_the_end_is_a_usage_error_naming_the_real_entry_count() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha"), ("b.txt", b"bravo")]);
+    let zip = write_zip_via_pack(&dir, &[("one.txt", b"first"), ("two.txt", b"second")]);
+
+    for path in [&archive, &zip] {
+        let out = run_output(&["cat", path.to_str().unwrap(), "--index", "9"]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{}: stderr {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("#9") && stderr.contains("0-1"),
+            "the refusal must name the index asked for and the VALID range, \
+             whichever route found it: {stderr}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "an out-of-range index must not stream anything first"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--index` and PATTERNS are alternative ways of saying "which entries",
+/// never a combination — exit 2 rather than a guess at union or
+/// intersection.
+#[test]
+fn index_and_patterns_together_are_a_usage_error() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha"), ("b.txt", b"bravo")]);
+    let dest = dir.join("out");
+
+    let out = run_output(&["cat", archive.to_str().unwrap(), "a.txt", "--index", "1"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--index"), "{stderr}");
+
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "a.txt",
+        "-C",
+        dest.to_str().unwrap(),
+        "--index",
+        "1",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        !dest.exists(),
+        "the refusal must come before anything is created"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--index` selects entries, so on `unpack` it needs -C for exactly the
+/// reason a pattern does — and the refusal names the flag the user typed.
+#[test]
+fn unpack_by_index_without_a_directory_names_the_index_in_its_refusal() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha"), ("b.txt", b"bravo")]);
+
+    let out = run_output(&["unpack", archive.to_str().unwrap(), "--index", "1"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--index 1") && stderr.contains("-C"),
+        "the refusal must name what was typed and what to do instead: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The containered half of the feature: `unpack --index N -C out` writes
+/// exactly that entry and nothing else.
+#[test]
+fn unpack_by_index_extracts_only_the_selected_entry() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(
+        &dir,
+        &[
+            ("a.txt", b"alpha"),
+            ("b.txt", b"bravo"),
+            ("c.txt", b"charlie"),
+        ],
+    );
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--index",
+        "1",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(dest.join("b.txt")).unwrap(), b"bravo");
+    assert!(!dest.join("a.txt").exists(), "only the selected entry");
+    assert!(!dest.join("c.txt").exists(), "only the selected entry");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--json` carries the index too, since a script selecting by position has
+/// to read it from somewhere.
+#[test]
+fn list_json_carries_the_archive_index_of_every_entry() {
+    let dir = tmp_dir();
+    let archive = write_fixture_tar(&dir, &[("a.txt", b"alpha"), ("b.txt", b"bravo")]);
+    let out = run_output(&["list", "--json", archive.to_str().unwrap()]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let rows = v.as_array().unwrap();
+    assert_eq!(rows[0]["index"], 0);
+    assert_eq!(rows[0]["name"], "a.txt");
+    assert_eq!(rows[1]["index"], 1);
+    assert_eq!(rows[1]["name"], "b.txt");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------
+// `list` reports its fidelity, through the same printer `test` uses.
+// ---------------------------------------------------------------------
+
+/// `list` used to drop the container's fidelity report entirely. On a piped
+/// zip — the one shape whose forward read provably loses metadata — `test`
+/// warned and `list` printed its rows in silence.
+///
+/// Fixed by handing `report_fidelity` the report, the same call `test` and
+/// `unpack -C` make. Asserted against `test`'s own stderr on the identical
+/// bytes so the two verbs cannot drift: whatever `test` says was lost,
+/// `list` says too.
+#[test]
+fn list_reports_the_same_fidelity_warnings_test_does() {
+    let dir = tmp_dir();
+    let zip = write_zip_via_pack(&dir, &[("one.txt", b"first"), ("two.txt", b"second")]);
+    let bytes = std::fs::read(&zip).unwrap();
+
+    let listed = run_with_stdin_output(&["list", "-"], &bytes);
+    assert!(
+        listed.status.success(),
+        "a warning is not a failure without --strict-fidelity"
+    );
+    let list_err = String::from_utf8_lossy(&listed.stderr).to_string();
+    let tested = run_with_stdin_output(&["test", "-"], &bytes);
+    let test_err = String::from_utf8_lossy(&tested.stderr).to_string();
+
+    assert!(
+        test_err.contains("fidelity warning(s)"),
+        "the fixture must be a shape that really does lose something: {test_err}"
+    );
+    assert!(
+        list_err.contains("fidelity warning(s)"),
+        "`list` must report what it lost, not print rows in silence: {list_err}"
+    );
+    // Same warnings, verbatim, because it is the same printer over the same
+    // report — not a second one that could word things differently.
+    let warnings_of = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| l.trim_start().starts_with("- "))
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+    assert_eq!(
+        warnings_of(&list_err),
+        warnings_of(&test_err),
+        "list:\n{list_err}\ntest:\n{test_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// And the gate: `list --strict-fidelity` exits 4 on the same archive it
+/// exits 0 on without the flag, the same contract `test` and `unpack -C`
+/// have.
+#[test]
+fn list_strict_fidelity_turns_a_warning_into_exit_four() {
+    let dir = tmp_dir();
+    let zip = write_zip_via_pack(&dir, &[("one.txt", b"first")]);
+    let bytes = std::fs::read(&zip).unwrap();
+
+    let lenient = run_with_stdin_output(&["list", "-"], &bytes);
+    assert_eq!(lenient.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&lenient.stdout).contains("one.txt"),
+        "the listing itself is still printed"
+    );
+
+    let strict = run_with_stdin_output(&["list", "-", "--strict-fidelity"], &bytes);
+    assert_eq!(
+        strict.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&strict.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&strict.stdout).contains("one.txt"),
+        "the gate is a verdict on a listing that was still produced"
+    );
+
+    // A read that loses nothing is still exit 0 under the flag — the gate is
+    // on what was LOST, never on the rung.
+    let clean = run_output(&["list", zip.to_str().unwrap(), "--strict-fidelity"]);
+    assert_eq!(
+        clean.status.code(),
+        Some(0),
+        "a seekable zip loses nothing: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------
 // The test suite's own temp directories.
 // ---------------------------------------------------------------------
 

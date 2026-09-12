@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
     ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts,
-    EncodeOpts, EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields,
+    EncodeOpts, Entry, EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields,
     OpenOpts, PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source,
     SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain_deep_with, safe_join,
 };
@@ -284,6 +284,208 @@ fn open_archive(
     }
 }
 
+/// Which entries a read verb acts on.
+///
+/// The three ways of saying "which entries" are variants of ONE type rather
+/// than two parameters a caller could pass together, because "a name pattern
+/// AND a position" has no meaning anybody would agree on — union, or
+/// intersection? Making the ambiguity unrepresentable below the CLI means the
+/// only place that has to rule on it is the one place a user can type both,
+/// and the ruling there is a usage error (exit 2) rather than a guess.
+///
+/// # Index numbering
+///
+/// [`Selection::Indices`] is **0-based**, and an index is a position in
+/// ARCHIVE ORDER — the order [`ArchiveRead::next_entry`] yields, which is the
+/// order [`list`] returns and therefore the order `stuffr list`'s own index
+/// column prints. That is what makes `list` and `--index` incapable of
+/// disagreeing: both read the same sequence and count it the same way.
+///
+/// 0-based because it is the same integer [`ArchiveRead::by_index`] already
+/// takes. The flag, the column, the trait method and the out-of-range message
+/// zip already raises (`index 9; this archive has 2 entries`) then all speak
+/// one numbering, with no `-1` anywhere — and a translation layer is exactly
+/// where an off-by-one hides.
+///
+/// # Order and duplicates
+///
+/// Entries are visited in archive order whatever order the indices arrive in,
+/// and a repeated index selects its entry once. That is the same contract
+/// [`Selection::Names`] already has, and it is what lets the random-access
+/// route and the counted route produce byte-identical output: the counted
+/// route can only ever deliver archive order, so defining the contract any
+/// other way would make the two routes disagree by construction.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Selection {
+    /// Every entry in the archive.
+    #[default]
+    All,
+    /// Entries whose name matches one of these patterns — an exact entry
+    /// name, or a directory selecting everything beneath it.
+    Names(Vec<String>),
+    /// Entries at these archive positions, 0-based. See the type's own doc
+    /// for the numbering and the ordering rules.
+    Indices(Vec<usize>),
+}
+
+impl Selection {
+    /// The patterns to name in an [`Error::EntryNotFound`] when a selection
+    /// matched nothing. `None` for [`Selection::All`], which cannot miss, and
+    /// for [`Selection::Indices`], which reports its own out-of-range index
+    /// with the archive's length attached.
+    fn missed(&self) -> Option<String> {
+        match self {
+            Selection::Names(p) if !p.is_empty() => Some(p.join(", ")),
+            _ => None,
+        }
+    }
+}
+
+/// Runs `visit` over exactly the entries `selection` picks, in archive order,
+/// returning how many were visited.
+///
+/// The single place [`cat`] and [`extract`] agree on what a selection MEANS.
+/// They were two hand-copied `if !patterns.is_empty() && !matches_any(..)`
+/// guards before `--index` existed, which is one copy per verb of a rule that
+/// has to be identical in both — the drift shape [`open_archive`] was factored
+/// out to prevent on the chain-resolution side.
+fn visit_selected(
+    ar: &mut dyn ArchiveRead,
+    selection: &Selection,
+    mut visit: impl FnMut(&mut Entry<'_>) -> Result<()>,
+) -> Result<u64> {
+    if let Selection::Indices(wanted) = selection {
+        return visit_by_index(ar, wanted, visit);
+    }
+    let mut visited = 0u64;
+    while let Some(mut entry) = ar.next_entry()? {
+        if let Selection::Names(patterns) = selection
+            && !patterns.is_empty()
+            && !matches_any(&entry.meta().name, patterns)
+        {
+            continue;
+        }
+        visited += 1;
+        visit(&mut entry)?;
+    }
+    Ok(visited)
+}
+
+/// [`visit_selected`] for [`Selection::Indices`]: two routes to the same
+/// answer.
+///
+/// 1. **Random access.** [`ArchiveRead::by_index`] reaches an entry without
+///    touching any other, and is what makes `--index` cheap on a large zip.
+/// 2. **Counting the forward walk.** Works for every container and every
+///    source shape, a pipe included, because it needs nothing but
+///    `next_entry`.
+///
+/// Route 1 is taken only when the read is authoritative AND the container
+/// actually has an index; `by_index`'s own refusal is the signal for the
+/// second half, and container-conformance property 6 is what makes it
+/// trustworthy — a container that faked random access over a forward-only
+/// source would fail that property before it ever reached here. zip is the
+/// only container in this build that takes route 1 at all: tar, ar and cpio
+/// are sequential formats with no index and refuse `by_index` on every source
+/// shape, seekable included.
+///
+/// **A refusal has two spellings, and both mean "count instead".** They are
+/// not interchangeable and neither is redundant:
+///
+/// * [`Error::NotSeekable`] — *the source* cannot seek. A piped zip.
+/// * [`Error::Unsupported`] — *the format* has no index to seek to, however
+///   seekable the source is. `tar.rs`, `ar.rs` and `cpio.rs` each raise this
+///   on a seekable source deliberately, so that a caller is told "reaching
+///   entry N here means walking 0..N" rather than being handed a re-scan
+///   billed as random access.
+///
+/// Catching only the first was a real defect in this function's first draft:
+/// every `--index` against a tar, ar or cpio ON A FILE failed at exit 3 with
+/// "tar carries no entry index", because the honest refusal was propagated as
+/// though it were fatal instead of being read as the routing signal it is.
+/// The CLI tests caught it immediately; the unit tests below now pin both
+/// spellings so it cannot come back.
+///
+/// Treating `Unsupported` as routing rather than as fatal cannot SWALLOW a
+/// genuine capability limit — zip raises it for an encrypted entry, and for a
+/// zstd entry on a pure build — because the counted route then reaches that
+/// same entry through `next_entry` and raises the identical error there. The
+/// cost of the ambiguity is a walk, never a wrong answer.
+///
+/// The rung gate is `is_authoritative()`, NOT `== Rung::Exact`: zip's `open`
+/// takes its indexed branch for `Exact` (a file) and `Spilled` (a pipe the
+/// ladder spooled to disk) alike, and both really do have the central
+/// directory in hand. Gating on `Exact` alone would send a spooled read down
+/// the slow route while the fast one was sitting right there.
+///
+/// Both routes must give the same answer, which is why `wanted` is sorted and
+/// deduplicated first — see [`Selection`]'s own doc — and why out-of-range is
+/// reported with the identical message either way.
+fn visit_by_index(
+    ar: &mut dyn ArchiveRead,
+    wanted: &[usize],
+    mut visit: impl FnMut(&mut Entry<'_>) -> Result<()>,
+) -> Result<u64> {
+    let mut wanted: Vec<usize> = wanted.to_vec();
+    wanted.sort_unstable();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return Ok(0);
+    }
+
+    // The probe and the first delivery are the same call: asking twice would
+    // decode the first entry twice, and on a zip whose first selected entry is
+    // a symlink the target is read as part of building the entry, so "just to
+    // see whether it works" is not free.
+    //
+    // It reduces to a `bool` rather than staying a `match` around the whole
+    // fast path because a `match` on `Result<Entry<'_>, _>` holds the borrow
+    // of `ar` for the entire match — the scrutinee temporary outlives every
+    // arm — so the second `by_index` inside it cannot borrow `ar` again.
+    let random_access = ar.fidelity().rung.is_authoritative()
+        && match ar.by_index(wanted[0]) {
+            Ok(mut entry) => {
+                visit(&mut entry)?;
+                true
+            }
+            // "No random access here" — count instead. Both spellings; see
+            // this function's doc for why there are two.
+            Err(Error::NotSeekable { .. } | Error::Unsupported(_)) => false,
+            Err(e) => return Err(e),
+        };
+    if random_access {
+        for &index in &wanted[1..] {
+            let mut entry = ar.by_index(index)?;
+            visit(&mut entry)?;
+        }
+        return Ok(wanted.len() as u64);
+    }
+
+    let mut position = 0usize;
+    let mut cursor = 0usize;
+    let mut visited = 0u64;
+    while let Some(mut entry) = ar.next_entry()? {
+        if wanted[cursor] == position {
+            visit(&mut entry)?;
+            visited += 1;
+            cursor += 1;
+            // Everything asked for has been delivered; reading the rest of
+            // the archive would buy nothing. Safe for the out-of-range check
+            // below precisely because it only fires when `cursor` did NOT
+            // reach the end, which is the case this break cannot be in.
+            if cursor == wanted.len() {
+                return Ok(visited);
+            }
+        }
+        position += 1;
+    }
+    // The SAME constructor a container's own `by_index` uses for the same
+    // mistake — see `Error::entry_index_out_of_range`. Sharing it is what
+    // makes "both routes give the same answer" true of the failure as well as
+    // of the success.
+    Err(Error::entry_index_out_of_range(wanted[cursor], position))
+}
+
 /// Lists every entry in an archive, extracting nothing.
 ///
 /// `memory_limit` bounds the codec layer beneath the container — see
@@ -292,14 +494,45 @@ fn open_archive(
 /// true of the ENTRIES: reaching the container's first header still decodes
 /// whatever codec sits above it, so this verb is as exposed to a crafted
 /// dictionary declaration as `unpack` is.
-pub fn list(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Vec<EntryMeta>> {
-    let (mut ar, _format, _consumed) =
+///
+/// # Why it returns an [`Outcome`] as well as the entries
+///
+/// It used to return the `Vec` alone, and therefore **dropped the container's
+/// fidelity report on the floor**. Measured on a zip whose central directory
+/// holds 8 records under 6 distinct names: `stuffr test` warned that 2 records
+/// are shadowed and unreachable, while `stuffr list` on the identical bytes
+/// printed 6 rows and nothing at all on stderr. `list` is the verb a user
+/// reaches for FIRST, so it was the one verb staying silent about the one
+/// thing its own output was incomplete about.
+///
+/// The `Outcome`'s `bytes_out` is 0 — listing reads no payload, which is the
+/// whole point of the verb — so it carries the report and the format, and
+/// nothing else. Returning the same type `test`, `cat` and `extract` already
+/// return is what lets the CLI hand it to the SAME `report_fidelity` call
+/// rather than growing a second printer that could drift.
+///
+/// The entries' positions in the returned `Vec` are the indices
+/// [`Selection::Indices`] selects by: one forward walk produces both, so they
+/// cannot disagree.
+pub fn list(
+    src: Input,
+    max_ratio: u64,
+    memory_limit: Option<u64>,
+) -> Result<(Vec<EntryMeta>, Outcome)> {
+    let (mut ar, format, _consumed) =
         open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     let mut out = Vec::new();
     while let Some(entry) = ar.next_entry()? {
         out.push(entry.meta().clone());
     }
-    Ok(out)
+    let outcome = Outcome {
+        bytes_in: 0,
+        bytes_out: 0,
+        format,
+        fidelity: ar.fidelity().clone(),
+        notes: Vec::new(),
+    };
+    Ok((out, outcome))
 }
 
 /// Reads every entry to the end, verifying integrity, writing nothing.
@@ -386,7 +619,8 @@ impl Default for ExtractOpts {
     }
 }
 
-/// Extracts entries matching `patterns` (all of them when empty) into `dest`.
+/// Extracts the entries [`Selection`] picks — by name, by 0-based archive
+/// position, or all of them — into `dest`.
 ///
 /// # Not atomic, unlike the single-stream path
 ///
@@ -423,7 +657,7 @@ impl Default for ExtractOpts {
 /// 3. The budget is charged from bytes **actually read**, not from the size
 ///    the header declares. A header that under-declares its length would
 ///    otherwise walk straight through the check it exists to satisfy.
-pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) -> Result<Outcome> {
+pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) -> Result<Outcome> {
     // Before `src` is consumed by `open_archive`, which takes it by value.
     let compressed_total = o.compressed_total.or_else(|| {
         src.path()
@@ -453,12 +687,8 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
     // (0o555, say) could not be written into afterwards.
     let mut deferred_dirs: Vec<(PathBuf, EntryMeta)> = Vec::new();
 
-    while let Some(mut entry) = ar.next_entry()? {
+    matched += visit_selected(ar.as_mut(), selection, |entry| {
         let meta = entry.meta().clone();
-        if !patterns.is_empty() && !matches_any(&meta.name, patterns) {
-            continue;
-        }
-        matched += 1;
 
         // Containment BEFORE anything is created. Checking after opening the
         // destination would already have created a file at an attacker's
@@ -556,7 +786,8 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
                 });
             }
         }
-    }
+        Ok(())
+    })?;
 
     // Now that nothing more will be created inside them. Sorted deepest
     // path first: a parent chmod'd to something without the execute bit
@@ -589,10 +820,14 @@ pub fn extract(src: Input, dest: &Path, patterns: &[String], o: &ExtractOpts) ->
         warn_metadata(&mut warnings, &meta.name, missing);
     }
 
-    // Patterns that select nothing must not report success: a typo'd name
+    // A selection that selects nothing must not report success: a typo'd name
     // would otherwise look exactly like an archive that had nothing to give.
-    if !patterns.is_empty() && matched == 0 {
-        return Err(Error::EntryNotFound(patterns.join(", ")));
+    // An index selection never reaches here having matched nothing — an index
+    // past the end is already an error naming the archive's real length.
+    if matched == 0
+        && let Some(missed) = selection.missed()
+    {
+        return Err(Error::EntryNotFound(missed));
     }
 
     // The container's own report, plus everything writing to disk cost. This
@@ -688,17 +923,17 @@ fn warn_metadata(warnings: &mut Vec<Fidelity>, entry: &str, missing: MetaFields)
     });
 }
 
-/// Writes the payload of every entry matching `patterns` (all of them when
-/// empty) to `dst`, in archive order.
+/// Writes the payload of every entry [`Selection`] picks — by name, by 0-based
+/// archive position, or all of them — to `dst`, in archive order.
 ///
 /// No containment here, deliberately: `cat` opens no path at all. An entry's
-/// name is only ever compared against `patterns`, and its bytes go to `dst`
+/// name is only ever compared against the selection, and its bytes go to `dst`
 /// — a hostile name has nowhere to point. The bomb budget still applies,
 /// since the motivating case (`curl … | stuffr cat - a.txt`) streams
 /// untrusted input of unknown size.
 pub fn cat(
     src: Input,
-    patterns: &[String],
+    selection: &Selection,
     max_ratio: u64,
     memory_limit: Option<u64>,
     dst: &mut dyn Write,
@@ -712,19 +947,18 @@ pub fn cat(
     let mut written = 0u64;
     let mut matched = 0u64;
 
-    while let Some(mut entry) = ar.next_entry()? {
-        let meta = entry.meta().clone();
-        if !patterns.is_empty() && !matches_any(&meta.name, patterns) {
-            continue;
-        }
-        matched += 1;
+    matched += visit_selected(ar.as_mut(), selection, |entry| {
+        let name = entry.meta().name.clone();
         // A directory or symlink entry frames no payload, so this copies
         // zero bytes for one rather than needing a case of its own.
-        written += copy_charging(entry.reader(), dst, &meta.name, &mut budget)?;
-    }
+        written += copy_charging(entry.reader(), dst, &name, &mut budget)?;
+        Ok(())
+    })?;
 
-    if !patterns.is_empty() && matched == 0 {
-        return Err(Error::EntryNotFound(patterns.join(", ")));
+    if matched == 0
+        && let Some(missed) = selection.missed()
+    {
+        return Err(Error::EntryNotFound(missed));
     }
     dst.flush()?;
 
@@ -1808,6 +2042,243 @@ fn copy_charging(
 mod tests {
     use super::*;
     use stuffr_core::{DEFAULT_MAX_RATIO, ReaderSource};
+
+    /// A container of `a`/`b`/`c`/`d` that records which of the two routes
+    /// [`visit_by_index`] actually took.
+    ///
+    /// Hand-rolled rather than borrowed from `stuffr_core::testing`, because
+    /// that module is behind the `testing` feature and the gate's default
+    /// test leg does not enable it — a mock that only exists under
+    /// `--all-features` would leave these assertions unrun on one of the two
+    /// legs, which is exactly the "never executed once" shape the workspace
+    /// already found in its `x-pure` tests.
+    /// How a container answers `by_index`. The two refusals are NOT
+    /// interchangeable and both are real: `NotSeekable` is "this source
+    /// cannot seek" (a piped zip), `Unsupported` is "this format has no index
+    /// to seek to" (tar, ar and cpio on a real file, each raising it
+    /// deliberately rather than billing a re-scan as random access).
+    ///
+    /// Both are in this enum because catching only the first shipped a
+    /// version in which every `--index` against a tar ON A FILE failed at
+    /// exit 3.
+    #[derive(Clone, Copy, Debug)]
+    enum Index {
+        Has,
+        RefusesNotSeekable,
+        RefusesUnsupported,
+    }
+
+    struct Routes {
+        names: Vec<&'static str>,
+        next: usize,
+        report: FidelityReport,
+        index: Index,
+        by_index_calls: usize,
+        next_entry_calls: usize,
+    }
+
+    impl Routes {
+        fn new(rung: Rung, index: Index) -> Self {
+            Self {
+                names: vec!["a", "b", "c", "d"],
+                next: 0,
+                report: FidelityReport::new(rung),
+                index,
+                by_index_calls: 0,
+                next_entry_calls: 0,
+            }
+        }
+
+        fn entry(name: &str) -> Entry<'static> {
+            // The payload is the name repeated, so a test comparing BYTES
+            // rather than names cannot be satisfied by the wrong entry.
+            let payload = name.repeat(3).into_bytes();
+            Entry::new(
+                EntryMeta::file(name),
+                Box::new(std::io::Cursor::new(payload)),
+            )
+        }
+    }
+
+    impl ArchiveRead for Routes {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            self.next_entry_calls += 1;
+            if self.next >= self.names.len() {
+                return Ok(None);
+            }
+            let name = self.names[self.next];
+            self.next += 1;
+            Ok(Some(Self::entry(name)))
+        }
+
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.by_index_calls += 1;
+            match self.index {
+                Index::RefusesNotSeekable => {
+                    return Err(Error::NotSeekable {
+                        format: FormatId::new("mock"),
+                    });
+                }
+                Index::RefusesUnsupported => {
+                    return Err(Error::Unsupported(format!(
+                        "mock carries no entry index, so entry {index} can only be reached \
+                         by reading forward from the start"
+                    )));
+                }
+                Index::Has => {}
+            }
+            match self.names.get(index) {
+                Some(name) => Ok(Self::entry(name)),
+                None => Err(Error::entry_index_out_of_range(index, self.names.len())),
+            }
+        }
+
+        fn fidelity(&self) -> &FidelityReport {
+            &self.report
+        }
+    }
+
+    /// Collects what a selection delivers, as `(name, payload)` pairs.
+    fn deliver(ar: &mut Routes, selection: &Selection) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut got = Vec::new();
+        visit_selected(ar, selection, |entry| {
+            let name = entry.meta().name.clone();
+            let mut payload = Vec::new();
+            entry.reader().read_to_end(&mut payload)?;
+            got.push((name, payload));
+            Ok(())
+        })?;
+        Ok(got)
+    }
+
+    /// Every way a container can answer `by_index`. Each of the three must
+    /// end up delivering the same entries.
+    const EVERY_INDEX_BEHAVIOUR: [Index; 3] = [
+        Index::Has,
+        Index::RefusesNotSeekable,
+        Index::RefusesUnsupported,
+    ];
+
+    /// The property the whole two-route design rests on: a container WITH an
+    /// index and one WITHOUT must deliver the same entries, in the same
+    /// order, with the same bytes, for the same `--index` request — and
+    /// "without" covers BOTH refusal spellings.
+    ///
+    /// Asserted against an absolute expectation as well as against each
+    /// other — two routes that were off by one in the same direction would
+    /// agree with each other perfectly and still both be wrong.
+    #[test]
+    fn the_random_access_and_counted_routes_deliver_identical_entries() {
+        let want = vec![
+            ("b".to_string(), b"bbb".to_vec()),
+            ("d".to_string(), b"ddd".to_vec()),
+        ];
+        let selection = Selection::Indices(vec![1, 3]);
+
+        let mut indexed = Routes::new(Rung::Exact, Index::Has);
+        let fast = deliver(&mut indexed, &selection).unwrap();
+        assert!(
+            indexed.by_index_calls == 2 && indexed.next_entry_calls == 0,
+            "a container with an index must be reached through it, not walked: \
+             by_index={}, next_entry={}",
+            indexed.by_index_calls,
+            indexed.next_entry_calls
+        );
+        assert_eq!(
+            fast, want,
+            "the random-access route delivered the wrong entries"
+        );
+
+        for refusal in [Index::RefusesNotSeekable, Index::RefusesUnsupported] {
+            let mut sequential = Routes::new(Rung::Exact, refusal);
+            let counted = deliver(&mut sequential, &selection)
+                .unwrap_or_else(|e| panic!("{refusal:?} must route to the walk, not fail: {e}"));
+            assert!(
+                sequential.next_entry_calls > 0,
+                "{refusal:?}: a container that refuses by_index must be counted instead"
+            );
+            assert_eq!(counted, want, "{refusal:?}: the counted route was wrong");
+            assert_eq!(fast, counted, "{refusal:?}: the two routes disagreed");
+        }
+    }
+
+    /// Indices are 0-based, and `Selection::Indices(vec![0])` is the FIRST
+    /// entry. Pinned on its own because an off-by-one here would be invisible
+    /// to the agreement test above (both routes share the numbering).
+    #[test]
+    fn index_zero_is_the_first_entry_on_every_route() {
+        for behaviour in EVERY_INDEX_BEHAVIOUR {
+            let mut ar = Routes::new(Rung::Exact, behaviour);
+            let got = deliver(&mut ar, &Selection::Indices(vec![0])).unwrap();
+            assert_eq!(
+                got,
+                vec![("a".to_string(), b"aaa".to_vec())],
+                "{behaviour:?}"
+            );
+        }
+    }
+
+    /// Archive order, and once each, whatever order the flags arrived in —
+    /// the contract that lets the two routes agree at all.
+    #[test]
+    fn indices_are_delivered_in_archive_order_and_deduplicated() {
+        for behaviour in EVERY_INDEX_BEHAVIOUR {
+            let mut ar = Routes::new(Rung::Exact, behaviour);
+            let got = deliver(&mut ar, &Selection::Indices(vec![2, 0, 2])).unwrap();
+            let names: Vec<&str> = got.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["a", "c"], "{behaviour:?}");
+        }
+    }
+
+    /// A forward-only read has no index to jump with even if the container
+    /// type normally has one — a piped zip is exactly that — so the rung gate
+    /// must keep `by_index` unasked.
+    #[test]
+    fn a_non_authoritative_read_is_never_asked_for_random_access() {
+        let mut ar = Routes::new(Rung::ForwardOnly, Index::Has);
+        let got = deliver(&mut ar, &Selection::Indices(vec![1])).unwrap();
+        assert_eq!(got, vec![("b".to_string(), b"bbb".to_vec())]);
+        assert_eq!(
+            ar.by_index_calls, 0,
+            "the rung said the read is not authoritative; by_index must not be tried"
+        );
+    }
+
+    /// Out of range is exit 2 and names the archive's real length — the same
+    /// message whichever route found it, so a script cannot tell them apart.
+    #[test]
+    fn an_out_of_range_index_is_the_same_usage_error_on_every_route() {
+        let mut messages = Vec::new();
+        for behaviour in EVERY_INDEX_BEHAVIOUR {
+            let mut ar = Routes::new(Rung::Exact, behaviour);
+            let err = deliver(&mut ar, &Selection::Indices(vec![9]))
+                .expect_err("index 9 of a 4-entry archive must be refused");
+            assert_eq!(err.exit_code(), 2, "{behaviour:?}: {err}");
+            let text = err.to_string();
+            assert!(
+                text.contains("#9") && text.contains("0-3"),
+                "the message must name the index asked for and the VALID range: {text}"
+            );
+            messages.push(text);
+        }
+        assert!(
+            messages.windows(2).all(|w| w[0] == w[1]),
+            "the routes reported the same mistake differently: {messages:?}"
+        );
+    }
+
+    /// The counted route must stop as soon as the last requested index has
+    /// been delivered — `cat --index 0` of a thousand-entry archive should
+    /// not read nine hundred and ninety-nine more headers.
+    #[test]
+    fn the_counted_route_stops_once_the_last_requested_index_is_delivered() {
+        let mut ar = Routes::new(Rung::Exact, Index::RefusesNotSeekable);
+        deliver(&mut ar, &Selection::Indices(vec![0])).unwrap();
+        assert_eq!(
+            ar.next_entry_calls, 1,
+            "reading past the last requested entry buys nothing"
+        );
+    }
 
     #[test]
     fn ratio_guarded_source_forwards_bytes_unchanged() {

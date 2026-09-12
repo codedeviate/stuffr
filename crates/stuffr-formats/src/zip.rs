@@ -721,9 +721,11 @@ impl ArchiveRead for ZipIndexed {
     fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
         let len = self.archive.len();
         if index >= len {
-            return Err(Error::EntryNotFound(format!(
-                "index {index}; this archive has {len} entries"
-            )));
+            // Through the shared constructor, NOT a `format!` of its own: a
+            // caller counting a forward walk raises the very same refusal for
+            // the very same mistake, and the two must be indistinguishable.
+            // See `Error::entry_index_out_of_range`.
+            return Err(Error::entry_index_out_of_range(index, len));
         }
         self.entry_at(index)
     }

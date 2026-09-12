@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use stuffr::entries::{self, ExtractOpts};
+use stuffr::entries::{self, ExtractOpts, Selection};
 use stuffr::ops::{Input, Output};
 use stuffr::{EntryKind, EntryMeta, Error, Fidelity, FormatId};
 
@@ -107,8 +107,13 @@ fn a_traversing_entry_is_refused_as_a_typed_unsafe_path_naming_itself() {
     let archive = write_tar(&root.join("evil.tar"), &[file("../escaped.txt", b"pwned")]);
     let dest = root.join("out");
 
-    let err = entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default())
-        .expect_err("a traversing entry must be refused");
+    let err = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .expect_err("a traversing entry must be refused");
 
     match &err {
         Error::UnsafePath { path, reason } => {
@@ -135,8 +140,13 @@ fn an_escaping_symlink_target_is_refused_before_the_link_exists() {
     );
     let dest = root.join("out");
 
-    let err = entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default())
-        .expect_err("an escaping symlink target must be refused");
+    let err = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .expect_err("an escaping symlink target must be refused");
     assert!(matches!(err, Error::UnsafePath { .. }), "got {err:?}");
     assert!(
         std::fs::symlink_metadata(dest.join("link")).is_err(),
@@ -158,8 +168,13 @@ fn a_dot_entry_names_the_destination_and_extracts_alongside_real_entries() {
     );
     let dest = root.join("out");
 
-    let outcome = entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default())
-        .expect("`./` names the destination and must be accepted");
+    let outcome = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .expect("`./` names the destination and must be accepted");
     assert_eq!(outcome.bytes_out, 9, "alpha + beta");
     assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
     assert_eq!(std::fs::read(dest.join("sub/b.txt")).unwrap(), b"beta");
@@ -177,7 +192,7 @@ fn patterns_select_entries_and_naming_none_of_them_is_an_error() {
     entries::extract(
         Input::Path(archive.clone()),
         &dest,
-        &["b.txt".to_string()],
+        &Selection::Names(vec!["b.txt".to_string()]),
         &ExtractOpts::default(),
     )
     .unwrap();
@@ -187,7 +202,7 @@ fn patterns_select_entries_and_naming_none_of_them_is_an_error() {
     let err = entries::extract(
         Input::Path(archive),
         &root.join("out2"),
-        &["nosuch.txt".to_string()],
+        &Selection::Names(vec!["nosuch.txt".to_string()]),
         &ExtractOpts::default(),
     )
     .expect_err("a pattern matching nothing must not report success");
@@ -209,7 +224,7 @@ fn an_entry_past_the_ratio_budget_is_a_resource_limit_not_a_containment_refusal(
     let err = entries::extract(
         Input::Path(archive),
         &dest,
-        &[],
+        &Selection::All,
         &ExtractOpts {
             max_ratio: 1,
             compressed_total: Some(1),
@@ -246,6 +261,7 @@ fn create_archive_stores_final_components_so_its_output_can_be_extracted_again()
         None,
     )
     .unwrap()
+    .0
     .into_iter()
     .map(|e| e.name)
     .collect();
@@ -254,7 +270,13 @@ fn create_archive_stores_final_components_so_its_output_can_be_extracted_again()
     // The round trip is the point: `pack` must not be able to write an
     // archive `extract` would refuse at exit 7.
     let dest = root.join("out");
-    entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+    entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .unwrap();
     assert_eq!(std::fs::read(dest.join("one.txt")).unwrap(), b"first");
     assert_eq!(std::fs::read(dest.join("two.txt")).unwrap(), b"second");
 }
@@ -270,8 +292,13 @@ fn what_extraction_could_not_restore_reaches_the_outcome_report() {
     );
     let dest = root.join("out");
 
-    let outcome =
-        entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+    let outcome = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .unwrap();
 
     assert!(
         outcome.fidelity.has_warnings(),
@@ -316,8 +343,13 @@ fn a_restrictive_parent_directory_does_not_block_its_childs_own_metadata() {
     let archive = write_tar(&root.join("restrictive.tar"), &[locked, child]);
     let dest = root.join("out");
 
-    let outcome =
-        entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+    let outcome = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .unwrap();
 
     assert!(
         !outcome.fidelity.has_warnings(),
@@ -365,8 +397,13 @@ fn an_out_of_order_archive_still_applies_children_before_their_parent() {
     let archive = write_tar(&root.join("out-of-order.tar"), &[child, locked]);
     let dest = root.join("out");
 
-    let outcome =
-        entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+    let outcome = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .unwrap();
 
     assert!(
         !outcome.fidelity.has_warnings(),
@@ -400,8 +437,13 @@ fn an_archive_whose_metadata_is_fully_restored_reports_no_warnings() {
     );
     let dest = root.join("out");
 
-    let outcome =
-        entries::extract(Input::Path(archive), &dest, &[], &ExtractOpts::default()).unwrap();
+    let outcome = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .unwrap();
     assert!(
         !outcome.fidelity.has_warnings(),
         "nothing was lost, so --strict-fidelity must pass: {:?}",

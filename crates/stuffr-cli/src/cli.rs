@@ -92,6 +92,16 @@ pub enum Command {
         /// it. Needs -C, which is what asks for entry-aware extraction.
         #[arg(value_name = "PATTERNS")]
         patterns: Vec<String>,
+        /// Extract the entry at this position instead of naming it. Repeatable.
+        ///
+        /// 0-BASED, counting in archive order — the same number `stuffr list`
+        /// prints in its first column. This is how you reach an entry whose
+        /// name you cannot type: two entries sharing a name in a zip's index,
+        /// or `Makefile` and `makefile` from a case-sensitive filesystem on a
+        /// case-insensitive one. Needs -C, like PATTERNS, and cannot be
+        /// combined with them — they are two ways of saying the same thing.
+        #[arg(long, value_name = "N")]
+        index: Vec<usize>,
         /// Extract the archive's entries into this directory.
         ///
         /// Absolute entry paths, `..` traversal and symlinks escaping this
@@ -137,6 +147,15 @@ pub enum Command {
         /// any, `cat` decodes the input as a single stream.
         #[arg(value_name = "PATTERNS")]
         patterns: Vec<String>,
+        /// Stream the entry at this position instead of naming it. Repeatable.
+        ///
+        /// 0-BASED, counting in archive order — the same number `stuffr list`
+        /// prints in its first column. `stuffr cat a.zip --index 6 > out.sh`
+        /// is how you pull out an entry whose name is ambiguous or
+        /// untypeable. Like PATTERNS, naming one asks for entry-aware
+        /// streaming; the two cannot be combined.
+        #[arg(long, value_name = "N")]
+        index: Vec<usize>,
         /// Use this format instead of detecting one. Required for formats with
         /// no magic bytes and no extension.
         #[arg(long)]
@@ -166,6 +185,9 @@ pub enum Command {
     /// List the formats this build contains.
     Formats,
     /// List an archive's entries without extracting.
+    ///
+    /// The first column is the entry's 0-based position in archive order,
+    /// which is what `cat --index` and `unpack --index` select by.
     #[command(alias = "ls")]
     List {
         /// Archive path, or `-` for stdin.
@@ -185,6 +207,13 @@ pub enum Command {
         /// output. Defaults to 25% of available RAM, honouring cgroup limits.
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
+        /// Fail (exit 4) if the read approximated or lost anything.
+        ///
+        /// A listing can be incomplete — a zip whose index shadows records
+        /// enumerates fewer entries than the archive declares — so `list`
+        /// gates on fidelity for the same reason `test` and `unpack -C` do.
+        #[arg(long)]
+        strict_fidelity: bool,
     },
     /// Verify every entry's integrity without extracting.
     Test {
