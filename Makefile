@@ -173,6 +173,13 @@ fuzz: fuzz-corpus
 	    echo "make fuzz: target '$$target' crashed (or otherwise exited non-zero) — see output below" >&2; \
 	    cat "$$tmp"; rm -f "$$tmp"; status=1; continue; \
 	  fi; \
+	  : "No '|| true' on the next line, unlike ci.yml's otherwise-identical" ; \
+	  : "copy. A make recipe runs under a plain /bin/sh with no -e, so a" ; \
+	  : "no-match grep pipeline sets \$$? and carries on, reaching the" ; \
+	  : "explicit empty/zero check below. GitHub Actions runs its run: block" ; \
+	  : "under bash -e -o pipefail, where the same line would abort the whole" ; \
+	  : "script before that check ever ran — hence the '|| true' there and" ; \
+	  : "not here. Do not tidy either half into matching the other." ; \
 	  n=$$(grep -oE 'Done [0-9]+ runs' "$$tmp" | tail -1 | grep -oE '[0-9]+'); \
 	  if [ -z "$$n" ] || [ "$$n" -eq 0 ]; then \
 	    echo "make fuzz: target '$$target' reported zero (or no) executions — treating as a failure, not a clean run" >&2; \
@@ -191,7 +198,13 @@ hooks:
 #
 # NOT part of `check`: this WRITES real files under `fuzz/corpus/`, which is
 # generated and gitignored (`fuzz/.gitignore`'s `/corpus`) rather than
-# refreshed on every commit. The generator itself lives in the FACADE crate
+# refreshed on every commit. `fuzz` depends on it because fuzzing from an
+# empty corpus is much WORSE coverage — not because the execution-count check
+# in that recipe would catch it. It would not: libFuzzer still performs its
+# `-runs=N` mutation passes from nothing and prints a full `Done N runs`
+# (measured: `codec` against an emptied corpus reported `Done 2000 runs`, exit
+# 0). That check catches a target returning early on every input, or a run
+# that never started. The generator itself lives in the FACADE crate
 # (`crates/stuffr/tests/fuzz_corpus.rs`), not `stuffr-core` — `stuffr-core`
 # has zero format dependencies and cannot build a real gzip stream or tar
 # archive, only mocks — so it IS compiled and type-checked by `make

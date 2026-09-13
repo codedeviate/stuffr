@@ -199,11 +199,22 @@ jobs:
       - name: install cargo-fuzz
         if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
         run: cargo install cargo-fuzz --version 0.13.2 --locked
-      # Generated, not committed (`fuzz/.gitignore`'s `/corpus`) — without
-      # this, every target below fuzzes from an empty corpus, which is
-      # exactly the "silently fuzzes nothing" failure mode the execution-
-      # count check two steps down exists to catch, not something to rely
-      # on this step alone to prevent.
+      # Generated, not committed (`fuzz/.gitignore`'s `/corpus`). Without
+      # this step every target below would fuzz from nothing — much worse
+      # coverage, since each run would start from a blank slate instead of
+      # the seeds that reach every registered format.
+      #
+      # Note what that failure is NOT: it is not caught by the execution-
+      # count check two steps down. An empty corpus still EXECUTES —
+      # libFuzzer performs its `-runs=N` mutation passes from nothing and
+      # reports a full `Done N runs` (measured directly: `codec` against an
+      # emptied `fuzz/corpus/codec` reported `Done 2000 runs`, exit 0). The
+      # execution-count check catches a different scenario: a target that
+      # returns early on every input, or a run that never really started —
+      # anything that exits 0 without libFuzzer printing a non-zero summary
+      # line. Both failures are worth preventing; only one of them is
+      # prevented HERE, and an earlier version of this comment claimed
+      # otherwise.
       - run: make fuzz-corpus
       # Ruling I: pure tier only. `stuffr-fuzz` depends on `stuffr` (and
       # `stuffr-core`) with no `c-backed` feature, so this already fuzzes
@@ -218,13 +229,30 @@ jobs:
       #
       # Ruling G: fixed `-runs=N`, not `-max_total_time=N` — a time budget
       # makes coverage depend on runner load, so the same commit fuzzes a
-      # different amount every run and a crash stops being reproducible
-      # from the log. Fixed `-seed=` so the mutation sequence is
-      # reproducible, and the exact `cargo fuzz run ...` command is echoed
-      # so a developer can copy it straight out of a red log. This job is
-      # NOT part of `gate` for the same reason `miri` isn't: `make check`
-      # runs after every edit, and a seeded fuzz pass — however short — is
-      # not that.
+      # different amount every run. Fixed `-seed=` so the mutation sequence
+      # is reproducible, and the exact `cargo fuzz run ...` command is
+      # echoed so a developer can copy it straight out of a red log. This
+      # job is NOT part of `gate` for the same reason `miri` isn't: `make
+      # check` runs after every edit, and a seeded fuzz pass — however
+      # short — is not that.
+      #
+      # What a fixed `-runs` and `-seed` do NOT buy, and it matters: this
+      # job is NOT deterministic. Measured on the `container` target, same
+      # seed, same corpus, five identical re-runs: 3 of 5 found a crash on
+      # one pass and 2 of 5 on the next. The seed fixes libFuzzer's own
+      # mutation PRNG, not the order it walks the corpus directory or its
+      # entropic scheduling, and both feed the mutator. So a green
+      # `fuzz-smoke` is not proof of absence — the same commit, seed and
+      # corpus can find a crash on the next push.
+      #
+      # It still earns the right to block, because the flakiness is
+      # FALSE-NEGATIVE ONLY: a seeded run may miss a crash it found before,
+      # but it never reports one that did not happen. A red `fuzz-smoke` is
+      # always a real finding; a green one is "nothing found this pass".
+      # Treat a crash that will not reproduce from the echoed command as
+      # expected, not as a flaky test to be quieted — re-run it, or hand
+      # the artifact in `fuzz/artifacts/` to `cargo fuzz run <target>
+      # <artifact>`, which IS deterministic.
       #
       # Ruling H: a corpus that silently failed to generate, or a target
       # stubbed to return early on every input, would otherwise exit 0 and
@@ -236,7 +264,7 @@ jobs:
       # at its top: the run then exits with no "Done N runs" line at all,
       # and this check correctly refuses it. See task-5-report.md for the
       # quoted failure).
-      - name: fuzz codec, container and chain (short, seeded, deterministic)
+      - name: fuzz codec, container and chain (short, seeded; see Ruling G — not deterministic)
         run: |
           set -u
           FUZZ_RUNS=2000
@@ -252,6 +280,17 @@ jobs:
               status=1
               continue
             fi
+            # `|| true` is load-bearing HERE and absent from the identical
+            # line in the Makefile, on purpose. GitHub Actions runs a `run:`
+            # block under `bash -e -o pipefail`, so a no-match grep pipeline
+            # would abort this whole script via `set -e` before reaching the
+            # explicit zero-count check below — which is the check that turns
+            # "no summary line" into a reported failure rather than a silent
+            # one. A make recipe runs under a plain `/bin/sh` with no `-e`,
+            # so `Makefile`'s copy must NOT have it: there, `|| true` would
+            # be harmless but pointless, and adding `-e` to that recipe to
+            # "match" would break the recipe's own `continue`-and-collect
+            # loop. Do not tidy either half into agreeing with the other.
             count=$(grep -oE 'Done [0-9]+ runs' "$log" | tail -1 | grep -oE '[0-9]+' || true)
             if [ -z "$count" ] || [ "$count" -eq 0 ]; then
               echo "::error::fuzz target '$target' reported zero (or no) executions in its libFuzzer summary — treating this as a failure, not a clean run"

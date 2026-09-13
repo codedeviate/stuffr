@@ -1,12 +1,20 @@
 name: fuzz (deep, scheduled)
 
-# The counterpart to ci.yml's `fuzz-smoke` job: that job is short, seeded and
-# deterministic on purpose (Ruling G — a few thousand runs per target, a few
-# seconds each), which is what earns it the right to run on every push and PR
-# without slowing them down. This workflow trades determinism for depth: it
-# runs on a schedule, gives each target real wall-clock time, and is not
-# reproducible run-to-run by design — its job is to find what the smoke job's
-# fixed, small budget cannot reach, not to be re-run and get the same answer.
+# The counterpart to ci.yml's `fuzz-smoke` job: that job is short and seeded on
+# purpose (Ruling G — a few thousand runs per target, a few seconds each),
+# which is what earns it the right to run on every push and PR without slowing
+# them down. This workflow trades that fixed, small budget for depth: it runs
+# on a schedule and gives each target real wall-clock time, so what it covers
+# depends on runner load by design.
+#
+# Note that the smoke job is NOT the deterministic half of this pairing, even
+# though its budget is fixed — see ci.yml's Ruling G comment for the
+# measurement (same seed and corpus, 3/5 then 2/5 crashes across identical
+# re-runs: `-seed=` fixes the mutation PRNG, not corpus directory order or
+# entropic scheduling). The real distinction between the two jobs is budget
+# shape — a fixed run count that cannot slow a PR down, versus wall-clock time
+# that can go deep — not reproducible versus not. Both are false-negative-only:
+# either may miss a crash, neither invents one.
 #
 # Ruling I's "pure tier only" reasoning does NOT apply here on principle —
 # this is exactly the workflow a `--features c-backed` pass would belong in if
