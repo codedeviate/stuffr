@@ -132,8 +132,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Sink,
-    Source, probe,
+    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, PeekSource, Resolved, Result,
+    Sink, Source,
 };
 
 use crate::normalize::CPIO_MALFORMED_AS_INVALID_DATA_EOF;
@@ -343,20 +343,22 @@ impl ArchiveRead for CpioRead {
             CpioState::Ended => return Ok(None),
         };
 
-        // Once, before the crate's own parser sees byte zero. Peeking is
-        // non-consuming: a seekable source is read and rewound, a pipe is
-        // wrapped in a replaying `PeekSource`, so the reader below still
-        // sees byte zero either way. A read failure here propagates as
-        // `Error::Io` — property 10's source-error passthrough — rather
-        // than being mistaken for a variant refusal.
-        let src = if self.magic_checked {
-            src
-        } else {
-            let (prefix, src) = probe(src)?;
+        // Peeked before EVERY header, not just the first: `refuse_an_
+        // oversized_namesize` (Task 5c) must see `c_namesize` before
+        // `cpio::newc::Reader::new` gets a chance to allocate on its say-so,
+        // and that allocation is one `Reader::new` call per entry, not one
+        // per archive. Peeking is non-consuming — a seekable source is read
+        // and rewound to wherever it started, a pipe is wrapped in a
+        // replaying `PeekSource` — so the reader below still sees the same
+        // bytes either way. A read failure here propagates as `Error::Io` —
+        // property 10's source-error passthrough — rather than being
+        // mistaken for a variant refusal.
+        let (prefix, src) = peek_header_prefix(src)?;
+        if !self.magic_checked {
             refuse_a_recognised_variant_this_crate_cannot_read(&prefix)?;
             self.magic_checked = true;
-            src
-        };
+        }
+        refuse_an_oversized_namesize(&prefix)?;
 
         let mut reader = cpio::newc::Reader::new(src).map_err(classify_cpio_error)?;
         if reader.entry().is_trailer() {
@@ -510,6 +512,130 @@ fn is_symlink_mode(mode: u32) -> bool {
 /// `S_IFLNK` mode could otherwise force an allocation of that size before
 /// any caller had asked to read anything.
 const MAX_SYMLINK_TARGET_LEN: u64 = 65_536;
+
+/// Offset, from the start of a `newc` header, of the byte immediately past
+/// `c_namesize` — the field this container must inspect before delegating
+/// to the `cpio` crate. Six-byte magic, then eleven 8-byte hex fields
+/// (`c_ino` through `c_rdevminor`), then the 8-byte `c_namesize` field
+/// itself: `6 + 8 * 12 == 102`. See the crate's own `newc::Reader::new`
+/// (quoted verbatim in this file's module doc / the task brief that added
+/// this check) for the exact field order this mirrors.
+const CPIO_NAMESIZE_FIELD_END: usize = 6 + 8 * 12;
+
+/// Ceiling on a `newc` header's declared `c_namesize`, checked from the raw
+/// header bytes BEFORE `cpio::newc::Reader::new` gets a chance to allocate
+/// `name_len` zeroed bytes on the header's say-so alone.
+///
+/// This is the same shape of bug [`MAX_SYMLINK_TARGET_LEN`] already closes
+/// for a symlink's target, and the same fix: `cpio-0.4.1/src/newc.rs`'s
+/// `Reader::new` does
+///
+/// ```text
+/// let mut name_bytes = vec![0u8; name_len];
+/// inner.read_exact(&mut name_bytes)?;
+/// ```
+///
+/// with `name_len` taken straight from the header, before a single byte of
+/// the name is read. The real fuzz reproducer (Task 5c) hit `libFuzzer:
+/// out-of-memory (malloc(2863311530))` inside exactly this call, at run
+/// ~868 on one corpus seed and ~30,986 on another — well inside the
+/// scheduled deep-fuzz workflow's budget, though outside the smoke job's
+/// 2000-run one. The crate cannot be patched from here, so the check has
+/// to run in this module, before the crate's parser is invoked at all.
+///
+/// **Why a fixed ceiling, not `DecodeOpts::memory_limit`:** `DecodeOpts`
+/// binds a CODEC's dictionary/window allocation (see its own doc — the
+/// identical shape closed in Phase 1f for `xz-pure`, `lzip`, `lzma-pure`),
+/// but containers are opened through `OpenOpts`, which carries no memory
+/// field at all — [`MAX_SYMLINK_TARGET_LEN`]'s doc already establishes this
+/// for the very same reason. There is nothing to bind against here; a fixed
+/// structural ceiling is the only option this container has, exactly as it
+/// was for the symlink case.
+///
+/// **Why `Error::ResourceLimit` (exit 6), not `Error::Corrupt` (exit 5):**
+/// arguably a `c_namesize` this large is a malformed header rather than a
+/// resource question — no real cpio archive's name field gets anywhere
+/// close, so one could read this as "the file is lying about its own
+/// shape," which is what `Corrupt` means elsewhere in this project. But
+/// [`MAX_SYMLINK_TARGET_LEN`]'s existing refusal — the structurally
+/// identical case one field over in the same header — already chose
+/// `ResourceLimit`, reasoning "no legitimate symlink target is this long"
+/// rather than treating the declaration itself as damage. Splitting the two
+/// fields onto different exit codes for the same shape of implausible
+/// header value would be a harder inconsistency to defend than either
+/// choice alone, so this follows the sibling's precedent rather than
+/// re-litigating it: this build is refusing to allocate that much for a
+/// name, the same framing `DecodeOpts::memory_limit`'s own doc uses.
+///
+/// **Why 65,536 bytes:** `MAX_SYMLINK_TARGET_LEN`'s own figure and
+/// reasoning transfer unchanged — a generous ceiling well beyond any real
+/// platform's `PATH_MAX` (4096 on Linux, 1024 on macOS/BSD), and a `newc`
+/// entry name is exactly as path-shaped as a symlink target. Proven against
+/// a legitimate long, deeply-nested name well under this ceiling by
+/// `a_legitimate_long_name_still_round_trips`.
+const MAX_CPIO_NAME_LEN: u64 = 65_536;
+
+/// Parses just the `c_namesize` field out of a raw header prefix, trusting
+/// nothing past it. `None` means the prefix is too short to contain the
+/// field (a stream ending before offset 102 is truncated, and
+/// `cpio::newc::Reader::new`'s own EOF handling is the right place to say
+/// so — this function does not duplicate it) or the bytes are not valid
+/// 8-hex-digit ASCII (likewise the crate's own error is the right one to
+/// surface).
+fn peek_namesize(prefix: &[u8]) -> Option<u32> {
+    let field = prefix.get(CPIO_NAMESIZE_FIELD_END - 8..CPIO_NAMESIZE_FIELD_END)?;
+    let s = std::str::from_utf8(field).ok()?;
+    u32::from_str_radix(s, 16).ok()
+}
+
+/// Refuses a header whose declared `c_namesize` exceeds
+/// [`MAX_CPIO_NAME_LEN`] — see that constant's doc for the reasoning behind
+/// both the bound and the error kind.
+fn refuse_an_oversized_namesize(prefix: &[u8]) -> Result<()> {
+    let Some(name_len) = peek_namesize(prefix) else {
+        return Ok(());
+    };
+    if u64::from(name_len) > MAX_CPIO_NAME_LEN {
+        return Err(Error::ResourceLimit(format!(
+            "entry header declares a name of {name_len} bytes, past the \
+             {MAX_CPIO_NAME_LEN}-byte ceiling this container reads eagerly; no legitimate cpio \
+             entry name is this long"
+        )));
+    }
+    Ok(())
+}
+
+/// Peeks the fixed prefix of the NEXT header — enough to cover
+/// `c_namesize` — without disturbing what a caller reads afterwards.
+///
+/// Deliberately not `stuffr_core::probe`: that helper rewinds a seekable
+/// source to ABSOLUTE offset 0, which is exactly right for identifying a
+/// fresh stream's format once (its own doc: "peeks `PROBE_LEN` of the
+/// file") but wrong here, because this runs before EVERY entry's header —
+/// rewinding to file offset 0 mid-archive would replay the first entry
+/// forever. Instead this saves and restores the CURRENT position for a
+/// seekable source, and wraps a forward-only one in the same
+/// [`PeekSource`] `probe` itself uses, which does not assume any particular
+/// starting offset.
+fn peek_header_prefix(mut src: CpioSource) -> Result<(Vec<u8>, CpioSource)> {
+    if let Some(seek) = src.as_seek() {
+        let start = seek.stream_position()?;
+        let mut buf = vec![0u8; CPIO_NAMESIZE_FIELD_END];
+        let mut filled = 0;
+        while filled < buf.len() {
+            match seek.read(&mut buf[filled..])? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        buf.truncate(filled);
+        seek.seek(io::SeekFrom::Start(start))?;
+        return Ok((buf, src));
+    }
+    let peek = PeekSource::fill(src, CPIO_NAMESIZE_FIELD_END)?;
+    let prefix = peek.prefix().to_vec();
+    Ok((prefix, Box::new(peek)))
+}
 
 /// Reads a symlink entry's target out of its payload — see the module doc's
 /// "Symlinks" section for why this container reads it eagerly rather than
@@ -1563,5 +1689,188 @@ mod tests {
     #[should_panic(expected = "no reference `this-binary-does-not-exist-xyz` tool found on PATH")]
     fn require_bin_panics_rather_than_skips_silently() {
         require_bin("this-binary-does-not-exist-xyz");
+    }
+
+    // --- Task 5c: the `c_namesize` OOM the fuzzer found -------------------
+    //
+    // `cpio-0.4.1/src/newc.rs`'s `Reader::new` allocates `vec![0u8; name_len]`
+    // — `name_len` taken straight from the header's `c_namesize` field —
+    // BEFORE reading a single byte of the name. A header declaring
+    // `0x80000000` buys a ~2 GiB zeroed allocation from a handful of bytes on
+    // disk; the real fuzz target hit `libFuzzer: out-of-memory
+    // (malloc(2863311530))` inside this exact call.
+
+    /// One field of a `newc` header: 8 lowercase-hex ASCII digits, exactly
+    /// what `cpio::newc::read_hex_u32` (vendored crate source, quoted in the
+    /// task brief) parses back out.
+    fn hex8(n: u32) -> [u8; 8] {
+        let s = format!("{n:08x}");
+        s.as_bytes().try_into().unwrap()
+    }
+
+    /// A hand-built, byte-level `newc` header — magic plus all thirteen
+    /// fixed 8-byte fields, `c_namesize` set to an absurd value and NOTHING
+    /// after it: no name bytes, not even the rest of a real archive. Total
+    /// length is exactly `HEADER_LEN` (110: 6-byte magic + 13 8-byte
+    /// fields) — see the crate's own `newc.rs` `HEADER_LEN` constant, quoted
+    /// in this module's doc.
+    ///
+    /// `0xAAAA_AAAA` (2_863_311_530) is not a round number chosen for looks —
+    /// it is the exact figure the real fuzz reproducer's libFuzzer abort
+    /// named (`malloc(2863311530)`), so this header reproduces the same
+    /// declared size the fuzzer actually found, not a stand-in for it.
+    const ABSURD_NAMESIZE: u32 = 0xAAAA_AAAA;
+
+    fn header_declaring_namesize(namesize: u32) -> Vec<u8> {
+        let mut h = Vec::with_capacity(110);
+        h.extend_from_slice(b"070701"); // c_magic (newc)
+        h.extend_from_slice(&hex8(0)); // c_ino
+        h.extend_from_slice(&hex8(0o100_644)); // c_mode: regular file
+        h.extend_from_slice(&hex8(0)); // c_uid
+        h.extend_from_slice(&hex8(0)); // c_gid
+        h.extend_from_slice(&hex8(1)); // c_nlink
+        h.extend_from_slice(&hex8(0)); // c_mtime
+        h.extend_from_slice(&hex8(0)); // c_filesize
+        h.extend_from_slice(&hex8(0)); // c_devmajor
+        h.extend_from_slice(&hex8(0)); // c_devminor
+        h.extend_from_slice(&hex8(0)); // c_rdevmajor
+        h.extend_from_slice(&hex8(0)); // c_rdevminor
+        h.extend_from_slice(&hex8(namesize)); // c_namesize
+        h.extend_from_slice(&hex8(0)); // c_checksum
+        assert_eq!(h.len(), 110, "must be exactly HEADER_LEN, no name bytes");
+        h
+    }
+
+    /// A `Source` that panics if ever asked to fill a buffer larger than
+    /// `max_single_read`.
+    ///
+    /// This is what turns "no allocation happened" from an assertion into
+    /// something a test can actually falsify. `cpio::newc::Reader::new`'s
+    /// name-reading code is the ONLY caller anywhere in this path that would
+    /// ever request a buffer sized by an attacker-controlled `c_namesize` —
+    /// and it allocates that buffer (`vec![0u8; name_len]`) BEFORE handing it
+    /// to `read_exact`, so a request here for anything past a sane header-
+    /// sized window proves that allocation already happened. A pre-flight
+    /// refusal that runs before `Reader::new` is ever reached can never trip
+    /// this guard; a refusal bolted on AFTER the crate's own parsing (i.e.
+    /// the bug, un-fixed) trips it on the very first oversized read.
+    struct PanicsOnBigRead {
+        inner: std::io::Cursor<Vec<u8>>,
+        max_single_read: usize,
+    }
+
+    impl Read for PanicsOnBigRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(
+                buf.len() <= self.max_single_read,
+                "a single read of {} bytes was requested — past the {}-byte guard. This is \
+                 proof the oversized `c_namesize` allocation (`vec![0u8; name_len]` inside the \
+                 `cpio` crate's `Reader::new`) was reached before any refusal ran, i.e. the \
+                 pre-flight check did not fire before the crate's own parser did",
+                buf.len(),
+                self.max_single_read
+            );
+            std::io::Read::read(&mut self.inner, buf)
+        }
+    }
+
+    impl Source for PanicsOnBigRead {
+        fn caps(&self) -> stuffr_core::SourceCaps {
+            stuffr_core::SourceCaps {
+                seekable: false,
+                len: None,
+            }
+        }
+        fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
+            None
+        }
+    }
+
+    fn open_guarded(bytes: Vec<u8>, max_single_read: usize) -> Box<dyn ArchiveRead> {
+        let src: Box<dyn Source> = Box::new(PanicsOnBigRead {
+            inner: std::io::Cursor::new(bytes),
+            max_single_read,
+        });
+        let resolved = stuffr_core::resolve(
+            src,
+            CPIO,
+            CpioNewc.caps(),
+            &stuffr_core::StreamPolicy::default(),
+        )
+        .expect("resolve");
+        CpioNewc
+            .open(resolved, &OpenOpts::default())
+            .expect("open reads no byte")
+    }
+
+    /// The failing-first test for Task 5c: an absurd `c_namesize` must be
+    /// refused as a typed error, at exit 6 (`Error::ResourceLimit`) — never
+    /// exit 5 (`Error::Corrupt`), and never by way of the 2.6 GiB allocation
+    /// the un-fixed crate makes on the way to failing. `max_single_read` is
+    /// set to `PROBE_LEN` (4096, the peek window this fix itself uses) —
+    /// generous for any legitimate header read, and roughly six orders of
+    /// magnitude below the declared name length, so nothing on the honest
+    /// path can trip it.
+    #[test]
+    fn refuses_an_absurd_namesize_before_the_allocation_it_would_size() {
+        let bytes = header_declaring_namesize(ABSURD_NAMESIZE);
+        let mut ar = open_guarded(bytes, stuffr_core::PROBE_LEN);
+
+        let err = ar
+            .next_entry()
+            .expect_err("an absurd c_namesize must be refused");
+
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "an implausible declared name length is this build refusing to allocate, not a \
+             verdict that the file is damaged — see MAX_CPIO_NAME_LEN's doc; got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 6, "ResourceLimit is exit 6: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&ABSURD_NAMESIZE.to_string()),
+            "the message must name the declared size, got: {msg}"
+        );
+    }
+
+    /// The regression guard for the test above: a header naming a namesize
+    /// UNDER the ceiling must still fail (there is no name data behind it,
+    /// so it is a truncated archive), but as ordinary corruption — exit 5 —
+    /// never `ResourceLimit`. Pins that the new check is bounded by
+    /// `MAX_CPIO_NAME_LEN`, not "any namesize with no data behind it."
+    #[test]
+    fn a_modest_namesize_with_no_data_behind_it_is_corrupt_not_resource_limited() {
+        let bytes = header_declaring_namesize(64);
+        let mut ar = open_guarded(bytes, 4096);
+        let err = ar
+            .next_entry()
+            .expect_err("a truncated entry must still fail");
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "a small, merely-truncated namesize is corruption, not a resource ceiling: {err:?}"
+        );
+    }
+
+    /// A legitimate long name — well past any ordinary path, comfortably
+    /// under the ceiling — must still round-trip. Guards against the
+    /// obvious way to get this wrong: picking a ceiling so tight it refuses
+    /// real archives, which this project has shipped before (see
+    /// `CLAUDE.md`'s running count of checks that fired on legitimate
+    /// input).
+    #[test]
+    fn a_legitimate_long_name_still_round_trips() {
+        let deep_name: String = std::iter::repeat_n("segment/", 500).collect::<String>() + "leaf";
+        assert!(
+            deep_name.len() < 65_536,
+            "fixture must stay under the ceiling to prove a real long name is unaffected"
+        );
+        let bytes = build_cpio(&[(deep_name.as_str(), b"payload")]);
+        let mut ar = open(&bytes);
+        let entry = ar
+            .next_entry()
+            .expect("a legitimate long name must not be refused")
+            .expect("must yield the one entry written");
+        assert_eq!(entry.meta().name, deep_name);
     }
 }
