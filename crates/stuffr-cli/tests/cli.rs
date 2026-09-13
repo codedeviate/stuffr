@@ -1986,6 +1986,124 @@ fn list_refuses_nesting_past_the_depth_bound() {
     assert!(err.contains("nesting"), "{err}");
 }
 
+/// Task 4b (Phase 3a's fuzzing harness found this within seconds of the
+/// `chain` target running). A truncated zlib stream with no container atop
+/// it: `resolve_chain_deep_with` cannot resolve a container from the path
+/// (`.zz` names nothing) or from the decoded bytes (there aren't enough of
+/// them), so it falls into the peek-the-decoded-stream loop in
+/// `probe.rs::resolve_chain_deep_with`, which used to hand the raw
+/// `io::ErrorKind::InvalidData` `probe(decoded)` raised straight through a
+/// bare `?` — `Error::Io`, exit 1, "stuffr failed" — for bytes that are
+/// simply corrupt. `cat` (via `ops::decompress`, which already routes its
+/// decode read through `Error::from_decode_io`) always got this right; the
+/// two verbs disagreeing on the exit code for the identical bytes is the
+/// bug.
+#[test]
+fn list_reports_a_truncated_codec_stream_as_corrupt_not_as_an_io_failure() {
+    let dir = tmp_dir();
+    let trunc = dir.join("trunc.zz");
+    // A valid zlib header (`78 da`) plus one more byte, then nothing —
+    // enough to identify the format, not enough to decode a single byte of
+    // payload.
+    std::fs::write(&trunc, [0x78, 0xda, 0x0a]).unwrap();
+
+    let cat_out = run_output(&["cat", trunc.to_str().unwrap()]);
+    assert_eq!(
+        cat_out.status.code(),
+        Some(5),
+        "cat (unaffected by this bug) must still exit 5: {}",
+        String::from_utf8_lossy(&cat_out.stderr)
+    );
+
+    let list_out = run_output(&["list", trunc.to_str().unwrap()]);
+    assert_eq!(
+        list_out.status.code(),
+        Some(5),
+        "list must agree with cat on the SAME bytes — exit 1 here means stuffr claimed it \
+         failed, when the truth is the input is corrupt: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let list_err = String::from_utf8_lossy(&list_out.stderr);
+    assert!(
+        list_err.contains("archive is corrupt"),
+        "must be Error::Corrupt's own wording, not Error::Io's: {list_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The second shape Task 4b's fuzzing found: an EMPTY file named `.lz`.
+/// `lzip`'s decoder does not check the magic until its first `read`, so this
+/// hits the identical `probe(decoded)` site as the truncated-zlib case
+/// above, by a different route — an empty stream rather than a short one.
+#[test]
+fn list_reports_an_empty_lzip_stream_as_corrupt_not_as_an_io_failure() {
+    let dir = tmp_dir();
+    let empty = dir.join("empty.lz");
+    std::fs::write(&empty, []).unwrap();
+
+    let cat_out = run_output(&["cat", empty.to_str().unwrap()]);
+    assert_eq!(
+        cat_out.status.code(),
+        Some(5),
+        "cat (unaffected by this bug) must still exit 5: {}",
+        String::from_utf8_lossy(&cat_out.stderr)
+    );
+
+    let list_out = run_output(&["list", empty.to_str().unwrap()]);
+    assert_eq!(
+        list_out.status.code(),
+        Some(5),
+        "list must agree with cat on the SAME bytes: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let list_err = String::from_utf8_lossy(&list_out.stderr);
+    assert!(
+        list_err.contains("archive is corrupt") && list_err.contains("LZIP"),
+        "must be Error::Corrupt's own wording, naming what lzip's decoder actually \
+         complained about: {list_err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The hazard side of Task 4b's fix: a genuine i/o failure reading the RAW
+/// source (never reaching a decoder at all) must stay `Error::Io` — exit 1
+/// — and must NOT be swept into `Error::Corrupt` by a fix that reclassifies
+/// too broadly. Opening a directory as if it were a file is a real,
+/// deterministic i/o failure that arises before any codec sees a single
+/// byte: `resolve_chain_deep_with`'s OWN top-level `probe(src)` call reads
+/// the raw source, and a fix that widened `Error::from_decode_io` to that
+/// call (or into `probe`/`PeekSource::fill` themselves, rather than scoping
+/// it to the decoded-stream `probe` call inside the re-probe loop) would
+/// make this exit 5 instead — a new lie in the opposite direction from the
+/// bug this task fixes.
+#[test]
+fn list_reports_a_directory_as_an_io_failure_not_as_corrupt() {
+    let dir = tmp_dir();
+    let sub = dir.join("not_a_file");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let out = run_output(&["list", sub.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a genuine i/o failure on the raw source must stay exit 1, not become exit 5: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.starts_with("stuffr: i/o error:"),
+        "must be Error::Io's own wording, not Error::Corrupt's \"archive is corrupt\": {err}"
+    );
+    assert!(
+        !err.contains("archive is corrupt"),
+        "must not have been reclassified as corrupt: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------
 // `--max-ratio` on `list`/`test`: the codec layer beneath a container is
 // bounded the same way `unpack`/`cat` already bound a bare codec stream.

@@ -206,6 +206,25 @@ impl Error {
     ///
     /// Lives in `stuffr-core` rather than in `ops` because Phase 2's containers
     /// need the identical classification on their own decode paths.
+    ///
+    /// **Task 4b (Phase 3a's fuzzing harness) added a fourth call site:**
+    /// `probe.rs`'s `resolve_chain_deep_with` re-probes a DECODED stream
+    /// whenever a codec has no container above it and the path named
+    /// nothing further (stdin, or an extension that ran out) — the loop
+    /// documented on `resolve_chain_deep`'s own doc comment. That re-probe
+    /// used to read through a bare `?`, so a truncated zlib stream
+    /// (`\x78\xda\x0a`, three bytes) or an empty file named `.lz` reported
+    /// `Error::Io` — exit 1, "stuffr failed" — for input that is simply
+    /// corrupt, while `stuffr cat` on the IDENTICAL bytes (via
+    /// `ops::decompress`, whose decode read was already wired to this
+    /// function) correctly exited 5. This is deliberately NOT filed as a
+    /// sixth instance of `exit_code`'s `_ => 1` wildcard misfiling a KNOWN
+    /// variant (see that match's own comment for the five it has produced):
+    /// `Error::Io` reaching that wildcard is correct, by construction —
+    /// it has no dedicated arm because the wildcard IS its arm. The bug
+    /// here was upstream of `exit_code` entirely: the wrong variant got
+    /// constructed in the first place, at a read that passed through a
+    /// decoder without this classifier's protection.
     pub fn from_decode_io(e: std::io::Error) -> Self {
         match e.kind() {
             std::io::ErrorKind::InvalidData => Error::Corrupt(e.to_string()),

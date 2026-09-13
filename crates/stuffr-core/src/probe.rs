@@ -475,7 +475,35 @@ pub fn resolve_chain_deep_with(
         }
 
         let decoded = reg.require_codec(current_codec)?.decoder(src, opts)?;
-        let (next_prefix, next_src) = probe(decoded)?;
+        // This `probe` reads through a DECODER — unlike the one at the top
+        // of this function, and unlike `resolve_chain_deep_with`'s own
+        // `probe(src)` two calls up, both of which read the RAW,
+        // undecoded source. An `io::Error` here means the bytes this codec
+        // just produced are malformed, not that the raw source or the
+        // environment failed, so it is reclassified via
+        // `Error::from_decode_io` exactly like every other decoder-side
+        // read in this crate (`ops.rs`, `entries.rs`, `conformance.rs`).
+        //
+        // Left as a bare `?` (as it was until Task 4b), a truncated `.zz`
+        // or an empty `.lz` — a codec stream with no container above it, so
+        // resolution bottoms out in this very loop re-probing the decoded
+        // bytes — surfaced as `Error::Io`: exit 1, "stuffr failed", for
+        // input that is simply corrupt. `ops::decompress` decodes the
+        // identical bytes through a call already wired to
+        // `Error::from_decode_io`, so `cat` and `list` disagreed on the
+        // exit code for the same input; see `error.rs`'s doc comment on
+        // `from_decode_io` for the convention this leans on, and
+        // `Error::exit_code`'s comment for this wildcard's history.
+        //
+        // Do NOT widen this to `probe(src)` above (raw source) or to
+        // `probe`/`PeekSource::fill` themselves — either would reclassify a
+        // genuine i/o failure on the raw source (a real disk error, a
+        // permission failure, a broken pipe) as `Corrupt`, which is a new
+        // lie in the opposite direction.
+        let (next_prefix, next_src) = probe(decoded).map_err(|e| match e {
+            Error::Io(io_err) => Error::from_decode_io(io_err),
+            other => other,
+        })?;
         depth += 1;
 
         let next_chain = match resolve_chain(reg, None, &next_prefix) {
@@ -1249,6 +1277,135 @@ mod tests {
             Err(Error::ChainTooDeep { depth }) => assert_eq!(depth, MAX_CHAIN_DEPTH),
             Err(other) => panic!("expected ChainTooDeep, got {other:?}"),
             Ok(_) => panic!("nesting past the bound must be refused, path or no path"),
+        }
+    }
+
+    // --- Task 4b: a decoder-side io::Error must reclassify; a raw-source
+    // one must not -------------------------------------------------------
+
+    /// A `Source` whose every read raises `InvalidData` — used two ways
+    /// below: wrapped as the return of a codec's own `decoder()` (so the
+    /// failure looks exactly like a corrupt payload discovered only once
+    /// something reads the decoded bytes), and handed directly to
+    /// `resolve_chain_deep` as the RAW top-level source (so the identical
+    /// error kind arises before any codec is even involved). The two tests
+    /// using it must disagree on the resulting `Error` variant — that
+    /// disagreement is the whole point of Task 4b's fix.
+    struct AlwaysInvalidData;
+
+    impl Read for AlwaysInvalidData {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decoded bytes are malformed",
+            ))
+        }
+    }
+
+    impl Source for AlwaysInvalidData {
+        fn caps(&self) -> crate::source::SourceCaps {
+            crate::source::SourceCaps {
+                seekable: false,
+                len: None,
+            }
+        }
+
+        fn as_seek(&mut self) -> Option<&mut dyn crate::source::SeekRead> {
+            None
+        }
+    }
+
+    /// A codec whose `decoder()` construction always succeeds (matching
+    /// every real codec's lazy-construction convention — see `zlib.rs` and
+    /// `lzip.rs`) but whose FIRST read fails with `InvalidData`, standing in
+    /// for a corrupt payload behind an intact-looking header.
+    struct FailingDecodeCodec;
+
+    impl Codec for FailingDecodeCodec {
+        fn id(&self) -> FormatId {
+            FormatId::new("always-fails-to-decode")
+        }
+
+        fn caps(&self) -> CodecCaps {
+            CodecCaps {
+                encode: false,
+                decode: true,
+                ..Default::default()
+            }
+        }
+
+        fn decoder(&self, _src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+            Ok(Box::new(AlwaysInvalidData))
+        }
+
+        fn encoder(&self, _dst: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+            unimplemented!("this test never encodes")
+        }
+    }
+
+    /// The fix itself: a codec stream with no container above it (so
+    /// resolution bottoms out at `Chain::Raw` and re-probes the decoded
+    /// bytes, per `resolve_chain_deep_with`'s own doc comment) whose decoded
+    /// bytes turn out to be malformed must report `Error::Corrupt` — exit 5
+    /// — not `Error::Io`. Before Task 4b's fix this was `Err(Error::Io(_))`,
+    /// the identical bug `list_reports_a_truncated_codec_stream_as_corrupt_
+    /// not_as_an_io_failure` and `list_reports_an_empty_lzip_stream_as_
+    /// corrupt_not_as_an_io_failure` pin at the CLI level with the real
+    /// zlib and lzip codecs.
+    #[test]
+    fn a_decoder_side_io_error_while_re_probing_becomes_corrupt() {
+        let mut reg = Registry::new();
+        const FAILING: FormatId = FormatId::new("always-fails-to-decode");
+        const FAILING_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: &[0xab, 0xcd],
+            format: FAILING,
+        }];
+        reg.register_codec(
+            Arc::new(FailingDecodeCodec),
+            FormatMeta::codec(FAILING, &["fail"], FAILING_MAGIC),
+        );
+
+        // Real, readable bytes for the RAW top-level probe to sniff magic
+        // from — only the DECODED stream (`AlwaysInvalidData`) ever fails.
+        let bytes = vec![0xab, 0xcd, 0x00, 0x00];
+        match resolve_chain_deep(
+            &reg,
+            None,
+            Box::new(ReaderSource::new(io::Cursor::new(bytes))),
+        ) {
+            Err(Error::Corrupt(msg)) => assert!(
+                msg.contains("malformed"),
+                "must carry the decoder's own message via Error::from_decode_io: {msg}"
+            ),
+            Err(other) => panic!("expected Corrupt (a decoder-side read failed), got {other:?}"),
+            Ok(_) => panic!("a decoder that always fails to read cannot resolve successfully"),
+        }
+    }
+
+    /// The hazard side: the SAME `InvalidData` error kind, but raised by the
+    /// RAW source before any codec is even chosen, must stay `Error::Io` —
+    /// exit 1 — never `Error::Corrupt`. This is what a fix that reclassified
+    /// too broadly (inside `probe`/`PeekSource::fill` themselves, or at
+    /// `resolve_chain_deep_with`'s own top-level `probe(src)` call) would
+    /// get wrong: it has nothing to do with the error's `ErrorKind`, only
+    /// with WHICH read produced it, so this guard cannot be satisfied by
+    /// checking the kind alone the way the CLI-level directory test does.
+    #[test]
+    fn a_raw_source_io_error_of_the_identical_kind_stays_io_not_corrupt() {
+        let reg = mock_registry_with_codec_and_container();
+        match resolve_chain_deep(&reg, None, Box::new(AlwaysInvalidData)) {
+            Err(Error::Io(io_err)) => assert_eq!(
+                io_err.kind(),
+                std::io::ErrorKind::InvalidData,
+                "sanity: this must be the same error kind the test above reclassifies, so the \
+                 two tests differ only in WHERE the read happened"
+            ),
+            Err(other) => panic!(
+                "a raw-source failure must stay Io, not become {other:?} — reclassifying it \
+                 would be a lie in the opposite direction from Task 4b's bug"
+            ),
+            Ok(_) => panic!("a raw source that always errors cannot resolve successfully"),
         }
     }
 
