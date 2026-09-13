@@ -1485,6 +1485,601 @@ mod broken_containers {
         assert_panics_naming_with(&MockReadOnly::new(&fx), &meta, &fx, "property 3");
     }
 
+    // -----------------------------------------------------------------
+    // Task 2: doubles for `assert_container_conforms_with`'s OWN property
+    // set (1, 2, 4-8) — proving the fixture-driven harness can fail, not
+    // just the write-capable one below. Property 3 already has both halves
+    // right above.
+    //
+    // The brief asked for four doubles, covering properties 4 (x2) and 5
+    // and 6. That undershoots what Task 1's review actually found: properties
+    // 1, 2, 7 and 8 were only ever HAND-REASONED, never exercised by a
+    // failing test — exactly the gap that let property 3 sit dormant
+    // through a whole review round before this file caught it. So this
+    // block covers every property that admits a double: 1, 2, 4, 5, 6, 7
+    // and 8.
+    //
+    // Every double here delegates to `FramedMockContainer` for parsing —
+    // the same wire format `MockReadOnly` itself forwards to — and perturbs
+    // exactly one thing, the same style every double above this point in
+    // the module already uses for the write-capable harness.
+    // -----------------------------------------------------------------
+
+    /// Property 1's fixture-entry-point half. Identical reason to the
+    /// write-capable double below: a mismatched `id()` is otherwise
+    /// completely silent, and nothing else here would catch it.
+    struct WrongIdReadOnly;
+
+    impl Container for WrongIdReadOnly {
+        fn id(&self) -> FormatId {
+            FormatId::new("wrong-id-read-only")
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            FramedMockContainer.open(resolved, o)
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported("wrong-id-read-only cannot write".into()))
+        }
+    }
+
+    #[test]
+    fn fixture_property_one_catches_a_mismatched_id() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(&WrongIdReadOnly, &read_only_meta(), &fx, "property 1");
+    }
+
+    /// Property 2's write-refusal half. A container that claims
+    /// `caps.write == false` must have `create()` actually refuse — this one
+    /// claims read-only and then writes successfully anyway, which is the
+    /// dishonesty the check exists to catch. Nothing else in this harness
+    /// ever calls `create()`, so without this double the check runs and
+    /// never sees a failing case.
+    struct FalselyWritable;
+
+    impl Container for FalselyWritable {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            FramedMockContainer.open(resolved, o)
+        }
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            // BUG: claims caps.write == false but create() succeeds anyway.
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    #[test]
+    fn fixture_property_two_catches_a_write_that_should_have_been_refused() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(&FalselyWritable, &read_only_meta(), &fx, "property 2");
+    }
+
+    /// Property 8, isolated from the three properties that embed it (2, 6,
+    /// 7): `Error::Io` is unclassified (falls through `exit_code`'s
+    /// wildcard to exit 1, "stuffr failed"), so a read-only refusal reported
+    /// that way must be caught even though the refusal itself is otherwise
+    /// entirely correct.
+    struct MisclassifiesRefusal;
+
+    impl Container for MisclassifiesRefusal {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            FramedMockContainer.open(resolved, o)
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            // BUG: refuses to write (correctly), but as an unclassified
+            // error rather than a capability limit.
+            Err(Error::Io(io::Error::other(
+                "misclassifies-refusal: refuses to write",
+            )))
+        }
+    }
+
+    #[test]
+    fn fixture_property_eight_catches_an_unclassified_write_refusal() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(&MisclassifiesRefusal, &read_only_meta(), &fx, "property 8");
+    }
+
+    /// Property 4 (enumeration), first half: drops the LAST entry. A
+    /// one-entry lookahead is enough — the fixture harness has no
+    /// incrementality property to trip, so there is no reason to buffer the
+    /// whole archive just to recognise "this was the last one".
+    struct DropsAnEntry;
+
+    struct DropsAnEntryRead {
+        inner: Box<dyn ArchiveRead>,
+        pending: Option<(EntryMeta, Vec<u8>)>,
+    }
+
+    impl DropsAnEntryRead {
+        fn pull(inner: &mut dyn ArchiveRead) -> Result<Option<(EntryMeta, Vec<u8>)>> {
+            let Some(mut entry) = inner.next_entry()? else {
+                return Ok(None);
+            };
+            let meta = entry.meta().clone();
+            let mut data = Vec::new();
+            entry.reader().read_to_end(&mut data)?;
+            Ok(Some((meta, data)))
+        }
+    }
+
+    impl ArchiveRead for DropsAnEntryRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            if self.pending.is_none() {
+                self.pending = Self::pull(&mut *self.inner)?;
+            }
+            let Some(current) = self.pending.take() else {
+                return Ok(None);
+            };
+            // BUG: peeks one entry ahead; if there is none, `current` WAS
+            // the last entry, and it is withheld instead of returned.
+            self.pending = Self::pull(&mut *self.inner)?;
+            if self.pending.is_none() {
+                return Ok(None);
+            }
+            let (meta, data) = current;
+            Ok(Some(Entry::new(meta, Box::new(io::Cursor::new(data)))))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for DropsAnEntry {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(DropsAnEntryRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+                pending: None,
+            }))
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported("drops-an-entry cannot write".into()))
+        }
+    }
+
+    #[test]
+    fn fixture_property_four_catches_a_reader_that_drops_the_last_entry() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha"), ("b.txt", b"beta")]),
+            expected: &[
+                ExpectedEntry {
+                    name: "a.txt",
+                    content: b"alpha",
+                },
+                ExpectedEntry {
+                    name: "b.txt",
+                    content: b"beta",
+                },
+            ],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(&DropsAnEntry, &read_only_meta(), &fx, "property 4");
+    }
+
+    /// Property 4, second half: renames the FIRST entry. `DropsAnEntry`
+    /// above changes the entry COUNT; this changes only a NAME — a distinct
+    /// way the same `assert_eq!` on the name vector can fail, and the two
+    /// together are what stop one bug shape standing in for the other.
+    struct RenamesAnEntry;
+
+    struct RenamesAnEntryRead {
+        inner: Box<dyn ArchiveRead>,
+        seen_first: bool,
+    }
+
+    impl ArchiveRead for RenamesAnEntryRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            let Some(entry) = self.inner.next_entry()? else {
+                return Ok(None);
+            };
+            if !self.seen_first {
+                self.seen_first = true;
+                let mut meta = entry.meta().clone();
+                // BUG: the first entry is silently renamed.
+                meta.name.push_str("-renamed");
+                return Ok(Some(Entry::new(meta, entry.into_reader())));
+            }
+            Ok(Some(entry))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for RenamesAnEntry {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(RenamesAnEntryRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+                seen_first: false,
+            }))
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported("renames-an-entry cannot write".into()))
+        }
+    }
+
+    #[test]
+    fn fixture_property_four_catches_a_reader_that_renames_the_first_entry() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha"), ("b.txt", b"beta")]),
+            expected: &[
+                ExpectedEntry {
+                    name: "a.txt",
+                    content: b"alpha",
+                },
+                ExpectedEntry {
+                    name: "b.txt",
+                    content: b"beta",
+                },
+            ],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(&RenamesAnEntry, &read_only_meta(), &fx, "property 4");
+    }
+
+    /// Property 5 (content): right names, wrong bytes. The brief calls this
+    /// one out as mattering most — a container that enumerates correctly
+    /// and decodes wrongly is exactly what a fixture with no `expected`
+    /// content would wave through.
+    struct CorruptsContent;
+
+    struct CorruptsContentRead {
+        inner: Box<dyn ArchiveRead>,
+    }
+
+    impl ArchiveRead for CorruptsContentRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            let Some(mut entry) = self.inner.next_entry()? else {
+                return Ok(None);
+            };
+            let meta = entry.meta().clone();
+            let mut data = Vec::new();
+            entry.reader().read_to_end(&mut data)?;
+            // BUG: the name is reported correctly; the content is not.
+            match data.first_mut() {
+                Some(byte) => *byte ^= 0xFF,
+                None => data.push(0xFF),
+            }
+            Ok(Some(Entry::new(meta, Box::new(io::Cursor::new(data)))))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for CorruptsContent {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(CorruptsContentRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+            }))
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported("corrupts-content cannot write".into()))
+        }
+    }
+
+    #[test]
+    fn fixture_property_five_catches_a_reader_that_serves_wrong_content_for_the_right_name() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(&CorruptsContent, &read_only_meta(), &fx, "property 5");
+    }
+
+    /// Property 6 (truncation): ignores the actual input entirely and
+    /// always serves the fixture's own known-good manifest, regardless of
+    /// what bytes `open()` was actually handed. The strongest way to violate
+    /// property 6 — it does not even look at `resolved`.
+    struct IgnoresTruncation {
+        known: Vec<(String, Vec<u8>)>,
+    }
+
+    impl IgnoresTruncation {
+        fn from_fixture(fixture: &ContainerFixture) -> Self {
+            Self {
+                known: fixture
+                    .expected
+                    .iter()
+                    .map(|e| (e.name.to_string(), e.content.to_vec()))
+                    .collect(),
+            }
+        }
+    }
+
+    struct IgnoresTruncationRead {
+        known: Vec<(String, Vec<u8>)>,
+        pos: usize,
+        report: FidelityReport,
+    }
+
+    impl ArchiveRead for IgnoresTruncationRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            let Some((name, data)) = self.known.get(self.pos).cloned() else {
+                return Ok(None);
+            };
+            self.pos += 1;
+            Ok(Some(Entry::new(
+                EntryMeta::file(name),
+                Box::new(io::Cursor::new(data)),
+            )))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            match self.known.get(index).cloned() {
+                Some((name, data)) => Ok(Entry::new(
+                    EntryMeta::file(name),
+                    Box::new(io::Cursor::new(data)),
+                )),
+                None => Err(Error::EntryNotFound(index.to_string())),
+            }
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            &self.report
+        }
+    }
+
+    impl Container for IgnoresTruncation {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, _resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            // BUG: never looks at the resolved source, so a genuinely
+            // truncated (or corrupted) input is served the identical
+            // known-good manifest as an untouched one.
+            Ok(Box::new(IgnoresTruncationRead {
+                known: self.known.clone(),
+                pos: 0,
+                report: FidelityReport::exact(),
+            }))
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported("ignores-truncation cannot write".into()))
+        }
+    }
+
+    #[test]
+    fn fixture_property_six_catches_a_reader_that_ignores_truncation() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha"), ("b.txt", b"beta")]),
+            expected: &[
+                ExpectedEntry {
+                    name: "a.txt",
+                    content: b"alpha",
+                },
+                ExpectedEntry {
+                    name: "b.txt",
+                    content: b"beta",
+                },
+            ],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(
+            &IgnoresTruncation::from_fixture(&fx),
+            &read_only_meta(),
+            &fx,
+            "property 6",
+        );
+    }
+
+    /// Property 7 (corruption), deliberately distinct from `IgnoresTruncation`
+    /// above. A double that merely "ignores whatever the input actually
+    /// was" trips property 6 FIRST, since it runs before property 7 and
+    /// looks identical from a truncated input's point of view — so isolating
+    /// property 7 needs a double that tells the two apart.
+    ///
+    /// This one passes truncation through HONESTLY: it drains whatever the
+    /// real, possibly-short payload actually was, so a genuinely truncated
+    /// input still surfaces as a real parse error exactly as it would
+    /// without this double (see the property-6 test below, which passes).
+    /// Only CONTENT is repaired, and only after a structurally successful
+    /// parse: the real (possibly byte-flipped) payload is discarded and
+    /// replaced with the fixture's own known-good bytes for that entry name.
+    /// The fixture's payload is long enough that the harness's middle-byte
+    /// flip always lands inside it, never inside the header, so corruption
+    /// never prevents the structural parse from succeeding.
+    struct RestoresKnownContent {
+        known: Vec<(String, Vec<u8>)>,
+    }
+
+    impl RestoresKnownContent {
+        fn from_fixture(fixture: &ContainerFixture) -> Self {
+            Self {
+                known: fixture
+                    .expected
+                    .iter()
+                    .map(|e| (e.name.to_string(), e.content.to_vec()))
+                    .collect(),
+            }
+        }
+    }
+
+    struct RestoresKnownContentRead {
+        inner: Box<dyn ArchiveRead>,
+        known: Vec<(String, Vec<u8>)>,
+    }
+
+    impl ArchiveRead for RestoresKnownContentRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            let Some(mut entry) = self.inner.next_entry()? else {
+                return Ok(None);
+            };
+            let meta = entry.meta().clone();
+            // Drains the REAL (possibly corrupted) payload, so a genuine
+            // parse failure or a genuine short read still surfaces exactly
+            // as it would without this double.
+            let mut real = Vec::new();
+            entry.reader().read_to_end(&mut real)?;
+            // BUG: substitutes the fixture's own known-good bytes for this
+            // entry's name instead of what was actually decoded.
+            let content = self
+                .known
+                .iter()
+                .find(|(name, _)| *name == meta.name)
+                .map(|(_, data)| data.clone())
+                .unwrap_or(real);
+            Ok(Some(Entry::new(meta, Box::new(io::Cursor::new(content)))))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for RestoresKnownContent {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(RestoresKnownContentRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+                known: self.known.clone(),
+            }))
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported(
+                "restores-known-content cannot write".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn fixture_property_seven_catches_a_reader_that_repairs_corrupted_content() {
+        // A single 40-byte payload: long enough that the harness's
+        // middle-byte flip (at `bytes.len() / 2`) always lands inside the
+        // payload, never inside the 15-byte header (`"FE"` + u32 name_len +
+        // 1-byte name + u64 data_len), so the real parse below stays
+        // structurally intact and only the content differs.
+        const PAYLOAD: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn";
+        assert_eq!(PAYLOAD.len(), 40);
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a", PAYLOAD)]),
+            expected: &[ExpectedEntry {
+                name: "a",
+                content: PAYLOAD,
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(
+            &RestoresKnownContent::from_fixture(&fx),
+            &read_only_meta(),
+            &fx,
+            "property 7",
+        );
+    }
+
     /// Property 1 exists because a mismatched registration is otherwise
     /// completely silent — every other property would still pass.
     struct WrongId;
