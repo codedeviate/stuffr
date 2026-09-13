@@ -397,14 +397,25 @@ impl CpioSource {
         // whole prefix) is kept and topped up rather than re-read.
         self.peeked.drain(..self.pos);
         self.pos = 0;
+        // Into a scratch buffer, NOT straight into `self.peeked`, and the
+        // difference is the `?` on the next line. Resizing `peeked` to 102
+        // first and reading into its tail leaves it zero-filled past the real
+        // bytes if that read fails, and `Read for CpioSource` would then
+        // replay those zeros as stream content. Unreachable today —
+        // `CpioRead::next_entry` has already moved to `Ended` and dropped the
+        // source by then — but `io::ErrorKind::Interrupted` is a legal,
+        // retryable transient, so a caller that retries is all it would take.
+        // `ar.rs`'s `ArGuardPhase::Header` arm reads through a scratch `tmp`
+        // for the same reason; two guards written weeks apart should not have
+        // two buffer idioms, one of them latently wrong.
         while self.peeked.len() < CPIO_NAMESIZE_FIELD_END {
-            let at = self.peeked.len();
-            self.peeked.resize(CPIO_NAMESIZE_FIELD_END, 0);
-            let n = self.inner.read(&mut self.peeked[at..])?;
-            self.peeked.truncate(at + n);
+            let want = CPIO_NAMESIZE_FIELD_END - self.peeked.len();
+            let mut tmp = vec![0u8; want];
+            let n = self.inner.read(&mut tmp)?;
             if n == 0 {
                 break;
             }
+            self.peeked.extend_from_slice(&tmp[..n]);
         }
         Ok(())
     }
