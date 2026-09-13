@@ -85,6 +85,89 @@
 //! `tar::Header::set_path`, which refuses both (see `tar.rs`'s `add` for how
 //! that module works around it). Property 12's hostile names are stored and
 //! read back verbatim by construction, with nothing for this module to do.
+//!
+//! # Task 5d: two of three header-declared-length OOMs, and why the third needs no fix here
+//!
+//! `ar` 0.9.0 allocates three buffers straight from header-declared lengths,
+//! before validating them and before a byte of what they will hold is read —
+//! the same shape of bug Task 5c closed for `cpio.rs`'s `c_namesize`:
+//!
+//! - `lib.rs:261`, `*name_table = vec![0; size as usize];` — the GNU
+//!   long-name table, sized from the SAME 10-digit decimal `file size`
+//!   field (`buffer[48..58]`) every entry header carries.
+//! - `lib.rs:307`, `let mut id_buffer = vec![0; padded_length as usize];` —
+//!   the BSD extended (`#1/N`) identifier, sized from a 13-digit decimal
+//!   field (`buffer[3..16]`) unique to that header shape.
+//! - `lib.rs:746`, `let mut str_table_data = vec![0u8; str_table_len as
+//!   usize];` — the GNU symbol table's own string table, sized from a
+//!   length read out of the symbol table's PAYLOAD (not a header field),
+//!   inside `Archive::parse_symbol_table_if_necessary`.
+//!
+//! The third is real in the crate but **dead code from this module**: it is
+//! reachable only through `Archive::symbols()` (and `count_entries`/
+//! `jump_to_entry`, which call `scan_if_necessary` but never parse the
+//! symbol table itself). [`ArRead::by_index`] above never calls into any of
+//! them — it answers `Unsupported`/`NotSeekable` unconditionally, without
+//! touching the archive's seek-based API at all, and nothing else in this
+//! workspace calls `.symbols(`, `count_entries` or `jump_to_entry` either.
+//! So it is left unfixed, deliberately: bounding it would mean peeking into
+//! a payload this container never asks the crate to parse, for a code path
+//! nothing here can reach. **If `by_index` or a `symbols` surface is ever
+//! added for `ar`, this is the site that must be bounded FIRST, before that
+//! lands.**
+//!
+//! The other two are both real, and both on this container's ORDINARY read
+//! path, not just a hostile one: the GNU name table is what `ar`'s own
+//! default variant on Linux writes (see the cross-compiled `.rlib` files
+//! this fix was measured against, below), and the BSD extended form is what
+//! THIS container's own writer produces for any `/`-bearing or >16-byte
+//! identifier (see `write_safe_identifier` above).
+//!
+//! ## Why the fix cannot be a single peek before each entry, unlike `cpio.rs`
+//!
+//! `cpio.rs`'s `peek_header_prefix` peeks once per entry because cpio's
+//! format is 1:1: every header the crate reads corresponds to exactly one
+//! entry this container hands back (or the trailer). `ar::Archive::next_entry`
+//! is not 1:1: a GNU name table or symbol table header is consumed and
+//! `continue`d past internally, inside the SAME call, with no yield point
+//! for this module to peek from in between — and, `ArRead::archive` being a
+//! raw pointer leaked at `open` time (see this module's own doc above),
+//! there is no way to reach back into a live `ar::Archive`'s private reader
+//! to peek mid-archive even once that call returns.
+//!
+//! So the guard lives BELOW the crate instead of above it: [`ArGuardedReader`]
+//! wraps the real source and is what `ar::Archive` reads from for the whole
+//! archive's lifetime, mirroring just enough of `ar::Header::read`'s own
+//! state machine — global header, optional one-byte pad, 60-byte header,
+//! payload — to recognise a header BOUNDARY and hold the full 60 bytes back
+//! (never releasing a partial header to the crate) until [`scan_ar_header`]
+//! has checked the one or two length fields it carries. A refusal happens
+//! before any of those 60 bytes ever reach the crate, which is what makes it
+//! run before the crate's own `vec![0; ...]` rather than merely before this
+//! container returns an `Entry` for it.
+//!
+//! ## Sizing the two ceilings
+//!
+//! Measured across every `.a`/`.rlib` this machine has (478 archives:
+//! everything under `/usr/lib`, `/usr/local/lib` and `~/.rustup`, including
+//! the 40-58 MB cross-compiled `libcore`/`libstd` `.rlib`s for
+//! `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, which are GNU-
+//! variant regardless of build host):
+//!
+//! - The largest real GNU name table was **27,616 bytes**
+//!   (`libcompiler_builtins-*.rlib`, hundreds of small translation units).
+//! - The largest real BSD extended identifier was **100 bytes** — a path,
+//!   the same shape `MAX_CPIO_NAME_LEN`/`MAX_SYMLINK_TARGET_LEN` bound.
+//!
+//! [`MAX_BSD_IDENTIFIER_LEN`] follows Task 5c's own figure and reasoning
+//! unchanged: a single identifier is exactly as path-shaped as a symlink
+//! target or a cpio entry name, and 65,536 bytes is generous over the
+//! largest real one measured (100) by 655x. [`MAX_GNU_NAME_TABLE_LEN`] does
+//! NOT reuse that figure — a name table is a TABLE, not a path, and a real
+//! one can legitimately hold thousands of names. 16 MiB is ~608x the largest
+//! real one measured (a library with 100,000 members averaging 40-byte names
+//! would need roughly 4 MiB), while remaining ~570x smaller than the ~9.3
+//! GiB a 10-digit declared length can otherwise buy.
 
 use std::io::{self, Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -155,10 +238,15 @@ impl Container for Ar {
     fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
         let Resolved { source, report, .. } = resolved;
         let seekable = source.caps().seekable;
+        // Wrapped in `ArGuardedReader` before the crate ever sees it — see
+        // the module doc's Task 5d section for why the guard has to be
+        // installed here, below the crate, rather than as a peek this
+        // module performs itself before delegating.
+        let guarded = ArGuardedReader::new(source);
         // Leaked deliberately and reclaimed in `ArRead::drop` — see that
         // struct's own doc for why, and `tar.rs`'s module doc for the fuller
         // argument this mirrors.
-        let archive: *mut ArArchive = Box::into_raw(Box::new(ar::Archive::new(source)));
+        let archive: *mut ArArchive = Box::into_raw(Box::new(ar::Archive::new(guarded)));
         Ok(Box::new(ArRead {
             archive,
             current: None,
@@ -185,7 +273,334 @@ fn classify_ar_error(e: io::Error) -> Error {
     Error::from_decode_io(e)
 }
 
-type ArSource = Box<dyn Source>;
+// --- Task 5d: guarding two header-declared-length allocations -------------
+//
+// See the module doc's "Two of three header-declared-length OOMs" section
+// for the full picture. What follows is [`ArGuardedReader`] (the wrapper
+// `ar::Archive` reads from for the whole archive's lifetime) and
+// [`scan_ar_header`] (the stripped-down mirror of `ar::Header::read`'s own
+// state machine it uses to find and validate every header).
+
+/// Fixed width of one `ar` entry header — six ASCII fields plus the 16-byte
+/// identifier, `` ` `` and `\n`. Mirrors the vendored crate's own private
+/// `ENTRY_HEADER_LEN` (`ar-0.9.0/src/lib.rs:103`).
+const AR_ENTRY_HEADER_LEN: usize = 60;
+
+/// Ceiling on a BSD extended (`#1/N`) identifier's declared length —
+/// `ar-0.9.0/src/lib.rs:307`'s `let mut id_buffer = vec![0; padded_length as
+/// usize];`, run before a single byte of the name is read.
+///
+/// Reuses Task 5c's own figure (`MAX_CPIO_NAME_LEN`/`MAX_SYMLINK_TARGET_LEN`)
+/// unchanged: a single identifier is exactly as path-shaped as a symlink
+/// target or a cpio entry name, so the same reasoning transfers — a
+/// generous ceiling well beyond any real platform's `PATH_MAX` (4096 on
+/// Linux, 1024 on macOS/BSD). Measured directly rather than assumed: the
+/// largest BSD extended identifier across 478 real `.a`/`.rlib` files on
+/// this machine (see the module doc) was 100 bytes — this ceiling is 655x
+/// that.
+const MAX_BSD_IDENTIFIER_LEN: u64 = 65_536;
+
+/// Ceiling on a GNU archive's long-name TABLE — `ar-0.9.0/src/lib.rs:261`'s
+/// `*name_table = vec![0; size as usize];`, run before a single byte of the
+/// table is read.
+///
+/// Deliberately NOT [`MAX_BSD_IDENTIFIER_LEN`]'s figure: a name table is a
+/// TABLE, not a path, and a real one can legitimately hold thousands of
+/// names (every entry whose identifier exceeds 15 bytes contributes one
+/// `name/\n` record). Measured directly: the largest across the same 478
+/// real archives — including 40-58 MB cross-compiled `libcore`/`libstd`
+/// `.rlib`s — was 27,616 bytes (`libcompiler_builtins-*.rlib`, hundreds of
+/// small translation units). 16 MiB is ~608x that (a library with 100,000
+/// members averaging 40-byte names would need roughly 4 MiB), while staying
+/// ~570x smaller than the ~9.3 GiB a 10-digit declared length can otherwise
+/// buy.
+const MAX_GNU_NAME_TABLE_LEN: u64 = 16 * 1024 * 1024;
+
+/// What [`scan_ar_header`] learned about one 60-byte header, needed only to
+/// track [`ArGuardedReader`]'s own position through the stream — never to
+/// resolve a name or build an `ar::Header`, which the crate still does
+/// itself once these bytes reach it.
+struct ArHeaderScan {
+    /// Total bytes following this header before the next header (or EOF):
+    /// the raw, UNADJUSTED `file size` field (`buffer[48..58]`) — this is
+    /// also the length a BSD extended identifier's own bytes are carved out
+    /// of, so it already covers that case with no separate tracking.
+    payload_len: u64,
+    /// Whether a single `\n` pad byte follows the payload — decided by the
+    /// ADJUSTED size (`payload_len` minus a BSD identifier's length, if
+    /// any), matching `ar::Header::size()`/`Archive::next_entry`'s own
+    /// `size % 2 != 0` check.
+    pad_after: bool,
+}
+
+/// Parses one `ar` header's decimal ASCII field the same way the vendored
+/// crate's own `parse_number` does (UTF-8, then `trim_end`, then base 10) —
+/// `None` rather than an error on anything that does not parse, because a
+/// field this function cannot read is a field the crate's OWN reparse of
+/// these same bytes cannot read either, and `Header::read` raises the
+/// accurate `Corrupt` error for that once it reaches them. This function
+/// only ever needs to decide "is this dangerously large", never "is this
+/// archive well-formed".
+fn parse_ar_field(bytes: &[u8]) -> Option<u64> {
+    std::str::from_utf8(bytes).ok()?.trim_end().parse().ok()
+}
+
+/// Refuses a declared length past `limit`, before the crate ever allocates
+/// from it — [`io::ErrorKind::OutOfMemory`] is what `Error::from_decode_io`
+/// already classifies as [`Error::ResourceLimit`] (exit 6), so no new error
+/// plumbing is needed to get the same typed refusal Task 5c's cpio guard
+/// raises directly.
+fn refuse_if_over(value: u64, limit: u64, what: &str, noun: &str) -> io::Result<()> {
+    if value > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!(
+                "{what} declares a {noun} of {value} bytes, past the {limit}-byte ceiling this \
+                 container reads eagerly; no legitimate archive's {noun} is this large"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Inspects one complete 60-byte `ar` entry header, mirroring just enough of
+/// `ar::Header::read`'s own branching (global variant detection, the GNU
+/// name-table and BSD extended-identifier special cases) to validate the
+/// two length fields those branches allocate from — see the module doc.
+///
+/// `variant` is threaded through exactly as the crate threads its own
+/// `Variant` through `Header::read`: once a header sets it to `Gnu` or `Bsd`,
+/// later headers cannot flip it back, which is what makes the branch order
+/// below (GNU checks before the BSD check, matching the crate's own
+/// sequence) produce identical outcomes to an `else if` chain even though
+/// the crate itself writes the BSD check as a separate, unconditional `if`
+/// — the two are equivalent because reaching either GNU branch already
+/// disqualifies the BSD one via the `variant != Gnu` guard, the same way an
+/// `else if` would.
+fn scan_ar_header(
+    hdr: &[u8; AR_ENTRY_HEADER_LEN],
+    variant: &mut ar::Variant,
+) -> io::Result<ArHeaderScan> {
+    let mut identifier = hdr[0..16].to_vec();
+    while identifier.last() == Some(&b' ') {
+        identifier.pop();
+    }
+    let size = parse_ar_field(&hdr[48..58]).unwrap_or(0);
+    let mut adjusted_size = size;
+
+    if *variant != ar::Variant::BSD && identifier.starts_with(b"/") {
+        *variant = ar::Variant::GNU;
+        if identifier == b"//" {
+            refuse_if_over(
+                size,
+                MAX_GNU_NAME_TABLE_LEN,
+                "a GNU archive",
+                "long-name table",
+            )?;
+        }
+        // The GNU symbol table (identifier exactly `/`) and an ordinary GNU
+        // short-name reference (`/N`) both carry `size` bytes of payload and
+        // no further length field this container can reach — see the
+        // module doc's "dead code from this module" paragraph for why the
+        // symbol table's OWN string-table length is out of scope.
+    } else if *variant != ar::Variant::BSD && identifier.ends_with(b"/") {
+        *variant = ar::Variant::GNU;
+    } else if *variant != ar::Variant::GNU && identifier.starts_with(b"#1/") {
+        *variant = ar::Variant::BSD;
+        if let Some(padded_length) = parse_ar_field(&hdr[3..16]) {
+            refuse_if_over(
+                padded_length,
+                MAX_BSD_IDENTIFIER_LEN,
+                "a BSD extended (`#1/N`)",
+                "identifier length",
+            )?;
+            // Matches `Header::read`: a `size` smaller than `padded_length`
+            // is the crate's own `InvalidData` refusal once it reparses
+            // these bytes, not a resource question — nothing to guard here,
+            // `adjusted_size` just stays at the raw `size`.
+            if size >= padded_length {
+                adjusted_size = size - padded_length;
+            }
+        }
+    }
+
+    Ok(ArHeaderScan {
+        payload_len: size,
+        pad_after: !adjusted_size.is_multiple_of(2),
+    })
+}
+
+/// Where [`ArGuardedReader::read`] currently is in the archive, mirroring
+/// `ar::Archive`'s own private position tracking closely enough to find
+/// every header boundary — see the module doc for why this has to live
+/// below the crate rather than as a peek-then-delegate helper.
+enum ArGuardPhase {
+    /// Still inside the 8-byte magic `!<arch>\n`; passed through untouched.
+    GlobalHeader { remaining: u8 },
+    /// A single `\n` pad byte must be read (and passed through) before the
+    /// next header — `ar` pads every odd-sized record.
+    Pad,
+    /// At a header boundary: accumulating up to `AR_ENTRY_HEADER_LEN` bytes
+    /// into `buf` before releasing ANY of them, so [`scan_ar_header`] always
+    /// sees the header whole. A short read here (fewer than the full width,
+    /// at true end of stream) means there is nothing complete enough to
+    /// validate; what was read is released as-is and the crate's own
+    /// `read_exact` retry surfaces the resulting `UnexpectedEof`, same as if
+    /// this wrapper were not here.
+    Header { buf: Vec<u8> },
+    /// A header (validated, or the truncated remainder above) is being
+    /// drained out of `buf` before falling back to [`ArGuardPhase::Payload`].
+    Serving {
+        buf: Vec<u8>,
+        pos: usize,
+        remaining: u64,
+        pad_after: bool,
+    },
+    /// Passing through `remaining` payload bytes verbatim — covers a BSD
+    /// identifier's own bytes plus the entry's real data, or a skipped GNU
+    /// name/symbol table's payload, all alike: nothing downstream of a
+    /// validated header allocates from a declared length again until the
+    /// NEXT header.
+    Payload { remaining: u64, pad_after: bool },
+}
+
+/// Wraps the real archive source and is what `ar::Archive` reads from for
+/// the archive's WHOLE lifetime, inspecting every entry header before the
+/// crate ever sees it — see the module doc's "Why the fix cannot be a
+/// single peek before each entry" section for why this shape, rather than
+/// `cpio.rs`'s peek-then-delegate helper, is what closes this container's
+/// two reachable OOM sites.
+struct ArGuardedReader {
+    inner: Box<dyn Source>,
+    phase: ArGuardPhase,
+    variant: ar::Variant,
+}
+
+impl ArGuardedReader {
+    fn new(inner: Box<dyn Source>) -> Self {
+        ArGuardedReader {
+            inner,
+            phase: ArGuardPhase::GlobalHeader {
+                remaining: GLOBAL_HEADER.len() as u8,
+            },
+            variant: ar::Variant::Common,
+        }
+    }
+}
+
+impl Read for ArGuardedReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            match &mut self.phase {
+                ArGuardPhase::GlobalHeader { remaining } => {
+                    if *remaining == 0 {
+                        self.phase = ArGuardPhase::Header {
+                            buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
+                        };
+                        continue;
+                    }
+                    let want = (*remaining as usize).min(out.len());
+                    let n = self.inner.read(&mut out[..want])?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    *remaining -= n as u8;
+                    return Ok(n);
+                }
+                ArGuardPhase::Pad => {
+                    let mut one = [0u8; 1];
+                    let n = self.inner.read(&mut one)?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    out[0] = one[0];
+                    self.phase = ArGuardPhase::Header {
+                        buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
+                    };
+                    return Ok(1);
+                }
+                ArGuardPhase::Header { buf } => {
+                    while buf.len() < AR_ENTRY_HEADER_LEN {
+                        let want = AR_ENTRY_HEADER_LEN - buf.len();
+                        let mut tmp = vec![0u8; want];
+                        let n = self.inner.read(&mut tmp)?;
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    if buf.is_empty() {
+                        return Ok(0);
+                    }
+                    let (payload_len, pad_after) = if buf.len() == AR_ENTRY_HEADER_LEN {
+                        let hdr: [u8; AR_ENTRY_HEADER_LEN] = buf
+                            .as_slice()
+                            .try_into()
+                            .expect("just checked buf.len() == AR_ENTRY_HEADER_LEN");
+                        let scan = scan_ar_header(&hdr, &mut self.variant)?;
+                        (scan.payload_len, scan.pad_after)
+                    } else {
+                        // Truncated mid-header — see this phase's own doc.
+                        (0, false)
+                    };
+                    let full = std::mem::take(buf);
+                    self.phase = ArGuardPhase::Serving {
+                        buf: full,
+                        pos: 0,
+                        remaining: payload_len,
+                        pad_after,
+                    };
+                }
+                ArGuardPhase::Serving {
+                    buf,
+                    pos,
+                    remaining,
+                    pad_after,
+                } => {
+                    if *pos < buf.len() {
+                        let n = (buf.len() - *pos).min(out.len());
+                        out[..n].copy_from_slice(&buf[*pos..*pos + n]);
+                        *pos += n;
+                        return Ok(n);
+                    }
+                    self.phase = ArGuardPhase::Payload {
+                        remaining: *remaining,
+                        pad_after: *pad_after,
+                    };
+                }
+                ArGuardPhase::Payload {
+                    remaining,
+                    pad_after,
+                } => {
+                    if *remaining == 0 {
+                        self.phase = if *pad_after {
+                            ArGuardPhase::Pad
+                        } else {
+                            ArGuardPhase::Header {
+                                buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
+                            }
+                        };
+                        continue;
+                    }
+                    let want = out
+                        .len()
+                        .min(usize::try_from(*remaining).unwrap_or(usize::MAX));
+                    let n = self.inner.read(&mut out[..want])?;
+                    if n == 0 {
+                        return Ok(0);
+                    }
+                    *remaining -= n as u64;
+                    return Ok(n);
+                }
+            }
+        }
+    }
+}
+
+type ArSource = ArGuardedReader;
 type ArArchive = ar::Archive<ArSource>;
 
 /// Owns the archive on the heap and, while one is in progress, the entry
@@ -986,5 +1401,271 @@ mod tests {
     #[should_panic(expected = "no reference `this-binary-does-not-exist-xyz` tool found on PATH")]
     fn require_bin_panics_rather_than_skips_silently() {
         require_bin("this-binary-does-not-exist-xyz");
+    }
+
+    // --- Task 5d: the two header-declared-length OOMs the fuzzer would find ---
+    //
+    // `ar-0.9.0/src/lib.rs:261` and `:307` allocate `vec![0; N]` straight from
+    // a header field, before a single byte of the name/table is read. See
+    // the module doc's own section for the full picture; what follows
+    // hand-builds the two dangerous header shapes byte-for-byte, the same
+    // technique `cpio.rs`'s Task 5c tests use.
+
+    /// One `ar` header field: `n` written as decimal ASCII, left-justified
+    /// and space-padded to exactly `width` bytes — the same layout
+    /// `ar::Header::write`'s own `{:<N}` format specifiers produce.
+    fn dec_field(n: u64, width: usize) -> Vec<u8> {
+        let s = format!("{n:<width$}");
+        assert_eq!(
+            s.len(),
+            width,
+            "{n} does not fit left-justified in {width} bytes"
+        );
+        s.into_bytes()
+    }
+
+    /// A plain (non-extended) 16-byte identifier field: `s`, space-padded.
+    fn padded_identifier(s: &str) -> [u8; 16] {
+        let mut id = [b' '; 16];
+        let bytes = s.as_bytes();
+        assert!(bytes.len() <= 16, "fixture identifier too long: {s:?}");
+        id[..bytes.len()].copy_from_slice(bytes);
+        id
+    }
+
+    /// A BSD extended (`#1/N`) identifier field: `#1/` plus `padded_length`
+    /// as a 13-byte decimal field — `ar-0.9.0/src/lib.rs:296`'s own
+    /// `parse_number("BSD filename length", &buffer[3..16], 10)`.
+    fn bsd_ext_identifier_field(padded_length: u64) -> [u8; 16] {
+        let mut id = [0u8; 16];
+        id[0..3].copy_from_slice(b"#1/");
+        id[3..16].copy_from_slice(&dec_field(padded_length, 13));
+        id
+    }
+
+    /// One hand-built 60-byte `ar` entry header — every field but the
+    /// identifier and the declared size is a harmless placeholder, since
+    /// every test below is refused (or fails) before those fields are ever
+    /// consulted.
+    fn ar_header_raw(identifier: &[u8; 16], size: u64) -> Vec<u8> {
+        let mut h = Vec::with_capacity(60);
+        h.extend_from_slice(identifier);
+        h.extend_from_slice(&dec_field(0, 12)); // mtime
+        h.extend_from_slice(&dec_field(0, 6)); // uid
+        h.extend_from_slice(&dec_field(0, 6)); // gid
+        h.extend_from_slice(format!("{:<8}", "100644").as_bytes()); // mode
+        h.extend_from_slice(&dec_field(size, 10)); // file size
+        h.extend_from_slice(b"`\n");
+        assert_eq!(h.len(), 60, "must be exactly ENTRY_HEADER_LEN");
+        h
+    }
+
+    /// A `Source` that panics if ever asked to fill a buffer larger than
+    /// `max_single_read` — see `cpio.rs`'s identically-named struct for the
+    /// full reasoning. `ArGuardedReader`'s own `Header` phase never requests
+    /// more than `AR_ENTRY_HEADER_LEN` (60) bytes from the source in one
+    /// call, so a request here for anything past a sane header-sized window
+    /// proves the crate's own `vec![0; N]` allocation was reached — i.e.
+    /// that the pre-flight check did not run before the crate's parser did.
+    struct PanicsOnBigRead {
+        inner: std::io::Cursor<Vec<u8>>,
+        max_single_read: usize,
+    }
+
+    impl Read for PanicsOnBigRead {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            assert!(
+                buf.len() <= self.max_single_read,
+                "a single read of {} bytes was requested — past the {}-byte guard. This is proof \
+                 the oversized header-declared allocation was reached before any refusal ran, \
+                 i.e. the pre-flight check did not fire before the crate's own parser did",
+                buf.len(),
+                self.max_single_read
+            );
+            std::io::Read::read(&mut self.inner, buf)
+        }
+    }
+
+    impl Source for PanicsOnBigRead {
+        fn caps(&self) -> stuffr_core::SourceCaps {
+            stuffr_core::SourceCaps {
+                seekable: false,
+                len: None,
+            }
+        }
+        fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
+            None
+        }
+    }
+
+    fn open_guarded(bytes: Vec<u8>, max_single_read: usize) -> Box<dyn ArchiveRead> {
+        let src: Box<dyn Source> = Box::new(PanicsOnBigRead {
+            inner: std::io::Cursor::new(bytes),
+            max_single_read,
+        });
+        let resolved =
+            stuffr_core::resolve(src, AR, Ar.caps(), &stuffr_core::StreamPolicy::default())
+                .expect("resolve");
+        Ar.open(resolved, &OpenOpts::default())
+            .expect("open reads no byte")
+    }
+
+    /// The failing-first test for Task 5d's first site: an absurd GNU
+    /// long-name-table size must be refused as a typed error, at exit 6
+    /// (`Error::ResourceLimit`) — never exit 5 (`Error::Corrupt`), and never
+    /// by way of the multi-gigabyte allocation the un-fixed crate makes on
+    /// the way to failing. `max_single_read` is `PROBE_LEN` (4096) — generous
+    /// for any legitimate header read, and roughly six orders of magnitude
+    /// below the declared table length, so nothing on the honest path can
+    /// trip it.
+    #[test]
+    fn refuses_an_absurd_gnu_name_table_size_before_the_allocation_it_would_size() {
+        let absurd_size: u64 = 8_000_000_000; // ~7.45 GiB, well past the ceiling
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend_from_slice(&ar_header_raw(&padded_identifier("//"), absurd_size));
+        // No table payload follows — the refusal must happen before any of
+        // it is expected, so there is nothing to supply.
+
+        let mut ar = open_guarded(bytes, stuffr_core::PROBE_LEN);
+        let err = ar
+            .next_entry()
+            .expect_err("an absurd GNU name-table size must be refused");
+
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "an implausible declared table length is this build refusing to allocate, not a \
+             verdict that the file is damaged — see MAX_GNU_NAME_TABLE_LEN's doc; got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 6, "ResourceLimit is exit 6: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&absurd_size.to_string()),
+            "the message must name the declared size, got: {msg}"
+        );
+    }
+
+    /// The failing-first test for Task 5d's second site: an absurd BSD
+    /// extended identifier length, same shape as the name-table test above.
+    #[test]
+    fn refuses_an_absurd_bsd_identifier_length_before_the_allocation_it_would_size() {
+        let absurd_len: u64 = 8_000_000_000;
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend_from_slice(&ar_header_raw(
+            &bsd_ext_identifier_field(absurd_len),
+            absurd_len,
+        ));
+        // No identifier/payload bytes follow — same reasoning as above.
+
+        let mut ar = open_guarded(bytes, stuffr_core::PROBE_LEN);
+        let err = ar
+            .next_entry()
+            .expect_err("an absurd BSD extended identifier length must be refused");
+
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "an implausible declared identifier length is this build refusing to allocate, not \
+             a verdict that the file is damaged — see MAX_BSD_IDENTIFIER_LEN's doc; got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 6, "ResourceLimit is exit 6: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&absurd_len.to_string()),
+            "the message must name the declared length, got: {msg}"
+        );
+    }
+
+    /// The regression guard for the name-table test: a header naming a size
+    /// UNDER the ceiling must still fail (there is no table data behind it),
+    /// but as ordinary corruption — exit 5 — never `ResourceLimit`. Pins
+    /// that the new check is bounded by `MAX_GNU_NAME_TABLE_LEN`, not "any
+    /// name-table size with no data behind it."
+    #[test]
+    fn a_modest_gnu_name_table_size_with_no_data_behind_it_is_corrupt_not_resource_limited() {
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend_from_slice(&ar_header_raw(&padded_identifier("//"), 64));
+        // No table payload follows: truncated, not oversized.
+
+        let mut ar = open(&bytes);
+        let err = ar
+            .next_entry()
+            .expect_err("a truncated name table must still fail");
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "a small, merely-truncated size is corruption, not a resource ceiling: {err:?}"
+        );
+    }
+
+    /// The regression guard for the BSD identifier test, mirroring the one
+    /// above.
+    #[test]
+    fn a_modest_bsd_identifier_length_with_no_data_behind_it_is_corrupt_not_resource_limited() {
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend_from_slice(&ar_header_raw(&bsd_ext_identifier_field(64), 64));
+        // No identifier bytes follow: truncated, not oversized.
+
+        let mut ar = open(&bytes);
+        let err = ar
+            .next_entry()
+            .expect_err("a truncated BSD extended identifier must still fail");
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "a small, merely-truncated length is corruption, not a resource ceiling: {err:?}"
+        );
+    }
+
+    /// A legitimate, REAL-shaped large GNU name table must still round
+    /// trip. Guards against the obvious way to get this wrong: picking a
+    /// ceiling so tight it refuses real archives, which this project has
+    /// shipped before (see `CLAUDE.md`'s running count of checks that fired
+    /// on legitimate input). Sized past the largest table actually measured
+    /// on this machine (27,616 bytes — see the module doc) and far under
+    /// `MAX_GNU_NAME_TABLE_LEN`. This container's own writer never produces
+    /// the GNU variant (see `write_safe_identifier`'s doc), so the fixture
+    /// is hand-built rather than round-tripped through `build_ar`.
+    #[test]
+    fn a_legitimate_large_gnu_name_table_still_round_trips() {
+        let mut table = Vec::new();
+        for i in 0..1000u32 {
+            table.extend_from_slice(
+                format!("a-fairly-long-object-file-name-{i:04}.o/\n").as_bytes(),
+            );
+        }
+        if !table.len().is_multiple_of(2) {
+            table.push(b'\n'); // even-align, the same convention a real GNU writer uses
+        }
+        assert!(
+            table.len() > 27_616,
+            "fixture must exceed the largest real name table measured"
+        );
+        assert!(
+            (table.len() as u64) < MAX_GNU_NAME_TABLE_LEN,
+            "fixture must stay comfortably under the ceiling"
+        );
+
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend_from_slice(&ar_header_raw(&padded_identifier("//"), table.len() as u64));
+        bytes.extend_from_slice(&table);
+        // One ordinary entry afterward: a short GNU-style name, stored
+        // inline and terminated with `/` rather than referencing the table.
+        bytes.extend_from_slice(&ar_header_raw(&padded_identifier("a.txt/"), 5));
+        bytes.extend_from_slice(b"hello");
+        bytes.push(b'\n'); // size 5 is odd: one pad byte follows
+
+        let mut ar = open(&bytes);
+        let mut entry = ar
+            .next_entry()
+            .expect("a legitimate large name table must not be refused")
+            .expect("must yield the one real entry");
+        assert_eq!(entry.meta().name, "a.txt");
+        let mut got = Vec::new();
+        entry.reader().read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hello");
+        drop(entry);
+        assert!(
+            ar.next_entry().unwrap().is_none(),
+            "must be exactly one real entry"
+        );
     }
 }
