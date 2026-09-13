@@ -79,7 +79,32 @@ lzma-rust2 = "0.20"
 tar = { version = "0.4.46", default-features = false }
 # The simplest container in the tree: no trailer at all, so a reader knows
 # it has reached the end only because the underlying stream has (`ar 0.9.0`).
-ar = "0.9"
+#
+# PINNED EXACTLY, and the pin is load-bearing. `ar.rs`'s `ArGuardedReader`
+# and `scan_ar_header` mirror `ar::Header::read`'s PRIVATE header state
+# machine, because the allocations and the slice index they bound all happen
+# inside the crate, below anything this module can peek at. Five facts about
+# 0.9.0's internals are hard-coded there: the 60-byte header width, the
+# `[48..58]` file-size field, the `[3..16]` BSD extended length field, the
+# `[1..16]` GNU short-name index, and the `size % 2` pad rule — plus the
+# GNU-before-BSD branch order the variant latch depends on. A 0.9.x patch
+# release that changes ANY of them desyncs the mirror silently, and the
+# symptom is the worst kind: the guard scans payload bytes as headers, and a
+# coincidental `#1/<big>` or `//` inside a real object file produces a FALSE
+# `ResourceLimit` (exit 6) or `Corrupt` (exit 5) on a perfectly valid
+# archive. Nothing in the test suite would detect that — the suite proves the
+# guard fires on hostile input and stays silent on 666 real archives, both
+# measured against 0.9.0.
+#
+# This is the same deliberate, documented cost `ruzstd = "=0.8.1"` carried
+# under the MSRV section until 1.88 lifted it: an exact pin blocks
+# patch-level fixes, and is worth it only while something concrete depends on
+# the exact version. Before loosening this to a caret range, re-verify each
+# of those five facts against the new `ar` source line by line — or replace
+# the mirror with a drift test that compares the guard's boundary walk
+# against the crate's own entry offsets over a fixture set, which is what
+# would make a caret range safe.
+ar = "=0.9.0"
 # `newc` only — the crate ships no odc or CRC variant, so this container
 # declares exactly that rather than implying the others work.
 cpio = "0.4"
