@@ -99,6 +99,46 @@ impl Error {
 
     /// Maps to the process exit code, per the spec's table. Lives here rather
     /// than in the CLI so it is unit-testable without a process spawn.
+    ///
+    /// # Exit 5 or exit 6 on an absurd header field: the rule the guards actually follow
+    ///
+    /// Five guards in this workspace refuse a declared header field before it
+    /// can do damage, and they split across two codes:
+    ///
+    /// | guard | error | exit |
+    /// |---|---|---|
+    /// | `cpio.rs`'s `c_namesize` ceiling | `ResourceLimit` | 6 |
+    /// | `ar.rs`'s `refuse_if_over` (GNU name table, BSD identifier) | `ResourceLimit` | 6 |
+    /// | `ar.rs`'s `/N` index past the declared name table | `Corrupt` | 5 |
+    /// | `zip.rs`'s entry payload that never delivers its declared size | `Corrupt` | 5 |
+    /// | `zip.rs`'s index that reaches no entry over a file that opens with one | `Corrupt` | 5 |
+    ///
+    /// **The rule is a fact about what stuffr DID, not about what the input
+    /// declared:**
+    ///
+    /// * **Exit 6 — stuffr declined to ask the allocator.** The field was
+    ///   measured against a structural ceiling and refused before anything was
+    ///   sized from it. Nothing was read past the header.
+    /// * **Exit 5 — stuffr read the bytes and they contradict each other.** No
+    ///   allocation was ever in question; what is wrong is the file's
+    ///   agreement with itself.
+    ///
+    /// **It is NOT "could a bigger machine honour it".** Three of those sites
+    /// used to argue that locally, and their own reproducers falsify it:
+    /// cpio's is a **274-byte file declaring a 2.6 GiB name**, which no
+    /// machine anywhere can deliver, and it answers 6; ar's two guards split
+    /// across 5 and 6 on the **same 68-byte file**. Nothing about the input's
+    /// plausibility separates them, so a caller cannot predict the code from
+    /// the file — only from which guard stopped first. Each site links here
+    /// rather than re-deriving a local justification, because four local
+    /// derivations produced four different rules for one contract.
+    ///
+    /// What a caller can still read off the code: exit 6 says a LIMIT decided
+    /// the outcome, exit 5 says the FILE did and no budget changes that. The
+    /// container ceilings above are fixed rather than tunable (`OpenOpts`
+    /// carries no memory field, unlike `DecodeOpts::memory_limit`), so exit 6
+    /// there is not an invitation to retry with a bigger budget — it is still
+    /// the honest code, because a ceiling and not the bytes is what decided.
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::Usage(_) => 2,
