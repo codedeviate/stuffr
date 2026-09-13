@@ -9,7 +9,7 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 2c complete at `0.3.0` — eleven codecs and four containers,
+> **Status: Phase 3a complete at `0.3.1` — eleven codecs and four containers,
 > three of the codecs parallel on request, and a default build that needs
 > no C toolchain to read *or write* xz, LZMA1 or LZIP.** `stuffr pack`,
 > `unpack`, `cat`, `info`, `list`, `test` and `formats` all work, on files
@@ -19,10 +19,32 @@ read list.
 > `tar`, `zip` (`zip64` included) — each codec proven against the
 > conformance harness Phase 1c introduced and later cycles grew to twelve
 > properties, each container proven against the analogous
-> container-conformance harness, and then proven to coexist. **811** tests
-> under `--all-features`, **746** on the default tier — a different set, not
+> container-conformance harness, and then proven to coexist. **848** tests
+> under `--all-features`, **783** on the default tier — a different set, not
 > a subset, because the two tiers select different backends. Clean across
 > build, clippy and fmt.
+>
+> **Phase 3a added a fuzzing harness and fixed what it found — the
+> behaviour is the headline, not the fuzzer.** Five exit codes changed or
+> tightened, each a bug fix rather than a new feature:
+> `Error::NotSeekable` — the mandated reply to `by_index` on a forward-only
+> source, e.g. an archive read from a pipe — moved from exit 1 to its
+> correct **exit 3**, so a valid archive on a pipe no longer reports "stuffr
+> failed" for a by-design refusal. A malformed codec stream with no
+> container above it (a truncated `.zz`, an empty `.lz`) moved from exit 1
+> to the correct **exit 5**: `stuffr list`/`cat` used to disagree on the
+> same bytes. A stored zip entry is now held to the size its header
+> declares (**exit 5** on a mismatch) — a crafted entry declaring a size
+> with no matching data used to satisfy its own CRC and report "exact
+> fidelity" at exit 0 (`stuffr list` still reports the declared size on such
+> an entry, since `list` reads no payload in any container). `cpio` and
+> `ar` now refuse an absurd size field **before** it reaches an allocator
+> (**exit 6**) rather than after; a 68-byte `.a` that used to panic (exit
+> 101) is now a clean **exit 5**. None of this changed a public API
+> signature — see [CONTRIBUTING.md](CONTRIBUTING.md#versioning) for why
+> `0.3.1` rather than `0.4.0` is the right version for it. Also: `ar` is now
+> pinned exactly at `=0.9.0`, because `ar.rs` mirrors several private facts
+> about its header state machine.
 >
 > **`0.3.0` carries more than the write-side composition it was bumped for.**
 > Entries can be reached by **index**: `stuffr list`'s first column is the

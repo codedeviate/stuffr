@@ -257,6 +257,85 @@ Rules for touching either region:
    would change how the gate is used. Run it when you touch `tar.rs`'s or
    `ar.rs`'s pointer handling, and let CI run it the rest of the time.
 
+## Fuzzing
+
+Phase 3a added a fuzzing harness over the excluded `fuzz/` crate
+(`build: add an excluded fuzz crate`, so it never affects a `cargo build`
+of the workspace). Three targets, each `#![no_main]` and driven by
+libFuzzer through `cargo fuzz`:
+
+| Target | Covers |
+|---|---|
+| `codec.rs` | One codec's decoder, fed raw bytes. A selector byte picks the format from [`CODEC_SLOTS`](#the-slot-tables-are-append-only) so one corpus exercises every registered codec. |
+| `container.rs` | One container's reader, both ladder rungs — the selector's high bit picks seekable vs. `ForwardOnly` so both walk paths get fuzzed, not just the seekable one. Also runs an independent EOCD re-parse and a second forward-only walk as cross-checks (see the module doc for why each is not redundant with the honesty oracle below). |
+| `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the layer a real `curl \| stuffr cat -` exercises and a silent wrong-format bug once lived in. |
+
+Every decode path in all three is bounded (`DecodeOpts::memory_limit`,
+a capped output read) for the same reason the codec's own conformance
+harness bounds decode: an unbounded pre-flight allocation or an
+unconditional `read_to_end` on a decompression bomb would turn every
+subsequent run into an OOM or a false "crash" instead of a finding.
+
+### The oracle lives in the library, not in the targets
+
+`stuffr-core/src/honesty.rs` holds the four invariants the targets assert —
+`check_error_is_classified`, `check_entry_size`, `check_entry_count`,
+`check_fidelity_claim` — re-exported through `stuffr_core::testing` (gated
+`#[cfg(any(test, feature = "testing"))]`) rather than written inline in a
+fuzz target. The reason is structural, not a style preference: **a fuzz
+target's checks cannot be unit-tested, so a harness that runs clean is
+indistinguishable from one whose invariants are vacuous** — "ran 30 seconds,
+found nothing" looks identical either way, whether the target is genuinely
+clean or the assertion inside it never fires. Because the four functions
+live in an ordinary library module, each has a `mod broken_honesty` double
+proving it *can* fail — the same `broken_codecs`/`broken_containers` pattern
+the conformance harnesses already use — so a vacuous check is caught the
+same way a vacuous conformance property would be.
+
+The first invariant, `check_error_is_classified`, guards `Error::exit_code`'s
+`_ => 1` wildcard: hostile bytes may be refused, but never as exit 1, which
+means "stuffr itself failed" rather than "the input was bad". It found a real
+bug before the fuzzer had run once — `Error::NotSeekable` was falling through
+to exit 1 despite being the *mandated* reply to `by_index` on a forward-only
+source, so a valid archive read from a pipe was reporting failure for a
+by-design refusal. It is now exit 3.
+
+### The slot tables are append-only
+
+`CODEC_SLOTS` and `CONTAINER_SLOTS` (`stuffr-core`'s `testing` module) map a
+fuzz input's selector byte to a format name. **Append only — never reorder,
+never remove; retire a slot by leaving it in place.** The ordering is the
+wire format of every corpus seed on disk: a seed minimised against `bzip2`
+is a seed whose selector byte, modulo the table's length, happens to land on
+`bzip2`'s current index. Reorder the table and that same seed silently
+starts feeding a different codec — nothing fails to tell you, and a corpus
+built to cover eleven codecs quietly stops covering one of them.
+
+### Corpus and running locally
+
+The corpus is generated, not committed (`fuzz/.gitignore`'s `/corpus`):
+
+```bash
+make fuzz-corpus   # (re)generate fuzz/corpus/{codec,container,chain}
+make fuzz          # short, seeded smoke pass — the local equivalent of CI's fuzz-smoke job
+```
+
+`make fuzz` mirrors `ci.yml`'s `fuzz-smoke` job exactly — same fixed
+`-runs=2000 -seed=1` budget per target, same non-zero-execution-count check
+so a target that silently returns early on every input can't pass by doing
+nothing. Neither `fuzz-corpus` nor `fuzz` is part of `make check`: `cargo
+fuzz` needs the nightly toolchain the gate does not assume, and generating
+the corpus writes real files under a gitignored directory rather than
+something every edit should refresh. A slower, wall-clock-budgeted pass runs
+weekly (and on demand) via `.github/workflows/fuzz-deep.yml`, independent of
+`ci.yml`.
+
+**A crash becomes an ordinary regression test, not a file left in
+`fuzz/artifacts/`.** Reduce the crashing input, understand which of the four
+invariants (or which codec/container property) it violates, and add it as a
+named unit or CLI test the normal way — the artifact itself is not the
+fix and is not meant to be committed.
+
 ## Testing
 
 Test-driven: write the failing test, watch it fail for the reason you expect,
