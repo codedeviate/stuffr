@@ -269,6 +269,14 @@ fuzz_target!(|data: &[u8]| {
         };
         let declared_size = entry.meta().size;
         let entry_name = entry.meta().name.clone();
+        // Cloned alongside the name, and for the same reason: `entry.meta()`
+        // borrows `entry`, which `entry.reader()` below needs mutably.
+        // `check_entry_size` consults the kind because a SYMLINK's payload is
+        // read by the container itself and the caller is handed
+        // `io::empty()` — see that function's own doc for why passing the
+        // kind is what stops this target aborting on the first legitimate
+        // archive `make fuzz-corpus` writes.
+        let entry_kind = entry.meta().kind.clone();
         enumerated += 1;
 
         let mut produced = 0u64;
@@ -298,7 +306,7 @@ fuzz_target!(|data: &[u8]| {
         // `entry` is dropped at the end of this loop body, releasing its
         // borrow on `ar` before the next `ar.next_entry()` call.
 
-        check_entry_size(declared_size, produced, &entry_name).expect("entry size");
+        check_entry_size(declared_size, produced, &entry_name, &entry_kind).expect("entry size");
     }
 
     // Read the report only now that the walk is complete, not mid-walk.

@@ -6,7 +6,7 @@
 //! looks identical either way. Here each one has a broken double proving it
 //! can fail, exactly as `conformance.rs`'s `broken_codecs` does.
 
-use crate::{Error, Fidelity, FidelityReport};
+use crate::{EntryKind, Error, Fidelity, FidelityReport};
 
 /// Hostile bytes may be refused, but never as an internal error.
 ///
@@ -27,8 +27,42 @@ pub fn check_error_is_classified(e: &Error) -> Result<(), String> {
     }
 }
 
-/// A header that declares *n* bytes must deliver exactly *n*.
-pub fn check_entry_size(declared: Option<u64>, produced: u64, name: &str) -> Result<(), String> {
+/// A header that declares *n* bytes must deliver exactly *n* — **unless the
+/// entry is a symlink**, whose payload its container consumed before the
+/// caller ever saw it.
+///
+/// The exemption is not a softening of the invariant; without it the oracle
+/// is simply wrong. A symlink's target IS its payload in both `zip` and
+/// `cpio`, so both read it eagerly while the entry is still in hand, put it
+/// in `EntryKind::Symlink { target }`, and hand the caller `io::empty()` —
+/// with `EntryMeta::size` still carrying the declared target length, because
+/// that is what the header said. Declared 8, produced 0, by design, on every
+/// symlink in every archive this project writes. Measured: `stuffr pack tree
+/// -o t.zip` over a directory holding one symlink, fed to the `container`
+/// fuzz target, aborted with `entry "tree/link.txt" declared 8 bytes but
+/// produced 0` — a legitimate archive stuffr had just written moments
+/// earlier. An oracle that fires there cries wolf on the first valid archive
+/// the corpus generator produces and buries every real finding behind it.
+///
+/// Nothing is lost by the exemption, which is the reason it is safe to make:
+/// the eager read is the one place a truncated target COULD hide, and both
+/// containers already check it there themselves — `zip.rs`'s and `cpio.rs`'s
+/// `read_symlink_target` each raise [`Error::Corrupt`] when the payload runs
+/// short of the declared length, before an `Entry` is ever handed back. The
+/// check is not skipped; it has already happened.
+///
+/// Every other kind stays in scope, `Dir` and `Other` included: a directory
+/// entry declares zero and delivers zero, and an entry that cannot say what
+/// it is has no eager-read convention to stand on.
+pub fn check_entry_size(
+    declared: Option<u64>,
+    produced: u64,
+    name: &str,
+    kind: &EntryKind,
+) -> Result<(), String> {
+    if matches!(kind, EntryKind::Symlink { .. }) {
+        return Ok(());
+    }
     match declared {
         Some(d) if d != produced => Err(format!(
             "entry {name:?} declared {d} bytes but produced {produced}"
@@ -158,15 +192,47 @@ mod broken_honesty {
 
     #[test]
     fn a_declared_size_that_disagrees_with_bytes_produced_is_refused() {
-        let msg = check_entry_size(Some(100), 42, "a.txt").expect_err("mismatch must fail");
+        let msg = check_entry_size(Some(100), 42, "a.txt", &EntryKind::File)
+            .expect_err("mismatch must fail");
         assert!(msg.contains("a.txt"), "must name the entry: {msg}");
         assert!(
             msg.contains("100") && msg.contains("42"),
             "must name both numbers: {msg}"
         );
         // An undeclared size cannot disagree with anything.
-        assert!(check_entry_size(None, 42, "a.txt").is_ok());
-        assert!(check_entry_size(Some(42), 42, "a.txt").is_ok());
+        assert!(check_entry_size(None, 42, "a.txt", &EntryKind::File).is_ok());
+        assert!(check_entry_size(Some(42), 42, "a.txt", &EntryKind::File).is_ok());
+        // And the exemption below is specific to symlinks, not to "any kind
+        // that is not a file": a directory or an unclassifiable entry
+        // declaring bytes it does not deliver is still a violation.
+        for kind in [EntryKind::Dir, EntryKind::Other] {
+            assert!(
+                check_entry_size(Some(100), 42, "a.txt", &kind).is_err(),
+                "{kind:?} must stay in scope"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symlink_whose_target_was_consumed_eagerly_is_permitted() {
+        // `zip.rs` and `cpio.rs` both read a symlink's target out of its
+        // payload while the entry is in hand and hand the caller
+        // `io::empty()` afterwards, `EntryMeta::size` still carrying the
+        // declared target length. Declared 8, produced 0, on every symlink in
+        // every archive this project writes — a passing outcome by design.
+        //
+        // This is an OVER-strictness guard, so neutering `check_entry_size`
+        // to `Ok(())` makes it pass harder rather than fail. Its falsification
+        // is the opposite edit — deleting the `EntryKind::Symlink` arm — and
+        // that has been made and observed red; see the task report. The
+        // sibling test above is what reddens under the neutering edit.
+        let link = EntryKind::Symlink {
+            target: "real.txt".into(),
+        };
+        assert!(
+            check_entry_size(Some(8), 0, "link.txt", &link).is_ok(),
+            "a symlink's target is read by the container, not by the caller"
+        );
     }
 
     #[test]
