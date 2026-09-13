@@ -690,10 +690,15 @@ fn note_unreachable_records(
 /// The cost of the narrowness is a miss, never a wrong answer. A
 /// stub-prefixed (self-extracting) archive whose index is unusable is not
 /// caught, because its first local header sits at `ZipArchive::offset()`
-/// rather than at 0 — and that figure does not exist until the archive is
-/// open, by which point these bytes are no longer reachable. A miss leaves
-/// the behaviour exactly as it was; a false positive would refuse a valid
-/// archive.
+/// rather than at 0. **That is a deferral, not an impossibility, and the
+/// earlier wording here claimed the latter.** `ZipArchive::into_inner` is
+/// public in zip 8.6.0 alongside `offset()`, so the bytes ARE reachable from
+/// inside the `is_empty()` branch; closing the gap means re-reading four
+/// bytes at `offset()` there. It is left open because the exposure is narrow
+/// — magic detection needs `PK` at offset 0, so only extension-based
+/// resolution reaches a stub-prefixed file at all, and the fuzz targets
+/// cannot construct the class either. A miss leaves the behaviour exactly as
+/// it was; a false positive would refuse a valid archive.
 fn begins_with_a_local_header<R: Read + Seek>(r: &mut R) -> bool {
     let mut head = [0u8; 4];
     r.seek(SeekFrom::Start(0)).is_ok()
@@ -715,10 +720,19 @@ fn begins_with_a_local_header<R: Read + Seek>(r: &mut R) -> bool {
 /// the SAME binary recovers in full, correctly named, when the identical
 /// bytes arrive on a pipe. Info-ZIP's `unzip -l` refuses it at exit 3.
 ///
-/// [`note_unreachable_records`] cannot see this, and is not being loosened to
-/// make it: its guard 1 requires the EOCD's declared comment length to run
-/// exactly to the end of the file, this record's does not, so `declared` is
-/// `None` and there is no count to compare against. That guard is what keeps
+/// [`note_unreachable_records`] cannot see the 568-byte reproducer, and is not
+/// being loosened to make it: its guard 1 requires the EOCD's declared comment
+/// length to run exactly to the end of the file, that record's does not, so
+/// `declared` is `None` and there is no count to compare against.
+///
+/// **It is not blind to the whole class, though, and an earlier wording here
+/// overstated that.** Of 211 inputs this guard refuses, one had a
+/// well-formed-enough EOCD that `note_unreachable_records` did fire on it —
+/// exit 0 with an `EntryCountMismatch` warning, exit 4 under the strict gate.
+/// This guard runs first, so such an archive is now refused at exit 5 rather
+/// than warned about. That escalation is right on the merits — nothing was
+/// reachable either way — but it does mean a zero-enumeration archive can no
+/// longer report a count mismatch. That guard is what keeps
 /// the count warning off healthy archives and it is right; this is a second,
 /// independent observation standing beside it.
 ///

@@ -102,8 +102,10 @@ impl Error {
     ///
     /// # Exit 5 or exit 6 on an absurd header field: the rule the guards actually follow
     ///
-    /// Five guards in this workspace refuse a declared header field before it
-    /// can do damage, and they split across two codes:
+    /// Five of this workspace's guards refuse a declared header field before
+    /// it can do damage, and they split across two codes. The table is
+    /// exhaustive of the five it names, NOT of every bounding check in the
+    /// tree — see the known exception below it:
     ///
     /// | guard | error | exit |
     /// |---|---|---|
@@ -132,6 +134,23 @@ impl Error {
     /// the file — only from which guard stopped first. Each site links here
     /// rather than re-deriving a local justification, because four local
     /// derivations produced four different rules for one contract.
+    ///
+    /// **One live pair does NOT follow this rule, and saying so here is the
+    /// point of writing the rule down.** `cpio.rs`'s and `zip.rs`'s
+    /// `read_symlink_target` apply the SAME predicate against the SAME
+    /// constant — `declared > MAX_SYMLINK_TARGET_LEN`, 65,536 — and answer
+    /// differently: cpio `ResourceLimit`/6, zip `Corrupt`/5. By the rule above
+    /// both are 6: the field is measured against a structural ceiling and
+    /// refused before anything is sized from it. zip's own message even reads
+    /// "refusing to allocate", which is this rule's definition of exit 6.
+    ///
+    /// It is left inconsistent rather than fixed silently because changing it
+    /// is a user-visible exit-code change and **no test covers either site's
+    /// code today** — an untested behaviour change is not something to slip in
+    /// beside a documentation fix. Whoever aligns them should write that test
+    /// first. Two earlier attempts to state this contract were each falsified
+    /// by a live site; this is the third, and it names its own exception
+    /// rather than waiting to be caught by a fourth reader.
     ///
     /// What a caller can still read off the code: exit 6 says a LIMIT decided
     /// the outcome, exit 5 says the FILE did and no budget changes that. The
