@@ -132,8 +132,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, PeekSource, Resolved, Result,
-    Sink, Source,
+    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Sink,
+    Source,
 };
 
 use crate::normalize::CPIO_MALFORMED_AS_INVALID_DATA_EOF;
@@ -240,7 +240,10 @@ impl Container for CpioNewc {
         let Resolved { source, report, .. } = resolved;
         let seekable = source.caps().seekable;
         Ok(Box::new(CpioRead {
-            state: CpioState::Idle(source),
+            // The one and only place a `CpioSource` is built — see its doc
+            // for why installing the read-ahead buffer here, rather than
+            // wrapping per entry, is the whole fix.
+            state: CpioState::Idle(CpioSource::new(source)),
             report,
             seekable,
             magic_checked: false,
@@ -305,7 +308,126 @@ fn classify_cpio_error(e: io::Error) -> Error {
     Error::from_decode_io(e)
 }
 
-type CpioSource = Box<dyn Source>;
+/// The reader `cpio::newc::Reader` is handed, installed exactly ONCE per
+/// archive (in `CpioNewc::open`) and threaded through every entry by
+/// [`CpioState`]: it wraps the real source and carries the single, reused
+/// read-ahead buffer [`CpioRead::next_entry`]'s per-header peek fills.
+///
+/// # Why a wrapper installed once, and not a peek per entry
+///
+/// [`refuse_an_oversized_namesize`] has to see `c_namesize` before EVERY
+/// header, because the allocation it guards is one `cpio::newc::Reader::new`
+/// call per entry, not one per archive. The obvious way to write that —
+/// wrap the source in a fresh `PeekSource` before each header, the way
+/// `stuffr_core::probe` wraps one before a whole stream — is what 0.3.1
+/// shipped, and it is quadratic: `PeekSource::fill` takes a
+/// `Box<dyn Source>` and RETURNS a new one, so entry *N*'s bytes are read
+/// through *N* nested dynamic-dispatch frames, each retaining its own
+/// ~112-byte prefix. Measured on a forward-only (pipe-shaped) archive of
+/// zero-length entries, release build:
+///
+/// | entries | nested peek (0.3.1) | this wrapper |
+/// |---|---|---|
+/// | 5,000 | 116 ms | 5.2 ms |
+/// | 10,000 | 368 ms | 5.8 ms |
+/// | 20,000 | 1.56 s | 6.9 ms |
+/// | 40,000 | 6.10 s | 12.0 ms |
+/// | 100,000 | **stack overflow, `SIGABRT`** | 27.0 ms |
+///
+/// Doubling the entry count quadrupled the time, and at 100,000 entries the
+/// nesting exhausted a 2 MiB test-thread stack outright — so the fix for an
+/// unbounded per-header ALLOCATION had bought an unbounded per-entry frame.
+/// `ar.rs`'s `ArGuardedReader` is the
+/// sibling precedent and has never had this problem for exactly this reason:
+/// it is installed once, below the crate, and inspects headers as they flow
+/// through it. cpio can take the same shape but does not need the full state
+/// machine, because this module — unlike `ar`'s — already drives the
+/// entry loop itself and therefore already knows where every header starts.
+///
+/// # The nesting is unrepresentable, not merely avoided
+///
+/// `CpioSource` deliberately does NOT implement [`Source`]. `PeekSource::fill`
+/// — and every other wrapper in `stuffr_core::source` — takes a
+/// `Box<dyn Source>`, so re-wrapping this type does not TYPECHECK. That is
+/// the regression guard: a timing assertion tight enough to separate linear
+/// from quadratic growth would flake on a loaded CI runner, whereas "it does
+/// not compile" cannot silently stop being true. The measurement above is
+/// reproducible on demand via the `#[ignore]`d
+/// `a_forward_read_scales_linearly_with_entry_count`.
+///
+/// # One path, not two
+///
+/// The 0.3.1 helper had a separate seekable branch that read the prefix and
+/// then seeked back. That is gone: buffering 102 bytes costs the same on a
+/// file as on a pipe, and a single path is one fewer place for the two to
+/// disagree. Nothing below this wrapper seeks — `by_index` refuses on every
+/// cpio source (see [`CpioRead::by_index`]) — so no position needs restoring.
+struct CpioSource {
+    inner: Box<dyn Source>,
+    /// Bytes read ahead of `cpio::newc::Reader` and not yet replayed to it.
+    /// Never longer than [`CPIO_NAMESIZE_FIELD_END`]: it is topped up to
+    /// that width before each header and fully drained by the header read
+    /// that follows.
+    peeked: Vec<u8>,
+    /// How much of `peeked` has already been replayed.
+    pos: usize,
+}
+
+impl CpioSource {
+    fn new(inner: Box<dyn Source>) -> Self {
+        CpioSource {
+            inner,
+            peeked: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    /// Reads ahead far enough to cover `c_namesize` — see
+    /// [`CPIO_NAMESIZE_FIELD_END`] — without consuming anything: whatever is
+    /// buffered here is replayed by this type's own `Read` impl before a single
+    /// byte is taken from `inner` again.
+    ///
+    /// A short read is not an error. A stream that ends before offset 102 is
+    /// truncated, and `cpio::newc::Reader::new`'s own `read_exact` is the
+    /// right place to say so — [`peek_namesize`] returns `None` for a prefix
+    /// too short to hold the field, so the guard simply stands aside.
+    fn fill_header_prefix(&mut self) -> Result<()> {
+        // Anything already replayed is spent; anything not replayed (there
+        // is none on the honest path, since a header read always drains the
+        // whole prefix) is kept and topped up rather than re-read.
+        self.peeked.drain(..self.pos);
+        self.pos = 0;
+        while self.peeked.len() < CPIO_NAMESIZE_FIELD_END {
+            let at = self.peeked.len();
+            self.peeked.resize(CPIO_NAMESIZE_FIELD_END, 0);
+            let n = self.inner.read(&mut self.peeked[at..])?;
+            self.peeked.truncate(at + n);
+            if n == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// What [`CpioSource::fill_header_prefix`] buffered, and what the two
+    /// header guards inspect. Borrowed, not cloned — the borrow ends before
+    /// this source is moved into `cpio::newc::Reader::new`.
+    fn header_prefix(&self) -> &[u8] {
+        &self.peeked[self.pos..]
+    }
+}
+
+impl Read for CpioSource {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos < self.peeked.len() {
+            let n = (self.peeked.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.peeked[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
 
 /// What this reader currently holds. See the module doc's "Not
 /// self-referential" section for why this shape, rather than a borrowed
@@ -337,28 +459,29 @@ impl ArchiveRead for CpioRead {
         // Recover the raw reader, finishing off whatever entry the PREVIOUS
         // call returned — `Reader::finish` drains any bytes the caller did
         // not read itself, exactly as if the caller had read them.
-        let src = match std::mem::replace(&mut self.state, CpioState::Ended) {
+        let mut src = match std::mem::replace(&mut self.state, CpioState::Ended) {
             CpioState::Idle(src) => src,
             CpioState::Reading(reader) => reader.finish().map_err(classify_cpio_error)?,
             CpioState::Ended => return Ok(None),
         };
 
-        // Peeked before EVERY header, not just the first: `refuse_an_
+        // Read ahead before EVERY header, not just the first: `refuse_an_
         // oversized_namesize` (Task 5c) must see `c_namesize` before
         // `cpio::newc::Reader::new` gets a chance to allocate on its say-so,
         // and that allocation is one `Reader::new` call per entry, not one
-        // per archive. Peeking is non-consuming — a seekable source is read
-        // and rewound to wherever it started, a pipe is wrapped in a
-        // replaying `PeekSource` — so the reader below still sees the same
-        // bytes either way. A read failure here propagates as `Error::Io` —
-        // property 10's source-error passthrough — rather than being
-        // mistaken for a variant refusal.
-        let (prefix, src) = peek_header_prefix(src)?;
+        // per archive. The read-ahead is non-consuming — `src` replays what
+        // it buffered — and it reuses ONE buffer for the archive's whole
+        // lifetime rather than stacking a wrapper per entry; see
+        // `CpioSource`'s doc for the measurements that shape cost. A read
+        // failure here propagates as `Error::Io` — property 10's
+        // source-error passthrough — rather than being mistaken for a
+        // variant refusal.
+        src.fill_header_prefix()?;
         if !self.magic_checked {
-            refuse_a_recognised_variant_this_crate_cannot_read(&prefix)?;
+            refuse_a_recognised_variant_this_crate_cannot_read(src.header_prefix())?;
             self.magic_checked = true;
         }
-        refuse_an_oversized_namesize(&prefix)?;
+        refuse_an_oversized_namesize(src.header_prefix())?;
 
         let mut reader = cpio::newc::Reader::new(src).map_err(classify_cpio_error)?;
         if reader.entry().is_trailer() {
@@ -603,38 +726,6 @@ fn refuse_an_oversized_namesize(prefix: &[u8]) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-/// Peeks the fixed prefix of the NEXT header — enough to cover
-/// `c_namesize` — without disturbing what a caller reads afterwards.
-///
-/// Deliberately not `stuffr_core::probe`: that helper rewinds a seekable
-/// source to ABSOLUTE offset 0, which is exactly right for identifying a
-/// fresh stream's format once (its own doc: "peeks `PROBE_LEN` of the
-/// file") but wrong here, because this runs before EVERY entry's header —
-/// rewinding to file offset 0 mid-archive would replay the first entry
-/// forever. Instead this saves and restores the CURRENT position for a
-/// seekable source, and wraps a forward-only one in the same
-/// [`PeekSource`] `probe` itself uses, which does not assume any particular
-/// starting offset.
-fn peek_header_prefix(mut src: CpioSource) -> Result<(Vec<u8>, CpioSource)> {
-    if let Some(seek) = src.as_seek() {
-        let start = seek.stream_position()?;
-        let mut buf = vec![0u8; CPIO_NAMESIZE_FIELD_END];
-        let mut filled = 0;
-        while filled < buf.len() {
-            match seek.read(&mut buf[filled..])? {
-                0 => break,
-                n => filled += n,
-            }
-        }
-        buf.truncate(filled);
-        seek.seek(io::SeekFrom::Start(start))?;
-        return Ok((buf, src));
-    }
-    let peek = PeekSource::fill(src, CPIO_NAMESIZE_FIELD_END)?;
-    let prefix = peek.prefix().to_vec();
-    Ok((prefix, Box::new(peek)))
 }
 
 /// Reads a symlink entry's target out of its payload — see the module doc's
@@ -1872,5 +1963,41 @@ mod tests {
             .expect("a legitimate long name must not be refused")
             .expect("must yield the one entry written");
         assert_eq!(entry.meta().name, deep_name);
+    }
+    /// A timing harness, not a gate — see the note in this module's
+    /// `CpioSource` doc. Reads a forward-only (pipe-shaped) archive at two
+    /// entry counts an order of magnitude apart and prints the wall time
+    /// for each, so the growth can be read off directly.
+    ///
+    /// `#[ignore]`d deliberately: the numbers below are seconds on an idle
+    /// machine, and any ratio assertion tight enough to separate linear
+    /// from quadratic is loose enough to flake on a loaded CI runner. The
+    /// regression guard for the shape this measures is a TYPE-level one
+    /// instead (see `CpioSource`'s doc); this test exists so the
+    /// measurement can be reproduced on demand:
+    ///
+    /// ```text
+    /// cargo test -p stuffr-formats --features cpio --release --lib \
+    ///     -- --ignored --nocapture scales
+    /// ```
+    #[test]
+    #[ignore = "timing harness, run explicitly with --ignored --nocapture"]
+    fn a_forward_read_scales_linearly_with_entry_count() {
+        for n in [10_000usize, 100_000usize] {
+            let names: Vec<String> = (0..n).map(|i| format!("entry{i:07}")).collect();
+            let entries: Vec<(&str, &[u8])> =
+                names.iter().map(|s| (s.as_str(), &b""[..])).collect();
+            let bytes = build_cpio(&entries);
+            let started = std::time::Instant::now();
+            let mut ar = open_forward_only(&CpioNewc, &bytes);
+            let mut seen = 0usize;
+            while let Some(entry) = ar.next_entry().expect("forward read") {
+                let _ = entry.meta();
+                seen += 1;
+            }
+            let elapsed = started.elapsed();
+            assert_eq!(seen, n, "every entry must come back");
+            println!("forward read: {n} entries in {elapsed:?}");
+        }
     }
 }
