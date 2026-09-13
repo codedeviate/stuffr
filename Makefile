@@ -6,7 +6,7 @@
 
 CARGO ?= cargo
 
-.PHONY: help check fmt fmt-check lint test test-pure release miri hooks clean
+.PHONY: help check fmt fmt-check lint test test-pure release miri hooks clean fuzz-corpus
 
 help:
 	@echo 'stuffr development targets:'
@@ -19,6 +19,7 @@ help:
 	@echo '  make miri     Miri over the two unsafe regions (tar.rs, ar.rs)'
 	@echo '  make hooks    install the commit-msg hook (once per clone)'
 	@echo '  make clean    remove build artefacts'
+	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain}'
 
 # Ordered so the cheapest gate fails first.
 check: fmt-check lint test test-pure release
@@ -140,6 +141,19 @@ miri:
 hooks:
 	git config core.hooksPath .githooks
 	@echo '✓ commit-msg hook active (core.hooksPath = .githooks)'
+
+# Regenerates fuzz/fuzz-run seed corpus under fuzz/corpus/{codec,container,chain}.
+#
+# NOT part of `check`: this WRITES real files under `fuzz/corpus/`, which is
+# generated and gitignored (`fuzz/.gitignore`'s `/corpus`) rather than
+# refreshed on every commit. The generator itself lives in the FACADE crate
+# (`crates/stuffr/tests/fuzz_corpus.rs`), not `stuffr-core` — `stuffr-core`
+# has zero format dependencies and cannot build a real gzip stream or tar
+# archive, only mocks — so it IS compiled and type-checked by `make
+# test`/`make test-pure` on every run; only this target's actual write is
+# skipped there, via `#[ignore]`.
+fuzz-corpus:
+	$(CARGO) test -p stuffr --features testing generate_corpus -- --ignored
 
 clean:
 	$(CARGO) clean
