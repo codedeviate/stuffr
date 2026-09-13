@@ -144,6 +144,22 @@ impl Error {
             // this wildcard has produced in this phase, after
             // `ChainTooDeep` and `EntryNotFound`.
             Error::Unsupported(_) => 3,
+            // "You asked for random access and this source cannot do it" is
+            // the same answer as the two arms above — a capability limit,
+            // actionable, and never an internal failure. It is the *required*
+            // reply to `by_index` on a forward-only source (container
+            // conformance property 6, and fourteen raisers across `tar.rs`,
+            // `ar.rs`, `cpio.rs` and `zip.rs`), so a valid archive on a pipe
+            // produced it on every single read — and the wildcard below
+            // reported that by-design refusal as exit 1, "stuffr failed".
+            // `entries.rs:453` already treats it as interchangeable with
+            // `Unsupported` when deciding whether to fall back to a forward
+            // walk; the exit code now agrees with that. The FIFTH wrong code
+            // this wildcard has produced, after `ChainTooDeep`,
+            // `EntryNotFound`, `Unsupported` and the
+            // `UnknownFormat`/`AmbiguousFormat` pair. Found by Phase 3a's
+            // honesty oracle (`honesty.rs`), before the fuzzer had run once.
+            Error::NotSeekable { .. } => 3,
             Error::FidelityDegraded(_) => 4,
             Error::Corrupt(_) => 5,
             // A nesting bound is a bound on WORK, the same family as the
@@ -212,6 +228,13 @@ mod tests {
             Error::Unsupported("no zstd in this build".into()).exit_code(),
             3
         );
+        assert_eq!(
+            Error::NotSeekable {
+                format: FormatId::new("squashfs")
+            }
+            .exit_code(),
+            3
+        );
         assert_eq!(Error::FidelityDegraded(2).exit_code(), 4);
         assert_eq!(Error::Corrupt("bad crc".into()).exit_code(), 5);
         assert_eq!(Error::EntryNotFound("nosuch.txt".into()).exit_code(), 2);
@@ -264,7 +287,18 @@ mod tests {
             format: FormatId::new("squashfs"),
         };
         assert!(e.to_string().contains("squashfs"));
-        assert_eq!(e.exit_code(), 1);
+        // Exit 3, not 1. A source that cannot seek is a capability limit in
+        // exactly the sense `Unsupported` and `CapabilityUnavailable` are,
+        // and it is the mandated answer to `by_index` on a forward-only
+        // source — so exit 1 meant every valid archive read from a pipe
+        // reported "stuffr failed". See `exit_code`'s own arm for why this
+        // is the fifth variant the wildcard has misfiled.
+        assert_eq!(e.exit_code(), 3);
+        assert_ne!(
+            e.exit_code(),
+            1,
+            "a by-design refusal must stay distinguishable from an internal failure"
+        );
     }
 
     #[test]
@@ -337,8 +371,9 @@ mod tests {
     /// `AmbiguousFormat` fell through the wildcard to 1 — an internal
     /// failure — so `stuffr list plain.txt.gz` exited 2 and `stuffr list
     /// plain.txt` exited 1 for the same class of mistake. Explicit arms,
-    /// not the wildcard: that wildcard has now produced a wrong code four
-    /// times in this phase.
+    /// not the wildcard: that wildcard has now produced a wrong code five
+    /// times, `NotSeekable` being the fifth (see its own arm in
+    /// `exit_code`).
     #[test]
     fn pointing_a_verb_at_the_wrong_file_is_always_exit_two() {
         assert_eq!(
