@@ -103,17 +103,26 @@
 //!   length read out of the symbol table's PAYLOAD (not a header field),
 //!   inside `Archive::parse_symbol_table_if_necessary`.
 //!
-//! The third is real in the crate but **dead code from this module**: it is
-//! reachable only through `Archive::symbols()` (and `count_entries`/
-//! `jump_to_entry`, which call `scan_if_necessary` but never parse the
-//! symbol table itself). [`ArRead::by_index`] above never calls into any of
-//! them — it answers `Unsupported`/`NotSeekable` unconditionally, without
-//! touching the archive's seek-based API at all, and nothing else in this
-//! workspace calls `.symbols(`, `count_entries` or `jump_to_entry` either.
-//! So it is left unfixed, deliberately: bounding it would mean peeking into
-//! a payload this container never asks the crate to parse, for a code path
-//! nothing here can reach. **If `by_index` or a `symbols` surface is ever
-//! added for `ar`, this is the site that must be bounded FIRST, before that
+//! The third is real in the crate but **unreachable from this module — as a
+//! matter of typechecking, not of call graph**. It is reached only through
+//! `Archive::symbols()` (and `count_entries`/`jump_to_entry`, which call
+//! `scan_if_necessary` but never parse the symbol table themselves), and all
+//! three live in `impl<R: Read + Seek> Archive<R>` (`ar-0.9.0/src/lib.rs:626`)
+//! while [`ArSource`] is [`ArGuardedReader`], which implements `Read` and not
+//! `Seek` — as did the `Box<dyn Source>` it replaced, since `Source: Read +
+//! Send`. **Calling any of them from here would not compile.**
+//!
+//! That is worth stating precisely rather than as "nothing calls it", which
+//! is also true (`ArRead::by_index` answers `Unsupported`/`NotSeekable`
+//! unconditionally, and no other caller in this workspace names `.symbols(`,
+//! `count_entries` or `jump_to_entry`) but is the weaker fact: a call graph
+//! can silently stop being empty when someone adds one line, whereas a
+//! missing `Seek` bound cannot. So the site is left unfixed deliberately:
+//! bounding it would mean peeking into a payload this container never asks
+//! the crate to parse, for code the compiler will not let this module reach.
+//! **If `ar` ever grows a real `by_index` or `symbols` surface — which means
+//! giving [`ArSource`] a `Seek` impl, the very thing that unlocks these
+//! methods — this is the site that must be bounded FIRST, before that
 //! lands.**
 //!
 //! The FOURTH site is not an allocation at all and is worse than any of
@@ -491,8 +500,8 @@ fn scan_ar_header(
             // table (identifier exactly `/`) is excluded because the crate
             // returns from that branch before parsing an index at all; its
             // OWN string-table length is out of scope for a different
-            // reason — see the module doc's "dead code from this module"
-            // paragraph.
+            // reason — the module doc's third site, which this module cannot
+            // reach without giving `ArSource` a `Seek` impl.
             refuse_an_out_of_range_name_table_index(&hdr[1..16], *name_table_len)?;
         }
     } else if *variant != ar::Variant::BSD && identifier.ends_with(b"/") {

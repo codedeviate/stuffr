@@ -54,6 +54,29 @@ pub fn check_error_is_classified(e: &Error) -> Result<(), String> {
 /// Every other kind stays in scope, `Dir` and `Other` included: a directory
 /// entry declares zero and delivers zero, and an entry that cannot say what
 /// it is has no eager-read convention to stand on.
+///
+/// # The exemption is keyed on the KIND, and is therefore wider than its reason
+///
+/// The justification above is specific to `zip` and `cpio`, the two
+/// containers that consume a symlink's payload eagerly. `tar` does not: it
+/// reports `EntryKind::Symlink` from its typeflag byte (`tar.rs`'s
+/// `entry_kind`) while leaving the payload alone, and `ar` has no symlink
+/// concept at all. So this `matches!` also disables the oracle for a tar
+/// symlink entry, where "the container ate the payload" is simply not what
+/// happened. That is an over-reach, not a considered scope — do not read the
+/// exemption as evidence that tar symlinks were excluded on purpose.
+///
+/// It is tolerated rather than narrowed because nothing is currently lost by
+/// it: `tar.rs`'s own `EntryPayload` raises [`Error::Corrupt`] for a symlink
+/// payload shorter than its header declares, so a fuzz target meeting a
+/// truncated tar symlink takes the error branch and never reaches this check
+/// — the same "already checked, one layer down" argument the zip/cpio case
+/// rests on, arrived at by accident rather than by design. Narrowing this to
+/// "the container consumed the payload" would mean carrying that fact on the
+/// `Entry` itself, which is a container-API change for no behaviour change
+/// today. If a container is ever added that reports `Symlink` AND does not
+/// check its own payload length, this is the line that must be narrowed
+/// first.
 pub fn check_entry_size(
     declared: Option<u64>,
     produced: u64,
