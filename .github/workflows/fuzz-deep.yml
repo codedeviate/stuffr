@@ -1,0 +1,98 @@
+name: fuzz (deep, scheduled)
+
+# The counterpart to ci.yml's `fuzz-smoke` job: that job is short, seeded and
+# deterministic on purpose (Ruling G — a few thousand runs per target, a few
+# seconds each), which is what earns it the right to run on every push and PR
+# without slowing them down. This workflow trades determinism for depth: it
+# runs on a schedule, gives each target real wall-clock time, and is not
+# reproducible run-to-run by design — its job is to find what the smoke job's
+# fixed, small budget cannot reach, not to be re-run and get the same answer.
+#
+# Ruling I's "pure tier only" reasoning does NOT apply here on principle —
+# this is exactly the workflow a `--features c-backed` pass would belong in if
+# one is ever wanted — but none is added yet: nothing has motivated the extra
+# time cost so far, and adding it is a one-line change to the matrix below
+# when it is.
+
+on:
+  schedule:
+    # Once a week (Sunday, 03:17 UTC — off the hour to avoid the scheduling
+    # pile-up GitHub warns about at :00). Deep fuzzing is exploratory, not a
+    # release gate, so weekly is enough cadence to be worth the runner time
+    # without competing for capacity with `ci.yml` on every push.
+    - cron: "17 3 * * 0"
+  # Lets a maintainer kick off a deep run on demand (e.g. right after a
+  # change to a codec/container's decode path) without waiting for Sunday.
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-deep:
+    name: fuzz deep (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # Ruling J: a scheduled workflow must not run in a fork of this
+    # repository. `schedule` events aren't delivered to forks by GitHub in
+    # the first place unless a fork owner has separately enabled Actions and
+    # recreated the schedule themselves, but `workflow_dispatch` above can be
+    # triggered manually from a fork — this guard is what actually closes
+    # that gap, not the schedule trigger's own default behaviour.
+    if: github.repository == 'codedeviate/stuffr'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [codec, container, chain]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # See ci.yml's `fuzz-smoke` job: `fuzz/` is excluded from the
+          # workspace and builds into its own `fuzz/target`, not the
+          # workspace's `target/`.
+          workspaces: "fuzz -> target"
+      # See ci.yml's `fuzz-smoke` job for why this is necessary at all:
+      # rust-toolchain.toml pins 1.95, and cargo-fuzz needs nightly.
+      - run: rm rust-toolchain.toml
+      # Same pin and same reasoning as ci.yml's `fuzz-smoke` job: cargo-fuzz
+      # has no prebuilt binary on this image, and pinning is what makes the
+      # cache key meaningful (bump both together, deliberately).
+      - name: cache cargo-fuzz binary
+        id: cache-cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+      - name: install cargo-fuzz
+        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # Generated, not committed (`fuzz/.gitignore`'s `/corpus`) — regenerated
+      # fresh for every scheduled run, exactly as ci.yml's smoke job does.
+      - run: make fuzz-corpus
+      # Real time, not a fixed `-runs=`, unlike the smoke job: this workflow
+      # exists specifically to spend wall-clock time the smoke job's Ruling-G
+      # determinism budget can't afford. 20 minutes per target keeps the
+      # three-way matrix under GitHub's per-job limits with headroom for
+      # queueing, while still being an order of magnitude deeper than the
+      # smoke job's few seconds.
+      - name: fuzz ${{ matrix.target }} (20 minutes)
+        run: |
+          cmd="cargo fuzz run ${{ matrix.target }} -- -max_total_time=1200"
+          echo "==> $cmd"
+          $cmd
+      # Ruling J: a crash input that only lives on the runner's disk is a
+      # wasted run — the runner is torn down the moment the job ends. This
+      # step is `if: failure()` so it uploads exactly when the step above
+      # crashed (a timeout with nothing found exits 0 and skips this).
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: warn
+          retention-days: 30

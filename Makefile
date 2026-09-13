@@ -6,7 +6,7 @@
 
 CARGO ?= cargo
 
-.PHONY: help check fmt fmt-check lint test test-pure release miri hooks clean fuzz-corpus
+.PHONY: help check fmt fmt-check lint test test-pure release miri hooks clean fuzz-corpus fuzz
 
 help:
 	@echo 'stuffr development targets:'
@@ -20,6 +20,7 @@ help:
 	@echo '  make hooks    install the commit-msg hook (once per clone)'
 	@echo '  make clean    remove build artefacts'
 	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain}'
+	@echo '  make fuzz     short, seeded smoke pass over codec/container/chain (mirrors CI)'
 
 # Ordered so the cheapest gate fails first.
 check: fmt-check lint test test-pure release
@@ -137,6 +138,50 @@ miri:
 	  fi; \
 	  echo "==> $$n tests passed under MIRIFLAGS=$$flags"; \
 	done
+
+# Local rehearsal of ci.yml's `fuzz-smoke` job: same fixed -runs/-seed
+# budget per target, same non-zero-execution-count check (Ruling H — see
+# that job's comments for why the check exists and how it was verified to
+# actually fail). NOT part of `check`, for the same reason `miri` isn't:
+# cargo-fuzz needs the nightly toolchain, and `make check` is meant to run
+# after every edit on whatever toolchain is active.
+#
+# Unlike CI, this does NOT `rm rust-toolchain.toml` — that file is a
+# tracked part of a local checkout, not an ephemeral one, and deleting it
+# out from under your working tree to run one target would be a surprise
+# every other command in this Makefile has to live with afterwards. Every
+# invocation below uses an explicit `+nightly` override instead, which wins
+# over the 1.95 pin without touching the file (verified locally: `cargo
+# fuzz run` with the pin in place and no override fails with "the option
+# `Z` is only accepted on the nightly compiler"; `cargo +nightly fuzz run`
+# does not).
+#
+# cargo-fuzz itself is a precondition, not something this target installs:
+# `cargo install cargo-fuzz --locked` once per machine, matching the
+# version ci.yml pins (0.13.2 at time of writing). A Makefile reaching past
+# the workspace to modify your toolchain on every invocation would be worse
+# than asking once.
+FUZZ_RUNS = 2000
+FUZZ_SEED = 1
+fuzz: fuzz-corpus
+	@status=0; \
+	for target in codec container chain; do \
+	  cmd="cargo +nightly fuzz run $$target -- -runs=$(FUZZ_RUNS) -seed=$(FUZZ_SEED)"; \
+	  echo "==> $$cmd"; \
+	  tmp=$$(mktemp); \
+	  if ! $$cmd >"$$tmp" 2>&1; then \
+	    echo "make fuzz: target '$$target' crashed (or otherwise exited non-zero) — see output below" >&2; \
+	    cat "$$tmp"; rm -f "$$tmp"; status=1; continue; \
+	  fi; \
+	  n=$$(grep -oE 'Done [0-9]+ runs' "$$tmp" | tail -1 | grep -oE '[0-9]+'); \
+	  if [ -z "$$n" ] || [ "$$n" -eq 0 ]; then \
+	    echo "make fuzz: target '$$target' reported zero (or no) executions — treating as a failure, not a clean run" >&2; \
+	    cat "$$tmp"; rm -f "$$tmp"; status=1; continue; \
+	  fi; \
+	  echo "target '$$target': $$n executions — OK"; \
+	  rm -f "$$tmp"; \
+	done; \
+	exit $$status
 
 hooks:
 	git config core.hooksPath .githooks

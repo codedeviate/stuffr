@@ -162,6 +162,107 @@ jobs:
       # nothing.
       - run: make miri
 
+  fuzz-smoke:
+    name: fuzz smoke (codec, container, chain — pure tier)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # `fuzz/` is excluded from the workspace (its own Cargo.toml,
+          # `publish = false`) and cargo-fuzz builds it into `fuzz/target`,
+          # not the workspace's own `target/` — the default rust-cache
+          # config here would cache the latter and miss this job's actual
+          # build output entirely.
+          workspaces: "fuzz -> target"
+      # rust-toolchain.toml pins 1.95 for local development, and rustup
+      # honours it for every `cargo` invocation regardless of which
+      # toolchain actions/steps selected above — see "gate" and "miri"'s
+      # identical step. `cargo fuzz` needs the nightly compiler (it passes
+      # `-Zsanitizer=address` to rustc), and without removing this file
+      # `dtolnay/rust-toolchain@nightly` is inert and every `cargo fuzz`
+      # call below fails with "the option `Z` is only accepted on the
+      # nightly compiler" — reproduced locally while writing this job.
+      - run: rm rust-toolchain.toml
+      # cargo-fuzz ships no prebuilt binary and isn't on the runner image.
+      # Pinned to the version this job was written and verified against
+      # (0.13.2); cached below so a warm run doesn't recompile it from
+      # scratch. Bump deliberately, the same way the rest of this project
+      # pins tool versions it depends on.
+      - name: cache cargo-fuzz binary
+        id: cache-cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-0.13.2-${{ runner.os }}
+      - name: install cargo-fuzz
+        if: steps.cache-cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # Generated, not committed (`fuzz/.gitignore`'s `/corpus`) — without
+      # this, every target below fuzzes from an empty corpus, which is
+      # exactly the "silently fuzzes nothing" failure mode the execution-
+      # count check two steps down exists to catch, not something to rely
+      # on this step alone to prevent.
+      - run: make fuzz-corpus
+      # Ruling I: pure tier only. `stuffr-fuzz` depends on `stuffr` (and
+      # `stuffr-core`) with no `c-backed` feature, so this already fuzzes
+      # the default/pure selection. The two build tiers register different
+      # IMPLEMENTATIONS behind the same slot names (see `stuffr-core`'s
+      # `testing::CODEC_SLOTS`/`CONTAINER_SLOTS` and the Makefile's own
+      # `test`/`test-pure` split for the identical reasoning) — fuzzing
+      # `--features c-backed` here too would double this job's time for a
+      # second pass over the same surface, not new coverage. The scheduled
+      # deep workflow (`fuzz-deep.yml`) is where that tier would be added
+      # if ever wanted.
+      #
+      # Ruling G: fixed `-runs=N`, not `-max_total_time=N` — a time budget
+      # makes coverage depend on runner load, so the same commit fuzzes a
+      # different amount every run and a crash stops being reproducible
+      # from the log. Fixed `-seed=` so the mutation sequence is
+      # reproducible, and the exact `cargo fuzz run ...` command is echoed
+      # so a developer can copy it straight out of a red log. This job is
+      # NOT part of `gate` for the same reason `miri` isn't: `make check`
+      # runs after every edit, and a seeded fuzz pass — however short — is
+      # not that.
+      #
+      # Ruling H: a corpus that silently failed to generate, or a target
+      # stubbed to return early on every input, would otherwise exit 0 and
+      # print output indistinguishable from a clean run. This step parses
+      # libFuzzer's own "Done N runs" summary line and fails if the count
+      # is zero or the line is missing entirely (the latter is what happens
+      # when a target crashes or exits before printing it — verified by
+      # temporarily stubbing `codec.rs`'s target to `std::process::exit(0)`
+      # at its top: the run then exits with no "Done N runs" line at all,
+      # and this check correctly refuses it. See task-5-report.md for the
+      # quoted failure).
+      - name: fuzz codec, container and chain (short, seeded, deterministic)
+        run: |
+          set -u
+          FUZZ_RUNS=2000
+          FUZZ_SEED=1
+          status=0
+          for target in codec container chain; do
+            cmd="cargo fuzz run $target -- -runs=$FUZZ_RUNS -seed=$FUZZ_SEED"
+            echo "==> $cmd"
+            log=$(mktemp)
+            if ! $cmd >"$log" 2>&1; then
+              echo "::error::fuzz target '$target' crashed (or otherwise exited non-zero) — see output below"
+              cat "$log"
+              status=1
+              continue
+            fi
+            count=$(grep -oE 'Done [0-9]+ runs' "$log" | tail -1 | grep -oE '[0-9]+' || true)
+            if [ -z "$count" ] || [ "$count" -eq 0 ]; then
+              echo "::error::fuzz target '$target' reported zero (or no) executions in its libFuzzer summary — treating this as a failure, not a clean run"
+              cat "$log"
+              status=1
+              continue
+            fi
+            echo "fuzz target '$target': $count executions — OK"
+          done
+          exit $status
+
   purity:
     name: purity (pure pulls in no C-compiling crate)
     runs-on: ubuntu-latest
