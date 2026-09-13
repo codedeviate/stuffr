@@ -60,16 +60,26 @@
 //!    property blind to two codecs whose corrupted-decode failure path is
 //!    only reached through a compressible stream's match/back-reference
 //!    structure — see [`compressible`]'s doc.
-//! 10. Truncated input is rejected. Unlike property 9, nothing can switch
-//!     this off: every framed format detects premature EOF regardless of
-//!     checksum, so a codec failing this should either detect truncation or
-//!     be reconsidered. This is not the same guarantee as property 9's: even
-//!     a raw, unframed stream can often still catch truncation structurally
-//!     — raw deflate has no checksum (so corruption decodes to silently wrong
-//!     bytes, property 9's exact gap) but its `BFINAL` bit means a stream cut
-//!     short before the final block surfaces as `UnexpectedEof` anyway. That
-//!     split — truncation catchable without any checksum, corruption not —
-//!     is exactly why the two properties are gated differently. Cuts at
+//! 10. Truncated input is rejected. Unlike property 9, almost nothing can
+//!     switch this off: every framed format detects premature EOF regardless
+//!     of checksum, so a codec failing this should either detect truncation
+//!     or be reconsidered. This is not the same guarantee as property 9's:
+//!     even a raw, unframed stream can often still catch truncation
+//!     structurally — raw deflate has no checksum (so corruption decodes to
+//!     silently wrong bytes, property 9's exact gap) but its `BFINAL` bit
+//!     means a stream cut short before the final block surfaces as
+//!     `UnexpectedEof` anyway. That split — truncation catchable without any
+//!     checksum, corruption not — is exactly why the two properties are
+//!     gated differently. The one declaration-gated exception,
+//!     `CodecCaps::truncation_undetectable`, exists for a format measured to
+//!     have NEITHER signal at all — see that field's own doc for the one
+//!     codec (Unix compress, `legacy::compress_z`) that needs it, backed by a
+//!     bit-level measurement and two independent reference tools agreeing.
+//!     It is not a loophole: `testing::MockCodec`, the harness's own bare
+//!     unframed double, deliberately does NOT set it and is proven, in this
+//!     module's own tests, to still fail property 10 — the exception is for a
+//!     real, external format fact, not for a codec that merely finds framing
+//!     inconvenient to add. Cuts at
 //!     several lengths, not only the midpoint — including one byte short of
 //!     the full length and a small prefix — because a cut exactly at a
 //!     format's own internal framing boundary (lz4's 64 KiB block boundary,
@@ -688,56 +698,68 @@ fn assert_codec_conforms_impl(codec: &dyn Codec, meta: &FormatMeta, fixture: Opt
         //     property for why the midpoint alone is not enough — and
         //     requires the classified error, not merely that one occurred:
         //     see the module doc's note on `Error::from_decode_io`.
-        match &corruption_input {
-            Some(base) if base.is_empty() => {
-                skip(
-                    id,
-                    10,
-                    "the encoded stream/fixture is empty; nothing to truncate",
-                );
-            }
-            Some(base) => {
-                let len = base.len();
-                let mut cuts: Vec<usize> = vec![1, len / 2, len.saturating_sub(1)];
-                cuts.retain(|&c| c < len);
-                cuts.sort_unstable();
-                cuts.dedup();
-                for cut in cuts {
-                    let truncated = base[..cut].to_vec();
-                    let src: Box<dyn Source> =
-                        Box::new(ReaderSource::new(std::io::Cursor::new(truncated)));
-                    let mut dec = codec
-                        .decoder(src, &DecodeOpts::default())
-                        .unwrap_or_else(|e| {
-                            panic!("conformance[{id}] property 10 decoder (cut {cut}/{len}): {e}")
-                        });
-                    let mut out = Vec::new();
-                    match dec.read_to_end(&mut out) {
-                        Ok(_) => panic!(
-                            "conformance[{id}] property 10: truncated input (cut to {cut} of \
+        if caps.truncation_undetectable {
+            skip(
+                id,
+                10,
+                "this codec declares CodecCaps::truncation_undetectable — measurement (see \
+                 that field's doc) found no signal in the format that could ever tell a \
+                 truncated stream from a complete one",
+            );
+        } else {
+            match &corruption_input {
+                Some(base) if base.is_empty() => {
+                    skip(
+                        id,
+                        10,
+                        "the encoded stream/fixture is empty; nothing to truncate",
+                    );
+                }
+                Some(base) => {
+                    let len = base.len();
+                    let mut cuts: Vec<usize> = vec![1, len / 2, len.saturating_sub(1)];
+                    cuts.retain(|&c| c < len);
+                    cuts.sort_unstable();
+                    cuts.dedup();
+                    for cut in cuts {
+                        let truncated = base[..cut].to_vec();
+                        let src: Box<dyn Source> =
+                            Box::new(ReaderSource::new(std::io::Cursor::new(truncated)));
+                        let mut dec = codec.decoder(src, &DecodeOpts::default()).unwrap_or_else(
+                            |e| {
+                                panic!(
+                                    "conformance[{id}] property 10 decoder (cut {cut}/{len}): {e}"
+                                )
+                            },
+                        );
+                        let mut out = Vec::new();
+                        match dec.read_to_end(&mut out) {
+                            Ok(_) => panic!(
+                                "conformance[{id}] property 10: truncated input (cut to {cut} of \
                              {len} bytes) decoded without error; a codec failing this should \
                              either detect truncation or be reconsidered"
-                        ),
-                        Err(e) => {
-                            let classified = crate::Error::from_decode_io(e);
-                            assert!(
-                                matches!(classified, crate::Error::Corrupt(_)),
-                                "conformance[{id}] property 10: truncated input (cut to {cut} \
+                            ),
+                            Err(e) => {
+                                let classified = crate::Error::from_decode_io(e);
+                                assert!(
+                                    matches!(classified, crate::Error::Corrupt(_)),
+                                    "conformance[{id}] property 10: truncated input (cut to {cut} \
                                  of {len} bytes) raised {classified:?}, expected \
                                  Error::Corrupt (exit 5) — NormalizeDecodeErrors should \
                                  classify truncation as InvalidData"
-                            );
-                            assert_eq!(
-                                classified.exit_code(),
-                                5,
-                                "conformance[{id}] property 10: Error::Corrupt must be exit \
+                                );
+                                assert_eq!(
+                                    classified.exit_code(),
+                                    5,
+                                    "conformance[{id}] property 10: Error::Corrupt must be exit \
                                  code 5"
-                            );
+                                );
+                            }
                         }
                     }
                 }
+                None => skip(id, 10, NO_FIXTURE),
             }
-            None => skip(id, 10, NO_FIXTURE),
         }
 
         // 11. A genuine I/O failure reading the SOURCE — not malformed

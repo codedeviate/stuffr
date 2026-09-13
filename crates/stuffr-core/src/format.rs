@@ -141,6 +141,47 @@ pub struct CodecCaps {
     /// ratios, and two builds of stuffr would otherwise produce very different
     /// files from an identical command with no way to tell which they got.
     pub weak_encoder: bool,
+
+    /// True only when the format itself carries no signal whatsoever — no
+    /// checksum, no length, no structural decode constraint, no end-of-stream
+    /// marker — that could ever distinguish a truncated stream from a complete
+    /// one. Conformance property 9 (`conformance.rs`) already has a
+    /// declaration-gated skip for "no checksum"
+    /// (`CorruptionDetection::Never`); property 10 (truncation) does not,
+    /// deliberately — `conformance.rs`'s own `mod broken_codecs` keeps
+    /// `testing::MockCodec`, a bare unframed XOR pass-through, specifically
+    /// UNABLE to clear property 10
+    /// (`mock_codec_clears_every_property_up_to_truncation`) to prove the
+    /// property really does fire against an unframed stream, and every real
+    /// codec so far closes the gap: a mandatory checksum (gzip, zlib, bzip2,
+    /// snappy), a per-writer optional one this build's own encoder always
+    /// turns on (zstd, xz, lz4), structural invalidity from a range coder
+    /// (LZMA1), or, for a codec with neither, an explicit end-of-stream
+    /// signal (raw deflate's `BFINAL` bit — see `deflate.rs`).
+    ///
+    /// `legacy::compress_z` (Phase 3b) is the first exception, and this field
+    /// exists because of it, not in anticipation of it: Unix compress's LZW
+    /// code stream has none of the above. A prefix of a valid stream decodes
+    /// via the identical state machine as the full stream and simply runs out
+    /// of bits, producing a shorter but otherwise byte-correct prefix of the
+    /// real output with no error — measured directly, at the bit level, on
+    /// this project's own `hello.Z` fixture: cutting 1, 25 or 50 of its 51
+    /// bytes left between 5 and 7 leftover, unconsumed bits in every case,
+    /// including the GENUINE, untruncated end (6 leftover bits) — no leftover
+    /// count or value distinguishes a real ending from a truncated one, because
+    /// both stop for the identical reason (too few bits left for the next
+    /// code). Confirmed independently against two production reference
+    /// tools, not just this crate: `/usr/bin/uncompress` and `/usr/bin/gzip
+    /// -dc` on macOS both exit 0 with silently-partial output on the same cut
+    /// files, rather than reporting an error. This is a real, external,
+    /// cross-validated fact about the format, not a gap in `compress_z`'s own
+    /// decoder — see that module's doc for the full measurement.
+    ///
+    /// Defaults to `false` (assumed detectable) via [`Self::round_trip`] and
+    /// [`Self::decode_only`], so every existing codec's behavior — including
+    /// `testing::MockCodec`'s own deliberate failure above — is unchanged;
+    /// only `compress_z::CompressZ` sets this explicitly.
+    pub truncation_undetectable: bool,
 }
 
 /// What a container can do, and what it needs from its input.
@@ -215,6 +256,7 @@ impl CodecCaps {
             detects_corruption: CorruptionDetection::Never,
             memory_per_worker: None,
             weak_encoder: false,
+            truncation_undetectable: false,
         }
     }
 
@@ -230,6 +272,7 @@ impl CodecCaps {
             detects_corruption: CorruptionDetection::Never,
             memory_per_worker: None,
             weak_encoder: false,
+            truncation_undetectable: false,
         }
     }
 }

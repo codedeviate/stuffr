@@ -26,6 +26,8 @@ pub mod cpio;
 pub mod deflate;
 #[cfg(feature = "gzip")]
 pub mod gzip;
+#[cfg(any(feature = "lha", feature = "arj", feature = "compress"))]
+pub mod legacy;
 #[cfg(feature = "lz4")]
 pub mod lz4;
 #[cfg(feature = "lzip")]
@@ -148,6 +150,15 @@ pub fn register_all(registry: &mut Registry) {
     registry.register_codec(std::sync::Arc::new(zstd_c::Zstd), zstd_c::meta());
     #[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
     registry.register_codec(std::sync::Arc::new(zstd_pure::Zstd), zstd_pure::meta());
+
+    // Phase 3b, Task 4: the first read-only legacy codec. No mutual
+    // exclusion to worry about — unlike xz/lzma/zstd, this format has only
+    // one backend.
+    #[cfg(feature = "compress")]
+    registry.register_codec(
+        std::sync::Arc::new(legacy::compress_z::CompressZ),
+        legacy::compress_z::meta(),
+    );
 }
 
 /// How many formats this build contains. Useful for smoke tests.
