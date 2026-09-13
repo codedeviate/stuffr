@@ -92,6 +92,61 @@ jobs:
           cmd="cargo fuzz run ${{ matrix.target }} -- -max_total_time=1200"
           echo "==> $cmd"
           $cmd
+      # A red scheduled run is opened by whoever gets the email, possibly
+      # weeks later and not necessarily the person who wrote the target, so
+      # the triage instructions go in the failed job's own log rather than in
+      # a comment nobody opens the file to read. The 20-minute budget is
+      # deliberately NOT reduced to make red runs rarer: depth is the entire
+      # reason this workflow exists, and a job tuned to find less is not the
+      # answer to a job whose findings nobody can interpret.
+      #
+      # There is no known-crash exemption to state here, deliberately. The one
+      # crash this workflow was expected to ship red on — the 568-byte zip
+      # whose central directory reaches nothing, which needed roughly 16,500
+      # runs to rediscover — is FIXED (`zip.rs`'s
+      # `refuse_an_index_that_reaches_nothing`), and the parked reproducer was
+      # verified to run clean through this target afterwards. A red run
+      # therefore means a NEW finding, which is the first thing a triager
+      # needs to know. If a crash is ever knowingly parked again, THIS is
+      # where it must be named: a scheduled job that is red by construction,
+      # with nothing saying so, trains people to ignore it, and then it is
+      # worth nothing.
+      - name: how to triage this failure
+        if: failure()
+        run: |
+          cat <<'TRIAGE'
+          A deep fuzz run found something. There are no knowingly-parked
+          crashes in this workflow, so treat this as a new finding.
+
+          1. Download the `fuzz-crash-${{ matrix.target }}` artifact from this
+             run's summary page. It holds the crashing input, one file.
+
+          2. Reproduce it locally (nightly + cargo-fuzz 0.13.2):
+
+                 make fuzz-corpus
+                 cargo +nightly fuzz run ${{ matrix.target }} PATH/TO/INPUT
+
+             A single named input runs once and exits 77 on a finding, 0 if it
+             no longer reproduces.
+
+          3. The panic message names the invariant that failed — one of
+             check_error_is_classified, check_entry_size, check_entry_count or
+             check_fidelity_claim. Read that function's doc comment in
+             crates/stuffr-core/src/honesty.rs FIRST: each one states what it
+             deliberately permits, and several findings in this project's
+             history were the oracle being too strict rather than the code
+             being wrong.
+
+          4. To reproduce at the CLI instead: the `codec` and `container`
+             targets' inputs carry a leading SELECTOR byte that is not part of
+             the stream — its low 7 bits index CODEC_SLOTS/CONTAINER_SLOTS
+             (crates/stuffr-core/src/testing.rs) and its high bit picks the
+             seekable rung. Strip it (`tail -c +2`) to get the bytes stuffr
+             itself would read. `chain` inputs carry no selector byte.
+
+          5. Crash artifacts are kept for 30 days. Copy the input out of the
+             artifact before then, or the finding is lost with it.
+          TRIAGE
       # Ruling J: a crash input that only lives on the runner's disk is a
       # wasted run — the runner is torn down the moment the job ends. This
       # step is `if: failure()` so it uploads exactly when the step above
