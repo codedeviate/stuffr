@@ -1315,10 +1315,16 @@ mod tests {
         }
     }
 
-    /// A codec whose `decoder()` construction always succeeds (matching
-    /// every real codec's lazy-construction convention — see `zlib.rs` and
-    /// `lzip.rs`) but whose FIRST read fails with `InvalidData`, standing in
-    /// for a corrupt payload behind an intact-looking header.
+    /// A codec whose `decoder()` construction always succeeds but whose FIRST
+    /// read fails with `InvalidData`, standing in for a corrupt payload behind
+    /// an intact-looking header.
+    ///
+    /// `zlib.rs` is the lazy shape this models. Do NOT read it as "every real
+    /// codec constructs lazily" — `xz_pure.rs` and `lzip.rs` both read at
+    /// construction (`fill_buf()`), and reach the same place only because they
+    /// end in `.unwrap_or(&[])`, which swallows the failure and defers it to
+    /// the re-probe read this module classifies. An earlier version of this
+    /// comment named `lzip.rs` as an example of the convention it contradicts.
     struct FailingDecodeCodec;
 
     impl Codec for FailingDecodeCodec {
