@@ -210,8 +210,38 @@ hooks:
 # archive, only mocks — so it IS compiled and type-checked by `make
 # test`/`make test-pure` on every run; only this target's actual write is
 # skipped there, via `#[ignore]`.
+#
+# The recipe below does NOT just run that test: it checks the filter matched
+# something and that seeds reached the disk. Neither is paranoia. A cargo test
+# filter that matches nothing exits 0 and prints `0 passed`, so renaming the
+# generator turns this target into a silent no-op — and `fuzz`'s downstream
+# execution-count check will not notice, as this comment's own paragraph above
+# already establishes (libFuzzer reports a full `Done N runs` from an empty
+# corpus). With no guard at either end, the corpus — the harness's entire
+# coverage story — could quietly become nothing with every gate still green.
+# `--exact` would not close it: a renamed test matches nothing under `--exact`
+# too, and still exits 0. Counting what ran, and then looking at the disk, is
+# what closes it.
 fuzz-corpus:
-	$(CARGO) test -p stuffr --features testing generate_corpus -- --ignored
+	@out=$$($(CARGO) test -p stuffr --features testing generate_corpus -- --ignored 2>&1); \
+	status=$$?; \
+	printf '%s\n' "$$out"; \
+	[ $$status -eq 0 ] || exit $$status; \
+	ran=$$(printf '%s\n' "$$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' \
+	       | awk '{ total += $$1 } END { print total + 0 }'); \
+	if [ "$$ran" -eq 0 ]; then \
+	  echo "make fuzz-corpus: the 'generate_corpus' filter matched no test — the corpus was NOT regenerated" >&2; \
+	  echo "  (a cargo test filter that matches nothing exits 0; this is the guard that turns that into a failure)" >&2; \
+	  exit 1; \
+	fi; \
+	for target in codec container chain; do \
+	  dir=fuzz/corpus/$$target; \
+	  if [ -z "$$(find $$dir -type f -size +0c 2>/dev/null | head -1)" ]; then \
+	    echo "make fuzz-corpus: $$dir holds no non-empty seed after a run the generator reported as passing" >&2; \
+	    exit 1; \
+	  fi; \
+	done; \
+	echo "✓ corpus regenerated ($$ran generator test(s) ran; codec/container/chain all non-empty)"
 
 clean:
 	$(CARGO) clean
