@@ -506,7 +506,7 @@ checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "stuffr"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "stuffr-core",
  "stuffr-formats",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "stuffr-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "tempfile",
  "thiserror",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "stuffr-formats"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "ar",
  "brotli",
