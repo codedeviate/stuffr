@@ -14,6 +14,8 @@ pub mod error;
 pub mod fidelity;
 pub mod format;
 pub mod governor;
+#[cfg(any(test, feature = "testing"))]
+mod honesty;
 pub mod ladder;
 pub mod probe;
 pub mod registry;

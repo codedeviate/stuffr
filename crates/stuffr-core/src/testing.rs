@@ -19,6 +19,30 @@ pub use crate::conformance::{
     assert_codec_conforms, assert_codec_conforms_with, compressible, incompressible,
 };
 pub use crate::container_conformance::{assert_container_conforms, open_forward_only};
+pub use crate::honesty::{
+    check_entry_count, check_entry_size, check_error_is_classified, check_fidelity_claim,
+};
+
+/// The fuzzer's codec selector table: byte `n % CODEC_SLOTS.len()` names a
+/// format, so this ordering is the wire format of every corpus seed on disk.
+///
+/// **Append only. NEVER reorder, never remove — retire a slot by leaving it in
+/// place.** Reordering silently changes what every existing corpus seed means:
+/// a seed minimised against `bzip2` would start feeding `brotli` instead, and
+/// nothing would fail to tell you.
+///
+/// This lives in `stuffr-core` rather than in the fuzz targets because a later
+/// task's corpus generator runs inside this crate and must write the *same*
+/// selector byte the targets decode. `stuffr-core` cannot depend on `fuzz/`,
+/// which is excluded from the workspace, so a copy in each would be free to
+/// drift — precisely the failure the append-only rule exists to prevent.
+pub const CODEC_SLOTS: &[&str] = &[
+    "gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd", "xz", "lzma", "lzip",
+];
+
+/// The fuzzer's container selector table. Same append-only rule as
+/// [`CODEC_SLOTS`], for the same reason.
+pub const CONTAINER_SLOTS: &[&str] = &["tar", "ar", "cpio", "zip"];
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
 pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");
