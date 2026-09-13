@@ -89,6 +89,7 @@ use crate::archive::{ArchiveRead, Container, CreateOpts, EntryMeta, OpenOpts, Pl
 use crate::error::Result;
 use crate::fidelity::Rung;
 use crate::format::FormatMeta;
+use crate::honesty::check_error_is_classified;
 use crate::source::{ReaderSource, SeekRead, Source, SourceCaps};
 
 /// `S_IFMT`: the four top bits of a unix `st_mode` that name the entry's
@@ -537,6 +538,206 @@ fn read_all_meta_seekable(container: &dyn Container, bytes: &[u8]) -> Vec<EntryM
         out.push(meta);
     }
     out
+}
+
+/// One entry a fixture is known to contain.
+///
+/// Content is stored inline rather than hashed: fixtures are small by
+/// design, a byte comparison gives a far better failure message than a
+/// hash mismatch, and it keeps `stuffr-core` free of a digest dependency.
+#[derive(Debug, Clone)]
+pub struct ExpectedEntry {
+    pub name: &'static str,
+    pub content: &'static [u8],
+}
+
+/// An archive with known contents, for a container that cannot write its own
+/// test input.
+///
+/// **`provenance` is load-bearing, not decoration.** It records where
+/// `expected` came from, and it is printed in every failure message this
+/// harness raises. A fixture whose expectation was derived from the very
+/// crate under test proves only that the crate agrees with itself; saying so
+/// at the point of failure is what stops that being mistaken for evidence.
+#[derive(Debug, Clone)]
+pub struct ContainerFixture {
+    pub bytes: &'static [u8],
+    pub expected: &'static [ExpectedEntry],
+    pub provenance: &'static str,
+}
+
+/// Asserts every conformance property that applies to a container which
+/// CANNOT write its own test input — the shape every Phase 3 legacy format
+/// takes (read-only, `caps.write == false`).
+///
+/// [`assert_container_conforms`] is unusable here: it calls `build()` inside
+/// its `if caps.read` block, and `build()` unwraps `create()`, so a
+/// `write: false` container kills the harness outright rather than running a
+/// reduced property set (`the_write_gated_entry_point_cannot_run_a_read_only_
+/// container` in `mod broken_containers` pins this). This entry point takes a
+/// known-good `fixture` instead of building one, and runs the subset of
+/// properties that make sense without a write side — deliberately a
+/// SEPARATE function from `assert_container_conforms`, not a unified one with
+/// more gating, for the same reason the codec side keeps
+/// `assert_codec_conforms`/`assert_codec_conforms_with` apart.
+///
+/// Every assertion message begins `conformance[{id}] property N (...)` and
+/// includes `fixture provenance: {}`, so a red test says up front how
+/// trustworthy its own expectation is — load-bearing where a later fixture's
+/// `expected` was derived from the very crate under test.
+pub fn assert_container_conforms_with(
+    container: &dyn Container,
+    meta: &FormatMeta,
+    fixture: &ContainerFixture,
+) {
+    let id = container.id();
+    let caps = container.caps();
+    let provenance = fixture.provenance;
+
+    // 1. Identity: a mismatched registration is otherwise silent.
+    assert_eq!(
+        id, meta.id,
+        "conformance[{id}] property 1: Container::id() disagrees with its registered \
+         FormatMeta (fixture provenance: {provenance})"
+    );
+
+    // 2. Read-only declaration: caps.read must be true (this entry point has
+    //    nothing to run otherwise), and if the container also declares
+    //    write: false, create() must genuinely refuse rather than silently
+    //    succeed — a read-only container that writes anyway is lying about
+    //    its own caps.
+    assert!(
+        caps.read,
+        "conformance[{id}] property 2: assert_container_conforms_with requires caps.read \
+         (fixture provenance: {provenance})"
+    );
+    if !caps.write {
+        let result = container.create(
+            PlainSink::new(Box::new(CaptureWriter::new())),
+            &CreateOpts::default(),
+        );
+        match result {
+            Ok(_) => panic!(
+                "conformance[{id}] property 2: caps.write is false but create() succeeded — \
+                 a read-only container must refuse to write, not silently accept \
+                 (fixture provenance: {provenance})"
+            ),
+            Err(e) => {
+                if let Err(msg) = check_error_is_classified(&e) {
+                    panic!(
+                        "conformance[{id}] property 8: create()'s read-only refusal is not \
+                         classified: {msg} (fixture provenance: {provenance})"
+                    );
+                }
+            }
+        }
+    }
+
+    // 3. Magic agreement: AT LEAST ONE registered rule must match the
+    //    fixture's own bytes. No round trip needed — the fixture already IS
+    //    the encoded form.
+    if !meta.magics.is_empty() {
+        let hit = meta.magics.iter().any(|r| {
+            fixture.bytes.len() >= r.offset + r.bytes.len()
+                && &fixture.bytes[r.offset..r.offset + r.bytes.len()] == r.bytes
+        });
+        assert!(
+            hit,
+            "conformance[{id}] property 3: no registered magic rule matches the fixture's \
+             bytes (fixture provenance: {provenance})"
+        );
+    }
+
+    // 4 & 5. Enumeration and content: read the fixture back through the
+    //    container's own reader and compare against the manifest — this is
+    //    the property the manifest exists for; without it the harness only
+    //    proves the container returns *something*.
+    let got = read_all(container, fixture.bytes).unwrap_or_else(|e| {
+        panic!(
+            "conformance[{id}] property 4: failed to read the fixture back: {e} \
+             (fixture provenance: {provenance})"
+        )
+    });
+    let got_names: Vec<&str> = got.iter().map(|(name, _)| name.as_str()).collect();
+    let want_names: Vec<&str> = fixture.expected.iter().map(|e| e.name).collect();
+    assert_eq!(
+        got_names, want_names,
+        "conformance[{id}] property 4: entry names/order disagree with the fixture's \
+         manifest (fixture provenance: {provenance})"
+    );
+    for (got_entry, want_entry) in got.iter().zip(fixture.expected.iter()) {
+        assert_eq!(
+            &got_entry.1[..],
+            want_entry.content,
+            "conformance[{id}] property 5: content mismatch for entry {:?} \
+             (fixture provenance: {provenance})",
+            want_entry.name
+        );
+    }
+
+    // 6. Truncation. UNCONDITIONAL, mirroring the write-capable harness's own
+    //    property 9: the one property a container author cannot vote
+    //    themselves out of. The container must either error (classified, not
+    //    exit 1) or return fewer entries than the manifest promises;
+    //    silently returning the full expected set is the failure.
+    let cut = fixture.bytes.len() / 2;
+    if cut > 0 {
+        match read_all(container, &fixture.bytes[..cut]) {
+            Err(e) => {
+                if let Err(msg) = check_error_is_classified(&e) {
+                    panic!(
+                        "conformance[{id}] property 8: truncation error is not classified: \
+                         {msg} (fixture provenance: {provenance})"
+                    );
+                }
+            }
+            Ok(entries) => {
+                assert!(
+                    entries.len() < fixture.expected.len(),
+                    "conformance[{id}] property 6: a fixture truncated to {cut} of {} bytes \
+                     was accepted silently, returning all {} expected entries \
+                     (fixture provenance: {provenance})",
+                    fixture.bytes.len(),
+                    fixture.expected.len(),
+                );
+            }
+        }
+    }
+
+    // 7. Corruption: flip the middle byte. Never the expected content
+    //    unchanged — an error, a short read, or different content are all
+    //    acceptable, exactly like the write-capable harness's own property 7
+    //    (renumbered here to avoid colliding with property 6 above).
+    if !fixture.bytes.is_empty() {
+        let mut corrupted = fixture.bytes.to_vec();
+        let mid = corrupted.len() / 2;
+        corrupted[mid] ^= 0xFF;
+        match read_all(container, &corrupted) {
+            Err(e) => {
+                if let Err(msg) = check_error_is_classified(&e) {
+                    panic!(
+                        "conformance[{id}] property 8: corruption error is not classified: \
+                         {msg} (fixture provenance: {provenance})"
+                    );
+                }
+            }
+            Ok(entries) => {
+                let unchanged = entries.len() == fixture.expected.len()
+                    && entries
+                        .iter()
+                        .zip(fixture.expected.iter())
+                        .all(|(g, w)| g.0 == w.name && g.1 == w.content);
+                assert!(
+                    !unchanged,
+                    "conformance[{id}] property 7: a corrupted fixture (middle byte flipped \
+                     at offset {mid} of {}) read back byte-identical to the uncorrupted \
+                     expectation — corruption went completely undetected \
+                     (fixture provenance: {provenance})",
+                    fixture.bytes.len(),
+                );
+            }
+        }
+    }
 }
 
 pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
@@ -1005,11 +1206,174 @@ mod tests {
 mod broken_containers {
     use super::*;
     use crate::archive::{ArchiveRead, ArchiveWrite, Entry, Sink};
+    use crate::error::Error;
     use crate::fidelity::FidelityReport;
     use crate::format::{ContainerCaps, FormatId};
     use crate::ladder::Resolved;
     use crate::testing::{FramedMockContainer, framed_container_meta};
     use std::io::Read;
+
+    /// Shared by every read-only double below, so `assert_container_conforms`
+    /// and `assert_container_conforms_with` agree on which id names them.
+    const READ_ONLY_DOUBLE: FormatId = FormatId::new("read-only-double");
+
+    fn read_only_meta() -> FormatMeta {
+        FormatMeta {
+            id: READ_ONLY_DOUBLE,
+            kind: crate::format::FormatKind::Container,
+            magics: &[],
+            extensions: &[],
+            priority: 0,
+        }
+    }
+
+    /// A container that reads but cannot write — the shape every Phase 3
+    /// legacy format takes, and the shape that had never existed in this
+    /// tree.
+    struct ReadOnlyDouble;
+
+    impl Container for ReadOnlyDouble {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: false,
+                needs_seek: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, _resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Err(Error::Unsupported("read-only-double: no fixture".into()))
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported("read-only-double cannot write".into()))
+        }
+    }
+
+    /// `assert_container_conforms` calls `build()` inside its `if caps.read`
+    /// block, and `build()` unwraps `create()`. A `write: false` container
+    /// therefore kills the harness instead of running a reduced property set.
+    ///
+    /// This test exists to pin that the OLD entry point is unusable for a
+    /// read-only container, which is why `assert_container_conforms_with` had
+    /// to be added rather than the gating merely tightened.
+    #[test]
+    #[should_panic(expected = "create")]
+    fn the_write_gated_entry_point_cannot_run_a_read_only_container() {
+        assert_container_conforms(&ReadOnlyDouble, &read_only_meta());
+    }
+
+    /// The base every later read-only double in this phase wraps, rather than
+    /// reimplements from scratch.
+    ///
+    /// Reuses [`FramedMockContainer`]'s own wire format and `ArchiveRead`
+    /// wholesale — the "FE"/"FZ" length-prefixed framing already proven (by
+    /// the tests above `mod broken_containers`) to detect truncation and
+    /// corruption honestly — so this double's ONLY behavioural difference
+    /// from `FramedMockContainer` is refusing to write, which is exactly the
+    /// shape every Phase 3 legacy container takes. A hand-rolled second parser
+    /// here would have to re-earn that honesty from scratch, and would be
+    /// free to drift from the one already proven.
+    ///
+    /// Holds the fixture it was built from so a WRAPPING double can reach it
+    /// — e.g. one that ignores a genuine parse failure and serves the
+    /// fixture's own expectation regardless of what the source actually
+    /// contained ("ignored truncation"). A double that instead needs to
+    /// perturb what a real parse produced (a dropped entry, a renamed entry,
+    /// wrong content) wraps the `Box<dyn ArchiveRead>` `open` returns here,
+    /// the same way every double in `mod broken_containers` above wraps
+    /// `FramedMockContainer`'s.
+    struct MockReadOnly {
+        fixture: ContainerFixture,
+    }
+
+    impl MockReadOnly {
+        fn new(fixture: &ContainerFixture) -> Self {
+            Self {
+                fixture: fixture.clone(),
+            }
+        }
+
+        /// The fixture this double was built from.
+        fn fixture(&self) -> &ContainerFixture {
+            &self.fixture
+        }
+    }
+
+    impl Container for MockReadOnly {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            FramedMockContainer.open(resolved, o)
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported("mock-read-only cannot write".into()))
+        }
+    }
+
+    /// Builds bytes in `FramedMockContainer`'s own wire format
+    /// (`repeat: "FE" | name_len u32le | name | data_len u64le | data`,
+    /// `trailer: "FZ"`) by hand, so `MockReadOnly` — a container that cannot
+    /// write — has something genuine to read. Leaked rather than a `const`
+    /// byte literal: computing it once from the entry list is what keeps this
+    /// test's fixture and its manifest (`ExpectedEntry`) impossible to drift
+    /// apart by hand-transcription error.
+    fn framed_fixture_bytes(entries: &[(&str, &[u8])]) -> &'static [u8] {
+        let mut out = Vec::new();
+        for (name, data) in entries {
+            out.extend_from_slice(b"FE");
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            out.extend_from_slice(data);
+        }
+        out.extend_from_slice(b"FZ");
+        Box::leak(out.into_boxed_slice())
+    }
+
+    #[test]
+    fn the_fixture_entry_point_accepts_a_read_only_container() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_container_conforms_with(&MockReadOnly::new(&fx), &read_only_meta(), &fx);
+    }
+
+    /// Pins the contract Task 2's four wrapping doubles depend on: `new`
+    /// actually stores what it is given, and `fixture()` hands it back
+    /// unaltered. Without this, `MockReadOnly::fixture` would be a field no
+    /// test in this task exercises.
+    #[test]
+    fn mock_read_only_exposes_the_fixture_it_was_built_from() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "mock_read_only_exposes_the_fixture_it_was_built_from",
+        };
+        let mock = MockReadOnly::new(&fx);
+        assert_eq!(mock.fixture().bytes, fx.bytes);
+        assert_eq!(mock.fixture().provenance, fx.provenance);
+    }
 
     /// Property 1 exists because a mismatched registration is otherwise
     /// completely silent — every other property would still pass.
