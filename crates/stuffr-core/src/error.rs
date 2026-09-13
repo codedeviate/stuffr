@@ -148,9 +148,12 @@ impl Error {
             // the same answer as the two arms above — a capability limit,
             // actionable, and never an internal failure. It is the *required*
             // reply to `by_index` on a forward-only source (container
-            // conformance property 6, and fourteen raisers across `tar.rs`,
-            // `ar.rs`, `cpio.rs` and `zip.rs`), so a valid archive on a pipe
-            // produced it on every single read — and the wildcard below
+            // conformance property 6, and SEVEN raisers: `tar.rs`, `ar.rs`,
+            // `cpio.rs` and `zip.rs` each raise it once for exactly this, and
+            // `ladder.rs` (twice) and `probe.rs` (once) raise it from below
+            // the container layer, when the ladder itself cannot supply
+            // seek), so a valid archive on a pipe produced it on every single
+            // read — and the wildcard below
             // reported that by-design refusal as exit 1, "stuffr failed".
             // `entries.rs:453` already treats it as interchangeable with
             // `Unsupported` when deciding whether to fall back to a forward

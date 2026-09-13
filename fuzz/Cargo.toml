@@ -11,10 +11,30 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 stuffr = { path = "../crates/stuffr", features = ["testing"] }
 stuffr-core = { path = "../crates/stuffr-core", features = ["testing"] }
+tempfile = "3"
+# Only for `container.rs`'s independent EOCD re-parse (Ruling A's second
+# guard) — opens a SECOND `zip::ZipArchive` over the same bytes stuffr's own
+# `zip.rs` already opened, so the two can be compared from outside. Metadata
+# only, never decoding an entry, so no codec features are needed.
+zip = { version = "8.6", default-features = false }
 
 [[bin]]
-name = "smoke"
-path = "fuzz_targets/smoke.rs"
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "container"
+path = "fuzz_targets/container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chain"
+path = "fuzz_targets/chain.rs"
 test = false
 doc = false
 bench = false

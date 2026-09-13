@@ -12,10 +12,11 @@ use crate::{Error, Fidelity, FidelityReport};
 ///
 /// `Error::exit_code`'s `_ => 1` wildcard means "stuffr failed". Anything
 /// reaching it for a *bad input* is a misclassification: the input is the
-/// problem, not the program. This guards the wildcard that has produced four
+/// problem, not the program. This guards the wildcard that has produced five
 /// wrong exit codes in this project (`ChainTooDeep`, `EntryNotFound`,
-/// `Unsupported`, and the `UnknownFormat`/`AmbiguousFormat` pair, each fixed
-/// after the fact).
+/// `Unsupported`, the `UnknownFormat`/`AmbiguousFormat` pair, and
+/// `NotSeekable` — the fifth, found by this very oracle before the fuzzer had
+/// run once — each fixed after the fact).
 pub fn check_error_is_classified(e: &Error) -> Result<(), String> {
     match e.exit_code() {
         1 => Err(format!(
@@ -54,7 +55,7 @@ pub fn check_entry_size(declared: Option<u64>, produced: u64, name: &str) -> Res
 ///
 /// **Counts are `usize`, but [`Fidelity::EntryCountMismatch`] carries `u64`.**
 /// Callers converting from `u64` must **saturate**
-/// (`u64::try_from(n).unwrap_or(usize::MAX)`), never cast: `as usize` on a
+/// (`usize::try_from(n).unwrap_or(usize::MAX)`), never cast: `as usize` on a
 /// 32-bit target truncates, and a header declaring `2^32 + 6` would then
 /// compare equal to 6 entries and pass this check silently.
 pub fn check_entry_count(
@@ -192,10 +193,15 @@ mod broken_honesty {
         // produces within minutes, so an oracle firing here would cry wolf on
         // every such zip and bury the real finding.
         //
-        // The other over-strictness guard in this module, so like
-        // `corrupt_unsupported_and_resource_limit_are_all_permitted` it
-        // cannot be reddened by neutering. Falsified by deleting the
-        // `EntryCountMismatch` arm from `check_entry_count`; observed red.
+        // The other over-strictness guard in this module — but, unlike
+        // `corrupt_unsupported_and_resource_limit_are_all_permitted`, NOT
+        // immune to neutering: this test's first assertion guards against
+        // over-strictness (a shortfall the report owns up to must be
+        // permitted) and is falsified by deleting the `EntryCountMismatch`
+        // arm from `check_entry_count`, but its second assertion below (the
+        // unrelated-warning check) still requires the function to REFUSE an
+        // undeclared shortfall, so neutering it to `Ok(())` reddens that
+        // assertion instead. Both edits have been made and observed red.
         let mut declared = FidelityReport::new(Rung::Exact);
         declared.warn(Fidelity::EntryCountMismatch {
             format: crate::FormatId::new("zip"),

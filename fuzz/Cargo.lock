@@ -546,6 +546,8 @@ dependencies = [
  "libfuzzer-sys",
  "stuffr",
  "stuffr-core",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]
