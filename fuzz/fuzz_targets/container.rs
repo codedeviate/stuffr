@@ -125,6 +125,12 @@ fn declared_zip_index(path: &Path) -> Option<usize> {
 /// reasons neither of the other two checks would ever observe), so this runs
 /// for every slot, not only zip.
 ///
+/// **What a divergence PROVES is not the same for zip as for the other
+/// three**, and reading this count as "the seekable walk approximated
+/// something" regardless of slot was the over-strict shape the Phase 3a
+/// whole-branch review caught before the first deep run. See the predicate at
+/// the bottom of the target for the split and the argument.
+///
 /// `None` means "inconclusive", not "zero entries": any error along this path
 /// still goes through `check_error_is_classified` (so a genuine
 /// misclassification reachable ONLY via the forward-only route is still
@@ -335,8 +341,59 @@ fuzz_target!(|data: &[u8]| {
     // forward-only branch and `check_fidelity_claim` can never fire there
     // regardless — running the second walk would cost a walk for an
     // observation that can never matter.
+    //
+    // The PREDICATE is per-slot, because what a divergence proves is not the
+    // same for zip as for the other three, and the difference is the format's
+    // and not an implementation detail:
+    //
+    // * **zip has an authoritative index.** The central directory decides
+    //   what the archive contains; a `PK\x03\x04` the CD does not reference
+    //   is not an entry. A self-extracting stub, an archive comment, junk
+    //   appended past the EOCD, or a fuzzer's mutation landing inside a
+    //   STORED payload all make the forward walk count local headers the
+    //   seekable read is right to ignore — the parked reproducer itself
+    //   carries one at offset 521. `forward != seekable` therefore reports a
+    //   correct seekable read as a finding, which is the shape that gets a
+    //   scheduled job muted. Not hypothetical: a two-entry zip with one
+    //   extra local header spliced in ahead of the central directory —
+    //   what a tool that "deletes" an entry by rewriting the index alone
+    //   leaves behind — lists as two entries under `unzip -l` and under
+    //   stuffr alike, at exit 0 with an empty report, and aborted this
+    //   target under the wide predicate. The one direction that cannot be explained that
+    //   way is a seekable read that reaches NOTHING while a forward walk of
+    //   the same bytes reaches something: an authoritative index excluding
+    //   every local header in the file is not a reading of a healthy archive,
+    //   it is an index that does not describe this file. That is exactly the
+    //   568-byte finding (0 vs 4).
+    //
+    //   **Measured, and stated rather than glossed: that zip arm is
+    //   currently unreachable.** `zip.rs`'s
+    //   `refuse_an_index_that_reaches_nothing` refuses the same inputs at
+    //   `open`, so this line is never reached for them — the parked
+    //   reproducer runs clean through this target now, under the WIDE
+    //   predicate as well. `forward > 0` needs a local file header at
+    //   offset 0 (`ZipStreamed` ends immediately on anything else: a
+    //   four-byte stub prepended to that reproducer makes the forward walk
+    //   count 0, not 4), and offset 0 is exactly the evidence that guard
+    //   fires on. Kept anyway, and NOT vacuous in the tautological sense:
+    //   what satisfies it is a DIFFERENT piece of code, so loosening or
+    //   removing that guard brings this arm straight back to life. An
+    //   oracle whose only witness is the fix it polices is worth keeping;
+    //   one that cannot fail whatever the code does is not.
+    // * **tar, ar and cpio have no index at all.** Both walks are the same
+    //   forward parse of the same bytes; neither reader has a second source
+    //   of truth to disagree with. Any divergence there is a real finding,
+    //   and narrowing these three to the zero case as well would throw away a
+    //   sound observation on three of the four slots to fix a problem only
+    //   the fourth has.
     let approximated = seekable
-        && forward_entry_count(container.as_ref(), payload).is_some_and(|n| n != enumerated);
+        && forward_entry_count(container.as_ref(), payload).is_some_and(|forward| {
+            if name == "zip" {
+                enumerated == 0 && forward > 0
+            } else {
+                forward != enumerated
+            }
+        });
 
     check_fidelity_claim(report, approximated).expect("fidelity claim");
 });
