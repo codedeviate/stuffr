@@ -1185,6 +1185,40 @@ fn assert_panics_naming(container: &dyn Container, meta: &FormatMeta, expected: 
     }
 }
 
+/// [`assert_panics_naming`]'s counterpart for the fixture-driven entry point.
+/// Needed for the same reason that one is: `catch_unwind` alone proves
+/// nothing about *which* property fired, only that something did.
+#[cfg(test)]
+fn assert_panics_naming_with(
+    container: &dyn Container,
+    meta: &FormatMeta,
+    fixture: &ContainerFixture,
+    expected: &str,
+) {
+    let id = container.id();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_container_conforms_with(container, meta, fixture);
+    }));
+    match result {
+        Ok(()) => panic!(
+            "conformance[{id}]: expected assert_container_conforms_with to panic naming \
+             {expected:?}, but it passed"
+        ),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("<non-string panic payload>");
+            assert!(
+                message.contains(expected),
+                "conformance[{id}]: panicked, but the message did not mention {expected:?}: \
+                 {message}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,7 +1242,7 @@ mod broken_containers {
     use crate::archive::{ArchiveRead, ArchiveWrite, Entry, Sink};
     use crate::error::Error;
     use crate::fidelity::FidelityReport;
-    use crate::format::{ContainerCaps, FormatId};
+    use crate::format::{ContainerCaps, FormatId, MagicRule};
     use crate::ladder::Resolved;
     use crate::testing::{FramedMockContainer, framed_container_meta};
     use std::io::Read;
@@ -1226,6 +1260,37 @@ mod broken_containers {
             priority: 0,
         }
     }
+
+    /// `read_only_meta()` with `magics` overridden — `read_only_meta()` itself
+    /// declares none, which is what leaves property 3 (magic agreement)
+    /// permanently skipped rather than exercised. The two tests right below
+    /// `framed_fixture_bytes` are what actually run it, one each way.
+    fn read_only_meta_with_magics(magics: &'static [MagicRule]) -> FormatMeta {
+        FormatMeta {
+            magics,
+            ..read_only_meta()
+        }
+    }
+
+    /// Matches the leading `"FE"` tag every `framed_fixture_bytes` archive
+    /// begins with (see [`framed_fixture_bytes`]'s own doc comment for the
+    /// wire format) — a real registered rule a well-formed fixture satisfies.
+    const FRAMED_FIXTURE_MAGIC: MagicRule = MagicRule {
+        offset: 0,
+        bytes: b"FE",
+        format: READ_ONLY_DOUBLE,
+    };
+
+    /// A rule no `framed_fixture_bytes` archive can ever match: every such
+    /// archive begins `"FE"`, never `"NO"`, at offset 0 — genuinely ABSENT
+    /// from the fixture, not merely checked at the wrong offset (which would
+    /// test offset handling, not the "no rule matches" case property 3
+    /// exists for).
+    const ABSENT_MAGIC: MagicRule = MagicRule {
+        offset: 0,
+        bytes: b"NO",
+        format: READ_ONLY_DOUBLE,
+    };
 
     /// A container that reads but cannot write — the shape every Phase 3
     /// legacy format takes, and the shape that had never existed in this
@@ -1373,6 +1438,51 @@ mod broken_containers {
         let mock = MockReadOnly::new(&fx);
         assert_eq!(mock.fixture().bytes, fx.bytes);
         assert_eq!(mock.fixture().provenance, fx.provenance);
+    }
+
+    /// Property 3 (magic agreement) is gated on `!meta.magics.is_empty()`,
+    /// and every fixture above declares none — so nothing above ever runs
+    /// it. This is the PASSING case: a `FormatMeta` that declares a rule the
+    /// fixture's own bytes genuinely satisfy, proving the property executes
+    /// and does not wrongly reject a matching fixture — not merely that it
+    /// never rejects because it is skipped.
+    #[test]
+    fn the_fixture_entry_point_checks_magic_agreement_when_the_format_declares_one() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        let meta = read_only_meta_with_magics(&[FRAMED_FIXTURE_MAGIC]);
+        assert_container_conforms_with(&MockReadOnly::new(&fx), &meta, &fx);
+    }
+
+    /// The FAILING half: without this, the passing test above only shows the
+    /// property does not wrongly reject — it says nothing about whether the
+    /// property can actually catch a real mismatch. `ABSENT_MAGIC` names a
+    /// rule this fixture's bytes never satisfy at offset 0, so property 3
+    /// must panic.
+    ///
+    /// Mirrors the write-capable harness's own property 2 semantics: AT LEAST
+    /// ONE registered rule must match, not every one (a format with
+    /// alternative signatures is not failed by its second rule). A single
+    /// non-matching rule here is the minimal case of that — zero of one
+    /// matching — not a claim that every rule must match.
+    #[test]
+    fn property_three_catches_a_fixture_that_matches_no_registered_magic() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        let meta = read_only_meta_with_magics(&[ABSENT_MAGIC]);
+        assert_panics_naming_with(&MockReadOnly::new(&fx), &meta, &fx, "property 3");
     }
 
     /// Property 1 exists because a mismatched registration is otherwise
