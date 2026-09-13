@@ -285,7 +285,12 @@ impl Container for Zip {
             // afterwards) and hold the enumeration to it.
             let mut adapter = SeekAdapter(source);
             let declared = read_declared_index(&mut adapter);
+            // Read while the source is still reachable, for the same reason
+            // `read_declared_index` is: nothing gets the bytes back out from
+            // under a `ZipArchive`.
+            let opens_with_an_entry = begins_with_a_local_header(&mut adapter);
             let archive = zip::ZipArchive::new(adapter).map_err(classify_zip_error)?;
+            refuse_an_index_that_reaches_nothing(&archive, opens_with_an_entry)?;
             let mut report = report;
             note_unreachable_records(&mut report, &archive, declared);
             return Ok(Box::new(ZipIndexed {
@@ -668,6 +673,89 @@ fn note_unreachable_records(
              it; only the last record under each name can be read"
         ),
     });
+}
+
+/// Does the file open with a local file header?
+///
+/// Four bytes at offset 0, and deliberately only there. Byte 0 of a zip is a
+/// local file header (the archive holds at least one entry), an
+/// end-of-central-directory record (it holds none), a zip64 record, or a
+/// self-extracting stub — it is never `PK\x03\x04` on an archive with no
+/// entries. Scanning the whole file for the signature instead is what the
+/// FORWARD reader does, and outside that reader's framing walk it is a
+/// heuristic: those four bytes occur inside stored payloads and inside file
+/// comments, which is the whole reason [`read_declared_index`] refuses a bare
+/// backwards search for the EOCD's own signature. Offset 0 is a check.
+///
+/// The cost of the narrowness is a miss, never a wrong answer. A
+/// stub-prefixed (self-extracting) archive whose index is unusable is not
+/// caught, because its first local header sits at `ZipArchive::offset()`
+/// rather than at 0 — and that figure does not exist until the archive is
+/// open, by which point these bytes are no longer reachable. A miss leaves
+/// the behaviour exactly as it was; a false positive would refuse a valid
+/// archive.
+fn begins_with_a_local_header<R: Read + Seek>(r: &mut R) -> bool {
+    let mut head = [0u8; 4];
+    r.seek(SeekFrom::Start(0)).is_ok()
+        && r.read_exact(&mut head).is_ok()
+        && head == SIG_LOCAL_HEADER
+}
+
+/// Refuses an archive whose index reaches NOTHING while the file itself opens
+/// with an entry.
+///
+/// Measured, on the 568-byte reproducer Phase 3a's `container` fuzz target
+/// parked (`crash-fidelity-claim-zip.bin`; its first byte is the target's
+/// format selector, not archive content). Its only `PK\x05\x06` record
+/// declares `total_entries = 0` and `cd_offset = 0`, and `ZipArchive` accepts
+/// it. Before this guard `stuffr list` printed no rows, `stuffr test
+/// --strict-fidelity` answered `0 bytes verified (exact fidelity)`, and
+/// `stuffr unpack -C out --strict-fidelity` created an empty directory — all
+/// three at exit 0, with the strict gate on — for a file whose four entries
+/// the SAME binary recovers in full, correctly named, when the identical
+/// bytes arrive on a pipe. Info-ZIP's `unzip -l` refuses it at exit 3.
+///
+/// [`note_unreachable_records`] cannot see this, and is not being loosened to
+/// make it: its guard 1 requires the EOCD's declared comment length to run
+/// exactly to the end of the file, this record's does not, so `declared` is
+/// `None` and there is no count to compare against. That guard is what keeps
+/// the count warning off healthy archives and it is right; this is a second,
+/// independent observation standing beside it.
+///
+/// **Refused, not warned** — the opposite ruling to the count shortfall two
+/// functions up, and the same one the size-lying entry got. There the index
+/// is self-consistent and the reader reaches most of it, so handing back what
+/// is reachable is a service and naming the shortfall is enough. Here nothing
+/// is reachable, so a warning would leave `unpack -C out` creating an empty
+/// directory at exit 0, with `--strict-fidelity` the only thing between a
+/// user and a restore that silently produced no files. `Error::Corrupt` (exit
+/// 5) rather than `ResourceLimit` (exit 6) for the reason `error.rs`'s
+/// `exit_code` states once for all five bounding guards: the bytes were read
+/// and found to contradict themselves, and no budget makes that archive
+/// readable.
+///
+/// **Still not recovered.** Reaching the four entries would mean
+/// re-implementing the central-directory parse this module deliberately
+/// delegates — the "declared, not recovered" ruling in the module doc. The
+/// message names the route that already works instead.
+///
+/// A legitimately empty zip is unaffected and must stay that way: it is 22
+/// bytes beginning `PK\x05\x06`, so `opens_with_an_entry` is false and this
+/// returns `Ok`. `an_empty_zip_is_still_exact_and_empty` pins it.
+fn refuse_an_index_that_reaches_nothing(
+    archive: &zip::ZipArchive<SeekAdapter>,
+    opens_with_an_entry: bool,
+) -> Result<()> {
+    if !archive.is_empty() || !opens_with_an_entry {
+        return Ok(());
+    }
+    Err(Error::Corrupt(
+        "zip index reaches no entries at all, yet the file opens with a local file header \
+         (`PK\\x03\\x04`): the end-of-central-directory record does not describe this archive. \
+         A forward read of the same bytes (`cat FILE | stuffr list -`) parses the local \
+         headers instead"
+            .into(),
+    ))
 }
 
 struct ZipIndexed {
@@ -2015,6 +2103,101 @@ mod tests {
         let bytes = build_zip(&[]);
         let ar = open_seekable(&bytes);
         assert_eq!(count_mismatch(ar.fidelity()), None);
+        assert!(ar.fidelity().is_lossless());
+    }
+
+    // -----------------------------------------------------------------------
+    // An index that reaches NOTHING over a file that opens with an entry
+    // -----------------------------------------------------------------------
+
+    /// Rewrites the EOCD's two counts and its central-directory offset to
+    /// zero, leaving every local header and every central-directory record
+    /// physically intact.
+    ///
+    /// The same shape the parked 568-byte fuzz reproducer has
+    /// (`crash-fidelity-claim-zip.bin`): a single mutated EOCD that describes
+    /// an empty archive sitting on top of a file that is not one. Forged
+    /// rather than written, for the reason `with_shadowed_record` gives —
+    /// `ZipWriter` will not produce it, and the file that motivates it comes
+    /// from somewhere else.
+    fn with_an_index_reaching_nothing(bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        let eocd = out.len() - END_OF_CENTRAL_DIR_TOTAL;
+        assert_eq!(out[eocd..eocd + 4], SIG_END_OF_CENTRAL_DIR, "no EOCD");
+        out[eocd + 8..eocd + 12].copy_from_slice(&[0u8; 4]); // both counts
+        out[eocd + 16..eocd + 20].copy_from_slice(&[0u8; 4]); // cd_offset
+        out
+    }
+
+    /// The defect this exists for, and the worst shape this module has
+    /// shipped: a seekable read that recovers NOTHING and calls it exact.
+    ///
+    /// Before the guard, the reproducer's four entries were reported as zero
+    /// rows by `list`, zero bytes verified by `test --strict-fidelity` and an
+    /// empty destination directory by `unpack -C --strict-fidelity`, all
+    /// three at exit 0 — while a forward read of the identical bytes
+    /// recovered all four, correctly named. `note_unreachable_records` cannot
+    /// see it: its guard 1 rejects the mutated EOCD, so there is no declared
+    /// count to compare and `check_entry_count` has nothing to say.
+    #[test]
+    fn an_index_reaching_nothing_over_a_file_that_opens_with_an_entry_is_refused() {
+        let clean = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        let bytes = with_an_index_reaching_nothing(&clean);
+        // The premise: the forward reader still finds the entries, so the
+        // bytes really do carry something an "empty archive" verdict loses.
+        assert_eq!(
+            read_all_forward(&bytes).expect("forward read").len(),
+            2,
+            "the forged archive must still be forward-readable, or this test \
+             is refusing a file with nothing in it"
+        );
+
+        let Err(err) = try_open_seekable(&bytes) else {
+            panic!("an empty-and-exact verdict over these bytes is a lie");
+        };
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "self-contradiction, not a resource limit: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("PK\\x03\\x04"),
+            "the message must name the evidence: {msg}"
+        );
+    }
+
+    /// The other arm of the conjunction, and the twelfth-wrongly-firing-check
+    /// guard: a legitimately empty zip is a real thing and must stay exit 0
+    /// with exact fidelity.
+    ///
+    /// It is 22 bytes beginning `PK\x05\x06`, so it is `is_empty()` — the
+    /// half the reproducer shares — and is accepted purely because it does
+    /// NOT open with a local file header. Zero entries on its own is never
+    /// enough to refuse.
+    #[test]
+    fn an_empty_zip_is_still_exact_and_empty() {
+        let bytes = build_zip(&[]);
+        assert_eq!(bytes[..4], SIG_END_OF_CENTRAL_DIR, "not a bare EOCD");
+        let mut ar = try_open_seekable(&bytes).expect("an empty zip is not corrupt");
+        assert!(ar.next_entry().expect("walk").is_none());
+        assert_eq!(ar.fidelity().rung, Rung::Exact);
+        assert!(
+            ar.fidelity().is_lossless(),
+            "an empty archive lost nothing: {:?}",
+            ar.fidelity().warnings
+        );
+    }
+
+    /// The remaining arm: an ordinary archive opens with a local file header
+    /// on every single read, so the header half of the conjunction is true
+    /// for essentially every zip in the world. Only reaching nothing makes it
+    /// a finding.
+    #[test]
+    fn an_ordinary_zip_opens_with_a_local_header_and_is_still_accepted() {
+        let bytes = build_zip(&[("a.txt", b"alpha")]);
+        assert_eq!(bytes[..4], SIG_LOCAL_HEADER, "not a local header");
+        let ar = open_seekable(&bytes);
         assert!(ar.fidelity().is_lossless());
     }
 
