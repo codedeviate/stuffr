@@ -343,6 +343,28 @@ impl Codec for Xz {
     /// means allow; the fill happens once, non-destructively, into the same
     /// `BufReader` that goes on to back the decoder, so nothing already
     /// buffered is re-read from the underlying source.
+    ///
+    /// **This `fill_buf` is eager, not lazy — one of two exceptions in this
+    /// crate** (`lzip.rs`'s decoder does the same, for the same reason; the
+    /// other thirteen `decoder()` impls read nothing until a caller's first
+    /// `read()`, so the "every codec's `decoder()` is lazy" claim recorded in
+    /// Task 4b's own report is true everywhere except here and in
+    /// `lzip.rs`). The `.unwrap_or(&[])` below is not a shortcut, it is
+    /// load-bearing: this codec can be constructed as an INNER layer of a
+    /// nested chain (`probe.rs`'s re-probe loop builds each inner
+    /// `decoder()` with `src` already wrapped by the previous layer's own
+    /// decode), so a read failure here can be the previous layer surfacing
+    /// corruption, not a fresh raw-source failure. That loop's construction
+    /// call — `reg.require_codec(..)?.decoder(src, opts)?` — is a bare `?`,
+    /// unprotected by `Error::from_decode_io`; only the loop's LATER
+    /// re-probe call is (that is the one Commit 7d157b9 fixed). Swallowing
+    /// the error here defers it to that protected call instead: the
+    /// identical read fails again once decoding actually happens, and comes
+    /// back `Error::Corrupt` (exit 5) as it should. Change `.unwrap_or(&[])`
+    /// to `?` — a perfectly natural-looking cleanup — and the same failure
+    /// instead returns straight out of THIS `decoder()` call as a bare
+    /// `Error::Io` (exit 1, "stuffr failed", for input that is actually
+    /// corrupt): 7d157b9's bug again, at a different call site.
     fn decoder(&self, src: Box<dyn Source>, o: &DecodeOpts) -> Result<Box<dyn Source>> {
         let mut buffered = BufReader::new(src);
         if let Some(limit) = o.memory_limit {

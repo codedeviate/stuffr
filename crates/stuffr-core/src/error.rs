@@ -174,6 +174,10 @@ impl Error {
             | Error::ResourceLimit(_)
             | Error::ChainTooDeep { .. } => 6,
             Error::UnsafePath { .. } => 7,
+            // A wrong exit code landing here is not always this match's own
+            // fault: it can equally mean the wrong `Error` variant was
+            // constructed upstream, before this function ever ran. See
+            // `Error::from_decode_io` — Task 4b's fix lives there, not here.
             _ => 1,
         }
     }

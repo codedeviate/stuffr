@@ -2073,11 +2073,23 @@ fn list_reports_an_empty_lzip_stream_as_corrupt_not_as_an_io_failure() {
 /// too broadly. Opening a directory as if it were a file is a real,
 /// deterministic i/o failure that arises before any codec sees a single
 /// byte: `resolve_chain_deep_with`'s OWN top-level `probe(src)` call reads
-/// the raw source, and a fix that widened `Error::from_decode_io` to that
-/// call (or into `probe`/`PeekSource::fill` themselves, rather than scoping
-/// it to the decoded-stream `probe` call inside the re-probe loop) would
-/// make this exit 5 instead — a new lie in the opposite direction from the
-/// bug this task fixes.
+/// the raw source.
+///
+/// This does NOT prove that widening `Error::from_decode_io` to that
+/// top-level `probe(src)` call (or into `probe`/`PeekSource::fill`
+/// themselves, rather than scoping it to the decoded-stream `probe` call
+/// inside the re-probe loop) would be safe — checked, and it is a narrower
+/// guard than that. `from_decode_io` only reclassifies `InvalidData` and
+/// `OutOfMemory`; a directory read raises `std::io::ErrorKind::IsADirectory`,
+/// neither of those, so it comes back `Error::Io` — exit 1 — whether or not
+/// that call is widened, and this test cannot tell the two cases apart. What
+/// it DOES catch is a cruder fix: one that swept every raw-source
+/// `io::Error` into `Error::Corrupt` regardless of kind. The widening claim
+/// itself is proven in `probe.rs`'s own
+/// `a_raw_source_io_error_of_the_identical_kind_stays_io_not_corrupt`, which
+/// deliberately uses an `InvalidData`-kind raw-source error — the one kind
+/// `from_decode_io` actually reclassifies — and would flip to `Corrupt` if
+/// that call site were widened.
 #[test]
 fn list_reports_a_directory_as_an_io_failure_not_as_corrupt() {
     let dir = tmp_dir();
