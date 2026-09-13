@@ -696,10 +696,11 @@ impl ZipIndexed {
             return Ok(Entry::new(meta, Box::new(io::empty())));
         }
 
+        let payload = EntryPayload::new(file, meta.size, &meta.name);
         Ok(Entry::new(
             meta,
             Box::new(NormalizeDecodeErrors::new(
-                file,
+                payload,
                 ZIP_MALFORMED_AS_INVALID_INPUT_EOF,
             )),
         ))
@@ -843,10 +844,11 @@ impl ArchiveRead for ZipStreamed {
         // explicitly rather than read off the entry so the seekable path is
         // the only one that CAN supply a mode, and this one visibly cannot.
         let meta = entry_meta(&file, None);
+        let payload = EntryPayload::new(file, meta.size, &meta.name);
         Ok(Some(Entry::new(
             meta,
             Box::new(NormalizeDecodeErrors::new(
-                file,
+                payload,
                 ZIP_MALFORMED_AS_INVALID_INPUT_EOF,
             )),
         )))
@@ -974,6 +976,105 @@ fn skip(source: &mut Pushback, mut count: u64, what: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One entry's payload, held to the length its own header declares — the
+/// short-read guard `tar.rs`, `ar.rs` and `cpio.rs` have each carried since
+/// Phase 2 and zip did not.
+///
+/// It looks redundant next to zip's per-entry crc32 and it is not, because
+/// the crc is computed over the bytes DELIVERED and compared against a value
+/// the SAME header supplies. A local header declaring 42 uncompressed bytes,
+/// 0 compressed bytes and crc32 `0` — the crc of nothing — therefore
+/// satisfies its own checksum perfectly, and `zip::ZipFile`'s reader is a
+/// `Take` over the COMPRESSED length, so nothing else in the read path ever
+/// looked at the uncompressed one. Found by the `container` fuzz target;
+/// before this, `stuffr list` printed `42  hello.txt` while `stuffr test
+/// --strict-fidelity` answered `0 bytes verified (exact fidelity)` at exit 0
+/// and `unpack` wrote the empty file.
+///
+/// Both directions are refused. A payload that runs out early is truncation;
+/// one that keeps going past the declared length is a header disagreeing with
+/// its own contents — Info-ZIP's `unzip -t` reports that second shape too
+/// (`ucsize 1 <> csize 5 for STORED entry`) and exits non-zero for it.
+///
+/// `Error::Corrupt` (exit 5), not a fidelity warning, and the wording is
+/// `tar.rs`'s verbatim so the four containers answer a cut payload with one
+/// sentence. The bytes are MISSING, not approximated: a warning would leave
+/// `unpack` writing a truncated file and calling the run successful, with
+/// `--strict-fidelity` the only thing between a user and a silently wrong
+/// file on disk. That is the opposite ruling to `Fidelity::
+/// EntryCountMismatch`, deliberately — there the archive's index is
+/// self-consistent and the READER cannot reach every record, so returning
+/// what is reachable is a service; here the archive contradicts itself and
+/// there is nothing honest to return.
+///
+/// A SYMLINK entry never reaches this: `ZipIndexed::entry_at` consumes its
+/// payload itself (the target IS the payload) and hands the caller
+/// `io::empty()` before this wrapper is ever built. `read_symlink_target`
+/// does its own short-read check, so nothing is lost by that.
+struct EntryPayload<R> {
+    inner: R,
+    /// Payload bytes the entry's header promised and has not delivered.
+    /// `None` when the header declared no size at all — impossible for zip
+    /// today (`entry_meta` always sets one) and left representable rather
+    /// than `expect`ed, so a future metadata change cannot turn this into a
+    /// panic.
+    remaining: Option<u64>,
+    /// Kept for the error message: a corrupt archive should say WHICH entry.
+    name: String,
+}
+
+impl<R> EntryPayload<R> {
+    fn new(inner: R, declared: Option<u64>, name: &str) -> Self {
+        Self {
+            inner,
+            remaining: declared,
+            name: name.to_owned(),
+        }
+    }
+}
+
+impl<R: Read> Read for EntryPayload<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // `Read`'s contract: an empty buffer reads nothing and is not an
+        // error. Without this the short-read check below cannot tell "the
+        // stream ended" from "you gave me nowhere to put bytes" and reports
+        // an intact archive as truncated — the same guard, for the same
+        // reason, that `tar.rs`'s `EntryPayload::read` opens with.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = self.inner.read(buf)?;
+        let Some(remaining) = self.remaining.as_mut() else {
+            return Ok(n);
+        };
+        if n == 0 {
+            if *remaining > 0 {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "entry `{}` is {} bytes short of the size its header declares; \
+                         the archive is truncated",
+                        self.name, remaining
+                    ),
+                ));
+            }
+            return Ok(0);
+        }
+        if n as u64 > *remaining {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "entry `{}` delivers more bytes than the size its header declares; \
+                     the archive's index and its contents disagree",
+                    self.name
+                ),
+            ));
+        }
+        *remaining -= n as u64;
+        Ok(n)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2162,6 +2263,240 @@ mod tests {
         bytes[at] ^= 0xff;
         let err = read_all_forward(&bytes).expect_err("a bad crc32 must be refused");
         assert_eq!(err.exit_code(), 5, "got {err:?}");
+    }
+
+    /// The crc32 a zip entry's header carries, computed here rather than
+    /// pulled in as a dependency: `hand_built_zip` below needs a CORRECT
+    /// checksum for an archive whose only defect is its size field, and
+    /// `stuffr-formats` has no crc32 crate of its own (the `zip` crate keeps
+    /// the one it uses private). Eight lines of the textbook bitwise form —
+    /// pinned against a known vector by the test below it.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// The helper above is only useful if it is right, and a wrong one would
+    /// make every test built on it fail for the wrong reason — a bad crc32
+    /// is refused as corruption too, which is exactly the verdict those tests
+    /// assert. Pinned against the standard `check` vector and the empty
+    /// string.
+    #[test]
+    fn the_test_crc32_agrees_with_the_standard_vector() {
+        assert_eq!(crc32(b""), 0);
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// Builds a one-entry zip from RAW field values — a local file header, a
+    /// matching central-directory record and an end-of-central-directory
+    /// record — so a test can state a header that disagrees with its own
+    /// payload.
+    ///
+    /// `build_with` cannot serve here and no amount of coaxing will make it:
+    /// `zip::ZipWriter` computes the crc32 and both size fields from the data
+    /// it is handed, so every archive it produces is self-consistent by
+    /// construction. That is the very property under test, which is why this
+    /// lays the bytes down by hand. Fields are little-endian throughout, per
+    /// APPNOTE 4.3.7 (local header) and 4.3.12 (central header).
+    ///
+    /// The central record repeats whatever the local one said, so the two
+    /// reading rungs — forward (local headers) and seekable (the central
+    /// directory) — see the identical claim and neither can pass by reading
+    /// the other's numbers.
+    fn hand_built_zip(
+        name: &str,
+        crc: u32,
+        compressed: u32,
+        uncompressed: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let n = name.as_bytes();
+        let n_len = u16::try_from(n.len()).expect("a test name is short");
+
+        let mut local = Vec::new();
+        local.extend_from_slice(&SIG_LOCAL_HEADER);
+        local.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        local.extend_from_slice(&0u16.to_le_bytes()); // flags: NO data descriptor
+        local.extend_from_slice(&0u16.to_le_bytes()); // method: STORE
+        local.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        local.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        local.extend_from_slice(&crc.to_le_bytes());
+        local.extend_from_slice(&compressed.to_le_bytes());
+        local.extend_from_slice(&uncompressed.to_le_bytes());
+        local.extend_from_slice(&n_len.to_le_bytes());
+        local.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        local.extend_from_slice(n);
+        local.extend_from_slice(payload);
+
+        let mut central = Vec::new();
+        central.extend_from_slice(&SIG_CENTRAL_HEADER);
+        central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+        central.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        central.extend_from_slice(&0u16.to_le_bytes()); // flags
+        central.extend_from_slice(&0u16.to_le_bytes()); // method: STORE
+        central.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        central.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        central.extend_from_slice(&crc.to_le_bytes());
+        central.extend_from_slice(&compressed.to_le_bytes());
+        central.extend_from_slice(&uncompressed.to_le_bytes());
+        central.extend_from_slice(&n_len.to_le_bytes());
+        central.extend_from_slice(&0u16.to_le_bytes()); // extra length
+        central.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        central.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+        central.extend_from_slice(&0u16.to_le_bytes()); // internal attributes
+        central.extend_from_slice(&0u32.to_le_bytes()); // external attributes
+        central.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+        central.extend_from_slice(n);
+
+        let mut eocd = Vec::new();
+        eocd.extend_from_slice(&SIG_END_OF_CENTRAL_DIR);
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // this disk
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // disk with the cd
+        eocd.extend_from_slice(&1u16.to_le_bytes()); // records on this disk
+        eocd.extend_from_slice(&1u16.to_le_bytes()); // records total
+        eocd.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        eocd.extend_from_slice(&(local.len() as u32).to_le_bytes());
+        eocd.extend_from_slice(&0u16.to_le_bytes()); // comment length
+
+        let mut out = local;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&eocd);
+        out
+    }
+
+    /// An entry whose header declares an uncompressed size its payload never
+    /// delivers. **The fuzzer's finding, minimised**: `container` aborted on
+    /// a 677-byte artefact (`.superpowers/sdd/2026-09-12-phase3a-fuzzing-
+    /// harness/crash-entry-size-container.bin`) with `entry "…sample/
+    /// hello.txt…" declared 42 bytes but produced 0`; every byte of it that
+    /// did not contribute is gone from this, leaving the shape itself.
+    ///
+    /// zip's own crc32 cannot catch it and this is not a gap in the check but
+    /// its definition: the crc is computed over the bytes DELIVERED and
+    /// compared against a value the SAME header supplies, so a header
+    /// declaring 42 uncompressed bytes, 0 compressed bytes and crc32 `0` —
+    /// the crc of nothing — satisfies its own checksum exactly. `ZipFile`'s
+    /// reader is a `Take` over the COMPRESSED length; before this guard
+    /// nothing in the read path ever compared the uncompressed length against
+    /// anything at all.
+    ///
+    /// Measured before it was fixed: `stuffr list` printed `42  hello.txt`,
+    /// `stuffr test --strict-fidelity` answered `0 bytes verified (exact
+    /// fidelity)` at exit 0, and `stuffr unpack --strict-fidelity` wrote a
+    /// 0-byte `hello.txt` and reported exact fidelity — the tool contradicting
+    /// itself across two lines and calling both of them clean.
+    #[test]
+    fn a_declared_size_the_payload_never_delivers_is_corruption() {
+        let bytes = hand_built_zip("hello.txt", 0, 0, 42, b"");
+
+        let err = read_all_forward(&bytes).expect_err("a short payload must be refused");
+        assert_eq!(err.exit_code(), 5, "forward rung: got {err:?}");
+        let err = read_all_seekable(&bytes).expect_err("a short payload must be refused");
+        assert_eq!(err.exit_code(), 5, "seekable rung: got {err:?}");
+    }
+
+    /// The same lie the other way up: a payload LONGER than the uncompressed
+    /// size its header declares. Info-ZIP's `unzip -t` calls this out
+    /// (`ucsize 1 <> csize 5 for STORED entry`, exit 1); before this guard
+    /// stuffr listed the entry as 1 byte, verified 5, and reported exact
+    /// fidelity at exit 0.
+    ///
+    /// Worth a test of its own rather than folding into the one above: the
+    /// short case is caught by a reader that ends early, the long case by one
+    /// that does not end at all, and a guard written for only the first is
+    /// the easy mistake here.
+    #[test]
+    fn a_payload_longer_than_its_declared_size_is_corruption() {
+        let payload = b"alpha";
+        let crc = crc32(payload);
+        let bytes = hand_built_zip("a.txt", crc, payload.len() as u32, 1, payload);
+
+        let err = read_all_forward(&bytes).expect_err("an over-long payload must be refused");
+        assert_eq!(err.exit_code(), 5, "forward rung: got {err:?}");
+        let err = read_all_seekable(&bytes).expect_err("an over-long payload must be refused");
+        assert_eq!(err.exit_code(), 5, "seekable rung: got {err:?}");
+    }
+
+    /// The false-firing guard for the two tests above, in the shape most
+    /// likely to trip one: an entry that declares nothing and delivers
+    /// nothing, built by the same hand-laid bytes so the ONLY difference from
+    /// the refused archive is the number in the size field.
+    ///
+    /// A round-trip test would not do — it proves the writer and the reader
+    /// agree, which they would even if both were wrong about this — so this
+    /// states the bytes itself and asserts the read is clean.
+    #[test]
+    fn an_entry_that_delivers_what_it_declares_is_not_refused() {
+        for (payload, declared) in [(&b""[..], 0u32), (&b"alpha"[..], 5)] {
+            let crc = crc32(payload);
+            let bytes = hand_built_zip("a.txt", crc, payload.len() as u32, declared, payload);
+
+            let got = read_all_forward(&bytes).expect("an honest header must not be refused");
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].1, payload, "forward rung returned the wrong payload");
+            let got = read_all_seekable(&bytes).expect("an honest header must not be refused");
+            assert_eq!(got.len(), 1);
+            assert_eq!(
+                got[0].1, payload,
+                "seekable rung returned the wrong payload"
+            );
+        }
+    }
+
+    /// A SYMLINK entry has the same surface shape as the bug — a non-zero
+    /// declared size and a reader that hands back nothing — and must not be
+    /// refused. `ZipIndexed::entry_at` consumes a symlink's payload itself,
+    /// because the target IS the payload, and gives the caller `io::empty()`
+    /// afterwards; `meta.size` keeps the declared target length. Truncation
+    /// there is already `read_symlink_target`'s job and it raises
+    /// `Error::Corrupt` of its own, so nothing is lost by leaving this shape
+    /// alone — and a length guard applied to it would refuse every symlink in
+    /// every zip this project writes.
+    ///
+    /// This is also the archive that made `check_entry_size` itself too
+    /// strict: `stuffr pack tree -o t.zip` over a directory holding one
+    /// symlink, fed to the `container` fuzz target, aborted with `entry
+    /// "tree/link.txt" declared 8 bytes but produced 0` — a legitimate
+    /// archive stuffr had just written.
+    #[test]
+    fn a_symlinks_eagerly_consumed_payload_is_not_a_short_read() {
+        let mut link = EntryMeta::file("link.txt");
+        link.kind = EntryKind::Symlink {
+            target: "real.txt".into(),
+        };
+        let bytes = build_with(
+            &CreateOpts::default(),
+            &[(EntryMeta::file("real.txt"), b"hello"), (link, b"")],
+        );
+
+        let got = read_all_seekable(&bytes).expect("a symlink must not be refused");
+        assert_eq!(got.len(), 2);
+        let (meta, data) = &got[1];
+        assert_eq!(
+            meta.kind,
+            EntryKind::Symlink {
+                target: "real.txt".into()
+            }
+        );
+        assert_eq!(
+            meta.size,
+            Some(8),
+            "the declared size stays the target length"
+        );
+        assert!(
+            data.is_empty(),
+            "the target was consumed by the reader, not left for the caller"
+        );
     }
 
     // -----------------------------------------------------------------------
