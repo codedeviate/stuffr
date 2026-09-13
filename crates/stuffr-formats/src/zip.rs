@@ -1097,6 +1097,12 @@ fn skip(source: &mut Pushback, mut count: u64, what: &str) -> Result<()> {
 /// what is reachable is a service; here the archive contradicts itself and
 /// there is nothing honest to return.
 ///
+/// Exit 5 rather than `ResourceLimit`'s 6 for the reason
+/// `stuffr_core::Error::exit_code`'s doc states once for all five of this
+/// workspace's header-field guards: the bytes were READ and found to
+/// disagree with each other, where exit 6 means a ceiling refused before an
+/// allocator was asked.
+///
 /// A SYMLINK entry never reaches this: `ZipIndexed::entry_at` consumes its
 /// payload itself (the target IS the payload) and hands the caller
 /// `io::empty()` before this wrapper is ever built. `read_symlink_target`

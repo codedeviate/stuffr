@@ -676,19 +676,18 @@ const CPIO_NAMESIZE_FIELD_END: usize = 6 + 8 * 12;
 /// was for the symlink case.
 ///
 /// **Why `Error::ResourceLimit` (exit 6), not `Error::Corrupt` (exit 5):**
-/// arguably a `c_namesize` this large is a malformed header rather than a
-/// resource question — no real cpio archive's name field gets anywhere
-/// close, so one could read this as "the file is lying about its own
-/// shape," which is what `Corrupt` means elsewhere in this project. But
-/// [`MAX_SYMLINK_TARGET_LEN`]'s existing refusal — the structurally
-/// identical case one field over in the same header — already chose
-/// `ResourceLimit`, reasoning "no legitimate symlink target is this long"
-/// rather than treating the declaration itself as damage. Splitting the two
-/// fields onto different exit codes for the same shape of implausible
-/// header value would be a harder inconsistency to defend than either
-/// choice alone, so this follows the sibling's precedent rather than
-/// re-litigating it: this build is refusing to allocate that much for a
-/// name, the same framing `DecodeOpts::memory_limit`'s own doc uses.
+/// because the refusal happens BEFORE the crate's allocator is asked — the
+/// rule for all five of this workspace's header-field guards, written once
+/// in `stuffr_core::Error::exit_code`'s doc comment and pointed at from
+/// here rather than re-derived. [`MAX_SYMLINK_TARGET_LEN`]'s refusal, the
+/// structurally identical case one field over in the same header, is the
+/// same shape and the same code.
+///
+/// It is emphatically NOT a judgement that a 2.6 GiB name is a size some
+/// larger machine could honour. The Task 5c reproducer is a 274-byte file,
+/// and nothing anywhere can deliver that name; `ar.rs`'s two guards answer
+/// 5 and 6 on one 68-byte file for the same reason. What separates the codes
+/// is which guard stopped first, not how plausible the field is.
 ///
 /// **Why 65,536 bytes:** `MAX_SYMLINK_TARGET_LEN`'s own figure and
 /// reasoning transfer unchanged — a generous ceiling well beyond any real

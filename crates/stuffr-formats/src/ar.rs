@@ -368,6 +368,13 @@ fn parse_ar_field(bytes: &[u8]) -> Option<u64> {
 /// already classifies as [`Error::ResourceLimit`] (exit 6), so no new error
 /// plumbing is needed to get the same typed refusal Task 5c's cpio guard
 /// raises directly.
+///
+/// Exit 6 because the refusal happens BEFORE an allocator is asked, which is
+/// the whole of the rule — written once in `stuffr_core::Error::exit_code`'s
+/// doc comment, which this site and its four siblings point at rather than
+/// each re-deriving. It is not a judgement that the declared size is
+/// plausible; [`refuse_an_out_of_range_name_table_index`] answers exit 5 on
+/// the same 68-byte file.
 fn refuse_if_over(value: u64, limit: u64, what: &str, noun: &str) -> io::Result<()> {
     if value > limit {
         return Err(io::Error::new(
@@ -408,21 +415,23 @@ fn refuse_if_over(value: u64, limit: u64, what: &str, noun: &str) -> io::Result<
 ///
 /// # Why `Corrupt` (exit 5), and not `ResourceLimit` (exit 6) like its three neighbours
 ///
-/// [`refuse_if_over`]'s two callers and `cpio.rs`'s `c_namesize` guard all
-/// refuse a plausible-but-expensive SIZE: the header is well formed, this
-/// build simply declines to allocate that much, and a machine with more
-/// memory could legitimately honour it. That is what exit 6 tells a caller,
-/// and it is why it sits alongside `Unsupported`/`CapabilityUnavailable` as
-/// "this build/source cannot do that" rather than "the file is damaged".
+/// **The rule for the whole set of five guards is written once, in
+/// `stuffr_core::Error::exit_code`'s doc comment. Read it there, not here.**
+/// In short: exit 6 is "stuffr declined to ask the allocator", exit 5 is
+/// "stuffr read the bytes and they contradict each other" — a fact about
+/// what stuffr did, not about what the file declared.
 ///
-/// Nothing is allocated here, and no machine anywhere could honour this
-/// header: an offset past the end of the name table THE ARCHIVE ITSELF
-/// declared is the file contradicting its own shape, which is what
-/// [`Error::Corrupt`] means everywhere else in this project — `zip.rs`'s
-/// declared-vs-delivered entry size, `cpio.rs`'s short symlink target,
-/// `tar.rs`'s short payload. Answering exit 6 would additionally be an
-/// actively misleading verdict: it invites a retry with a larger memory
-/// budget, and no budget can ever make this archive readable.
+/// This site is the second shape. Nothing is allocated: an offset past the
+/// end of the name table THE ARCHIVE ITSELF declared is the file
+/// contradicting its own shape, which is what [`Error::Corrupt`] means
+/// everywhere else in this project — `zip.rs`'s declared-vs-delivered entry
+/// size, `cpio.rs`'s short symlink target, `tar.rs`'s short payload.
+///
+/// An earlier version of this comment argued the split as "exit 6 refuses a
+/// size a bigger machine could honour". That criterion is FALSE and its own
+/// neighbours falsify it: cpio's exit-6 reproducer is a 274-byte file
+/// declaring a 2.6 GiB name, and this guard and [`refuse_if_over`] split
+/// across 5 and 6 on the same 68-byte file.
 ///
 /// The `InvalidData` kind is how that verdict reaches the caller: the
 /// crate's own `reader.read(&mut buffer)?` (`lib.rs:236`) is bare, with no
