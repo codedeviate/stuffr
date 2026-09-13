@@ -1,12 +1,14 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use stuffr_core::testing::{
     CONTAINER_SLOTS, check_entry_count, check_entry_size, check_error_is_classified,
     check_fidelity_claim,
 };
-use stuffr_core::{Error, FileSource, FormatId, OpenOpts, ReaderSource, Source, StreamPolicy};
+use stuffr_core::{
+    Container, Error, FileSource, FormatId, OpenOpts, ReaderSource, Source, StreamPolicy,
+};
 
 /// Independently parses a seekable zip's declared entry count from its EOCD
 /// record, applying the same two guards
@@ -93,6 +95,98 @@ fn declared_zip_index(path: &Path) -> Option<usize> {
     Some(usize::from(entries))
 }
 
+/// Walks `payload` through `container` a SECOND time, forward-only, counting
+/// entries — Ruling B's independent observation for `check_fidelity_claim`.
+///
+/// This is not redundant with `check_entry_count`: that check compares the
+/// EOCD's declared count (zip only) against the PRIMARY (seekable) walk's own
+/// enumeration, and whenever the two genuinely disagree, `zip.rs`'s own
+/// `note_unreachable_records` — which runs the identical two guards — has
+/// already added `Fidelity::EntryCountMismatch` to the report, which makes
+/// `report.is_lossless()` false and lets `check_fidelity_claim` return `Ok`
+/// regardless of `approximated`. So a disagreement between "declared" and
+/// "seekably enumerated" can never be the fact that makes `check_fidelity_claim`
+/// fire — it is always already owned up to, or the archive never gets this far
+/// because `check_entry_count` panicked first.
+///
+/// The genuinely independent fact is a disagreement between two *readings of
+/// the same bytes that never touch the EOCD's declared count at all*: the
+/// seekable walk (which, for zip, counts central-directory records) against a
+/// forward-only walk of the identical bytes (which counts LOCAL file headers
+/// as they stream past). A local header with no corresponding central-directory
+/// record — extra bytes the seekable/authoritative reading never sees at
+/// all — makes the forward count diverge from the seekable one while the
+/// central directory itself, and hence the EOCD's declared count, is entirely
+/// self-consistent: `check_entry_count` passes cleanly, no
+/// `EntryCountMismatch` warning is ever raised, and the report stays
+/// `Rung::Exact` with empty `warnings` — exactly the `is_lossless()` state
+/// `check_fidelity_claim` polices. Not zip-specific in principle (any
+/// container's forward and seekable readers could in principle diverge for
+/// reasons neither of the other two checks would ever observe), so this runs
+/// for every slot, not only zip.
+///
+/// `None` means "inconclusive", not "zero entries": any error along this path
+/// still goes through `check_error_is_classified` (so a genuine
+/// misclassification reachable ONLY via the forward-only route is still
+/// caught), but a legitimately classified refusal — `Unsupported` on a zip
+/// using data descriptors, say, which `zip.rs`'s forward reader cannot walk —
+/// means this comparison simply has nothing to say, not that anything is
+/// wrong.
+fn forward_entry_count(container: &dyn Container, payload: &[u8]) -> Option<usize> {
+    let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(payload.to_vec())));
+    let resolved = match stuffr_core::resolve(
+        src,
+        container.id(),
+        container.caps(),
+        &StreamPolicy::ForwardOnly,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            check_error_is_classified(&e).expect("forward cross-check: resolve classification");
+            return None;
+        }
+    };
+    let mut ar = match container.open(resolved, &OpenOpts::default()) {
+        Ok(a) => a,
+        Err(e) => {
+            check_error_is_classified(&e).expect("forward cross-check: open classification");
+            return None;
+        }
+    };
+
+    let mut count = 0usize;
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut entry = match ar.next_entry() {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(e) => {
+                check_error_is_classified(&e)
+                    .expect("forward cross-check: next_entry classification");
+                return None;
+            }
+        };
+        count += 1;
+        // Drain the payload: the forward reader's position for entry N+1
+        // depends on having consumed entry N's bytes, since there is no seek
+        // to skip ahead with. Leaving this unread would make the count an
+        // artefact of OUR walk, not a fact about the archive.
+        loop {
+            match entry.reader().read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    let e = Error::from_decode_io(e);
+                    check_error_is_classified(&e)
+                        .expect("forward cross-check: entry read classification");
+                    return None;
+                }
+            }
+        }
+    }
+    Some(count)
+}
+
 fuzz_target!(|data: &[u8]| {
     let Some((&selector, payload)) = data.split_first() else {
         return;
@@ -112,12 +206,24 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
 
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let path = tmp.path().join("input");
+    // The tempdir/file is needed ONLY on the seekable path: the forward-only
+    // branch below builds its `Source` straight from an in-memory `Cursor`
+    // and never touches a path. `_tmp_guard` keeps the `TempDir` alive (and
+    // therefore its cleanup deferred to the end of this closure) without
+    // paying for one on iterations that never use it.
+    let mut _tmp_guard: Option<tempfile::TempDir> = None;
+    let path: Option<PathBuf> = if seekable {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let p = tmp.path().join("input");
+        std::fs::write(&p, payload).expect("write temp input");
+        _tmp_guard = Some(tmp);
+        Some(p)
+    } else {
+        None
+    };
 
-    let src: Box<dyn Source> = if seekable {
-        std::fs::write(&path, payload).expect("write temp input");
-        match FileSource::open(&path) {
+    let src: Box<dyn Source> = if let Some(p) = &path {
+        match FileSource::open(p) {
             Ok(s) => Box::new(s),
             Err(e) => {
                 check_error_is_classified(&e).expect("FileSource::open error classification");
@@ -151,9 +257,6 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut enumerated: usize = 0;
-    // Independent observation 1 for Ruling B: some entry's produced byte
-    // count disagreed with its declared size.
-    let mut short_entry_seen = false;
 
     loop {
         let mut entry = match ar.next_entry() {
@@ -175,7 +278,18 @@ fuzz_target!(|data: &[u8]| {
                 Ok(0) => break,
                 Ok(n) => produced += n as u64,
                 Err(e) => {
-                    let e = Error::from(e);
+                    // `from_decode_io`, NOT the bare `Error::Io` `Error::from`
+                    // would give: an `io::Error` here can be malformed-input
+                    // `InvalidData`, which this boundary is EXPECTED to
+                    // reclassify as `Error::Corrupt` (exit 5) — see
+                    // `error.rs`'s own doc on `from_decode_io` and its other
+                    // callers (`ops.rs`, `entries.rs`, `conformance.rs`).
+                    // Using the bare `From` here would make this oracle call
+                    // an unconditional panic wearing an invariant's clothes:
+                    // every read error, hostile or not, is `Error::Io`, which
+                    // is exit 1 by construction, which
+                    // `check_error_is_classified` always refuses.
+                    let e = Error::from_decode_io(e);
                     check_error_is_classified(&e).expect("entry read error classification");
                     return;
                 }
@@ -185,9 +299,6 @@ fuzz_target!(|data: &[u8]| {
         // borrow on `ar` before the next `ar.next_entry()` call.
 
         check_entry_size(declared_size, produced, &entry_name).expect("entry size");
-        if declared_size.is_some_and(|d| d != produced) {
-            short_entry_seen = true;
-        }
     }
 
     // Read the report only now that the walk is complete, not mid-walk.
@@ -199,20 +310,25 @@ fuzz_target!(|data: &[u8]| {
     // `declared = None` there and `check_entry_count` returns `Ok`
     // immediately, correctly: only zip has a count to check against.
     let declared: Option<usize> = if seekable && name == "zip" {
-        declared_zip_index(&path)
+        declared_zip_index(path.as_deref().expect("path is Some whenever seekable"))
     } else {
         None
     };
-    // Independent observation 2 for Ruling B: the index this target itself
-    // parsed disagreed with what the walk actually enumerated.
-    let count_mismatch_seen = declared.is_some_and(|d| d != enumerated);
 
     check_entry_count(declared, enumerated, report).expect("entry count");
 
-    // Ruling B: `approximated` must be an independent observation, never
-    // `report.has_warnings()` (a tautology — the report is what is being
-    // checked) and never a constant `false` (which disables the invariant
-    // outright). Both terms above come from facts THIS walk observed.
-    let approximated = short_entry_seen || count_mismatch_seen;
+    // Ruling B: `approximated` must be an independent observation — one that
+    // can be TRUE in a state where every other oracle call in this target
+    // still returns `Ok`. `forward_entry_count`'s cross-check is exactly
+    // that: see its own doc comment for why it cannot be satisfied by the
+    // same fact `check_entry_count` already owns up to. Only run on the
+    // seekable path: `Rung::ForwardOnly` is never `is_authoritative()`
+    // (`fidelity.rs`), so `report.is_lossless()` is already false on the
+    // forward-only branch and `check_fidelity_claim` can never fire there
+    // regardless — running the second walk would cost a walk for an
+    // observation that can never matter.
+    let approximated = seekable
+        && forward_entry_count(container.as_ref(), payload).is_some_and(|n| n != enumerated);
+
     check_fidelity_claim(report, approximated).expect("fidelity claim");
 });
