@@ -86,11 +86,11 @@
 //! that module works around it). Property 12's hostile names are stored and
 //! read back verbatim by construction, with nothing for this module to do.
 //!
-//! # Task 5d: two of three header-declared-length OOMs, and why the third needs no fix here
+//! # Four header fields `ar` 0.9.0 trusts before use, and what this module does about each
 //!
-//! `ar` 0.9.0 allocates three buffers straight from header-declared lengths,
-//! before validating them and before a byte of what they will hold is read —
-//! the same shape of bug Task 5c closed for `cpio.rs`'s `c_namesize`:
+//! Three are allocations made straight from a header-declared length, before
+//! validating it and before a byte of what it will hold is read — the same
+//! shape of bug Task 5c closed for `cpio.rs`'s `c_namesize`:
 //!
 //! - `lib.rs:261`, `*name_table = vec![0; size as usize];` — the GNU
 //!   long-name table, sized from the SAME 10-digit decimal `file size`
@@ -116,8 +116,17 @@
 //! added for `ar`, this is the site that must be bounded FIRST, before that
 //! lands.**
 //!
-//! The other two are both real, and both on this container's ORDINARY read
-//! path, not just a hostile one: the GNU name table is what `ar`'s own
+//! The FOURTH site is not an allocation at all and is worse than any of
+//! them: `lib.rs:269`'s `name_table[start..]`, a slice index taken straight
+//! from `buffer[1..16]` with no bounds check, which **panics** — exit 101,
+//! on a 68-byte file. Task 5d enumerated the three allocation sites in this
+//! very function and did not look for the non-allocation one. It is bounded
+//! by [`refuse_an_out_of_range_name_table_index`], which is also where the
+//! reasoning for its different error kind lives: `Corrupt` (exit 5), not
+//! `ResourceLimit` (exit 6) like the two guards beside it.
+//!
+//! The two guarded allocations are both real, and both on this container's
+//! ORDINARY read path, not just a hostile one: the GNU name table is what `ar`'s own
 //! default variant on Linux writes (see the cross-compiled `.rlib` files
 //! this fix was measured against, below), and the BSD extended form is what
 //! THIS container's own writer produces for any `/`-bearing or >16-byte
@@ -239,9 +248,9 @@ impl Container for Ar {
         let Resolved { source, report, .. } = resolved;
         let seekable = source.caps().seekable;
         // Wrapped in `ArGuardedReader` before the crate ever sees it — see
-        // the module doc's Task 5d section for why the guard has to be
-        // installed here, below the crate, rather than as a peek this
-        // module performs itself before delegating.
+        // the module doc's "Four header fields" section for why the guard
+        // has to be installed here, below the crate, rather than as a peek
+        // this module performs itself before delegating.
         let guarded = ArGuardedReader::new(source);
         // Leaked deliberately and reclaimed in `ArRead::drop` — see that
         // struct's own doc for why, and `tar.rs`'s module doc for the fuller
@@ -273,10 +282,10 @@ fn classify_ar_error(e: io::Error) -> Error {
     Error::from_decode_io(e)
 }
 
-// --- Task 5d: guarding two header-declared-length allocations -------------
+// --- Guarding the header fields `ar` 0.9.0 trusts before use --------------
 //
-// See the module doc's "Two of three header-declared-length OOMs" section
-// for the full picture. What follows is [`ArGuardedReader`] (the wrapper
+// See the module doc's "Four header fields `ar` 0.9.0 trusts before use"
+// section for the full picture. What follows is [`ArGuardedReader`] (the wrapper
 // `ar::Archive` reads from for the whole archive's lifetime) and
 // [`scan_ar_header`] (the stripped-down mirror of `ar::Header::read`'s own
 // state machine it uses to find and validate every header).
@@ -363,10 +372,82 @@ fn refuse_if_over(value: u64, limit: u64, what: &str, noun: &str) -> io::Result<
     Ok(())
 }
 
+/// Refuses a GNU short-name reference (`/N`) whose index points past the
+/// long-name table this archive actually declared.
+///
+/// This is the FOURTH header field `ar::Header::read` trusts before use,
+/// and the only one of the four that is not an allocation:
+/// `ar-0.9.0/src/lib.rs:269` slices `name_table[start..]` with `start`
+/// taken straight from `buffer[1..16]`, bounds-checked against nothing. A
+/// **68-byte** archive — the 8-byte global header plus one header naming
+/// `/9999`, with no `//` member anywhere — is enough:
+///
+/// ```text
+/// $ stuffr list evil.a
+/// thread 'main' panicked at .../ar-0.9.0/src/lib.rs:269:39:
+/// range start index 9999 out of range for slice of length 0
+/// exit=101
+/// ```
+///
+/// A panic is strictly worse than the three OOMs beside it, and not only
+/// because exit 101 means *stuffr* failed: `stuffr_core::honesty`'s
+/// `check_error_is_classified` — the oracle Phase 3a built precisely to
+/// catch hostile input escaping the error vocabulary — can NEVER see one,
+/// because a panic is not an `Error`. The fuzz target aborts before the
+/// oracle runs, so the entire class is invisible to the harness meant to
+/// find it.
+///
+/// # Why `Corrupt` (exit 5), and not `ResourceLimit` (exit 6) like its three neighbours
+///
+/// [`refuse_if_over`]'s two callers and `cpio.rs`'s `c_namesize` guard all
+/// refuse a plausible-but-expensive SIZE: the header is well formed, this
+/// build simply declines to allocate that much, and a machine with more
+/// memory could legitimately honour it. That is what exit 6 tells a caller,
+/// and it is why it sits alongside `Unsupported`/`CapabilityUnavailable` as
+/// "this build/source cannot do that" rather than "the file is damaged".
+///
+/// Nothing is allocated here, and no machine anywhere could honour this
+/// header: an offset past the end of the name table THE ARCHIVE ITSELF
+/// declared is the file contradicting its own shape, which is what
+/// [`Error::Corrupt`] means everywhere else in this project — `zip.rs`'s
+/// declared-vs-delivered entry size, `cpio.rs`'s short symlink target,
+/// `tar.rs`'s short payload. Answering exit 6 would additionally be an
+/// actively misleading verdict: it invites a retry with a larger memory
+/// budget, and no budget can ever make this archive readable.
+///
+/// The `InvalidData` kind is how that verdict reaches the caller: the
+/// crate's own `reader.read(&mut buffer)?` (`lib.rs:236`) is bare, with no
+/// `annotate()` in the way, so the kind survives to `classify_ar_error` and
+/// lands on [`Error::Corrupt`] — the same route `refuse_if_over`'s
+/// `OutOfMemory` takes to [`Error::ResourceLimit`].
+fn refuse_an_out_of_range_name_table_index(field: &[u8], name_table_len: u64) -> io::Result<()> {
+    // An index this cannot parse is one the crate's OWN reparse of the same
+    // bytes cannot parse either — see `parse_ar_field`'s doc. Its error is
+    // the accurate one; do not pre-empt it with a worse guess.
+    let Some(start) = parse_ar_field(field) else {
+        return Ok(());
+    };
+    // `start == name_table_len` is legal and must stay legal: slicing a
+    // `Vec` at exactly its length yields an empty slice, which the crate
+    // then resolves to an empty identifier rather than panicking.
+    if start > name_table_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "an entry's GNU short-name reference points at offset {start} of a long-name \
+                 table this archive declares as {name_table_len} bytes; the archive contradicts \
+                 its own shape"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Inspects one complete 60-byte `ar` entry header, mirroring just enough of
 /// `ar::Header::read`'s own branching (global variant detection, the GNU
-/// name-table and BSD extended-identifier special cases) to validate the
-/// two length fields those branches allocate from — see the module doc.
+/// name-table, short-name-reference and BSD extended-identifier special
+/// cases) to validate the three header fields those branches use before
+/// checking them — see the module doc.
 ///
 /// `variant` is threaded through exactly as the crate threads its own
 /// `Variant` through `Header::read`: once a header sets it to `Gnu` or `Bsd`,
@@ -380,6 +461,7 @@ fn refuse_if_over(value: u64, limit: u64, what: &str, noun: &str) -> io::Result<
 fn scan_ar_header(
     hdr: &[u8; AR_ENTRY_HEADER_LEN],
     variant: &mut ar::Variant,
+    name_table_len: &mut u64,
 ) -> io::Result<ArHeaderScan> {
     let mut identifier = hdr[0..16].to_vec();
     while identifier.last() == Some(&b' ') {
@@ -397,12 +479,22 @@ fn scan_ar_header(
                 "a GNU archive",
                 "long-name table",
             )?;
+            // The crate replaces its whole `name_table` with exactly `size`
+            // bytes (`lib.rs:261-263`) and errors out if the stream cannot
+            // deliver them, so `size` is the length every LATER `/N`
+            // reference gets resolved against. A second `//` member
+            // overwrites it there and here alike.
+            *name_table_len = size;
+        } else if identifier != b"/" {
+            // An ordinary GNU short-name reference (`/N`), whose index the
+            // crate slices its name table with, unchecked. The GNU SYMBOL
+            // table (identifier exactly `/`) is excluded because the crate
+            // returns from that branch before parsing an index at all; its
+            // OWN string-table length is out of scope for a different
+            // reason — see the module doc's "dead code from this module"
+            // paragraph.
+            refuse_an_out_of_range_name_table_index(&hdr[1..16], *name_table_len)?;
         }
-        // The GNU symbol table (identifier exactly `/`) and an ordinary GNU
-        // short-name reference (`/N`) both carry `size` bytes of payload and
-        // no further length field this container can reach — see the
-        // module doc's "dead code from this module" paragraph for why the
-        // symbol table's OWN string-table length is out of scope.
     } else if *variant != ar::Variant::BSD && identifier.ends_with(b"/") {
         *variant = ar::Variant::GNU;
     } else if *variant != ar::Variant::GNU && identifier.starts_with(b"#1/") {
@@ -474,6 +566,13 @@ struct ArGuardedReader {
     inner: Box<dyn Source>,
     phase: ArGuardPhase,
     variant: ar::Variant,
+    /// Length of the GNU long-name table this archive declared, mirroring
+    /// `ar::Archive`'s own `name_table: Vec<u8>` closely enough to bound the
+    /// `/N` index that slices it — see
+    /// [`refuse_an_out_of_range_name_table_index`]. Zero until a `//` member
+    /// is seen, which is exactly the state the crate's own empty `Vec` is in
+    /// and the state the 68-byte panic reproducer exploits.
+    name_table_len: u64,
 }
 
 impl ArGuardedReader {
@@ -484,6 +583,7 @@ impl ArGuardedReader {
                 remaining: GLOBAL_HEADER.len() as u8,
             },
             variant: ar::Variant::Common,
+            name_table_len: 0,
         }
     }
 }
@@ -540,7 +640,8 @@ impl Read for ArGuardedReader {
                             .as_slice()
                             .try_into()
                             .expect("just checked buf.len() == AR_ENTRY_HEADER_LEN");
-                        let scan = scan_ar_header(&hdr, &mut self.variant)?;
+                        let scan =
+                            scan_ar_header(&hdr, &mut self.variant, &mut self.name_table_len)?;
                         (scan.payload_len, scan.pad_after)
                     } else {
                         // Truncated mid-header — see this phase's own doc.
@@ -1666,6 +1767,102 @@ mod tests {
         assert!(
             ar.next_entry().unwrap().is_none(),
             "must be exactly one real entry"
+        );
+    }
+    // --- Task 5e: the fourth trust-the-header site, and the only panic ---
+    //
+    // `ar-0.9.0/src/lib.rs:269` slices `name_table[start..]` with `start`
+    // taken straight from `buffer[1..16]`. See
+    // `refuse_an_out_of_range_name_table_index`'s doc for the full picture,
+    // including why this one is `Corrupt` where its three neighbours are
+    // `ResourceLimit`.
+
+    /// The failing-first test for Task 5e: the exact 68-byte archive that
+    /// panicked `stuffr list` at exit 101 must now be refused as a typed
+    /// error at exit 5.
+    ///
+    /// 68 bytes is the whole file: the 8-byte global header plus ONE
+    /// 60-byte entry header naming `/9999`, with no `//` member anywhere,
+    /// so the table the index reaches into is the crate's initial empty
+    /// `Vec`. Nothing in the fixture is incidental — drop the guard and
+    /// this test does not merely fail, it aborts the test binary.
+    #[test]
+    fn refuses_a_name_table_index_past_the_table_it_indexes() {
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend_from_slice(&ar_header_raw(&padded_identifier("/9999"), 0));
+        assert_eq!(bytes.len(), 68, "the reproducer is exactly 68 bytes");
+
+        let mut ar = open(&bytes);
+        let err = ar
+            .next_entry()
+            .expect_err("an out-of-range name-table index must be refused, not sliced");
+
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "an offset past the end of the table the archive itself declared is the file \
+             contradicting its own shape, not a resource ceiling — see \
+             refuse_an_out_of_range_name_table_index's doc; got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5, "Corrupt is exit 5: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("9999"),
+            "the message must name the offset the header declared, got: {msg}"
+        );
+    }
+
+    /// The over-strictness guard for the test above, and the reason the
+    /// check has to track the declared table length rather than simply
+    /// refusing every `/N`: a GNU archive whose short-name reference
+    /// resolves INSIDE its own name table is the ordinary shape `ar` writes
+    /// on Linux, and must still read.
+    ///
+    /// Deliberately different from
+    /// `a_legitimate_large_name_table_still_reads`, which stores its one
+    /// entry inline (`a.txt/`) and therefore never exercises the `/N`
+    /// branch at all. This one resolves entry names through the table
+    /// twice, including a non-zero offset, which is what makes it a real
+    /// falsification of "refuse everything".
+    #[test]
+    fn a_name_table_index_inside_the_table_still_resolves() {
+        let first = b"a-name-far-too-long-to-store-inline.o/\n";
+        let second = b"another-name-far-too-long-for-16-bytes.o/\n";
+        let mut table = Vec::new();
+        table.extend_from_slice(first);
+        let second_at = table.len();
+        table.extend_from_slice(second);
+        assert!(
+            !table.len().is_multiple_of(2),
+            "fixture relies on the odd-size pad path too"
+        );
+
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend_from_slice(&ar_header_raw(&padded_identifier("//"), table.len() as u64));
+        bytes.extend_from_slice(&table);
+        bytes.push(b'\n'); // odd table size: one pad byte
+
+        bytes.extend_from_slice(&ar_header_raw(&padded_identifier("/0"), 5));
+        bytes.extend_from_slice(b"hello");
+        bytes.push(b'\n'); // size 5 is odd: one pad byte
+
+        bytes.extend_from_slice(&ar_header_raw(
+            &padded_identifier(&format!("/{second_at}")),
+            6,
+        ));
+        bytes.extend_from_slice(b"world!");
+
+        let mut ar = open(&bytes);
+        let mut names = Vec::new();
+        while let Some(entry) = ar.next_entry().expect("a legitimate GNU archive must read") {
+            names.push(entry.meta().name.clone());
+        }
+        assert_eq!(
+            names,
+            vec![
+                "a-name-far-too-long-to-store-inline.o".to_string(),
+                "another-name-far-too-long-for-16-bytes.o".to_string(),
+            ],
+            "both names must resolve through the table"
         );
     }
 }
