@@ -47,6 +47,9 @@ zip = ["dep:zip", "dep:time", "dep:flate2"]
 # standalone `.zst` (via `ruzstd`) but not a zstd-compressed zip ENTRY, since
 # zip's `zstd` feature is the one that pulls `zstd-sys`.
 zip-zstd = ["zip?/zstd"]
+lha = ["dep:delharc"]
+arj = ["dep:unarj-rs"]
+compress = ["dep:newtua-lzw-z"]
 
 [dependencies]
 stuffr-core = { workspace = true }
@@ -64,6 +67,9 @@ ar = { workspace = true, optional = true }
 cpio = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
+delharc = { workspace = true, optional = true }
+unarj-rs = { workspace = true, optional = true }
+newtua-lzw-z = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }

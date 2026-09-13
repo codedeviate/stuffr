@@ -194,3 +194,17 @@ zip = { version = "8.6", default-features = false, features = [
 # declares it, so the two unify to one build of one version.
 time = { version = "0.3", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
+# All three pinned EXACTLY. Two different reasons:
+#
+# `delharc` — the maintained 0.8 line requires rustc 1.95 and this project's
+# MSRV is 1.88, so 0.6.2 is the newest release that fits. Patch fixes on 0.8
+# will not reach us until the MSRV moves; revisit this pin when it does, not
+# before.
+#
+# `unarj-rs` — declares no `rust-version` at all, so a patch release can raise
+# the MSRV with nothing to announce it (the `ruzstd` 0.8.2 failure mode under
+# MSRV in CLAUDE.md). The `msrv` CI job is the detector; the pin is what makes
+# that detection actionable rather than a surprise.
+delharc = { version = "=0.6.2", default-features = false, features = ["std", "lh1", "lz"] }
+unarj-rs = "=0.2.1"
+newtua-lzw-z = "=0.1.0"

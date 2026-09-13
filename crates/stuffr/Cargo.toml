@@ -51,7 +51,7 @@ pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pur
 # container in on its own. This is the one capability difference `c-backed`
 # makes to a container: reading and writing a zstd-compressed zip entry.
 c-backed = ["zstd-c", "xz-c", "lzma-c", "stuffr-formats/zip-zstd"]
-legacy = []
+legacy = ["stuffr-formats/lha", "stuffr-formats/arj", "stuffr-formats/compress"]
 full = ["pure", "c-backed", "legacy"]
 serde = ["dep:serde", "stuffr-core/serde"]
 # Exposes test-only instrumentation (see `ops::sync_call_count`) that would
