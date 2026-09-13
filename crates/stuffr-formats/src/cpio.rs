@@ -357,8 +357,10 @@ fn classify_cpio_error(e: io::Error) -> Error {
 ///
 /// # One path, not two
 ///
-/// The 0.3.1 helper had a separate seekable branch that read the prefix and
-/// then seeked back. That is gone: buffering 102 bytes costs the same on a
+/// Task 5c's first version of this guard — which lived only inside the
+/// Phase 3a branch and never shipped in any release — had a separate
+/// seekable branch that read the prefix and then seeked back. That is gone:
+/// buffering 102 bytes costs the same on a
 /// file as on a pipe, and a single path is one fewer place for the two to
 /// disagree. Nothing below this wrapper seeks — `by_index` refuses on every
 /// cpio source (see [`CpioRead::by_index`]) — so no position needs restoring.

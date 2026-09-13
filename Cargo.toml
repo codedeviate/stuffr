@@ -83,24 +83,50 @@ tar = { version = "0.4.46", default-features = false }
 # PINNED EXACTLY, and the pin is load-bearing. `ar.rs`'s `ArGuardedReader`
 # and `scan_ar_header` mirror `ar::Header::read`'s PRIVATE header state
 # machine, because the allocations and the slice index they bound all happen
-# inside the crate, below anything this module can peek at. Five facts about
-# 0.9.0's internals are hard-coded there: the 60-byte header width, the
-# `[48..58]` file-size field, the `[3..16]` BSD extended length field, the
-# `[1..16]` GNU short-name index, and the `size % 2` pad rule — plus the
-# GNU-before-BSD branch order the variant latch depends on. A 0.9.x patch
-# release that changes ANY of them desyncs the mirror silently, and the
-# symptom is the worst kind: the guard scans payload bytes as headers, and a
-# coincidental `#1/<big>` or `//` inside a real object file produces a FALSE
-# `ResourceLimit` (exit 6) or `Corrupt` (exit 5) on a perfectly valid
-# archive. Nothing in the test suite would detect that — the suite proves the
-# guard fires on hostile input and stays silent on 666 real archives, both
-# measured against 0.9.0.
+# inside the crate, below anything this module can peek at. EIGHT facts about
+# 0.9.0's internals are hard-coded there — the list said five until the Phase
+# 3a whole-branch review recounted it, and the three it was missing are the
+# ones a reader would never think to check:
+#
+#   1. the 60-byte header width;
+#   2. the `[48..58]` file-size field;
+#   3. the `[3..16]` BSD extended length field;
+#   4. the `[1..16]` GNU short-name index;
+#   5. the `size % 2` pad rule;
+#   6. that the pad byte is consumed BEFORE the next header rather than after
+#      the payload — the ORDERING fact 5's existence implies but does not
+#      state, and what `ArGuardPhase::Pad -> Header` encodes;
+#   7. that `ar::Entry`'s `Drop` drains the unread payload (`lib.rs:851`).
+#      `ArGuardPhase::Payload`'s byte counter is only correct because every
+#      payload byte is eventually pulled THROUGH the wrapper; a crate that
+#      stopped draining would make the wrapper read the next header's bytes
+#      as payload and then scan payload as headers — precisely the
+#      false-positive failure this pin exists to prevent;
+#   8. that the crate's read at `lib.rs:234` is UN-annotated, so the
+#      `io::ErrorKind` the guards raise survives to `classify_ar_error`.
+#      Annotate it upstream and `refuse_if_over`'s `OutOfMemory` stops
+#      landing on `ResourceLimit` — a silently wrong exit code, not a
+#      failure.
+#
+# — plus the GNU-before-BSD branch order the variant latch depends on. A
+# 0.9.x patch release that changes ANY of them desyncs the mirror silently,
+# and the symptom is the worst kind: the guard scans payload bytes as
+# headers, and a coincidental `#1/<big>` or `//` inside a real object file
+# produces a FALSE `ResourceLimit` (exit 6) or `Corrupt` (exit 5) on a
+# perfectly valid archive. Nothing in the test suite would detect that — the
+# suite proves the guard fires on hostile input, and the silent-on-real-input
+# half was measured by sweeping every `.a`/`.rlib` on one machine. That
+# figure and its scope live in `ar.rs`'s module doc (478 archives) and are
+# deliberately NOT restated here: the count is a property of the machine, not
+# of the guard — an independent later sweep on a differently-populated box
+# found 444, every one silent — and a number duplicated across two files is a
+# number that drifts. This note said 666 for exactly that reason.
 #
 # This is the same deliberate, documented cost `ruzstd = "=0.8.1"` carried
 # under the MSRV section until 1.88 lifted it: an exact pin blocks
 # patch-level fixes, and is worth it only while something concrete depends on
 # the exact version. Before loosening this to a caret range, re-verify each
-# of those five facts against the new `ar` source line by line — or replace
+# of those eight facts against the new `ar` source line by line — or replace
 # the mirror with a drift test that compares the guard's boundary walk
 # against the crate's own entry offsets over a fixture set, which is what
 # would make a caret range safe.

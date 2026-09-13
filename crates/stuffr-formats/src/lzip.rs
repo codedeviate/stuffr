@@ -468,7 +468,7 @@ impl Codec for Lzip {
     ///
     /// **This `fill_buf` is eager, not lazy — one of two exceptions in this
     /// crate** (`xz_pure.rs`'s decoder does the same, for the same reason;
-    /// the other thirteen `decoder()` impls read nothing until a caller's
+    /// the other twelve `decoder()` impls read nothing until a caller's
     /// first `read()`, so the "every codec's `decoder()` is lazy" claim
     /// recorded in Task 4b's own report is true everywhere except here and
     /// in `xz_pure.rs`). The `.unwrap_or(&[])` below is not a shortcut, it

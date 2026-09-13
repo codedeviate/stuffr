@@ -141,12 +141,12 @@
 //! THIS container's own writer produces for any `/`-bearing or >16-byte
 //! identifier (see `write_safe_identifier` above).
 //!
-//! ## Why the fix cannot be a single peek before each entry, unlike `cpio.rs`
+//! ## Why the fix cannot be a single peek before each entry
 //!
-//! `cpio.rs`'s `peek_header_prefix` peeks once per entry because cpio's
-//! format is 1:1: every header the crate reads corresponds to exactly one
-//! entry this container hands back (or the trailer). `ar::Archive::next_entry`
-//! is not 1:1: a GNU name table or symbol table header is consumed and
+//! A peek-per-entry guard needs the format to be 1:1 — every header the
+//! crate reads corresponding to exactly one entry this container hands back
+//! (or the trailer). cpio is; `ar::Archive::next_entry`
+//! is not: a GNU name table or symbol table header is consumed and
 //! `continue`d past internally, inside the SAME call, with no yield point
 //! for this module to peek from in between — and, `ArRead::archive` being a
 //! raw pointer leaked at `open` time (see this module's own doc above),
@@ -155,7 +155,14 @@
 //!
 //! So the guard lives BELOW the crate instead of above it: [`ArGuardedReader`]
 //! wraps the real source and is what `ar::Archive` reads from for the whole
-//! archive's lifetime, mirroring just enough of `ar::Header::read`'s own
+//! archive's lifetime. `cpio.rs` ended up with the SAME below-the-crate shape
+//! (`CpioSource`) even though a peek-per-entry guard was available to it, and
+//! for a different reason — Task 5e measured the per-entry wrapper's nesting
+//! at quadratic, overflowing the stack at 100,000 entries. See `CpioSource`'s
+//! own doc; an earlier version of this section argued from a
+//! `peek_header_prefix` helper that no longer exists, and contradicted it.
+//!
+//! The wrapper mirrors just enough of `ar::Header::read`'s own
 //! state machine — global header, optional one-byte pad, 60-byte header,
 //! payload — to recognise a header BOUNDARY and hold the full 60 bytes back
 //! (never releasing a partial header to the crate) until [`scan_ar_header`]
@@ -434,7 +441,7 @@ fn refuse_if_over(value: u64, limit: u64, what: &str, noun: &str) -> io::Result<
 /// across 5 and 6 on the same 68-byte file.
 ///
 /// The `InvalidData` kind is how that verdict reaches the caller: the
-/// crate's own `reader.read(&mut buffer)?` (`lib.rs:236`) is bare, with no
+/// crate's own `reader.read(&mut buffer)?` (`lib.rs:234`) is bare, with no
 /// `annotate()` in the way, so the kind survives to `classify_ar_error` and
 /// lands on [`Error::Corrupt`] — the same route `refuse_if_over`'s
 /// `OutOfMemory` takes to [`Error::ResourceLimit`].

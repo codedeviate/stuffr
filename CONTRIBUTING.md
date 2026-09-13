@@ -268,7 +268,7 @@ libFuzzer through `cargo fuzz`:
 |---|---|
 | `codec.rs` | One codec's decoder, fed raw bytes. A selector byte picks the format from [`CODEC_SLOTS`](#the-slot-tables-are-append-only) so one corpus exercises every registered codec. |
 | `container.rs` | One container's reader, both ladder rungs — the selector's high bit picks seekable vs. `ForwardOnly` so both walk paths get fuzzed, not just the seekable one. Also runs an independent EOCD re-parse and a second forward-only walk as cross-checks (see the module doc for why each is not redundant with the honesty oracle below). |
-| `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the layer a real `curl \| stuffr cat -` exercises and a silent wrong-format bug once lived in. |
+| `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the three. |
 
 Every decode path in all three is bounded (`DecodeOpts::memory_limit`,
 a capped output read) for the same reason the codec's own conformance
@@ -320,10 +320,28 @@ make fuzz-corpus   # (re)generate fuzz/corpus/{codec,container,chain}
 make fuzz          # short, seeded smoke pass — the local equivalent of CI's fuzz-smoke job
 ```
 
-`make fuzz` mirrors `ci.yml`'s `fuzz-smoke` job exactly — same fixed
-`-runs=2000 -seed=1` budget per target, same non-zero-execution-count check
-so a target that silently returns early on every input can't pass by doing
-nothing. Neither `fuzz-corpus` nor `fuzz` is part of `make check`: `cargo
+`make fuzz` mirrors `ci.yml`'s `fuzz-smoke` job — same fixed `-runs=2000
+-seed=1` budget per target, same non-zero-execution-count check so a target
+that silently returns early on every input can't pass by doing nothing. (Not
+*exactly*: the CI copy ends its grep pipeline with `|| true`, because GitHub
+runs that block under `bash -e -o pipefail` where a no-match grep would abort
+the script before the check it feeds. The Makefile runs under a plain `sh`
+and must not. Both files say so; do not tidy either into matching the other.)
+
+**A fixed `-runs` and `-seed` do not make either run deterministic, and a
+green one is not proof of absence.** Measured on the `container` target with
+the same seed and the same corpus, five identical re-runs: 3 of 5 found a
+crash on one pass and 2 of 5 on the next. `-seed=` fixes libFuzzer's mutation
+PRNG, not the order it walks the corpus directory or its entropic scheduling,
+and both feed the mutator. The flakiness is **false-negative only** — a run
+may miss a crash it found before, but it never reports one that did not
+happen — which is what earns the job the right to block. So treat a crash
+that will not reproduce from the echoed command as expected rather than as a
+flaky test to be quieted: re-run it, or hand the artifact to `cargo fuzz run
+<target> <artifact>`, which *is* deterministic. `ci.yml`'s Ruling G comment
+carries the same measurement.
+
+Neither `fuzz-corpus` nor `fuzz` is part of `make check`: `cargo
 fuzz` needs the nightly toolchain the gate does not assume, and generating
 the corpus writes real files under a gitignored directory rather than
 something every edit should refresh. A slower, wall-clock-budgeted pass runs
