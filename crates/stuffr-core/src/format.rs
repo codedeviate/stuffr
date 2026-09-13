@@ -145,25 +145,41 @@ pub struct CodecCaps {
     /// True only when the format itself carries no signal whatsoever — no
     /// checksum, no length, no structural decode constraint, no end-of-stream
     /// marker — that could ever distinguish a truncated stream from a complete
-    /// one. Conformance property 9 (`conformance.rs`) already has a
-    /// declaration-gated skip for "no checksum"
-    /// (`CorruptionDetection::Never`); property 10 (truncation) does not,
-    /// deliberately — `conformance.rs`'s own `mod broken_codecs` keeps
-    /// `testing::MockCodec`, a bare unframed XOR pass-through, specifically
-    /// UNABLE to clear property 10
-    /// (`mock_codec_clears_every_property_up_to_truncation`) to prove the
-    /// property really does fire against an unframed stream, and every real
-    /// codec so far closes the gap: a mandatory checksum (gzip, zlib, bzip2,
-    /// snappy), a per-writer optional one this build's own encoder always
-    /// turns on (zstd, xz, lz4), structural invalidity from a range coder
-    /// (LZMA1), or, for a codec with neither, an explicit end-of-stream
-    /// signal (raw deflate's `BFINAL` bit — see `deflate.rs`).
+    /// one. This does NOT exempt a codec from conformance property 10
+    /// (truncation, `conformance.rs`) — property 10 has no bare skip for any
+    /// declaration, deliberately: `conformance.rs`'s own `mod broken_codecs`
+    /// keeps `testing::MockCodec`, a bare unframed XOR pass-through,
+    /// specifically UNABLE to clear property 10
+    /// (`mock_codec_clears_every_property_up_to_truncation`), and a codec
+    /// that answered nothing at all about truncation would be
+    /// indistinguishable from one that never checked.
+    ///
+    /// What this field switches property 10 to instead is a WEAKER, but
+    /// still falsifiable, property: on truncated input, the decoder must
+    /// either error, or produce a byte sequence that is a genuine prefix of
+    /// what the same decoder produces from the untruncated input. That still
+    /// catches a real defect class — a decoder that mishandles a partial
+    /// final unit and emits wrong trailing bytes, reordered bytes, or
+    /// fabricated padding fails this exactly as it would fail the strict
+    /// "must always error" property — while not demanding a guarantee the
+    /// format cannot give. `conformance.rs`'s
+    /// `a_decoder_that_returns_a_non_prefix_on_truncation_is_caught` proves
+    /// the weaker check still fires, by mutation, the same way
+    /// `mock_codec_clears_every_property_up_to_truncation` proves the strict
+    /// one does.
+    ///
+    /// Every real codec so far closes the gap the strict property demands: a
+    /// mandatory checksum (gzip, zlib, bzip2, snappy), a per-writer optional
+    /// one this build's own encoder always turns on (zstd, xz, lz4),
+    /// structural invalidity from a range coder (LZMA1), or, for a codec with
+    /// neither, an explicit end-of-stream signal (raw deflate's `BFINAL` bit
+    /// — see `deflate.rs`).
     ///
     /// `legacy::compress_z` (Phase 3b) is the first exception, and this field
     /// exists because of it, not in anticipation of it: Unix compress's LZW
     /// code stream has none of the above. A prefix of a valid stream decodes
     /// via the identical state machine as the full stream and simply runs out
-    /// of bits, producing a shorter but otherwise byte-correct prefix of the
+    /// of bits, producing a shorter but otherwise byte-correct PREFIX of the
     /// real output with no error — measured directly, at the bit level, on
     /// this project's own `hello.Z` fixture: cutting 1, 25 or 50 of its 51
     /// bytes left between 5 and 7 leftover, unconsumed bits in every case,
@@ -173,14 +189,17 @@ pub struct CodecCaps {
     /// code). Confirmed independently against two production reference
     /// tools, not just this crate: `/usr/bin/uncompress` and `/usr/bin/gzip
     /// -dc` on macOS both exit 0 with silently-partial output on the same cut
-    /// files, rather than reporting an error. This is a real, external,
-    /// cross-validated fact about the format, not a gap in `compress_z`'s own
-    /// decoder — see that module's doc for the full measurement.
+    /// files, and in every case what they emit is a strict prefix of the
+    /// untruncated decode — never garbage, never a differently-ordered or
+    /// padded result. This is a real, external, cross-validated fact about
+    /// the format, not a gap in `compress_z`'s own decoder — see that
+    /// module's doc for the full measurement.
     ///
-    /// Defaults to `false` (assumed detectable) via [`Self::round_trip`] and
-    /// [`Self::decode_only`], so every existing codec's behavior — including
-    /// `testing::MockCodec`'s own deliberate failure above — is unchanged;
-    /// only `compress_z::CompressZ` sets this explicitly.
+    /// Defaults to `false` (the strict property applies) via
+    /// [`Self::round_trip`] and [`Self::decode_only`], so every existing
+    /// codec's behavior — including `testing::MockCodec`'s own deliberate
+    /// failure above — is unchanged; only `compress_z::CompressZ` sets this
+    /// explicitly.
     pub truncation_undetectable: bool,
 }
 
