@@ -1922,9 +1922,9 @@ mod broken_containers {
         );
     }
 
-    /// Property 5 (content): right names, wrong bytes. The brief calls this
-    /// one out as mattering most — a container that enumerates correctly
-    /// and decodes wrongly is exactly what a fixture with no `expected`
+    /// Property 5 (content): right names, wrong bytes. This is the double
+    /// that matters most — a container which enumerates correctly and
+    /// decodes wrongly is exactly what a fixture with no `expected`
     /// content would wave through.
     struct CorruptsContent;
 
