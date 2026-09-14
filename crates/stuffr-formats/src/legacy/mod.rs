@@ -9,3 +9,5 @@
 
 #[cfg(feature = "compress")]
 pub mod compress_z;
+#[cfg(feature = "lha")]
+pub mod lha;

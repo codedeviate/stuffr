@@ -159,6 +159,11 @@ pub fn register_all(registry: &mut Registry) {
         std::sync::Arc::new(legacy::compress_z::CompressZ),
         legacy::compress_z::meta(),
     );
+
+    // Phase 3b, Task 5: the first read-only legacy CONTAINER — the shape
+    // Tasks 1-2's fixture-driven conformance harness was built for.
+    #[cfg(feature = "lha")]
+    registry.register_container(std::sync::Arc::new(legacy::lha::Lha), legacy::lha::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.

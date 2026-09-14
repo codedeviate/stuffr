@@ -986,6 +986,32 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
         .map(|r| r.id.as_str())
         .collect();
 
+    // `lha` (Phase 3b) is the first container gated behind a feature that
+    // `pure` does not carry: `--features legacy` (bundled into
+    // `full`/`--all-features`) adds it, the default `pure` build does not.
+    // Every OTHER container so far sits in `pure` itself, so "how many
+    // containers" used to be one tier-invariant number this whole test
+    // could check `stuffr::registry()` against directly. It no longer is:
+    // THIS test binary alone reports 4 under `cargo test --workspace`
+    // (`make check`'s `test-pure` leg, no `legacy`) and 5 under
+    // `--all-features` (`test`) — so a page correctly describing BOTH the
+    // default build and an `--all-features` one legitimately states two
+    // different container counts, and neither is stale just because it
+    // does not match whichever tier happens to compile this assertion.
+    // `base_containers` is the tier-invariant quartet (tar/ar/cpio/zip);
+    // `LEGACY_ONLY_CONTAINERS.len()` is added back on rather than reading
+    // `containers.len()` directly, so the "full build" count stays 5 even
+    // when THIS run (`test-pure`) has `lha` absent and cannot see it for
+    // itself. A future legacy container (ARJ) extends the list, not this
+    // reasoning.
+    const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha"];
+    let base_containers: Vec<&str> = containers
+        .iter()
+        .copied()
+        .filter(|id| !LEGACY_ONLY_CONTAINERS.contains(id))
+        .collect();
+    let full_container_count = base_containers.len() + LEGACY_ONLY_CONTAINERS.len();
+
     // (1) No "still to come" line may name a format this build registers.
     // Checked per SENTENCE, so "still to come: walking a directory tree"
     // sitting in the same paragraph as the word "zip" does not trip it.
@@ -1042,9 +1068,24 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
         let noun = next
             .trim_matches(|c: char| !c.is_alphanumeric())
             .to_lowercase();
+        if noun == "containers" {
+            // Either the tier-invariant base count or the full
+            // (`pure` + `legacy`) count is a true claim — see the comment
+            // on `LEGACY_ONLY_CONTAINERS` above for why there are now two,
+            // and why the second is computed rather than read off
+            // `containers.len()` (which this run may not be able to see).
+            assert!(
+                *value == base_containers.len() || *value == full_container_count,
+                "the page says `{word} containers`, but this build has {} base containers \
+                 ({} once every legacy container is counted) — the counts on this page are \
+                 what a user trusts before running `stuffr formats`",
+                base_containers.len(),
+                full_container_count
+            );
+            continue;
+        }
         let expected = match noun.as_str() {
             "formats" | "rows" => rows.len(),
-            "containers" => containers.len(),
             "codecs" => codecs.len(),
             _ => continue,
         };

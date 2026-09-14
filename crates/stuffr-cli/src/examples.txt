@@ -706,10 +706,11 @@ WHAT THIS BUILD CAN DO
       the eleven round-trip codecs gzip, zlib, deflate, bzip2, brotli, lz4,
       snappy, zstd, xz, lzma and lzip, plus the tar, ar, cpio and zip
       containers — the KIND column tells codecs and containers apart. A build
-      with `--features legacy` (bundled into `--features full`) adds one more
-      row, the read-only `compress` codec — see "READ-ONLY LEGACY FORMATS"
-      below — so an `--all-features` build lists 16 rows (12 codecs, still 4
-      containers) rather than 15. zstd's row differs by which backend is
+      with `--features legacy` (bundled into `--features full`) adds two more
+      rows: the read-only `compress` codec and the read-only `lha` container
+      — see "READ-ONLY LEGACY FORMATS" below — so an `--all-features` build
+      lists 17 rows (12 codecs, 5 containers) rather than 15. zstd's row
+      differs by which backend is
       compiled in: a build with the `zstd-c` feature (needs a C toolchain)
       shows `yes` in WRITE, using the real `libzstd`; a pure-Rust build
       falls back to `ruzstd` instead, and shows `weak` in WRITE — see
@@ -735,9 +736,10 @@ WHAT THIS BUILD CAN DO
       `zstd` — `ruzstd` has no multi-threaded encoder to hand a worker
       count to. Adding `--features c-backed` flips `zstd` to `yes` as
       well, alongside its WRITE column becoming `yes`; it changes nothing
-      else in this column, on any tier. All four containers — tar, ar, cpio
-      and zip — always show `-` here: none of them parallelises anything, on
-      any tier.
+      else in this column, on any tier. All four containers — tar, ar,
+      cpio and zip — always show `-` here: none of them parallelises
+      anything, on any tier. `lha` (behind `--features legacy`) shows `-`
+      too, trivially — it has no encoder to parallelise in the first place.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -957,3 +959,31 @@ READ-ONLY LEGACY FORMATS
       tools alike — measured directly, not assumed. `stuffr formats` still
       reports it accurately (KIND `codec`, WRITE `-`), the same promise "WHAT
       THIS BUILD CAN DO" above makes for every other row.
+
+  stuffr list backup.lzh
+      LHA/LZH, behind its own `--features lha` (bundled into `--features
+      legacy`/`full`/`--all-features`, same as `compress` above). This is
+      the first read-only CONTAINER, not codec: an `--all-features` build
+      therefore has five containers in total — tar, ar, cpio, zip and lha —
+      not four. Unlike `compress`, `lha` genuinely STREAMS: the crate behind
+      it (`delharc`) parses forward off a pipe natively, with no `Seek`
+      anywhere in its decode path, so `list`/`test`/`cat`/`unpack -C` and
+      `--max-ratio` all work exactly the same over a real file or a pipe —
+      no bound-before-allocation guard needed, unlike the ARJ container a
+      later phase adds. Its magic sits at offset 2, not 0 (`-lh` for the
+      LHarc family, `-lz` for the older LArc one this build also reads), so
+      both `.lzh` and `.lha` are detected automatically.
+
+      This container is READ-ONLY: `stuffr pack notes.txt --format lha`
+      fails with `Error::Unsupported` (exit 3) — there is no LHA ENCODER
+      here, only a reader for archives written by the real, decades-old
+      `lha`/`lhasa` tools. An entry using a compression method this build's
+      `delharc` feature set cannot decode (compiled with `std`, `lh1`, `lz`
+      — no `lhx`) is also `Error::Unsupported`, not corruption: the archive
+      is fine, this build just cannot decode that one method. A directory
+      entry (`-lhd-`) is the one case where an unsupported decoder is NOT an
+      error — it has no payload to decode in the first place, and reads back
+      as an empty directory. Every plain entry carries its own CRC-16, and a
+      corrupted one is reported as `Error::Corrupt` (exit 5) once its payload
+      has been fully read, the same as any other checksum-carrying format
+      here.
