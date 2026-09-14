@@ -45,6 +45,11 @@
 //!   [`LhaEntryReader`]). Downstream, `entries.rs`'s `copy_charging` applies
 //!   [`Error::from_decode_io`] to this, which is what turns it into
 //!   [`Error::Corrupt`] (exit 5) for a real caller.
+//! - A payload that stops short of its declared length → the same
+//!   `InvalidData`, folded from delharc's `UnexpectedEof` by
+//!   [`fold_truncated_payload`], for the same reason and at the same
+//!   boundary. Left alone it was exit 1 — the Phase 3a honesty oracle's
+//!   finding; see that function's doc.
 //! - Malformed header structure, encountered while [`LhaRead::next_entry`]
 //!   advances via `next_file()` (or while [`Lha::open`] parses the first
 //!   header), is classified directly by [`classify_lha_error`] into
@@ -328,9 +333,46 @@ struct LhaEntryReader<'a> {
     crc_checked: bool,
 }
 
+/// The payload-path twin of [`classify_lha_error`], and the reason it has to
+/// exist separately: `next_entry` returns `Result<_, crate::Error>` and can
+/// therefore build an `Error::Corrupt` directly, but an entry's payload is
+/// handed to the caller as an `impl Read`, whose only error channel is
+/// `io::Error`. A truncated payload reaches that channel as delharc's
+/// synthesised short-read signal, `io::ErrorKind::UnexpectedEof`, and
+/// `Error::from_decode_io` — which every caller of an entry reader runs it
+/// through — folds only `InvalidData` and `OutOfMemory`, leaving everything
+/// else as `Error::Io`, i.e. exit 1: *stuffr* failed. So an archive whose
+/// last entry is simply cut short reported an internal failure rather than a
+/// damaged file.
+///
+/// Found by the Phase 3a honesty oracle (`check_error_is_classified`) once
+/// the legacy formats joined the default feature set and the pure-tier fuzz
+/// job reached them for the first time; the minimised input is a `-lh0-`
+/// archive declaring a 6-byte `sample/hello.txt` and carrying 4 bytes of it.
+///
+/// Folding happens HERE, at this module's own boundary, and folds
+/// `UnexpectedEof` ALONE — never in `from_decode_io`, where it would apply to
+/// every format and every layer. The narrowness is what keeps a genuine
+/// source failure honest: delharc's blanket `stub_io::Read` impl propagates
+/// an underlying reader's error verbatim (`Err(e) => return Err(e)` in its
+/// `read_all`), so a failing disk still arrives as `PermissionDenied` and
+/// passes straight through this function unchanged. Container-conformance
+/// property 9 is the standing proof of that, and
+/// `a_source_error_during_a_payload_read_is_not_relabelled_as_corruption`
+/// below pins it for this specific call site.
+fn fold_truncated_payload(e: io::Error) -> io::Error {
+    if e.kind() == io::ErrorKind::UnexpectedEof {
+        return io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("LHA entry payload ended before its declared length: {e}"),
+        );
+    }
+    e
+}
+
 impl Read for LhaEntryReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
+        let n = self.inner.read(buf).map_err(fold_truncated_payload)?;
         if !self.crc_checked && self.inner.is_empty() {
             self.crc_checked = true;
             if !self.inner.crc_is_ok() {
@@ -663,6 +705,124 @@ mod tests {
             "expected Error::Unsupported, got {err:?}"
         );
         assert_eq!(err.exit_code(), 3);
+    }
+
+    /// The Phase 3a honesty oracle's finding, pinned. `check_error_is_
+    /// classified` refuses any error that maps to exit 1 for hostile input,
+    /// and a `-lh0-` archive whose payload simply stops short produced
+    /// exactly that: delharc's `UnexpectedEof` travelled the `impl Read`
+    /// channel, `Error::from_decode_io` left it as `Error::Io`, and stuffr
+    /// announced that *stuffr* had failed on a file that was merely cut off.
+    /// See [`fold_truncated_payload`] for why the fold lives at this
+    /// module's boundary rather than in `from_decode_io`.
+    #[test]
+    fn a_truncated_entry_payload_is_reported_as_corrupt_not_as_an_io_failure() {
+        let whole = build_single_entry_lha("sample/hello.txt", b"-lh0-", b"alpha\n");
+        // Two payload bytes short, plus the end-of-archive marker: the shape
+        // the fuzzer minimised to, a header that declares more than the file
+        // carries.
+        let cut = whole[..whole.len() - 3].to_vec();
+        assert!(
+            cut.len() > 2 + usize::from(whole[0]),
+            "the cut must land inside the payload, not inside the header"
+        );
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(cut)));
+        let resolved = stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default())
+            .expect("resolve over a seekable source");
+        let mut ar = Lha.open(resolved, &OpenOpts::default()).expect("open");
+        let mut entry = ar
+            .next_entry()
+            .expect("the header is intact, so the entry itself must be produced")
+            .expect("one entry");
+
+        let mut data = Vec::new();
+        let io_err = entry
+            .reader()
+            .read_to_end(&mut data)
+            .expect_err("a payload shorter than its declared length must fail");
+        let err = Error::from_decode_io(io_err);
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "a truncated entry is a damaged archive (exit 5), never an internal failure \
+             (exit 1) — got {err:?}"
+        );
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "expected Error::Corrupt, got {err:?}"
+        );
+    }
+
+    /// The other half of [`fold_truncated_payload`]'s claim, and the half
+    /// that would make the fold a liability if it were wrong: a genuine
+    /// source failure DURING a payload read keeps its own kind and is never
+    /// relabelled as corruption. Container-conformance property 9 proves
+    /// this for a source that fails on its very first read — before any
+    /// header is parsed — which never reaches the entry reader at all; this
+    /// pins the same claim at the one call site that folds.
+    #[test]
+    fn a_source_error_during_a_payload_read_is_not_relabelled_as_corruption() {
+        struct FailsAfter {
+            bytes: std::io::Cursor<Vec<u8>>,
+            budget: usize,
+        }
+        impl Read for FailsAfter {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.budget == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "the disk said no",
+                    ));
+                }
+                let take = buf.len().min(self.budget);
+                let n = self.bytes.read(&mut buf[..take])?;
+                self.budget -= n;
+                Ok(n)
+            }
+        }
+        impl Source for FailsAfter {
+            fn caps(&self) -> stuffr_core::SourceCaps {
+                stuffr_core::SourceCaps {
+                    seekable: false,
+                    len: None,
+                }
+            }
+            fn as_seek(&mut self) -> Option<&mut dyn stuffr_core::SeekRead> {
+                None
+            }
+        }
+
+        let whole = build_single_entry_lha("sample/hello.txt", b"-lh0-", b"alpha\n");
+        // Everything up to and including the header, nothing of the payload.
+        let budget = 2 + usize::from(whole[0]);
+        let src: Box<dyn Source> = Box::new(FailsAfter {
+            bytes: io::Cursor::new(whole),
+            budget,
+        });
+        let resolved = stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default())
+            .expect("resolve over a forward-only source");
+        let mut ar = Lha.open(resolved, &OpenOpts::default()).expect("open");
+        let mut entry = ar
+            .next_entry()
+            .expect("the header is served in full, so the entry is produced")
+            .expect("one entry");
+
+        let mut data = Vec::new();
+        let io_err = entry
+            .reader()
+            .read_to_end(&mut data)
+            .expect_err("a source that refuses to serve the payload must fail the read");
+        assert_eq!(
+            io_err.kind(),
+            io::ErrorKind::PermissionDenied,
+            "a failing disk must not be reported as a damaged archive — got {io_err:?}"
+        );
+        let err = Error::from_decode_io(io_err);
+        assert!(
+            !matches!(err, Error::Corrupt(_)),
+            "expected the source error to pass through, got {err:?}"
+        );
     }
 
     /// `-lhd-` is delharc's own "this entry is a directory (or symlink)"
