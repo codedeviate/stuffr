@@ -370,22 +370,38 @@ fn check_property_10(
             };
 
             // Monotonicity across this same sweep, for the weaker form
-            // only: cuts are visited ascending, so the last value this
-            // holds after the loop is whichever of them decoded
-            // successfully AND had the largest cut position. A bare
-            // prefix check alone leaves a residual gap — the empty
+            // only: cuts are visited ascending, so `last_ok_len` holds
+            // whichever of them decoded successfully most recently. A
+            // bare prefix check alone leaves a residual gap — the empty
             // string is a prefix of every string — so a decoder that
             // always answers empty on truncated input would pass it
             // outright. Two things close that gap: (a) output length
             // must never SHRINK as a less-severe (larger) truncation is
             // tried, checked pairwise below; (b) checked once after the
-            // loop, the largest cut tried — one byte short of the whole
+            // loop, the LARGEST cut tried — one byte short of the whole
             // stream, in the `len - 1` case — must decode to SOME output
             // whenever the untruncated reference is non-empty. An
             // always-empty decoder satisfies (a) trivially (0 never
             // shrinks) but fails (b): see
             // `a_decoder_that_always_answers_empty_on_truncation_is_caught`.
+            //
+            // (b) needs its own variable, and the reason is a defect this
+            // guard shipped with: keyed off `last_ok_len` it asked about
+            // the last cut that SUCCEEDED, not the largest cut tried. A
+            // codec answering `Ok(empty)` at cut 1 (a partial header —
+            // nothing to emit yet, nothing wrong yet) and ERRORING at
+            // every larger cut therefore failed, with a message stating
+            // the opposite of what happened — punished for being
+            // stricter than the property requires. `.Z` dodged it by
+            // accident alone: `parse_header` errors on a 1-byte input, so
+            // it never produces that `Ok(empty)`.
             let mut last_ok_len: Option<usize> = None;
+            // `Some(n)`: the largest cut in this sweep decoded without
+            // error, to `n` bytes. `None`: it errored — which is the
+            // strict form, stricter than this property demands, and
+            // nothing to check.
+            let mut largest_cut_ok_len: Option<usize> = None;
+            let largest_cut = cuts.last().copied();
 
             for cut in cuts {
                 let truncated = base[..cut].to_vec();
@@ -426,6 +442,9 @@ fn check_property_10(
                                 );
                             }
                             last_ok_len = Some(out.len());
+                            if Some(cut) == largest_cut {
+                                largest_cut_ok_len = Some(out.len());
+                            }
                         }
                         None => panic!(
                             "conformance[{id}] property 10: truncated input (cut to {cut} \
@@ -453,16 +472,17 @@ fn check_property_10(
             }
 
             if let Some(full) = &full_reference
-                && let Some(largest_ok_len) = last_ok_len
+                && let Some(largest_ok_len) = largest_cut_ok_len
             {
                 assert!(
                     largest_ok_len > 0 || full.is_empty(),
-                    "conformance[{id}] property 10 (truncation_undetectable): every \
-                     truncated cut in this sweep that decoded without error produced \
-                     EMPTY output, but the untruncated input decodes to {} bytes — a \
-                     decoder that always answers empty on truncation would otherwise \
-                     pass the bare prefix check (the empty string is a prefix of \
-                     everything); this closes that gap",
+                    "conformance[{id}] property 10 (truncation_undetectable): the largest \
+                     cut in this sweep ({} of {len} bytes) decoded without error to EMPTY \
+                     output, but the untruncated input decodes to {} bytes — a decoder \
+                     that always answers empty on truncation would otherwise pass the \
+                     bare prefix check (the empty string is a prefix of everything); this \
+                     closes that gap",
+                    largest_cut.unwrap_or(0),
                     full.len()
                 );
             }
@@ -1498,6 +1518,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The over-strictness guard for `check_property_10`'s closing check,
+    /// and the shape that used to FAIL it: `Ok(empty)` at the smallest cut,
+    /// a classified error at every larger one.
+    ///
+    /// That is a legitimate — indeed stricter than required — decoder. Cut 1
+    /// is a partial header: nothing to emit yet, and nothing detectably
+    /// wrong yet, so answering empty is honest. At `len / 2` and `len - 1`
+    /// enough structure is present to see the stream is cut short, so it
+    /// errors, which is the STRICT form of property 10 the weaker
+    /// `truncation_undetectable` form does not even ask for.
+    ///
+    /// Keyed off the last cut that SUCCEEDED, the closing check read that as
+    /// "every truncated cut that decoded produced empty output" and failed
+    /// the codec, with a message stating the opposite of what happened. It
+    /// now keys off the LARGEST cut tried, as its own comment always said it
+    /// did, so this passes. `.Z` never met the defect because `parse_header`
+    /// errors on a 1-byte input — accident, not design, and Phase 3c's
+    /// formats have no reason to share the accident.
+    ///
+    /// Tested directly against [`check_property_10`] for the same reason
+    /// `AlwaysEmptyOnTruncation` is: its output depends on the TOTAL length
+    /// of its input, so it cannot pass property 8's incrementality check by
+    /// construction.
+    #[derive(Debug)]
+    struct StricterThanRequiredOnTruncation {
+        full_len: usize,
+    }
+
+    impl Codec for StricterThanRequiredOnTruncation {
+        fn id(&self) -> FormatId {
+            MOCK_CODEC
+        }
+
+        fn caps(&self) -> CodecCaps {
+            CodecCaps {
+                decode: true,
+                truncation_undetectable: true,
+                ..Default::default()
+            }
+        }
+
+        fn decoder(
+            &self,
+            mut src: Box<dyn Source>,
+            _o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source>> {
+            let mut buf = Vec::new();
+            src.read_to_end(&mut buf)?;
+            let n = buf.len();
+            let out: Box<dyn std::io::Read + Send> = if n == self.full_len {
+                Box::new(std::io::Cursor::new(buf))
+            } else if n <= 1 {
+                // A partial header: nothing decodable yet, nothing wrong yet.
+                Box::new(std::io::Cursor::new(Vec::new()))
+            } else {
+                // Enough structure to see the stream is cut short. The kind
+                // matters: property 10's strict arm requires the error to
+                // classify as `Error::Corrupt` (exit 5).
+                Box::new(FailingReader)
+            };
+            Ok(Box::new(crate::source::StreamOnly::new(out)))
+        }
+
+        fn encoder(
+            &self,
+            _dst: Box<dyn Write + Send>,
+            _o: &EncodeOpts,
+        ) -> crate::Result<Box<dyn crate::archive::Sink>> {
+            panic!(
+                "StricterThanRequiredOnTruncation cannot encode — the harness must never call \
+                 this"
+            )
+        }
+    }
+
+    /// Raises `InvalidData` on every read — what a decoder that has detected
+    /// a truncated stream reports, and what `Error::from_decode_io` folds
+    /// onto `Error::Corrupt`.
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated stream",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_codec_stricter_than_truncation_undetectable_requires_is_not_punished() {
+        let fixture: Vec<u8> = (0u32..8192).map(|i| (i % 251) as u8 + 1).collect();
+        let codec = StricterThanRequiredOnTruncation {
+            full_len: fixture.len(),
+        };
+        let id = codec.id();
+        let caps = codec.caps();
+        let corruption_input = Some(fixture);
+
+        // No panic: the largest cut ERRORED, which is stricter than this
+        // property demands, so the non-triviality check has nothing to say.
+        check_property_10(&codec, id, caps, &corruption_input);
     }
 
     #[test]
