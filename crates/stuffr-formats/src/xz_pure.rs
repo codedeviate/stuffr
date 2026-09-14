@@ -59,7 +59,9 @@
 //!
 //! ## Concatenated streams must not be silently truncated — `allow_multiple_streams`
 //!
-//! `lzma_rust2::XzReader::new`'s second argument is not a memory limit and
+//! `allow_multiple_streams` — `XzStream::new`'s first argument, and
+//! `XzReader::new`'s second, which is where this was originally measured —
+//! is not a memory limit and
 //! its value is not cosmetic, despite looking like an optional knob: with it
 //! `false`, two real concatenated xz streams together encoding 26 plain
 //! bytes decode to 13 — `Ok`, no error, exactly half the data silently
@@ -187,7 +189,29 @@
 //! type of its own and needs an explicit `.check(Check::Crc64)`; there is no
 //! equivalent call to hunt for here.
 //!
-//! ## Decode memory bound: a dictionary pre-flight, not a bounded constructor
+//! ## Decode memory bound: a bounded decoder, with a dictionary pre-flight above it
+//!
+//! **Phase 3b changed this.** Through 0.4.0 the decoder was
+//! `lzma_rust2::XzReader`, which takes no memory limit at all, and the whole
+//! bound was the prefix pre-flight described below. That pre-flight parses
+//! ONE block header out of the buffered prefix, which left two ways past it,
+//! both reached: a large dictionary declared in a LATER block or a later
+//! concatenated stream, and — the one the `codec` fuzz target found — the
+//! index's record count, a varint at the far end of the stream that
+//! `Index::parse` turns into a `Vec::try_reserve_exact` of 16 bytes a record
+//! *before* comparing it with the blocks it decoded. A 117-byte input asked
+//! for **227 GiB** that way. No prefix parser can reach the end of a stream
+//! of unbounded length, and no wrapper around the reader can intervene: the
+//! count is consumed inside the crate.
+//!
+//! The decoder is now [`XzPureDecoder`], a `Read` loop over the crate's
+//! sans-I/O `XzStream`, built with `new_mem_limit` — which checks every
+//! block header against the limit as it is parsed, and whose index handling
+//! never preallocates by a declared count. See that type's own doc for the
+//! measurements, and for why this is not the push-to-pull bridge Phase 1e
+//! cancelled. The pre-flight below is KEPT above it, unchanged: it refuses a
+//! first-block declaration before a byte is decoded, with a message naming
+//! `--memory-limit`.
 //!
 //! `XzReader::new` allocates a dictionary buffer sized by the value the
 //! *stream declares in its own header*, before any output is produced and
@@ -210,16 +234,16 @@
 //! bytes, which for such a file is a handful, and the cost is paid in the
 //! allocation before any output exists.
 //!
-//! Neither `XzReader` nor the lower-level push/pull `XzStream`'s bounded
-//! `new_mem_limit` constructor is used to close this — the latter is real,
-//! but reaching it from the `Read`-shaped `XzReader` this codec is built on
-//! would mean a push-to-pull bridge, which Phase 1e measured and cancelled as
-//! unworkable (see `lzma_pure.rs`'s module doc, "The push-to-pull bridge is
-//! cancelled", for the two measurements that killed it). Instead,
-//! [`declared_dictionary_bytes`] parses just enough of the stream header and
+//! `XzStream`'s bounded `new_mem_limit` constructor now closes this from
+//! underneath — see [`XzPureDecoder`]. It was passed over in Phase 1f on the
+//! reading that getting there from a `Read`-shaped codec meant a push-to-pull
+//! bridge of the kind Phase 1e cancelled; that reading was wrong, and
+//! [`XzPureDecoder`]'s doc says why. Above it, and still load-bearing for the
+//! message a user meets, [`declared_dictionary_bytes`] parses just enough of the stream header and
 //! block header to read the LZMA2 filter's dictionary-size byte directly, and
 //! `decoder` below checks it against [`DecodeOpts::memory_limit`] *before*
-//! `XzReader::new` is ever called — a pre-flight, not a bounded constructor.
+//! any decoder is constructed — a pre-flight above a bounded decoder, not
+//! a substitute for one.
 //!
 //! **Verified against real `xz` output at four presets** (`-0`, `-3`, `-6`,
 //! `-9`) and confirmed to match the documented preset dictionaries exactly —
@@ -257,7 +281,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::num::NonZeroU64;
 
-use lzma_rust2::{XzOptions, XzReader, XzWriter, XzWriterMt};
+use lzma_rust2::{Action, Status, XzOptions, XzStream, XzWriter, XzWriterMt};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, Result, Sink,
@@ -336,7 +360,8 @@ impl Codec for Xz {
     /// statement is narrower than zstd's: a checkless `.xz` is possible but
     /// unusual, where a checkless `.zst` is ordinary.
     ///
-    /// **Memory pre-flight**: before `XzReader::new` ever runs, the block
+    /// **Memory pre-flight**: before the decoder is built at all, the first
+    /// block
     /// header's declared LZMA2 dictionary size is read out of the buffered
     /// prefix and checked against [`DecodeOpts::memory_limit`] — see the
     /// module doc's "Decode memory bound" section. `None` (cannot decide)
@@ -380,7 +405,7 @@ impl Codec for Xz {
                 )));
             }
         }
-        let dec = XzReader::new(buffered, true);
+        let dec = XzPureDecoder::new(buffered, o.memory_limit, true);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             dec,
             XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF,
@@ -462,6 +487,160 @@ impl Codec for Xz {
             _lease: lease,
         }))
     }
+}
+
+/// The `Read` face of `lzma_rust2::XzStream`, this codec's decoder.
+///
+/// **Why not `XzReader`, which is already `Read`-shaped.** `XzReader` takes
+/// no memory limit of any kind, and two of its allocations are sized by
+/// numbers the file declares about itself:
+///
+/// 1. the LZMA2 dictionary, declared per BLOCK header — the 69.35 MB-from-60-
+///    bytes amplification the module doc's "Decode memory bound" section
+///    measured; and
+/// 2. the index's record count, a single varint read at the end of the
+///    stream, which `Index::parse` turns straight into
+///    `Vec::try_reserve_exact(count)` of a 16-byte record **before** it
+///    compares that count against the number of blocks it actually
+///    decoded. A **117-byte** crafted `.xz` (`fd 37 7a 58 5a 00 00 04 e6 d6
+///    b4 46 00 ff ff ff fc 38 …`: zero blocks, so byte 12 is the index
+///    indicator, then a varint decoding to 15,294,529,535) makes that call
+///    `malloc(244_712_472_560)` — 227 GiB from 117 bytes, roughly two
+///    billion to one. Phase 3a's `codec` fuzz target found it; the
+///    reservation is lazy, so a platform that overcommits shows no RSS at
+///    all and the parse then fails on the first malformed record, which is
+///    why `stuffr cat` on the same bytes exits 5 in 7.6 MB and looks
+///    healthy. It is the same defect either way: a bound the caller asked
+///    for that the decoder never consulted.
+///
+/// The Phase 1f pre-flight in [`Xz::decoder`] above closes (1) for the FIRST
+/// block only — [`declared_dictionary_bytes`] parses one block header out of
+/// the buffered prefix — and cannot close (2) at all, because the index sits
+/// at the far end of a stream of unbounded length and a prefix parser can
+/// never reach it. Neither can any wrapper around the reader: the count is
+/// consumed inside the crate, and by the time our bytes are asked for again
+/// the allocation has happened.
+///
+/// `XzStream` — the crate's sans-I/O decoder, same module, same parsers —
+/// has both bounds by construction. `new_mem_limit` checks **every** block
+/// header against the limit as it is parsed (its own doc says so, and
+/// `xz/reader.rs`'s `mem_limit_kb < need_mem` refusal is in the per-block
+/// path), and its index handling compares the declared record count with
+/// the blocks it decoded BEFORE allocating anything, so the 227 GiB request
+/// is not made at all — it is `index record count does not match number of
+/// blocks`, exit 5, in constant space.
+///
+/// **This is not the push-to-pull bridge Phase 1e cancelled.** That ruling
+/// (`lzma_pure.rs`'s module doc) was about `lzma-rs`'s `Write`-shaped
+/// decompressor, whose `LzCircularBuffer` emitted nothing at all until the
+/// dictionary window wrapped — buffering *behind* the interface a bridge
+/// would wrap, which no bridge could undo. `XzStream::process` has none of
+/// that shape: it is a pull API already (hand it an input slice and an
+/// output slice, it fills what it can), so this adapter is a loop, not a
+/// bridge, and conformance property 8 (incremental decoding) still passes —
+/// `it_serves_output_before_it_has_read_everything` measures it.
+///
+/// The pre-flight in `decoder` is KEPT rather than deleted now that the
+/// stream is bounded: it refuses a first-block declaration before a single
+/// byte is decoded and with a message naming `--memory-limit`, which is what
+/// a user meets. This type's limit is the floor under it, for the block
+/// headers and the index a prefix cannot see.
+struct XzPureDecoder<R: BufRead> {
+    inner: R,
+    stream: XzStream,
+    done: bool,
+}
+
+impl<R: BufRead> XzPureDecoder<R> {
+    /// `None` means no bound, matching [`DecodeOpts::memory_limit`]'s own
+    /// contract for library callers (see `no_limit_means_no_bound_for_library_callers`).
+    ///
+    /// `allow_multiple_streams` is a parameter rather than the hard-coded
+    /// `true` [`Xz::decoder`] always passes, so that
+    /// `false_would_silently_truncate_a_concatenated_stream` can prove the
+    /// `false` case still loses the second stream **through this very type**
+    /// — it used to prove it against `XzReader`, which is no longer the
+    /// decoder and so no longer evidence about one.
+    fn new(inner: R, memory_limit: Option<u64>, allow_multiple_streams: bool) -> Self {
+        let stream = match memory_limit {
+            Some(limit) => XzStream::new_mem_limit(allow_multiple_streams, mem_limit_kb(limit)),
+            None => XzStream::new(allow_multiple_streams),
+        };
+        Self {
+            inner,
+            stream,
+            done: false,
+        }
+    }
+}
+
+/// `DecodeOpts::memory_limit`'s bytes as `lzma_rust2`'s KiB.
+///
+/// Rounds DOWN, so the limit is never exceeded by the rounding itself, and
+/// clamps to `u32::MAX - 1` rather than `u32::MAX`: the crate documents
+/// `u32::MAX` as "no limit", so a caller asking for a 4 TiB bound would
+/// otherwise get an unbounded decoder — the one value in the whole range
+/// that must not round to itself.
+fn mem_limit_kb(limit: u64) -> u32 {
+    (limit / 1024).min(u64::from(u32::MAX - 1)) as u32
+}
+
+impl<R: BufRead> std::io::Read for XzPureDecoder<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let input = self.inner.fill_buf()?;
+            let starved = input.is_empty();
+            // `Finish` only once the source is genuinely exhausted: passing
+            // it while bytes remain would make every short read look like a
+            // truncated stream.
+            let action = if starved { Action::Finish } else { Action::Run };
+            let result = self
+                .stream
+                .process(input, out, action)
+                .map_err(rename_oom)?;
+            self.inner.consume(result.bytes_consumed);
+
+            if result.status == Status::StreamEnd {
+                self.done = true;
+                return Ok(result.bytes_produced);
+            }
+            if result.bytes_produced > 0 {
+                return Ok(result.bytes_produced);
+            }
+            // No output, no end, and nothing left to feed it: the stream
+            // wants more input that will never arrive. `process` raises this
+            // itself from every state that accumulates a header, but the
+            // LZMA2 payload states can return `Ok` with nothing moved, and
+            // looping on that would hang rather than report the truncation.
+            if starved && result.bytes_consumed == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "unexpected end of XZ stream",
+                ));
+            }
+        }
+    }
+}
+
+/// Re-words `lzma_rust2`'s `mem_limit_kb` refusal so it names the flag that
+/// raises it, the way [`Xz::decoder`]'s pre-flight does.
+///
+/// The KIND is preserved exactly, and that is the load-bearing part:
+/// `OutOfMemory` is deliberately absent from
+/// [`XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`], so it reaches
+/// `Error::from_decode_io` unfolded and classifies as `Error::ResourceLimit`
+/// — exit 6, a bound on work, never exit 5's "this file is damaged".
+fn rename_oom(e: std::io::Error) -> std::io::Error {
+    if e.kind() != std::io::ErrorKind::OutOfMemory {
+        return e;
+    }
+    std::io::Error::new(
+        std::io::ErrorKind::OutOfMemory,
+        format!("xz: decoding this stream needs more memory than --memory-limit allows ({e})"),
+    )
 }
 
 /// This codec's block size for `XzWriterMt`: three times the preset's
@@ -773,6 +952,24 @@ mod tests {
         buf.contents()
     }
 
+    /// Encodes at an explicit preset, for the tests that care about the
+    /// DICTIONARY a stream declares rather than about its contents.
+    fn encode_with_level(level: i32, plain: &[u8]) -> Vec<u8> {
+        let buf = SharedBuf::new();
+        let mut sink = Xz
+            .encoder(
+                Box::new(buf.clone()),
+                &EncodeOpts {
+                    level: Some(level),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        sink.write_all(plain).unwrap();
+        sink.finish().unwrap();
+        buf.contents()
+    }
+
     fn decompress(bytes: Vec<u8>) -> Vec<u8> {
         let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(bytes)));
         let mut dec = Xz.decoder(src, &DecodeOpts::default()).unwrap();
@@ -978,7 +1175,7 @@ mod tests {
         two.extend_from_slice(&compress(b"second-stream"));
         let full_len = b"first-stream-second-stream".len();
 
-        let mut single = XzReader::new(std::io::Cursor::new(two), false);
+        let mut single = XzPureDecoder::new(std::io::BufReader::new(two.as_slice()), None, false);
         let mut out = Vec::new();
         let result = single.read_to_end(&mut out);
         assert!(
@@ -1514,8 +1711,8 @@ mod tests {
     }
 
     /// The refusal path: preset 9's 64 MiB dictionary, under a 1 MiB limit,
-    /// must be refused by `decoder()` itself — before `XzReader::new` (and
-    /// its allocation) ever runs — and the refusal must be exit 6
+    /// must be refused by `decoder()` itself — before the decoder (and its
+    /// allocation) is built at all — and the refusal must be exit 6
     /// (`ResourceLimit`), NEVER exit 5: the file is not damaged, this build
     /// simply will not allocate that much.
     #[test]
@@ -1655,5 +1852,217 @@ mod tests {
 
         let _ = std::fs::remove_file(&src_path);
         let _ = std::fs::remove_file(&xz_path);
+    }
+
+    /// Phase 3a's `codec` fuzz target, run 1: a **117-byte** input (one
+    /// selector byte plus these 116) drove `malloc(244_712_472_560)` — 227
+    /// GiB, roughly two billion to one — past libFuzzer's limit. Preserved
+    /// at `.superpowers/sdd/2026-09-13-phase3b-legacy-read-core/
+    /// oom-xz-codec.bin`; inlined here so the guard survives that directory
+    /// and `fuzz/artifacts`, which is gitignored and has lost two
+    /// reproducers already.
+    ///
+    /// The shape: byte 12 is `0x00`, the index indicator, so the stream
+    /// declares ZERO blocks and the index starts immediately; the record
+    /// count that follows is the varint `ff ff ff fc 38`, which decodes to
+    /// 15,294,529,535. `lzma_rust2`'s `Index::parse` turns that straight
+    /// into `Vec::try_reserve_exact(count)` of a 16-byte record — 15.29e9 ×
+    /// 16 = 244,712,472,560 — and only afterwards compares the count with
+    /// the blocks it decoded. [`XzPureDecoder`]'s `XzStream` makes that
+    /// comparison FIRST, so the allocation is never requested.
+    ///
+    /// **Why this asserts on the message.** The reservation is lazy: on a
+    /// platform that overcommits it succeeds untouched (7.6 MB peak RSS
+    /// measured through `stuffr cat` on these bytes), the parse then fails
+    /// on the first malformed record, and the verdict is exit 5 either way.
+    /// So the exit code alone cannot tell the two implementations apart and
+    /// a test asserting only on it would stay green against the defect.
+    /// `index record count does not match number of blocks` is raised only
+    /// by the pre-allocation check; `XzReader`'s route reports `invalid
+    /// index record unpadded size` instead, from inside the loop that runs
+    /// only after the 227 GiB has been asked for. The message is the
+    /// evidence that the allocation was never reached — and, being the
+    /// crate's, it is pinned as a `contains`, with the exit code asserted
+    /// separately so an upstream re-wording degrades this to a weaker test
+    /// rather than a false failure.
+    #[test]
+    fn the_fuzzers_index_count_bomb_is_checked_before_it_is_allocated_for() {
+        const OOM_REPRODUCER: &[u8] = &[
+            0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x04, 0xe6, 0xd6, 0xb4, 0x46, 0x00, 0xff,
+            0xff, 0xff, 0xfc, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38,
+            0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38,
+            0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38,
+            0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38,
+            0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x38, 0x82, 0x2e, 0x3d, 0x18, 0xa5,
+            0x66, 0x7c, 0xd0, 0xd3, 0x4d, 0x77, 0xc8, 0x00, 0x00, 0xae, 0x8f, 0x8e, 0x42, 0x00,
+            0x00, 0x00, 0xa8, 0x67, 0xd7, 0xb1, 0xc4, 0xe2, 0xa6, 0xfb, 0x02, 0x04, 0x00, 0x00,
+            0x00, 0x04, 0xd9, 0x5a,
+        ];
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(
+            OOM_REPRODUCER.to_vec(),
+        )));
+        // The fuzz target's own options, verbatim.
+        let mut dec = Xz
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit: Some(64 * 1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .expect("the bomb is in the index, past `decoder()`'s prefix pre-flight");
+        let mut out = Vec::new();
+        let io_err = dec
+            .read_to_end(&mut out)
+            .expect_err("a 15.29-billion-record index over zero blocks is not decodable");
+        let msg = io_err.to_string();
+        let err = Error::from_decode_io(io_err);
+
+        assert!(
+            msg.contains("index record count"),
+            "the count must be rejected against the block count BEFORE any record is read \
+             — that check is what replaces the 227 GiB reservation; got: {msg}"
+        );
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "an index that contradicts its own stream is a damaged file, not a refused \
+             budget: nothing was declined here, the allocation simply never happened: {err}"
+        );
+    }
+
+    /// The hole the pre-flight cannot see, and the reason the bound belongs
+    /// in the decoder rather than in a prefix parser:
+    /// [`declared_dictionary_bytes`] reads ONE block header out of the first
+    /// 4 KiB, so a stream whose large dictionary is declared later — a
+    /// second block, or as here a second concatenated stream, which
+    /// `decoder` decodes by design (`allow_multiple_streams: true`) — walked
+    /// straight past it and allocated in full.
+    ///
+    /// Preset 0 first (256 KiB, comfortably under the 1 MiB limit, so the
+    /// pre-flight allows the decoder to be built at all), preset 9 second
+    /// (64 MiB). The refusal must therefore arrive from `read`, not from
+    /// `decoder()`, and it must be exit 6: this file is not damaged, this
+    /// build will not allocate that much for it.
+    #[test]
+    fn a_later_stream_declaring_a_bigger_dictionary_is_refused_too() {
+        let mut two = compress_fastest(b"first-stream-");
+        two.extend_from_slice(&encode_with_level(9, b"second-stream"));
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(two.clone())));
+        let mut dec = Xz
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit: Some(1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .expect("the first block's 256 KiB is under the limit, so construction succeeds");
+        let mut out = Vec::new();
+        let io_err = dec
+            .read_to_end(&mut out)
+            .expect_err("the second stream's 64 MiB dictionary must be refused");
+        let err = Error::from_decode_io(io_err);
+        assert_eq!(
+            err.exit_code(),
+            6,
+            "a memory refusal is ResourceLimit, never Corrupt: {err}"
+        );
+        assert!(
+            err.to_string().contains("--memory-limit"),
+            "the message must name the flag that raises it: {err}"
+        );
+
+        // The other half, and the one that catches an over-broad fix: the
+        // very same bytes must decode completely when the limit allows it.
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(two)));
+        let mut dec = Xz
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit: Some(256 * 1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut out = Vec::new();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"first-stream-second-stream");
+    }
+
+    /// The false-positive guard for the bound this task added, run against
+    /// the reference tool's own output rather than ours: `xz -9` declares a
+    /// 64 MiB dictionary, which is legal, common at high presets, and what
+    /// the CLI's default limit (25% of available RAM, floored at 256 MiB)
+    /// is sized to accommodate. A bound that refused this would be worse
+    /// than the bug it closed. Skips cleanly when `xz` is not on `PATH`.
+    ///
+    /// Note the 40 KiB: `lzma_rust2` charges the dictionary PLUS a fixed 40
+    /// KiB of decoder state, so an `xz -9` stream needs 65,576 KiB and a
+    /// limit of exactly 64 MiB (65,536 KiB) refuses it by 40 KiB. That is
+    /// honest — the memory is really needed — and it is why this test
+    /// asserts against the CLI's 256 MiB floor and against `None`, the two
+    /// limits a caller actually meets, rather than against a figure chosen
+    /// to sit exactly on the boundary.
+    #[test]
+    fn a_real_xz_9_stream_still_decodes_under_the_default_limit() {
+        let Some(xz) = which_xz() else {
+            return;
+        };
+        let plain = b"legitimate high-preset payload ".repeat(4000);
+        let mut child = std::process::Command::new(&xz)
+            .arg("-9")
+            .arg("-c")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), &plain).unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "system xz failed to compress: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let packed = out.stdout;
+
+        for limit in [Some(256 * 1024 * 1024), None] {
+            let src: Box<dyn Source> =
+                Box::new(ReaderSource::new(std::io::Cursor::new(packed.clone())));
+            let mut dec = Xz
+                .decoder(
+                    src,
+                    &DecodeOpts {
+                        memory_limit: limit,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|e| panic!("`xz -9` output must decode at {limit:?}: {e}"));
+            let mut got = Vec::new();
+            dec.read_to_end(&mut got)
+                .unwrap_or_else(|e| panic!("`xz -9` output must decode at {limit:?}: {e}"));
+            assert_eq!(got, plain, "at {limit:?}");
+        }
+    }
+
+    /// `u32::MAX` is `lzma_rust2`'s "no limit" sentinel, so the one value in
+    /// the range that must not be produced by rounding a real limit down.
+    /// A caller asking for a 4 TiB bound must get a bounded decoder, not an
+    /// unbounded one.
+    #[test]
+    fn the_kib_conversion_rounds_down_and_never_lands_on_the_no_limit_sentinel() {
+        assert_eq!(mem_limit_kb(0), 0);
+        assert_eq!(mem_limit_kb(1023), 0, "rounds down, never up");
+        assert_eq!(mem_limit_kb(64 * 1024 * 1024), 65_536);
+        assert_eq!(mem_limit_kb(u64::MAX), u32::MAX - 1);
+        assert_ne!(
+            mem_limit_kb(u64::MAX),
+            u32::MAX,
+            "u32::MAX means NO limit: a huge bound must never decay into none at all"
+        );
     }
 }
