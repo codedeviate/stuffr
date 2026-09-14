@@ -160,7 +160,17 @@ recipe every run. Regenerate `sample.lzh`'s recorded CRCs by hand (re-run
   Both names are stored directly in each local file header's own
   null-terminated `name` field (no separator translation applied anywhere
   in `unarj-rs` or in `legacy::arj`), so `/` reads back as a literal path
-  separator exactly as written.
+  separator exactly as written. **Each local header sets `arj_flags =
+  0x10` (`PATHSYM_FLAG`) accordingly**, which it did not until the Phase 3b
+  fix wave: the spec's local-file-header table reads "(0x10 =
+  PATHSYM_FLAG) indicates filename translated (`\` changed to `/`)", and a
+  cleared flag beside a `/`-bearing name entitles a spec-conformant reader
+  to take `/` as a literal character in a flat filename. `unarj-rs` never
+  reads the byte, so nothing in this repository could have caught it —
+  exactly the parser-agrees-with-itself shape the `file_type = 2`
+  deviation below already had. The MAIN header's own `flags` byte stays
+  `0`, correctly: that bit describes the ARCHIVE NAME, which this fixture
+  leaves empty.
 - **Byte layout, traced from the crate's own field-by-field parse** (each
   local file header's fixed prefix, and the main header's, are both exactly
   30 bytes — `header_size`, the header content's OWN first byte, is 30 in
@@ -182,7 +192,8 @@ recipe every run. Regenerate `sample.lzh`'s recorded CRCs by hand (re-run
     empty)`.
   - Each local file header's content (30-byte fixed prefix + name + two
     NULs): `header_size(1, =30) + archiver_version_number(1) +
-    min_version_to_extract(1) + host_os(1, =2 Unix) + arj_flags(1) +
+    min_version_to_extract(1) + host_os(1, =2 Unix) + arj_flags(1, =0x10
+    PATHSYM_FLAG, since both names use `/`) +
     compression_method(1, =0 Stored) + file_type(1, =0 Binary) +
     reserved(1) + date_time_modified(4, zero — no valid calendar date, so
     this container's `dos_mtime` reports `None` for both entries) +
@@ -210,6 +221,20 @@ recipe every run. Regenerate `sample.lzh`'s recorded CRCs by hand (re-run
     16-byte name `sample/sub/b.bin` + 2 = 48-byte content, wrapped = 58
     bytes, + 5 payload bytes = 63) + 4-byte end marker: 42 + 64 + 63 + 4 =
     173, matching `ls -l sample.arj`.
+- **`archiver_version_number = 0` and `min_version_to_extract = 0`, in the
+  main header and in both local headers: checked against the spec and left
+  as they are, deliberately.** The published table gives these two bytes as
+  bare `1 archiver version number` / `1 minimum archiver version to
+  extract` with no stated range, no reserved value and no rule that 0 is
+  illegal, so unlike `file_type` (which the table requires equal 2) and
+  `arj_flags` (whose meaning the table states outright) there is nothing
+  here to conform TO. Real ARJ would write its own release number; this
+  fixture was not written by ARJ, and inventing a plausible-looking version
+  would make it look more provenanced than it is — which is the opposite of
+  what this manifest is for. `unarj-rs` reads neither byte
+  (`main_header.rs`/`local_file_header.rs` parse them into fields nothing
+  consults), so the choice is inert in both directions. Recorded here so a
+  future reader meets a ruling rather than an oversight.
 - **Verification: none independent — see above.** The only checks run were
   internal consistency ones: `legacy::arj::tests::arj_conforms` (the
   fixture read back through `unarj-rs` itself, which is not independent of

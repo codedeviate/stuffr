@@ -348,10 +348,21 @@ impl ArchiveRead for ArjRead {
             // A directory carries no payload this container cares about.
             // `skip` advances the underlying reader past whatever bytes the
             // header still declares (ordinarily zero for a directory)
-            // rather than decoding them — the crate has no other way to
-            // reach the NEXT header, since `get_next_entry` does not skip
-            // unread payload itself (see this module's doc / the fixture's
-            // own envelope layout in MANIFEST.md).
+            // rather than decoding them, because `get_next_entry` does not
+            // skip unread payload itself (see this module's doc / the
+            // fixture's own envelope layout in MANIFEST.md).
+            //
+            // What that buys is narrower than "otherwise the next header is
+            // unreachable", and the difference is worth stating because it
+            // is what makes this call testable: `unarj_rs`'s `read_header`
+            // SCANS byte by byte for the `60 EA` magic (crate 0.2.1,
+            // `arj_archive.rs:129-140`), so an unskipped payload is usually
+            // walked over and the next real header still found. The payload
+            // that is NOT harmless is one CONTAINING those two bytes — the
+            // scan stops inside it and parses entry data as a header.
+            // `a_directory_entry_is_reported_as_dir_and_the_next_entry_is_
+            // still_found` uses exactly such a payload, so removing this
+            // call turns that test red rather than leaving it green.
             if let Err(e) = self.archive.skip(&header) {
                 self.done = true;
                 return Err(classify_arj_io(e));
@@ -574,7 +585,18 @@ mod tests {
         header.push(0); // archiver_version_number
         header.push(0); // min_version_to_extract
         header.push(2); // host_os = Unix
-        header.push(0); // arj_flags
+        // PATHSYM_FLAG. The spec's local-file-header table reads
+        // "(0x10 = PATHSYM_FLAG) indicates filename translated
+        // (\\ changed to /)", and both of this fixture's names use `/` as
+        // their separator — so a cleared flag makes the header contradict
+        // the bytes right after it, and entitles a spec-conformant reader
+        // to treat `/` as a literal character in a flat filename. Nothing
+        // in this repository could have caught that: `unarj-rs` never reads
+        // the byte and applies no translation either way (see
+        // `fixtures/legacy/MANIFEST.md`), which is precisely the
+        // parser-agrees-with-itself shape the `file_type = 2` deviation
+        // already had.
+        header.push(0x10); // arj_flags = PATHSYM_FLAG
         header.push(0); // compression_method = Stored
         header.push(0); // file_type = Binary
         header.push(0); // reserved (skipped by the parser)
@@ -635,6 +657,35 @@ mod tests {
             built, SAMPLE_ARJ,
             "sample.arj must be exactly what build_arj produces — see MANIFEST.md"
         );
+    }
+
+    /// Rewrites the checked-in `sample.arj` from [`build_arj`]. Ignored by
+    /// default — it WRITES into the source tree — and exists so that a
+    /// deliberate change to the recipe above has a mechanical way to land in
+    /// the fixture, rather than leaving
+    /// `the_checked_in_fixture_matches_its_own_construction_recipe` red with
+    /// no way to fix it but a hex editor:
+    ///
+    /// ```text
+    /// cargo test -p stuffr-formats --features arj --lib \
+    ///     regenerate_the_checked_in_fixture -- --ignored
+    /// ```
+    ///
+    /// Re-read `MANIFEST.md`'s `sample.arj` section afterwards: its byte
+    /// layout and total-size arithmetic are prose, and nothing recomputes
+    /// them.
+    #[test]
+    #[ignore = "writes into the source tree; run with --ignored after changing build_arj"]
+    fn regenerate_the_checked_in_fixture() {
+        let built = build_arj(&[
+            ("sample/hello.txt", b"alpha\n"),
+            ("sample/sub/b.bin", b"beta\n"),
+        ]);
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("legacy")
+            .join("sample.arj");
+        std::fs::write(&path, &built).unwrap();
     }
 
     #[test]
@@ -969,6 +1020,100 @@ mod tests {
             .expect("a volume label entry must not be refused")
             .expect("must yield the one entry written");
         assert_eq!(entry.meta().kind, EntryKind::Other);
+    }
+
+    /// `FileType::Directory` is the one entry-kind path in either legacy
+    /// container with no test at all — `lha.rs` has
+    /// `a_directory_entry_is_produced_not_refused` and this had nothing.
+    /// It is also the only branch that calls `self.archive.skip(&header)`.
+    ///
+    /// The directory's declared payload is `60 EA 00 00` deliberately: that
+    /// is the end-of-archive marker, and `unarj_rs::read_header` finds its
+    /// next header by SCANNING for the `60 EA` magic rather than expecting
+    /// it at the current position. So an unskipped payload of ordinary
+    /// bytes would be walked over harmlessly and this test would pass with
+    /// the `skip` call deleted — measured, not assumed. With these four
+    /// bytes the scan stops INSIDE the payload, reads the entry data as a
+    /// header, and `after.txt` disappears. That is what makes the call
+    /// load-bearing and this test able to fail.
+    ///
+    /// The declared sizes are deliberately NON-ZERO in the header here and
+    /// the entry is still reported as `size: Some(0)`. That is the ruling,
+    /// not an accident, and it differs from LHA's (which reports a
+    /// directory's declared sizes verbatim): an ARJ directory entry has no
+    /// content, the bytes a header claims for one are not retrievable
+    /// through this container in any case, and reporting a size `cat` could
+    /// never produce would be a number with nothing behind it. `skip` still
+    /// honours the DECLARED length, which is why the following entry is
+    /// found — the two are separate questions.
+    ///
+    /// The `skip` error path stays unreached, and cannot be reached from a
+    /// fixture: `ArjArchieve::skip` is a bare `seek(SeekFrom::Current(n))`
+    /// (crate 0.2.1, `arj_archive.rs:33`), and seeking past the end of a
+    /// file or a cursor succeeds on every platform this builds for. Only a
+    /// source whose SEEK fails could trip it.
+    #[test]
+    fn a_directory_entry_is_reported_as_dir_and_the_next_entry_is_still_found() {
+        const DIR_PAYLOAD: &[u8] = &[0x60, 0xEA, 0x00, 0x00];
+
+        let mut header = Vec::with_capacity(30);
+        header.push(30); // header_size (inner byte; no extension)
+        header.push(0); // archiver_version_number
+        header.push(0); // min_version_to_extract
+        header.push(2); // host_os = Unix
+        header.push(0); // arj_flags
+        header.push(0); // compression_method = Stored
+        header.push(3); // file_type = Directory
+        header.push(0); // reserved
+        header.extend_from_slice(&0u32.to_le_bytes()); // date_time_modified
+        header.extend_from_slice(&(DIR_PAYLOAD.len() as u32).to_le_bytes()); // compressed_size
+        header.extend_from_slice(&(DIR_PAYLOAD.len() as u32).to_le_bytes()); // original_size
+        header.extend_from_slice(&crc32_ieee(DIR_PAYLOAD).to_le_bytes()); // original_crc32
+        header.extend_from_slice(&0u16.to_le_bytes()); // file_spec_position
+        header.extend_from_slice(&0u16.to_le_bytes()); // file_access_mode
+        header.push(0); // first_chapter
+        header.push(0); // last_chapter
+        assert_eq!(header.len(), 30);
+        header.extend_from_slice(b"d"); // name
+        header.push(0); // name terminator
+        header.push(0); // comment terminator
+
+        let mut bytes = build_main_header();
+        bytes.extend_from_slice(&wrap_header(&header));
+        bytes.extend_from_slice(DIR_PAYLOAD);
+        bytes.extend_from_slice(&build_local_file_entry("after.txt", b"beta"));
+        bytes.extend_from_slice(&[0x60, 0xEA]);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut ar = open_seekable(&bytes);
+
+        let mut dir = ar
+            .next_entry()
+            .expect("a directory entry must not be refused")
+            .expect("must yield the directory entry");
+        assert_eq!(dir.meta().kind, EntryKind::Dir);
+        assert_eq!(dir.meta().name, "d");
+        assert_eq!(dir.meta().size, Some(0), "see this test's doc comment");
+        assert_eq!(dir.meta().compressed_size, Some(0));
+        let mut payload = Vec::new();
+        dir.reader()
+            .read_to_end(&mut payload)
+            .expect("a directory entry's reader is empty, never an error");
+        assert!(payload.is_empty());
+        drop(dir);
+
+        // The whole point of the `skip` call: without it the reader is
+        // still sitting on the directory's declared payload, whose first
+        // two bytes are the header magic `read_header` scans for, and this
+        // archive ends there instead.
+        let mut next = ar
+            .next_entry()
+            .expect("the entry after a directory must still parse")
+            .expect("must yield the second entry");
+        assert_eq!(next.meta().name, "after.txt");
+        let mut data = Vec::new();
+        next.reader().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"beta");
     }
 
     #[test]
