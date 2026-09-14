@@ -157,13 +157,19 @@ pub struct CodecCaps {
     /// What this field switches property 10 to instead is a WEAKER, but
     /// still falsifiable, property: on truncated input, the decoder must
     /// either error, or produce a byte sequence that is a genuine prefix of
-    /// what the same decoder produces from the untruncated input. That still
-    /// catches a real defect class — a decoder that mishandles a partial
-    /// final unit and emits wrong trailing bytes, reordered bytes, or
-    /// fabricated padding fails this exactly as it would fail the strict
-    /// "must always error" property — while not demanding a guarantee the
-    /// format cannot give. `conformance.rs`'s
-    /// `a_decoder_that_returns_a_non_prefix_on_truncation_is_caught` proves
+    /// what the same decoder produces from the untruncated input — one that
+    /// never shrinks as a less severe truncation is tried (monotonicity
+    /// across the several cut lengths property 10 already sweeps), and that
+    /// is not trivially empty when the untruncated decode is not (closing
+    /// the residual gap a bare prefix check alone leaves: the empty string
+    /// is a prefix of everything). That still catches real defect classes —
+    /// a decoder that mishandles a partial final unit and emits wrong
+    /// trailing bytes, reordered bytes, or fabricated padding fails this
+    /// exactly as it would fail the strict "must always error" property, and
+    /// one that always answers empty on truncation fails it too — while not
+    /// demanding a guarantee the format cannot give. `conformance.rs`'s
+    /// `a_decoder_that_returns_a_non_prefix_on_truncation_is_caught` and
+    /// `a_decoder_that_always_answers_empty_on_truncation_is_caught` prove
     /// the weaker check still fires, by mutation, the same way
     /// `mock_codec_clears_every_property_up_to_truncation` proves the strict
     /// one does.

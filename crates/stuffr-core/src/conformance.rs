@@ -62,28 +62,35 @@
 //!    structure — see [`compressible`]'s doc.
 //! 10. Truncated input is rejected — or, for a codec declaring
 //!     `CodecCaps::truncation_undetectable`, decodes to a genuine PREFIX of
-//!     the untruncated output. Unlike property 9, nothing switches this off
-//!     to a bare skip: every framed format detects premature EOF regardless
-//!     of checksum, so a codec failing the strict form should either detect
-//!     truncation or be reconsidered. This is not the same guarantee as
-//!     property 9's: even a raw, unframed stream can often still catch
-//!     truncation structurally — raw deflate has no checksum (so corruption
-//!     decodes to silently wrong bytes, property 9's exact gap) but its
-//!     `BFINAL` bit means a stream cut short before the final block surfaces
-//!     as `UnexpectedEof` anyway. That split — truncation catchable without
-//!     any checksum, corruption not — is exactly why the two properties are
-//!     gated differently. `CodecCaps::truncation_undetectable` is the one
-//!     declaration that changes this property's SHAPE rather than skipping
-//!     it — see that field's own doc for the one codec (Unix compress,
-//!     `legacy::compress_z`) that sets it, backed by a bit-level measurement
-//!     and two independent reference tools agreeing that truncation there
-//!     always yields a strict prefix, never garbage. It is not a loophole:
+//!     the untruncated output that never shrinks as truncation eases
+//!     (monotonicity across the swept cuts) and is never trivially empty
+//!     once the untruncated decode is not. Unlike property 9, nothing
+//!     switches this off to a bare skip: every framed format detects
+//!     premature EOF regardless of checksum, so a codec failing the strict
+//!     form should either detect truncation or be reconsidered. This is not
+//!     the same guarantee as property 9's: even a raw, unframed stream can
+//!     often still catch truncation structurally — raw deflate has no
+//!     checksum (so corruption decodes to silently wrong bytes, property 9's
+//!     exact gap) but its `BFINAL` bit means a stream cut short before the
+//!     final block surfaces as `UnexpectedEof` anyway. That split —
+//!     truncation catchable without any checksum, corruption not — is
+//!     exactly why the two properties are gated differently.
+//!     `CodecCaps::truncation_undetectable` is the one declaration that
+//!     changes this property's SHAPE rather than skipping it — see that
+//!     field's own doc for the one codec (Unix compress, `legacy::
+//!     compress_z`) that sets it, backed by a bit-level measurement and two
+//!     independent reference tools agreeing that truncation there always
+//!     yields a strict prefix, never garbage. It is not a loophole:
 //!     `testing::MockCodec`, the harness's own bare unframed double,
 //!     deliberately does NOT set it and is proven, in this module's own
-//!     tests, to still fail the strict form, and
-//!     `a_decoder_that_returns_a_non_prefix_on_truncation_is_caught` proves
-//!     the WEAKER form still catches a real defect (wrong trailing bytes) —
-//!     the field changes what is demanded, never removes the demand. Cuts at
+//!     tests, to still fail the strict form; `a_decoder_that_returns_a_non_
+//!     prefix_on_truncation_is_caught` proves the weaker form still catches
+//!     wrong trailing bytes, and `a_decoder_that_always_answers_empty_on_
+//!     truncation_is_caught` proves it also catches the residual gap a bare
+//!     prefix check alone leaves — the empty string is a prefix of
+//!     everything, so a decoder that always answers empty on truncated
+//!     input would otherwise pass outright. The field changes what is
+//!     demanded, never removes the demand. Cuts at
 //!     several lengths, not only the midpoint — including one byte short of
 //!     the full length and a small prefix — because a cut exactly at a
 //!     format's own internal framing boundary (lz4's 64 KiB block boundary,
@@ -283,6 +290,186 @@ fn skip(id: crate::format::FormatId, property: u32, reason: &str) {
 
 const NO_FIXTURE: &str = "this codec cannot encode its own test input and no fixture was \
                            supplied; pass one via assert_codec_conforms_with";
+
+/// Property 10: truncated input is rejected — or, for a codec declaring
+/// `CodecCaps::truncation_undetectable`, decodes to a genuine,
+/// monotonically-growing, non-trivial prefix of the untruncated output.
+/// Gated on caps.decode alone, not on detects_corruption: no declaration can
+/// switch this off to a bare skip. The incentive on a red property 9 at
+/// 11pm is to flip detects_corruption to Never, and the only consequence
+/// used to be that property 9 disappeared. Even a codec with no checksum at
+/// all often still catches this structurally — see the module doc's note on
+/// raw deflate's BFINAL bit — so a codec failing the strict form should
+/// detect truncation or be reconsidered, not assumed exempt because it is
+/// also exempt from property 9. `truncation_undetectable` narrows what is
+/// demanded; it never removes the demand — see that field's own doc.
+///
+/// Cuts at several lengths — see the module doc's note on this property for
+/// why the midpoint alone is not enough — and, for the strict form,
+/// requires the classified error, not merely that one occurred: see the
+/// module doc's note on `Error::from_decode_io`.
+///
+/// A free function, not inlined into [`assert_codec_conforms_impl`], so it
+/// can be exercised directly in a test — bypassing properties 1-9, in
+/// particular property 8's incrementality check, which a double whose
+/// OUTPUT depends on the TOTAL length of its input (such as the one
+/// `a_decoder_that_always_answers_empty_on_truncation_is_caught` uses)
+/// cannot pass by construction: it must see the whole input before it can
+/// answer anything, which is itself the read-to-end shape property 8
+/// exists to catch. Testing property 10 in isolation is the only way to
+/// prove that SPECIFIC double is caught by property 10 rather than merely
+/// by property 8 firing first for an unrelated reason.
+fn check_property_10(
+    codec: &dyn Codec,
+    id: crate::format::FormatId,
+    caps: CodecCaps,
+    corruption_input: &Option<Vec<u8>>,
+) {
+    match corruption_input {
+        Some(base) if base.is_empty() => {
+            skip(
+                id,
+                10,
+                "the encoded stream/fixture is empty; nothing to truncate",
+            );
+        }
+        Some(base) => {
+            let len = base.len();
+            let mut cuts: Vec<usize> = vec![1, len / 2, len.saturating_sub(1)];
+            cuts.retain(|&c| c < len);
+            cuts.sort_unstable();
+            cuts.dedup();
+
+            // The weaker form's reference point: what THIS codec decodes
+            // the FULL, untruncated input to. Every truncated decode that
+            // does not error must be a prefix of this. Computed once, up
+            // front, only when the weaker form is in play — the strict
+            // form never needs it.
+            let full_reference = if caps.truncation_undetectable {
+                let src: Box<dyn Source> =
+                    Box::new(ReaderSource::new(std::io::Cursor::new(base.clone())));
+                let mut dec = codec
+                    .decoder(src, &DecodeOpts::default())
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "conformance[{id}] property 10 (truncation_undetectable): \
+                             opening the FULL, untruncated input failed: {e}"
+                        )
+                    });
+                let mut out = Vec::new();
+                dec.read_to_end(&mut out).unwrap_or_else(|e| {
+                    panic!(
+                        "conformance[{id}] property 10 (truncation_undetectable): decoding \
+                         the FULL, untruncated fixture must succeed — it is the reference \
+                         every truncated decode is checked against: {e}"
+                    )
+                });
+                Some(out)
+            } else {
+                None
+            };
+
+            // Monotonicity across this same sweep, for the weaker form
+            // only: cuts are visited ascending, so the last value this
+            // holds after the loop is whichever of them decoded
+            // successfully AND had the largest cut position. A bare
+            // prefix check alone leaves a residual gap — the empty
+            // string is a prefix of every string — so a decoder that
+            // always answers empty on truncated input would pass it
+            // outright. Two things close that gap: (a) output length
+            // must never SHRINK as a less-severe (larger) truncation is
+            // tried, checked pairwise below; (b) checked once after the
+            // loop, the largest cut tried — one byte short of the whole
+            // stream, in the `len - 1` case — must decode to SOME output
+            // whenever the untruncated reference is non-empty. An
+            // always-empty decoder satisfies (a) trivially (0 never
+            // shrinks) but fails (b): see
+            // `a_decoder_that_always_answers_empty_on_truncation_is_caught`.
+            let mut last_ok_len: Option<usize> = None;
+
+            for cut in cuts {
+                let truncated = base[..cut].to_vec();
+                let src: Box<dyn Source> =
+                    Box::new(ReaderSource::new(std::io::Cursor::new(truncated)));
+                let mut dec = codec
+                    .decoder(src, &DecodeOpts::default())
+                    .unwrap_or_else(|e| {
+                        panic!("conformance[{id}] property 10 decoder (cut {cut}/{len}): {e}")
+                    });
+                let mut out = Vec::new();
+                match dec.read_to_end(&mut out) {
+                    Ok(_) => match &full_reference {
+                        Some(full) => {
+                            assert!(
+                                out.len() <= full.len() && full[..out.len()] == out[..],
+                                "conformance[{id}] property 10 (truncation_undetectable): \
+                                 truncated input (cut to {cut} of {len} bytes) decoded to \
+                                 {} bytes that are NOT a prefix of the {}-byte reference \
+                                 decode of the full input — a codec declaring \
+                                 truncation_undetectable must still decode truncated input \
+                                 to a genuine prefix, never fabricated, reordered or padded \
+                                 bytes",
+                                out.len(),
+                                full.len()
+                            );
+                            if let Some(prev_len) = last_ok_len {
+                                assert!(
+                                    out.len() >= prev_len,
+                                    "conformance[{id}] property 10 (truncation_undetectable): \
+                                     monotonicity violated — cut {cut} of {len} bytes (a \
+                                     LESS severe truncation than an earlier, smaller cut \
+                                     already tried in this same sweep) decoded to {} bytes, \
+                                     FEWER than that earlier cut's {prev_len} bytes; an \
+                                     honest prefix-producing decoder's output never shrinks \
+                                     as less of the stream is missing",
+                                    out.len()
+                                );
+                            }
+                            last_ok_len = Some(out.len());
+                        }
+                        None => panic!(
+                            "conformance[{id}] property 10: truncated input (cut to {cut} \
+                             of {len} bytes) decoded without error; a codec failing this \
+                             should either detect truncation or be reconsidered"
+                        ),
+                    },
+                    Err(e) => {
+                        let classified = crate::Error::from_decode_io(e);
+                        assert!(
+                            matches!(classified, crate::Error::Corrupt(_)),
+                            "conformance[{id}] property 10: truncated input (cut to {cut} \
+                             of {len} bytes) raised {classified:?}, expected \
+                             Error::Corrupt (exit 5) — NormalizeDecodeErrors should \
+                             classify truncation as InvalidData"
+                        );
+                        assert_eq!(
+                            classified.exit_code(),
+                            5,
+                            "conformance[{id}] property 10: Error::Corrupt must be exit \
+                             code 5"
+                        );
+                    }
+                }
+            }
+
+            if let Some(full) = &full_reference
+                && let Some(largest_ok_len) = last_ok_len
+            {
+                assert!(
+                    largest_ok_len > 0 || full.is_empty(),
+                    "conformance[{id}] property 10 (truncation_undetectable): every \
+                     truncated cut in this sweep that decoded without error produced \
+                     EMPTY output, but the untruncated input decodes to {} bytes — a \
+                     decoder that always answers empty on truncation would otherwise \
+                     pass the bare prefix check (the empty string is a prefix of \
+                     everything); this closes that gap",
+                    full.len()
+                );
+            }
+        }
+        None => skip(id, 10, NO_FIXTURE),
+    }
+}
 
 /// Asserts every conformance property that applies to `codec`, using `fixture`
 /// as the encoded test input for a codec that cannot encode its own — see the
@@ -688,120 +875,9 @@ fn assert_codec_conforms_impl(codec: &dyn Codec, meta: &FormatMeta, fixture: Opt
             }
         }
 
-        // 10. Truncated input is rejected — or, for a codec declaring
-        //     `CodecCaps::truncation_undetectable`, decodes to a genuine
-        //     prefix of the untruncated output. Gated on caps.decode alone,
-        //     not on detects_corruption: no declaration can switch this off
-        //     to a bare skip. The incentive on a red property 9 at 11pm is to
-        //     flip detects_corruption to Never, and the only consequence used
-        //     to be that property 9 disappeared. Even a codec with no
-        //     checksum at all often still catches this structurally — see the
-        //     module doc's note on raw deflate's BFINAL bit — so a codec
-        //     failing the strict form should detect truncation or be
-        //     reconsidered, not assumed exempt because it is also exempt from
-        //     property 9. `truncation_undetectable` narrows what is demanded;
-        //     it never removes the demand — see that field's own doc.
-        //
-        //     Cuts at several lengths — see the module doc's note on this
-        //     property for why the midpoint alone is not enough — and, for
-        //     the strict form, requires the classified error, not merely
-        //     that one occurred: see the module doc's note on
-        //     `Error::from_decode_io`.
-        match &corruption_input {
-            Some(base) if base.is_empty() => {
-                skip(
-                    id,
-                    10,
-                    "the encoded stream/fixture is empty; nothing to truncate",
-                );
-            }
-            Some(base) => {
-                let len = base.len();
-                let mut cuts: Vec<usize> = vec![1, len / 2, len.saturating_sub(1)];
-                cuts.retain(|&c| c < len);
-                cuts.sort_unstable();
-                cuts.dedup();
-
-                // The weaker form's reference point: what THIS codec decodes
-                // the FULL, untruncated input to. Every truncated decode that
-                // does not error must be a prefix of this. Computed once, up
-                // front, only when the weaker form is in play — the strict
-                // form never needs it.
-                let full_reference = if caps.truncation_undetectable {
-                    let src: Box<dyn Source> =
-                        Box::new(ReaderSource::new(std::io::Cursor::new(base.clone())));
-                    let mut dec = codec
-                        .decoder(src, &DecodeOpts::default())
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "conformance[{id}] property 10 (truncation_undetectable): \
-                                 opening the FULL, untruncated input failed: {e}"
-                            )
-                        });
-                    let mut out = Vec::new();
-                    dec.read_to_end(&mut out).unwrap_or_else(|e| {
-                        panic!(
-                            "conformance[{id}] property 10 (truncation_undetectable): decoding \
-                             the FULL, untruncated fixture must succeed — it is the reference \
-                             every truncated decode is checked against: {e}"
-                        )
-                    });
-                    Some(out)
-                } else {
-                    None
-                };
-
-                for cut in cuts {
-                    let truncated = base[..cut].to_vec();
-                    let src: Box<dyn Source> =
-                        Box::new(ReaderSource::new(std::io::Cursor::new(truncated)));
-                    let mut dec = codec
-                        .decoder(src, &DecodeOpts::default())
-                        .unwrap_or_else(|e| {
-                            panic!("conformance[{id}] property 10 decoder (cut {cut}/{len}): {e}")
-                        });
-                    let mut out = Vec::new();
-                    match dec.read_to_end(&mut out) {
-                        Ok(_) => match &full_reference {
-                            Some(full) => assert!(
-                                out.len() <= full.len() && full[..out.len()] == out[..],
-                                "conformance[{id}] property 10 (truncation_undetectable): \
-                                 truncated input (cut to {cut} of {len} bytes) decoded to \
-                                 {} bytes that are NOT a prefix of the {}-byte reference \
-                                 decode of the full input — a codec declaring \
-                                 truncation_undetectable must still decode truncated input \
-                                 to a genuine prefix, never fabricated, reordered or padded \
-                                 bytes",
-                                out.len(),
-                                full.len()
-                            ),
-                            None => panic!(
-                                "conformance[{id}] property 10: truncated input (cut to {cut} \
-                                 of {len} bytes) decoded without error; a codec failing this \
-                                 should either detect truncation or be reconsidered"
-                            ),
-                        },
-                        Err(e) => {
-                            let classified = crate::Error::from_decode_io(e);
-                            assert!(
-                                matches!(classified, crate::Error::Corrupt(_)),
-                                "conformance[{id}] property 10: truncated input (cut to {cut} \
-                                 of {len} bytes) raised {classified:?}, expected \
-                                 Error::Corrupt (exit 5) — NormalizeDecodeErrors should \
-                                 classify truncation as InvalidData"
-                            );
-                            assert_eq!(
-                                classified.exit_code(),
-                                5,
-                                "conformance[{id}] property 10: Error::Corrupt must be exit \
-                                 code 5"
-                            );
-                        }
-                    }
-                }
-            }
-            None => skip(id, 10, NO_FIXTURE),
-        }
+        // 10. See [`check_property_10`] — broken out into its own function
+        //     so it can be exercised directly, bypassing properties 1-9.
+        check_property_10(codec, id, caps, &corruption_input);
 
         // 11. A genuine I/O failure reading the SOURCE — not malformed
         //     content the codec itself rejects — must surface unchanged as
@@ -1329,6 +1405,99 @@ mod tests {
             &fixture,
             "property 10",
         );
+    }
+
+    /// Declares `truncation_undetectable: true` and decodes the FULL input
+    /// correctly (identity), but answers EMPTY for any shorter (truncated)
+    /// one. This passes the bare prefix check trivially — the empty string
+    /// is a prefix of everything — which is exactly the residual gap
+    /// `check_property_10`'s closing checks (monotonicity, then
+    /// non-triviality of the largest cut) exist to catch.
+    ///
+    /// Its `decoder` reads the WHOLE input eagerly to compare `buf.len()`
+    /// against the length it was told is "full" — its output is a function
+    /// of the TOTAL length of its input, so it cannot be incremental BY
+    /// CONSTRUCTION (it must see everything before it can answer anything).
+    /// That is exactly the read-to-end shape conformance property 8 exists
+    /// to catch, so this double is tested directly against
+    /// [`check_property_10`] below, not through
+    /// `assert_codec_conforms`/`_with`'s full pipeline — see that function's
+    /// own doc for why going through the full pipeline would name property 8
+    /// instead of property 10, proving nothing about the property this
+    /// double exists to exercise.
+    #[derive(Debug)]
+    struct AlwaysEmptyOnTruncation {
+        full_len: usize,
+    }
+
+    impl Codec for AlwaysEmptyOnTruncation {
+        fn id(&self) -> FormatId {
+            MOCK_CODEC
+        }
+
+        fn caps(&self) -> CodecCaps {
+            CodecCaps {
+                decode: true,
+                truncation_undetectable: true,
+                ..Default::default()
+            }
+        }
+
+        fn decoder(
+            &self,
+            mut src: Box<dyn Source>,
+            _o: &DecodeOpts,
+        ) -> crate::Result<Box<dyn Source>> {
+            let mut buf = Vec::new();
+            src.read_to_end(&mut buf)?;
+            let out = if buf.len() == self.full_len {
+                buf
+            } else {
+                Vec::new()
+            };
+            Ok(Box::new(crate::source::StreamOnly::new(
+                std::io::Cursor::new(out),
+            )))
+        }
+
+        fn encoder(
+            &self,
+            _dst: Box<dyn Write + Send>,
+            _o: &EncodeOpts,
+        ) -> crate::Result<Box<dyn crate::archive::Sink>> {
+            panic!("AlwaysEmptyOnTruncation cannot encode — the harness must never call this")
+        }
+    }
+
+    #[test]
+    fn a_decoder_that_always_answers_empty_on_truncation_is_caught() {
+        let fixture: Vec<u8> = (0u32..8192).map(|i| (i % 251) as u8 + 1).collect();
+        let codec = AlwaysEmptyOnTruncation {
+            full_len: fixture.len(),
+        };
+        let id = codec.id();
+        let caps = codec.caps();
+        let corruption_input = Some(fixture);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_property_10(&codec, id, caps, &corruption_input);
+        }));
+        match result {
+            Ok(()) => {
+                panic!("expected check_property_10 to panic naming \"property 10\", but it passed")
+            }
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("<non-string panic payload>");
+                assert!(
+                    message.contains("property 10"),
+                    "panicked, but the message did not mention \"property 10\": {message}"
+                );
+            }
+        }
     }
 
     #[test]

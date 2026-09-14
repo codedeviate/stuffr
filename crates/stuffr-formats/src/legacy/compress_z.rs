@@ -244,6 +244,14 @@ struct DictState {
     oldcode: u32,
     finchar: u8,
     stack: Vec<u8>,
+    /// Counts block-mode CLEAR codes actually processed. Test-only
+    /// instrumentation, not production state: it exists so
+    /// `decodes_a_stream_with_block_mode_clears_and_width_growth` can assert
+    /// the CLEAR branch (`compress_z.rs`'s own module doc — previously
+    /// exercised by NO test in the repo) was genuinely reached, rather than
+    /// merely hoping a large enough payload happens to trigger it.
+    #[cfg(test)]
+    clears_seen: u32,
 }
 
 impl DictState {
@@ -268,6 +276,8 @@ impl DictState {
             oldcode: 0,
             finchar: 0,
             stack: Vec::new(),
+            #[cfg(test)]
+            clears_seen: 0,
         }
     }
 }
@@ -289,6 +299,13 @@ struct LzwZReader<R> {
 }
 
 impl<R: Read> LzwZReader<R> {
+    /// How many block-mode CLEAR codes this decode actually processed.
+    /// Test-only — see [`DictState::clears_seen`]'s doc.
+    #[cfg(test)]
+    fn clears_seen(&self) -> u32 {
+        self.dict.as_ref().map_or(0, |d| d.clears_seen)
+    }
+
     fn new(inner: R) -> Self {
         Self {
             bits: BitSource::new(inner),
@@ -385,6 +402,10 @@ impl<R: Read> LzwZReader<R> {
         let mut code = raw;
 
         if dict.block_mode && code == CLEAR {
+            #[cfg(test)]
+            {
+                dict.clears_seen += 1;
+            }
             let new_bp = align_to_group(dict.bitpos, dict.n_bits, dict.boff);
             self.bits.skip(new_bp - dict.bitpos)?;
             dict.boff = new_bp;
@@ -432,7 +453,7 @@ impl<R: Read> LzwZReader<R> {
             dict.prefix[dict.free_ent as usize] = dict.oldcode;
             dict.suffix[dict.free_ent as usize] = dict.finchar;
             dict.free_ent += 1;
-            if dict.free_ent > dict.maxcode && dict.n_bits < dict.maxbits {
+            if dict.free_ent > dict.maxcode {
                 let new_bp = align_to_group(dict.bitpos, dict.n_bits, dict.boff);
                 self.bits.skip(new_bp - dict.bitpos)?;
                 dict.boff = new_bp;
@@ -672,23 +693,55 @@ mod tests {
     }
 
     fn system_compress(compress_bin: &std::path::Path, payload: &[u8], tag: usize) -> Vec<u8> {
+        system_compress_args(compress_bin, payload, tag, &[])
+    }
+
+    /// [`system_compress`]'s generalisation for a specific `-b maxbits`
+    /// (or any other flag `/usr/bin/compress` accepts before `-c`).
+    fn system_compress_args(
+        compress_bin: &std::path::Path,
+        payload: &[u8],
+        tag: usize,
+        extra_args: &[&str],
+    ) -> Vec<u8> {
         let in_path = std::env::temp_dir().join(format!(
             "stuffr-compress-z-{tag}-{}.txt",
             std::process::id()
         ));
         std::fs::write(&in_path, payload).unwrap();
         let out = std::process::Command::new(compress_bin)
+            .args(extra_args)
             .arg("-c")
             .arg(&in_path)
             .output()
             .unwrap();
         assert!(
             out.status.success(),
-            "payload {tag}: system compress failed: {}",
+            "tag {tag}: system compress {extra_args:?} failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
         let _ = std::fs::remove_file(&in_path);
         out.stdout
+    }
+
+    /// A deterministic, non-repeating pseudo-random payload over a small
+    /// alphabet — high enough entropy that `/usr/bin/compress` fills its
+    /// dictionary (and, at `-b 12` over a large enough length, resets it via
+    /// block-mode CLEAR) rather than compressing so well the fixed-size
+    /// payload never reaches those branches. `xorshift64`, not a crate
+    /// dependency: deterministic across runs and platforms, which is what
+    /// makes a byte-exact assertion against it meaningful.
+    fn pseudo_random_payload(len: usize, seed: u64) -> Vec<u8> {
+        const ALPHABET: &[u8] = b"abcdefghijklmnop ";
+        let mut state = seed | 1; // xorshift64 requires a non-zero state
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ALPHABET[(state as usize) % ALPHABET.len()]
+            })
+            .collect()
     }
 
     #[test]
@@ -719,5 +772,76 @@ mod tests {
                  only checked for success"
             );
         }
+    }
+
+    /// Regression test for a real bug the review round caught: the width-
+    /// growth guard used to read `dict.free_ent > dict.maxcode &&
+    /// dict.n_bits < dict.maxbits`. That second clause is FALSE from the
+    /// very first code whenever `maxbits == INIT_BITS == 9` (the code width
+    /// never has room to grow past what it starts at), so the branch never
+    /// ran at all — including its `align_to_group`/bit-skip step, which the
+    /// real encoder performs unconditionally at this exact point regardless
+    /// of whether the width numerically changes. Skipping it left the
+    /// decoder's bit position permanently out of sync with the real stream
+    /// the moment the dictionary filled (512 entries), corrupting every code
+    /// read after that point.
+    ///
+    /// Measured directly: a 130 000-byte payload compressed with
+    /// `compress -b 9` used to fail (`invalid LZW code in stream`) once
+    /// decoded far enough to fill the dictionary; dropping the `n_bits <
+    /// maxbits` clause entirely (this codec's own bounds check on `code` is
+    /// what keeps indexing memory-safe, not that clause — see `code >
+    /// dict.free_ent` above) decodes it byte-exactly, and changes nothing
+    /// for `-b 10/12/16` (also covered below and by the cross-validation
+    /// test), since for those the clause was true anyway at the point that
+    /// matters.
+    #[test]
+    fn a_maxbits_9_stream_decodes_byte_exactly() {
+        let compress_bin = require_bin("compress");
+        let payload = pseudo_random_payload(130_000, 0xC0FFEE);
+        let packed = system_compress_args(&compress_bin, &payload, 300, &["-b", "9"]);
+        let decoded = decompress(&packed)
+            .unwrap_or_else(|e| panic!("maxbits=9 stream failed to decode: {e}"));
+        assert_eq!(
+            decoded, payload,
+            "a maxbits=9 stream, once the 512-entry dictionary fills, must still decode \
+             byte-exactly"
+        );
+    }
+
+    /// Before this test, NO test in the repo exercised the block-mode CLEAR
+    /// branch (group alignment, `boff` update, dictionary reset, forced
+    /// literal) at all: `hello.Z` has 0 CLEARs and a single code width (9),
+    /// and the cross-validation test's own width-growth payload only grows
+    /// 9->10, 0 CLEARs. `-b 12` over a large, high-entropy payload forces
+    /// `compress`'s ratio-triggered dictionary reset repeatedly as it goes,
+    /// AND grows the code width from 9 up through 12 — so this asserts the
+    /// CLEAR branch was actually reached (not merely hoped for), not just
+    /// that the decode happened to succeed.
+    #[test]
+    fn decodes_a_stream_with_block_mode_clears_and_width_growth() {
+        let compress_bin = require_bin("compress");
+        let payload = pseudo_random_payload(130_000, 0xBADC0DE);
+        let packed = system_compress_args(&compress_bin, &payload, 301, &["-b", "12"]);
+
+        let src: Box<dyn Source> =
+            Box::new(ReaderSource::new(std::io::Cursor::new(packed.clone())));
+        let mut reader = LzwZReader::new(src);
+        let mut decoded = Vec::new();
+        reader
+            .read_to_end(&mut decoded)
+            .unwrap_or_else(|e| panic!("maxbits=12 stream failed to decode: {e}"));
+
+        assert_eq!(
+            decoded, payload,
+            "a maxbits=12 stream must decode byte-exactly"
+        );
+        assert!(
+            reader.clears_seen() > 0,
+            "this payload was expected to force at least one block-mode CLEAR (dictionary \
+             reset) — got 0. Either compress's ratio-triggered reset behavior changed, or the \
+             payload needs to be larger/more random; either way, a run of this test that \
+             passes without ever reaching CLEAR proves nothing about that branch"
+        );
     }
 }
