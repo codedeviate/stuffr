@@ -142,7 +142,8 @@ use unarj_rs::date_time::DosDateTime;
 use unarj_rs::local_file_header::{CompressionMethod, FileType};
 
 use stuffr_core::{
-    ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
+    ArchiveRead, ArchiveWrite, Container, ContainerCaps, CorruptionDetection, CreateOpts, Entry,
+    EntryKind, EntryMeta,
     Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, SeekRead,
     Sink, Source,
 };
@@ -175,6 +176,10 @@ impl Container for Arj {
         // cannot read an archive at all without `Seek`.
         ContainerCaps {
             needs_seek: true,
+            // Every ARJ entry carries a CRC-32, checked by `unarj-rs` once
+            // the payload is decoded — mandated by the format, so `Always`,
+            // the same declaration `lha` makes for its CRC-16.
+            detects_corruption: CorruptionDetection::Always,
             ..ContainerCaps::read_only()
         }
     }

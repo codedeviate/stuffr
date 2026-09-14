@@ -719,9 +719,25 @@ pub fn assert_container_conforms_with(
 
     // 7. Corruption: flip the middle byte. Never the expected content
     //    unchanged — an error, a short read, or different content are all
-    //    acceptable, exactly like the write-capable harness's own property 7
-    //    (renumbered here to avoid colliding with property 6 above).
-    if !fixture.bytes.is_empty() {
+    //    acceptable.
+    //
+    //    GATED on the declared `ContainerCaps::detects_corruption`, exactly
+    //    as the codec harness gates its own corruption property (property 9
+    //    there) on `CodecCaps::detects_corruption`. Ungated, this was
+    //    stricter than the codec harness applies to the same concept, with
+    //    none of the argument that justifies making TRUNCATION unconditional
+    //    — a container declaring no integrity check cannot promise to notice
+    //    a flipped byte, and a fixture whose midpoint lands in a reserved,
+    //    comment or padding field no reader consults would fail a CORRECT
+    //    container. Both current fixtures pass only because their midpoints
+    //    happen to land under a CRC. The skip is reported, never silent.
+    if caps.detects_corruption == crate::format::CorruptionDetection::Never {
+        eprintln!(
+            "conformance[{id}] property 7: skipped — this container declares \
+             CorruptionDetection::Never, so no check exists to prove (fixture \
+             provenance: {provenance})"
+        );
+    } else if !fixture.bytes.is_empty() {
         let mut corrupted = fixture.bytes.to_vec();
         let mid = corrupted.len() / 2;
         corrupted[mid] ^= 0xFF;
@@ -1287,7 +1303,7 @@ mod broken_containers {
     use crate::archive::{ArchiveRead, ArchiveWrite, Entry, Sink};
     use crate::error::Error;
     use crate::fidelity::FidelityReport;
-    use crate::format::{ContainerCaps, FormatId, MagicRule};
+    use crate::format::{ContainerCaps, CorruptionDetection, FormatId, MagicRule};
     use crate::ladder::Resolved;
     use crate::testing::{FramedMockContainer, framed_container_meta};
     use std::io::Read;
@@ -1303,6 +1319,30 @@ mod broken_containers {
             magics: &[],
             extensions: &[],
             priority: 0,
+        }
+    }
+
+    /// The caps every read-only double here declares, except
+    /// [`FalselyWritable`], which spells its own out.
+    ///
+    /// Shared for ONE reason, and it is not boilerplate: `write: false` is
+    /// the condition under which property 2's `create()` check runs at all,
+    /// so eight independent copies were eight future chances to write
+    /// `write: true` and silently disable that property for one double with
+    /// nothing failing to say so. `detects_corruption` is load-bearing the
+    /// same way for property 7. Everything ELSE each double duplicates — the
+    /// `id()`/`open()`/`create()` glue — stays duplicated on purpose: that
+    /// region is the perturbation surface, each double differs from the
+    /// others in a different place, and flat copies are what make which
+    /// place visible at the point of reading.
+    fn read_only_double_caps() -> ContainerCaps {
+        ContainerCaps {
+            forward_parse: true,
+            // These doubles wrap `FramedMockContainer`, whose framing does
+            // detect a flipped byte, so property 7 genuinely runs against
+            // them — `RestoresKnownContent` exists to fail it.
+            detects_corruption: CorruptionDetection::Always,
+            ..ContainerCaps::read_only()
         }
     }
 
@@ -1418,12 +1458,7 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
-            }
+            read_only_double_caps()
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             FramedMockContainer.open(resolved, o)
@@ -1560,12 +1595,7 @@ mod broken_containers {
             FormatId::new("wrong-id-read-only")
         }
         fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
-            }
+            read_only_double_caps()
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             FramedMockContainer.open(resolved, o)
@@ -1601,10 +1631,15 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
+            // NOT `read_only_double_caps()`, deliberately: this double's
+            // entire perturbation is the gap between `write: false` here and
+            // a `create()` that succeeds anyway, so the claim it lies about
+            // is spelled out at the point of reading.
             ContainerCaps {
                 read: true,
                 write: false,
                 forward_parse: true,
+                detects_corruption: CorruptionDetection::Always,
                 ..Default::default()
             }
         }
@@ -1642,12 +1677,7 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
-            }
+            read_only_double_caps()
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             FramedMockContainer.open(resolved, o)
@@ -1727,12 +1757,7 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
-            }
+            read_only_double_caps()
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             Ok(Box::new(DropsAnEntryRead {
@@ -1802,12 +1827,7 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
-            }
+            read_only_double_caps()
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             Ok(Box::new(RenamesAnEntryRead {
@@ -1877,12 +1897,7 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
-            }
+            read_only_double_caps()
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             Ok(Box::new(CorruptsContentRead {
@@ -1963,12 +1978,7 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
-            }
+            read_only_double_caps()
         }
         fn open(&self, _resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             // BUG: never looks at the resolved source, so a genuinely
@@ -2027,6 +2037,11 @@ mod broken_containers {
     /// never prevents the structural parse from succeeding.
     struct RestoresKnownContent {
         known: Vec<(String, Vec<u8>)>,
+        /// What this double's `caps()` DECLARES. `Always` is the ordinary
+        /// case; `Never` exists to prove property 7's evidence gate is real
+        /// — see `a_container_declaring_no_corruption_detection_skips_-
+        /// property_seven`.
+        declares: CorruptionDetection,
     }
 
     impl RestoresKnownContent {
@@ -2037,6 +2052,15 @@ mod broken_containers {
                     .iter()
                     .map(|e| (e.name.to_string(), e.content.to_vec()))
                     .collect(),
+                declares: CorruptionDetection::Always,
+            }
+        }
+
+        /// The same broken reader, declaring no corruption detection at all.
+        fn undeclared(fixture: &ContainerFixture) -> Self {
+            Self {
+                declares: CorruptionDetection::Never,
+                ..Self::from_fixture(fixture)
             }
         }
     }
@@ -2081,10 +2105,8 @@ mod broken_containers {
         }
         fn caps(&self) -> ContainerCaps {
             ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
+                detects_corruption: self.declares,
+                ..read_only_double_caps()
             }
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
@@ -2122,6 +2144,36 @@ mod broken_containers {
             &read_only_meta(),
             &fx,
             "property 7",
+        );
+    }
+
+    /// The over-strictness half of property 7's evidence gate: the SAME
+    /// broken reader, declaring `CorruptionDetection::Never`, must be let
+    /// through rather than failed.
+    ///
+    /// Without this, gating the property would be indistinguishable from
+    /// deleting it — a gate that is never observed to skip anything is not
+    /// evidence of a gate. It is the container-side twin of the codec
+    /// harness's own `detects_corruption == Never` skip, and the reason it
+    /// is safe is the same: a format with no integrity check cannot notice a
+    /// flipped byte, and demanding it forces a fake.
+    #[test]
+    fn a_container_declaring_no_corruption_detection_skips_property_seven() {
+        const PAYLOAD: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn";
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a", PAYLOAD)]),
+            expected: &[ExpectedEntry {
+                name: "a",
+                content: PAYLOAD,
+            }],
+            provenance: "hand-built in this test",
+        };
+        // No panic: property 7 is skipped on the declaration, and every
+        // other property this double satisfies still runs.
+        assert_container_conforms_with(
+            &RestoresKnownContent::undeclared(&fx),
+            &read_only_meta(),
+            &fx,
         );
     }
 
@@ -2177,12 +2229,7 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                read: true,
-                write: false,
-                forward_parse: true,
-                ..Default::default()
-            }
+            read_only_double_caps()
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             let report = resolved.report.clone();

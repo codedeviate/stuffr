@@ -66,7 +66,8 @@ use std::time::{Duration, UNIX_EPOCH};
 use delharc::LhaDecodeReader;
 use delharc::decode::LhaDecodeError;
 use stuffr_core::{
-    ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
+    ArchiveRead, ArchiveWrite, Container, ContainerCaps, CorruptionDetection, CreateOpts, Entry,
+    EntryKind, EntryMeta,
     Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Sink,
     Source,
 };
@@ -113,6 +114,12 @@ impl Container for Lha {
         // `needs_seek: false` too, which `delharc` genuinely does not need.
         ContainerCaps {
             forward_parse: true,
+            // Every plain LHA entry carries a CRC-16 the format MANDATES,
+            // and `delharc`'s `crc_check()` is what raises on a mismatch —
+            // a format-wide guarantee, not a per-writer option, so
+            // `Always`. Read by the read-only conformance harness's
+            // corruption property.
+            detects_corruption: CorruptionDetection::Always,
             ..ContainerCaps::read_only()
         }
     }

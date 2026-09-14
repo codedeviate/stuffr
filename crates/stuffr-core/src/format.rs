@@ -241,6 +241,28 @@ pub struct ContainerCaps {
     /// A symlink can be recorded as a link, target and all, rather than as a
     /// regular file carrying the target text as its contents.
     pub stores_symlinks: bool,
+    /// Whether reading an archive of this format will NOTICE a corrupted
+    /// byte rather than silently returning wrong data — and, where it does,
+    /// what kind of guarantee that is. The container-side twin of
+    /// [`CodecCaps::detects_corruption`], reusing the same enum and the same
+    /// three meanings.
+    ///
+    /// Read by the read-only conformance harness's corruption property, and
+    /// it is the reason that property is honest rather than merely strict:
+    /// the harness flips the fixture's middle byte and demands the read-back
+    /// differ from the expectation, which a container with no integrity
+    /// check at all cannot promise. A fixture whose midpoint lands in a
+    /// reserved, comment or padding field no reader consults would fail a
+    /// CORRECT container, and the module's own rule is that properties skip
+    /// on evidence, never on trust — `ContainerCaps` being one of the two
+    /// admissible kinds of evidence.
+    ///
+    /// Defaults to [`CorruptionDetection::Never`] via [`Self::read_only`],
+    /// [`Self::read_write`] and `Default`, so a container claims this the
+    /// same way it claims every other capability here: explicitly. `lha`
+    /// (CRC-16 per entry) and `arj` (CRC-32 per entry) are the first two to
+    /// declare it.
+    pub detects_corruption: CorruptionDetection,
 }
 
 /// A magic-byte rule. Detection matches these against a bounded prefix.
@@ -317,6 +339,7 @@ impl ContainerCaps {
             needs_seek: false,
             stores_dirs: false,
             stores_symlinks: false,
+            detects_corruption: CorruptionDetection::Never,
         }
     }
 
