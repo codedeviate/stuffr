@@ -1,11 +1,48 @@
-//! Container conformance: one call per container, thirteen properties.
+//! Container conformance: TWO entry points, two property sets, two
+//! numberings.
 //!
 //! The codec equivalent (`conformance.rs`) caught defects at codec two rather
 //! than codec nine. Containers vary structurally more than codecs, not less,
 //! so the same method applies. Properties skip on EVIDENCE — `ContainerCaps`
 //! and measurement — never on trust, exactly as the codec harness does.
 //!
-//! Thirteen properties, one function.
+//! - [`assert_container_conforms`] — a container that can write its own test
+//!   input. Thirteen properties, numbered 1-13 below, raised as
+//!   `conformance[{id}] property N: ...`.
+//! - [`assert_container_conforms_with`] — a container that CANNOT (every
+//!   read-only legacy format). Nine properties, numbered 1-9 in a scheme of
+//!   its OWN, raised as `conformance[{id}] fixture property N: ...`.
+//!
+//! **The two numberings collide and the messages are what tell them apart.**
+//! Five numbers mean different things in the two sets — 4 is "`finish`
+//! surfaces a write error" in one and "entry enumeration" in the other, 6 is
+//! `by_index` honesty against truncation, 7 rung honesty against corruption —
+//! so a bare `property 6` sent a reader to the wrong entry in this very list.
+//! The read-only set is not a SUBSET of the list below, whatever its own
+//! function doc used to say; it is a relabelling. Hence the `fixture` tag on
+//! every message the fixture-driven entry point raises, and hence its own
+//! enumeration, here rather than in a comment inside the function:
+//!
+//! 1. Identity, as below.
+//! 2. The read-only declaration is honoured: `caps.read` must be true, and a
+//!    container declaring `write: false` must have `create()` genuinely
+//!    refuse rather than quietly succeed.
+//! 3. Magic agreement, against the FIXTURE's own bytes — no round trip,
+//!    since the fixture already is the encoded form.
+//! 4. Enumeration: names and order match the fixture's manifest.
+//! 5. Content: each entry's bytes match the manifest.
+//! 6. Truncation, unconditional on `caps.read`, mirroring 9 below.
+//! 7. Corruption: a flipped middle byte must not read back byte-identical to
+//!    the manifest. GATED on `ContainerCaps::detects_corruption`, exactly as
+//!    the codec harness gates its own corruption property — see that field.
+//! 8. Error classification: every refusal 2, 6 and 7 provoke must pass
+//!    `check_error_is_classified` (never `exit_code`'s `_ => 1` wildcard).
+//!    Embedded in those three rather than standalone.
+//! 9. Source-error passthrough: a source that fails every read must surface
+//!    that failure AS ITSELF, never as corruption and never as a clean end
+//!    of archive. The twin of 10 below.
+//!
+//! Thirteen properties for the write-capable entry point, one function.
 //!
 //! 1. Identity: `Container::id()` must agree with the `FormatMeta` it is
 //!    registered under, or a mismatched registration is completely silent —
@@ -592,12 +629,17 @@ pub struct ContainerFixture {
 /// properties that make sense without a write side — deliberately a
 /// SEPARATE function from `assert_container_conforms`, not a unified one with
 /// more gating, for the same reason the codec side keeps
-/// `assert_codec_conforms`/`assert_codec_conforms_with` apart.
+/// `assert_codec_conforms`/`assert_codec_conforms_with` apart. Its nine
+/// properties are a RELABELLING, not a subset — see the module doc.
 ///
-/// Every assertion message begins `conformance[{id}] property N (...)` and
+/// Every assertion message begins `conformance[{id}] fixture property N` and
 /// includes `fixture provenance: {}`, so a red test says up front how
 /// trustworthy its own expectation is — load-bearing where a later fixture's
-/// `expected` was derived from the very crate under test.
+/// `expected` was derived from the very crate under test. The `fixture` tag
+/// is not decoration: this function's nine properties are numbered in a
+/// scheme of their own, and five of those numbers mean something else in
+/// [`assert_container_conforms`]'s thirteen. See the module doc, which
+/// enumerates both.
 pub fn assert_container_conforms_with(
     container: &dyn Container,
     meta: &FormatMeta,
@@ -610,7 +652,7 @@ pub fn assert_container_conforms_with(
     // 1. Identity: a mismatched registration is otherwise silent.
     assert_eq!(
         id, meta.id,
-        "conformance[{id}] property 1: Container::id() disagrees with its registered \
+        "conformance[{id}] fixture property 1: Container::id() disagrees with its registered \
          FormatMeta (fixture provenance: {provenance})"
     );
 
@@ -621,7 +663,7 @@ pub fn assert_container_conforms_with(
     //    its own caps.
     assert!(
         caps.read,
-        "conformance[{id}] property 2: assert_container_conforms_with requires caps.read \
+        "conformance[{id}] fixture property 2: assert_container_conforms_with requires caps.read \
          (fixture provenance: {provenance})"
     );
     if !caps.write {
@@ -631,14 +673,14 @@ pub fn assert_container_conforms_with(
         );
         match result {
             Ok(_) => panic!(
-                "conformance[{id}] property 2: caps.write is false but create() succeeded — \
+                "conformance[{id}] fixture property 2: caps.write is false but create() succeeded — \
                  a read-only container must refuse to write, not silently accept \
                  (fixture provenance: {provenance})"
             ),
             Err(e) => {
                 if let Err(msg) = check_error_is_classified(&e) {
                     panic!(
-                        "conformance[{id}] property 8: create()'s read-only refusal is not \
+                        "conformance[{id}] fixture property 8: create()'s read-only refusal is not \
                          classified: {msg} (fixture provenance: {provenance})"
                     );
                 }
@@ -656,7 +698,7 @@ pub fn assert_container_conforms_with(
         });
         assert!(
             hit,
-            "conformance[{id}] property 3: no registered magic rule matches the fixture's \
+            "conformance[{id}] fixture property 3: no registered magic rule matches the fixture's \
              bytes (fixture provenance: {provenance})"
         );
     }
@@ -667,7 +709,7 @@ pub fn assert_container_conforms_with(
     //    proves the container returns *something*.
     let got = read_all(container, fixture.bytes).unwrap_or_else(|e| {
         panic!(
-            "conformance[{id}] property 4: failed to read the fixture back: {e} \
+            "conformance[{id}] fixture property 4: failed to read the fixture back: {e} \
              (fixture provenance: {provenance})"
         )
     });
@@ -675,14 +717,14 @@ pub fn assert_container_conforms_with(
     let want_names: Vec<&str> = fixture.expected.iter().map(|e| e.name).collect();
     assert_eq!(
         got_names, want_names,
-        "conformance[{id}] property 4: entry names/order disagree with the fixture's \
+        "conformance[{id}] fixture property 4: entry names/order disagree with the fixture's \
          manifest (fixture provenance: {provenance})"
     );
     for (got_entry, want_entry) in got.iter().zip(fixture.expected.iter()) {
         assert_eq!(
             &got_entry.1[..],
             want_entry.content,
-            "conformance[{id}] property 5: content mismatch for entry {:?} \
+            "conformance[{id}] fixture property 5: content mismatch for entry {:?} \
              (fixture provenance: {provenance})",
             want_entry.name
         );
@@ -699,7 +741,7 @@ pub fn assert_container_conforms_with(
             Err(e) => {
                 if let Err(msg) = check_error_is_classified(&e) {
                     panic!(
-                        "conformance[{id}] property 8: truncation error is not classified: \
+                        "conformance[{id}] fixture property 8: truncation error is not classified: \
                          {msg} (fixture provenance: {provenance})"
                     );
                 }
@@ -707,7 +749,7 @@ pub fn assert_container_conforms_with(
             Ok(entries) => {
                 assert!(
                     entries.len() < fixture.expected.len(),
-                    "conformance[{id}] property 6: a fixture truncated to {cut} of {} bytes \
+                    "conformance[{id}] fixture property 6: a fixture truncated to {cut} of {} bytes \
                      was accepted silently, returning all {} expected entries \
                      (fixture provenance: {provenance})",
                     fixture.bytes.len(),
@@ -733,7 +775,7 @@ pub fn assert_container_conforms_with(
     //    happen to land under a CRC. The skip is reported, never silent.
     if caps.detects_corruption == crate::format::CorruptionDetection::Never {
         eprintln!(
-            "conformance[{id}] property 7: skipped — this container declares \
+            "conformance[{id}] fixture property 7: skipped — this container declares \
              CorruptionDetection::Never, so no check exists to prove (fixture \
              provenance: {provenance})"
         );
@@ -745,7 +787,7 @@ pub fn assert_container_conforms_with(
             Err(e) => {
                 if let Err(msg) = check_error_is_classified(&e) {
                     panic!(
-                        "conformance[{id}] property 8: corruption error is not classified: \
+                        "conformance[{id}] fixture property 8: corruption error is not classified: \
                          {msg} (fixture provenance: {provenance})"
                     );
                 }
@@ -758,7 +800,7 @@ pub fn assert_container_conforms_with(
                         .all(|(g, w)| g.0 == w.name && g.1 == w.content);
                 assert!(
                     !unchanged,
-                    "conformance[{id}] property 7: a corrupted fixture (middle byte flipped \
+                    "conformance[{id}] fixture property 7: a corrupted fixture (middle byte flipped \
                      at offset {mid} of {}) read back byte-identical to the uncorrupted \
                      expectation — corruption went completely undetected \
                      (fixture provenance: {provenance})",
@@ -785,7 +827,7 @@ pub fn assert_container_conforms_with(
     {
         let e = read_all_over_failing_source(container).unwrap_or_else(|| {
             panic!(
-                "conformance[{id}] property 9: a source that fails every read produced no \
+                "conformance[{id}] fixture property 9: a source that fails every read produced no \
                  error at all — the failure went completely unnoticed \
                  (fixture provenance: {provenance})"
             )
@@ -793,7 +835,7 @@ pub fn assert_container_conforms_with(
         assert_eq!(
             e.kind(),
             io::ErrorKind::PermissionDenied,
-            "conformance[{id}] property 9: a source error surfaced as {:?} rather than \
+            "conformance[{id}] fixture property 9: a source error surfaced as {:?} rather than \
              passing through — a disk failure must not be reported as corruption \
              (fixture provenance: {provenance})",
             e.kind()
@@ -1562,7 +1604,7 @@ mod broken_containers {
             provenance: "hand-built in this test",
         };
         let meta = read_only_meta_with_magics(&[ABSENT_MAGIC]);
-        assert_panics_naming_with(&MockReadOnly::new(&fx), &meta, &fx, "property 3");
+        assert_panics_naming_with(&MockReadOnly::new(&fx), &meta, &fx, "fixture property 3");
     }
 
     // -----------------------------------------------------------------
@@ -1615,7 +1657,7 @@ mod broken_containers {
             }],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&WrongIdReadOnly, &read_only_meta(), &fx, "property 1");
+        assert_panics_naming_with(&WrongIdReadOnly, &read_only_meta(), &fx, "fixture property 1");
     }
 
     /// Property 2's write-refusal half. A container that claims
@@ -1662,7 +1704,7 @@ mod broken_containers {
             }],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&FalselyWritable, &read_only_meta(), &fx, "property 2");
+        assert_panics_naming_with(&FalselyWritable, &read_only_meta(), &fx, "fixture property 2");
     }
 
     /// Property 8, isolated from the three properties that embed it (2, 6,
@@ -1701,7 +1743,12 @@ mod broken_containers {
             }],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&MisclassifiesRefusal, &read_only_meta(), &fx, "property 8");
+        assert_panics_naming_with(
+            &MisclassifiesRefusal,
+            &read_only_meta(),
+            &fx,
+            "fixture property 8",
+        );
     }
 
     /// Property 4 (enumeration), first half: drops the LAST entry. A
@@ -1786,7 +1833,7 @@ mod broken_containers {
             ],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&DropsAnEntry, &read_only_meta(), &fx, "property 4");
+        assert_panics_naming_with(&DropsAnEntry, &read_only_meta(), &fx, "fixture property 4");
     }
 
     /// Property 4, second half: renames the FIRST entry. `DropsAnEntry`
@@ -1856,7 +1903,7 @@ mod broken_containers {
             ],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&RenamesAnEntry, &read_only_meta(), &fx, "property 4");
+        assert_panics_naming_with(&RenamesAnEntry, &read_only_meta(), &fx, "fixture property 4");
     }
 
     /// Property 5 (content): right names, wrong bytes. The brief calls this
@@ -1919,7 +1966,7 @@ mod broken_containers {
             }],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&CorruptsContent, &read_only_meta(), &fx, "property 5");
+        assert_panics_naming_with(&CorruptsContent, &read_only_meta(), &fx, "fixture property 5");
     }
 
     /// Property 6 (truncation): ignores the actual input entirely and
@@ -2015,7 +2062,7 @@ mod broken_containers {
             &IgnoresTruncation::from_fixture(&fx),
             &read_only_meta(),
             &fx,
-            "property 6",
+            "fixture property 6",
         );
     }
 
@@ -2143,7 +2190,7 @@ mod broken_containers {
             &RestoresKnownContent::from_fixture(&fx),
             &read_only_meta(),
             &fx,
-            "property 7",
+            "fixture property 7",
         );
     }
 
@@ -2262,7 +2309,7 @@ mod broken_containers {
             &SwallowsSourceError { relabel: false },
             &read_only_meta(),
             &fx,
-            "property 9",
+            "fixture property 9",
         );
     }
 
@@ -2280,7 +2327,7 @@ mod broken_containers {
             &SwallowsSourceError { relabel: true },
             &read_only_meta(),
             &fx,
-            "property 9",
+            "fixture property 9",
         );
     }
 

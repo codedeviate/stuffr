@@ -524,7 +524,7 @@ mod tests {
 
     /// Step 7 (Task 1's deferred minor): `lha_meta()` registers two magic
     /// rules (`-lh`, `-lz`), and the fixture's own bytes match only the
-    /// first. `assert_container_conforms_with`'s property 3 already runs
+    /// first. `assert_container_conforms_with`'s fixture property 3 already runs
     /// this via `lha_conforms` above (it would fail loudly if the harness's
     /// "any one rule" semantics required EVERY rule to match instead) — this
     /// test pins the premise directly, so a future change to either the
