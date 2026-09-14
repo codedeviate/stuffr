@@ -273,6 +273,14 @@ strong zstd encoder:
 cargo install stuffr-cli --features c-backed    # needs a C compiler, nothing else
 ```
 
+The three read-only legacy formats (Unix `compress` `.Z`, LHA/LZH, ARJ) are
+opt-in too, and pure Rust like the default tier:
+
+```sh
+cargo install stuffr-cli --features legacy      # adds .Z, .lzh and .arj (read-only)
+cargo install stuffr-cli --features full        # both of the above at once
+```
+
 Using it as a library instead:
 
 ```sh

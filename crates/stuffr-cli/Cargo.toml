@@ -14,6 +14,32 @@ readme = "README.md"
 name = "stuffr"
 path = "src/main.rs"
 
+# Passthroughs to the facade, and they exist for one reason: `cargo install
+# stuffr-cli --features <x>` is what the documentation tells a user to type,
+# and Cargo resolves `<x>` against THIS package, not against its dependency.
+# Until Phase 3b's fix wave there was no `[features]` section here at all, so
+# every documented install command failed with "the package 'stuffr-cli' does
+# not contain this feature" — `--features c-backed` had shipped that way since
+# before `legacy` existed, printed as a copyable line in both READMEs. The only
+# working spelling was `--features stuffr/legacy`, which appeared nowhere.
+#
+# One entry per name any document tells a user to install with: the two build
+# tiers, the `legacy` bundle, `full`, and the three legacy formats the README
+# names individually. `cargo install stuffr-cli` on its own still gets the
+# facade's own `default = ["pure"]` — nothing here is a default, so adding a
+# feature never silently changes what a plain install builds.
+# `documented_install_commands_name_features_this_crate_declares` in
+# `tests/cli.rs` fails the build if a README grows a `--features` spelling this
+# table does not carry.
+[features]
+pure = ["stuffr/pure"]
+c-backed = ["stuffr/c-backed"]
+legacy = ["stuffr/legacy"]
+full = ["stuffr/full"]
+lha = ["stuffr/lha"]
+arj = ["stuffr/arj"]
+compress = ["stuffr/compress"]
+
 [dependencies]
 stuffr = { path = "../stuffr", version = "0.4.0", features = ["serde"] }
 clap = { workspace = true }

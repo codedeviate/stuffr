@@ -7640,3 +7640,75 @@ fn a_temp_directory_name_is_not_reproducible_from_the_pid_and_a_counter() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Every `cargo install stuffr-cli --features <x>` a shipped document prints
+/// must name a feature `stuffr-cli` actually declares.
+///
+/// This exists because the opposite shipped. `crates/stuffr-cli/Cargo.toml`
+/// carried no `[features]` section at all, while `README.md` printed
+/// `cargo install stuffr-cli --features c-backed` as a copyable line — and
+/// Cargo resolves a `--features` name against the package being installed,
+/// not against its dependencies, so the command answered "the package
+/// 'stuffr-cli' does not contain this feature" and the only working spelling
+/// (`--features stuffr/c-backed`) appeared in no document. Phase 3b made it
+/// acute by adding `legacy`, whose whole point is that a user turns it on.
+///
+/// Parsed out of the documents rather than listed here: a command added to a
+/// README by a future phase is exactly the case a hardcoded list cannot
+/// cover. The `[features]` table is read as text for the same reason the
+/// version grep in `CLAUDE.md` is — no TOML parser is a dependency of this
+/// crate, and a feature line is `name = [...]` at the start of a line, which
+/// is unambiguous inside the one section this looks at.
+#[test]
+fn documented_install_commands_name_features_this_crate_declares() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+
+    let features: Vec<String> = manifest
+        .split("\n[")
+        .find(|section| section.starts_with("features]"))
+        .expect("stuffr-cli must declare a [features] section: without one, every \
+                 documented `cargo install stuffr-cli --features …` fails")
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(_, rhs)| rhs.trim_start().starts_with('['))
+        .map(|(name, _)| name.trim().to_string())
+        .collect();
+    assert!(
+        features.contains(&"legacy".to_string()),
+        "the parse found {features:?}; if `legacy` is missing the scan itself is broken, \
+         not the manifest"
+    );
+
+    let docs = [
+        manifest_dir.join("README.md"),
+        manifest_dir.parent().unwrap().parent().unwrap().join("README.md"),
+        manifest_dir.join("src").join("examples.txt"),
+    ];
+    let mut commands_checked = 0usize;
+    for doc in docs {
+        let text = std::fs::read_to_string(&doc).unwrap();
+        for line in text.lines() {
+            let Some(rest) = line.split("cargo install stuffr-cli").nth(1) else {
+                continue;
+            };
+            let Some(after) = rest.split("--features").nth(1) else {
+                continue;
+            };
+            let name = after.trim().split_whitespace().next().unwrap_or("");
+            commands_checked += 1;
+            assert!(
+                features.contains(&name.to_string()),
+                "{} prints `cargo install stuffr-cli --features {name}`, but stuffr-cli \
+                 declares only {features:?} — that command fails with \"the package \
+                 'stuffr-cli' does not contain this feature\"",
+                doc.display()
+            );
+        }
+    }
+    assert!(
+        commands_checked >= 2,
+        "expected the READMEs to print at least the c-backed and legacy install \
+         commands; found {commands_checked} — the scan has stopped finding them"
+    );
+}

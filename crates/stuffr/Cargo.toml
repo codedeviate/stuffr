@@ -51,7 +51,17 @@ pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pur
 # container in on its own. This is the one capability difference `c-backed`
 # makes to a container: reading and writing a zstd-compressed zip entry.
 c-backed = ["zstd-c", "xz-c", "lzma-c", "stuffr-formats/zip-zstd"]
-legacy = ["stuffr-formats/lha", "stuffr-formats/arj", "stuffr-formats/compress"]
+lha = ["stuffr-formats/lha"]
+arj = ["stuffr-formats/arj"]
+compress = ["stuffr-formats/compress"]
+# A bundle of the three passthroughs above, not a second spelling of them.
+# `README.md` tells a reader the three legacy formats sit "behind their own
+# `--features compress`/`lha`/`arj`", so each has to exist HERE as well as in
+# `stuffr-formats` — a facade user typing the documented name got "does not
+# contain this feature" until Phase 3b's fix wave, and `crates/stuffr/tests/
+# facade.rs` now keys its per-name `cfg!(feature = ...)` checks off exactly
+# these three.
+legacy = ["lha", "arj", "compress"]
 full = ["pure", "c-backed", "legacy"]
 serde = ["dep:serde", "stuffr-core/serde"]
 # Exposes test-only instrumentation (see `ops::sync_call_count`) that would
