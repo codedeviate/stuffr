@@ -154,8 +154,13 @@ Wanted, not scheduled.
   *metadata awareness* (show the control file, the spec, the manifest) rather
   than new parsing.
 - **Encrypted archive read** — AES-encrypted zip, 7z AES. Read only; see Part 1.
-- Retrocomputing formats: Amiga `.dms`/`.lzx`, Atari, CP/M, `.ALZ`, `.EGG`,
-  `.BH`, `.PAK`, `.SQZ`, `.UC2`, `.HA`, `.YZ1`, `.PMA`
+- Retrocomputing formats: Amiga `.dms`, Atari, CP/M, `.ALZ`, `.EGG`,
+  `.BH`, `.PAK`, `.SQZ`, `.UC2`, `.HA`, `.YZ1`, `.PMA`.
+  **Amiga/MS `.lzx` was on this list and is not any more** — Phase 3b deferred
+  it to Phase 3c alongside StuffIt's older methods, so it is scheduled rather
+  than excluded. What holds it back is evidence, not appetite: there is no
+  second implementation and no obtainable tool, so a fixture and its expected
+  contents would both come from the one crate being tested.
 - WIM, DMG (as distribution formats rather than disk images)
 - WARC, and `.tar.zst` variants with sidecar indexes
 
