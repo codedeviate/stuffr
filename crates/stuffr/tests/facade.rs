@@ -31,9 +31,55 @@ fn facade_reexports_core_version() {
 /// here; only a feature that is off by default does.
 ///
 /// A name added here must be a real one-tier (or, as here, one-feature-set)
-/// format, not a typo being waved through: a typo resolves on neither tier,
-/// which is exactly what the assertion below exists to catch.
-const TIER_SPECIFIC: &[&str] = &["compress", "lha", "arj"];
+/// format, not a typo being waved through.
+///
+/// **The exemption is CONDITIONAL on the feature being absent**, and that is
+/// the whole of it. A flat `&[&str]` consulted unconditionally would exempt
+/// these three on `--all-features` too, where all three ARE registered — so
+/// a name misspelled in a slot table and mirrored into this list would be
+/// rescued by the very exemption meant to expose it, and pass on both legs
+/// forever. (What still works today without the condition: `lha` genuinely
+/// registers under `--all-features`, so it passes on the FIRST clause,
+/// verified rather than exempted. It is the mirrored typo that escapes,
+/// because a typo registers nowhere and the exemption then covers it
+/// everywhere.)
+///
+/// `cfg!(feature = ...)` rather than a live-registry witness, which is what
+/// `stuffr-cli`'s `legacy_bundle_compiled` has to use: THIS crate is the one
+/// that declares the features, so it can ask the question directly, and a
+/// misspelled FEATURE name is a `cargo` check-cfg warning — which `-D
+/// warnings` turns into a build failure — rather than a silently false
+/// constant.
+struct TierSpecific {
+    /// The slot name, as it appears in `CODEC_SLOTS`/`CONTAINER_SLOTS`.
+    name: &'static str,
+    /// Whether the Cargo feature that registers it is compiled into THIS
+    /// build. When it is, the name is not exempt from anything: it must be
+    /// genuinely registered.
+    compiled: bool,
+}
+
+const TIER_SPECIFIC: &[TierSpecific] = &[
+    TierSpecific {
+        name: "compress",
+        compiled: cfg!(feature = "compress"),
+    },
+    TierSpecific {
+        name: "lha",
+        compiled: cfg!(feature = "lha"),
+    },
+    TierSpecific {
+        name: "arj",
+        compiled: cfg!(feature = "arj"),
+    },
+];
+
+/// True only if `name` is listed AND its feature is absent from this build.
+fn exempt_from_registration(name: &str) -> bool {
+    TIER_SPECIFIC
+        .iter()
+        .any(|t| t.name == name && !t.compiled)
+}
 
 /// A `TIER_SPECIFIC` entry that names no slot at all is an exemption with
 /// nothing to exempt — most likely a slot that was renamed out from under it,
@@ -42,11 +88,34 @@ const TIER_SPECIFIC: &[&str] = &["compress", "lha", "arj"];
 /// mistake, and nothing else in the tree would notice.
 #[test]
 fn every_tier_specific_exemption_names_a_real_slot() {
-    for name in TIER_SPECIFIC {
+    for entry in TIER_SPECIFIC {
+        let name = &entry.name;
         assert!(
             CODEC_SLOTS.contains(name) || CONTAINER_SLOTS.contains(name),
             "TIER_SPECIFIC exempts {name:?}, which is in neither slot table — a stale \
              exemption leaves the slot it was meant to cover unguarded"
+        );
+    }
+}
+
+/// The other half, and the one the flat list could not make: when a
+/// `TIER_SPECIFIC` name's feature IS compiled, the format must genuinely be
+/// registered. Checking the slot table alone (which is what
+/// `every_tier_specific_exemption_names_a_real_slot` does) looks in the same
+/// wrong place a mirrored typo lives in.
+#[test]
+fn every_tier_specific_name_is_registered_when_its_feature_is_compiled() {
+    let matrix = stuffr::registry().matrix();
+    for entry in TIER_SPECIFIC {
+        if !entry.compiled {
+            continue;
+        }
+        assert!(
+            matrix.iter().any(|row| row.id.as_str() == entry.name),
+            "TIER_SPECIFIC names {:?} and its Cargo feature IS compiled into this build, \
+             but no such format is registered — either the registration broke or the name \
+             is a typo the exemption would otherwise wave through on both legs",
+            entry.name
         );
     }
 }
@@ -75,7 +144,7 @@ fn every_selector_slot_names_a_registered_format() {
         let registered = ids(kind);
         for name in table {
             assert!(
-                registered.contains(name) || TIER_SPECIFIC.contains(name),
+                registered.contains(name) || exempt_from_registration(name),
                 "{label} slot {name:?} is registered by neither tier — a typo there is a \
                  corpus seed that decodes to no format at all. Registered {kind:?}s here: \
                  {registered:?}"
