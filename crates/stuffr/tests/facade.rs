@@ -10,23 +10,30 @@ fn facade_reexports_core_version() {
 /// Slot names the fuzzer's selector tables carry that this build legitimately
 /// does not register — a format present on only ONE of the two tiers.
 ///
-/// **Empty today, and that is measured rather than assumed.** Every format
-/// with two backends registers under a single shared `FormatId` —
-/// `xz_shared.rs`'s `XZ`, `lzma_shared.rs`'s `LZMA`, `zstd_shared.rs`'s
-/// `ZSTD` — so which backend wins changes the *implementation* behind a name,
-/// never the name itself. All fifteen slots therefore resolve on both legs
-/// the gate runs (`make test` and `make test-pure`).
+/// **No longer empty, exactly as predicted below, and the day has come:**
+/// Phase 3b appended `compress`, `lha` and `arj` to `CODEC_SLOTS` /
+/// `CONTAINER_SLOTS`. Measured, not assumed — `cargo test -p stuffr --test
+/// facade every_selector_slot_names_a_registered_format`:
+/// - `--all-features` (`legacy` on): passes.
+/// - no features beyond the default (`legacy` off): failed with `CODEC_SLOTS
+///   slot "compress" is registered by neither tier` before these three names
+///   were added here.
 ///
-/// **It will not stay empty.** `stuffr/Cargo.toml`'s `legacy = []` is in
-/// `full` but not in `default = ["pure"]`, so the first Phase 3-4 legacy
-/// format registers under `--all-features` and not on the default leg. The
-/// day its slot is appended, this test fails `make test-pure` — and the fix
-/// is a name here, not a weakened assertion.
+/// So this is feature-gating, not the pure/c-backed backend split the
+/// paragraph below was originally written about — but the shape is the same
+/// the comment predicted: a name registered on `make test` and not on `make
+/// test-pure` needs to be named here, and the fix is a name, not a weakened
+/// assertion.
 ///
-/// A name added here must be a real one-tier format, not a typo being waved
-/// through: a typo resolves on neither tier, which is exactly what the
-/// assertion below exists to catch.
-const TIER_SPECIFIC: &[&str] = &[];
+/// Every format with two backends still registers under a single shared
+/// `FormatId` — `xz_shared.rs`'s `XZ`, `lzma_shared.rs`'s `LZMA`,
+/// `zstd_shared.rs`'s `ZSTD` — so backend selection alone never puts a name
+/// here; only a feature that is off by default does.
+///
+/// A name added here must be a real one-tier (or, as here, one-feature-set)
+/// format, not a typo being waved through: a typo resolves on neither tier,
+/// which is exactly what the assertion below exists to catch.
+const TIER_SPECIFIC: &[&str] = &["compress", "lha", "arj"];
 
 /// A `TIER_SPECIFIC` entry that names no slot at all is an exemption with
 /// nothing to exempt — most likely a slot that was renamed out from under it,

@@ -54,10 +54,23 @@ test-pure:
 # The second build is not redundant: it proves stuffr-core still compiles with
 # no optional features, which is the guarantee behind "cargo install needs no
 # C toolchain".
+#
+# The third is a compile-only floor, not a third test leg: `check` runs
+# exactly two (`test`, `test-pure`), and `legacy` lives only in the first,
+# which also enables `c-backed` — so the pure+legacy combination (what a
+# `--features legacy` user on a pure build actually has) is never TESTED by
+# either leg. A legacy format that accidentally leaned on something
+# C-backed would pass the whole gate and only break for that user. Adding a
+# full third `cargo test --features pure,legacy` run would cost another
+# 35-60s for a combination whose realistic failure mode is a compile error,
+# not a behavioural one — `cargo check`, not `cargo test`, is what this
+# guards. Verified clean as of Phase 3b Task 7: `cargo check -p stuffr
+# --features legacy --no-default-features` exits 0.
 release:
 	$(CARGO) build --release --workspace
 	$(CARGO) build -p stuffr-core --no-default-features
 	$(CARGO) build -p stuffr-formats --no-default-features
+	$(CARGO) check -p stuffr --features legacy --no-default-features
 
 # NOT part of `check`, deliberately: Miri is 10-50x slower than a native run
 # and the gate is already 35-60s. Run it when you touch the self-referential
@@ -222,8 +235,17 @@ hooks:
 # `--exact` would not close it: a renamed test matches nothing under `--exact`
 # too, and still exits 0. Counting what ran, and then looking at the disk, is
 # what closes it.
+#
+# `--features testing,legacy`, not just `testing`: Phase 3b's three read-only
+# legacy slots (`compress`, `lha`, `arj`) are feature-gated behind `legacy`
+# (in `full`, not in `default`), and `generate_corpus` only seeds a slot this
+# build's registry actually has — see `registered_codec_slots`/
+# `registered_container_slots` in `fuzz_corpus.rs`. Without `legacy` here,
+# this target would keep regenerating a corpus silently missing all three,
+# with every count-based guard below still green (they derive their expected
+# counts from the same registry, so they'd agree with the smaller corpus).
 fuzz-corpus:
-	@out=$$($(CARGO) test -p stuffr --features testing generate_corpus -- --ignored 2>&1); \
+	@out=$$($(CARGO) test -p stuffr --features testing,legacy generate_corpus -- --ignored 2>&1); \
 	status=$$?; \
 	printf '%s\n' "$$out"; \
 	[ $$status -eq 0 ] || exit $$status; \

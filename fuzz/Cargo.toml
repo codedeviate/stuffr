@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-stuffr = { path = "../crates/stuffr", features = ["testing"] }
+stuffr = { path = "../crates/stuffr", features = ["testing", "legacy"] }
 stuffr-core = { path = "../crates/stuffr-core", features = ["testing"] }
 tempfile = "3"
 # Only for `container.rs`'s independent EOCD re-parse (Ruling A's second

@@ -227,6 +227,14 @@ jobs:
       # deep workflow (`fuzz-deep.yml`) is where that tier would be added
       # if ever wanted.
       #
+      # Phase 3b: `fuzz/Cargo.toml` also enables `legacy` (`compress`, `lha`,
+      # `arj`) alongside `testing`. That is orthogonal to this ruling, not an
+      # exception to it: `legacy` has no C dependency (`delharc`, `unarj-rs`
+      # are pure Rust; `compress`'s own decoder has none at all), so it stays
+      # on the pure/no-C-toolchain side of the split this job's name refers
+      # to — it is simply a feature this job's build did not carry before
+      # these three read-only formats existed to fuzz.
+      #
       # Ruling G: fixed `-runs=N`, not `-max_total_time=N` — a time budget
       # makes coverage depend on runner load, so the same commit fuzzes a
       # different amount every run. Fixed `-seed=` so the mutation sequence

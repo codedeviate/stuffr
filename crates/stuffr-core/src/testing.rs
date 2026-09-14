@@ -41,11 +41,23 @@ pub use crate::honesty::{
 /// drift — precisely the failure the append-only rule exists to prevent.
 pub const CODEC_SLOTS: &[&str] = &[
     "gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd", "xz", "lzma", "lzip",
+    // Phase 3b. APPENDED, never inserted: the index of each name is the
+    // selector byte of every corpus seed already on disk. `compress` is
+    // read-only, so its corpus seed comes from a committed fixture rather
+    // than from encoding through this build's own code — see
+    // `crates/stuffr/tests/fuzz_corpus.rs`.
+    "compress",
 ];
 
 /// The fuzzer's container selector table. Same append-only rule as
 /// [`CODEC_SLOTS`], for the same reason.
-pub const CONTAINER_SLOTS: &[&str] = &["tar", "ar", "cpio", "zip"];
+pub const CONTAINER_SLOTS: &[&str] = &[
+    "tar", "ar", "cpio", "zip",
+    // Phase 3b. APPENDED, never inserted, same reason as `compress` above.
+    // Both are read-only: their corpus seeds are fixture-sourced, not
+    // written by this build.
+    "lha", "arj",
+];
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
 pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");

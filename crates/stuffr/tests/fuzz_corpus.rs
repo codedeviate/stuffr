@@ -28,6 +28,16 @@
 //!   temp file and handed straight to `ops::inspect` / `entries::list`, so a
 //!   chain seed is just the bytes of some real, complete input (a plain
 //!   archive, a bare codec stream, or a composed one).
+//!
+//! Phase 3b adds three READ-ONLY slots (`compress`, `lha`, `arj`), which this
+//! generator cannot build the way every other slot's seed is built — there
+//! is no encoder/writer to call. Their "own encoded stream" / "own archive
+//! bytes" above are instead read straight from the committed fixtures under
+//! `crates/stuffr-formats/fixtures/legacy/` (see [`legacy_codec_fixture`] and
+//! [`legacy_container_fixture`]); everything downstream of that — the
+//! selector prefix, the forward/seekable duplication for containers, the
+//! exact-count assertion — treats them exactly like any other registered
+//! slot.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -92,6 +102,37 @@ fn registered_container_slots() -> Vec<(u8, &'static str)> {
         .collect()
 }
 
+/// Phase 3b: `compress` is decode-only (see `legacy::compress_z`'s module
+/// doc), so `ops::compress` cannot build its seed the way every other codec
+/// slot's seed is built below. Its seed is the committed fixture's bytes
+/// instead. `None` for every non-legacy slot, which still builds its own
+/// seed by encoding.
+fn legacy_codec_fixture(name: &str) -> Option<&'static str> {
+    match name {
+        "compress" => Some("hello.Z"),
+        _ => None,
+    }
+}
+
+/// Same idea as [`legacy_codec_fixture`], for the two read-only legacy
+/// containers `lha` and `arj`.
+fn legacy_container_fixture(name: &str) -> Option<&'static str> {
+    match name {
+        "lha" => Some("sample.lzh"),
+        "arj" => Some("sample.arj"),
+        _ => None,
+    }
+}
+
+/// Path to a committed fixture under `crates/stuffr-formats/fixtures/legacy/`.
+/// `CARGO_MANIFEST_DIR` for this crate is `crates/stuffr`, so the fixtures
+/// directory is a sibling crate's, not this one's own.
+fn legacy_fixture_path(filename: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../stuffr-formats/fixtures/legacy")
+        .join(filename)
+}
+
 /// Counts of seeds `generate_corpus` actually wrote, one field per fuzz
 /// target directory — returned so callers can assert an EXACT expected
 /// count (a generator that silently drops one slot must fail loudly, not
@@ -132,21 +173,26 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // rather than emit one, on exactly the tier where it matters most.
     let mut codec_count = 0usize;
     for (selector, name) in registered_codec_slots() {
-        let out_path = work.path().join(format!("codec-{name}.out"));
-        let o = CompressOpts {
-            format: Some(FormatId::new(name)),
-            allow_weak_encoder: true,
-            sync: false,
-            ..Default::default()
-        };
-        ops::compress(
-            Input::Path(sample_file.clone()),
-            Output::Path(out_path.clone()),
-            &o,
-        )?;
-
         let mut seed = vec![selector];
-        seed.extend(read_all(&out_path)?);
+        if let Some(fixture) = legacy_codec_fixture(name) {
+            // Phase 3b: read-only codec — no encoder to build this seed
+            // with, so the committed fixture's own bytes ARE the seed body.
+            seed.extend(read_all(&legacy_fixture_path(fixture))?);
+        } else {
+            let out_path = work.path().join(format!("codec-{name}.out"));
+            let o = CompressOpts {
+                format: Some(FormatId::new(name)),
+                allow_weak_encoder: true,
+                sync: false,
+                ..Default::default()
+            };
+            ops::compress(
+                Input::Path(sample_file.clone()),
+                Output::Path(out_path.clone()),
+                &o,
+            )?;
+            seed.extend(read_all(&out_path)?);
+        }
         std::fs::write(codec_dir.join(format!("{name}.seed")), &seed)?;
         codec_count += 1;
     }
@@ -165,19 +211,37 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // all — undoing exactly the reachability Task 3's fix round was about.
     let mut container_count = 0usize;
     for (selector, name) in registered_container_slots() {
-        let out_path = work.path().join(format!("container-{name}.out"));
-        entries::create_archive(
-            std::slice::from_ref(&sample_dir),
-            Output::Path(out_path.clone()),
-            FormatId::new(name),
-            None,
-            &CompressOpts {
-                sync: false,
-                ..Default::default()
-            },
-        )?;
-        let bytes = read_all(&out_path)?;
+        let bytes = if let Some(fixture) = legacy_container_fixture(name) {
+            // Phase 3b: read-only container — no writer to build this seed
+            // with, so the committed fixture's own bytes ARE the archive.
+            read_all(&legacy_fixture_path(fixture))?
+        } else {
+            let out_path = work.path().join(format!("container-{name}.out"));
+            entries::create_archive(
+                std::slice::from_ref(&sample_dir),
+                Output::Path(out_path.clone()),
+                FormatId::new(name),
+                None,
+                &CompressOpts {
+                    sync: false,
+                    ..Default::default()
+                },
+            )?;
+            read_all(&out_path)?
+        };
 
+        // Both variants below apply to every container, including the two
+        // legacy ones, the same as the writable containers — but what the
+        // "forward" (high bit clear) variant actually EXERCISES differs for
+        // them:
+        // - `arj` declares `needs_seek: true`, so `resolve()` cannot honour
+        //   a forward-only request over it at all — its "forward" seed
+        //   still spools to a real seekable temp file (`Rung::Spilled`),
+        //   exercising the ladder's spool path rather than a genuine
+        //   forward parse.
+        // - `lha` declares `needs_seek: false` and parses forward natively,
+        //   so its "forward" seed is a real forward-only parse, same as
+        //   `tar`/`ar`/`cpio`.
         for (tag, sel) in [("forward", selector), ("seekable", selector | 0x80)] {
             let mut seed = vec![sel];
             seed.extend_from_slice(&bytes);
