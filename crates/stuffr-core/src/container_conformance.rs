@@ -410,16 +410,29 @@ impl Source for FailingSource {
 /// returning the first error encountered (classified per
 /// [`classify_container_error`]), or `None` if the whole archive read back
 /// with no error at all — which, fed a source that fails every read, means
-/// the failure went completely unnoticed. Panics with a generic message if
-/// `resolve` or `open` themselves fail.
+/// the failure went completely unnoticed.
+///
+/// A failure from `resolve` or `open` is RETURNED, not panicked on, unlike
+/// every other setup helper in this module. The failing source is the point
+/// here, and a container that meets it during setup has surfaced it just as
+/// honestly as one that meets it mid-read — the property is that the error
+/// arrives as ITSELF, not where it arrives. This matters for a container
+/// declaring `needs_seek` over a forward-only source: the ladder spools it,
+/// and the spool is what reads the failing source, so `resolve` is where the
+/// error appears and panicking there would make the property unrunnable for
+/// exactly the container shape (ARJ's) that most needs it.
 fn read_all_over_failing_source(container: &dyn Container) -> Option<io::Error> {
-    let id = container.id();
     let src: Box<dyn Source> = Box::new(FailingSource);
-    let resolved = crate::resolve(src, id, container.caps(), &crate::StreamPolicy::default())
-        .unwrap_or_else(|e| panic!("conformance[{id}] resolve over a failing source: {e}"));
-    let mut ar = container
-        .open(resolved, &OpenOpts::default())
-        .unwrap_or_else(|e| panic!("conformance[{id}] open over a failing source: {e}"));
+    let resolved =
+        match crate::resolve(src, container.id(), container.caps(), &crate::StreamPolicy::default())
+        {
+            Ok(r) => r,
+            Err(e) => return Some(classify_container_error(e)),
+        };
+    let mut ar = match container.open(resolved, &OpenOpts::default()) {
+        Ok(ar) => ar,
+        Err(e) => return Some(classify_container_error(e)),
+    };
     loop {
         match ar.next_entry() {
             Ok(Some(mut entry)) => {
@@ -737,6 +750,38 @@ pub fn assert_container_conforms_with(
                 );
             }
         }
+    }
+
+    // 9. A genuine source I/O error passes through as ITSELF, never
+    //    relabelled as corruption — the write-capable harness's own property
+    //    10, ported here because this is the one claim the read-only formats
+    //    argue at length and nothing tested. `lha.rs` and `arj.rs` each carry
+    //    a paragraph deriving, from the dependency's source, that folding
+    //    `UnexpectedEof -> Corrupt` is safe BECAUSE a real source failure
+    //    keeps its own `io::ErrorKind`. Hand-reasoning is exactly what this
+    //    harness exists to replace: get it wrong and a failing disk is
+    //    reported as a damaged archive (exit 5) instead of an i/o error
+    //    (exit 1), which sends a user to re-download a file that was never
+    //    the problem.
+    //
+    //    Needs no fixture: the source fails on its first read, so there is
+    //    nothing for it to be a fixture OF.
+    {
+        let e = read_all_over_failing_source(container).unwrap_or_else(|| {
+            panic!(
+                "conformance[{id}] property 9: a source that fails every read produced no \
+                 error at all — the failure went completely unnoticed \
+                 (fixture provenance: {provenance})"
+            )
+        });
+        assert_eq!(
+            e.kind(),
+            io::ErrorKind::PermissionDenied,
+            "conformance[{id}] property 9: a source error surfaced as {:?} rather than \
+             passing through — a disk failure must not be reported as corruption \
+             (fixture provenance: {provenance})",
+            e.kind()
+        );
     }
 }
 
@@ -2077,6 +2122,118 @@ mod broken_containers {
             &read_only_meta(),
             &fx,
             "property 7",
+        );
+    }
+
+    /// Property 9 (source-error passthrough): a reader that answers a
+    /// genuine i/o failure with a clean end-of-archive.
+    ///
+    /// This is the shape the property exists to catch, and it is not
+    /// hypothetical — it is what a `next_entry` written as
+    /// `self.inner.next_entry().unwrap_or(None)`, or one that folds every
+    /// error to `Corrupt` on the way past, actually does. A failing disk
+    /// then reads back as a valid, empty archive: `stuffr list` prints
+    /// nothing at exit 0, and `unpack` makes an empty directory and calls it
+    /// done. `lha.rs` and `arj.rs` each argue at length that they do NOT do
+    /// this; the double is what makes the argument checkable.
+    ///
+    /// `RESULT` selects which of the two wrong answers the double gives, so
+    /// one double covers both: swallowing the error entirely, and
+    /// relabelling it as corruption (exit 5 for a full disk — the error is
+    /// reported, but as the wrong thing, and `check_error_is_classified`
+    /// cannot see that because `Corrupt` is perfectly well classified).
+    struct SwallowsSourceError {
+        relabel: bool,
+    }
+
+    struct SwallowsSourceErrorRead {
+        inner: Box<dyn ArchiveRead>,
+        relabel: bool,
+        report: FidelityReport,
+    }
+
+    impl ArchiveRead for SwallowsSourceErrorRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            match self.inner.next_entry() {
+                Ok(entry) => Ok(entry),
+                // BUG, both arms: a source failure is not an end of
+                // archive, and it is not corruption either.
+                Err(_) if self.relabel => Err(Error::Corrupt(
+                    "swallows-source-error: archive is corrupt".into(),
+                )),
+                Err(_) => Ok(None),
+            }
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            &self.report
+        }
+    }
+
+    impl Container for SwallowsSourceError {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                read: true,
+                write: false,
+                forward_parse: true,
+                ..Default::default()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            let report = resolved.report.clone();
+            Ok(Box::new(SwallowsSourceErrorRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+                relabel: self.relabel,
+                report,
+            }))
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::CapabilityUnavailable {
+                format: READ_ONLY_DOUBLE,
+                available: "read",
+                requested: "written",
+            })
+        }
+    }
+
+    #[test]
+    fn fixture_property_nine_catches_a_reader_that_swallows_a_source_error() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(
+            &SwallowsSourceError { relabel: false },
+            &read_only_meta(),
+            &fx,
+            "property 9",
+        );
+    }
+
+    #[test]
+    fn fixture_property_nine_catches_a_reader_that_relabels_a_source_error() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(
+            &SwallowsSourceError { relabel: true },
+            &read_only_meta(),
+            &fx,
+            "property 9",
         );
     }
 
