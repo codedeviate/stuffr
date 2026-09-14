@@ -55,21 +55,38 @@ test-pure:
 # no optional features, which is the guarantee behind "cargo install needs no
 # C toolchain".
 #
-# The third is a compile-only floor, not a third test leg: `check` runs
-# exactly two (`test`, `test-pure`), and `legacy` lives only in the first,
-# which also enables `c-backed` — so the pure+legacy combination (what a
-# `--features legacy` user on a pure build actually has) is never TESTED by
-# either leg. A legacy format that accidentally leaned on something
-# C-backed would pass the whole gate and only break for that user. Adding a
-# full third `cargo test --features pure,legacy` run would cost another
-# 35-60s for a combination whose realistic failure mode is a compile error,
-# not a behavioural one — `cargo check`, not `cargo test`, is what this
-# guards. Verified clean as of Phase 3b Task 7: `cargo check -p stuffr
-# --features legacy --no-default-features` exits 0.
+# The third and fourth are a compile-only floor, not a third test leg:
+# `check` runs exactly two (`test`, `test-pure`), and `legacy` lives only in
+# the first, which also enables `c-backed` — so the pure+legacy combination
+# (what a `--features legacy` user on a pure build actually has, since
+# `default = ["pure"]`) is never TESTED by either leg. A legacy format that
+# accidentally leaned on something C-backed would pass the whole gate and
+# only break for that user. Adding a full third `cargo test --features
+# pure,legacy` run would cost another 35-60s for a combination whose
+# realistic failure mode is a compile error, not a behavioural one —
+# `cargo check`, not `cargo test`, is what this guards.
+#
+# Two commands, checking two different things — stated explicitly because a
+# fix-round review caught the first draft's comment and command disagreeing:
+# - `--features legacy` (defaults ON, so `pure` is enabled and `c-backed` is
+#   not) is the actual pure+legacy configuration the paragraph above names.
+#   Verified clean as of the fix round: 0 warnings.
+# - `--features legacy --no-default-features` (no `pure`, no `c-backed`) is
+#   narrower still: legacy alone, isolated from every optional codec/
+#   container. It compiles too, but with 7 dead-code warnings in
+#   `stuffr-formats` (`normalize.rs`'s error-normalisation helpers, used only
+#   by the pure/c-backed codecs this configuration excludes) — expected, and
+#   not what a `--features legacy` user's build actually looks like. Kept
+#   anyway as the same zero-optional-features floor the two builds above
+#   check for `stuffr-core`/`stuffr-formats`, applied to `stuffr` under
+#   `legacy` specifically: it proves `legacy` does not silently lean on
+#   `pure` being compiled in, independent of whether a real build has `pure`
+#   on.
 release:
 	$(CARGO) build --release --workspace
 	$(CARGO) build -p stuffr-core --no-default-features
 	$(CARGO) build -p stuffr-formats --no-default-features
+	$(CARGO) check -p stuffr --features legacy
 	$(CARGO) check -p stuffr --features legacy --no-default-features
 
 # NOT part of `check`, deliberately: Miri is 10-50x slower than a native run
