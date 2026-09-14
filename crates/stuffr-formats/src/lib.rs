@@ -151,7 +151,7 @@ pub fn register_all(registry: &mut Registry) {
     #[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
     registry.register_codec(std::sync::Arc::new(zstd_pure::Zstd), zstd_pure::meta());
 
-    // Phase 3b, Task 4: the first read-only legacy codec. No mutual
+    // The first read-only legacy codec (Phase 3b). No mutual
     // exclusion to worry about — unlike xz/lzma/zstd, this format has only
     // one backend.
     #[cfg(feature = "compress")]
@@ -160,12 +160,13 @@ pub fn register_all(registry: &mut Registry) {
         legacy::compress_z::meta(),
     );
 
-    // Phase 3b, Task 5: the first read-only legacy CONTAINER — the shape
-    // Tasks 1-2's fixture-driven conformance harness was built for.
+    // The first read-only legacy CONTAINER (Phase 3b) — the shape
+    // `assert_container_conforms_with`, the fixture-driven conformance
+    // harness, was built for.
     #[cfg(feature = "lha")]
     registry.register_container(std::sync::Arc::new(legacy::lha::Lha), legacy::lha::meta());
 
-    // Phase 3b, Task 6: the last format this phase adds, and the constrained
+    // The last format Phase 3b adds, and the constrained
     // case — unlike lha, ArjArchieve needs Seek and decodes an entry whole,
     // with no per-entry streaming. See `legacy::arj`'s module doc.
     #[cfg(feature = "arj")]

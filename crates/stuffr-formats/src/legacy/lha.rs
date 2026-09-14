@@ -6,7 +6,7 @@
 //! bound anywhere in its public API — and it implements `std::io::Read`
 //! directly for the CURRENT entry's decoded bytes. So LHA parses forward off
 //! a pipe natively: `--max-ratio` works normally here, and no
-//! bound-before-allocation guard is needed the way ARJ's Task 6 needs one
+//! bound-before-allocation guard is needed the way `legacy::arj` needs one
 //! (that crate materialises whole entries; this one does not). Do not copy
 //! ARJ's guard in here "for symmetry" — it would be dead code protecting
 //! against a decode shape this crate does not have.
@@ -75,10 +75,10 @@ pub const LHA: FormatId = FormatId::new("lha");
 
 /// LHA/LZH archives carry several method-family spellings at the same
 /// offset (`compression` is 5 bytes: `-`, two method letters, a digit or
-/// letter, `-`). Two rules, deliberately, not one: Task 1 left the
-/// conformance harness's "at least one of several" magic semantics
-/// unexercised by any registered format, and this is where it first gets a
-/// real second rule to prove it against. `sample.lzh`'s own fixture uses
+/// letter, `-`). Two rules, deliberately, not one: no registered format
+/// exercised the container-conformance harness's "at least one of several"
+/// magic semantics before this one, and this is where it first gets a real
+/// second rule to prove it against. `sample.lzh`'s own fixture uses
 /// `-lh0-`, which matches the first rule and not the second — exactly the
 /// "one hits, one doesn't" shape the property needs.
 const LHA_MAGIC: &[MagicRule] = &[
@@ -433,7 +433,7 @@ mod tests {
         assert_container_conforms_with(&Lha, &meta(), &fx);
     }
 
-    /// Step 6: `forward_parse: true` is a claim the conformance harness
+    /// `forward_parse: true` is a claim the conformance harness
     /// checks only indirectly (via the read-only properties above, which
     /// never open a genuinely non-seekable source). This proves it directly:
     /// read the fixture through the exact "erase `Seek` at the type level"
@@ -521,7 +521,7 @@ mod tests {
         assert_eq!(m.extensions, &["lzh", "lha"]);
     }
 
-    /// Step 7 (Task 1's deferred minor): `lha_meta()` registers two magic
+    /// `lha_meta()` registers two magic
     /// rules (`-lh`, `-lz`), and the fixture's own bytes match only the
     /// first. `assert_container_conforms_with`'s fixture property 3 already runs
     /// this via `lha_conforms` above (it would fail loudly if the harness's

@@ -136,7 +136,18 @@ encoders, and its own review cycle — exactly as read did across Tasks 1-7 —
 and shipping it inside `0.4.0` would mean either delaying the read-only
 formats that were already fuzzed and reviewed, or claiming write coverage the
 test suite does not have. So `0.4.0` now says only what actually shipped, and
-legacy write becomes its own cycle — Phase 3c, landing as `0.4.1`. That is a
+legacy write becomes its own cycle — Phase 3c, landing as `0.4.1`.
+
+**Phase 3c carries ARC and ZOO as well**, and that belongs here rather than
+only in a plan outside the repository, because a reader of this repo would
+otherwise conclude the two were dropped. They were scoped into Phase 3b
+originally, on a single crate (`unarc-rs`) that would have served both; that
+direction was abandoned in favour of a per-format crate for each of the three
+formats that shipped, and ARC and ZOO moved with it into 3c rather than out
+of the project. Nothing of the abandoned direction remains in the tree
+(`grep -rn unarc` finds nothing), which is exactly why the deferral needs
+writing down. So 3c is: write support for `compress`/`lha`/`arj`, plus READ
+support for ARC and ZOO. That is a
 PATCH, not a milestone, because it is additive to traits that already exist
 (`Container::create`, `Codec::encoder` are both already part of the public
 surface; Phase 3c gives three more formats a real implementation of each, it

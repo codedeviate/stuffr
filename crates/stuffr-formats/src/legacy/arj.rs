@@ -51,10 +51,10 @@
 //!
 //! Note the FIRST line: `compressed_buffer` is sized from `header.
 //! compressed_size` and allocated **unconditionally**, for every
-//! compression method, before the method is even inspected — the task
-//! brief that added this module names `original_size` as the field to
-//! guard, and that field matters too (a second `vec![0; header.
-//! original_size]` for every method except `Stored`), but tracing the
+//! compression method, before the method is even inspected. The obvious
+//! field to guard is `original_size` — and that field does matter (a second
+//! `vec![0; header.original_size]` for every method except `Stored`) — but
+//! tracing the
 //! crate's own source (there is no independent tool to check this fixture
 //! or this reasoning against — see `fixtures/legacy/MANIFEST.md`) shows
 //! `compressed_size` is allocated FIRST and unconditionally, so
@@ -793,7 +793,7 @@ mod tests {
         assert_eq!(got, want, "a spooled read must recover every entry");
     }
 
-    /// Step 6 (the highest-risk line in this task): an entry declaring an
+    /// An entry declaring an
     /// absurd size must be refused WITHOUT the allocation `ArjArchieve::
     /// read` would otherwise perform. A test that only checks the error
     /// code passes even if the bytes are allocated and then rejected —

@@ -450,7 +450,7 @@ Read and write symmetry wherever it is technically possible.
 - **Modern codecs:** zstd, xz/LZMA2, LZMA1, LZIP, brotli, lz4, snappy, gzip/zlib/deflate, bzip2 *(all implemented, Phase 1)*
 - **Containers:** tar, cpio *(`newc` only)*, ar, zip/zip64 *(all implemented, Phase 2)*; 7z, squashfs, ISO 9660, MS CAB, RAR *(read only)* remain — each deferred to its own cycle, see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)
 - **Plain storage:** collecting and compressing are separate axes — tar, cpio, ar, zip-stored and 7z-copy all give you a container with no compression
-- **Legacy:** LHA/LZH, Unix `compress` `.Z` and ARJ *(read-only, Phase 3b, behind `--features legacy`)*; `pack` `.z`, ARC, ZOO, StuffIt `.sit`, LZX *(not yet — read/write for the three above is Phase 3c)*
+- **Legacy:** LHA/LZH, Unix `compress` `.Z` and ARJ *(read-only, Phase 3b, behind `--features legacy`)*. **Phase 3c** adds two things and it is worth saying which: WRITE support for exactly those three (`pack --format lha`/`arj`/`compress`, which today refuse at exit 3), and READ support for **ARC and ZOO**, deferred into that cycle rather than dropped. StuffIt `.sit` and LZX are not scheduled at all — see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)
 
 A few formats are read-only by **external constraint rather than effort** — RAR's
 compressor is proprietary and the free `unrar` source is licensed for

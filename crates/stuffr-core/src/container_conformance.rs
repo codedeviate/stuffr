@@ -1546,10 +1546,10 @@ mod broken_containers {
         assert_container_conforms_with(&MockReadOnly::new(&fx), &read_only_meta(), &fx);
     }
 
-    /// Pins the contract Task 2's four wrapping doubles depend on: `new`
+    /// Pins the contract the wrapping doubles below depend on: `new`
     /// actually stores what it is given, and `fixture()` hands it back
     /// unaltered. Without this, `MockReadOnly::fixture` would be a field no
-    /// test in this task exercises.
+    /// test exercises.
     #[test]
     fn mock_read_only_exposes_the_fixture_it_was_built_from() {
         let fx = ContainerFixture {
@@ -1611,18 +1611,16 @@ mod broken_containers {
     }
 
     // -----------------------------------------------------------------
-    // Task 2: doubles for `assert_container_conforms_with`'s OWN property
-    // set (1, 2, 4-8) — proving the fixture-driven harness can fail, not
-    // just the write-capable one below. Property 3 already has both halves
-    // right above.
+    // Doubles for `assert_container_conforms_with`'s OWN property set —
+    // proving the fixture-driven harness can fail, not just the
+    // write-capable one below. Property 3 already has both halves right
+    // above.
     //
-    // The brief asked for four doubles, covering properties 4 (x2) and 5
-    // and 6. That undershoots what Task 1's review actually found: properties
-    // 1, 2, 7 and 8 were only ever HAND-REASONED, never exercised by a
-    // failing test — exactly the gap that let property 3 sit dormant
-    // through a whole review round before this file caught it. So this
-    // block covers every property that admits a double: 1, 2, 4, 5, 6, 7
-    // and 8.
+    // EVERY property that admits a double has one, rather than only the
+    // handful whose failure modes look most likely: properties 1, 2, 7 and
+    // 8 were at one point hand-reasoned and never exercised by a failing
+    // test, which is exactly the gap that let property 3 sit dormant
+    // through a whole review round before this file caught it.
     //
     // Every double here delegates to `FramedMockContainer` for parsing —
     // the same wire format `MockReadOnly` itself forwards to — and perturbs

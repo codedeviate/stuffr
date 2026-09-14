@@ -2,8 +2,8 @@
 //! `legacy` for why this whole family is.
 //!
 //! **This codec does NOT decode through `newtua_lzw_z::Decoder`, despite
-//! that being the brief's starting instruction and this crate's only public
-//! streaming type.** Measured directly against this project's own 51-byte
+//! that being this crate's only public streaming type, and the obvious
+//! thing to reach for.** Measured directly against this project's own 51-byte
 //! `hello.Z` fixture: `Decoder::read` calls `ensure_decoded`, whose own doc
 //! says plainly "The full compressed input is read and decoded on the first
 //! read call" — and conformance property 8 caught this immediately, the
@@ -11,7 +11,7 @@
 //! 51 bytes (threshold 12); a read-to-end implementation looks exactly like
 //! this`. `Decoder::new(..).read_to_end(..)` is, byte for byte, what the
 //! crate's own `decompress`/`decompress_slice` do internally — so `Decoder`
-//! buys nothing over them for the one reason the task brief reached for it:
+//! buys nothing over them for the one reason it would be reached for:
 //! bounding a decompression bomb's peak memory the way `xz_pure.rs` and
 //! `lzip.rs` do. Worse, it silently defeats `stuffr`'s own `--max-ratio`
 //! guard (`RatioGuard` in `stuffr-core/src/source/limit.rs`): that guard is
@@ -28,8 +28,8 @@
 //! pending buffer and returning, so both a caller's read loop and
 //! `RatioGuard` see genuine incremental progress.
 //!
-//! `newtua-lzw-z` stays a dependency — pinned exactly, as the brief asked —
-//! but as a `[dev-dependencies]` entry (`stuffr-formats/Cargo.toml`), not a
+//! `newtua-lzw-z` stays a dependency — pinned exactly, like every other
+//! legacy dependency here — but as a `[dev-dependencies]` entry (`stuffr-formats/Cargo.toml`), not a
 //! `dep:` behind the `compress` feature: its only remaining job is as an
 //! independent decode oracle in this module's own tests
 //! (`matches_the_crates_own_reference_decoder_across_many_payloads`),
