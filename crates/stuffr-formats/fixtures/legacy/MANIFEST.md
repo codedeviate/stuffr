@@ -157,7 +157,11 @@ Append one entry per fixture added, in the same shape.
   - Main header content (32 bytes: the 30-byte fixed prefix above, then an
     empty name and an empty comment, each a lone `0x00`): `header_size(1,
     =30) + archiver_version_number(1) + min_version_to_extract(1) +
-    host_os(1, =2 Unix) + flags(1) + security_version(1) + file_type(1) +
+    host_os(1, =2 Unix) + flags(1) + security_version(1) + file_type(1, =2
+    — the ARJ spec's main-header table requires this field equal 2;
+    `unarj-rs` never validates it, so an earlier version of this fixture
+    shipped it as 0 and nothing in this repo noticed until the task-6
+    review checked the fixture against the published spec directly) +
     reserved(1) + creation_date_time(4, zero) + compr_size(4, zero) +
     archive_size(4, zero) + security_envelope(4, zero) +
     file_spec_position(2, zero) + security_envelope_length(2, zero) +

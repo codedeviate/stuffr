@@ -101,6 +101,26 @@
 //! encoder here, only a reader for archives the real, decades-old
 //! `arj`/`unarj` tools wrote.
 //!
+//! An entry whose `compression_method` is `NoData`, `NoDataNoCrc` or
+//! `Unknown` has no decoder in `unarj-rs` at all — `ArjArchieve::read`'s own
+//! match falls to an arm that raises `io::ErrorKind::InvalidData` for these,
+//! which would otherwise fold onto `Error::Corrupt` via the rule above. That
+//! is the wrong answer: the archive is not damaged, this crate simply has no
+//! decoder for that method. [`ArjRead::next_entry`] checks
+//! `compression_method` itself, before calling `read`, and raises
+//! [`Error::Unsupported`] (exit 3) directly for these three — the same
+//! capability-vs-damage distinction `legacy::lha`'s `is_decoder_supported()`
+//! check makes for an unsupported LHA method.
+//!
+//! # Entry kinds
+//!
+//! Only `FileType::Directory` gets special handling (no payload is decoded;
+//! see [`ArjRead::next_entry`]). `Binary` and `Text7Bit` are
+//! [`EntryKind::File`]. `VolumeLabel`, `ChapterLabel`, `CommentHeader` and
+//! any `Unknown` value are [`EntryKind::Other`] — the kind that exists for
+//! exactly this: an entry this container can read the bytes of but cannot
+//! honestly call a plain file.
+//!
 //! # `by_index` has one honest answer, not two
 //!
 //! Unlike `legacy::lha` (which answers `Error::NotSeekable` on a genuinely
@@ -120,7 +140,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use unarj_rs::arj_archive::ArjArchieve;
 use unarj_rs::date_time::DosDateTime;
-use unarj_rs::local_file_header::FileType;
+use unarj_rs::local_file_header::{CompressionMethod, FileType};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CreateOpts, Entry, EntryKind, EntryMeta,
@@ -336,6 +356,25 @@ impl ArchiveRead for ArjRead {
             return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
         }
 
+        // A capability gap, not damage: `ArjArchieve::read` has no decoder
+        // for any of these three and raises `io::ErrorKind::InvalidData`,
+        // which `classify_arj_io` would otherwise fold onto `Error::Corrupt`
+        // — see this module's doc. Checked before the size guard below: an
+        // entry this build cannot decode at all should say so, regardless
+        // of how large it claims to be.
+        if matches!(
+            header.compression_method,
+            CompressionMethod::NoData
+                | CompressionMethod::NoDataNoCrc
+                | CompressionMethod::Unknown(_)
+        ) {
+            self.done = true;
+            return Err(Error::Unsupported(format!(
+                "entry `{name}` uses ARJ compression method {:?}, which this build cannot decode",
+                header.compression_method
+            )));
+        }
+
         // THE GUARD — see this module's doc and MAX_ARJ_ENTRY_LEN's own.
         // Must run before `self.archive.read` below: that call allocates a
         // buffer sized by these two fields, unconditionally, before it has
@@ -355,12 +394,22 @@ impl ArchiveRead for ArjRead {
             }
         };
 
+        // See this module's doc's "Entry kinds" section: only `Binary` and
+        // `Text7Bit` are plain files. `VolumeLabel`, `ChapterLabel`,
+        // `CommentHeader` and any `Unknown` value are `EntryKind::Other` —
+        // this container can hand back their bytes but cannot honestly call
+        // them a plain file.
+        let kind = match header.file_type {
+            FileType::Binary | FileType::Text7Bit => EntryKind::File,
+            _ => EntryKind::Other,
+        };
+
         let meta = EntryMeta {
             name,
             size: Some(u64::from(header.original_size)),
             compressed_size: Some(u64::from(header.compressed_size)),
             mtime,
-            kind: EntryKind::File,
+            kind,
             ..Default::default()
         };
         Ok(Some(Entry::new(meta, Box::new(io::Cursor::new(data)))))
@@ -481,7 +530,7 @@ mod tests {
         content.push(2); // host_os = Unix
         content.push(0); // flags
         content.push(0); // security_version
-        content.push(0); // file_type
+        content.push(2); // file_type (the ARJ spec requires 2 for the main header)
         content.push(0); // reserved (skipped by the parser)
         content.extend_from_slice(&0u32.to_le_bytes()); // creation_date_time
         content.extend_from_slice(&0u32.to_le_bytes()); // compr_size
@@ -742,6 +791,68 @@ mod tests {
         );
     }
 
+    /// Pins the discovery this task's review (S1) found unpinned: the test
+    /// above sets BOTH `original_size` and `compressed_size` to the same
+    /// absurd value, so it cannot tell the two `refuse_if_over_ceiling`
+    /// calls apart — deleting the `compressed_size` one left the whole
+    /// suite green. Here `original_size` is small and legal on its own;
+    /// only an absurd `compressed_size` can trip a refusal, so only the
+    /// `compressed_size` half of the guard can save this test. Falsified:
+    /// removing that call reproduces the review's finding exactly —
+    /// `Corrupt("failed to fill whole buffer")`, `read_exact`'s own
+    /// message, reachable only after the 1 GiB allocation already
+    /// succeeded.
+    #[test]
+    fn an_absurd_compressed_size_alone_is_refused_before_it_is_allocated() {
+        const ABSURD_SIZE: u32 = 1024 * 1024 * 1024; // 1 GiB, well past the ceiling
+        const LEGAL_ORIGINAL_SIZE: u32 = 5; // small and legal, standing alone
+
+        let mut header = Vec::with_capacity(34);
+        header.push(30);
+        header.push(0);
+        header.push(0);
+        header.push(2);
+        header.push(0);
+        header.push(0); // compression_method = Stored
+        header.push(0); // file_type = Binary
+        header.push(0);
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&ABSURD_SIZE.to_le_bytes()); // compressed_size
+        header.extend_from_slice(&LEGAL_ORIGINAL_SIZE.to_le_bytes()); // original_size
+        header.extend_from_slice(&0u32.to_le_bytes()); // original_crc32 (irrelevant: refused first)
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.push(0);
+        header.push(0);
+        header.push(b'x'); // name: "x"
+        header.push(0);
+        header.push(0);
+
+        let mut bytes = build_main_header();
+        bytes.extend_from_slice(&wrap_header(&header));
+        // Deliberately no payload bytes follow — if the compressed_size
+        // guard did not run, the crate would try to allocate a 1 GiB
+        // buffer before ever noticing there is nothing behind it to read.
+        bytes.extend_from_slice(&[0x60, 0xEA]);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut ar = open_seekable(&bytes);
+        let err = ar
+            .next_entry()
+            .expect_err("an entry declaring a 1 GiB compressed_size must be refused");
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "a legal original_size must not save an absurd compressed_size from refusal; \
+             got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 6, "ResourceLimit is exit 6: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&ABSURD_SIZE.to_string()),
+            "the message must name the declared compressed_size, got: {msg}"
+        );
+    }
+
     /// The regression guard for the test above: a legitimate entry well
     /// under the ceiling must still round-trip, so the guard is bounded by
     /// `MAX_ARJ_ENTRY_LEN` and not merely "any entry from a header this
@@ -755,6 +866,93 @@ mod tests {
             .expect("a legitimate entry must not be refused")
             .expect("must yield the one entry written");
         assert_eq!(entry.meta().name, "plain.txt");
+    }
+
+    /// A capability gap, not damage: `NoData`/`NoDataNoCrc`/`Unknown` have
+    /// no decoder in `unarj-rs` at all. Falsifies S3 from the task-6 review:
+    /// before the check in `next_entry` existed, this method's
+    /// `io::ErrorKind::InvalidData` (raised by `ArjArchieve::read`'s own
+    /// match) folded straight onto `Error::Corrupt` (exit 5) via
+    /// `classify_arj_io`, telling a user the archive was damaged when this
+    /// build simply cannot read that one method.
+    #[test]
+    fn an_unsupported_compression_method_is_reported_as_unsupported_not_corrupt() {
+        let mut header = Vec::with_capacity(34);
+        header.push(30);
+        header.push(0);
+        header.push(0);
+        header.push(2);
+        header.push(0);
+        header.push(9); // compression_method = NoData: no decoder in unarj-rs
+        header.push(0); // file_type = Binary
+        header.push(0);
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes()); // compressed_size
+        header.extend_from_slice(&0u32.to_le_bytes()); // original_size
+        header.extend_from_slice(&0u32.to_le_bytes()); // original_crc32
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.push(0);
+        header.push(0);
+        header.push(b'x'); // name: "x"
+        header.push(0);
+        header.push(0);
+
+        let mut bytes = build_main_header();
+        bytes.extend_from_slice(&wrap_header(&header));
+        bytes.extend_from_slice(&[0x60, 0xEA]);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut ar = open_seekable(&bytes);
+        let err = ar.next_entry().expect_err(
+            "an unsupported compression method must be refused, not produce a fake entry",
+        );
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Error::Unsupported, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    /// `VolumeLabel`/`ChapterLabel`/`CommentHeader`/`Unknown` file types are
+    /// `EntryKind::Other`, not `EntryKind::File` — falsifies S4 from the
+    /// task-6 review.
+    #[test]
+    fn a_volume_label_entry_is_reported_as_other_not_file() {
+        let content = b"VOL1";
+        let mut header = Vec::with_capacity(34);
+        header.push(30);
+        header.push(0);
+        header.push(0);
+        header.push(2);
+        header.push(0);
+        header.push(0); // compression_method = Stored
+        header.push(4); // file_type = VolumeLabel
+        header.push(0);
+        header.extend_from_slice(&0u32.to_le_bytes());
+        header.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        header.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        header.extend_from_slice(&crc32_ieee(content).to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.push(0);
+        header.push(0);
+        header.push(b'v'); // name: "v"
+        header.push(0);
+        header.push(0);
+
+        let mut bytes = build_main_header();
+        bytes.extend_from_slice(&wrap_header(&header));
+        bytes.extend_from_slice(content);
+        bytes.extend_from_slice(&[0x60, 0xEA]);
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+
+        let mut ar = open_seekable(&bytes);
+        let entry = ar
+            .next_entry()
+            .expect("a volume label entry must not be refused")
+            .expect("must yield the one entry written");
+        assert_eq!(entry.meta().kind, EntryKind::Other);
     }
 
     #[test]
