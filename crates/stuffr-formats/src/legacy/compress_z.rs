@@ -46,6 +46,16 @@
 //! with this module's own decoder across every payload the cross-check
 //! test sweeps.
 //!
+//! **There is exactly one payload shape where `newtua-lzw-z` is NOT an
+//! oracle, and it is asserted rather than left to be rediscovered:** a
+//! `maxbits == 9` stream whose 512-entry dictionary fills. 0.1.0 still
+//! carries the `n_bits < maxbits` width-growth clause this module removed
+//! (see `a_maxbits_9_stream_decodes_byte_exactly`, which documents the bug
+//! and pins the divergence), so it refuses such a stream outright. The real
+//! tools side with this module: BSD `compress -b 9`'s bytes are identical to
+//! what `SynthZ` writes, and GNU `uncompress` decodes them byte-exactly.
+//! Reach for the crate as an oracle anywhere else; not there.
+//!
 //! ## Truncation: no error, but never garbage — measured, not assumed
 //!
 //! `CodecCaps::truncation_undetectable` is set for this codec, and it needed
@@ -739,6 +749,219 @@ mod tests {
         out.stdout
     }
 
+    /// Decompresses `packed` with the system `uncompress`, as the external
+    /// witness that a stream this module SYNTHESISED is a genuine `.Z` and
+    /// not merely something this module's own decoder happens to like. The
+    /// temp file keeps its `.Z` suffix because both `uncompress`
+    /// implementations refuse a name without one even under `-c`.
+    fn system_uncompress(uncompress_bin: &std::path::Path, packed: &[u8], tag: usize) -> Vec<u8> {
+        let in_path =
+            std::env::temp_dir().join(format!("stuffr-compress-z-{tag}-{}.Z", std::process::id()));
+        std::fs::write(&in_path, packed).unwrap();
+        let out = std::process::Command::new(uncompress_bin)
+            .arg("-c")
+            .arg(&in_path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "tag {tag}: system uncompress rejected a synthesised stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_file(&in_path);
+        out.stdout
+    }
+
+    /// A deterministic Unix-`compress` ENCODER — test-only, and the reason
+    /// the two tests below no longer ask a system tool for their input.
+    ///
+    /// ## Why this exists: the reference tools disagree at `maxbits == 9`
+    ///
+    /// Both `compress` implementations this project meets write the same
+    /// `-b 9` header (`1f 9d 89`), and produce mutually unreadable bytes
+    /// under it once the 512-entry dictionary fills. MEASURED, on a
+    /// 130 000-byte pseudo-random payload:
+    ///
+    /// | stream | this module | GNU `uncompress` | BSD `uncompress` |
+    /// |---|---|---|---|
+    /// | BSD `compress -b 9` | byte-exact | byte-exact | refuses `maxbits < 12` |
+    /// | GNU `compress -b 9` | `invalid LZW code` | **`corrupt input`** | refuses `maxbits < 12` |
+    ///
+    /// The middle cell is the finding: **(N)compress 5.0 cannot decode its
+    /// own `-b 9` output.** It is a defect in that encoder, not a second
+    /// legal dialect — it begins the moment the dictionary fills (clean at
+    /// 300 input bytes, broken at 600 and every size above) and nothing
+    /// reads the result. So `-b 9` from the system tool cannot serve as a
+    /// reference stream on a machine whose `compress` is (N)compress, which
+    /// is every Linux CI runner. BSD's own `uncompress` is no fallback
+    /// either: it refuses ANY `maxbits < 12` outright, its own `-b 9` and
+    /// `-b 10` output included.
+    ///
+    /// ## Why growing to 10 bits at `maxbits == 9` is correct
+    ///
+    /// Because `INIT_BITS == 9`, the ordinary rule — widen when `free_ent`
+    /// passes `maxcode`, and only cap `maxcode` at `maxmaxcode` once
+    /// `n_bits == maxbits` — makes a maxbits-9 stream widen to 10-bit codes
+    /// the instant its 512 entries are used up, and stay there. That reads
+    /// like a bug and is not one: it is what `compress.c`'s `output()` and
+    /// `getcode()` both do, and BSD `compress -b 9`'s bytes agree with this
+    /// encoder's byte for byte, decoded byte-exactly by GNU `uncompress`.
+    ///
+    /// ## What keeps this from being self-referential
+    ///
+    /// A synthesiser written alongside the decoder it feeds could mirror the
+    /// decoder's bug and prove nothing. Two live guards, not a comment:
+    ///
+    /// 1. [`the_stream_synthesiser_matches_the_system_encoder_byte_for_byte`]
+    ///    compares this encoder's output with the REAL `compress` binary's,
+    ///    byte for byte, at four `maxbits` — an external encoder, agreeing
+    ///    exactly.
+    /// 2. [`decodes_a_stream_with_block_mode_clears_and_width_growth`] hands
+    ///    its synthesised CLEAR-bearing stream to the system `uncompress`
+    ///    and requires the original plaintext back — an external decoder,
+    ///    agreeing exactly.
+    ///
+    /// ## Deliberately not modelled: the ratio heuristic
+    ///
+    /// The real encoder decides WHEN to emit a block-mode CLEAR from a
+    /// compression-ratio check (`cl_block`), and the two implementations
+    /// disagree wildly about it — on one 130 000-byte payload at `-b 12`,
+    /// BSD emits 2 CLEARs and GNU emits 0, which is precisely how the CLEAR
+    /// test came to assert against a stream that had none. `clear_after`
+    /// places the CLEAR explicitly instead: same wire format, no heuristic,
+    /// same answer on every machine.
+    struct SynthZ {
+        maxbits: u32,
+        maxmaxcode: u32,
+        n_bits: u32,
+        maxcode: u32,
+        free_ent: u32,
+        /// The current output group, LSB-first. A group is `n_bits` bytes —
+        /// at most 16, so at most 128 bits, which is exactly why this is a
+        /// `u128` and not a `u64`.
+        acc: u128,
+        acc_bits: u32,
+        clear_flg: bool,
+        out: Vec<u8>,
+    }
+
+    impl SynthZ {
+        fn new(maxbits: u32) -> Self {
+            assert!(
+                (INIT_BITS..=MAX_MAXBITS).contains(&maxbits),
+                "maxbits {maxbits} outside the format's own 9..=16"
+            );
+            Self {
+                maxbits,
+                maxmaxcode: 1 << maxbits,
+                n_bits: INIT_BITS,
+                maxcode: (1 << INIT_BITS) - 1,
+                // Block mode, always: it is what both real encoders default
+                // to, and the CLEAR code only exists under it.
+                free_ent: CLEAR + 1,
+                acc: 0,
+                acc_bits: 0,
+                clear_flg: false,
+                out: vec![
+                    COMPRESS_MAGIC_BYTES[0],
+                    COMPRESS_MAGIC_BYTES[1],
+                    BLOCK_MODE_FLAG | maxbits as u8,
+                ],
+            }
+        }
+
+        fn flush_group(&mut self, bytes: u32) {
+            for i in 0..bytes {
+                self.out.push(((self.acc >> (8 * i)) & 0xff) as u8);
+            }
+            self.acc = 0;
+            self.acc_bits = 0;
+        }
+
+        /// `compress.c`'s `output()`, arm for arm: write the code, flush a
+        /// full group, then — if the next entry would not fit, or a CLEAR is
+        /// pending — zero-pad the partial group to `n_bits` bytes (the width
+        /// the group was STARTED at, which is why the padding happens before
+        /// the width changes) and re-derive the width.
+        fn output(&mut self, code: u32) {
+            self.acc |= u128::from(code) << self.acc_bits;
+            self.acc_bits += self.n_bits;
+            if self.acc_bits == self.n_bits * 8 {
+                self.flush_group(self.n_bits);
+            }
+            if self.free_ent > self.maxcode || self.clear_flg {
+                if self.acc_bits > 0 {
+                    self.flush_group(self.n_bits);
+                }
+                if self.clear_flg {
+                    self.n_bits = INIT_BITS;
+                    self.maxcode = (1 << INIT_BITS) - 1;
+                    self.clear_flg = false;
+                } else {
+                    self.n_bits += 1;
+                    self.maxcode = if self.n_bits == self.maxbits {
+                        self.maxmaxcode
+                    } else {
+                        (1 << self.n_bits) - 1
+                    };
+                }
+            }
+        }
+
+        /// At end of input only the bytes actually occupied are written —
+        /// NOT a zero-padded whole group. That asymmetry with `output`'s
+        /// padding is the real encoder's (`writebuf(buf, (offset + 7) / 8)`)
+        /// and it is what leaves a genuine `.Z` ending with a handful of
+        /// unconsumed bits, exactly as this module's doc describes.
+        fn finish(mut self) -> Vec<u8> {
+            if self.acc_bits > 0 {
+                let bytes = self.acc_bits.div_ceil(8);
+                self.flush_group(bytes);
+            }
+            self.out
+        }
+    }
+
+    /// Encodes `payload` as a block-mode `.Z` stream at `maxbits`, emitting
+    /// one block-mode CLEAR once `clear_after` input bytes have been
+    /// consumed (`None` for no CLEAR at all).
+    ///
+    /// The CLEAR is emitted at the one point the real encoder's `cl_block`
+    /// can fire — immediately after a code has been output and the current
+    /// string reset to a single literal — which is what guarantees the code
+    /// following a CLEAR is a literal below 256, the invariant every
+    /// decoder's CLEAR branch relies on.
+    fn synth_z(payload: &[u8], maxbits: u32, clear_after: Option<usize>) -> Vec<u8> {
+        let mut e = SynthZ::new(maxbits);
+        let Some((&first, rest)) = payload.split_first() else {
+            return e.finish();
+        };
+        let mut dict: std::collections::HashMap<(u32, u8), u32> = std::collections::HashMap::new();
+        let mut ent = u32::from(first);
+        let mut clear_after = clear_after;
+        for (i, &c) in rest.iter().enumerate() {
+            if let Some(&next) = dict.get(&(ent, c)) {
+                ent = next;
+                continue;
+            }
+            e.output(ent);
+            if e.free_ent < e.maxmaxcode {
+                dict.insert((ent, c), e.free_ent);
+                e.free_ent += 1;
+            }
+            ent = u32::from(c);
+            if clear_after.is_some_and(|at| i + 1 >= at) {
+                dict.clear();
+                e.free_ent = CLEAR + 1;
+                e.clear_flg = true;
+                e.output(CLEAR);
+                clear_after = None;
+            }
+        }
+        e.output(ent);
+        e.finish()
+    }
+
     /// A deterministic, non-repeating pseudo-random payload over a small
     /// alphabet — high enough entropy that `/usr/bin/compress` fills its
     /// dictionary (and, at `-b 12` over a large enough length, resets it via
@@ -789,6 +1012,59 @@ mod tests {
         }
     }
 
+    /// Falsifies [`SynthZ`] against the real thing: at four `maxbits`, its
+    /// bytes must be IDENTICAL to what the system `compress` binary writes
+    /// for the same payload. Without this, the two tests below would feed
+    /// this module's decoder a stream written by this module's own test
+    /// code — a closed loop that could agree on a shared mistake and call it
+    /// a pass.
+    ///
+    /// Every payload here is under 10 000 bytes, and that is structural
+    /// rather than lucky: `cl_block`'s ratio check is gated on `in_count >=
+    /// checkpoint` with `CHECK_GAP == 10 000`, so no implementation's
+    /// heuristic can fire below that and the output is the canonical LZW
+    /// stream with nothing left to disagree about. 9 000 is then as large as
+    /// that bound allows, and it needs to be: at `-b 10` it fills the
+    /// dictionary and so exercises the `n_bits == maxbits` maxcode cap,
+    /// which a 1 200-byte payload reached at NO maxbits — measured by
+    /// breaking the cap and watching this test stay green.
+    ///
+    /// The 200-byte payload is the `maxbits == 9` case specifically: it is
+    /// short enough that the 512-entry dictionary never fills, which is the
+    /// only region where (N)compress 5.0's `-b 9` output is still correct
+    /// (see [`SynthZ`]'s own doc for the measurement).
+    ///
+    /// One thing this test does NOT reach, and the CLEAR test below does:
+    /// the zero-padding of a partial group. A width transition always lands
+    /// exactly on a group boundary — each width holds a power-of-two number
+    /// of codes and a group is 8 — so only a CLEAR, which resets at an
+    /// arbitrary point, leaves a partial group to pad.
+    #[test]
+    fn the_stream_synthesiser_matches_the_system_encoder_byte_for_byte() {
+        let compress_bin = require_bin("compress");
+        let cases: &[(usize, u32)] = &[(200, 9), (9_000, 10), (9_000, 12), (9_000, 16)];
+
+        for (i, &(len, maxbits)) in cases.iter().enumerate() {
+            let payload = pseudo_random_payload(len, 0xC0FFEE);
+            let theirs = system_compress_args(
+                &compress_bin,
+                &payload,
+                400 + i,
+                &["-b", &maxbits.to_string()],
+            );
+            let ours = synth_z(&payload, maxbits, None);
+            assert_eq!(
+                ours,
+                theirs,
+                "maxbits={maxbits}, {len}-byte payload: this test's own encoder wrote {} bytes \
+                 and the system `compress` wrote {} — they must agree byte for byte, or the \
+                 streams the tests below decode are not real `.Z` streams",
+                ours.len(),
+                theirs.len()
+            );
+        }
+    }
+
     /// Regression test for a real bug the review round caught: the width-
     /// growth guard used to read `dict.free_ent > dict.maxcode &&
     /// dict.n_bits < dict.maxbits`. That second clause is FALSE from the
@@ -801,20 +1077,20 @@ mod tests {
     /// the moment the dictionary filled (512 entries), corrupting every code
     /// read after that point.
     ///
-    /// Measured directly: a 130 000-byte payload compressed with
-    /// `compress -b 9` used to fail (`invalid LZW code in stream`) once
-    /// decoded far enough to fill the dictionary; dropping the `n_bits <
-    /// maxbits` clause entirely (this codec's own bounds check on `code` is
-    /// what keeps indexing memory-safe, not that clause — see `code >
-    /// dict.free_ent` above) decodes it byte-exactly, and changes nothing
-    /// for `-b 10/12/16` (also covered below and by the cross-validation
-    /// test), since for those the clause was true anyway at the point that
-    /// matters.
+    /// The stream is SYNTHESISED rather than taken from the system tool, and
+    /// that is not a convenience: (N)compress 5.0 — the `compress` on every
+    /// Linux CI runner — writes `-b 9` output that its OWN `uncompress`
+    /// rejects as `corrupt input`, while BSD's `uncompress` refuses every
+    /// `maxbits < 12` outright. There is no machine on which the system tool
+    /// can supply a valid maxbits-9 stream AND read it back. [`SynthZ`]'s
+    /// doc carries the full measurement, and
+    /// [`the_stream_synthesiser_matches_the_system_encoder_byte_for_byte`]
+    /// is what keeps this stream honest.
     #[test]
     fn a_maxbits_9_stream_decodes_byte_exactly() {
-        let compress_bin = require_bin("compress");
-        let payload = pseudo_random_payload(130_000, 0xC0FFEE);
-        let packed = system_compress_args(&compress_bin, &payload, 300, &["-b", "9"]);
+        let payload = pseudo_random_payload(40_000, 0xC0FFEE);
+        let packed = synth_z(&payload, 9, None);
+
         let decoded = decompress(&packed)
             .unwrap_or_else(|e| panic!("maxbits=9 stream failed to decode: {e}"));
         assert_eq!(
@@ -822,22 +1098,61 @@ mod tests {
             "a maxbits=9 stream, once the 512-entry dictionary fills, must still decode \
              byte-exactly"
         );
+        // `newtua-lzw-z` — this module's decode oracle everywhere else, and
+        // the implementation this port is derived from — still carries the
+        // `n_bits < maxbits` clause described above, so it REFUSES this
+        // stream. That divergence is asserted rather than left implicit for
+        // two reasons: it is the one payload shape where the oracle is not
+        // an oracle (a reader who sees it used freely elsewhere needs to
+        // know where it stops), and it is what makes the fix above a real
+        // improvement over its ancestor rather than a restatement of it.
+        // Stable because the dependency is pinned `=0.1.0`; if a bump makes
+        // this start passing, the crate has fixed the same bug and this
+        // assertion should become an equality against `payload`.
+        let oracle = lzw_z::decompress_slice(&packed);
+        assert!(
+            oracle.is_err(),
+            "newtua-lzw-z 0.1.0 is expected to refuse a maxbits=9 stream whose dictionary \
+             fills — it has the very `n_bits < maxbits` clause this test's own regression \
+             documents. It returned {} bytes instead; re-read this test if the pin moved.",
+            oracle.map_or(0, |v| v.len())
+        );
     }
 
     /// Before this test, NO test in the repo exercised the block-mode CLEAR
     /// branch (group alignment, `boff` update, dictionary reset, forced
     /// literal) at all: `hello.Z` has 0 CLEARs and a single code width (9),
     /// and the cross-validation test's own width-growth payload only grows
-    /// 9->10, 0 CLEARs. `-b 12` over a large, high-entropy payload forces
-    /// `compress`'s ratio-triggered dictionary reset repeatedly as it goes,
-    /// AND grows the code width from 9 up through 12 — so this asserts the
-    /// CLEAR branch was actually reached (not merely hoped for), not just
-    /// that the decode happened to succeed.
+    /// 9->10, 0 CLEARs.
+    ///
+    /// It used to ask `compress -b 12` over a large random payload to
+    /// produce a CLEAR by its own ratio heuristic, and that is exactly what
+    /// broke: on one 130 000-byte payload BSD `compress` emits 2 CLEARs and
+    /// (N)compress emits 0, so the branch this test exists for was reached
+    /// on one machine and not the other — the vacuity its own assertion
+    /// message warned about, arriving as a red CI job. The CLEAR is now
+    /// placed explicitly by [`synth_z`], which is deterministic everywhere,
+    /// and the stream still grows the code width 9->10->11->12 before the
+    /// CLEAR and again after it.
+    ///
+    /// The external witness here is a decoder rather than an encoder: the
+    /// system `uncompress` must return the original plaintext from this
+    /// synthesised stream. BOTH implementations accept `maxbits == 12` (it
+    /// is 9 and 10 that BSD refuses), so unlike the maxbits-9 test above
+    /// this one gets a real third-party decoder's verdict on every machine.
     #[test]
     fn decodes_a_stream_with_block_mode_clears_and_width_growth() {
-        let compress_bin = require_bin("compress");
-        let payload = pseudo_random_payload(130_000, 0xBADC0DE);
-        let packed = system_compress_args(&compress_bin, &payload, 301, &["-b", "12"]);
+        let uncompress_bin = require_bin("uncompress");
+        let payload = pseudo_random_payload(40_000, 0xBADC0DE);
+        let packed = synth_z(&payload, 12, Some(20_000));
+
+        assert_eq!(
+            system_uncompress(&uncompress_bin, &packed, 410),
+            payload,
+            "the system `uncompress` must read this synthesised stream back as the original \
+             plaintext — otherwise it is not a real `.Z` and proves nothing about this \
+             module's decoder"
+        );
 
         let src: Box<dyn Source> =
             Box::new(ReaderSource::new(std::io::Cursor::new(packed.clone())));
@@ -854,9 +1169,44 @@ mod tests {
         assert!(
             reader.clears_seen() > 0,
             "this payload was expected to force at least one block-mode CLEAR (dictionary \
-             reset) — got 0. Either compress's ratio-triggered reset behavior changed, or the \
-             payload needs to be larger/more random; either way, a run of this test that \
-             passes without ever reaching CLEAR proves nothing about that branch"
+             reset) — got 0. `synth_z` was asked for one explicitly, so either it stopped \
+             emitting it or the decoder stopped recognising it; either way, a run of this \
+             test that passes without ever reaching CLEAR proves nothing about that branch"
         );
+    }
+
+    /// The system tool's own streams, at every `maxbits` both
+    /// implementations can actually write and read — the interop half that
+    /// [`a_maxbits_9_stream_decodes_byte_exactly`] gave up when it stopped
+    /// asking a binary for its input.
+    ///
+    /// 10..=16, not 9..=16. `maxbits == 9` is excluded for one measured
+    /// reason and not out of caution: (N)compress 5.0's `-b 9` output is
+    /// undecodable by (N)compress 5.0 itself once the dictionary fills, so
+    /// including it here would assert that this module reads a stream its
+    /// own author cannot. See [`SynthZ`]'s doc.
+    ///
+    /// The payload is large enough that `-b 16` genuinely reaches 16-bit
+    /// codes rather than stopping partway up the ladder.
+    #[test]
+    fn a_system_compress_stream_decodes_byte_exactly_at_every_readable_maxbits() {
+        let compress_bin = require_bin("compress");
+        let payload = pseudo_random_payload(130_000, 0xC0FFEE);
+
+        for maxbits in 10..=16u32 {
+            let packed = system_compress_args(
+                &compress_bin,
+                &payload,
+                420 + maxbits as usize,
+                &["-b", &maxbits.to_string()],
+            );
+            let decoded = decompress(&packed).unwrap_or_else(|e| {
+                panic!("maxbits={maxbits}: decoding the system tool's own output failed: {e}")
+            });
+            assert_eq!(
+                decoded, payload,
+                "maxbits={maxbits}: decoded bytes must match the ORIGINAL plaintext exactly"
+            );
+        }
     }
 }
