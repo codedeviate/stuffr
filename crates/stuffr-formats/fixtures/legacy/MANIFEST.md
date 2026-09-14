@@ -7,6 +7,19 @@ anything.
 
 Append one entry per fixture added, in the same shape.
 
+**Before editing `sample.lzh` or `sample.arj`, note this asymmetry between
+them.** `sample.lzh`'s entry below records its two entries' CRC-16 values and
+`lha v`'s output as literal hex, frozen at the moment the fixture was built.
+`sample.arj`'s entry computes its expectations (CRC-32, sizes) from the
+construction recipe at TEST time (`legacy::arj::tests::build_arj`), not from
+literals written here. So a hand-edit to `sample.lzh`'s bytes can silently
+strand the literal hex recorded below — it would no longer describe the
+bytes on disk, and nothing would fail to say so — in a way a hand-edit to
+`sample.arj` cannot, since its test recomputes expectations from the same
+recipe every run. Regenerate `sample.lzh`'s recorded CRCs by hand (re-run
+`lha v`/`t` from its own section below) if its bytes ever change;
+`sample.arj` needs no such step.
+
 ---
 
 ## `hello.Z`

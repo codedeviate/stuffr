@@ -9,20 +9,25 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 3a complete at `0.3.1` — eleven codecs and four containers,
-> three of the codecs parallel on request, and a default build that needs
-> no C toolchain to read *or write* xz, LZMA1 or LZIP.** `stuffr pack`,
+> **Status: Phase 3b complete at `0.4.0` — eleven round-trip codecs and four
+> round-trip containers on the default tier, three read-only legacy formats
+> behind `--features legacy`, and a default build that needs no C toolchain
+> to read *or write* xz, LZMA1 or LZIP.** `stuffr pack`,
 > `unpack`, `cat`, `info`, `list`, `test` and `formats` all work, on files
 > and through pipes, and `curl … | stuffr cat - | grep pattern` runs.
 > `stuffr formats` lists codecs `brotli`, `bzip2`, `deflate`, `gzip`, `lz4`,
 > `lzip`, `lzma`, `snappy`, `xz`, `zlib`, `zstd` and containers `ar`, `cpio`,
-> `tar`, `zip` (`zip64` included) — each codec proven against the
-> conformance harness Phase 1c introduced and later cycles grew to twelve
+> `tar`, `zip` (`zip64` included) on every build — each codec proven against
+> the conformance harness Phase 1c introduced and later cycles grew to twelve
 > properties, each container proven against the analogous
-> container-conformance harness, and then proven to coexist. **848** tests
-> under `--all-features`, **783** on the default tier — a different set, not
-> a subset, because the two tiers select different backends. Clean across
-> build, clippy and fmt.
+> container-conformance harness, and then proven to coexist. A build with
+> `--features legacy` (bundled into `full`/`--all-features`) adds a 12th
+> codec, `compress` (`.Z`), and a 5th and 6th container, `lha`/`.lzh` and
+> `arj` — all three READ-ONLY, and proven against a fixture-driven variant of
+> the same conformance harnesses, built for exactly this shape (see the
+> Phase 3b paragraphs below). **905** tests under `--all-features`, **802**
+> on the default tier — a different set, not a subset, because the two
+> tiers select different backends. Clean across build, clippy and fmt.
 >
 > **Phase 3a added a fuzzing harness and fixed what it found — the
 > behaviour is the headline, not the fuzzer.** Five exit codes changed or
@@ -179,6 +184,62 @@ read list.
 > regression test, and validates the fix and the format's ordinary
 > multi-member case against the reference `lzip` 1.26 tool directly, in both
 > directions.
+>
+> **Phase 3b adds three READ-ONLY legacy formats — Unix `compress` (`.Z`),
+> LHA/LZH and ARJ — behind their own `--features compress`/`lha`/`arj`
+> (bundled into `--features legacy`, itself bundled into `full`).** All three
+> are decode-only by construction, not by a missing feature: there never was
+> a `compress` encoder here, and `lha`/`arj` read archives the real,
+> decades-old `lha`/`lhasa` and `arj`/`unarj` tools wrote. `stuffr pack
+> --format lha` (or `arj`, or `compress`) refuses at **exit 3**, naming the
+> format read-only in this build, rather than failing obscurely.
+>
+> **LHA and ARJ differ in shape, and the difference is visible at the
+> command line, not just in the source.** LHA (`delharc`) parses forward off
+> a pipe with no `Seek` anywhere in its decode path, so `cat old.lzh | stuffr
+> list -` is a genuine forward parse, the same footing `tar`, `ar` and `cpio`
+> already stand on. ARJ (`unarj-rs`) needs `Seek` to read an archive at all,
+> so a piped ARJ is spooled to a temp file first — the same ladder rung `zip`
+> takes when forced onto its indexed path — and reports `Rung::Spilled`
+> rather than `ForwardOnly`; that rung is authoritative, so it works, but it
+> spends disk a plain LHA read never has to. ARJ also has no per-entry
+> streaming reader at all: an entry decodes whole, so `--max-ratio` is a
+> coarser bound there than on the other five containers, and a fixed 256 MiB
+> per-entry ceiling — checked **before** allocating, at exit 6, never exit
+> 5 — is the real backstop against a hostile header, since there is no
+> `--memory-limit`-style knob for a container to read in the first place.
+>
+> **The three fixtures carry different evidentiary weight, and that is
+> written down rather than left for a reader to assume parity.** `.Z`'s
+> fixture is produced by the real `/usr/bin/compress`; LHA's expected output
+> is independently confirmed by `lhasa` (`lha v`/`t`/`x`), a decoder sharing
+> no code with the `delharc` crate this container wraps; **ARJ's fixture is
+> hand-built from stuffr's own reading of the (unofficial) ARJ specification
+> and of `unarj-rs`'s own parser, with no independent tool anywhere on the
+> build machine to check it against.** A review during this phase caught one
+> real deviation from the published spec (the main header's `file_type`
+> field) that no test in this repository could have caught unassisted,
+> precisely because the fixture and the parser under test were derived from
+> the same source. See `crates/stuffr-formats/fixtures/legacy/MANIFEST.md`
+> for the full, per-fixture provenance.
+>
+> Unix `compress` (`.Z`) is the plainest of the three, and the one with the
+> most interesting implementation history: the crate first chosen for it
+> turned out to decode its *entire* input on the first `Read::read` call
+> regardless of buffer size, which defeats `--max-ratio`'s incremental
+> accounting outright — so `compress_z.rs` now carries a from-scratch
+> incremental LZW decoder, and the original crate (`newtua-lzw-z`) is kept
+> only as a dev-dependency cross-validation oracle. Unix `compress` also
+> carries no checksum and no end-of-stream marker at all, so truncation is
+> undetectable **by construction** — measured true of the real `compress`
+> and `gzip -dc` too, not just this decoder. stuffr's guarantee is narrower
+> here than everywhere else as a result: a truncated `.Z` must still decode
+> to a genuine prefix of the full output, never to fabricated bytes, but an
+> outright error is not owed.
+>
+> `delharc` is pinned exactly at `=0.6.2`: its `0.8` line needs rustc 1.95,
+> six minors past this project's 1.88 MSRV. Revisit the pin when MSRV moves,
+> not on a schedule.
 >
 > **Not yet: `7z`, squashfs, ISO 9660, MS CAB and RAR.** Those five
 > containers are deferred past Phase 2, each needing its own cycle — see
@@ -381,7 +442,7 @@ Read and write symmetry wherever it is technically possible.
 - **Modern codecs:** zstd, xz/LZMA2, LZMA1, LZIP, brotli, lz4, snappy, gzip/zlib/deflate, bzip2 *(all implemented, Phase 1)*
 - **Containers:** tar, cpio *(`newc` only)*, ar, zip/zip64 *(all implemented, Phase 2)*; 7z, squashfs, ISO 9660, MS CAB, RAR *(read only)* remain — each deferred to its own cycle, see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)
 - **Plain storage:** collecting and compressing are separate axes — tar, cpio, ar, zip-stored and 7z-copy all give you a container with no compression
-- **Legacy:** LHA/LZH, Unix `compress` `.Z`, `pack` `.z`, ARC, ARJ, ZOO, StuffIt `.sit` *(older methods)*, LZX
+- **Legacy:** LHA/LZH, Unix `compress` `.Z` and ARJ *(read-only, Phase 3b, behind `--features legacy`)*; `pack` `.z`, ARC, ZOO, StuffIt `.sit`, LZX *(not yet — read/write for the three above is Phase 3c)*
 
 A few formats are read-only by **external constraint rather than effort** — RAR's
 compressor is proprietary and the free `unrar` source is licensed for
@@ -405,7 +466,7 @@ remains decode-only for licence reasons, not effort.
 |---|---|
 | `pure` *(default)* | everything with a pure-Rust implementation — all eleven codecs, including read+write xz, LZMA1 and LZIP, plus all four containers |
 | `c-backed` | `zstd-sys` and `liblzma`, both vendored and built statically; also the one entry codec inside `zip` that needs a C-compiling crate (see below); later `unrar` (decode) |
-| `legacy` | the historical format set |
+| `legacy` | the historical format set — `compress`, `lha`, `arj`; READ-ONLY as of Phase 3b |
 | `full` | all of the above |
 
 `c-backed` needs a C compiler and **nothing else** — no `libclang`, no system

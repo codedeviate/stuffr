@@ -101,7 +101,7 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.1.0` | Phase 1 — the modern codecs, parallel encode and the thread governor. Streams and single files, no containers. |
 | `0.2.0` | Phase 2 — containers, and the ZIP-on-a-pipe contract test. |
 | `0.3.0` | Phase 2c and its follow-ups — write-side composition (`pack -o bundle.tar.gz` in one pass) and directory walking, so the read/write symmetry claim becomes true for archives; plus entry selection by index (`list`'s index column, `cat --index`, `unpack --index`), `list` reporting fidelity and gaining `--strict-fidelity`, the declaration of zip central-directory records shadowed by a duplicate name, and the guard refusing a pack that would replace a good archive with an empty one. |
-| `0.4.0` | Phases 3–4 — legacy read and write, fuzzed. |
+| `0.4.0` | Phase 3a–3b — the fuzzing harness, the honesty oracle and the exit-code corrections it found, plus three read-only legacy formats (`compress`, `lha`, `arj`), each proven against the fixture-driven conformance harness Phase 3b's Task 1 introduced for read-only containers. |
 | `0.5.x` | Phase 5 — compatibility symlinks, `convert`, polish. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
@@ -126,6 +126,24 @@ selection by index, `list`'s fidelity reporting, the zip shadowed-record
 declaration, the empty-plan guard — and since nothing had shipped, the honest
 move was to redefine what `0.3.0` contains rather than to let the first release
 notes describe a subset of what the tag actually carries.
+
+The `0.4.0` **row** was revised a **third** time, and for the same reason
+`0.3.0`'s was widened rather than renumbered: the row used to promise "legacy
+read and write", and write support is real, undone work rather than a
+formality. Extending `Codec::encoder` and `Container::create` to `compress`,
+`lha` and `arj` needs its own fixtures, its own interop checks against real
+encoders, and its own review cycle — exactly as read did across Tasks 1-7 —
+and shipping it inside `0.4.0` would mean either delaying the read-only
+formats that were already fuzzed and reviewed, or claiming write coverage the
+test suite does not have. So `0.4.0` now says only what actually shipped, and
+legacy write becomes its own cycle — Phase 3c, landing as `0.4.1`. That is a
+PATCH, not a milestone, because it is additive to traits that already exist
+(`Container::create`, `Codec::encoder` are both already part of the public
+surface; Phase 3c gives three more formats a real implementation of each, it
+does not change either trait's shape) — a phase's own work is not
+automatically a milestone, the same distinction that kept `0.3.1` (three
+exit-code fixes, no capability change) a PATCH against `0.3.0`'s own row
+above it.
 
 After 1.0, normal semver applies: breaking changes to any public API in
 `stuffr-core` or the `stuffr` facade require a major bump.
