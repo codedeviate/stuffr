@@ -7,6 +7,8 @@
 //! `crates/stuffr-formats/fixtures/legacy/MANIFEST.md` for how each
 //! fixture was made.
 
+#[cfg(feature = "arj")]
+pub mod arj;
 #[cfg(feature = "compress")]
 pub mod compress_z;
 #[cfg(feature = "lha")]

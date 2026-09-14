@@ -164,6 +164,12 @@ pub fn register_all(registry: &mut Registry) {
     // Tasks 1-2's fixture-driven conformance harness was built for.
     #[cfg(feature = "lha")]
     registry.register_container(std::sync::Arc::new(legacy::lha::Lha), legacy::lha::meta());
+
+    // Phase 3b, Task 6: the last format this phase adds, and the constrained
+    // case — unlike lha, ArjArchieve needs Seek and decodes an entry whole,
+    // with no per-entry streaming. See `legacy::arj`'s module doc.
+    #[cfg(feature = "arj")]
+    registry.register_container(std::sync::Arc::new(legacy::arj::Arj), legacy::arj::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.

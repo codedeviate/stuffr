@@ -103,3 +103,100 @@ Append one entry per fixture added, in the same shape.
   rather than 3c, per the task brief. No disagreement between the two
   implementations was found — both report identical paths, sizes, CRC-16
   values and plaintext.
+
+---
+
+## `sample.arj`
+
+- **Format:** ARJ, consumed by `legacy::arj`.
+- **Spec consulted:** "ARJ TECHNICAL INFORMATION", April 1993 (ARJ Software
+  Inc.'s own format notes, widely mirrored; the copy read for this task is
+  <https://www.opennet.ru/docs/formats/arj.txt>) — for the general shape:
+  header id `0x60 0xEA`, a basic-header CRC-32, the "zero-length header
+  size means end of archive" convention, and the extended-header
+  size-prefixed-then-zero-terminated framing.
+- **Producer: hand-built, not any tool on this machine, and with no
+  independent witness at all — the weakest provenance in this phase.**
+  `arj`/`unarj` are not in Homebrew and nothing else on this machine reads
+  or writes ARJ; unlike `sample.lzh` (independently verified against
+  `lhasa`, a decoder wholly separate from `delharc`) and `hello.Z` (built by
+  the real `/usr/bin/compress`), this fixture has no second implementation
+  to check it against. **The exact byte layout was therefore traced
+  field-by-field from `unarj-rs` 0.2.1's own parser source** —
+  `main_header.rs::MainHeader::load_from`, `local_file_header.rs::
+  LocalFileHeader::load_from`, and `arj_archive.rs`'s `read_header`/
+  `read_extended_headers`/`get_next_entry`/`read` — rather than purely from
+  the published spec above, because that is what determines whether the
+  fixture actually decodes under the crate this container wraps, and the
+  spec text's own field names for a few bytes (e.g. whether offset 8 holds
+  one creation timestamp or two separate ones) do not matter to a minimal
+  fixture that zeroes that range regardless. **Stated plainly, per the task
+  brief: the expectation this fixture is checked against was derived from
+  reading `unarj-rs`'s own parsing logic, so a mistake shared between this
+  fixture's construction and that parser would agree with itself and pass
+  completely undetected.** `legacy::arj::tests::build_arj` is the
+  construction expressed as real, checked-in Rust (unlike `sample.lzh`'s
+  throwaway, unchecked-in Python script) — run
+  `the_checked_in_fixture_matches_its_own_construction_recipe` to reproduce
+  these exact bytes from that function.
+- **Two entries, both `compression_method = 0` (Stored)** so no compression
+  algorithm needs reimplementing to build this fixture, the same choice
+  `sample.lzh` makes with `-lh0-`:
+  - `sample/hello.txt` — the 6-byte ASCII string `alpha\n`.
+  - `sample/sub/b.bin` — the 5-byte ASCII string `beta\n`.
+  Both names are stored directly in each local file header's own
+  null-terminated `name` field (no separator translation applied anywhere
+  in `unarj-rs` or in `legacy::arj`), so `/` reads back as a literal path
+  separator exactly as written.
+- **Byte layout, traced from the crate's own field-by-field parse** (each
+  local file header's fixed prefix, and the main header's, are both exactly
+  30 bytes — `header_size`, the header content's OWN first byte, is 30 in
+  both, at or below the crate's extension thresholds `STD_HDR_SIZE`/
+  `FIRST_HDR_SIZE`, so neither writes the crate's conditional 4-byte
+  extension block):
+  - Main header content (32 bytes: the 30-byte fixed prefix above, then an
+    empty name and an empty comment, each a lone `0x00`): `header_size(1,
+    =30) + archiver_version_number(1) + min_version_to_extract(1) +
+    host_os(1, =2 Unix) + flags(1) + security_version(1) + file_type(1) +
+    reserved(1) + creation_date_time(4, zero) + compr_size(4, zero) +
+    archive_size(4, zero) + security_envelope(4, zero) +
+    file_spec_position(2, zero) + security_envelope_length(2, zero) +
+    encryption_version(1) + last_chapter(1) + name(1, empty) + comment(1,
+    empty)`.
+  - Each local file header's content (30-byte fixed prefix + name + two
+    NULs): `header_size(1, =30) + archiver_version_number(1) +
+    min_version_to_extract(1) + host_os(1, =2 Unix) + arj_flags(1) +
+    compression_method(1, =0 Stored) + file_type(1, =0 Binary) +
+    reserved(1) + date_time_modified(4, zero — no valid calendar date, so
+    this container's `dos_mtime` reports `None` for both entries) +
+    compressed_size(4, = the entry's byte length, since Stored) +
+    original_size(4, = the same length) + original_crc32(4, CRC-32/
+    IEEE of the plaintext) + file_spec_position(2, zero) +
+    file_access_mode(2, zero) + first_chapter(1) + last_chapter(1) +
+    name(N, e.g. `sample/hello.txt`) + name_terminator(1, `0x00`) +
+    comment(1, empty, `0x00`)`.
+  - Every header (main and local) is wrapped identically: magic `0x60 0xEA`
+    + a little-endian `u16` content length + the content above + a
+    little-endian `u32` CRC-32/IEEE over the content + a little-endian
+    `u16` zero, the "no extended headers" terminator
+    `read_extended_headers` reads immediately after every header.
+  - Each local file header's wrapped envelope is followed directly by that
+    entry's raw payload bytes (verbatim, since `Stored`).
+  - The archive ends with `0x60 0xEA` followed by a `u16` zero — `
+    read_header` recognises a zero content length as "no more headers" and
+    returns *before* reading any CRC after it, so this marker is exactly
+    four bytes, not the six a non-empty header would need.
+  - 173 bytes total: main header (32-byte content, wrapped with magic +
+    u16 length + 4-byte CRC + u16 terminator = 42 bytes) + entry 1 (30-byte
+    header prefix + 16-byte name `sample/hello.txt` + 2 NULs = 48-byte
+    content, wrapped = 58 bytes, + 6 payload bytes = 64) + entry 2 (30 +
+    16-byte name `sample/sub/b.bin` + 2 = 48-byte content, wrapped = 58
+    bytes, + 5 payload bytes = 63) + 4-byte end marker: 42 + 64 + 63 + 4 =
+    173, matching `ls -l sample.arj`.
+- **Verification: none independent — see above.** The only checks run were
+  internal consistency ones: `legacy::arj::tests::arj_conforms` (the
+  fixture read back through `unarj-rs` itself, which is not independent of
+  the construction) and `the_checked_in_fixture_matches_its_own_
+  construction_recipe` (the checked-in bytes match `build_arj`'s output
+  exactly, which proves re-derivability, not correctness against any
+  outside ground truth).

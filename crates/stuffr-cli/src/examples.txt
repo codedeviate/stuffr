@@ -706,10 +706,11 @@ WHAT THIS BUILD CAN DO
       the eleven round-trip codecs gzip, zlib, deflate, bzip2, brotli, lz4,
       snappy, zstd, xz, lzma and lzip, plus the tar, ar, cpio and zip
       containers — the KIND column tells codecs and containers apart. A build
-      with `--features legacy` (bundled into `--features full`) adds two more
-      rows: the read-only `compress` codec and the read-only `lha` container
-      — see "READ-ONLY LEGACY FORMATS" below — so an `--all-features` build
-      lists 17 rows (12 codecs, 5 containers) rather than 15. zstd's row
+      with `--features legacy` (bundled into `--features full`) adds three
+      more rows: the read-only `compress` codec and the read-only `lha` and
+      `arj` containers — see "READ-ONLY LEGACY FORMATS" below — so an
+      `--all-features` build lists 18 rows (12 codecs, 6 containers) rather
+      than 15. zstd's row
       differs by which backend is
       compiled in: a build with the `zstd-c` feature (needs a C toolchain)
       shows `yes` in WRITE, using the real `libzstd`; a pure-Rust build
@@ -738,8 +739,9 @@ WHAT THIS BUILD CAN DO
       well, alongside its WRITE column becoming `yes`; it changes nothing
       else in this column, on any tier. All four containers — tar, ar,
       cpio and zip — always show `-` here: none of them parallelises
-      anything, on any tier. `lha` (behind `--features legacy`) shows `-`
-      too, trivially — it has no encoder to parallelise in the first place.
+      anything, on any tier. `lha` and `arj` (both behind `--features
+      legacy`) show `-` too, trivially — neither has an encoder to
+      parallelise in the first place.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -963,16 +965,15 @@ READ-ONLY LEGACY FORMATS
   stuffr list backup.lzh
       LHA/LZH, behind its own `--features lha` (bundled into `--features
       legacy`/`full`/`--all-features`, same as `compress` above). This is
-      the first read-only CONTAINER, not codec: an `--all-features` build
-      therefore has five containers in total — tar, ar, cpio, zip and lha —
-      not four. Unlike `compress`, `lha` genuinely STREAMS: the crate behind
-      it (`delharc`) parses forward off a pipe natively, with no `Seek`
-      anywhere in its decode path, so `list`/`test`/`cat`/`unpack -C` and
-      `--max-ratio` all work exactly the same over a real file or a pipe —
-      no bound-before-allocation guard needed, unlike the ARJ container a
-      later phase adds. Its magic sits at offset 2, not 0 (`-lh` for the
-      LHarc family, `-lz` for the older LArc one this build also reads), so
-      both `.lzh` and `.lha` are detected automatically.
+      the first read-only CONTAINER, not codec. Unlike `compress`, `lha`
+      genuinely STREAMS: the crate behind it (`delharc`) parses forward off
+      a pipe natively, with no `Seek` anywhere in its decode path, so
+      `list`/`test`/`cat`/`unpack -C` and `--max-ratio` all work exactly the
+      same over a real file or a pipe — no bound-before-allocation guard
+      needed, unlike the ARJ container below, which needs one. Its magic
+      sits at offset 2, not 0 (`-lh` for the LHarc family, `-lz` for the
+      older LArc one this build also reads), so both `.lzh` and `.lha` are
+      detected automatically.
 
       This container is READ-ONLY: `stuffr pack notes.txt --format lha`
       fails with `Error::Unsupported` (exit 3) — there is no LHA ENCODER
@@ -987,3 +988,37 @@ READ-ONLY LEGACY FORMATS
       corrupted one is reported as `Error::Corrupt` (exit 5) once its payload
       has been fully read, the same as any other checksum-carrying format
       here.
+
+  stuffr list backup.arj
+      ARJ, behind its own `--features arj` (bundled into `--features
+      legacy`/`full`/`--all-features`, same as `compress` and `lha` above).
+      An `--all-features` build therefore has six containers in total — tar,
+      ar, cpio, zip, lha and arj — not four. Its magic (`0x60 0xEA`) sits at
+      offset 0.
+
+      Unlike `lha`, ARJ is the CONSTRAINED case: the crate behind it
+      (`unarj-rs`) needs `Seek` to read an archive at all, and decodes each
+      entry WHOLE — there is no per-entry streaming reader. `list`/`test`
+      still work over a pipe (the ladder spools it to a temp file first,
+      same as `zip` forced onto its indexed path), but the read is never
+      forward-only the way `lha`'s is. Because an entry is decoded whole,
+      this build refuses an entry whose header declares an implausible size
+      — past a fixed 256 MiB ceiling — BEFORE allocating for it, at exit 6
+      (`ResourceLimit`), never exit 5: the archive is not necessarily
+      damaged, this build simply will not allocate that much for one entry
+      it cannot stream. This is not the same knob as `--memory-limit`: that
+      flag binds a CODEC's own dictionary allocation (see "GUARDING AGAINST
+      DECOMPRESSION BOMBS" and `--memory-limit`'s own entry above); a
+      container opens with no such flag to read, so this ceiling is fixed
+      rather than configurable.
+
+      This container is READ-ONLY: `stuffr pack notes.txt --format arj`
+      fails with `Error::Unsupported` (exit 3) — there is no ARJ ENCODER
+      here, only a reader for archives written by the real, decades-old
+      `arj`/`unarj` tools. Every entry carries its own CRC-32, checked once
+      its payload has been decoded, and a mismatch is `Error::Corrupt` (exit
+      5) — the same promise every other checksum-carrying format here
+      makes. `by_index` has exactly one answer on this container, unlike
+      `lha`'s two: ARJ carries no entry index of its own on any source
+      shape it is ever opened over, so `Error::Unsupported` routes straight
+      to a forward count instead.

@@ -993,11 +993,12 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
     // containers" used to be one tier-invariant number this whole test
     // could check `stuffr::registry()` against directly. It no longer is:
     // THIS test binary alone reports 4 under `cargo test --workspace`
-    // (`make check`'s `test-pure` leg, no `legacy`) and 5 under
-    // `--all-features` (`test`) — so a page correctly describing BOTH the
-    // default build and an `--all-features` one legitimately states two
-    // different container counts, and neither is stale just because it
-    // does not match whichever tier happens to compile this assertion.
+    // (`make check`'s `test-pure` leg, no `legacy`) and 6 under
+    // `--all-features` (`test`, now that Task 6 has added `arj` alongside
+    // `lha`) — so a page correctly describing BOTH the default build and
+    // an `--all-features` one legitimately states two different container
+    // counts, and neither is stale just because it does not match
+    // whichever tier happens to compile this assertion.
     //
     // `base_containers` is the tier-invariant quartet (tar/ar/cpio/zip).
     // The "full" count must NOT be `base_containers.len() +
@@ -1021,7 +1022,7 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
     // way, so the full count is the best available PROJECTION — base plus
     // the fixed legacy list — which is what a page describing a
     // DIFFERENT, `--all-features` build is entitled to claim.
-    const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha"];
+    const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha", "arj"];
     let base_containers: Vec<&str> = containers
         .iter()
         .copied()
