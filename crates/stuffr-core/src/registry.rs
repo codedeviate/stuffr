@@ -109,6 +109,36 @@ impl Registry {
         self.container(id).ok_or(Error::FormatNotEnabled(id))
     }
 
+    /// The container for `id`, if this build has it **and** it can write.
+    ///
+    /// [`Self::require_encoder`]'s container-side twin, and it exists for the
+    /// same reason that one does: without it a caller reaches `create()` on a
+    /// container that cannot write, and the natural body for that method is a
+    /// panic — reachable straight from a command line.
+    ///
+    /// Phase 3b introduced the first read-only CONTAINERS (LHA, ARJ) and this
+    /// gate did not exist, so `ContainerCaps::write` was read by no caller at
+    /// all and each adapter hand-rolled its own `Error::Unsupported` refusal.
+    /// That was harmless only because both happened to return `Err`, and it
+    /// left one contract speaking three sentences: `unsupported: LHA/LZH is
+    /// read-only in this build` from a container against `` `compress` can be
+    /// read but not written by this build`` from a codec, for the identical
+    /// user action at the identical exit code. The refusal now comes from the
+    /// registry for codecs and containers alike, in one sentence, and each
+    /// trait method keeps its own `Err` as an unreachable backstop rather
+    /// than as the thing a user actually meets.
+    pub fn require_container_writer(&self, id: FormatId) -> Result<&Arc<dyn Container>> {
+        let container = self.require_container(id)?;
+        if !container.caps().write {
+            return Err(Error::CapabilityUnavailable {
+                format: id,
+                available: "read",
+                requested: "written",
+            });
+        }
+        Ok(container)
+    }
+
     /// Extension lookup. Accepts `"gz"` or `".gz"`, any case.
     pub fn by_extension(&self, ext: &str) -> Option<FormatId> {
         let key = ext.trim_start_matches('.').to_ascii_lowercase();
@@ -465,5 +495,67 @@ mod tests {
             3,
             "a capability refusal must be distinguishable from other errors so a script can branch on it"
         );
+    }
+
+    /// The container-side mirror of the test above, and the hole Phase 3b
+    /// left open: `ContainerCaps::write` was declared by two read-only
+    /// containers and consulted by no caller, so a `create()` whose natural
+    /// body is a panic was reachable straight from `stuffr pack`.
+    #[test]
+    fn a_read_only_container_is_refused_a_writer_rather_than_reaching_it() {
+        use crate::archive::{ArchiveRead, ArchiveWrite, Container, CreateOpts, OpenOpts};
+        use crate::format::ContainerCaps;
+        use crate::ladder::Resolved;
+
+        /// The shape every Phase 3b legacy container takes: readable, not
+        /// writable. Delegates `open` to `MockContainer` so only `caps`
+        /// differs.
+        struct ReadOnlyContainer;
+        impl Container for ReadOnlyContainer {
+            fn id(&self) -> FormatId {
+                MOCK_CONTAINER
+            }
+            fn caps(&self) -> ContainerCaps {
+                ContainerCaps::read_only()
+            }
+            fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+                MockContainer.open(resolved, o)
+            }
+            fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+                // Never exercised by this test, for the same reason
+                // `ReadOnlyCodec::encoder`'s panic above is not: the gate
+                // stops the caller first. It documents what a container
+                // author's natural `create()` body would be without one.
+                panic!("a capability check must stop the caller before it reaches here");
+            }
+        }
+
+        let mut reg = Registry::new();
+        reg.register_container(
+            std::sync::Arc::new(ReadOnlyContainer),
+            FormatMeta::container(MOCK_CONTAINER, &["mar"], &[]),
+        );
+
+        // Reading is available; only the writer is refused.
+        assert!(reg.require_container(MOCK_CONTAINER).is_ok());
+
+        let Err(err) = reg.require_container_writer(MOCK_CONTAINER) else {
+            panic!("expected CapabilityUnavailable for a read-only container");
+        };
+        assert!(
+            matches!(err, Error::CapabilityUnavailable { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("mock-container"),
+            "must name the format: {err}"
+        );
+        assert_eq!(err.exit_code(), 3);
+
+        // And a writable container still gets through, so the gate is not
+        // refusing everything.
+        let mut ok = Registry::new();
+        ok.register_container(Arc::new(MockContainer), container_meta());
+        assert!(ok.require_container_writer(MOCK_CONTAINER).is_ok());
     }
 }

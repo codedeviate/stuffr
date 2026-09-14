@@ -1047,7 +1047,12 @@ pub fn create_archive(
     codec: Option<FormatId>,
     o: &CompressOpts,
 ) -> Result<Outcome> {
-    let kind = crate::registry().require_container(container)?;
+    // `require_container_writer`, not `require_container`: a read-only
+    // container (LHA, ARJ) must be refused here, by the registry, in the same
+    // sentence `require_encoder` refuses a decode-only codec — not by
+    // reaching `create()` and relying on each adapter to hand-roll a refusal
+    // of its own. See that method's doc comment.
+    let kind = crate::registry().require_container_writer(container)?;
 
     // Resolved, checked and consented to BEFORE the destination is opened —
     // the same order `ops::compress_with` uses, so a rejected level or an

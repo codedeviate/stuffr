@@ -132,10 +132,18 @@ impl Codec for CompressZ {
         Ok(Box::new(StreamOnly::new(LzwZReader::new(src))))
     }
 
+    /// Unreachable through ops: `Registry::require_encoder` reads
+    /// `caps().encode` and refuses first (`CLAUDE.md` mandates registering
+    /// through it rather than the raw accessor). This is the trait-level
+    /// backstop, and it answers the SAME error the registry raises — it used
+    /// to answer `Error::Unsupported` with a carefully-worded sentence no
+    /// user could ever reach.
     fn encoder(&self, _dst: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
-        Err(Error::Unsupported(
-            "compress (.Z) is decode-only in this build".into(),
-        ))
+        Err(Error::CapabilityUnavailable {
+            format: COMPRESS,
+            available: "read",
+            requested: "written",
+        })
     }
 }
 
@@ -526,11 +534,18 @@ mod tests {
     }
 
     #[test]
-    fn encoder_is_unsupported_not_a_panic() {
+    fn encoder_is_refused_as_a_capability_limit_not_a_panic() {
         let opts = EncodeOpts::default();
         match CompressZ.encoder(Box::new(stuffr_core::testing::SharedBuf::new()), &opts) {
             Err(err) => {
-                assert!(matches!(err, Error::Unsupported(_)));
+                // The SAME variant `Registry::require_encoder` raises — the
+                // refusal a user actually meets. This method is unreachable
+                // through ops, and used to answer a different, carefully
+                // worded `Error::Unsupported` nobody could ever see.
+                assert!(
+                    matches!(err, Error::CapabilityUnavailable { .. }),
+                    "got {err:?}"
+                );
                 assert_eq!(err.exit_code(), 3);
             }
             Ok(_) => panic!("compress (.Z) must not be able to encode"),

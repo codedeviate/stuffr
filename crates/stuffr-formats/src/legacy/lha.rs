@@ -54,8 +54,11 @@
 //!   to exit 1 (see that function's doc for why this distinction matters).
 //! - Genuine io errors (a failing source) pass through as themselves via the
 //!   same function.
-//! - `create()` → [`Error::Unsupported`] (exit 3), naming the format
-//!   read-only in this build.
+//! - `create()` → [`Error::CapabilityUnavailable`] (exit 3), `` `lha` can be
+//!   read but not written by this build``. Unreachable through ops, which is
+//!   the point: `Registry::require_container_writer` refuses on `caps().write`
+//!   before `create()` is ever called, so the trait method is a backstop that
+//!   answers the same error rather than a second, differently-worded one.
 
 use std::io::{self, Read};
 use std::time::{Duration, UNIX_EPOCH};
@@ -103,12 +106,14 @@ impl Container for Lha {
     }
 
     fn caps(&self) -> ContainerCaps {
+        // `ContainerCaps::read_only()` rather than a literal spelling out
+        // `read: true, write: false`: the constructor was written for exactly
+        // this case ("a container that can be read but not written") and had
+        // no user until the first two read-only containers arrived. It sets
+        // `needs_seek: false` too, which `delharc` genuinely does not need.
         ContainerCaps {
-            read: true,
-            write: false,
             forward_parse: true,
-            needs_seek: false,
-            ..Default::default()
+            ..ContainerCaps::read_only()
         }
     }
 
@@ -125,10 +130,18 @@ impl Container for Lha {
         }))
     }
 
+    /// Unreachable through ops: `Registry::require_container_writer` reads
+    /// `caps().write` and refuses first, exactly as `require_encoder` does
+    /// for a decode-only codec. This is the trait-level backstop, and it
+    /// answers the SAME error the registry raises — a caller who reached
+    /// `create()` directly must not meet a differently-worded refusal for
+    /// the identical contract.
     fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
-        Err(Error::Unsupported(
-            "LHA/LZH is read-only in this build".into(),
-        ))
+        Err(Error::CapabilityUnavailable {
+            format: LHA,
+            available: "read",
+            requested: "written",
+        })
     }
 }
 
@@ -471,13 +484,20 @@ mod tests {
     }
 
     #[test]
-    fn create_is_refused_as_unsupported_not_a_panic() {
+    fn create_is_refused_as_a_capability_limit_not_a_panic() {
         match Lha.create(
             PlainSink::new(Box::new(stuffr_core::testing::SharedBuf::new())),
             &CreateOpts::default(),
         ) {
             Err(err) => {
-                assert!(matches!(err, Error::Unsupported(_)));
+                // The SAME variant `Registry::require_container_writer`
+                // raises — the refusal a user actually meets. A different
+                // one here would mean two sentences for one contract, which
+                // is what this used to be.
+                assert!(
+                    matches!(err, Error::CapabilityUnavailable { .. }),
+                    "got {err:?}"
+                );
                 assert_eq!(err.exit_code(), 3);
             }
             Ok(_) => panic!("LHA must refuse to write"),

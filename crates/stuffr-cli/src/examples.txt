@@ -951,9 +951,12 @@ READ-ONLY LEGACY FORMATS
       --format needed.
 
       This codec is READ-ONLY: `stuffr pack notes.txt --format compress`
-      fails with `Error::Unsupported` (exit 3) — there never was a `compress`
-      ENCODER here, only a decoder for reading what the real, decades-old
-      `compress`(1) tool already wrote. Unlike every codec in the pure/
+      fails with `Error::CapabilityUnavailable` (exit 3), printing
+      "`compress` can be read but not written by this build" — there never
+      was a `compress` ENCODER here, only a decoder for reading what the
+      real, decades-old `compress`(1) tool already wrote. The `lha` and
+      `arj` containers below refuse in that same one sentence, from the same
+      capability gate in the registry. Unlike every codec in the pure/
       c-backed tiers above, it also carries no length field, checksum or
       end-of-stream marker of its own: a `.Z` file truncated part-way through
       decodes to a silently SHORTER prefix of the original data rather than
@@ -976,8 +979,9 @@ READ-ONLY LEGACY FORMATS
       detected automatically.
 
       This container is READ-ONLY: `stuffr pack notes.txt --format lha`
-      fails with `Error::Unsupported` (exit 3) — there is no LHA ENCODER
-      here, only a reader for archives written by the real, decades-old
+      fails with `Error::CapabilityUnavailable` (exit 3), the same one
+      sentence `--format compress` above answers with — there is no LHA
+      ENCODER here, only a reader for archives written by the real, decades-old
       `lha`/`lhasa` tools. An entry using a compression method this build's
       `delharc` feature set cannot decode (compiled with `std`, `lh1`, `lz`
       — no `lhx`) is also `Error::Unsupported`, not corruption: the archive
@@ -1013,8 +1017,9 @@ READ-ONLY LEGACY FORMATS
       rather than configurable.
 
       This container is READ-ONLY: `stuffr pack notes.txt --format arj`
-      fails with `Error::Unsupported` (exit 3) — there is no ARJ ENCODER
-      here, only a reader for archives written by the real, decades-old
+      fails with `Error::CapabilityUnavailable` (exit 3), the same one
+      sentence `--format compress` above answers with — there is no ARJ
+      ENCODER here, only a reader for archives written by the real, decades-old
       `arj`/`unarj` tools. Every entry carries its own CRC-32, checked once
       its payload has been decoded, and a mismatch is `Error::Corrupt` (exit
       5) — the same promise every other checksum-carrying format here

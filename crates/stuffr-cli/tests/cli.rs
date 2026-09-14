@@ -1200,17 +1200,22 @@ fn examples_pages_first_worked_example_runs_as_documented() {
 }
 
 /// `pack --format lha`/`arj`/`compress` must refuse CLEARLY — exit 3, naming
-/// the format read-only in this build — never fail obscurely (an internal
-/// panic, a bare i/o error, or an unrelated exit code). Phase 3b's three
-/// legacy formats each answer `Error::Unsupported` from
-/// `Codec::encoder`/`Container::create` directly (see `legacy::lha`,
-/// `legacy::arj`, `legacy::compress_z`'s own `create`/`encoder`
-/// implementations), so this pins that all the way through the CLI rather
-/// than only at the trait level each module's own unit tests already cover.
+/// the format as readable but not writable by this build — never fail
+/// obscurely (an internal panic, a bare i/o error, or an unrelated exit
+/// code). All three now take the SAME route: the registry refuses on the
+/// declared capability, `Registry::require_encoder` for the `compress`
+/// codec and `Registry::require_container_writer` for the `lha`/`arj`
+/// containers, both raising `Error::CapabilityUnavailable`. Each module's
+/// own `encoder()`/`create()` still returns that same error as an
+/// unreachable backstop. This pins it all the way through the CLI rather
+/// than only at the trait level each module's unit tests already cover.
 ///
-/// Runtime-checked, not `cfg`-gated: `stuffr-cli` has no Cargo features of
-/// its own (see its `Cargo.toml`), so whether `legacy` is compiled in can
-/// only be asked of the live registry, the same way
+/// Runtime-checked, not `cfg`-gated. `stuffr-cli` does now declare a
+/// `legacy` feature (a passthrough to `stuffr/legacy`, so
+/// `cargo install stuffr-cli --features legacy` works), but `cargo test
+/// --workspace --all-features` unifies features across the workspace, so
+/// this binary's own `cfg!(feature = "legacy")` is not what decides whether
+/// the three formats are compiled in — the live registry is, the same way
 /// `examples_page_covers_every_format_and_flag` above already asks it for
 /// container counts. On the default `pure` tier (`cargo test --workspace`,
 /// no `--all-features`) none of the three is registered at all, and
@@ -1257,21 +1262,19 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
              {:?}; stderr: {err}",
             res.status.code()
         );
-        // `lha`/`arj` (containers, `Container::create`) and `compress` (a
-        // codec, `Codec::encoder`) phrase this differently — "read-only in
-        // this build" against "can be read but not written by this
-        // build" — so the check is per-format rather than one shared
-        // substring, to avoid quietly demanding a rewrite neither module
-        // actually needs.
+        // ONE sentence for all three, which is the point of the shared
+        // gate: the containers used to say "unsupported: LHA/LZH is
+        // read-only in this build" (their own hand-rolled
+        // `Container::create` refusal) while the codec said "`compress` can
+        // be read but not written by this build" (the registry's), and a
+        // comment here called that difference "phrasing" when it was two
+        // different code paths. A per-format substring would let them drift
+        // apart again without failing.
         let lower = err.to_lowercase();
-        let names_read_only = match name {
-            "compress" => lower.contains("read") && lower.contains("not written"),
-            _ => lower.contains("read-only") || lower.contains("read only"),
-        };
         assert!(
-            names_read_only,
-            "`--format {name}`'s refusal must name the format as read-only/not-written in \
-             this build rather than fail obscurely: {err}"
+            lower.contains(&format!("`{name}` can be read but not written by this build")),
+            "`--format {name}`'s refusal must be the one shared capability sentence, \
+             naming the format, rather than a per-format phrasing: {err}"
         );
         assert!(
             !dst.exists(),

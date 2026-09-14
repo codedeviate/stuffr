@@ -13,12 +13,9 @@
 //!
 //! ```text
 //! ContainerCaps {
-//!     read: true,
-//!     write: false,
-//!     forward_parse: false,
 //!     needs_seek: true,
-//!     ..Default::default()
-//! }
+//!     ..ContainerCaps::read_only()   // read: true, write: false,
+//! }                                  // forward_parse: false
 //! ```
 //!
 //! `forward_parse: false` together with `needs_seek: true` means
@@ -97,7 +94,9 @@
 //!   `UnexpectedEof` for a clean end-of-input, never for an inner error
 //!   that already carries its own kind.
 //!
-//! `create()` is [`Error::Unsupported`] (exit 3): there never was an ARJ
+//! `create()` is [`Error::CapabilityUnavailable`] (exit 3), the same refusal
+//! `Registry::require_container_writer` raises before ops ever reaches it (see
+//! `lha.rs`'s twin): there never was an ARJ
 //! encoder here, only a reader for archives the real, decades-old
 //! `arj`/`unarj` tools wrote.
 //!
@@ -171,12 +170,12 @@ impl Container for Arj {
     }
 
     fn caps(&self) -> ContainerCaps {
+        // See `lha.rs`'s twin for why the constructor rather than a literal.
+        // `needs_seek: true` is the one thing ARJ must override: `unarj-rs`
+        // cannot read an archive at all without `Seek`.
         ContainerCaps {
-            read: true,
-            write: false,
-            forward_parse: false,
             needs_seek: true,
-            ..Default::default()
+            ..ContainerCaps::read_only()
         }
     }
 
@@ -191,8 +190,16 @@ impl Container for Arj {
         }))
     }
 
+    /// Unreachable through ops: `Registry::require_container_writer` reads
+    /// `caps().write` and refuses first, exactly as `require_encoder` does
+    /// for a decode-only codec. This is the trait-level backstop, and it
+    /// answers the SAME error the registry raises — see `lha.rs`'s twin.
     fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
-        Err(Error::Unsupported("ARJ is read-only in this build".into()))
+        Err(Error::CapabilityUnavailable {
+            format: ARJ,
+            available: "read",
+            requested: "written",
+        })
     }
 }
 
@@ -646,13 +653,18 @@ mod tests {
     }
 
     #[test]
-    fn create_is_refused_as_unsupported_not_a_panic() {
+    fn create_is_refused_as_a_capability_limit_not_a_panic() {
         match Arj.create(
             PlainSink::new(Box::new(stuffr_core::testing::SharedBuf::new())),
             &CreateOpts::default(),
         ) {
             Err(err) => {
-                assert!(matches!(err, Error::Unsupported(_)));
+                // The SAME variant `Registry::require_container_writer`
+                // raises — see `lha.rs`'s twin.
+                assert!(
+                    matches!(err, Error::CapabilityUnavailable { .. }),
+                    "got {err:?}"
+                );
                 assert_eq!(err.exit_code(), 3);
             }
             Ok(_) => panic!("ARJ must refuse to write"),
