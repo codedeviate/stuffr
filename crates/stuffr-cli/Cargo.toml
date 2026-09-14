@@ -40,6 +40,16 @@ lha = ["stuffr/lha"]
 arj = ["stuffr/arj"]
 compress = ["stuffr/compress"]
 
+# Note the absence of `default-features = false` here: this edge always
+# requests `stuffr`'s own `default` feature set (`pure` and, since the commit
+# that added `legacy` to it, `legacy` too) regardless of any
+# `--no-default-features`/`--features` passed to `stuffr-cli` itself —
+# `stuffr-cli` declares no `[features] default` of its own for that flag to
+# disable. Verified directly: `cargo build -p stuffr-cli
+# --no-default-features` (no `--features` at all) still ships `lha`, `arj`
+# and `compress` in `stuffr formats`. Consequence: there is no CLI-flag-only
+# way to build the `stuffr` binary without `legacy` any more — see the dead
+# projection this made in `crates/stuffr-cli/tests/cli.rs`.
 [dependencies]
 stuffr = { path = "../stuffr", version = "0.4.0", features = ["serde"] }
 clap = { workspace = true }

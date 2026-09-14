@@ -11,7 +11,7 @@ categories = ["compression", "encoding", "filesystem"]
 readme = "README.md"
 
 [features]
-default = ["pure"]
+default = ["pure", "legacy"]
 # One passthrough feature per format, `stuffr/<name>` mirroring
 # `stuffr-formats/<name>` exactly, so a caller can pick a single codec
 # (`stuffr = { features = ["zstd-c"] }`) instead of the whole `pure` or
@@ -45,6 +45,18 @@ zip = ["stuffr-formats/zip"]
 # to be there, since its DEFAULT features do pull `zstd-sys` and the
 # workspace manifest's curated feature list is the only thing stopping it.
 pure = ["gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd-pure", "xz-pure", "lzma-pure", "lzip", "tar", "ar", "cpio", "zip"]
+# `default` used to be `["pure"]` alone, so a plain `cargo install stuffr-cli`
+# (or `cargo add stuffr`) showed 15 formats, not 18: the three read-only
+# legacy formats below were reachable only via an explicit `--features
+# legacy`, and `stuffr formats` on an unadorned install never listed
+# `compress`, `lha` or `arj`. Decided: fold `legacy` into `default` too. All
+# three are pure Rust, inside MSRV 1.88, and add no build requirement beyond
+# what `pure` already needs — the accepted cost is `chrono` and
+# `iana-time-zone` (via `delharc`) now entering every default build, not just
+# an opted-in one. `--features legacy` still exists and still works, for the
+# one build it now actually narrows rather than widens:
+# `--no-default-features --features pure` (what the `purity` CI job builds
+# and what "no legacy" now means).
 # `stuffr-formats/zip-zstd` rather than a `zip-zstd` passthrough of its own:
 # it uses the weak `zip?/zstd` syntax, so it adds zstd to the zip container
 # only when `zip` is ALSO enabled (which `pure` does) and never pulls the

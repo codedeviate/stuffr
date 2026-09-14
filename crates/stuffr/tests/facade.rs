@@ -10,46 +10,60 @@ fn facade_reexports_core_version() {
 /// Slot names the fuzzer's selector tables carry that this build legitimately
 /// does not register — a format present on only ONE of the two tiers.
 ///
-/// **No longer empty, exactly as predicted below, and the day has come:**
-/// Phase 3b appended `compress`, `lha` and `arj` to `CODEC_SLOTS` /
-/// `CONTAINER_SLOTS`. Measured, not assumed — `cargo test -p stuffr --test
-/// facade every_selector_slot_names_a_registered_format`:
-/// - `--all-features` (`legacy` on): passes.
-/// - no features beyond the default (`legacy` off): failed with `CODEC_SLOTS
-///   slot "compress" is registered by neither tier` before these three names
-///   were added here.
+/// **Empty again, and for a different reason than it was empty the first
+/// time.** Phase 3b appended `compress`, `lha` and `arj` to `CODEC_SLOTS` /
+/// `CONTAINER_SLOTS` and this list briefly named all three, because `legacy`
+/// lived only in `full`/`--all-features` and `make test-pure`'s plain
+/// `cargo test --workspace` genuinely did not compile them. That is no
+/// longer true: `legacy` joined `stuffr`'s `default` feature set (so a
+/// plain `cargo install`/`stuffr formats` shows all 18 rows, not 15), and
+/// **every** `cargo test` of this crate now compiles the three regardless
+/// of which command-line features are named — see below.
 ///
-/// So this is feature-gating, not the pure/c-backed backend split the
-/// paragraph below was originally written about — but the shape is the same
-/// the comment predicted: a name registered on `make test` and not on `make
-/// test-pure` needs to be named here, and the fix is a name, not a weakened
-/// assertion.
+/// Measured, not assumed: `cargo test -p stuffr --no-default-features
+/// --features c-backed --test facade` — the narrowest feature set any
+/// command in this repo's `Makefile`/CI actually runs this test suite
+/// under — still registers `compress`/`lha`/`arj`. The reason is this
+/// crate's own `[dev-dependencies]` entry, `stuffr = { path = ".", features
+/// = ["serde", "testing"] }`: it does not set `default-features = false`,
+/// so it requests `stuffr`'s `default` feature (now `pure` **and**
+/// `legacy`) on the same compiled unit the test binary links against,
+/// regardless of what `--no-default-features`/`--features` were passed to
+/// the *outer* `cargo test` invocation. Cargo unifies features per package
+/// instance across the whole graph; a self-referential dev-dependency that
+/// wants `default` on wins over an outer flag that wanted it off. There is
+/// consequently no `cargo test` command line that builds this crate's own
+/// tests with `legacy` off — only editing this dev-dependency to add
+/// `default-features = false` would do that, and nothing in this repo does.
+///
+/// Kept as an empty list rather than deleted, along with the mechanism
+/// below: a *future* feature that is genuinely off in some `cargo test`
+/// invocation (unlike `legacy` now) can still use it, and
+/// `every_tier_specific_exemption_names_a_real_slot` intentionally does no
+/// work while the list is empty — see its own doc comment.
 ///
 /// Every format with two backends still registers under a single shared
 /// `FormatId` — `xz_shared.rs`'s `XZ`, `lzma_shared.rs`'s `LZMA`,
 /// `zstd_shared.rs`'s `ZSTD` — so backend selection alone never puts a name
-/// here; only a feature that is off by default does.
+/// here; only a feature that is off in some real `cargo test` invocation
+/// does.
 ///
-/// A name added here must be a real one-tier (or, as here, one-feature-set)
-/// format, not a typo being waved through.
+/// A name added here must be a real one-tier (or one-feature-set) format
+/// that some actual test command compiles without, not a typo being waved
+/// through.
 ///
 /// **The exemption is CONDITIONAL on the feature being absent**, and that is
 /// the whole of it. A flat `&[&str]` consulted unconditionally would exempt
-/// these three on `--all-features` too, where all three ARE registered — so
-/// a name misspelled in a slot table and mirrored into this list would be
-/// rescued by the very exemption meant to expose it, and pass on both legs
-/// forever. (What still works today without the condition: `lha` genuinely
-/// registers under `--all-features`, so it passes on the FIRST clause,
-/// verified rather than exempted. It is the mirrored typo that escapes,
-/// because a typo registers nowhere and the exemption then covers it
-/// everywhere.)
+/// a listed name even where it IS registered — so a name misspelled in a
+/// slot table and mirrored into this list would be rescued by the very
+/// exemption meant to expose it, and pass on every leg forever.
 ///
 /// `cfg!(feature = ...)` rather than a live-registry witness, which is what
-/// `stuffr-cli`'s `legacy_bundle_compiled` has to use: THIS crate is the one
-/// that declares the features, so it can ask the question directly, and a
-/// misspelled FEATURE name is a `cargo` check-cfg warning — which `-D
-/// warnings` turns into a build failure — rather than a silently false
-/// constant.
+/// `stuffr-cli`'s tests have to use (see `crates/stuffr-cli/tests/cli.rs`):
+/// THIS crate is the one that declares the features, so it can ask the
+/// question directly, and a misspelled FEATURE name is a `cargo` check-cfg
+/// warning — which `-D warnings` turns into a build failure — rather than a
+/// silently false constant.
 struct TierSpecific {
     /// The slot name, as it appears in `CODEC_SLOTS`/`CONTAINER_SLOTS`.
     name: &'static str,
@@ -59,20 +73,7 @@ struct TierSpecific {
     compiled: bool,
 }
 
-const TIER_SPECIFIC: &[TierSpecific] = &[
-    TierSpecific {
-        name: "compress",
-        compiled: cfg!(feature = "compress"),
-    },
-    TierSpecific {
-        name: "lha",
-        compiled: cfg!(feature = "lha"),
-    },
-    TierSpecific {
-        name: "arj",
-        compiled: cfg!(feature = "arj"),
-    },
-];
+const TIER_SPECIFIC: &[TierSpecific] = &[];
 
 /// True only if `name` is listed AND its feature is absent from this build.
 fn exempt_from_registration(name: &str) -> bool {
@@ -84,6 +85,12 @@ fn exempt_from_registration(name: &str) -> bool {
 /// leaving the real name unguarded while the stale one silently keeps the
 /// escape hatch alive. The tables are append-only, so this can only happen by
 /// mistake, and nothing else in the tree would notice.
+///
+/// Currently vacuous — `TIER_SPECIFIC` is empty (see its doc comment), so
+/// this loop iterates zero entries and the assertion never runs. That is
+/// expected, not a sign the test stopped doing work: it exists for whichever
+/// future format re-populates the list, and an empty list has nothing wrong
+/// with it to find.
 #[test]
 fn every_tier_specific_exemption_names_a_real_slot() {
     for entry in TIER_SPECIFIC {

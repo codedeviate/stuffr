@@ -986,58 +986,42 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
         .map(|r| r.id.as_str())
         .collect();
 
-    // `lha` (Phase 3b) is the first container gated behind a feature that
-    // `pure` does not carry: `--features legacy` (bundled into
-    // `full`/`--all-features`) adds it, the default `pure` build does not.
-    // Every OTHER container so far sits in `pure` itself, so "how many
-    // containers" used to be one tier-invariant number this whole test
-    // could check `stuffr::registry()` against directly. It no longer is:
-    // THIS test binary alone reports 4 under `cargo test --workspace`
-    // (`make check`'s `test-pure` leg, no `legacy`) and 6 under
-    // `--all-features` (`test`, now that Task 6 has added `arj` alongside
-    // `lha`) — so a page correctly describing BOTH the default build and
-    // an `--all-features` one legitimately states two different container
-    // counts, and neither is stale just because it does not match
-    // whichever tier happens to compile this assertion.
+    // `lha`/`arj` (Phase 3b) used to be the first containers gated behind a
+    // feature `pure` did not carry, back when `default = ["pure"]` and
+    // `legacy` lived only in `full`/`--all-features` — so this test binary
+    // could genuinely see two different container counts depending on
+    // which `make check` leg compiled it (4 under `test-pure`, 6 under
+    // `--all-features`), and the code below used to carry a PROJECTED count
+    // (`base_containers.len() + LEGACY_ONLY_CONTAINERS.len()`) for the legs
+    // where it could not observe `lha`/`arj` directly.
     //
-    // `base_containers` is the tier-invariant quartet (tar/ar/cpio/zip).
-    // The "full" count must NOT be `base_containers.len() +
-    // LEGACY_ONLY_CONTAINERS.len()` computed as bare arithmetic — a first
-    // version of this fix did exactly that, and it cannot tell "the
-    // `legacy` feature is simply off" (test-pure; `lha` was never going to
-    // be here) apart from "the `legacy` feature IS on but `lha`'s own
-    // registration silently broke" (a real regression `stuffr formats`
-    // would also show). Both look identical to a formula that only ever
-    // adds a constant. So this instead asks the LIVE registry whether the
-    // `legacy` Cargo feature bundle was compiled in at all, witnessed by
-    // `compress` — a format registered independently of `lha`, by a
-    // separate call in `register_all`, but gated by the exact same
-    // `legacy` bundle (`stuffr/Cargo.toml`'s `legacy = [".../lha",
-    // ".../arj", ".../compress"]`). If `compress` is present, `legacy` was
-    // compiled, and `lha` is EXPECTED to be there too — its absence then
-    // means a genuine registration bug, not an untested tier, so the "full"
-    // count degrades to the tier-invariant base rather than silently
-    // staying at a stale "base + 1". If `compress` is absent (the default
-    // `pure` tier), there is no way for this run to observe `lha` either
-    // way, so the full count is the best available PROJECTION — base plus
-    // the fixed legacy list — which is what a page describing a
-    // DIFFERENT, `--all-features` build is entitled to claim.
+    // That projection is now dead code, not just an unused branch: `legacy`
+    // joined `stuffr`'s `default` feature set, and — measured, not assumed —
+    // there is no longer any `cargo build`/`cargo test` of the `stuffr-cli`
+    // binary that lacks it, `--no-default-features` included.
+    // `crates/stuffr-cli/Cargo.toml`'s `[dependencies]` entry,
+    // `stuffr = { path = "../stuffr", ..., features = ["serde"] }`, does not
+    // set `default-features = false`, so it always requests `stuffr`'s
+    // `default` (now `pure` **and** `legacy`) regardless of what
+    // `--no-default-features`/`--features` this binary itself was built
+    // with — `stuffr-cli` declares no `[features] default` of its own for
+    // `--no-default-features` to even disable. Verified directly: `cargo
+    // build -p stuffr-cli --no-default-features` (no `--features` at all)
+    // still ships `lha`, `arj` and `compress` in `stuffr formats`. So
+    // `containers.len()` is trusted unconditionally below — there is no
+    // real build left for a projection to stand in for.
+    //
+    // `base_containers` (the tier-invariant round-trip quartet: tar/ar/
+    // cpio/zip) is kept, because the page still legitimately describes that
+    // subset by itself in some sentences (e.g. "four round-trip
+    // containers", distinct from "six total").
     const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha", "arj"];
     let base_containers: Vec<&str> = containers
         .iter()
         .copied()
         .filter(|id| !LEGACY_ONLY_CONTAINERS.contains(id))
         .collect();
-    let legacy_bundle_compiled = rows.iter().any(|r| r.id.as_str() == "compress");
-    let full_container_count = if legacy_bundle_compiled {
-        // `legacy` is compiled: trust the live registry fully. If `lha`'s
-        // own registration is broken, `containers` already reflects that
-        // (it simply is not in it), so this collapses to `base_containers
-        // .len()` on its own — no separate assertion needed to catch it.
-        containers.len()
-    } else {
-        base_containers.len() + LEGACY_ONLY_CONTAINERS.len()
-    };
+    let full_container_count = containers.len();
 
     // (1) No "still to come" line may name a format this build registers.
     // Checked per SENTENCE, so "still to come: walking a directory tree"
@@ -1096,13 +1080,14 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
             .trim_matches(|c: char| !c.is_alphanumeric())
             .to_lowercase();
         if noun == "containers" {
-            // Either the tier-invariant base count or the full
-            // (`pure` + `legacy`) count is a true claim — see
-            // `full_container_count`'s own comment above for why there are
-            // now two, and why it is derived from the live registry
-            // (via `legacy_bundle_compiled`) rather than bare arithmetic:
-            // a build where `legacy` is on but `lha` failed to register
-            // must NOT still accept a stale "five".
+            // Either the tier-invariant base count (the round-trip
+            // quartet) or the full (`pure` + `legacy`) count is a true
+            // claim — see `full_container_count`'s own comment above for
+            // why it is now trusted straight from the live registry with
+            // no projection: every real build of this binary compiles
+            // `legacy` in, so a `lha`/`arj` registration failure would
+            // already show up as `containers.len()` shrinking, not as a
+            // stale count surviving here.
             assert!(
                 *value == base_containers.len() || *value == full_container_count,
                 "the page says `{word} containers`, but this build has {} base containers \
@@ -1210,18 +1195,27 @@ fn examples_pages_first_worked_example_runs_as_documented() {
 /// unreachable backstop. This pins it all the way through the CLI rather
 /// than only at the trait level each module's unit tests already cover.
 ///
-/// Runtime-checked, not `cfg`-gated. `stuffr-cli` does now declare a
-/// `legacy` feature (a passthrough to `stuffr/legacy`, so
-/// `cargo install stuffr-cli --features legacy` works), but `cargo test
-/// --workspace --all-features` unifies features across the workspace, so
-/// this binary's own `cfg!(feature = "legacy")` is not what decides whether
-/// the three formats are compiled in — the live registry is, the same way
-/// `examples_page_covers_every_format_and_flag` above already asks it for
-/// container counts. On the default `pure` tier (`cargo test --workspace`,
-/// no `--all-features`) none of the three is registered at all, and
-/// `--format lha` is indistinguishable from any other unrecognised name
-/// ("unknown format `lha`", exit 2) — a different, already-covered claim,
-/// not this test's to make.
+/// Runtime-checked, not `cfg`-gated. `stuffr-cli` does declare a `legacy`
+/// feature (a passthrough to `stuffr/legacy`, so `cargo install stuffr-cli
+/// --features legacy` still works — it is just no longer required), but
+/// `cargo test --workspace --all-features` unifies features across the
+/// workspace, so this binary's own `cfg!(feature = "legacy")` is not what
+/// decides whether the three formats are compiled in — the live registry
+/// is, the same way `examples_page_covers_every_format_and_flag` above
+/// already asks it for container counts.
+///
+/// The `!registered` skip below is now believed unreachable rather than
+/// removed: `legacy` joined `stuffr`'s `default` feature set, and
+/// `stuffr-cli`'s own dependency on `stuffr` requests `stuffr`'s defaults
+/// unconditionally (see the dead-projection comment in
+/// `the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come`
+/// above for the measured proof), so there is no longer a `cargo test`
+/// invocation of this binary where any of the three is absent. Kept as a
+/// guard rather than an assertion of reachability: if a future Cargo.toml
+/// edit ever makes a legacy-less `stuffr-cli` build possible again (e.g. by
+/// adding `default-features = false` to that dependency edge), this test
+/// should degrade gracefully rather than fail on a tier it was never
+/// written to cover.
 #[test]
 fn pack_refuses_a_read_only_legacy_format_clearly() {
     let registry = stuffr::registry();
@@ -1235,9 +1229,11 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
         let registered = registry.container(stuffr::FormatId::new(name)).is_some()
             || registry.codec(stuffr::FormatId::new(name)).is_some();
         if !registered {
-            // `legacy` was not compiled into this build (the default
-            // `pure` tier) — the read-only refusal this test pins simply
-            // does not exist on this tier, and asserting "unknown format"
+            // `legacy` was not compiled into this build — believed
+            // unreachable now that `legacy` is in `stuffr`'s `default`
+            // feature set (see this test's own doc comment), but if it ever
+            // fires again, the read-only refusal this test pins simply
+            // does not exist on that build, and asserting "unknown format"
             // instead would duplicate a claim `formats_now_reports_gzip`-
             // style tests already make elsewhere.
             continue;
