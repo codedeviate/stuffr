@@ -1199,6 +1199,90 @@ fn examples_pages_first_worked_example_runs_as_documented() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `pack --format lha`/`arj`/`compress` must refuse CLEARLY — exit 3, naming
+/// the format read-only in this build — never fail obscurely (an internal
+/// panic, a bare i/o error, or an unrelated exit code). Phase 3b's three
+/// legacy formats each answer `Error::Unsupported` from
+/// `Codec::encoder`/`Container::create` directly (see `legacy::lha`,
+/// `legacy::arj`, `legacy::compress_z`'s own `create`/`encoder`
+/// implementations), so this pins that all the way through the CLI rather
+/// than only at the trait level each module's own unit tests already cover.
+///
+/// Runtime-checked, not `cfg`-gated: `stuffr-cli` has no Cargo features of
+/// its own (see its `Cargo.toml`), so whether `legacy` is compiled in can
+/// only be asked of the live registry, the same way
+/// `examples_page_covers_every_format_and_flag` above already asks it for
+/// container counts. On the default `pure` tier (`cargo test --workspace`,
+/// no `--all-features`) none of the three is registered at all, and
+/// `--format lha` is indistinguishable from any other unrecognised name
+/// ("unknown format `lha`", exit 2) — a different, already-covered claim,
+/// not this test's to make.
+#[test]
+fn pack_refuses_a_read_only_legacy_format_clearly() {
+    let registry = stuffr::registry();
+    let dir = tmp("legacy-format-refusal-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("notes.txt");
+    std::fs::write(&src, b"payload").unwrap();
+
+    for (name, out_ext) in [("lha", "lzh"), ("arj", "arj"), ("compress", "z")] {
+        let registered = registry.container(stuffr::FormatId::new(name)).is_some()
+            || registry.codec(stuffr::FormatId::new(name)).is_some();
+        if !registered {
+            // `legacy` was not compiled into this build (the default
+            // `pure` tier) — the read-only refusal this test pins simply
+            // does not exist on this tier, and asserting "unknown format"
+            // instead would duplicate a claim `formats_now_reports_gzip`-
+            // style tests already make elsewhere.
+            continue;
+        }
+        let dst = dir.join(format!("out.{out_ext}"));
+        let res = Command::new(STUFFR)
+            .args([
+                "pack",
+                src.to_str().unwrap(),
+                "--format",
+                name,
+                "-o",
+                dst.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&res.stderr);
+        assert_eq!(
+            res.status.code(),
+            Some(3),
+            "`--format {name}` must refuse at exit 3 (this build cannot do that), got \
+             {:?}; stderr: {err}",
+            res.status.code()
+        );
+        // `lha`/`arj` (containers, `Container::create`) and `compress` (a
+        // codec, `Codec::encoder`) phrase this differently — "read-only in
+        // this build" against "can be read but not written by this
+        // build" — so the check is per-format rather than one shared
+        // substring, to avoid quietly demanding a rewrite neither module
+        // actually needs.
+        let lower = err.to_lowercase();
+        let names_read_only = match name {
+            "compress" => lower.contains("read") && lower.contains("not written"),
+            _ => lower.contains("read-only") || lower.contains("read only"),
+        };
+        assert!(
+            names_read_only,
+            "`--format {name}`'s refusal must name the format as read-only/not-written in \
+             this build rather than fail obscurely: {err}"
+        );
+        assert!(
+            !dst.exists(),
+            "a refused pack must not leave a partial `{}` behind",
+            dst.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_corrupt_archive_exits_five_not_one() {
     let src = tmp("cli-corrupt.txt");
