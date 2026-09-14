@@ -998,19 +998,45 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
     // default build and an `--all-features` one legitimately states two
     // different container counts, and neither is stale just because it
     // does not match whichever tier happens to compile this assertion.
-    // `base_containers` is the tier-invariant quartet (tar/ar/cpio/zip);
-    // `LEGACY_ONLY_CONTAINERS.len()` is added back on rather than reading
-    // `containers.len()` directly, so the "full build" count stays 5 even
-    // when THIS run (`test-pure`) has `lha` absent and cannot see it for
-    // itself. A future legacy container (ARJ) extends the list, not this
-    // reasoning.
+    //
+    // `base_containers` is the tier-invariant quartet (tar/ar/cpio/zip).
+    // The "full" count must NOT be `base_containers.len() +
+    // LEGACY_ONLY_CONTAINERS.len()` computed as bare arithmetic — a first
+    // version of this fix did exactly that, and it cannot tell "the
+    // `legacy` feature is simply off" (test-pure; `lha` was never going to
+    // be here) apart from "the `legacy` feature IS on but `lha`'s own
+    // registration silently broke" (a real regression `stuffr formats`
+    // would also show). Both look identical to a formula that only ever
+    // adds a constant. So this instead asks the LIVE registry whether the
+    // `legacy` Cargo feature bundle was compiled in at all, witnessed by
+    // `compress` — a format registered independently of `lha`, by a
+    // separate call in `register_all`, but gated by the exact same
+    // `legacy` bundle (`stuffr/Cargo.toml`'s `legacy = [".../lha",
+    // ".../arj", ".../compress"]`). If `compress` is present, `legacy` was
+    // compiled, and `lha` is EXPECTED to be there too — its absence then
+    // means a genuine registration bug, not an untested tier, so the "full"
+    // count degrades to the tier-invariant base rather than silently
+    // staying at a stale "base + 1". If `compress` is absent (the default
+    // `pure` tier), there is no way for this run to observe `lha` either
+    // way, so the full count is the best available PROJECTION — base plus
+    // the fixed legacy list — which is what a page describing a
+    // DIFFERENT, `--all-features` build is entitled to claim.
     const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha"];
     let base_containers: Vec<&str> = containers
         .iter()
         .copied()
         .filter(|id| !LEGACY_ONLY_CONTAINERS.contains(id))
         .collect();
-    let full_container_count = base_containers.len() + LEGACY_ONLY_CONTAINERS.len();
+    let legacy_bundle_compiled = rows.iter().any(|r| r.id.as_str() == "compress");
+    let full_container_count = if legacy_bundle_compiled {
+        // `legacy` is compiled: trust the live registry fully. If `lha`'s
+        // own registration is broken, `containers` already reflects that
+        // (it simply is not in it), so this collapses to `base_containers
+        // .len()` on its own — no separate assertion needed to catch it.
+        containers.len()
+    } else {
+        base_containers.len() + LEGACY_ONLY_CONTAINERS.len()
+    };
 
     // (1) No "still to come" line may name a format this build registers.
     // Checked per SENTENCE, so "still to come: walking a directory tree"
@@ -1070,10 +1096,12 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
             .to_lowercase();
         if noun == "containers" {
             // Either the tier-invariant base count or the full
-            // (`pure` + `legacy`) count is a true claim — see the comment
-            // on `LEGACY_ONLY_CONTAINERS` above for why there are now two,
-            // and why the second is computed rather than read off
-            // `containers.len()` (which this run may not be able to see).
+            // (`pure` + `legacy`) count is a true claim — see
+            // `full_container_count`'s own comment above for why there are
+            // now two, and why it is derived from the live registry
+            // (via `legacy_bundle_compiled`) rather than bare arithmetic:
+            // a build where `legacy` is on but `lha` failed to register
+            // must NOT still accept a stale "five".
             assert!(
                 *value == base_containers.len() || *value == full_container_count,
                 "the page says `{word} containers`, but this build has {} base containers \
