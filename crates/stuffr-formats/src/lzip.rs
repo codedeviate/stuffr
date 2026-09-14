@@ -51,6 +51,17 @@
 //! later member prints only the earlier members' data and exits 0 — silent
 //! data loss, indistinguishable from a short, honest file.
 //!
+//! **The same branch is in `LzipStream`**, which is the decoder this codec
+//! actually uses as of Phase 3b (see [`LzipPureDecoder`] for why it moved
+//! off `LzipReader`) — `process`'s `LzipState::Header` arm finishes the
+//! stream instead of raising when `parse_header` fails behind a member that
+//! already decoded. So none of what follows is obsolete; the guard is
+//! needed exactly as before. What DID change is how the guard sees the
+//! evidence: `LzipStream` hands back the bytes it could not make a header
+//! out of (`unused_input()`) and its own count of verified members
+//! (`member_count()`), where `LzipReader` exposed neither and the retired
+//! `TailWrapper` had to infer both from outside.
+//!
 //! ## The fix: two checks, closing two different gaps
 //!
 //! [`GuardedLzipReader`] adds exactly the two checks the raw crate cannot
@@ -62,8 +73,8 @@
 //!    immediately. This alone catches non-LZIP input and a damaged first
 //!    header — but NOT a damaged later member, because by the time that
 //!    member's bytes are current, this check has already run and passed.
-//! 2. **Once `LzipReader` itself reports `Ok(0)`, this wrapper classifies
-//!    whatever the underlying reader still holds** — NOT a blanket "any
+//! 2. **Once the decoder itself reports `Ok(0)`, this wrapper classifies
+//!    what the stream could not use** — NOT a blanket "any
 //!    unconsumed byte is corrupt" (Review Round 1 caught that: it rejected
 //!    files the reference `lzip` binary itself accepts, e.g. NUL-padded
 //!    trailing garbage), but [`GuardedLzipReader::classify_trailing_data`],
@@ -150,10 +161,10 @@
 //!   unconditionally. [`TrailingVerdict::Reject`] unconditionally in this
 //!   case, no further inspection.
 //! - **At least one member decoded, and the stream then truly ends** (no
-//!   more bytes exist anywhere, verified by pulling up to 7 bytes in a
-//!   loop rather than trusting a single `fill_buf`, matching reference
-//!   lzip's own `readblock` loop in spirit — see
-//!   [`GuardedLzipReader::peek_tail`]'s doc): reference lzip's
+//!   more bytes exist anywhere: the bytes `LzipStream` handed back as
+//!   unused, then — only if those do not already answer it — up to 7 more
+//!   pulled in a loop rather than trusting a single `fill_buf`, matching
+//!   reference lzip's own `readblock` loop in spirit): reference lzip's
 //!   `check_prefix` applies — a CONTIGUOUS match against the magic,
 //!   starting at position 0, over however many of the first 4 bytes are
 //!   actually available. Looks like the truncated start of a real header →
@@ -199,9 +210,10 @@
 //! stopped pre-filling before handing a codec its source, THIS codec would
 //! break on a slow/fragmented pipe and its own tests — which all construct
 //! sources from an in-memory `Cursor`, not a genuinely slow pipe — would
-//! not catch it. [`GuardedLzipReader::peek_tail`] (check 2, at the tail of
-//! the stream rather than the head) does not share this dependency: it
-//! loops its own reads rather than trusting one `fill_buf`, precisely
+//! not catch it. [`GuardedLzipReader::classify_trailing_data`] (check 2, at
+//! the tail of the stream rather than the head) does not share this
+//! dependency: it loops its own reads rather than trusting one `fill_buf`,
+//! precisely
 //! because nothing upstream pre-fills the TAIL of the stream the way
 //! `probe` pre-fills the head.
 //!
@@ -344,11 +356,49 @@
 //! while the `lzip`-binary checks validate the outer LZIP container (the
 //! header, trailer and multi-member framing) that `liblzma` never sees.
 //!
-//! ## Decode memory bound: a dictionary pre-flight, not a bounded constructor
+//! ## Decode memory bound: a bounded decoder, with a dictionary pre-flight above it
+//!
+//! **Phase 3b changed this.** Through 0.4.1 the decoder was
+//! `lzma_rust2::LzipReader`, which takes no memory limit at all, and the
+//! whole bound was the prefix pre-flight described below. That pre-flight
+//! parses the FIRST member's header, and an LZIP file is a CONCATENATION of
+//! members, each declaring its own dictionary — so a large dictionary
+//! declared by any member but the first walked straight past it. Measured
+//! through the CLI at 0.4.1, on two `lzip`-produced members with the
+//! second's byte 5 raised to `0x1d`: `stuffr cat --memory-limit 1M` decoded
+//! the 114-byte file at exit 0 with **544 MB** peak RSS, against 7.3 MB for
+//! the first member alone — the same declaration that is refused at exit 6
+//! when it is the first member. Smaller than the hole `xz_pure.rs` closed
+//! one commit earlier, and worth saying so: LZIP's largest coded dictionary
+//! is 512 MiB and the format carries no index, so there is nothing here
+//! like the record count that turned 117 bytes into a 227 GiB reservation.
+//!
+//! The decoder is now [`LzipPureDecoder`], a `Read` loop over the crate's
+//! sans-I/O `LzipStream`, built with `new_mem_limit` — which checks EVERY
+//! member's declared dictionary against the limit inside `start_member`,
+//! before that member's `LzmaStream` exists. See that type's own doc for the
+//! measurements, and for why this is not the push-to-pull bridge Phase 1e
+//! cancelled. The pre-flight below is KEPT above it: it refuses a first
+//! member's declaration before a byte is decoded and before any decoder is
+//! built, with a message naming `--memory-limit`, and that is the message
+//! most users meet. [`rename_oom`] gives the same naming to the refusals
+//! that come from inside the stream, where the crate's own text names
+//! `mem_limit_kb`, an argument no user of this tool has ever seen.
+//!
+//! One consequence worth stating plainly, because it is a behaviour change:
+//! the crate charges `dictionary + 22 KiB` per member
+//! (`get_memory_usage(dict, lc=3, lp=0)`), so `--memory-limit` set to
+//! EXACTLY a stream's dictionary size now refuses it, by those 22 KiB,
+//! where the pre-flight alone allowed it. That is honest — the memory is
+//! really needed — and it is the same shape as the 40 KiB `xz_pure.rs`
+//! documents for its own bound.
 //!
 //! Header byte 5 (the 6th byte: `"LZIP"` magic, 1-byte version, then this)
-//! declares the member's dictionary size, and `lzma_rust2::LzipReader`
-//! allocates a buffer of that size before producing any output — the same
+//! declares the member's dictionary size, and `lzma-rust2` allocates a
+//! buffer of that size — per MEMBER, on both of its decoders — before
+//! producing any output for it (measured below against `LzipReader`, which
+//! was the decoder at the time; `LzipStream` does the same, which is why
+//! `new_mem_limit` checks the declaration first). The same
 //! shape `xz_pure.rs`'s module doc documents for `XzReader`, measured here
 //! independently: a 114-byte member with byte 5 crafted to `0x1d` (declaring
 //! `1 << 29` = 512 MiB) drove peak RSS to **538 MB** against a roughly 1.6 MB
@@ -359,13 +409,13 @@
 //! preset size), so this pre-flight cannot assume a preset default the way a
 //! level-only check could — it has to read the byte.
 //!
-//! Closed the same way as `xz_pure.rs`: [`declared_dictionary_bytes`] parses
-//! header byte 5 directly out of the buffered prefix and `decoder` below
-//! checks it against [`DecodeOpts::memory_limit`] *before* `LzipReader::new`
-//! is ever called, rather than building a push-to-pull bridge onto
-//! `lzma_rust2::LzipStream`'s own bounded constructor — see `lzma_pure.rs`'s
-//! module doc, "The push-to-pull bridge is cancelled", for why that bridge is
-//! not on the table.
+//! The pre-flight itself: [`declared_dictionary_bytes`] parses header byte 5
+//! directly out of the buffered prefix and `decoder` below checks it against
+//! [`DecodeOpts::memory_limit`] *before* any decoder is built. Phase 1f
+//! stopped there, on the reading that reaching `LzipStream`'s own bounded
+//! constructor meant the push-to-pull bridge Phase 1e cancelled; that
+//! reading was wrong — see [`LzipPureDecoder`]'s doc, and `lzma_pure.rs`'s
+//! module doc for what the cancelled bridge actually was.
 //!
 //! The formula, verified against reference `lzip` 1.26's own output:
 //! `base = 1 << (b & 0x1f)`, then `base - (base / 16) * ((b >> 5) & 0x07)`.
@@ -380,12 +430,13 @@
 //! **`None` means ALLOW, not refuse.** Fewer than 6 bytes in the prefix means
 //! a truncated header, which is corruption belonging to
 //! [`GuardedLzipReader`]'s own checks (or the backend's), not to this
-//! resource check.
+//! resource check. That is the pre-flight's rule alone: a member it cannot
+//! read a declaration out of is still bounded underneath it, by the stream.
 
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::num::NonZeroU64;
 
-use lzma_rust2::{LzipOptions, LzipReader, LzipWriter, LzipWriterMt};
+use lzma_rust2::{Action, LzipOptions, LzipStream, LzipWriter, LzipWriterMt, Status};
 
 use stuffr_core::{
     Codec, CodecCaps, CorruptionDetection, DecodeOpts, EncodeOpts, Error, FormatId, FormatMeta,
@@ -461,10 +512,13 @@ impl Codec for Lzip {
     /// `crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF`'s doc.
     ///
     /// **Memory pre-flight**: before `GuardedLzipReader` (and the
-    /// `LzipReader` it wraps) ever exists, header byte 5's declared
+    /// [`LzipPureDecoder`] it wraps) ever exists, header byte 5's declared
     /// dictionary size is read out of the buffered prefix and checked
     /// against [`DecodeOpts::memory_limit`] — see the module doc's "Decode
-    /// memory bound" section. `None` (cannot decide) means allow.
+    /// memory bound" section. `None` (cannot decide) means allow. It is a
+    /// pre-flight above a bounded decoder, not a substitute for one: the
+    /// limit is handed down to `LzipStream::new_mem_limit`, which is what
+    /// bounds the second and every later member of a concatenation.
     ///
     /// **This `fill_buf` is eager, not lazy — one of two exceptions in this
     /// crate** (`xz_pure.rs`'s decoder does the same, for the same reason;
@@ -502,7 +556,7 @@ impl Codec for Lzip {
                 )));
             }
         }
-        let guarded = GuardedLzipReader::new(buffered);
+        let guarded = GuardedLzipReader::new(buffered, o.memory_limit);
         Ok(Box::new(StreamOnly::new(NormalizeDecodeErrors::new(
             guarded,
             LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF,
@@ -596,7 +650,7 @@ fn member_size_for(opts: &LzipOptions) -> NonZeroU64 {
 
 /// Reads the declared dictionary size out of an LZIP member header's byte 5
 /// (the 6th byte: 4-byte `"LZIP"` magic, 1-byte version, then this) —
-/// without constructing `LzipReader` or allocating anything sized by it. See
+/// without constructing a decoder or allocating anything sized by it. See
 /// the module doc's "Decode memory bound" section for why this exists and
 /// what it was measured against.
 ///
@@ -728,158 +782,193 @@ impl Sink for LzipSink {
     }
 }
 
-/// Wraps `BufReader<Box<dyn Source>>` for two things `lzma_rust2::LzipReader`
-/// gives no way to ask from the outside, both needed by
-/// `GuardedLzipReader::classify_trailing_data`:
+/// The `Read` face of `lzma_rust2::LzipStream`, this codec's decoder, and
+/// what makes [`DecodeOpts::memory_limit`] bind on EVERY member rather than
+/// only the first.
 ///
-/// 1. **How many bytes has `LzipReader` genuinely consumed so far** (via its
-///    own `Read::read` calls — never via `fill_buf` alone, which is a
-///    non-destructive peek this codec's own upfront magic check relies on
-///    NOT counting as consumption). This is what makes "has at least one
-///    member been successfully decoded yet" answerable at all: the crate
-///    exposes no such accessor, and the two scenarios
-///    `classify_trailing_data` must tell apart (a header-parse failure on
-///    the very first attempt, versus a fully decoded — possibly
-///    empty-content — first member followed by nothing else) are otherwise
-///    indistinguishable purely from `Ok`/`Err` timing at the outer `read`
-///    call boundary: both manifest as "the very first call returns `Ok(0)`".
-/// 2. **The last up to 6 bytes actually consumed.** This is the harder
-///    problem, and the one that broke the first version of this fix: when
-///    `LzipReader::start_next_member` fails to parse the next member's
-///    header, it does NOT fail atomically — `LzipHeader::parse` reads
-///    magic, then version, then the dictionary-size byte, sequentially,
-///    and returns as soon as any one of them is wrong. Those bytes are
-///    genuinely consumed (the read calls that obtained them succeeded)
-///    before the failure, and once `LzipReader` gives up and hands control
-///    back to us as `Ok(0)`, they are GONE — not retrievable by peeking
-///    forward, because peeking forward only sees what comes AFTER them.
-///    Measured directly what this breaks: appending `"LZ"` + 40 unrelated
-///    bytes after a valid member, `LzipReader`'s own failed header attempt
-///    reads exactly 4 bytes (`"LZXX"`, the magic mismatching at the third
-///    byte) before giving up — so a plain forward peek from that point
-///    only ever sees the 38 REMAINING bytes, none of which resemble the
-///    magic at all, and would wrongly ACCEPT what reference lzip rejects.
-///    Recording the last 6 consumed bytes as they flow through — nothing
-///    else ever intervenes between a failed header attempt and the `Ok(0)`
-///    it produces (verified against `lzma_rust2` 0.20.1's own control
-///    flow) — recovers the right byte VALUES, but `tail` alone cannot say
-///    how MANY of them belong to the failed attempt once it has already
-///    saturated at 6 from earlier, unrelated reads.
+/// **Why not `LzipReader`, which is already `Read`-shaped.** `LzipReader`
+/// takes no memory limit of any kind, and the dictionary it allocates per
+/// member is sized by a number that member declares about ITSELF (header
+/// byte 5 — see [`declared_dictionary_bytes`]). Phase 1f bounded that with
+/// a prefix pre-flight: one header, parsed out of the buffered prefix,
+/// checked before the reader was built. An LZIP file is a CONCATENATION of
+/// members, so a dictionary declared by any member but the first walked
+/// straight past it.
 ///
-///    Review Round 2 caught that the fix's first version got this count via
-///    arithmetic that assumed exactly one 20-byte trailer preceded the
-///    failed attempt within the same outer read call (later widened,
-///    still wrongly, to "one trailer plus N complete 26-byte empty-member
-///    cycles"). Both were WRONG, and reachable with a single genuinely
-///    empty-content member (legal LZIP — this codec's own `lzip_conforms`
-///    test round-trips one) sitting between a real member and a corrupted
-///    header: `LzipReader`'s loop processes the empty member's
-///    already-succeeded header, its trailer, AND the next (failed) header
-///    attempt all within ONE outer call, and the empty member's own LZMA
-///    end-marker has no fixed, predictable byte cost (measured: 36 bytes
-///    total for this codec's own empty-payload member, not the 26 either
-///    fix assumed) — no per-member byte count is safe to assume, ever.
+/// Measured directly at 0.4.1, before this change: `lzip -9` on a 20-byte
+/// payload as member one (a 4,096-byte dictionary — lzip shrinks the
+/// dictionary to fit small inputs) followed by the same again with byte 5
+/// patched to `0x1d`, declaring `1 << 29` = 512 MiB, as member two.
+/// `stuffr cat --memory-limit 1M` on the 114-byte result decoded both
+/// members and exited 0 at **544 MB** peak RSS, against **7.3 MB** for
+/// member one alone — the identical declaration that is refused at exit 6
+/// when it is the FIRST member. Reference `lzip` 1.26 decodes that file
+/// correctly (it grows its buffer rather than preallocating the declared
+/// size), so it is a legitimate file to refuse on resource grounds, never a
+/// corrupt one — the same standing as the single-member fixture in
+/// `the_reference_tool_still_accepts_what_we_now_refuse`.
 ///
-///    The fix that actually holds does not try to predict any member's
-///    byte cost at all. `call_sizes` tracks the sizes of the last 3 `read`
-///    calls, watching for the one pattern that can only mean "a trailer
-///    was just fully, successfully read": `4, 8, 8` — `LzipTrailer::parse`
-///    reads its three fields (CRC, data size, member size) via exactly
-///    those three fixed-size calls, in that order, and a trailer that
-///    fails partway is a genuine `Err` this codec never reaches
-///    `classify_trailing_data` for at all (propagated directly, not
-///    folded into `Ok(0)`). Every time that pattern is seen,
-///    `consumed_after_last_trailer` snapshots `consumed` — so by
-///    construction, whatever has been consumed SINCE that snapshot is
-///    EXACTLY "everything after the most recently confirmed trailer",
-///    updated fresh at every member boundary, however many intervened,
-///    however large their content. The failed attempt is always the very
-///    last thing consumed before `Ok(0)` (nothing else reads in between),
-///    so `consumed - consumed_after_last_trailer` recovers its byte count
-///    directly, with no assumption left to falsify — including the
-///    partial-attempt case (a header failing partway because the source
-///    itself ran out, contributing a genuine but harmless 0-byte read).
+/// The exposure is real but NOT xz's: LZIP's largest coded dictionary is
+/// 512 MiB and the format carries no index, so there is nothing here like
+/// the record count that turned 117 bytes into a 227 GiB reservation in
+/// `xz_pure.rs`. Ratio measured above: 114 bytes to 544 MB.
 ///
-///    One residual worth naming rather than leaving implicit: `[4, 8, 8]`
-///    is a READ-SIZE pattern, not a content check, so a real LZMA content
-///    read that the CALLER happened to split into three consecutive calls
-///    of exactly 4, then 8, then 8 bytes would reset the snapshot too
-///    early, by coincidence. Not ruled out by construction — but not
-///    reachable by anything this project's own callers do either: `ops`
-///    drives decoding with a 64 KiB buffer, and the conformance harness's
-///    incremental-decode property bounds every read at 1 byte, which can
-///    never produce an 8-byte call at all. No test exercises this because
-///    no caller in this codebase is shaped to trigger it.
-struct TailWrapper<R> {
+/// `LzipStream` — the crate's sans-I/O LZIP decoder, same module, same
+/// parsers — has the bound by construction: `new_mem_limit` checks every
+/// member header against the limit inside `start_member`, BEFORE that
+/// member's `LzmaStream` and its dictionary exist. Its own doc says so
+/// ("Each member header is checked against the limit as it is parsed").
+///
+/// **This is not the push-to-pull bridge Phase 1e cancelled**, which is the
+/// reading this module's doc used to give for not reaching for
+/// `new_mem_limit` at all. That ruling (`lzma_pure.rs`'s module doc) was
+/// about `lzma-rs`'s `Write`-shaped decompressor, whose `LzCircularBuffer`
+/// emitted nothing until the dictionary window wrapped — buffering BEHIND
+/// the interface a bridge would wrap, which no bridge could undo.
+/// `LzipStream::process` has none of that shape: it is a pull API already
+/// (hand it an input slice and an output slice, it fills what it can), so
+/// this adapter is a loop, not a bridge, and conformance property 8
+/// (incremental decoding) still passes. `xz_pure.rs`'s `XzPureDecoder` is
+/// the same loop over the same crate's `XzStream`, landed one commit
+/// earlier for the same reason.
+///
+/// **It also retires `TailWrapper`**, the 150-line reader this type
+/// replaced. That wrapper existed only because `LzipReader` exposes
+/// neither "how many members have you decoded" nor "what bytes did you
+/// absorb that belong to no member", so
+/// [`GuardedLzipReader::classify_trailing_data`] had to recover both from
+/// outside: a byte counter, a 6-byte sliding window of consumed bytes, and
+/// a watch for the `[4, 8, 8]` read-size shape `LzipTrailer::parse` always
+/// produces, whose one documented residual was that an ordinary content
+/// read split 4/8/8 by a caller would reset the snapshot by coincidence.
+/// `LzipStream` answers both questions directly — [`member_count`] and
+/// [`unused_input`], the latter being exactly `accum` (the failed header
+/// attempt, 0-6 bytes) followed by the payload decoder's pushback, in
+/// stream order — so every one of those inferences is gone, residual
+/// included.
+///
+/// [`member_count`]: LzipStream::member_count
+/// [`unused_input`]: LzipStream::unused_input
+struct LzipPureDecoder<R: BufRead> {
     inner: R,
-    consumed: u64,
-    /// Last up to 6 bytes consumed, oldest at index 0 of the filled prefix.
-    tail: [u8; 6],
-    tail_len: usize,
-    /// Sizes of the last 3 `read` calls, oldest first (`[0]`) to most
-    /// recent (`[2]`) — watched only for the `[4, 8, 8]` shape a
-    /// completed trailer read always produces. See this type's doc, point
-    /// 2, for why that shape is unambiguous.
-    call_sizes: [usize; 3],
-    /// `consumed`, snapshotted every time `call_sizes` becomes `[4, 8, 8]`
-    /// (a trailer was just fully read). See this type's doc, point 2.
-    consumed_after_last_trailer: u64,
+    stream: LzipStream,
+    done: bool,
 }
 
-impl<R> TailWrapper<R> {
-    fn new(inner: R) -> Self {
+impl<R: BufRead> LzipPureDecoder<R> {
+    /// `None` means no bound, matching [`DecodeOpts::memory_limit`]'s own
+    /// contract for library callers (see
+    /// `no_limit_means_no_bound_for_library_callers`).
+    fn new(inner: R, memory_limit: Option<u64>) -> Self {
+        let stream = match memory_limit {
+            Some(limit) => LzipStream::new_mem_limit(mem_limit_kb(limit)),
+            None => LzipStream::new(),
+        };
         Self {
             inner,
-            consumed: 0,
-            tail: [0u8; 6],
-            tail_len: 0,
-            call_sizes: [0; 3],
-            consumed_after_last_trailer: 0,
+            stream,
+            done: false,
         }
     }
 
-    /// Reaches the wrapped reader directly — for `GuardedLzipReader`'s own
-    /// peeks (`fill_buf`, and the destructive forward read past a failed
-    /// header attempt), which must not themselves feed back into `tail`,
-    /// `consumed`, or `call_sizes`: by the time either peek runs, the
-    /// decision they exist to support has either not yet been made
-    /// (`fill_buf`, non-destructive by construction) or already has been
-    /// (the forward read, which runs AFTER everything else was consulted).
-    fn raw_mut(&mut self) -> &mut R {
+    /// The buffered source underneath, for [`GuardedLzipReader`]'s own two
+    /// peeks: the magic check before decoding starts (non-destructive) and
+    /// the forward read past the end (destructive, and run only once the
+    /// stream has finished, so nothing downstream can want those bytes
+    /// again).
+    fn inner_mut(&mut self) -> &mut R {
         &mut self.inner
     }
 
-    /// Slides up to 6 bytes' worth of newly-consumed data into `tail`,
-    /// dropping the oldest bytes first if it would overflow.
-    fn push_tail(&mut self, new: &[u8]) {
-        if new.is_empty() {
-            return;
-        }
-        if new.len() >= self.tail.len() {
-            let start = new.len() - self.tail.len();
-            self.tail.copy_from_slice(&new[start..]);
-            self.tail_len = self.tail.len();
-            return;
-        }
-        let total = (self.tail_len + new.len()).min(self.tail.len());
-        let drop_from_front = (self.tail_len + new.len()).saturating_sub(self.tail.len());
-        let kept = self.tail_len - drop_from_front;
-        self.tail.copy_within(drop_from_front..self.tail_len, 0);
-        self.tail[kept..kept + new.len()].copy_from_slice(new);
-        self.tail_len = total;
+    /// Members decoded AND verified against their own trailers so far.
+    /// `0` at the point [`GuardedLzipReader::classify_trailing_data`] runs
+    /// would mean the stream ended without a single good member.
+    fn member_count(&self) -> usize {
+        self.stream.member_count()
+    }
+
+    /// Bytes taken from the source that turned out to belong to no member:
+    /// the header attempt that failed to parse, then whatever the payload
+    /// decoder had read ahead and handed back, in stream order. Empty until
+    /// the stream has ended.
+    fn unused_input(&self) -> &[u8] {
+        self.stream.unused_input()
     }
 }
 
-impl<R: Read> Read for TailWrapper<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.consumed += n as u64;
-        self.push_tail(&buf[..n]);
-        self.call_sizes = [self.call_sizes[1], self.call_sizes[2], n];
-        if self.call_sizes == [4, 8, 8] {
-            self.consumed_after_last_trailer = self.consumed;
+/// [`DecodeOpts::memory_limit`]'s bytes as `lzma_rust2`'s KiB.
+///
+/// Rounds DOWN, so the limit is never exceeded by the rounding itself, and
+/// clamps to `u32::MAX - 1` rather than `u32::MAX`: the crate documents
+/// `u32::MAX` as "no limit", so a caller asking for a 4 TiB bound would
+/// otherwise get an unbounded decoder — the one value in the whole range
+/// that must not round to itself.
+///
+/// `xz_pure.rs` has a byte-identical helper, deliberately not shared: that
+/// module only exists in a build with the `xz-pure` feature, and this one
+/// is built unconditionally, so importing it would silently unbound LZIP in
+/// every `c-backed` build.
+fn mem_limit_kb(limit: u64) -> u32 {
+    (limit / 1024).min(u64::from(u32::MAX - 1)) as u32
+}
+
+/// Re-words `lzma_rust2`'s `mem_limit_kb` refusal so it names the flag that
+/// raises it, the way [`Lzip::decoder`]'s pre-flight does — the crate's own
+/// text is `needed memory too big for mem_limit_kb`, which names an
+/// argument no user of this tool has ever seen.
+///
+/// The KIND is preserved exactly, and that is the load-bearing part:
+/// `OutOfMemory` is deliberately absent from
+/// [`LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF`], so it reaches
+/// `Error::from_decode_io` unfolded and classifies as `Error::ResourceLimit`
+/// — exit 6, a bound on work, never exit 5's "this file is damaged".
+fn rename_oom(e: std::io::Error) -> std::io::Error {
+    if e.kind() != ErrorKind::OutOfMemory {
+        return e;
+    }
+    std::io::Error::new(
+        ErrorKind::OutOfMemory,
+        format!("lzip: decoding this stream needs more memory than --memory-limit allows ({e})"),
+    )
+}
+
+impl<R: BufRead> Read for LzipPureDecoder<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.done || out.is_empty() {
+            return Ok(0);
         }
-        Ok(n)
+        loop {
+            let input = self.inner.fill_buf()?;
+            let starved = input.is_empty();
+            // `Finish` only once the source is genuinely exhausted: passing
+            // it while bytes remain would make every short read look like a
+            // truncated stream.
+            let action = if starved { Action::Finish } else { Action::Run };
+            let result = self
+                .stream
+                .process(input, out, action)
+                .map_err(rename_oom)?;
+            self.inner.consume(result.bytes_consumed);
+
+            if result.status == Status::StreamEnd {
+                self.done = true;
+                return Ok(result.bytes_produced);
+            }
+            if result.bytes_produced > 0 {
+                return Ok(result.bytes_produced);
+            }
+            // No output, no end, and nothing left to feed it: the stream
+            // wants more input that will never arrive. `process` raises
+            // this itself from the header and trailer states, but the LZMA1
+            // payload state can return `Ok` with nothing moved, and looping
+            // on that would hang rather than report the truncation.
+            if starved && result.bytes_consumed == 0 {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "unexpected end of LZIP stream",
+                ));
+            }
+        }
     }
 }
 
@@ -889,7 +978,7 @@ impl<R: Read> Read for TailWrapper<R> {
 /// blanket "any leftover byte is corrupt" — that was Review Round 1's
 /// finding: it rejected files the reference `lzip` accepts.
 struct GuardedLzipReader {
-    inner: LzipReader<TailWrapper<BufReader<Box<dyn Source>>>>,
+    inner: LzipPureDecoder<BufReader<Box<dyn Source>>>,
     state: GuardState,
 }
 
@@ -922,27 +1011,27 @@ impl GuardedLzipReader {
     /// `Box<dyn Source>` so `Codec::decoder` can peek the header's declared
     /// dictionary size (via one non-destructive `fill_buf` call — see the
     /// module doc's "Decode memory bound" section) *before* this type, and
-    /// the `LzipReader` it wraps, ever exist — nothing already buffered by
-    /// that peek is re-read from the underlying source, because it is the
-    /// same `BufReader`, not a fresh one.
-    fn new(buffered: BufReader<Box<dyn Source>>) -> Self {
+    /// the [`LzipPureDecoder`] it wraps, ever exist — nothing already
+    /// buffered by that peek is re-read from the underlying source, because
+    /// it is the same `BufReader`, not a fresh one.
+    ///
+    /// `memory_limit` is handed straight down to `LzipStream::new_mem_limit`,
+    /// which is what bounds the SECOND and every later member; the
+    /// pre-flight in `Codec::decoder` only ever sees the first.
+    fn new(buffered: BufReader<Box<dyn Source>>, memory_limit: Option<u64>) -> Self {
         Self {
-            inner: LzipReader::new(TailWrapper::new(buffered)),
+            inner: LzipPureDecoder::new(buffered, memory_limit),
             state: GuardState::Unchecked,
         }
     }
 
     /// Non-destructive: do the first bytes available match LZIP's magic?
     /// One `BufRead::fill_buf` call, run once before `inner` ever sees the
-    /// stream. Reaches straight through `TailWrapper` via `raw_mut()`: this
-    /// peek must NOT be recorded as consumption (see `TailWrapper`'s doc).
+    /// stream. Reaches the buffered source directly, past the decoder:
+    /// `fill_buf` is non-destructive by construction, so nothing the
+    /// decoder later reads is lost to it.
     fn magic_matches(&mut self) -> std::io::Result<bool> {
-        Ok(self
-            .inner
-            .inner_mut()
-            .raw_mut()
-            .fill_buf()?
-            .starts_with(MAGIC_BYTES))
+        Ok(self.inner.inner_mut().fill_buf()?.starts_with(MAGIC_BYTES))
     }
 
     /// Pulls up to `need` more bytes from whatever remains once `inner`
@@ -953,18 +1042,16 @@ impl GuardedLzipReader {
     /// (`decoder.cc`), needed so a source that happens to deliver these
     /// final bytes across more than one physical read (a slow pipe, say)
     /// is not mistaken for having fewer bytes left than it really does.
-    /// Reaches straight through `TailWrapper` via `raw_mut()`: by this
-    /// point `classify_trailing_data` has already consulted `tail` and
-    /// `consumed`, so nothing is lost by bypassing further tracking, and
-    /// destructive is fine regardless — `inner` has already finished, so
-    /// nothing downstream will ever see these bytes again either way.
+    /// Reaches the buffered source directly, past the decoder: destructive
+    /// is fine here — `inner` has already reported its end, so nothing
+    /// downstream will ever see these bytes again.
     ///
     /// Returns `(bytes, how_many_are_real)`.
     fn read_more(&mut self, need: usize) -> std::io::Result<(Vec<u8>, usize)> {
         let mut probe = vec![0u8; need];
         let mut n = 0usize;
         while n < need {
-            match self.inner.inner_mut().raw_mut().read(&mut probe[n..])? {
+            match self.inner.inner_mut().read(&mut probe[n..])? {
                 0 => break,
                 read => n += read,
             }
@@ -985,7 +1072,7 @@ impl GuardedLzipReader {
     /// The one case this function does NOT need to handle at all: leftover
     /// bytes whose first four match `"LZIP"` exactly AND at least one more
     /// byte follows them. That combination never reaches here — if the
-    /// magic is fully intact and something follows, `lzma_rust2::LzipReader`
+    /// magic is fully intact and something follows, `lzma_rust2::LzipStream`
     /// itself successfully starts parsing it as a genuine next member and
     /// keeps decoding (or fails with a real decode error), so `inner.read`
     /// does not return `Ok(0)` in the first place.
@@ -996,107 +1083,64 @@ impl GuardedLzipReader {
         // at member header" / bad-version / bad-dictionary-size, none of
         // which ever consult `check_prefix`/`check_corrupt`.
         //
-        // The ONLY way this function is reached with no member successfully
-        // decoded yet: `LzipHeader::parse` failed on version or dictionary
-        // size (magic itself is already covered by this codec's own upfront
-        // check, run before `inner` ever sees the stream). That failure
-        // consumes at most 6 bytes (`lzma_rust2`'s own `HEADER_SIZE`) before
-        // giving up — nowhere near enough for a genuine member, which needs
-        // at least `HEADER_SIZE + TRAILER_SIZE` (26) bytes even for a
-        // zero-byte payload, and measurably more in practice (a real
-        // empty-payload member is 36 bytes). This is NOT reachable via "a
-        // fully valid header with a missing body" — that combination
-        // succeeds `start_next_member` and fails later, as a genuine `Err`
-        // from constructing/reading the LZMA body, never as `Ok(0)` here;
-        // verified directly (see
-        // `a_lone_valid_looking_header_with_no_body_is_rejected_as_the_first_member`,
-        // which passes via that `Err` path, not through this branch at all).
-        //
-        // [`TailWrapper`] is what makes "at least one member decoded"
-        // externally observable at all, since `lzma_rust2::LzipReader`
-        // exposes no such accessor and the two scenarios are otherwise
-        // indistinguishable from outside (both look like "the very first
-        // `read` call returns `Ok(0)`") — see that type's doc.
-        const MIN_VALID_MEMBER_SIZE: u64 = 26; // HEADER_SIZE (6) + TRAILER_SIZE (20)
-        let wrapper = self.inner.inner_mut();
-        if wrapper.consumed < MIN_VALID_MEMBER_SIZE {
+        // `LzipStream` raises exactly those as a genuine `Err` rather than
+        // as a silent end — `parse_header` fails with `self.members == 0`,
+        // so the error propagates instead of finishing the stream — which
+        // means this function is not reachable with nothing decoded; `read`
+        // below sees them on its `Err` arm and fails. The branch here is
+        // belt-and-braces: ACCEPTING with no member decoded would be the
+        // silent-empty-decode defect this type exists to close, so it
+        // refuses rather than resting on that reading of the crate staying
+        // true. `member_count()` is the crate's own count of members
+        // decoded AND verified against their trailers, where the retired
+        // `TailWrapper` had to infer "at least one member" from a 26-byte
+        // minimum on a byte counter it maintained itself.
+        if self.inner.member_count() == 0 {
             return Ok(TrailingVerdict::Reject(
-                "the LZIP stream's first member header parsed far enough to pass the magic \
-                 check but failed later (version or dictionary size) — the reference lzip tool \
-                 treats this as an unconditional error too, never as ignorable trailing data",
+                "the LZIP stream ended without a single verified member — the reference lzip \
+                 tool treats a first-member header failure as an unconditional error too, \
+                 never as ignorable trailing data",
             ));
         }
 
-        // Reconstruct the up-to-6-byte header attempt `LzipReader`'s own
-        // failed `start_next_member` just made. `tail`'s LAST 6 bytes are
-        // "the last 6 bytes consumed overall, oldest at index 0" — but that
-        // window saturates at 6, so once it has been filled by an earlier,
-        // UNRELATED read (a prior member's trailer, say), the sliding
-        // window alone cannot tell "these are this attempt's own bytes"
-        // apart from "these are stale bytes from whatever came before it".
-        // Measured directly why this distinction matters: appending `"LZ"`
-        // + 40 unrelated bytes after a valid member, the failed attempt
-        // consumes exactly 4 bytes (`"LZXX"`) — using `tail`'s full 6 bytes
-        // unconditionally would silently include 2 bytes from the PRIOR
-        // member's trailer at the front, misaligning the window and (in
-        // that specific case) hiding the magic mismatch entirely.
+        // The header attempt that ended the stream, straight from the
+        // crate: `LzipStream::unused_input()` is `accum` — the bytes
+        // collected toward a member header when parsing them failed, or
+        // when the source ran out part-way through one — followed by
+        // whatever pushback the payload decoder had read ahead and handed
+        // back, in stream order. Everything past it is still unread in the
+        // `BufReader` underneath.
         //
-        // Review Round 2 caught that this fix's first version tried to
-        // recover the count via byte-count arithmetic that assumed a fixed
-        // cost per intervening member (one 20-byte trailer, later widened
-        // to "20 + 26*M" for M intervening empty members) — WRONG either
-        // way, and reachable by a perfectly ordinary, CONFORMING encoder
-        // with just ONE intervening empty member, not a contrived chain: a
-        // genuinely empty-content member is legal LZIP (this codec's own
-        // `lzip_conforms` test round-trips one), and its own LZMA
-        // end-marker has no fixed, predictable byte cost — "26 bytes per
-        // empty member" was itself an unverified assumption, and the real
-        // figure (measured: 36 bytes for this codec's own empty-payload
-        // member) broke the arithmetic the same way the original "one
-        // trailer" assumption did. One real member, one genuinely EMPTY
-        // member, then a corrupted third header is enough to reach this —
-        // and it is exactly the kind of file `lzip` itself can produce and
-        // reference lzip 1.26 still rejects ("Corrupt header in
-        // multimember file", file and stdin agreeing). A second attempt,
-        // tracking read-call SIZES instead of an aggregate count, fixed
-        // that case but broke a DIFFERENT one it hadn't been checked
-        // against: a header attempt failing because the source itself ran
-        // out partway through (a genuine, harmless 0-byte read) doesn't
-        // fit a fixed [4]/[4,1]/[4,1,1] size pattern either.
-        //
-        // No fixed per-member cost, and no fixed read-call-size pattern,
-        // survived contact with a real case — so the fix that holds
-        // predicts neither. [`TailWrapper::consumed_after_last_trailer`]
-        // is a snapshot of `consumed` taken every time a trailer is
-        // confirmed fully read (the unambiguous `[4, 8, 8]` read-size
-        // shape `LzipTrailer::parse` always produces) — updated fresh at
-        // EVERY member boundary, however many intervened, however large
-        // their content, with no need to predict any of it. The failed
-        // attempt is always the very last thing consumed before `Ok(0)`
-        // (nothing else reads in between), so simply summing bytes
-        // consumed since that snapshot recovers its count directly —
-        // including the partial-attempt case, since a harmless 0-byte read
-        // contributes 0 to a sum without needing special-casing the way it
-        // broke the size-pattern match.
-        let k = ((wrapper.consumed - wrapper.consumed_after_last_trailer) as usize).min(6);
-        let tail = wrapper.tail;
+        // The retired `TailWrapper` reconstructed this same window from
+        // outside, with a byte counter, a 6-byte sliding window and a watch
+        // for the `[4, 8, 8]` read-size shape a completed trailer read
+        // always produces, because `LzipReader` exposes nothing equivalent.
+        // See [`LzipPureDecoder`]'s doc for what that cost and for the one
+        // coincidence it could still get wrong.
+        let leftover = self.inner.unused_input();
+        let leftover_len = leftover.len();
+        let k = leftover_len.min(6);
         let mut window = [0u8; 6];
-        window[..k].copy_from_slice(&tail[6 - k..]);
+        window[..k].copy_from_slice(&leftover[..k]);
 
-        // Peek `7 - k` bytes forward: enough to fill out the rest of the
-        // conceptual 6-byte window plus one more, to answer reference
-        // lzip's own "is there anything beyond it" question in the same
-        // single step.
-        let forward_needed = 6 - k + 1;
-        let (forward, forward_got) = self.read_more(forward_needed)?;
-        let extra = forward_got.min(6 - k);
-        window[k..k + extra].copy_from_slice(&forward[..extra]);
-        let window_len = k + extra;
-        // Got fewer bytes forward than asked for only because a `read` call
-        // genuinely returned `Ok(0)` — true end of the source, nothing
-        // beyond the window. Reference lzip's own `rdec.finished()` check,
-        // reconstructed the same way.
-        let at_eof = forward_got < forward_needed;
+        // More than a window's worth already in hand answers reference
+        // lzip's "is there anything beyond it" question outright, with no
+        // read at all. Otherwise peek `6 - k + 1` bytes forward: enough to
+        // fill out the rest of the conceptual 6-byte window plus one more,
+        // answering it in the same single step.
+        let (window_len, at_eof) = if leftover_len > 6 {
+            (6, false)
+        } else {
+            let forward_needed = 6 - k + 1;
+            let (forward, forward_got) = self.read_more(forward_needed)?;
+            let extra = forward_got.min(6 - k);
+            window[k..k + extra].copy_from_slice(&forward[..extra]);
+            // Got fewer bytes forward than asked for only because a `read`
+            // call genuinely returned `Ok(0)` — true end of the source,
+            // nothing beyond the window. Reference lzip's own
+            // `rdec.finished()` check, reconstructed the same way.
+            (k + extra, forward_got < forward_needed)
+        };
 
         if at_eof {
             if window_len == 0 {
@@ -1542,21 +1586,32 @@ mod tests {
     /// measurement rather than an assumption from the format spec alone —
     /// see the module doc's "Corruption detection" section.
     ///
-    /// Measured exactly TWO positions that flip a byte and still decode to
-    /// the exact original plaintext (for a 173-byte encoded stream: bytes
-    /// 150 and 152, the last three bytes of the embedded LZMA1 body minus
-    /// one). This is not a gap in the CRC32 guarantee — it is the same
-    /// range-coder flush-tail phenomenon `lzma_pure.rs`'s own sweep
-    /// documents for the identical underlying `lzma_rust2::LzmaReader`/
-    /// `LzmaWriter` pair: a handful of trailing bytes in the range coder's
-    /// flush exist to satisfy its own internal state machine, and their
-    /// exact VALUE (as opposed to their presence) does not reach the
-    /// decoded output at all for a short stream. A byte that provably
-    /// cannot change the decoded content cannot be "detected" as corrupt by
-    /// any checksum, LZIP's included, because there is nothing wrong with
-    /// the content to detect — the same reasoning `snappy.rs`'s own
-    /// `Always` sweep documents for its one framing-byte exception. Kept as
-    /// an exact assertion, not a bound, so a change in this count (a
+    /// **Every one of the 173 positions is detected. This number changed
+    /// with the decoder, and the change is an improvement, not a
+    /// relaxation.** Through 0.4.1 — `LzipReader` over `LzmaReader` — this
+    /// sweep measured exactly TWO positions that flip a byte and still
+    /// decode to the exact original plaintext (bytes 150 and 152, in the
+    /// embedded LZMA1 body's range-coder flush tail), and documented them
+    /// as the same structurally-inert phenomenon `lzma_pure.rs`'s own sweep
+    /// records: bytes whose VALUE, as opposed to their presence, never
+    /// reaches the decoded output of a short stream.
+    ///
+    /// `LzipStream` over `LzmaStream` — [`LzipPureDecoder`]'s backend —
+    /// reports both as `InvalidData: LZMA stream not properly terminated`,
+    /// measured directly at each position. That message comes from
+    /// `lzma_reader.rs`'s `run`, which checks the range decoder's own end
+    /// state (`rc.is_stream_finished()`) once the end-of-payload marker has
+    /// been seen: a flush tail that no longer decodes to the coder's
+    /// finished state is caught there, where the previous route decoded the
+    /// same bytes and said nothing. The plaintext still comes back
+    /// identical at those positions if you ignore the error — the byte
+    /// genuinely cannot change the content — so this is a stricter
+    /// STRUCTURAL check, not a content one, and strictness in that
+    /// direction cannot make a good file fail: the reference-tool tests in
+    /// this module decode real `lzip` output at every preset, and the
+    /// round-trip and conformance properties cover this codec's own.
+    ///
+    /// Kept as an exact assertion, not a bound, so a change in this count (a
     /// `lzma-rust2` upgrade changing the flush length, say) gets noticed
     /// rather than silently absorbed.
     #[test]
@@ -1600,9 +1655,10 @@ mod tests {
              backend raises onto InvalidData; {other_kind} positions reported neither"
         );
         assert_eq!(
-            silently_unchanged, 2,
-            "expected exactly 2 structurally inert bytes (the range coder's flush tail) for \
-             this payload; measured {silently_unchanged} — see this test's doc comment before \
+            silently_unchanged, 0,
+            "every flipped position must be DETECTED on this decoder — the two flush-tail \
+             bytes that used to pass silently are caught by the range coder's own end-state \
+             check; measured {silently_unchanged} — see this test's doc comment before \
              changing this number"
         );
         assert_eq!(invalid_data, packed.len() - silently_unchanged);
@@ -2454,5 +2510,191 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- Every member's dictionary, not just the first (Phase 3b) — see
+    // [`LzipPureDecoder`]'s own doc for the measurement and for why
+    // `LzipStream::new_mem_limit` is a loop rather than the push-to-pull
+    // bridge Phase 1e cancelled.
+
+    /// **The hole the prefix pre-flight cannot see.**
+    /// [`declared_dictionary_bytes`] reads header byte 5 of the FIRST
+    /// member out of the buffered prefix, and an LZIP file is a
+    /// concatenation of members, each carrying its own dictionary
+    /// declaration. A small first member therefore let an arbitrarily large
+    /// later one straight through. Measured at 0.4.1 through the CLI, on a
+    /// file built the way `lzip` itself concatenates (`lzip -c a > out.lz;
+    /// lzip -c b >> out.lz`, byte 5 of the second member then raised to
+    /// `0x1d`): `stuffr cat --memory-limit 1M` decoded both members at exit
+    /// 0 with **544 MB** peak RSS, against **7.3 MB** for the first member
+    /// alone.
+    ///
+    /// The fixture here is the same shape from this codec's OWN encoder,
+    /// which declares a fixed 8 MiB dictionary at its default level rather
+    /// than shrinking it to fit a tiny payload the way reference `lzip`
+    /// does — hence the 16 MiB limit below: large enough that member one
+    /// passes both the pre-flight and the per-member bound, small enough
+    /// that member two's 512 MiB cannot.
+    ///
+    /// The refusal must therefore arrive from `read`, not from `decoder()`
+    /// — which is why this test decodes rather than just constructing — and
+    /// it must be exit 6: the file is not damaged (reference `lzip` decodes
+    /// it, as `the_reference_tool_still_accepts_what_we_now_refuse` pins for
+    /// the single-member version of the same crafted byte), this build
+    /// simply will not allocate that much for it.
+    ///
+    /// **On what this asserts.** `xz_pure.rs`'s equivalent had to pin the
+    /// message, because its reproducer exited 5 both before and after the
+    /// fix. This one does not share that trap: before the fix the decode
+    /// SUCCEEDED, so `expect_err` alone already separates the two
+    /// implementations. The exit code and the flag name are asserted on top
+    /// of that because they are the contract a user meets — exit 6, never
+    /// exit 5, and a message naming the flag that raises the bound.
+    #[test]
+    fn a_later_member_declaring_a_bigger_dictionary_is_refused_too() {
+        let mut second = compress(b"second-member-payload");
+        assert_ne!(
+            second[5], 0x1d,
+            "the fixture's premise: this codec's own encode declares a SMALL dictionary for a \
+             tiny payload, so raising byte 5 below is what makes member two expensive"
+        );
+        second[5] = 0x1d; // declares 1 << 29 = 512 MiB
+
+        let mut two = compress(b"first-member-payload");
+        let first_len = two.len();
+        two.extend_from_slice(&second);
+
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(std::io::Cursor::new(two)));
+        let mut dec = Lzip
+            .decoder(
+                src,
+                &DecodeOpts {
+                    memory_limit: Some(16 * 1024 * 1024),
+                    ..Default::default()
+                },
+            )
+            .expect(
+                "the FIRST member declares a dictionary well under the limit, so the pre-flight \
+                 must allow the decoder to be built at all — that is the whole point of the \
+                 fixture",
+            );
+
+        let mut out = Vec::new();
+        let io_err = dec.read_to_end(&mut out).expect_err(
+            "a 512 MiB dictionary declared by the SECOND member must be refused just as the \
+             first member's would be — before this bound existed this decoded at exit 0",
+        );
+        let err = Error::from_decode_io(io_err);
+        assert_eq!(
+            err.exit_code(),
+            6,
+            "a memory refusal is ResourceLimit, not Corrupt — the file is fine, this build will \
+             not allocate for it: {err}"
+        );
+        assert!(
+            err.to_string().contains("--memory-limit"),
+            "the message must name the flag so the user can raise it: {err}"
+        );
+        assert!(
+            first_len > 0,
+            "sanity: the first member is a real encode, not an empty one"
+        );
+    }
+
+    /// The false-positive guard for the bound above, and the one that
+    /// matters more: this project has shipped twelve checks that refused
+    /// legitimate input. A multi-member file whose members are all ordinary
+    /// must still decode byte-exactly — built by the reference tool itself
+    /// (`lzip -c a > out.lz; lzip -c b >> out.lz`, the documented way to
+    /// concatenate), not by this codec, so the fixture cannot inherit an
+    /// assumption from the encoder under test.
+    ///
+    /// Asserted at the CLI's own default floor (256 MiB) and at `None`, the
+    /// two limits a caller actually meets. Note the 22 KiB: `lzma_rust2`
+    /// charges the dictionary PLUS a fixed 22 KiB of LZMA1 decoder state
+    /// (`get_memory_usage(dict, lc=3, lp=0)` — 10 KiB of fixed overhead plus
+    /// 12 KiB of probability tables), so a limit set to EXACTLY a stream's
+    /// dictionary size now refuses it by 22 KiB. That is honest, and it is
+    /// why this test asserts against the limits users meet rather than
+    /// against a figure sitting on the boundary.
+    #[test]
+    fn a_real_multi_member_lzip_file_still_decodes_under_the_default_limit() {
+        let lzip = require_lzip();
+
+        // ~1.5 MiB each, deliberately: reference `lzip` sizes a member's
+        // dictionary to fit its input (7,680 bytes for a 7.6 KiB payload,
+        // measured — it buffers stdin rather than falling back to the
+        // preset), so a small fixture would declare a dictionary so tiny
+        // that no plausible over-strict bound could refuse it and this
+        // guard would pass against a broken one. At this size each member
+        // declares ~1.5 MiB, which a mis-scaled limit does refuse — checked
+        // by mutating `mem_limit_kb` to divide by MiB instead of KiB.
+        let first = b"first member, from the reference tool ".repeat(40_000);
+        let second = b"second member, from the reference tool ".repeat(40_000);
+
+        let mut packed = Vec::new();
+        for (part, level) in [(&first, "-9"), (&second, "-6")] {
+            let mut child = std::process::Command::new(&lzip)
+                .arg(level)
+                .arg("-c")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(child.stdin.as_mut().unwrap(), part.as_slice()).unwrap();
+            drop(child.stdin.take());
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "sanity check on the reference tool itself: it must compress {level}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            packed.extend_from_slice(&out.stdout);
+        }
+
+        let mut expected = first.clone();
+        expected.extend_from_slice(&second);
+
+        for limit in [Some(256 * 1024 * 1024), None] {
+            let src: Box<dyn Source> =
+                Box::new(ReaderSource::new(std::io::Cursor::new(packed.clone())));
+            let mut dec = Lzip
+                .decoder(
+                    src,
+                    &DecodeOpts {
+                        memory_limit: limit,
+                        ..Default::default()
+                    },
+                )
+                .unwrap_or_else(|e| {
+                    panic!("a two-member reference-tool file must decode at {limit:?}: {e}")
+                });
+            let mut got = Vec::new();
+            dec.read_to_end(&mut got).unwrap_or_else(|e| {
+                panic!("a two-member reference-tool file must decode at {limit:?}: {e}")
+            });
+            assert_eq!(got, expected, "at {limit:?}");
+        }
+    }
+
+    /// The one value in the whole range that must not round to itself:
+    /// `u32::MAX` is `lzma_rust2`'s "no limit" sentinel, so a caller asking
+    /// for a 4 TiB bound must not silently get an unbounded decoder.
+    /// Rounding is DOWN throughout, so the limit is never exceeded by the
+    /// conversion itself. Mirrors `xz_pure.rs`'s test of its own identical
+    /// helper — deliberately not shared; see [`mem_limit_kb`]'s doc.
+    #[test]
+    fn the_kib_conversion_rounds_down_and_never_lands_on_the_no_limit_sentinel() {
+        assert_eq!(mem_limit_kb(0), 0);
+        assert_eq!(mem_limit_kb(1023), 0, "rounds down, never up");
+        assert_eq!(mem_limit_kb(1024), 1);
+        assert_eq!(mem_limit_kb(64 * 1024 * 1024), 65_536);
+        assert_eq!(
+            mem_limit_kb(u64::MAX),
+            u32::MAX - 1,
+            "u32::MAX is the crate's \"no limit\" sentinel: clamping onto it would turn the \
+             largest possible bound into no bound at all"
+        );
     }
 }
