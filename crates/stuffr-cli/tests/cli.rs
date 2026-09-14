@@ -7707,7 +7707,7 @@ fn documented_install_commands_name_features_this_crate_declares() {
             let Some(after) = rest.split("--features").nth(1) else {
                 continue;
             };
-            let name = after.trim().split_whitespace().next().unwrap_or("");
+            let name = after.split_whitespace().next().unwrap_or("");
             commands_checked += 1;
             assert!(
                 features.contains(&name.to_string()),
