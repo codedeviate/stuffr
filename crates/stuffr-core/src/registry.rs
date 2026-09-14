@@ -521,7 +521,11 @@ mod tests {
             fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
                 MockContainer.open(resolved, o)
             }
-            fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            fn create(
+                &self,
+                _dst: Box<dyn Sink>,
+                _o: &CreateOpts,
+            ) -> Result<Box<dyn ArchiveWrite>> {
                 // Never exercised by this test, for the same reason
                 // `ReadOnlyCodec::encoder`'s panic above is not: the gate
                 // stops the caller first. It documents what a container

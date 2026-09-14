@@ -460,12 +460,15 @@ impl Source for FailingSource {
 /// exactly the container shape (ARJ's) that most needs it.
 fn read_all_over_failing_source(container: &dyn Container) -> Option<io::Error> {
     let src: Box<dyn Source> = Box::new(FailingSource);
-    let resolved =
-        match crate::resolve(src, container.id(), container.caps(), &crate::StreamPolicy::default())
-        {
-            Ok(r) => r,
-            Err(e) => return Some(classify_container_error(e)),
-        };
+    let resolved = match crate::resolve(
+        src,
+        container.id(),
+        container.caps(),
+        &crate::StreamPolicy::default(),
+    ) {
+        Ok(r) => r,
+        Err(e) => return Some(classify_container_error(e)),
+    };
     let mut ar = match container.open(resolved, &OpenOpts::default()) {
         Ok(ar) => ar,
         Err(e) => return Some(classify_container_error(e)),
@@ -1657,7 +1660,12 @@ mod broken_containers {
             }],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&WrongIdReadOnly, &read_only_meta(), &fx, "fixture property 1");
+        assert_panics_naming_with(
+            &WrongIdReadOnly,
+            &read_only_meta(),
+            &fx,
+            "fixture property 1",
+        );
     }
 
     /// Property 2's write-refusal half. A container that claims
@@ -1704,7 +1712,12 @@ mod broken_containers {
             }],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&FalselyWritable, &read_only_meta(), &fx, "fixture property 2");
+        assert_panics_naming_with(
+            &FalselyWritable,
+            &read_only_meta(),
+            &fx,
+            "fixture property 2",
+        );
     }
 
     /// Property 8, isolated from the three properties that embed it (2, 6,
@@ -1903,7 +1916,12 @@ mod broken_containers {
             ],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&RenamesAnEntry, &read_only_meta(), &fx, "fixture property 4");
+        assert_panics_naming_with(
+            &RenamesAnEntry,
+            &read_only_meta(),
+            &fx,
+            "fixture property 4",
+        );
     }
 
     /// Property 5 (content): right names, wrong bytes. The brief calls this
@@ -1966,7 +1984,12 @@ mod broken_containers {
             }],
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(&CorruptsContent, &read_only_meta(), &fx, "fixture property 5");
+        assert_panics_naming_with(
+            &CorruptsContent,
+            &read_only_meta(),
+            &fx,
+            "fixture property 5",
+        );
     }
 
     /// Property 6 (truncation): ignores the actual input entirely and

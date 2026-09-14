@@ -143,9 +143,8 @@ use unarj_rs::local_file_header::{CompressionMethod, FileType};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CorruptionDetection, CreateOpts, Entry,
-    EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, SeekRead,
-    Sink, Source,
+    EntryKind, EntryMeta, Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts,
+    Resolved, Result, SeekRead, Sink, Source,
 };
 
 pub const ARJ: FormatId = FormatId::new("arj");

@@ -1272,7 +1272,9 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
         // apart again without failing.
         let lower = err.to_lowercase();
         assert!(
-            lower.contains(&format!("`{name}` can be read but not written by this build")),
+            lower.contains(&format!(
+                "`{name}` can be read but not written by this build"
+            )),
             "`--format {name}`'s refusal must be the one shared capability sentence, \
              naming the format, rather than a per-format phrasing: {err}"
         );
@@ -7670,8 +7672,10 @@ fn documented_install_commands_name_features_this_crate_declares() {
     let features: Vec<String> = manifest
         .split("\n[")
         .find(|section| section.starts_with("features]"))
-        .expect("stuffr-cli must declare a [features] section: without one, every \
-                 documented `cargo install stuffr-cli --features …` fails")
+        .expect(
+            "stuffr-cli must declare a [features] section: without one, every \
+                 documented `cargo install stuffr-cli --features …` fails",
+        )
         .lines()
         .filter_map(|line| line.split_once('='))
         .filter(|(_, rhs)| rhs.trim_start().starts_with('['))
@@ -7685,7 +7689,12 @@ fn documented_install_commands_name_features_this_crate_declares() {
 
     let docs = [
         manifest_dir.join("README.md"),
-        manifest_dir.parent().unwrap().parent().unwrap().join("README.md"),
+        manifest_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("README.md"),
         manifest_dir.join("src").join("examples.txt"),
     ];
     let mut commands_checked = 0usize;

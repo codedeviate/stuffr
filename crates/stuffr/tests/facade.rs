@@ -76,9 +76,7 @@ const TIER_SPECIFIC: &[TierSpecific] = &[
 
 /// True only if `name` is listed AND its feature is absent from this build.
 fn exempt_from_registration(name: &str) -> bool {
-    TIER_SPECIFIC
-        .iter()
-        .any(|t| t.name == name && !t.compiled)
+    TIER_SPECIFIC.iter().any(|t| t.name == name && !t.compiled)
 }
 
 /// A `TIER_SPECIFIC` entry that names no slot at all is an exemption with

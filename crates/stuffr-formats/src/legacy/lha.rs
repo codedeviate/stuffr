@@ -67,9 +67,8 @@ use delharc::LhaDecodeReader;
 use delharc::decode::LhaDecodeError;
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CorruptionDetection, CreateOpts, Entry,
-    EntryKind, EntryMeta,
-    Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts, Resolved, Result, Sink,
-    Source,
+    EntryKind, EntryMeta, Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts,
+    Resolved, Result, Sink, Source,
 };
 
 pub const LHA: FormatId = FormatId::new("lha");
