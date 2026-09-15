@@ -57,6 +57,11 @@ pub const CONTAINER_SLOTS: &[&str] = &[
     // Both are read-only: their corpus seeds are fixture-sourced, not
     // written by this build.
     "lha", "arj",
+    // Phase 3c. APPENDED, never inserted. Read-only too, and the one slot
+    // whose decoders are this project's own from-scratch code rather than a
+    // wrapped crate — which is precisely the kind the `container` target
+    // exists to hammer.
+    "arc",
 ];
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");

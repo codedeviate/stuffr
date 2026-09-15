@@ -29,7 +29,8 @@
 //!   chain seed is just the bytes of some real, complete input (a plain
 //!   archive, a bare codec stream, or a composed one).
 //!
-//! Phase 3b adds three READ-ONLY slots (`compress`, `lha`, `arj`), which this
+//! Phase 3b adds three READ-ONLY slots (`compress`, `lha`, `arj`) and Phase
+//! 3c a fourth (`arc`), which this
 //! generator cannot build the way every other slot's seed is built — there
 //! is no encoder/writer to call. Their "own encoded stream" / "own archive
 //! bytes" above are instead read straight from the committed fixtures under
@@ -114,12 +115,18 @@ fn legacy_codec_fixture(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Same idea as [`legacy_codec_fixture`], for the two read-only legacy
-/// containers `lha` and `arj`.
+/// Same idea as [`legacy_codec_fixture`], for the three read-only legacy
+/// containers `lha`, `arj` and `arc`.
+///
+/// `arc`'s seed is `cpm.arc` rather than any of the nine other borrowed
+/// archives, for the same reason it is the conformance fixture: two entries
+/// and two different compression methods, so a mutation has more than one
+/// header and more than one decoder to land in.
 fn legacy_container_fixture(name: &str) -> Option<&'static str> {
     match name {
         "lha" => Some("sample.lzh"),
         "arj" => Some("sample.arj"),
+        "arc" => Some("arc/cpm.arc"),
         _ => None,
     }
 }
