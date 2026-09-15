@@ -410,6 +410,57 @@ filename is not a method identifier" warning names. Likewise
 `Crunched`) and `license.pak` (method 11, Distilled) are each their own
 method, not aliases.
 
+### Two expected-output files, borrowed alongside the archives — Phase 3c Task 3
+
+`arc/DDTZ.COM` (9,984 bytes) and `arc/READ.COM` (128 bytes) are byte-for-byte
+copies of the two files of the same names in `unarc-rs` 0.6.3's own
+`tests/arc/` tree — the plaintext `cpm.arc`'s two entries decode to. Same
+provenance, same licence and the same **borrowed, immutable-bytes** style as
+the archives above: nobody here will regenerate them, and there is no recipe
+to recompute them from. Verified identical to the crate's copies by SHA-256
+at the time of borrowing (`fc2769fe…d2c9` and `25784f64…7e79`).
+
+**Why they were borrowed at all, when the ten archives were not enough.**
+Container-conformance fixture property 5 compares each entry's decoded bytes
+against `ExpectedEntry::content`, so a fixture needs the plaintext from
+somewhere. For every *stored* entry that somewhere is the archive itself —
+`store.arc`'s method-2 payload IS the LICENSE content, a byte range with no
+decoder involved, and `legacy::arc`'s tests slice it directly and reuse it as
+the expectation for `crunch.arc`, `crunch2.arc`, `squashed.arc`,
+`license_crunched.pak` and `license_squashed.pak`. `cpm.arc` has no such
+sibling: both of its entries are compressed (Squeezed and RLE90) and the
+corpus holds no stored copy of either file. The only alternative would have
+been to let this project's own decoder supply the expectation it is then
+checked against, which is precisely the self-agreement this manifest's banner
+exists to prevent.
+
+**They are bound to the archive by the archive's own CRC, not by anyone's
+decoder.** `crc16_arc(DDTZ.COM)` is `0xB3F0` and `crc16_arc(READ.COM)` is
+`0xC093` — exactly the values `cpm.arc`'s two headers carry (the table above,
+measured independently of both). `legacy::arc::tests::the_borrowed_expected_
+outputs_match_the_crc_their_archive_stores` re-derives that agreement on every
+test run, with no decompression anywhere in the loop, so a future edit to
+either `.COM` file goes red before any conformance test does. The same test
+checks `store.arc`'s raw payload against its own stored `0xB065`, which is what
+qualifies that byte range to stand in as the LICENSE expectation.
+
+### `date` and `time` are the LOW and HIGH halves of that `u32` — Phase 3c Task 3
+
+The table above reads the field as `date_time(u32 LE, packed DOS)` without
+committing to which half is which, and the distinction turns out to matter.
+ARC's header stores `date` first and `time` second, so the little-endian `u32`
+is `date | (time << 16)`. `unarc-rs`'s `DosDateTime` takes the opposite halves
+(`(self.0 >> 25) & 0x7F` for the year, `self.0 & 0x1F` for the seconds), and
+under that reading `cpm.arc`'s two entries have **month 0** — not a date at
+all. Under the reading used by `legacy::arc` they are 1985-11-20 00:00:38 and
+1985-11-20 00:01:52, which is a plausible stamp for a CP/M archive, and
+`crunch.arc`'s becomes 2024-05-16 23:08:26 rather than a month-8 date in 2072.
+
+Recorded as a **reasoned choice, not a measurement**: no tool on this machine
+reads an ARC archive, so nothing independent confirms it. The cost of being
+wrong is a wrong timestamp on `stuffr list`, never wrong data — no conformance
+property reads `mtime`.
+
 ### ZOO header layout (as measured)
 
 The archive header is `"ZOO 2.10 Archive."` (17 bytes) padded to a 20-byte
