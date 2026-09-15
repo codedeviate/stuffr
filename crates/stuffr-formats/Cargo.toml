@@ -59,6 +59,14 @@ arj = ["dep:unarj-rs"]
 # `fixtures/legacy/MANIFEST.md`.
 arc = []
 
+# ZOO wraps no crate for its framing or its LZW either — same disqualification
+# of `unarc-rs`, and `legacy/zoo.rs` was written against zoo 2.10's OWN C
+# source instead (Debian `zoo` 2.10-28, read, never linked). The `delharc`
+# edge is real and narrow: ZOO's packing method 2 is a raw `-lh5-` stream, and
+# `delharc::decode::Lh5Decoder` already ships in this crate for `lha`, so that
+# one layer is delegated rather than written a second time.
+zoo = ["dep:delharc"]
+
 # No `dep:` here: `newtua-lzw-z`'s only production role was supposed to be
 # decoding, but its `Decoder` reads and decodes its ENTIRE input on the
 # first `read()` call (measured — see `legacy/compress_z.rs`'s module doc),

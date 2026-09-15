@@ -10,9 +10,9 @@
 //! full width asked for.
 //!
 //! Three readers want exactly that and each was independently correct about
-//! it: ARC's squeeze Huffman layer, ARC's Crunched/Squashed LZW, and — as
-//! of Phase 3c Task 4 — ZOO's `lzd` LZW, which is what made the
-//! duplication real rather than hypothetical. zoo 2.10's own `rd_dcode`
+//! it: ARC's squeeze Huffman layer, ARC's Crunched/Squashed LZW, and ZOO's
+//! `lzd` LZW — the last of which is what made the duplication real rather
+//! than hypothetical. zoo 2.10's own `rd_dcode`
 //! (`lzd.c`) assembles its code out of `word = byte | (next << 8)` shifted
 //! right by the offset within the byte, which is this same order arrived at
 //! from a different direction.
