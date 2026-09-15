@@ -481,48 +481,128 @@ zoo_minus(u32 LE) + major_ver(u8) + minor_ver(u8)`, at which point the true
 on-disk classic header ends (34 bytes) — `zoo_start` is the authoritative
 pointer to the first directory entry and was used directly rather than
 assuming a fixed offset; it independently confirmed `zoo_start = 42` and byte
-42 does carry the `0xFDC4A7DC` tag in all four fixtures, so the extra 8
-bytes between the 34-byte classic header and offset 42 are archive-format
-padding this parser does not need to interpret. **Caution for a future
-reader:** `unarc-rs`'s own `ZooHeader::load_from` reads a fixed 46-byte
-buffer that runs 12 bytes past the real 34-byte header and into the first
-directory entry's own bytes before `zoo_archive.rs` seeks back to
-`zoo_start` — so any field this manifest might have reported from bytes
-34–45 (there are none of interest here) would have been reading directory-entry
-bytes mislabeled as header fields, not a stuffr-specific mistake, an
-artifact of how the crate's struct is laid out. `major_ver`/`minor_ver` (both
-measured as `2`/`0` across all four fixtures) sit safely inside the real
-34-byte header and are not affected.
+42 does carry the `0xFDC4A7DC` tag in all four fixtures. **Task 4 correction:
+the eight bytes between the 34-byte classic header and offset 42 are not
+"padding", as this paragraph once said** — `zoo.h` names them (`HTYPE_I 34`,
+`ACMTPOS_I 35`, `ACMTLEN_I 39`, `HVDATA_I 41`, giving `SIZ_ZOOH 42`), and
+they are the archive-comment fields of the newer header. See the corrected
+directory-entry subsection below, and `legacy/zoo.rs`'s module doc.
+`major_ver`/`minor_ver` (both measured as `2`/`0` across all four fixtures)
+sit inside the classic 34-byte prefix and were never in doubt.
 
-Each directory entry is `zoo_tag(u32 LE) + dir_type(u8) + method(u8) +
-next(u32 LE) + offset(u32 LE, absolute file position of payload) +
-date_time(u32 LE) + crc16(u16 LE) + original_size(u32 LE) +
-compressed_size(u32 LE) + major_ver(u8) + minor_ver(u8) + deleted(u8) +
-struc(u8) + comment(u32 LE) + cmt_size(u16 LE) + name(13, NUL-padded) +
-var_dir_len(u8) + tz(u8) + dir_crc(u32 LE) + namlen(u8) + dirlen(u8)` — 59
-bytes fixed, from `DIRENT_HEADER_SIZE`. `next == 0` on a *fully present*
-entry means "last real entry"; all four fixtures here additionally carry a
-**short terminal marker after the last real entry** — 56 bytes, not 59 (the
-archive ends 3 bytes into what would be the fixed record), but the `next`
-field at byte offset 6 is fully present and reads `0` within those 56 bytes,
-so a reader must not require the full 59-byte record before checking `next`
-for the terminator, only enough of it (the `next` field alone: 10 bytes in)
-to see the terminator's `next == 0`. Confirmed byte-for-byte, not assumed:
-all four fixtures end with the identical 56-byte tail
-`dca7c4fd0200000000…00fc83` (tag + `dir_type=2` + zeros + two bytes that
-land inside what would be `dir_crc`'s field, immaterial since `next` already
-read `0`). **Worth flagging for Task 4's reader, not just this manifest**:
-`unarc-rs`'s own `get_next_entry` does an unconditional `read_exact` of the
-full 59-byte buffer and would raise an I/O error on this exact shape if it
-were ever called a second time — none of `unarc-rs`'s own tests do call it
-twice, so this edge case is untested by the crate that wrote these fixtures.
+**CORRECTED IN TASK 4 — this subsection previously described a 59-byte
+fixed directory entry and a "short terminal marker", and both claims were
+wrong.** They were derived from `unarc-rs`'s `DIRENT_HEADER_SIZE`, which is
+the only ZOO reader that was in reach when Task 2 measured this corpus. Task
+4 obtained zoo 2.10's own C source (Debian `zoo` 2.10-28 — read, never
+compiled or linked) and it settles the layout directly. What follows is the
+corrected reading; the superseded one is described at the end so a future
+reader meeting `unarc-rs` is not surprised by it a second time.
+
+`zoo.h` defines the record lengths and every field offset:
+
+```text
+#define  SIZ_DIR  51          /* length of type 1 directory entry */
+#define  SIZ_DIRL 56          /* length of type 2 directory entry */
+#define  DTAG_I   0    DTYP_I 4    PKM_I  5    NXT_I  6    OFS_I  10
+#define  DAT_I    14   TIM_I  16   CRC_I  18   ORGS_I 20   SIZNOW_I 24
+#define  DMAJ_I   28   DMIN_I 29   DEL_I  30   STRUC_I 31
+#define  CMT_I    32   CMTSIZ_I 36  FNAME_I 38  FNM_SIZ 13
+#define  VARDIRLEN_I  51      /* length of var. direntry -- an `int` */
+#define  TZ_I     53          /* timezone */
+#define  DCRC_I   54          /* CRC of directory entry -- an `int` */
+#define  NAMLEN_I   (SIZ_DIRL + 0)
+#define  DIRLEN_I   (SIZ_DIRL + 1)
+#define  NO_TZ    127
+```
+
+So the fixed record is **56 bytes** for a type-2 entry and **51** for a
+type-0/1 one; `var_dir_len` is a **`u16`** at 51 and `dir_crc` a **`u16`** at
+54; and `namlen`/`dirlen` are the first two bytes of the VARIABLE part, which
+is `var_dir_len` bytes long and follows the fixed record. A whole entry is
+therefore `56 + var_dir_len` bytes. `unarc-rs` reaches 59 by modelling
+`var_dir_len` as a `u8`, `dir_crc` as a `u32`, and pulling `namlen` and
+`dirlen` into the fixed record — three errors that happen to cancel to
+`56 + 3`.
+
+**There is no short terminal marker.** All four fixtures end in a COMPLETE
+56-byte type-2 record with `next == 0`, which is the trailing null entry
+`zooadd.c` writes (`direntry.next = direntry.offset = 0L; /* trailing null
+entry */`) and which `zoolist.c` breaks on before counting it as an entry.
+Five independent measurements, each re-derived from the bytes on disk:
+
+- `tz` reads `127` at offset 53 in every fixture — `zoo.h`'s `NO_TZ`, the
+  sentinel `dir_to_b` writes when the timezone is unknown. Under the 59-byte
+  reading that byte is `0` and 53 holds the second byte of `dir_crc`.
+- `var_dir_len` as a `u16` reads 13, 10, 13, 13, and the variable part is
+  then self-consistent: `namlen = 0`, `dirlen = 3`, `dirname = "..\0"`, plus
+  the eight bytes `dir_to_b` writes after them (`system_id` 2, `fattr` 3,
+  `vflag`+`version_no` 3) — exactly `2 + 0 + 3 + 8 = 13`, and `2 + 0 + 0 + 8
+  = 10` for `default.zoo`, whose `dirlen` is 0.
+- Each record's own stored `dir_crc` — a CRC-16/ARC over `SIZ_DIRL +
+  var_dir_len` bytes with the `dir_crc` field itself zeroed, `portable.c`'s
+  `dir_to_b` — **reproduces byte-exactly under this layout and under no
+  other**: `0x0272` (`store.zoo` and `wrongcrc16.zoo`), `0x5810`
+  (`default.zoo`), `0xBE16` (`high_per.zoo`), and `0x83FC` for the terminal
+  record in all four. That last figure is the direct refutation of the
+  "short marker" reading: a record three bytes short of its own length could
+  not carry a CRC over itself that checks out.
+- `next + 56` is exactly each fixture's file length. Under 59, every ZOO
+  archive ever written would end three bytes inside its own terminator.
+- `offset` minus the end of the record (`56 + var_dir_len`) is exactly 5 in
+  all four — `zoo.h`'s `SIZ_FLDR`, the five-byte `FILE_LEADER "@)#("` plus
+  its NUL that `zooadd.c` writes between a directory entry and its payload
+  (`direntry.offset = this_dir_offset + SIZ_DIRL + direntry.var_dir_len +
+  SIZ_FLDR`). The bytes are `40 29 23 28 00` in every fixture. A reader must
+  locate payloads through `offset`, never by arithmetic on the record length.
+
+**What this means for a reader, stated plainly because the superseded
+reading asked for the opposite:** read the full fixed record and treat a
+short one as truncation. The earlier advice — "a reader must not require the
+full 59-byte record before checking `next`" — existed only to work around
+the wrong record size, and following it would have meant tolerating a
+genuinely truncated final record. `legacy/zoo.rs`'s
+`an_archive_whose_terminal_record_is_short_is_corrupt` pins the strict
+reading, and `a_directory_entrys_own_crc_confirms_the_fifty_six_byte_record`
+pins the layout the strictness depends on.
+
+**The `unarc-rs` hazard is real, just not the one first recorded.** Its
+`get_next_entry` does an unconditional `read_exact` of 59 bytes, so on these
+fixtures a second call runs three bytes past end of file and raises an I/O
+error. None of `unarc-rs`'s own tests calls it twice, so the crate that
+supplied this corpus never exercises its own terminator handling — which is
+why the wrong size went unnoticed there and was inherited here.
+
+Also worth keeping from the superseded text: `unarc-rs`'s `ZooHeader::
+load_from` reads a fixed 46-byte buffer that runs 12 bytes past the real
+34-byte classic header (`MINZOOHSIZ`) and into the first directory entry's
+bytes before `zoo_archive.rs` seeks back to `zoo_start`. The eight bytes
+between 34 and `zoo_start = 42` are not padding either, as this manifest once
+said: `zoo.h` names them — `HTYPE_I 34`, `ACMTPOS_I 35`, `ACMTLEN_I 39`,
+`HVDATA_I 41`, giving `SIZ_ZOOH 42`, the archive-comment fields of the newer
+header. Measured in all four fixtures: `type = 1`, `acmt_pos = 0`,
+`acmt_len = 0`, `vdata = 3`.
 
 | file | entry name | method byte | method | compressed | original | stored CRC-16 |
 |---|---|---|---|---|---|---|
 | `zoo/store.zoo` | `license` | 0 | Stored | 11357 | 11357 | `0xB065` |
-| `zoo/default.zoo` | `license` | 1 | Compressed (old LZW, `salzweg`) | 5282 | 11357 | `0xB065` |
+| `zoo/default.zoo` | `license` | 1 | Compressed (zoo's own 13-bit `lzd` LZW — see the note below the table) | 5282 | 11357 | `0xB065` |
 | `zoo/high_per.zoo` | `license` | 2 | CompressedLh5 (delharc LH5) | 4003 | 11357 | `0xB065` |
 | `zoo/wrongcrc16.zoo` | `license` | 0 | Stored | 11357 | 11357 | `0xB065` (see below — payload is NOT the 0xB065 content) |
+
+**Task 4 correction to the method-1 row.** It read "old LZW, `salzweg`",
+naming the crate `unarc-rs` routes this method through. `salzweg` is not the
+format: it caps at **12** bits and errors once its table passes 4096
+entries, where `lzconst.h` gives `MAXBITS 13` / `MAXMAX 8192` and `lzc.c`
+emits a CLEAR only when the table fills at that ceiling. `salzweg` decodes
+`default.zoo` correctly because that fixture never gets there — measured
+while implementing the decoder, its dictionary peaks at **4011** of 8192
+entries and its widest code is 12 bits, and its stream opens with a leading
+CLEAR (code #1) and ends on `Z_EOF` with zero bytes and zero bits left over.
+So this corpus cannot distinguish a 12-bit reading from a 13-bit one, and
+`legacy/zoo.rs` implements the format's own figure because the 12-bit one
+would fail on any larger ZOO archive. Recorded here so the gap is not
+mistaken for coverage.
 
 ### Step 3 verdict: does the corpus cover what an ARC/ZOO reader must support?
 
@@ -585,9 +665,14 @@ set in three words: "RLE90 + squeeze + crunch". Measured coverage:
   the master design's three-method list — bonus coverage, not required.
 
 ZOO's required scope in the design doc is just "ZOO (own)", with no method
-list — the corpus covers all three of the format's known methods (Stored 0,
-Compressed 1, CompressedLh5 2), which is a superset of any minimum this
-design doc names.
+list — the corpus covers all three methods the format ever assigned
+(`zoo.h`'s `MAX_PACK` is 2): Stored 0, Compressed 1, CompressedLh5 2. That
+is a superset of any minimum this design doc names. **One gap Task 4
+measured and could not close from these bytes:** every ZOO fixture holds
+exactly ONE entry, so nothing in this corpus witnesses a multi-entry
+directory chain — which is why `legacy/zoo.rs` declares `needs_seek` rather
+than claiming a forward parse it cannot demonstrate, and why its
+multi-entry, cyclic and deleted-entry tests all build their own archives.
 
 **Ruling D verdict, as instructed:**
 - **`cpm.arc`: borrowed.** Not because it is a refusal fixture — because it
