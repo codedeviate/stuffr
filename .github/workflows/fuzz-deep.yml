@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [codec, container, chain]
+        target: [codec, container, chain, roundtrip]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

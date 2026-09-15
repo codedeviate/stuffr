@@ -28,6 +28,15 @@
 //!   temp file and handed straight to `ops::inspect` / `entries::list`, so a
 //!   chain seed is just the bytes of some real, complete input (a plain
 //!   archive, a bare codec stream, or a composed one).
+//! - `roundtrip.rs` (Phase 3c Task 8) reads a leading selector byte whose
+//!   HIGH BIT picks the TABLE rather than the ladder rung — set means
+//!   `CODEC_SLOTS`, clear means `CONTAINER_SLOTS` — and whose remaining
+//!   bytes are the archive's CONTENT, not its bytes. So a round-trip seed
+//!   is `[table_bit | slot_index] ++ <arbitrary payload>`, and a seed needs
+//!   no format knowledge at all: any bytes are a valid payload. The seeds
+//!   below exist to put one live payload in front of every WRITABLE slot,
+//!   so the fuzzer's first mutations start from a shape that already
+//!   completes a round trip rather than from nothing.
 //!
 //! Phase 3b added three READ-ONLY slots (`lha`, `arj` and, at the time,
 //! `compress`) and Phase 3c a fourth container (`arc`), none of which this
@@ -181,6 +190,50 @@ pub struct CorpusCounts {
     pub codec: usize,
     pub container: usize,
     pub chain: usize,
+    pub roundtrip: usize,
+}
+
+/// The payload every `roundtrip` seed carries after its selector byte.
+///
+/// Deliberately compressible and deliberately not a round number of bytes:
+/// a payload that is all one value would let a codec whose output length
+/// happens to match hide a content bug behind an equal length, and a length
+/// on a power-of-two boundary is the one length every block-oriented
+/// encoder is already tested at.
+const ROUNDTRIP_PAYLOAD: &[u8] = b"stuffr round-trip fuzz seed \x00\x01\x02\xfe\xff payload; \
+repetition repetition repetition repetition repetition.";
+
+/// `CODEC_SLOTS` entries this build registers **with an encoder**, and
+/// `CONTAINER_SLOTS` entries it registers **with a writer** — the filter
+/// `roundtrip.rs` itself applies before doing anything, mirrored here so the
+/// corpus does not carry a seed for a slot the target returns from
+/// immediately. `arc` and `zoo` have no writer and never will, so they are
+/// absent from the round-trip corpus while being present in `container`'s.
+fn writable_codec_slots() -> Vec<(u8, &'static str)> {
+    CODEC_SLOTS
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| {
+            stuffr::registry()
+                .codec(FormatId::new(name))
+                .is_some_and(|c| c.caps().encode)
+        })
+        .map(|(i, name)| (i as u8, *name))
+        .collect()
+}
+
+/// Same as [`writable_codec_slots`], for `CONTAINER_SLOTS`.
+fn writable_container_slots() -> Vec<(u8, &'static str)> {
+    CONTAINER_SLOTS
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| {
+            stuffr::registry()
+                .container(FormatId::new(name))
+                .is_some_and(|c| c.caps().write)
+        })
+        .map(|(i, name)| (i as u8, *name))
+        .collect()
 }
 
 /// Writes one seed corpus per fuzz target under `root/{codec,container,chain}`.
@@ -188,9 +241,11 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     let codec_dir = root.join("codec");
     let container_dir = root.join("container");
     let chain_dir = root.join("chain");
+    let roundtrip_dir = root.join("roundtrip");
     std::fs::create_dir_all(&codec_dir)?;
     std::fs::create_dir_all(&container_dir)?;
     std::fs::create_dir_all(&chain_dir)?;
+    std::fs::create_dir_all(&roundtrip_dir)?;
 
     // Scratch area for building each seed before its bytes are read back and
     // (re-)written with a selector prefix under the real target directories.
@@ -355,10 +410,38 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
         chain_count += 1;
     }
 
+    // --- roundtrip/ ------------------------------------------------------
+    // One seed per WRITABLE slot: the selector byte, then a payload. Unlike
+    // every block above, nothing here has to build a valid stream of the
+    // named format — the target does that itself, which is the whole point
+    // of it. The seed's only job is to name a slot and hand it something to
+    // write, so the fuzzer's first mutations start from an input that
+    // already completes a round trip rather than from a selector with no
+    // body at all.
+    //
+    // The high bit is the TABLE bit here, not the rung bit `container`'s
+    // seeds carry: set selects `CODEC_SLOTS`, clear selects
+    // `CONTAINER_SLOTS`. See `roundtrip.rs`'s own comment for why the write
+    // side has no rung to choose.
+    let mut roundtrip_count = 0usize;
+    for (selector, name) in writable_container_slots() {
+        let mut seed = vec![selector];
+        seed.extend_from_slice(ROUNDTRIP_PAYLOAD);
+        std::fs::write(roundtrip_dir.join(format!("container-{name}.seed")), &seed)?;
+        roundtrip_count += 1;
+    }
+    for (selector, name) in writable_codec_slots() {
+        let mut seed = vec![selector | 0x80];
+        seed.extend_from_slice(ROUNDTRIP_PAYLOAD);
+        std::fs::write(roundtrip_dir.join(format!("codec-{name}.seed")), &seed)?;
+        roundtrip_count += 1;
+    }
+
     Ok(CorpusCounts {
         codec: codec_count,
         container: container_count,
         chain: chain_count,
+        roundtrip: roundtrip_count,
     })
 }
 
@@ -377,11 +460,13 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
     let expected_codec = registered_codec_slots().len();
     let expected_container = registered_container_slots().len() * 2;
     let expected_chain = CHAIN_SHAPES.len();
+    let expected_roundtrip = writable_codec_slots().len() + writable_container_slots().len();
 
     for (target, got, expected) in [
         ("codec", counts.codec, expected_codec),
         ("container", counts.container, expected_container),
         ("chain", counts.chain, expected_chain),
+        ("roundtrip", counts.roundtrip, expected_roundtrip),
     ] {
         assert!(
             expected > 0,
@@ -421,7 +506,7 @@ fn generate_corpus_writes_the_real_seed_corpus() {
     let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus");
     let counts = generate_corpus(&corpus_root).unwrap();
     assert!(
-        counts.codec > 0 && counts.container > 0 && counts.chain > 0,
+        counts.codec > 0 && counts.container > 0 && counts.chain > 0 && counts.roundtrip > 0,
         "wrote an empty corpus for at least one target: {counts:?}"
     );
 }

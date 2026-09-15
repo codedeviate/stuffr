@@ -179,7 +179,7 @@ jobs:
       - run: make miri
 
   fuzz-smoke:
-    name: fuzz smoke (codec, container, chain — pure tier)
+    name: fuzz smoke (codec, container, chain, roundtrip — pure tier)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -288,13 +288,13 @@ jobs:
       # at its top: the run then exits with no "Done N runs" line at all,
       # and this check correctly refuses it. See task-5-report.md for the
       # quoted failure).
-      - name: fuzz codec, container and chain (short, seeded; see Ruling G — not deterministic)
+      - name: fuzz all four targets (short, seeded; see Ruling G — not deterministic)
         run: |
           set -u
           FUZZ_RUNS=2000
           FUZZ_SEED=1
           status=0
-          for target in codec container chain; do
+          for target in codec container chain roundtrip; do
             cmd="cargo fuzz run $target -- -runs=$FUZZ_RUNS -seed=$FUZZ_SEED"
             echo "==> $cmd"
             log=$(mktemp)

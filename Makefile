@@ -19,8 +19,8 @@ help:
 	@echo '  make miri     Miri over the two unsafe regions (tar.rs, ar.rs)'
 	@echo '  make hooks    install the commit-msg hook (once per clone)'
 	@echo '  make clean    remove build artefacts'
-	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain}'
-	@echo '  make fuzz     short, seeded smoke pass over codec/container/chain (mirrors CI)'
+	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip}'
+	@echo '  make fuzz     short, seeded smoke pass over the four targets (mirrors CI)'
 
 # Ordered so the cheapest gate fails first.
 check: fmt-check lint test test-pure release
@@ -211,7 +211,7 @@ FUZZ_RUNS = 2000
 FUZZ_SEED = 1
 fuzz: fuzz-corpus
 	@status=0; \
-	for target in codec container chain; do \
+	for target in codec container chain roundtrip; do \
 	  cmd="cargo +nightly fuzz run $$target -- -runs=$(FUZZ_RUNS) -seed=$(FUZZ_SEED)"; \
 	  echo "==> $$cmd"; \
 	  tmp=$$(mktemp); \
@@ -240,7 +240,8 @@ hooks:
 	git config core.hooksPath .githooks
 	@echo '✓ commit-msg hook active (core.hooksPath = .githooks)'
 
-# Regenerates fuzz/fuzz-run seed corpus under fuzz/corpus/{codec,container,chain}.
+# Regenerates fuzz/fuzz-run seed corpus under
+# fuzz/corpus/{codec,container,chain,roundtrip}.
 #
 # NOT part of `check`: this WRITES real files under `fuzz/corpus/`, which is
 # generated and gitignored (`fuzz/.gitignore`'s `/corpus`) rather than
@@ -289,14 +290,14 @@ fuzz-corpus:
 	  echo "  (a cargo test filter that matches nothing exits 0; this is the guard that turns that into a failure)" >&2; \
 	  exit 1; \
 	fi; \
-	for target in codec container chain; do \
+	for target in codec container chain roundtrip; do \
 	  dir=fuzz/corpus/$$target; \
 	  if [ -z "$$(find $$dir -type f -size +0c 2>/dev/null | head -1)" ]; then \
 	    echo "make fuzz-corpus: $$dir holds no non-empty seed after a run the generator reported as passing" >&2; \
 	    exit 1; \
 	  fi; \
 	done; \
-	echo "✓ corpus regenerated ($$ran generator test(s) ran; codec/container/chain all non-empty)"
+	echo "✓ corpus regenerated ($$ran generator test(s) ran; all four target corpora non-empty)"
 
 clean:
 	$(CARGO) clean

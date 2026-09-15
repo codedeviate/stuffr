@@ -38,3 +38,14 @@ path = "fuzz_targets/chain.rs"
 test = false
 doc = false
 bench = false
+
+# Phase 3c Task 8. The only target that runs an ENCODER: the other three
+# feed their input to a decoder, so nothing in this harness executed
+# `Codec::encoder` or `Container::create`/`add`/`finish` at all until this
+# one existed.
+[[bin]]
+name = "roundtrip"
+path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
