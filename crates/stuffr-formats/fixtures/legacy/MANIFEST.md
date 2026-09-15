@@ -456,10 +456,22 @@ all. Under the reading used by `legacy::arc` they are 1985-11-20 00:00:38 and
 1985-11-20 00:01:52, which is a plausible stamp for a CP/M archive, and
 `crunch.arc`'s becomes 2024-05-16 23:08:26 rather than a month-8 date in 2072.
 
-Recorded as a **reasoned choice, not a measurement**: no tool on this machine
-reads an ARC archive, so nothing independent confirms it. The cost of being
-wrong is a wrong timestamp on `stuffr list`, never wrong data — no conformance
-property reads `mtime`.
+**Settled by measurement, not left as a reading of the spec.** The swapped
+order is falsified independently by all ten borrowed archives — re-derived
+from the bytes, not transcribed from a review:
+
+| fixtures | date-low (this reading) | swapped (`unarc-rs`'s) |
+|---|---|---|
+| `arc/cpm.arc` #1 | 1985-11-20 00:00:38 | **1980-00-19** — month 0, not a date |
+| the four `.pak`s | 2025-12-16 16:18:58 | **2045-02-29** — a 29 February in a non-leap year |
+| the five other `.arc`s | 2024-05-16 23:08:26 | 2072-08-13 11:05:32 |
+
+Two impossibilities and one implausibility (a 2072 stamp on a 2024 corpus)
+against four plausible ones — 1985 for a CP/M archive, 2024-25 for a corpus
+assembled then — plus the structural argument above. A future reader must not
+"correct" this toward `unarc-rs`. The cost had it been wrong would have been a
+wrong timestamp on `stuffr list`, never wrong data: no conformance property
+reads `mtime`.
 
 ### ZOO header layout (as measured)
 

@@ -51,13 +51,24 @@
 //!
 //! ARC's header stores `date` then `time`, so the little-endian `u32` at
 //! that offset reads `date | (time << 16)`. `unarc-rs`'s `DosDateTime`
-//! takes the opposite halves (`(dt.0 >> 25) & 0x7F` for the year), and on
-//! `cpm.arc` that yields month `0` — not a date at all — for both entries,
-//! where the reading used here yields 1985-11-20, a plausible stamp for a
-//! CP/M archive. The evidence is that asymmetry plus the classic ARC
-//! header's own field order; `mtime` is informational metadata no
-//! conformance property checks, so the cost of being wrong is a wrong
-//! timestamp, never wrong data.
+//! takes the opposite halves (`(dt.0 >> 25) & 0x7F` for the year).
+//!
+//! **Settled by measurement, not by reading the spec**: the swapped order
+//! is falsified independently by all ten borrowed archives, and a future
+//! reader must not "correct" this toward `unarc-rs`.
+//!
+//! | fixtures | date-low (here) | swapped (`unarc-rs`) |
+//! |---|---|---|
+//! | `cpm.arc` #1 | 1985-11-20 00:00:38 | **month 0** — not a date |
+//! | the four `.pak`s | 2025-12-16 16:18:58 | **2045-02-29** — a 29 February in a non-leap year |
+//! | the five other `.arc`s | 2024-05-16 23:08:26 | 2072-08-13 |
+//!
+//! Three impossibilities and one implausibility against four plausible
+//! stamps (1985 for a CP/M archive, 2024-25 for a corpus assembled then),
+//! plus the structural argument above. `a_packed_timestamp_reads_date_from_
+//! the_low_half` pins the first row. `mtime` is informational metadata no
+//! conformance property checks, so the cost of being wrong would have been
+//! a wrong timestamp, never wrong data — but it is not wrong.
 //!
 //! # Methods: four decoded, the rest refused as a capability limit
 //!
@@ -87,8 +98,10 @@
 //!
 //! **Squashed (9) came free with Crunched (8)** and is therefore decoded
 //! rather than refused: it is the identical LZW engine at 13 bits with no
-//! leading maxbits byte and no RLE pass. Crushed (10) and Distilled (11)
-//! are entirely separate algorithms and stay refused.
+//! leading maxbits byte and no RLE pass. Five of ARC's eleven methods are
+//! still refused, not two: Crushed (10) and Distilled (11) are entirely
+//! separate algorithms, and the pre-8 Crunched variants (5, 6, 7) are
+//! refused for the reason two paragraphs above.
 //!
 //! **One LZW branch has no borrowed fixture behind it: the CLEAR code.**
 //! Every archive in the corpus compresses the same 11,357-byte LICENSE and
@@ -119,6 +132,29 @@
 //! - That ceiling is deliberately NOT `--memory-limit`: that flag binds a
 //!   CODEC's own allocation through `DecodeOpts`, and a container opens
 //!   through `OpenOpts`, which carries no memory field at all.
+//!
+//! **`stuffr list` therefore decodes every entry here, which it does not in
+//! any other container, and that divergence is deliberate.** `CLAUDE.md`
+//! states the invariant for the other four — "`list` reads no payload, in
+//! any of the four containers" — so a reader meeting ARC's behaviour needs
+//! the exception written down where they are. `next_entry` decodes and
+//! checks both the declared size and the CRC-16 before yielding an entry,
+//! so a metadata-only verb pays the whole decode. Kept, for two reasons:
+//! the eager decode is what makes [`check_declared_size`] possible at all
+//! (a size lie is invisible until something produces the bytes), and ARC is
+//! a floppy-era format whose archives are small by construction. The costs,
+//! stated rather than hidden: `list` on a large multi-entry `.arc` does
+//! O(archive) decode work, and `list` on a Crushed or Distilled `.pak`
+//! exits 3 where the header alone could have answered.
+//!
+//! **Two LZW engines now live in this crate** — `legacy::compress_z`'s and
+//! this module's — and that duplication is accepted rather than an
+//! oversight. They are different dialects (Unix `compress`'s block-mode
+//! CLEAR and byte alignment against ARC's), so a shared abstraction would
+//! have to be parameterised over the disagreement, which is how such
+//! abstractions become harder to read than the duplication. Recorded
+//! because `legacy::dos` was extracted in this same task for the opposite
+//! reason: that was the SAME computation twice, and this is not.
 //!
 //! # Error mapping has no wildcard
 //!
@@ -766,8 +802,9 @@ fn unsqueeze(input: &[u8], name: &str) -> Result<Vec<u8>> {
     let numnodes = usize::from(u16::from_le_bytes([input[0], input[1]]));
     if numnodes >= SQUEEZE_VALUES {
         return Err(Error::Corrupt(format!(
-            "entry `{name}` declares {numnodes} Huffman nodes, more than the \
-             {SQUEEZE_VALUES} values the squeeze tree can hold"
+            "entry `{name}` declares {numnodes} Huffman nodes; a tree over \
+             {SQUEEZE_VALUES} values has at most {} internal nodes",
+            SQUEEZE_VALUES - 1
         )));
     }
     if numnodes == 0 {
