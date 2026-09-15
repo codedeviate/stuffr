@@ -1026,6 +1026,30 @@ LEGACY FORMATS
       `/`, the same convention zip follows. Symlinks are NOT stored: `pack`
       warns and skips one rather than writing something a reader would
       restore as an ordinary file.
+
+      ENTRY NAMES ARE NOW REPORTED EXACTLY AS THE ARCHIVE STORES THEM, and
+      that changed in Phase 3c Task 6 in a way that can break a script.
+      The crate behind the reader strips `..`, `.` and empty components
+      from every name; stuffr no longer does. So an archive whose entry is
+      `../../etc/passwd` used to extract to `<dest>/etc/passwd` at exit 0,
+      reported as exact fidelity, and is now refused at exit 7 with nothing
+      written — that is the point of the change. Two smaller differences
+      come with it, and both matter because entry names are matched
+      EXACTLY: a non-printable byte escapes as `%XX` in UPPER-case hex
+      where it used to be lower (`%c3` becomes `%C3`), and a literal `%`
+      in a stored name is now escaped as well (`%1f` becomes `%251f`, so a
+      stored literal is no longer indistinguishable from an escaped byte).
+      A `stuffr cat`/`--pattern` argument written against the old spelling
+      answers `EntryNotFound` at exit 2; run `stuffr list` and copy the
+      name from there. `\` is still split as a path separator, so a
+      DOS-era `dos\sub\file.txt` still reads as `dos/sub/file.txt`.
+
+      One related change is NOT specific to LHA: a FILE entry named `.`
+      resolves to the destination directory itself, and `unpack` used to
+      try to create a file over it — `i/o error: Is a directory`, exit 1,
+      the code that means stuffr failed. Any such entry, in any container,
+      is now refused at exit 7. A DIRECTORY entry named `.`, which is what
+      `tar cf x.tar .` writes first, is unaffected.
       An entry using a compression method this build's
       `delharc` feature set cannot decode (compiled with `std`, `lh1`, `lz`
       — no `lhx`) is also `Error::Unsupported`, not corruption: the archive

@@ -334,6 +334,34 @@ read list.
 > Symlinks are not stored: `pack` warns and skips one rather than writing
 > something a reader would restore as an ordinary file.
 >
+> **Task 6 also changed how LHA entry NAMES are reported, and it can break a
+> working pipeline — read this before upgrading if you script `.lzh`.**
+> `delharc`, the crate behind the reader, strips `..`, `.` and empty
+> components from every name it hands back. stuffr now reports the name the
+> archive actually stores. Three consequences:
+>
+> * A traversal or absolute entry that previously **extracted silently at
+>   exit 0** — `../../etc/passwd` landed at `<dest>/etc/passwd` and `stuffr
+>   unpack` reported `(exact fidelity)` — is now **refused at exit 7** with
+>   nothing written. That is the fix, and it is why the change was made.
+> * A non-printable byte is escaped `%XX` with **upper-case** hex where
+>   `delharc` used lower (`%c3` → `%C3`), and a literal `%` in a stored name
+>   is now escaped too (`%1f` → `%251f`, so a stored literal is no longer
+>   indistinguishable from an escaped byte). Entry names are matched
+>   **exactly**, so `stuffr cat old.lzh 'na%c3me.txt'` and any `--pattern`
+>   written against the old spelling now answer `EntryNotFound` at exit 2.
+>   Run `stuffr list` and copy the name from there.
+> * `\` is still split as a path separator, exactly as before — a DOS-era
+>   `dos\sub\file.txt` still reports as `dos/sub/file.txt`.
+>
+> Separately, and found while testing this: a **file** entry named `.`
+> resolves to the destination directory itself, and `unpack` used to
+> `File::create` over it — `i/o error: Is a directory`, **exit 1**, which is
+> the code reserved for stuffr failing. It is now refused at exit 7 for every
+> container (the hole was in the shared extraction loop, and a raw `tar` with
+> such an entry reached it too). A **directory** entry named `.` — what `tar
+> cf x.tar .` emits — is unaffected.
+>
 > **Not yet: `7z`, squashfs, ISO 9660, MS CAB and RAR.** Those five
 > containers are deferred past Phase 2, each needing its own cycle — see
 > [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md).

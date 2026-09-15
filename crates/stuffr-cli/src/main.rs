@@ -685,28 +685,44 @@ fn refuse_unhonoured_extract_flags(output: bool, format: bool) -> stuffr::Result
 /// on every decode path, and on a bare container pack it is simply inert in
 /// the same way `--no-sync` is (nothing allocates a dictionary), so it costs
 /// nothing to accept.
+///
+/// **All three sentences used to say "no container in this build compresses
+/// anything itself", and that was already false when it was written:** `zip`
+/// deflates its entries. Phase 3c Task 6 made it plainly false — `pack -o
+/// x.lzh` runs a real `-lh5-` compressor (measured: 100 KB of text → 315
+/// bytes) and `-o x.lzh --threads 4` meets this refusal. The honest reason
+/// is narrower and is what they say now: no container here has a PARALLEL
+/// encoder, so `--threads`/`--turbo` have nothing to govern, and none has a
+/// weak fallback encoder for `--allow-weak-encoder` to consent to. The
+/// refusals themselves are unchanged and still correct.
+///
+/// Worth recording because of what did NOT catch this: the examples-page
+/// count guard derives its numbers from the LIVE registry, but the registry
+/// tells it how many rows there are, never what any row's WRITE column says.
+/// Every stale "read-only" sentence in this task had to be found by hand for
+/// the same reason.
 fn refuse_unhonoured_pack_flags(opts: &CompressOpts, has_codec: bool) -> stuffr::Result<()> {
     if has_codec {
         return Ok(());
     }
     if opts.threads.is_some() {
         return Err(stuffr::Error::Usage(
-            "--threads governs a codec's parallel encoder; no container in this build \
-             compresses anything itself, so there is no worker count to hand it"
+            "--threads governs a codec's parallel encoder; no container in this build has \
+             a parallel encoder of its own, so there is no worker count to hand it"
                 .into(),
         ));
     }
     if opts.turbo {
         return Err(stuffr::Error::Usage(
             "--turbo lifts the CPU cap for a codec's parallel encoder; no container in \
-             this build compresses anything itself"
+             this build has a parallel encoder of its own"
                 .into(),
         ));
     }
     if opts.allow_weak_encoder {
         return Err(stuffr::Error::Usage(
-            "--allow-weak-encoder consents to a codec's fallback encoder; no container \
-             in this build compresses anything itself"
+            "--allow-weak-encoder consents to a codec's fallback encoder; no container in \
+             this build has an encoder that can fall back"
                 .into(),
         ));
     }
