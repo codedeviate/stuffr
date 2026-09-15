@@ -1490,6 +1490,44 @@ mod tests {
         assert!(err.to_string().contains('3'), "{err}");
     }
 
+    /// The OTHER record length. `zoo.h` gives `SIZ_DIR 51` for a type-0/1
+    /// entry — no `var_dir_len`, no `tz`, no `dir_crc`, and no variable part
+    /// behind it — and every borrowed fixture is type 2, so nothing in the
+    /// corpus exercises the shorter branch. Reading a 56-byte record over a
+    /// 51-byte one would swallow the first five bytes of the file leader and
+    /// put `offset` five bytes out for every entry after it.
+    #[test]
+    fn a_type_one_entry_is_read_as_the_shorter_fifty_one_byte_record() {
+        let mut first = Spec::stored("OLD1.TXT", b"an older entry");
+        first.dir_type = 1;
+        let mut second = Spec::stored("OLD2.TXT", b"and the one behind it");
+        second.dir_type = 1;
+        let got = read_all(&build_zoo(&[first, second])).expect("a type-1 chain reads");
+        assert_eq!(
+            got,
+            vec![
+                ("OLD1.TXT".to_string(), b"an older entry".to_vec()),
+                ("OLD2.TXT".to_string(), b"and the one behind it".to_vec()),
+            ]
+        );
+    }
+
+    /// An LH5 payload that is not an LH5 stream is damage, not a capability
+    /// limit: the method IS decodable by this build, these particular bytes
+    /// are not. `delharc`'s own error is folded to [`Error::Corrupt`], never
+    /// left as `Error::Io` — the reader here is an in-memory slice, so there
+    /// is no genuine source failure it could be confused with.
+    #[test]
+    fn an_lh5_payload_that_does_not_decode_is_corrupt() {
+        let mut spec = Spec::stored("BAD.LH5", &[0xFFu8; 64]);
+        spec.method = 2;
+        spec.declared_org = Some(4096);
+        let err = read_all(&build_zoo(&[spec])).expect_err("garbage is not an LH5 stream");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(err.to_string().contains("BAD.LH5"), "{err}");
+    }
+
     #[test]
     fn a_directory_entry_type_past_two_is_unsupported() {
         let mut spec = Spec::stored("X.TXT", b"whatever");
