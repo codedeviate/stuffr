@@ -233,7 +233,9 @@ pub enum Fidelity {
     /// the reproducer that motivated this variant is a record whose name
     /// field is intact and whose link field is not.
     #[error(
-        "`{format}` directory record at offset {offset} fails its own checksum          ({computed:#06x} computed against {recorded:#06x} recorded); the record has been          altered since it was written"
+        "`{format}` directory record at offset {offset} fails its own checksum \
+         ({computed:#06x} computed against {recorded:#06x} recorded); the record has been \
+         altered since it was written"
     )]
     DirectoryRecordChecksum {
         format: FormatId,

@@ -54,8 +54,16 @@
 //!   the fixture whose `dirlen` is 0.
 //! - The stored `dir_crc` — a CRC-16/ARC over the record with its own CRC
 //!   field zeroed, `portable.c`'s `dir_to_b` — reproduces byte-exactly for
-//!   all four fixtures ONLY under this layout, the terminator included.
+//!   all four REAL records under this layout and matches none of them under
+//!   the 59-byte one (`0x38f3`, `0x8805`, `0x27c2`, `0x38f3` against the
+//!   recorded `0x0272`, `0x5810`, `0xbe16`, `0x0272`).
 //!   `a_directory_entrys_own_crc_confirms_the_fifty_six_byte_record` pins it.
+//!   **The terminal record is deliberately NOT part of that argument**,
+//!   though its own CRC does check out: it is the last thing in the file, so
+//!   a 59-byte slice of it clips at EOF back to the same 56 bytes and both
+//!   models produce the identical `0x83fc`. A check that cannot distinguish
+//!   two hypotheses is evidence for neither, and citing it would have made
+//!   the case look broader than it is.
 //! - `next` + 56 is exactly each fixture's file length. Under 59 every ZOO
 //!   file ever written would end three bytes into its own terminator.
 //! - `offset` − (record end) is exactly 5 in all four, which is
@@ -92,18 +100,25 @@
 //! The evidence was weighed BOTH ways rather than assumed, because
 //! `lha`/`arc` do claim `forward_parse` and a spool costs a user disk:
 //!
-//! - **For a forward walk:** zoo's own `zoolist.c` refuses a chain that does
-//!   not advance (`if (direntry.next <= zoo_pointer) prterror('f', "ZOO
-//!   chain structure is corrupted\n")`), and `zooadd.c` always appends, so
-//!   a zoo-written chain IS monotonic. This reader enforces the same rule —
-//!   see [`ZooRead::next_entry`].
-//! - **Against:** `offset` carries no such rule anywhere in zoo's source,
-//!   and it is the field a forward walk would have to trust. **And every
-//!   borrowed fixture holds exactly ONE entry**, so no byte in this
-//!   project's possession can demonstrate a multi-entry forward walk at
-//!   all. Claiming `forward_parse` would be asserting a property the corpus
-//!   cannot witness, and the failure mode of getting it wrong is refusing a
-//!   legitimate archive over a pipe.
+//! - **For a forward walk, and it is stronger than it first looks:** zoo's
+//!   own `zoolist.c` refuses a chain that does not advance (`if
+//!   (direntry.next <= zoo_pointer) prterror('f', "ZOO chain structure is
+//!   corrupted\n")`), and the writer puts both fields ahead of the reader
+//!   too — `zooadd.c` computes `direntry.offset = this_dir_offset +
+//!   SIZ_DIRL + var_dir_len + SIZ_FLDR` and then sets `next = zootell()`
+//!   immediately past the payload. So for any zoo-WRITTEN archive a forward
+//!   parse is demonstrably feasible, `offset` included. This reader enforces
+//!   the chain half of that rule — see [`ZooRead::next_entry`].
+//! - **Against:** what `zooadd.c` shows is what one writer does, not what
+//!   the FORMAT requires — `offset` is an absolute position and nothing in
+//!   `portable.c`'s reader constrains it, where the chain at least has
+//!   `zoolist.c`'s explicit rule behind it. **And every borrowed fixture
+//!   holds exactly ONE entry**, so no byte in this project's possession can
+//!   demonstrate a multi-entry forward walk at all. Claiming `forward_parse`
+//!   would mean shipping a walk whose correctness rests on a writer's
+//!   habit and which no test here can exercise; the failure mode of getting
+//!   it wrong is refusing a legitimate archive over a pipe, where the cost
+//!   of the conservative choice is only a temp file.
 //!
 //! So a file opens at `Rung::Exact` and a pipe is spooled to a temp file and
 //! opens at `Rung::Spilled` — a lower rung, still `is_authoritative()`, so
@@ -118,11 +133,18 @@
 //! would spin forever. [`ZooRead::next_entry`] refuses any `next` that does
 //! not clear the current record's own bytes, as [`Error::Corrupt`] (exit 5)
 //! — the file contradicting its own shape, `Error::exit_code`'s rule, and
-//! nothing was allocated on its say-so. It is deliberately the same verdict
-//! zoo 2.10 reaches (`prterror('f', ...)` is fatal there), so it cannot be
-//! a check that fires on input the reference tool accepts. Both a
-//! self-referential entry and a longer cycle are pinned, because a guard
-//! that only catches self-reference is the common half-fix.
+//! nothing was allocated on its say-so.
+//!
+//! **It is STRICTER than zoo's own rule, not the same one**, and the
+//! difference is worth stating rather than glossed as agreement.
+//! `zoolist.c:447` is fatal on `next <= zoo_pointer`, i.e. a link that does
+//! not move past the record's START; this refuses one that does not clear
+//! the record's END, up to 55 bytes further on. Every archive zoo writes
+//! satisfies both (`next = offset + size_now`, past the record and its
+//! payload), so nothing real sits in the gap — but a file could, and this
+//! reader would refuse what zoo 2.10 accepts. Both a self-referential entry
+//! and a longer cycle are pinned, because a guard that only catches
+//! self-reference is the common half-fix.
 //!
 //! # Methods: three, and the third is `delharc`'s
 //!
@@ -179,13 +201,35 @@
 //! reason: the eager decode is what makes [`check_declared_size`] possible
 //! at all.
 //!
+//! # Which readings no borrowed byte witnesses
+//!
+//! **Three branches are pinned only by archives written in this module's own
+//! test code, and that is the weakest evidence class in this phase.** Each
+//! reading is derived from zoo 2.10's source, so it is not
+//! self-referential — but `build_zoo` and the reader above share an author,
+//! so a field both sides read from the same wrong offset would agree with
+//! itself and be wrong on disk. Named here rather than discovered later:
+//!
+//! - **The long filename** in the variable part (`zoo.h`'s `NAMLEN_I`,
+//!   `LFNAME_I`). Every fixture has `namlen == 0`.
+//! - **A deleted entry** being skipped (`zoolist.c`'s own handling). No
+//!   fixture carries `deleted == 1`.
+//! - **The 51-byte type-0/1 record** (`zoo.h`'s `SIZ_DIR`). Every fixture is
+//!   type 2.
+//!
+//! What the borrowed bytes DO witness is the layout itself — the 56-byte
+//! record, the variable part, the file leader and the per-entry CRC — and
+//! those are proven against the four real archives with a parser written out
+//! longhand, never against anything this module builds.
+//!
 //! # Three deliberate limitations, each with its evidence
 //!
 //! - **A deleted entry is skipped, not listed.** `zoo` marks a deleted
 //!   entry `deleted = 1` and leaves it in the chain; `zoolist.c` counts
 //!   those separately and does not list them, and `zoo x` does not extract
-//!   them. This reader does the same. No borrowed fixture carries one, so
-//!   the branch is pinned by a synthesised archive.
+//!   them. This reader does the same, and counts it as a record ON the chain
+//!   — which is what keeps an all-deleted archive out of
+//!   [`ZooRead::refuse_a_chain_that_reaches_nothing`]'s way.
 //! - **The directory name in the variable part is NOT joined onto the entry
 //!   name.** Every borrowed fixture sets it to `..` — and zoo 2.10's own
 //!   `frd_dir` strips `../` components out of that field for
@@ -193,11 +237,14 @@
 //!   a traversal to reject for no gain. The long FILENAME (`namlen` /
 //!   `lfname`) IS used when present, since that is the entry's real name
 //!   and the 13-byte DOS field is its truncation.
-//! - **`dir_crc` is not enforced at read time**, only in a test. zoo itself
+//! - **`dir_crc` is checked and SURFACED, never enforced.** zoo itself
 //!   treats a bad one as advisory — `zoolist.c` prints a `*` beside the
 //!   entry and carries on — so refusing would be stricter than the
 //!   reference tool, which is how a guard comes to fire on legitimate
-//!   input. It is far more useful as the independent witness that this
+//!   input. But staying silent is the other way to get it wrong: every
+//!   field a caller is about to trust comes out of that record. A mismatch
+//!   is [`Fidelity::DirectoryRecordChecksum`], which `--strict-fidelity`
+//!   turns into exit 4. It doubles as the independent witness that this
 //!   module's record layout is right at all.
 //!
 //! # Error mapping has no wildcard
@@ -227,12 +274,12 @@ use std::time::SystemTime;
 use delharc::decode::{Decoder, Lh5Decoder};
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CorruptionDetection, CreateOpts, Entry,
-    EntryKind, EntryMeta, Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts,
-    Resolved, Result, SeekRead, Sink, Source,
+    EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, FormatMeta, MagicRule,
+    OpenOpts, Resolved, Result, SeekRead, Sink, Source,
 };
 
 use super::bits::LsbBitReader;
-use super::crc::crc16_arc;
+use super::crc::{crc16_arc, crc16_arc_continued};
 use super::dos;
 
 pub const ZOO: FormatId = FormatId::new("zoo");
@@ -248,6 +295,16 @@ const ZOO_TAG: u32 = 0xFDC4_A7DC;
 /// this reader needs: `zoo_start` is the authoritative pointer to the first
 /// directory entry, so the header's real length never has to be inferred.
 const MIN_HEADER_LEN: usize = 34;
+
+/// `zoo.h`: `#define SIZ_ZOOH 42` — the newer archive header, the classic
+/// 34-byte prefix plus `type`, `acmt_pos`, `acmt_len` and `vdata`.
+const SIZ_ZOOH: usize = 42;
+
+/// `zoo.h`: `#define FIXED_OFFSET 34` — `zoo_start` in archives old enough to
+/// have no extended header at all. `portable.c`'s `b_to_zooh` keys off this
+/// exact value, not off the file's length, to decide whether those four extra
+/// fields are present.
+const FIXED_OFFSET: u32 = 34;
 
 /// `zoo.h`: `#define SIZ_DIR 51` — a type-0/1 directory entry, which ends
 /// at `fname` with no `var_dir_len`, `tz` or `dir_crc` behind it.
@@ -317,10 +374,35 @@ impl Container for Zoo {
         }
         let zoo_start = le32(&header, 24);
 
+        // `portable.c`'s `b_to_zooh` reads the newer header's four extra
+        // fields only when `zoo_start != FIXED_OFFSET`, and this follows that
+        // rule rather than the byte count: an archive whose data starts at 34
+        // IS the old header, and there is nothing behind it to read. Only the
+        // archive comment's extent is kept — it is the one legitimate thing
+        // that can sit outside the directory chain, and
+        // [`ZooRead::refuse_a_chain_that_reaches_nothing`] has to account for
+        // it.
+        let mut archive_comment_end = 0u64;
+        if zoo_start != FIXED_OFFSET {
+            let mut ext = [0u8; SIZ_ZOOH - MIN_HEADER_LEN];
+            src.read_exact(&mut ext).map_err(classify_zoo_io)?;
+            // `ACMTPOS_I 35`, `ACMTLEN_I 39`, i.e. offsets 1 and 5 within
+            // the eight bytes behind the classic header.
+            let acmt_len = u64::from(le16(&ext, 5));
+            if acmt_len > 0 {
+                archive_comment_end = u64::from(le32(&ext, 1)) + acmt_len;
+            }
+        }
+
+        let file_len = src.seek(SeekFrom::End(0)).map_err(classify_zoo_io)?;
+
         Ok(Box::new(ZooRead {
             src,
             report,
             next_pos: Some(u64::from(zoo_start)),
+            archive_comment_end,
+            file_len,
+            entries_on_chain: 0,
             done: false,
         }))
     }
@@ -452,6 +534,13 @@ impl Method {
 struct DirEntry {
     /// Total bytes the fixed record occupies: [`SIZ_DIR`] or [`SIZ_DIRL`].
     fixed_len: usize,
+    /// Fixed part plus variable part — what `dir_to_b` writes, and where the
+    /// next thing in the file begins.
+    record_len: u64,
+    /// `Some((computed, recorded))` when this record's own `dir_crc`
+    /// disagrees with its bytes. `None` for a record that checks out AND for
+    /// a type-0/1 record, which carries no such field at all.
+    dir_crc_mismatch: Option<(u16, u16)>,
     method_byte: u8,
     next: u32,
     offset: u32,
@@ -511,13 +600,15 @@ fn read_dir_entry(src: &mut ZooSeekAdapter, pos: u64) -> Result<DirEntry> {
     };
 
     let mut name = dos_name;
+    let mut var: Vec<u8> = Vec::new();
+    let mut dir_crc_mismatch = None;
     if fixed_len == SIZ_DIRL {
         // The variable part. `var_dir_len` is a `u16`, so this allocation is
         // bounded by 64 KiB by the field's own type and needs no ceiling of
         // its own — unlike `size_now`/`org_size`, which are `u32`.
         let var_len = usize::from(le16(&rec, 51));
         if var_len > 0 {
-            let mut var = vec![0u8; var_len];
+            var = vec![0u8; var_len];
             src.read_exact(&mut var).map_err(classify_zoo_io)?;
             // `zoo.h`: NAMLEN_I = SIZ_DIRL + 0, DIRLEN_I = SIZ_DIRL + 1,
             // LFNAME_I = SIZ_DIRL + 2. `dirlen`/`dirname` are deliberately
@@ -536,10 +627,29 @@ fn read_dir_entry(src: &mut ZooSeekAdapter, pos: u64) -> Result<DirEntry> {
                 }
             }
         }
+
+        // `dir_to_b` (`portable.c`) zeroes the `dir_crc` field, runs
+        // `addbfcrc` over `SIZ_DIRL + var_dir_len` bytes, and writes the
+        // result back into it. Recomputed the same way and COMPARED, never
+        // enforced — see [`Fidelity::DirectoryRecordChecksum`] for why a
+        // record checksum warns where a content checksum refuses.
+        let recorded = le16(&rec, 54);
+        let mut zeroed = rec;
+        zeroed[54] = 0;
+        zeroed[55] = 0;
+        let mut computed = crc16_arc(&zeroed);
+        if !var.is_empty() {
+            computed = crc16_arc_continued(computed, &var);
+        }
+        if computed != recorded {
+            dir_crc_mismatch = Some((computed, recorded));
+        }
     }
 
     Ok(DirEntry {
         fixed_len,
+        record_len: fixed_len as u64 + var.len() as u64,
+        dir_crc_mismatch,
         method_byte: rec[5],
         next: le32(&rec, 6),
         offset: le32(&rec, 10),
@@ -579,6 +689,16 @@ struct ZooRead {
     /// Position of the next directory entry to read, or `None` once the
     /// terminator was reached.
     next_pos: Option<u64>,
+    /// End of the archive comment, or 0 when there is none. The one thing
+    /// that can legitimately sit outside the directory chain — see
+    /// [`ZooRead::refuse_a_chain_that_reaches_nothing`].
+    archive_comment_end: u64,
+    /// The archive's own length, read once at `open`.
+    file_len: u64,
+    /// Directory records the chain led to, the terminator excluded. Counts
+    /// DELETED records too: they are entries this archive holds and does not
+    /// hand back, which is a different thing from a chain that led nowhere.
+    entries_on_chain: u64,
     /// Set once the chain ended or any error was raised — either way
     /// nothing more will be read.
     done: bool,
@@ -610,6 +730,68 @@ impl ZooRead {
     /// [`Entry`], so that `next_entry` can set `done` after calling it: an
     /// `Entry<'_>` borrows `self` for the caller's whole lifetime, which
     /// would make the error/end bookkeeping around it unexpressible.
+    /// Refuses an archive whose directory chain led to NO entry at all while
+    /// the file holds bytes nothing on that chain accounts for.
+    ///
+    /// **The reproducer is four bytes.** Zeroing the first record's `next` in
+    /// `store.zoo` turns that record into a terminator: `list` printed no
+    /// rows, `test --strict-fidelity` answered `0 bytes verified (exact
+    /// fidelity)` and `unpack --strict-fidelity` made an empty directory, all
+    /// at exit 0, over 11,418 bytes of content the chain never mentions. A
+    /// user concludes the archive was empty.
+    ///
+    /// **`Error::Corrupt` (exit 5), and the two zip precedents resolve it
+    /// rather than leaving it to feel.** `note_unreachable_records` warns,
+    /// because there the index is self-consistent and handing back what IS
+    /// reachable is a service. `refuse_an_index_that_reaches_nothing` refuses,
+    /// because nothing is reachable and a warning would leave `unpack`
+    /// creating an empty directory at exit 0 with `--strict-fidelity` the only
+    /// thing between a user and it. This is the second shape exactly. Against
+    /// `Error::exit_code`'s own rule: nothing was allocated on the file's
+    /// say-so and no larger budget could make it readable, so this is not
+    /// exit 6 — the bytes were read and found to contradict themselves, which
+    /// is 5.
+    ///
+    /// **The predicate is a CONJUNCTION, and both arms matter**, for the same
+    /// reason zip's is: an archive with no entries is a legitimate thing to
+    /// meet, and refusing one would be the fourteenth instance of this
+    /// project's second-commonest defect.
+    ///
+    /// - Arm 1 counts records ON THE CHAIN, not entries yielded, so an
+    ///   archive whose every member is marked `deleted` — what `zoo d`
+    ///   leaves behind, with the payloads still in the file — never reaches
+    ///   arm 2 at all.
+    /// - Arm 2 asks whether anything lies past what a chain with no entries
+    ///   can account for: the terminator record itself, and the archive
+    ///   comment, whose extent comes from the header's own `acmt_pos`/
+    ///   `acmt_len`.
+    ///
+    /// **Can a legitimately empty `.zoo` exist?** Established from zoo 2.10's
+    /// source rather than from the fixtures, because four fixtures are an
+    /// observation. `zoo a` on a new archive that adds nothing `unlink`s the
+    /// file (`zooadd.c`: "No files added"), and `zoo P` over an archive whose
+    /// members are all deleted unlinks its temp file and keeps the original
+    /// (`zoopack.c`, `extcount == 0`) — so zoo 2.10 itself never writes one.
+    /// That is emphatically NOT a licence to refuse one: a header followed by
+    /// a terminator satisfies every rule the format states, another writer may
+    /// produce it, and `a_legitimately_empty_archive_is_accepted` builds one
+    /// and proves it reads as zero entries at exit 0.
+    fn refuse_a_chain_that_reaches_nothing(&self, pos: u64, terminator: &DirEntry) -> Result<()> {
+        if self.entries_on_chain > 0 {
+            return Ok(());
+        }
+        let accounted = (pos + terminator.record_len).max(self.archive_comment_end);
+        if self.file_len > accounted {
+            return Err(Error::Corrupt(format!(
+                "the ZOO directory chain reaches no entry at all — the record at offset {pos} \
+                 is already the terminator — yet {} bytes lie past everything that chain \
+                 accounts for, so this archive holds content nothing can reach",
+                self.file_len - accounted
+            )));
+        }
+        Ok(())
+    }
+
     fn next_entry_inner(&mut self) -> Result<Option<(EntryMeta, Vec<u8>)>> {
         loop {
             let Some(pos) = self.next_pos else {
@@ -617,12 +799,34 @@ impl ZooRead {
             };
             let header = read_dir_entry(&mut self.src, pos)?;
 
+            // Surfaced for EVERY record, the terminator included, and before
+            // anything is decided on the strength of its fields. A record
+            // that fails its own checksum has been altered since it was
+            // written, and the name, sizes, offset and next link a caller is
+            // about to trust all come out of it — see
+            // `Fidelity::DirectoryRecordChecksum` for why this warns where a
+            // content checksum refuses.
+            if let Some((computed, recorded)) = header.dir_crc_mismatch {
+                self.report.warn(Fidelity::DirectoryRecordChecksum {
+                    format: ZOO,
+                    offset: pos,
+                    computed,
+                    recorded,
+                });
+            }
+
             if header.next == 0 {
-                // The terminator. `zooadd.c` writes a trailing record with
-                // `next = offset = 0`, and `zoolist.c` breaks on it BEFORE
-                // counting it as an entry — so it is an end marker, never a
-                // zero-length file, and nothing about it is reported.
+                // The terminator. `next == 0` is the WHOLE rule and no other
+                // field is specified: `zooadd.c` writes the trailing record
+                // as `direntry` with `next = offset = 0` and everything else
+                // left at whatever the struct held, and `zoolist.c` breaks on
+                // `next == 0` before consulting a single other field. All
+                // four borrowed fixtures happen to carry an all-zero
+                // terminator — that is an observation about one writer's
+                // zeroed struct, not a rule, and requiring it would be
+                // exactly the inheritance Ruling J exists to prevent.
                 self.next_pos = None;
+                self.refuse_a_chain_that_reaches_nothing(pos, &header)?;
                 return Ok(None);
             }
 
@@ -640,6 +844,7 @@ impl ZooRead {
                 )));
             }
             self.next_pos = Some(u64::from(header.next));
+            self.entries_on_chain += 1;
 
             if header.deleted {
                 // `zoo` keeps deleted entries in the chain and neither lists
@@ -1169,8 +1374,20 @@ mod tests {
 
     /// Assembles a complete ZOO archive: a 42-byte header, one record plus
     /// leader plus payload per spec, and the trailing terminator `zooadd.c`
-    /// writes. Offsets and `next` links are filled in from the real byte
-    /// positions, so nothing here can drift from the layout above.
+    /// writes.
+    ///
+    /// **This builder and the reader above share an author, and that is the
+    /// weakest evidence class in this phase.** Offsets, `next` links and each
+    /// record's `dir_crc` are filled in from the real byte positions — which
+    /// keeps the builder self-consistent, and self-consistency is precisely
+    /// what it cannot vouch for: a field both sides read from the same wrong
+    /// offset would agree here and be wrong on disk. Every archive built
+    /// here is therefore evidence about BEHAVIOUR (a cycle is refused, a
+    /// deleted entry is skipped, a size lie is caught) and never about
+    /// LAYOUT. Layout is settled by the four borrowed fixtures and by zoo
+    /// 2.10's own source, which is why
+    /// `a_directory_entrys_own_crc_confirms_the_fifty_six_byte_record` walks
+    /// the real archives with a parser written out longhand instead.
     fn build_zoo(specs: &[Spec]) -> Vec<u8> {
         let mut out: Vec<u8> = Vec::new();
         let mut text = [0u8; 20];
@@ -1186,6 +1403,9 @@ mod tests {
         out.push(3); // vdata
         assert_eq!(out.len(), 42, "SIZ_ZOOH");
 
+        // `(record start, fixed+variable length)` per record, so the
+        // `dir_crc` pass below can cover exactly what `dir_to_b` covers.
+        let mut records: Vec<(usize, usize)> = Vec::new();
         let mut dir_at: Vec<usize> = Vec::new();
         for spec in specs {
             let at = out.len();
@@ -1227,6 +1447,7 @@ mod tests {
                 rec[51..53].copy_from_slice(&(var.len() as u16).to_le_bytes());
                 rec[53] = 127; // NO_TZ
             }
+            records.push((at, fixed + var.len()));
             out.extend_from_slice(&rec);
             out.extend_from_slice(&var);
             out.extend_from_slice(b"@)#(\0"); // FILE_LEADER + SIZ_FLDR
@@ -1239,6 +1460,8 @@ mod tests {
         let mut term = vec![0u8; SIZ_DIRL];
         term[0..4].copy_from_slice(&ZOO_TAG.to_le_bytes());
         term[4] = 2;
+        term[53] = 127; // NO_TZ, as `newdir` sets it
+        records.push((term_at as usize, SIZ_DIRL));
         out.extend_from_slice(&term);
 
         for (i, &at) in dir_at.iter().enumerate() {
@@ -1246,6 +1469,20 @@ mod tests {
                 .next_override
                 .unwrap_or_else(|| dir_at.get(i + 1).map(|&n| n as u32).unwrap_or(term_at));
             out[at + 6..at + 10].copy_from_slice(&next.to_le_bytes());
+        }
+
+        // LAST, because `dir_to_b` computes the record's checksum once every
+        // other field is final — and `next` is only final after the pass
+        // above. A builder that hashed each record as it wrote it would
+        // produce archives that warn about themselves.
+        for (at, len) in records {
+            if out[at + 4] != 2 {
+                continue; // a type-0/1 record carries no `dir_crc` field
+            }
+            out[at + 54] = 0;
+            out[at + 55] = 0;
+            let crc = crc16_arc(&out[at..at + len]);
+            out[at + 54..at + 56].copy_from_slice(&crc.to_le_bytes());
         }
         out
     }
@@ -1289,8 +1526,14 @@ mod tests {
     /// the `u16` at offset 51 — so this is the single test that decides
     /// between this module's 56-byte record and `unarc-rs`'s 59.
     ///
-    /// It checks the terminator too, which is the record `MANIFEST.md`
-    /// described as three bytes short: it verifies clean, so it is not short.
+    /// **The four REAL records carry the whole argument.** The terminal
+    /// record is checked too, and it verifies clean — but it is NOT evidence
+    /// and must not be cited as such: it is the last thing in the file, so a
+    /// 59-byte slice of it clips at EOF back to the same 56 bytes and both
+    /// models compute the identical `0x83fc`. A check that cannot
+    /// distinguish two hypotheses supports neither. It is kept because "the
+    /// terminator's own CRC checks out" is a true and useful fact about the
+    /// fixtures; the assertion that discriminates is the loop above it.
     /// The `tz == 127` assertion is the second, independent leg — `NO_TZ`
     /// lands at offset 53 only under this layout.
     #[test]
@@ -1312,6 +1555,20 @@ mod tests {
                 e.dir_crc,
                 "{label}: the directory entry's own CRC only reproduces over a \
                  {SIZ_DIRL}-byte fixed record plus its variable part"
+            );
+            // And the counter-model FAILS, which is what makes the line above
+            // a discriminator rather than a coincidence: `unarc-rs`'s 59-byte
+            // fixed record with `dir_crc` as a u32 at 53 hashes a different
+            // span and reads its expectation from a different place.
+            let alt = &bytes[e.at..e.at + 59 + e.var_len];
+            let mut alt_zeroed = alt.to_vec();
+            for b in &mut alt_zeroed[53..57] {
+                *b = 0;
+            }
+            assert_ne!(
+                crc16_arc(&alt_zeroed),
+                u32::from_le_bytes([alt[53], alt[54], alt[55], alt[56]]) as u16,
+                "{label}: the 59-byte model must NOT also reproduce, or this proves nothing"
             );
 
             // The terminator, read as a COMPLETE record ending at EOF.
@@ -1571,6 +1828,202 @@ mod tests {
         let err = read_all(cut).expect_err("a truncated terminator must be refused");
         assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
         assert_eq!(err.exit_code(), 5, "{err}");
+    }
+
+    // ---- a chain that reaches nothing ----
+
+    /// What one archive read produced: its entries, and the fidelity report
+    /// that came with them.
+    type ReadWithReport = (Vec<(String, Vec<u8>)>, FidelityReport);
+
+    /// Opens an archive and returns its entries alongside the fidelity report
+    /// the read produced, because several properties below are about what was
+    /// WARNED rather than what came back.
+    fn read_all_with_report(bytes: &[u8]) -> Result<ReadWithReport> {
+        let mut ar = open_seekable(bytes)?;
+        let mut out = Vec::new();
+        while let Some(mut entry) = ar.next_entry()? {
+            let name = entry.meta().name.clone();
+            let mut data = Vec::new();
+            entry.reader().read_to_end(&mut data)?;
+            out.push((name, data));
+        }
+        let report = ar.fidelity().clone();
+        Ok((out, report))
+    }
+
+    /// Zeroes the first record's `next` in a real archive — the reviewer's
+    /// four-byte mutation.
+    fn with_the_chain_cut_at_the_first_record(bytes: &[u8]) -> Vec<u8> {
+        let mut out = bytes.to_vec();
+        let start = u32::from_le_bytes([out[24], out[25], out[26], out[27]]) as usize;
+        out[start + 6..start + 10].copy_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    /// **The required fix.** Four bytes turn `store.zoo`'s only record into a
+    /// terminator, and before this guard `list` printed no rows, `test
+    /// --strict-fidelity` answered `0 bytes verified (exact fidelity)` and
+    /// `unpack --strict-fidelity` made an empty directory — all at exit 0,
+    /// over 11,418 bytes of content the chain never mentions.
+    #[test]
+    fn a_chain_that_reaches_no_entry_over_a_file_holding_content_is_corrupt() {
+        let bytes = with_the_chain_cut_at_the_first_record(STORE_ZOO);
+        assert_eq!(bytes.len(), STORE_ZOO.len(), "only four bytes change");
+        let err = read_all(&bytes).expect_err("an archive nothing can reach must be refused");
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "the bytes were read and found to contradict themselves, and no larger budget \
+             could make the file readable — see Error::exit_code's own rule: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("11418") && msg.contains("reaches no entry"),
+            "the message must name the orphaned bytes, got: {msg}"
+        );
+    }
+
+    /// The other half of the conjunction, and the one that decides whether
+    /// this guard is a fix or the fourteenth wrong refusal. A header followed
+    /// by nothing but a terminator satisfies every rule the format states.
+    ///
+    /// zoo 2.10 itself never writes one — `zoo a` unlinks a new archive that
+    /// added nothing, and `zoo P` over an all-deleted archive keeps the
+    /// original rather than writing an emptied one — which is a fact about
+    /// that writer, not about the format, and is not licence to refuse one.
+    #[test]
+    fn a_legitimately_empty_archive_is_accepted() {
+        let bytes = build_zoo(&[]);
+        assert_eq!(bytes.len(), 42 + SIZ_DIRL, "a header and a terminator");
+        let (got, report) = read_all_with_report(&bytes).expect("an empty archive is not corrupt");
+        assert!(got.is_empty(), "no entries, and no error either: {got:?}");
+        assert!(
+            !report.has_warnings(),
+            "an empty archive is exact, not approximated: {:?}",
+            report.warnings
+        );
+    }
+
+    /// An empty archive that carries an archive COMMENT still reads. The
+    /// comment is the one thing that legitimately sits outside the directory
+    /// chain, so arm 2 accounts for it from the header's own `acmt_pos` /
+    /// `acmt_len` rather than treating every trailing byte as orphaned.
+    #[test]
+    fn an_empty_archive_with_an_archive_comment_is_accepted() {
+        let mut bytes = build_zoo(&[]);
+        let comment = b"packed by something that is not zoo";
+        let at = bytes.len() as u32;
+        bytes.extend_from_slice(comment);
+        // ACMTPOS_I 35, ACMTLEN_I 39.
+        bytes[35..39].copy_from_slice(&at.to_le_bytes());
+        bytes[39..41].copy_from_slice(&(comment.len() as u16).to_le_bytes());
+        let got = read_all(&bytes).expect("an archive comment is not orphaned content");
+        assert!(got.is_empty());
+    }
+
+    /// An archive whose every member is marked deleted yields no entries and
+    /// must still not be refused — `zoo d` leaves exactly this, payloads
+    /// included. Arm 1 counts records ON THE CHAIN rather than entries
+    /// yielded, so this never reaches arm 2 at all.
+    #[test]
+    fn an_archive_whose_every_entry_is_deleted_is_accepted() {
+        let mut a = Spec::stored("GONE1.TXT", b"first, deleted");
+        a.deleted = true;
+        let mut b = Spec::stored("GONE2.TXT", b"second, deleted");
+        b.deleted = true;
+        let (got, report) = read_all_with_report(&build_zoo(&[a, b]))
+            .expect("an all-deleted archive is not corrupt");
+        assert!(got.is_empty(), "{got:?}");
+        assert!(!report.has_warnings(), "{:?}", report.warnings);
+    }
+
+    /// **Arm 1 is what keeps trailing bytes tolerated**, and this is the test
+    /// that makes it load-bearing. `arc.rs` already ruled on this shape for
+    /// the four `.pak` fixtures' ten unexplained trailing bytes: content
+    /// after a valid end marker is IGNORED, never read as corruption. A guard
+    /// that asked "does anything lie past the terminator?" without first
+    /// asking "did the chain reach anything?" would refuse a perfectly
+    /// readable archive for a byte nobody consults.
+    #[test]
+    fn an_archive_with_trailing_bytes_after_its_terminator_still_reads() {
+        let mut bytes = STORE_ZOO.to_vec();
+        bytes.extend_from_slice(b"whatever a later tool appended here");
+        let (got, report) = read_all_with_report(&bytes).expect("trailing bytes are ignored");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, license());
+        assert!(!report.has_warnings(), "{:?}", report.warnings);
+    }
+
+    /// The regression guard for the refusal: all four real fixtures, and a
+    /// well-formed multi-entry archive, must be unaffected.
+    #[test]
+    fn the_borrowed_fixtures_are_never_refused_as_reaching_nothing() {
+        for (bytes, label) in [
+            (STORE_ZOO, "store.zoo"),
+            (DEFAULT_ZOO, "default.zoo"),
+            (HIGH_PER_ZOO, "high_per.zoo"),
+        ] {
+            let (got, report) =
+                read_all_with_report(bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(got.len(), 1, "{label}");
+            assert!(!report.has_warnings(), "{label}: {:?}", report.warnings);
+        }
+        // `wrongcrc16.zoo` fails on its entry's CONTENT checksum, which is a
+        // different verdict and must stay that one.
+        let err = read_all(WRONGCRC16_ZOO).unwrap_err();
+        assert!(err.to_string().contains("CRC-16/ARC"), "{err}");
+    }
+
+    // ---- the record's own checksum ----
+
+    /// zoo prints a `*` beside a record whose `dir_crc` fails and carries on
+    /// listing it (`zoolist.c`). This reader does the same thing in this
+    /// project's vocabulary: a fidelity warning, which `--strict-fidelity`
+    /// turns into exit 4, and never a refusal — refusing would be stricter
+    /// than the reference implementation.
+    #[test]
+    fn a_record_that_fails_its_own_checksum_warns_rather_than_refusing() {
+        // Alter a field no other check reads: the entry's own DOS name. The
+        // content CRC still matches, the sizes still agree, the chain still
+        // advances — only the record's self-check notices.
+        let mut bytes = STORE_ZOO.to_vec();
+        let start = 42usize;
+        bytes[start + FNAME_I] = b'L'; // "license" -> "License"
+        let (got, report) = read_all_with_report(&bytes).expect("a record checksum never refuses");
+        assert_eq!(got.len(), 1, "the entry is still handed back");
+        assert_eq!(got[0].0, "License", "the altered name is reported verbatim");
+        assert!(
+            report.has_warnings(),
+            "--strict-fidelity must gate on this: exit 0 over an altered record is the defect"
+        );
+        let warned = report.warnings.iter().any(|w| {
+            matches!(
+                w,
+                Fidelity::DirectoryRecordChecksum { offset, .. } if *offset == start as u64
+            )
+        });
+        assert!(warned, "got {:?}", report.warnings);
+    }
+
+    /// The mutation that motivated the refusal also fails its record
+    /// checksum, and that is a SECOND, independent observation rather than
+    /// the one the refusal rests on — the refusal is structural (a chain
+    /// reaching nothing over a file holding content) and fires on formats
+    /// and record types that carry no checksum at all.
+    #[test]
+    fn the_cut_chains_record_also_fails_its_own_checksum() {
+        let bytes = with_the_chain_cut_at_the_first_record(STORE_ZOO);
+        let rec = &bytes[42..42 + SIZ_DIRL + 13];
+        let mut zeroed = rec.to_vec();
+        zeroed[54] = 0;
+        zeroed[55] = 0;
+        assert_ne!(
+            crc16_arc(&zeroed),
+            u16::from_le_bytes([rec[54], rec[55]]),
+            "zeroing `next` must invalidate the record's own checksum"
+        );
     }
 
     // ---- the chain guard ----

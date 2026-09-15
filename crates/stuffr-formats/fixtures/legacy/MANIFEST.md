@@ -539,14 +539,25 @@ Five independent measurements, each re-derived from the bytes on disk:
   the eight bytes `dir_to_b` writes after them (`system_id` 2, `fattr` 3,
   `vflag`+`version_no` 3) — exactly `2 + 0 + 3 + 8 = 13`, and `2 + 0 + 0 + 8
   = 10` for `default.zoo`, whose `dirlen` is 0.
-- Each record's own stored `dir_crc` — a CRC-16/ARC over `SIZ_DIRL +
-  var_dir_len` bytes with the `dir_crc` field itself zeroed, `portable.c`'s
-  `dir_to_b` — **reproduces byte-exactly under this layout and under no
-  other**: `0x0272` (`store.zoo` and `wrongcrc16.zoo`), `0x5810`
-  (`default.zoo`), `0xBE16` (`high_per.zoo`), and `0x83FC` for the terminal
-  record in all four. That last figure is the direct refutation of the
-  "short marker" reading: a record three bytes short of its own length could
-  not carry a CRC over itself that checks out.
+- Each of the four REAL records' own stored `dir_crc` — a CRC-16/ARC over
+  `SIZ_DIRL + var_dir_len` bytes with the `dir_crc` field itself zeroed,
+  `portable.c`'s `dir_to_b` — **reproduces byte-exactly under this layout,
+  and the 59-byte model reproduces none of them**:
+
+  | fixture | recorded | 56-byte model | 59-byte model |
+  |---|---|---|---|
+  | `store.zoo` | `0x0272` | **`0x0272` ✓** | `0x38f3` ✗ |
+  | `default.zoo` | `0x5810` | **`0x5810` ✓** | `0x8805` ✗ |
+  | `high_per.zoo` | `0xbe16` | **`0xbe16` ✓** | `0x27c2` ✗ |
+  | `wrongcrc16.zoo` | `0x0272` | **`0x0272` ✓** | `0x38f3` ✗ |
+
+  **The terminal record is deliberately NOT in that table**, and an earlier
+  version of this correction wrongly cited it. Its `0x83fc` checks out under
+  BOTH models — it is the last thing in the file, so a 59-byte slice of it
+  clips at EOF back to the same 56 bytes. A check that cannot distinguish two
+  hypotheses is evidence for neither, and including it made the case look
+  broader than it is. The four real records are the whole discriminator, and
+  they are sufficient.
 - `next + 56` is exactly each fixture's file length. Under 59, every ZOO
   archive ever written would end three bytes inside its own terminator.
 - `offset` minus the end of the record (`56 + var_dir_len`) is exactly 5 in

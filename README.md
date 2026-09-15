@@ -25,8 +25,8 @@ read list.
 > (see the Phase 3b paragraphs below), all of it then proven to coexist. The
 > `legacy` feature (bundled into `full`/`--all-features`) still exists and
 > still works — it is what `--no-default-features --features pure` would
-> otherwise lack, not something a default build needs to opt into. **1009**
-> tests under `--all-features`, **944** on the default tier — a different
+> otherwise lack, not something a default build needs to opt into. **1018**
+> tests under `--all-features`, **953** on the default tier — a different
 > set, not a subset, because the two tiers select different backends.
 > (The previous figures here, 963/898, were stale by two: the gate's own
 > output read 965/900 before ZOO landed. Both counts are measured from
