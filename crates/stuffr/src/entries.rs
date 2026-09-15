@@ -707,6 +707,51 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                 reason: "resolved outside the destination",
             });
         }
+        // `safe_join` resolves `.` and `./` to `dest` ITSELF — deliberately,
+        // because that is the first entry `tar cf x.tar .` emits — and it
+        // cannot decide this case on its own, because it never sees the
+        // entry's KIND. So the refusal belongs here, the one place that has
+        // both the resolved path and the kind.
+        //
+        // Left open, a FILE entry named `.` made `unpack` run
+        // `File::create(dest)` on the caller's own directory: `i/o error: Is
+        // a directory (os error 21)`, **exit 1** — "stuffr failed" for a
+        // three-byte hostile name, which is the one code `check_error_is_
+        // classified` exists to keep hostile input out of. A `Symlink` named
+        // `.` is worse still: `replace_conflicting` plus `create_symlink`
+        // would replace the destination directory with a link.
+        //
+        // Exit 7 (`UnsafePath`), argued against `error.rs`'s own rule rather
+        // than picked for symmetry with the refusal above it:
+        //
+        // * NOT exit 5 (`Corrupt`) — nothing about the archive disagrees
+        //   with itself. A `-lh0-` entry named `.` is a well-formed header
+        //   delivering exactly the payload it declares; `error.rs` reserves
+        //   5 for "stuffr read the bytes and they contradict each other".
+        // * NOT exit 6 — no limit decided anything and nothing was sized
+        //   from a declared field, which is `error.rs`'s definition of 6.
+        // * NOT exit 3 — this build reads the entry perfectly well; the
+        //   refusal is about what MATERIALISING it would do, not about a
+        //   capability this build lacks.
+        // * NOT exit 1, which is the whole point.
+        //
+        // That leaves the family of "the archive asked this extraction to
+        // write somewhere it must not", which is exactly `UnsafePath`, and
+        // it already carries a sibling shape: `safe_join` refuses `a/..`
+        // with "path traversal nets back to the destination" — the other
+        // name that resolves to `dest`, refused there because that one has
+        // no legitimate reading at all.
+        //
+        // The hole was NOT introduced by the LHA name change; it is
+        // pre-existing and a raw `tar` with a `REGTYPE` `.` entry reaches it
+        // identically. Closing it here closes it for every container at
+        // once, which is why it is not in `lha.rs`.
+        if target == dest && !matches!(meta.kind, EntryKind::Dir) {
+            return Err(Error::UnsafePath {
+                path: meta.name.clone(),
+                reason: "only a directory entry may name the destination itself",
+            });
+        }
         // Still before any filesystem call for this entry — and the one
         // check that has to look at the filesystem, because the two above
         // are lexical and a lexical check cannot see a symlink standing in

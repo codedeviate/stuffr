@@ -1367,6 +1367,7 @@ fn pack_writes_a_compress_stream_the_system_tool_reads() {
 #[test]
 fn pack_writes_an_lha_archive_the_system_tool_reads() {
     let lha_bin = require_lhasa();
+    let banner = lhasa_banner(&lha_bin);
     let dir = tmp("lha-write-dir");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("tree/sub")).unwrap();
@@ -1397,7 +1398,7 @@ fn pack_writes_an_lha_archive_the_system_tool_reads() {
     let test = Command::new(&lha_bin).arg("t").arg(&dst).output().unwrap();
     assert!(
         test.status.success(),
-        "lhasa must accept an archive stuffr wrote: {}\n{}",
+        "{banner} must accept an archive stuffr wrote: {}\n{}",
         String::from_utf8_lossy(&test.stdout),
         String::from_utf8_lossy(&test.stderr)
     );
@@ -1414,7 +1415,7 @@ fn pack_writes_an_lha_archive_the_system_tool_reads() {
         .unwrap();
     assert!(
         extract.status.success(),
-        "lhasa must extract it: {}",
+        "{banner} must extract it: {}",
         String::from_utf8_lossy(&extract.stderr)
     );
     assert_eq!(std::fs::read(out.join("tree/alpha.txt")).unwrap(), alpha);
@@ -2677,6 +2678,140 @@ fn a_traversing_entry_is_refused_and_writes_nothing_outside_the_destination() {
         "the refusal must name the offending entry, got: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// A **file** entry named `.` must be refused, not `File::create`d over the
+/// caller's own destination directory.
+///
+/// `safe_join` resolves `.` to `dest` itself, deliberately — that is the
+/// first entry `tar cf x.tar .` emits, and a DIRECTORY entry naming it is
+/// correct and common. It cannot decide the case alone because it never sees
+/// the entry's kind, so `entries.rs` refuses a non-`Dir` entry that resolves
+/// to `dest` after the join.
+///
+/// Before that refusal existed this was **exit 1** — `i/o error: Is a
+/// directory (os error 21)` — from three bytes of hostile name. Exit 1 means
+/// *stuffr* failed, the one code hostile input must never produce and the
+/// invariant `check_error_is_classified` exists to hold.
+///
+/// Written with the raw `tar` crate, never through stuffr: this is a shape
+/// stuffr would not itself produce, and the hole is pre-existing in
+/// `entries.rs` rather than anything a container introduced.
+#[test]
+fn a_file_entry_naming_the_destination_itself_is_refused() {
+    let dir = tmp_dir();
+    let evil = dir.join("dot.tar");
+    write_raw_tar(&evil, &[Raw::File(".", b"pwned")]);
+    let out_dir = dir.join("out");
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "a file entry naming the destination must be an unsafe path (exit 7), never exit 1 \
+         (`stuffr failed`), stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out_dir.is_dir(),
+        "the destination must still be a directory, not a file stuffr created over it"
+    );
+
+    // A DIRECTORY entry named `.` is the legitimate shape and must still
+    // work — the refusal is pinned to the kind, not to the name.
+    let ok = dir.join("dotdir.tar");
+    write_raw_tar(&ok, &[Raw::Dir("."), Raw::File("a.txt", b"hi")]);
+    let ok_dir = dir.join("ok");
+    let out = run_output(&[
+        "unpack",
+        ok.to_str().unwrap(),
+        "-C",
+        ok_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "`tar cf x.tar .`'s own leading directory entry must still extract, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(ok_dir.join("a.txt")).unwrap(), b"hi");
+}
+
+/// The same refusal reached through LHA, which is where it was found.
+///
+/// `delharc`'s own name accessor stripped `.` to the empty string, so this
+/// entry used to be refused one step earlier by `safe_join`'s "empty entry
+/// name". Reporting the name verbatim — which is what containment needs —
+/// let the raw `.` through to the hole `entries.rs` now closes, so BOTH
+/// containers are tested: closing it in one place is the point.
+#[test]
+fn an_lha_file_entry_naming_the_destination_itself_is_refused() {
+    let dir = tmp_dir();
+    let evil = dir.join("dot.lzh");
+    std::fs::write(&evil, raw_lha_entry(b".", b"-lh0-", b"pwned")).unwrap();
+    let out_dir = dir.join("out");
+
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "an LHA file entry naming the destination must be exit 7, never exit 1, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out_dir.is_dir(),
+        "the destination must still be a directory"
+    );
+}
+
+/// One LHA level-1 header plus a stored (`-lh0-`) payload and the
+/// end-of-archive marker, built here rather than through stuffr for the same
+/// reason `write_raw_tar` exists: these are archives stuffr must be able to
+/// REFUSE, and it would never write one.
+fn raw_lha_entry(name: &[u8], method: &[u8; 5], content: &[u8]) -> Vec<u8> {
+    let mut crc: u16 = 0;
+    for &b in content {
+        crc ^= u16::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    let size = content.len() as u32;
+    let mut counted: Vec<u8> = Vec::new();
+    counted.extend_from_slice(method);
+    counted.extend_from_slice(&size.to_le_bytes()); // level-1 skip size
+    counted.extend_from_slice(&size.to_le_bytes()); // original size
+    counted.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+    counted.push(0x20); // MS-DOS ARCHIVE
+    counted.push(1); // header level
+    counted.push(name.len() as u8);
+    counted.extend_from_slice(name);
+    counted.extend_from_slice(&crc.to_le_bytes());
+    counted.push(b'U'); // OS-TYPE: Unix
+    counted.extend_from_slice(&0u16.to_le_bytes()); // no extra headers
+
+    let mut out = vec![
+        counted.len() as u8,
+        counted.iter().fold(0u8, |a, &b| a.wrapping_add(b)),
+    ];
+    out.extend_from_slice(&counted);
+    out.extend_from_slice(content);
+    out.push(0); // end-of-archive marker
+    out
 }
 
 #[test]
@@ -5943,6 +6078,23 @@ fn require_lhasa() -> PathBuf {
              knowing rather than passing silently"
         )
     })
+}
+
+/// lhasa's banner, which carries its VERSION, so an assertion that fires on
+/// a runner says which build produced it. Ubuntu noble ships lhasa 0.4.0
+/// while this project's `-lhd-` guard was measured against 0.6.0 — see
+/// `legacy/lha.rs`'s `lhasa_banner` for why that difference is worth one
+/// line of output.
+fn lhasa_banner(bin: &std::path::Path) -> String {
+    let out = Command::new(bin)
+        .output()
+        .expect("run lhasa with no arguments for its banner");
+    let text = if out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    } else {
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    text.lines().next().unwrap_or("<no banner>").to_string()
 }
 
 /// The permission bits only. The file-type bits are not what any container
