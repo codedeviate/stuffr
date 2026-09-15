@@ -98,6 +98,18 @@
 //!    actually pulled from the source, not assumed from an implementation's
 //!    shape — this is the property that caught lz4 buffering 4 MiB on the
 //!    codec side.
+//!
+//! **Properties 5-8 all need the ladder to supply a forward-only source,
+//! and for some containers it never can.** See [`reachable_forward_only`]:
+//! under `StreamPolicy::ForwardOnly` the spool and salvage rungs are both
+//! off, so a container declaring `needs_seek` (or not declaring
+//! `forward_parse`) resolves to `Err(NotSeekable)` and the setup helpers
+//! PANIC. Those four properties therefore skip for such a container — each
+//! saying so on stderr, never in silence. Nothing ELSE about the harness
+//! changes for that shape: properties 1-4 and 9-13, the truncation sweep
+//! and the payload cut included, all still run, over the spooled source a
+//! real caller gets.
+
 //! 9. Truncation is detected and reported as `io::ErrorKind::InvalidData`,
 //!    UNCONDITIONALLY on `caps.read` — the one property a container author
 //!    cannot vote themselves out of, mirroring codec property 10. Even a
@@ -146,7 +158,7 @@ use std::sync::{Arc, Mutex};
 use crate::archive::{ArchiveRead, Container, CreateOpts, EntryMeta, OpenOpts, PlainSink};
 use crate::error::Result;
 use crate::fidelity::Rung;
-use crate::format::FormatMeta;
+use crate::format::{ContainerCaps, FormatMeta};
 use crate::honesty::check_error_is_classified;
 use crate::source::{ReaderSource, SeekRead, Source, SourceCaps};
 
@@ -342,6 +354,54 @@ fn read_all(container: &dyn Container, bytes: &[u8]) -> Result<Vec<(String, Vec<
 /// first — and a hand-rolled second copy over there would be free to drift
 /// from this one, which is exactly how a test ends up asserting against a
 /// setup the harness no longer uses.
+/// Whether [`crate::ladder::resolve`] can hand this container a GENUINELY
+/// forward-only source at all — the precondition every helper built on
+/// [`open_forward_only`] silently assumed until a `needs_seek` container
+/// gained a writer.
+///
+/// Read straight off `resolve`'s own rung order under
+/// [`crate::StreamPolicy::ForwardOnly`], not guessed: that policy resolves
+/// `(allow_forward_only = true, spill = Off, allow_degraded = false)`, so
+/// rung 3 (spool) and rung 4 (degraded salvage) are both unavailable and
+/// rung 2 is the only one left. Rung 2's guard is
+/// `caps.forward_parse && allow_forward_only && !caps.needs_seek`. Anything
+/// failing it falls all the way through to `Err(NotSeekable)` — which
+/// `open_forward_only` and [`first_entry_source_bytes`] both turn into a
+/// setup PANIC, deliberately (a container that cannot do what its caps
+/// claim is broken outright, not in violation of one property).
+///
+/// So for a container declaring `needs_seek` — `legacy::arj`, whose
+/// `unarj-rs` cannot read an archive without `Seek`, and `legacy::zoo` —
+/// properties 5-8 are not merely uninteresting, they are UNRUNNABLE: the
+/// ladder spools such a source to a temp file before the container sees a
+/// byte, which is exactly what makes a "how much of the source was pulled"
+/// measurement (property 8) a statement about the ladder rather than about
+/// the container. Skipping is therefore the honest answer, and each of the
+/// four says so on stderr rather than passing in silence — the same
+/// skip-on-evidence-and-report-it discipline the fixture-driven entry point
+/// applies to its own properties 7 and 10.
+fn reachable_forward_only(caps: ContainerCaps) -> bool {
+    caps.forward_parse && !caps.needs_seek
+}
+
+/// The reason [`reachable_forward_only`] said no, for the skip messages.
+/// Both halves of that conjunction are reported, because a container
+/// failing both should not have a reader guessing which one applied.
+fn why_not_forward_only(caps: ContainerCaps) -> String {
+    match (caps.forward_parse, caps.needs_seek) {
+        (false, true) => "this container declares needs_seek and not forward_parse, so the \
+                          ladder never supplies it a forward-only source"
+            .to_string(),
+        (false, false) => "this container does not declare forward_parse, so the ladder's \
+                           forward-only rung is not open to it"
+            .to_string(),
+        (true, true) => "this container declares needs_seek, which closes the ladder's \
+                         forward-only rung even though it also claims forward_parse"
+            .to_string(),
+        (true, false) => unreachable!("reachable_forward_only() was true"),
+    }
+}
+
 pub fn open_forward_only(container: &dyn Container, bytes: &[u8]) -> Box<dyn ArchiveRead> {
     let id = container.id();
     let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes.to_vec())));
@@ -1078,11 +1138,17 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
             &[("a.txt", &b"alpha"[..]), ("b.txt", &b"beta"[..])],
         );
 
+        // Properties 5, 6, 7 and 8 all need the ladder to hand this
+        // container a genuinely forward-only source. It cannot for every
+        // container — see `reachable_forward_only` — and where it cannot,
+        // each of the four skips VISIBLY rather than failing in setup.
+        let forward_only = reachable_forward_only(caps);
+
         // 5. Forward parse from a GENUINELY non-seekable source — a real
         //    pipe-shaped reader, not a Cursor pretending to lack Seek. See
         //    `open_forward_only`'s doc comment for why `ReaderSource` is what
         //    makes this structural rather than a mere `caps()` claim.
-        if caps.forward_parse {
+        if forward_only {
             let fwd = read_all_forward_only(container, &bytes);
             assert_eq!(
                 fwd.len(),
@@ -1091,11 +1157,16 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                  yielded {} entries, expected 2",
                 fwd.len()
             );
+        } else {
+            eprintln!(
+                "conformance[{id}] property 5: skipped — {}",
+                why_not_forward_only(caps)
+            );
         }
 
         // 6. by_index must return Err(NotSeekable) rather than lie when the
         //    ladder supplied a forward-only source.
-        {
+        if forward_only {
             let mut ar = open_forward_only(container, &bytes);
             match ar.by_index(0) {
                 Err(crate::error::Error::NotSeekable { .. }) => {}
@@ -1108,26 +1179,40 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                      be Err(NotSeekable), got {e:?}"
                 ),
             }
+        } else {
+            eprintln!(
+                "conformance[{id}] property 6: skipped — {}. This container's own tests \
+                 own the `by_index` claim over the source shape it DOES get",
+                why_not_forward_only(caps)
+            );
         }
 
         // 7. Rung honesty. A trailing_index container read forward has not
         //    consulted its authoritative index, so it must not report Exact.
         if caps.trailing_index {
-            let ar = open_forward_only(container, &bytes);
-            let rung = ar.fidelity().rung;
-            assert_ne!(
-                rung,
-                Rung::Exact,
-                "conformance[{id}] property 7: a trailing-index container read forward \
-                 reported Rung::Exact, but its authoritative index is at the END of the \
-                 stream and was never read"
-            );
+            if forward_only {
+                let ar = open_forward_only(container, &bytes);
+                let rung = ar.fidelity().rung;
+                assert_ne!(
+                    rung,
+                    Rung::Exact,
+                    "conformance[{id}] property 7: a trailing-index container read forward \
+                     reported Rung::Exact, but its authoritative index is at the END of the \
+                     stream and was never read"
+                );
+            } else {
+                eprintln!(
+                    "conformance[{id}] property 7: skipped — {}, so there is no forward read \
+                     for the trailing index to go unconsulted by",
+                    why_not_forward_only(caps)
+                );
+            }
         }
 
         // 8. Entry data streams incrementally, so `stuffr cat big.tar | head`
         //    does not buffer the archive. Measured by counting bytes pulled
         //    from the source before the FIRST entry's data is available.
-        {
+        if forward_only {
             let big = build(container, &[("big.bin", &vec![b'x'; 4 * 1024 * 1024][..])]);
             let counting = CountingSource::new(&big);
             let consumed = first_entry_source_bytes(container, counting);
@@ -1136,6 +1221,13 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 "conformance[{id}] property 8: reaching the first entry consumed \
                  {consumed} of {} archive bytes — the whole archive was buffered",
                 big.len()
+            );
+        } else {
+            eprintln!(
+                "conformance[{id}] property 8: skipped — {}. The ladder SPOOLS such a \
+                 source, so the whole archive is read before the container sees a byte of \
+                 it and this measurement would describe the ladder, not the container",
+                why_not_forward_only(caps)
             );
         }
 
@@ -1468,11 +1560,85 @@ fn assert_panics_naming_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::{ArchiveWrite, Sink};
+    use crate::format::FormatId;
+    use crate::ladder::Resolved;
     use crate::testing::{FramedMockContainer, framed_container_meta};
 
     #[test]
     fn a_well_behaved_container_satisfies_properties_one_to_thirteen() {
         assert_container_conforms(&FramedMockContainer, &framed_container_meta());
+    }
+
+    /// [`FramedMockContainer`] wearing ARJ's caps shape — `needs_seek: true`,
+    /// `forward_parse: false` — and nothing else changed.
+    ///
+    /// The double exists because ARJ became the first WRITE-capable container
+    /// in this tree that the ladder can never hand a forward-only source
+    /// (Phase 3c Task 7). Before [`reachable_forward_only`] existed, running
+    /// the thirteen-property harness on such a container did not fail a
+    /// property — it died in property 6's SETUP, at
+    /// `open_forward_only`'s own `resolve forward-only` panic, because
+    /// `StreamPolicy::ForwardOnly` has no rung left for a `needs_seek`
+    /// container to take.
+    struct SeekOnlyMockContainer;
+
+    impl Container for SeekOnlyMockContainer {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                needs_seek: true,
+                ..ContainerCaps::read_write()
+            }
+        }
+
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            FramedMockContainer.open(resolved, o)
+        }
+
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    /// A container the ladder can only ever hand a SPOOLED source must still
+    /// run the harness end to end, skipping properties 5-8 and asserting
+    /// every other one over the source shape it really gets.
+    ///
+    /// The positive twin of `mod broken_containers` below: those prove the
+    /// harness can fail, this proves it can still RUN for the one container
+    /// shape whose setup it used to die in.
+    #[test]
+    fn a_seek_only_container_runs_the_harness_to_completion() {
+        assert_container_conforms(&SeekOnlyMockContainer, &framed_container_meta());
+    }
+
+    /// The gate is a conjunction and both halves matter — a container may
+    /// fail it for either reason, and the skip message must say which.
+    #[test]
+    fn the_forward_only_gate_reads_both_halves_of_the_ladder_rung() {
+        let fwd = ContainerCaps {
+            forward_parse: true,
+            ..ContainerCaps::read_only()
+        };
+        assert!(reachable_forward_only(fwd));
+        assert!(!reachable_forward_only(ContainerCaps::read_only()));
+        assert!(!reachable_forward_only(ContainerCaps {
+            needs_seek: true,
+            ..fwd
+        }));
+        assert!(
+            why_not_forward_only(ContainerCaps {
+                needs_seek: true,
+                ..fwd
+            })
+            .contains("even though it also claims forward_parse"),
+            "a container claiming both must not be told it lacks forward_parse"
+        );
+        assert!(why_not_forward_only(ContainerCaps::read_only()).contains("does not declare"));
     }
 
     #[test]
