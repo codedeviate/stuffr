@@ -743,43 +743,12 @@ fn unpack_rle90(input: &[u8], name: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Reads bits least-significant-first within each byte, in byte order.
-///
-/// That is the order both ARC bitstreams use (`bitstream_io`'s
-/// `LittleEndian` in `unarc-rs`'s terms). `read_bits` answers `None` the
-/// moment the stream cannot supply the full width asked for, which is how
-/// both decoders below detect a clean end of stream.
-struct BitReader<'a> {
-    data: &'a [u8],
-    pos: usize,
-    buf: u32,
-    bits: u32,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        BitReader {
-            data,
-            pos: 0,
-            buf: 0,
-            bits: 0,
-        }
-    }
-
-    fn read_bits(&mut self, n: u32) -> Option<u16> {
-        debug_assert!(n <= 16);
-        while self.bits < n {
-            let byte = *self.data.get(self.pos)?;
-            self.pos += 1;
-            self.buf |= u32::from(byte) << self.bits;
-            self.bits += 8;
-        }
-        let value = (self.buf & ((1u32 << n) - 1)) as u16;
-        self.buf >>= n;
-        self.bits -= n;
-        Some(value)
-    }
-}
+/// Both ARC bitstreams read least-significant-bit-first within each byte,
+/// in byte order (`bitstream_io`'s `LittleEndian` in `unarc-rs`'s terms).
+/// That reader lives in [`super::bits`] because ZOO's `lzd` wants the
+/// identical computation — see that module's own doc for why this one is
+/// shared where the LZW engines around it deliberately are not.
+use super::bits::LsbBitReader as BitReader;
 
 /// The squeeze tree's symbol count: 256 byte values plus one end marker.
 const SQUEEZE_VALUES: usize = 257;

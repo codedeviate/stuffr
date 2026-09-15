@@ -12,6 +12,11 @@
 pub mod arc;
 #[cfg(feature = "arj")]
 pub mod arj;
+// The least-significant-bit-first bit reader ARC's two bitstreams read
+// through. See its own module doc for why THIS is shared where the LZW
+// engines built on it are deliberately not.
+#[cfg(feature = "arc")]
+mod bits;
 #[cfg(feature = "compress")]
 pub mod compress_z;
 // ZOO (Phase 3c Task 4) will need this too; widen the `cfg` when it lands
