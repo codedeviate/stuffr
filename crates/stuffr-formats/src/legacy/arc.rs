@@ -1663,13 +1663,20 @@ mod tests {
         assert!(err.to_string().contains("13-bit"), "{err}");
     }
 
-    /// Packs nine-bit codes the way both ARC LZW dialects do — least
-    /// significant bit first within each byte, in byte order.
-    fn pack_nine_bit_codes(codes: &[u16]) -> Vec<u8> {
+    /// Packs codes the way both ARC LZW dialects do — least significant bit
+    /// first within each byte, in byte order — at an EXPLICIT width per
+    /// code.
+    ///
+    /// The width schedule is stated by the caller as data rather than
+    /// computed from the decoder's own state, deliberately: if
+    /// `LzwCodes::next` widens at a different point than the caller says,
+    /// the bits misalign and the decode comes out wrong, which is the whole
+    /// point of the test below.
+    fn pack_codes(codes: &[(u32, u16)]) -> Vec<u8> {
         let (mut out, mut buf, mut bits) = (Vec::new(), 0u32, 0u32);
-        for &c in codes {
+        for &(width, c) in codes {
             buf |= u32::from(c) << bits;
-            bits += 9;
+            bits += width;
             while bits >= 8 {
                 out.push((buf & 0xFF) as u8);
                 buf >>= 8;
@@ -1683,41 +1690,61 @@ mod tests {
     }
 
     /// The one LZW branch no borrowed archive reaches — see this module's
-    /// doc. Hand-packed rather than borrowed, and what it proves is
-    /// bounded: that CLEAR is handled AS a reset rather than decoded as an
-    /// ordinary dictionary code, and that the slot it frees (256) is
-    /// refilled from the pre-clear `oldcode`.
+    /// doc — exercised by a hand-packed stream that reaches it three
+    /// different ways.
     ///
-    /// The stream is `A`, CLEAR, 256, `B`, 257, and every step of its tail
-    /// depends on the reset having happened:
+    /// **The stream steps the code width up to ten BEFORE its CLEAR, and
+    /// that is the point.** 256 nine-bit literals fill the dictionary to
+    /// 512 entries, which is one past nine bits' largest code, so the CLEAR
+    /// itself is read at ten bits and the code after it at nine again. An
+    /// earlier version of this test was entirely nine-bit, which made the
+    /// width reset a no-op inside it: deleting `width = LZW_INIT_BITS` from
+    /// the `clear_pending` arm left every test in this module green. That is
+    /// the most consequential way to get CLEAR wrong, because a real encoder
+    /// does reset to nine-bit codes and a decoder that does not
+    /// desynchronises the entire remaining bitstream.
     ///
-    /// - The code read immediately after a CLEAR is the ONE place a 256 is
-    ///   not intercepted as another CLEAR, so it is also the only way a
-    ///   dictionary chain can ever run through slot 256.
-    /// - With `free_ent` reset to 256, that 256 is the KwKwK case (a code
-    ///   naming the entry being built right now) and expands to `AA`; slot
-    ///   256 is then refilled from the PRE-clear `oldcode`.
-    /// - Slot 257 links back through 256, so the final code expands to
-    ///   `AAB` — reachable only if slot 256 really was rewritten.
+    /// The tail then pins the dictionary side. The code read immediately
+    /// after a CLEAR is the ONE place a 256 is not intercepted as another
+    /// CLEAR, so it is also the only way a chain can run through slot 256:
+    /// with `free_ent` reset to 256 that code is the KwKwK case and expands
+    /// to `AA`, slot 256 is refilled from the PRE-clear `oldcode`, and the
+    /// closing 257 chains back through it to expand to `AAB`.
     ///
-    /// Decoding to `AAABAAB` therefore falsifies three separate mistakes:
-    /// reading CLEAR as an ordinary dictionary code, leaving `free_ent` at
-    /// 257 across the reset (slot 256 then still holds the zeroed table),
-    /// and skipping the post-clear insert altogether.
+    /// **What this does NOT prove**, stated because the module doc is
+    /// already honest about the bound: agreement with a real encoder. A
+    /// real ARC encoder sets `free_ent` to 257 at a CLEAR where the decoder
+    /// sets 256, so slot 256 is written by the decoder and referenced by no
+    /// encoder — a literal 256 straight after a CLEAR is not something an
+    /// encoder emits. The tail proves this mirrors the reference
+    /// implementation's quirk; the width step-up before the CLEAR is the
+    /// half that a real archive would also exercise.
     #[test]
     fn a_clear_code_resets_the_dictionary_and_reuses_its_own_slot() {
-        let codes = pack_nine_bit_codes(&[65, LZW_CLEAR, 256, 66, 257]);
+        let mut codes: Vec<(u32, u16)> = Vec::new();
+        // 256 nine-bit literals: the first seeds `oldcode`, the other 255
+        // each add a dictionary entry, taking `free_ent` from 257 to 512.
+        codes.extend(std::iter::repeat_n((9u32, b'A' as u16), 256));
+        codes.push((10, LZW_CLEAR)); // read at ten bits — free_ent passed 511
+        codes.push((9, 256)); // the post-clear read, back at nine bits
+        codes.push((9, b'B' as u16));
+        codes.push((9, 257));
+        let packed = pack_codes(&codes);
+
+        let mut want = vec![b'A'; 258];
+        want.extend_from_slice(b"BAAB");
+
         let mut crunched = vec![12u8];
-        crunched.extend_from_slice(&codes);
+        crunched.extend_from_slice(&packed);
         assert_eq!(
             lzw_decode(&crunched, LzwVariant::Crunched, "t").unwrap(),
-            b"AAABAAB"
+            want
         );
         // The same codes in the Squashed dialect, which differs only in its
         // maximum width and its missing leading byte.
         assert_eq!(
-            lzw_decode(&codes, LzwVariant::Squashed, "t").unwrap(),
-            b"AAABAAB"
+            lzw_decode(&packed, LzwVariant::Squashed, "t").unwrap(),
+            want
         );
     }
 
