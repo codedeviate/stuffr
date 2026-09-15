@@ -136,7 +136,11 @@ encoders, and its own review cycle — exactly as read did across Tasks 1-7 —
 and shipping it inside `0.4.0` would mean either delaying the read-only
 formats that were already fuzzed and reviewed, or claiming write coverage the
 test suite does not have. So `0.4.0` now says only what actually shipped, and
-legacy write becomes its own cycle — Phase 3c, landing as `0.4.1`.
+legacy write becomes its own cycle — Phase 3c, which landed as **`0.4.2`**.
+(The plan said `0.4.1`; that number was taken in the meantime by the
+`xz-pure` index-bomb fix, an unrelated single-commit patch cut before Phase
+3c's first task. The phase moved to the next patch rather than displacing a
+tag that already existed.)
 
 **Phase 3c carries ARC and ZOO as well**, and that belongs here rather than
 only in a plan outside the repository, because a reader of this repo would
@@ -212,6 +216,23 @@ attribute, and the reference destructure ends in `..` for the same reason a
 `match` on a non-exhaustive enum ends in a wildcard arm. The rule for structs
 is therefore: **carry it if downstream only ever destructures; skip it if
 downstream ever constructs.**
+
+**Two structs have now grown a field under this rule, and both are worth
+knowing before the next one does.** `CodecCaps` gained
+`truncation_undetectable` in Phase 3b and `ExpectedEntry` gained
+`stored_crc` in Phase 3c Task 1. Each is a public field added to a public
+struct with no `#[non_exhaustive]`, which is precisely the change this
+section says would break an external crate constructing one with an
+exhaustive literal. Nothing in this workspace broke either time, and the
+reason is the same in both cases and is the thing to preserve: every
+in-tree construction site goes through a named constructor
+(`CodecCaps::round_trip()`, `decode_only()`) or a `..Default::default()`
+tail, both of which absorb a new field for free. `ExpectedEntry` is the
+one that does NOT yet have that protection — it has no constructor and no
+`Default`, so every fixture builds it literally and every future field
+touches all of them. **Give it a named constructor before adding another
+field**, the way the capability structs already have one; the argument is
+already written above, this is only the site that has not taken it.
 
 ### Which enums are open, which are closed
 
@@ -302,20 +323,38 @@ Rules for touching either region:
 
 Phase 3a added a fuzzing harness over the excluded `fuzz/` crate
 (`build: add an excluded fuzz crate`, so it never affects a `cargo build`
-of the workspace). Three targets, each `#![no_main]` and driven by
+of the workspace). Four targets, each `#![no_main]` and driven by
 libFuzzer through `cargo fuzz`:
 
 | Target | Covers |
 |---|---|
 | `codec.rs` | One codec's decoder, fed raw bytes. A selector byte picks the format from [`CODEC_SLOTS`](#the-slot-tables-are-append-only) so one corpus exercises every registered codec. |
 | `container.rs` | One container's reader, both ladder rungs — the selector's high bit picks seekable vs. `ForwardOnly` so both walk paths get fuzzed, not just the seekable one. Also runs an independent EOCD re-parse and a second forward-only walk as cross-checks (see the module doc for why each is not redundant with the honesty oracle below). |
-| `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the three. |
+| `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the four. |
+| `roundtrip.rs` | The WRITE side, added in Phase 3c Task 8 — the only target that runs an encoder at all. The input is the archive's CONTENT, not its bytes: a selector picks a writable slot (its high bit selects `CODEC_SLOTS` over `CONTAINER_SLOTS`; there is no ladder rung to choose when writing), the payload is written through it and read straight back, and the two must agree byte-for-byte. |
 
-Every decode path in all three is bounded (`DecodeOpts::memory_limit`,
+Every decode path in all four is bounded (`DecodeOpts::memory_limit`,
 a capped output read) for the same reason the codec's own conformance
 harness bounds decode: an unbounded pre-flight allocation or an
 unconditional `read_to_end` on a decompression bomb would turn every
 subsequent run into an OOM or a false "crash" instead of a finding.
+`roundtrip.rs` bounds the WRITE side too, and for the mirror reason:
+`lha`'s encoder buffers roughly 8.4x its input before emitting anything,
+which reaches `handle_alloc_error` — a SIGABRT carrying no stuffr message
+— rather than any error this project could classify.
+
+**A new target must be shown to complete an iteration, not assumed to.**
+Phase 3a shipped a target that used `Error::from(io)` everywhere, so every
+input produced `Error::Io` — exit 1 — which the oracle always refuses; it
+had never completed a single iteration and looked exactly like a clean run.
+`roundtrip.rs` was therefore checked the way `mod broken_codecs` checks a
+conformance property: with its equality assertion temporarily sabotaged to
+`got == content && content.is_empty()`, all eighteen writable slots
+(twelve codecs, six containers) reach it and report *"same length but
+different contents"* — which is only reachable when the real comparison
+was true, i.e. when the round trip genuinely completed. Do the same for
+the next target; an execution count alone does not distinguish the two
+cases.
 
 ### The oracle lives in the library, not in the targets
 
@@ -357,7 +396,7 @@ built to cover eleven codecs quietly stops covering one of them.
 The corpus is generated, not committed (`fuzz/.gitignore`'s `/corpus`):
 
 ```bash
-make fuzz-corpus   # (re)generate fuzz/corpus/{codec,container,chain}
+make fuzz-corpus   # (re)generate fuzz/corpus/{codec,container,chain,roundtrip}
 make fuzz          # short, seeded smoke pass — the local equivalent of CI's fuzz-smoke job
 ```
 

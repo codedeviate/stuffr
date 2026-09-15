@@ -9,7 +9,7 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 3c in progress at `0.4.1` — twelve round-trip codecs
+> **Status: Phase 3c is complete at `0.4.2` — twelve round-trip codecs
 > (`compress` joined them in Task 5) and six round-trip containers
 > (`lha` joined them in Task 6 and `arj` in Task 7), plus
 > two read-only legacy containers, all in the
@@ -30,13 +30,24 @@ read list.
 > (see the Phase 3b paragraphs below), all of it then proven to coexist. The
 > `legacy` feature (bundled into `full`/`--all-features`) still exists and
 > still works — it is what `--no-default-features --features pure` would
-> otherwise lack, not something a default build needs to opt into. **1018**
-> tests under `--all-features`, **953** on the default tier — a different
+> otherwise lack, not something a default build needs to opt into. **1055**
+> tests under `--all-features`, **990** on the default tier — a different
 > set, not a subset, because the two tiers select different backends.
-> (The previous figures here, 963/898, were stale by two: the gate's own
-> output read 965/900 before ZOO landed. Both counts are measured from
-> `make check`'s two `cargo test` runs, not carried forward.) Clean
-> across build, clippy and fmt.
+> (Every figure printed here has been stale at least once — 963/898 and
+> then 1018/953, each carried forward from a task that added tests after
+> writing the sentence. Both counts are measured from `make check`'s two
+> `cargo test` runs at the moment of the bump, never carried forward.)
+> Clean across build, clippy and fmt.
+>
+> **The fuzz harness gained a fourth target in Task 8, and it is the
+> first that runs an ENCODER.** `codec`, `container` and `chain` all
+> point hostile bytes at a decoder, so a phase whose headline was three
+> new encoders had added no fuzz coverage of its own work at all.
+> `roundtrip` inverts the input — the fuzzer's bytes become the
+> archive's *content* rather than its bytes — writes them through one
+> writable format picked by a selector byte, reads them straight back,
+> and requires the payload to survive byte-for-byte. See
+> [CONTRIBUTING.md](CONTRIBUTING.md#fuzzing).
 >
 > **Phase 3a added a fuzzing harness and fixed what it found — the
 > behaviour is the headline, not the fuzzer.** Five exit codes changed or
