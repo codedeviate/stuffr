@@ -57,11 +57,13 @@ pub const CONTAINER_SLOTS: &[&str] = &[
     // Both are read-only: their corpus seeds are fixture-sourced, not
     // written by this build.
     "lha", "arj",
-    // Phase 3c. APPENDED, never inserted. Read-only too, and the one slot
-    // whose decoders are this project's own from-scratch code rather than a
-    // wrapped crate — which is precisely the kind the `container` target
-    // exists to hammer.
-    "arc",
+    // Phase 3c. APPENDED, never inserted. Read-only too, and the two slots
+    // whose framing and decoders are this project's own from-scratch code
+    // rather than a wrapped crate — which is precisely the kind the
+    // `container` target exists to hammer. `zoo` adds a shape no other slot
+    // has: a directory chain of attacker-controlled absolute file offsets,
+    // where a mutated link is a walk that must still terminate.
+    "arc", "zoo",
 ];
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");

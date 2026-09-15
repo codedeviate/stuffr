@@ -115,18 +115,27 @@ fn legacy_codec_fixture(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Same idea as [`legacy_codec_fixture`], for the three read-only legacy
-/// containers `lha`, `arj` and `arc`.
+/// Same idea as [`legacy_codec_fixture`], for the four read-only legacy
+/// containers `lha`, `arj`, `arc` and `zoo`.
 ///
 /// `arc`'s seed is `cpm.arc` rather than any of the nine other borrowed
 /// archives, for the same reason it is the conformance fixture: two entries
 /// and two different compression methods, so a mutation has more than one
 /// header and more than one decoder to land in.
+///
+/// `zoo`'s is `high_per.zoo`, and the choice is the opposite trade made for
+/// the same reason: all four ZOO fixtures hold one entry, so none offers a
+/// second header, and what varies between them is the decoder behind that
+/// entry. `high_per.zoo` is the LH5 one — the only ZOO method whose decoder
+/// is a dependency rather than this module's own code, and therefore the
+/// one whose failure modes nothing in this repository can reason about
+/// from source. `store.zoo` would exercise no decoder at all.
 fn legacy_container_fixture(name: &str) -> Option<&'static str> {
     match name {
         "lha" => Some("sample.lzh"),
         "arj" => Some("sample.arj"),
         "arc" => Some("arc/cpm.arc"),
+        "zoo" => Some("zoo/high_per.zoo"),
         _ => None,
     }
 }
