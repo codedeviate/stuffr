@@ -144,10 +144,15 @@ otherwise conclude the two were dropped. They were scoped into Phase 3b
 originally, on a single crate (`unarc-rs`) that would have served both; that
 direction was abandoned in favour of a per-format crate for each of the three
 formats that shipped, and ARC and ZOO moved with it into 3c rather than out
-of the project. Nothing of the abandoned direction remains in the tree
-(`grep -rn unarc` finds nothing), which is exactly why the deferral needs
-writing down. So 3c is: write support for `compress`/`lha`/`arj`, plus READ
-support for ARC and ZOO. That is a
+of the project. **`grep -rn unarc` now finds plenty, and none of it is that
+direction**: `unarc-rs` is still disqualified as a DEPENDENCY (rustc 1.95,
+vendored C++, a second zip/tar stack — the reasons are in
+`fixtures/legacy/MANIFEST.md`), and what the tree carries is its MIT/Apache
+test corpus borrowed as bytes plus prose explaining why the code was not.
+Nothing imports or links it; `Cargo.lock` has no such entry. So 3c is: write
+support for `compress`/`lha`/`arj`, plus READ support for ARC and ZOO — both
+of which have now landed, each with its framing written from scratch. That
+is a
 PATCH, not a milestone, because it is additive to traits that already exist
 (`Container::create`, `Codec::encoder` are both already part of the public
 surface; Phase 3c gives three more formats a real implementation of each, it
