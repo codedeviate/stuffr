@@ -702,13 +702,13 @@ WHAT THIS BUILD CAN DO
 
   stuffr formats
       Lists the formats compiled into THIS binary, not everything stuffr will
-      ever support. A default build has nineteen rows: the eleven
+      ever support. A default build has twenty rows: the eleven
       round-trip codecs gzip, zlib, deflate, bzip2, brotli, lz4, snappy,
       zstd, xz, lzma and lzip, the round-trip tar, ar, cpio and zip
-      containers, and the four read-only legacy formats — the `compress`
-      codec and the `lha`/`arj`/`arc` containers, added to `default`
+      containers, and the five read-only legacy formats — the `compress`
+      codec and the `lha`/`arj`/`arc`/`zoo` containers, added to `default`
       alongside `pure` so a plain `cargo install`/`cargo build` shows all
-      nineteen, not just fifteen — see "READ-ONLY LEGACY FORMATS" below.
+      twenty, not just fifteen — see "READ-ONLY LEGACY FORMATS" below.
       The KIND
       column tells codecs and containers apart. `--features legacy` (bundled
       into `full`) still exists, but only narrows a build now: it is what
@@ -727,9 +727,9 @@ WHAT THIS BUILD CAN DO
       more capable. lzip's row is unaffected by `c-backed` entirely — it has
       only ever had the one, pure-Rust `lzma-rust2` backend, so this feature
       changes nothing about it, in either direction. Every build lists all
-      nineteen of those rows unless `--no-default-features` narrows it — the
+      twenty of those rows unless `--no-default-features` narrows it — the
       ONLY capability difference `c-backed` makes anywhere in this matrix is
-      zstd's WRITE column, `weak` against `yes`; the four legacy rows sit
+      zstd's WRITE column, `weak` against `yes`; the five legacy rows sit
       outside that comparison entirely, being read-only on every tier — see
       "READ-ONLY LEGACY FORMATS" below.
 
@@ -739,11 +739,11 @@ WHAT THIS BUILD CAN DO
       `zstd` — `ruzstd` has no multi-threaded encoder to hand a worker
       count to. Adding `--features c-backed` flips `zstd` to `yes` as
       well, alongside its WRITE column becoming `yes`; it changes nothing
-      else in this column, on any tier. All seven containers — tar, ar,
-      cpio, zip, lha, arj and arc — always show `-` here: none of them
-      parallelises anything, on any tier (`lha`, `arj` and `arc` trivially
-      so — none of the three has an encoder to parallelise in the first
-      place).
+      else in this column, on any tier. All eight containers — tar, ar,
+      cpio, zip, lha, arj, arc and zoo — always show `-` here: none of
+      them parallelises anything, on any tier (`lha`, `arj`, `arc` and
+      `zoo` trivially so — none of the four has an encoder to parallelise
+      in the first place).
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -1000,10 +1000,10 @@ READ-ONLY LEGACY FORMATS
   stuffr list backup.arj
       ARJ, behind its own `--features arj` (bundled into `--features
       legacy`, itself in `default`/`full`/`--all-features`, same as
-      `compress` and `lha` above). A default build therefore has seven
-      containers in total — tar, ar, cpio, zip, lha, arj and arc — not four;
-      only `--no-default-features --features pure` (or narrower) is back to
-      four.
+      `compress` and `lha` above). A default build therefore has eight
+      containers in total — tar, ar, cpio, zip, lha, arj, arc and zoo — not
+      four; only `--no-default-features --features pure` (or narrower) is
+      back to four.
       Its magic (`0x60 0xEA`) sits at
       offset 0.
 
@@ -1067,3 +1067,37 @@ READ-ONLY LEGACY FORMATS
       a codec rather than a container. Damage is never scanned past:
       a byte that is not ARC's `0x1A` marker where a header must begin is
       exit 5, not a search for the next plausible header.
+
+  stuffr list old.zoo
+      ZOO, behind its own `--features zoo`, bundled into `--features
+      legacy` exactly like the four above. Like `arc` its framing is
+      decoded from scratch here; unlike `arc` the format could be checked
+      against the ORIGINAL implementation — zoo 2.10's own C source — so
+      every structural constant this reader uses cites the macro it came
+      from rather than a modern reading of the layout.
+
+      Three packing methods are decoded, which is all the format ever
+      assigned: Stored (0), zoo's own 13-bit LZW (1), and LH5 (2), that
+      last one through the same `delharc` this build already carries for
+      `lha`. A method byte above 2 is `Error::Unsupported` (exit 3),
+      naming it — the archive is fine, the byte is outside the format.
+
+      ZOO's directory is a LINKED LIST of absolute file offsets, not a
+      sequence of headers, so this container needs `Seek`: a piped
+      `cat old.zoo | stuffr list -` still works, but the ladder spools it
+      to a temp file first (the same rung `arj` and an indexed `zip` take)
+      rather than parsing forward the way `lha` and `arc` do. A chain that
+      does not advance — a self-referential or cyclic `next` link — is
+      `Error::Corrupt` (exit 5), which is zoo's own verdict on the same
+      shape. A deleted entry stays in the chain and is skipped, neither
+      listed nor extracted, again matching zoo.
+
+      This container is READ-ONLY: `stuffr pack notes.txt --format zoo`
+      fails with `Error::CapabilityUnavailable` (exit 3), the same one
+      sentence `--format compress`, `lha`, `arj` and `arc` answer with.
+      Every entry carries its own CRC-16, checked before a single decoded
+      byte is handed back. An entry decodes whole, so a directory entry
+      declaring an implausible size is refused before the allocation it
+      would size, at exit 6 (`ResourceLimit`) against the same fixed
+      256 MiB ceiling `arc` and `arj` use — again not `--memory-limit`,
+      which binds a codec rather than a container.

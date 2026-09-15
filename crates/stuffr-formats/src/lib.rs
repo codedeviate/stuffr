@@ -30,7 +30,8 @@ pub mod gzip;
     feature = "lha",
     feature = "arj",
     feature = "compress",
-    feature = "arc"
+    feature = "arc",
+    feature = "zoo"
 ))]
 pub mod legacy;
 #[cfg(feature = "lz4")]
@@ -184,6 +185,14 @@ pub fn register_all(registry: &mut Registry) {
     // here for the obvious reason.
     #[cfg(feature = "arc")]
     registry.register_container(std::sync::Arc::new(legacy::arc::Arc), legacy::arc::meta());
+
+    // Phase 3c's second legacy container, and the one whose format could be
+    // checked against the ORIGINAL implementation rather than a modern
+    // reading of it — zoo 2.10's own C source. Unlike `arc` it declares
+    // `needs_seek`, because ZOO's directory is a chain of absolute file
+    // offsets; see `legacy::zoo`'s module doc.
+    #[cfg(feature = "zoo")]
+    registry.register_container(std::sync::Arc::new(legacy::zoo::Zoo), legacy::zoo::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.

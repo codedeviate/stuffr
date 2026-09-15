@@ -23,8 +23,8 @@ encoder:
 cargo install stuffr-cli --features c-backed    # needs a C compiler, nothing else
 ```
 
-The four read-only legacy formats (Unix `compress` `.Z`, LHA/LZH, ARJ,
-ARC/PAK) are in the default build too, pure Rust like the rest of it — no
+The five read-only legacy formats (Unix `compress` `.Z`, LHA/LZH, ARJ,
+ARC/PAK, ZOO) are in the default build too, pure Rust like the rest of it — no
 extra flag needed.
 `--features legacy` still exists and still works; it only matters paired with
 `--no-default-features` (e.g. `--no-default-features --features pure`, the

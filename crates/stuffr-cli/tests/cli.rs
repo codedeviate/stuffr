@@ -1015,7 +1015,7 @@ fn the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come() {
     // cpio/zip) is kept, because the page still legitimately describes that
     // subset by itself in some sentences (e.g. "four round-trip
     // containers", distinct from "six total").
-    const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha", "arj", "arc"];
+    const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha", "arj", "arc", "zoo"];
     let base_containers: Vec<&str> = containers
         .iter()
         .copied()
@@ -1184,7 +1184,7 @@ fn examples_pages_first_worked_example_runs_as_documented() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `pack --format lha`/`arj`/`compress`/`arc` must refuse CLEARLY — exit 3, naming
+/// `pack --format lha`/`arj`/`compress`/`arc`/`zoo` must refuse CLEARLY — exit 3, naming
 /// the format as readable but not writable by this build — never fail
 /// obscurely (an internal panic, a bare i/o error, or an unrelated exit
 /// code). All three now take the SAME route: the registry refuses on the
@@ -1230,6 +1230,7 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
         ("arj", "arj"),
         ("compress", "z"),
         ("arc", "arc"),
+        ("zoo", "zoo"),
     ] {
         let registered = registry.container(stuffr::FormatId::new(name)).is_some()
             || registry.codec(stuffr::FormatId::new(name)).is_some();
@@ -1263,7 +1264,7 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
              {:?}; stderr: {err}",
             res.status.code()
         );
-        // ONE sentence for all four, which is the point of the shared
+        // ONE sentence for all five, which is the point of the shared
         // gate: the containers used to say "unsupported: LHA/LZH is
         // read-only in this build" (their own hand-rolled
         // `Container::create` refusal) while the codec said "`compress` can

@@ -40,6 +40,7 @@ lha = ["stuffr/lha"]
 arj = ["stuffr/arj"]
 compress = ["stuffr/compress"]
 arc = ["stuffr/arc"]
+zoo = ["stuffr/zoo"]
 
 # Note the absence of `default-features = false` here: this edge always
 # requests `stuffr`'s own `default` feature set (`pure` and, since the commit
