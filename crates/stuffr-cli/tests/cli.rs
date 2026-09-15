@@ -1184,23 +1184,27 @@ fn examples_pages_first_worked_example_runs_as_documented() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `pack --format lha`/`arj`/`compress`/`arc`/`zoo` must refuse CLEARLY — exit 3, naming
+/// `pack --format lha`/`arj`/`arc`/`zoo` must refuse CLEARLY — exit 3, naming
 /// the format as readable but not writable by this build — never fail
 /// obscurely (an internal panic, a bare i/o error, or an unrelated exit
-/// code). All three now take the SAME route: the registry refuses on the
-/// declared capability, `Registry::require_encoder` for the `compress`
-/// codec and `Registry::require_container_writer` for the `lha`/`arj`
-/// containers, both raising `Error::CapabilityUnavailable`. Each module's
-/// own `encoder()`/`create()` still returns that same error as an
+/// code). All four take the SAME route: `Registry::require_container_writer`
+/// refuses on the declared capability, raising `Error::CapabilityUnavailable`.
+/// Each module's own `create()` still returns that same error as an
 /// unreachable backstop. This pins it all the way through the CLI rather
 /// than only at the trait level each module's unit tests already cover.
+///
+/// **`compress` left this list in Phase 3c Task 5** — it is no longer
+/// read-only, so it no longer belongs among the formats this test proves
+/// REFUSE to write. `pack_writes_a_compress_stream_the_system_tool_reads`
+/// below is its positive counterpart, proving the opposite claim for the one
+/// format that changed.
 ///
 /// Runtime-checked, not `cfg`-gated. `stuffr-cli` does declare a `legacy`
 /// feature (a passthrough to `stuffr/legacy`, so `cargo install stuffr-cli
 /// --features legacy` still works — it is just no longer required), but
 /// `cargo test --workspace --all-features` unifies features across the
 /// workspace, so this binary's own `cfg!(feature = "legacy")` is not what
-/// decides whether the three formats are compiled in — the live registry
+/// decides whether the four formats are compiled in — the live registry
 /// is, the same way `examples_page_covers_every_format_and_flag` above
 /// already asks it for container counts.
 ///
@@ -1210,7 +1214,7 @@ fn examples_pages_first_worked_example_runs_as_documented() {
 /// unconditionally (see the dead-projection comment in
 /// `the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come`
 /// above for the measured proof), so there is no longer a `cargo test`
-/// invocation of this binary where any of the three is absent. Kept as a
+/// invocation of this binary where any of the four is absent. Kept as a
 /// guard rather than an assertion of reachability: if a future Cargo.toml
 /// edit ever makes a legacy-less `stuffr-cli` build possible again (e.g. by
 /// adding `default-features = false` to that dependency edge), this test
@@ -1228,7 +1232,6 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
     for (name, out_ext) in [
         ("lha", "lzh"),
         ("arj", "arj"),
-        ("compress", "z"),
         ("arc", "arc"),
         ("zoo", "zoo"),
     ] {
@@ -1264,14 +1267,13 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
              {:?}; stderr: {err}",
             res.status.code()
         );
-        // ONE sentence for all five, which is the point of the shared
+        // ONE sentence for all four, which is the point of the shared
         // gate: the containers used to say "unsupported: LHA/LZH is
         // read-only in this build" (their own hand-rolled
-        // `Container::create` refusal) while the codec said "`compress` can
-        // be read but not written by this build" (the registry's), and a
-        // comment here called that difference "phrasing" when it was two
-        // different code paths. A per-format substring would let them drift
-        // apart again without failing.
+        // `Container::create` refusal) before `require_container_writer`
+        // existed, and a comment here called that difference "phrasing" when
+        // it was two different code paths. A per-format substring would let
+        // them drift apart again without failing.
         let lower = err.to_lowercase();
         assert!(
             lower.contains(&format!(
@@ -1286,6 +1288,72 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
             dst.display()
         );
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The positive counterpart to `pack_refuses_a_read_only_legacy_format_
+/// clearly` above, for the one format Phase 3c Task 5 moved out of that
+/// list: `pack --format compress` must actually write a `.Z` file the real
+/// system `uncompress` can read back, at the default level (16, not the
+/// maxbits-9 special case `compress_z.rs`'s own unit tests cover directly).
+#[test]
+fn pack_writes_a_compress_stream_the_system_tool_reads() {
+    let uncompress_bin = require_bin("uncompress");
+    let dir = tmp("compress-write-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("notes.txt");
+    let plain = b"the quick brown fox jumps over the lazy dog\n".repeat(200);
+    std::fs::write(&src, &plain).unwrap();
+    // Uppercase `.Z`, deliberately: the system `uncompress` appends `.Z`
+    // itself when the name it is given does not already end in it (both
+    // implementations), so a lowercase `.z` — this format's own registered
+    // extension, and the natural spelling `--format compress` writing to a
+    // bare `-o` name would otherwise pick — would have it look for
+    // `notes.txt.z.Z` and fail with "No such file or directory".
+    let dst = dir.join("notes.txt.Z");
+
+    let res = Command::new(STUFFR)
+        .args([
+            "pack",
+            src.to_str().unwrap(),
+            "--format",
+            "compress",
+            "-o",
+            dst.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "pack --format compress must now succeed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(dst.exists(), "pack must have written {}", dst.display());
+
+    let out = Command::new(&uncompress_bin)
+        .arg("-c")
+        .arg(&dst)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "the system uncompress must read this build's own .Z output: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.stdout, plain,
+        "the system uncompress's output must match the original plaintext exactly"
+    );
+
+    // stuffr's own reader must agree too.
+    let cat = Command::new(STUFFR)
+        .args(["cat", dst.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(cat.status.success());
+    assert_eq!(cat.stdout, plain);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

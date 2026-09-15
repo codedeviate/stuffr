@@ -86,8 +86,63 @@
 //! external, cross-validated fact about the format, matching precisely why
 //! gzip/zlib/bzip2/snappy all carry a mandatory checksum and Unix compress
 //! predates and lacks one.
+//!
+//! ## Encoding (Phase 3c, Task 5)
+//!
+//! `LzwEncoder` is a from-scratch block-mode LZW encoder, promoted out of
+//! `#[cfg(test)]` where it lived as `SynthZ` — proven byte-for-byte against
+//! the real `compress` binary at four `maxbits` values (`the_stream_
+//! synthesiser_matches_the_system_encoder_byte_for_byte`) before it was ever
+//! wired to a `Sink`. Two changes from its test-only ancestor, both load-
+//! bearing:
+//!
+//! 1. **It streams.** `SynthZ` buffered its whole output in a `Vec<u8>` —
+//!    fine for a test encoding a few kilobytes, wrong for a `Sink`, which
+//!    must not accumulate an encode of arbitrary length in memory.
+//!    `LzwEncoder::output`/`finish` now take the destination buffer as a
+//!    parameter instead of owning one, so [`CompressZSink::write`] can flush
+//!    each completed group straight to the underlying `Write` and hold onto
+//!    nothing bigger than one code group (at most 16 bits) between calls.
+//!    Memory is otherwise bounded exactly the way the DECODER's is: the
+//!    dictionary (`HashMap<(u32, u8), u32>`) never exceeds `maxmaxcode`
+//!    entries (65,536 at `maxbits == 16`), the same ceiling `DictState`'s
+//!    `prefix`/`suffix` vectors allocate up front on the read side.
+//! 2. **It has no ratio heuristic.** The real encoder decides WHEN to emit a
+//!    block-mode CLEAR from a compression-ratio check (`cl_block`), and the
+//!    two reference implementations disagree wildly about it (see `SynthZ`'s
+//!    own historical doc, preserved on the test helper below). This encoder
+//!    never emits one: `block_mode` is still set in the header (matching
+//!    both real encoders' default), but the dictionary simply fills and
+//!    FREEZES at `maxmaxcode`, encoding every further byte with codes already
+//!    in it. That is a real, legal `.Z` stream — the reference decoders
+//!    accept a stream with zero CLEARs just as readily as one with several —
+//!    and it means this encoder's output is never asserted byte-identical to
+//!    a system encoder's on any payload where the ratio heuristic might have
+//!    fired (anything at or past `CHECK_GAP == 10,000` input bytes). What
+//!    property 2's own round trip and the interop test below DO assert is
+//!    that this encoder's output round-trips through this module's own
+//!    decoder, and that the real `uncompress` reads it back correctly — both
+//!    hold regardless of whether a CLEAR ever appears.
+//!
+//! `check_encode_opts` maps `EncodeOpts::level` onto `maxbits` (`compress`'s
+//! own `-b` flag), rejecting anything outside `9..=16` as `Error::Usage`
+//! before either `encoder()` touches a destination — conformance property 6
+//! checks the two agree. The default (`level: None`) is `maxbits == 16`, the
+//! best ratio the format has, matching every other codec's convention of
+//! defaulting to the strongest setting a user doesn't have to ask for.
+//!
+//! **Level 9 is deliberately not the default and is real.** GNU `ncompress`
+//! 5.0 cannot decode its own `-b 9` output once the 512-entry dictionary
+//! fills (measured during Phase 3b — see `synth_z`'s doc, kept on the test
+//! helper below), which is why this module's own interop test for it
+//! resolves GNU `ncompress`'s `uncompress` deliberately rather than through
+//! `PATH` — a fixed Homebrew path on macOS (where `PATH`'s own `uncompress`
+//! is the BSD implementation), `PATH` resolution everywhere else (where
+//! `ncompress` is the only `uncompress` a CI runner has). See
+//! `require_gnu_uncompress`'s own doc for why each branch is correct on its
+//! platform.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 
 use stuffr_core::{
@@ -131,7 +186,7 @@ impl Codec for CompressZ {
     fn caps(&self) -> CodecCaps {
         CodecCaps {
             truncation_undetectable: true,
-            ..CodecCaps::decode_only()
+            ..CodecCaps::round_trip()
         }
     }
 
@@ -142,18 +197,227 @@ impl Codec for CompressZ {
         Ok(Box::new(StreamOnly::new(LzwZReader::new(src))))
     }
 
-    /// Unreachable through ops: `Registry::require_encoder` reads
-    /// `caps().encode` and refuses first (`CLAUDE.md` mandates registering
-    /// through it rather than the raw accessor). This is the trait-level
-    /// backstop, and it answers the SAME error the registry raises — it used
-    /// to answer `Error::Unsupported` with a carefully-worded sentence no
-    /// user could ever reach.
-    fn encoder(&self, _dst: Box<dyn Write + Send>, _o: &EncodeOpts) -> Result<Box<dyn Sink>> {
-        Err(Error::CapabilityUnavailable {
-            format: COMPRESS,
-            available: "read",
-            requested: "written",
-        })
+    /// `compress`'s own `-b` flag: `maxbits` in `9..=16`. `None` (no
+    /// `--level`) means 16, the best ratio the format has. Raised before
+    /// `encoder()` touches a destination — see the module doc.
+    fn check_encode_opts(&self, o: &EncodeOpts) -> Result<()> {
+        match o.level {
+            Some(n) if !(INIT_BITS as i32..=MAX_MAXBITS as i32).contains(&n) => Err(Error::Usage(
+                format!("compress maxbits must be 9-16, got {n}"),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Wraps [`LzwEncoder`] in [`CompressZSink`] — see the module doc for why
+    /// the encoder streams instead of buffering, and why it never emits a
+    /// block-mode CLEAR.
+    fn encoder(&self, mut dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {
+        self.check_encode_opts(o)?;
+        let maxbits = o.level.map(|n| n as u32).unwrap_or(MAX_MAXBITS);
+        let (enc, header) = LzwEncoder::new(maxbits);
+        dst.write_all(&header)?;
+        Ok(Box::new(CompressZSink {
+            dst,
+            enc,
+            scratch: Vec::with_capacity(2),
+        }))
+    }
+}
+
+/// Streaming block-mode LZW encoder. See the module doc's "Encoding" section
+/// for what makes this different from `SynthZ`, the test-only ancestor it was
+/// promoted from.
+///
+/// Memory is bounded regardless of input length: `dict` holds at most
+/// `maxmaxcode` entries (a `u32` key pair to a `u32` code — the same
+/// `2^maxbits` ceiling the decoder's own `prefix`/`suffix` vectors allocate
+/// up front), and `acc`/`acc_bits` is a single bit accumulator no wider than
+/// one code group. Nothing here grows with the number of bytes encoded.
+struct LzwEncoder {
+    maxbits: u32,
+    maxmaxcode: u32,
+    n_bits: u32,
+    maxcode: u32,
+    free_ent: u32,
+    /// The current output group, LSB-first. A group is `n_bits` bytes — at
+    /// most 16, so at most 128 bits, which is exactly why this is a `u128`
+    /// and not a `u64`.
+    acc: u128,
+    acc_bits: u32,
+    clear_flg: bool,
+    dict: HashMap<(u32, u8), u32>,
+    /// The LZW "current string" code, as a dictionary index — `None` only
+    /// before the first byte has been seen.
+    ent: Option<u32>,
+}
+
+impl LzwEncoder {
+    /// Block mode, always: it is what both real encoders default to, and the
+    /// CLEAR code only exists under it — even though this encoder never
+    /// emits one (see the module doc). Returns the 3-byte `.Z` header
+    /// alongside the fresh encoder state, since the header must reach the
+    /// destination exactly once, before any code group.
+    fn new(maxbits: u32) -> (Self, [u8; 3]) {
+        assert!(
+            (INIT_BITS..=MAX_MAXBITS).contains(&maxbits),
+            "maxbits {maxbits} outside the format's own 9..=16 — check_encode_opts should \
+             have refused this before an encoder was ever constructed"
+        );
+        (
+            Self {
+                maxbits,
+                maxmaxcode: 1 << maxbits,
+                n_bits: INIT_BITS,
+                maxcode: (1 << INIT_BITS) - 1,
+                free_ent: CLEAR + 1,
+                acc: 0,
+                acc_bits: 0,
+                clear_flg: false,
+                dict: HashMap::new(),
+                ent: None,
+            },
+            [
+                COMPRESS_MAGIC_BYTES[0],
+                COMPRESS_MAGIC_BYTES[1],
+                BLOCK_MODE_FLAG | maxbits as u8,
+            ],
+        )
+    }
+
+    /// `compress.c`'s `output()`, arm for arm: write the code, flush a full
+    /// group, then — if the next entry would not fit, or a CLEAR is pending —
+    /// zero-pad the partial group to `n_bits` bytes (the width the group was
+    /// STARTED at, which is why the padding happens before the width
+    /// changes) and re-derive the width. Emitted bytes are appended to `out`
+    /// rather than owned, which is what makes this streaming: a caller
+    /// flushes `out` and clears it after every call instead of letting it
+    /// grow for the whole encode.
+    fn output(&mut self, code: u32, out: &mut Vec<u8>) {
+        self.acc |= u128::from(code) << self.acc_bits;
+        self.acc_bits += self.n_bits;
+        if self.acc_bits == self.n_bits * 8 {
+            self.flush_group(self.n_bits, out);
+        }
+        if self.free_ent > self.maxcode || self.clear_flg {
+            if self.acc_bits > 0 {
+                self.flush_group(self.n_bits, out);
+            }
+            if self.clear_flg {
+                self.n_bits = INIT_BITS;
+                self.maxcode = (1 << INIT_BITS) - 1;
+                self.clear_flg = false;
+            } else {
+                self.n_bits += 1;
+                self.maxcode = if self.n_bits == self.maxbits {
+                    self.maxmaxcode
+                } else {
+                    (1 << self.n_bits) - 1
+                };
+            }
+        }
+    }
+
+    fn flush_group(&mut self, bytes: u32, out: &mut Vec<u8>) {
+        for i in 0..bytes {
+            out.push(((self.acc >> (8 * i)) & 0xff) as u8);
+        }
+        self.acc = 0;
+        self.acc_bits = 0;
+    }
+
+    /// Feeds one byte of plaintext through the LZW matcher: extend the
+    /// current string if the dictionary already holds `(ent, byte)`,
+    /// otherwise emit `ent`'s code, learn the new pair (unless the
+    /// dictionary has frozen at `maxmaxcode` — see the module doc), and
+    /// start a fresh string at `byte`. Returns `true` only when a code was
+    /// actually emitted (never on the very first byte, and never on a
+    /// dictionary-hit extension) — the same distinction the real encoder's
+    /// `cl_block` ratio check is gated on, which is why the CLEAR-injecting
+    /// test helper below keys off it rather than injecting one at an
+    /// arbitrary byte offset.
+    fn push_byte(&mut self, byte: u8, out: &mut Vec<u8>) -> bool {
+        match self.ent {
+            None => {
+                self.ent = Some(u32::from(byte));
+                false
+            }
+            Some(ent) => {
+                if let Some(&next) = self.dict.get(&(ent, byte)) {
+                    self.ent = Some(next);
+                    false
+                } else {
+                    self.output(ent, out);
+                    if self.free_ent < self.maxmaxcode {
+                        self.dict.insert((ent, byte), self.free_ent);
+                        self.free_ent += 1;
+                    }
+                    self.ent = Some(u32::from(byte));
+                    true
+                }
+            }
+        }
+    }
+
+    /// At end of input only the bytes actually occupied are written — NOT a
+    /// zero-padded whole group. That asymmetry with `output`'s padding is the
+    /// real encoder's (`writebuf(buf, (offset + 7) / 8)`) and it is what
+    /// leaves a genuine `.Z` ending with a handful of unconsumed bits, exactly
+    /// as this module's doc describes.
+    fn finish(mut self, out: &mut Vec<u8>) {
+        if let Some(ent) = self.ent {
+            self.output(ent, out);
+        }
+        if self.acc_bits > 0 {
+            let bytes = self.acc_bits.div_ceil(8);
+            self.flush_group(bytes, out);
+        }
+    }
+}
+
+/// [`Sink`] over [`LzwEncoder`]. Holds nothing bigger than one call's worth of
+/// emitted bytes (at most two code-group flushes, ≤ 32 bytes — see
+/// [`LzwEncoder::output`]) between writes: `scratch` is cleared and reused
+/// every call rather than accumulating, which is the whole point (see the
+/// module doc's "It streams" note).
+struct CompressZSink {
+    dst: Box<dyn Write + Send>,
+    enc: LzwEncoder,
+    scratch: Vec<u8>,
+}
+
+impl Write for CompressZSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &byte in buf {
+            self.scratch.clear();
+            self.enc.push_byte(byte, &mut self.scratch);
+            if !self.scratch.is_empty() {
+                self.dst.write_all(&self.scratch)?;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.dst.flush()
+    }
+}
+
+impl Sink for CompressZSink {
+    /// Emits the final (possibly partial) code and its trailing, unpadded
+    /// group, then flushes the destination. See [`LzwEncoder::finish`] for
+    /// why the tail is never zero-padded to a whole group.
+    fn finish(self: Box<Self>) -> Result<()> {
+        let CompressZSink {
+            mut dst,
+            enc,
+            scratch: _,
+        } = *self;
+        let mut tail = Vec::new();
+        enc.finish(&mut tail);
+        dst.write_all(&tail)?;
+        dst.flush()?;
+        Ok(())
     }
 }
 
@@ -533,7 +797,15 @@ mod tests {
     #[test]
     fn capabilities_and_metadata_match_the_format() {
         let c = CompressZ.caps();
-        assert!(c.decode && !c.encode);
+        assert!(
+            c.decode && c.encode,
+            "Phase 3c Task 5 gave this codec a real encoder — see the module doc"
+        );
+        assert!(
+            !c.parallel_encode,
+            "this encoder has no multi-threaded path; declare it honestly (conformance \
+             property 12)"
+        );
         assert!(
             c.truncation_undetectable,
             "see this module's doc and CodecCaps::truncation_undetectable's own doc for why"
@@ -543,22 +815,38 @@ mod tests {
         assert_eq!(m.extensions, &["z"]);
     }
 
+    /// A level outside `9..=16` is `Error::Usage` (exit 2), raised by
+    /// `check_encode_opts` before `encoder()` ever touches a destination —
+    /// conformance property 6 checks the two agree on every level, this test
+    /// pins the specific range the format itself defines.
     #[test]
-    fn encoder_is_refused_as_a_capability_limit_not_a_panic() {
-        let opts = EncodeOpts::default();
-        match CompressZ.encoder(Box::new(stuffr_core::testing::SharedBuf::new()), &opts) {
-            Err(err) => {
-                // The SAME variant `Registry::require_encoder` raises — the
-                // refusal a user actually meets. This method is unreachable
-                // through ops, and used to answer a different, carefully
-                // worded `Error::Unsupported` nobody could ever see.
-                assert!(
-                    matches!(err, Error::CapabilityUnavailable { .. }),
-                    "got {err:?}"
-                );
-                assert_eq!(err.exit_code(), 3);
+    fn a_level_outside_9_to_16_is_a_usage_error() {
+        for level in [i32::MIN, 0, 8, 17, i32::MAX] {
+            let opts = EncodeOpts {
+                level: Some(level),
+                ..Default::default()
+            };
+            let err = CompressZ.check_encode_opts(&opts).unwrap_err();
+            assert!(matches!(err, Error::Usage(_)), "level {level}: got {err:?}");
+            assert_eq!(err.exit_code(), 2);
+            match CompressZ.encoder(Box::new(stuffr_core::testing::SharedBuf::new()), &opts) {
+                Err(err) => assert!(
+                    matches!(err, Error::Usage(_)),
+                    "level {level}: encoder() must agree with check_encode_opts, got {err:?}"
+                ),
+                Ok(_) => {
+                    panic!("level {level}: encoder() accepted a level check_encode_opts rejects")
+                }
             }
-            Ok(_) => panic!("compress (.Z) must not be able to encode"),
+        }
+        for level in [9, 10, 16] {
+            let opts = EncodeOpts {
+                level: Some(level),
+                ..Default::default()
+            };
+            CompressZ
+                .check_encode_opts(&opts)
+                .unwrap_or_else(|e| panic!("level {level} must be accepted: {e}"));
         }
     }
 
@@ -589,9 +877,85 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
+    /// Was `assert_codec_conforms_with(.., Some(HELLO_Z))` while this codec
+    /// was decode-only. With a real encoder it graduates to the FULL
+    /// twelve-property harness, round trip (property 2) included — see the
+    /// module doc's "Encoding" section for what changes once this runs.
     #[test]
-    fn compress_z_conforms() {
-        stuffr_core::testing::assert_codec_conforms_with(&CompressZ, &meta(), Some(HELLO_Z));
+    fn compress_z_conforms_with_an_encoder() {
+        stuffr_core::testing::assert_codec_conforms(&CompressZ, &meta());
+    }
+
+    /// The system tool must read what we write. This is the external witness
+    /// `.Z` has and ARJ does not (ARJ's own fixture has no independent tool
+    /// to check it against at all — see `legacy/mod.rs`'s MANIFEST note).
+    ///
+    /// Deliberately at the DEFAULT level (16), not 9: `SynthZ`'s own doc (see
+    /// the historical comment kept on the test helper below) measured that
+    /// (N)compress 5.0 cannot decode its own `-b 9` output once the
+    /// dictionary fills, so `-b 9` needs its own, separately-justified test —
+    /// [`the_system_uncompress_reads_what_we_write_at_maxbits_9`] — rather
+    /// than being folded into this one.
+    #[test]
+    fn the_system_uncompress_reads_what_we_write() {
+        let uncompress_bin = require_bin("uncompress");
+        let payload = pseudo_random_payload(9_000, 0xFEEDFACE);
+
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut sink = CompressZ
+            .encoder(Box::new(buf.clone()), &EncodeOpts::default())
+            .unwrap();
+        sink.write_all(&payload).unwrap();
+        sink.finish().unwrap();
+        let packed = buf.contents();
+
+        assert_eq!(
+            system_uncompress(&uncompress_bin, &packed, 500),
+            payload,
+            "the system `uncompress` must read this build's own `.Z` output back as the \
+             original plaintext"
+        );
+
+        // Our own decoder must agree too — this is the property 2 round trip
+        // already checked, restated here because it is the point of this
+        // specific test's name.
+        assert_eq!(decompress(&packed).unwrap(), payload);
+    }
+
+    /// `maxbits == 9` is the one level where NEITHER real `compress` can
+    /// serve as a full round-trip witness (see this module's own doc and
+    /// `synth_z`'s historical doc above): BSD `uncompress` refuses any
+    /// `maxbits < 12` outright, including its own encoder's `-b 9` output,
+    /// and GNU `ncompress` 5.0 cannot decode its OWN `-b 9` output once the
+    /// 512-entry dictionary fills. So the only witness able to both accept a
+    /// `maxbits == 9` stream and be present on every platform this project
+    /// tests on is GNU `ncompress`'s `uncompress` — see
+    /// [`require_gnu_uncompress`] for how this resolves it deliberately
+    /// rather than through `PATH`, and why that resolves to the SAME binary
+    /// on both platforms this project runs on despite the two branches
+    /// looking different.
+    #[test]
+    fn the_system_uncompress_reads_what_we_write_at_maxbits_9() {
+        let uncompress_bin = require_gnu_uncompress();
+        let payload = pseudo_random_payload(400, 0xFEEDFACE);
+
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let opts = EncodeOpts {
+            level: Some(9),
+            ..Default::default()
+        };
+        let mut sink = CompressZ.encoder(Box::new(buf.clone()), &opts).unwrap();
+        sink.write_all(&payload).unwrap();
+        sink.finish().unwrap();
+        let packed = buf.contents();
+
+        assert_eq!(
+            system_uncompress(&uncompress_bin, &packed, 501),
+            payload,
+            "GNU ncompress's own uncompress must read this build's maxbits=9 output back as \
+             the original plaintext"
+        );
+        assert_eq!(decompress(&packed).unwrap(), payload);
     }
 
     /// Direct falsification of property 8's specific concern: read exactly
@@ -717,6 +1081,51 @@ mod tests {
             })
     }
 
+    /// Resolves GNU `ncompress`'s own `uncompress` — the one witness able to
+    /// read a `maxbits == 9` stream back (see `the_system_uncompress_reads_
+    /// what_we_write_at_maxbits_9`'s doc for why: BSD `uncompress` refuses
+    /// any `maxbits < 12` outright, and GNU `ncompress` 5.0's OWN encoder
+    /// output at `-b 9` is unreadable even by itself once the dictionary
+    /// fills, so only a stream this crate wrote plus the GNU DECODER
+    /// specifically proves anything here).
+    ///
+    /// Deliberately NOT `require_bin("uncompress")` — resolving through
+    /// `PATH` would exercise a DIFFERENT implementation per platform while
+    /// looking identical, exactly the shape that has already produced three
+    /// Linux-only CI failures this machine could not see (cpio's missing
+    /// `S_IFREG`, `ar`'s inline-name collapse, and GNU `uncompress`'s own
+    /// maxbits-9 decode defect this project measured once already). Instead:
+    ///
+    /// - **macOS**: Homebrew's `ncompress` formula is keg-only, so the GNU
+    ///   binary sits at this fixed path under NO name on `PATH` at all —
+    ///   and macOS's own `/usr/bin/uncompress` on `PATH` is the BSD
+    ///   implementation, which would silently make this test pass for the
+    ///   wrong reason (refusing outright, not reading successfully) if
+    ///   swapped in by accident.
+    /// - **Every other platform (CI's Linux runners)**: `ci.yml` installs
+    ///   the `ncompress` package unconditionally, and on Debian/Ubuntu that
+    ///   package IS the system `uncompress` under the plain name — there is
+    ///   no BSD alternative there to collide with, so `PATH` resolution is
+    ///   correct and reaches the identical GNU implementation the macOS
+    ///   branch reaches by fixed path.
+    fn require_gnu_uncompress() -> std::path::PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            let path = std::path::PathBuf::from("/opt/homebrew/opt/ncompress/bin/uncompress");
+            assert!(
+                path.is_file(),
+                "{path:?} not found — this test requires GNU (N)compress's `uncompress` \
+                 specifically, not macOS's own BSD `/usr/bin/uncompress` (see this function's \
+                 own doc); `brew install ncompress`"
+            );
+            path
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            require_bin("uncompress")
+        }
+    }
+
     fn system_compress(compress_bin: &std::path::Path, payload: &[u8], tag: usize) -> Vec<u8> {
         system_compress_args(compress_bin, payload, tag, &[])
     }
@@ -772,10 +1181,22 @@ mod tests {
         out.stdout
     }
 
-    /// A deterministic Unix-`compress` ENCODER — test-only, and the reason
-    /// the two tests below no longer ask a system tool for their input.
+    /// Historical note, kept for anyone who reads this test file top to
+    /// bottom: this helper used to build its OWN from-scratch LZW encoder
+    /// (`SynthZ`), separate from and predating the production one. Phase 3c
+    /// Task 5 promoted that engine out of `#[cfg(test)]` into
+    /// [`super::LzwEncoder`] and wired it to a real [`stuffr_core::Sink`]
+    /// (see the module doc's "Encoding" section) — so this helper now drives
+    /// the SAME production type the `Codec::encoder` impl uses, via
+    /// [`LzwEncoder::push_byte`]'s public-within-module `bool` return (did
+    /// this call actually emit a code, as opposed to extending a dictionary
+    /// match?) to place a manual CLEAR at exactly the point the real
+    /// encoder's `cl_block` ratio check could fire. That return value is
+    /// what lets `clear_after` below skip a CLEAR opportunity on an
+    /// iteration that only extended a match — exactly as the original
+    /// hand-rolled dictionary loop did by `continue`-ing past the check.
     ///
-    /// ## Why this exists: the reference tools disagree at `maxbits == 9`
+    /// ## Why this exists at all: the reference tools disagree at `maxbits == 9`
     ///
     /// Both `compress` implementations this project meets write the same
     /// `-b 9` header (`1f 9d 89`), and produce mutually unreadable bytes
@@ -809,8 +1230,10 @@ mod tests {
     ///
     /// ## What keeps this from being self-referential
     ///
-    /// A synthesiser written alongside the decoder it feeds could mirror the
-    /// decoder's bug and prove nothing. Two live guards, not a comment:
+    /// A synthesiser sharing no code with the production encoder could prove
+    /// something a wrapper around that SAME encoder cannot on its own — so
+    /// two live guards still carry the external weight, unchanged by this
+    /// promotion:
     ///
     /// 1. [`the_stream_synthesiser_matches_the_system_encoder_byte_for_byte`]
     ///    compares this encoder's output with the REAL `compress` binary's,
@@ -829,137 +1252,39 @@ mod tests {
     /// BSD emits 2 CLEARs and GNU emits 0, which is precisely how the CLEAR
     /// test came to assert against a stream that had none. `clear_after`
     /// places the CLEAR explicitly instead: same wire format, no heuristic,
-    /// same answer on every machine.
-    struct SynthZ {
-        maxbits: u32,
-        maxmaxcode: u32,
-        n_bits: u32,
-        maxcode: u32,
-        free_ent: u32,
-        /// The current output group, LSB-first. A group is `n_bits` bytes —
-        /// at most 16, so at most 128 bits, which is exactly why this is a
-        /// `u128` and not a `u64`.
-        acc: u128,
-        acc_bits: u32,
-        clear_flg: bool,
-        out: Vec<u8>,
-    }
-
-    impl SynthZ {
-        fn new(maxbits: u32) -> Self {
-            assert!(
-                (INIT_BITS..=MAX_MAXBITS).contains(&maxbits),
-                "maxbits {maxbits} outside the format's own 9..=16"
-            );
-            Self {
-                maxbits,
-                maxmaxcode: 1 << maxbits,
-                n_bits: INIT_BITS,
-                maxcode: (1 << INIT_BITS) - 1,
-                // Block mode, always: it is what both real encoders default
-                // to, and the CLEAR code only exists under it.
-                free_ent: CLEAR + 1,
-                acc: 0,
-                acc_bits: 0,
-                clear_flg: false,
-                out: vec![
-                    COMPRESS_MAGIC_BYTES[0],
-                    COMPRESS_MAGIC_BYTES[1],
-                    BLOCK_MODE_FLAG | maxbits as u8,
-                ],
-            }
-        }
-
-        fn flush_group(&mut self, bytes: u32) {
-            for i in 0..bytes {
-                self.out.push(((self.acc >> (8 * i)) & 0xff) as u8);
-            }
-            self.acc = 0;
-            self.acc_bits = 0;
-        }
-
-        /// `compress.c`'s `output()`, arm for arm: write the code, flush a
-        /// full group, then — if the next entry would not fit, or a CLEAR is
-        /// pending — zero-pad the partial group to `n_bits` bytes (the width
-        /// the group was STARTED at, which is why the padding happens before
-        /// the width changes) and re-derive the width.
-        fn output(&mut self, code: u32) {
-            self.acc |= u128::from(code) << self.acc_bits;
-            self.acc_bits += self.n_bits;
-            if self.acc_bits == self.n_bits * 8 {
-                self.flush_group(self.n_bits);
-            }
-            if self.free_ent > self.maxcode || self.clear_flg {
-                if self.acc_bits > 0 {
-                    self.flush_group(self.n_bits);
-                }
-                if self.clear_flg {
-                    self.n_bits = INIT_BITS;
-                    self.maxcode = (1 << INIT_BITS) - 1;
-                    self.clear_flg = false;
-                } else {
-                    self.n_bits += 1;
-                    self.maxcode = if self.n_bits == self.maxbits {
-                        self.maxmaxcode
-                    } else {
-                        (1 << self.n_bits) - 1
-                    };
-                }
-            }
-        }
-
-        /// At end of input only the bytes actually occupied are written —
-        /// NOT a zero-padded whole group. That asymmetry with `output`'s
-        /// padding is the real encoder's (`writebuf(buf, (offset + 7) / 8)`)
-        /// and it is what leaves a genuine `.Z` ending with a handful of
-        /// unconsumed bits, exactly as this module's doc describes.
-        fn finish(mut self) -> Vec<u8> {
-            if self.acc_bits > 0 {
-                let bytes = self.acc_bits.div_ceil(8);
-                self.flush_group(bytes);
-            }
-            self.out
-        }
-    }
-
+    /// same answer on every machine. The PRODUCTION encoder
+    /// ([`super::LzwEncoder`] as `Codec::encoder` drives it) never calls this
+    /// — it has no ratio heuristic at all and simply never emits a CLEAR
+    /// (see the module doc).
+    ///
     /// Encodes `payload` as a block-mode `.Z` stream at `maxbits`, emitting
     /// one block-mode CLEAR once `clear_after` input bytes have been
     /// consumed (`None` for no CLEAR at all).
-    ///
-    /// The CLEAR is emitted at the one point the real encoder's `cl_block`
-    /// can fire — immediately after a code has been output and the current
-    /// string reset to a single literal — which is what guarantees the code
-    /// following a CLEAR is a literal below 256, the invariant every
-    /// decoder's CLEAR branch relies on.
     fn synth_z(payload: &[u8], maxbits: u32, clear_after: Option<usize>) -> Vec<u8> {
-        let mut e = SynthZ::new(maxbits);
+        let (mut enc, header) = LzwEncoder::new(maxbits);
+        let mut out = header.to_vec();
         let Some((&first, rest)) = payload.split_first() else {
-            return e.finish();
+            enc.finish(&mut out);
+            return out;
         };
-        let mut dict: std::collections::HashMap<(u32, u8), u32> = std::collections::HashMap::new();
-        let mut ent = u32::from(first);
+        // Seeds `enc.ent` exactly as the first call to `push_byte` would
+        // (its `None` branch) — spelled out via the public entry point
+        // rather than reaching into the private field directly, so this
+        // helper exercises the same code every real write does.
+        enc.push_byte(first, &mut out);
         let mut clear_after = clear_after;
         for (i, &c) in rest.iter().enumerate() {
-            if let Some(&next) = dict.get(&(ent, c)) {
-                ent = next;
-                continue;
-            }
-            e.output(ent);
-            if e.free_ent < e.maxmaxcode {
-                dict.insert((ent, c), e.free_ent);
-                e.free_ent += 1;
-            }
-            ent = u32::from(c);
-            if clear_after.is_some_and(|at| i + 1 >= at) {
-                dict.clear();
-                e.free_ent = CLEAR + 1;
-                e.clear_flg = true;
-                e.output(CLEAR);
+            let emitted = enc.push_byte(c, &mut out);
+            if emitted && clear_after.is_some_and(|at| i + 1 >= at) {
+                enc.dict.clear();
+                enc.free_ent = CLEAR + 1;
+                enc.clear_flg = true;
+                enc.output(CLEAR, &mut out);
                 clear_after = None;
             }
         }
-        e.output(ent);
-        e.finish()
+        enc.finish(&mut out);
+        out
     }
 
     /// A deterministic, non-repeating pseudo-random payload over a small
@@ -1012,7 +1337,7 @@ mod tests {
         }
     }
 
-    /// Falsifies [`SynthZ`] against the real thing: at four `maxbits`, its
+    /// Falsifies `synth_z` against the real thing: at four `maxbits`, its
     /// bytes must be IDENTICAL to what the system `compress` binary writes
     /// for the same payload. Without this, the two tests below would feed
     /// this module's decoder a stream written by this module's own test
@@ -1032,7 +1357,7 @@ mod tests {
     /// The 200-byte payload is the `maxbits == 9` case specifically: it is
     /// short enough that the 512-entry dictionary never fills, which is the
     /// only region where (N)compress 5.0's `-b 9` output is still correct
-    /// (see [`SynthZ`]'s own doc for the measurement).
+    /// (see `synth_z`'s own doc for the measurement).
     ///
     /// One thing this test does NOT reach, and the CLEAR test below does:
     /// the zero-padding of a partial group. A width transition always lands
@@ -1082,7 +1407,7 @@ mod tests {
     /// Linux CI runner — writes `-b 9` output that its OWN `uncompress`
     /// rejects as `corrupt input`, while BSD's `uncompress` refuses every
     /// `maxbits < 12` outright. There is no machine on which the system tool
-    /// can supply a valid maxbits-9 stream AND read it back. [`SynthZ`]'s
+    /// can supply a valid maxbits-9 stream AND read it back. `synth_z`'s
     /// doc carries the full measurement, and
     /// [`the_stream_synthesiser_matches_the_system_encoder_byte_for_byte`]
     /// is what keeps this stream honest.
@@ -1184,7 +1509,7 @@ mod tests {
     /// reason and not out of caution: (N)compress 5.0's `-b 9` output is
     /// undecodable by (N)compress 5.0 itself once the dictionary fills, so
     /// including it here would assert that this module reads a stream its
-    /// own author cannot. See [`SynthZ`]'s doc.
+    /// own author cannot. See `synth_z`'s doc.
     ///
     /// The payload is large enough that `-b 16` genuinely reaches 16-bit
     /// codes rather than stopping partway up the ladder.
