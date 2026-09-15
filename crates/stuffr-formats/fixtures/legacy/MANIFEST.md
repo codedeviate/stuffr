@@ -242,3 +242,258 @@ recipe every run. Regenerate `sample.lzh`'s recorded CRCs by hand (re-run
   construction_recipe` (the checked-in bytes match `build_arj`'s output
   exactly, which proves re-derivability, not correctness against any
   outside ground truth).
+
+---
+
+## The `unarc-rs` 0.6.3 borrowed corpus (ARC/PAK, ZOO) — Phase 3c Task 2
+
+Fourteen archives in `fixtures/legacy/arc/` (ten: four `.pak`, six `.arc`) and
+`fixtures/legacy/zoo/` (four `.zoo`), for the ARC/PAK and ZOO **read-only**
+decoders landing in Phase 3c Tasks 3–4. All fourteen are byte-for-byte copies
+of files from `unarc-rs` 0.6.3's own `tests/` tree — no bytes here were
+written by this project.
+
+**Provenance.** `unarc-rs` 0.6.3, downloaded from crates.io (`cargo download`
+equivalent — the extracted `.crate` tarball, not a git checkout).
+`Cargo.toml` declares `license = "MIT OR Apache-2.0"` (verified directly by
+reading the file: `license = "MIT OR Apache-2.0"` on its own line, package
+`unarc-rs`, version `0.6.3`, repository
+`https://github.com/mkrueger/unarc-rs`). The package's own `LICENSE` file
+(11,357 bytes) is the Apache-2.0 full text; no separate MIT text file ships
+inside this downloaded package (`find <extracted crate> -maxdepth 1 -iname
+'*license*'` finds exactly one file). The SPDX `license` field in `Cargo.toml`
+is what is relied on here — a dual `MIT OR Apache-2.0` grant lets the
+downstream user (this project) pick either license, and a permissive licence
+does not require both texts to ship in every redistribution to be valid. This
+is recorded so a future reader does not mistake the single bundled file for
+the whole story.
+
+**The crate itself is disqualified as a dependency — bytes only, never code.**
+Same three reasons the Phase 3c design doc gives: an unconditional MSRV of
+rustc 1.95 via `delharc = "0.8.0"` (six minors past this project's 1.88 floor
+— the same `delharc` 0.8 line already ruled out for LHA in Phase 3b, see this
+file's `sample.lzh` section and `crates/stuffr-formats/Cargo.toml`'s own
+pin note), vendored C++ via `unrar = "0.5.8"`, and a second zip
+(`zip = "8.6.0"`) and tar (`tar = "0.4"`) stack duplicating what
+`stuffr-formats` already carries. Confirmed directly in
+`unarc-rs-0.6.3/Cargo.toml`'s `[dependencies]` table, not assumed. Only the
+test corpus under `tests/` is reused; nothing here imports or calls into
+`unarc_rs`.
+
+**The expectation is the CRC-16 inside each file, not anything we or
+`unarc-rs` assert.** Every ARC/PAK entry and every ZOO entry carries a
+per-entry CRC-16/ARC (`crate::legacy::crc::crc16_arc`, polynomial `0xA001`,
+pinned in Phase 3c Task 1 against the published check value `"123456789"` →
+`0xBB3D`) computed by the *original* archiving tool, decades before this
+project existed. The conformance property Task 1 built checks stuffr's own
+decoder output against that stored value — a witness independent of both
+`unarc-rs` and of this project. **Following `sample.arj`'s style, not
+`sample.lzh`'s:** the per-entry `stored_crc` (and method/name/size) values
+below are recorded here for human provenance and cross-checking, but
+Task 3/4's actual `ExpectedEntry::stored_crc` values must be **parsed from
+each archive's own header bytes at test time**, by code, the way
+`legacy::arj::tests::build_arj` derives `sample.arj`'s expectations from its
+own construction recipe every run — never hardcoded from the hex literals in
+this manifest, and **never computed by decoding the payload and hashing the
+result**. That second form would silently turn the CRC property back into a
+self-consistency check (decode, hash your own output, compare to itself) —
+exactly the defect class Task 1's fix round closed for the codec side
+(`stored_crc` must be transcribed from bytes the archive itself supplies, not
+derived from what our own decoder produces). The byte offsets in the two
+subsections below are what a header parser must read to get `stored_crc`
+independently of decoding.
+
+**Independent measurement method.** All fields below (method byte, name,
+compressed/original size, stored CRC-16) were read directly from each
+archive's raw bytes by a throwaway Python script (not checked into the repo;
+kept in the session scratchpad), which reimplements the ARC and ZOO header
+layouts from scratch against `unarc-rs`'s own struct definitions
+(`src/arc/local_file_header.rs` + `src/arc/arc_archive.rs`'s `read_header`;
+`src/zoo/dirent.rs` + `src/zoo/zoo_header.rs`) — i.e. the *format*, not the
+*crate*, was consulted, the same way Phase 3b traced `sample.arj`'s byte
+layout from `unarj-rs`'s parser source without running `unarj-rs` itself.
+`unarc-rs`'s own tests (`tests/arc_decompression.rs`,
+`tests/zoo_decompression.rs`) were read afterward only as a **cross-check**,
+never as the source of truth — their asserted method names agree with every
+figure below, which is corroborating, not foundational.
+
+### ARC header layout (as measured)
+
+Each entry: a `0x1A` marker byte, then a 28-byte fixed record — `method(1) +
+name(13, NUL-padded) + compressed_size(u32 LE) + date_time(u32 LE, packed
+DOS) + crc16(u16 LE) + original_size(u32 LE)` — then that many bytes of
+payload. `method == 0` immediately after a `0x1A` marks end-of-archive (a
+2-byte marker, no trailing record). This is the ARC format from
+`ArcArchive::HEADER_SIZE = 28`/`ID = 0x1A`, confirmed against every file
+below (every computed payload range stayed in-bounds; `store.arc`'s single
+entry's payload was also byte-for-byte diffed against `unarc-rs`'s own
+bundled `LICENSE` file and matched exactly, 11,357 bytes).
+
+| file | entry name | method byte | method | compressed | original | stored CRC-16 |
+|---|---|---|---|---|---|---|
+| `arc/store.arc` | `LICENSE` | 2 | Unpacked (Stored) | 11357 | 11357 | `0xB065` |
+| `arc/crunch.arc` | `LICENSE` | 8 | Crunched | 5309 | 11357 | `0xB065` |
+| `arc/crunch2.arc` | `LICENSE` | 8 | Crunched | 5258 | 11357 | `0xB065` |
+| `arc/squashed.arc` | `LICENSE` | 9 | Squashed | 5279 | 11357 | `0xB065` |
+| `arc/wrongcrc16.arc` | `LICENSE` | 2 | Unpacked (Stored) | 11357 | 11357 | `0xB065` (see below — payload is NOT the 0xB065 content) |
+| `arc/cpm.arc` entry 1 | `DDTZ.COM` | 4 | Squeezed (RLE+Huffman) | 9348 | 9984 | `0xB3F0` |
+| `arc/cpm.arc` entry 2 | `READ.COM` | 3 | RLE90 (Packed) | 67 | 128 | `0xC093` |
+| `arc/license.pak` | `LICENSE` | 11 | Distilled | 4246 | 11357 | `0xB065` |
+| `arc/license_crunched.pak` | `LICENSE` | 8 | Crunched | 5255 | 11357 | `0xB065` |
+| `arc/license_squashed.pak` | `LICENSE` | 9 | Squashed | 5279 | 11357 | `0xB065` |
+| `arc/license_crushed.pak` | `LICENSE` | 10 | Crushed | 5261 | 11357 | `0xB065` |
+
+**Do not read `license_crushed.pak`'s name as evidence it is `crunch`'s
+scope.** ARC's method table has both a `Crunched` family (methods 5–8, one
+LZW variant with an RLE90 pre/post pass — all four numbers decode through the
+identical routine in `unarc-rs`, and presumably must in any reader, since
+nothing distinguishes them but the version of the tool that wrote them) *and*
+a separate, later `Crushed` method (10, a different LZW variant, no RLE
+pass) — "crushed" and "crunched" are two different methods by design, not a
+spelling variant of one. This file measures as method **10**, Crushed, not
+part of the 5–8 Crunched family — exactly the trap the task brief's "a
+filename is not a method identifier" warning names. Likewise
+`license_squashed.pak` (method 9, Squashed — no RLE pass, distinct from
+`Crunched`) and `license.pak` (method 11, Distilled) are each their own
+method, not aliases.
+
+### ZOO header layout (as measured)
+
+The archive header is `"ZOO 2.10 Archive."` (17 bytes) padded to a 20-byte
+text field, then `zoo_tag(u32 LE, must be 0xFDC4A7DC) + zoo_start(u32 LE) +
+zoo_minus(u32 LE) + major_ver(u8) + minor_ver(u8)`, at which point the true
+on-disk classic header ends (34 bytes) — `zoo_start` is the authoritative
+pointer to the first directory entry and was used directly rather than
+assuming a fixed offset; it independently confirmed `zoo_start = 42` and byte
+42 does carry the `0xFDC4A7DC` tag in all four fixtures, so the extra 8
+bytes between the 34-byte classic header and offset 42 are archive-format
+padding this parser does not need to interpret. **Caution for a future
+reader:** `unarc-rs`'s own `ZooHeader::load_from` reads a fixed 46-byte
+buffer that runs 12 bytes past the real 34-byte header and into the first
+directory entry's own bytes before `zoo_archive.rs` seeks back to
+`zoo_start` — so any field this manifest might have reported from bytes
+34–45 (there are none of interest here) would have been reading directory-entry
+bytes mislabeled as header fields, not a stuffr-specific mistake, an
+artifact of how the crate's struct is laid out. `major_ver`/`minor_ver` (both
+measured as `2`/`0` across all four fixtures) sit safely inside the real
+34-byte header and are not affected.
+
+Each directory entry is `zoo_tag(u32 LE) + dir_type(u8) + method(u8) +
+next(u32 LE) + offset(u32 LE, absolute file position of payload) +
+date_time(u32 LE) + crc16(u16 LE) + original_size(u32 LE) +
+compressed_size(u32 LE) + major_ver(u8) + minor_ver(u8) + deleted(u8) +
+struc(u8) + comment(u32 LE) + cmt_size(u16 LE) + name(13, NUL-padded) +
+var_dir_len(u8) + tz(u8) + dir_crc(u32 LE) + namlen(u8) + dirlen(u8)` — 59
+bytes fixed, from `DIRENT_HEADER_SIZE`. `next == 0` on a *fully present*
+entry means "last real entry"; all four fixtures here additionally carry a
+**short terminal marker after the last real entry** — 56 bytes, not 59 (the
+archive ends 3 bytes into what would be the fixed record), but the `next`
+field at byte offset 6 is fully present and reads `0` within those 56 bytes,
+so a reader must not require the full 59-byte record before checking `next`
+for the terminator, only enough of it (the `next` field alone: 10 bytes in)
+to see the terminator's `next == 0`. Confirmed byte-for-byte, not assumed:
+all four fixtures end with the identical 56-byte tail
+`dca7c4fd0200000000…00fc83` (tag + `dir_type=2` + zeros + two bytes that
+land inside what would be `dir_crc`'s field, immaterial since `next` already
+read `0`). **Worth flagging for Task 4's reader, not just this manifest**:
+`unarc-rs`'s own `get_next_entry` does an unconditional `read_exact` of the
+full 59-byte buffer and would raise an I/O error on this exact shape if it
+were ever called a second time — none of `unarc-rs`'s own tests do call it
+twice, so this edge case is untested by the crate that wrote these fixtures.
+
+| file | entry name | method byte | method | compressed | original | stored CRC-16 |
+|---|---|---|---|---|---|---|
+| `zoo/store.zoo` | `license` | 0 | Stored | 11357 | 11357 | `0xB065` |
+| `zoo/default.zoo` | `license` | 1 | Compressed (old LZW, `salzweg`) | 5282 | 11357 | `0xB065` |
+| `zoo/high_per.zoo` | `license` | 2 | CompressedLh5 (delharc LH5) | 4003 | 11357 | `0xB065` |
+| `zoo/wrongcrc16.zoo` | `license` | 0 | Stored | 11357 | 11357 | `0xB065` (see below — payload is NOT the 0xB065 content) |
+
+### Step 3 verdict: does the corpus cover what an ARC/ZOO reader must support?
+
+**Yes, against the master design's own scope, with one honestly-flagged gap
+that does not block Tasks 3–4.**
+
+The master design (`~/Development/Thomas/superpowers/stuffr/specs/
+2026-08-25-stuffr-compression-tool-design.md`) names ARC's required method
+set in three words: "RLE90 + squeeze + crunch". Measured coverage:
+
+- **RLE90 (method 3):** `arc/cpm.arc` entry 2 (`READ.COM`). Present in no
+  other borrowed file.
+- **Squeeze (method 4):** `arc/cpm.arc` entry 1 (`DDTZ.COM`). Present in no
+  other borrowed file.
+- **Crunch (methods 5–8, one decode routine):** method 8 specifically, in
+  four files (`crunch.arc`, `crunch2.arc`, `license_crunched.pak`, and — see
+  Ruling D below — `license_cypted.arc`, not borrowed). Methods 5–7 have no
+  fixture at all, but `unarc-rs`'s own decoder (and, by the design doc's
+  reasoning, any reader following the same table) routes all four numbers
+  through one routine, so 8 stands in for the family the same way `xz`/`lzma`
+  share one backend in this project's own codec tier split.
+- **Stored (methods 1 [old, shorter header] / 2):** method 2 covered by
+  `store.arc` and both `.pak`/`.arc` "stored-shape" entries. **Method 1 — the
+  old, pre-5.21 header shape without the trailing `original_size` field (24
+  bytes instead of 28) — has ZERO coverage in this corpus.** This is a
+  genuinely different on-disk header shape, not just a decode-routine
+  question, so it is flagged here rather than silently assumed compatible.
+  It is outside the master design's three-method minimum (RLE90/squeeze/
+  crunch never mentions "stored" as a checkbox at all, and every "stored"
+  fixture here already uses the newer method-2 header shape), so it does not
+  block Tasks 3–4, but a reader that wants to accept the oldest ARC files in
+  the wild will need either a fixture from elsewhere or an explicit,
+  documented refusal for method 1's header shape.
+- **Beyond the minimum, for free:** Squashed (9), Crushed (10) and Distilled
+  (11) are all covered too (the four `.pak` files), though none is named in
+  the master design's three-method list — bonus coverage, not required.
+
+ZOO's required scope in the design doc is just "ZOO (own)", with no method
+list — the corpus covers all three of the format's known methods (Stored 0,
+Compressed 1, CompressedLh5 2), which is a superset of any minimum this
+design doc names.
+
+**Ruling D verdict, as instructed:**
+- **`cpm.arc`: borrowed.** Not because it is a refusal fixture — because it
+  is the *only* borrowed file exercising RLE90 or Squeeze at all, both named
+  explicitly in the master design's ARC method list. Skipping it would leave
+  two of three required methods with zero corpus coverage.
+- **`license_cypted.arc`: not borrowed, and this is the "redundant" branch of
+  Ruling D's either/or.** Its one entry uses Crunched(8) (already covered by
+  `crunch.arc`/`crunch2.arc`/`license_crunched.pak`) under ARC's XOR
+  "encryption" (`arc_archive.rs`'s own doc comment: "ARC has no encryption
+  flag in headers — wrong passwords result in CRC errors"). Because there is
+  no header bit marking an entry encrypted, a reader with no password support
+  cannot special-case it at all — it can only decode the method normally and
+  observe the CRC-16 mismatch that decrypting-with-no-key produces, which is
+  the *identical* code path `wrongcrc16.arc` already forces (successful
+  method-level decode, CRC-16 disagreement, `Error::Corrupt`). It exercises
+  no method and no code path the other nine ARC-family fixtures do not
+  already cover, so it was left out rather than borrowed for a feature this
+  format cannot even signal it needs.
+
+### Step 4: `wrongcrc16.zoo` and `wrongcrc16.arc` really do carry bad CRCs
+
+Both are the negative fixture the CRC conformance property needs — proof the
+property can actually fire, not just pass vacuously. Confirmed with an
+**independent** CRC-16/ARC implementation (a from-scratch Python
+bit-at-a-time version, not a port of `crc16_arc` in
+`crates/stuffr-formats/src/legacy/crc.rs` and not calling into `unarc-rs`),
+pinned first against the same published check value Task 1 used
+(`crc16_arc(b"123456789") == 0xBB3D`), then sanity-checked against the two
+*correct* stored-method siblings before touching the "wrong" ones:
+
+| file | stored CRC-16 (header) | CRC-16 of the actual on-disk payload | match? |
+|---|---|---|---|
+| `arc/store.arc` (sanity check) | `0xB065` | `0xB065` | yes |
+| `zoo/store.zoo` (sanity check) | `0xB065` | `0xB065` | yes |
+| `arc/wrongcrc16.arc` | `0xB065` | `0xE763` | **no** |
+| `zoo/wrongcrc16.zoo` | `0xB065` | `0xE763` | **no** |
+
+Both negative fixtures declare the *same* header CRC as the correct
+`LICENSE` content (`0xB065`, matching `store.arc`/`store.zoo`) while their
+actual stored payload bytes compute to the *same* wrong value (`0xE763`) in
+both formats — consistent with both being derived from one shared corrupted
+copy of the same underlying test asset upstream, not two independent
+mistakes. Both entries use method "Stored" (ARC method 2, ZOO method 0), so
+no decompression step is involved in either check above — the mismatch is in
+the raw bytes themselves, not introduced by this measurement. **The
+anti-vacuity double is present and confirmed for both formats — Ruling D's
+concern (that only the ZOO side might have one) does not hold: `unarc-rs`
+ships the ARC-side twin too, and it was borrowed.**
