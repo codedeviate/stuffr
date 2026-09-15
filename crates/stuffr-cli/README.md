@@ -25,8 +25,11 @@ cargo install stuffr-cli --features c-backed    # needs a C compiler, nothing el
 
 The five legacy formats (Unix `compress` `.Z`, LHA/LZH, ARJ, ARC/PAK, ZOO)
 are in the default build too, pure Rust like the rest of it — no extra flag
-needed. `compress` and `lha` read AND write as of Phase 3c (`lha` reads seven
-compression methods and writes `-lh5-`); `arj`, `arc` and `zoo` are read-only
+needed. `compress`, `lha` and `arj` read AND write as of Phase 3c (`lha` reads
+seven compression methods and writes `-lh5-`; `arj` reads five and writes only
+the uncompressed one, so an ARJ archive stuffr writes is larger than its
+input — and nothing outside this project has ever read one, since no
+`arj`/`unarj` tool is obtainable); `arc` and `zoo` are read-only
 and refuse `pack --format <name>` at exit 3.
 `--features legacy` still exists and still works; it only matters paired with
 `--no-default-features` (e.g. `--no-default-features --features pure`, the

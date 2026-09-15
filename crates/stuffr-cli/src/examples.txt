@@ -79,7 +79,7 @@ COMPRESSING A FILE
       cost of ratio; its default is 3. lz4 and snappy have no level at all —
       neither underlying crate exposes such a knob — so --level is accepted
       and silently ignored rather than rejected, unlike every other codec on
-      this page. `compress` (see "LEGACY FORMATS" below — one of the two
+      this page. `compress` (see "LEGACY FORMATS" below — one of the three
       legacy formats that writes) is the one codec whose range is not
       0-something: `9..=16`, `compress`(1)'s own `-b` (`maxbits`) flag, 16 by
       default; a value outside that range is the same usage error (exit 2)
@@ -710,11 +710,12 @@ WHAT THIS BUILD CAN DO
       round-trip codecs gzip, zlib, deflate, bzip2, brotli, lz4, snappy,
       zstd, xz, lzma and lzip, the round-trip tar, ar, cpio and zip
       containers, and the five legacy formats — the `compress` codec
-      (read AND write, as of Phase 3c Task 5), the `lha` container
-      (read AND write, as of Phase 3c Task 6 — but see the WARNING under
-      "LEGACY FORMATS" below: it READS seven compression
-      methods and WRITES one) and the READ-ONLY
-      `arj`/`arc`/`zoo` containers, added to `default`
+      (read AND write, as of Phase 3c Task 5), the `lha` and `arj`
+      containers (read AND write, as of Phase 3c Tasks 6 and 7 — but see
+      the WARNING under "LEGACY FORMATS" below: `lha` READS seven
+      compression methods and WRITES one, and `arj` READS five and
+      WRITES only the uncompressed one) and the READ-ONLY
+      `arc`/`zoo` containers, added to `default`
       alongside `pure` so a plain `cargo install`/`cargo build` shows all
       twenty, not just fifteen — see "LEGACY FORMATS" below.
       The KIND
@@ -739,9 +740,9 @@ WHAT THIS BUILD CAN DO
       ONLY capability difference `c-backed` makes anywhere in this matrix is
       zstd's WRITE column, `weak` against `yes`; the five legacy rows sit
       outside that comparison entirely, `c-backed` changing nothing about any
-      of them — `compress` and `lha` show `yes` in WRITE on every tier
-      (there is only ever the one implementation of each), and
-      `arj`/`arc`/`zoo` stay `-`,
+      of them — `compress`, `lha` and `arj` show `yes` in WRITE on every
+      tier (there is only ever the one implementation of each), and
+      `arc`/`zoo` stay `-`,
       read-only on every tier — see "LEGACY FORMATS" below.
 
       The PARALLEL column is truthful per build too, and independent of
@@ -752,9 +753,10 @@ WHAT THIS BUILD CAN DO
       well, alongside its WRITE column becoming `yes`; it changes nothing
       else in this column, on any tier. All eight containers — tar, ar,
       cpio, zip, lha, arj, arc and zoo — always show `-` here: none of
-      them parallelises anything, on any tier (`arj`, `arc` and
-      `zoo` trivially so — none of the three has an encoder to parallelise
-      in the first place; `lha` has one and it is single-threaded).
+      them parallelises anything, on any tier (`arc` and
+      `zoo` trivially so — neither has an encoder to parallelise
+      in the first place; `lha` and `arj` have one each and both are
+      single-threaded — and `arj`'s does not compress at all).
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -952,8 +954,8 @@ NOT YET
 
 LEGACY FORMATS
 
-  The set from the 1980s and early 1990s. `compress` and `lha` read AND
-  write (Phase 3c Tasks 5 and 6); `arj`, `arc` and `zoo` are READ-ONLY and
+  The set from the 1980s and early 1990s. `compress`, `lha` and `arj` read
+  AND write (Phase 3c Tasks 5, 6 and 7); `arc` and `zoo` are READ-ONLY and
   refuse `pack --format <name>` with one shared sentence at exit 3.
   This section was called "READ-ONLY LEGACY FORMATS" while all of them were.
 
@@ -981,12 +983,12 @@ LEGACY FORMATS
       that same GNU `ncompress` — a genuine defect in that one encoder, not
       a second legal dialect — so this build writes the BSD-shaped bytes at
       that level instead, which every reference decoder handles correctly.
-      The `arj`, `arc` and `zoo` containers below are still
+      The `arc` and `zoo` containers below are still
       READ-ONLY, and refuse `pack --format <name>` with
       `Error::CapabilityUnavailable` (exit 3) from the same capability gate
       `compress` itself used to answer through before this phase. `lha`
-      left that list in Phase 3c Task 6 and now writes too — with the
-      method caveat its own entry below spells out.
+      left that list in Phase 3c Task 6 and `arj` in Task 7; both write
+      now, each with the method caveat its own entry below spells out.
       Unlike every OTHER codec in the pure/c-backed tiers above, `.Z` also
       carries no length field, checksum or end-of-stream marker of its own:
       a `.Z` file truncated part-way through decodes to a silently SHORTER
@@ -1061,6 +1063,7 @@ LEGACY FORMATS
       has been fully read, the same as any other checksum-carrying format
       here.
 
+  stuffr pack tree -o backup.arj
   stuffr list backup.arj
       ARJ, behind its own `--features arj` (bundled into `--features
       legacy`, itself in `default`/`full`/`--all-features`, same as
@@ -1087,11 +1090,33 @@ LEGACY FORMATS
       container opens with no such flag to read, so this ceiling is fixed
       rather than configurable.
 
-      This container is READ-ONLY: `stuffr pack notes.txt --format arj`
-      fails with `Error::CapabilityUnavailable` (exit 3), the same one
-      sentence `lha` above answers with — there is no ARJ
-      ENCODER here, only a reader for archives written by the real, decades-old
-      `arj`/`unarj` tools. Every entry carries its own CRC-32, checked once
+      This container WRITES too, as of Phase 3c Task 7 — and with TWO
+      warnings, both wider than the `yes` in `stuffr formats`' WRITE
+      column. **First: it does not compress.** The reader accepts ARJ's
+      five methods; the writer emits method 0, `Stored`, and nothing else,
+      so `stuffr pack tree -o backup.arj` produces a real, valid ARJ
+      archive that is LARGER than the input, not smaller. Re-packing a
+      compressed `.arj` through `unpack` then `pack` loses no data and no
+      names — it loses the compression. Put a codec under it if you want
+      the size back: `-o backup.arj.gz` works, and composes exactly like
+      `bundle.tar.gz` above.
+
+      **Second, and it is the honest reason this entry reads differently
+      from `lha`'s: nothing outside stuffr has ever read an ARJ archive
+      stuffr wrote.** `.Z` is checked against the real `compress`(1) and
+      `.lzh` against `lhasa`; no `arj`/`unarj` binary is obtainable, so
+      here the archive is only ever judged by the same project that wrote
+      it. What is done about that is a byte-level test asserting the
+      published specification's own constraints — the ones the ARJ reader
+      this build uses parses and then ignores — against the bytes the
+      encoder emits. That is real, and it is not a second implementation.
+      If you have `arj` or `unarj` on a machine somewhere, a report either
+      way is worth more than anything in this repository.
+
+      A symlink is refused rather than stored (exit 3): ARJ's own entry-type
+      table has no value for a link, so writing one would put the target
+      text in a regular file's contents. Directories ARE stored, as
+      themselves. Every entry carries its own CRC-32, checked once
       its payload has been decoded, and a mismatch is `Error::Corrupt` (exit
       5) — the same promise every other checksum-carrying format here
       makes. `by_index` has exactly one answer on this container, unlike
@@ -1121,7 +1146,8 @@ LEGACY FORMATS
 
       This container is READ-ONLY: `stuffr pack notes.txt --format arc`
       fails with `Error::CapabilityUnavailable` (exit 3), the same one
-      sentence `lha` and `arj` above answer with. Every
+      sentence `lha` above used to answer with, before it and `arj` both
+      gained encoders. Every
       entry carries its own CRC-16, checked before a single decoded byte
       is handed back, so a mismatch is `Error::Corrupt` (exit 5) rather
       than silently wrong data. Like `arj`, an entry decodes whole, so a
@@ -1158,7 +1184,7 @@ LEGACY FORMATS
 
       This container is READ-ONLY: `stuffr pack notes.txt --format zoo`
       fails with `Error::CapabilityUnavailable` (exit 3), the same one
-      sentence `lha`, `arj` and `arc` above answer with.
+      sentence `arc` above answers with.
       Every entry carries its own CRC-16, checked before a single decoded
       byte is handed back. An entry decodes whole, so a directory entry
       declaring an implausible size is refused before the allocation it

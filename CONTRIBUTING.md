@@ -152,9 +152,13 @@ test corpus borrowed as bytes plus prose explaining why the code was not.
 Nothing imports or links it; `Cargo.lock` has no such entry. So 3c is: write
 support for `compress`/`lha`/`arj`, plus READ support for ARC and ZOO. ARC and
 ZOO's read support, `compress`'s write support (Task 5 — the first of the
-three write tasks to land) and `lha`'s (Task 6, a `-lh5-` encoder verified
-against `lhasa`) have now shipped, each with its framing written
-from scratch; `arj` alone still refuses to write, pending its own task.
+three write tasks to land), `lha`'s (Task 6, a `-lh5-` encoder verified
+against `lhasa`) and `arj`'s (Task 7, a store-only encoder with **no
+external witness at all** — no `arj`/`unarj` binary is obtainable, so
+byte-level assertions against the published spec's own constraints stand in
+for the reference tool the other two have) have all now shipped, each with
+its framing written from scratch. `arc` and `zoo` are what still refuses to
+write.
 That is a
 PATCH, not a milestone, because it is additive to traits that already exist
 (`Container::create`, `Codec::encoder` are both already part of the public

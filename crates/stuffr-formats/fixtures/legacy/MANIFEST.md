@@ -267,6 +267,47 @@ head off — each style fails differently when mishandled.
   construction_recipe` (the checked-in bytes match `build_arj`'s output
   exactly, which proves re-derivability, not correctness against any
   outside ground truth).
+- **Phase 3c Task 7 gave ARJ an encoder, and this fixture MUST NOT be
+  regenerated with it.** The same rule `sample.lzh` carries, for a sharper
+  reason: an input produced by the code under test proves nothing about
+  that code, and here there is no outside witness to fall back on. Keep
+  `build_arj` — the hand transcription — as the fixture's only source.
+  `legacy::arj::tests::regenerate_the_checked_in_fixture` (ignored by
+  default) is still the way to land a deliberate recipe change, and it
+  writes `build_arj`'s output, never the encoder's.
+- **What the encoder DID add here is a second transcription, and its
+  agreement is worth stating precisely.**
+  `the_encoder_reproduces_the_hand_built_fixture_byte_for_byte` asserts
+  that `ArjWrite` — written for Task 7 from the published header tables —
+  emits these exact 173 bytes for the same two entries. `build_arj` was
+  written in Phase 3b from the same tables and from `unarj-rs`'s parser.
+  Two independent transcriptions agreeing raises the bar: a mistake now has
+  to be one BOTH made identically. It is still not an outside witness —
+  both are this project's — and it does not upgrade this fixture out of
+  "weakest provenance in the phase".
+- **The fields left at 0 are now the ENCODER's choices too, not only this
+  fixture's**, because that equality test pins them together. The rulings
+  above for `archiver version number` and `minimum archiver version to
+  extract` therefore govern what `stuffr pack --format arj` writes. One
+  more field is in the same position and was re-examined for Task 7:
+  `security version`, whose spec note is `(2 = current)` rather than a
+  "must equal" like `file type`'s. This archive is not secured
+  (SECURED_FLAG is clear) and no tool exists to check a written value
+  against, so it stays 0 — recorded as an open question rather than
+  quietly closed.
+- **The spec constraints `unarj-rs` does not check are now asserted against
+  ENCODER OUTPUT, not only reasoned about here.**
+  `legacy::arj::tests::spec_constraints_the_reader_never_checks` walks the
+  bytes with its own offset arithmetic (never through `unarj-rs`, which
+  would defeat the purpose) and asserts: the main header's `file type` must
+  equal 2; PATHSYM_FLAG set exactly when a stored name uses `/`, and clear
+  when it does not; no other arj flag set; the basic-header-size identity
+  `first_hdr_size + strlen(filename) + 1 + strlen(comment) + 1`; and the
+  2600-byte maximum. The negative half of the PATHSYM claim is reachable
+  only there — both of THIS fixture's names contain `/`, so a writer that
+  set the flag unconditionally would satisfy every other test in the tree.
+  Measured, not assumed: that edit leaves 24 of 25 `legacy::arj` tests
+  green.
 
 ---
 

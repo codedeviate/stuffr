@@ -40,14 +40,19 @@
 //! exact-count assertion — treats them exactly like any other registered
 //! slot.
 //!
-//! **`compress` gained a real encoder in Phase 3c Task 5** and could now
-//! build its own seed the way every non-legacy codec below does —
-//! [`legacy_codec_fixture`] keeps routing it through `hello.Z` anyway,
-//! deliberately: that fixture is `/usr/bin/compress`'s own output (an
-//! external encoder, not this crate's), so the corpus keeps a seed that
-//! does not depend on this project's own encoder agreeing with itself. The
-//! `lha`/`arj`/`arc` containers still have no writer at all, so their
-//! fixture routing remains load-bearing, not a style choice.
+//! **`compress` (Task 5), `lha` (Task 6) and `arj` (Task 7) have real
+//! encoders now** and could each build their own seed the way every other
+//! slot below does. [`legacy_codec_fixture`]/[`legacy_container_fixture`]
+//! keep routing `compress` and `arj` through their committed fixtures
+//! anyway, deliberately and for the same reason in both cases: a seed built
+//! by this project's own encoder is a seed the fuzzer explores outward from
+//! a shape that encoder already believes in. `hello.Z` is
+//! `/usr/bin/compress`'s output, so it is an EXTERNAL encoder's; and while
+//! `sample.arj` is hand-built rather than external (no `arj` tool is
+//! obtainable — see `legacy::arj`'s module doc), it is at least not the
+//! encoder's own output. `lha` stays on `sample.lzh` for the strongest
+//! version of the same reason — `lhasa`, an implementation outside this
+//! project, verified it — and `arc`/`zoo` have no writer to leave it for.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -125,8 +130,16 @@ fn legacy_codec_fixture(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Same idea as [`legacy_codec_fixture`], for the four read-only legacy
-/// containers `lha`, `arj`, `arc` and `zoo`.
+/// Same idea as [`legacy_codec_fixture`], for the four legacy containers
+/// whose seed comes from a committed fixture: `lha`, `arj`, `arc` and
+/// `zoo`.
+///
+/// `arc` and `zoo` are here because they have no writer at all. `lha` and
+/// `arj` gained one in Phase 3c Tasks 6 and 7 and stay here anyway, so that
+/// the corpus keeps a seed neither format's own encoder produced —
+/// `sample.lzh` was verified by `lhasa` and `sample.arj` is hand-built from
+/// the published header tables. Neither fixture may be regenerated with the
+/// encoder that now exists; `fixtures/legacy/MANIFEST.md` says so for both.
 ///
 /// `arc`'s seed is `cpm.arc` rather than any of the nine other borrowed
 /// archives, for the same reason it is the conformance fixture: two entries
@@ -240,8 +253,11 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     let mut container_count = 0usize;
     for (selector, name) in registered_container_slots() {
         let bytes = if let Some(fixture) = legacy_container_fixture(name) {
-            // Phase 3b: read-only container — no writer to build this seed
-            // with, so the committed fixture's own bytes ARE the archive.
+            // The committed fixture's own bytes ARE the archive — because
+            // the container has no writer (`arc`, `zoo`) or because a seed
+            // this project's own encoder produced would be worth less than
+            // one it did not (`lha`, `arj`). See
+            // `legacy_container_fixture`'s own doc.
             read_all(&legacy_fixture_path(fixture))?
         } else {
             let out_path = work.path().join(format!("container-{name}.out"));

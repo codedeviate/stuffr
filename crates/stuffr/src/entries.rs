@@ -1093,7 +1093,9 @@ pub fn create_archive(
     o: &CompressOpts,
 ) -> Result<Outcome> {
     // `require_container_writer`, not `require_container`: a read-only
-    // container (LHA, ARJ) must be refused here, by the registry, in the same
+    // container (ARC, ZOO — LHA and ARJ were on this list until Phase 3c
+    // Tasks 6 and 7 gave them encoders) must be refused here, by the
+    // registry, in the same
     // sentence `require_encoder` refuses a decode-only codec — not by
     // reaching `create()` and relying on each adapter to hand-roll a refusal
     // of its own. See that method's doc comment.
