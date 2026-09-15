@@ -49,7 +49,13 @@
 //! byte 45, and a read of the first 45 bytes returns one entry, cleanly.
 //! Container-conformance property 9 passes here because none of its four cut
 //! offsets lands on a boundary — not because this format detects every
-//! truncation. What a writer CAN control is whether it manufactures such a
+//! truncation. **The margin is ONE BYTE**, and "offset-dependent" is too
+//! comfortable a word for it: the cuts are `1, len/3, len/2, len-1`, and on
+//! a two-entry archive `len/2` IS the entry boundary exactly when the two
+//! `-lh5-` payloads are the same length — today they are 13 and 12. A
+//! one-byte change in either payload turns that property red with no defect
+//! present, and the fix would be a bigger fixture, never a loosened
+//! property. What a writer CAN control is whether it manufactures such a
 //! boundary at the end of every archive it writes, and this one does not.
 //!
 //! # `delharc` streams; this is why LHA's caps differ from ARJ's
@@ -384,21 +390,51 @@ const LHA_PATH_SEPARATOR: u8 = 0xFF;
 /// never asked to round-trip a hostile name, since there is no encoder to
 /// produce one. Graduating to the write-capable harness is what surfaced it.
 ///
-/// # What it still does
+/// # What it does, enumerated — THREE differences, not one
 ///
-/// Presentation, not structure. `0xFF` becomes `/` (the format's separator),
-/// printable ASCII passes through, and every other byte is escaped `%XX` —
-/// the same escaping `delharc` applies, kept so a Shift-JIS or CP437 name
-/// from a real DOS-era archive still renders as it did before rather than as
-/// a run of U+FFFD. The escape is also what keeps the output a valid
-/// `String` without a lossy conversion inventing characters, and — because
-/// `%` itself is escaped to `%25` — the mapping is injective, so two
-/// different stored names can never collapse onto one reported name.
+/// An earlier version of this doc said "only the FILTERING is dropped" and
+/// that the `%XX` escaping was "the same escaping `delharc` applies". Both
+/// were false, and the review that measured them is why this list is
+/// exhaustive rather than a summary. Against `delharc 0.6.2`
+/// (`parser.rs:449-515`):
+///
+/// | stored | `delharc` | here | why |
+/// |---|---|---|---|
+/// | `../../etc/passwd` | `etc/passwd` | `../../etc/passwd` | the filtering, dropped — see above |
+/// | byte `0xC3` | `%c3` | `%C3` | `{:02X}`, cosmetic |
+/// | a literal `%1f` | `%1f` | `%251f` | `%` is escaped too, so the mapping is injective |
+/// | `dos\sub\file.txt` | `dos/sub/file.txt` | `dos/sub/file.txt` | unchanged: `\` IS split |
+///
+/// Structure is preserved exactly. `0xFF` (the format's own separator), `/`
+/// and `\` all become `/`, which is what `delharc` does and what LHA
+/// archives in the wild need: `\` is the native separator of the DOS-era
+/// tools this format exists to read, so leaving it literal would flatten a
+/// whole directory tree into one filename. It also cuts the security way:
+/// splitting is what makes `a\..\..\etc\passwd` visible to
+/// `entries.rs`'s `safe_join` as traversal instead of hiding the intent
+/// inside a single component — the same argument that justifies dropping
+/// the filtering above.
+///
+/// The two escaping changes are deliberate improvements with a cost, and
+/// the cost is stated rather than glossed. `%` → `%25` removes a genuine
+/// ambiguity (a stored literal `%1f` was previously indistinguishable from
+/// an escaped `0x1F`), and it is what makes the mapping injective, so two
+/// different stored names can never collapse onto one reported name. The
+/// hex case is cosmetic. **Both change name matching, which is exact**: an
+/// entry a user previously reached as `stuffr cat old.lzh 'na%c3me.txt'` is
+/// now `na%C3me.txt`, and the old spelling is `Error::EntryNotFound` (exit
+/// 2). `README.md`'s status block and `examples.txt`'s LHA entry say so
+/// where a user will meet it.
+///
+/// Escaping at all — rather than `String::from_utf8_lossy` — keeps a
+/// Shift-JIS or CP437 name from a real DOS-era archive renderable instead of
+/// a run of U+FFFD, and guarantees the output is printable ASCII, so an
+/// embedded NUL or a stray `/`-lookalike byte cannot reach a `Path::join`
+/// having been invented on the way.
 ///
 /// Header precedence mirrors `delharc`'s: an extra header of type
 /// [`EXT_HEADER_FILENAME`] wins over the base header's `filename` field, and
-/// an [`EXT_HEADER_PATH`] extra header is prepended as the directory. Only
-/// the FILTERING is dropped.
+/// an [`EXT_HEADER_PATH`] extra header is prepended as the directory.
 fn raw_pathname(header: &LhaHeader) -> String {
     let mut dir: &[u8] = &[];
     let mut ext_name: &[u8] = &[];
@@ -428,7 +464,11 @@ fn raw_pathname(header: &LhaHeader) -> String {
     let mut out = String::with_capacity(raw.len());
     for &b in &raw {
         match b {
-            LHA_PATH_SEPARATOR => out.push('/'),
+            // `\\` alongside `0xFF`, matching `delharc`: it is the native
+            // separator of the DOS-era tools that wrote these archives, so
+            // a name carrying one is a PATH, not a filename with an odd
+            // character in it. See this function's table.
+            LHA_PATH_SEPARATOR | b'\\' => out.push('/'),
             b'%' => out.push_str("%25"),
             0x20..=0x7E => out.push(b as char),
             other => {
@@ -779,16 +819,43 @@ fn write_level1_header(
 /// property of the FORMAT, not a shortcut: `zip` solves the same problem with
 /// data descriptors, which LHA has no equivalent of.
 ///
-/// The cost is real and worth stating plainly: peak memory during `add` is
-/// roughly the entry's uncompressed size plus its compressed size, for ONE
-/// entry at a time. Nothing accumulates across entries — each is written
-/// through and both buffers dropped — so a 10,000-entry archive of small
-/// files costs what its largest single file costs, not the sum. There is no
-/// ceiling on it, deliberately: a fixed one would refuse to pack a large file
-/// that this machine can hold, and `ContainerCaps`/`CreateOpts` carry no
-/// memory budget for a container to consult (`DecodeOpts::memory_limit` binds
-/// a CODEC, and is a decode-side field besides — see `arj.rs`'s own note on
-/// the same gap).
+/// The cost is real, it is **~8.4x the entry's size on incompressible data**,
+/// and an earlier version of this doc understated it by roughly four times
+/// by calling it "the uncompressed size plus the compressed size". Measured
+/// with `/usr/bin/time -l` on a release build, `stuffr pack <file> --format
+/// lha`:
+///
+/// | input | peak RSS | ratio |
+/// |---|---|---|
+/// | 50 MiB random | 444 MB | **8.5x** |
+/// | 100 MiB random | 817 MB | **8.2x** |
+/// | 100.7 MiB compressible text | 146 MB | 1.45x |
+///
+/// The mechanism is `oxiarc-lzhuf`'s own shape, not the buffering above:
+/// `LzssEncoder::encode(&[u8]) -> Vec<LzssToken>` materialises one 6-byte
+/// token per literal for the whole entry (`lzss.rs:548`, reserving
+/// `len / 2 + 1` up front), and `optimal.rs` builds a second full Vec beside
+/// it. Compressible input escapes it because matches collapse many bytes
+/// into one token — which is why the text row is 1.45x and the random rows
+/// are eight.
+///
+/// **Exhaustion is a process ABORT, not an error.** `grep -rn try_reserve`
+/// over `oxiarc-lzhuf 0.4.2`'s source returns **zero** hits, so a failed
+/// allocation goes to `handle_alloc_error` → `SIGABRT`: no
+/// `Error::ResourceLimit` (exit 6), no exit 1, no stuffr message of any
+/// kind, and a `pack` over a whole tree takes the entire archive down with
+/// it. Budget roughly 4.2 GB for a 500 MB entry and 8.4 GB for a 1 GB one.
+///
+/// Nothing accumulates ACROSS entries — each is written through and its
+/// buffers dropped — so a 10,000-entry archive of small files costs what its
+/// largest single entry costs, not the sum.
+///
+/// Unbounded anyway, deliberately: the threat model here is local files the
+/// user named, a fixed ceiling would refuse files this machine can hold, and
+/// `ContainerCaps`/`CreateOpts` carry no memory budget for a container to
+/// consult (`DecodeOpts::memory_limit` binds a CODEC, and is a decode-side
+/// field besides — see `arj.rs`'s own note on the same gap). The figures and
+/// the abort are here so the cost is predictable rather than a surprise.
 struct LhaWrite {
     /// `None` once `finish` has consumed it.
     dst: Option<Box<dyn Sink>>,
@@ -929,10 +996,14 @@ impl ArchiveWrite for LhaWrite {
     /// make the last byte of every archive stuffr produces removable with no
     /// reader on earth able to tell, which is the shape of silent truncation
     /// this project refuses everywhere else. MEASURED, not reasoned about:
-    /// with the marker written, container-conformance property 9's
-    /// `bytes.len() - 1` cut — which removes exactly that byte — was accepted
-    /// silently, returning all entries at no error. See the module doc's
-    /// "The end-of-archive marker" section and
+    /// with the marker written, **two** of container-conformance property
+    /// 9's four cuts are accepted silently on the two-entry fixture — the
+    /// `len - 1` cut (89 of 90 bytes, which removes exactly that byte and
+    /// returns BOTH entries) and the midpoint (45, which lands on entry 1's
+    /// own boundary and returns one). The harness iterates in order and
+    /// panics at 45, so its message names that one; only the first is this
+    /// ruling's own doing — see the module doc's "The end-of-archive marker"
+    /// section for the separation, and
     /// `an_archive_stops_at_its_last_entry_so_a_cut_tail_is_detectable`.
     ///
     /// Never via `Drop` — see `tar.rs`'s own `finish` doc for why that is the
@@ -1004,17 +1075,16 @@ mod tests {
     /// `a_reader_still_accepts_the_optional_end_of_archive_marker` a real
     /// test of the reader rather than a test of our own writer's choice.
     fn build_single_entry_lha(name: &str, method: &[u8; 5], content: &[u8]) -> Vec<u8> {
+        build_named_entry_lha(name.as_bytes(), method, content)
+    }
+
+    /// [`build_single_entry_lha`] over RAW name bytes, so a test can store a
+    /// name no `String` can hold — a `0xFF` separator, a non-UTF-8 byte —
+    /// which is exactly what `raw_pathname`'s table needs.
+    fn build_named_entry_lha(name: &[u8], method: &[u8; 5], content: &[u8]) -> Vec<u8> {
         let size = content.len() as u32;
         let mut out = Vec::new();
-        write_level1_header(
-            &mut out,
-            method,
-            name.as_bytes(),
-            size,
-            size,
-            crc16_arc(content),
-            0,
-        );
+        write_level1_header(&mut out, method, name, size, size, crc16_arc(content), 0);
         out.extend_from_slice(content);
         out.push(0); // end-of-archive marker
         out
@@ -1609,37 +1679,81 @@ mod tests {
         );
     }
 
-    /// The premise behind [`raw_pathname`], pinned directly against
-    /// `delharc 0.6.2`'s own accessor rather than only through
-    /// container-conformance property 12. Property 12 tells you a name was
-    /// altered; this tells you WHAT alters it and by how much, so a future
-    /// `delharc` bump that stopped sanitising would show up here as a
-    /// premise that no longer holds rather than as a mysteriously
-    /// unnecessary function.
+    /// Every difference between [`raw_pathname`] and `delharc`'s own
+    /// accessor, pinned as a table against the live crate so the doc cannot
+    /// drift from the behaviour.
+    ///
+    /// The `\` row is the one with teeth. `\` is the native separator of the
+    /// DOS-era tools that wrote these archives, and an earlier version of
+    /// this module did NOT split on it — a `dos\sub\file.txt` entry came
+    /// back as one literal filename, flattening the directory structure of
+    /// exactly the archives this format exists to read, and hiding
+    /// `a\..\..\etc\passwd`'s traversal from `safe_join` inside a single
+    /// component. Both halves are asserted: what this module reports, and
+    /// what `delharc` reports for the same bytes, so a crate release that
+    /// changed either shows up here as a premise that no longer holds
+    /// rather than as a silently unnecessary function.
     #[test]
-    fn delharc_sanitises_the_names_this_module_reports_verbatim() {
-        for (stored, delharc_says) in [
-            ("../../etc/passwd", "etc/passwd"),
-            ("/abs/path", "abs/path"),
-            ("a/../../b", "a/b"),
-        ] {
-            let bytes = build_single_entry_lha(stored, b"-lh0-", b"x");
-            let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes)));
-            let resolved = stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default())
-                .expect("resolve");
-            let mut ar = Lha.open(resolved, &OpenOpts::default()).expect("open");
-            let entry = ar.next_entry().expect("next").expect("one entry");
+    fn a_stored_name_maps_to_a_reported_name_exactly_as_documented() {
+        // (stored bytes, what this module reports, what delharc reports)
+        let cases: &[(&[u8], &str, &str)] = &[
+            (b"../../etc/passwd", "../../etc/passwd", "etc/passwd"),
+            (b"/abs/path", "/abs/path", "abs/path"),
+            (b"a/../../b", "a/../../b", "a/b"),
+            (
+                b"dos\\sub\\file.txt",
+                "dos/sub/file.txt",
+                "dos/sub/file.txt",
+            ),
+            (
+                b"a\\..\\..\\etc\\passwd",
+                "a/../../etc/passwd",
+                "a/etc/passwd",
+            ),
+            (b"ff\xffsep.txt", "ff/sep.txt", "ff/sep.txt"),
+            (b"na\xc3me.txt", "na%C3me.txt", "na%c3me.txt"),
+            (b"lit%1f.txt", "lit%251f.txt", "lit%1f.txt"),
+        ];
+        for (stored, want, delharc_says) in cases {
             assert_eq!(
-                entry.meta().name,
-                stored,
-                "this module must report {stored:?} exactly as stored"
+                &reported_name(stored),
+                want,
+                "stored {:?} must be reported as {want:?}",
+                String::from_utf8_lossy(stored)
             );
-            // And the accessor it deliberately does not use would not have.
-            assert_ne!(
-                delharc_says, stored,
-                "if delharc no longer rewrites {stored:?}, raw_pathname's premise has changed"
+            // The `dos\sub` row is the one where the two columns AGREE —
+            // deliberately, because that is the behaviour this module had to
+            // restore after a review measured it flattened.
+            let bytes = build_named_entry_lha(stored, b"-lh0-", b"x");
+            let reader = LhaDecodeReader::new(io::Cursor::new(bytes)).expect("parse the header");
+            assert_eq!(
+                &reader.header().parse_pathname_to_str(),
+                delharc_says,
+                "delharc 0.6.2's own accessor no longer reports {:?} as {delharc_says:?}",
+                String::from_utf8_lossy(stored)
             );
         }
+
+        // The escaping is injective: two different stored names can never
+        // report as one.
+        assert_ne!(
+            reported_name(b"lit%1f.txt"),
+            reported_name(b"lit\x1f.txt"),
+            "a literal `%1f` and an escaped 0x1F must not collapse onto one name"
+        );
+    }
+
+    /// Reads one entry's reported name back out of a single-entry archive,
+    /// through the real `Lha::open` path rather than by calling
+    /// [`raw_pathname`] directly — the name a CALLER sees is the claim.
+    fn reported_name(stored: &[u8]) -> String {
+        let bytes = build_named_entry_lha(stored, b"-lh0-", b"x");
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes)));
+        let resolved =
+            stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default()).expect("resolve");
+        let mut ar = Lha.open(resolved, &OpenOpts::default()).expect("open");
+        let entry = ar.next_entry().expect("next").expect("one entry");
+        entry.meta().name.clone()
     }
 
     /// A name longer than a level-1 header's single length byte can
@@ -1849,6 +1963,33 @@ mod tests {
         )
     }
 
+    /// lhasa's own banner, which carries its VERSION, folded into every
+    /// assertion message below.
+    ///
+    /// Not decoration. The `-lhd-` trailing-separator guard was measured
+    /// against lhasa **0.6.0**; Ubuntu noble ships **0.4.0**. If that older
+    /// build happens to TOLERATE an unterminated `-lhd-` name, the guard
+    /// goes green on CI with the defect reinstated and only a machine with
+    /// 0.6.0 ever notices — a failure that would otherwise be read as
+    /// "works on CI, broken locally". Printing the version at the moment an
+    /// assertion fires is what makes that diagnosable in one look instead of
+    /// a bisect.
+    ///
+    /// Run with no arguments, which is how lhasa prints its usage banner
+    /// (`Lhasa v0.6.0 command line LHA tool ...`); the exit status is
+    /// ignored because a usage banner is a failure by convention.
+    fn lhasa_banner(bin: &std::path::Path) -> String {
+        let out = std::process::Command::new(bin)
+            .output()
+            .expect("run lhasa with no arguments for its banner");
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        } else {
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        text.lines().next().unwrap_or("<no banner>").to_string()
+    }
+
     /// LHA's external witness, and the ONLY evidence in this module that
     /// what the `-lh5-` encoder writes is genuinely LHA rather than
     /// something `delharc` and `oxiarc-lzhuf` merely agree about.
@@ -1870,6 +2011,7 @@ mod tests {
     #[test]
     fn lhasa_reads_what_we_write() {
         let lha_bin = require_lhasa();
+        let banner = lhasa_banner(&lha_bin);
 
         // Deliberately three shapes: text that compresses, an
         // incompressible payload big enough to cross several `-lh5-`
@@ -1924,7 +2066,7 @@ mod tests {
             .expect("run lha t");
         assert!(
             test.status.success(),
-            "lhasa refused an archive this build wrote: status {:?}\nstdout: {}\nstderr: {}",
+            "{banner} refused an archive this build wrote: status {:?}\nstdout: {}\nstderr: {}",
             test.status.code(),
             String::from_utf8_lossy(&test.stdout),
             String::from_utf8_lossy(&test.stderr)
@@ -1947,7 +2089,7 @@ mod tests {
         let rows = text.lines().filter(|l| l.contains("-lh")).count();
         assert_eq!(
             rows, 4,
-            "lhasa must see all four entries — listing no rows at all is the silent \
+            "{banner} must see all four entries — listing no rows at all is the silent \
              end-of-archive an unterminated -lhd- name causes: {text}"
         );
 
@@ -1960,23 +2102,23 @@ mod tests {
             .expect("run lha x");
         assert!(
             extract.status.success(),
-            "lhasa failed to extract: {}",
+            "{banner} failed to extract: {}",
             String::from_utf8_lossy(&extract.stderr)
         );
         for (name, want) in &entries {
             let got = std::fs::read(out.join(name))
-                .unwrap_or_else(|e| panic!("lhasa did not extract {name}: {e}"));
+                .unwrap_or_else(|e| panic!("{banner} did not extract {name}: {e}"));
             assert_eq!(
                 &got[..],
                 *want,
-                "lhasa extracted {name} with {} bytes, expected {}",
+                "{banner} extracted {name} with {} bytes, expected {}",
                 got.len(),
                 want.len()
             );
         }
         assert!(
             out.join("adir").is_dir(),
-            "lhasa must extract the -lhd- entry as a directory"
+            "{banner} must extract the -lhd- entry as a directory"
         );
     }
 }
