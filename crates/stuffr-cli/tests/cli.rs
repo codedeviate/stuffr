@@ -1184,7 +1184,7 @@ fn examples_pages_first_worked_example_runs_as_documented() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `pack --format arj`/`arc`/`zoo` must refuse CLEARLY — exit 3, naming
+/// `pack --format arc`/`zoo` must refuse CLEARLY — exit 3, naming
 /// the format as readable but not writable by this build — never fail
 /// obscurely (an internal panic, a bare i/o error, or an unrelated exit
 /// code). All three take the SAME route: `Registry::require_container_writer`
@@ -1193,13 +1193,16 @@ fn examples_pages_first_worked_example_runs_as_documented() {
 /// unreachable backstop. This pins it all the way through the CLI rather
 /// than only at the trait level each module's unit tests already cover.
 ///
-/// **`compress` left this list in Phase 3c Task 5 and `lha` in Task 6** —
-/// neither is read-only any more, so neither belongs among the formats this
-/// test proves REFUSE to write.
-/// `pack_writes_a_compress_stream_the_system_tool_reads` and
-/// `pack_writes_an_lha_archive_the_system_tool_reads` below are their
-/// positive counterparts, proving the opposite claim for the two formats
-/// that changed.
+/// **`compress` left this list in Phase 3c Task 5, `lha` in Task 6 and
+/// `arj` in Task 7** — none is read-only any more, so none belongs among
+/// the formats this test proves REFUSE to write.
+/// `pack_writes_a_compress_stream_the_system_tool_reads`,
+/// `pack_writes_an_lha_archive_the_system_tool_reads` and
+/// `pack_writes_an_arj_archive_stuffr_reads_back` below are their positive
+/// counterparts, proving the opposite claim for the three formats that
+/// changed. The third is named differently on purpose: no `arj`/`unarj`
+/// binary is obtainable, so that one is a round trip through stuffr's own
+/// reader and nothing outside this project judges it.
 ///
 /// Runtime-checked, not `cfg`-gated. `stuffr-cli` does declare a `legacy`
 /// feature (a passthrough to `stuffr/legacy`, so `cargo install stuffr-cli
@@ -1231,7 +1234,7 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
     let src = dir.join("notes.txt");
     std::fs::write(&src, b"payload").unwrap();
 
-    for (name, out_ext) in [("arj", "arj"), ("arc", "arc"), ("zoo", "zoo")] {
+    for (name, out_ext) in [("arc", "arc"), ("zoo", "zoo")] {
         let registered = registry.container(stuffr::FormatId::new(name)).is_some()
             || registry.codec(stuffr::FormatId::new(name)).is_some();
         if !registered {
@@ -1264,7 +1267,7 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
              {:?}; stderr: {err}",
             res.status.code()
         );
-        // ONE sentence for all three, which is the point of the shared
+        // ONE sentence for both, which is the point of the shared
         // gate: the containers used to say "unsupported: ARJ is
         // read-only in this build" (their own hand-rolled
         // `Container::create` refusal) before `require_container_writer`
@@ -1437,6 +1440,112 @@ fn pack_writes_an_lha_archive_the_system_tool_reads() {
             "`stuffr list` lost {name}: {listing}"
         );
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The positive counterpart to `pack_refuses_a_read_only_legacy_format_
+/// clearly` above, for the format Phase 3c Task 7 moved out of that list —
+/// **and the one with no external witness at all.**
+///
+/// Its two siblings are judged from outside this project: the real
+/// `uncompress`(1) reads what `--format compress` writes, and `lhasa` reads
+/// what `--format lha` writes. No `arj`/`unarj` binary is obtainable here,
+/// so this is a round trip through stuffr's OWN reader and proves exactly
+/// that much — the archive stuffr writes is one stuffr reads back with the
+/// tree intact. Everything that could be done about that gap was done in
+/// `legacy::arj`'s unit tests (`spec_constraints_the_reader_never_checks`
+/// asserts, on emitted bytes, the spec constraints `unarj-rs` ignores) and
+/// it is named here so this test is not mistaken for the same kind of
+/// evidence its two siblings carry.
+///
+/// A CONTAINER, so a whole tree goes in — files and the directory entry
+/// above them — and the entries come back with their names, their contents
+/// and their kinds.
+#[test]
+fn pack_writes_an_arj_archive_stuffr_reads_back() {
+    let dir = tmp("arj-write-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("tree/sub")).unwrap();
+    let alpha = b"the quick brown fox jumps over the lazy dog\n".repeat(120);
+    std::fs::write(dir.join("tree/alpha.txt"), &alpha).unwrap();
+    std::fs::write(dir.join("tree/sub/beta.bin"), b"beta\n").unwrap();
+    let dst = dir.join("out.arj");
+
+    let res = Command::new(STUFFR)
+        .args([
+            "pack",
+            dir.join("tree").to_str().unwrap(),
+            "--format",
+            "arj",
+            "-o",
+            dst.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "pack --format arj must now succeed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(dst.exists(), "pack must have written {}", dst.display());
+
+    // The magic the registry detects it by, at offset 0 — so the file is
+    // recognised as ARJ without `--format`, which the `list` below relies
+    // on.
+    let head = std::fs::read(&dst).unwrap();
+    assert_eq!(
+        &head[0..2],
+        &[0x60, 0xEA],
+        "an ARJ archive opens with its own header id"
+    );
+
+    // `test` verifies every entry's CRC-32, which is the strongest check
+    // available without a second implementation.
+    let verify = Command::new(STUFFR)
+        .args(["test", dst.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        verify.status.success(),
+        "`stuffr test` must accept an archive stuffr wrote: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+
+    let list = Command::new(STUFFR)
+        .args(["list", dst.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let listing = String::from_utf8_lossy(&list.stdout);
+    for name in ["tree/alpha.txt", "tree/sub/beta.bin"] {
+        assert!(
+            listing.contains(name),
+            "`stuffr list` lost {name}: {listing}"
+        );
+    }
+
+    // ...and the bytes have to come back, not merely the names.
+    let out = dir.join("out");
+    let unpack = Command::new(STUFFR)
+        .args(["unpack", dst.to_str().unwrap(), "-C", out.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        unpack.status.success(),
+        "unpack must restore the tree: {}",
+        String::from_utf8_lossy(&unpack.stderr)
+    );
+    assert_eq!(std::fs::read(out.join("tree/alpha.txt")).unwrap(), alpha);
+    assert_eq!(
+        std::fs::read(out.join("tree/sub/beta.bin")).unwrap(),
+        b"beta\n"
+    );
+    assert!(
+        out.join("tree/sub").is_dir(),
+        "the directory entries must come back as directories, which is what \
+         ContainerCaps::stores_dirs claims"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
