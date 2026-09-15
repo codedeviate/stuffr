@@ -7,18 +7,38 @@ anything.
 
 Append one entry per fixture added, in the same shape.
 
-**Before editing `sample.lzh` or `sample.arj`, note this asymmetry between
-them.** `sample.lzh`'s entry below records its two entries' CRC-16 values and
-`lha v`'s output as literal hex, frozen at the moment the fixture was built.
-`sample.arj`'s entry computes its expectations (CRC-32, sizes) from the
-construction recipe at TEST time (`legacy::arj::tests::build_arj`), not from
-literals written here. So a hand-edit to `sample.lzh`'s bytes can silently
-strand the literal hex recorded below — it would no longer describe the
-bytes on disk, and nothing would fail to say so — in a way a hand-edit to
-`sample.arj` cannot, since its test recomputes expectations from the same
-recipe every run. Regenerate `sample.lzh`'s recorded CRCs by hand (re-run
-`lha v`/`t` from its own section below) if its bytes ever change;
-`sample.arj` needs no such step.
+**This file now documents fixtures built under three different provenance
+styles, and a future editor must know which one applies before touching
+anything.** Confusing them is the recurring failure mode this note exists to
+head off — each style fails differently when mishandled.
+
+1. **Hand-built, literal-hex style (`sample.lzh`).** This project wrote the
+   bytes AND the expectations, and the expectations are recorded here as
+   frozen hex, checked by nothing at test time. A hand-edit to the fixture's
+   bytes can silently strand the literal hex below it — it would no longer
+   describe the bytes on disk, and nothing would fail to say so. Regenerate
+   the recorded values by hand (re-run `lha v`/`t`) if the bytes ever
+   change.
+2. **Hand-built, recompute-at-test-time style (`sample.arj`).** This project
+   also wrote both the bytes and the expectations, but the expectations are
+   derived from the same construction recipe every test run
+   (`legacy::arj::tests::build_arj`), never from literals written here. A
+   hand-edit to the fixture without a matching edit to the recipe fails the
+   test that checks re-derivability, rather than silently stranding a
+   comment.
+3. **Borrowed, immutable-bytes style (the `unarc-rs` ARC/PAK/ZOO corpus,
+   below).** Neither the bytes nor a construction recipe belong to this
+   project — nobody here will ever regenerate them, and there is no recipe
+   to recompute from. The method/name/size/CRC tables in that section exist
+   **only** for human provenance and cross-checking; they are pinned by no
+   test and must never become the source a test reads its expectations
+   from. In particular, `ExpectedEntry::stored_crc` for these fixtures must
+   be **parsed from each archive's own header bytes at test time** — never
+   hardcoded from this file's tables, and never computed by decoding the
+   payload and hashing the result (that would silently turn the CRC
+   conformance property into a self-consistency check). A future editor who
+   only reads this banner, and never reaches that section's own prose,
+   should still know that rule from here.
 
 ---
 
@@ -343,6 +363,39 @@ bundled `LICENSE` file and matched exactly, 11,357 bytes).
 | `arc/license_squashed.pak` | `LICENSE` | 9 | Squashed | 5279 | 11357 | `0xB065` |
 | `arc/license_crushed.pak` | `LICENSE` | 10 | Crushed | 5261 | 11357 | `0xB065` |
 
+**The four `.pak` files carry 10 bytes after their 2-byte EOF marker; the six
+`.arc` files carry none.** Measured directly, not inferred: `license.pak`,
+`license_crunched.pak`, `license_squashed.pak` and `license_crushed.pak` each
+end `... 1a 00 fe 02 01 00 00 00 00 00 fe 00` — the ordinary `0x1A 0x00`
+end-of-archive marker, followed by the identical ten bytes `fe 02 01 00 00 00
+00 00 fe 00` in all four files, with nothing after them (confirmed against
+each file's own size: header + payload + 2-byte marker + these 10 bytes
+accounts for the entire file, e.g. `license.pak` is exactly `29 + 4246 + 2 +
+10 = 4287` bytes). `store.arc`, `crunch.arc`, `crunch2.arc`, `squashed.arc`,
+`wrongcrc16.arc` and `cpm.arc` all end at the 2-byte marker with no trailing
+bytes at all.
+
+**These ten bytes are unexplained.** Nothing in `unarc-rs`'s own `arc`
+module reads or references them — `ArcArchive`'s `FileType` enum
+(`arc/local_file_header.rs`) is never constructed or consulted by
+`arc_archive.rs`, `read_header`, or anywhere else in the crate that was
+checked — and no short reading of the classic ARC/PAK header layout traced
+for the tables above accounts for a trailing 10-byte record after the
+EOF marker. Rather than guess what they are, this manifest records only what
+is certain: they exist, they are byte-identical across all four `.pak`
+fixtures, and `unarc-rs`'s own reader ignores them completely because
+`read_header` returns as soon as it sees `0x1A 0x00`, never scanning past
+it.
+
+**The consequence for Task 3 is what matters, independent of the
+explanation:** an ARC/PAK reader must stop consuming input at the EOF
+marker and must **not** assert that the marker coincides with end of file —
+a reader written to require exact end-of-file at the marker (the way several
+containers already in this project assert full consumption) will fail on
+these four `.pak` fixtures for a reason invisible until this note. Trailing
+bytes after a valid EOF marker must be tolerated (ignored), not treated as
+corruption or as a sign more entries remain.
+
 **Do not read `license_crushed.pak`'s name as evidence it is `crunch`'s
 scope.** ARC's method table has both a `Crunched` family (methods 5–8, one
 LZW variant with an RLE90 pre/post pass — all four numbers decode through the
@@ -428,18 +481,42 @@ set in three words: "RLE90 + squeeze + crunch". Measured coverage:
   reasoning, any reader following the same table) routes all four numbers
   through one routine, so 8 stands in for the family the same way `xz`/`lzma`
   share one backend in this project's own codec tier split.
-- **Stored (methods 1 [old, shorter header] / 2):** method 2 covered by
-  `store.arc` and both `.pak`/`.arc` "stored-shape" entries. **Method 1 — the
-  old, pre-5.21 header shape without the trailing `original_size` field (24
-  bytes instead of 28) — has ZERO coverage in this corpus.** This is a
-  genuinely different on-disk header shape, not just a decode-routine
-  question, so it is flagged here rather than silently assumed compatible.
-  It is outside the master design's three-method minimum (RLE90/squeeze/
-  crunch never mentions "stored" as a checkbox at all, and every "stored"
-  fixture here already uses the newer method-2 header shape), so it does not
-  block Tasks 3–4, but a reader that wants to accept the oldest ARC files in
-  the wild will need either a fixture from elsewhere or an explicit,
-  documented refusal for method 1's header shape.
+- **Stored (methods 1 / 2):** method 2 covered by `store.arc` and both
+  `.pak`/`.arc` "stored-shape" entries. **Method 1 has ZERO coverage in this
+  corpus — measured, and confirmed twice** (the from-scratch parser found no
+  method-1 entry anywhere in the fourteen files, and neither does a `grep`
+  of every measured method byte in the two tables above). That much is
+  fact, derived from bytes on disk.
+  **Ruling F — what follows is NOT measured, and an earlier draft of this
+  manifest stated it with the same authority as the tables above, which was
+  wrong.** This manifest previously asserted that method 1 is "an old,
+  pre-5.21 header shape without the trailing `original_size` field (24 bytes
+  instead of 28)". That claim is inherited domain knowledge about the
+  historical ARC format, not something derived from any byte in this
+  corpus — this corpus contains no method-1 entry to derive it from. Worse,
+  it is **contradicted by the one piece of evidence this repo does have**:
+  `unarc-rs`'s own `arc/local_file_header.rs` parses method 1 and method 2
+  through the exact same code path (`CompressionMethod::Unpacked(1)` and
+  `Unpacked(2)` are the only two arms that map to `Unpacked`, and
+  `LocalFileHeader::load_from` reads one fixed 28-byte record regardless of
+  which of the two the method byte says), so the one reference implementation
+  in reach of this task treats methods 1 and 2 as identical at 28 bytes, not
+  24. Separating what is known from what is believed: **measured (twice)** —
+  this corpus has no method-1 fixture; **measured, in source** — the one
+  reference parser available treats method 1 identically to method 2, both
+  28 bytes; **unverified belief, provenance unclear** — that some historical,
+  pre-5.21 ARC tool wrote a genuinely different, shorter 24-byte header for
+  method 1. This repository has no fixture, no tool output and no spec text
+  in hand to confirm or refute that belief either way, so it is recorded
+  here as an open question, not as settled fact.
+  The consequence for Task 3, stated explicitly rather than left implicit:
+  **treating method 1 identically to method 2 (28-byte header) is a
+  defensible implementation choice** — at least as well-founded as writing a
+  24-byte special case for a shape this project has never seen a single byte
+  of — and Task 3 gets to rule on it rather than inherit a settled-sounding
+  sentence from this manifest. The cost if the open question resolves the
+  other way later is small and bounded: one additional reader branch, added
+  once a real method-1 archive exists to test it against.
 - **Beyond the minimum, for free:** Squashed (9), Crushed (10) and Distilled
   (11) are all covered too (the four `.pak` files), though none is named in
   the master design's three-method list — bonus coverage, not required.
