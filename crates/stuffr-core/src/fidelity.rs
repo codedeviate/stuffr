@@ -206,6 +206,41 @@ pub enum Fidelity {
 
     #[error("stream truncated at offset {at}")]
     TruncatedStream { at: u64 },
+
+    /// A directory record carries a checksum over ITSELF, and it does not
+    /// match the bytes the record is made of.
+    ///
+    /// Distinct from every other integrity signal in this enum: those are
+    /// about an entry's CONTENT, and a content checksum that fails is
+    /// [`crate::Error::Corrupt`], not a warning, because there is nothing
+    /// honest to hand back. This is about the METADATA record, and the
+    /// verdict is deliberately softer for one measured reason — the format
+    /// that carries such a field may itself treat it as advisory. ZOO is the
+    /// first: `zoo` 2.10's own lister prints a `*` beside an entry whose
+    /// `dir_crc` fails and carries on listing it, so refusing would be
+    /// stricter than the reference implementation, which is how a guard comes
+    /// to fire on input a real tool accepts.
+    ///
+    /// What it must NOT do is stay silent. A record whose own checksum fails
+    /// has been altered since it was written, and every field a caller is
+    /// about to trust — the entry's name, size, offset, and the link to the
+    /// next record — comes out of it. `--strict-fidelity` turns this into
+    /// exit 4, which is the whole point: a verb that says "exact fidelity"
+    /// over an altered record is making a claim the archive itself disputes.
+    ///
+    /// `offset` is the record's own position in the file, because a record
+    /// that fails its checksum may have no usable name to identify it by —
+    /// the reproducer that motivated this variant is a record whose name
+    /// field is intact and whose link field is not.
+    #[error(
+        "`{format}` directory record at offset {offset} fails its own checksum          ({computed:#06x} computed against {recorded:#06x} recorded); the record has been          altered since it was written"
+    )]
+    DirectoryRecordChecksum {
+        format: FormatId,
+        offset: u64,
+        computed: u16,
+        recorded: u16,
+    },
 }
 
 /// What a read cost in fidelity. Returned alongside data, never logged and
