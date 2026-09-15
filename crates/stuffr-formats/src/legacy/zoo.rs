@@ -983,7 +983,9 @@ mod tests {
         record: &'static [u8],
         dir_crc: u16,
         tz: u8,
+        var_len: usize,
         at: usize,
+        payload_at: usize,
         next: u32,
     }
 
@@ -1034,7 +1036,9 @@ mod tests {
                 record: &bytes[at..at + record_len],
                 dir_crc: le16(at + 54),
                 tz: bytes[at + 53],
+                var_len,
                 at,
+                payload_at: offset,
                 next,
             });
             at = next as usize;
@@ -1344,6 +1348,14 @@ mod tests {
             let e = &raw_entries(bytes)[0];
             let record_end = e.at + e.record.len();
             assert_eq!(&bytes[record_end..record_end + 5], b"@)#(\0", "{label}");
+            assert_eq!(
+                record_end + 5,
+                e.payload_at,
+                "{label}: the leader is EXACTLY what separates a record from its data, so \
+                 `offset` must land five bytes past the record's end — this is the arithmetic \
+                 a reader must not do for itself, pinned so that doing it would at least be \
+                 visibly wrong here"
+            );
         }
     }
 
@@ -1623,7 +1635,10 @@ mod tests {
             (HIGH_PER_ZOO, "high_per.zoo", 13),
         ] {
             let e = &raw_entries(bytes)[0];
-            assert_eq!(e.record.len(), SIZ_DIRL + var_len, "{label}");
+            assert_eq!(
+                e.var_len, var_len,
+                "{label}: the u16 at offset 51 is the variable part's length"
+            );
             assert_eq!(read_all(bytes).unwrap()[0].0, "license", "{label}");
         }
     }
