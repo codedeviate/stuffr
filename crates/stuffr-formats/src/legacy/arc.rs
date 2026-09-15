@@ -547,6 +547,7 @@ impl ArchiveRead for ArcRead {
             let method = Method::from_byte(header.method_byte, &header.name)?;
             let payload = self.read_payload(&header.name, header.compressed_size)?;
             let decoded = decode(method, &payload, &header.name)?;
+            check_declared_size(&header, decoded.len())?;
             let got = crc16_arc(&decoded);
             if got != header.crc16 {
                 return Err(Error::Corrupt(format!(
@@ -597,6 +598,51 @@ impl ArchiveRead for ArcRead {
     fn fidelity(&self) -> &FidelityReport {
         &self.report
     }
+}
+
+/// Refuses an entry whose decoded length disagrees with the `original_size`
+/// its own header declares — in EITHER direction.
+///
+/// This is the declared-versus-delivered guard `tar.rs`, `ar.rs`, `cpio.rs`
+/// and `zip.rs` each already carry, and `Error::exit_code`'s own doc records
+/// the ruling: the archive contradicts itself, so there is nothing honest to
+/// hand back and it is [`Error::Corrupt`] (exit 5), never a fidelity
+/// warning. A warning would leave `unpack` writing the wrong-length file at
+/// exit 0, with `--strict-fidelity` the only thing between a user and it.
+///
+/// **The per-entry CRC-16 is not a substitute, and a 41-byte archive proves
+/// it**: a Stored entry declaring `compressed_size = 10`, `original_size =
+/// 4096`, carrying the correct CRC-16 of the ten bytes it really holds,
+/// satisfies its own checksum exactly — so `list` printed 4096, `test
+/// --strict-fidelity` answered "10 bytes verified (exact fidelity)", and
+/// `unpack` wrote a 10-byte file, all at exit 0. The same shape zip's
+/// size-lying entry had, in the only container added since that ruling was
+/// written. `an_entry_that_declares_a_size_its_payload_does_not_deliver_is_
+/// corrupt` pins both directions with a CRC that is CORRECT for the payload
+/// actually carried, so the guard cannot pass on the checksum's back.
+///
+/// Checked BEFORE the CRC, deliberately: a payload that decoded to the
+/// wrong length can name two concrete figures, where a checksum can only
+/// report that something differs. Both are exit 5, so the ordering changes
+/// the message rather than the verdict.
+fn check_declared_size(header: &ArcHeader, produced: usize) -> Result<()> {
+    let declared = u64::from(header.original_size);
+    let produced = produced as u64;
+    let name = &header.name;
+    if produced < declared {
+        return Err(Error::Corrupt(format!(
+            "entry `{name}` decoded to {produced} bytes, {} short of the {declared} its \
+             header declares; the archive is truncated",
+            declared - produced
+        )));
+    }
+    if produced > declared {
+        return Err(Error::Corrupt(format!(
+            "entry `{name}` decoded to {produced} bytes, past the {declared} its header \
+             declares; the header and the entry's contents disagree"
+        )));
+    }
+    Ok(())
 }
 
 /// Runs one entry's payload through the decoder its method names.
@@ -1109,6 +1155,19 @@ mod tests {
     /// shapes no borrowed fixture carries (a hostile size, a refused method,
     /// a missing terminator).
     fn build_arc_entry(method: u8, name: &str, payload: &[u8], declared_size: u32) -> Vec<u8> {
+        build_arc_entry_declaring(method, name, payload, declared_size, payload.len() as u32)
+    }
+
+    /// The same, with `original_size` under the caller's control too, so a
+    /// header can be made to lie about what its payload delivers while its
+    /// CRC-16 stays CORRECT for the bytes actually carried.
+    fn build_arc_entry_declaring(
+        method: u8,
+        name: &str,
+        payload: &[u8],
+        declared_size: u32,
+        declared_original: u32,
+    ) -> Vec<u8> {
         let mut out = vec![MARKER, method];
         let mut field = [0u8; NAME_LEN];
         field[..name.len()].copy_from_slice(name.as_bytes());
@@ -1116,7 +1175,7 @@ mod tests {
         out.extend_from_slice(&declared_size.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // date/time
         out.extend_from_slice(&crc16_arc(payload).to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&declared_original.to_le_bytes());
         out.extend_from_slice(payload);
         out
     }
@@ -1257,6 +1316,78 @@ mod tests {
             msg.contains("0xe763") && msg.contains("0xb065"),
             "the message must name both the computed and the recorded CRC, got: {msg}"
         );
+    }
+
+    /// The declared-versus-delivered guard, with the CRC-16 CORRECT for the
+    /// payload actually carried — so the guard cannot be passing on the
+    /// checksum's back.
+    ///
+    /// Unguarded, this exact 41-byte archive made the tool contradict itself
+    /// and call both halves exact: `list` printed 4096, `test
+    /// --strict-fidelity` answered "10 bytes verified (exact fidelity)", and
+    /// `unpack --strict-fidelity` wrote a 10-byte file — all at exit 0.
+    /// Both directions are refused, as in `zip.rs`.
+    #[test]
+    fn an_entry_that_declares_a_size_its_payload_does_not_deliver_is_corrupt() {
+        for (declared_original, direction) in [(4096u32, "short"), (3u32, "long")] {
+            let mut bytes =
+                build_arc_entry_declaring(2, "LIE.TXT", b"ten bytes!", 10, declared_original);
+            bytes.extend_from_slice(&[MARKER, 0]);
+            assert_eq!(bytes.len(), 41, "the reviewer's reproducer is 41 bytes");
+            // The CRC in that header is the real one for the ten bytes
+            // behind it, so nothing below can be the checksum firing.
+            assert_eq!(
+                u16::from_le_bytes([bytes[23], bytes[24]]),
+                crc16_arc(b"ten bytes!")
+            );
+
+            let err = match read_all(&bytes) {
+                Ok(v) => panic!("a header lying {direction} by design was accepted: {v:?}"),
+                Err(e) => e,
+            };
+            assert!(matches!(err, Error::Corrupt(_)), "{direction}: {err:?}");
+            assert_eq!(
+                err.exit_code(),
+                5,
+                "{direction}: a self-contradicting archive is corrupt, not a capability \
+                 limit or a resource ceiling — {err}"
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("LIE.TXT")
+                    && msg.contains("10")
+                    && msg.contains(&declared_original.to_string()),
+                "{direction}: the message must name the entry and both figures, got: {msg}"
+            );
+        }
+    }
+
+    /// The regression guard for the test above: every borrowed archive
+    /// decodes to exactly the `original_size` its header declares, so the
+    /// new comparison cannot be one that fires on legitimate input — this
+    /// project's second-commonest defect.
+    #[test]
+    fn every_fixture_decodes_to_exactly_the_size_its_header_declares() {
+        for (bytes, label) in [
+            (CPM_ARC, "cpm.arc"),
+            (STORE_ARC, "store.arc"),
+            (CRUNCH_ARC, "crunch.arc"),
+            (CRUNCH2_ARC, "crunch2.arc"),
+            (SQUASHED_ARC, "squashed.arc"),
+            (LICENSE_CRUNCHED_PAK, "license_crunched.pak"),
+            (LICENSE_SQUASHED_PAK, "license_squashed.pak"),
+        ] {
+            let mut ar = open_forward(bytes);
+            let mut seen = 0usize;
+            while let Some(mut entry) = ar.next_entry().unwrap_or_else(|e| panic!("{label}: {e}")) {
+                let declared = entry.meta().size.expect("ARC always declares a size");
+                let mut data = Vec::new();
+                entry.reader().read_to_end(&mut data).unwrap();
+                assert_eq!(data.len() as u64, declared, "{label}");
+                seen += 1;
+            }
+            assert!(seen > 0, "{label} yielded no entry");
+        }
     }
 
     /// Crushed (10) and Distilled (11) are capability limits, not damage:
