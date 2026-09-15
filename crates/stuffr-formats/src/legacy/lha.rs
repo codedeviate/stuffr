@@ -1035,27 +1035,19 @@ mod tests {
     const SAMPLE_LZH: &[u8] = include_bytes!("../../fixtures/legacy/sample.lzh");
 
     const LHA_EXPECTED: &[ExpectedEntry] = &[
-        ExpectedEntry {
-            stored_crc: None,
-            name: "sample/hello.txt",
-            content: b"alpha\n",
-        },
-        ExpectedEntry {
-            stored_crc: None,
-            name: "sample/sub/b.bin",
-            content: b"beta\n",
-        },
+        ExpectedEntry::new("sample/hello.txt", b"alpha\n"),
+        ExpectedEntry::new("sample/sub/b.bin", b"beta\n"),
     ];
 
     fn lha_fixture() -> ContainerFixture {
-        ContainerFixture {
-            bytes: SAMPLE_LZH,
-            expected: LHA_EXPECTED,
-            provenance: "hand-built LHA level-1 archive (two `-lh0-`/store entries), \
-                         independently verified with lhasa 0.6.0 (`lha v`/`lha t`/`lha x`) — \
-                         an implementation independent of delharc; see \
-                         fixtures/legacy/MANIFEST.md's `sample.lzh` entry",
-        }
+        ContainerFixture::new(
+            SAMPLE_LZH,
+            LHA_EXPECTED,
+            "hand-built LHA level-1 archive (two `-lh0-`/store entries), \
+             independently verified with lhasa 0.6.0 (`lha v`/`lha t`/`lha x`) — an \
+             implementation independent of delharc; see \
+             fixtures/legacy/MANIFEST.md's `sample.lzh` entry",
+        )
     }
 
     /// Hand-builds a one-entry LHA level-1 archive with an arbitrary

@@ -1094,23 +1094,15 @@ mod tests {
     const SAMPLE_ARJ: &[u8] = include_bytes!("../../fixtures/legacy/sample.arj");
 
     const ARJ_EXPECTED: &[ExpectedEntry] = &[
-        ExpectedEntry {
-            stored_crc: None,
-            name: "sample/hello.txt",
-            content: b"alpha\n",
-        },
-        ExpectedEntry {
-            stored_crc: None,
-            name: "sample/sub/b.bin",
-            content: b"beta\n",
-        },
+        ExpectedEntry::new("sample/hello.txt", b"alpha\n"),
+        ExpectedEntry::new("sample/sub/b.bin", b"beta\n"),
     ];
 
     fn arj_fixture() -> ContainerFixture {
-        ContainerFixture {
-            bytes: SAMPLE_ARJ,
-            expected: ARJ_EXPECTED,
-            provenance: "hand-built ARJ archive (two Stored/method-0 entries), constructed by \
+        ContainerFixture::new(
+            SAMPLE_ARJ,
+            ARJ_EXPECTED,
+            "hand-built ARJ archive (two Stored/method-0 entries), constructed by \
                          tracing unarj-rs 0.2.1's own parser source field-by-field \
                          (local_file_header.rs, main_header.rs, arj_archive.rs) — NOT verified \
                          against any independent ARJ reader, since none is installed on this \
@@ -1128,7 +1120,7 @@ mod tests {
                          test that pins the checked-in fixture to it, and \
                          `spec_constraints_the_reader_never_checks` for the fields the \
                          SPECIFICATION constrains and unarj-rs does not.",
-        }
+        )
     }
 
     /// CRC-32 (IEEE 802.3 / ISO-HDLC — poly 0xEDB88320 reflected, init and

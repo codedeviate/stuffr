@@ -1120,21 +1120,15 @@ mod tests {
         let entries: Vec<ExpectedEntry> = raw
             .iter()
             .zip(contents)
-            .map(|(r, c)| ExpectedEntry {
-                name: Box::leak(r.name.clone().into_boxed_str()),
-                content: c,
-                stored_crc: Some(r.crc16),
+            .map(|(r, c)| {
+                ExpectedEntry::with_crc(Box::leak(r.name.clone().into_boxed_str()), c, r.crc16)
             })
             .collect();
         Box::leak(entries.into_boxed_slice())
     }
 
     fn fixture(bytes: &'static [u8], contents: &[&'static [u8]]) -> ContainerFixture {
-        ContainerFixture {
-            bytes,
-            expected: manifest(bytes, contents),
-            provenance: PROVENANCE,
-        }
+        ContainerFixture::new(bytes, manifest(bytes, contents), PROVENANCE)
     }
 
     fn open_forward(bytes: &[u8]) -> Box<dyn ArchiveRead> {

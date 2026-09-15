@@ -871,6 +871,22 @@ fn read_all_meta_seekable(container: &dyn Container, bytes: &[u8]) -> Vec<EntryM
 /// Content is stored inline rather than hashed: fixtures are small by
 /// design, a byte comparison gives a far better failure message than a
 /// hash mismatch, and it keeps `stuffr-core` free of a digest dependency.
+///
+/// **`#[non_exhaustive]`, unlike every capability struct in this crate**, and
+/// the asymmetry is the point rather than an inconsistency. `CONTRIBUTING.md`
+/// keeps `CodecCaps`/`ContainerCaps` literal-constructible because a caller
+/// legitimately sets an arbitrary SUBSET of a dozen fields and reaches for
+/// `..CodecCaps::round_trip()` to absorb the rest — an attribute that forbids
+/// literal construction from another crate would punish every format author.
+/// A fixture entry is the opposite shape: three fields, all mandatory, and
+/// exactly two meaningful spellings ([`Self::new`] and [`Self::with_crc`]).
+/// There is no subset to express, so nothing is lost by closing it and the
+/// next field costs no caller anything.
+///
+/// Closed in Phase 3c Task 8's fix round, deliberately at the same release
+/// that ADDED `stored_crc` — see `CLAUDE.md`'s Versioning section for the
+/// measured reverse-dependency check that made the moment cheap.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ExpectedEntry {
     pub name: &'static str,
@@ -891,6 +907,32 @@ pub struct ExpectedEntry {
     pub stored_crc: Option<u16>,
 }
 
+impl ExpectedEntry {
+    /// An entry whose archive records no per-entry CRC, or one nobody has
+    /// transcribed a CRC for yet. Property 10 skips it, visibly.
+    pub const fn new(name: &'static str, content: &'static [u8]) -> Self {
+        Self {
+            name,
+            content,
+            stored_crc: None,
+        }
+    }
+
+    /// An entry carrying the CRC-16 its own archive header records.
+    ///
+    /// `stored_crc` must be transcribed from the archive BYTES — never
+    /// computed from `content`, never obtained by asking a decoder. The
+    /// field's own doc says why at length; this constructor exists so that
+    /// rule has one door to come through.
+    pub const fn with_crc(name: &'static str, content: &'static [u8], stored_crc: u16) -> Self {
+        Self {
+            name,
+            content,
+            stored_crc: Some(stored_crc),
+        }
+    }
+}
+
 /// An archive with known contents, for a container that cannot write its own
 /// test input.
 ///
@@ -899,11 +941,36 @@ pub struct ExpectedEntry {
 /// harness raises. A fixture whose expectation was derived from the very
 /// crate under test proves only that the crate agrees with itself; saying so
 /// at the point of failure is what stops that being mistaken for evidence.
+///
+/// `#[non_exhaustive]` for the same reason [`ExpectedEntry`] is, and closed in
+/// the same edit: three mandatory fields, one meaningful spelling, no subset
+/// to express. It is also the struct every one of those entries is nested
+/// inside, so leaving it open would have meant walking the identical call
+/// sites a second time the day it grows a field.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ContainerFixture {
     pub bytes: &'static [u8],
     pub expected: &'static [ExpectedEntry],
     pub provenance: &'static str,
+}
+
+impl ContainerFixture {
+    /// `provenance` is not decoration: it is printed in every failure
+    /// message this harness raises, and it is what stops a fixture whose
+    /// expectation was derived from the crate under test being mistaken for
+    /// independent evidence. It has no default for that reason.
+    pub const fn new(
+        bytes: &'static [u8],
+        expected: &'static [ExpectedEntry],
+        provenance: &'static str,
+    ) -> Self {
+        Self {
+            bytes,
+            expected,
+            provenance,
+        }
+    }
 }
 
 /// Asserts every conformance property that applies to a container which
