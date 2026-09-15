@@ -217,22 +217,34 @@ attribute, and the reference destructure ends in `..` for the same reason a
 is therefore: **carry it if downstream only ever destructures; skip it if
 downstream ever constructs.**
 
-**Two structs have now grown a field under this rule, and both are worth
-knowing before the next one does.** `CodecCaps` gained
-`truncation_undetectable` in Phase 3b and `ExpectedEntry` gained
-`stored_crc` in Phase 3c Task 1. Each is a public field added to a public
-struct with no `#[non_exhaustive]`, which is precisely the change this
-section says would break an external crate constructing one with an
-exhaustive literal. Nothing in this workspace broke either time, and the
-reason is the same in both cases and is the thing to preserve: every
-in-tree construction site goes through a named constructor
-(`CodecCaps::round_trip()`, `decode_only()`) or a `..Default::default()`
-tail, both of which absorb a new field for free. `ExpectedEntry` is the
-one that does NOT yet have that protection — it has no constructor and no
-`Default`, so every fixture builds it literally and every future field
-touches all of them. **Give it a named constructor before adding another
-field**, the way the capability structs already have one; the argument is
-already written above, this is only the site that has not taken it.
+**Two structs have grown a field under this rule, and the two were handled
+differently on purpose.** `CodecCaps` gained `truncation_undetectable` in
+Phase 3b; `ExpectedEntry` gained `stored_crc` in Phase 3c Task 1. Each is a
+public field added to a public struct with no `#[non_exhaustive]`, which is
+precisely the change this section says breaks an external crate constructing
+one with an exhaustive literal — and since `0.3.1` these crates have been
+**published on crates.io**, so "external crate" is not hypothetical.
+
+- **`CodecCaps` and `ContainerCaps` stay open**, and that is measured rather
+  than assumed: all 46 of their literals in `stuffr-formats` end in a `..`
+  tail (`..CodecCaps::round_trip()`, `..Default::default()`), so a new field
+  is already absorbed for free at every site. Closing them would forbid `..`
+  construction from another crate outright — the exact cost the paragraphs
+  above refuse to impose on format authors.
+- **`ExpectedEntry` and `ContainerFixture` are now closed** —
+  `#[non_exhaustive]` plus const constructors (`ExpectedEntry::new` /
+  `with_crc`, `ContainerFixture::new`), landed in the same release that added
+  the field. They are the opposite shape from a capability struct: three
+  fields, all mandatory, two meaningful spellings, no subset to express, so
+  nothing is lost by closing them.
+
+**The deciding rule, then, is the field count and whether callers set
+subsets** — not "struct versus enum". And **the moment to close one is the
+release that changes it**, while the affected population is known. For
+`0.4.2` that population was measured at zero external reverse dependencies
+on `stuffr-core` (crates.io reverse-dependency API, verified 2026-09-16), and
+none enabling `testing`; a later release cannot assume the same, which is why
+the check is dated wherever it is recorded.
 
 ### Which enums are open, which are closed
 
