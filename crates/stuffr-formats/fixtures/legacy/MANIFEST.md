@@ -69,7 +69,12 @@ head off — each style fails differently when mishandled.
 ## `sample.lzh`
 
 - **Format:** LHA/LZH, consumed by `legacy::lha`.
-- **Producer: hand-built, not any tool on this machine.** No tool available
+- **Producer: hand-built, not any tool on this machine.** (Phase 3c Task 6
+  gave *stuffr itself* an LHA encoder, so that is no longer literally true of
+  this machine — but it must not be used to regenerate this fixture, and the
+  reason is the whole point of the fixture: an input produced by the code
+  under test proves nothing about it. `sample.lzh` stays hand-built and
+  `lhasa`-verified.) No third-party tool available
   here can CREATE an `.lzh` archive: `lhasa` (installed via `brew install
   lhasa`, 0.6.0) is decompress-only (`lha l|v|t|x|p`, no add/create verb —
   see its own `lha` usage banner), and `delharc` (the Rust crate this

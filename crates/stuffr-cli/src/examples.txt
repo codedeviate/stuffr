@@ -79,8 +79,8 @@ COMPRESSING A FILE
       cost of ratio; its default is 3. lz4 and snappy have no level at all —
       neither underlying crate exposes such a knob — so --level is accepted
       and silently ignored rather than rejected, unlike every other codec on
-      this page. `compress` (see "READ-ONLY LEGACY FORMATS" below — it alone
-      among the legacy formats writes) is the one codec whose range is not
+      this page. `compress` (see "LEGACY FORMATS" below — one of the two
+      legacy formats that writes) is the one codec whose range is not
       0-something: `9..=16`, `compress`(1)'s own `-b` (`maxbits`) flag, 16 by
       default; a value outside that range is the same usage error (exit 2)
       as bzip2's `--level 0` above.
@@ -710,10 +710,13 @@ WHAT THIS BUILD CAN DO
       round-trip codecs gzip, zlib, deflate, bzip2, brotli, lz4, snappy,
       zstd, xz, lzma and lzip, the round-trip tar, ar, cpio and zip
       containers, and the five legacy formats — the `compress` codec
-      (read AND write, as of Phase 3c Task 5) and the READ-ONLY
-      `lha`/`arj`/`arc`/`zoo` containers, added to `default`
+      (read AND write, as of Phase 3c Task 5), the `lha` container
+      (read AND write, as of Phase 3c Task 6 — but see the WARNING under
+      "LEGACY FORMATS" below: it READS seven compression
+      methods and WRITES one) and the READ-ONLY
+      `arj`/`arc`/`zoo` containers, added to `default`
       alongside `pure` so a plain `cargo install`/`cargo build` shows all
-      twenty, not just fifteen — see "READ-ONLY LEGACY FORMATS" below.
+      twenty, not just fifteen — see "LEGACY FORMATS" below.
       The KIND
       column tells codecs and containers apart. `--features legacy` (bundled
       into `full`) still exists, but only narrows a build now: it is what
@@ -736,9 +739,10 @@ WHAT THIS BUILD CAN DO
       ONLY capability difference `c-backed` makes anywhere in this matrix is
       zstd's WRITE column, `weak` against `yes`; the five legacy rows sit
       outside that comparison entirely, `c-backed` changing nothing about any
-      of them — `compress` shows `yes` in WRITE on every tier (there is only
-      ever the one implementation), and `lha`/`arj`/`arc`/`zoo` stay `-`,
-      read-only on every tier — see "READ-ONLY LEGACY FORMATS" below.
+      of them — `compress` and `lha` show `yes` in WRITE on every tier
+      (there is only ever the one implementation of each), and
+      `arj`/`arc`/`zoo` stay `-`,
+      read-only on every tier — see "LEGACY FORMATS" below.
 
       The PARALLEL column is truthful per build too, and independent of
       the WRITE column above: on the default (`pure`) tier it reads `yes`
@@ -748,9 +752,9 @@ WHAT THIS BUILD CAN DO
       well, alongside its WRITE column becoming `yes`; it changes nothing
       else in this column, on any tier. All eight containers — tar, ar,
       cpio, zip, lha, arj, arc and zoo — always show `-` here: none of
-      them parallelises anything, on any tier (`lha`, `arj`, `arc` and
-      `zoo` trivially so — none of the four has an encoder to parallelise
-      in the first place).
+      them parallelises anything, on any tier (`arj`, `arc` and
+      `zoo` trivially so — none of the three has an encoder to parallelise
+      in the first place; `lha` has one and it is single-threaded).
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -946,7 +950,12 @@ NOT YET
   page says.
 
 
-READ-ONLY LEGACY FORMATS
+LEGACY FORMATS
+
+  The set from the 1980s and early 1990s. `compress` and `lha` read AND
+  write (Phase 3c Tasks 5 and 6); `arj`, `arc` and `zoo` are READ-ONLY and
+  refuse `pack --format <name>` with one shared sentence at exit 3.
+  This section was called "READ-ONLY LEGACY FORMATS" while all of them were.
 
   stuffr unpack backup.Z
       Unix `compress`, gzip's predecessor. Behind its own `--features
@@ -972,10 +981,12 @@ READ-ONLY LEGACY FORMATS
       that same GNU `ncompress` — a genuine defect in that one encoder, not
       a second legal dialect — so this build writes the BSD-shaped bytes at
       that level instead, which every reference decoder handles correctly.
-      The `lha`, `arj`, `arc` and `zoo` containers below are still
+      The `arj`, `arc` and `zoo` containers below are still
       READ-ONLY, and refuse `pack --format <name>` with
       `Error::CapabilityUnavailable` (exit 3) from the same capability gate
-      `compress` itself used to answer through before this phase.
+      `compress` itself used to answer through before this phase. `lha`
+      left that list in Phase 3c Task 6 and now writes too — with the
+      method caveat its own entry below spells out.
       Unlike every OTHER codec in the pure/c-backed tiers above, `.Z` also
       carries no length field, checksum or end-of-stream marker of its own:
       a `.Z` file truncated part-way through decodes to a silently SHORTER
@@ -985,11 +996,12 @@ READ-ONLY LEGACY FORMATS
       `codec`, WRITE `yes`), the same promise "WHAT THIS BUILD CAN DO" above
       makes for every other row.
 
+  stuffr pack tree -o backup.lzh
   stuffr list backup.lzh
       LHA/LZH, behind its own `--features lha` (bundled into `--features
       legacy`, itself in `default`/`full`/`--all-features`, same as
-      `compress` above). This is
-      the first read-only CONTAINER, not codec. Unlike `compress`, `lha`
+      `compress` above). It was the first read-only CONTAINER, not codec,
+      and gained an encoder in Phase 3c Task 6. Unlike `compress`, `lha`
       genuinely STREAMS: the crate behind it (`delharc`) parses forward off
       a pipe natively, with no `Seek` anywhere in its decode path, so
       `list`/`test`/`cat`/`unpack -C` and `--max-ratio` all work exactly the
@@ -999,11 +1011,22 @@ READ-ONLY LEGACY FORMATS
       older LArc one this build also reads), so both `.lzh` and `.lha` are
       detected automatically.
 
-      This container is READ-ONLY: `stuffr pack notes.txt --format lha`
-      fails with `Error::CapabilityUnavailable` (exit 3), the same one
-      sentence `arj`, `arc` and `zoo` below all answer with — there is no LHA
-      ENCODER here, only a reader for archives written by the real, decades-old
-      `lha`/`lhasa` tools. An entry using a compression method this build's
+      IT READS SEVEN COMPRESSION METHODS AND WRITES ONE, and that
+      asymmetry is the thing to know before using `pack --format lha`.
+      The reader accepts `-lh0-` through `-lh7-` (plus the older LArc
+      `-lz*-` family); the writer emits `-lh5-` — 8 KB window, static
+      Huffman, the method every LHA tool in existence supports — and
+      nothing else. So unpacking an `-lh7-` archive and packing it again
+      gives you a valid `.lzh` whose entries are `-lh5-`: a larger file,
+      no data loss, and a method an older tool is more likely to read.
+      `--level` is accepted and ignored, because in LHA the method letter
+      IS the level and this build writes one method.
+
+      A directory is stored as an `-lhd-` entry and listed with a trailing
+      `/`, the same convention zip follows. Symlinks are NOT stored: `pack`
+      warns and skips one rather than writing something a reader would
+      restore as an ordinary file.
+      An entry using a compression method this build's
       `delharc` feature set cannot decode (compiled with `std`, `lh1`, `lz`
       — no `lhx`) is also `Error::Unsupported`, not corruption: the archive
       is fine, this build just cannot decode that one method. A directory

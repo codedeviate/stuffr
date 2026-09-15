@@ -151,9 +151,10 @@ vendored C++, a second zip/tar stack — the reasons are in
 test corpus borrowed as bytes plus prose explaining why the code was not.
 Nothing imports or links it; `Cargo.lock` has no such entry. So 3c is: write
 support for `compress`/`lha`/`arj`, plus READ support for ARC and ZOO. ARC and
-ZOO's read support, and `compress`'s write support (Task 5 — the first of the
-three write tasks to land), have now shipped, each with its framing written
-from scratch; `lha` and `arj` still refuse to write, pending their own tasks.
+ZOO's read support, `compress`'s write support (Task 5 — the first of the
+three write tasks to land) and `lha`'s (Task 6, a `-lh5-` encoder verified
+against `lhasa`) have now shipped, each with its framing written
+from scratch; `arj` alone still refuses to write, pending its own task.
 That is a
 PATCH, not a milestone, because it is additive to traits that already exist
 (`Container::create`, `Codec::encoder` are both already part of the public
