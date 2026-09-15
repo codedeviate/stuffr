@@ -6,14 +6,14 @@
 //! decoders against the tool that wrote the archive, so it stopped being a
 //! test helper and became the witness.
 //!
-//! `#[allow(dead_code)]` is now needed for ONE build configuration rather
-//! than for a task's worth of time: `--features lha` on its own. ARC and ZOO
-//! both call this from production code, so any build carrying either has real
-//! callers — but LHA's own read path never needed it (it delegates to
-//! `delharc`'s internal `crc_check()`), and `lha.rs`'s only use is a
-//! `#[cfg(test)]` fixture builder. Remove the attribute if `lha` ever gains a
-//! production caller of its own.
-#[allow(dead_code)]
+//! The `#[allow(dead_code)]` this module carried for `crc16_arc` is gone as
+//! of Phase 3c Task 6, and the note it carried is worth keeping as history:
+//! it existed because `--features lha` on its own had no production caller —
+//! LHA's READ path delegates its integrity check to `delharc`'s internal
+//! `crc_check()`, so `lha.rs`'s only use was a `#[cfg(test)]` fixture
+//! builder. LHA's `-lh5-` ENCODER is that production caller: an LHA header
+//! records the CRC-16/ARC of the entry's UNCOMPRESSED bytes, and nothing in
+//! `delharc` computes one, because `delharc` cannot write.
 pub(crate) fn crc16_arc(data: &[u8]) -> u16 {
     crc16_arc_continued(0, data)
 }

@@ -47,7 +47,11 @@ zip = ["dep:zip", "dep:time", "dep:flate2"]
 # standalone `.zst` (via `ruzstd`) but not a zstd-compressed zip ENTRY, since
 # zip's `zstd` feature is the one that pulls `zstd-sys`.
 zip-zstd = ["zip?/zstd"]
-lha = ["dep:delharc"]
+# `delharc` reads; `oxiarc-lzhuf` writes. Two crates for one format because
+# neither does both — see `legacy/lha.rs`'s module doc for what the split
+# costs (the encoder writes `-lh5-` alone, while the reader accepts `-lh0-`
+# through `-lh7-`).
+lha = ["dep:delharc", "dep:oxiarc-lzhuf"]
 arj = ["dep:unarj-rs"]
 
 # No `dep:` line, like `compress` below and for the same reason: there is no
@@ -94,6 +98,7 @@ zip = { workspace = true, optional = true }
 time = { workspace = true, optional = true }
 delharc = { workspace = true, optional = true }
 unarj-rs = { workspace = true, optional = true }
+oxiarc-lzhuf = { workspace = true, optional = true }
 
 [dev-dependencies]
 stuffr-core = { workspace = true, features = ["testing"] }

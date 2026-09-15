@@ -208,3 +208,30 @@ clap = { version = "4", features = ["derive"] }
 delharc = { version = "=0.6.2", default-features = false, features = ["std", "lh1", "lz"] }
 unarj-rs = "=0.2.1"
 newtua-lzw-z = "=0.1.0"
+# The LHA `-lh5-` ENCODER (Phase 3c, Task 6). `delharc` decodes and has no
+# writer at all, so the write side needed a second crate; this is the only
+# published pure-Rust LZH compressor in reach.
+#
+# Pinned exactly, for the reason the three pins above share and one of its
+# own: 0.4.2 is a young crate on a fast-moving 0.4.x line, and `lha.rs`'s
+# writer depends on `encode_lzh(.., LzhMethod::Lh5)` producing a stream
+# `delharc` AND `lhasa` both decode — a property no version range can
+# promise and only the interop tests can check.
+#
+# `default-features = false` and NOT `lha-oracle`: that feature implies
+# `parallel`, which is the crate's ONLY optional dependency edge (`rayon`),
+# and its name and its own `tests/lha_oracle.rs` say what it is — a test
+# oracle that shells out to a real `lha`, not a shipping path. Default
+# features are empty in 0.4.2, so this line and a bare `"=0.4.2"` resolve
+# identically today; it is written out because a later release that gives
+# the crate a default feature must not acquire it here silently.
+#
+# The whole tree is `oxiarc-lzhuf -> oxiarc-core -> thiserror`, already in
+# this workspace. No `-sys` crate, no `cc`, no `bindgen`, no build script at
+# all (`build = false` in both manifests) — verified with
+# `cargo tree -p stuffr --features legacy -e normal,build`, the edge set that
+# can see a build-dependency, which is the check `unarc-rs` failed in Phase
+# 3b. Apache-2.0, the same licence `lzma-rust2` already brings to a default
+# build. `rust-version = "1.85"`, below this workspace's 1.88 floor, so it
+# imposes no MSRV constraint.
+oxiarc-lzhuf = { version = "=0.4.2", default-features = false }

@@ -470,6 +470,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "oxiarc-core"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7105e98c1e12eb2d8a4e003419455b13747f5b31d02740f451f5413491d1cf84"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "oxiarc-lzhuf"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3c6c90e86124a4921f8a497bfcb041f03e44a88457bb2ea32b9371f391da5e9"
+dependencies = [
+ "oxiarc-core",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -622,6 +640,7 @@ dependencies = [
  "flate2",
  "lz4_flex",
  "lzma-rust2 0.20.1",
+ "oxiarc-lzhuf",
  "ruzstd",
  "snap",
  "stuffr-core",

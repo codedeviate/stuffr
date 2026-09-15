@@ -1,4 +1,56 @@
-//! LHA/LZH, read-only, via `delharc`.
+//! LHA/LZH: read via `delharc`, write via `oxiarc-lzhuf`.
+//!
+//! # The reader accepts seven methods; the writer emits ONE
+//!
+//! Read-only for the whole of Phase 3b and given a `-lh5-` encoder in Phase
+//! 3c Task 6, which is where the asymmetry comes from and it is worth
+//! meeting before anything else here: the READER accepts `-lh0-` through
+//! `-lh7-` (plus the LArc `-lz*-` family, per the `delharc` features this
+//! build compiles — `std`, `lh1`, `lz`, no `lhx`), while the WRITER emits
+//! `-lh5-` and nothing else. `-lhd-` is written too, but that is a KIND
+//! marker for a directory entry rather than a compression method.
+//!
+//! So `ContainerCaps::write == true` means "stuffr can produce an LHA
+//! archive", never "stuffr can reproduce THIS LHA archive". Unpacking an
+//! `-lh7-` archive and packing it again yields a valid `.lzh` whose entries
+//! are `-lh5-`: a smaller dictionary, a larger file, no data loss. Phase 3c's
+//! design names this a known weakness rather than an oversight, and
+//! [`Lha::caps`] and `examples.txt`'s legacy section both state it where a
+//! caller and a user respectively will meet it.
+//!
+//! `-lh5-` and not `-lh6-`/`-lh7-` because it is what every LHA reader in
+//! existence supports; the whole point of this format being here is the
+//! decades-old tools, and the two larger-window methods postdate a good deal
+//! of them.
+//!
+//! # The end-of-archive marker is written for an EMPTY archive alone
+//!
+//! LHA's terminator is one `0x00` byte standing in for the next header's
+//! length field, and `delharc` treats it and end-of-file as the same answer
+//! (`parser.rs:190`, `Some(0) | None => return Ok(None)`). Two consequences,
+//! both measured rather than reasoned about:
+//!
+//! - An EMPTY archive has no other spelling. `LhaDecodeReader::new` raises
+//!   `"a header is missing"` the moment its first header read comes back
+//!   empty, so a zero-byte file is not a readable empty LHA archive at all.
+//!   [`LhaWrite::finish`] writes the marker when nothing was added, and
+//!   [`Lha::open`] peeks one byte to turn it back into "no entries" instead
+//!   of `Error::Corrupt`.
+//! - For a NON-empty archive the marker is redundant, and writing it would
+//!   make the last byte of every archive stuffr produces removable with no
+//!   reader able to tell. Measured on the conformance harness's own
+//!   two-entry fixture: with the marker the archive is 90 bytes and a read
+//!   of its first 89 returns BOTH entries at no error.
+//!
+//! The honest limit, stated rather than implied closed: LHA carries no entry
+//! count, no index and no mandatory trailer, so a cut landing EXACTLY on an
+//! entry boundary is indistinguishable from a shorter valid archive, and no
+//! writer choice changes that. Measured on the same fixture: entry 1 ends at
+//! byte 45, and a read of the first 45 bytes returns one entry, cleanly.
+//! Container-conformance property 9 passes here because none of its four cut
+//! offsets lands on a boundary — not because this format detects every
+//! truncation. What a writer CAN control is whether it manufactures such a
+//! boundary at the end of every archive it writes, and this one does not.
 //!
 //! # `delharc` streams; this is why LHA's caps differ from ARJ's
 //!
@@ -33,6 +85,14 @@
 //! wraps. Both agree, byte for byte — there is no lhasa/delharc disagreement
 //! to report for this fixture.
 //!
+//! Task 6 did not retire that fixture and must not: the thirteen-property
+//! harness round-trips through THIS PROJECT'S OWN encoder, so every property
+//! in it is stuffr agreeing with stuffr. `sample.lzh` is the one check here
+//! that evidence from outside this crate underwrites, and
+//! `lhasa_reads_what_we_write` is its write-side twin — the only test proving
+//! that what `oxiarc-lzhuf` emits is genuinely LHA rather than something it
+//! and `delharc` merely agree about.
+//!
 //! # Error mapping has no wildcard
 //!
 //! - `is_decoder_supported() == false` → [`Error::Unsupported`] (exit 3). A
@@ -59,22 +119,40 @@
 //!   to exit 1 (see that function's doc for why this distinction matters).
 //! - Genuine io errors (a failing source) pass through as themselves via the
 //!   same function.
-//! - `create()` → [`Error::CapabilityUnavailable`] (exit 3), `` `lha` can be
-//!   read but not written by this build``. Unreachable through ops, which is
-//!   the point: `Registry::require_container_writer` refuses on `caps().write`
-//!   before `create()` is ever called, so the trait method is a backstop that
-//!   answers the same error rather than a second, differently-worded one.
+//! - On the WRITE side: a name too long for a level-1 header's single length
+//!   byte, a `Symlink` or `Other` entry kind, and a payload past the format's
+//!   `u32` size fields are each [`Error::Unsupported`] (exit 3) — a limit of
+//!   the FORMAT this build writes, named, never a silent truncation or a
+//!   quietly different entry kind. The one exception is the encoder itself
+//!   failing, which is [`Error::Io`] (exit 1) deliberately: see
+//!   [`LhaWrite::add`].
+//!
+//! # Two crates, and why the name parsing is this module's own
+//!
+//! `delharc` cannot write and `oxiarc-lzhuf` does not parse headers, so this
+//! module owns the header layout in both directions ([`write_level1_header`])
+//! and delegates only the `-lh5-` bitstream. It also parses entry NAMES
+//! itself: `delharc`'s own accessor strips `..`, `.` and empty components,
+//! which would destroy the evidence the ops-layer containment refusal depends
+//! on. See [`raw_pathname`].
 
-use std::io::{self, Read};
-use std::time::{Duration, UNIX_EPOCH};
+use std::fmt::Write as _;
+use std::io::{self, Read, Write};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use delharc::LhaDecodeReader;
 use delharc::decode::LhaDecodeError;
+use delharc::header::LhaHeader;
+use delharc::header::ext::{EXT_HEADER_FILENAME, EXT_HEADER_PATH};
+use oxiarc_lzhuf::{LzhMethod, encode_lzh};
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CorruptionDetection, CreateOpts, Entry,
     EntryKind, EntryMeta, Error, FidelityReport, FormatId, FormatMeta, MagicRule, OpenOpts,
     Resolved, Result, Sink, Source,
 };
+
+use super::crc::crc16_arc;
+use super::dos;
 
 pub const LHA: FormatId = FormatId::new("lha");
 
@@ -110,12 +188,39 @@ impl Container for Lha {
         LHA
     }
 
+    /// # `write: true` does NOT mean every method round-trips
+    ///
+    /// This is the one place in `ContainerCaps` where the flag is coarser
+    /// than the format, so read this before believing it: the READER accepts
+    /// `-lh0-` through `-lh7-` (plus the LArc `-lz*-` family, subject to the
+    /// `delharc` features this build compiles — see the module doc), while
+    /// the WRITER emits `-lh5-` and nothing else. `ContainerCaps` has no
+    /// per-method field and this task did not invent one, so a caller reading
+    /// `write: true` learns "stuffr can produce an LHA archive", never
+    /// "stuffr can reproduce THIS LHA archive's method". Re-packing an
+    /// `-lh7-` archive through `stuffr unpack`/`stuffr pack` therefore
+    /// produces a valid `.lzh` whose entries are `-lh5-` — smaller dictionary,
+    /// larger output, no data loss. The asymmetry is deliberate (Phase 3c's
+    /// design names it as a known weakness), not an oversight, and
+    /// `examples.txt`'s legacy section states it for a user.
+    ///
+    /// `stores_dirs: true` is a separate, narrower claim and it is genuine:
+    /// a directory goes out as an `-lhd-` entry, which is the format's own
+    /// marker for "this is a directory, there is no payload", and
+    /// [`LhaRead::next_entry`] reads it back as [`EntryKind::Dir`].
+    /// `-lhd-` is a KIND marker rather than a compression method, so it does
+    /// not widen the "one method" claim above.
+    ///
+    /// `stores_symlinks` stays false: LHA's own convention for a symlink is
+    /// a `-lhd-` entry whose name is `link|target`, which no part of this
+    /// module reads back as a link, so claiming it would produce exactly the
+    /// lie the field exists to prevent.
     fn caps(&self) -> ContainerCaps {
-        // `ContainerCaps::read_only()` rather than a literal spelling out
-        // `read: true, write: false`: the constructor was written for exactly
-        // this case ("a container that can be read but not written") and had
-        // no user until the first two read-only containers arrived. It sets
-        // `needs_seek: false` too, which `delharc` genuinely does not need.
+        // Was `ContainerCaps::read_only()` for the whole of Phase 3b. The
+        // sibling constructor is the same shape with `write: true`, and
+        // `needs_seek: false` still holds in both directions — `delharc`
+        // genuinely does not need seek to read, and the writer only ever
+        // appends.
         ContainerCaps {
             forward_parse: true,
             // Every plain LHA entry carries a CRC-16 the format MANDATES,
@@ -124,16 +229,52 @@ impl Container for Lha {
             // `Always`. Read by the read-only conformance harness's
             // corruption property.
             detects_corruption: CorruptionDetection::Always,
-            ..ContainerCaps::read_only()
+            stores_dirs: true,
+            ..ContainerCaps::read_write()
         }
     }
 
+    /// # The one byte peeked before `delharc` sees the stream
+    ///
+    /// `LhaDecodeReader::new` raises `HeaderParse("a header is missing")` the
+    /// moment its first header read comes back empty (`decode.rs:150`), and a
+    /// header read comes back empty for TWO different inputs: end-of-file,
+    /// and a header-length byte of `0`. The second of those is LHA's own
+    /// end-of-archive marker, so at offset 0 it means an archive with no
+    /// entries — a perfectly valid thing for [`LhaWrite::finish`] to have
+    /// produced, and the only spelling an empty LHA archive HAS (there is no
+    /// header to hold a count and no trailer to state one). Handed straight
+    /// to `delharc` it came back as `Error::Corrupt`: an empty archive
+    /// reported as a damaged file.
+    ///
+    /// One byte is peeked to separate the two, and only the explicit `0` is
+    /// accepted. A zero-length stream stays an error, deliberately: nothing
+    /// in it says "LHA", so "this file is not an archive" is the honest
+    /// answer, and conflating the two would make `stuffr list` print nothing
+    /// at exit 0 for any empty file that happened to be named `.lzh`.
+    ///
+    /// [`stuffr_core::PeekSource`] rather than a hand-rolled one-byte buffer,
+    /// and the SEEKABLE flag is captured before it: a peek wrapper reports
+    /// `seekable: false` by construction, and `by_index`'s two spellings
+    /// (`NotSeekable` for a pipe, `Unsupported` for a real file with no
+    /// index) depend on knowing which one this source really was.
     fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
         let Resolved { source, report, .. } = resolved;
         let seekable = source.caps().seekable;
+        let peeked = stuffr_core::PeekSource::fill(source, 1)?;
+        if peeked.prefix() == [0] {
+            return Ok(Box::new(LhaRead {
+                reader: None,
+                report,
+                seekable,
+                advance_before_yield: false,
+                done: true,
+            }));
+        }
+        let source: Box<dyn Source> = Box::new(peeked);
         let reader = LhaDecodeReader::new(source).map_err(classify_lha_error)?;
         Ok(Box::new(LhaRead {
-            reader,
+            reader: Some(reader),
             report,
             seekable,
             advance_before_yield: false,
@@ -141,18 +282,20 @@ impl Container for Lha {
         }))
     }
 
-    /// Unreachable through ops: `Registry::require_container_writer` reads
-    /// `caps().write` and refuses first, exactly as `require_encoder` does
-    /// for a decode-only codec. This is the trait-level backstop, and it
-    /// answers the SAME error the registry raises — a caller who reached
-    /// `create()` directly must not meet a differently-worded refusal for
-    /// the identical contract.
-    fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
-        Err(Error::CapabilityUnavailable {
-            format: LHA,
-            available: "read",
-            requested: "written",
-        })
+    /// Writes LHA level-1 headers with `-lh5-` payloads. See [`LhaWrite`].
+    ///
+    /// `CreateOpts::level` is deliberately ignored rather than validated:
+    /// LHA's method letter IS its level, this build writes one method, and
+    /// there is no second knob (no dictionary choice, no effort setting) that
+    /// a number could select. Refusing a level would be worse — `stuffr pack
+    /// --level 6 -o x.lzh` is a reasonable thing to type, and the only honest
+    /// answers are "ignored" or "invent a mapping onto `-lh4-`/`-lh6-`/
+    /// `-lh7-`", which this build cannot write.
+    fn create(&self, dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+        Ok(Box::new(LhaWrite {
+            dst: Some(dst),
+            wrote_any: false,
+        }))
     }
 }
 
@@ -202,6 +345,101 @@ impl Container for Lha {
 /// never rewritten to `UnexpectedEof`. Only delharc's own synthesised
 /// "fewer bytes than requested, no underlying error" signal uses that kind,
 /// so folding it here cannot mistake a bad disk for a bad archive.
+/// The byte LHA uses to separate path components inside a stored name.
+///
+/// Never ambiguous against a name component: `EntryMeta::name` is a `String`,
+/// so it is UTF-8, and `0xFF` is not a byte any UTF-8 encoding can produce.
+/// That is why [`LhaWrite::add`] can store a `/`-bearing name verbatim rather
+/// than needing `ar.rs`'s extended-identifier dance.
+const LHA_PATH_SEPARATOR: u8 = 0xFF;
+
+/// The entry's stored name, reported EXACTLY as the archive carries it.
+///
+/// # Why this is not `LhaHeader::parse_pathname_to_str`
+///
+/// `delharc`'s own accessor SANITISES, and says so in its doc: "Malicious
+/// path components, like `..`, `.` or `//` are stripped from the path names."
+/// Measured against `delharc 0.6.2`'s `parse_pathname_to_str` (its
+/// `parser.rs:453` splits on `0xFF`, `/` and `\`, then drops every `.`, `..`
+/// and empty component):
+///
+/// | stored in the archive | `parse_pathname_to_str` | this function |
+/// |---|---|---|
+/// | `../../etc/passwd` | `etc/passwd` | `../../etc/passwd` |
+/// | `/abs/path` | `abs/path` | `/abs/path` |
+/// | `a/../../b` | `a/b` | `a/../../b` |
+///
+/// That is the wrong direction for this project, and container-conformance
+/// property 12 is the standing statement of why: containment is enforced
+/// ONCE, at the ops layer (`entries.rs`'s `safe_join` and
+/// `refuse_symlinked_ancestors`), and it can only refuse what it can still
+/// see. A container that helpfully rewrites `../../etc/passwd` into
+/// `etc/passwd` turns a refusal into a silent rename — the archive's claim
+/// disappears, `stuffr list` shows a name the archive does not contain, and
+/// the one code path built to say "no" never runs. The instinct is inverted
+/// on purpose: the container must not help.
+///
+/// This was invisible for the whole of Phase 3b because the read-only
+/// conformance harness has no property 12 — a fixture-driven container is
+/// never asked to round-trip a hostile name, since there is no encoder to
+/// produce one. Graduating to the write-capable harness is what surfaced it.
+///
+/// # What it still does
+///
+/// Presentation, not structure. `0xFF` becomes `/` (the format's separator),
+/// printable ASCII passes through, and every other byte is escaped `%XX` —
+/// the same escaping `delharc` applies, kept so a Shift-JIS or CP437 name
+/// from a real DOS-era archive still renders as it did before rather than as
+/// a run of U+FFFD. The escape is also what keeps the output a valid
+/// `String` without a lossy conversion inventing characters, and — because
+/// `%` itself is escaped to `%25` — the mapping is injective, so two
+/// different stored names can never collapse onto one reported name.
+///
+/// Header precedence mirrors `delharc`'s: an extra header of type
+/// [`EXT_HEADER_FILENAME`] wins over the base header's `filename` field, and
+/// an [`EXT_HEADER_PATH`] extra header is prepended as the directory. Only
+/// the FILTERING is dropped.
+fn raw_pathname(header: &LhaHeader) -> String {
+    let mut dir: &[u8] = &[];
+    let mut ext_name: &[u8] = &[];
+    for extra in header.iter_extra() {
+        match extra {
+            [EXT_HEADER_FILENAME, data @ ..] => ext_name = data,
+            [EXT_HEADER_PATH, data @ ..] => dir = data,
+            _ => {}
+        }
+    }
+    let base: &[u8] = if ext_name.is_empty() {
+        &header.filename
+    } else {
+        ext_name
+    };
+
+    let mut raw: Vec<u8> = Vec::with_capacity(dir.len() + base.len() + 1);
+    raw.extend_from_slice(dir);
+    // A path extra header conventionally ends with the separator already;
+    // adding a second one would report `dir//file`, which is a name the
+    // archive does not carry.
+    if !raw.is_empty() && raw.last() != Some(&LHA_PATH_SEPARATOR) && !base.is_empty() {
+        raw.push(LHA_PATH_SEPARATOR);
+    }
+    raw.extend_from_slice(base);
+
+    let mut out = String::with_capacity(raw.len());
+    for &b in &raw {
+        match b {
+            LHA_PATH_SEPARATOR => out.push('/'),
+            b'%' => out.push_str("%25"),
+            0x20..=0x7E => out.push(b as char),
+            other => {
+                // Infallible: writing to a String cannot fail.
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
 fn classify_lha_error(e: LhaDecodeError<Box<dyn Source>>) -> Error {
     let io_err: io::Error = e.into();
     if io_err.kind() == io::ErrorKind::UnexpectedEof {
@@ -211,7 +449,11 @@ fn classify_lha_error(e: LhaDecodeError<Box<dyn Source>>) -> Error {
 }
 
 struct LhaRead {
-    reader: LhaDecodeReader<Box<dyn Source>>,
+    /// `None` for an archive that declared itself empty with a leading `0`
+    /// end-of-archive marker — see [`Lha::open`]. `delharc` has no
+    /// "no entries" state to construct, so the absence IS that state, and
+    /// `done` is set alongside it so nothing ever has to unwrap this.
+    reader: Option<LhaDecodeReader<Box<dyn Source>>>,
     report: FidelityReport,
     seekable: bool,
     /// Whether `next_file()` must be called before the header currently
@@ -234,8 +476,15 @@ impl ArchiveRead for LhaRead {
             return Ok(None);
         }
 
+        let Some(reader) = self.reader.as_mut() else {
+            // Unreachable: `done` is set wherever `reader` is `None`, and the
+            // check above already returned. Kept as a branch rather than an
+            // `expect` so an empty archive can never panic.
+            return Ok(None);
+        };
+
         if self.advance_before_yield {
-            match self.reader.next_file() {
+            match reader.next_file() {
                 Ok(true) => {}
                 Ok(false) => {
                     self.done = true;
@@ -249,8 +498,8 @@ impl ArchiveRead for LhaRead {
         }
         self.advance_before_yield = true;
 
-        let header = self.reader.header();
-        let name = header.parse_pathname_to_str();
+        let header = reader.header();
+        let name = raw_pathname(header);
         let is_directory = header.is_directory();
         let size = header.original_size;
         let compressed_size = header.compressed_size;
@@ -260,7 +509,7 @@ impl ArchiveRead for LhaRead {
             .and_then(|dt| u64::try_from(dt.timestamp()).ok())
             .map(|secs| UNIX_EPOCH + Duration::from_secs(secs));
 
-        if !is_directory && !self.reader.is_decoder_supported() {
+        if !is_directory && !reader.is_decoder_supported() {
             let method = String::from_utf8_lossy(&header.compression).into_owned();
             self.done = true;
             return Err(Error::Unsupported(format!(
@@ -289,7 +538,7 @@ impl ArchiveRead for LhaRead {
             Box::new(io::empty())
         } else {
             Box::new(LhaEntryReader {
-                inner: &mut self.reader,
+                inner: reader,
                 crc_checked: false,
             })
         };
@@ -386,11 +635,329 @@ impl Read for LhaEntryReader<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The write side, added in Phase 3c Task 6
+// ---------------------------------------------------------------------------
+
+/// The ONE compression method this build writes, via `oxiarc-lzhuf`.
+///
+/// `-lh5-` and not `-lh6-`/`-lh7-` (bigger dictionaries, better ratios)
+/// because it is the method every LHA reader in existence supports: LHarc
+/// 2.x and every tool since. `-lh6-`/`-lh7-` postdate a good deal of the
+/// software that reads `.lzh` at all, and this format's entire reason to be
+/// here is reading and writing archives for tools that are decades old.
+const METHOD_LH5: [u8; 5] = *b"-lh5-";
+
+/// The marker a DIRECTORY entry carries in the same 5-byte field. Not a
+/// compression method — `delharc`'s `CompressionMethod::is_directory` is
+/// what reads it, and such an entry has no payload at all.
+const METHOD_LHD: [u8; 5] = *b"-lhd-";
+
+/// Every byte of a level-1 header except the filename: the 5-byte method,
+/// three `u32` fields (skip size, original size, timestamp), the MS-DOS
+/// attribute byte, the level byte, the filename-LENGTH byte, the `u16`
+/// CRC-16, the OS-TYPE byte and the `u16` "first extra header length".
+///
+/// Counted from the header's third byte, because that is what the
+/// header-length field itself measures — the length byte and the checksum
+/// byte in front of it are excluded, which is also why
+/// [`write_level1_header`] computes the wrapping checksum over exactly this
+/// run. `delharc`'s parser makes the same split at `parser.rs:190`.
+const LEVEL1_HEADER_OVERHEAD: usize = 25;
+
+/// The longest name a level-1 header can carry, because the header length is
+/// a single byte and [`LEVEL1_HEADER_OVERHEAD`] of it is already spoken for.
+///
+/// Level 2 lifts this (a `u16` header size, the name in an extra header) and
+/// this build does not write level 2 — so an over-long name is refused with
+/// [`Error::Unsupported`] (exit 3) naming the limit, never silently
+/// truncated. Truncating would be the worse failure by far: two entries
+/// whose names differ only past byte 230 would collapse onto one name and
+/// extraction would overwrite one with the other.
+const MAX_LEVEL1_NAME: usize = u8::MAX as usize - LEVEL1_HEADER_OVERHEAD;
+
+/// MS-DOS `ARCHIVE` — the attribute byte every writer in the wild sets for
+/// an ordinary entry, and what `sample.lzh` itself carries.
+const MSDOS_ATTR_ARCHIVE: u8 = 0x20;
+
+/// OS-TYPE `'U'`: Unix. Chosen for what it means to a READER — `delharc`'s
+/// `parse_last_modified` consults a Unix timestamp in the level-1 extended
+/// area only for `U`/`OSK`, finds none here (this writer emits no extended
+/// area), and falls back to the MS-DOS timestamp in the base header, which
+/// is the field [`dos_timestamp`] fills.
+const OS_TYPE_UNIX: u8 = b'U';
+
+/// An entry payload this build refuses to compress, because LHA's size
+/// fields are `u32`.
+fn check_u32_size(name: &str, size: u64) -> Result<u32> {
+    u32::try_from(size).map_err(|_| {
+        Error::Unsupported(format!(
+            "LHA cannot store `{name}`: {size} bytes exceeds the format's 4 GiB (u32) per-entry \
+             size field"
+        ))
+    })
+}
+
+/// Packs a `SystemTime` into the MS-DOS `YYYYYYYM MMMDDDDD hhhhhmmm mmmsssss`
+/// word a level-0/1 header's `last_modified` field holds.
+///
+/// `None` — which the caller stores as a literal zero, the "no timestamp"
+/// shape a minimal archive uses and the one `delharc`'s
+/// `parse_msdos_datetime` already answers `None` to — outside MS-DOS's own
+/// 1980..=2107 range, and before the epoch. That is a real fidelity limit of
+/// the FORMAT rather than of this writer, and it is the reason the seconds
+/// field is halved: MS-DOS records seconds in units of two, so an odd second
+/// is rounded DOWN, never up. Down, so a restored mtime is never later than
+/// the original — `make`-style "is this newer than that" comparisons then
+/// err toward rebuilding rather than toward skipping a rebuild.
+fn dos_timestamp(t: SystemTime) -> Option<u32> {
+    let (year, month, day, hour, minute, second) = dos::civil_fields(t)?;
+    let year = u32::try_from(year - 1980).ok()?;
+    if year > 0x7F {
+        return None;
+    }
+    Some((year << 25) | (month << 21) | (day << 16) | (hour << 11) | (minute << 5) | (second / 2))
+}
+
+/// Appends one LHA **level-1** header to `out`.
+///
+/// Level 1 rather than 0 or 2 for two reasons, both about who can read the
+/// result: level 0 has no OS-TYPE byte at all (so no reader can tell how to
+/// interpret the name), and level 2 stores its name in extra headers, which
+/// the oldest tools do not parse. Level 1 is what `sample.lzh` — the fixture
+/// `lhasa` independently verified in Phase 3b — already is.
+///
+/// `skip_size` is level 1's own quirk and is NOT simply the compressed size:
+/// the field holds the number of bytes between the end of this header and the
+/// start of the next one, i.e. the compressed payload PLUS every extra
+/// header. This writer emits no extra headers (`first_header_len` is zero),
+/// so the two are equal here — stated rather than assumed, because adding one
+/// extra header later without adjusting this field would desynchronise every
+/// reader from the second entry onward.
+fn write_level1_header(
+    out: &mut Vec<u8>,
+    method: &[u8; 5],
+    name: &[u8],
+    skip_size: u32,
+    original_size: u32,
+    crc: u16,
+    timestamp: u32,
+) {
+    // Everything the header-length byte counts and the checksum covers.
+    let mut counted = Vec::with_capacity(LEVEL1_HEADER_OVERHEAD + name.len());
+    counted.extend_from_slice(method);
+    counted.extend_from_slice(&skip_size.to_le_bytes());
+    counted.extend_from_slice(&original_size.to_le_bytes());
+    counted.extend_from_slice(&timestamp.to_le_bytes());
+    counted.push(MSDOS_ATTR_ARCHIVE);
+    counted.push(1); // header level
+    counted.push(name.len() as u8); // bounded by MAX_LEVEL1_NAME at the call site
+    counted.extend_from_slice(name);
+    counted.extend_from_slice(&crc.to_le_bytes());
+    counted.push(OS_TYPE_UNIX);
+    counted.extend_from_slice(&0u16.to_le_bytes()); // first_header_len: no extra headers
+    debug_assert_eq!(
+        counted.len(),
+        LEVEL1_HEADER_OVERHEAD + name.len(),
+        "LEVEL1_HEADER_OVERHEAD no longer describes this header"
+    );
+
+    out.push(counted.len() as u8);
+    out.push(counted.iter().fold(0u8, |acc, &b| acc.wrapping_add(b)));
+    out.extend_from_slice(&counted);
+}
+
+/// The LHA writer: level-1 headers, `-lh5-` payloads, `-lhd-` directories.
+///
+/// # Why an entry is buffered whole, and what that costs
+///
+/// An LHA header declares the entry's compressed size, its uncompressed size
+/// AND its CRC-16 *before* the payload, and this project's writers must work
+/// over a non-seekable destination (a pipe), so there is nowhere to go back
+/// and patch those three fields in. The payload therefore has to be fully
+/// read and fully compressed before its header can be written. That is a
+/// property of the FORMAT, not a shortcut: `zip` solves the same problem with
+/// data descriptors, which LHA has no equivalent of.
+///
+/// The cost is real and worth stating plainly: peak memory during `add` is
+/// roughly the entry's uncompressed size plus its compressed size, for ONE
+/// entry at a time. Nothing accumulates across entries — each is written
+/// through and both buffers dropped — so a 10,000-entry archive of small
+/// files costs what its largest single file costs, not the sum. There is no
+/// ceiling on it, deliberately: a fixed one would refuse to pack a large file
+/// that this machine can hold, and `ContainerCaps`/`CreateOpts` carry no
+/// memory budget for a container to consult (`DecodeOpts::memory_limit` binds
+/// a CODEC, and is a decode-side field besides — see `arj.rs`'s own note on
+/// the same gap).
+struct LhaWrite {
+    /// `None` once `finish` has consumed it.
+    dst: Option<Box<dyn Sink>>,
+    /// Whether any entry has been written. Read by [`LhaWrite::finish`],
+    /// which emits the end-of-archive marker for an EMPTY archive alone —
+    /// see that method for the whole ruling.
+    wrote_any: bool,
+}
+
+impl ArchiveWrite for LhaWrite {
+    fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        // A DIRECTORY's stored name must end with a path separator, and this
+        // is not cosmetic — it is the same class of interop defect as
+        // `cpio.rs`'s missing `S_IFREG`, invisible to every test that reads
+        // back through `delharc`. MEASURED against lhasa 0.6.0: an `-lhd-`
+        // entry whose name does not end in a separator makes lhasa END THE
+        // ARCHIVE THERE, silently, at exit 0 — `lha v` on a one-directory
+        // archive printed `Total 0 files`, and on a directory followed by a
+        // file printed `Total 0 files` too, losing the file as well. With a
+        // trailing `/` both entries list and both extract. `delharc` is
+        // indifferent either way (it takes the kind from the method field),
+        // which is exactly why nothing in this module would have caught it.
+        //
+        // `/` and not `0xFF`: lhasa translates `0xFF` only in the extended
+        // PATH header, never in a level-1 base filename, and a name stored
+        // `adir\xff` was dropped the same way a bare `adir` was. This
+        // writer stores whole paths in the base filename with literal `/`
+        // separators — that is what `sample.lzh` does and what `lhasa`
+        // reads — so `/` is the separator that is already in use here.
+        //
+        // The trailing separator comes back on the read side, so a directory
+        // lists as `tree/`. That is the same convention `zip` follows, and
+        // container-conformance property 13 deliberately does not assert a
+        // directory entry's name for exactly this reason.
+        let stored_name = match &meta.kind {
+            EntryKind::Dir if !meta.name.ends_with('/') => format!("{}/", meta.name),
+            _ => meta.name.clone(),
+        };
+        let name = stored_name.as_bytes();
+        if name.len() > MAX_LEVEL1_NAME {
+            return Err(Error::Unsupported(format!(
+                "LHA cannot store `{}`: its stored name is {} bytes (a directory gains a \
+                 trailing separator) and a level-1 header's filename field holds at most \
+                 {MAX_LEVEL1_NAME}",
+                meta.name,
+                name.len()
+            )));
+        }
+
+        let (method, payload, original_size, crc) = match &meta.kind {
+            // No payload, no compression, no CRC to compute — `-lhd-` says
+            // "directory" and everything else about the entry is the header.
+            // `data` is deliberately not read, the same contract `tar.rs` and
+            // `cpio.rs` apply to this kind.
+            EntryKind::Dir => (METHOD_LHD, Vec::new(), 0u32, 0u16),
+            EntryKind::File => {
+                // Refused off the DECLARED size first, before a byte is read
+                // or allocated, exactly as `cpio.rs`'s `add` does and for the
+                // same reason: a caller who already knows an entry is
+                // oversized costs nothing to refuse.
+                if let Some(size) = meta.size {
+                    check_u32_size(&meta.name, size)?;
+                }
+                let mut raw = Vec::new();
+                data.read_to_end(&mut raw)?;
+                let original_size = check_u32_size(&meta.name, raw.len() as u64)?;
+                let crc = crc16_arc(&raw);
+                let packed = encode_lzh(&raw, LzhMethod::Lh5).map_err(|e| {
+                    // Deliberately `Error::Io` — exit 1, which means "stuffr
+                    // failed", and that is the honest verdict here. Every
+                    // other error in this module classifies something about
+                    // the INPUT (a damaged archive, a method this build
+                    // cannot decode); this one can only fire if the encoder
+                    // cannot encode ordinary bytes, which is stuffr's own
+                    // fault and nobody else's. Unreachable in practice:
+                    // `encode_lzh` writes into a `Vec` (no I/O to fail) and
+                    // `Lh5` is a method it implements, so its two error
+                    // paths are both closed at this call site.
+                    Error::Io(io::Error::other(format!(
+                        "the LHA -lh5- encoder failed on `{}`: {e}",
+                        meta.name
+                    )))
+                })?;
+                (METHOD_LH5, packed, original_size, crc)
+            }
+            // `Symlink` and `Other` both land here. Refused rather than
+            // written as a regular file: LHA's own symlink convention is an
+            // `-lhd-` entry whose name is `link|target`, which this module's
+            // READER does not decode back into `EntryKind::Symlink`, so
+            // writing one would produce an archive stuffr itself reads as a
+            // directory with a strange name. `caps().stores_symlinks` is
+            // false, so `entries.rs` warns and skips before reaching here;
+            // only a hand-built plan can, and it gets a named refusal rather
+            // than a silent misrepresentation.
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "LHA cannot store `{}`: this build writes regular files and directories, \
+                     not {other:?}",
+                    meta.name
+                )));
+            }
+        };
+
+        // Level 1's "skip size" is the compressed payload plus every extra
+        // header; this writer emits none, so they are equal. See
+        // `write_level1_header`.
+        let skip_size = check_u32_size(&meta.name, payload.len() as u64)?;
+        let timestamp = meta.mtime.and_then(dos_timestamp).unwrap_or(0);
+
+        let mut header = Vec::with_capacity(2 + LEVEL1_HEADER_OVERHEAD + name.len());
+        write_level1_header(
+            &mut header,
+            &method,
+            name,
+            skip_size,
+            original_size,
+            crc,
+            timestamp,
+        );
+
+        let dst = self
+            .dst
+            .as_mut()
+            .ok_or_else(|| Error::Usage("LHA writer used after finish()".into()))?;
+        dst.write_all(&header)?;
+        dst.write_all(&payload)?;
+        self.wrote_any = true;
+        Ok(())
+    }
+
+    /// Returns the destination WITHOUT writing an end-of-archive marker, and
+    /// that is a deliberate ruling rather than an omission.
+    ///
+    /// LHA's terminator is a single `0x00` byte standing in for the next
+    /// header's length field, and it is OPTIONAL: `delharc` ends the archive
+    /// on `Some(0) | None` at `parser.rs:190` — a zero byte and end-of-file
+    /// are the same answer — and `lhasa` agrees. Writing one would therefore
+    /// make the last byte of every archive stuffr produces removable with no
+    /// reader on earth able to tell, which is the shape of silent truncation
+    /// this project refuses everywhere else. MEASURED, not reasoned about:
+    /// with the marker written, container-conformance property 9's
+    /// `bytes.len() - 1` cut — which removes exactly that byte — was accepted
+    /// silently, returning all entries at no error. See the module doc's
+    /// "The end-of-archive marker" section and
+    /// `an_archive_stops_at_its_last_entry_so_a_cut_tail_is_detectable`.
+    ///
+    /// Never via `Drop` — see `tar.rs`'s own `finish` doc for why that is the
+    /// one path a caller may rely on. The destination is returned, not
+    /// finished: the caller owns completion, because a codec layer beneath us
+    /// may have its own trailer still to write.
+    fn finish(mut self: Box<Self>) -> Result<Box<dyn Sink>> {
+        let mut dst = self
+            .dst
+            .take()
+            .ok_or_else(|| Error::Usage("LHA writer finished twice".into()))?;
+        if !self.wrote_any {
+            dst.write_all(&[0])?;
+        }
+        Ok(dst)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::crc::crc16_arc;
     use super::*;
-    use stuffr_core::testing::{ContainerFixture, ExpectedEntry, assert_container_conforms_with};
+    use stuffr_core::testing::{
+        ContainerFixture, ExpectedEntry, assert_container_conforms, assert_container_conforms_with,
+    };
     use stuffr_core::{CreateOpts, OpenOpts, PlainSink, ReaderSource, StreamPolicy};
 
     const SAMPLE_LZH: &[u8] = include_bytes!("../../fixtures/legacy/sample.lzh");
@@ -423,37 +990,76 @@ mod tests {
     /// 5-byte method identifier — the same layout `sample.lzh` uses (see
     /// MANIFEST.md), generalised so tests can exercise method families that
     /// fixture deliberately does not (an unsupported method, a directory).
+    /// Built on the PRODUCTION [`write_level1_header`] rather than a second
+    /// hand-rolled copy of the layout, so a change to the header this module
+    /// writes cannot leave these tests asserting against the shape it used to
+    /// write. Only the payload is left to the caller — that is the whole
+    /// point of this helper: it stores `content` verbatim under an arbitrary
+    /// 5-byte method identifier, which is how tests reach method families the
+    /// `-lh5-` encoder cannot produce (an unsupported method, a directory,
+    /// a deliberately truncated payload).
+    ///
+    /// Note the trailing `0` end-of-archive marker, which [`LhaWrite::finish`]
+    /// deliberately does NOT write: keeping it here is what makes
+    /// `a_reader_still_accepts_the_optional_end_of_archive_marker` a real
+    /// test of the reader rather than a test of our own writer's choice.
     fn build_single_entry_lha(name: &str, method: &[u8; 5], content: &[u8]) -> Vec<u8> {
-        let filename = name.as_bytes();
-        let file_crc = crc16_arc(content);
-
-        let mut counted = Vec::new();
-        counted.extend_from_slice(method);
-        counted.extend_from_slice(&(content.len() as u32).to_le_bytes()); // compressed_size
-        counted.extend_from_slice(&(content.len() as u32).to_le_bytes()); // original_size
-        counted.extend_from_slice(&0u32.to_le_bytes()); // last_modified
-        counted.push(0x20); // msdos_attrs (ARCHIVE)
-        counted.push(1); // lha_level
-        counted.push(filename.len() as u8);
-        counted.extend_from_slice(filename);
-        counted.extend_from_slice(&file_crc.to_le_bytes());
-        counted.push(b'U'); // os_type: Unix
-        counted.extend_from_slice(&0u16.to_le_bytes()); // first_header_len: none
-
-        let header_len = u8::try_from(counted.len()).expect("header fits in a u8 length field");
-        let csum = counted.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-
-        let mut out = Vec::with_capacity(2 + counted.len() + content.len() + 1);
-        out.push(header_len);
-        out.push(csum);
-        out.extend_from_slice(&counted);
+        let size = content.len() as u32;
+        let mut out = Vec::new();
+        write_level1_header(
+            &mut out,
+            method,
+            name.as_bytes(),
+            size,
+            size,
+            crc16_arc(content),
+            0,
+        );
         out.extend_from_slice(content);
         out.push(0); // end-of-archive marker
         out
     }
 
+    /// Builds an archive through the real writer, the way every write-side
+    /// test and the conformance harness itself reaches it.
+    fn build_lha(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Lha
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        for (name, data) in entries {
+            w.add(&EntryMeta::file(*name), &mut io::Cursor::new(*data))
+                .expect("add");
+        }
+        w.finish().expect("finish").finish().expect("sink finish");
+        buf.contents()
+    }
+
+    /// The FULL thirteen-property harness, not the fixture-driven one — LHA
+    /// graduated when `ContainerCaps::write` became true in Phase 3c Task 6.
+    /// Read a failure's prefix carefully: this raises `property N` (1-13)
+    /// while [`lha_conforms_against_the_external_fixture`] below still raises
+    /// `fixture property N` (1-10), and five numbers mean different things in
+    /// the two schemes.
     #[test]
-    fn lha_conforms() {
+    fn lha_conforms_with_a_writer() {
+        assert_container_conforms(&Lha, &meta());
+    }
+
+    /// Kept alongside the write-capable harness rather than replaced by it,
+    /// and the reason is the whole argument for this fixture's existence: the
+    /// thirteen-property harness round-trips through THIS PROJECT'S OWN
+    /// encoder, so every one of its properties is stuffr agreeing with
+    /// stuffr. `sample.lzh` was verified by `lhasa` — an implementation
+    /// sharing no code with `delharc` — so it is the one check here that
+    /// evidence from outside this crate underwrites. Dropping it on the
+    /// grounds that the bigger harness subsumes it would trade a witness for
+    /// a mirror.
+    #[test]
+    fn lha_conforms_against_the_external_fixture() {
         let fx = lha_fixture();
         assert_container_conforms_with(&Lha, &meta(), &fx);
     }
@@ -515,32 +1121,20 @@ mod tests {
     }
 
     #[test]
-    fn create_is_refused_as_a_capability_limit_not_a_panic() {
-        match Lha.create(
-            PlainSink::new(Box::new(stuffr_core::testing::SharedBuf::new())),
-            &CreateOpts::default(),
-        ) {
-            Err(err) => {
-                // The SAME variant `Registry::require_container_writer`
-                // raises — the refusal a user actually meets. A different
-                // one here would mean two sentences for one contract, which
-                // is what this used to be.
-                assert!(
-                    matches!(err, Error::CapabilityUnavailable { .. }),
-                    "got {err:?}"
-                );
-                assert_eq!(err.exit_code(), 3);
-            }
-            Ok(_) => panic!("LHA must refuse to write"),
-        }
-    }
-
-    #[test]
     fn capabilities_and_metadata_match_the_format() {
         let c = Lha.caps();
-        assert!(c.read && !c.write);
-        assert!(c.forward_parse, "delharc streams; see this module's doc");
+        assert!(c.read && c.write, "LHA reads and writes as of Task 6");
+        assert!(
+            c.forward_parse,
+            "delharc streams, and the write side did not change that; see this module's doc"
+        );
         assert!(!c.needs_seek);
+        assert!(c.stores_dirs, "a directory goes out as an -lhd- entry");
+        assert!(
+            !c.stores_symlinks,
+            "LHA's `link|target` convention is not read back as a link here, so claiming it \
+             would be the exact lie the field exists to prevent"
+        );
         let m = meta();
         assert_eq!(m.id, LHA);
         assert_eq!(m.extensions, &["lzh", "lha"]);
@@ -832,5 +1426,557 @@ mod tests {
             .read_to_end(&mut data)
             .expect("a directory's reader must be empty, not erroring");
         assert!(data.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // The write side (Phase 3c, Task 6)
+    // -----------------------------------------------------------------
+
+    /// The written method is pinned at the BYTE level, not inferred from a
+    /// successful round trip: `delharc` reads `-lh0-` through `-lh7-`, so
+    /// every one of them would round-trip through this module's own reader
+    /// and nothing in the harness would notice if the encoder silently
+    /// started writing a different one. The header level is pinned for the
+    /// same reason — level 0 and level 2 also round-trip here, and both are
+    /// worse for the old tools this format exists to interoperate with (see
+    /// [`write_level1_header`]).
+    #[test]
+    fn every_entry_is_written_as_a_level_1_lh5_header() {
+        let bytes = build_lha(&[("a.txt", b"alpha"), ("b/c.bin", b"\x00\xff\x00")]);
+        for start in entry_offsets(&bytes) {
+            assert_eq!(
+                &bytes[start + 2..start + 7],
+                &METHOD_LH5,
+                "the entry at offset {start} is not -lh5-"
+            );
+            // Within the counted run: method(5) + skip(4) + original(4) +
+            // timestamp(4) + attrs(1), so the level byte is index 18, and
+            // the counted run starts two bytes into the header.
+            assert_eq!(
+                bytes[start + 2 + 18],
+                1,
+                "the entry at offset {start} is not a level-1 header"
+            );
+        }
+    }
+
+    /// Walks the archive's headers and returns each entry's starting
+    /// offset, asserting on the way that the walk lands EXACTLY on the end
+    /// of the file.
+    ///
+    /// That last assertion is the structural half of
+    /// [`an_archive_stops_at_its_last_entry_so_a_cut_tail_is_detectable`]:
+    /// "the archive does not end with a trailing zero byte" cannot be
+    /// checked by looking at the last byte, because a `-lh5-` payload's
+    /// last byte is zero often enough to make such a test pass or fail by
+    /// luck (the two-entry fixture's really does). Walking the entry chain
+    /// answers the actual question — whether anything follows the final
+    /// entry.
+    fn entry_offsets(bytes: &[u8]) -> Vec<usize> {
+        let mut offsets = Vec::new();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let header_len = usize::from(bytes[pos]);
+            assert_ne!(header_len, 0, "unexpected end-of-archive marker at {pos}");
+            let skip = u32::from_le_bytes([
+                bytes[pos + 7],
+                bytes[pos + 8],
+                bytes[pos + 9],
+                bytes[pos + 10],
+            ]) as usize;
+            offsets.push(pos);
+            pos += 2 + header_len + skip;
+        }
+        assert_eq!(
+            pos,
+            bytes.len(),
+            "the entry chain must account for every byte — anything left over is a trailer"
+        );
+        offsets
+    }
+
+    /// A directory is the ONE entry that does not get `-lh5-`, and
+    /// `caps().stores_dirs` is the claim this pins at the byte level.
+    /// Container-conformance property 13 already proves the ROUND TRIP
+    /// (`EntryKind::Dir` in, `EntryKind::Dir` out); this proves it is
+    /// `-lhd-` specifically that carries it, which is what an old reader
+    /// needs to see.
+    #[test]
+    fn a_directory_goes_out_as_an_lhd_entry_with_no_payload() {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Lha
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut meta_in = EntryMeta::file("some/dir");
+        meta_in.kind = EntryKind::Dir;
+        w.add(&meta_in, &mut io::empty()).expect("add a directory");
+        w.finish().expect("finish").finish().expect("sink finish");
+        let bytes = buf.contents();
+
+        assert_eq!(&bytes[2..7], &METHOD_LHD);
+        // The stored name gained a trailing separator, and this is the
+        // PORTABLE proof of it: `lhasa_reads_what_we_write` below catches
+        // the same thing through the reference tool, but only on a machine
+        // that has one. See `LhaWrite::add` for what lhasa does without it.
+        let name_len = usize::from(bytes[2 + 19]);
+        let name = &bytes[2 + 20..2 + 20 + name_len];
+        assert_eq!(
+            name, b"some/dir/",
+            "a directory's stored name must end with a path separator"
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]),
+            0,
+            "a directory's skip size must be zero — anything else desynchronises \
+             every reader from the next entry onward"
+        );
+        assert_eq!(
+            bytes.len(),
+            2 + usize::from(bytes[0]),
+            "a directory entry is its header and nothing else"
+        );
+    }
+
+    /// `finish` writes the end-of-archive marker for an EMPTY archive and
+    /// for no other, and both halves of that matter.
+    ///
+    /// The empty half: `delharc` cannot construct a reader at all when its
+    /// first header read comes back empty (`LhaDecodeReader::new` raises
+    /// `"a header is missing"`), so a zero-byte file is not a readable
+    /// empty LHA archive — the single `0` byte is the only spelling there
+    /// is, and [`Lha::open`]'s one-byte peek is what turns it back into
+    /// "no entries" rather than "corrupt".
+    ///
+    /// The non-empty half is the ruling [`LhaWrite::finish`] documents, and
+    /// it is MEASURED rather than argued. With the marker appended to the
+    /// two-entry archive the harness builds, the archive is 90 bytes and
+    /// `read_all` on its first 89 — i.e. exactly the same archive with the
+    /// marker removed — returns BOTH entries with no error at all: the tail
+    /// byte's loss is undetectable by construction, because `parser.rs:190`
+    /// treats a `0` byte and end-of-file as the same answer. Not writing it
+    /// is what keeps container-conformance property 9's `len - 1` cut
+    /// landing inside a payload, where the entry's own declared length
+    /// catches it.
+    #[test]
+    fn an_archive_stops_at_its_last_entry_so_a_cut_tail_is_detectable() {
+        assert_eq!(
+            build_lha(&[]),
+            vec![0],
+            "an empty archive is the end-of-archive marker alone"
+        );
+
+        let bytes = build_lha(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        // Structural, not "the last byte is not zero": see `entry_offsets`
+        // for why that weaker spelling would pass or fail by luck.
+        assert_eq!(entry_offsets(&bytes).len(), 2);
+
+        // The archive as written: every entry read back, no error.
+        assert_eq!(read_entries(&bytes).expect("intact").len(), 2);
+
+        // One byte short: detected, because the cut now lands inside entry
+        // 2's payload rather than removing an optional trailer.
+        let err = read_entries(&bytes[..bytes.len() - 1])
+            .expect_err("a cut tail must be detected, not read as a shorter archive");
+        assert!(err.contains("ended before its declared length"), "{err}");
+
+        // And with the marker written, the identical cut is invisible —
+        // the measurement the ruling rests on.
+        let mut with_marker = bytes.clone();
+        with_marker.push(0);
+        let got = read_entries(&with_marker[..with_marker.len() - 1])
+            .expect("removing the marker leaves a perfectly valid archive");
+        assert_eq!(
+            got.len(),
+            2,
+            "with the marker written, `len - 1` is a clean archive and nothing can say otherwise"
+        );
+    }
+
+    /// LHA's optional terminator must still be ACCEPTED on the read side —
+    /// essentially every archive in the wild has one, `sample.lzh`
+    /// included. [`build_single_entry_lha`] writes one deliberately, so this
+    /// is a real test of the reader rather than a test of our own writer.
+    #[test]
+    fn a_reader_still_accepts_the_optional_end_of_archive_marker() {
+        let bytes = build_single_entry_lha("sample/hello.txt", b"-lh0-", b"alpha\n");
+        assert_eq!(bytes.last(), Some(&0), "the fixture builder writes one");
+        assert_eq!(
+            read_entries(&bytes).expect("a terminated archive reads fine"),
+            vec![("sample/hello.txt".to_string(), b"alpha\n".to_vec())]
+        );
+    }
+
+    /// The premise behind [`raw_pathname`], pinned directly against
+    /// `delharc 0.6.2`'s own accessor rather than only through
+    /// container-conformance property 12. Property 12 tells you a name was
+    /// altered; this tells you WHAT alters it and by how much, so a future
+    /// `delharc` bump that stopped sanitising would show up here as a
+    /// premise that no longer holds rather than as a mysteriously
+    /// unnecessary function.
+    #[test]
+    fn delharc_sanitises_the_names_this_module_reports_verbatim() {
+        for (stored, delharc_says) in [
+            ("../../etc/passwd", "etc/passwd"),
+            ("/abs/path", "abs/path"),
+            ("a/../../b", "a/b"),
+        ] {
+            let bytes = build_single_entry_lha(stored, b"-lh0-", b"x");
+            let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes)));
+            let resolved = stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default())
+                .expect("resolve");
+            let mut ar = Lha.open(resolved, &OpenOpts::default()).expect("open");
+            let entry = ar.next_entry().expect("next").expect("one entry");
+            assert_eq!(
+                entry.meta().name,
+                stored,
+                "this module must report {stored:?} exactly as stored"
+            );
+            // And the accessor it deliberately does not use would not have.
+            assert_ne!(
+                delharc_says, stored,
+                "if delharc no longer rewrites {stored:?}, raw_pathname's premise has changed"
+            );
+        }
+    }
+
+    /// A name longer than a level-1 header's single length byte can
+    /// describe is REFUSED, never truncated. Truncating would let two
+    /// entries whose names differ only past byte 230 collapse onto one
+    /// name, and extraction would then overwrite one file with the other.
+    #[test]
+    fn a_name_too_long_for_a_level_1_header_is_refused() {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Lha
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+
+        // One byte under the limit still works, so the refusal is pinned to
+        // the boundary rather than to "long names fail".
+        let ok = "x".repeat(MAX_LEVEL1_NAME);
+        w.add(
+            &EntryMeta::file(&ok),
+            &mut io::Cursor::new(b"hi".as_slice()),
+        )
+        .expect("a name of exactly the maximum length must be accepted");
+
+        let too_long = "x".repeat(MAX_LEVEL1_NAME + 1);
+        let err = w
+            .add(
+                &EntryMeta::file(&too_long),
+                &mut io::Cursor::new(b"hi".as_slice()),
+            )
+            .expect_err("one byte over must be refused");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 3, "{err}");
+    }
+
+    /// `stores_symlinks` is false, so `entries.rs` warns and skips before
+    /// reaching `add`. A hand-built plan can still get here, and it must
+    /// meet a named refusal rather than an archive whose link has silently
+    /// become a directory with a strange name.
+    #[test]
+    fn a_symlink_is_refused_rather_than_written_as_something_else() {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Lha
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut meta_in = EntryMeta::file("link");
+        meta_in.kind = EntryKind::Symlink {
+            target: "a.txt".into(),
+        };
+        let err = w
+            .add(&meta_in, &mut io::empty())
+            .expect_err("LHA must refuse a symlink rather than misrepresent it");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 3, "{err}");
+    }
+
+    /// mtime survives the round trip to MS-DOS's own resolution. The
+    /// conformance harness's property 11 checks only the fields a container
+    /// REPORTS, and this one is reported, so a silent loss here (writing a
+    /// literal zero and reading `None` back) would pass every property in
+    /// the harness.
+    ///
+    /// The expected value is rounded DOWN to an even second deliberately —
+    /// see [`dos_timestamp`] — and the assertion says so rather than
+    /// choosing an even second and hiding the rounding.
+    #[test]
+    fn an_mtime_round_trips_to_ms_dos_two_second_resolution() {
+        // 2001-02-03 04:05:07 UTC, an ODD second.
+        let when = UNIX_EPOCH + Duration::from_secs(981_173_107);
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Lha
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut meta_in = EntryMeta::file("dated.txt");
+        meta_in.mtime = Some(when);
+        w.add(&meta_in, &mut io::Cursor::new(b"hi".as_slice()))
+            .expect("add");
+        w.finish().expect("finish").finish().expect("sink finish");
+
+        let bytes = buf.contents();
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes)));
+        let resolved =
+            stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default()).expect("resolve");
+        let mut ar = Lha.open(resolved, &OpenOpts::default()).expect("open");
+        let entry = ar.next_entry().expect("next").expect("one entry");
+        assert_eq!(
+            entry.meta().mtime,
+            Some(UNIX_EPOCH + Duration::from_secs(981_173_106)),
+            "MS-DOS stores seconds in units of two, so an odd second rounds DOWN"
+        );
+    }
+
+    /// Outside MS-DOS's own 1980..=2107 year range there is nothing to
+    /// store, so the field goes out as the format's own "no timestamp"
+    /// zero and the reader reports `None`. A wrapped or clamped year would
+    /// be worse than an absent one: it reads back as a confident lie.
+    #[test]
+    fn a_timestamp_outside_the_ms_dos_range_is_absent_rather_than_wrong() {
+        // 1970-01-01, a decade before MS-DOS's epoch.
+        assert_eq!(dos_timestamp(UNIX_EPOCH), None);
+        // 2108-01-01 00:00:00 UTC, one year past the last year the 7-bit
+        // field can express.
+        assert_eq!(
+            dos_timestamp(UNIX_EPOCH + Duration::from_secs(4_355_596_800)),
+            None
+        );
+        // And one that IS in range, so the guard is pinned to the boundary
+        // rather than to "timestamps do not work".
+        assert!(dos_timestamp(UNIX_EPOCH + Duration::from_secs(981_173_107)).is_some());
+    }
+
+    /// An entry payload that expands under `-lh5-` is still written as
+    /// `-lh5-`, and still round-trips. Worth pinning because it is the one
+    /// case a "store when compression does not help" fallback would
+    /// silently change the written method for — this build writes ONE
+    /// method and `caps()`'s doc says so.
+    #[test]
+    fn an_incompressible_payload_still_round_trips_under_lh5() {
+        let payload = stuffr_core::conformance::incompressible(64 * 1024);
+        let bytes = build_lha(&[("random.bin", &payload)]);
+        assert_eq!(&bytes[2..7], &METHOD_LH5);
+        assert_eq!(
+            read_entries(&bytes).expect("round trip"),
+            vec![("random.bin".to_string(), payload)]
+        );
+    }
+
+    /// Reads every entry back, returning names and payloads, or the first
+    /// error's message. The write-side tests' own `read_all` — deliberately
+    /// separate from the conformance harness's private one, and returning a
+    /// `String` rather than a typed error because every caller here only
+    /// wants to say which failure it saw.
+    fn read_entries(bytes: &[u8]) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes.to_vec())));
+        let resolved = stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default())
+            .map_err(|e| format!("resolve: {e}"))?;
+        let mut ar = Lha
+            .open(resolved, &OpenOpts::default())
+            .map_err(|e| format!("open: {e}"))?;
+        let mut out = Vec::new();
+        loop {
+            match ar.next_entry() {
+                Ok(Some(mut entry)) => {
+                    let name = entry.meta().name.clone();
+                    let mut data = Vec::new();
+                    entry
+                        .reader()
+                        .read_to_end(&mut data)
+                        .map_err(|e| format!("read {name}: {e}"))?;
+                    out.push((name, data));
+                }
+                Ok(None) => return Ok(out),
+                Err(e) => return Err(format!("next_entry: {e}")),
+            }
+        }
+    }
+
+    /// The reference tool, resolved the way `ar.rs`, `cpio.rs`, `zip.rs`
+    /// and `lzip.rs` all resolve theirs: a hard failure when it is absent,
+    /// never a silent skip. CI installs it — `.github/workflows/ci.yml`'s
+    /// three `apt-get install` lines carry `lhasa`.
+    ///
+    /// # TWO names for one program, and both have to be tried
+    ///
+    /// Homebrew's `lhasa` formula installs the binary as **`lha`**
+    /// (`/opt/homebrew/bin/lha -> ../Cellar/lhasa/0.6.0/bin/lha`, plus
+    /// `man1/lha.1`), while Debian's and Ubuntu's `lhasa` package installs
+    /// exactly one binary and calls it **`lhasa`**
+    /// (`packages.ubuntu.com/noble/amd64/lhasa/filelist` and the Debian
+    /// bookworm equivalent both list `/usr/bin/lhasa` and `man1/lhasa.1`,
+    /// and no `lha`). Same program, same verbs, different spelling — so a
+    /// `require_bin("lha")` passes on a developer's Mac and turns every CI
+    /// job red, which is the exact failure mode Phase 3b's `require_bin`
+    /// produced on a released tag by not following the tool to the
+    /// workflow.
+    ///
+    /// Both are tried, `lha` first because that is this project's own
+    /// development platform. Nothing else on either platform is called
+    /// either name (`jlha-utils` would provide a different `lha`, and is
+    /// not installed by this project's CI), so the fallback cannot select
+    /// a different implementation the way a bare `uncompress` can — see
+    /// `compress_z.rs`'s `require_gnu_uncompress` for the case where it
+    /// could and a fixed path was needed instead.
+    fn require_lhasa() -> std::path::PathBuf {
+        let path = std::env::var_os("PATH").expect("PATH must be set");
+        let dirs: Vec<_> = std::env::split_paths(&path).collect();
+        for bin in ["lha", "lhasa"] {
+            if let Some(hit) = dirs.iter().find_map(|dir| {
+                let candidate = dir.join(bin);
+                candidate.is_file().then_some(candidate)
+            }) {
+                return hit;
+            }
+        }
+        panic!(
+            "no reference lhasa tool found on PATH under either of its two names, `lha` \
+             (Homebrew) or `lhasa` (Debian/Ubuntu) — this test proved nothing, which is worth \
+             knowing rather than passing silently. `brew install lhasa` / `apt-get install \
+             lhasa`"
+        )
+    }
+
+    /// LHA's external witness, and the ONLY evidence in this module that
+    /// what the `-lh5-` encoder writes is genuinely LHA rather than
+    /// something `delharc` and `oxiarc-lzhuf` merely agree about.
+    ///
+    /// That distinction is the whole point: every other write-side test
+    /// here reads back through `delharc`, so a shared misunderstanding of
+    /// the `-lh5-` bitstream between the encoder crate and the decoder
+    /// crate would pass all of them. `lhasa` is a third implementation (C,
+    /// by Simon Howard, sharing no code with either) and it DECOMPRESSES
+    /// ONLY — which is exactly what is needed here and why no test in
+    /// Phase 3b could exist in the other direction.
+    ///
+    /// Both of lhasa's verbs are used, because they check different things:
+    /// `lha t` verifies each entry's CRC-16 (so the header's CRC field, the
+    /// one `delharc` also checks, is confirmed by an independent
+    /// computation), and `lha x` writes the files out so their BYTES can be
+    /// compared — a CRC agreeing proves the check value matches, not that
+    /// the plaintext is right.
+    #[test]
+    fn lhasa_reads_what_we_write() {
+        let lha_bin = require_lhasa();
+
+        // Deliberately three shapes: text that compresses, an
+        // incompressible payload big enough to cross several `-lh5-`
+        // blocks, and an empty file — the three places a block-structured
+        // Huffman encoder goes wrong.
+        let prose = b"the quick brown fox jumps over the lazy dog\n".repeat(400);
+        let noise = stuffr_core::conformance::incompressible(70_000);
+        let entries: Vec<(&str, &[u8])> = vec![
+            ("prose.txt", &prose),
+            ("noise.bin", &noise),
+            ("empty.txt", b""),
+        ];
+
+        // A DIRECTORY entry leads, and that is the part of this test with
+        // real teeth: an `-lhd-` entry whose stored name does not end with a
+        // path separator makes lhasa end the archive there, silently, at
+        // exit 0 — the three files behind it vanish and nothing complains.
+        // See `LhaWrite::add`'s own note for the measurements. `delharc`
+        // reads either spelling, so this is the only thing in the suite that
+        // can catch a regression in it, which is why the entry count is
+        // asserted below rather than only the files' bytes.
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Lha
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut dir_meta = EntryMeta::file("adir");
+        dir_meta.kind = EntryKind::Dir;
+        w.add(&dir_meta, &mut io::empty()).expect("add a directory");
+        for (name, data) in &entries {
+            w.add(&EntryMeta::file(*name), &mut io::Cursor::new(*data))
+                .expect("add");
+        }
+        w.finish().expect("finish").finish().expect("sink finish");
+        let bytes = buf.contents();
+
+        let dir = std::env::temp_dir().join(format!(
+            "stuffr-lha-interop-{}-{:p}",
+            std::process::id(),
+            &bytes
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let archive = dir.join("written.lzh");
+        std::fs::write(&archive, &bytes).expect("write archive");
+
+        let test = std::process::Command::new(&lha_bin)
+            .arg("t")
+            .arg(&archive)
+            .output()
+            .expect("run lha t");
+        assert!(
+            test.status.success(),
+            "lhasa refused an archive this build wrote: status {:?}\nstdout: {}\nstderr: {}",
+            test.status.code(),
+            String::from_utf8_lossy(&test.stdout),
+            String::from_utf8_lossy(&test.stderr)
+        );
+
+        // The count, not just the files: lhasa's own view of how many
+        // entries the archive holds is what a dropped `-lhd-` entry shows
+        // up in, and `lha v`'s trailing summary is where it says so.
+        let listing = std::process::Command::new(&lha_bin)
+            .arg("v")
+            .arg(&archive)
+            .output()
+            .expect("run lha v");
+        let text = String::from_utf8_lossy(&listing.stdout);
+        // Counted from the listing's own rows rather than matched against
+        // its summary line: lhasa pads that line into columns, and a
+        // literal carrying a run of spaces is what
+        // `no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation`
+        // refuses. Every listed entry's row names its method.
+        let rows = text.lines().filter(|l| l.contains("-lh")).count();
+        assert_eq!(
+            rows, 4,
+            "lhasa must see all four entries — listing no rows at all is the silent \
+             end-of-archive an unterminated -lhd- name causes: {text}"
+        );
+
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).expect("out dir");
+        let extract = std::process::Command::new(&lha_bin)
+            .arg(format!("xfw={}", out.display()))
+            .arg(&archive)
+            .output()
+            .expect("run lha x");
+        assert!(
+            extract.status.success(),
+            "lhasa failed to extract: {}",
+            String::from_utf8_lossy(&extract.stderr)
+        );
+        for (name, want) in &entries {
+            let got = std::fs::read(out.join(name))
+                .unwrap_or_else(|e| panic!("lhasa did not extract {name}: {e}"));
+            assert_eq!(
+                &got[..],
+                *want,
+                "lhasa extracted {name} with {} bytes, expected {}",
+                got.len(),
+                want.len()
+            );
+        }
+        assert!(
+            out.join("adir").is_dir(),
+            "lhasa must extract the -lhd- entry as a directory"
+        );
     }
 }

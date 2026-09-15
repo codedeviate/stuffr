@@ -22,7 +22,9 @@ pub mod compress_z;
 #[cfg(any(feature = "lha", feature = "arc", feature = "zoo"))]
 mod crc;
 // The DOS packed-timestamp helper every date-carrying legacy container uses.
-#[cfg(any(feature = "arj", feature = "arc", feature = "zoo"))]
+// `lha` joined this list in Phase 3c Task 6: its encoder is the first
+// thing here that has to WRITE a DOS timestamp rather than only parse one.
+#[cfg(any(feature = "arj", feature = "arc", feature = "zoo", feature = "lha"))]
 mod dos;
 #[cfg(feature = "lha")]
 pub mod lha;

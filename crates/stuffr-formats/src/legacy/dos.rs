@@ -44,6 +44,27 @@ pub(crate) fn mtime(
         .map(|s| UNIX_EPOCH + Duration::from_secs(s))
 }
 
+/// The inverse of [`mtime`]: the six calendar fields for a `SystemTime`,
+/// in UTC.
+///
+/// Added in Phase 3c Task 6, when LHA gained an encoder and became the first
+/// legacy format in this tree that has to WRITE a DOS timestamp rather than
+/// only read one. The bit layout still stays with the caller, for exactly the
+/// reason the module doc gives — this hands back the six numbers, and
+/// `lha.rs` packs them into LHA's own `YYYYYYYM MMMDDDDD hhhhhmmm mmmsssss`
+/// word.
+///
+/// `None` for an instant before the epoch, which is the same boundary
+/// [`mtime`] refuses in the other direction.
+#[allow(dead_code)]
+pub(crate) fn civil_fields(t: SystemTime) -> Option<(i64, u32, u32, u32, u32, u32)> {
+    let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let days = i64::try_from(secs / 86_400).ok()?;
+    let rem = u32::try_from(secs % 86_400).ok()?;
+    let (y, m, d) = civil_from_days(days);
+    Some((y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60))
+}
+
 /// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian
 /// `(year, month, day)` — Howard Hinnant's `days_from_civil` algorithm
 /// (public domain; <http://howardhinnant.github.io/date_algorithms.html>).
@@ -55,6 +76,24 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doy = (153 * mp + 2) / 5 + i64::from(d) - 1; // [0, 365]
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146_097 + doe - 719_468
+}
+
+/// `(year, month, day)` for a day count since the Unix epoch — the exact
+/// inverse of [`days_from_civil`], from the same public-domain source. Kept
+/// beside it deliberately: an era-arithmetic mistake in one is only visible
+/// against the other, which is what
+/// `every_day_of_a_leap_cycle_round_trips_through_both_directions` checks.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -87,6 +126,56 @@ mod tests {
         // epoch, so a 1969 stamp has nowhere to go and reports absent
         // rather than wrapping to some far-future instant.
         assert!(mtime(1969, 12, 31, 0, 0, 0).is_none());
+    }
+
+    /// The two directions have to agree at every date, not merely at the
+    /// three fixed points above: LHA's encoder turns a `SystemTime` into
+    /// calendar fields with [`civil_fields`] and its reader turns them back
+    /// with [`mtime`], so a disagreement anywhere shows up as an archive
+    /// whose stored date is not the one that was packed. A full 400-year
+    /// Gregorian cycle is swept, which is the period after which the
+    /// leap-year pattern repeats — an era-boundary error therefore cannot
+    /// hide between two sampled points.
+    #[test]
+    fn every_day_of_a_leap_cycle_round_trips_through_both_directions() {
+        // 1970-01-01 through 2369-12-31: one whole 400-year cycle.
+        for day in 0..146_097i64 {
+            let (y, m, d) = civil_from_days(day);
+            assert_eq!(
+                days_from_civil(y, m, d),
+                day,
+                "day {day} -> {y:04}-{m:02}-{d:02} -> and back"
+            );
+        }
+    }
+
+    /// The seconds-of-day half of the same claim, through the public pair.
+    #[test]
+    fn civil_fields_is_the_inverse_of_mtime() {
+        for secs in [
+            0u64,
+            1,
+            59,
+            60,
+            3600,
+            86_399,
+            86_400,
+            501_292_912,
+            1_700_000_000,
+        ] {
+            let t = UNIX_EPOCH + Duration::from_secs(secs);
+            let (y, mo, d, h, mi, s) = civil_fields(t).expect("after the epoch");
+            assert_eq!(
+                mtime(y, mo, d, h, mi, s),
+                Some(t),
+                "{secs} -> {y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_instant_before_the_epoch_has_no_civil_fields() {
+        assert!(civil_fields(UNIX_EPOCH - Duration::from_secs(1)).is_none());
     }
 
     #[test]

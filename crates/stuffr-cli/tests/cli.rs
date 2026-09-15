@@ -1184,20 +1184,22 @@ fn examples_pages_first_worked_example_runs_as_documented() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `pack --format lha`/`arj`/`arc`/`zoo` must refuse CLEARLY — exit 3, naming
+/// `pack --format arj`/`arc`/`zoo` must refuse CLEARLY — exit 3, naming
 /// the format as readable but not writable by this build — never fail
 /// obscurely (an internal panic, a bare i/o error, or an unrelated exit
-/// code). All four take the SAME route: `Registry::require_container_writer`
+/// code). All three take the SAME route: `Registry::require_container_writer`
 /// refuses on the declared capability, raising `Error::CapabilityUnavailable`.
 /// Each module's own `create()` still returns that same error as an
 /// unreachable backstop. This pins it all the way through the CLI rather
 /// than only at the trait level each module's unit tests already cover.
 ///
-/// **`compress` left this list in Phase 3c Task 5** — it is no longer
-/// read-only, so it no longer belongs among the formats this test proves
-/// REFUSE to write. `pack_writes_a_compress_stream_the_system_tool_reads`
-/// below is its positive counterpart, proving the opposite claim for the one
-/// format that changed.
+/// **`compress` left this list in Phase 3c Task 5 and `lha` in Task 6** —
+/// neither is read-only any more, so neither belongs among the formats this
+/// test proves REFUSE to write.
+/// `pack_writes_a_compress_stream_the_system_tool_reads` and
+/// `pack_writes_an_lha_archive_the_system_tool_reads` below are their
+/// positive counterparts, proving the opposite claim for the two formats
+/// that changed.
 ///
 /// Runtime-checked, not `cfg`-gated. `stuffr-cli` does declare a `legacy`
 /// feature (a passthrough to `stuffr/legacy`, so `cargo install stuffr-cli
@@ -1229,12 +1231,7 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
     let src = dir.join("notes.txt");
     std::fs::write(&src, b"payload").unwrap();
 
-    for (name, out_ext) in [
-        ("lha", "lzh"),
-        ("arj", "arj"),
-        ("arc", "arc"),
-        ("zoo", "zoo"),
-    ] {
+    for (name, out_ext) in [("arj", "arj"), ("arc", "arc"), ("zoo", "zoo")] {
         let registered = registry.container(stuffr::FormatId::new(name)).is_some()
             || registry.codec(stuffr::FormatId::new(name)).is_some();
         if !registered {
@@ -1267,8 +1264,8 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
              {:?}; stderr: {err}",
             res.status.code()
         );
-        // ONE sentence for all four, which is the point of the shared
-        // gate: the containers used to say "unsupported: LHA/LZH is
+        // ONE sentence for all three, which is the point of the shared
+        // gate: the containers used to say "unsupported: ARJ is
         // read-only in this build" (their own hand-rolled
         // `Container::create` refusal) before `require_container_writer`
         // existed, and a comment here called that difference "phrasing" when
@@ -1354,6 +1351,91 @@ fn pack_writes_a_compress_stream_the_system_tool_reads() {
         .unwrap();
     assert!(cat.status.success());
     assert_eq!(cat.stdout, plain);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The positive counterpart to `pack_refuses_a_read_only_legacy_format_
+/// clearly` above, for the format Phase 3c Task 6 moved out of that list.
+///
+/// A CONTAINER, not a codec, so this proves more than its `compress`
+/// sibling does: a whole directory tree is packed — files and the directory
+/// entry above them — the real `lhasa` reads the result back, and stuffr's
+/// own `list` agrees on the entry names. `lhasa` is decompress-only, which
+/// is exactly what makes it the right witness here and why no such test
+/// could exist while LHA was read-only.
+#[test]
+fn pack_writes_an_lha_archive_the_system_tool_reads() {
+    let lha_bin = require_lhasa();
+    let dir = tmp("lha-write-dir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("tree/sub")).unwrap();
+    let alpha = b"the quick brown fox jumps over the lazy dog\n".repeat(120);
+    std::fs::write(dir.join("tree/alpha.txt"), &alpha).unwrap();
+    std::fs::write(dir.join("tree/sub/beta.bin"), b"beta\n").unwrap();
+    let dst = dir.join("out.lzh");
+
+    let res = Command::new(STUFFR)
+        .args([
+            "pack",
+            dir.join("tree").to_str().unwrap(),
+            "--format",
+            "lha",
+            "-o",
+            dst.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        res.status.success(),
+        "pack --format lha must now succeed: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(dst.exists(), "pack must have written {}", dst.display());
+
+    // The external witness: lhasa verifies every entry's CRC-16 itself.
+    let test = Command::new(&lha_bin).arg("t").arg(&dst).output().unwrap();
+    assert!(
+        test.status.success(),
+        "lhasa must accept an archive stuffr wrote: {}\n{}",
+        String::from_utf8_lossy(&test.stdout),
+        String::from_utf8_lossy(&test.stderr)
+    );
+
+    // ...and the bytes it extracts must be the bytes that went in. A CRC
+    // agreeing proves the check value matches, not that the plaintext is
+    // right.
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let extract = Command::new(&lha_bin)
+        .arg(format!("xfw={}", out.display()))
+        .arg(&dst)
+        .output()
+        .unwrap();
+    assert!(
+        extract.status.success(),
+        "lhasa must extract it: {}",
+        String::from_utf8_lossy(&extract.stderr)
+    );
+    assert_eq!(std::fs::read(out.join("tree/alpha.txt")).unwrap(), alpha);
+    assert_eq!(
+        std::fs::read(out.join("tree/sub/beta.bin")).unwrap(),
+        b"beta\n"
+    );
+
+    // stuffr's own reader must agree on what is in there.
+    let list = Command::new(STUFFR)
+        .args(["list", dst.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(list.status.success());
+    let listing = String::from_utf8_lossy(&list.stdout);
+    for name in ["tree/alpha.txt", "tree/sub/beta.bin"] {
+        assert!(
+            listing.contains(name),
+            "`stuffr list` lost {name}: {listing}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5841,6 +5923,24 @@ fn require_bin(bin: &str) -> PathBuf {
         panic!(
             "no reference `{bin}` tool found on PATH — this test proved nothing, which is \
              worth knowing rather than passing silently"
+        )
+    })
+}
+
+/// lhasa, under EITHER of the two names its packagers give it: Homebrew
+/// installs the binary as `lha`, Debian and Ubuntu install exactly one
+/// binary and call it `lhasa`. Same program, different spelling, so a
+/// `require_bin("lha")` here would pass on a developer's Mac and turn all
+/// three CI test jobs red. `legacy/lha.rs`'s own `require_lhasa` carries the
+/// evidence (package file lists, both distributions) and is the same
+/// resolution; the duplication is the same one `require_bin` itself already
+/// has between this file and four format modules.
+fn require_lhasa() -> PathBuf {
+    which("lha").or_else(|| which("lhasa")).unwrap_or_else(|| {
+        panic!(
+            "no reference lhasa tool found on PATH under either of its two names, `lha` \
+             (Homebrew) or `lhasa` (Debian/Ubuntu) — this test proved nothing, which is worth \
+             knowing rather than passing silently"
         )
     })
 }
