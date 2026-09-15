@@ -46,18 +46,22 @@
 //! 10. CRC-witness (integrity, Phase 3c): a container declaring per-entry
 //!     integrity (`detects_corruption` `Always` or `WhenPresent`) must
 //!     produce, for every entry, bytes whose independently-computed
-//!     CRC-16/ARC matches the fixture manifest's — the check the archive's
-//!     ORIGINAL encoder made possible, decades before this project existed.
-//!     `Structural` and `Never` skip, visibly, exactly as property 7 does.
-//!     Runs BEFORE properties 4 and 5 so a double with wrong content is
-//!     attributed to ITS OWN property rather than tripping 5 first — the
-//!     false-pass trap `mod broken_containers` warns about elsewhere in this
-//!     file. This is what makes a BORROWED fixture (one this project did not
-//!     author) trustworthy: Phase 3b's hand-built ARJ fixture had one author
-//!     write both the bytes and the expectation, and a misreading passed
-//!     silently; ARC and ZOO's own encoders recorded a CRC nobody in this
-//!     project wrote, so agreement with it is evidence from OUTSIDE the
-//!     crate.
+//!     CRC-16/ARC matches [`ExpectedEntry::stored_crc`] — a value
+//!     TRANSCRIBED from the archive's own bytes, never computed from
+//!     `content`. Comparing against a CRC derived from `content` would only
+//!     be the harness checking its own manifest against itself (exactly what
+//!     property 5 already does, and more strongly); the witness has to come
+//!     from the tool that wrote the archive, decades before this project
+//!     existed, which is what `stored_crc` records. `Structural`, `Never`,
+//!     and an entry with no `stored_crc` all skip, visibly. Runs BEFORE
+//!     properties 4 and 5 so a double with wrong content is attributed to
+//!     ITS OWN property rather than tripping 5 first — the false-pass trap
+//!     `mod broken_containers` warns about elsewhere in this file. This is
+//!     what makes a BORROWED fixture (one this project did not author)
+//!     trustworthy: Phase 3b's hand-built ARJ fixture had one author write
+//!     both the bytes and the expectation, and a misreading passed silently;
+//!     ARC and ZOO's own encoders recorded a CRC nobody in this project
+//!     wrote, so agreement with it is evidence from OUTSIDE the crate.
 //!
 //! Thirteen properties for the write-capable entry point, one function.
 //!
@@ -648,6 +652,20 @@ fn read_all_meta_seekable(container: &dyn Container, bytes: &[u8]) -> Vec<EntryM
 pub struct ExpectedEntry {
     pub name: &'static str,
     pub content: &'static [u8],
+    /// The CRC-16 this entry's own archive header records, transcribed from
+    /// the archive BYTES — never computed from `content`, and never obtained
+    /// by asking a decoder.
+    ///
+    /// That distinction is the entire point. `content` is what we believe
+    /// the entry holds; this is what the tool that WROTE the archive
+    /// believed, years or decades ago. Comparing our decode against it is a
+    /// third party checking us. Computing it from `content` would just be us
+    /// checking us, which is what property 5 already does.
+    ///
+    /// `None` for formats that record no per-entry CRC, or for a fixture
+    /// nobody has transcribed one for yet — property 10 then has nothing to
+    /// check for that entry and skips it, visibly.
+    pub stored_crc: Option<u16>,
 }
 
 /// An archive with known contents, for a container that cannot write its own
@@ -763,10 +781,22 @@ pub fn assert_container_conforms_with(
 
     // 10. CRC-witness (integrity): a container declaring per-entry integrity
     //     must produce, for every entry, bytes whose CRC-16/ARC matches the
-    //     fixture manifest's. GATED more narrowly than property 7:
-    //     `Structural` skips here too, because a structural-only guarantee
-    //     (a length field, a trailer magic) says nothing about per-BYTE
-    //     integrity the way a CRC does.
+    //     one the ARCHIVE ITSELF recorded — `ExpectedEntry::stored_crc`,
+    //     transcribed from the archive's own bytes, never computed from
+    //     `content`. That is the whole point: comparing against
+    //     `crc16_arc_witness(content)` would just be the harness checking
+    //     its own manifest against itself, which is exactly what property 5
+    //     already does (byte for byte, and more strongly). A real witness
+    //     has to come from OUTSIDE the fixture's own `expected` data — the
+    //     tool that wrote the archive, decades ago, not this project.
+    //
+    //     GATED more narrowly than property 7: `Structural` skips here too,
+    //     because a structural-only guarantee (a length field, a trailer
+    //     magic) says nothing about per-BYTE integrity the way a CRC does.
+    //     An entry whose `stored_crc` is `None` — no format-specific
+    //     transcription exists for it yet, or the format records none —
+    //     skips too, visibly, one entry at a time: absence of a witness is
+    //     not evidence against the decode.
     //
     //     Computed with `crc16_arc_witness`, an implementation independently
     //     written for THIS harness rather than imported from
@@ -789,15 +819,23 @@ pub fn assert_container_conforms_with(
         crate::format::CorruptionDetection::Always
         | crate::format::CorruptionDetection::WhenPresent => {
             for want in fixture.expected {
+                let Some(stored_crc) = want.stored_crc else {
+                    eprintln!(
+                        "conformance[{id}] fixture property 10: skipped for entry {:?} — this \
+                         fixture records no archive-stored CRC to witness against (fixture \
+                         provenance: {provenance})",
+                        want.name
+                    );
+                    continue;
+                };
                 if let Some((_, got_bytes)) = got.iter().find(|(name, _)| name == want.name) {
                     let got_crc = crc16_arc_witness(got_bytes);
-                    let want_crc = crc16_arc_witness(want.content);
                     assert_eq!(
-                        got_crc, want_crc,
+                        got_crc, stored_crc,
                         "conformance[{id}] fixture property 10: decoded bytes for entry {:?} \
                          differ from the CRC the archive stores — CRC-16/ARC {got_crc:#06x} \
-                         decoded vs {want_crc:#06x} recorded in the fixture manifest, which is \
-                         the archive's own encoder checking this decoder from outside the crate \
+                         decoded vs {stored_crc:#06x} recorded in the archive's own header, which \
+                         is the archive's own encoder checking this decoder from outside the crate \
                          (fixture provenance: {provenance})",
                         want.name
                     );
@@ -1648,6 +1686,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -1665,6 +1704,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -1686,6 +1726,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -1711,6 +1752,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -1763,6 +1805,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -1815,6 +1858,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -1859,6 +1903,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -1944,10 +1989,12 @@ mod broken_containers {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha"), ("b.txt", b"beta")]),
             expected: &[
                 ExpectedEntry {
+                    stored_crc: None,
                     name: "a.txt",
                     content: b"alpha",
                 },
                 ExpectedEntry {
+                    stored_crc: None,
                     name: "b.txt",
                     content: b"beta",
                 },
@@ -2014,10 +2061,12 @@ mod broken_containers {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha"), ("b.txt", b"beta")]),
             expected: &[
                 ExpectedEntry {
+                    stored_crc: None,
                     name: "a.txt",
                     content: b"alpha",
                 },
                 ExpectedEntry {
+                    stored_crc: None,
                     name: "b.txt",
                     content: b"beta",
                 },
@@ -2099,6 +2148,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -2112,47 +2162,25 @@ mod broken_containers {
         );
     }
 
-    /// Property 10 (CRC-witness): right name, wrong bytes, on a container
-    /// that DECLARES per-entry integrity — exactly `CorruptsContent` above,
-    /// except this one claims `Always`/`WhenPresent` rather than
-    /// `Structural`, so it is property 10's own evidence gate that decides
-    /// which property catches it. Named for what it represents: a decoder
-    /// that runs straight past the point where a real per-entry CRC check
-    /// would have caught the corruption, and hands back the wrong bytes
-    /// anyway with no error at all.
+    /// Property 10 (CRC-witness), round 2: the ORIGINAL version of this
+    /// double flipped a decoded byte, which meant it was really testing
+    /// property 5 twice (once via exact bytes, once via a CRC computed from
+    /// those same bytes) — a review caught that property 10 as first built
+    /// compared `crc16_arc_witness(decoded)` against
+    /// `crc16_arc_witness(manifest.content)`, both derived from data the
+    /// harness itself already trusted, so it could never catch anything
+    /// property 5 would miss. `ExpectedEntry::stored_crc` fixes that: this
+    /// double decodes CORRECTLY (a plain, unmodified `FramedMockContainer`
+    /// parse — properties 4 and 5 have nothing to catch), and the fault
+    /// lives entirely in the FIXTURE's `stored_crc`, deliberately
+    /// disagreeing with the content both the container and the manifest
+    /// agree on. That is the real shape a self-consistent mis-decode takes:
+    /// everything this project checks against ITSELF passes, and only a
+    /// witness from OUTSIDE the fixture — the archive's own recorded CRC —
+    /// catches it. Configurable `declares` so the same double proves both
+    /// halves of property 10's evidence gate below.
     struct DecodesPastItsCrc {
         declares: CorruptionDetection,
-    }
-
-    struct DecodesPastItsCrcRead {
-        inner: Box<dyn ArchiveRead>,
-    }
-
-    impl ArchiveRead for DecodesPastItsCrcRead {
-        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
-            let Some(mut entry) = self.inner.next_entry()? else {
-                return Ok(None);
-            };
-            let meta = entry.meta().clone();
-            let mut data = Vec::new();
-            entry.reader().read_to_end(&mut data)?;
-            // BUG: the fixture was never corrupted — this is the ordinary,
-            // clean read every OTHER property in this harness exercises —
-            // yet the last byte of every entry's payload comes back wrong,
-            // silently, as though nothing ever checked it against the
-            // archive's own recorded CRC.
-            match data.last_mut() {
-                Some(byte) => *byte ^= 0xFF,
-                None => data.push(0xFF),
-            }
-            Ok(Some(Entry::new(meta, Box::new(io::Cursor::new(data)))))
-        }
-        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
-            self.inner.by_index(index)
-        }
-        fn fidelity(&self) -> &FidelityReport {
-            self.inner.fidelity()
-        }
     }
 
     impl Container for DecodesPastItsCrc {
@@ -2166,9 +2194,7 @@ mod broken_containers {
             }
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
-            Ok(Box::new(DecodesPastItsCrcRead {
-                inner: FramedMockContainer.open(resolved, o)?,
-            }))
+            FramedMockContainer.open(resolved, o)
         }
         fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
             Err(Error::Unsupported(
@@ -2178,13 +2204,28 @@ mod broken_containers {
     }
 
     #[test]
-    fn fixture_property_ten_catches_a_reader_that_decodes_past_its_crc() {
+    fn fixture_property_ten_catches_content_that_disagrees_with_the_stored_crc() {
+        let content: &[u8] = b"alpha";
+        let real_crc = crc16_arc_witness(content);
         let fx = ContainerFixture {
-            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
-            expected: &[ExpectedEntry {
+            bytes: framed_fixture_bytes(&[("a.txt", content)]),
+            // `Box::leak`, not a plain array literal: `stored_crc` is
+            // computed at runtime from `real_crc`, so the array is not a
+            // `const`-promotable temporary the way every OTHER fixture
+            // literal in this file is (name/content are always literals).
+            // Same leaking `framed_fixture_bytes` itself already uses for
+            // `bytes`.
+            expected: Box::leak(Box::new([ExpectedEntry {
                 name: "a.txt",
-                content: b"alpha",
-            }],
+                content,
+                // Deliberately wrong — one bit off the REAL CRC-16/ARC of
+                // `content`. Properties 4 and 5 compare decoded bytes
+                // against `content`, not `stored_crc`, and the decode here
+                // is genuinely correct, so they have nothing to catch. Only
+                // property 10, which compares against `stored_crc`
+                // specifically, sees a disagreement at all.
+                stored_crc: Some(real_crc ^ 1),
+            }])),
             provenance: "hand-built in this test",
         };
         assert_panics_naming_with(
@@ -2198,33 +2239,33 @@ mod broken_containers {
     }
 
     /// The over-strictness half of property 10's evidence gate — the SAME
-    /// broken reader, declaring `Structural` rather than `Always`, must NOT
-    /// be caught by property 10. It is still wrong, though: property 5 (the
-    /// unconditional exact-content check, later in the same function) still
-    /// catches it, which is what proves this is a genuine SKIP and not a
-    /// double that stopped being broken. A double whose bug had no effect at
-    /// all on a clean read (the shape `a_container_declaring_no_corruption_-
-    /// detection_skips_property_seven` uses) cannot demonstrate that here:
-    /// property 10 and property 5 both inspect the same clean decode, so
-    /// nothing short of an actually-wrong decode distinguishes "skipped" from
-    /// "never ran because nothing is broken".
+    /// fixture (correct content, deliberately wrong `stored_crc`), declaring
+    /// `Structural` rather than `Always`. This is a STRONGER proof of skip
+    /// than round 1's version could give: because the decode is genuinely
+    /// correct here, properties 4 and 5 have nothing to catch either, so
+    /// skipping property 10 must mean the ENTIRE call raises no panic at
+    /// all — not "some other property caught it instead". If property 10
+    /// ran anyway, `assert_eq!(got_crc, stored_crc)` would fail immediately
+    /// since `stored_crc` is deliberately wrong.
     #[test]
     fn a_container_declaring_structural_corruption_detection_skips_property_ten() {
+        let content: &[u8] = b"alpha";
+        let real_crc = crc16_arc_witness(content);
         let fx = ContainerFixture {
-            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
-            expected: &[ExpectedEntry {
+            bytes: framed_fixture_bytes(&[("a.txt", content)]),
+            expected: Box::leak(Box::new([ExpectedEntry {
                 name: "a.txt",
-                content: b"alpha",
-            }],
+                content,
+                stored_crc: Some(real_crc ^ 1),
+            }])),
             provenance: "hand-built in this test",
         };
-        assert_panics_naming_with(
+        assert_container_conforms_with(
             &DecodesPastItsCrc {
                 declares: CorruptionDetection::Structural,
             },
             &read_only_meta(),
             &fx,
-            "fixture property 5",
         );
     }
 
@@ -2307,10 +2348,12 @@ mod broken_containers {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha"), ("b.txt", b"beta")]),
             expected: &[
                 ExpectedEntry {
+                    stored_crc: None,
                     name: "a.txt",
                     content: b"alpha",
                 },
                 ExpectedEntry {
+                    stored_crc: None,
                     name: "b.txt",
                     content: b"beta",
                 },
@@ -2440,6 +2483,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a", PAYLOAD)]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a",
                 content: PAYLOAD,
             }],
@@ -2469,6 +2513,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a", PAYLOAD)]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a",
                 content: PAYLOAD,
             }],
@@ -2559,6 +2604,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],
@@ -2577,6 +2623,7 @@ mod broken_containers {
         let fx = ContainerFixture {
             bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
             expected: &[ExpectedEntry {
+                stored_crc: None,
                 name: "a.txt",
                 content: b"alpha",
             }],

@@ -463,10 +463,12 @@ mod tests {
 
     const ARJ_EXPECTED: &[ExpectedEntry] = &[
         ExpectedEntry {
+            stored_crc: None,
             name: "sample/hello.txt",
             content: b"alpha\n",
         },
         ExpectedEntry {
+            stored_crc: None,
             name: "sample/sub/b.bin",
             content: b"beta\n",
         },
