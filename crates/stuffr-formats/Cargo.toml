@@ -50,6 +50,15 @@ zip-zstd = ["zip?/zstd"]
 lha = ["dep:delharc"]
 arj = ["dep:unarj-rs"]
 
+# No `dep:` line, like `compress` below and for the same reason: there is no
+# crate behind this one. `unarc-rs` 0.6.3 — the only reference ARC/PAK
+# implementation in reach — is disqualified as a dependency (rustc 1.95 via
+# `delharc = "0.8"`, vendored C++ via `unrar`, and a second zip/tar stack),
+# so its test corpus is borrowed as BYTES and every decoder in
+# `legacy/arc.rs` is this project's own. See that module's doc and
+# `fixtures/legacy/MANIFEST.md`.
+arc = []
+
 # No `dep:` here: `newtua-lzw-z`'s only production role was supposed to be
 # decoding, but its `Decoder` reads and decodes its ENTIRE input on the
 # first `read()` call (measured — see `legacy/compress_z.rs`'s module doc),
