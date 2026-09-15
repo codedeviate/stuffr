@@ -702,13 +702,14 @@ WHAT THIS BUILD CAN DO
 
   stuffr formats
       Lists the formats compiled into THIS binary, not everything stuffr will
-      ever support. A default build has eighteen rows: the eleven
+      ever support. A default build has nineteen rows: the eleven
       round-trip codecs gzip, zlib, deflate, bzip2, brotli, lz4, snappy,
       zstd, xz, lzma and lzip, the round-trip tar, ar, cpio and zip
-      containers, and the three read-only legacy formats — the `compress`
-      codec and the `lha`/`arj` containers, added to `default` alongside
-      `pure` so a plain `cargo install`/`cargo build` shows all eighteen,
-      not just fifteen — see "READ-ONLY LEGACY FORMATS" below. The KIND
+      containers, and the four read-only legacy formats — the `compress`
+      codec and the `lha`/`arj`/`arc` containers, added to `default`
+      alongside `pure` so a plain `cargo install`/`cargo build` shows all
+      nineteen, not just fifteen — see "READ-ONLY LEGACY FORMATS" below.
+      The KIND
       column tells codecs and containers apart. `--features legacy` (bundled
       into `full`) still exists, but only narrows a build now: it is what
       `--no-default-features --features pure` would otherwise lack, not
@@ -726,9 +727,9 @@ WHAT THIS BUILD CAN DO
       more capable. lzip's row is unaffected by `c-backed` entirely — it has
       only ever had the one, pure-Rust `lzma-rust2` backend, so this feature
       changes nothing about it, in either direction. Every build lists all
-      eighteen of those rows unless `--no-default-features` narrows it — the
+      nineteen of those rows unless `--no-default-features` narrows it — the
       ONLY capability difference `c-backed` makes anywhere in this matrix is
-      zstd's WRITE column, `weak` against `yes`; the three legacy rows sit
+      zstd's WRITE column, `weak` against `yes`; the four legacy rows sit
       outside that comparison entirely, being read-only on every tier — see
       "READ-ONLY LEGACY FORMATS" below.
 
@@ -738,10 +739,11 @@ WHAT THIS BUILD CAN DO
       `zstd` — `ruzstd` has no multi-threaded encoder to hand a worker
       count to. Adding `--features c-backed` flips `zstd` to `yes` as
       well, alongside its WRITE column becoming `yes`; it changes nothing
-      else in this column, on any tier. All six containers — tar, ar,
-      cpio, zip, lha and arj — always show `-` here: none of them
-      parallelises anything, on any tier (`lha` and `arj` trivially so —
-      neither has an encoder to parallelise in the first place).
+      else in this column, on any tier. All seven containers — tar, ar,
+      cpio, zip, lha, arj and arc — always show `-` here: none of them
+      parallelises anything, on any tier (`lha`, `arj` and `arc` trivially
+      so — none of the three has an encoder to parallelise in the first
+      place).
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
@@ -998,9 +1000,10 @@ READ-ONLY LEGACY FORMATS
   stuffr list backup.arj
       ARJ, behind its own `--features arj` (bundled into `--features
       legacy`, itself in `default`/`full`/`--all-features`, same as
-      `compress` and `lha` above). A default build therefore has six
-      containers in total — tar, ar, cpio, zip, lha and arj — not four; only
-      `--no-default-features --features pure` (or narrower) is back to four.
+      `compress` and `lha` above). A default build therefore has seven
+      containers in total — tar, ar, cpio, zip, lha, arj and arc — not four;
+      only `--no-default-features --features pure` (or narrower) is back to
+      four.
       Its magic (`0x60 0xEA`) sits at
       offset 0.
 
@@ -1031,3 +1034,36 @@ READ-ONLY LEGACY FORMATS
       `lha`'s two: ARJ carries no entry index of its own on any source
       shape it is ever opened over, so `Error::Unsupported` routes straight
       to a forward count instead.
+
+  stuffr list old.arc
+      ARC (and its PAK descendant — both `.arc` and `.pak` are read by this
+      one container), behind its own `--features arc`, bundled into
+      `--features legacy` exactly like the three above. The oldest format
+      stuffr reads, and the only one whose decoders are written from
+      scratch here rather than delegated to a crate: nothing publishable
+      wraps it that this project can depend on. Like `lha` and unlike
+      `arj`, it parses forward off a pipe — every entry's size is in its
+      own header — so `cat old.arc | stuffr list -` is a genuine forward
+      walk.
+
+      Four of ARC's compression methods are decoded: Stored (1 and 2),
+      Packed/RLE90 (3), Squeezed (4) and Crunched (8), plus PAK's Squashed
+      (9), which came free with Crunched. An entry using Crushed (10),
+      Distilled (11) or one of the pre-8 Crunched variants (5, 6, 7) is
+      `Error::Unsupported` (exit 3), naming the method — the archive is
+      fine, this build has no decoder for it. Note that a name is not a
+      method: `license_crushed.pak` really is Crushed (10), a different
+      algorithm from Crunched (8), not a spelling of it.
+
+      This container is READ-ONLY: `stuffr pack notes.txt --format arc`
+      fails with `Error::CapabilityUnavailable` (exit 3), the same one
+      sentence `--format compress`, `lha` and `arj` answer with. Every
+      entry carries its own CRC-16, checked before a single decoded byte
+      is handed back, so a mismatch is `Error::Corrupt` (exit 5) rather
+      than silently wrong data. Like `arj`, an entry decodes whole, so a
+      header declaring an implausible size is refused before the
+      allocation it would size, at exit 6 (`ResourceLimit`) against the
+      same fixed 256 MiB ceiling — again not `--memory-limit`, which binds
+      a codec rather than a container. Damage is never scanned past:
+      a byte that is not ARC's `0x1A` marker where a header must begin is
+      exit 5, not a search for the next plausible header.

@@ -66,6 +66,7 @@ c-backed = ["zstd-c", "xz-c", "lzma-c", "stuffr-formats/zip-zstd"]
 lha = ["stuffr-formats/lha"]
 arj = ["stuffr-formats/arj"]
 compress = ["stuffr-formats/compress"]
+arc = ["stuffr-formats/arc"]
 # A bundle of the three passthroughs above, not a second spelling of them.
 # `README.md` tells a reader the three legacy formats sit "behind their own
 # `--features compress`/`lha`/`arj`", so each has to exist HERE as well as in
@@ -73,7 +74,7 @@ compress = ["stuffr-formats/compress"]
 # contain this feature" until Phase 3b's fix wave, and `crates/stuffr/tests/
 # facade.rs` now keys its per-name `cfg!(feature = ...)` checks off exactly
 # these three.
-legacy = ["lha", "arj", "compress"]
+legacy = ["lha", "arj", "compress", "arc"]
 full = ["pure", "c-backed", "legacy"]
 serde = ["dep:serde", "stuffr-core/serde"]
 # Exposes test-only instrumentation (see `ops::sync_call_count`) that would

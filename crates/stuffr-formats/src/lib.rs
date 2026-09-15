@@ -26,7 +26,12 @@ pub mod cpio;
 pub mod deflate;
 #[cfg(feature = "gzip")]
 pub mod gzip;
-#[cfg(any(feature = "lha", feature = "arj", feature = "compress"))]
+#[cfg(any(
+    feature = "lha",
+    feature = "arj",
+    feature = "compress",
+    feature = "arc"
+))]
 pub mod legacy;
 #[cfg(feature = "lz4")]
 pub mod lz4;
@@ -171,6 +176,14 @@ pub fn register_all(registry: &mut Registry) {
     // with no per-entry streaming. See `legacy::arj`'s module doc.
     #[cfg(feature = "arj")]
     registry.register_container(std::sync::Arc::new(legacy::arj::Arj), legacy::arj::meta());
+
+    // Phase 3c's first legacy container, and the first in this workspace
+    // that wraps no crate at all: `legacy::arc` decodes ARC/PAK from
+    // scratch, because the one reference implementation in reach is
+    // disqualified as a dependency. `std::sync::Arc` is spelled in full
+    // here for the obvious reason.
+    #[cfg(feature = "arc")]
+    registry.register_container(std::sync::Arc::new(legacy::arc::Arc), legacy::arc::meta());
 }
 
 /// How many formats this build contains. Useful for smoke tests.
