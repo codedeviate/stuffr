@@ -201,10 +201,31 @@ clap = { version = "4", features = ["derive"] }
 # will not reach us until the MSRV moves; revisit this pin when it does, not
 # before.
 #
-# `unarj-rs` — declares no `rust-version` at all, so a patch release can raise
-# the MSRV with nothing to announce it (the `ruzstd` 0.8.2 failure mode under
-# MSRV in CLAUDE.md). The `msrv` CI job is the detector; the pin is what makes
-# that detection actionable rather than a surprise.
+# `unarj-rs` — TWO reasons now, and the second is load-bearing behaviour, not
+# just an MSRV guard. Enumerated rather than summarised, the way `ar = "=0.9.0"`
+# enumerates its eight, because a fact nobody wrote down is a fact that desyncs
+# silently:
+#
+#   1. It declares no `rust-version` at all, so a patch release can raise the
+#      MSRV with nothing to announce it (the `ruzstd` 0.8.2 failure mode under
+#      MSRV in CLAUDE.md). The `msrv` CI job is the detector; the pin is what
+#      makes that detection actionable rather than a surprise.
+#   2. `ArjArchieve::read` compares the DECODED length against the header's
+#      `original_size` ("Decompressed size does not match the original size",
+#      `io::ErrorKind::InvalidData`) — and that check, inside this exact
+#      version, is the whole of ARJ's declared-vs-delivered guarantee. Phase 3c
+#      Task 7 made the project depend on it: `legacy::arj` adds no such
+#      comparison of its own, so the fuzz oracle `check_entry_size`
+#      (`fuzz/fuzz_targets/container.rs`, called for every slot including ARJ)
+#      holds for ARJ only because that line exists. `arc.rs` shipped the
+#      opposite shape in this same phase — a size reported from a header and
+#      never compared with the bytes produced, every checksum passing, `list`
+#      and `test --strict-fidelity` both reporting exact at exit 0.
+#      `legacy::arj::tests::an_entry_whose_header_lies_about_its_size_is_corrupt`
+#      pins the behaviour in-tree and reddens if a patch release drops it, so
+#      this is documentation of an unobvious dependency rather than an open
+#      hole — but do not loosen the pin without re-reading `arj_archive.rs`
+#      for that comparison.
 delharc = { version = "=0.6.2", default-features = false, features = ["std", "lh1", "lz"] }
 unarj-rs = "=0.2.1"
 newtua-lzw-z = "=0.1.0"

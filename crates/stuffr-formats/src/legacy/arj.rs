@@ -35,6 +35,15 @@
 //!   field the reader ignores is a field only a written-output assertion
 //!   can protect.
 //!
+//! The same discipline applies to the fields the spec does NOT constrain,
+//! and there are four: `archiver version number`, `minimum archiver version
+//! to extract`, `security version` and [`FILESPEC_POSITION`]. Each is
+//! written as 0, each is ARGUED — in `fixtures/legacy/MANIFEST.md`'s
+//! `sample.arj` block, and for the last one in its own constant's doc — and
+//! each is pinned by a test, so a zero nobody chose cannot appear among
+//! zeros that were chosen. The last of the four was enumerated only in Task
+//! 7's fix round, which is the point of writing the list down.
+//!
 //! [`the_encoder_reproduces_the_hand_built_fixture_byte_for_byte`] is the
 //! third leg and the nearest thing here to a second opinion: `build_arj` (the
 //! fixture recipe, hand-transcribed in Phase 3b) and [`ArjWrite`] (written
@@ -674,6 +683,58 @@ const METHOD_STORED: u8 = 0;
 const FILE_TYPE_BINARY: u8 = 0;
 const FILE_TYPE_DIRECTORY: u8 = 3;
 
+/// `filespec position in filename` — 2 bytes in BOTH header tables, written
+/// as 0 by this encoder on every header, and that is a RULING, not an
+/// oversight.
+///
+/// # What the specification actually says
+///
+/// Nothing beyond the field's name. The line is `2   filespec position in
+/// filename` in the main-header table and again, identically, in the
+/// local-file-header table, with no prose anywhere in the document, no
+/// worked example of a stored filename, no statement of whether the value
+/// is 0- or 1-based, and no rule for a name carrying no path at all. That
+/// was checked, not assumed: the published text was re-read for every
+/// occurrence of "filespec", and the independent transcription at
+/// `fileformat.info/format/arj/corion.htm` (offset `001Ah`, `1 word`) gives
+/// the same bare line. `unarj-rs` parses it into
+/// `LocalFileHeader::file_spec_position` and reads it nowhere.
+///
+/// The name is strongly suggestive — the offset within `filename` at which
+/// the file spec proper begins, i.e. the length of the leading path, so 4
+/// for `dir/inner.txt` — and that reading is what a search engine will
+/// summarise back at you. It is not what any obtainable document states,
+/// and this module does not manufacture citations: see the module doc's
+/// first section for why that standard is stricter here than anywhere else
+/// in this workspace.
+///
+/// # Why 0 rather than the evident value
+///
+/// Because the two are not symmetric in what they cost when wrong, and
+/// there is no witness to tell us which we are.
+///
+/// 0 says "the file spec starts at the start of the filename" — there is no
+/// leading path to skip. An extractor honouring it uses the WHOLE stored
+/// name, which is exactly what stuffr means: `pack` stores full relative
+/// paths and `unpack` recreates the tree from them. So the worst a
+/// path-stripping tool does with 0 is decline to strip, which a user can
+/// see and undo.
+///
+/// A computed value that is off by one, or 1-based where the reader is
+/// 0-based, makes that same tool cut the wrong number of characters off
+/// every name in the archive — a silently mangled tree, in the one format
+/// in this workspace with nothing outside the project able to notice. The
+/// asymmetry is the argument.
+///
+/// **Revisit the moment a real `arj`/`unarj` binary is available**: one
+/// `xxd` of a genuine multi-directory archive settles both the semantics
+/// and the base, and computing it then costs four lines here and a matching
+/// edit to `build_arj`. Recorded in `fixtures/legacy/MANIFEST.md` alongside
+/// the three other fields left at 0, and pinned by
+/// `spec_constraints_the_reader_never_checks` so it cannot drift into a
+/// value nobody argued for.
+const FILESPEC_POSITION: u16 = 0;
+
 /// CRC-32/ISO-HDLC (reflected polynomial 0xEDB88320, init and xorout
 /// 0xFFFFFFFF) — the check an ARJ header records for the entry's original
 /// bytes, and the one its own basic-header CRC field carries over the header
@@ -796,7 +857,7 @@ fn build_main_header() -> Vec<u8> {
     content.extend_from_slice(&0u32.to_le_bytes()); // date time last modified
     content.extend_from_slice(&0u32.to_le_bytes()); // archive size
     content.extend_from_slice(&0u32.to_le_bytes()); // security envelope position
-    content.extend_from_slice(&0u16.to_le_bytes()); // filespec position in filename
+    content.extend_from_slice(&FILESPEC_POSITION.to_le_bytes()); // see the constant's own doc
     content.extend_from_slice(&0u16.to_le_bytes()); // security envelope length
     content.extend_from_slice(&0u16.to_le_bytes()); // currently not used
     debug_assert_eq!(
@@ -976,7 +1037,7 @@ impl ArchiveWrite for ArjWrite {
         content.extend_from_slice(&size.to_le_bytes()); // compressed size
         content.extend_from_slice(&size.to_le_bytes()); // original size (Stored: equal)
         content.extend_from_slice(&crc32_ieee(&payload).to_le_bytes());
-        content.extend_from_slice(&0u16.to_le_bytes()); // filespec position in filename
+        content.extend_from_slice(&FILESPEC_POSITION.to_le_bytes()); // see the constant's doc
         content.extend_from_slice(&access_mode.to_le_bytes());
         content.extend_from_slice(&0u16.to_le_bytes()); // host data (currently not used)
         debug_assert_eq!(
@@ -1424,6 +1485,18 @@ mod tests {
             "spec: the main header's PATHSYM_FLAG describes the ARCHIVE NAME, which is empty"
         );
         assert_eq!(main[4], 0, "not secured, not a volume, not a backup");
+        // "2 filespec position in filename" — main header, offset 24.
+        // Written 0 deliberately; see `FILESPEC_POSITION`'s own doc for the
+        // argument, which is that no obtainable document states this
+        // field's semantics and the two candidate values fail differently.
+        // Asserted here rather than only argued in prose, because nothing
+        // reads the field and only a written-output assertion can protect
+        // it — the same reason this whole test exists.
+        assert_eq!(
+            u16::from_le_bytes([main[24], main[25]]),
+            0,
+            "the main header's filespec position is 0 by ruling, not by accident"
+        );
 
         // --- each local file header -------------------------------------
         // Walked with this test's own arithmetic, so a parser that ignores
@@ -1472,6 +1545,18 @@ mod tests {
             assert_eq!(h[5], 0, "spec: method 0 = stored — {name}");
             assert_eq!(h[6], 0, "spec: file type 0 = binary — {name}");
             assert_eq!(h[3], 2, "spec: host OS 2 = UNIX — {name}");
+            // "2 filespec position in filename", local header offset 24.
+            // 0 for BOTH names, including the one carrying a path, where
+            // the evident value would be 4. See `FILESPEC_POSITION`'s doc:
+            // no obtainable document states the semantics or even the base,
+            // and 0's failure mode (a path-stripping tool declines to
+            // strip) is visible and undoable where a wrong offset's (every
+            // name cut at the wrong place) is silent.
+            assert_eq!(
+                u16::from_le_bytes([h[24], h[25]]),
+                0,
+                "the filespec position is 0 by ruling, not by accident — {name}"
+            );
 
             // "4 compressed size" / "4 original size": equal under
             // `Stored`, and both the real payload length. A header

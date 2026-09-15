@@ -288,13 +288,40 @@ head off — each style fails differently when mishandled.
 - **The fields left at 0 are now the ENCODER's choices too, not only this
   fixture's**, because that equality test pins them together. The rulings
   above for `archiver version number` and `minimum archiver version to
-  extract` therefore govern what `stuffr pack --format arj` writes. One
-  more field is in the same position and was re-examined for Task 7:
-  `security version`, whose spec note is `(2 = current)` rather than a
-  "must equal" like `file type`'s. This archive is not secured
-  (SECURED_FLAG is clear) and no tool exists to check a written value
-  against, so it stays 0 — recorded as an open question rather than
-  quietly closed.
+  extract` therefore govern what `stuffr pack --format arj` writes. Two
+  more fields are in the same position and were re-examined for Task 7:
+  - **`security version`**, whose spec note is `(2 = current)` rather than
+    a "must equal" like `file type`'s. This archive is not secured
+    (SECURED_FLAG is clear) and no tool exists to check a written value
+    against, so it stays 0 — recorded as an open question rather than
+    quietly closed.
+  - **`filespec position in filename`** (2 bytes, in BOTH header tables),
+    which the Task 7 review found enumerated nowhere — the one zero field
+    nobody had argued. **Ruling: it stays 0, deliberately.** The published
+    text gives the field NAME and nothing else: no prose, no worked
+    example of a stored filename, no statement of whether the value is 0-
+    or 1-based, and no rule for a name carrying no path. That was checked
+    rather than assumed — the spec was re-read for every occurrence of
+    "filespec", and the independent transcription at
+    `fileformat.info/format/arj/corion.htm` (offset `001Ah`, `1 word`)
+    carries the same bare line. `unarj-rs` parses it and reads it nowhere.
+    The evident reading (the offset where the base name starts, so 4 for
+    `dir/inner.txt`) is what a search engine will summarise back at you
+    and is not what any obtainable document states; this manifest does not
+    manufacture citations. The two candidate values also fail
+    ASYMMETRICALLY, which is the argument: 0 means "no leading path to
+    skip", so a path-stripping extractor honouring it keeps the whole
+    stored name — visible, and exactly what stuffr intends, since `pack`
+    stores full relative paths — whereas a computed value off by one, or
+    1-based where the reader is 0-based, silently cuts every name in the
+    archive at the wrong place, in the one format here with nothing
+    outside the project able to notice. Revisit the moment a real
+    `arj`/`unarj` binary exists: one `xxd` of a genuine multi-directory
+    archive settles both the semantics and the base. Pinned by
+    `legacy::arj::tests::spec_constraints_the_reader_never_checks` (both
+    headers, and for a `/`-bearing name as well as a flat one) so it
+    cannot drift into a value nobody argued for, and by
+    `FILESPEC_POSITION`'s own doc comment in `arj.rs`.
 - **The spec constraints `unarj-rs` does not check are now asserted against
   ENCODER OUTPUT, not only reasoned about here.**
   `legacy::arj::tests::spec_constraints_the_reader_never_checks` walks the
