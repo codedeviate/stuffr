@@ -135,11 +135,13 @@
 //! the same as `tar`/`ar`/`cpio` deliberately raising `Unsupported` on a
 //! seekable source with no index of their own.
 use std::io::{self, Read, Seek, SeekFrom};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use unarj_rs::arj_archive::ArjArchieve;
 use unarj_rs::date_time::DosDateTime;
 use unarj_rs::local_file_header::{CompressionMethod, FileType};
+
+use super::dos;
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Container, ContainerCaps, CorruptionDetection, CreateOpts, Entry,
@@ -278,41 +280,20 @@ fn classify_arj_io(e: io::Error) -> Error {
 /// a minimal or hand-built entry uses to declare no timestamp at all
 /// (`sample.arj`'s own two entries do exactly this; see
 /// `fixtures/legacy/MANIFEST.md`).
+///
+/// The calendar arithmetic itself lives in [`super::dos`], shared with
+/// `legacy::arc`; only the unpacking of ARJ's own fields is here, because
+/// the two formats pack the halves of their `u32` in opposite orders and
+/// that is the detail each container has to get right for itself.
 fn dos_mtime(dt: DosDateTime) -> Option<SystemTime> {
-    let (year, month, day) = (
+    dos::mtime(
         i64::from(dt.year()),
         u32::from(dt.month()),
         u32::from(dt.day()),
-    );
-    if month == 0 || month > 12 || day == 0 || day > 31 {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    let secs = days
-        .checked_mul(86_400)?
-        .checked_add(i64::from(dt.hour()) * 3600)?
-        .checked_add(i64::from(dt.minute()) * 60)?
-        .checked_add(i64::from(dt.second()))?;
-    u64::try_from(secs)
-        .ok()
-        .map(|s| UNIX_EPOCH + Duration::from_secs(s))
-}
-
-/// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian
-/// `(year, month, day)` — Howard Hinnant's `days_from_civil` algorithm
-/// (public domain; <http://howardhinnant.github.io/date_algorithms.html>),
-/// used because converting a DOS-packed timestamp needs exactly this and
-/// nothing in this workspace already provides it — `stuffr-core` takes no
-/// date/calendar dependency, and this is the one site in `stuffr-formats`
-/// that needs one, small enough to write out rather than add a crate for.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = (i64::from(m) + 9) % 12; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
+        u32::from(dt.hour()),
+        u32::from(dt.minute()),
+        u32::from(dt.second()),
+    )
 }
 
 struct ArjRead {
@@ -456,6 +437,7 @@ impl ArchiveRead for ArjRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
     use stuffr_core::testing::{ContainerFixture, ExpectedEntry, assert_container_conforms_with};
     use stuffr_core::{CreateOpts, OpenOpts, PlainSink, ReaderSource, StreamPolicy};
 
@@ -1133,11 +1115,5 @@ mod tests {
     fn dos_mtime_is_none_for_an_all_zero_packed_value() {
         // month == 0, which sample.arj's own entries use (see MANIFEST.md).
         assert_eq!(dos_mtime(DosDateTime::new(0)), None);
-    }
-
-    #[test]
-    fn days_from_civil_matches_the_epoch_anchor() {
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(1969, 12, 31), -1);
     }
 }
