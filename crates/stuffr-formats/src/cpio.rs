@@ -940,7 +940,7 @@ fn unix_seconds(t: SystemTime) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stuffr_core::testing::{SharedBuf, assert_container_conforms, open_forward_only};
+    use stuffr_core::testing::{SharedBuf, assert_container_conforms_skipping, open_forward_only};
     use stuffr_core::{ArchiveRead, CreateOpts, OpenOpts, PlainSink, ReaderSource, Source};
 
     fn build_cpio(entries: &[(&str, &[u8])]) -> Vec<u8> {
@@ -999,7 +999,9 @@ mod tests {
 
     #[test]
     fn cpio_conforms() {
-        assert_container_conforms(&CpioNewc, &meta());
+        // Skips property 7 alone: `newc` has no trailing_index. Asserted, so
+        // a property going quiet fails here rather than in silence.
+        assert_container_conforms_skipping(&CpioNewc, &meta(), &[7]);
     }
 
     #[test]

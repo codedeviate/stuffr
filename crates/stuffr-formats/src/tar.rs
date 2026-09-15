@@ -908,7 +908,7 @@ impl Read for CountingReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stuffr_core::testing::{SharedBuf, assert_container_conforms, open_forward_only};
+    use stuffr_core::testing::{SharedBuf, assert_container_conforms_skipping, open_forward_only};
     use stuffr_core::{
         ArchiveRead, CreateOpts, EntryKind, EntryMeta, OpenOpts, PlainSink, ReaderSource, Rung,
         Source, StreamPolicy,
@@ -964,7 +964,11 @@ mod tests {
 
     #[test]
     fn tar_conforms() {
-        assert_container_conforms(&Tar, &meta());
+        // Skips property 7 alone: tar has no trailing_index, so there is no
+        // end-of-stream index a forward read could leave unconsulted. Every
+        // other property runs — and the list is asserted, so one of them
+        // going quiet fails here rather than in silence.
+        assert_container_conforms_skipping(&Tar, &meta(), &[7]);
     }
 
     /// The rung and the losses are two different questions, and a piped tar

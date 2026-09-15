@@ -158,7 +158,7 @@ use std::sync::{Arc, Mutex};
 use crate::archive::{ArchiveRead, Container, CreateOpts, EntryMeta, OpenOpts, PlainSink};
 use crate::error::Result;
 use crate::fidelity::Rung;
-use crate::format::{ContainerCaps, FormatMeta};
+use crate::format::{ContainerCaps, FormatId, FormatMeta};
 use crate::honesty::check_error_is_classified;
 use crate::source::{ReaderSource, SeekRead, Source, SourceCaps};
 
@@ -359,34 +359,68 @@ fn read_all(container: &dyn Container, bytes: &[u8]) -> Result<Vec<(String, Vec<
 /// [`open_forward_only`] silently assumed until a `needs_seek` container
 /// gained a writer.
 ///
-/// Read straight off `resolve`'s own rung order under
-/// [`crate::StreamPolicy::ForwardOnly`], not guessed: that policy resolves
-/// `(allow_forward_only = true, spill = Off, allow_degraded = false)`, so
-/// rung 3 (spool) and rung 4 (degraded salvage) are both unavailable and
-/// rung 2 is the only one left. Rung 2's guard is
-/// `caps.forward_parse && allow_forward_only && !caps.needs_seek`. Anything
-/// failing it falls all the way through to `Err(NotSeekable)` — which
-/// `open_forward_only` and [`first_entry_source_bytes`] both turn into a
-/// setup PANIC, deliberately (a container that cannot do what its caps
-/// claim is broken outright, not in violation of one property).
+/// **MEASURED, not mirrored.** An earlier version of this function restated
+/// `ladder.rs`'s rung-2 guard as `caps.forward_parse && !caps.needs_seek`,
+/// which was accurate and still wrong in kind: a hand-copied predicate goes
+/// stale silently, and the failure mode is that a rung which became MORE
+/// permissive leaves these properties skipping for containers they would now
+/// run for. So the question is put to `resolve` itself, with the same policy
+/// the setup helpers use. Under [`crate::StreamPolicy::ForwardOnly`] the
+/// spool and salvage rungs are both disabled, so an `Ok` can only be rung 2
+/// and an `Err(NotSeekable)` is the exact condition that would turn
+/// [`open_forward_only`]/[`first_entry_source_bytes`] into a setup PANIC.
+/// The rung is asserted rather than assumed, so a future policy change that
+/// made `ForwardOnly` return some other rung fails loudly here instead of
+/// quietly widening what this predicate means.
 ///
-/// So for a container declaring `needs_seek` — `legacy::arj`, whose
-/// `unarj-rs` cannot read an archive without `Seek`, and `legacy::zoo` —
-/// properties 5-8 are not merely uninteresting, they are UNRUNNABLE: the
-/// ladder spools such a source to a temp file before the container sees a
-/// byte, which is exactly what makes a "how much of the source was pulled"
-/// measurement (property 8) a statement about the ladder rather than about
-/// the container. Skipping is therefore the honest answer, and each of the
-/// four says so on stderr rather than passing in silence — the same
-/// skip-on-evidence-and-report-it discipline the fixture-driven entry point
-/// applies to its own properties 7 and 10.
-fn reachable_forward_only(caps: ContainerCaps) -> bool {
-    caps.forward_parse && !caps.needs_seek
+/// An EMPTY source: rung 2 hands the source back without reading a byte, so
+/// there is nothing for the probe to consume, and nothing downstream sees
+/// this source at all.
+///
+/// For a container declaring `needs_seek` — `legacy::arj`, whose `unarj-rs`
+/// cannot read an archive without `Seek`, and `legacy::zoo` — this is false,
+/// and properties 7 and 8 are then genuinely unrunnable: the ladder spools
+/// such a source before the container sees a byte, which is what makes a
+/// "how much of the source was pulled" measurement (property 8) a statement
+/// about the ladder rather than about the container. Properties 5 and 6 are
+/// NOT skipped for that shape — they take a weaker second form instead; see
+/// their own comments, and `CodecCaps::truncation_undetectable` for the
+/// precedent (a property weakened to what the format can still promise,
+/// never removed).
+fn reachable_forward_only(id: FormatId, caps: ContainerCaps) -> bool {
+    let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(Vec::new())));
+    match crate::resolve(src, id, caps, &crate::StreamPolicy::ForwardOnly) {
+        Ok(resolved) => {
+            assert_eq!(
+                resolved.rung,
+                Rung::ForwardOnly,
+                "conformance[{id}]: StreamPolicy::ForwardOnly resolved to {:?}, not \
+                 Rung::ForwardOnly — this harness reads that policy as \"rung 2 or nothing\", \
+                 and every forward-only property's setup depends on it",
+                resolved.rung
+            );
+            true
+        }
+        Err(crate::error::Error::NotSeekable { .. }) => false,
+        Err(e) => panic!(
+            "conformance[{id}]: resolving under StreamPolicy::ForwardOnly failed with {e:?}, \
+             which is neither rung 2 nor the NotSeekable refusal this harness knows how to \
+             read"
+        ),
+    }
 }
 
-/// The reason [`reachable_forward_only`] said no, for the skip messages.
-/// Both halves of that conjunction are reported, because a container
-/// failing both should not have a reader guessing which one applied.
+/// The reason [`reachable_forward_only`]'s measurement came back false, for
+/// the skip and second-form messages.
+///
+/// This one IS a mirror — of `ladder.rs`'s rung-2 guard,
+/// `caps.forward_parse && allow_forward_only && !caps.needs_seek` (see
+/// `crate::ladder::resolve`, the "Rung 2: full-fidelity forward parse"
+/// branch) — and it is a mirror on purpose: `resolve` answers yes or no and
+/// never says why, so the explanation has to be reconstructed. Nothing is
+/// GATED on it; it only phrases a message. If the rung's guard changes, the
+/// measurement above stays correct and this sentence becomes imprecise,
+/// which is the right way round for a mirror to fail.
 fn why_not_forward_only(caps: ContainerCaps) -> String {
     match (caps.forward_parse, caps.needs_seek) {
         (false, true) => "this container declares needs_seek and not forward_parse, so the \
@@ -398,7 +432,136 @@ fn why_not_forward_only(caps: ContainerCaps) -> String {
         (true, true) => "this container declares needs_seek, which closes the ladder's \
                          forward-only rung even though it also claims forward_parse"
             .to_string(),
-        (true, false) => unreachable!("reachable_forward_only() was true"),
+        (true, false) => "the ladder refused a forward-only source for a reason this \
+                          explanation does not model — see crate::ladder::resolve"
+            .to_string(),
+    }
+}
+
+/// Opens `container` over a non-seekable source under the DEFAULT policy —
+/// the full ladder, so a `needs_seek` container gets the spool a real caller
+/// gets — and hands back the rung the ladder reached along with the reader.
+///
+/// Properties 5 and 6 take their second form through this. Panics with a
+/// generic (non "property N") message on setup failure, the same convention
+/// `build` and `open_forward_only` follow.
+fn open_under_the_full_ladder(
+    container: &dyn Container,
+    bytes: &[u8],
+) -> (Rung, Box<dyn ArchiveRead>) {
+    let id = container.id();
+    let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes.to_vec())));
+    let resolved = crate::resolve(src, id, container.caps(), &crate::StreamPolicy::default())
+        .unwrap_or_else(|e| panic!("conformance[{id}] resolve (full ladder): {e}"));
+    let rung = resolved.rung;
+    let ar = container
+        .open(resolved, &OpenOpts::default())
+        .unwrap_or_else(|e| panic!("conformance[{id}] open (full ladder): {e}"));
+    (rung, ar)
+}
+
+/// Which properties actually ASSERTED something, and which did not.
+///
+/// # Why this exists, and what it caught
+///
+/// Every gate in this harness used to report a skip on stderr and nothing
+/// more, so the run-set was unverified — not merely for a container that
+/// lies about its caps, but for ANY reason, an honest declaration included.
+/// A test asserting only "the harness did not panic" cannot tell "skipped 3
+/// of 13" from "skipped 12 of 13".
+///
+/// That is not theoretical. Adding `|| !forward_only` to property 9's cut
+/// loop disables TRUNCATION DETECTION — the one property a container author
+/// is not allowed to vote themselves out of — for every `needs_seek`
+/// container, and the whole suite stayed green. A container could stop
+/// noticing a cut archive entirely and ship.
+///
+/// So the run-set is a checked fact: [`assert_container_conforms_skipping`]
+/// takes the skip list its caller expects, and this ledger asserts three
+/// things at the end of every run — the skipped set is EXACTLY that list,
+/// no property is both run and skipped, and every number in 1..=13 is
+/// accounted for as one or the other. A property that stops running now
+/// fails its container's own test, in that container's own file, where a
+/// reviewer reads it.
+///
+/// `ran` is recorded where the assertion actually happens, never at the top
+/// of a block — for the loop-shaped properties (3, 9, 12) that means
+/// counting iterations, because a `continue` that skips every iteration
+/// leaves the block "entered" and nothing checked.
+#[derive(Default)]
+struct PropertyLedger {
+    ran: Vec<u8>,
+    skipped: Vec<u8>,
+}
+
+impl PropertyLedger {
+    /// Records that property `n` asserted something.
+    fn ran(&mut self, n: u8) {
+        self.ran.push(n);
+    }
+
+    /// Records that property `n` did not run, and says so on stderr — the
+    /// skip stays visible in test output as well as checkable.
+    fn skipped(&mut self, id: FormatId, n: u8, why: &str) {
+        eprintln!("conformance[{id}] property {n}: skipped — {why}");
+        self.skipped.push(n);
+    }
+
+    /// `ran` when `did`, `skipped` otherwise. For the loop-shaped
+    /// properties, whose "did it run" answer is an iteration count.
+    fn record(&mut self, id: FormatId, n: u8, did: bool, why: &str) {
+        if did {
+            self.ran(n);
+        } else {
+            self.skipped(id, n, why);
+        }
+    }
+
+    fn assert_run_set(&self, id: FormatId, expected_skipped: &[u8]) {
+        let sorted = |v: &[u8]| {
+            let mut v = v.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let ran = sorted(&self.ran);
+        let skipped = sorted(&self.skipped);
+        let want = sorted(expected_skipped);
+
+        let both: Vec<u8> = ran
+            .iter()
+            .copied()
+            .filter(|n| skipped.contains(n))
+            .collect();
+        assert!(
+            both.is_empty(),
+            "conformance[{id}] run-set: propert{} {both:?} recorded as BOTH run and skipped, \
+             so the ledger describes neither",
+            if both.len() == 1 { "y" } else { "ies" }
+        );
+
+        assert_eq!(
+            skipped, want,
+            "conformance[{id}] run-set: this container skipped properties {skipped:?}, but its \
+             own test says it should skip exactly {want:?}. A property that stops running is \
+             invisible otherwise — the whole suite stays green while the check is gone. Either \
+             the harness stopped running something it used to, or this container's expected \
+             skip list needs updating with a reason a reviewer can read"
+        );
+
+        let mut seen = ran;
+        seen.extend_from_slice(&skipped);
+        seen.sort_unstable();
+        seen.dedup();
+        let all: Vec<u8> = (1u8..=13).collect();
+        assert_eq!(
+            seen,
+            all,
+            "conformance[{id}] run-set: properties {:?} are accounted for as neither run nor \
+             skipped. Every one of 1..=13 must record itself, or a deleted block leaves no \
+             trace at all",
+            all.iter().filter(|n| !seen.contains(n)).collect::<Vec<_>>()
+        );
     }
 }
 
@@ -1046,15 +1209,48 @@ pub fn assert_container_conforms_with(
     }
 }
 
+/// Every property, for a container that skips none of them.
+///
+/// A thin wrapper over [`assert_container_conforms_skipping`] with an empty
+/// skip list, which is the strongest statement a caller can make: all
+/// thirteen ran. Most containers in this tree cannot use it — a property
+/// gated on a capability the container does not declare counts as skipped —
+/// and that is the point: the skip list is written where a reviewer reads it
+/// rather than inferred from `caps()` at a distance.
 pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
+    assert_container_conforms_skipping(container, meta, &[]);
+}
+
+/// Every property, asserting that EXACTLY `expected_skipped` did not run.
+///
+/// "Skipped" here means "asserted nothing", whether because the container
+/// declares no capability the property is about (property 7 for a container
+/// with no trailing index; property 13 for one storing neither directories
+/// nor symlinks) or because the ladder cannot construct the property's
+/// premise (7 and 8 for a `needs_seek` container). It does NOT mean
+/// "inapplicable" as a judgement — the ledger records what happened, and the
+/// caller states what it expects to happen.
+///
+/// Passing the list is mandatory rather than advisory, and the reason is in
+/// [`PropertyLedger`]'s own doc: before this existed a property could stop
+/// running with nothing failing, and one demonstrably did — truncation
+/// detection, silently disabled for every `needs_seek` container, whole
+/// suite green.
+pub fn assert_container_conforms_skipping(
+    container: &dyn Container,
+    meta: &FormatMeta,
+    expected_skipped: &[u8],
+) {
     let id = container.id();
     let caps = container.caps();
+    let mut ledger = PropertyLedger::default();
 
     // 1. Identity: a mismatched registration is otherwise silent.
     assert_eq!(
         id, meta.id,
         "conformance[{id}] property 1: Container::id() disagrees with its registered FormatMeta"
     );
+    ledger.ran(1);
 
     if caps.write && caps.read {
         // 2. Magic agreement: AT LEAST ONE registered rule must match, not
@@ -1071,16 +1267,21 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 "conformance[{id}] property 2: no registered magic rule matches what create() \
                  produced"
             );
+            ledger.ran(2);
+        } else {
+            ledger.skipped(id, 2, "this format registers no magic rule to agree with");
         }
 
         // 3. Round trip, EMPTY FIRST. Zero entries is where containers break
         //    for the same reason empty input breaks codecs: the structure
         //    still needs its header and trailer.
+        let mut round_trips = 0usize;
         for entries in [
             &[][..],
             &[("a.txt", &b"alpha"[..])][..],
             &[("a.txt", &b"alpha"[..]), ("b/c.bin", &b"\x00\xff\x00"[..])][..],
         ] {
+            round_trips += 1;
             let bytes = build(container, entries);
             let got = read_all(container, &bytes).unwrap_or_else(|e| {
                 panic!(
@@ -1109,6 +1310,14 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 );
             }
         }
+        // Counted, not assumed: a `continue` at the top of that loop would
+        // leave the block entered and nothing round-tripped.
+        ledger.record(
+            id,
+            3,
+            round_trips == 3,
+            "the round-trip loop ran no shape at all",
+        );
 
         // 4. finish() flushes AND surfaces a write error that Drop would
         //    swallow. Pointed at a real hazard: zip's own Drop finalizes and
@@ -1130,6 +1339,16 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
             "conformance[{id}] property 4: a destination that fails every write produced \
              neither an add() nor a finish() error"
         );
+        ledger.ran(4);
+    } else {
+        for n in [2u8, 3, 4] {
+            ledger.skipped(
+                id,
+                n,
+                "this container does not declare both read and write, so there is no round \
+                 trip to make",
+            );
+        }
     }
 
     if caps.read {
@@ -1138,16 +1357,36 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
             &[("a.txt", &b"alpha"[..]), ("b.txt", &b"beta"[..])],
         );
 
-        // Properties 5, 6, 7 and 8 all need the ladder to hand this
-        // container a genuinely forward-only source. It cannot for every
-        // container — see `reachable_forward_only` — and where it cannot,
-        // each of the four skips VISIBLY rather than failing in setup.
-        let forward_only = reachable_forward_only(caps);
+        // Properties 5, 6, 7 and 8 all want the ladder to hand this
+        // container a genuinely forward-only source, and it cannot for every
+        // container — see `reachable_forward_only`, which MEASURES the
+        // question rather than restating the rung's guard.
+        //
+        // 7 and 8 then skip. 5 and 6 do NOT: they take a weaker SECOND FORM
+        // instead, the same doctrine `CodecCaps::truncation_undetectable`
+        // established on the codec side, where a codec that cannot promise
+        // to detect truncation still owes a strict prefix and monotonically
+        // non-decreasing lengths. A `needs_seek` container does not FAIL on
+        // a pipe — the ladder spools it — so it still owes an answer about
+        // what happens on one.
+        let forward_only = reachable_forward_only(id, caps);
 
-        // 5. Forward parse from a GENUINELY non-seekable source — a real
-        //    pipe-shaped reader, not a Cursor pretending to lack Seek. See
-        //    `open_forward_only`'s doc comment for why `ReaderSource` is what
+        // 5. The streaming premise, in one of two forms.
+        //
+        //    5 (forward): parse from a GENUINELY non-seekable source — a
+        //    real pipe-shaped reader, not a Cursor pretending to lack Seek.
+        //    See `open_forward_only`'s doc for why `ReaderSource` is what
         //    makes this structural rather than a mere `caps()` claim.
+        //
+        //    5 (spilled): for a container the ladder can only spool, the
+        //    claim narrows to what such a container can still promise — a
+        //    pipe must still yield EVERY entry, the ladder must report
+        //    `Rung::Spilled` for it, and the container must report that same
+        //    rung back rather than claiming `Exact`. The last of those three
+        //    is the half that is about the container at all, and it was
+        //    asserted nowhere before: `zip`'s trailing-index honesty
+        //    (property 7) has no analogue for a format whose rung came from
+        //    a spool.
         if forward_only {
             let fwd = read_all_forward_only(container, &bytes);
             assert_eq!(
@@ -1158,14 +1397,59 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 fwd.len()
             );
         } else {
-            eprintln!(
-                "conformance[{id}] property 5: skipped — {}",
+            let (rung, mut ar) = open_under_the_full_ladder(container, &bytes);
+            assert_eq!(
+                rung,
+                Rung::Spilled,
+                "conformance[{id}] property 5 (spilled): {}, so the full ladder must have \
+                 SPOOLED this pipe; it reported {rung:?} instead",
                 why_not_forward_only(caps)
             );
+            let reported = ar.fidelity().rung;
+            assert_eq!(
+                reported, rung,
+                "conformance[{id}] property 5 (spilled): the ladder reached {rung:?} but the \
+                 container reports {reported:?}. A read that cost a temp file must not be \
+                 presented as one that did not"
+            );
+            assert!(
+                reported.is_authoritative(),
+                "conformance[{id}] property 5 (spilled): a spooled read is authoritative — \
+                 {reported:?} says otherwise, which would warn a user about a loss that did \
+                 not happen"
+            );
+            let mut got = Vec::new();
+            while let Some(mut entry) = ar.next_entry().unwrap_or_else(|e| {
+                panic!("conformance[{id}] property 5 (spilled): next_entry: {e}")
+            }) {
+                got.push(entry.meta().name.clone());
+                let mut data = Vec::new();
+                entry.reader().read_to_end(&mut data).unwrap_or_else(|e| {
+                    panic!("conformance[{id}] property 5 (spilled): entry read: {e}")
+                });
+            }
+            assert_eq!(
+                got,
+                vec!["a.txt".to_string(), "b.txt".to_string()],
+                "conformance[{id}] property 5 (spilled): a spooled pipe must still yield every \
+                 entry, in order"
+            );
         }
+        ledger.ran(5);
 
-        // 6. by_index must return Err(NotSeekable) rather than lie when the
-        //    ladder supplied a forward-only source.
+        // 6. `by_index` must not fake random access, in one of two forms.
+        //
+        //    6 (forward): from a forward-only source the only honest answer
+        //    is `Err(NotSeekable)`.
+        //
+        //    6 (spilled): a `needs_seek` container never meets that source,
+        //    so the claim narrows to the source it DOES meet — the answer
+        //    must be the CORRECT entry or a classified refusal, never a
+        //    different entry. Returning the wrong one is the failure this
+        //    property exists for, and it survives the narrowing intact;
+        //    `Unsupported` ("this format has no index") and `NotSeekable`
+        //    ("this source cannot seek") are both honest, and `entries.rs`
+        //    routes either to a counted forward walk.
         if forward_only {
             let mut ar = open_forward_only(container, &bytes);
             match ar.by_index(0) {
@@ -1180,33 +1464,68 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 ),
             }
         } else {
-            eprintln!(
-                "conformance[{id}] property 6: skipped — {}. This container's own tests \
-                 own the `by_index` claim over the source shape it DOES get",
-                why_not_forward_only(caps)
-            );
+            let (_, mut ar) = open_under_the_full_ladder(container, &bytes);
+            match ar.by_index(0) {
+                Ok(entry) => assert_eq!(
+                    entry.meta().name,
+                    "a.txt",
+                    "conformance[{id}] property 6 (spilled): by_index(0) returned the WRONG \
+                     entry. A wrong entry is worse than a refusal — `cat --index 0` would \
+                     print another file's bytes and exit 0"
+                ),
+                Err(e) => {
+                    if let Err(msg) = check_error_is_classified(&e) {
+                        panic!(
+                            "conformance[{id}] property 6 (spilled): by_index()'s refusal is \
+                             not classified: {msg}"
+                        );
+                    }
+                    assert!(
+                        matches!(
+                            e,
+                            crate::error::Error::Unsupported(_)
+                                | crate::error::Error::NotSeekable { .. }
+                        ),
+                        "conformance[{id}] property 6 (spilled): by_index() must answer with \
+                         the entry, `Unsupported` (this format has no index) or `NotSeekable` \
+                         (this source cannot seek) — `entries.rs` routes those two to a \
+                         counted walk and anything else straight to the caller. Got {e:?}"
+                    );
+                }
+            }
         }
+        ledger.ran(6);
 
         // 7. Rung honesty. A trailing_index container read forward has not
         //    consulted its authoritative index, so it must not report Exact.
-        if caps.trailing_index {
-            if forward_only {
-                let ar = open_forward_only(container, &bytes);
-                let rung = ar.fidelity().rung;
-                assert_ne!(
-                    rung,
-                    Rung::Exact,
-                    "conformance[{id}] property 7: a trailing-index container read forward \
-                     reported Rung::Exact, but its authoritative index is at the END of the \
-                     stream and was never read"
-                );
-            } else {
-                eprintln!(
-                    "conformance[{id}] property 7: skipped — {}, so there is no forward read \
-                     for the trailing index to go unconsulted by",
+        if caps.trailing_index && forward_only {
+            let ar = open_forward_only(container, &bytes);
+            let rung = ar.fidelity().rung;
+            assert_ne!(
+                rung,
+                Rung::Exact,
+                "conformance[{id}] property 7: a trailing-index container read forward \
+                 reported Rung::Exact, but its authoritative index is at the END of the \
+                 stream and was never read"
+            );
+            ledger.ran(7);
+        } else if !caps.trailing_index {
+            ledger.skipped(
+                id,
+                7,
+                "this container declares no trailing_index, so there is no end-of-stream \
+                 index for a forward read to leave unconsulted",
+            );
+        } else {
+            ledger.skipped(
+                id,
+                7,
+                &format!(
+                    "{}, so there is no forward read for the trailing index to go \
+                     unconsulted by",
                     why_not_forward_only(caps)
-                );
-            }
+                ),
+            );
         }
 
         // 8. Entry data streams incrementally, so `stuffr cat big.tar | head`
@@ -1222,22 +1541,29 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                  {consumed} of {} archive bytes — the whole archive was buffered",
                 big.len()
             );
+            ledger.ran(8);
         } else {
-            eprintln!(
-                "conformance[{id}] property 8: skipped — {}. The ladder SPOOLS such a \
-                 source, so the whole archive is read before the container sees a byte of \
-                 it and this measurement would describe the ladder, not the container",
-                why_not_forward_only(caps)
+            ledger.skipped(
+                id,
+                8,
+                &format!(
+                    "{}. The ladder SPOOLS such a source, so the whole archive is read \
+                     before the container sees a byte of it and this measurement would \
+                     describe the ladder, not the container",
+                    why_not_forward_only(caps)
+                ),
             );
         }
 
         // 9. Truncation. UNCONDITIONAL on caps.read: cutting a stream is
         //    detectable structurally by every container here — a header
         //    promises a payload length the stream does not deliver.
+        let mut framing_cuts = 0usize;
         for cut in [1usize, bytes.len() / 3, bytes.len() / 2, bytes.len() - 1] {
             if cut == 0 || cut >= bytes.len() {
                 continue;
             }
+            framing_cuts += 1;
             let err = read_all_expecting_error(container, &bytes[..cut]);
             let Some(e) = err else {
                 panic!(
@@ -1254,6 +1580,17 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                 e.kind()
             );
         }
+        // COUNTED, and this is the counter the whole ledger exists for: a
+        // predicate added to that loop's `continue` disables truncation
+        // detection with the block still entered. It was demonstrated —
+        // `|| !forward_only` there left the entire suite green.
+        //
+        // The payload cut below is counted SEPARATELY and both are required,
+        // because they are two different checks under one number: the four
+        // framing cuts cannot reach an entry's payload on the small fixture
+        // (that is why 9b exists at all), so "some cut ran" is not enough to
+        // say property 9 ran.
+        let mut payload_cut_ran = false;
 
         // 9b. Truncation INSIDE an entry's payload, which the four cuts above
         //     cannot reach: on the small two-entry fixture they all land in a
@@ -1324,7 +1661,19 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                  reporting a full disk",
                 e.kind()
             );
+            payload_cut_ran = true;
         }
+        // A container that cannot write cannot have a payload cut built for
+        // it — the framing cuts are then the whole of property 9.
+        let nine_ran = framing_cuts > 0 && (!caps.write || payload_cut_ran);
+        ledger.record(
+            id,
+            9,
+            nine_ran,
+            "the truncation sweep checked no cut at all, or checked framing and not payload — \
+             see PropertyLedger's own doc for why this is the property that must never stop \
+             running",
+        );
 
         // 10. A genuine source I/O error passes through as itself.
         {
@@ -1337,6 +1686,7 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                  passing through — a disk failure must not be reported as corruption",
                 e.kind()
             );
+            ledger.ran(10);
         }
 
         // 11. Metadata survives to the declared fidelity. Only fields the
@@ -1394,6 +1744,14 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                      entry as some other kind"
                 );
             }
+            ledger.ran(11);
+        } else {
+            ledger.skipped(
+                id,
+                11,
+                "this container cannot write, so there is no entry of ours to read metadata \
+                 back from",
+            );
         }
 
         // 12. Hostile names survive VERBATIM. Deliberate inversion: the
@@ -1401,7 +1759,9 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
         //     and it can only refuse what it can still see.
         if caps.write {
             let hostile = ["../../etc/passwd", "/abs/path", "a/../../b"];
+            let mut names_checked = 0usize;
             for name in hostile {
+                names_checked += 1;
                 let bytes = build(container, &[(name, &b"x"[..])]);
                 let got = read_all(container, &bytes).unwrap_or_else(|e| {
                     panic!("conformance[{id}] property 12: failed to read back {name:?}: {e}")
@@ -1414,6 +1774,19 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                     got[0].0
                 );
             }
+            ledger.record(
+                id,
+                12,
+                names_checked > 0,
+                "the hostile-name loop checked no name",
+            );
+        } else {
+            ledger.skipped(
+                id,
+                12,
+                "this container cannot write, so there is no hostile name of ours to store \
+                 and read back",
+            );
         }
 
         // 13. `stores_dirs`/`stores_symlinks` are behaviour, not a claim.
@@ -1432,7 +1805,7 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
         //     Empty data, because that is exactly what `entries.rs` hands a
         //     container for these two kinds: a directory has no payload, and a
         //     symlink's target lives in `EntryMeta`, not in the reader.
-        if caps.write {
+        if caps.write && (caps.stores_dirs || caps.stores_symlinks) {
             if caps.stores_dirs {
                 let mut meta_in = EntryMeta::file("d");
                 meta_in.kind = crate::archive::EntryKind::Dir;
@@ -1485,7 +1858,72 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
                     ),
                 }
             }
+            ledger.ran(13);
+        } else if !caps.write {
+            ledger.skipped(
+                id,
+                13,
+                "this container cannot write, so there is no directory or symlink entry of \
+                 ours to read back",
+            );
+        } else {
+            ledger.skipped(
+                id,
+                13,
+                "this container claims neither stores_dirs nor stores_symlinks, so it is \
+                 asked for neither",
+            );
         }
+    } else {
+        for n in 5u8..=13 {
+            ledger.skipped(id, n, "this container does not declare read");
+        }
+    }
+
+    ledger.assert_run_set(id, expected_skipped);
+}
+
+/// [`FramedMockContainer`] wearing ARJ's caps shape — `needs_seek: true`,
+/// `forward_parse: false` — and nothing else changed.
+///
+/// The double exists because ARJ became the first WRITE-capable container
+/// in this tree that the ladder can never hand a forward-only source
+/// (Phase 3c Task 7). Before [`reachable_forward_only`] existed, running
+/// the thirteen-property harness on such a container did not fail a
+/// property — it died in property 6's SETUP, at
+/// `open_forward_only`'s own `resolve forward-only` panic, because
+/// `StreamPolicy::ForwardOnly` has no rung left for a `needs_seek`
+/// container to take.
+#[cfg(test)]
+struct SeekOnlyMockContainer;
+
+#[cfg(test)]
+impl Container for SeekOnlyMockContainer {
+    fn id(&self) -> FormatId {
+        crate::testing::FramedMockContainer.id()
+    }
+
+    fn caps(&self) -> ContainerCaps {
+        ContainerCaps {
+            needs_seek: true,
+            ..ContainerCaps::read_write()
+        }
+    }
+
+    fn open(
+        &self,
+        resolved: crate::ladder::Resolved,
+        o: &OpenOpts,
+    ) -> Result<Box<dyn ArchiveRead>> {
+        crate::testing::FramedMockContainer.open(resolved, o)
+    }
+
+    fn create(
+        &self,
+        dst: Box<dyn crate::archive::Sink>,
+        o: &CreateOpts,
+    ) -> Result<Box<dyn crate::archive::ArchiveWrite>> {
+        crate::testing::FramedMockContainer.create(dst, o)
     }
 }
 
@@ -1499,9 +1937,27 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
 /// property and passes while proving nothing.
 #[cfg(test)]
 fn assert_panics_naming(container: &dyn Container, meta: &FormatMeta, expected: &str) {
+    assert_panics_naming_skipping(container, meta, &[7, 13], expected);
+}
+
+/// [`assert_panics_naming`] for a double whose caps skip a different set —
+/// the seek-only doubles, which also skip property 8.
+///
+/// The skip list matters even here, where a panic is expected: if the
+/// double's own property failed to fire, the run-set assertion is what would
+/// panic instead, and the message check would then report that the expected
+/// property was never named. A wrong skip list would make that second panic
+/// fire for the wrong reason.
+#[cfg(test)]
+fn assert_panics_naming_skipping(
+    container: &dyn Container,
+    meta: &FormatMeta,
+    expected_skipped: &[u8],
+    expected: &str,
+) {
     let id = container.id();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_container_conforms(container, meta);
+        assert_container_conforms_skipping(container, meta, expected_skipped);
     }));
     match result {
         Ok(()) => panic!(
@@ -1560,48 +2016,18 @@ fn assert_panics_naming_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive::{ArchiveWrite, Sink};
-    use crate::format::FormatId;
-    use crate::ladder::Resolved;
     use crate::testing::{FramedMockContainer, framed_container_meta};
 
+    /// The mock skips 7 (no trailing index) and 13 (it claims neither
+    /// `stores_dirs` nor `stores_symlinks`); the other eleven run, and the
+    /// ledger asserts exactly that.
     #[test]
     fn a_well_behaved_container_satisfies_properties_one_to_thirteen() {
-        assert_container_conforms(&FramedMockContainer, &framed_container_meta());
-    }
-
-    /// [`FramedMockContainer`] wearing ARJ's caps shape — `needs_seek: true`,
-    /// `forward_parse: false` — and nothing else changed.
-    ///
-    /// The double exists because ARJ became the first WRITE-capable container
-    /// in this tree that the ladder can never hand a forward-only source
-    /// (Phase 3c Task 7). Before [`reachable_forward_only`] existed, running
-    /// the thirteen-property harness on such a container did not fail a
-    /// property — it died in property 6's SETUP, at
-    /// `open_forward_only`'s own `resolve forward-only` panic, because
-    /// `StreamPolicy::ForwardOnly` has no rung left for a `needs_seek`
-    /// container to take.
-    struct SeekOnlyMockContainer;
-
-    impl Container for SeekOnlyMockContainer {
-        fn id(&self) -> FormatId {
-            FramedMockContainer.id()
-        }
-
-        fn caps(&self) -> ContainerCaps {
-            ContainerCaps {
-                needs_seek: true,
-                ..ContainerCaps::read_write()
-            }
-        }
-
-        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
-            FramedMockContainer.open(resolved, o)
-        }
-
-        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
-            FramedMockContainer.create(dst, o)
-        }
+        assert_container_conforms_skipping(
+            &FramedMockContainer,
+            &framed_container_meta(),
+            &[7, 13],
+        );
     }
 
     /// A container the ladder can only ever hand a SPOOLED source must still
@@ -1611,25 +2037,42 @@ mod tests {
     /// The positive twin of `mod broken_containers` below: those prove the
     /// harness can fail, this proves it can still RUN for the one container
     /// shape whose setup it used to die in.
+    /// **The skip list is the assertion.** "Ran to completion" on its own
+    /// could not tell "skipped 3 of 13" from "skipped 12 of 13", which is
+    /// exactly how truncation detection was shown to be silently disablable
+    /// for every `needs_seek` container — see [`PropertyLedger`]. 7 (no
+    /// trailing index) and 13 (neither stores flag) it shares with
+    /// `FramedMockContainer`; 8 is the one `needs_seek` adds, because the
+    /// ladder spools the source before the container sees it. 5 and 6 run in
+    /// their spilled form, and 9 — the truncation sweep — runs unchanged.
     #[test]
     fn a_seek_only_container_runs_the_harness_to_completion() {
-        assert_container_conforms(&SeekOnlyMockContainer, &framed_container_meta());
+        assert_container_conforms_skipping(
+            &SeekOnlyMockContainer,
+            &framed_container_meta(),
+            &[7, 8, 13],
+        );
     }
 
-    /// The gate is a conjunction and both halves matter — a container may
-    /// fail it for either reason, and the skip message must say which.
+    /// The gate is MEASURED through `resolve`, and both halves of the rung's
+    /// guard matter — a container may fail it for either reason, and the
+    /// explanation must say which.
     #[test]
     fn the_forward_only_gate_reads_both_halves_of_the_ladder_rung() {
+        let id = FramedMockContainer.id();
         let fwd = ContainerCaps {
             forward_parse: true,
             ..ContainerCaps::read_only()
         };
-        assert!(reachable_forward_only(fwd));
-        assert!(!reachable_forward_only(ContainerCaps::read_only()));
-        assert!(!reachable_forward_only(ContainerCaps {
-            needs_seek: true,
-            ..fwd
-        }));
+        assert!(reachable_forward_only(id, fwd));
+        assert!(!reachable_forward_only(id, ContainerCaps::read_only()));
+        assert!(!reachable_forward_only(
+            id,
+            ContainerCaps {
+                needs_seek: true,
+                ..fwd
+            }
+        ));
         assert!(
             why_not_forward_only(ContainerCaps {
                 needs_seek: true,
@@ -3255,6 +3698,174 @@ mod broken_containers {
             &MislabelsSourceErrors,
             &framed_container_meta(),
             "property 10",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Seek-only doubles.
+    //
+    // Every double above wears `FramedMockContainer.caps()` —
+    // `forward_parse: true, needs_seek: false` — so until Phase 3c Task 7's
+    // fix round not one of them exercised the path a `needs_seek` container
+    // takes. That mattered: the run-set ledger proves a property still RAN,
+    // and a double is what proves it can still FAIL when it does. Without
+    // these three, properties 5 and 6 had no double at all in their spilled
+    // form, and property 9 had none on the branch where truncation detection
+    // was demonstrably disablable.
+    // -----------------------------------------------------------------------
+
+    /// `SeekOnlyMockContainer`'s caps over [`AcceptsTruncation`]'s body.
+    ///
+    /// The exact shape the reviewer's edit produced: truncation silently
+    /// accepted, on the container class where nothing was watching. Property
+    /// 9 must still catch it — the ledger alone would not, since the ledger
+    /// says a property ran and says nothing about whether it can fail.
+    struct SeekOnlyAcceptsTruncation;
+
+    impl Container for SeekOnlyAcceptsTruncation {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            SeekOnlyMockContainer.caps()
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(AcceptsTruncationRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+            }))
+        }
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    /// `"property 9:"` with the colon, not the bare `"property 9"`: that is
+    /// the FRAMING sweep's own marker, and the payload cut says `"property 9
+    /// (payload)"` instead. The distinction is load-bearing here — the
+    /// reviewer's edit disabled the framing cuts alone, and the payload cut
+    /// still caught this double, so a test matching the bare prefix would
+    /// have passed under the very edit this double exists to answer.
+    /// MEASURED, not assumed.
+    #[test]
+    fn property_nine_still_catches_truncation_on_a_seek_only_container() {
+        assert_panics_naming_skipping(
+            &SeekOnlyAcceptsTruncation,
+            &framed_container_meta(),
+            &[7, 8, 13],
+            "property 9:",
+        );
+    }
+
+    /// A seek-only container that reports `Rung::Exact` for a read the
+    /// ladder had to SPOOL — property 5's spilled form, proven able to fail.
+    ///
+    /// This is the half of 5′ that is about the container rather than the
+    /// ladder, and it is a real hazard: a spooled read costs a temp file and
+    /// a full copy, and presenting it as `Exact` tells a caller it got the
+    /// cheap path. `zip`'s trailing-index honesty (property 7) has no
+    /// analogue for a format whose rung came from a spool, which is why this
+    /// had to be its own check.
+    struct SeekOnlyClaimsExact;
+
+    struct SeekOnlyClaimsExactRead {
+        inner: Box<dyn ArchiveRead>,
+        report: FidelityReport,
+    }
+
+    impl ArchiveRead for SeekOnlyClaimsExactRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            self.inner.next_entry()
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        // BUG: a read the ladder reached by spooling, reported as the rung
+        // a seekable file would have got for free.
+        fn fidelity(&self) -> &FidelityReport {
+            &self.report
+        }
+    }
+
+    impl Container for SeekOnlyClaimsExact {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            SeekOnlyMockContainer.caps()
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(SeekOnlyClaimsExactRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+                report: FidelityReport::exact(),
+            }))
+        }
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    #[test]
+    fn property_five_catches_a_spooled_read_reported_as_exact() {
+        assert_panics_naming_skipping(
+            &SeekOnlyClaimsExact,
+            &framed_container_meta(),
+            &[7, 8, 13],
+            "property 5 (spilled)",
+        );
+    }
+
+    /// A seek-only container whose `by_index` refuses with a code that is
+    /// neither `Unsupported` nor `NotSeekable` — property 6's spilled form,
+    /// proven able to fail.
+    ///
+    /// `entries.rs` routes exactly those two to a counted forward walk and
+    /// hands anything else straight to the caller, so a container answering
+    /// `Corrupt` here turns `cat --index 0` on a perfectly good archive into
+    /// "this archive is damaged", exit 5.
+    struct SeekOnlyMisroutesByIndex;
+
+    struct SeekOnlyMisroutesByIndexRead {
+        inner: Box<dyn ArchiveRead>,
+    }
+
+    impl ArchiveRead for SeekOnlyMisroutesByIndexRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            self.inner.next_entry()
+        }
+        // BUG: classified, but not one of the two refusals the fallback
+        // knows how to route.
+        fn by_index(&mut self, _index: usize) -> Result<Entry<'_>> {
+            Err(Error::Corrupt("seek-only double: no index".into()))
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for SeekOnlyMisroutesByIndex {
+        fn id(&self) -> FormatId {
+            FramedMockContainer.id()
+        }
+        fn caps(&self) -> ContainerCaps {
+            SeekOnlyMockContainer.caps()
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(SeekOnlyMisroutesByIndexRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+            }))
+        }
+        fn create(&self, dst: Box<dyn Sink>, o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            FramedMockContainer.create(dst, o)
+        }
+    }
+
+    #[test]
+    fn property_six_catches_a_by_index_refusal_the_fallback_cannot_route() {
+        assert_panics_naming_skipping(
+            &SeekOnlyMisroutesByIndex,
+            &framed_container_meta(),
+            &[7, 8, 13],
+            "property 6 (spilled)",
         );
     }
 

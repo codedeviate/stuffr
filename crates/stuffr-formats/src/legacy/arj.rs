@@ -1025,7 +1025,8 @@ mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
     use stuffr_core::testing::{
-        ContainerFixture, ExpectedEntry, assert_container_conforms, assert_container_conforms_with,
+        ContainerFixture, ExpectedEntry, assert_container_conforms_skipping,
+        assert_container_conforms_with,
     };
     use stuffr_core::{CreateOpts, OpenOpts, PlainSink, ReaderSource, StreamPolicy};
 
@@ -1332,7 +1333,20 @@ mod tests {
     /// own those claims for this container's real source shapes.
     #[test]
     fn arj_conforms_with_a_writer() {
-        assert_container_conforms(&Arj, &meta());
+        // Skips 7 and 8, and the list is ASSERTED rather than reported to
+        // stderr — see `PropertyLedger` in `container_conformance.rs` for
+        // the demonstration that made that necessary (truncation detection
+        // silently disabled for every `needs_seek` container, whole suite
+        // green). 7: ARJ has no trailing index. 8: incrementality is
+        // unmeasurable once the ladder spools, because the spool reads the
+        // whole archive before this container sees a byte.
+        //
+        // **5 and 6 are NOT skipped.** They take their spilled second form:
+        // a piped ARJ must still yield every entry at `Rung::Spilled`, and
+        // `by_index` over that spooled source must answer the right entry or
+        // a classified refusal. `by_index_is_always_unsupported` below pins
+        // WHICH refusal ARJ gives; the harness pins that it is an honest one.
+        assert_container_conforms_skipping(&Arj, &meta(), &[7, 8]);
     }
 
     /// **The constraints the ARJ SPECIFICATION states and no reader in this

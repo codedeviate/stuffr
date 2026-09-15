@@ -19,8 +19,8 @@ pub use crate::conformance::{
     assert_codec_conforms, assert_codec_conforms_with, compressible, incompressible,
 };
 pub use crate::container_conformance::{
-    ContainerFixture, ExpectedEntry, assert_container_conforms, assert_container_conforms_with,
-    open_forward_only,
+    ContainerFixture, ExpectedEntry, assert_container_conforms, assert_container_conforms_skipping,
+    assert_container_conforms_with, open_forward_only,
 };
 pub use crate::honesty::{
     check_entry_count, check_entry_size, check_error_is_classified, check_fidelity_claim,
@@ -54,8 +54,13 @@ pub const CODEC_SLOTS: &[&str] = &[
 pub const CONTAINER_SLOTS: &[&str] = &[
     "tar", "ar", "cpio", "zip",
     // Phase 3b. APPENDED, never inserted, same reason as `compress` above.
-    // Both are read-only: their corpus seeds are fixture-sourced, not
-    // written by this build.
+    // Their corpus seeds are fixture-sourced rather than written by this
+    // build — which was because neither could write when the slots landed,
+    // and is now a deliberate choice: `lha` gained an encoder in Phase 3c
+    // Task 6 and `arj` in Task 7, and both seeds still come from
+    // `fixtures/legacy/` so the fuzzer explores outward from bytes this
+    // project's own encoders did not produce. See `fuzz_corpus.rs`'s
+    // `legacy_container_fixture`.
     "lha", "arj",
     // Phase 3c. APPENDED, never inserted. Read-only too, and the two slots
     // whose framing and decoders are this project's own from-scratch code

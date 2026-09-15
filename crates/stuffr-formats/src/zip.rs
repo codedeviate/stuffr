@@ -1933,6 +1933,11 @@ mod tests {
 
     #[test]
     fn zip_conforms() {
+        // **Skips nothing.** zip is the only container in this tree that runs
+        // all thirteen: it declares `trailing_index` (property 7), both
+        // `stores_dirs` and `stores_symlinks` (13), and parses forward (5,
+        // 6, 8). The empty list is the strongest statement a caller can
+        // make here, and it is asserted rather than assumed.
         assert_container_conforms(&Zip, &meta());
     }
 

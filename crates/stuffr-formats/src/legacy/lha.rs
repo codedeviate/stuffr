@@ -1027,7 +1027,8 @@ mod tests {
     use super::super::crc::crc16_arc;
     use super::*;
     use stuffr_core::testing::{
-        ContainerFixture, ExpectedEntry, assert_container_conforms, assert_container_conforms_with,
+        ContainerFixture, ExpectedEntry, assert_container_conforms_skipping,
+        assert_container_conforms_with,
     };
     use stuffr_core::{CreateOpts, OpenOpts, PlainSink, ReaderSource, StreamPolicy};
 
@@ -1116,7 +1117,10 @@ mod tests {
     /// the two schemes.
     #[test]
     fn lha_conforms_with_a_writer() {
-        assert_container_conforms(&Lha, &meta());
+        // Skips property 7 alone: LHA has no trailing index. 13 RUNS —
+        // `stores_dirs` is true (`-lhd-` entries), even though
+        // `stores_symlinks` is not.
+        assert_container_conforms_skipping(&Lha, &meta(), &[7]);
     }
 
     /// Kept alongside the write-capable harness rather than replaced by it,

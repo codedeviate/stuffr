@@ -1049,7 +1049,7 @@ fn unix_seconds(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stuffr_core::testing::{SharedBuf, assert_container_conforms, open_forward_only};
+    use stuffr_core::testing::{SharedBuf, assert_container_conforms_skipping, open_forward_only};
     use stuffr_core::{
         ArchiveRead, CreateOpts, EntryMeta, OpenOpts, PlainSink, ReaderSource, Source,
     };
@@ -1105,7 +1105,12 @@ mod tests {
 
     #[test]
     fn ar_conforms() {
-        assert_container_conforms(&Ar, &meta());
+        // Skips 7 (no trailing_index) and 13 (ar's format has neither a
+        // directory nor a symlink concept — `stores_dirs`/`stores_symlinks`
+        // are both false, which is the whole reason those fields exist; see
+        // `ContainerCaps::stores_dirs`). Asserted, so a property going quiet
+        // fails here.
+        assert_container_conforms_skipping(&Ar, &meta(), &[7, 13]);
     }
 
     #[test]
