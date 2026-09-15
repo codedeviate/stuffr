@@ -8155,3 +8155,173 @@ fn documented_install_commands_name_features_this_crate_declares() {
          commands; found {commands_checked} — the scan has stopped finding them"
     );
 }
+
+/// **Every "<number> round-trip/read-only/pure-tier <noun>" claim in the
+/// three documents a user reads, checked against the live registry.**
+///
+/// This closes a class rather than an instance. Three stale
+/// write-capability claims were found BY HAND across Phase 3c Tasks 5, 6 and
+/// 7 — `README.md`'s own headline said "four round-trip containers, plus
+/// four read-only legacy containers" when the binary had six and two — and
+/// the reason no test caught any of them is structural:
+/// `the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come`
+/// derives ROW counts from the registry and has no notion of the WRITE
+/// column, and it reads only the `--examples` page, not the two READMEs
+/// where two of the three lived.
+///
+/// Three qualifiers, each with a count the registry can answer:
+///
+/// - `round-trip` — the format can be written as well as read
+///   (`FormatRow::write`, which is `ContainerCaps::write` for a container
+///   and `CodecCaps::encode` for a codec; zstd's `weak` still counts as
+///   writable, which is what `stuffr formats` shows).
+/// - `read-only` — it cannot.
+/// - `pure-tier` — what remains once the legacy formats are excluded, which
+///   is what `--no-default-features --features pure` builds. Included rather
+///   than exempted on purpose: a tier-narrowed sentence is a real thing to
+///   want to write, and leaving it unchecked would be a loophole any stale
+///   claim could take.
+///
+/// The noun is `codecs` or `containers` and never `formats`, deliberately:
+/// `README.md` carries a historical "Phase 3b adds three READ-ONLY legacy
+/// formats" sentence that was true when written and is narrating, not
+/// claiming. Narrowing the noun is how that stays sayable without carving a
+/// per-sentence exception a future stale claim could hide in. An optional
+/// `legacy` may sit between the qualifier and the noun ("two read-only
+/// legacy containers").
+#[test]
+fn no_document_carries_a_stale_round_trip_or_read_only_count() {
+    // `compress` is to codecs what `LEGACY_ONLY_CONTAINERS` is to
+    // containers: registered only when the `legacy` feature is compiled in,
+    // which every real build of this binary does (see
+    // `the_examples_page_cannot_carry_a_stale_count_or_a_shipped_still_to_come`'s
+    // own comment for the measured proof), so it is what a `pure-tier`
+    // count excludes.
+    const LEGACY_ONLY_CODECS: &[&str] = &["compress"];
+    const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha", "arj", "arc", "zoo"];
+
+    let registry = stuffr::registry();
+    let rows = registry.matrix();
+    let is_container = |id| registry.container(id).is_some();
+
+    let count = |container: bool, pred: &dyn Fn(&stuffr::FormatRow) -> bool| {
+        rows.iter()
+            .filter(|r| is_container(r.id) == container && pred(r))
+            .count()
+    };
+    let legacy = |container: bool, id: &str| {
+        if container {
+            LEGACY_ONLY_CONTAINERS.contains(&id)
+        } else {
+            LEGACY_ONLY_CODECS.contains(&id)
+        }
+    };
+
+    // (qualifier, is_container) -> the count the registry says
+    let expected = |qualifier: &str, container: bool| -> usize {
+        match qualifier {
+            "round-trip" => count(container, &|r| r.write),
+            "read-only" => count(container, &|r| !r.write),
+            "pure-tier" => count(container, &|r| !legacy(container, r.id.as_str())),
+            other => unreachable!("unhandled qualifier {other}"),
+        }
+    };
+
+    const NUMBERS: &[(&str, usize)] = &[
+        ("one", 1),
+        ("two", 2),
+        ("three", 3),
+        ("four", 4),
+        ("five", 5),
+        ("six", 6),
+        ("seven", 7),
+        ("eight", 8),
+        ("nine", 9),
+        ("ten", 10),
+        ("eleven", 11),
+        ("twelve", 12),
+        ("thirteen", 13),
+        ("fourteen", 14),
+        ("fifteen", 15),
+        ("sixteen", 16),
+        ("seventeen", 17),
+        ("eighteen", 18),
+        ("nineteen", 19),
+        ("twenty", 20),
+    ];
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs = [
+        manifest_dir.join("README.md"),
+        manifest_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("README.md"),
+        manifest_dir.join("src").join("examples.txt"),
+    ];
+
+    let mut claims_checked = 0usize;
+    for doc in docs {
+        let text = std::fs::read_to_string(&doc).unwrap();
+        // Whitespace-normalised: every one of these documents wraps, and a
+        // count split across a line break must still read as one phrase.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let words: Vec<String> = flat
+            .split(' ')
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
+                    .to_lowercase()
+            })
+            .collect();
+        for i in 0..words.len() {
+            let Some((_, value)) = NUMBERS.iter().find(|(w, _)| *w == words[i]) else {
+                continue;
+            };
+            let Some(qualifier) = words.get(i + 1) else {
+                continue;
+            };
+            if !["round-trip", "read-only", "pure-tier"].contains(&qualifier.as_str()) {
+                continue;
+            }
+            // An optional `legacy` between the qualifier and the noun.
+            let noun = match words.get(i + 2).map(String::as_str) {
+                Some("legacy") => words.get(i + 3),
+                other => other.and_then(|_| words.get(i + 2)),
+            };
+            let container = match noun.map(String::as_str) {
+                Some("containers") => true,
+                Some("codecs") => false,
+                // `formats` deliberately excluded — see this test's doc.
+                _ => continue,
+            };
+            claims_checked += 1;
+            let want = expected(qualifier, container);
+            assert_eq!(
+                *value,
+                want,
+                "{} says `{} {qualifier}{} {}`, but this build has {want}. This is the \
+                 check that closes the class three stale write-capability claims were found \
+                 by hand in: the row-count guard cannot see the WRITE column, so nothing \
+                 else would say so",
+                doc.display(),
+                words[i],
+                if words.get(i + 2).map(String::as_str) == Some("legacy") {
+                    " legacy"
+                } else {
+                    ""
+                },
+                if container { "containers" } else { "codecs" },
+            );
+        }
+    }
+
+    // A scan that matched nothing would pass forever. These documents carry
+    // such claims today and the point of the test is that they stay true.
+    assert!(
+        claims_checked >= 6,
+        "the scan found only {claims_checked} qualified counts across the three documents — \
+         it is matching nothing and proving nothing"
+    );
+}

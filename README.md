@@ -10,8 +10,9 @@ for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
 > **Status: Phase 3c in progress at `0.4.1` — twelve round-trip codecs
-> (`compress` joined them in Task 5) and four round-trip containers, plus
-> four read-only legacy containers, all in the
+> (`compress` joined them in Task 5) and six round-trip containers
+> (`lha` joined them in Task 6 and `arj` in Task 7), plus
+> two read-only legacy containers, all in the
 > default build, which needs no C toolchain to read *or write* xz, LZMA1 or
 > LZIP.** `stuffr pack`,
 > `unpack`, `cat`, `info`, `list`, `test` and `formats` all work, on files
@@ -528,9 +529,9 @@ OOM killer.
 ## Planned CLI
 
 *Phase 2 and later. `pack`, `unpack`, `cat`, `info`, `formats`, `list` and
-`test` all work today, across the eleven round-trip codecs and four
+`test` all work today, across the twelve round-trip codecs and six
 round-trip containers
-(`ar`, `cpio`, `tar`, `zip`/`zip64`) `stuffr formats` lists — `pack`/`unpack`/
+(`ar`, `arj`, `cpio`, `lha`, `tar`, `zip`/`zip64`) `stuffr formats` lists — `pack`/`unpack`/
 `cat` are entry-aware for every container, with extraction-time path
 containment and bomb limits on by default. `convert` and `install-links`
 are not implemented yet. `pack` walks a directory tree, and

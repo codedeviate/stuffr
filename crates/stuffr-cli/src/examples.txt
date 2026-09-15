@@ -706,10 +706,13 @@ WHAT THIS BUILD CAN DO
 
   stuffr formats
       Lists the formats compiled into THIS binary, not everything stuffr will
-      ever support. A default build has twenty rows: the eleven
-      round-trip codecs gzip, zlib, deflate, bzip2, brotli, lz4, snappy,
-      zstd, xz, lzma and lzip, the round-trip tar, ar, cpio and zip
-      containers, and the five legacy formats — the `compress` codec
+      ever support. A default build has twenty rows: twelve
+      round-trip codecs — gzip, zlib, deflate, bzip2, brotli, lz4, snappy,
+      zstd, xz, lzma, lzip and `compress` — and eight containers, six of
+      them round-trip (tar, ar, cpio, zip, lha, arj) and two read-only
+      (arc, zoo). Counted the other way, that is the eleven pure-tier
+      codecs and four pure-tier containers, plus
+      the five legacy formats — the `compress` codec
       (read AND write, as of Phase 3c Task 5), the `lha` and `arj`
       containers (read AND write, as of Phase 3c Tasks 6 and 7 — but see
       the WARNING under "LEGACY FORMATS" below: `lha` READS seven
@@ -808,7 +811,7 @@ PARALLEL ENCODE FLAGS
 
   stuffr pack big.dat --format xz --threads 4
       Encode with 4 worker threads instead of stuffr's default of one. Only
-      THREE of this build's eleven round-trip codecs actually parallelise
+      THREE of this build's twelve round-trip codecs actually parallelise
       their encoder: xz and lzip on every build, and zstd only with --features
       c-backed (the default ruzstd encoder has no multi-threaded path).
       Counted by implementation rather than format this is four
@@ -912,9 +915,12 @@ EXIT CODES
 
 NOT YET
 
-  A pure build (the default) has eleven round-trip codecs and four
+  A `--no-default-features --features pure` build has eleven pure-tier
+  codecs and four pure-tier
   containers: gzip, zlib, deflate, bzip2, brotli, lz4, snappy, zstd, xz, lzma
-  and lzip, plus tar, ar, cpio and zip. zstd's pure backend (`ruzstd`) is a weak fallback (see
+  and lzip, plus tar, ar, cpio and zip. (It is no longer what a plain
+  `cargo build` gives you — `legacy` joined `default`, so the default build
+  adds the five legacy formats on top; see "LEGACY FORMATS" above.) zstd's pure backend (`ruzstd`) is a weak fallback (see
   "USING A WEAK FALLBACK ENCODER" above); xz's and lzma's pure backends are
   not — both read and write full-ratio output with no C toolchain, just
   slower than `--features c-backed`'s `liblzma` (roughly 1.2-1.3x to
