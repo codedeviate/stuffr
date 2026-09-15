@@ -150,9 +150,11 @@ vendored C++, a second zip/tar stack — the reasons are in
 `fixtures/legacy/MANIFEST.md`), and what the tree carries is its MIT/Apache
 test corpus borrowed as bytes plus prose explaining why the code was not.
 Nothing imports or links it; `Cargo.lock` has no such entry. So 3c is: write
-support for `compress`/`lha`/`arj`, plus READ support for ARC and ZOO — both
-of which have now landed, each with its framing written from scratch. That
-is a
+support for `compress`/`lha`/`arj`, plus READ support for ARC and ZOO. ARC and
+ZOO's read support, and `compress`'s write support (Task 5 — the first of the
+three write tasks to land), have now shipped, each with its framing written
+from scratch; `lha` and `arj` still refuse to write, pending their own tasks.
+That is a
 PATCH, not a milestone, because it is additive to traits that already exist
 (`Container::create`, `Codec::encoder` are both already part of the public
 surface; Phase 3c gives three more formats a real implementation of each, it

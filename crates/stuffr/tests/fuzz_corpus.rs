@@ -29,16 +29,25 @@
 //!   chain seed is just the bytes of some real, complete input (a plain
 //!   archive, a bare codec stream, or a composed one).
 //!
-//! Phase 3b adds three READ-ONLY slots (`compress`, `lha`, `arj`) and Phase
-//! 3c a fourth (`arc`), which this
-//! generator cannot build the way every other slot's seed is built — there
-//! is no encoder/writer to call. Their "own encoded stream" / "own archive
+//! Phase 3b added three READ-ONLY slots (`lha`, `arj` and, at the time,
+//! `compress`) and Phase 3c a fourth container (`arc`), none of which this
+//! generator could build the way every other slot's seed is built — there
+//! was no encoder/writer to call. Their "own encoded stream" / "own archive
 //! bytes" above are instead read straight from the committed fixtures under
 //! `crates/stuffr-formats/fixtures/legacy/` (see [`legacy_codec_fixture`] and
 //! [`legacy_container_fixture`]); everything downstream of that — the
 //! selector prefix, the forward/seekable duplication for containers, the
 //! exact-count assertion — treats them exactly like any other registered
 //! slot.
+//!
+//! **`compress` gained a real encoder in Phase 3c Task 5** and could now
+//! build its own seed the way every non-legacy codec below does —
+//! [`legacy_codec_fixture`] keeps routing it through `hello.Z` anyway,
+//! deliberately: that fixture is `/usr/bin/compress`'s own output (an
+//! external encoder, not this crate's), so the corpus keeps a seed that
+//! does not depend on this project's own encoder agreeing with itself. The
+//! `lha`/`arj`/`arc` containers still have no writer at all, so their
+//! fixture routing remains load-bearing, not a style choice.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -103,11 +112,12 @@ fn registered_container_slots() -> Vec<(u8, &'static str)> {
         .collect()
 }
 
-/// Phase 3b: `compress` is decode-only (see `legacy::compress_z`'s module
-/// doc), so `ops::compress` cannot build its seed the way every other codec
-/// slot's seed is built below. Its seed is the committed fixture's bytes
-/// instead. `None` for every non-legacy slot, which still builds its own
-/// seed by encoding.
+/// `compress`'s seed is the committed `hello.Z` fixture's bytes — deliberately
+/// still, even though Phase 3c Task 5 gave it a real encoder `ops::compress`
+/// could now call: `hello.Z` is `/usr/bin/compress`'s own output, an external
+/// encoder's bytes, which the corpus keeps rather than trading for a seed
+/// this project's own encoder produced (see this file's module doc). `None`
+/// for every non-legacy slot, which builds its own seed by encoding.
 fn legacy_codec_fixture(name: &str) -> Option<&'static str> {
     match name {
         "compress" => Some("hello.Z"),
@@ -191,8 +201,10 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     for (selector, name) in registered_codec_slots() {
         let mut seed = vec![selector];
         if let Some(fixture) = legacy_codec_fixture(name) {
-            // Phase 3b: read-only codec — no encoder to build this seed
-            // with, so the committed fixture's own bytes ARE the seed body.
+            // A legacy slot named here routes through its committed
+            // fixture's own bytes as the seed body — see
+            // `legacy_codec_fixture`'s doc for why `compress` still does
+            // this deliberately, now that it has an encoder.
             seed.extend(read_all(&legacy_fixture_path(fixture))?);
         } else {
             let out_path = work.path().join(format!("codec-{name}.out"));

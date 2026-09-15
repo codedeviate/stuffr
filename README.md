@@ -9,8 +9,9 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Phase 3c in progress at `0.4.1` — eleven round-trip codecs and
-> four round-trip containers, plus five read-only legacy formats, all in the
+> **Status: Phase 3c in progress at `0.4.1` — twelve round-trip codecs
+> (`compress` joined them in Task 5) and four round-trip containers, plus
+> four read-only legacy containers, all in the
 > default build, which needs no C toolchain to read *or write* xz, LZMA1 or
 > LZIP.** `stuffr pack`,
 > `unpack`, `cat`, `info`, `list`, `test` and `formats` all work, on files
@@ -20,7 +21,9 @@ read list.
 > `ar`, `arc` (`.pak` included), `arj`, `cpio`, `lha` (`.lzh` included),
 > `tar`, `zip` (`zip64` included), `zoo` on every build — each round-trip codec and container proven
 > against the conformance harness Phase 1c introduced and later cycles grew
-> to twelve properties, and each read-only legacy format proven against a
+> to twelve properties (`compress` graduated into that full set in Task 5,
+> having run only the fixture-driven decode-only variant before), and each
+> read-only legacy container proven against a
 > fixture-driven variant of the same harnesses, built for exactly this shape
 > (see the Phase 3b paragraphs below), all of it then proven to coexist. The
 > `legacy` feature (bundled into `full`/`--all-features`) still exists and
@@ -290,6 +293,25 @@ read list.
 > verdict on the same shape, so a cyclic archive terminates rather than
 > spinning.
 >
+> **Phase 3c Task 5 gave Unix `compress` a real encoder — the first of the
+> phase's three write tasks (`compress`/`lha`/`arj`) to land.** `pack
+> --format compress` now writes a `.Z` file the real `compress`(1)/
+> `uncompress`(1) tools read back byte-exactly; `lha` and `arj` still refuse
+> at exit 3 until their own tasks land. `--level` maps onto `compress`'s own
+> `-b` flag (`maxbits`, `9..=16`, not the 0-9 shape every other codec here
+> uses), defaulting to 16. The encoder is a from-scratch, block-mode LZW
+> implementation promoted out of the test suite that proved it byte-for-byte
+> against the real tool before it was ever wired to a `Sink` — it never
+> emits a block-mode CLEAR (the real encoder's ratio heuristic for that is
+> itself not portable between BSD and GNU `compress`, see the paragraph
+> above), and its dictionary simply freezes once full, which every reference
+> decoder accepts. One level is deliberately not the default despite being
+> real: GNU `ncompress` 5.0 cannot decode its own `-b 9` output once the
+> 512-entry dictionary fills, so this build writes the BSD-shaped bytes at
+> that level instead — correct, and decodable by every reference tool this
+> project tested, but the format's own reference *encoder* disagreeing with
+> its own reference *decoder* is why `-b 9` is opt-in rather than default.
+>
 > **Not yet: `7z`, squashfs, ISO 9660, MS CAB and RAR.** Those five
 > containers are deferred past Phase 2, each needing its own cycle — see
 > [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md).
@@ -322,9 +344,9 @@ strong zstd encoder:
 cargo install stuffr-cli --features c-backed    # needs a C compiler, nothing else
 ```
 
-The five read-only legacy formats (Unix `compress` `.Z`, LHA/LZH, ARJ,
-ARC/PAK, ZOO) are in the default build too, pure Rust like the rest of it — no
-extra flag needed.
+The five legacy formats (Unix `compress` `.Z` — read AND write, as of Phase 3c
+Task 5 — plus the read-only LHA/LZH, ARJ, ARC/PAK and ZOO) are in the default
+build too, pure Rust like the rest of it — no extra flag needed.
 `--features legacy` still exists and still works; it only matters paired with
 `--no-default-features` (e.g. `--no-default-features --features pure`, the
 build the `purity` CI job checks, is the one combination that excludes them).
@@ -499,7 +521,7 @@ Read and write symmetry wherever it is technically possible.
 - **Modern codecs:** zstd, xz/LZMA2, LZMA1, LZIP, brotli, lz4, snappy, gzip/zlib/deflate, bzip2 *(all implemented, Phase 1)*
 - **Containers:** tar, cpio *(`newc` only)*, ar, zip/zip64 *(all implemented, Phase 2)*; 7z, squashfs, ISO 9660, MS CAB, RAR *(read only)* remain — each deferred to its own cycle, see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)
 - **Plain storage:** collecting and compressing are separate axes — tar, cpio, ar, zip-stored and 7z-copy all give you a container with no compression
-- **Legacy:** LHA/LZH, Unix `compress` `.Z` and ARJ *(read-only, Phase 3b, part of the default build — `--features legacy` still exists for a `--no-default-features` build)*, joined by **ARC/PAK** and **ZOO** *(read-only, Phase 3c, their framing and decoders written from scratch)*. **Phase 3c** adds two things and it is worth saying which: WRITE support for exactly the first three (`pack --format lha`/`arj`/`compress`, which today refuse at exit 3), and READ support for **ARC and ZOO** — both have now landed. StuffIt `.sit` *(older methods only)* and Amiga/MS LZX are **3c candidates too**, gated on evidence rather than effort: neither has a second implementation or a tool to check a fixture against, so a fixture and its expectation would both come from the crate under test. StuffIt `.sitx` and its later methods stay permanently out — see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)
+- **Legacy:** LHA/LZH, Unix `compress` `.Z` and ARJ *(Phase 3b, part of the default build — `--features legacy` still exists for a `--no-default-features` build)*, joined by **ARC/PAK** and **ZOO** *(read-only, Phase 3c, their framing and decoders written from scratch)*. **Phase 3c** adds three things and it is worth saying which, since they landed across separate tasks: WRITE support for `compress` (Task 5 — `pack --format compress` now works; `lha`/`arj` still refuse at exit 3, their own write tasks not yet done), and READ support for **ARC and ZOO** — the latter two, and `compress`'s write side, have now landed. StuffIt `.sit` *(older methods only)* and Amiga/MS LZX are **3c candidates too**, gated on evidence rather than effort: neither has a second implementation or a tool to check a fixture against, so a fixture and its expectation would both come from the crate under test. StuffIt `.sitx` and its later methods stay permanently out — see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)
 
 A few formats are read-only by **external constraint rather than effort** — RAR's
 compressor is proprietary and the free `unrar` source is licensed for
@@ -523,7 +545,7 @@ remains decode-only for licence reasons, not effort.
 |---|---|
 | `pure` *(default)* | everything with a pure-Rust implementation — all eleven codecs, including read+write xz, LZMA1 and LZIP, plus all four containers |
 | `c-backed` | `zstd-sys` and `liblzma`, both vendored and built statically; also the one entry codec inside `zip` that needs a C-compiling crate (see below); later `unrar` (decode) |
-| `legacy` *(default)* | the historical format set — `compress`, `lha`, `arj`, `arc`, `zoo`; READ-ONLY |
+| `legacy` *(default)* | the historical format set — `compress` (read AND write, Phase 3c Task 5), `lha`, `arj`, `arc`, `zoo` (read-only) |
 | `full` | all of the above |
 
 `c-backed` needs a C compiler and **nothing else** — no `libclang`, no system
