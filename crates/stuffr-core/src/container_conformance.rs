@@ -10,14 +10,15 @@
 //!   input. Thirteen properties, numbered 1-13 below, raised as
 //!   `conformance[{id}] property N: ...`.
 //! - [`assert_container_conforms_with`] — a container that CANNOT (every
-//!   read-only legacy format). Nine properties, numbered 1-9 in a scheme of
+//!   read-only legacy format). Ten properties, numbered 1-10 in a scheme of
 //!   its OWN, raised as `conformance[{id}] fixture property N: ...`.
 //!
 //! **The two numberings collide and the messages are what tell them apart.**
-//! Five numbers mean different things in the two sets — 4 is "`finish`
+//! Six numbers mean different things in the two sets — 4 is "`finish`
 //! surfaces a write error" in one and "entry enumeration" in the other, 6 is
-//! `by_index` honesty against truncation, 7 rung honesty against corruption —
-//! so a bare `property 6` sent a reader to the wrong entry in this very list.
+//! `by_index` honesty against truncation, 7 rung honesty against corruption,
+//! 10 genuine source-I/O passthrough against the CRC-witness below — so a
+//! bare `property 6` sent a reader to the wrong entry in this very list.
 //! The read-only set is not a SUBSET of the list below, whatever its own
 //! function doc used to say; it is a relabelling. Hence the `fixture` tag on
 //! every message the fixture-driven entry point raises, and hence its own
@@ -40,7 +41,23 @@
 //!    Embedded in those three rather than standalone.
 //! 9. Source-error passthrough: a source that fails every read must surface
 //!    that failure AS ITSELF, never as corruption and never as a clean end
-//!    of archive. The twin of 10 below.
+//!    of archive. The twin of write-capable property 10 (also an I/O-
+//!    passthrough claim, under a different number in that scheme).
+//! 10. CRC-witness (integrity, Phase 3c): a container declaring per-entry
+//!     integrity (`detects_corruption` `Always` or `WhenPresent`) must
+//!     produce, for every entry, bytes whose independently-computed
+//!     CRC-16/ARC matches the fixture manifest's — the check the archive's
+//!     ORIGINAL encoder made possible, decades before this project existed.
+//!     `Structural` and `Never` skip, visibly, exactly as property 7 does.
+//!     Runs BEFORE properties 4 and 5 so a double with wrong content is
+//!     attributed to ITS OWN property rather than tripping 5 first — the
+//!     false-pass trap `mod broken_containers` warns about elsewhere in this
+//!     file. This is what makes a BORROWED fixture (one this project did not
+//!     author) trustworthy: Phase 3b's hand-built ARJ fixture had one author
+//!     write both the bytes and the expectation, and a misreading passed
+//!     silently; ARC and ZOO's own encoders recorded a CRC nobody in this
+//!     project wrote, so agreement with it is evidence from OUTSIDE the
+//!     crate.
 //!
 //! Thirteen properties for the write-capable entry point, one function.
 //!
@@ -244,6 +261,35 @@ fn build(container: &dyn Container, entries: &[(&str, &[u8])]) -> Vec<u8> {
         .finish()
         .unwrap_or_else(|e| panic!("conformance[{id}] finish (sink): {e}"));
     cap.contents()
+}
+
+/// CRC-16/ARC (reflected polynomial `0xA001`, init 0, no final xor),
+/// independently written for the fixture harness's own property 10.
+///
+/// Not a call into `stuffr-formats::legacy::crc::crc16_arc` — it cannot be:
+/// `stuffr-core` has zero format dependencies, and the crate dependency edge
+/// runs the other way (`stuffr-formats` already depends on `stuffr-core`),
+/// so that routine is structurally unreachable from here. Property 10 exists
+/// to give a fixture this project did not author (ARC's, ZOO's) a witness
+/// from OUTSIDE the crate; a harness that borrowed the production
+/// implementation to check itself would just be agreeing with itself again.
+/// Pinned to the same external CRC RevEng check value
+/// (`crc16_arc_witness_matches_the_published_check_value`, below) that
+/// `legacy/crc.rs` pins its own copy to, so a transcription error in one
+/// cannot silently agree with a transcription error in the other.
+fn crc16_arc_witness(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &b in data {
+        crc ^= b as u16;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
 }
 
 /// Reads every entry back out of `bytes` through `container`'s own reader,
@@ -632,15 +678,15 @@ pub struct ContainerFixture {
 /// properties that make sense without a write side — deliberately a
 /// SEPARATE function from `assert_container_conforms`, not a unified one with
 /// more gating, for the same reason the codec side keeps
-/// `assert_codec_conforms`/`assert_codec_conforms_with` apart. Its nine
+/// `assert_codec_conforms`/`assert_codec_conforms_with` apart. Its ten
 /// properties are a RELABELLING, not a subset — see the module doc.
 ///
 /// Every assertion message begins `conformance[{id}] fixture property N` and
 /// includes `fixture provenance: {}`, so a red test says up front how
 /// trustworthy its own expectation is — load-bearing where a later fixture's
 /// `expected` was derived from the very crate under test. The `fixture` tag
-/// is not decoration: this function's nine properties are numbered in a
-/// scheme of their own, and five of those numbers mean something else in
+/// is not decoration: this function's ten properties are numbered in a
+/// scheme of their own, and six of those numbers mean something else in
 /// [`assert_container_conforms`]'s thirteen. See the module doc, which
 /// enumerates both.
 pub fn assert_container_conforms_with(
@@ -706,16 +752,72 @@ pub fn assert_container_conforms_with(
         );
     }
 
-    // 4 & 5. Enumeration and content: read the fixture back through the
-    //    container's own reader and compare against the manifest — this is
-    //    the property the manifest exists for; without it the harness only
-    //    proves the container returns *something*.
+    // Read the fixture back once, up front — properties 10, 4 and 5 all
+    // inspect the same clean decode, and 10 must see it FIRST (below).
     let got = read_all(container, fixture.bytes).unwrap_or_else(|e| {
         panic!(
             "conformance[{id}] fixture property 4: failed to read the fixture back: {e} \
              (fixture provenance: {provenance})"
         )
     });
+
+    // 10. CRC-witness (integrity): a container declaring per-entry integrity
+    //     must produce, for every entry, bytes whose CRC-16/ARC matches the
+    //     fixture manifest's. GATED more narrowly than property 7:
+    //     `Structural` skips here too, because a structural-only guarantee
+    //     (a length field, a trailer magic) says nothing about per-BYTE
+    //     integrity the way a CRC does.
+    //
+    //     Computed with `crc16_arc_witness`, an implementation independently
+    //     written for THIS harness rather than imported from
+    //     `stuffr-formats` — `stuffr-core` has zero format dependencies, and
+    //     the dependency edge runs the other way (`stuffr-formats` already
+    //     depends on `stuffr-core`), so the production `crc16_arc` in
+    //     `legacy/crc.rs` is unreachable from here regardless. Two
+    //     independently written implementations of the same well-known
+    //     algorithm, each pinned to the same external CRC RevEng check value
+    //     (`0xBB3D` for `"123456789"` — see this module's own test below and
+    //     `legacy/crc.rs`'s), is closer to a real witness than one shared
+    //     routine would be.
+    //
+    //     Runs BEFORE properties 4 and 5, deliberately: a double that
+    //     returns wrong content for a real, uncorrupted fixture would
+    //     otherwise trip property 5 first and never exercise this one at
+    //     all — the exact false-pass trap `mod broken_containers` calls out
+    //     for property 6 vs 7 (`IgnoresTruncation` vs `RestoresKnownContent`).
+    match caps.detects_corruption {
+        crate::format::CorruptionDetection::Always
+        | crate::format::CorruptionDetection::WhenPresent => {
+            for want in fixture.expected {
+                if let Some((_, got_bytes)) = got.iter().find(|(name, _)| name == want.name) {
+                    let got_crc = crc16_arc_witness(got_bytes);
+                    let want_crc = crc16_arc_witness(want.content);
+                    assert_eq!(
+                        got_crc, want_crc,
+                        "conformance[{id}] fixture property 10: decoded bytes for entry {:?} \
+                         differ from the CRC the archive stores — CRC-16/ARC {got_crc:#06x} \
+                         decoded vs {want_crc:#06x} recorded in the fixture manifest, which is \
+                         the archive's own encoder checking this decoder from outside the crate \
+                         (fixture provenance: {provenance})",
+                        want.name
+                    );
+                }
+            }
+        }
+        crate::format::CorruptionDetection::Structural
+        | crate::format::CorruptionDetection::Never => {
+            eprintln!(
+                "conformance[{id}] fixture property 10: skipped — this container declares \
+                 {:?}, not Always or WhenPresent, so no per-entry CRC exists to witness against \
+                 (fixture provenance: {provenance})",
+                caps.detects_corruption
+            );
+        }
+    }
+
+    // 4 & 5. Enumeration and content: compare the same decode against the
+    //    manifest — this is the property the manifest exists for; without it
+    //    the harness only proves the container returns *something*.
     let got_names: Vec<&str> = got.iter().map(|(name, _)| name.as_str()).collect();
     let want_names: Vec<&str> = fixture.expected.iter().map(|e| e.name).collect();
     assert_eq!(
@@ -1333,6 +1435,14 @@ mod tests {
     #[test]
     fn a_well_behaved_container_satisfies_properties_one_to_thirteen() {
         assert_container_conforms(&FramedMockContainer, &framed_container_meta());
+    }
+
+    #[test]
+    fn crc16_arc_witness_matches_the_published_check_value() {
+        // Same external constant `legacy/crc.rs` pins its own, independent
+        // implementation to: the ASCII string "123456789" -> 0xBB3D, CRC-16/ARC's
+        // standard check value from the CRC RevEng catalogue.
+        assert_eq!(crc16_arc_witness(b"123456789"), 0xBB3D);
     }
 }
 
@@ -1960,7 +2070,19 @@ mod broken_containers {
             READ_ONLY_DOUBLE
         }
         fn caps(&self) -> ContainerCaps {
-            read_only_double_caps()
+            // NOT `read_only_double_caps()`: that declares `Always`, and
+            // wrong content under `Always`/`WhenPresent` is now property
+            // 10's job too, which runs BEFORE property 4 & 5 and would
+            // attribute this double's bug to itself instead — the exact
+            // false-pass trap property 10's own comment (in
+            // `assert_container_conforms_with`) warns about. `Structural`
+            // keeps this double isolated to the property it exists to prove:
+            // wrong content under the RIGHT name is a property 5 failure
+            // whether or not the format also happens to carry a CRC.
+            ContainerCaps {
+                detects_corruption: CorruptionDetection::Structural,
+                ..read_only_double_caps()
+            }
         }
         fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
             Ok(Box::new(CorruptsContentRead {
@@ -1984,6 +2106,122 @@ mod broken_containers {
         };
         assert_panics_naming_with(
             &CorruptsContent,
+            &read_only_meta(),
+            &fx,
+            "fixture property 5",
+        );
+    }
+
+    /// Property 10 (CRC-witness): right name, wrong bytes, on a container
+    /// that DECLARES per-entry integrity — exactly `CorruptsContent` above,
+    /// except this one claims `Always`/`WhenPresent` rather than
+    /// `Structural`, so it is property 10's own evidence gate that decides
+    /// which property catches it. Named for what it represents: a decoder
+    /// that runs straight past the point where a real per-entry CRC check
+    /// would have caught the corruption, and hands back the wrong bytes
+    /// anyway with no error at all.
+    struct DecodesPastItsCrc {
+        declares: CorruptionDetection,
+    }
+
+    struct DecodesPastItsCrcRead {
+        inner: Box<dyn ArchiveRead>,
+    }
+
+    impl ArchiveRead for DecodesPastItsCrcRead {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            let Some(mut entry) = self.inner.next_entry()? else {
+                return Ok(None);
+            };
+            let meta = entry.meta().clone();
+            let mut data = Vec::new();
+            entry.reader().read_to_end(&mut data)?;
+            // BUG: the fixture was never corrupted — this is the ordinary,
+            // clean read every OTHER property in this harness exercises —
+            // yet the last byte of every entry's payload comes back wrong,
+            // silently, as though nothing ever checked it against the
+            // archive's own recorded CRC.
+            match data.last_mut() {
+                Some(byte) => *byte ^= 0xFF,
+                None => data.push(0xFF),
+            }
+            Ok(Some(Entry::new(meta, Box::new(io::Cursor::new(data)))))
+        }
+        fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+            self.inner.by_index(index)
+        }
+        fn fidelity(&self) -> &FidelityReport {
+            self.inner.fidelity()
+        }
+    }
+
+    impl Container for DecodesPastItsCrc {
+        fn id(&self) -> FormatId {
+            READ_ONLY_DOUBLE
+        }
+        fn caps(&self) -> ContainerCaps {
+            ContainerCaps {
+                detects_corruption: self.declares,
+                ..read_only_double_caps()
+            }
+        }
+        fn open(&self, resolved: Resolved, o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
+            Ok(Box::new(DecodesPastItsCrcRead {
+                inner: FramedMockContainer.open(resolved, o)?,
+            }))
+        }
+        fn create(&self, _dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
+            Err(Error::Unsupported(
+                "decodes-past-its-crc cannot write".into(),
+            ))
+        }
+    }
+
+    #[test]
+    fn fixture_property_ten_catches_a_reader_that_decodes_past_its_crc() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(
+            &DecodesPastItsCrc {
+                declares: CorruptionDetection::Always,
+            },
+            &read_only_meta(),
+            &fx,
+            "fixture property 10",
+        );
+    }
+
+    /// The over-strictness half of property 10's evidence gate — the SAME
+    /// broken reader, declaring `Structural` rather than `Always`, must NOT
+    /// be caught by property 10. It is still wrong, though: property 5 (the
+    /// unconditional exact-content check, later in the same function) still
+    /// catches it, which is what proves this is a genuine SKIP and not a
+    /// double that stopped being broken. A double whose bug had no effect at
+    /// all on a clean read (the shape `a_container_declaring_no_corruption_-
+    /// detection_skips_property_seven` uses) cannot demonstrate that here:
+    /// property 10 and property 5 both inspect the same clean decode, so
+    /// nothing short of an actually-wrong decode distinguishes "skipped" from
+    /// "never ran because nothing is broken".
+    #[test]
+    fn a_container_declaring_structural_corruption_detection_skips_property_ten() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "hand-built in this test",
+        };
+        assert_panics_naming_with(
+            &DecodesPastItsCrc {
+                declares: CorruptionDetection::Structural,
+            },
             &read_only_meta(),
             &fx,
             "fixture property 5",

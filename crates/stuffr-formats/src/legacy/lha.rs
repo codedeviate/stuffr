@@ -388,6 +388,7 @@ impl Read for LhaEntryReader<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::crc::crc16_arc;
     use super::*;
     use stuffr_core::testing::{ContainerFixture, ExpectedEntry, assert_container_conforms_with};
     use stuffr_core::{CreateOpts, OpenOpts, PlainSink, ReaderSource, StreamPolicy};
@@ -414,26 +415,6 @@ mod tests {
                          an implementation independent of delharc; see \
                          fixtures/legacy/MANIFEST.md's `sample.lzh` entry",
         }
-    }
-
-    /// CRC-16/ARC, bit for bit the same table-driven algorithm as delharc's
-    /// own `crc::Crc16` (verified against it directly: this is the same
-    /// implementation used to build `sample.lzh` itself, cross-checked by
-    /// `delharc` decoding that fixture and by `lha t`/`lha v` — see
-    /// MANIFEST.md).
-    fn crc16_arc(data: &[u8]) -> u16 {
-        let mut crc: u16 = 0;
-        for &b in data {
-            crc ^= b as u16;
-            for _ in 0..8 {
-                if crc & 1 != 0 {
-                    crc = (crc >> 1) ^ 0xA001;
-                } else {
-                    crc >>= 1;
-                }
-            }
-        }
-        crc
     }
 
     /// Hand-builds a one-entry LHA level-1 archive with an arbitrary

@@ -11,5 +11,10 @@
 pub mod arj;
 #[cfg(feature = "compress")]
 pub mod compress_z;
+// ARC and ZOO (Phase 3c) will need this too; gated on `lha` alone for now
+// because `lha` is the only format that currently calls into it — widen the
+// `cfg` when ARC/ZOO land rather than gating on formats that do not use it.
+#[cfg(feature = "lha")]
+mod crc;
 #[cfg(feature = "lha")]
 pub mod lha;
