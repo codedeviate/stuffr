@@ -66,8 +66,7 @@ fuzz_target!(|data: &[u8]| {
                         // refuses — an unconditional panic, not an
                         // invariant.
                         let e = stuffr_core::Error::from_decode_io(e);
-                        check_error_is_classified(&e)
-                            .expect("decode-read error classification");
+                        check_error_is_classified(&e).expect("decode-read error classification");
                         break;
                     }
                 }

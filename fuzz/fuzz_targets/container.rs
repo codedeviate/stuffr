@@ -72,7 +72,8 @@ fn declared_zip_index(path: &Path) -> Option<usize> {
     // the collapsed count against itself and could never disagree — a
     // tautology. `entries` here is the archive's own un-collapsed claim.
     let entries = u16::from_le_bytes([tail[at + 10], tail[at + 11]]);
-    let cd_offset = u32::from_le_bytes([tail[at + 16], tail[at + 17], tail[at + 18], tail[at + 19]]);
+    let cd_offset =
+        u32::from_le_bytes([tail[at + 16], tail[at + 17], tail[at + 18], tail[at + 19]]);
     if entries == u16::MAX || cd_offset == u32::MAX {
         // zip64 escape hatch — out of scope here, see the doc comment.
         return None;

@@ -11,8 +11,9 @@ CARGO ?= cargo
 help:
 	@echo 'stuffr development targets:'
 	@echo '  make check    fmt, lint, test, release build — the full gate'
-	@echo '  make fmt      format the workspace'
+	@echo '  make fmt      format the workspace, and fuzz/ (excluded from it)'
 	@echo '  make lint     clippy, all targets and features, warnings denied'
+	@echo '                (the workspace, and fuzz/ --locked)'
 	@echo '  make test     full test suite with all features'
 	@echo '  make test-pure  the default (pure) tier, where no C backend wins'
 	@echo '  make release  optimised build, plus the no-default-features check'
@@ -26,14 +27,42 @@ help:
 check: fmt-check lint test test-pure release
 	@echo '✓ all gates passed'
 
+# `fuzz/` is `exclude`d from the workspace (see the root `Cargo.toml`), so a
+# `--workspace` command does not reach it — which left FOUR fuzz targets
+# unlinted, unformatted, and `fuzz/Cargo.lock` a version-bump site nothing in
+# the gate could see. All three symptoms have one cause and one fix: name the
+# manifest explicitly here, in both the format and the lint gates.
+#
+# **`--locked` is the part that closes the lockfile hole, and it is not
+# decoration.** `fuzz/Cargo.lock` pins `stuffr`/`stuffr-core`/`stuffr-formats`
+# by version, and nothing else in the gate builds the fuzz crate — so a bump
+# that edited the four `Cargo.toml` sites and forgot the lockfile used to stay
+# invisible until somebody ran `make fuzz`. Measured, by setting the lockfile
+# back to `0.4.1` and re-running this target: `error: the lock file
+# .../fuzz/Cargo.lock needs to be updated but --locked was passed to prevent
+# this`, exit 101. So the gate now fails the bump directly.
+#
+# Cheap, and it was already clean when it landed: clippy found zero warnings
+# across the four targets, rustfmt two wrapping violations (both fixed in the
+# same commit). This adds coverage, not a backlog.
+#
+# NOT folded into `[workspace] members` instead, which would close the same
+# three: that puts four libFuzzer-linked binaries into `cargo build --release
+# --workspace`, i.e. into `release` below, for no gain.
+#
+# CI needs no separate edit — its `gate` job runs `make check`, so both new
+# steps ride along.
 fmt:
 	$(CARGO) fmt --all
+	$(CARGO) fmt --manifest-path fuzz/Cargo.toml --all
 
 fmt-check:
 	$(CARGO) fmt --all --check
+	$(CARGO) fmt --manifest-path fuzz/Cargo.toml --all --check
 
 lint:
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+	$(CARGO) clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
 
 test:
 	$(CARGO) test --workspace --all-features
