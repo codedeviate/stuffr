@@ -21,6 +21,22 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # `make check`'s lint and fmt steps now reach `fuzz/` as well as the
+          # workspace, and `fuzz/` is `exclude`d from the workspace so it has
+          # its OWN `target/`. The default config caches only the workspace's,
+          # so without the second entry this job rebuilds `libfuzzer-sys` and
+          # the whole fuzz dependency tree from scratch on every run. The
+          # first entry is the default and must be restated: naming
+          # `workspaces` replaces the default rather than adding to it.
+          #
+          # This is the ONLY job that needs it — `msrv` and `c-backed` invoke
+          # `cargo` against the workspace directly, and the workspace excludes
+          # `fuzz/`. Verified by reading each job's own run steps, not assumed
+          # from the job names.
+          workspaces: |
+            . -> target
+            fuzz -> target
       # rust-toolchain.toml pins 1.95 for local development, and rustup
       # honours it for every `cargo` invocation regardless of which toolchain
       # actions/steps selected above — without removing it, this job's
