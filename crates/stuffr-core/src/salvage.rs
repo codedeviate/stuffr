@@ -31,12 +31,23 @@
 //!   entry the moment a real scanner carried a CRC-32.
 //! - **Detecting a shadowed record** (setting [`SalvagedEntry::shadows`]) is
 //!   generic too: [`annotate_candidates`] remembers the first candidate to
-//!   report each distinct [`Verifier`] value and marks any LATER candidate
-//!   reporting the identical value as shadowing it. This is a MEASUREMENT —
-//!   an equality check on [`Candidate::verifier`] — never an inference from
-//!   [`EntryMeta::name`] repeating: two different files that happen to share
-//!   a name must not be linked this way, only two records whose original
-//!   writer computed the same checksum for both.
+//!   report each distinct `(name, declared_len, verifier)` triple and marks
+//!   any LATER candidate reporting the identical triple as shadowing it.
+//!   This is a MEASUREMENT, never an inference from [`EntryMeta::name`]
+//!   alone repeating: two different files that happen to share a name must
+//!   not be linked this way, only two records whose original writer
+//!   computed the same checksum, over the same declared length, under the
+//!   same name. The checksum alone is not enough either — fixed after this
+//!   module's own fix-round review measured it against real archives: every
+//!   empty file and every directory entry in a zip has `Crc32(0)` — a
+//!   structural certainty for a zero-byte payload, not a collision — so a
+//!   checksum-only match reported an ordinary Python package's dozen
+//!   `__init__.py` files, and its directories, as duplicates of one another.
+//!   The degenerate case is refused outright rather than papered over by the
+//!   wider conjunction: a candidate with `declared_len == Some(0)` never
+//!   shadows and is never shadowed, because a checksum over zero bytes is
+//!   the same value for every empty entry that ever existed and proves
+//!   nothing about any of them being copies of each other.
 //!
 //! [`collect_candidates`] (the resync loop: find a candidate, bound its
 //! declared length, advance) and [`annotate_candidates`] (verify + shadow,
@@ -84,9 +95,31 @@ pub enum SalvageStatus {
     /// A checksum the original writer computed agrees.
     Intact,
     /// Every declared byte was present and the header self-verified, but the
-    /// format offers no way to prove the content.
+    /// format offers NO CHECKSUM AT ALL to prove the content — tar, cpio and
+    /// ar, in this project's own formats. Never the right answer for a
+    /// format that DOES carry one; see [`SalvageStatus::Unverified`] for
+    /// that case, which this status is not permitted to stand in for.
     Complete,
-    /// The payload ran out, or the decoder failed mid-stream.
+    /// Every declared byte was present, but this build could not decode the
+    /// payload to check the checksum the format DOES carry — an unsupported
+    /// compression method, most concretely an encrypted (AES, method 99)
+    /// zip entry this build cannot decrypt. Distinct from [`Self::Complete`]
+    /// ("the format offers no way to prove it") and from [`Self::Partial`]
+    /// ("this build tried and it disagreed, or ran out"): "the format CAN
+    /// prove it and this build did not even try" is a third, different
+    /// fact, and it is the one a user can act on (a rebuild, a different
+    /// feature set) where the other two are not. Reported for a found entry
+    /// using a method this build cannot decode — the exit-code table this
+    /// status exists to keep honest reserves exit 3 for exactly that case,
+    /// never exit 0, which is what reporting `Complete` for an undecodable
+    /// method would have routed it to.
+    Unverified,
+    /// The payload ran out, the decoder failed mid-stream, or the content
+    /// decoded whole and disagreed with the checksum the original writer
+    /// computed. All three are the same fact from a caller's perspective —
+    /// this build could not confirm the content is what was written — and
+    /// none of them is `Complete` (something WAS checked) or `Intact` (it
+    /// did not agree, or never finished).
     Partial,
 }
 
@@ -101,9 +134,11 @@ pub struct SalvagedEntry {
     pub offset: u64,
     pub meta: EntryMeta,
     pub status: SalvageStatus,
-    /// Set when this record's checksum matches an EARLIER record's — a
-    /// measurement, never inferred from a repeated name. `None` in this
-    /// task: nothing here compares checksums across entries yet.
+    /// Set when this record's `(name, declared_len, verifier)` all agree
+    /// with an EARLIER record's — a measurement, never inferred from a
+    /// repeated name alone, and never set for a degenerate zero-length
+    /// checksum (every empty file and every directory entry shares one).
+    /// See [`annotate_candidates`] for where this is computed.
     pub shadows: Option<usize>,
 }
 
@@ -239,22 +274,46 @@ pub fn annotate_candidates(
     candidates: Vec<Candidate>,
 ) -> Result<SalvageOutcome> {
     let mut entries = Vec::with_capacity(candidates.len());
-    // Earliest scan_position to report each distinct checksum seen so far —
-    // a candidate reporting one already in here is shadowing that position.
-    let mut seen: Vec<(Verifier, usize)> = Vec::new();
+    // Earliest scan_position to report each distinct (name, declared_len,
+    // verifier) triple seen so far — a candidate reporting one already in
+    // here is shadowing that position. A degenerate zero-length checksum
+    // (every empty file, every directory entry) is never pushed here and
+    // never looked up here — see `is_degenerate` below.
+    let mut seen: Vec<(String, Option<u64>, Verifier, usize)> = Vec::new();
 
     for (scan_position, candidate) in candidates.into_iter().enumerate() {
         let status = scan.verify(src, &candidate)?;
 
-        let shadows = candidate.verifier.and_then(|verifier| {
-            seen.iter()
-                .find(|&&(seen_verifier, _)| seen_verifier == verifier)
-                .map(|&(_, earlier_position)| earlier_position)
-        });
-        if let Some(verifier) = candidate.verifier
+        let declared_len = candidate.declared_len;
+        let verifier = candidate.verifier;
+        // A checksum over zero declared bytes is the same value for every
+        // empty entry that ever existed (CRC-32 and CRC-16/ARC of an empty
+        // input are both fixed constants) and proves nothing about any two
+        // of them being copies of each other — measured against a real
+        // archive during this task's fix round: every `__init__.py` and
+        // every directory entry collapsed onto one shadow chain under a
+        // checksum-only match.
+        let is_degenerate = declared_len == Some(0);
+
+        let shadows = if is_degenerate {
+            None
+        } else {
+            verifier.and_then(|v| {
+                seen.iter()
+                    .find(|&&(ref seen_name, seen_len, seen_verifier, _)| {
+                        seen_verifier == v
+                            && seen_len == declared_len
+                            && *seen_name == candidate.meta.name
+                    })
+                    .map(|&(_, _, _, earlier_position)| earlier_position)
+            })
+        };
+
+        if !is_degenerate
             && shadows.is_none()
+            && let Some(v) = verifier
         {
-            seen.push((verifier, scan_position));
+            seen.push((candidate.meta.name.clone(), declared_len, v, scan_position));
         }
 
         entries.push(SalvagedEntry {
@@ -410,9 +469,12 @@ mod tests {
     /// Reports a fixed, caller-scripted sequence of candidates and answers
     /// `verify` from the SAME script rather than decoding anything — this
     /// module's engine is proven against mocks, and verification/shadow
-    /// detection are no exception.
+    /// detection are no exception. Each entry names its own `name` and
+    /// `declared_len` (rather than a fixed, offset-derived name) so a test
+    /// can freely vary any one of the three fields shadow detection now
+    /// requires to agree.
     struct ScriptedCandidates {
-        plan: Vec<(Option<Verifier>, SalvageStatus)>,
+        plan: Vec<(&'static str, Option<u64>, Option<Verifier>, SalvageStatus)>,
         next: usize,
     }
 
@@ -426,18 +488,18 @@ mod tests {
                 return Ok(None);
             }
             let offset = self.next as u64;
-            let (verifier, _) = self.plan[self.next];
+            let (name, declared_len, verifier, _) = self.plan[self.next];
             self.next += 1;
             Ok(Some(Candidate {
                 offset,
-                meta: EntryMeta::file(format!("entry-{offset}")),
-                declared_len: Some(1),
+                meta: EntryMeta::file(name),
+                declared_len,
                 verifier,
             }))
         }
 
         fn verify(&self, _src: &mut dyn SeekRead, candidate: &Candidate) -> Result<SalvageStatus> {
-            Ok(self.plan[candidate.offset as usize].1)
+            Ok(self.plan[candidate.offset as usize].3)
         }
     }
 
@@ -448,9 +510,19 @@ mod tests {
     fn verify_decides_each_entrys_status_not_a_hardcoded_default() {
         let mut scan = ScriptedCandidates {
             plan: vec![
-                (Some(Verifier::Crc32(1)), SalvageStatus::Intact),
-                (None, SalvageStatus::Complete),
-                (Some(Verifier::Crc32(2)), SalvageStatus::Partial),
+                (
+                    "a",
+                    Some(1),
+                    Some(Verifier::Crc32(1)),
+                    SalvageStatus::Intact,
+                ),
+                ("b", Some(1), None, SalvageStatus::Complete),
+                (
+                    "c",
+                    Some(1),
+                    Some(Verifier::Crc32(2)),
+                    SalvageStatus::Partial,
+                ),
             ],
             next: 0,
         };
@@ -461,17 +533,31 @@ mod tests {
         assert_eq!(out.entries[2].status, SalvageStatus::Partial);
     }
 
-    /// A later candidate reporting the SAME verifier as an earlier one is
-    /// its shadow — pointing at the earliest position, not merely "some"
-    /// earlier one — and this is a checksum equality, never anything to do
-    /// with `meta.name`, which `ScriptedCandidates` does not even vary here.
+    /// A later candidate reporting the SAME name, declared_len AND verifier
+    /// as an earlier one is its shadow — pointing at the earliest position,
+    /// not merely "some" earlier one.
     #[test]
     fn a_later_candidate_sharing_an_earlier_verifier_is_marked_as_its_shadow() {
         let mut scan = ScriptedCandidates {
             plan: vec![
-                (Some(Verifier::Crc32(7)), SalvageStatus::Intact),
-                (Some(Verifier::Crc32(9)), SalvageStatus::Intact),
-                (Some(Verifier::Crc32(7)), SalvageStatus::Intact),
+                (
+                    "dup",
+                    Some(1),
+                    Some(Verifier::Crc32(7)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "other",
+                    Some(1),
+                    Some(Verifier::Crc32(9)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "dup",
+                    Some(1),
+                    Some(Verifier::Crc32(7)),
+                    SalvageStatus::Intact,
+                ),
             ],
             next: 0,
         };
@@ -493,8 +579,8 @@ mod tests {
     fn candidates_with_no_verifier_never_shadow_each_other() {
         let mut scan = ScriptedCandidates {
             plan: vec![
-                (None, SalvageStatus::Complete),
-                (None, SalvageStatus::Complete),
+                ("a", Some(1), None, SalvageStatus::Complete),
+                ("a", Some(1), None, SalvageStatus::Complete),
             ],
             next: 0,
         };
@@ -502,5 +588,68 @@ mod tests {
             .expect("scripted candidates must annotate cleanly");
         assert_eq!(out.entries[0].shadows, None);
         assert_eq!(out.entries[1].shadows, None);
+    }
+
+    /// Two candidates whose checksum AND declared_len agree but whose NAME
+    /// differs must never be linked — the fix-round requirement that a
+    /// checksum match alone is not enough, only the full
+    /// `(name, declared_len, verifier)` triple.
+    #[test]
+    fn a_matching_verifier_under_a_different_name_is_never_marked_as_a_shadow() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (
+                    "one.txt",
+                    Some(4),
+                    Some(Verifier::Crc32(42)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "two.txt",
+                    Some(4),
+                    Some(Verifier::Crc32(42)),
+                    SalvageStatus::Intact,
+                ),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(
+            out.entries[1].shadows, None,
+            "same checksum, different name — not a shadow"
+        );
+    }
+
+    /// The degenerate case: every empty entry (and, in zip, every directory
+    /// entry) checksums to the same fixed constant over zero declared
+    /// bytes. Even under the SAME name, a zero-length checksum must never
+    /// mark a shadow — the value proves nothing, unlike a real collision.
+    #[test]
+    fn a_zero_length_declared_verifier_never_shadows_even_under_a_matching_name() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (
+                    "empty.txt",
+                    Some(0),
+                    Some(Verifier::Crc32(0)),
+                    SalvageStatus::Complete,
+                ),
+                (
+                    "empty.txt",
+                    Some(0),
+                    Some(Verifier::Crc32(0)),
+                    SalvageStatus::Complete,
+                ),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries[0].shadows, None);
+        assert_eq!(
+            out.entries[1].shadows, None,
+            "a zero-byte checksum must never mark a shadow, even under an identical name"
+        );
     }
 }

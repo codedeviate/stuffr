@@ -32,12 +32,18 @@
 //!    note gives: the day a length is read some other way, the ceiling is
 //!    already in place.
 //! 5. The name decodes as UTF-8 — strictly, not the lossy fallback
-//!    `zip.rs`'s central-directory walk uses for the same field. That walk
-//!    starts from an EOCD-anchored offset, where a signature match is
-//!    already high-confidence and an unreadable name is still a name worth
-//!    reporting. A raw byte-level match here carries none of that
-//!    confidence yet, so an undecodable name is treated as the coincidence
-//!    it almost certainly is, rather than forced through lossily.
+//!    `zip.rs`'s central-directory walk uses for the same field. This is
+//!    NOT about how much confidence a signature match carries here versus
+//!    there — it is that CP437 (the pre-EFS encoding a lossy decode would
+//!    accept) maps every one of the 256 byte values to *something*, so a
+//!    lossy decode excludes NOTHING and would gut this one check, the whole
+//!    line of defence between a real header and four coincidental magic
+//!    bytes. Strict UTF-8 is a real filter — most random byte sequences are
+//!    not valid UTF-8; lossy CP437 is not a filter at all. The cost is a
+//!    genuine CP437-named entry from a pre-EFS writer being rejected HERE —
+//!    closed by reconciling against the central directory instead, which
+//!    carries no such restriction (see "Central-directory reconciliation"
+//!    below), never by weakening this gate.
 //! 6. `local_header_offset + declared_len` fits inside the source. Nothing
 //!    is ever sized or allocated from `declared_len` to reach this check —
 //!    it is pure arithmetic against the source's own length.
@@ -81,30 +87,51 @@
 //!   already makes, used directly here because the entries this module
 //!   exists to recover (a shadowed record, a CP437-named one) are precisely
 //!   the ones the `zip` crate's own indexed reader cannot reach at all.
-//! - **Anything else**: `Complete`. This build's zip codec registers more
-//!   methods than this verifier decodes; a candidate using one is still
-//!   correctly discovered and bounded, it is simply not checked against its
-//!   CRC-32 today — a narrower scope than "every zip method", recorded here
-//!   rather than silently assumed away.
+//! - **Anything else**: [`SalvageStatus::Unverified`]. This build's zip
+//!   codec registers more methods than this verifier decodes (method 99,
+//!   AES, is the sharpest instance — an entry salvage cannot decrypt); a
+//!   candidate using one is still correctly discovered and bounded, but its
+//!   CRC-32 is simply not checked. `Unverified`, never `Complete`: the
+//!   format DOES carry a checksum here, this build only failed to check it,
+//!   and `Complete` is reserved for a format with no checksum to offer at
+//!   all (see `SalvageStatus`'s own doc comment for why the two must not
+//!   share a word).
+//!
+//! Both decode branches are STREAMED, never buffered: `verify_candidate`
+//! reads through a fixed-size window, updating a running CRC-32 and a
+//! decoded-byte count, and materialises neither a compressed nor a
+//! decompressed copy of the payload. This closes a real allocation defect a
+//! fix-round review measured: buffering `DeflateDecoder::read_to_end`
+//! reached a 64 MiB decode from a 65 KB archive with `--max-entry` set to
+//! 1 MiB — `max_entry` bounds the DECLARED COMPRESSED length only
+//! ([`stuffr_core::salvage::collect_candidates`]'s job), and deflate's
+//! ~1032:1 worst-case ratio means the 4 GiB default admits a multi-terabyte
+//! decode buffer, in the one verb this project builds specifically to run
+//! on hostile input. The Deflate branch additionally stops the moment
+//! decoded bytes exceed the local header's OWN declared `uncompressed_size`
+//! — a second, independent bound (on output, not input) that a buffered
+//! `read_to_end` had no way to apply, since nothing consulted that field at
+//! all before this fix.
 //!
 //! Fewer than the declared number of bytes actually present (a short read at
-//! any point) is `Partial` immediately, before any decode is attempted — the
+//! any point) is `Partial` immediately, before verification concludes — the
 //! "payload ran out" half of [`SalvageStatus::Partial`]'s definition. A full
 //! decode that disagrees with the declared CRC-32 is ALSO `Partial`, not a
-//! fourth status: [`stuffr_core::salvage`]'s three tiers are deliberately
+//! fourth status: [`stuffr_core::salvage`]'s tiers are deliberately
 //! exhaustive, and a checksum that was checked and failed is exactly as
 //! unproven as a decode that failed outright — neither `Intact` (the
 //! checksum did not agree) nor `Complete` (something WAS checked, and it did
-//! not hold).
+//! not hold) nor `Unverified` (something WAS attempted, unlike an
+//! undecodable method).
 //!
 //! # Central-directory reconciliation (ruling R-H)
 //!
-//! The raw scan's strict UTF-8 name gate (this module's own
-//! [`read_candidate_at`]) rejects a legitimate CP437-named entry from a
-//! pre-EFS writer — deliberately, per the earlier section above arguing why
-//! the gate stays strict. That gate has nowhere to fall back to on its own,
-//! so [`salvage_zip`] is the actual safety net ruling R-H requires: it runs
-//! the raw scan, then walks the central directory
+//! The raw scan's strict UTF-8 name gate (criterion 5 above) rejects a
+//! legitimate CP437-named entry from a pre-EFS writer — deliberately: see
+//! that criterion for why the gate stays strict rather than accepting a
+//! lossy decode. That gate has nowhere to fall back to on its own, so
+//! [`salvage_zip`] is the actual safety net ruling R-H requires: it runs the
+//! raw scan, then walks the central directory
 //! ([`crate::zip::walk_central_directory`]) when one is intact, and for
 //! every central-directory record whose `local_header_offset` the scan did
 //! NOT already find — a name the scan's UTF-8 gate rejected, or a length the
@@ -114,14 +141,11 @@
 //! already past `zip.rs`'s own record-level checks) rather than re-deriving
 //! them from the raw header.
 //!
-//! This is the argument the earlier section's doc does not make: the reason
-//! a CP437 name is not lost is NOT "the scan carries less confidence than
-//! the index" — it is that **the central-directory path has no UTF-8
-//! restriction at all**, and reconciling the two sources means a name only
-//! the scan can see (behind a destroyed central directory) and a name only
-//! the central directory can see (behind the scan's UTF-8 gate) both
-//! survive. Only an archive with BOTH a destroyed central directory AND a
-//! non-UTF-8 name loses that entry — proven by
+//! Reconciling the two sources means a name only the scan can see (behind a
+//! destroyed central directory) and a name only the central directory can
+//! see (behind the scan's UTF-8 gate) both survive. Only an archive with
+//! BOTH a destroyed central directory AND a non-UTF-8 name loses that entry
+//! — proven by
 //! `a_non_utf8_name_the_scan_rejects_is_still_recovered_through_the_central_directory`
 //! below, whose falsification (skip the central-directory fallback) is
 //! recorded in the task report.
@@ -377,16 +401,30 @@ fn skip_forward(src: &mut dyn SeekRead, n: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Bytes read per verification chunk. Fixed and small so a candidate's
+/// declared length — up to `policy.max_entry`, 4 GiB by default — never
+/// determines how much memory verification uses: both decode branches below
+/// stream through a window this size and discard it once hashed, never
+/// materialising a whole compressed or decompressed copy of the payload.
+/// See the module doc's "Verification" section for the allocation defect
+/// this closes.
+const VERIFY_CHUNK: usize = 64 * 1024;
+
 /// Decides [`SalvageStatus`] for one candidate by re-reading the local
 /// header at its own `offset` — see this module's doc comment for why that
 /// works identically for a scan-found or a central-directory-recovered
-/// candidate — then decoding its declared payload and comparing it against
-/// [`Candidate::verifier`].
+/// candidate — then STREAMING its declared payload through the matching
+/// decoder and comparing a running CRC-32 against [`Candidate::verifier`].
 ///
-/// Never returns `Err` for malformed or truncated input: a read or decode
-/// failure here is exactly what [`SalvageStatus::Partial`] means, not a hard
-/// error. An `Err` only propagates from a genuine device-level I/O failure
-/// on `src` itself, never from data this function merely dislikes.
+/// Never returns `Err` for malformed, truncated OR genuinely I/O-failing
+/// input: every failure here — a bad checksum, a short read, a real device
+/// error partway through a payload — is folded into [`SalvageStatus::Partial`]
+/// alike. That is a deliberate choice, not an oversight: salvage exists to
+/// recover as much of a large, possibly damaged archive as it can, and a
+/// verb that aborted the ENTIRE run over one bad sector on one entry would
+/// be worse than marking that one entry `Partial` and continuing. A
+/// bubbled-up `Err` here would do exactly that, upstream in
+/// `stuffr_core::salvage::annotate_candidates`'s `?`.
 fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<SalvageStatus> {
     let Some(declared_len) = candidate.declared_len else {
         // A data-descriptor entry: no declared length, no verifier (see the
@@ -410,6 +448,9 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         return Ok(SalvageStatus::Partial);
     }
     let method = u16::from_le_bytes([fixed[8], fixed[9]]);
+    let uncompressed_size = u64::from(u32::from_le_bytes([
+        fixed[22], fixed[23], fixed[24], fixed[25],
+    ]));
     let name_len = u16::from_le_bytes([fixed[26], fixed[27]]);
     let extra_len = u16::from_le_bytes([fixed[28], fixed[29]]);
     let payload_start = candidate
@@ -421,51 +462,84 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         return Ok(SalvageStatus::Partial);
     }
 
-    let mut compressed = Vec::new();
-    if src.take(declared_len).read_to_end(&mut compressed).is_err() {
-        return Ok(SalvageStatus::Partial);
-    }
-    if compressed.len() as u64 != declared_len {
-        // Fewer bytes than this candidate's own header declared were
-        // actually present — the payload ran out before the header said it
-        // would, the first half of `SalvageStatus::Partial`'s definition.
-        return Ok(SalvageStatus::Partial);
-    }
+    // Bounds the COMPRESSED side: neither decode branch below can read past
+    // `declared_len` bytes of input, however the OUTPUT side is bounded
+    // (Stored has none to speak of; Deflate is bounded separately, below,
+    // by the header's own `uncompressed_size`).
+    let bounded = src.take(declared_len);
 
-    let decoded = match method {
-        // Stored: the payload IS the uncompressed bytes.
-        0 => compressed,
+    Ok(match method {
+        // Stored: the payload IS the uncompressed bytes — stream it
+        // straight through the hash, no decoder involved.
+        0 => stream_verify(bounded, declared_len, expected),
         // Deflate: `flate2::read::DeflateDecoder`, the same backend
         // `deflate.rs` already depends on for this exact format — see the
-        // module doc's "verification" section for why this is not a new
-        // decompression stack.
-        8 => {
-            let mut out = Vec::new();
-            if flate2::read::DeflateDecoder::new(compressed.as_slice())
-                .read_to_end(&mut out)
-                .is_err()
-            {
-                // The deflate stream itself ran out or was malformed before
-                // producing all its bytes — "the decoder failed mid-stream",
-                // the second half of `SalvageStatus::Partial`'s definition.
-                return Ok(SalvageStatus::Partial);
-            }
-            out
-        }
-        // A method this verifier does not decode — see the module doc.
-        // The declared bytes are confirmed present (above); their content is
-        // simply not checked by this build.
-        _ => return Ok(SalvageStatus::Complete),
-    };
+        // module doc's "Verification" section for why streaming this way is
+        // not a new decompression stack, and for the allocation defect a
+        // buffered version of this had.
+        8 => stream_verify(
+            flate2::read::DeflateDecoder::new(bounded),
+            uncompressed_size,
+            expected,
+        ),
+        // A method this verifier does not decode — see the module doc. The
+        // declared bytes are confirmed present above; the format DOES carry
+        // a checksum here, this build simply did not check it, which is
+        // exactly what `Unverified` (as opposed to `Complete`) says.
+        _ => SalvageStatus::Unverified,
+    })
+}
 
-    if crc32_ieee(&decoded) == expected {
-        Ok(SalvageStatus::Intact)
+/// Streams `reader` to completion, hashing as it goes and never
+/// materialising a buffer: `expected_len` is the exact byte count `reader`
+/// must produce (the raw payload length for Stored, the header's own
+/// `uncompressed_size` for Deflate — [`verify_candidate`] passes the right
+/// one for its method). Exceeding it stops immediately rather than reading
+/// further — the bound that closes an unbounded decompression bomb, since
+/// nothing else on the OUTPUT side would otherwise stop a small compressed
+/// input expanding far past what its own header claims.
+fn stream_verify(mut reader: impl Read, expected_len: u64, expected_crc: u32) -> SalvageStatus {
+    let mut crc_state: u32 = 0xFFFF_FFFF;
+    let mut produced: u64 = 0;
+    let mut buf = [0u8; VERIFY_CHUNK];
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            // A short/failing read partway through — "the payload ran out,
+            // or the decoder failed mid-stream", `SalvageStatus::Partial`'s
+            // own words. Covers a malformed deflate stream, a source that
+            // ran out before `declared_len`, and a genuine I/O error alike
+            // (see `verify_candidate`'s doc for why the last of those is
+            // deliberate).
+            Err(_) => return SalvageStatus::Partial,
+        };
+        produced += n as u64;
+        if produced > expected_len {
+            // Produced more than the header's own declared size — refuse to
+            // keep decoding rather than trusting the decoder to stop on its
+            // own; this is the bound against a small input that legitimately
+            // (or maliciously) expands far past its own declared size.
+            return SalvageStatus::Partial;
+        }
+        crc_state = crc32_ieee_update(crc_state, &buf[..n]);
+    }
+
+    if produced != expected_len {
+        // Fewer bytes than declared were actually produced — the payload
+        // ran out before the header said it would.
+        return SalvageStatus::Partial;
+    }
+
+    if !crc_state == expected_crc {
+        SalvageStatus::Intact
     } else {
         // Every declared byte decoded, but the result does not match the
         // checksum the original writer computed — not proven whole, so
         // `Partial`, never `Complete` (which would claim nothing had been
         // checked at all) and never `Intact`.
-        Ok(SalvageStatus::Partial)
+        SalvageStatus::Partial
     }
 }
 
@@ -483,8 +557,24 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 /// from `legacy/arj.rs` directly: that module is feature-gated behind
 /// `arj`/`arc`/`zoo`/`lha`, none of which `zip` implies, so a `zip`-only
 /// build must not depend on it.
+///
+/// `#[cfg(test)]`: production verification calls the incremental
+/// [`crc32_ieee_update`] directly (see [`stream_verify`]) and never needs a
+/// whole-buffer convenience wrapper; this exists to pin the algorithm
+/// against its published check value in one place, no different from
+/// `legacy/arj.rs`'s own copy.
+#[cfg(test)]
 fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
+    !crc32_ieee_update(0xFFFF_FFFF, data)
+}
+
+/// The same CRC, resumed from a running (not-yet-finalized) state — the
+/// state `stream_verify` threads across chunks so hashing a payload never
+/// needs it whole in memory at once. `crc32_ieee(data)` is exactly
+/// `!crc32_ieee_update(0xFFFF_FFFF, data)`; the two are proven identical
+/// across a chunked split by `resuming_a_crc_matches_hashing_it_whole`.
+fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
+    let mut crc = crc;
     for &b in data {
         crc ^= u32::from(b);
         for _ in 0..8 {
@@ -492,7 +582,7 @@ fn crc32_ieee(data: &[u8]) -> u32 {
             crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
         }
     }
-    !crc
+    crc
 }
 
 /// A `Sized` `Read + Seek` wrapper around a `&mut dyn SeekRead`, needed
@@ -525,18 +615,25 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     let mut candidates = collect_candidates(&mut scanner, src, policy)?;
 
     if let Some(cd_records) = crate::zip::walk_central_directory(&mut SeekReadRef(&mut *src)) {
-        let found_offsets: std::collections::HashSet<u64> =
+        let mut found_offsets: std::collections::HashSet<u64> =
             candidates.iter().map(|c| c.offset).collect();
 
         for record in &cd_records {
             if found_offsets.contains(&record.local_header_offset) {
-                // Already recovered by the scan — the scan's own candidate
-                // is authoritative (it read the name straight off the local
-                // header, rather than through the central directory's lossy
-                // decode).
+                // Already recovered — either by the scan (whose own
+                // candidate is authoritative: it read the name straight off
+                // the local header, rather than through the central
+                // directory's lossy decode) or by an EARLIER central-
+                // directory record in this same loop that already claimed
+                // this offset. Without tracking the latter, two CD records
+                // sharing a `local_header_offset` would each independently
+                // pass this check and manufacture a second, phantom
+                // candidate at a real header's offset — measured during
+                // this task's fix round.
                 continue;
             }
             if let Some(candidate) = candidate_from_cd_record(src, record, policy)? {
+                found_offsets.insert(candidate.offset);
                 candidates.push(candidate);
             }
         }
@@ -1075,6 +1172,43 @@ mod tests {
         );
     }
 
+    /// REQUIRED 1/2 (fix round 1): a local header whose OWN
+    /// `uncompressed_size` field understates what its compressed payload
+    /// would actually decode to (a corrupt or hostile header — untouched
+    /// here is `compressed_size`/CRC/payload bytes, only the declared
+    /// output size is dropped) must be `Partial`, never `Intact`. This pins
+    /// the OUTCOME of `stream_verify`'s output-side bound; the bound's
+    /// actual EARLY-STOP behaviour (never decoding past the declared size at
+    /// all, rather than decoding everything and comparing counts after) is
+    /// a memory-safety property this fast unit test cannot distinguish from
+    /// "decoded fully, then noticed the mismatch" — proven instead by direct
+    /// reproduction against the fix-round review's own measurement (a 65 KB
+    /// archive, highly compressible, driving a 64 MiB / `67_108_864`-byte
+    /// decode with the PRE-fix buffered code and `--max-entry` set to
+    /// 1 MiB — `max_entry` only ever bounded the DECLARED COMPRESSED
+    /// length, never the decoder's output), recorded in the task report
+    /// with the exact matching byte count.
+    #[test]
+    fn a_declared_uncompressed_size_understating_the_real_output_is_partial() {
+        // Large and highly compressible, so decoding it in full (which the
+        // pre-fix code did) is measurably different from stopping early.
+        let payload = vec![b'x'; 200_000];
+        let (mut bytes, _span) = build_deflated_single_entry_zip("big.bin", &payload);
+        // The local header's `uncompressed_size` field sits at offset 22..26
+        // (see `read_candidate_at`'s own field layout) — understate it far
+        // below what decoding the payload would really produce.
+        bytes[22..26].copy_from_slice(&10u32.to_le_bytes());
+
+        let out = salvage(&bytes);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(
+            out.entries[0].status,
+            SalvageStatus::Partial,
+            "decoded output exceeding the header's own declared uncompressed_size must stop \
+             and report Partial, never Intact or Complete"
+        );
+    }
+
     /// Task 4's third required test, verbatim from the brief. Note it
     /// asserts `Intact`, not a damage status: the two extra physical records
     /// in `build_shadowing_zip` are byte-identical copies of real data —
@@ -1208,6 +1342,70 @@ mod tests {
         );
     }
 
+    /// F7 (fix round 1): two central-directory records sharing a single
+    /// `local_header_offset` must not manufacture a second, phantom
+    /// candidate at a real header's offset. Both entries here are given
+    /// non-UTF-8 names (the same CP437 patching technique as the test
+    /// above) so BOTH are only reachable through the central-directory
+    /// fallback, forcing them through the exact loop the bug lived in
+    /// (`found_offsets` computed once before the loop, never updated as CD-
+    /// derived candidates were pushed). After building, the SECOND record's
+    /// `local_header_offset` field is overwritten to equal the first's —
+    /// simulating a central directory that lies about entry count, or is
+    /// simply corrupt in that one field.
+    #[test]
+    fn two_central_directory_records_sharing_a_local_header_offset_do_not_invent_a_phantom_entry() {
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            w.start_file("aa", opts).expect("start_file aa");
+            w.write_all(b"first").expect("write aa");
+            w.start_file("bb", opts).expect("start_file bb");
+            w.write_all(b"second").expect("write bb");
+            w.finish().expect("finish");
+        }
+        let mut bytes = cursor.into_inner();
+
+        // Patch every occurrence of `aa`/`bb` (local header + CD record,
+        // two each) to invalid UTF-8, same length — both entries now miss
+        // the raw scan entirely and can only be recovered through the
+        // central directory.
+        let mut at = 0usize;
+        while at + 2 <= bytes.len() {
+            if bytes[at..at + 2] == *b"aa" {
+                bytes[at..at + 2].copy_from_slice(&[0x80, 0x80]);
+                at += 2;
+            } else if bytes[at..at + 2] == *b"bb" {
+                bytes[at..at + 2].copy_from_slice(&[0x81, 0x81]);
+                at += 2;
+            } else {
+                at += 1;
+            }
+        }
+
+        let records = crate::zip::walk_central_directory(&mut Cursor::new(&bytes))
+            .expect("central directory must still walk (lossy name decode has no restriction)");
+        assert_eq!(records.len(), 2, "sanity: both records present");
+        let first_local_header_offset = records[0].local_header_offset;
+        let second_record_cd_offset = records[1].offset as usize;
+        // `local_header_offset` sits 42 bytes into a central-directory
+        // record's content (4-byte signature + `zip.rs`'s own
+        // `CENTRAL_HEADER_FIXED` layout, `le32(&fixed[38..])`) — same
+        // constant `crate::zip`'s own `cd_record_span` test helper uses.
+        bytes[second_record_cd_offset + 42..second_record_cd_offset + 46]
+            .copy_from_slice(&(first_local_header_offset as u32).to_le_bytes());
+
+        let out = salvage(&bytes);
+        assert_eq!(
+            out.entries.len(),
+            1,
+            "two CD records sharing one local_header_offset must recover ONE entry, not \
+             manufacture a phantom second one at the same offset"
+        );
+    }
+
     /// [`ZipSalvage::verify`] on a data-descriptor candidate (no declared
     /// length, no verifier — see the module's own "general-purpose bit 3"
     /// section) must answer `Complete`, never `Intact` (nothing was
@@ -1236,5 +1434,163 @@ mod tests {
     #[test]
     fn crc32_ieee_matches_the_standard_check_value() {
         assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// The incremental form must be indistinguishable from hashing the whole
+    /// run at once — `stream_verify` depends on this to hash a payload
+    /// chunk-by-chunk without ever holding it whole. Same reasoning
+    /// `legacy/crc.rs`'s own `resuming_a_crc_matches_hashing_the_whole_run`
+    /// gives for CRC-16/ARC, checked here for CRC-32/ISO-HDLC.
+    #[test]
+    fn resuming_a_crc_matches_hashing_it_whole() {
+        let data = b"123456789";
+        for split in 0..=data.len() {
+            let (a, b) = data.split_at(split);
+            let resumed = !crc32_ieee_update(crc32_ieee_update(0xFFFF_FFFF, a), b);
+            assert_eq!(resumed, crc32_ieee(data), "split at {split}");
+        }
+    }
+
+    /// REQUIRED 3 (fix round 1): the CRC check that decides `Intact` was
+    /// unpinned — `an_entry_whose_crc_agrees_is_intact` stayed green with
+    /// the comparison replaced by `true`, and separately with the deflate
+    /// decode-error branch neutered, because both of those defects are
+    /// masked by a Deflate entry's OWN decode succeeding or failing for
+    /// unrelated reasons. A **Stored** entry has no decoder to fail at all —
+    /// only the CRC-32 comparison can catch a corrupted payload — so one
+    /// flipped payload byte here, with the declared CRC and every size left
+    /// untouched, pins the comparison itself. This is also exactly the
+    /// spec's own named evidence-catalogue mutation, "a corrupted CRC".
+    #[test]
+    fn an_entry_whose_payload_byte_is_flipped_is_partial() {
+        let bytes = crate::zip::build_shadowing_zip();
+        let mut corrupted = bytes.clone();
+        // `one.txt`'s local header starts at offset 0 (see
+        // `a_candidate_carries_its_offset_name_and_crc32_verifier` above);
+        // its payload begins right after the 30-byte fixed header and its
+        // 7-byte name (`b"one.txt"`), with no extra field (Stored, built via
+        // a `Cursor`, per `build_shadowing_zip`'s own doc comment).
+        let payload_start = LOCAL_HEADER_TOTAL as usize + "one.txt".len();
+        corrupted[payload_start] ^= 0xFF;
+
+        let out = salvage(&corrupted);
+        assert_eq!(out.entries[0].meta.name, "one.txt");
+        assert_eq!(
+            out.entries[0].status,
+            SalvageStatus::Partial,
+            "a Stored entry's only proof is its CRC-32; a flipped payload byte must not pass"
+        );
+    }
+
+    // Falsification of REQUIRED 3, exactly as directed: replace the CRC
+    // comparison with `true` and confirm the new test above (which the
+    // unmodified suite passes) now fails, where the pre-fix suite stayed
+    // green at 20 passed under the identical edit. Not run automatically —
+    // recorded in the task report with the quoted failing output; this
+    // comment is the pointer to where in the file that edit lands
+    // (`stream_verify`'s `if !crc_state == expected_crc`).
+
+    /// A recognised-but-undecodable method (14 here — LZMA, which
+    /// `is_known_method` accepts but this build's zip decoder path does not)
+    /// must verify `Unverified`, never `Complete`: the format DOES carry a
+    /// checksum for this entry, this build simply did not check it. Method
+    /// 99 (AES) is the sharpest real instance the fix-round review named —
+    /// this pins the general mechanism on a method that needs no encrypted
+    /// fixture to construct.
+    #[test]
+    fn an_undecodable_but_recognised_method_verifies_as_unverified() {
+        let bytes = minimal_local_header(20, 14, "encrypted.bin", b"whatever this is");
+        let mut scan = ZipSalvage::new();
+        let candidate = scan
+            .next_candidate(&mut Cursor::new(bytes.clone()), 0)
+            .unwrap()
+            .expect("a well-formed header with a recognised method must be found");
+        let status = scan
+            .verify(&mut Cursor::new(bytes), &candidate)
+            .expect("verify never hard-errors");
+        assert_eq!(status, SalvageStatus::Unverified);
+    }
+
+    /// REQUIRED 6 (fix round 1), end-to-end: an archive shaped like an
+    /// ordinary Python package — two DIFFERENT empty files under different
+    /// names, plus a directory entry — must report no shadow links at all.
+    /// Every one of the three carries `Crc32(0)` (the fixed checksum of zero
+    /// bytes), which a checksum-only match previously collapsed onto a
+    /// single shadow chain — measured by the fix-round review against a
+    /// real archive shaped exactly like this one.
+    #[test]
+    fn empty_files_and_directories_are_never_marked_as_shadowing_each_other() {
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            w.start_file("pkg/__init__.py", opts).expect("start_file 1");
+            w.start_file("sub/__init__.py", opts).expect("start_file 2");
+            w.add_directory("adir/", opts).expect("add_directory");
+            w.finish().expect("finish");
+        }
+        let bytes = cursor.into_inner();
+
+        let out = salvage(&bytes);
+        assert_eq!(out.entries.len(), 3, "sanity: all three entries recovered");
+        for entry in &out.entries {
+            assert_eq!(
+                entry.shadows, None,
+                "entry `{}` must not be marked as shadowing anything: every empty/directory \
+                 entry shares the same zero-byte CRC-32 by construction, not by collision",
+                entry.meta.name
+            );
+        }
+    }
+
+    /// The sharper form of the same requirement: two empty files sharing
+    /// the SAME name, same declared_len (0) and same verifier (`Crc32(0)`)
+    /// — where the `(name, declared_len, verifier)` conjunction alone
+    /// WOULD match, unlike the different-named entries above. Only the
+    /// explicit zero-length rejection stops these from shadowing each
+    /// other; this is what actually falsifies if that rejection is removed
+    /// (see the task report). The `zip` crate's writer refuses two
+    /// `start_file` calls under an identical name, so this writes two
+    /// equal-length distinct names and patches the second down to the
+    /// first afterward, exactly as
+    /// `two_different_files_sharing_a_name_are_never_marked_as_shadowing_each_other`
+    /// does above.
+    #[test]
+    fn two_empty_files_sharing_a_name_are_never_marked_as_shadowing_each_other() {
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            w.start_file("same1.txt", opts).expect("start_file 1");
+            w.start_file("same2.txt", opts).expect("start_file 2");
+            w.finish().expect("finish");
+        }
+        let mut bytes = cursor.into_inner();
+
+        let mut patched = 0usize;
+        let mut at = 0usize;
+        while at + 9 <= bytes.len() {
+            if bytes[at..at + 9] == *b"same2.txt" {
+                bytes[at..at + 9].copy_from_slice(b"same1.txt");
+                patched += 1;
+                at += 9;
+            } else {
+                at += 1;
+            }
+        }
+        assert_eq!(
+            patched, 2,
+            "expected the second entry's local header and CD record names"
+        );
+
+        let out = salvage(&bytes);
+        assert_eq!(out.entries.len(), 2, "sanity: both empty entries recovered");
+        assert_eq!(
+            out.entries[1].shadows, None,
+            "two zero-byte entries sharing a name must not shadow each other — a checksum of \
+             zero bytes proves nothing, even under a matching name and length"
+        );
     }
 }
