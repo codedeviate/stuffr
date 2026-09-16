@@ -52,6 +52,8 @@ pub mod xz_c;
 pub mod xz_pure;
 #[cfg(feature = "zip")]
 pub mod zip;
+#[cfg(feature = "zip")]
+pub mod zip_salvage;
 #[cfg(feature = "zlib")]
 pub mod zlib;
 #[cfg(feature = "zstd-c")]
