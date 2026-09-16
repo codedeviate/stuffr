@@ -1028,7 +1028,7 @@ mod tests {
     use super::*;
     use stuffr_core::testing::{
         ContainerFixture, ExpectedEntry, assert_container_conforms_skipping,
-        assert_container_conforms_with,
+        assert_container_conforms_with_skipping,
     };
     use stuffr_core::{CreateOpts, OpenOpts, PlainSink, ReaderSource, StreamPolicy};
 
@@ -1127,7 +1127,15 @@ mod tests {
     #[test]
     fn lha_conforms_against_the_external_fixture() {
         let fx = lha_fixture();
-        assert_container_conforms_with(&Lha, &meta(), &fx);
+        // `[2, 10]`, in the FIXTURE numbering (1-10), which is not the
+        // thirteen-property scheme `lha_conforms_with_a_writer` above uses:
+        // 2 is the read-only refusal, and `lha` gained a writer in Phase 3c
+        // Task 6, so there is no refusal left to prove; 10 is the CRC
+        // witness, and `sample.lzh`'s manifest records no archive-stored
+        // CRC to witness against. Both are checked facts now rather than
+        // silent skips — fixture property 3 in particular used to skip with
+        // no output at all.
+        assert_container_conforms_with_skipping(&Lha, &meta(), &fx, &[2, 10]);
     }
 
     /// `forward_parse: true` is a claim the conformance harness

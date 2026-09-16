@@ -1087,7 +1087,7 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use stuffr_core::testing::{
         ContainerFixture, ExpectedEntry, assert_container_conforms_skipping,
-        assert_container_conforms_with,
+        assert_container_conforms_with_skipping,
     };
     use stuffr_core::{CreateOpts, OpenOpts, PlainSink, ReaderSource, StreamPolicy};
 
@@ -1903,7 +1903,14 @@ mod tests {
     #[test]
     fn arj_conforms() {
         let fx = arj_fixture();
-        assert_container_conforms_with(&Arj, &meta(), &fx);
+        // `[2, 10]`, in the FIXTURE numbering (1-10) — NOT the `[7, 8]` of
+        // `arj_conforms_with_a_writer`'s thirteen-property scheme, which is
+        // a different set of numbers about a different thing. 2 is the
+        // read-only refusal, and `arj` gained a writer in Phase 3c Task 7;
+        // 10 is the CRC witness, and this fixture's manifest records no
+        // archive-stored CRC (it is hand-built from the specification — see
+        // `MANIFEST.md` — so there is no outside witness to record).
+        assert_container_conforms_with_skipping(&Arj, &meta(), &fx, &[2, 10]);
     }
 
     #[test]

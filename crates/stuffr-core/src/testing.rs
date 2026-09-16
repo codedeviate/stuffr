@@ -20,7 +20,7 @@ pub use crate::conformance::{
 };
 pub use crate::container_conformance::{
     ContainerFixture, ExpectedEntry, assert_container_conforms, assert_container_conforms_skipping,
-    assert_container_conforms_with, open_forward_only,
+    assert_container_conforms_with, assert_container_conforms_with_skipping, open_forward_only,
 };
 pub use crate::honesty::{
     check_entry_count, check_entry_size, check_error_is_classified, check_fidelity_claim,

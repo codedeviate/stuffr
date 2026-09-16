@@ -13,6 +13,11 @@
 //!   read-only legacy format). Ten properties, numbered 1-10 in a scheme of
 //!   its OWN, raised as `conformance[{id}] fixture property N: ...`.
 //!
+//! Both have a `_skipping` form taking the expected skip list, and BOTH run
+//! a [`PropertyLedger`] over it. The fixture-driven one did not until the
+//! Phase 3c final review — which mattered, because it is the only harness
+//! `arc` and `zoo` run under.
+//!
 //! **The two numberings collide and the messages are what tell them apart.**
 //! Six numbers mean different things in the two sets — 4 is "`finish`
 //! surfaces a write error" in one and "entry enumeration" in the other, 6 is
@@ -99,16 +104,26 @@
 //!    shape — this is the property that caught lz4 buffering 4 MiB on the
 //!    codec side.
 //!
-//! **Properties 5-8 all need the ladder to supply a forward-only source,
-//! and for some containers it never can.** See [`reachable_forward_only`]:
-//! under `StreamPolicy::ForwardOnly` the spool and salvage rungs are both
-//! off, so a container declaring `needs_seek` (or not declaring
-//! `forward_parse`) resolves to `Err(NotSeekable)` and the setup helpers
-//! PANIC. Those four properties therefore skip for such a container — each
-//! saying so on stderr, never in silence. Nothing ELSE about the harness
-//! changes for that shape: properties 1-4 and 9-13, the truncation sweep
-//! and the payload cut included, all still run, over the spooled source a
-//! real caller gets.
+//! **Properties 5-8 all reach for a forward-only source, and for some
+//! containers the ladder can never supply one.** See
+//! [`reachable_forward_only`]: under `StreamPolicy::ForwardOnly` the spool
+//! and salvage rungs are both off, so a container declaring `needs_seek` (or
+//! not declaring `forward_parse`) resolves to `Err(NotSeekable)` and the
+//! setup helpers PANIC.
+//!
+//! **Only 7 and 8 skip for such a container; 5 and 6 are WEAKENED, not
+//! removed** — this paragraph said "those four properties therefore skip"
+//! until the Phase 3c final review caught it disagreeing with both the code
+//! and [`reachable_forward_only`]'s own doc 240 lines below. 7 and 8 are
+//! genuinely unrunnable (a "how much of the source was pulled" measurement
+//! over a spooled source is a statement about the ladder, not the
+//! container); 5 and 6 take a second form over the source shape such a
+//! container really gets, the same "weakened to what the format can still
+//! promise, never removed" move `CodecCaps::truncation_undetectable` makes
+//! on the codec side. `arj`'s checked skip list — `[7, 8]`, not `[5, 6, 7,
+//! 8]` — is the proof. Each real skip says so on stderr, never in silence.
+//! Nothing ELSE about the harness changes for that shape: properties 1-4 and
+//! 9-13, the truncation sweep and the payload cut included, all still run.
 
 //! 9. Truncation is detected and reported as `io::ErrorKind::InvalidData`,
 //!    UNCONDITIONALLY on `caps.read` — the one property a container author
@@ -479,22 +494,65 @@ fn open_under_the_full_ladder(
 /// So the run-set is a checked fact: [`assert_container_conforms_skipping`]
 /// takes the skip list its caller expects, and this ledger asserts three
 /// things at the end of every run — the skipped set is EXACTLY that list,
-/// no property is both run and skipped, and every number in 1..=13 is
-/// accounted for as one or the other. A property that stops running now
-/// fails its container's own test, in that container's own file, where a
+/// no property is both run and skipped, and every number in the scheme's
+/// range is accounted for as one or the other. A property that stops running
+/// now fails its container's own test, in that container's own file, where a
 /// reviewer reads it.
 ///
 /// `ran` is recorded where the assertion actually happens, never at the top
 /// of a block — for the loop-shaped properties (3, 9, 12) that means
 /// counting iterations, because a `continue` that skips every iteration
 /// leaves the block "entered" and nothing checked.
-#[derive(Default)]
+///
+/// # Both numberings, not just the write-capable one
+///
+/// The ledger shipped wired into [`assert_container_conforms_skipping`]
+/// alone, which left [`assert_container_conforms_with`] — the ONLY harness
+/// `arc` and `zoo` run under, and the newest decoders in the tree —
+/// unverified. Measured by the Phase 3c final review: fixture property 3
+/// (magic agreement) skipped in TOTAL silence there, with no `eprintln` at
+/// all, so a container that lost its magic registration would have taken the
+/// property with it and nothing would have said so.
+///
+/// It is therefore parameterised by its scheme rather than duplicated:
+/// `label` is `"property"` or `"fixture property"` and `highest` is 13 or
+/// 10. The two numberings COLLIDE — five numbers mean different things in
+/// the two sets — so the label is what keeps a message and a skip list
+/// attributable to one scheme; see this module's own doc, which enumerates
+/// both.
 struct PropertyLedger {
+    /// `"property"` or `"fixture property"` — the prefix every message this
+    /// ledger raises carries, and the only thing separating two colliding
+    /// numberings in test output.
+    label: &'static str,
+    /// The highest number in this scheme; the accounted-for assertion walks
+    /// `1..=highest`.
+    highest: u8,
     ran: Vec<u8>,
     skipped: Vec<u8>,
 }
 
 impl PropertyLedger {
+    /// The write-capable scheme: `property N`, 1-13.
+    fn write_capable() -> Self {
+        Self {
+            label: "property",
+            highest: 13,
+            ran: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
+    /// The fixture-driven scheme: `fixture property N`, 1-10.
+    fn fixture_driven() -> Self {
+        Self {
+            label: "fixture property",
+            highest: 10,
+            ran: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
     /// Records that property `n` asserted something.
     fn ran(&mut self, n: u8) {
         self.ran.push(n);
@@ -503,7 +561,7 @@ impl PropertyLedger {
     /// Records that property `n` did not run, and says so on stderr — the
     /// skip stays visible in test output as well as checkable.
     fn skipped(&mut self, id: FormatId, n: u8, why: &str) {
-        eprintln!("conformance[{id}] property {n}: skipped — {why}");
+        eprintln!("conformance[{id}] {} {n}: skipped — {why}", self.label);
         self.skipped.push(n);
     }
 
@@ -533,16 +591,16 @@ impl PropertyLedger {
             .copied()
             .filter(|n| skipped.contains(n))
             .collect();
+        let label = self.label;
         assert!(
             both.is_empty(),
-            "conformance[{id}] run-set: propert{} {both:?} recorded as BOTH run and skipped, \
-             so the ledger describes neither",
-            if both.len() == 1 { "y" } else { "ies" }
+            "conformance[{id}] {label} run-set: {both:?} recorded as BOTH run and skipped, \
+             so the ledger describes neither"
         );
 
         assert_eq!(
             skipped, want,
-            "conformance[{id}] run-set: this container skipped properties {skipped:?}, but its \
+            "conformance[{id}] {label} run-set: this container skipped {skipped:?}, but its \
              own test says it should skip exactly {want:?}. A property that stops running is \
              invisible otherwise — the whole suite stays green while the check is gone. Either \
              the harness stopped running something it used to, or this container's expected \
@@ -553,14 +611,15 @@ impl PropertyLedger {
         seen.extend_from_slice(&skipped);
         seen.sort_unstable();
         seen.dedup();
-        let all: Vec<u8> = (1u8..=13).collect();
+        let all: Vec<u8> = (1u8..=self.highest).collect();
         assert_eq!(
             seen,
             all,
-            "conformance[{id}] run-set: properties {:?} are accounted for as neither run nor \
-             skipped. Every one of 1..=13 must record itself, or a deleted block leaves no \
+            "conformance[{id}] {label} run-set: {:?} are accounted for as neither run nor \
+             skipped. Every one of 1..={} must record itself, or a deleted block leaves no \
              trace at all",
-            all.iter().filter(|n| !seen.contains(n)).collect::<Vec<_>>()
+            all.iter().filter(|n| !seen.contains(n)).collect::<Vec<_>>(),
+            self.highest
         );
     }
 }
@@ -997,14 +1056,47 @@ impl ContainerFixture {
 /// scheme of their own, and six of those numbers mean something else in
 /// [`assert_container_conforms`]'s thirteen. See the module doc, which
 /// enumerates both.
+///
+/// A thin wrapper over [`assert_container_conforms_with_skipping`] with an
+/// empty skip list — the strongest statement a caller can make: all ten ran.
+/// Most real fixtures cannot use it, and that is the point; see the skipping
+/// form's own doc.
 pub fn assert_container_conforms_with(
     container: &dyn Container,
     meta: &FormatMeta,
     fixture: &ContainerFixture,
 ) {
+    assert_container_conforms_with_skipping(container, meta, fixture, &[]);
+}
+
+/// [`assert_container_conforms_with`], with the run-set made a checked fact.
+///
+/// `expected_skipped` names, in the FIXTURE numbering (1-10), exactly the
+/// properties this container's caps and fixture make unrunnable. A
+/// [`PropertyLedger`] records every property as run or skipped and asserts
+/// the three things its doc describes at the end.
+///
+/// This did not exist until the Phase 3c final review: the ledger was wired
+/// into [`assert_container_conforms_skipping`] alone, and this — the only
+/// harness `arc` and `zoo` run under — had none, so fixture property 3
+/// skipped in total silence. A skip list written where a reviewer reads it
+/// is the whole instrument; inferring one from `caps()` at a distance is
+/// what it replaces.
+///
+/// **The numbering is this function's own.** `[7, 10]` here does not mean
+/// what `[7, 10]` means to [`assert_container_conforms_skipping`], and five
+/// numbers collide outright — hence the `fixture property` label on every
+/// message, including the ledger's own.
+pub fn assert_container_conforms_with_skipping(
+    container: &dyn Container,
+    meta: &FormatMeta,
+    fixture: &ContainerFixture,
+    expected_skipped: &[u8],
+) {
     let id = container.id();
     let caps = container.caps();
     let provenance = fixture.provenance;
+    let mut ledger = PropertyLedger::fixture_driven();
 
     // 1. Identity: a mismatched registration is otherwise silent.
     assert_eq!(
@@ -1012,16 +1104,35 @@ pub fn assert_container_conforms_with(
         "conformance[{id}] fixture property 1: Container::id() disagrees with its registered \
          FormatMeta (fixture provenance: {provenance})"
     );
+    ledger.ran(1);
+
+    // Property 8 is embedded in 2, 6 and 7 rather than standalone, so
+    // whether it RAN is an observation, not a branch: it runs only where one
+    // of those three actually produced an error to classify. Recorded once,
+    // at the end, from this flag.
+    let mut classified_an_error = false;
 
     // 2. Read-only declaration: caps.read must be true (this entry point has
     //    nothing to run otherwise), and if the container also declares
     //    write: false, create() must genuinely refuse rather than silently
     //    succeed — a read-only container that writes anyway is lying about
     //    its own caps.
+    //
+    //    The `caps.read` assert is a precondition on the HARNESS; the
+    //    refusal is the property. So the ledger keys on `!caps.write`: a
+    //    container that gained a writer (`lha` and `arj` both did, in Phase
+    //    3c) genuinely stops running this one, and says so, rather than
+    //    being recorded as run on the strength of a precondition.
     assert!(
         caps.read,
         "conformance[{id}] fixture property 2: assert_container_conforms_with requires caps.read \
          (fixture provenance: {provenance})"
+    );
+    ledger.record(
+        id,
+        2,
+        !caps.write,
+        "this container declares write: true, so it has no read-only refusal to prove",
     );
     if !caps.write {
         let result = container.create(
@@ -1041,6 +1152,7 @@ pub fn assert_container_conforms_with(
                          classified: {msg} (fixture provenance: {provenance})"
                     );
                 }
+                classified_an_error = true;
             }
         }
     }
@@ -1048,6 +1160,12 @@ pub fn assert_container_conforms_with(
     // 3. Magic agreement: AT LEAST ONE registered rule must match the
     //    fixture's own bytes. No round trip needed — the fixture already IS
     //    the encoded form.
+    //
+    //    This gate had no `else` and no `eprintln!` at all until the Phase 3c
+    //    final review: it was the one skip in this file that was completely
+    //    silent, in the harness `arc` and `zoo` are proven by and nothing
+    //    else. A container that lost its magic registration would have taken
+    //    the property with it.
     if !meta.magics.is_empty() {
         let hit = meta.magics.iter().any(|r| {
             fixture.bytes.len() >= r.offset + r.bytes.len()
@@ -1057,6 +1175,13 @@ pub fn assert_container_conforms_with(
             hit,
             "conformance[{id}] fixture property 3: no registered magic rule matches the fixture's \
              bytes (fixture provenance: {provenance})"
+        );
+        ledger.ran(3);
+    } else {
+        ledger.skipped(
+            id,
+            3,
+            "this format registers no magic rules to match against",
         );
     }
 
@@ -1105,6 +1230,13 @@ pub fn assert_container_conforms_with(
     //     otherwise trip property 5 first and never exercise this one at
     //     all — the exact false-pass trap `mod broken_containers` calls out
     //     for property 6 vs 7 (`IgnoresTruncation` vs `RestoresKnownContent`).
+    //
+    //     Ledger note: "ran" here is an ITERATION COUNT, not block entry —
+    //     a manifest whose every entry carries `stored_crc: None` enters the
+    //     `Always`/`WhenPresent` arm and witnesses nothing, which is the
+    //     `continue`-shaped false pass [`PropertyLedger`]'s own doc warns
+    //     about for the loop-shaped properties on the other side.
+    let mut witnessed = 0usize;
     match caps.detects_corruption {
         crate::format::CorruptionDetection::Always
         | crate::format::CorruptionDetection::WhenPresent => {
@@ -1129,16 +1261,23 @@ pub fn assert_container_conforms_with(
                          (fixture provenance: {provenance})",
                         want.name
                     );
+                    witnessed += 1;
                 }
             }
+            ledger.record(
+                id,
+                10,
+                witnessed > 0,
+                "no entry in this fixture's manifest records an archive-stored CRC",
+            );
         }
         crate::format::CorruptionDetection::Structural
         | crate::format::CorruptionDetection::Never => {
-            eprintln!(
-                "conformance[{id}] fixture property 10: skipped — this container declares \
-                 {:?}, not Always or WhenPresent, so no per-entry CRC exists to witness against \
-                 (fixture provenance: {provenance})",
-                caps.detects_corruption
+            ledger.skipped(
+                id,
+                10,
+                "this container declares neither Always nor WhenPresent corruption detection, \
+                 so no per-entry CRC exists to witness against",
             );
         }
     }
@@ -1153,6 +1292,8 @@ pub fn assert_container_conforms_with(
         "conformance[{id}] fixture property 4: entry names/order disagree with the fixture's \
          manifest (fixture provenance: {provenance})"
     );
+    ledger.ran(4);
+    let mut compared = 0usize;
     for (got_entry, want_entry) in got.iter().zip(fixture.expected.iter()) {
         assert_eq!(
             &got_entry.1[..],
@@ -1161,7 +1302,16 @@ pub fn assert_container_conforms_with(
              (fixture provenance: {provenance})",
             want_entry.name
         );
+        compared += 1;
     }
+    // Iteration count, not block entry: an empty manifest compares nothing
+    // while looking exactly like a clean run.
+    ledger.record(
+        id,
+        5,
+        compared > 0,
+        "this fixture's manifest declares no entries, so there is no content to compare",
+    );
 
     // 6. Truncation. UNCONDITIONAL, mirroring the write-capable harness's own
     //    property 9: the one property a container author cannot vote
@@ -1178,6 +1328,7 @@ pub fn assert_container_conforms_with(
                          {msg} (fixture provenance: {provenance})"
                     );
                 }
+                classified_an_error = true;
             }
             Ok(entries) => {
                 assert!(
@@ -1190,6 +1341,16 @@ pub fn assert_container_conforms_with(
                 );
             }
         }
+        ledger.ran(6);
+    } else {
+        // Silent until Phase 3c, like property 3 above: an empty fixture has
+        // nothing to cut, and the one property nobody may vote themselves
+        // out of simply did not happen.
+        ledger.skipped(
+            id,
+            6,
+            "the fixture is empty, so there is nothing to truncate",
+        );
     }
 
     // 7. Corruption: flip the middle byte. Never the expected content
@@ -1207,12 +1368,14 @@ pub fn assert_container_conforms_with(
     //    container. Both current fixtures pass only because their midpoints
     //    happen to land under a CRC. The skip is reported, never silent.
     if caps.detects_corruption == crate::format::CorruptionDetection::Never {
-        eprintln!(
-            "conformance[{id}] fixture property 7: skipped — this container declares \
-             CorruptionDetection::Never, so no check exists to prove (fixture \
-             provenance: {provenance})"
+        ledger.skipped(
+            id,
+            7,
+            "this container declares CorruptionDetection::Never, so no check exists to prove",
         );
-    } else if !fixture.bytes.is_empty() {
+    } else if fixture.bytes.is_empty() {
+        ledger.skipped(id, 7, "the fixture is empty, so there is no byte to flip");
+    } else {
         let mut corrupted = fixture.bytes.to_vec();
         let mid = corrupted.len() / 2;
         corrupted[mid] ^= 0xFF;
@@ -1224,6 +1387,7 @@ pub fn assert_container_conforms_with(
                          {msg} (fixture provenance: {provenance})"
                     );
                 }
+                classified_an_error = true;
             }
             Ok(entries) => {
                 let unchanged = entries.len() == fixture.expected.len()
@@ -1241,6 +1405,7 @@ pub fn assert_container_conforms_with(
                 );
             }
         }
+        ledger.ran(7);
     }
 
     // 9. A genuine source I/O error passes through as ITSELF, never
@@ -1273,7 +1438,23 @@ pub fn assert_container_conforms_with(
              (fixture provenance: {provenance})",
             e.kind()
         );
+        ledger.ran(9);
     }
+
+    // 8. Error classification, recorded last because it is EMBEDDED in 2, 6
+    //    and 7 rather than standalone: it ran if any of those three actually
+    //    produced an error for `check_error_is_classified` to judge. A
+    //    container that refuses nothing anywhere leaves it unrun, and the
+    //    ledger says so instead of the harness quietly proving nothing about
+    //    `exit_code`'s `_ => 1` wildcard.
+    ledger.record(
+        id,
+        8,
+        classified_an_error,
+        "no refusal path (read-only create, truncation, corruption) produced an error to classify",
+    );
+
+    ledger.assert_run_set(id, expected_skipped);
 }
 
 /// Every property, for a container that skips none of them.
@@ -1310,7 +1491,7 @@ pub fn assert_container_conforms_skipping(
 ) {
     let id = container.id();
     let caps = container.caps();
-    let mut ledger = PropertyLedger::default();
+    let mut ledger = PropertyLedger::write_capable();
 
     // 1. Identity: a mismatched registration is otherwise silent.
     assert_eq!(
@@ -2056,9 +2237,23 @@ fn assert_panics_naming_with(
     fixture: &ContainerFixture,
     expected: &str,
 ) {
+    assert_panics_naming_with_skipping(container, meta, fixture, &[], expected)
+}
+
+/// [`assert_panics_naming_with`] for a run the harness is expected to reach
+/// the END of — the two run-set doubles, whose panic comes from the ledger
+/// rather than from a property.
+#[cfg(test)]
+fn assert_panics_naming_with_skipping(
+    container: &dyn Container,
+    meta: &FormatMeta,
+    fixture: &ContainerFixture,
+    expected_skipped: &[u8],
+    expected: &str,
+) {
     let id = container.id();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_container_conforms_with(container, meta, fixture);
+        assert_container_conforms_with_skipping(container, meta, fixture, expected_skipped);
     }));
     match result {
         Ok(()) => panic!(
@@ -2368,7 +2563,82 @@ mod broken_containers {
             }],
             provenance: "hand-built in this test",
         };
-        assert_container_conforms_with(&MockReadOnly::new(&fx), &read_only_meta(), &fx);
+        // `[3, 10]`: `read_only_meta()` registers no magic rule, and this
+        // manifest records no archive-stored CRC. The skip list is the
+        // assertion — "ran to completion" could not tell those two skips
+        // from eight.
+        assert_container_conforms_with_skipping(
+            &MockReadOnly::new(&fx),
+            &read_only_meta(),
+            &fx,
+            &[3, 10],
+        );
+    }
+
+    /// **The fixture harness's run-set is a checked fact, in the
+    /// UNDERSTATED direction.** `MockReadOnly` over `read_only_meta()`
+    /// really does skip fixture properties 3 (no magic rule registered) and
+    /// 10 (no archive-stored CRC in the manifest); a caller claiming `&[]`
+    /// must be refused, or a skip list would be decoration.
+    ///
+    /// This is the double for the instrument the Phase 3c final review found
+    /// missing: `PropertyLedger` was wired into
+    /// `assert_container_conforms_skipping` alone, so fixture property 3 —
+    /// the only entry point `arc` and `zoo` are proven by — skipped in total
+    /// silence. Without this test, the ledger could be neutered to `Ok(())`
+    /// and nothing would say so.
+    ///
+    /// The message must name the FIXTURE numbering. Five numbers mean
+    /// different things in the two schemes, so a bare `run-set: skipped [3,
+    /// 10]` would send a reader to the wrong enumeration.
+    #[test]
+    fn an_understated_fixture_skip_list_fails_the_run_set() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                stored_crc: None,
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "an_understated_fixture_skip_list_fails_the_run_set",
+        };
+        assert_panics_naming_with_skipping(
+            &MockReadOnly::new(&fx),
+            &read_only_meta(),
+            &fx,
+            &[],
+            "fixture property run-set",
+        );
+    }
+
+    /// The OTHER direction, and the one a green suite hides: a skip list
+    /// that claims MORE than reality. Property 7 genuinely runs for this
+    /// double (`MockReadOnly` declares corruption detection and the fixture
+    /// is non-empty), so `&[3, 7, 10]` is a caller excusing a property that
+    /// did not need excusing — which is exactly how a real skip would come
+    /// to be waved through later, by editing the list instead of the code.
+    ///
+    /// Both directions matter because the ledger's own `assert_eq!` is set
+    /// equality: neutering it to a subset check would leave the test above
+    /// passing and only this one red.
+    #[test]
+    fn an_overstated_fixture_skip_list_fails_the_run_set() {
+        let fx = ContainerFixture {
+            bytes: framed_fixture_bytes(&[("a.txt", b"alpha")]),
+            expected: &[ExpectedEntry {
+                stored_crc: None,
+                name: "a.txt",
+                content: b"alpha",
+            }],
+            provenance: "an_overstated_fixture_skip_list_fails_the_run_set",
+        };
+        assert_panics_naming_with_skipping(
+            &MockReadOnly::new(&fx),
+            &read_only_meta(),
+            &fx,
+            &[3, 7, 10],
+            "fixture property run-set",
+        );
     }
 
     /// Pins the contract the wrapping doubles below depend on: `new`
@@ -2409,7 +2679,10 @@ mod broken_containers {
             provenance: "hand-built in this test",
         };
         let meta = read_only_meta_with_magics(&[FRAMED_FIXTURE_MAGIC]);
-        assert_container_conforms_with(&MockReadOnly::new(&fx), &meta, &fx);
+        // Only `[10]` this time — the magic rule this meta declares is
+        // exactly what takes 3 OFF the skip list, which is the difference
+        // between this test and the one above.
+        assert_container_conforms_with_skipping(&MockReadOnly::new(&fx), &meta, &fx, &[10]);
     }
 
     /// The FAILING half: without this, the passing test above only shows the
@@ -2936,12 +3209,16 @@ mod broken_containers {
             }])),
             provenance: "hand-built in this test",
         };
-        assert_container_conforms_with(
+        // `[3, 10]`: no magic rule, and `Structural` is precisely what
+        // takes property 10 out — which is this test's whole claim, now
+        // checked rather than inferred from the absence of a panic.
+        assert_container_conforms_with_skipping(
             &DecodesPastItsCrc {
                 declares: CorruptionDetection::Structural,
             },
             &read_only_meta(),
             &fx,
+            &[3, 10],
         );
     }
 
@@ -3197,10 +3474,14 @@ mod broken_containers {
         };
         // No panic: property 7 is skipped on the declaration, and every
         // other property this double satisfies still runs.
-        assert_container_conforms_with(
+        // `[3, 7, 10]`: no magic rule, no archive-stored CRC, and
+        // `CorruptionDetection::Never` is what takes 7 out — the skip this
+        // test is named for, now a checked fact.
+        assert_container_conforms_with_skipping(
             &RestoresKnownContent::undeclared(&fx),
             &read_only_meta(),
             &fx,
+            &[3, 7, 10],
         );
     }
 
