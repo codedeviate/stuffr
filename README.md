@@ -62,7 +62,9 @@ read list.
 > declares (**exit 5** on a mismatch) — a crafted entry declaring a size
 > with no matching data used to satisfy its own CRC and report "exact
 > fidelity" at exit 0 (`stuffr list` still reports the declared size on such
-> an entry, since `list` reads no payload in any container). `cpio` and
+> an entry, since `list` reads no payload in any container that streams —
+> Phase 3c's `arc` and `zoo` decode an entry whole, so `list` can fail on
+> those two, at exit 3 or 5). `cpio` and
 > `ar` now refuse an absurd size field **before** it reaches an allocator
 > (**exit 6**) rather than after; a 68-byte `.a` that used to panic (exit
 > 101) is now a clean **exit 5**. None of this changed a public API

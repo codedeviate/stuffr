@@ -1174,6 +1174,17 @@ LEGACY FORMATS
       a byte that is not ARC's `0x1A` marker where a header must begin is
       exit 5, not a search for the next plausible header.
 
+      **`stuffr list` CAN FAIL on this container, where on the other six it
+      cannot.** Everywhere else `list` reads no payload at all, so an entry
+      that cannot be decoded — an unsupported method, a bad CRC — is only
+      visible to a verb that reads one (`cat`, `test`, `unpack`). Here an
+      entry decodes WHOLE, and the decode is what makes the declared-size
+      comparison possible, so `stuffr list old.arc` on an archive using
+      Crushed or Distilled exits 3, and on one with a damaged entry exits 5.
+      A deliberate divergence, not an oversight; `zoo` below behaves the
+      same way. If you want a listing that cannot fail, there is none —
+      read the exit code.
+
   stuffr list old.zoo
       ZOO, behind its own `--features zoo`, bundled into `--features
       legacy` exactly like the four above. Like `arc` its framing is
@@ -1207,3 +1218,9 @@ LEGACY FORMATS
       would size, at exit 6 (`ResourceLimit`) against the same fixed
       256 MiB ceiling `arc` and `arj` use — again not `--memory-limit`,
       which binds a codec rather than a container.
+
+      **`stuffr list` CAN FAIL here too**, for the same reason and with the
+      same codes as `arc` above: an entry decodes whole, so an unsupported
+      method is exit 3 and a bad CRC-16 exit 5 from the listing verb itself,
+      where every container that streams an entry only ever reports those
+      from a verb that reads a payload.

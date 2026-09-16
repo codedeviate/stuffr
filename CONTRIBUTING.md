@@ -71,14 +71,53 @@ The version lives in exactly one place — `version` under `[workspace.package]`
 in the root `Cargo.toml` — and each crate inherits it with
 `version.workspace = true`.
 
-> **One manual step.** Cargo will not let a *dependency* version inherit from
-> the workspace, so the three inter-crate entries carry the number literally:
-> two in `[workspace.dependencies]` (root `Cargo.toml`) and one in
-> `crates/stuffr-cli/Cargo.toml`. Bump those together with the workspace
-> version. `grep -rn 'version' Cargo.toml crates/*/Cargo.toml | grep -v
-> rust-version` should show every occurrence reading the new number at once —
-> a missed one fails the build, but the recipe is worth running anyway,
-> because the failure is confusing when it happens.
+> **FIVE manual sites, not four.** Cargo will not let a *dependency* version
+> inherit from the workspace, so the three inter-crate entries carry the
+> number literally: two in `[workspace.dependencies]` (root `Cargo.toml`) and
+> one in `crates/stuffr-cli/Cargo.toml`. Bump those together with the
+> workspace version — four `Cargo.toml` sites in all. `grep -rn 'version'
+> Cargo.toml crates/*/Cargo.toml | grep -v rust-version` should show every
+> occurrence reading the new number at once; a missed one fails the build,
+> but the recipe is worth running anyway, because the failure is confusing
+> when it happens.
+>
+> **The fifth is `fuzz/Cargo.lock`, and that grep cannot see it** — it is a
+> lockfile, not a manifest, and `fuzz/` is `exclude`d from the workspace, so
+> no workspace `cargo` command resyncs it. It went stale once, at `0.3.1`
+> against manifests reading `0.4.0`, and nothing said so until somebody ran
+> `make fuzz`.
+>
+> Since Phase 3c the gate catches it instead of a human remembering: `make
+> lint` runs `cargo clippy --manifest-path fuzz/Cargo.toml --all-targets
+> --locked`, and `--locked` fails at exit 101 the moment the lockfile and the
+> manifests disagree. It refuses rather than repairs, deliberately — so the
+> sequence is: bump the four manifests, resync the lockfile
+> (`cargo metadata --manifest-path fuzz/Cargo.toml >/dev/null`, or `make
+> fuzz`, either of which rewrites it), then `make check`, and commit
+> `fuzz/Cargo.lock` with the bump.
+
+### Before publishing a bump
+
+One command checks all four crates, and it is the one to run:
+
+```bash
+cargo publish -p stuffr-core -p stuffr-formats -p stuffr -p stuffr-cli --dry-run
+```
+
+Cargo resolves the inter-crate order itself, packages all four, verify-builds
+each, and aborts every upload. Measured at `0.4.2`, with the version not yet
+on crates.io: **exit 0**.
+
+Running the crates one at a time instead is what the older note recommended,
+and it does not work at a bump: `cargo publish -p stuffr-formats --dry-run`
+alone fails with `failed to select a version for the requirement stuffr-core
+= "^<new>"` until the new `stuffr-core` is actually live. That failure is
+expected rather than a defect — but it means three of the four crates are
+never verify-built, which is precisely the coverage the command above gives
+you. Reach for `-p` on its own only to isolate a failure it reported.
+
+The real publish still goes in order: `stuffr-core`, `stuffr-formats`,
+`stuffr`, `stuffr-cli`.
 
 ### While below 1.0
 
@@ -226,9 +265,16 @@ one with an exhaustive literal — and since `0.3.1` these crates have been
 **published on crates.io**, so "external crate" is not hypothetical.
 
 - **`CodecCaps` and `ContainerCaps` stay open**, and that is measured rather
-  than assumed: all 46 of their literals in `stuffr-formats` end in a `..`
-  tail (`..CodecCaps::round_trip()`, `..Default::default()`), so a new field
-  is already absorbed for free at every site. Closing them would forbid `..`
+  than assumed: all **23** of their literals in `stuffr-formats` — 15
+  `CodecCaps` and 8 `ContainerCaps` — end in a `..` tail
+  (`..CodecCaps::round_trip()`, `..Default::default()`), zero bare, so a new
+  field is already absorbed for free at every site. (This said "46" until
+  Phase 3c's final review re-derived it. The naive
+  `grep -rn 'CodecCaps {\|ContainerCaps {'` answers 48: 23 literal openings,
+  23 `-> CodecCaps {` / `-> ContainerCaps {` **function signatures** one line
+  above them, and 2 doc-comment lines. Whoever measured it excluded the doc
+  comments and then counted every literal twice. The conclusion never
+  changed; the figure is quoted as a measurement, so it has to be one.) Closing them would forbid `..`
   construction from another crate outright — the exact cost the paragraphs
   above refuse to impose on format authors.
 - **`ExpectedEntry` and `ContainerFixture` are now closed** —
