@@ -675,6 +675,341 @@ fn note_unreachable_records(
     });
 }
 
+/// One central-directory file header, physically enumerated.
+///
+/// Unlike `zip::ZipArchive`'s own view (an `IndexMap` keyed by name — see
+/// [`DeclaredIndex`]'s doc for why that collapses two records sharing a name
+/// down to the last one), a `CdRecord` is one PER RECORD: an archive with
+/// eight central-directory records under six names yields eight of these,
+/// two of which repeat a `name` already seen at a different
+/// `local_header_offset`. That is precisely what [`walk_central_directory`]
+/// exists to recover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CdRecord {
+    /// Byte offset of this record's own signature within the archive.
+    pub offset: u64,
+    /// The local file header this record's entry claims to start at,
+    /// relative to the start of the archive. Two records can agree on every
+    /// other field and still be genuinely separate entries by differing only
+    /// here — that is the shape a shadowed pair takes.
+    pub local_header_offset: u64,
+    /// Decoded lossily (`String::from_utf8_lossy`): a name this project
+    /// cannot honestly represent is still a name a caller may want to see,
+    /// and a walk whose whole purpose is recovery should not itself refuse a
+    /// record over an encoding quirk.
+    pub name: String,
+    pub method: u16,
+    pub crc32: u32,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+}
+
+/// Ceiling on a central-directory record's declared `name_len`, checked
+/// before allocating a buffer sized from it — the same ceiling and the same
+/// reasoning as `cpio.rs`'s `c_namesize` guard and `ar.rs`'s BSD extended
+/// identifier: a length read from a scanned header is untrustworthy twice
+/// over, attacker-controlled and possibly corrupt, and 65,536 bytes is far
+/// past any real path.
+const MAX_CD_NAME_LEN: u64 = 65_536;
+
+/// Walks the central directory record by record, from the offset the
+/// archive's own end-of-central-directory record declares, recovering every
+/// record the archive physically holds.
+///
+/// `None` only when the walk cannot even begin: [`read_declared_index`]
+/// could not read the EOCD with certainty (it already refuses to guess
+/// there), or the initial seek to `cd_offset` itself fails. Once under way,
+/// this is a RECOVERY rather than a verifier — carrying `read_declared_
+/// index`'s discipline forward with one deliberate difference. That function
+/// feeds only a fidelity WARNING, so it returns `None` rather than a number
+/// it is not sure of; this feeds a recovery, so it returns the records it IS
+/// sure of and stops at the first one it is not. Either way, it never
+/// invents a record: the length of the returned `Vec` is always exactly what
+/// was actually walked, never the EOCD's declared count.
+pub fn walk_central_directory<R: Read + Seek>(r: &mut R) -> Option<Vec<CdRecord>> {
+    let declared = read_declared_index(r)?;
+    r.seek(SeekFrom::Start(declared.cd_offset)).ok()?;
+
+    let mut records = Vec::new();
+    loop {
+        let offset = r.stream_position().ok()?;
+        match read_one_cd_record(r, offset) {
+            Ok(Some(record)) => records.push(record),
+            // Not a central-directory signature at all — ordinarily the
+            // EOCD itself. The walk has reached the end of the index, which
+            // is the expected, healthy way for it to stop.
+            Ok(None) => break,
+            // Malformed, or refused before an allocation it could not
+            // justify. Either way: stop rather than invent what comes next.
+            // `note_unreachable_records`'s warning is what tells a caller
+            // when this recovery came up short of the EOCD's declared
+            // count.
+            Err(_) => break,
+        }
+    }
+    Some(records)
+}
+
+/// Reads one central-directory record at the reader's current position.
+///
+/// `Ok(None)` when the four bytes here are not [`SIG_CENTRAL_HEADER`] — not
+/// damage, just the walk reaching the end of the central directory (an EOCD,
+/// almost always). [`Error::ResourceLimit`] (exit 6) when `name_len` exceeds
+/// [`MAX_CD_NAME_LEN`], refused before the allocation it would otherwise
+/// justify. [`Error::Corrupt`] (exit 5) for anything else that keeps a
+/// record matched by signature from being read whole: a truncated fixed
+/// block, or a name/extra/comment field that runs past the end of the
+/// source. One arm per case, deliberately — see `error.rs`'s exit-5-versus-6
+/// rule.
+fn read_one_cd_record<R: Read + Seek>(r: &mut R, offset: u64) -> Result<Option<CdRecord>> {
+    let mut signature = [0u8; 4];
+    if r.read_exact(&mut signature).is_err() {
+        return Ok(None);
+    }
+    if signature != SIG_CENTRAL_HEADER {
+        return Ok(None);
+    }
+
+    let mut fixed = [0u8; CENTRAL_HEADER_FIXED];
+    r.read_exact(&mut fixed).map_err(|e| {
+        Error::Corrupt(format!(
+            "zip: central directory record at {offset} truncated: {e}"
+        ))
+    })?;
+
+    let method = le16(&fixed[6..]);
+    let crc32 = le32(&fixed[12..]);
+    let compressed_size = le32(&fixed[16..]);
+    let uncompressed_size = le32(&fixed[20..]);
+    let name_len = le16(&fixed[24..]);
+    let extra_len = le16(&fixed[26..]);
+    let comment_len = le16(&fixed[28..]);
+    let local_header_offset = le32(&fixed[38..]);
+
+    if u64::from(name_len) > MAX_CD_NAME_LEN {
+        return Err(Error::ResourceLimit(format!(
+            "central directory record at {offset} declares a name of {name_len} bytes, \
+             past the {MAX_CD_NAME_LEN}-byte ceiling this build allocates for one"
+        )));
+    }
+
+    let mut name_bytes = vec![0u8; name_len as usize];
+    r.read_exact(&mut name_bytes).map_err(|e| {
+        Error::Corrupt(format!(
+            "zip: central directory record at {offset}'s name truncated: {e}"
+        ))
+    })?;
+    let name = String::from_utf8_lossy(&name_bytes).into_owned();
+
+    skip_forward(r, u64::from(extra_len) + u64::from(comment_len)).map_err(|e| {
+        Error::Corrupt(format!(
+            "zip: central directory record at {offset}'s extra/comment field truncated: {e}"
+        ))
+    })?;
+
+    Ok(Some(CdRecord {
+        offset,
+        local_header_offset: u64::from(local_header_offset),
+        name,
+        method,
+        crc32,
+        compressed_size: u64::from(compressed_size),
+        uncompressed_size: u64::from(uncompressed_size),
+    }))
+}
+
+/// Reads and discards exactly `n` bytes, reporting a short read rather than
+/// silently accepting whatever was there. A raw seek past a field like this
+/// would not fail on a truncated source — the following read would just find
+/// itself somewhere it should not be — so this reads the bytes instead of
+/// jumping over them.
+fn skip_forward<R: Read>(r: &mut R, n: u64) -> io::Result<()> {
+    let copied = io::copy(&mut r.take(n), &mut io::sink())?;
+    if copied != n {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("expected to skip {n} bytes, only {copied} were available"),
+        ));
+    }
+    Ok(())
+}
+
+/// Reproduces the shape of a real-world archive: eight central-directory
+/// records under six names, where the two extras are byte-identical copies (a
+/// real local file header and payload, physically duplicated) at different
+/// local-header offsets. The bytes are BUILT here rather than committed, so
+/// nothing proprietary enters the tree and the expectation cannot strand from
+/// the fixture — the `sample.arj` lesson (see `CONTRIBUTING.md`'s legacy-
+/// formats section).
+///
+/// `pub(crate)`, not private: Task 4's `zip_salvage.rs` reuses this exact
+/// fixture (ruling R-D) rather than growing a second one that could drift
+/// from it. `#[cfg(test)]` at the top level of this module rather than
+/// nested inside `mod tests`, deliberately — a private `mod tests` is not
+/// visible to a sibling module in this crate, and R-D requires it to be.
+#[cfg(test)]
+pub(crate) fn build_shadowing_zip() -> Vec<u8> {
+    let names = [
+        "one.txt",
+        "two.txt",
+        "shadowed-a.bin",
+        "shadowed-b.bin",
+        "five.txt",
+        "six.txt",
+    ];
+    let payloads: [&[u8]; 6] = [
+        b"payload for entry one",
+        b"payload for entry two",
+        b"payload for the first record that will be shadowed",
+        b"payload for the second record that will be shadowed",
+        b"payload for entry five",
+        b"payload for entry six",
+    ];
+
+    // 1. A clean base archive, six distinct entries, Stored so that a local
+    // header's declared compressed size is unambiguous (no deflate framing
+    // to reason about) and — because the sink is a `Cursor` (`Seek`) —
+    // written with no data descriptor, per zip-rs's own `using_data_
+    // descriptor = !seek_possible`. That is what makes "30 bytes fixed +
+    // name + extra + compressed_size" the whole local block, checked
+    // directly below rather than assumed.
+    let mut cursor = io::Cursor::new(Vec::new());
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    {
+        let mut w = zip::ZipWriter::new(&mut cursor);
+        for (name, data) in names.iter().zip(payloads.iter()) {
+            w.start_file(*name, opts).expect("start_file");
+            w.write_all(data).expect("write payload");
+        }
+        w.finish().expect("finish base archive");
+    }
+    let base = cursor.into_inner();
+
+    let base_names = zip::ZipArchive::new(io::Cursor::new(base.clone()))
+        .expect("base archive opens")
+        .len();
+    assert_eq!(
+        base_names, 6,
+        "base fixture must start clean: 6 distinct, unshadowed names"
+    );
+
+    let declared =
+        read_declared_index(&mut io::Cursor::new(&base)).expect("base archive's EOCD reads");
+    let cd_start = usize::try_from(declared.cd_offset).expect("cd_offset fits usize");
+    let eocd_start = base.len() - END_OF_CENTRAL_DIR_TOTAL;
+    assert_eq!(
+        base[eocd_start..eocd_start + 4],
+        SIG_END_OF_CENTRAL_DIR,
+        "base fixture must end in a bare EOCD with no trailing comment"
+    );
+
+    // 2. Locate every record's own span in the central directory, and its
+    // local header's span, using nothing but the fixed-field layout this
+    // module already documents (`CENTRAL_HEADER_FIXED`'s doc, and the
+    // local-header layout `begins_with_a_local_header`/`read_symlink_
+    // target` rely on) — not `walk_central_directory` itself, which does
+    // not exist yet at the point in the TDD cycle this builder is written.
+    fn cd_record_span(bytes: &[u8], at: usize) -> (usize, usize) {
+        assert_eq!(
+            bytes[at..at + 4],
+            SIG_CENTRAL_HEADER,
+            "expected a central-directory record at this offset"
+        );
+        let name_len = le16(&bytes[at + 28..]) as usize;
+        let extra_len = le16(&bytes[at + 30..]) as usize;
+        let comment_len = le16(&bytes[at + 32..]) as usize;
+        let lho = le32(&bytes[at + 42..]) as usize;
+        (lho, 46 + name_len + extra_len + comment_len)
+    }
+    fn local_block_span(bytes: &[u8], lho: usize) -> usize {
+        assert_eq!(
+            bytes[lho..lho + 4],
+            SIG_LOCAL_HEADER,
+            "expected a local file header at the declared offset"
+        );
+        let name_len = le16(&bytes[lho + 26..]) as usize;
+        let extra_len = le16(&bytes[lho + 28..]) as usize;
+        let compressed_size = le32(&bytes[lho + 18..]) as usize;
+        30 + name_len + extra_len + compressed_size
+    }
+
+    let mut records = Vec::new();
+    let mut at = cd_start;
+    while at < eocd_start {
+        let (lho, len) = cd_record_span(&base, at);
+        records.push((at, lho, len));
+        at += len;
+    }
+    assert_eq!(
+        records.len(),
+        6,
+        "base fixture's central directory must hold exactly 6 records"
+    );
+
+    let (rec2_at, rec2_lho, rec2_len) = records[2];
+    let (rec3_at, rec3_lho, rec3_len) = records[3];
+    let rec2_local_len = local_block_span(&base, rec2_lho);
+    let rec3_local_len = local_block_span(&base, rec3_lho);
+
+    // 3. Assemble the shadowed archive: the original local file data, then a
+    // byte-identical copy of each shadowed entry's local header and payload
+    // at a NEW offset, then the central directory — the 6 original records
+    // followed by 2 duplicates whose only changed bytes are the patched
+    // local-header-offset field — then a patched EOCD declaring 8.
+    let mut out = Vec::new();
+    out.extend_from_slice(&base[..cd_start]);
+
+    let dup2_lho = out.len() as u32;
+    out.extend_from_slice(&base[rec2_lho..rec2_lho + rec2_local_len]);
+    let dup3_lho = out.len() as u32;
+    out.extend_from_slice(&base[rec3_lho..rec3_lho + rec3_local_len]);
+
+    let new_cd_start = out.len() as u32;
+    out.extend_from_slice(&base[cd_start..eocd_start]);
+    let dup2_cd_at = out.len();
+    out.extend_from_slice(&base[rec2_at..rec2_at + rec2_len]);
+    out[dup2_cd_at + 42..dup2_cd_at + 46].copy_from_slice(&dup2_lho.to_le_bytes());
+    let dup3_cd_at = out.len();
+    out.extend_from_slice(&base[rec3_at..rec3_at + rec3_len]);
+    out[dup3_cd_at + 42..dup3_cd_at + 46].copy_from_slice(&dup3_lho.to_le_bytes());
+
+    let new_eocd_start = out.len();
+    let new_cd_size = (new_eocd_start - new_cd_start as usize) as u32;
+    out.extend_from_slice(&base[eocd_start..]);
+    out[new_eocd_start + 8..new_eocd_start + 10].copy_from_slice(&8u16.to_le_bytes());
+    out[new_eocd_start + 10..new_eocd_start + 12].copy_from_slice(&8u16.to_le_bytes());
+    out[new_eocd_start + 12..new_eocd_start + 16].copy_from_slice(&new_cd_size.to_le_bytes());
+    out[new_eocd_start + 16..new_eocd_start + 20].copy_from_slice(&new_cd_start.to_le_bytes());
+
+    // 4. Assert the result really has 8 records under 6 names, using sources
+    // INDEPENDENT of `walk_central_directory`: the `zip` crate's own
+    // collapsed count for the names, and `read_declared_index` (this
+    // module's pre-existing EOCD reader) for the count now declared. A
+    // broken builder fails loudly here rather than silently handing Steps
+    // 1/6 a healthy 6-record zip that would pass while proving nothing —
+    // this project's own signature defect.
+    let shadowed_names = zip::ZipArchive::new(io::Cursor::new(out.clone()))
+        .expect("shadowed archive still opens")
+        .len();
+    assert_eq!(
+        shadowed_names, 6,
+        "shadowed fixture must still collapse to 6 distinct names"
+    );
+    let redeclared =
+        read_declared_index(&mut io::Cursor::new(&out)).expect("shadowed archive's EOCD reads");
+    assert_eq!(
+        redeclared.entries, 8,
+        "shadowed fixture must declare 8 records"
+    );
+    assert_eq!(
+        redeclared.cd_offset,
+        u64::from(new_cd_start),
+        "shadowed fixture's cd_offset must point at the rewritten central directory"
+    );
+
+    out
+}
+
 /// Does the file open with a local file header?
 ///
 /// Four bytes at offset 0, and deliberately only there. Byte 0 of a zip is a
@@ -2302,6 +2637,174 @@ mod tests {
             None,
             "99 vs 2 would be a false fidelity warning on a healthy archive"
         );
+    }
+
+    /// The brief's Step 1 test, verbatim: the walk reaches every physical
+    /// record, not every distinct name.
+    #[test]
+    fn the_record_walk_reaches_records_the_index_shadows() {
+        let bytes = build_shadowing_zip();
+        let recs = walk_central_directory(&mut io::Cursor::new(&bytes)).expect("walk");
+        assert_eq!(
+            recs.len(),
+            8,
+            "the walk must reach every record, not every NAME"
+        );
+        let names: Vec<_> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names.iter().collect::<std::collections::HashSet<_>>().len(),
+            6
+        );
+        // The two shadowed records carry the same CRC as their originals.
+        assert_eq!(recs[6].crc32, recs[2].crc32);
+        assert_eq!(recs[7].crc32, recs[3].crc32);
+        // ...at DIFFERENT offsets, which is what makes them separate records.
+        assert_ne!(recs[6].local_header_offset, recs[2].local_header_offset);
+        assert_ne!(recs[7].local_header_offset, recs[3].local_header_offset);
+    }
+
+    /// Every field the walk reports for a shadowed record, not only its CRC
+    /// and offset — pinning `method`/`compressed_size`/`uncompressed_size`
+    /// too, so a future refactor that copied only part of a record would
+    /// still be caught.
+    #[test]
+    fn a_shadowed_records_full_fields_match_its_original() {
+        let bytes = build_shadowing_zip();
+        let recs = walk_central_directory(&mut io::Cursor::new(&bytes)).expect("walk");
+        assert_eq!(recs[6].name, recs[2].name);
+        assert_eq!(recs[6].method, recs[2].method);
+        assert_eq!(recs[6].compressed_size, recs[2].compressed_size);
+        assert_eq!(recs[6].uncompressed_size, recs[2].uncompressed_size);
+        assert_eq!(recs[7].name, recs[3].name);
+        assert_eq!(recs[7].method, recs[3].method);
+        assert_eq!(recs[7].compressed_size, recs[3].compressed_size);
+        assert_eq!(recs[7].uncompressed_size, recs[3].uncompressed_size);
+    }
+
+    /// An ordinary, unshadowed zip walks to exactly its own entry count —
+    /// the walk must not manufacture shadowing where none exists.
+    #[test]
+    fn an_unshadowed_zip_walks_to_its_own_entry_count() {
+        let bytes = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta"), ("c.txt", b"gamma")]);
+        let recs = walk_central_directory(&mut io::Cursor::new(&bytes)).expect("walk");
+        assert_eq!(recs.len(), 3);
+        let names: Vec<_> = recs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["a.txt", "b.txt", "c.txt"]);
+    }
+
+    /// A central-directory record whose fixed block is cut short MID-WALK —
+    /// not the walk's opening seek, the second record — leaves the first,
+    /// whole record intact and stops there rather than inventing a second.
+    /// A fresh, self-consistent EOCD is appended after the cut so
+    /// `read_declared_index` still finds one and the walk truly gets to
+    /// BEGIN; without that, this would just re-test "no EOCD at all", which
+    /// [`read_declared_index`]'s own tests already cover.
+    #[test]
+    fn a_mid_walk_truncation_keeps_what_came_before_it_and_stops() {
+        let bytes = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        let declared = read_declared_index(&mut io::Cursor::new(&bytes)).expect("EOCD reads");
+        let cd_start = usize::try_from(declared.cd_offset).unwrap();
+        let record0_len = {
+            let name_len = le16(&bytes[cd_start + 28..]) as usize;
+            let extra_len = le16(&bytes[cd_start + 30..]) as usize;
+            let comment_len = le16(&bytes[cd_start + 32..]) as usize;
+            46 + name_len + extra_len + comment_len
+        };
+        let record1_start = cd_start + record0_len;
+
+        // Keep record 0 whole, plus 10 bytes of record 1 (its signature and
+        // part of its fixed block) — genuinely mid-structure.
+        let mut truncated = bytes[..record1_start + 10].to_vec();
+        let mut eocd = SIG_END_OF_CENTRAL_DIR.to_vec();
+        eocd.extend_from_slice(&[0u8; END_OF_CENTRAL_DIR_FIXED]);
+        eocd[8..10].copy_from_slice(&2u16.to_le_bytes());
+        eocd[10..12].copy_from_slice(&2u16.to_le_bytes());
+        eocd[16..20].copy_from_slice(&(cd_start as u32).to_le_bytes());
+        truncated.extend_from_slice(&eocd);
+
+        let recs = walk_central_directory(&mut io::Cursor::new(&truncated))
+            .expect("a well-formed EOCD is present; the walk must be able to begin");
+        assert_eq!(
+            recs.len(),
+            1,
+            "must recover exactly the one whole record before the truncation, never invent a second"
+        );
+        assert_eq!(recs[0].name, "a.txt");
+    }
+
+    /// [`read_declared_index`] itself already refuses a file too short to
+    /// hold an EOCD at all — this pins that [`walk_central_directory`]
+    /// inherits the refusal rather than guessing a `cd_offset` of its own:
+    /// `None`, never a record count invented from nothing.
+    #[test]
+    fn no_eocd_at_all_leaves_the_walk_unable_to_begin() {
+        let bytes = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        let declared = read_declared_index(&mut io::Cursor::new(&bytes)).expect("EOCD reads");
+        let cd_start = usize::try_from(declared.cd_offset).unwrap();
+        // Cut away everything from the central directory onward, EOCD
+        // included: nothing is left to declare a `cd_offset` from.
+        let truncated = &bytes[..cd_start];
+
+        assert_eq!(
+            walk_central_directory(&mut io::Cursor::new(truncated)),
+            None,
+            "no EOCD at all must leave the walk unable to start, not guessing"
+        );
+    }
+
+    /// [`MAX_CD_NAME_LEN`]'s ceiling is checked before allocating a name
+    /// buffer, exactly like `cpio.rs`'s `c_namesize` and `ar.rs`'s BSD
+    /// identifier guards it is deliberately the same numeral as. **Unlike
+    /// those two**, this one can never actually fire over a genuine central-
+    /// directory record: `name_len` is a 16-bit field (APPNOTE 4.3.12),
+    /// capping every real declared value at `u16::MAX` (65,535) — one byte
+    /// under the 65,536-byte ceiling — so there is no way to encode a
+    /// wire-valid record this guard would refuse. Recorded here rather than
+    /// silently dropped: the check is kept anyway, for the same reason
+    /// `error.rs`'s exit-5-vs-6 rule is written down once rather than
+    /// re-derived per call site — a future change to how `name_len` is read
+    /// (a wider field, a value assembled some other way) would have this
+    /// ceiling already in place. This test pins the boundary that DOES
+    /// exist: the maximum representable value is accepted, not refused.
+    #[test]
+    fn the_maximum_representable_name_len_stays_under_the_ceiling() {
+        let mut record = SIG_CENTRAL_HEADER.to_vec();
+        record.extend_from_slice(&[0u8; CENTRAL_HEADER_FIXED]);
+        record[4 + 24..4 + 26].copy_from_slice(&u16::MAX.to_le_bytes());
+        // The name field itself must still be present, or this would fail on
+        // truncation instead of pinning the ceiling comparison.
+        record.extend(std::iter::repeat_n(b'x', u16::MAX as usize));
+
+        let result = read_one_cd_record(&mut io::Cursor::new(&record), 0).expect("not refused");
+        let name = result.expect("a valid signature and whole record").name;
+        assert_eq!(name.len(), u16::MAX as usize);
+    }
+
+    /// A record whose fixed block is truncated is `Error::Corrupt` (exit 5),
+    /// the opposite verdict from the ceiling above on purpose: nothing here
+    /// was refused for being too expensive, the bytes that were there just
+    /// ran out mid-structure.
+    #[test]
+    fn a_truncated_fixed_block_is_corrupt_not_a_resource_limit() {
+        let mut record = SIG_CENTRAL_HEADER.to_vec();
+        record.extend_from_slice(&[0u8; CENTRAL_HEADER_FIXED - 5]);
+
+        let err = read_one_cd_record(&mut io::Cursor::new(&record), 0).unwrap_err();
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "expected Corrupt, got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5, "Corrupt is exit 5: {err:?}");
+    }
+
+    /// A non-central-header signature — the ordinary way the walk ends, an
+    /// EOCD record — is `Ok(None)`: the healthy end of the index, not an
+    /// error.
+    #[test]
+    fn a_non_central_header_signature_is_a_clean_stop_not_an_error() {
+        let record = SIG_END_OF_CENTRAL_DIR.to_vec();
+        let result = read_one_cd_record(&mut io::Cursor::new(&record), 0).expect("not an error");
+        assert_eq!(result, None);
     }
 
     /// Property 6 pins this for the forward source; this pins the other half,
