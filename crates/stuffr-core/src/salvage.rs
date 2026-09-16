@@ -12,24 +12,40 @@
 //! entirely against mocks — [`SalvageScan`] is the seam Task 2 onward builds
 //! real scanners against (starting with zip).
 //!
-//! Two things this task does NOT do, on purpose, because they need a real
-//! decoder to do honestly:
+//! ## Verification and shadowing (Task 4)
 //!
-//! - **Verifying a candidate's checksum**, to decide [`SalvageStatus::Intact`]
-//!   versus [`SalvageStatus::Complete`]. A candidate that clears the entry
-//!   ceiling is recorded as `Complete` here — the header parsed and nothing
-//!   is yet known to be missing — never `Intact`: nothing has read the
-//!   payload back and compared it against [`Candidate::verifier`], and
-//!   claiming otherwise is exactly what the salvage honesty oracle (a later
-//!   task's `check_salvage_claim`) exists to catch.
-//! - **Detecting a shadowed record**, i.e. setting [`SalvagedEntry::shadows`].
-//!   That is also a checksum comparison across entries, so it stays `None`
-//!   here.
+//! Two things this module now does, both format-agnostic:
 //!
-//! Both are real reconciliation work a later task adds; this module's job is
-//! the loop that finds candidates, bounds what they declare, and collects
-//! them — safely, against a hostile or merely corrupt input, before any of
-//! that work exists.
+//! - **Deciding [`SalvageStatus`]** is delegated to [`SalvageScan::verify`],
+//!   called once per candidate in [`annotate_candidates`]. The default
+//!   answers [`SalvageStatus::Complete`] — "every declared byte fit inside
+//!   the source and the header self-verified, but nothing checked its
+//!   content" — which is honest for a mock with no [`Candidate::verifier`]
+//!   to check, and for a real format with no checksum at all (tar, cpio,
+//!   ar). A format that DOES carry one (zip's CRC-32) overrides `verify` to
+//!   decode the payload and compare it, answering `Intact` on agreement and
+//!   `Partial` otherwise — never `Complete`, which is reserved for "no way
+//!   to prove", not "tried and it disagreed". Earlier revisions of this
+//!   module recorded every candidate as `Complete` unconditionally; that was
+//!   a placeholder, not a claim about zip, and it was wrong for every zip
+//!   entry the moment a real scanner carried a CRC-32.
+//! - **Detecting a shadowed record** (setting [`SalvagedEntry::shadows`]) is
+//!   generic too: [`annotate_candidates`] remembers the first candidate to
+//!   report each distinct [`Verifier`] value and marks any LATER candidate
+//!   reporting the identical value as shadowing it. This is a MEASUREMENT —
+//!   an equality check on [`Candidate::verifier`] — never an inference from
+//!   [`EntryMeta::name`] repeating: two different files that happen to share
+//!   a name must not be linked this way, only two records whose original
+//!   writer computed the same checksum for both.
+//!
+//! [`collect_candidates`] (the resync loop: find a candidate, bound its
+//! declared length, advance) and [`annotate_candidates`] (verify + shadow,
+//! above) are both exposed separately from [`salvage_all`] — which is just
+//! the two of them run in sequence — so a format that reconciles more than
+//! one candidate source (zip's central-directory fallback, `zip_salvage.rs`)
+//! can collect from each source under the identical bound, merge, and
+//! annotate the merged list exactly once, rather than annotating twice and
+//! reconciling two already-decided outcomes.
 
 use crate::archive::EntryMeta;
 use crate::error::{Error, Result};
@@ -133,6 +149,21 @@ impl Default for SalvagePolicy {
 pub trait SalvageScan {
     /// Find the next candidate at or after `from`. `Ok(None)` ends the scan.
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>>;
+
+    /// Decide what was actually proven about a candidate's payload, after
+    /// discovery — called once per candidate, in file order, by
+    /// [`annotate_candidates`].
+    ///
+    /// The default answers [`SalvageStatus::Complete`] unconditionally: a
+    /// scanner with no real checksum (or, in this module's own tests, a mock
+    /// that never populates [`Candidate::verifier`]) has nothing to check,
+    /// and `Complete` is the honest claim for that case. A format that DOES
+    /// carry a checksum overrides this to decode the payload — reusing its
+    /// own existing codec machinery, never inventing a new one here — and
+    /// compare it against [`Candidate::verifier`].
+    fn verify(&self, _src: &mut dyn SeekRead, _candidate: &Candidate) -> Result<SalvageStatus> {
+        Ok(SalvageStatus::Complete)
+    }
 }
 
 /// Walk `scan` over `src`, collecting every candidate it reports into a
@@ -155,7 +186,24 @@ pub fn salvage_all(
     src: &mut dyn SeekRead,
     policy: &SalvagePolicy,
 ) -> Result<SalvageOutcome> {
-    let mut entries = Vec::new();
+    let candidates = collect_candidates(scan, src, policy)?;
+    annotate_candidates(&*scan, src, candidates)
+}
+
+/// The resync loop alone: find a candidate, bound its declared length
+/// against `policy.max_entry` **before** anything is sized from it, advance
+/// strictly past it, repeat. Never reads a payload and never calls
+/// [`SalvageScan::verify`] — see [`annotate_candidates`] for that.
+///
+/// Exposed separately from [`salvage_all`] so a format that reconciles more
+/// than one candidate source (zip's central-directory fallback) can collect
+/// from each source under the identical bound before merging.
+pub fn collect_candidates(
+    scan: &mut dyn SalvageScan,
+    src: &mut dyn SeekRead,
+    policy: &SalvagePolicy,
+) -> Result<Vec<Candidate>> {
+    let mut candidates = Vec::new();
     let mut from = 0u64;
 
     while let Some(candidate) = scan.next_candidate(src, from)? {
@@ -169,22 +217,53 @@ pub fn salvage_all(
             )));
         }
 
-        let scan_position = entries.len();
-        entries.push(SalvagedEntry {
-            scan_position,
-            offset: candidate.offset,
-            meta: candidate.meta,
-            // Nothing has verified a checksum yet — see this module's doc
-            // comment. `Complete`, never `Intact`, is the honest claim here.
-            status: SalvageStatus::Complete,
-            shadows: None,
-        });
-
         // Advance strictly past this candidate so the scan always makes
         // progress, regardless of what the scanner reported `from` as or
         // whether it declared a length at all.
         let advance = candidate.declared_len.unwrap_or(1).max(1);
         from = candidate.offset.saturating_add(advance);
+
+        candidates.push(candidate);
+    }
+
+    Ok(candidates)
+}
+
+/// Turns already-discovered, already-bounded candidates — in file order —
+/// into the verified, shadow-annotated entries a caller receives. See this
+/// module's doc comment for what the two passes (verify, shadow) mean and
+/// why they live here rather than per-format.
+pub fn annotate_candidates(
+    scan: &dyn SalvageScan,
+    src: &mut dyn SeekRead,
+    candidates: Vec<Candidate>,
+) -> Result<SalvageOutcome> {
+    let mut entries = Vec::with_capacity(candidates.len());
+    // Earliest scan_position to report each distinct checksum seen so far —
+    // a candidate reporting one already in here is shadowing that position.
+    let mut seen: Vec<(Verifier, usize)> = Vec::new();
+
+    for (scan_position, candidate) in candidates.into_iter().enumerate() {
+        let status = scan.verify(src, &candidate)?;
+
+        let shadows = candidate.verifier.and_then(|verifier| {
+            seen.iter()
+                .find(|&&(seen_verifier, _)| seen_verifier == verifier)
+                .map(|&(_, earlier_position)| earlier_position)
+        });
+        if let Some(verifier) = candidate.verifier
+            && shadows.is_none()
+        {
+            seen.push((verifier, scan_position));
+        }
+
+        entries.push(SalvagedEntry {
+            scan_position,
+            offset: candidate.offset,
+            meta: candidate.meta,
+            status,
+            shadows,
+        });
     }
 
     Ok(SalvageOutcome { entries })
@@ -320,5 +399,108 @@ mod tests {
         assert_eq!(policy.partial, PartialPolicy::Keep);
         assert_eq!(policy.max_entry, MAX_SALVAGE_ENTRY);
         assert!(!policy.strict);
+    }
+
+    // -----------------------------------------------------------------
+    // Task 4: `verify` dispatch and shadow detection, proven against a
+    // mock — same discipline as the rest of this module, since neither
+    // mechanism needs to know which format it is annotating.
+    // -----------------------------------------------------------------
+
+    /// Reports a fixed, caller-scripted sequence of candidates and answers
+    /// `verify` from the SAME script rather than decoding anything — this
+    /// module's engine is proven against mocks, and verification/shadow
+    /// detection are no exception.
+    struct ScriptedCandidates {
+        plan: Vec<(Option<Verifier>, SalvageStatus)>,
+        next: usize,
+    }
+
+    impl SalvageScan for ScriptedCandidates {
+        fn next_candidate(
+            &mut self,
+            _src: &mut dyn SeekRead,
+            _from: u64,
+        ) -> Result<Option<Candidate>> {
+            if self.next >= self.plan.len() {
+                return Ok(None);
+            }
+            let offset = self.next as u64;
+            let (verifier, _) = self.plan[self.next];
+            self.next += 1;
+            Ok(Some(Candidate {
+                offset,
+                meta: EntryMeta::file(format!("entry-{offset}")),
+                declared_len: Some(1),
+                verifier,
+            }))
+        }
+
+        fn verify(&self, _src: &mut dyn SeekRead, candidate: &Candidate) -> Result<SalvageStatus> {
+            Ok(self.plan[candidate.offset as usize].1)
+        }
+    }
+
+    /// `verify` decides each entry's status — the whole point of Task 4:
+    /// this used to be a hardcoded `Complete` for every candidate, which was
+    /// wrong for any format carrying a real checksum.
+    #[test]
+    fn verify_decides_each_entrys_status_not_a_hardcoded_default() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (Some(Verifier::Crc32(1)), SalvageStatus::Intact),
+                (None, SalvageStatus::Complete),
+                (Some(Verifier::Crc32(2)), SalvageStatus::Partial),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries[0].status, SalvageStatus::Intact);
+        assert_eq!(out.entries[1].status, SalvageStatus::Complete);
+        assert_eq!(out.entries[2].status, SalvageStatus::Partial);
+    }
+
+    /// A later candidate reporting the SAME verifier as an earlier one is
+    /// its shadow — pointing at the earliest position, not merely "some"
+    /// earlier one — and this is a checksum equality, never anything to do
+    /// with `meta.name`, which `ScriptedCandidates` does not even vary here.
+    #[test]
+    fn a_later_candidate_sharing_an_earlier_verifier_is_marked_as_its_shadow() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (Some(Verifier::Crc32(7)), SalvageStatus::Intact),
+                (Some(Verifier::Crc32(9)), SalvageStatus::Intact),
+                (Some(Verifier::Crc32(7)), SalvageStatus::Intact),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries[0].shadows, None);
+        assert_eq!(out.entries[1].shadows, None);
+        assert_eq!(
+            out.entries[2].shadows,
+            Some(0),
+            "must point at the earliest matching position"
+        );
+    }
+
+    /// A candidate with no verifier at all (a format with no checksum, or a
+    /// zip data-descriptor entry) must never be reported as shadowing or
+    /// shadowed — there is nothing to measure, so nothing is claimed.
+    #[test]
+    fn candidates_with_no_verifier_never_shadow_each_other() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (None, SalvageStatus::Complete),
+                (None, SalvageStatus::Complete),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries[0].shadows, None);
+        assert_eq!(out.entries[1].shadows, None);
     }
 }
