@@ -19,6 +19,7 @@ mod honesty;
 pub mod ladder;
 pub mod probe;
 pub mod registry;
+pub mod salvage;
 pub mod size;
 pub mod source;
 #[cfg(any(test, feature = "testing"))]
