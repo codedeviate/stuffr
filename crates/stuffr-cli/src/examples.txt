@@ -931,7 +931,7 @@ NOT YET
   `--features c-backed` changes nothing about it, and there is no
   weak-fallback distinction for it either.
 
-  All four containers read and write, and all four entry-aware
+  All four pure-tier containers read and write, and all four entry-aware
   subcommands work on each of them identically: `list` and `test` read
   entries without extracting, `unpack -C` writes them to disk under the
   containment rules above, and `pack PATHS...` collects files into one.

@@ -229,7 +229,9 @@ read list.
 > rather than `ForwardOnly`; that rung is authoritative, so it works, but it
 > spends disk a plain LHA read never has to. ARJ also has no per-entry
 > streaming reader at all: an entry decodes whole, so `--max-ratio` is a
-> coarser bound there than on the other five containers, and a fixed 256 MiB
+> coarser bound there than on the five streaming containers (`tar`, `ar`,
+> `cpio`, `zip`, `lha`) — Phase 3c's `arc` and `zoo` decode whole for the
+> same reason, so they are coarse too — and a fixed 256 MiB
 > per-entry ceiling — checked **before** allocating, at exit 6, never exit
 > 5 — is the real backstop against a hostile header, since there is no
 > `--memory-limit`-style knob for a container to read in the first place.
@@ -635,7 +637,7 @@ remains decode-only for licence reasons, not effort.
 
 | Feature | Contents |
 |---|---|
-| `pure` *(default)* | everything with a pure-Rust implementation — all eleven codecs, including read+write xz, LZMA1 and LZIP, plus all four containers |
+| `pure` *(in `default`)* | everything modern with a pure-Rust implementation — all eleven pure-tier codecs, including read+write xz, LZMA1 and LZIP, plus all four pure-tier containers |
 | `c-backed` | `zstd-sys` and `liblzma`, both vendored and built statically; also the one entry codec inside `zip` that needs a C-compiling crate (see below); later `unrar` (decode) |
 | `legacy` *(default)* | the historical format set — `compress` (read AND write, Phase 3c Task 5), `lha` (read AND write, Task 6 — reads seven methods, writes `-lh5-`), `arj` (read AND write, Task 7 — reads five methods, writes `Stored`, so it does not compress), `arc`, `zoo` (read-only) |
 | `full` | all of the above |

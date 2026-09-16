@@ -8217,16 +8217,11 @@ fn documented_install_commands_name_features_this_crate_declares() {
          not the manifest"
     );
 
-    let docs = [
-        manifest_dir.join("README.md"),
-        manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("README.md"),
-        manifest_dir.join("src").join("examples.txt"),
-    ];
+    // The same list the count guards scan — widened past this crate's own
+    // three documents for the same reason they were: a stale `--features`
+    // spelling in `CONTRIBUTING.md` or on another crate's published page
+    // fails exactly as loudly for the reader who copies it.
+    let docs = user_facing_documents();
     let mut commands_checked = 0usize;
     for doc in docs {
         let text = std::fs::read_to_string(&doc).unwrap();
@@ -8255,8 +8250,198 @@ fn documented_install_commands_name_features_this_crate_declares() {
     );
 }
 
+/// **The documents this crate's count guards scan, in one place.**
+///
+/// It was three — this crate's README, the workspace README and
+/// `examples.txt` — and that list is precisely what let Phase 3c's final
+/// review find two stale published claims by hand: `crates/stuffr/README.md`
+/// is a live crates.io landing page that did not know the legacy formats
+/// existed, and `CONTRIBUTING.md` still said "eleven codecs". Neither was in
+/// the list, so neither could have been caught. Every follow-up that review
+/// raised lived in a file no task owned, which is the argument for widening
+/// the scan rather than adding a checklist.
+///
+/// All four crate READMEs are here because all four are published pages, and
+/// `CONTRIBUTING.md` because it is the document a contributor works from.
+fn user_facing_documents() -> Vec<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.parent().unwrap().parent().unwrap();
+    vec![
+        manifest_dir.join("README.md"),
+        manifest_dir.join("src").join("examples.txt"),
+        root.join("README.md"),
+        root.join("CONTRIBUTING.md"),
+        root.join("crates").join("stuffr").join("README.md"),
+        root.join("crates").join("stuffr-core").join("README.md"),
+        root.join("crates").join("stuffr-formats").join("README.md"),
+    ]
+}
+
+/// **An UNQUALIFIED "<number> codecs/containers" claim, checked too.**
+///
+/// The sibling below only checks a count carrying one of three qualifiers,
+/// which is why `crates/stuffr-cli/README.md` could name all five legacy
+/// formats and then, twenty lines lower in the same published page, say
+/// "Eleven codecs (…) and four containers (…)" with nothing failing. A bare
+/// codec count is the same class that test already owns; only the phrasing
+/// escaped it.
+///
+/// The rule has to allow a legitimately NARROWED claim — a feature table's
+/// `pure` row really does describe eleven codecs and four containers — so it
+/// is: an unqualified count must be the FULL registry figure, unless the
+/// clause it sits in carries a narrowing cue (`pure`, `writable`,
+/// `round-trip`, `read-only`, `legacy`, `no-default-features`), in which
+/// case one of the narrowed figures will do. A claim that is neither is what
+/// "Eleven codecs and four containers" was.
+///
+/// Clauses, not sentences: the flattened text is split on `. ` AND on `|`,
+/// so a markdown table cell is its own clause and a cue in the neighbouring
+/// row cannot vouch for it.
+///
+/// **What it does not reach**, so nobody overtrusts it: spelled-out numbers
+/// only (a digit evades, as it does in the sibling — no document uses one
+/// today); the nouns `codecs` and `containers` only, never `formats`, which
+/// is deliberately left to narrate; and a cue anywhere in the clause is
+/// taken at face value rather than parsed, so a long clause can excuse a
+/// narrowed count it did not really mean.
+#[test]
+fn no_document_carries_a_stale_unqualified_codec_or_container_count() {
+    const LEGACY_ONLY_CODECS: &[&str] = &["compress"];
+    const LEGACY_ONLY_CONTAINERS: &[&str] = &["lha", "arj", "arc", "zoo"];
+    const CUES: &[&str] = &[
+        "pure",
+        "pure-tier",
+        "writable",
+        "round-trip",
+        "read-only",
+        "legacy",
+        "no-default-features",
+    ];
+    const QUALIFIERS: &[&str] = &["round-trip", "read-only", "pure-tier"];
+    /// How many words before the count a narrowing cue may sit.
+    const CUE_WINDOW: usize = 8;
+
+    let registry = stuffr::registry();
+    let rows = registry.matrix();
+    let is_container = |id| registry.container(id).is_some();
+    let count = |container: bool, pred: &dyn Fn(&stuffr::FormatRow) -> bool| {
+        rows.iter()
+            .filter(|r| is_container(r.id) == container && pred(r))
+            .count()
+    };
+    let legacy = |container: bool, id: &str| {
+        if container {
+            LEGACY_ONLY_CONTAINERS.contains(&id)
+        } else {
+            LEGACY_ONLY_CODECS.contains(&id)
+        }
+    };
+    // The full count is the only one an unqualified, uncued claim may use.
+    let full = |container: bool| count(container, &|_| true);
+    // With a cue, any of these is a true statement about some build.
+    let narrowed = |container: bool| {
+        [
+            count(container, &|r| r.write),
+            count(container, &|r| !r.write),
+            count(container, &|r| !legacy(container, r.id.as_str())),
+        ]
+    };
+
+    const NUMBERS: &[(&str, usize)] = &[
+        ("one", 1),
+        ("two", 2),
+        ("three", 3),
+        ("four", 4),
+        ("five", 5),
+        ("six", 6),
+        ("seven", 7),
+        ("eight", 8),
+        ("nine", 9),
+        ("ten", 10),
+        ("eleven", 11),
+        ("twelve", 12),
+        ("thirteen", 13),
+        ("fourteen", 14),
+        ("fifteen", 15),
+        ("sixteen", 16),
+        ("seventeen", 17),
+        ("eighteen", 18),
+        ("nineteen", 19),
+        ("twenty", 20),
+    ];
+
+    let mut claims_checked = 0usize;
+    for doc in user_facing_documents() {
+        let text = std::fs::read_to_string(&doc).unwrap();
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for clause in flat.split(". ").flat_map(|s| s.split('|')) {
+            let words: Vec<String> = clause
+                .split(' ')
+                .map(|w| {
+                    w.trim_matches(|c: char| !c.is_alphanumeric() && c != '-')
+                        .to_lowercase()
+                })
+                .collect();
+            for i in 0..words.len() {
+                let Some((_, value)) = NUMBERS.iter().find(|(w, _)| *w == words[i]) else {
+                    continue;
+                };
+                let Some(noun) = words.get(i + 1) else {
+                    continue;
+                };
+                // A qualified claim belongs to the sibling test, which can
+                // say exactly which figure it must be.
+                if QUALIFIERS.contains(&noun.as_str()) {
+                    continue;
+                }
+                let container = match noun.as_str() {
+                    "containers" => true,
+                    "codecs" => false,
+                    _ => continue,
+                };
+                claims_checked += 1;
+                // The cue must be NEAR the count, not merely somewhere in
+                // the clause. Measured why: `default = ["pure", "legacy"]`
+                // appears in the same sentence as a general headline count
+                // on `crates/stuffr/README.md`, and a clause-wide cue let a
+                // deliberately-stalened "eleven codecs and four containers"
+                // pass on the strength of a `pure` inside a code span twelve
+                // words away. Eight words back through the noun is enough
+                // for every real narrowed claim in the tree and not enough
+                // for that.
+                let from = i.saturating_sub(CUE_WINDOW);
+                let cued = words[from..=i + 1]
+                    .iter()
+                    .any(|w| CUES.contains(&w.as_str()));
+                let want_full = full(container);
+                let ok = if cued {
+                    *value == want_full || narrowed(container).contains(value)
+                } else {
+                    *value == want_full
+                };
+                assert!(
+                    ok,
+                    "{} says `{} {noun}`, but this build registers {want_full} {noun} \
+                     (narrowed counts, allowed only in a clause naming a narrowing — \
+                     {CUES:?}, within {CUE_WINDOW} words — are {:?}). The clause is \
+                     {clause:?}",
+                    doc.display(),
+                    words[i],
+                    narrowed(container),
+                );
+            }
+        }
+    }
+
+    assert!(
+        claims_checked >= 5,
+        "the scan found only {claims_checked} unqualified counts — it is matching nothing \
+         and proving nothing"
+    );
+}
+
 /// **Every "<number> round-trip/read-only/pure-tier <noun>" claim in the
-/// three documents a user reads, checked against the live registry.**
+/// documents a user reads, checked against the live registry.**
 ///
 /// This closes a class rather than an instance. Three stale
 /// write-capability claims were found BY HAND across Phase 3c Tasks 5, 6 and
@@ -8349,21 +8534,11 @@ fn no_document_carries_a_stale_round_trip_or_read_only_count() {
         ("twenty", 20),
     ];
 
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let docs = [
-        manifest_dir.join("README.md"),
-        manifest_dir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("README.md"),
-        manifest_dir.join("src").join("examples.txt"),
-    ];
+    let docs = user_facing_documents();
 
     let mut claims_checked = 0usize;
-    for doc in docs {
-        let text = std::fs::read_to_string(&doc).unwrap();
+    for doc in &docs {
+        let text = std::fs::read_to_string(doc).unwrap();
         // Whitespace-normalised: every one of these documents wraps, and a
         // count split across a line break must still read as one phrase.
         let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -8419,8 +8594,9 @@ fn no_document_carries_a_stale_round_trip_or_read_only_count() {
     // A scan that matched nothing would pass forever. These documents carry
     // such claims today and the point of the test is that they stay true.
     assert!(
-        claims_checked >= 6,
-        "the scan found only {claims_checked} qualified counts across the three documents — \
-         it is matching nothing and proving nothing"
+        claims_checked >= 8,
+        "the scan found only {claims_checked} qualified counts across the {} documents — \
+         it is matching nothing and proving nothing",
+        docs.len()
     );
 }

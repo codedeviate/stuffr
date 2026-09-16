@@ -50,9 +50,13 @@ stuffr --examples                       # worked examples for every verb
 
 `-` means stdin everywhere, so `curl … | stuffr cat - | grep pattern` works.
 
-Eleven codecs (`gzip`, `zlib`, `deflate`, `bzip2`, `brotli`, `lz4`, `snappy`,
-`zstd`, `xz`, `lzma`, `lzip`) and four containers (`tar`, `ar`, `cpio` — `newc`
-only — and `zip`/`zip64`).
+Twelve codecs — `gzip`, `zlib`, `deflate`, `bzip2`, `brotli`, `lz4`,
+`snappy`, `zstd`, `xz`, `lzma`, `lzip` and Unix `compress` (`.Z`), all
+round-trip — and eight containers: `tar`, `ar`, `cpio` (`newc` only),
+`zip`/`zip64`, `lha` and `arj` are six round-trip containers, and `arc`/PAK
+and `zoo` are two read-only containers. That is what a plain
+`cargo install stuffr-cli` gives you; `stuffr formats` prints the matrix for
+the build you actually have.
 
 Full documentation, including the safety defaults and the two build tiers, is in
 the [project README](https://github.com/codedeviate/stuffr#readme).

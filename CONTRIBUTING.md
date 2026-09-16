@@ -401,7 +401,7 @@ wire format of every corpus seed on disk: a seed minimised against `bzip2`
 is a seed whose selector byte, modulo the table's length, happens to land on
 `bzip2`'s current index. Reorder the table and that same seed silently
 starts feeding a different codec — nothing fails to tell you, and a corpus
-built to cover eleven codecs quietly stops covering one of them.
+built to cover twelve codecs quietly stops covering one of them.
 
 ### Corpus and running locally
 
