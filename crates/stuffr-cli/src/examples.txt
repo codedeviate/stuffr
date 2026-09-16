@@ -1119,10 +1119,20 @@ LEGACY FORMATS
       If you have `arj` or `unarj` on a machine somewhere, a report either
       way is worth more than anything in this repository.
 
-      A symlink is refused rather than stored (exit 3): ARJ's own entry-type
-      table has no value for a link, so writing one would put the target
-      text in a regular file's contents. Directories ARE stored, as
-      themselves. Every entry carries its own CRC-32, checked once
+      A symlink is SKIPPED with a fidelity warning — not stored, and not
+      refused. ARJ's own entry-type table has no value for a link, so
+      writing one would put the target text in a regular file's contents;
+      `pack` names the entry it skipped, writes the rest, and exits 0.
+      --strict-fidelity turns that into exit 4, with the archive still on
+      disk. Exactly what `lha` says above, and what `ar` says about
+      directories: a kind a container cannot store is a fidelity loss, never
+      a refusal. (This paragraph said "refused rather than stored (exit 3)"
+      until Phase 3c's final review measured the binary and found no path to
+      exit 3 at all. It matters more than an ordinary typo because this page
+      ships INSIDE the binary, and `cli.rs`'s
+      `a_symlink_in_a_walked_tree_is_never_refused_and_the_page_may_not_say_it_is`
+      now runs the case on every writable container rather than trusting the
+      sentence.) Directories ARE stored, as themselves. Every entry carries its own CRC-32, checked once
       its payload has been decoded, and a mismatch is `Error::Corrupt` (exit
       5) — the same promise every other checksum-carrying format here
       makes. `by_index` has exactly one answer on this container, unlike

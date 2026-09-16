@@ -1184,6 +1184,105 @@ fn examples_pages_first_worked_example_runs_as_documented() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// **A behavioural claim on the `--examples` page, pinned by RUNNING it.**
+///
+/// The page ships INSIDE the binary and is where this project points users
+/// for exit-code contracts, and the count guards around it derive their
+/// expectations from the live registry — which is exactly why the COUNT
+/// claims were all correct and a BEHAVIOURAL one was not. Phase 3c's final
+/// review found `examples.txt`'s ARJ entry promising "A symlink is refused
+/// rather than stored (exit 3)" when the measured answer is exit 0 with a
+/// fidelity warning, exit 4 under `--strict-fidelity`. Nothing in the tree
+/// could have said so: the sentence was prose, and prose is not checked.
+///
+/// Two arms, and the first is what gives the second its authority:
+///
+/// 1. **Measured.** Every container the registry says can WRITE is packed
+///    over a tree holding a symlink, plain and `--strict-fidelity`. The
+///    answer is 0 or 4 — stored (tar, cpio, zip) or skipped with a named
+///    fidelity loss (ar, lha, arj) — and never 3. That is a real contract
+///    of its own, derived from the registry rather than a list here, so a
+///    seventh writable container joins it automatically.
+/// 2. **The page is held to it.** No sentence may say a symlink is refused
+///    at exit 3, because no container does that.
+///
+/// What this does NOT reach, stated so the next reader does not overtrust
+/// it: only the symlink class, and only the exit-3 verdict. A page claiming
+/// the wrong exit code for some other refusal is still unchecked prose. The
+/// class is cheap to extend one measured case at a time; it is not a general
+/// executable-docs harness and does not pretend to be.
+#[test]
+fn a_symlink_in_a_walked_tree_is_never_refused_and_the_page_may_not_say_it_is() {
+    let dir = tmp("examples-symlink-verdict");
+    let _ = std::fs::remove_dir_all(&dir);
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("file.txt"), b"payload").unwrap();
+    std::os::unix::fs::symlink("file.txt", tree.join("link.txt")).unwrap();
+
+    let registry = stuffr::registry();
+    let mut measured = 0usize;
+    for row in registry.matrix() {
+        if registry.container(row.id).is_none() || !row.write {
+            continue;
+        }
+        let id = row.id.as_str();
+        let out_path = dir.join(format!("out-{id}"));
+        for strict in [false, true] {
+            let _ = std::fs::remove_file(&out_path);
+            let mut cmd = Command::new(STUFFR);
+            cmd.arg("pack")
+                .arg(&tree)
+                .arg("-o")
+                .arg(&out_path)
+                .arg("--format")
+                .arg(id);
+            if strict {
+                cmd.arg("--strict-fidelity");
+            }
+            let out = cmd.output().unwrap();
+            let code = out.status.code();
+            assert!(
+                matches!(code, Some(0) | Some(4)),
+                "`pack` over a tree containing a symlink answered exit {code:?} for `{id}` \
+                 (strict-fidelity: {strict}). A kind a container cannot store is a fidelity \
+                 LOSS, never a refusal — and exit 3 in particular is what `examples.txt` \
+                 wrongly promised for `arj` until Phase 3c's final review measured it. \
+                 stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        measured += 1;
+    }
+    assert!(
+        measured >= 6,
+        "only {measured} writable containers were exercised; this build registers six, so the \
+         registry walk has stopped finding them and the measurement proves nothing"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let out = Command::new(STUFFR).arg("--examples").output().unwrap();
+    assert!(out.status.success(), "stuffr --examples must exit 0");
+    let text = String::from_utf8(out.stdout).unwrap();
+    // Whitespace-normalised, because the page wraps and a claim split across
+    // a line break must still read as one sentence.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for sentence in flat.split(". ") {
+        let lower = sentence.to_lowercase();
+        if !lower.contains("symlink") {
+            continue;
+        }
+        if !(lower.contains("refused") || lower.contains("refuses")) {
+            continue;
+        }
+        assert!(
+            !lower.contains("exit 3"),
+            "the examples page says a symlink is refused at exit 3, which the measurement \
+             above proves no writable container does: {sentence:?}"
+        );
+    }
+}
+
 /// `pack --format arc`/`zoo` must refuse CLEARLY — exit 3, naming
 /// the format as readable but not writable by this build — never fail
 /// obscurely (an internal panic, a bare i/o error, or an unrelated exit
