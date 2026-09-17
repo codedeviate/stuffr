@@ -362,13 +362,40 @@ pub fn collect_candidates(
         }
 
         // Advance strictly past this candidate so the scan always makes
-        // progress, regardless of what the scanner reported `from` as or
-        // whether it declared a length at all. A truncated candidate
-        // advances past the bytes that EXIST, not past the ones it claimed:
-        // advancing by the declared figure would skip the rest of the file
-        // (there is none) either way, but the available one keeps the loop's
-        // arithmetic honest about where it actually is.
-        let advance = bounded_len.unwrap_or(1).max(1);
+        // progress — but NEVER by a length this candidate merely CLAIMED.
+        // `available_len.is_some()` means the header's own declared length
+        // disagreed with the file (there were fewer bytes left than it
+        // said), and a header that lied about its size once cannot be
+        // trusted to say how much of the source its "payload" consumed
+        // either. This used to advance by `available_len` — the bytes
+        // actually present, not the declared figure — on the reasoning that
+        // a truncated entry has nothing worth finding after it anyway. That
+        // is true for a genuinely truncated REAL last entry, but the
+        // engine cannot tell that case apart from a coincidental
+        // false-positive header sitting on top of noise with a garbage
+        // multi-hundred-megabyte declared length: `available_len` is the
+        // same "everything left in the file" figure either way. Salvage
+        // Stage 2 Task 3's fix round 1 found exactly this — one
+        // coincidental marker+name match in an ARC noise corpus, with a
+        // declared length far past the file, jumped the scan straight to
+        // EOF in one step and silently dropped every real entry that
+        // happened to sit between it and the end of the file: no error, no
+        // `Partial`, no note, in the one verb whose entire job is not
+        // losing entries silently. So a truncated candidate now advances
+        // minimally — past its own marker byte only — so the very next
+        // byte onward is examined for another header. That costs a few
+        // bytes of re-scanning after a genuinely truncated real entry
+        // (which has nothing left to find anyway, so the outcome is
+        // unchanged); it is the entire fix for a phantom, whose lie no
+        // longer costs the rest of the archive. An UNTRUNCATED candidate's
+        // declared length was just checked against the file two lines
+        // above — it fits, so it is not a lie, and advancing by it is
+        // unchanged.
+        let advance = if candidate.available_len.is_some() {
+            1
+        } else {
+            candidate.declared_len.unwrap_or(1).max(1)
+        };
         from = candidate.offset.saturating_add(advance);
 
         candidates.push(candidate);

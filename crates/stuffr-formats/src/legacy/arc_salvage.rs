@@ -522,6 +522,66 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
+    // Fix round 1, REQUIRED 2: the anti-vacuity pair above only proves the
+    // gate REJECTS a coincidence — it never proves the SCAN survives one and
+    // keeps going. It did not: the fix round's own falsification of the
+    // pair above found a genuine marker+name coincidence in the noise at
+    // offset 251426 (name `"lf@"`, declared length 1,619,268,811), not the
+    // deliberately seeded defect header this test file's report originally
+    // (and wrongly) blamed. `stuffr_core::salvage::collect_candidates` used
+    // to advance past a truncated candidate by `available_len` — "every
+    // byte left in the file" by construction — so that one lying header
+    // jumped the scan straight to EOF and silently dropped every real entry
+    // after it, with no error, no `Partial`, no note. This test reproduces
+    // that shape directly rather than relying on a coincidence to appear
+    // in noise, and must never regress.
+    // -------------------------------------------------------------------
+
+    /// A real entry, then a region shaped exactly like the false positive
+    /// that exposed the engine bug — a plausible marker, a recognised
+    /// method, a printable name, but a declared `compressed_size` that
+    /// overruns everything left in the buffer (so `available_len` reports
+    /// "the rest of the file", the same figure a genuinely truncated real
+    /// last entry would report) — then MORE real entries after it. Before
+    /// the engine fix, `collect_candidates` trusted that lying length to
+    /// skip straight to the end of the source, and `SECOND.TXT` was never
+    /// found at all: this is that regression, made deterministic instead of
+    /// waiting for a coincidence in noise.
+    #[test]
+    fn a_lying_declared_length_does_not_swallow_the_real_entries_after_it() {
+        let mut bytes = build_arc_entry(2, "FIRST.TXT", b"hello");
+        // The phantom-shaped region: nothing genuine follows it before
+        // `SECOND.TXT`'s own header, so its declared 50,000,000-byte
+        // payload is a bald lie the moment the file runs out.
+        bytes.extend_from_slice(&build_arc_entry_declaring(
+            3,
+            "PHANTOM.BIN",
+            b"",
+            50_000_000,
+            0,
+        ));
+        bytes.extend_from_slice(&build_arc_entry(4, "SECOND.TXT", b"world"));
+        bytes.extend_from_slice(&[MARKER, 0]); // end-of-archive marker
+
+        let out = salvage_all(
+            &mut ArcSalvage::new(),
+            &mut Cursor::new(bytes),
+            &SalvagePolicy::default(),
+        )
+        .expect("a lying declared length must not abort the whole scan");
+
+        let names: Vec<&str> = out.entries.iter().map(|e| e.meta.name.as_str()).collect();
+        assert!(
+            names.contains(&"FIRST.TXT"),
+            "the entry BEFORE the phantom must survive: {names:?}"
+        );
+        assert!(
+            names.contains(&"SECOND.TXT"),
+            "the entry AFTER the phantom must survive — this is the whole fix: {names:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // The positive complement: a scanner that always returned `Ok(None)`
     // would also pass the anti-vacuity pair trivially. These prove the gate
     // ACCEPTS real headers too, not only rejects fake ones.
