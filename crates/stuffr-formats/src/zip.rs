@@ -847,8 +847,81 @@ fn skip_forward<R: Read>(r: &mut R, n: u64) -> io::Result<()> {
 /// from it. `#[cfg(test)]` at the top level of this module rather than
 /// nested inside `mod tests`, deliberately — a private `mod tests` is not
 /// visible to a sibling module in this crate, and R-D requires it to be.
+///
+/// **This fixture pins the IDENTICAL-duplicate case only, and that is now
+/// stated rather than left to be discovered.** The two extras are
+/// byte-for-byte copies, which is the shape the motivating real-world
+/// archive actually had — but it is only one of the two shapes a repeated
+/// name comes in, and under it a whole class of defect is invisible:
+/// marking a duplicate costs nothing to get right, and overwriting one on
+/// disk costs nothing at all, because the bytes agree. The final
+/// whole-branch review found three separate findings hiding behind exactly
+/// that. [`build_distinct_duplicate_zip`] is the other half — same eight
+/// records under the same six names, with the duplicates carrying DIFFERENT
+/// content — and both are kept, because both are real.
 #[cfg(test)]
 pub(crate) fn build_shadowing_zip() -> Vec<u8> {
+    build_duplicating_zip(DuplicateContent::Identical)
+}
+
+/// The realistic counterpart to [`build_shadowing_zip`]: the same eight
+/// central-directory records under the same six names, except each
+/// duplicate's payload is a DIFFERENT string of the same length, with its
+/// CRC-32 recomputed in both the local header and the central-directory
+/// record so every record still verifies as `Intact`.
+///
+/// Same length on purpose: every size field in both headers stays valid, so
+/// the ONLY thing separating this fixture from [`build_shadowing_zip`] is
+/// the payload bytes and the checksum over them. That is what makes it a
+/// controlled comparison rather than a second, differently-shaped archive —
+/// anything that behaves differently between the two does so because the
+/// duplicate's CONTENT differs, and for no other reason.
+///
+/// This is the shape `stuffr list`'s own `EntryCountMismatch` fidelity
+/// warning fires on (a repeated NAME, whatever the bytes under it), and the
+/// shape where recovering a record and then overwriting it with a later
+/// record's bytes actually loses data.
+#[cfg(test)]
+pub(crate) fn build_distinct_duplicate_zip() -> Vec<u8> {
+    build_duplicating_zip(DuplicateContent::Distinct)
+}
+
+/// Which of the two duplicate shapes [`build_duplicating_zip`] assembles.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DuplicateContent {
+    /// A byte-for-byte copy of the record it duplicates.
+    Identical,
+    /// The same name and the same length, different bytes, checksum
+    /// recomputed so the record is still `Intact`.
+    Distinct,
+}
+
+/// CRC-32/ISO-HDLC, the checksum a zip local/central header's `crc32` field
+/// carries over an entry's UNCOMPRESSED bytes.
+///
+/// `#[cfg(test)]` and used only by [`build_duplicating_zip`], which has to
+/// recompute one after rewriting a duplicated record's payload. Not taken
+/// from `crc32fast` for the reason `zip_salvage.rs`'s own copy records: a
+/// dependency for one twelve-line routine buys no capability. Pinned
+/// against the algorithm's published check value by
+/// `the_fixture_builders_crc_matches_the_published_check_value` below, so a
+/// transcription error cannot hide behind this project's own expectations.
+#[cfg(test)]
+fn fixture_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+#[cfg(test)]
+fn build_duplicating_zip(duplicate_content: DuplicateContent) -> Vec<u8> {
     let names = [
         "one.txt",
         "two.txt",
@@ -952,10 +1025,12 @@ pub(crate) fn build_shadowing_zip() -> Vec<u8> {
     let rec3_local_len = local_block_span(&base, rec3_lho);
 
     // 3. Assemble the shadowed archive: the original local file data, then a
-    // byte-identical copy of each shadowed entry's local header and payload
-    // at a NEW offset, then the central directory — the 6 original records
-    // followed by 2 duplicates whose only changed bytes are the patched
-    // local-header-offset field — then a patched EOCD declaring 8.
+    // copy of each shadowed entry's local header and payload at a NEW
+    // offset, then the central directory — the 6 original records followed
+    // by 2 duplicates whose only changed bytes are the patched
+    // local-header-offset field (plus, under `DuplicateContent::Distinct`,
+    // the payload and the two copies of its CRC-32) — then a patched EOCD
+    // declaring 8.
     let mut out = Vec::new();
     out.extend_from_slice(&base[..cd_start]);
 
@@ -963,6 +1038,42 @@ pub(crate) fn build_shadowing_zip() -> Vec<u8> {
     out.extend_from_slice(&base[rec2_lho..rec2_lho + rec2_local_len]);
     let dup3_lho = out.len() as u32;
     out.extend_from_slice(&base[rec3_lho..rec3_lho + rec3_local_len]);
+
+    // Under `Distinct`, overwrite each duplicate's payload IN PLACE with a
+    // same-length, different string and recompute its checksum. Same length
+    // is what keeps every size field in both headers valid, so the payload
+    // bytes and the CRC are the only difference between the two fixtures.
+    // `DIFFERENT_*` are byte-length-matched to the originals by the
+    // assertion right below, not by eye.
+    let dup_crcs: Option<(u32, u32)> = match duplicate_content {
+        DuplicateContent::Identical => None,
+        DuplicateContent::Distinct => {
+            const DIFFERENT_A: &[u8] = b"DIFFERENT bytes under the first duplicated name!!!";
+            const DIFFERENT_B: &[u8] = b"DIFFERENT bytes under the second duplicated name!!!";
+            let mut crcs = Vec::new();
+            for (lho, replacement) in [
+                (dup2_lho as usize, DIFFERENT_A),
+                (dup3_lho as usize, DIFFERENT_B),
+            ] {
+                let name_len = le16(&out[lho + 26..]) as usize;
+                let extra_len = le16(&out[lho + 28..]) as usize;
+                let payload_at = lho + 30 + name_len + extra_len;
+                let payload_len = le32(&out[lho + 18..]) as usize;
+                assert_eq!(
+                    payload_len,
+                    replacement.len(),
+                    "a distinct duplicate's replacement payload must be the SAME length as \
+                     the record it replaces, or every size field in both headers stops \
+                     agreeing with the bytes"
+                );
+                out[payload_at..payload_at + payload_len].copy_from_slice(replacement);
+                let crc = fixture_crc32(replacement);
+                out[lho + 14..lho + 18].copy_from_slice(&crc.to_le_bytes());
+                crcs.push(crc);
+            }
+            Some((crcs[0], crcs[1]))
+        }
+    };
 
     let new_cd_start = out.len() as u32;
     out.extend_from_slice(&base[cd_start..eocd_start]);
@@ -972,6 +1083,16 @@ pub(crate) fn build_shadowing_zip() -> Vec<u8> {
     let dup3_cd_at = out.len();
     out.extend_from_slice(&base[rec3_at..rec3_at + rec3_len]);
     out[dup3_cd_at + 42..dup3_cd_at + 46].copy_from_slice(&dup3_lho.to_le_bytes());
+
+    // The central-directory record carries its OWN copy of the checksum
+    // (offset 16 in a central header, against 14 in a local one), so a
+    // distinct duplicate has to patch both or the two indexes disagree
+    // about the same record — which would make the fixture itself the
+    // damage, rather than the duplicate name it exists to model.
+    if let Some((crc_a, crc_b)) = dup_crcs {
+        out[dup2_cd_at + 16..dup2_cd_at + 20].copy_from_slice(&crc_a.to_le_bytes());
+        out[dup3_cd_at + 16..dup3_cd_at + 20].copy_from_slice(&crc_b.to_le_bytes());
+    }
 
     let new_eocd_start = out.len();
     let new_cd_size = (new_eocd_start - new_cd_start as usize) as u32;
@@ -2679,6 +2800,91 @@ mod tests {
         assert_eq!(recs[7].method, recs[3].method);
         assert_eq!(recs[7].compressed_size, recs[3].compressed_size);
         assert_eq!(recs[7].uncompressed_size, recs[3].uncompressed_size);
+    }
+
+    /// `fixture_crc32` is pinned against CRC-32/ISO-HDLC's own published
+    /// check value (`0xCBF43926` over the nine bytes `123456789`), not
+    /// against anything this project computed. A transcription error in the
+    /// polynomial would otherwise be invisible: the builder writes a CRC and
+    /// this project's own reader checks it, so the two would agree on a
+    /// wrong value forever.
+    #[test]
+    fn the_fixture_builders_crc_matches_the_published_check_value() {
+        assert_eq!(fixture_crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// The realistic duplicate shape: eight records under six names, where
+    /// the two extras carry DIFFERENT bytes from the records whose name they
+    /// repeat. Everything structural matches [`build_shadowing_zip`] — same
+    /// counts, same names, same sizes — so the checksum is the one field
+    /// that separates the two fixtures, which is exactly what makes them a
+    /// controlled pair.
+    #[test]
+    fn the_distinct_duplicate_fixture_repeats_names_but_not_content() {
+        let bytes = build_distinct_duplicate_zip();
+        let recs = walk_central_directory(&mut io::Cursor::new(&bytes)).expect("walk");
+        assert_eq!(
+            recs.len(),
+            8,
+            "eight records, same as the identical fixture"
+        );
+        assert_eq!(
+            recs.iter()
+                .map(|r| r.name.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            6,
+            "under six names, same as the identical fixture"
+        );
+        assert_eq!(recs[6].name, recs[2].name, "the NAME is repeated");
+        assert_eq!(recs[7].name, recs[3].name);
+        assert_eq!(
+            recs[6].compressed_size, recs[2].compressed_size,
+            "same declared length — the payload swap is length-preserving"
+        );
+        assert_eq!(recs[7].compressed_size, recs[3].compressed_size);
+        assert_ne!(
+            recs[6].crc32, recs[2].crc32,
+            "and DIFFERENT content: the whole point of this fixture"
+        );
+        assert_ne!(recs[7].crc32, recs[3].crc32);
+    }
+
+    /// The two fixtures must actually differ, and differ only where they are
+    /// meant to. Without this, a builder bug that ignored
+    /// `DuplicateContent::Distinct` would leave every test that stands on
+    /// the new fixture silently re-testing the old one — the precise failure
+    /// mode (a fixture that does not model what its name says) that hid
+    /// three findings behind `build_shadowing_zip` in the first place.
+    #[test]
+    fn the_two_duplicate_fixtures_are_the_same_shape_and_different_bytes() {
+        let identical = build_shadowing_zip();
+        let distinct = build_distinct_duplicate_zip();
+        assert_eq!(
+            identical.len(),
+            distinct.len(),
+            "length-preserving by construction"
+        );
+        assert_ne!(identical, distinct, "but not the same bytes");
+
+        let id_recs = walk_central_directory(&mut io::Cursor::new(&identical)).expect("walk");
+        let di_recs = walk_central_directory(&mut io::Cursor::new(&distinct)).expect("walk");
+        for (id, di) in id_recs.iter().zip(di_recs.iter()) {
+            assert_eq!(id.name, di.name);
+            assert_eq!(id.local_header_offset, di.local_header_offset);
+            assert_eq!(id.compressed_size, di.compressed_size);
+            assert_eq!(id.uncompressed_size, di.uncompressed_size);
+            assert_eq!(id.method, di.method);
+        }
+        // The six originals are untouched; only records 6 and 7 changed.
+        for i in 0..6 {
+            assert_eq!(
+                id_recs[i].crc32, di_recs[i].crc32,
+                "record {i} must be identical between the two fixtures"
+            );
+        }
+        assert_ne!(id_recs[6].crc32, di_recs[6].crc32);
+        assert_ne!(id_recs[7].crc32, di_recs[7].crc32);
     }
 
     /// An ordinary, unshadowed zip walks to exactly its own entry count —

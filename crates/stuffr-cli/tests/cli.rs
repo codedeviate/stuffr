@@ -8702,9 +8702,45 @@ fn salvage_fixture_central_record(rec: &SalvageFixtureLocalRecord) -> Vec<u8> {
     bytes
 }
 
+/// What the two duplicate records at scan positions 6 and 7 carry.
+///
+/// [`build_shadowing_zip_fixture`]'s duplicates are byte-for-byte copies —
+/// the shape the motivating real-world archive had, and the only shape this
+/// file's fixtures modelled until the final whole-branch review. Under it,
+/// annotating a duplicate costs nothing to get right and overwriting one on
+/// disk costs nothing at all, because the bytes agree; three separate
+/// findings hid behind exactly that. [`build_duplicate_name_zip_fixture`]
+/// is the other half, and both are kept, because both are real.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SalvageFixtureDuplicates {
+    /// A byte-for-byte copy of the record whose name it repeats.
+    Identical,
+    /// The same name and the same length, DIFFERENT bytes — so both
+    /// records still verify as `Intact`, and recovering one and then
+    /// overwriting it with the other genuinely loses data.
+    Distinct,
+}
+
 /// Builds the shadowing fixture this section's own doc comment describes:
 /// 6 names, 8 physical local records, a central directory declaring all 8.
 fn build_shadowing_zip_fixture() -> Vec<u8> {
+    build_duplicating_zip_fixture(SalvageFixtureDuplicates::Identical)
+}
+
+/// The realistic counterpart: the same eight records under the same six
+/// names, with each duplicate carrying a DIFFERENT, same-length payload and
+/// its own recomputed CRC-32.
+///
+/// Same length on purpose — every size field in both headers stays valid, so
+/// the payload bytes and the checksum over them are the ONLY difference
+/// between this fixture and [`build_shadowing_zip_fixture`]. Anything that
+/// behaves differently between the two does so because the duplicate's
+/// content differs, and for no other reason.
+fn build_duplicate_name_zip_fixture() -> Vec<u8> {
+    build_duplicating_zip_fixture(SalvageFixtureDuplicates::Distinct)
+}
+
+fn build_duplicating_zip_fixture(duplicates: SalvageFixtureDuplicates) -> Vec<u8> {
     let originals_src: [(&str, &[u8]); 6] = [
         ("one.txt", b"payload for entry one"),
         ("two.txt", b"payload for entry two"),
@@ -8729,17 +8765,35 @@ fn build_shadowing_zip_fixture() -> Vec<u8> {
     }
 
     // The two physical duplicates, appended AFTER every original local
-    // record — this is what puts their scan positions at 6 and 7.
+    // record — this is what puts their scan positions at 6 and 7. Under
+    // `Distinct` their payloads are replaced by same-length, different
+    // strings; `salvage_fixture_local_record` recomputes the CRC-32 from
+    // whatever payload it is handed, so both the local header's copy and
+    // (via `salvage_fixture_central_record`) the central directory's copy
+    // follow automatically.
+    const DIFFERENT_A: &[u8] = b"DIFFERENT bytes under the first duplicated name!!!";
+    const DIFFERENT_B: &[u8] = b"DIFFERENT bytes under the second duplicated name!!!";
+    let (payload_a, payload_b) = match duplicates {
+        SalvageFixtureDuplicates::Identical => (originals_src[2].1, originals_src[3].1),
+        SalvageFixtureDuplicates::Distinct => {
+            // Length-preserving is asserted, not eyeballed: a mismatch would
+            // make the fixture itself the damage rather than the repeated
+            // name it exists to model.
+            assert_eq!(originals_src[2].1.len(), DIFFERENT_A.len());
+            assert_eq!(originals_src[3].1.len(), DIFFERENT_B.len());
+            (DIFFERENT_A, DIFFERENT_B)
+        }
+    };
     let dup_a = salvage_fixture_local_record(
         u32::try_from(out.len()).unwrap(),
         "shadowed-a.bin",
-        originals_src[2].1,
+        payload_a,
     );
     out.extend_from_slice(&dup_a.bytes);
     let dup_b = salvage_fixture_local_record(
         u32::try_from(out.len()).unwrap(),
         "shadowed-b.bin",
-        originals_src[3].1,
+        payload_b,
     );
     out.extend_from_slice(&dup_b.bytes);
 
@@ -8767,6 +8821,81 @@ fn write_shadowing_zip_fixture(dir: &Path) -> PathBuf {
     let path = dir.join("shadowing.zip");
     std::fs::write(&path, build_shadowing_zip_fixture()).unwrap();
     path
+}
+
+fn write_duplicate_name_zip_fixture(dir: &Path) -> PathBuf {
+    let path = dir.join("duplicate-names.zip");
+    std::fs::write(&path, build_duplicate_name_zip_fixture()).unwrap();
+    path
+}
+
+/// The two fixtures must actually differ, and differ only where they are
+/// meant to. Without this, a builder bug that ignored
+/// [`SalvageFixtureDuplicates::Distinct`] would leave every test standing on
+/// the new fixture silently re-testing the old one — the precise failure
+/// mode (a fixture that does not model what its name says) that hid three
+/// findings behind the identical-duplicate fixture in the first place.
+#[test]
+fn the_two_salvage_duplicate_fixtures_share_a_shape_and_differ_in_content() {
+    let identical = build_shadowing_zip_fixture();
+    let distinct = build_duplicate_name_zip_fixture();
+    assert_eq!(
+        identical.len(),
+        distinct.len(),
+        "length-preserving by construction"
+    );
+    assert_ne!(identical, distinct, "but not the same bytes");
+    // Everything before the first duplicate's local record is byte-identical
+    // — the six originals are untouched, which is what makes the two
+    // fixtures a controlled pair rather than two different archives.
+    let first_dup_at = identical
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"PK\x03\x04")
+        .map(|(i, _)| i)
+        .nth(6)
+        .expect("the fixture has eight local headers");
+    assert_eq!(identical[..first_dup_at], distinct[..first_dup_at]);
+}
+
+/// The distinct-content fixture is structurally the same archive to both
+/// readers: `list` still collapses it to six rows and still warns that two
+/// records are unreachable, and `salvage --list` still reaches all eight.
+/// That equivalence is what makes it a controlled comparison — whatever
+/// differs between the two fixtures downstream differs because the
+/// duplicates' CONTENT differs, not because the archives are shaped
+/// differently.
+#[test]
+fn the_duplicate_name_fixture_reads_the_same_as_the_identical_one() {
+    let dir = tmp_dir();
+    let archive = write_duplicate_name_zip_fixture(&dir);
+
+    let list_out = run_output(&["list", archive.to_str().unwrap()]);
+    let listing = String::from_utf8(list_out.stdout).unwrap();
+    assert_eq!(
+        listing.lines().count(),
+        6,
+        "`list` collapses a repeated name whatever the bytes under it: {listing}"
+    );
+    let warnings = String::from_utf8(list_out.stderr).unwrap();
+    assert!(
+        warnings.contains("8") && warnings.contains("6"),
+        "`list` must still warn that the index declares more records than it reaches: {warnings}"
+    );
+
+    let salvage_out = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stdout = String::from_utf8(salvage_out.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().count(),
+        8,
+        "`salvage --list` must reach every scanned record here too: {stdout}"
+    );
+    assert_eq!(
+        stdout.matches("Intact").count(),
+        8,
+        "every record verifies: the duplicates carry their own correct CRC-32, which is what \
+         makes losing one of them a real loss: {stdout}"
+    );
 }
 
 /// `--list` prints every record the scan found — 8, on the fixture above —
