@@ -8898,6 +8898,58 @@ fn the_duplicate_name_fixture_reads_the_same_as_the_identical_one() {
     );
 }
 
+/// The two annotations, measured against each other on the two fixtures.
+///
+/// On the identical-duplicate archive the duplicates are PROVEN copies and
+/// are marked `[shadowed: dup of #N]`. On the distinct-content one nothing
+/// is provably a copy, so the same two rows are marked `[name collision: #N
+/// uses this name too]` instead — the fact `stuffr list` warns about. Before
+/// this, salvage marked the second archive in no way at all, so `list` and
+/// `salvage` told a user two contradictory things about the same eight
+/// records.
+#[test]
+fn a_name_collision_and_a_shadow_are_two_different_annotations() {
+    let dir = tmp_dir();
+    let identical = write_shadowing_zip_fixture(&dir);
+    let distinct = write_duplicate_name_zip_fixture(&dir);
+
+    let id_rows =
+        String::from_utf8(run_output(&["salvage", identical.to_str().unwrap(), "--list"]).stdout)
+            .unwrap();
+    assert_eq!(
+        id_rows.matches("[shadowed: dup of #").count(),
+        2,
+        "byte-identical duplicates are shadows: {id_rows}"
+    );
+    assert_eq!(
+        id_rows.matches("[name collision:").count(),
+        0,
+        "a proven copy reports the stronger fact and only that one: {id_rows}"
+    );
+
+    let di_rows =
+        String::from_utf8(run_output(&["salvage", distinct.to_str().unwrap(), "--list"]).stdout)
+            .unwrap();
+    assert_eq!(
+        di_rows.matches("[shadowed: dup of #").count(),
+        0,
+        "no checksum agrees here, so nothing is a proven copy: {di_rows}"
+    );
+    assert!(
+        di_rows.contains("[name collision: #2 uses this name too]"),
+        "record 6 repeats record 2's name: {di_rows}"
+    );
+    assert!(
+        di_rows.contains("[name collision: #3 uses this name too]"),
+        "record 7 repeats record 3's name: {di_rows}"
+    );
+    assert_eq!(
+        di_rows.matches("[name collision:").count(),
+        2,
+        "exactly the two repeated names, never the six originals: {di_rows}"
+    );
+}
+
 /// `--list` prints every record the scan found — 8, on the fixture above —
 /// where plain `list` prints only the 6 names its central-directory reader
 /// collapses onto. The two shadows are annotated `[shadowed: dup of #N]`,

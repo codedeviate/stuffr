@@ -48,6 +48,22 @@
 //!   shadows and is never shadowed, because a checksum over zero bytes is
 //!   the same value for every empty entry that ever existed and proves
 //!   nothing about any of them being copies of each other.
+//! - **Detecting a repeated NAME** ([`SalvagedEntry::collides_with`]) is a
+//!   second, deliberately separate annotation, added after the final
+//!   whole-branch review found the word "shadow" doing two jobs. The two
+//!   facts are different and both worth printing: a shadow is a record
+//!   MEASURED to be a copy of an earlier one, a collision is a record whose
+//!   name an earlier one already used and whose content this scan could not
+//!   prove identical. `stuffr list`'s own `Fidelity::EntryCountMismatch`
+//!   warning is about the second, so on an archive whose duplicates differ,
+//!   `list` reported two records shadowed while `salvage --list` marked
+//!   none — one tool telling a user two contradictory things about the same
+//!   eight records. None of the guards on shadow detection above apply to a
+//!   collision, and applying them would be wrong: they exist because
+//!   claiming two records are COPIES needs proof, and a collision claims
+//!   nothing about content at all. The two are mutually exclusive — a
+//!   proven copy is reported as a shadow and nothing else, since that is
+//!   the strictly more informative claim.
 //!
 //! [`collect_candidates`] (the resync loop: find a candidate, bound its
 //! declared length, advance) and [`annotate_candidates`] (verify + shadow,
@@ -168,7 +184,35 @@ pub struct SalvagedEntry {
     /// repeated name alone, and never set for a degenerate zero-length
     /// checksum (every empty file and every directory entry shares one).
     /// See [`annotate_candidates`] for where this is computed.
+    ///
+    /// **This is the byte-identical duplicate, and ONLY that.** The other,
+    /// weaker fact — an earlier record under the same name whose content
+    /// this scan could not prove identical — is [`Self::collides_with`], and
+    /// the two are mutually exclusive by construction. They were one word
+    /// ("shadow") until the final whole-branch review measured what that
+    /// cost: `stuffr list`'s own fidelity warning uses "shadowed" for a
+    /// repeated NAME, so on an archive whose duplicates differ, `list` said
+    /// two records were shadowed and `salvage --list` marked none.
     pub shadows: Option<usize>,
+    /// Set when an EARLIER record carries the same `meta.name` and this one
+    /// is not that record's [`Self::shadows`] — i.e. the name repeats but
+    /// the content could not be proven identical.
+    ///
+    /// This is the fact `stuffr list`'s `Fidelity::EntryCountMismatch`
+    /// warning is about: a later record repeating a name is what makes an
+    /// earlier one unreachable through a central directory's name index,
+    /// whatever the bytes under it. It is also the fact that decides
+    /// anything on the WRITE side, because two records under one name and
+    /// two different payloads cannot both land on one path.
+    ///
+    /// Deliberately NOT gated on a verifier, a declared length or the
+    /// degenerate zero-length case the way [`Self::shadows`] is: those
+    /// guards exist because claiming two records are COPIES of each other
+    /// needs proof, and this annotation claims no such thing. A repeated
+    /// name is directly observed, and `None` here means only that no
+    /// earlier record used this name — never that one did and this could
+    /// not tell.
+    pub collides_with: Option<usize>,
 }
 
 /// The result of a scan: every entry the scanner recovered, in scan order.
@@ -309,6 +353,15 @@ pub fn annotate_candidates(
     // (every empty file, every directory entry) is never pushed here and
     // never looked up here — see `is_degenerate` below.
     let mut seen: Vec<(String, Option<u64>, Verifier, usize)> = Vec::new();
+    // Earliest scan_position to report each distinct NAME, regardless of
+    // anything else about the record — the weaker, directly-observed fact
+    // `SalvagedEntry::collides_with` reports, and the one `stuffr list`'s
+    // own fidelity warning is about. Kept separate from `seen` above rather
+    // than folded into it: that list is deliberately full of guards against
+    // over-claiming a COPY (a verifier must exist, the declared length must
+    // agree, a zero-length checksum never counts), and every one of them
+    // would be wrong here, where nothing about content is being claimed.
+    let mut names_seen: Vec<(String, usize)> = Vec::new();
 
     for (scan_position, candidate) in candidates.into_iter().enumerate() {
         let status = scan.verify(src, &candidate)?;
@@ -345,12 +398,31 @@ pub fn annotate_candidates(
             seen.push((candidate.meta.name.clone(), declared_len, v, scan_position));
         }
 
+        // The two annotations are mutually exclusive: a record proven to be
+        // a copy is reported as a shadow and nothing else, because "this is
+        // a duplicate of #2" is strictly more informative than "something
+        // earlier used this name". Everything else that repeats a name is a
+        // collision.
+        let earliest_with_name = names_seen
+            .iter()
+            .find(|(name, _)| *name == candidate.meta.name)
+            .map(|&(_, position)| position);
+        let collides_with = if shadows.is_some() {
+            None
+        } else {
+            earliest_with_name
+        };
+        if earliest_with_name.is_none() {
+            names_seen.push((candidate.meta.name.clone(), scan_position));
+        }
+
         entries.push(SalvagedEntry {
             scan_position,
             offset: candidate.offset,
             meta: candidate.meta,
             status,
             shadows,
+            collides_with,
         });
     }
 
@@ -479,6 +551,7 @@ mod tests {
         assert_eq!(entry.offset, 0);
         assert_eq!(entry.status, SalvageStatus::Complete);
         assert_eq!(entry.shadows, None);
+        assert_eq!(entry.collides_with, None);
     }
 
     #[test]
@@ -679,6 +752,173 @@ mod tests {
         assert_eq!(
             out.entries[1].shadows, None,
             "a zero-byte checksum must never mark a shadow, even under an identical name"
+        );
+        assert_eq!(
+            out.entries[1].collides_with,
+            Some(0),
+            "the NAME still repeats, and that is a directly observed fact no checksum \
+             guard applies to"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Name collisions: the second annotation, separate from shadowing.
+    // -----------------------------------------------------------------
+
+    /// The finding this annotation closes: two records under one name whose
+    /// content does NOT agree are what `stuffr list` calls shadowed, and
+    /// what salvage marked in no way at all — because its own `shadows`
+    /// means something stricter.
+    #[test]
+    fn a_repeated_name_with_different_content_is_reported_as_a_collision() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (
+                    "dup.txt",
+                    Some(21),
+                    Some(Verifier::Crc32(7)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "other.txt",
+                    Some(21),
+                    Some(Verifier::Crc32(9)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "dup.txt",
+                    Some(21),
+                    Some(Verifier::Crc32(11)),
+                    SalvageStatus::Intact,
+                ),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries[2].shadows, None, "the content does not agree");
+        assert_eq!(
+            out.entries[2].collides_with,
+            Some(0),
+            "but the name does, and that is the fact `list` warns about"
+        );
+        assert_eq!(out.entries[0].collides_with, None);
+        assert_eq!(out.entries[1].collides_with, None);
+    }
+
+    /// The two annotations are mutually exclusive: a record PROVEN to be a
+    /// copy says so, and does not also report the weaker fact. Reporting
+    /// both would make every shadow print two markers for one relationship.
+    #[test]
+    fn a_proven_shadow_is_not_also_reported_as_a_name_collision() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (
+                    "dup.txt",
+                    Some(21),
+                    Some(Verifier::Crc32(7)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "dup.txt",
+                    Some(21),
+                    Some(Verifier::Crc32(7)),
+                    SalvageStatus::Intact,
+                ),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries[1].shadows, Some(0));
+        assert_eq!(out.entries[1].collides_with, None);
+    }
+
+    /// A third record under a name two earlier ones already used points at
+    /// the EARLIEST of them, the same rule `shadows` follows — so a chain of
+    /// collisions names one origin rather than each pointing at its
+    /// predecessor.
+    #[test]
+    fn a_third_record_under_one_name_names_the_earliest_position() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (
+                    "dup",
+                    Some(4),
+                    Some(Verifier::Crc32(1)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "dup",
+                    Some(4),
+                    Some(Verifier::Crc32(2)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "dup",
+                    Some(4),
+                    Some(Verifier::Crc32(3)),
+                    SalvageStatus::Intact,
+                ),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries[1].collides_with, Some(0));
+        assert_eq!(out.entries[2].collides_with, Some(0));
+    }
+
+    /// The negative double: distinct names must never be marked, however
+    /// much else they share. Without this, an annotation that fired on
+    /// everything would pass every test above.
+    #[test]
+    fn distinct_names_are_never_reported_as_colliding() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                (
+                    "one.txt",
+                    Some(4),
+                    Some(Verifier::Crc32(42)),
+                    SalvageStatus::Intact,
+                ),
+                (
+                    "two.txt",
+                    Some(4),
+                    Some(Verifier::Crc32(42)),
+                    SalvageStatus::Intact,
+                ),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries[0].collides_with, None);
+        assert_eq!(out.entries[1].collides_with, None);
+    }
+
+    /// A collision needs no verifier at all, unlike a shadow. A format with
+    /// no checksum (tar, cpio, ar — and a zip data-descriptor entry) can
+    /// still repeat a name, and that repetition is exactly as real there.
+    #[test]
+    fn a_repeated_name_collides_even_with_no_verifier_to_compare() {
+        let mut scan = ScriptedCandidates {
+            plan: vec![
+                ("same", Some(4), None, SalvageStatus::Complete),
+                ("same", Some(4), None, SalvageStatus::Complete),
+            ],
+            next: 0,
+        };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(
+            out.entries[1].shadows, None,
+            "no verifier, so nothing proves they are copies"
+        );
+        assert_eq!(
+            out.entries[1].collides_with,
+            Some(0),
+            "but the name repeats, which needs no verifier to observe"
         );
     }
 }

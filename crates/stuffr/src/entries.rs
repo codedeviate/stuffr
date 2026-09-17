@@ -1177,7 +1177,17 @@ pub struct SalvagedRecord {
     pub scan_position: usize,
     pub name: String,
     pub status: stuffr_core::salvage::SalvageStatus,
+    /// An EARLIER scan position this record was measured to be a
+    /// byte-identical copy of — see
+    /// [`stuffr_core::salvage::SalvagedEntry::shadows`].
     pub shadows: Option<usize>,
+    /// An EARLIER scan position using the same name, where the two were NOT
+    /// proven identical — see
+    /// [`stuffr_core::salvage::SalvagedEntry::collides_with`]. Mutually
+    /// exclusive with [`Self::shadows`], and the fact that actually decides
+    /// what happens on disk: two records under one name with two different
+    /// payloads cannot both land on one path.
+    pub collides_with: Option<usize>,
     pub disposition: SalvageDisposition,
 }
 
@@ -1322,6 +1332,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
             name: entry.meta.name.clone(),
             status: entry.status,
             shadows: entry.shadows,
+            collides_with: entry.collides_with,
             disposition,
         });
     }
@@ -3872,6 +3883,7 @@ mod salvage_tests {
             name: "x".into(),
             status: SalvageStatus::Intact,
             shadows: None,
+            collides_with: None,
             disposition,
         };
 

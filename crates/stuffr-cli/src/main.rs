@@ -629,6 +629,15 @@ fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static s
 /// whole feature is built around — a `[shadowed: dup of #N]` suffix naming
 /// the EARLIER scan position, never "index", when this record shadows one.
 /// `[not selected]` marks a scan position `--index` excluded.
+///
+/// `[name collision: #N uses this name too]` is the SECOND, weaker
+/// annotation, and the two never appear on one row: a shadow is a record
+/// measured to be a byte-identical copy, a collision is a record whose name
+/// an earlier one already used and whose content was not proven identical.
+/// Until the final whole-branch review they shared one word, and the cost
+/// was measurable: on an archive whose duplicates differ, `stuffr list`
+/// warned that two records repeat a name and were shadowed, while this row
+/// marked nothing at all.
 fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     let status = match &record.disposition {
         entries::SalvageDisposition::WrittenPartial { cause, .. }
@@ -648,6 +657,9 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     let mut line = format!("{:<4} {:<32} {}", record.scan_position, status, record.name);
     if let Some(earlier) = record.shadows {
         line.push_str(&format!(" [shadowed: dup of #{earlier}]"));
+    }
+    if let Some(earlier) = record.collides_with {
+        line.push_str(&format!(" [name collision: #{earlier} uses this name too]"));
     }
     if matches!(record.disposition, entries::SalvageDisposition::NotSelected) {
         line.push_str(" [not selected]");

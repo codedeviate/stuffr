@@ -253,6 +253,16 @@ pub enum Command {
         /// Print every record the scan found, including ones this build
         /// never writes (a shadow, a skipped partial, an unverified entry).
         ///
+        /// A record that repeats an earlier record's name is marked one of
+        /// two ways, and they mean different things. `[shadowed: dup of #N]`
+        /// is a MEASUREMENT: name, declared length and checksum all agree
+        /// with record N, so nothing is lost by not writing this one.
+        /// `[name collision: #N uses this name too]` is the weaker fact:
+        /// the name repeats but the content was not proven identical, so
+        /// both records are worth having. It is the marker `stuffr list`'s
+        /// own "repeat a name … and are shadowed" fidelity warning
+        /// corresponds to.
+        ///
         /// `stuffr list` on the same archive can print FEWER rows than this:
         /// a record a later one shadows is invisible to `list`, which only
         /// ever sees what the central directory's own name index kept. Works

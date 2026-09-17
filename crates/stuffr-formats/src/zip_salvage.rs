@@ -1425,6 +1425,44 @@ mod tests {
         let out = salvage(&crate::zip::build_shadowing_zip());
         assert_eq!(out.entries[6].shadows, Some(2));
         assert_eq!(out.entries[6].status, SalvageStatus::Intact);
+        assert_eq!(
+            out.entries[6].collides_with, None,
+            "a PROVEN copy reports the stronger fact and only that one"
+        );
+    }
+
+    /// The same eight records with the duplicates' content changed: nothing
+    /// is a shadow any more (no checksum agrees), and the two repeated names
+    /// are reported as collisions instead — the annotation `stuffr list`'s
+    /// own fidelity warning corresponds to.
+    ///
+    /// The whole-branch review measured the gap this closes on exactly this
+    /// archive: `list` warned that two records repeat a name and are
+    /// shadowed, while `salvage --list` marked none of the eight rows at
+    /// all. `build_distinct_duplicate_zip` is length-preserving against
+    /// `build_shadowing_zip`, so the only difference between this test and
+    /// the one above is the duplicates' bytes.
+    #[test]
+    fn a_duplicate_name_over_different_content_is_marked_as_a_collision() {
+        let out = salvage(&crate::zip::build_distinct_duplicate_zip());
+        assert_eq!(out.entries.len(), 8);
+        assert!(
+            out.entries.iter().all(|e| e.shadows.is_none()),
+            "no checksum agrees, so nothing here is a proven copy"
+        );
+        assert_eq!(out.entries[6].collides_with, Some(2));
+        assert_eq!(out.entries[7].collides_with, Some(3));
+        assert!(
+            out.entries[..6].iter().all(|e| e.collides_with.is_none()),
+            "the six originals each use their name first"
+        );
+        assert!(
+            out.entries
+                .iter()
+                .all(|e| e.status == SalvageStatus::Intact),
+            "every record still verifies against its own CRC-32: both copies under each \
+             repeated name are genuinely recoverable, which is what makes losing one a loss"
+        );
     }
 
     /// Falsification guard for the mistake ruling out `shadows`-from-name:
