@@ -1200,6 +1200,57 @@ pub enum SalvageDisposition {
     /// kept for the same reason [`extract`]'s own match keeps a skip arm:
     /// `EntryKind` is `#[non_exhaustive]`.
     SkippedUnsupportedKind,
+    /// Not written: this entry's content was fine, but its BYTES could not
+    /// be put on disk — the destination refused the path this entry's own
+    /// name asks for, or the filesystem itself failed. `reason` is the
+    /// underlying error, printed on the entry's own row.
+    ///
+    /// # Why this exists (fix round 4, NEW-B)
+    ///
+    /// Every filesystem call that places a salvaged entry used to
+    /// `?`-propagate, ending the run. Measured on a ~1 KB zip holding
+    /// `a.txt`, an entry whose name is 404 characters, and `z.txt` — all
+    /// three `Intact`, all three listed at exit 0:
+    ///
+    /// ```text
+    /// $ stuffr salvage --format zip -C out long.zip
+    /// stuffr: i/o error: File name too long (os error 63)
+    /// exit=1                     # out/ holds a.txt; z.txt never attempted
+    /// ```
+    ///
+    /// Two separate defects in one line. The entry NAME comes from the
+    /// archive, so that is hostile input refused as **exit 1** — the code
+    /// this project reserves for "*stuffr* failed" and the one invariant
+    /// `stuffr_core::honesty::check_error_is_classified` exists to guard.
+    /// And it is the same class three fix rounds of Task 3c chased on the
+    /// size ceiling: one entry's problem discarding every entry after it,
+    /// in the verb whose entire purpose is not losing things. `z.txt` is
+    /// perfectly recoverable and was lost.
+    ///
+    /// # Why every filesystem failure folds, not a list of error kinds
+    ///
+    /// Refusing the name is correct — a 404-character component is not a
+    /// path this filesystem has — so the question was only how to report
+    /// it. Matching on `io::ErrorKind` to fold "name-shaped" failures and
+    /// keep the rest as aborts would be the fix-the-site shape rounds 1 and
+    /// 2 shipped twice: the next platform errno an archive can provoke
+    /// (`ENOTDIR` from a name colliding with a file, `EILSEQ`, a filesystem
+    /// with its own component rules) becomes exit 1 again. So the rule is
+    /// uniform and kind-blind: **a failure to place THIS entry is THIS
+    /// entry's outcome.** The same ruling `pack`'s directory walk already
+    /// took for an unreadable file — losing one file beats losing the run,
+    /// and the skip is named, not silent.
+    ///
+    /// The cost, stated rather than hidden: a genuinely run-wide
+    /// destination failure (a full disk) now reports one skipped row per
+    /// entry, each naming `No space left on device`, and exits 4 instead of
+    /// 1. Nothing is silent and nothing already written is lost.
+    ///
+    /// Containment is NOT folded: a name escaping `dest` is still
+    /// `Error::UnsafePath` (exit 7) and still aborts, exactly as
+    /// [`salvage`]'s own doc and `examples.txt` promise. Refusing to WRITE
+    /// somewhere is a different decision from failing to write here.
+    SkippedUnwritable { reason: String },
     /// Fix round 1, REQUIRED 1: not written because [`SalvageOpts::select`]
     /// is `Some` and this scan position is not in it — the caller asked for
     /// a different, narrower set of entries. Distinct from every `Skipped*`
@@ -1316,7 +1367,10 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
             | SalvageDisposition::SkippedPartial(_)
             | SalvageDisposition::SkippedNotBuiltIn
             | SalvageDisposition::SkippedShadow(_)
-            | SalvageDisposition::SkippedUnsupportedKind => any_degraded = true,
+            | SalvageDisposition::SkippedUnsupportedKind
+            // Bucket 4, beside the other skips: the entry's CONTENT was
+            // proven (it is not `Unverified`), only its placement failed.
+            | SalvageDisposition::SkippedUnwritable { .. } => any_degraded = true,
         }
     }
 
@@ -1549,8 +1603,14 @@ fn place_salvaged_entry(
         EntryKind::Dir => match &opts.dest {
             Some(dest) => {
                 let target = salvage_contained_target(dest, entry)?;
-                std::fs::create_dir_all(&target)?;
-                Ok(SalvageDisposition::Directory(target))
+                // Folded, not propagated — see
+                // `SalvageDisposition::SkippedUnwritable`. A directory
+                // entry's name is as archive-controlled as a file's, and
+                // `mkdir` refuses an over-long component identically.
+                match std::fs::create_dir_all(&target) {
+                    Ok(()) => Ok(SalvageDisposition::Directory(target)),
+                    Err(e) => Ok(unwritable(e)),
+                }
             }
             // Report-only: nothing to create, and nothing worth a path —
             // there is no `dest` for one to be relative to.
@@ -1695,23 +1755,16 @@ fn place_salvaged_file(
         .entry(write_target.clone())
         .or_insert(entry.scan_position);
 
-    // No `--force` concept exists for salvage (not in this feature's flag
-    // list) and none is needed: recovery is meant to be re-run, and a stale
-    // `.partial` (or a stale real-named file) from a previous attempt must
-    // not block this one. `true` unconditionally, unlike `extract`'s own
-    // `o.force`. `replace_conflicting` is reused rather than a bare
-    // `File::create` specifically because it also removes a pre-existing
-    // SYMLINK sitting at the target — `File::create` would instead follow
-    // it, landing the recovered bytes wherever it points.
-    //
-    // It is deliberately NOT what stops one salvage run overwriting its own
-    // earlier output: "replace what was already on disk" and "two records
-    // in this archive want one name" are different facts, and conflating
-    // them is exactly how eight recovered records became six files at exit
-    // 0. `claimed` above is what separates them.
-    replace_conflicting(&write_target, true)?;
-    create_parent(&write_target)?;
-    let mut out = std::fs::File::create(&write_target)?;
+    // Every call from here to `flush` touches the DESTINATION for this one
+    // entry, and every one of them can fail on a name the ARCHIVE chose.
+    // Folded into this entry's own outcome rather than propagated — see
+    // `SalvageDisposition::SkippedUnwritable` for the measurement (exit 1
+    // on a 404-character entry name, every later entry lost) and for why
+    // the fold is kind-blind.
+    let mut out = match open_salvage_target(&write_target) {
+        Ok(out) => out,
+        Err(e) => return Ok(unwritable(e)),
+    };
     let completed =
         match write_salvaged_payload(format, archive_path, entry, compressed_len, &mut out) {
             Ok(completed) => completed,
@@ -1720,9 +1773,27 @@ fn place_salvaged_file(
                 let _ = std::fs::remove_file(&write_target);
                 return Ok(SalvageDisposition::SkippedNotBuiltIn);
             }
+            // The two `Error::Io` sites a payload writer has are both about
+            // THIS entry — re-opening the archive to read its bytes, and
+            // writing them to the destination — so both fold here too,
+            // under the same rule, rather than ending the run. Anything
+            // else (a `Corrupt` from the format layer) is exceptional and
+            // still propagates.
+            Err(Error::Io(e)) => {
+                drop(out);
+                let _ = std::fs::remove_file(&write_target);
+                return Ok(unwritable(Error::Io(e)));
+            }
             Err(e) => return Err(e),
         };
-    out.flush()?;
+    if let Err(e) = out.flush() {
+        // A half-written file under the entry's REAL name is the exact
+        // hazard `.partial` naming exists to prevent, so it does not
+        // survive the failure that produced it.
+        drop(out);
+        let _ = std::fs::remove_file(&write_target);
+        return Ok(unwritable(Error::Io(e)));
+    }
 
     let partial_cause = is_partial.then_some(if completed {
         PartialCause::ChecksumMismatch
@@ -1761,6 +1832,49 @@ fn place_salvaged_file(
              archive may have changed on disk between scanning and salvage",
             entry.meta.name, entry.status
         )))
+    }
+}
+
+/// Opens the destination file for one salvaged entry: replace whatever sits
+/// there from an earlier run, create the parents, create the file.
+///
+/// Exists so [`place_salvaged_file`] has ONE fallible step to fold rather
+/// than four `?`s to remember — and so a later edit adding a fifth
+/// filesystem call puts it here, inside the fold, instead of beside it.
+/// Every call is the same one [`extract`] makes, unchanged: the difference
+/// between the two verbs is what happens when one of them fails, and that
+/// is decided by the caller.
+fn open_salvage_target(write_target: &Path) -> Result<std::fs::File> {
+    // No `--force` concept exists for salvage (not in this feature's flag
+    // list) and none is needed: recovery is meant to be re-run, and a stale
+    // `.partial` (or a stale real-named file) from a previous attempt must
+    // not block this one. `true` unconditionally, unlike `extract`'s own
+    // `o.force`. `replace_conflicting` is reused rather than a bare
+    // `File::create` specifically because it also removes a pre-existing
+    // SYMLINK sitting at the target — `File::create` would instead follow
+    // it, landing the recovered bytes wherever it points.
+    //
+    // It is deliberately NOT what stops one salvage run overwriting its own
+    // earlier output: "replace what was already on disk" and "two records
+    // in this archive want one name" are different facts, and conflating
+    // them is exactly how eight recovered records became six files at exit
+    // 0. `claimed`, in the caller, is what separates them.
+    replace_conflicting(write_target, true)?;
+    create_parent(write_target)?;
+    Ok(std::fs::File::create(write_target)?)
+}
+
+/// One entry could not be placed on disk: report it as that entry's own
+/// outcome, carrying the underlying failure.
+///
+/// `reason` is the error ALONE, not the path — every consumer that prints a
+/// disposition prints the record's own name beside it, and an entry name
+/// the archive chose can be hundreds of characters long, so repeating it
+/// here would double exactly the thing that is already hard to read. See
+/// [`SalvageDisposition::SkippedUnwritable`] for why this is a skip at all.
+fn unwritable(e: impl std::fmt::Display) -> SalvageDisposition {
+    SalvageDisposition::SkippedUnwritable {
+        reason: e.to_string(),
     }
 }
 
@@ -3927,6 +4041,101 @@ mod salvage_tests {
         assert!(!out_dir.path().join("dest").join("escaped.txt").exists());
     }
 
+    /// Fix round 4, NEW-B. Three healthy Stored entries, the middle one
+    /// named with a 404-character component — longer than any filesystem's
+    /// `NAME_MAX` (255 on APFS, ext4, XFS and every filesystem CI runs on),
+    /// so `File::create` refuses it with `ENAMETOOLONG`.
+    ///
+    /// The name comes from the ARCHIVE, and before this round that refusal
+    /// `?`-propagated out of `place_salvaged_file`, so the run ended:
+    ///
+    /// ```text
+    /// $ stuffr salvage --format zip -C out long.zip
+    /// stuffr: i/o error: File name too long (os error 63)
+    /// exit=1                      # out/ holds a.txt; z.txt never attempted
+    /// ```
+    ///
+    /// Two invariants broken at once — hostile input refused as exit 1, and
+    /// one entry's problem discarding every entry after it — which is why
+    /// this test asserts BOTH halves: `z.txt`, the entry that came AFTER the
+    /// hostile one, must be on disk with its real bytes, and the run must
+    /// not return `Err` at all. A version that refused the name and still
+    /// aborted would pass a test that only checked `a.txt`.
+    #[test]
+    fn a_name_the_filesystem_refuses_costs_that_entry_and_no_other() {
+        let long_name = format!("{}.txt", "L".repeat(400));
+        let mut bytes = local_header_entry("a.txt", b"AAAA", crc32(b"AAAA"));
+        bytes.extend_from_slice(&local_header_entry(&long_name, b"BBBB", crc32(b"BBBB")));
+        bytes.extend_from_slice(&local_header_entry("z.txt", b"ZZZZ", crc32(b"ZZZZ")));
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let outcome = salvage(&archive, &opts).expect(
+            "a name this filesystem cannot hold is ONE entry's problem: refusing it must not \
+             end the run, and must never be exit 1 — the code this project reserves for \
+             stuffr itself failing, raised here on input the archive chose (fix round 4)",
+        );
+
+        assert_eq!(outcome.entries.len(), 3);
+        assert_eq!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::Written(out_dir.path().join("a.txt"))
+        );
+        let SalvageDisposition::SkippedUnwritable { reason } = &outcome.entries[1].disposition
+        else {
+            panic!(
+                "expected SkippedUnwritable, got {:?}",
+                outcome.entries[1].disposition
+            );
+        };
+        assert!(
+            !reason.is_empty(),
+            "the skip must name why, or it is the silent-loss shape salvage exists to avoid"
+        );
+        assert_eq!(
+            outcome.entries[2].disposition,
+            SalvageDisposition::Written(out_dir.path().join("z.txt")),
+            "the entry AFTER the hostile name is the one the old behaviour lost"
+        );
+        assert_eq!(
+            std::fs::read(out_dir.path().join("z.txt")).unwrap(),
+            b"ZZZZ",
+            "and its bytes must be right, not merely reported written"
+        );
+        assert_eq!(salvage_exit_code(&outcome), 4);
+    }
+
+    /// The complement, so the fold above cannot be read as "salvage writes
+    /// anywhere it is pointed": a name that ESCAPES the destination is a
+    /// different decision and still refuses the whole run at exit 7. The two
+    /// live side by side deliberately — one is "this path is not somewhere
+    /// this filesystem can hold", the other is "this path is somewhere I
+    /// must not write", and collapsing them would turn a containment
+    /// refusal into a per-entry skip.
+    #[test]
+    fn an_escaping_name_still_refuses_the_run_even_though_an_unwritable_one_does_not() {
+        let mut bytes = local_header_entry("a.txt", b"AAAA", crc32(b"AAAA"));
+        bytes.extend_from_slice(&local_header_entry("../escaped.txt", b"XX", crc32(b"XX")));
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().join("dest")),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let err = salvage(&archive, &opts).expect_err("containment still aborts");
+        assert_eq!(err.exit_code(), 7);
+        assert!(!out_dir.path().join("escaped.txt").exists());
+    }
+
     /// The brief's third required test. The same corrupted-CRC fixture as
     /// the first test, but under `--strict`: a `Partial` entry must be
     /// skipped even though the default policy (`partial: Keep`) would have
@@ -4560,7 +4769,10 @@ mod arc_salvage_tests {
         assert_eq!(outcome.entries[1].name, "big.bin");
         assert_eq!(
             outcome.entries[1].status,
-            SalvageStatus::Unverified(stuffr_core::salvage::UnverifiedCause::OverEntryCeiling),
+            SalvageStatus::Unverified(stuffr_core::salvage::UnverifiedCause::OverEntryCeiling {
+                needed: 64,
+                ceiling: 16,
+            }),
             "an entry nobody read is Unverified — never Partial, which claims a decode ran, \
              and never `truncated`, which claims bytes are missing"
         );

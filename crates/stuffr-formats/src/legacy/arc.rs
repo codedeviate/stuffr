@@ -500,8 +500,28 @@ impl Method {
     }
 
     /// Every decodable method, in declaration order — seeded from the first
-    /// variant and driven by [`Self::next`]'s exhaustive `match`, so this
-    /// cannot fall behind the enum.
+    /// variant and driven by [`Self::next`]'s exhaustive `match`.
+    ///
+    /// **The chain is compiler-checked; the SEED is not, and that asymmetry
+    /// is the whole caveat** (fix round 4, NEW-E, measured by the round-3
+    /// re-review). A variant added at the END cannot be forgotten —
+    /// [`Self::next`]'s `match` stops compiling. A variant added at the
+    /// FRONT compiles cleanly with every `match` filled in and is still
+    /// missing from this iterator, because the seed names `Stored`
+    /// literally: the reviewer added one and measured `all()` returning the
+    /// same five, which would make `arc_salvage.rs`'s `method_for_codec`
+    /// answer `None` and salvage silently refuse to write that method.
+    ///
+    /// The front door is closed by a test rather than by the type system,
+    /// because no seed can be derived from an enum without either an
+    /// external crate or a `Default` that would be a lie here:
+    /// `arc_salvage.rs`'s
+    /// `every_method_the_reader_decodes_can_be_written_back` round-trips
+    /// **every byte `from_byte` accepts** through `codec()` and
+    /// `method_for_codec`, so any variant reachable from a real header —
+    /// which is the only way one is ever produced — must appear here or
+    /// that test fails. A variant unreachable from `from_byte` is
+    /// unreachable in production too.
     pub(super) fn all() -> impl Iterator<Item = Self> {
         std::iter::successors(Some(Method::Stored), |method| method.next())
     }

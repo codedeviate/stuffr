@@ -206,7 +206,29 @@ pub enum UnverifiedCause {
     /// as `Partial (truncated)` stated two false things — the entry is not
     /// truncated, and the empty `NAME.partial` it produced said nothing
     /// survived.
-    OverEntryCeiling,
+    ///
+    /// # Why it carries both figures (fix round 4, NEW-F)
+    ///
+    /// The `Err` this replaced carried a sentence naming the declared size
+    /// and the ceiling; the first version of this variant was a unit, so a
+    /// user meeting a container's own fixed ceiling was told neither number
+    /// and could not tell whether `--max-entry` would help. The cause is
+    /// the only place that knows both, so it carries both and the CLI row
+    /// prints them — the project's own "a message carries a cause", with
+    /// the numbers that make the message actionable.
+    OverEntryCeiling {
+        /// Bytes reading this entry would have required: the BOUNDED
+        /// figure the comparison actually used — `available_len` when the
+        /// payload is truncated, the header's `declared_len` otherwise —
+        /// never the raw declaration when the file holds less than it.
+        needed: u64,
+        /// The ceiling in force for this run: [`SalvagePolicy::max_entry`]
+        /// narrowed by [`SalvageScan::max_whole_entry`]. Equal to
+        /// `max_entry` means `--max-entry` can raise it; below it means a
+        /// whole-decoding container's own fixed ceiling decided, and no
+        /// flag moves that.
+        ceiling: u64,
+    },
 }
 
 /// What was proven about an entry AFTER decoding it.
@@ -367,9 +389,16 @@ pub trait SalvageScan {
     /// ([`UnverifiedCause::OverEntryCeiling`]), not a [`crate::Error`] the
     /// scanner raises, so it can never abort a run over one entry. A
     /// scanner that instead checks a size inside [`Self::verify`] and
-    /// `?`-propagates the failure reintroduces the exact defect this seam
-    /// was reshaped to make unrepresentable — see [`Self::verify`]'s own
-    /// contract below.
+    /// `?`-propagates the failure reintroduces the exact defect three fix
+    /// rounds of Task 3c chased.
+    ///
+    /// **That is documented, not enforced, and saying so is more useful
+    /// than claiming otherwise.** An earlier wording here called the defect
+    /// "unrepresentable"; it is not. [`Self::verify`] still returns
+    /// `Result` — it must, so a scanner CAN report a genuine run-level
+    /// fault — so the wrong thing is still expressible. What changed is
+    /// that the right thing now exists, costs one method, and is written
+    /// into [`Self::verify`]'s contract below.
     fn max_whole_entry(&self) -> u64 {
         u64::MAX
     }
@@ -574,8 +603,8 @@ pub fn annotate_candidates(
         // existed for.
         let bounded_len = candidate.available_len.or(candidate.declared_len);
         let status = match bounded_len {
-            Some(len) if len > ceiling => {
-                SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)
+            Some(needed) if needed > ceiling => {
+                SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling { needed, ceiling })
             }
             _ => scan.verify(src, &candidate)?,
         };
@@ -830,7 +859,10 @@ mod tests {
         assert_eq!(out.entries.len(), 1, "the entry is still reported");
         assert_eq!(
             out.entries[0].status,
-            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling {
+                needed: u64::MAX,
+                ceiling: MAX_SALVAGE_ENTRY,
+            })
         );
     }
 
@@ -876,7 +908,10 @@ mod tests {
         assert_eq!(out.entries[0].status, SalvageStatus::Complete);
         assert_eq!(
             out.entries[1].status,
-            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling {
+                needed: 4096,
+                ceiling: 64,
+            })
         );
     }
 
@@ -923,7 +958,12 @@ mod tests {
         .expect("a scanner ceiling is a per-entry refusal, not a run failure");
         assert_eq!(
             out.entries[0].status,
-            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling {
+                needed: 2048,
+                // The SCANNER's figure, not the policy's 4 GiB — the `min`
+                // is what this test is really pinning.
+                ceiling: 1024,
+            })
         );
     }
 
@@ -1011,7 +1051,14 @@ mod tests {
         .expect("a bounded refusal is per-entry, never a run failure");
         assert_eq!(
             out.entries[0].status,
-            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling),
+            // `needed` is 4096 — the bytes that ARE there — never the
+            // `u64::MAX` this candidate's header declared. Fix round 4
+            // (NEW-F): the figures a user is shown are the ones the
+            // comparison used.
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling {
+                needed: 4096,
+                ceiling: 1024,
+            }),
             "an over-ceiling entry is unverified, not truncated: nobody read it"
         );
     }

@@ -626,11 +626,11 @@ fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static s
         // ceiling), so nothing was read and nothing was decoded. It used to
         // be reported by ABORTING at exit 6 with a sentence naming both
         // figures, which cost every other entry in the archive; it is a row
-        // like any other now. The figures are not in the row — no
-        // `Unverified` cause carries its own detail (an undecodable method
-        // does not name the method either) and `SalvagedRecord` carries no
-        // declared length to print.
-        SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling) => {
+        // like any other now. The two FIGURES are not dropped with the
+        // sentence — [`describe_salvage_row`] appends them as a tag, so the
+        // status column stays the fixed width every other row uses while a
+        // user still learns what the entry needed and what the run allowed.
+        SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling { .. }) => {
             "Unverified (over the ceiling)"
         }
     }
@@ -672,6 +672,7 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
         | entries::SalvageDisposition::SkippedNotBuiltIn
         | entries::SalvageDisposition::SkippedShadow(_)
         | entries::SalvageDisposition::SkippedUnsupportedKind
+        | entries::SalvageDisposition::SkippedUnwritable { .. }
         | entries::SalvageDisposition::NotSelected
         | entries::SalvageDisposition::NotWritten => describe_salvage_status(record.status),
     };
@@ -692,6 +693,25 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     }
     if matches!(record.disposition, entries::SalvageDisposition::NotSelected) {
         line.push_str(" [not selected]");
+    }
+    // Fix round 4, NEW-F: the two figures the old exit-6 sentence carried.
+    // Without them a user meeting a whole-decoding container's own fixed
+    // ceiling learns neither what the entry needed nor what the run allowed,
+    // and cannot tell whether `--max-entry` would help — which is the whole
+    // difference between the two ceilings that compose here.
+    if let stuffr::salvage::SalvageStatus::Unverified(
+        stuffr::salvage::UnverifiedCause::OverEntryCeiling { needed, ceiling },
+    ) = record.status
+    {
+        line.push_str(&format!(
+            " [needs {needed} bytes; this run reads at most {ceiling} per entry]"
+        ));
+    }
+    // Fix round 4, NEW-B: an entry whose bytes could not be placed on disk
+    // names the reason on its own row. It used to end the run instead — at
+    // exit 1, on a name the ARCHIVE chose.
+    if let entries::SalvageDisposition::SkippedUnwritable { reason } = &record.disposition {
+        line.push_str(&format!(" [not written: {reason}]"));
     }
     line
 }
@@ -744,7 +764,11 @@ fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
             entries::SalvageDisposition::SkippedPartial(_)
             | entries::SalvageDisposition::SkippedNotBuiltIn
             | entries::SalvageDisposition::SkippedShadow(_)
-            | entries::SalvageDisposition::SkippedUnsupportedKind => skipped += 1,
+            | entries::SalvageDisposition::SkippedUnsupportedKind
+            // Counted as skipped, not as a bucket of its own: the summary's
+            // six counts must keep summing to the number of rows, and the
+            // per-entry reason is on the row (`[not written: …]`).
+            | entries::SalvageDisposition::SkippedUnwritable { .. } => skipped += 1,
             entries::SalvageDisposition::SkippedUnverified => unverified += 1,
             entries::SalvageDisposition::NotSelected => not_selected += 1,
             entries::SalvageDisposition::NotWritten => not_written += 1,
@@ -857,6 +881,7 @@ fn finish_single_file_recovery(
         | entries::SalvageDisposition::SkippedNotBuiltIn
         | entries::SalvageDisposition::SkippedPartial(_)
         | entries::SalvageDisposition::SkippedUnsupportedKind
+        | entries::SalvageDisposition::SkippedUnwritable { .. }
         | entries::SalvageDisposition::NotSelected
         | entries::SalvageDisposition::NotWritten => {
             eprintln!(

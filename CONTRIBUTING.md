@@ -142,7 +142,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.3.0` | Phase 2c and its follow-ups — write-side composition (`pack -o bundle.tar.gz` in one pass) and directory walking, so the read/write symmetry claim becomes true for archives; plus entry selection by index (`list`'s index column, `cat --index`, `unpack --index`), `list` reporting fidelity and gaining `--strict-fidelity`, the declaration of zip central-directory records shadowed by a duplicate name, and the guard refusing a pack that would replace a good archive with an empty one. |
 | `0.4.0` | Phase 3a–3b — the fuzzing harness, the honesty oracle and the exit-code corrections it found, plus three read-only legacy formats (`compress`, `lha`, `arj`), each proven against the fixture-driven conformance harness Phase 3b's Task 1 introduced for read-only containers. |
 | `0.5.0` | Salvage Stage 1 — the `salvage` verb and zip's central-directory recovery scan (`SalvageScan`, `Candidate`, `SalvageStatus`, `salvage_all`), reversing Phase 2's "declared, not recovered" ruling for zip: the shadowed-record parse that ruling declined to build now serves recovery, not only `list`'s warning. |
-| `0.5.x` (later) | Remaining Salvage stages (a `Complete` tier genuinely exercised by tar/cpio/ar, not only zip) and Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
+| `0.6.0` (next) | Salvage Stage 2 — legacy scanners (ARC first), and the per-entry salvage seam that came with them. A MINOR, not a `0.5.x` patch: `0.5.0` is PUBLISHED (crates.io, 2026-09-17) and Stage 2 breaks its `stuffr-core::salvage` API — `collect_candidates`/`annotate_candidates` both change signature, `UnverifiedCause` and `SalvageDisposition` both gain variants. Cargo reads a `0.x` middle number as the major, so a break to a published `0.5.0` cannot ship as `0.5.x`. |
+| `0.6.x`/later | Remaining Salvage stages (a `Complete` tier genuinely exercised by tar/cpio/ar, not only zip) and Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -221,13 +222,24 @@ Stage 1 adds a CLI verb (`salvage`) and new public surface in `stuffr-core`
 (`SalvageScan`, `Candidate`, `SalvageStatus`, `salvage_all` and their
 neighbours) — new capability, not a fix to an existing one, so it claims
 `0.5.0` on the same reasoning `0.4.0` claimed its own three new formats.
-Phase 5's original content moves to a later, not-yet-numbered `0.5.x` row,
+Phase 5's original content moves to a later, not-yet-numbered row,
 alongside whichever later Salvage stage lands next (a `Complete` tier
 genuinely exercised by tar/cpio/ar, per the design's own Stage 3 — Stage 1
 never exercises it, since zip always carries a CRC-32). Neither has landed,
 so pinning either to an exact number now would be the same mistake that
 moved `0.4.0`'s row twice already: claiming a number before the work behind
 it is real.
+
+The table was revised a **fifth** time, during Salvage Stage 2 Task 3c's
+fix round 4, and the reason is worth keeping because it is a repeat: the
+row for the remaining salvage stages said `0.5.x`, which was written while
+`CLAUDE.md` still claimed `0.5.0` was "bumped but NOT tagged and NOT
+published". It is published — crates.io, `2026-09-17T06:13:43Z`, tag
+`v0.5.0` at `498a59f`, measured against the registry rather than against
+either file — and Stage 2 breaks its published `stuffr-core::salvage` API,
+so the next release is `0.6.0`. **Check crates.io, never a sentence in this
+repository**: this is the second versioning argument a stale in-repo
+publication claim has misled (see `CLAUDE.md`'s Ruling P for the first).
 
 After 1.0, normal semver applies: breaking changes to any public API in
 `stuffr-core` or the `stuffr` facade require a major bump.

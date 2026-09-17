@@ -1149,10 +1149,51 @@ mod tests {
         assert_eq!(out.entries.len(), 1, "the entry is still reported");
         assert_eq!(
             out.entries[0].status,
-            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling),
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling {
+                needed: u64::from(ABSURD_SIZE),
+                ceiling: super::super::arc::MAX_ARC_ENTRY_LEN,
+            }),
             "an implausible declared length is this build refusing to allocate, not a verdict \
              that the archive is damaged — and not `Partial`, which would claim somebody read \
              it — see MAX_ARC_ENTRY_LEN's doc"
+        );
+    }
+
+    /// Fix round 4, NEW-E: every method a real ARC header can produce must
+    /// survive the round trip salvage's write path depends on —
+    /// `from_byte` → [`Method::codec`] → [`method_for_codec`].
+    ///
+    /// This is the guard on [`Method::all`]'s one uncovered hole. The
+    /// `successors` chain is compiler-checked at the back (a variant added
+    /// last stops [`Method::next`] compiling) but its SEED is the literal
+    /// `Method::Stored`, so a variant added at the FRONT compiles with every
+    /// `match` filled in and is silently absent from `all()` — measured by
+    /// the round-3 re-review. Driving this from `from_byte` over the whole
+    /// byte space rather than from `all()` is the point: it asks "can
+    /// salvage write back everything the reader can decode", which is the
+    /// production question, and it cannot be satisfied by an `all()` that
+    /// has quietly lost a variant.
+    #[test]
+    fn every_method_the_reader_decodes_can_be_written_back() {
+        let mut decodable = 0;
+        for byte in 0..=u8::MAX {
+            let Ok(method) = Method::from_byte(byte, "x") else {
+                continue;
+            };
+            decodable += 1;
+            assert_eq!(
+                method_for_codec(Some(method.codec())),
+                Some(method),
+                "method byte {byte} decodes as {method:?}, whose codec {:?} must map back to \
+                 it — otherwise salvage reports SkippedNotBuiltIn and silently writes nothing \
+                 for every entry using it",
+                method.codec()
+            );
+        }
+        assert_eq!(
+            decodable, 6,
+            "ARC's decodable method BYTES are 1, 2, 3, 4, 8 and 9 (1 and 2 share `Stored`); a \
+             change to that set is a deliberate act, not something this test should absorb"
         );
     }
 

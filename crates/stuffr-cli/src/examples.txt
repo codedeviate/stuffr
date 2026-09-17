@@ -836,12 +836,21 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   --max-entry) where 4 only says "degraded". 4 — any entry written
   as `.partial`, any entry written under a disambiguated
   `NAME.salvaged-N`, or any entry skipped for any other reason (a shadow,
-  --partial=skip, a kind this build has no shape for). 5 — the scan found
+  --partial=skip, a kind this build has no shape for, or a name this
+  filesystem will not hold). 5 — the scan found
   nothing recoverable in the archive at all, regardless of `--index`. 7 (a
   hostile path escaping -C or -o) aborts the run outright, exactly as it
   does for `unpack -C`, rather than being counted among the entries above.
   Exit 6 no longer reaches `salvage` at all: an entry over --max-entry is
   reported and skipped like any other, never allowed to end the run.
+
+  An entry whose NAME the destination filesystem refuses — a component past
+  its limit (255 bytes nearly everywhere), a name colliding with something
+  it cannot replace — is skipped the same way, with the reason on its own
+  row: `[not written: ...]`. It used to end the run at exit 1, losing every
+  entry after it, on a name the ARCHIVE chose. A name that would escape -C
+  is a different matter and still refuses outright at exit 7: not being able
+  to write a file here is not the same as not being allowed to.
 
 
 WHAT THIS BUILD CAN DO

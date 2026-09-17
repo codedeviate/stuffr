@@ -87,9 +87,14 @@
 //!
 //! What criterion 6 still does is bound. A truncated candidate's
 //! `available_len` — never its declared length — is what
-//! [`stuffr_core::salvage::collect_candidates`] checks against
-//! `policy.max_entry`, so a garbage length in a tail that is not there
-//! cannot abort a run at exit 6 and take every recovered entry with it.
+//! [`stuffr_core::salvage::annotate_candidates`] checks against the run's
+//! entry ceiling, so a garbage length in a tail that is not there cannot
+//! cost a caller the entries around it. (Task 3c's fix round 3 moved that
+//! check here from `collect_candidates`, which this paragraph used to name,
+//! and turned it from an `Error::ResourceLimit` that ended the run at exit
+//! 6 into a per-entry
+//! [`stuffr_core::salvage::UnverifiedCause::OverEntryCeiling`]. Exit 6 no
+//! longer reaches `salvage` at all.)
 //! **It is no longer what the scan advances by.** Task 3's fix round found
 //! that advancing by `available_len` let one coincidental phantom header —
 //! a marker+name match sitting on top of noise, with a garbage declared
@@ -159,7 +164,8 @@
 //! fix-round review measured: buffering `DeflateDecoder::read_to_end`
 //! reached a 64 MiB decode from a 65 KB archive with `--max-entry` set to
 //! 1 MiB — `max_entry` bounds the DECLARED COMPRESSED length only
-//! ([`stuffr_core::salvage::collect_candidates`]'s job), and deflate's
+//! ([`stuffr_core::salvage::annotate_candidates`]'s job since fix round 3;
+//! `collect_candidates` checks nothing), and deflate's
 //! ~1032:1 worst-case ratio means the 4 GiB default admits a multi-terabyte
 //! decode buffer, in the one verb this project builds specifically to run
 //! on hostile input. The Deflate branch additionally stops the moment
@@ -1448,6 +1454,121 @@ mod tests {
             }
             check(cursor.into_inner(), "mixed multi-entry archive");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Fix round 4, NEW-C: zip's own side of Task 3c's ceiling change, which
+    // shipped with nothing pinning it. Both of zip's candidate sources used
+    // to carry their own copy of the `policy.max_entry` check, each raising
+    // `Error::ResourceLimit` — an aborted run over one entry — and the two
+    // copies did not even compare the same figure (the engine's used
+    // `available_len.or(declared_len)`, the central directory's the raw
+    // `compressed_size`), so a truncated CD record over the ceiling aborted
+    // through one door and passed through the other. Both are gone; one
+    // rule now lives in `annotate_candidates`. These two tests pin the
+    // outcome on EACH source, because the source is exactly what used to
+    // decide it.
+    // -------------------------------------------------------------------
+
+    /// A healthy two-entry Stored archive. The raw local-header scan finds
+    /// both, so this is the scan-side path.
+    fn two_stored_entries_zip(small: &[u8], big: &[u8]) -> Vec<u8> {
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            w.start_file("small.txt", opts).unwrap();
+            w.write_all(small).unwrap();
+            w.start_file("big.txt", opts).unwrap();
+            w.write_all(big).unwrap();
+            w.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn a_zip_entry_over_the_ceiling_is_reported_and_skipped_on_the_raw_scan_path() {
+        let big = vec![b'B'; 64];
+        let bytes = two_stored_entries_zip(b"ok", &big);
+
+        let out = salvage_zip(
+            &mut Cursor::new(bytes.clone()),
+            &SalvagePolicy {
+                max_entry: 16,
+                ..SalvagePolicy::default()
+            },
+        )
+        .expect("an entry over the ceiling must not abort the run (it exited 6 before 5b57cb9)");
+
+        assert_eq!(out.entries.len(), 2, "both records are still reported");
+        assert_eq!(out.entries[0].meta.name, "small.txt");
+        assert_eq!(out.entries[0].status, SalvageStatus::Intact);
+        assert_eq!(out.entries[1].meta.name, "big.txt");
+        assert_eq!(
+            out.entries[1].status,
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling {
+                needed: 64,
+                ceiling: 16,
+            })
+        );
+
+        // Non-vacuity: the identical archive is wholly Intact at the
+        // default ceiling, so the assertion above is about the ceiling.
+        let clean = salvage(&bytes);
+        assert!(
+            clean
+                .entries
+                .iter()
+                .all(|e| e.status == SalvageStatus::Intact)
+        );
+    }
+
+    /// The same archive with `big.txt`'s LOCAL header made unrecognisable to
+    /// the raw scan — `version needed to extract` raised past
+    /// [`is_known_version`]'s ceiling of 63 — while its signature, and the
+    /// central directory that names it, stay intact. So the record reaches
+    /// the engine only through [`candidate_from_cd_record`], which is where
+    /// the second, deleted copy of the ceiling check lived.
+    #[test]
+    fn a_zip_entry_over_the_ceiling_is_reported_and_skipped_on_the_central_directory_path() {
+        let big = vec![b'B'; 64];
+        let mut bytes = two_stored_entries_zip(b"ok", &big);
+
+        // The second local header: find it by signature, past the first.
+        let second = (1..bytes.len() - 4)
+            .find(|&i| bytes[i..i + 4] == SIG_LOCAL_HEADER)
+            .expect("a two-entry archive has a second local header");
+        bytes[second + 4..second + 6].copy_from_slice(&9999u16.to_le_bytes());
+
+        // The raw scan alone must now MISS it — otherwise this test would
+        // silently re-test the scan path above.
+        let mut scan = ZipSalvage::new();
+        let raw = collect_candidates(&mut scan, &mut Cursor::new(bytes.clone())).unwrap();
+        assert_eq!(
+            raw.len(),
+            1,
+            "the patched local header must fail the raw scan's version gate, or this test \
+             proves nothing about the central-directory path"
+        );
+
+        let out = salvage_zip(
+            &mut Cursor::new(bytes),
+            &SalvagePolicy {
+                max_entry: 16,
+                ..SalvagePolicy::default()
+            },
+        )
+        .expect("the central-directory path must not abort the run either");
+
+        assert_eq!(out.entries.len(), 2, "reconciliation still recovers it");
+        assert_eq!(
+            out.entries[1].status,
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling {
+                needed: 64,
+                ceiling: 16,
+            })
+        );
     }
 
     /// Task 4's first required test, verbatim from the brief. This is the
