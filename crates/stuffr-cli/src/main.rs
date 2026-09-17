@@ -567,11 +567,15 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // through it — the report was already printed by
             // `dispatch_salvage`, so nothing is lost by not returning.
             //
-            // Exit 6 (over the ceiling) and exit 7 (path escape) never reach
-            // here: `entries::salvage` raises them as `Err` before a
-            // `SalvageOutcome` exists at all (see `salvage_exit_code`'s own
-            // doc), and the `?` above already propagated those through the
-            // normal `Error::exit_code` path.
+            // Exit 7 (path escape) never reaches here: `entries::salvage`
+            // raises it as `Err` before a `SalvageOutcome` exists at all
+            // (see `salvage_exit_code`'s own doc), and the `?` above already
+            // propagated it through the normal `Error::exit_code` path.
+            // Exit 6 used to be in this sentence — an entry over the ceiling
+            // aborted the run the same way — and since Task 3c's fix round 3
+            // it is not raised by salvage at all: such an entry is reported
+            // `Unverified (over the ceiling)` and lands in bucket 3, so one
+            // oversized declaration no longer costs every other entry.
             //
             // Safe despite every `--list` row having already gone to stdout
             // by this point: `std::io::Stdout` is an unconditional
@@ -616,6 +620,18 @@ fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static s
         }
         SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength) => {
             "Unverified (no declared length)"
+        }
+        // The entry is larger than this run will read for one entry
+        // (`--max-entry`, narrowed by a whole-decoding container's own
+        // ceiling), so nothing was read and nothing was decoded. It used to
+        // be reported by ABORTING at exit 6 with a sentence naming both
+        // figures, which cost every other entry in the archive; it is a row
+        // like any other now. The figures are not in the row — no
+        // `Unverified` cause carries its own detail (an undecodable method
+        // does not name the method either) and `SalvagedRecord` carries no
+        // declared length to print.
+        SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling) => {
+            "Unverified (over the ceiling)"
         }
     }
 }

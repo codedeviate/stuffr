@@ -807,6 +807,18 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       --memory-limit and container entry limits already apply elsewhere on
       this page.
 
+      An entry past the ceiling is ONE ENTRY'S problem: it is listed as
+      `Unverified (over the ceiling)`, nothing is written for it (not
+      even a 0-byte `.partial` — nobody read a byte of it, so there is no
+      surviving prefix to claim), and everything else in the archive is
+      recovered as usual, at exit 3. It used to abort the whole run at exit
+      6 instead, which meant one oversized declaration cost you every other
+      entry — in the one verb whose job is not losing entries. A container
+      that decodes an entry WHOLE narrows this ceiling further with its own
+      (ARC's is a fixed 256 MiB; see "READ-ONLY LEGACY FORMATS"), so
+      --max-entry can lower the figure for such a format but never raise it
+      past what that format will buffer.
+
   stuffr salvage broken.zip -C out/ --strict
       Demands proof: every Partial entry is skipped regardless of
       --partial, and nothing this build cannot verify is ever written.
@@ -817,17 +829,19 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   Exit codes for a COMPLETED salvage run (see "EXIT CODES" below for the
   full table), computed over whatever `--index` selected (the whole scan
   when it was omitted): 0 — every entry Intact or Complete. 3 — any entry
-  Unverified (an undecodable compression method, or a data-descriptor entry
-  with no length to reconcile against a central directory) — outranks 4
-  deliberately, since it names its own remedy (a rebuild, or
-  --features c-backed) where 4 only says "degraded". 4 — any entry written
+  Unverified (an undecodable compression method, a data-descriptor entry
+  with no length to reconcile against a central directory, or an entry past
+  the ceiling --max-entry sets) — outranks 4 deliberately, since it usually
+  names its own remedy (a rebuild, --features c-backed, or a higher
+  --max-entry) where 4 only says "degraded". 4 — any entry written
   as `.partial`, any entry written under a disambiguated
   `NAME.salvaged-N`, or any entry skipped for any other reason (a shadow,
   --partial=skip, a kind this build has no shape for). 5 — the scan found
-  nothing recoverable in the archive at all, regardless of `--index`. 6 and
-  7 (a declaration over --max-entry, or a hostile path escaping -C or -o)
-  abort the run outright, exactly as they do for `unpack -C`, rather than
-  being counted among the entries above.
+  nothing recoverable in the archive at all, regardless of `--index`. 7 (a
+  hostile path escaping -C or -o) aborts the run outright, exactly as it
+  does for `unpack -C`, rather than being counted among the entries above.
+  Exit 6 no longer reaches `salvage` at all: an entry over --max-entry is
+  reported and skipped like any other, never allowed to end the run.
 
 
 WHAT THIS BUILD CAN DO
@@ -1043,9 +1057,11 @@ EXIT CODES
      shadow, --partial=skip, a kind this build has no shape for)
   5  archive or stream is corrupt, or a `salvage` scan found nothing
      recoverable in the archive at all
-  6  resource limit exceeded (--max-ratio or --memory-limit tripped,
-     archive nesting exceeded the depth stuffr will peel through, or a
-     `salvage` entry's declared length exceeded --max-entry)
+  6  resource limit exceeded (--max-ratio or --memory-limit tripped, or
+     archive nesting exceeded the depth stuffr will peel through). NOT a
+     `salvage` entry over --max-entry: that is reported per entry as
+     `Unverified (over the ceiling)` and lands in 3, because one
+     oversized declaration must never cost a caller the rest of the archive
   7  unsafe path refused (including a `salvage` entry whose name would
      escape -C)
 

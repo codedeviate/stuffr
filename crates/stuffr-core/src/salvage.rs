@@ -65,23 +65,31 @@
 //!   proven copy is reported as a shadow and nothing else, since that is
 //!   the strictly more informative claim.
 //!
-//! [`collect_candidates`] (the resync loop: find a candidate, bound its
-//! declared length, advance) and [`annotate_candidates`] (verify + shadow,
-//! above) are both exposed separately from [`salvage_all`] — which is just
-//! the two of them run in sequence — so a format that reconciles more than
-//! one candidate source (zip's central-directory fallback, `zip_salvage.rs`)
-//! can collect from each source under the identical bound, merge, and
-//! annotate the merged list exactly once, rather than annotating twice and
-//! reconciling two already-decided outcomes.
+//! [`collect_candidates`] (the resync loop: find a candidate, advance) and
+//! [`annotate_candidates`] (bound + verify + shadow, above) are both
+//! exposed separately from [`salvage_all`] — which is just the two of them
+//! run in sequence — so a format that reconciles more than one candidate
+//! source (zip's central-directory fallback, `zip_salvage.rs`) can collect
+//! from each source, merge, and annotate the merged list exactly once
+//! rather than annotating twice and reconciling two already-decided
+//! outcomes. The run's ceiling on a single entry is applied once, in
+//! `annotate_candidates`, to whatever the merge produced — see
+//! [`UnverifiedCause::OverEntryCeiling`] for why it is a status there
+//! rather than a [`crate::Error`] anywhere.
 
 use std::io::{Read, Write};
 
 use crate::archive::EntryMeta;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::source::SeekRead;
 
 /// 4 GiB. A scanned length is untrustworthy TWICE over — attacker-controlled
 /// AND possibly corrupt — so this is a structural ceiling, not a budget.
+///
+/// Applied per ENTRY, never to the run: an entry over it is reported
+/// [`UnverifiedCause::OverEntryCeiling`] and skipped, and the rest of the
+/// archive is recovered as usual. It used to abort the run outright, which
+/// meant one absurd declaration cost every entry around it.
 pub const MAX_SALVAGE_ENTRY: u64 = 4 * 1024 * 1024 * 1024;
 
 /// What a format can prove about a candidate it found.
@@ -152,11 +160,12 @@ pub struct Candidate {
 
 /// Why an entry is [`SalvageStatus::Unverified`].
 ///
-/// Two causes, and the STATUS does not distinguish them because the decision
-/// they lead to is identical (listed, not written, exit 3) — the same split
-/// [`crate::salvage`]'s consumers apply to [`SalvageStatus::Partial`] via
-/// their own cause type (`entries.rs`'s `PartialCause`, one crate up): **a
-/// tier carries a decision, a message carries a cause.**
+/// Three causes, and the STATUS does not distinguish them because the
+/// decision they lead to is identical (listed, not written, exit 3) — the
+/// same split [`crate::salvage`]'s consumers apply to
+/// [`SalvageStatus::Partial`] via their own cause type (`entries.rs`'s
+/// `PartialCause`, one crate up): **a tier carries a decision, a message
+/// carries a cause.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnverifiedCause {
     /// This build recognises the entry's compression method but cannot
@@ -170,6 +179,34 @@ pub enum UnverifiedCause {
     /// does NOT reach this cause; see `zip_salvage.rs`'s
     /// `candidate_from_cd_record`.
     NoDeclaredLength,
+    /// The bytes this entry would have required are past the ceiling this
+    /// run will read for ONE entry — `policy.max_entry` narrowed by the
+    /// scanner's own [`SalvageScan::max_whole_entry`] — so nothing was read
+    /// and nothing was decoded. See [`annotate_candidates`], which is the
+    /// one place that decides this, for the whole rule.
+    ///
+    /// # Why this is a cause and not an `Err`
+    ///
+    /// Salvage Stage 2 Task 3c's fix round 3. This refusal used to be an
+    /// [`crate::Error::ResourceLimit`] raised from two different places — the
+    /// engine's own [`collect_candidates`], and (for ARC) the scanner's own
+    /// `verify` — and an `Err` at either site **aborts the whole run**:
+    /// measured at the CLI on a two-entry archive whose second entry was
+    /// over the ceiling, `stuffr salvage --list` printed no rows at all and
+    /// exited 6, and `salvage -C out` left the destination empty, losing a
+    /// first entry that decodes perfectly. That is the one thing this verb
+    /// exists not to do. Three fix rounds chased the shape from site to
+    /// site; what actually closes it is that an over-ceiling entry has a
+    /// STATUS, so there is no `Err` left to propagate.
+    ///
+    /// Distinct from [`SalvageStatus::Partial`], which is what this used to
+    /// collapse into once the `Err` was folded away at the write layer: a
+    /// truncated entry's genuine prefix IS recovered (as `NAME.partial`),
+    /// while an over-ceiling entry has real bytes nobody read. Reporting it
+    /// as `Partial (truncated)` stated two false things — the entry is not
+    /// truncated, and the empty `NAME.partial` it produced said nothing
+    /// survived.
+    OverEntryCeiling,
 }
 
 /// What was proven about an entry AFTER decoding it.
@@ -283,7 +320,12 @@ pub struct SalvagePolicy {
     /// Recovery-biased by default: salvage is the one permissive verb, and
     /// the strict path is the entire rest of the tool.
     pub partial: PartialPolicy,
-    /// Structural ceiling on any declared length, refused BEFORE allocation.
+    /// Structural ceiling on any one entry's length, refused BEFORE
+    /// allocation — and refused as a per-entry
+    /// [`UnverifiedCause::OverEntryCeiling`], never as an error that ends
+    /// the run. [`SalvageScan::max_whole_entry`] narrows it further for a
+    /// format that decodes an entry whole; the two compose as a minimum and
+    /// are applied together, once, in [`annotate_candidates`].
     pub max_entry: u64,
     /// Demand proof: partial skipped, ceiling fixed, nothing unverifiable.
     pub strict: bool,
@@ -307,9 +349,58 @@ pub trait SalvageScan {
     /// Find the next candidate at or after `from`. `Ok(None)` ends the scan.
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>>;
 
+    /// The largest single entry this scanner is willing to have read for it
+    /// — the ceiling [`annotate_candidates`] applies, narrowed further by
+    /// `policy.max_entry`, before it calls [`Self::verify`] at all.
+    ///
+    /// `u64::MAX` (the default) means "this scanner imposes none of its
+    /// own": zip streams every payload it verifies through a `take`, so the
+    /// only figure that bounds it is the policy's. A format that **decodes
+    /// an entry whole** — ARC, and the legacy containers still to come —
+    /// overrides this with its own container-side ceiling
+    /// (`arc.rs`'s `MAX_ARC_ENTRY_LEN`, 256 MiB), because for those the
+    /// figure really does become a single allocation.
+    ///
+    /// **Declaring a ceiling here is the ONLY way a scanner refuses an
+    /// entry for its size**, and that is the point: the refusal is then a
+    /// [`SalvageStatus`] the engine assigns
+    /// ([`UnverifiedCause::OverEntryCeiling`]), not a [`crate::Error`] the
+    /// scanner raises, so it can never abort a run over one entry. A
+    /// scanner that instead checks a size inside [`Self::verify`] and
+    /// `?`-propagates the failure reintroduces the exact defect this seam
+    /// was reshaped to make unrepresentable — see [`Self::verify`]'s own
+    /// contract below.
+    fn max_whole_entry(&self) -> u64 {
+        u64::MAX
+    }
+
     /// Decide what was actually proven about a candidate's payload, after
     /// discovery — called once per candidate, in file order, by
     /// [`annotate_candidates`].
+    ///
+    /// # The contract on `Err`
+    ///
+    /// **`Err` here aborts the WHOLE run**, discarding every entry already
+    /// recovered, so it is reserved for a fault that really is about the
+    /// run and not about this one entry (the destination is gone, the
+    /// source handle itself failed). Everything a single candidate can be
+    /// wrong about — a short read, a bad checksum, a method this build
+    /// cannot decode, a device error partway through one payload — is a
+    /// [`SalvageStatus`], never an `Err`. `zip_salvage.rs`'s own
+    /// `verify_candidate` has stated this in prose since Stage 1 and folds
+    /// every one of those; ARC's did not, for one case (its size ceiling),
+    /// and that single `?` cost three fix rounds. The size ceiling now
+    /// belongs to [`Self::max_whole_entry`], which the engine applies, so
+    /// there is nothing left for an implementation to `?` on.
+    ///
+    /// # What an implementation may assume
+    ///
+    /// The candidate's bounded length (`available_len` if the payload was
+    /// truncated, else `declared_len`) is already **at or below**
+    /// [`Self::max_whole_entry`] — [`annotate_candidates`] answers
+    /// [`UnverifiedCause::OverEntryCeiling`] itself, without calling this,
+    /// for anything above it. So an implementation that decodes whole may
+    /// size a buffer from that length without re-checking it.
     ///
     /// The default answers [`SalvageStatus::Complete`] unconditionally: a
     /// scanner with no real checksum (or, in this module's own tests, a mock
@@ -334,57 +425,58 @@ pub trait SalvageScan {
 /// containers already do, reporting `Rung::Spilled` — which is a later
 /// task's ops-layer concern, not this function's.
 ///
-/// Every candidate's `declared_len` is bounded against `policy.max_entry`
-/// **before** anything is sized from it: an oversized declaration is refused
-/// with [`Error::ResourceLimit`] the moment it is seen, never after an
-/// allocation or a read has already acted on it.
+/// Every candidate's length is bounded against the run's entry ceiling
+/// (`policy.max_entry`, narrowed by [`SalvageScan::max_whole_entry`])
+/// **before** anything is sized from it — in [`annotate_candidates`], one
+/// step before the only place that could size anything, and as a per-entry
+/// [`UnverifiedCause::OverEntryCeiling`] rather than a [`crate::Error`] that ends
+/// the run.
 pub fn salvage_all(
     scan: &mut dyn SalvageScan,
     src: &mut dyn SeekRead,
     policy: &SalvagePolicy,
 ) -> Result<SalvageOutcome> {
-    let candidates = collect_candidates(scan, src, policy)?;
-    annotate_candidates(&*scan, src, candidates)
+    let candidates = collect_candidates(scan, src)?;
+    annotate_candidates(&*scan, src, candidates, policy)
 }
 
-/// The resync loop alone: find a candidate, bound its declared length
-/// against `policy.max_entry` **before** anything is sized from it, advance
-/// strictly past it, repeat. Never reads a payload and never calls
-/// [`SalvageScan::verify`] — see [`annotate_candidates`] for that.
+/// The resync loop alone: find a candidate, advance strictly past it,
+/// repeat. Never reads a payload, never sizes anything from a declared
+/// length, and never calls [`SalvageScan::verify`] — see
+/// [`annotate_candidates`] for both the entry ceiling and the verification.
 ///
 /// Exposed separately from [`salvage_all`] so a format that reconciles more
 /// than one candidate source (zip's central-directory fallback) can collect
-/// from each source under the identical bound before merging.
+/// from each source before merging, and annotate the merged list once.
+///
+/// # The entry ceiling used to be enforced here, and was an `Err`
+///
+/// Salvage Stage 2 Task 3c's fix round 3 moved it to
+/// [`annotate_candidates`] and turned it into a status. Two things were
+/// wrong with it here, and only the second is obvious:
+///
+/// 1. **It refused a whole archive over one entry.** Measured at the CLI on
+///    a 78-byte two-entry ARC, `stuffr salvage --list --max-entry 4`
+///    printed no rows and exited 6 — the healthy first entry, which the
+///    same binary recovers byte-for-byte at the default ceiling, simply
+///    lost. That is the same defect the ARC scanner's own ceiling had, in
+///    the engine rather than in a format.
+/// 2. **It was one of two ceilings, checked in two places**, so which
+///    disposition an over-ceiling entry got depended on which check saw it
+///    first. There is now one rule, applied once, to both figures.
+///
+/// Nothing is weakened by the move: this loop sizes nothing from a declared
+/// length (it only advances `from` by it), so "bounded before anything is
+/// sized from it" holds exactly as before — the bound simply sits one
+/// function later, still strictly before the only allocation there is.
 pub fn collect_candidates(
     scan: &mut dyn SalvageScan,
     src: &mut dyn SeekRead,
-    policy: &SalvagePolicy,
 ) -> Result<Vec<Candidate>> {
     let mut candidates = Vec::new();
     let mut from = 0u64;
 
     while let Some(candidate) = scan.next_candidate(src, from)? {
-        // The ceiling is checked against what could actually be READ, not
-        // against what the header DECLARED, and the two differ only for a
-        // truncated candidate ([`Candidate::available_len`]). That is not a
-        // loosening: this ceiling exists to refuse before anything is sized
-        // from an attacker-controlled figure, and for a truncated candidate
-        // nothing can ever be sized past the bytes that exist — the source
-        // ends first. Checking the declared figure instead would abort the
-        // WHOLE run (exit 6) over a garbage length in a tail the scan has
-        // already established is not there, which is exactly the archive a
-        // caller reached for salvage to rescue.
-        let bounded_len = candidate.available_len.or(candidate.declared_len);
-        if let Some(len) = bounded_len
-            && len > policy.max_entry
-        {
-            return Err(Error::ResourceLimit(format!(
-                "declared entry length {len} bytes exceeds the {}-byte salvage ceiling \
-                 (see MAX_SALVAGE_ENTRY)",
-                policy.max_entry
-            )));
-        }
-
         // Advance strictly past this candidate so the scan always makes
         // progress — but NEVER by a length this candidate merely CLAIMED.
         // `available_len.is_some()` means the header's own declared length
@@ -428,15 +520,35 @@ pub fn collect_candidates(
     Ok(candidates)
 }
 
-/// Turns already-discovered, already-bounded candidates — in file order —
-/// into the verified, shadow-annotated entries a caller receives. See this
-/// module's doc comment for what the two passes (verify, shadow) mean and
-/// why they live here rather than per-format.
+/// Turns already-discovered candidates — in file order — into the bounded,
+/// verified, shadow-annotated entries a caller receives. See this module's
+/// doc comment for what the passes (bound, verify, shadow) mean and why
+/// they live here rather than per-format.
+///
+/// # The entry ceiling, in one place (fix round 3, Task 3c)
+///
+/// `policy.max_entry` narrowed by [`SalvageScan::max_whole_entry`] is the
+/// run's ceiling on ONE entry, and this is the only place it is applied. A
+/// candidate whose bounded length (`available_len` if the payload is
+/// truncated, else `declared_len`) is over it is reported
+/// [`SalvageStatus::Unverified`]`(`[`UnverifiedCause::OverEntryCeiling`]`)`
+/// and [`SalvageScan::verify`] is **not called for it at all** — so nothing
+/// is read and nothing is allocated, which was the whole purpose of the two
+/// `Err`-raising checks this replaced, without their cost: neither the
+/// engine's own nor a scanner's could refuse one entry without ending the
+/// run and discarding every entry already recovered.
+///
+/// The bounded length, never the declared one, is what is compared — the
+/// rule [`Candidate::available_len`]'s own doc argues for and the reason a
+/// truncated tail's garbage declaration cannot decide anything: a candidate
+/// whose payload ran out can never cost more than the bytes that exist.
 pub fn annotate_candidates(
     scan: &dyn SalvageScan,
     src: &mut dyn SeekRead,
     candidates: Vec<Candidate>,
+    policy: &SalvagePolicy,
 ) -> Result<SalvageOutcome> {
+    let ceiling = policy.max_entry.min(scan.max_whole_entry());
     let mut entries = Vec::with_capacity(candidates.len());
     // Earliest scan_position to report each distinct (name, declared_len,
     // verifier) triple seen so far — a candidate reporting one already in
@@ -455,7 +567,18 @@ pub fn annotate_candidates(
     let mut names_seen: Vec<(String, usize)> = Vec::new();
 
     for (scan_position, candidate) in candidates.into_iter().enumerate() {
-        let status = scan.verify(src, &candidate)?;
+        // Bounded length, then the ceiling, then — only if it fits —
+        // verification. `verify` is what reads and (for a whole-decoding
+        // format) allocates, so refusing above it is refusing before the
+        // allocation, which is the property the two `Err`s this replaced
+        // existed for.
+        let bounded_len = candidate.available_len.or(candidate.declared_len);
+        let status = match bounded_len {
+            Some(len) if len > ceiling => {
+                SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)
+            }
+            _ => scan.verify(src, &candidate)?,
+        };
 
         let declared_len = candidate.declared_len;
         let verifier = candidate.verifier;
@@ -531,7 +654,7 @@ pub fn annotate_candidates(
 /// when `reader` ran out or errored first — [`crate`]'s own convention
 /// throughout this module: "did not fully recover" is a fact a caller
 /// reports (as [`SalvageStatus::Partial`]'s own two causes already are),
-/// never an [`Error`] that aborts the whole run over one entry.
+/// never a [`crate::Error`] that aborts the whole run over one entry.
 ///
 /// Lives here, rather than duplicated once per format module, because it
 /// has no format-specific knowledge at all — only `Read`/`Write` and a byte
@@ -685,20 +808,123 @@ mod tests {
     }
 
     /// The ceiling test that matters most: a reader that PANICS on an
-    /// oversized read, so this test fails if the allocation happens at all
-    /// — not merely if the wrong error code comes back. See this module's
+    /// oversized read, so this test fails if the read happens at all — not
+    /// merely if the wrong status comes back. See this module's
     /// falsification note in the task report for what happens when the
     /// bound is moved below a read.
+    ///
+    /// Fix round 3 (Task 3c): the refusal is a per-entry STATUS now, not an
+    /// `Err` — so this asserts both halves, that nothing was read AND that
+    /// the run completed with the entry reported. The old assertion
+    /// (`unwrap_err()`, exit 6) proved only the first and was satisfied by
+    /// the behaviour that lost every other entry in the archive.
     #[test]
     fn an_absurd_declared_length_is_refused_before_the_allocation_it_would_size() {
         let mut scan = DeclaresLength(u64::MAX);
-        let err = salvage_all(
+        let out = salvage_all(
             &mut scan,
             &mut panicking_reader(4096),
             &SalvagePolicy::default(),
         )
-        .unwrap_err();
-        assert_eq!(err.exit_code(), 6);
+        .expect("an entry over the ceiling must not abort the run");
+        assert_eq!(out.entries.len(), 1, "the entry is still reported");
+        assert_eq!(
+            out.entries[0].status,
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)
+        );
+    }
+
+    /// The other half of the same rule, and the one the CLI reaches:
+    /// everything AROUND an over-ceiling entry is still recovered. Measured
+    /// before this fix as `stuffr salvage --list --max-entry 4` over a
+    /// 78-byte ARC — no rows at all, exit 6.
+    #[test]
+    fn an_entry_over_the_ceiling_does_not_cost_the_entries_around_it() {
+        struct TwoCandidates;
+        impl SalvageScan for TwoCandidates {
+            fn next_candidate(
+                &mut self,
+                _src: &mut dyn SeekRead,
+                from: u64,
+            ) -> Result<Option<Candidate>> {
+                let (offset, len, name) = match from {
+                    0 => (0u64, 16u64, "small-first"),
+                    1..=16 => (17u64, 4096u64, "huge-second"),
+                    _ => return Ok(None),
+                };
+                Ok(Some(Candidate {
+                    offset,
+                    payload_start: offset,
+                    meta: EntryMeta::file(name),
+                    declared_len: Some(len),
+                    verifier: Some(Verifier::Crc32(len as u32)),
+                    available_len: None,
+                }))
+            }
+        }
+
+        let out = salvage_all(
+            &mut TwoCandidates,
+            &mut bytes(&[0u8; 8192]),
+            &SalvagePolicy {
+                max_entry: 64,
+                ..SalvagePolicy::default()
+            },
+        )
+        .expect("one over-ceiling entry must never abort the run");
+        assert_eq!(out.entries.len(), 2);
+        assert_eq!(out.entries[0].status, SalvageStatus::Complete);
+        assert_eq!(
+            out.entries[1].status,
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)
+        );
+    }
+
+    /// A scanner's own [`SalvageScan::max_whole_entry`] narrows the policy's
+    /// ceiling — the composition ARC relies on, proven against a mock so it
+    /// does not depend on ARC's own 256 MiB constant. The candidate here is
+    /// well under `policy.max_entry` and over the scanner's own figure, so
+    /// only the `min` can refuse it; the panicking reader proves it is
+    /// refused without being read.
+    #[test]
+    fn a_scanners_own_whole_entry_ceiling_narrows_the_policys() {
+        struct DecodesWhole;
+        impl SalvageScan for DecodesWhole {
+            fn next_candidate(
+                &mut self,
+                _src: &mut dyn SeekRead,
+                from: u64,
+            ) -> Result<Option<Candidate>> {
+                if from > 0 {
+                    return Ok(None);
+                }
+                Ok(Some(Candidate {
+                    offset: 0,
+                    payload_start: 0,
+                    meta: EntryMeta::file("whole"),
+                    declared_len: Some(2048),
+                    verifier: Some(Verifier::Crc32(7)),
+                    available_len: None,
+                }))
+            }
+            fn max_whole_entry(&self) -> u64 {
+                1024
+            }
+            fn verify(&self, _src: &mut dyn SeekRead, _c: &Candidate) -> Result<SalvageStatus> {
+                panic!("verify must not run for a candidate over the ceiling");
+            }
+        }
+
+        let out = salvage_all(
+            &mut DecodesWhole,
+            &mut panicking_reader(4096),
+            &SalvagePolicy::default(),
+        )
+        .expect("a scanner ceiling is a per-entry refusal, not a run failure");
+        assert_eq!(
+            out.entries[0].status,
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)
+        );
     }
 
     #[test]
@@ -765,14 +991,16 @@ mod tests {
     /// The complement, so the rule above cannot be read as "truncated
     /// candidates are never bounded": what IS there is still bounded, and a
     /// truncated candidate holding more available bytes than the ceiling
-    /// allows is refused exactly as an untruncated one would be.
+    /// allows is refused exactly as an untruncated one would be — reported
+    /// [`UnverifiedCause::OverEntryCeiling`], never read (the reader
+    /// panics if it is), and never allowed to end the run.
     #[test]
     fn a_truncated_candidate_whose_available_bytes_exceed_the_ceiling_is_refused() {
         let mut scan = DeclaresMoreThanIsThere {
             declared: u64::MAX,
             available: 4096,
         };
-        let err = salvage_all(
+        let out = salvage_all(
             &mut scan,
             &mut panicking_reader(4096),
             &SalvagePolicy {
@@ -780,8 +1008,12 @@ mod tests {
                 ..SalvagePolicy::default()
             },
         )
-        .unwrap_err();
-        assert_eq!(err.exit_code(), 6);
+        .expect("a bounded refusal is per-entry, never a run failure");
+        assert_eq!(
+            out.entries[0].status,
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling),
+            "an over-ceiling entry is unverified, not truncated: nobody read it"
+        );
     }
 
     #[test]

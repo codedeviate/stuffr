@@ -1170,10 +1170,12 @@ pub enum SalvageDisposition {
     /// declined, but the cause costs nothing extra to learn.
     SkippedPartial(PartialCause),
     /// Not written: [`stuffr_core::salvage::SalvageStatus::Unverified`] —
-    /// nothing about this entry's content was verified, for either of that
-    /// status's two causes (Ruling R-M): this build recognises the entry's
-    /// compression method but cannot decode it, or no length was available
-    /// to bound a read against (an unreconciled zip data descriptor). The
+    /// nothing about this entry's content was verified, for any of that
+    /// status's three causes (Ruling R-M): this build recognises the
+    /// entry's compression method but cannot decode it, no length was
+    /// available to bound a read against (an unreconciled zip data
+    /// descriptor), or (Task 3c fix round 3) the entry is past the ceiling
+    /// this run will read for one entry, so nothing was read at all. The
     /// cause is not repeated here — it already lives on
     /// `SalvagedRecord::status`, this variant is only the DECISION ("listed,
     /// not written"), which is identical for both causes. Extracting the raw
@@ -1254,11 +1256,19 @@ pub struct SalvageOutcome {
 /// collapse onto five exit-code buckets, and until this fix round no
 /// aggregation policy was recorded anywhere.
 ///
-/// **Exit 6 (over the ceiling) and exit 7 (path escape) are NOT covered
-/// here.** Both are errors that abort the run — `salvage` returns `Err`
-/// before a `SalvageOutcome` ever exists — so there is nothing to
-/// aggregate for them; this function is only meaningful for a `salvage()`
-/// call that returned `Ok`.
+/// **Exit 7 (path escape) is NOT covered here**: it is an error that
+/// aborts the run — `salvage` returns `Err` before a `SalvageOutcome` ever
+/// exists — so there is nothing to aggregate for it; this function is only
+/// meaningful for a `salvage()` call that returned `Ok`.
+///
+/// **Exit 6 used to be in that sentence too, and is not any more** (Task 3c
+/// fix round 3). An entry past the run's entry ceiling was an
+/// `Error::ResourceLimit` that ended the run, which meant one oversized
+/// entry cost a caller every entry around it — measured at the CLI, `78`
+/// bytes of ARC and `--max-entry 4` printed no rows and recovered nothing.
+/// It is a per-entry
+/// `SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling)` now, so
+/// it aggregates here like any other status: bucket 3.
 ///
 /// Among a completed run's entries, the HIGHEST applicable bucket wins:
 ///
@@ -4458,6 +4468,134 @@ mod arc_salvage_tests {
 
         assert_eq!(outcome.entries[1].name, "b.dat");
         assert_eq!(outcome.entries[1].status, SalvageStatus::Partial);
+    }
+
+    /// Fix round 3, the acceptance test for the whole finding: **one entry
+    /// over the run's entry ceiling must cost that entry and nothing else**,
+    /// observed through the PUBLIC path and against the run's own outcome.
+    ///
+    /// # Why this test exists at all
+    ///
+    /// Rounds 1 and 2 each fixed the site the previous review named, and
+    /// each time the identical symptom was still reachable one function
+    /// upstream — measured at the CLI on an ARC holding a healthy `A.TXT`
+    /// and a 300 MiB entry whose declared bytes were all genuinely present:
+    /// `salvage --format arc --list` printed NO ROWS and exited 6, and
+    /// `-C out` left the destination empty. Round 2's own regression test
+    /// called `arc_salvage.rs`'s internal `write_payload_bounded` with an
+    /// injected 50-byte ceiling, which pinned that branch's arithmetic and
+    /// nothing about whether production ever reached it — and it did not.
+    /// So this one drives `salvage()` itself and asserts what a user sees:
+    /// the healthy entry is written, its bytes are right, the oversized
+    /// sibling is reported and skipped, and the run completes.
+    ///
+    /// # The lever, and why it is the same branch
+    ///
+    /// ARC's own ceiling is `MAX_ARC_ENTRY_LEN`, 256 MiB, and reaching it
+    /// honestly needs a 256 MiB archive — which the gate must not grow.
+    /// `policy.max_entry` is a SEPARATE ceiling (4 GiB by default, and
+    /// `--max-entry` at the CLI), but since fix round 3 the two are not
+    /// separate DECISIONS: `annotate_candidates` applies
+    /// `policy.max_entry.min(scan.max_whole_entry())` once, and reports
+    /// `UnverifiedCause::OverEntryCeiling` for anything above it. This test
+    /// therefore exercises the very comparison, the very status and the
+    /// very disposition a 256 MiB ARC entry does — the only difference is
+    /// which side of that `min` supplied the number. The other side is
+    /// pinned where it lives, in `arc_salvage.rs`'s
+    /// `refuses_an_absurd_compressed_size_before_the_allocation_it_would_size`
+    /// (a ~2.86 GiB declaration, under the default policy ceiling, so only
+    /// ARC's own figure can refuse it) and
+    /// `the_scanner_declares_arcs_own_whole_entry_ceiling`.
+    #[test]
+    fn an_over_ceiling_entry_is_skipped_while_its_healthy_sibling_is_recovered() {
+        let a_payload = b"hi";
+        let entry_a = arc_entry(1, "a.txt", a_payload, crc16_arc(a_payload));
+        // Every declared byte genuinely present — the shape that used to
+        // abort, as opposed to a truncated tail (fix round 1's case).
+        let big_payload = vec![0xABu8; 64];
+        let entry_b = arc_entry(1, "big.bin", &big_payload, crc16_arc(&big_payload));
+
+        let mut bytes = entry_a.clone();
+        bytes.extend_from_slice(&entry_b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("present-big.arc");
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let over_ceiling = SalvagePolicy {
+            // Above `a.txt`'s 2 declared bytes, below `big.bin`'s 64.
+            max_entry: 16,
+            ..SalvagePolicy::default()
+        };
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let outcome = salvage(
+            &archive,
+            &SalvageOpts {
+                dest: Some(out_dir.path().to_path_buf()),
+                policy: over_ceiling,
+                select: None,
+                format: Some(FormatId::new("arc")),
+            },
+        )
+        .expect(
+            "an entry over the ceiling is one entry's problem: the run must complete, not \
+             abort at exit 6 with nothing recovered (fix round 3)",
+        );
+
+        assert_eq!(outcome.entries.len(), 2, "both records are still reported");
+
+        assert_eq!(outcome.entries[0].name, "a.txt");
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Intact);
+        assert_eq!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::Written(out_dir.path().join("a.txt"))
+        );
+        assert_eq!(
+            std::fs::read(out_dir.path().join("a.txt")).unwrap(),
+            a_payload,
+            "the healthy entry's bytes must be right, not merely reported written"
+        );
+
+        assert_eq!(outcome.entries[1].name, "big.bin");
+        assert_eq!(
+            outcome.entries[1].status,
+            SalvageStatus::Unverified(stuffr_core::salvage::UnverifiedCause::OverEntryCeiling),
+            "an entry nobody read is Unverified — never Partial, which claims a decode ran, \
+             and never `truncated`, which claims bytes are missing"
+        );
+        assert_eq!(
+            outcome.entries[1].disposition,
+            SalvageDisposition::SkippedUnverified
+        );
+        assert!(
+            !out_dir.path().join("big.bin").exists()
+                && !out_dir.path().join("big.bin.partial").exists(),
+            "an over-ceiling entry must leave NOTHING on disk — a 0-byte `.partial` would \
+             claim nothing survived, while its bytes are all there, unread"
+        );
+        assert_eq!(salvage_exit_code(&outcome), 3);
+
+        // Non-vacuity: the identical archive recovers completely at the
+        // default ceiling, so the assertions above are about the ceiling
+        // and not about a fixture that was broken to begin with.
+        let clean_dir = tempfile::tempdir().unwrap();
+        let clean = salvage(
+            &archive,
+            &SalvageOpts {
+                dest: Some(clean_dir.path().to_path_buf()),
+                policy: SalvagePolicy::default(),
+                select: None,
+                format: Some(FormatId::new("arc")),
+            },
+        )
+        .unwrap();
+        assert_eq!(clean.entries[1].status, SalvageStatus::Intact);
+        assert_eq!(
+            std::fs::read(clean_dir.path().join("big.bin")).unwrap(),
+            big_payload
+        );
+        assert_eq!(salvage_exit_code(&clean), 0);
     }
 
     /// Fix round 1, MEDIUM-1. A Stored entry whose header declares a

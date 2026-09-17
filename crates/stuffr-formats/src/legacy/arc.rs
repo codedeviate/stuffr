@@ -453,10 +453,21 @@ impl Method {
     /// one, for what is really a single fact about each variant. Both now
     /// derive from this one method instead: `codec_for_arc_method` is
     /// `Self::from_byte(..).ok().map(Self::codec)`, and `method_for_codec`
-    /// searches the five variants for the one whose `codec()` matches.
-    /// Adding a sixth decodable method now means extending exactly two
-    /// `match`es in this file (this one and `from_byte`'s), not four
-    /// spread across two files.
+    /// searches [`Self::all`] for the variant whose `codec()` matches.
+    ///
+    /// **Adding a sixth decodable method is a COMPILE ERROR until three
+    /// `match`es in this file name it** — [`Self::from_byte`]'s, this one,
+    /// and [`Self::next`]'s. Fix round 3 corrected both halves of what this
+    /// paragraph used to claim: it said "exactly two `match`es", and the
+    /// site it missed was the one that could not have been caught by the
+    /// compiler at all — `arc_salvage.rs`'s `method_for_codec` held a
+    /// hand-written `const DECODABLE: [Method; 5]`, so a sixth variant left
+    /// out of it compiled cleanly and made the new method silently
+    /// unwritable (`method_for_codec` → `None` → `Error::Unsupported` →
+    /// `SalvageDisposition::SkippedNotBuiltIn`, an entry quietly never
+    /// recovered). [`Self::next`] replaced that array with an exhaustive
+    /// `match`, which is the difference between a documented convention and
+    /// an enforced one.
     pub(super) fn codec(self) -> FormatId {
         match self {
             Method::Stored => FormatId::new("arc-stored"),
@@ -465,6 +476,34 @@ impl Method {
             Method::Crunched => FormatId::new("arc-crunched"),
             Method::Squashed => FormatId::new("arc-squashed"),
         }
+    }
+
+    /// The variant after `self` in declaration order, `None` past the last.
+    ///
+    /// Exists only to drive [`Self::all`], and is written as an exhaustive
+    /// `match` for exactly one reason: **a sixth variant added to
+    /// [`Method`] without an arm here does not compile.** That is what
+    /// makes `all()` — and therefore `arc_salvage.rs`'s `method_for_codec`,
+    /// which decides whether salvage can write an entry at all — impossible
+    /// to leave behind. Its predecessor was a hand-written
+    /// `const DECODABLE: [Method; 5]` in the other file, which the compiler
+    /// had no way to check; see [`Self::codec`]'s doc for what forgetting
+    /// it would have cost.
+    const fn next(self) -> Option<Self> {
+        match self {
+            Method::Stored => Some(Method::Rle90),
+            Method::Rle90 => Some(Method::Squeezed),
+            Method::Squeezed => Some(Method::Crunched),
+            Method::Crunched => Some(Method::Squashed),
+            Method::Squashed => None,
+        }
+    }
+
+    /// Every decodable method, in declaration order — seeded from the first
+    /// variant and driven by [`Self::next`]'s exhaustive `match`, so this
+    /// cannot fall behind the enum.
+    pub(super) fn all() -> impl Iterator<Item = Self> {
+        std::iter::successors(Some(Method::Stored), |method| method.next())
     }
 }
 

@@ -796,7 +796,7 @@ impl std::io::Seek for SeekReadRef<'_> {
 /// for.
 pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
     let mut scanner = ZipSalvage::new();
-    let mut candidates = collect_candidates(&mut scanner, src, policy)?;
+    let mut candidates = collect_candidates(&mut scanner, src)?;
 
     if let Some(cd_records) = crate::zip::walk_central_directory(&mut SeekReadRef(&mut *src)) {
         let mut found_offsets: std::collections::HashSet<u64> =
@@ -816,7 +816,7 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
                 // this task's fix round.
                 continue;
             }
-            if let Some(candidate) = candidate_from_cd_record(src, record, policy)? {
+            if let Some(candidate) = candidate_from_cd_record(src, record)? {
                 found_offsets.insert(candidate.offset);
                 candidates.push(candidate);
             }
@@ -829,7 +829,7 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
         candidates.sort_by_key(|c| c.offset);
     }
 
-    annotate_candidates(&scanner, src, candidates)
+    annotate_candidates(&scanner, src, candidates, policy)
 }
 
 /// Builds a [`Candidate`] from a central-directory record the raw scan did
@@ -846,19 +846,25 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
 /// attacker- or corruption-controlled data, so this is checked before
 /// anything is built from it, exactly as the raw scan checks its own
 /// signature match.
+///
+/// # This used to carry a second copy of the entry ceiling
+///
+/// It compared `record.compressed_size` against `policy.max_entry` and
+/// raised [`stuffr_core::Error::ResourceLimit`] — which ENDED THE RUN, so
+/// whether one absurd central-directory record cost a caller the whole
+/// archive depended on which of the two sources found that record first
+/// (the raw scan's own copy of the same check, in
+/// `stuffr_core::salvage::collect_candidates`, had the identical effect).
+/// Salvage Stage 2 Task 3c's fix round 3 made the ceiling one rule applied
+/// once, in `annotate_candidates`, to the merged candidate list — which is
+/// strictly after this function and covers what it produces, so the check
+/// here was not merely redundant, it was the half that disagreed. Nothing
+/// here sizes a buffer from the declared length (the record's own payload
+/// is never read by this function), so removing it moves no allocation.
 fn candidate_from_cd_record(
     src: &mut dyn SeekRead,
     record: &crate::zip::CdRecord,
-    policy: &SalvagePolicy,
 ) -> Result<Option<Candidate>> {
-    if record.compressed_size > policy.max_entry {
-        return Err(Error::ResourceLimit(format!(
-            "central-directory record `{}` declares a compressed size of {} bytes, past the \
-             {}-byte salvage ceiling (see stuffr_core::salvage::MAX_SALVAGE_ENTRY)",
-            record.name, record.compressed_size, policy.max_entry
-        )));
-    }
-
     let Ok(file_len) = src.seek(SeekFrom::End(0)) else {
         return Ok(None);
     };

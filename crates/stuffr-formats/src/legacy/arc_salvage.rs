@@ -55,12 +55,18 @@
 //! against any ceiling.** An oversized `compressed_size` is neither
 //! obviously noise (unlike zip's 16-bit `name_len`, nothing about ARC's
 //! format makes a large `u32` implausible) nor safe to allocate from
-//! blindly. [`verify_candidate`] is where it is actually bounded — against
-//! [`super::arc::MAX_ARC_ENTRY_LEN`], the identical ceiling `arc.rs`'s own
-//! `read_payload` enforces — immediately before the payload buffer it would
-//! size is allocated, and via `Err`, not a silent skip: see that function's
-//! own doc and `refuses_an_absurd_compressed_size_before_the_allocation_it_
-//! would_size` below. Folding this into the discovery gate as a silent
+//! blindly. It is bounded one step later instead, by
+//! [`ArcSalvage::max_whole_entry`] — [`super::arc::MAX_ARC_ENTRY_LEN`], the
+//! identical ceiling `arc.rs`'s own `read_payload` enforces — which
+//! `stuffr_core::salvage::annotate_candidates` applies immediately before
+//! the payload buffer it would size is allocated, reporting
+//! [`UnverifiedCause::OverEntryCeiling`] for an entry above it. **A
+//! per-entry status, deliberately not an `Err`**: fix rounds 1 and 2 of
+//! Task 3c both left a `?` on this ceiling, and an `Err` from a scanner
+//! ends the whole run — see
+//! `refuses_an_absurd_compressed_size_before_the_allocation_it_would_size`
+//! below, which now pins both halves (nothing allocated, nothing else
+//! lost). Folding this into the discovery gate as a silent
 //! rejection would have made the anti-vacuity test's outcome depend on
 //! whatever compressed-size bytes the noise generator happened to produce
 //! at each coincidental marker+method hit — fragile, and beside the point:
@@ -74,8 +80,9 @@
 //! capability gate `arc.rs`'s own container applies — methods 5-7 and 10-11
 //! answer [`SalvageStatus::Unverified`], never [`SalvageStatus::Complete`]:
 //! ARC entries always carry a CRC-16, so `Complete` — "no checksum to
-//! offer" — would be a lie here, unlike tar/cpio/ar), bounds the declared
-//! length against the ceiling, then hands the payload to [`super::arc::decode`]
+//! offer" — would be a lie here, unlike tar/cpio/ar), then hands the
+//! payload — already bounded by the ceiling above, before this ever runs —
+//! to [`super::arc::decode`]
 //! — the identical whole-buffer decoder `arc.rs`'s own [`ArcRead`] calls,
 //! not a second decompression stack built for salvage. `arc.rs`'s own module
 //! doc records that this container "decodes whole and cannot stream"
@@ -97,9 +104,7 @@ use stuffr_core::salvage::{
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
-use super::arc::{
-    ArcHeader, HEADER_LEN, MARKER, Method, arc_mtime, decode, refuse_if_over_ceiling,
-};
+use super::arc::{ArcHeader, HEADER_LEN, MARKER, Method, arc_mtime, decode};
 
 /// The lowest and highest method byte ARC ever assigned — `arc.rs`'s own
 /// `ARC_MAGIC` table lists one [`stuffr_core::MagicRule`] per value in this
@@ -147,6 +152,28 @@ impl SalvageScan for ArcSalvage {
                 None => search_from = offset + 1,
             }
         }
+    }
+
+    /// ARC decodes an entry WHOLE — [`super::arc::MAX_ARC_ENTRY_LEN`]'s own
+    /// doc records that this container "decodes whole and cannot stream" —
+    /// so a candidate's declared length really does become one allocation
+    /// here, unlike zip, which streams every payload it verifies through a
+    /// `take` and therefore declares no ceiling of its own.
+    ///
+    /// Declaring it HERE is what makes it a per-entry refusal. Fix rounds 1
+    /// and 2 of Task 3c both left [`verify_candidate`] calling
+    /// [`super::arc::refuse_if_over_ceiling`] with a `?`, and an `Err` out
+    /// of `verify` aborts the entire run: measured at the CLI on a healthy
+    /// `A.TXT` followed by a 300 MiB entry whose declared bytes were all
+    /// genuinely present, `stuffr salvage --format arc --list` printed **no
+    /// rows at all** and exited 6, and `-C out` left the destination empty
+    /// — `A.TXT` recoverable the whole time and lost. The engine now reads
+    /// this figure, refuses above it as
+    /// [`stuffr_core::salvage::UnverifiedCause::OverEntryCeiling`], and
+    /// never calls `verify` for such a candidate, so nothing this module
+    /// does can turn one oversized entry into a failed archive.
+    fn max_whole_entry(&self) -> u64 {
+        super::arc::MAX_ARC_ENTRY_LEN
     }
 
     fn verify(&self, src: &mut dyn SeekRead, candidate: &Candidate) -> Result<SalvageStatus> {
@@ -311,20 +338,25 @@ fn codec_for_arc_method(method_byte: u8) -> Option<FormatId> {
 /// [`crate::salvage_verify::stream_verify`] — see this module's doc comment
 /// for why nothing here is a second decompression stack.
 ///
-/// Never returns `Err` for malformed, truncated or genuinely I/O-failing
-/// input — every one of those folds into [`SalvageStatus::Partial`], the
-/// same discipline `zip_salvage.rs`'s own `verify_candidate` documents at
-/// length: salvage exists to recover as much of a damaged archive as it
-/// can, and aborting the WHOLE run over one bad entry would be worse than
-/// marking that entry `Partial` and continuing.
+/// **Never returns `Err`, for any input — there are no exceptions left.**
+/// Malformed, truncated and genuinely I/O-failing input all fold into
+/// [`SalvageStatus::Partial`], the same discipline `zip_salvage.rs`'s own
+/// `verify_candidate` documents at length: salvage exists to recover as
+/// much of a damaged archive as it can, and aborting the WHOLE run over one
+/// bad entry would be worse than marking that entry `Partial` and
+/// continuing.
 ///
-/// The ONE exception is [`super::arc::refuse_if_over_ceiling`]: an
-/// implausible declared `compressed_size` is refused with
-/// [`stuffr_core::Error::ResourceLimit`] (exit 6), propagated rather than
-/// folded — the identical ceiling, the identical error, `arc.rs`'s own
-/// `read_payload` raises for the same field, checked here BEFORE the
-/// payload buffer it would size is ever allocated. See this module's doc
-/// for why this could not live in the discovery gate instead.
+/// There USED to be one exception — an implausible declared
+/// `compressed_size` refused with [`stuffr_core::Error::ResourceLimit`]
+/// (exit 6) and `?`-propagated — and it was the whole defect: one `Err` out
+/// of `verify` is an aborted run. The size ceiling is now
+/// [`ArcSalvage::max_whole_entry`], applied by the engine before this
+/// function is called, which is both the same protection (nothing is
+/// allocated for an over-ceiling entry, because nothing here runs) and a
+/// per-entry outcome. The `Result` in the signature is the trait's, kept so
+/// a scanner CAN report a genuine whole-run fault; this implementation has
+/// none to report. See [`ArcSalvage::max_whole_entry`] for what the old
+/// shape measured at the CLI.
 fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<SalvageStatus> {
     // The payload is PROVABLY incomplete — nothing needs decoding to know
     // the answer. Sits above the method dispatch on purpose, for the
@@ -371,12 +403,17 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         }
     };
 
-    // Bound BEFORE allocating the payload buffer below — the identical
-    // ceiling and error `arc.rs`'s own `read_payload` raises for this same
-    // field, checked independently here because `verify` is the one place
-    // in this module that actually allocates one.
-    refuse_if_over_ceiling(&header.name, declared_len, "compressed data")?;
-
+    // `declared_len` is already at or below `MAX_ARC_ENTRY_LEN`, so the
+    // buffer below is bounded: `annotate_candidates` compares every
+    // candidate's bounded length against `ArcSalvage::max_whole_entry` and
+    // answers `Unverified(OverEntryCeiling)` itself, without calling this
+    // function at all, for anything above it. That is the contract
+    // `SalvageScan::verify`'s own doc states, and it is why there is no
+    // `refuse_if_over_ceiling(..)?` here any more: this function raised
+    // exactly one `Err` for exactly this case, and a single `Err` out of
+    // `verify` aborts the whole run — see `ArcSalvage::max_whole_entry`
+    // for what that measured.
+    //
     // Fix round 1, LOW-1: use the field the candidate already carries
     // rather than re-deriving it — `Candidate::payload_start`'s own doc
     // exists precisely so nothing else in this crate has to recompute a
@@ -416,22 +453,23 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 /// unrecognised zip method — [`Error::Unsupported`], defensive rather than
 /// reachable.
 ///
-/// Fix round 2, Ruling S-K: searches the five decodable variants for the
-/// one whose [`Method::codec`] matches, rather than hand-copying the same
-/// five strings a second time in the opposite direction — see that
-/// method's own doc.
+/// Fix round 2, Ruling S-K: searches the decodable variants for the one
+/// whose [`Method::codec`] matches, rather than hand-copying the same five
+/// strings a second time in the opposite direction — see that method's own
+/// doc.
+///
+/// Fix round 3: the list searched is [`Method::all`], which is generated
+/// from an exhaustive `match` in `arc.rs`, not the `const DECODABLE:
+/// [Method; 5]` this function used to hold. That array was hand-maintained
+/// and compiler-checked for nothing: a sixth decodable method added to
+/// [`Method`] and forgotten here would have compiled, answered `None`,
+/// and turned every entry using it into a silent
+/// `SalvageDisposition::SkippedNotBuiltIn` — the exact "a real scanner
+/// that quietly writes nothing" failure this task exists to have closed.
+/// Now the enum cannot grow without `arc.rs` failing to compile.
 fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
-    const DECODABLE: [Method; 5] = [
-        Method::Stored,
-        Method::Rle90,
-        Method::Squeezed,
-        Method::Crunched,
-        Method::Squashed,
-    ];
     let codec = codec?;
-    DECODABLE
-        .into_iter()
-        .find(|&method| method.codec() == codec)
+    Method::all().find(|method| method.codec() == codec)
 }
 
 /// Reads one entry's compressed payload and writes its RECOVERED (decoded)
@@ -504,11 +542,32 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// whose only fault was one entry's truncated tail also being larger than
 /// the ceiling, `salvage --list` still aborted at exit 6 with NO rows
 /// printed at all, the exact symptom HIGH-1 was raised about, on the same
-/// input class. [`write_payload_bounded`] below now folds that refusal
-/// into `Ok(false)` instead — reported as this one entry not completing,
-/// never propagated as an `Err` that takes every other entry in the
-/// archive down with it, matching every other unrecoverable condition this
-/// function already reports this way.
+/// input class. [`write_payload_bounded`] below folds that refusal into
+/// `Ok(false)` instead — reported as this one entry not completing, never
+/// propagated as an `Err` that takes every other entry in the archive down
+/// with it, matching every other unrecoverable condition this function
+/// already reports this way.
+///
+/// # Fix round 3: that fold is a BACKSTOP on this `pub fn`, not the
+/// production decision — and saying so is the point
+///
+/// Rounds 1 and 2 each fixed the site the previous review named, and each
+/// time the same class of failure was still live one function upstream. It
+/// is upstream of this function too: the real decision now belongs to
+/// [`ArcSalvage::max_whole_entry`], which
+/// `stuffr_core::salvage::annotate_candidates` applies before
+/// [`verify_candidate`] ever runs, so an over-ceiling entry is
+/// `Unverified(OverEntryCeiling)` and `entries.rs`'s `place_salvaged_file`
+/// refuses every `Unverified` entry BEFORE calling a payload writer at all.
+/// Through `stuffr::entries::salvage` the branch below is therefore
+/// unreachable, and its unit test proves the branch's arithmetic and
+/// nothing about the wiring — which is exactly what the round-2 re-review
+/// measured and why a public-path test
+/// (`entries.rs`'s `arc_salvage_tests::an_over_ceiling_entry_is_skipped_
+/// while_its_healthy_sibling_is_recovered`) now exists beside it. The
+/// branch is kept because this function is `pub`: a direct caller supplying
+/// its own [`SalvagedEntry`] gets the bound too, and a bound on a public
+/// entry point is worth more than a line saved.
 pub fn write_payload(
     archive_path: &Path,
     entry: &SalvagedEntry,
@@ -638,7 +697,6 @@ pub fn salvage_arc(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
 mod tests {
     use std::io::{Cursor, Read, Seek};
 
-    use stuffr_core::Error;
     use stuffr_core::salvage::SalvagePolicy;
 
     use super::super::crc::crc16_arc;
@@ -1052,6 +1110,23 @@ mod tests {
     /// to the container-level test this one mirrors.
     const ABSURD_SIZE: u32 = 0xAAAA_AAAA;
 
+    /// Pins ARC's OWN ceiling, at its real 256 MiB value, through the real
+    /// scan — and pins both halves of what "refused" has to mean.
+    ///
+    /// `ABSURD_SIZE` (~2.86 GiB) is comfortably UNDER the default policy's
+    /// own 4 GiB `max_entry`, so the policy's figure cannot be what refuses
+    /// this candidate: only `ArcSalvage::max_whole_entry` can, which is
+    /// what makes this the wiring assertion for that method rather than a
+    /// restatement of the engine rule. The lying source panics on any large
+    /// read, so the first half — nothing is allocated or read for it — is
+    /// still proven exactly as before.
+    ///
+    /// Fix round 3 (Task 3c) changed the second half. This used to assert
+    /// `Err(ResourceLimit)`/exit 6, which is the behaviour that ABORTS THE
+    /// RUN: measured at the CLI, a healthy `A.TXT` followed by an entry
+    /// like this one printed no rows at all and recovered nothing. The
+    /// refusal is now a per-entry status, so the assertion is that the run
+    /// completed AND the entry is reported over the ceiling.
     #[test]
     fn refuses_an_absurd_compressed_size_before_the_allocation_it_would_size() {
         let bytes = build_arc_entry_declaring(2, "BIG.BIN", b"", ABSURD_SIZE, 0);
@@ -1065,17 +1140,33 @@ mod tests {
             // payload allocation this test forbids still would.
             max_single_read: 128 * 1024,
         };
-        let err = salvage_all(&mut ArcSalvage::new(), &mut src, &SalvagePolicy::default())
-            .expect_err("an absurd compressed_size must be refused");
         assert!(
-            matches!(err, Error::ResourceLimit(_)),
-            "an implausible declared length is this build refusing to allocate, not a verdict \
-             that the archive is damaged — see MAX_ARC_ENTRY_LEN's doc; got {err:?}"
+            u64::from(ABSURD_SIZE) < SalvagePolicy::default().max_entry,
+            "the point of this fixture is that only ARC's own ceiling can refuse it"
         );
-        assert_eq!(err.exit_code(), 6, "ResourceLimit is exit 6: {err:?}");
-        assert!(
-            err.to_string().contains(&ABSURD_SIZE.to_string()),
-            "the message must name the declared size, got: {err}"
+        let out = salvage_all(&mut ArcSalvage::new(), &mut src, &SalvagePolicy::default())
+            .expect("an absurd compressed_size is one entry's problem, not the run's");
+        assert_eq!(out.entries.len(), 1, "the entry is still reported");
+        assert_eq!(
+            out.entries[0].status,
+            SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling),
+            "an implausible declared length is this build refusing to allocate, not a verdict \
+             that the archive is damaged — and not `Partial`, which would claim somebody read \
+             it — see MAX_ARC_ENTRY_LEN's doc"
+        );
+    }
+
+    /// The wiring `refuses_an_absurd_compressed_size...` above depends on,
+    /// stated directly: the scanner `salvage_arc` builds declares ARC's own
+    /// container ceiling, not some other number. One line in production
+    /// (`ArcSalvage::max_whole_entry`), and until fix round 3 the
+    /// equivalent line had no test at all — the re-review's own finding
+    /// ("nothing asserts the public wrapper passes the real ceiling").
+    #[test]
+    fn the_scanner_declares_arcs_own_whole_entry_ceiling() {
+        assert_eq!(
+            ArcSalvage::new().max_whole_entry(),
+            super::super::arc::MAX_ARC_ENTRY_LEN
         );
     }
 
@@ -1106,6 +1197,17 @@ mod tests {
     // fixture rather than the real 256 MiB `MAX_ARC_ENTRY_LEN` — see
     // `write_payload_bounded`'s own doc for why building a
     // multi-hundred-megabyte fixture here would be the wrong fix.
+    //
+    // Fix round 3: this pins a BACKSTOP on a `pub fn`, and nothing more.
+    // It is honest about that now rather than standing in for a fix: the
+    // production decision is `ArcSalvage::max_whole_entry`, applied by the
+    // engine before `verify` runs, and it is pinned end to end by
+    // `entries.rs`'s
+    // `arc_salvage_tests::an_over_ceiling_entry_is_skipped_while_its_
+    // healthy_sibling_is_recovered`, which drives `stuffr::entries::
+    // salvage` and observes the run's own outcome. Keeping a unit test on
+    // an unreachable branch is fine; presenting one AS the fix is what
+    // round 2 did and what the re-review caught.
     // -------------------------------------------------------------------
 
     #[test]
