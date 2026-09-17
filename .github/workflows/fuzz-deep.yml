@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [codec, container, chain, roundtrip]
+        target: [codec, container, chain, roundtrip, salvage]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -80,6 +80,10 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       # Generated, not committed (`fuzz/.gitignore`'s `/corpus`) — regenerated
       # fresh for every scheduled run, exactly as ci.yml's smoke job does.
+      # `salvage` (Salvage Stage 1 Task 8) is not part of this step: it has no
+      # seed generator, so its matrix entry below runs from an empty corpus
+      # directory (`cargo fuzz run` creates one if it is missing) — real
+      # wall-clock iterations, just unseeded, same as ci.yml's smoke job.
       - run: make fuzz-corpus
       # Real time, not a fixed `-runs=`, unlike the smoke job: this workflow
       # exists specifically to spend wall-clock time the smoke job's Ruling-G

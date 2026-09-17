@@ -9,6 +9,30 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
+> **Status: Salvage Stage 1 is complete at `0.5.0` — `stuffr salvage`
+> recovers what a damaged zip's raw local-header scan can prove, even where
+> its central directory alone would show less.** `list`, `cat`, `unpack` and
+> `test` all stay exactly as uncompromising as they already were; `salvage`
+> is the one recovery-biased verb, and it is that willingness to accept
+> less-than-proven content that buys the other four the freedom to stay
+> strict. Its own `--strict` asks for that same discipline on request. A
+> scan position is a different numbering from `list`'s own index — on an
+> archive where a name is duplicated, `salvage --index 6` and `list --index
+> 6` can name different entries, or `list`'s may not exist at all — and
+> every message says "scan position", never "index", so the two cannot be
+> confused. Cross-checked against Info-Zip's `zip -FF`: on a truncated
+> archive, `-FF` copies a central-directory record from elsewhere in the
+> same file into the payload gap and reports success, where `stuffr salvage`
+> reports the entry absent — a real disagreement, recorded rather than tuned
+> away, since the fabrication is Info-Zip's own bug, not a shape to chase.
+> This reverses a Phase 2 ruling ("declared, not recovered"): the
+> central-directory parse that ruling declined to build now serves recovery
+> as well as `list`'s own duplicate-name warning. See
+> [CONTRIBUTING.md](CONTRIBUTING.md#fuzzing) for the fuzz harness's new
+> fifth target, and `crates/stuffr-cli/src/examples.txt`'s "RECOVERING A
+> DAMAGED ARCHIVE" section for the worked examples. **1130** tests under
+> `--all-features`, **1065** on the default tier.
+>
 > **Status: Phase 3c is complete at `0.4.2` — twelve round-trip codecs
 > (`compress` joined them in Task 5) and six round-trip containers
 > (`lha` joined them in Task 6 and `arj` in Task 7), plus
@@ -543,14 +567,17 @@ OOM killer.
 
 ## Planned CLI
 
-*Phase 2 and later. `pack`, `unpack`, `cat`, `info`, `formats`, `list` and
-`test` all work today, across the twelve round-trip codecs and six
-round-trip containers
+*Phase 2 and later. `pack`, `unpack`, `cat`, `info`, `formats`, `list`,
+`test` and `salvage` all work today, across the twelve round-trip codecs and
+six round-trip containers
 (`ar`, `arj`, `cpio`, `lha`, `tar`, `zip`/`zip64`) `stuffr formats` lists — `pack`/`unpack`/
 `cat` are entry-aware for every container, with extraction-time path
 containment and bomb limits on by default. `convert` and `install-links`
 are not implemented yet. `pack` walks a directory tree, and
-`pack -o bundle.tar.gz` composes a container on top of a codec in one pass.*
+`pack -o bundle.tar.gz` composes a container on top of a codec in one pass.
+`salvage` (Salvage Stage 1) recovers zip archives only — the one
+recovery-biased verb, everything else here stays as uncompromising as it
+was before it existed.*
 
 ```
 stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
@@ -560,6 +587,7 @@ stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a p
 stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
 stuffr formats                             # capability matrix for THIS build
 stuffr test     ARCHIVE                    # integrity check, no extraction
+stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip recovery; scan position, not list's index
 stuffr convert  IN -o OUT                  # recompress without staging to disk
 stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
 ```

@@ -195,7 +195,7 @@ jobs:
       - run: make miri
 
   fuzz-smoke:
-    name: fuzz smoke (codec, container, chain, roundtrip — pure tier)
+    name: fuzz smoke (codec, container, chain, roundtrip, salvage — pure tier)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -304,13 +304,19 @@ jobs:
       # at its top: the run then exits with no "Done N runs" line at all,
       # and this check correctly refuses it. See task-5-report.md for the
       # quoted failure).
-      - name: fuzz all four targets (short, seeded; see Ruling G — not deterministic)
+      - name: fuzz all five targets (short, seeded; see Ruling G — not deterministic)
         run: |
           set -u
           FUZZ_RUNS=2000
           FUZZ_SEED=1
           status=0
-          for target in codec container chain roundtrip; do
+          # `salvage` (Salvage Stage 1 Task 8) has no seeded corpus of its own
+          # — `make fuzz-corpus` deliberately does not generate one, since no
+          # generator here produces a plausible damaged zip to seed from — so
+          # it runs from nothing here, same as every local `make fuzz`. It
+          # still executes real libFuzzer iterations and the count check
+          # below still applies to it.
+          for target in codec container chain roundtrip salvage; do
             cmd="cargo fuzz run $target -- -runs=$FUZZ_RUNS -seed=$FUZZ_SEED"
             echo "==> $cmd"
             log=$(mktemp)

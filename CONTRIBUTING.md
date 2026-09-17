@@ -141,7 +141,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.2.0` | Phase 2 — containers, and the ZIP-on-a-pipe contract test. |
 | `0.3.0` | Phase 2c and its follow-ups — write-side composition (`pack -o bundle.tar.gz` in one pass) and directory walking, so the read/write symmetry claim becomes true for archives; plus entry selection by index (`list`'s index column, `cat --index`, `unpack --index`), `list` reporting fidelity and gaining `--strict-fidelity`, the declaration of zip central-directory records shadowed by a duplicate name, and the guard refusing a pack that would replace a good archive with an empty one. |
 | `0.4.0` | Phase 3a–3b — the fuzzing harness, the honesty oracle and the exit-code corrections it found, plus three read-only legacy formats (`compress`, `lha`, `arj`), each proven against the fixture-driven conformance harness Phase 3b's Task 1 introduced for read-only containers. |
-| `0.5.x` | Phase 5 — compatibility symlinks, `convert`, polish. |
+| `0.5.0` | Salvage Stage 1 — the `salvage` verb and zip's central-directory recovery scan (`SalvageScan`, `Candidate`, `SalvageStatus`, `salvage_all`), reversing Phase 2's "declared, not recovered" ruling for zip: the shadowed-record parse that ruling declined to build now serves recovery, not only `list`'s warning. |
+| `0.5.x` (later) | Remaining Salvage stages (a `Complete` tier genuinely exercised by tar/cpio/ar, not only zip) and Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -210,6 +211,23 @@ does not change either trait's shape) — a phase's own work is not
 automatically a milestone, the same distinction that kept `0.3.1` (three
 exit-code fixes, no capability change) a PATCH against `0.3.0`'s own row
 above it.
+
+The table was revised a **fourth** time, for Salvage Stage 1. `0.5.x` had
+stood for Phase 5 (compatibility symlinks, `convert`, polish) since the table
+was first written — a promise made before Salvage existed as a cycle at all.
+**The promise is not holy**: it has already moved three times as scope moved,
+and a name on a row is not a reason to ship the wrong work under it. Salvage
+Stage 1 adds a CLI verb (`salvage`) and new public surface in `stuffr-core`
+(`SalvageScan`, `Candidate`, `SalvageStatus`, `salvage_all` and their
+neighbours) — new capability, not a fix to an existing one, so it claims
+`0.5.0` on the same reasoning `0.4.0` claimed its own three new formats.
+Phase 5's original content moves to a later, not-yet-numbered `0.5.x` row,
+alongside whichever later Salvage stage lands next (a `Complete` tier
+genuinely exercised by tar/cpio/ar, per the design's own Stage 3 — Stage 1
+never exercises it, since zip always carries a CRC-32). Neither has landed,
+so pinning either to an exact number now would be the same mistake that
+moved `0.4.0`'s row twice already: claiming a number before the work behind
+it is real.
 
 After 1.0, normal semver applies: breaking changes to any public API in
 `stuffr-core` or the `stuffr` facade require a major bump.
@@ -381,17 +399,18 @@ Rules for touching either region:
 
 Phase 3a added a fuzzing harness over the excluded `fuzz/` crate
 (`build: add an excluded fuzz crate`, so it never affects a `cargo build`
-of the workspace). Four targets, each `#![no_main]` and driven by
+of the workspace). Five targets, each `#![no_main]` and driven by
 libFuzzer through `cargo fuzz`:
 
 | Target | Covers |
 |---|---|
 | `codec.rs` | One codec's decoder, fed raw bytes. A selector byte picks the format from [`CODEC_SLOTS`](#the-slot-tables-are-append-only) so one corpus exercises every registered codec. |
 | `container.rs` | One container's reader, both ladder rungs — the selector's high bit picks seekable vs. `ForwardOnly` so both walk paths get fuzzed, not just the seekable one. Also runs an independent EOCD re-parse and a second forward-only walk as cross-checks (see the module doc for why each is not redundant with the honesty oracle below). |
-| `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the four. |
+| `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the five. |
 | `roundtrip.rs` | The WRITE side, added in Phase 3c Task 8 — the only target that runs an encoder at all. The input is the archive's CONTENT, not its bytes: a selector picks a writable slot (its high bit selects `CODEC_SLOTS` over `CONTAINER_SLOTS`; there is no ladder rung to choose when writing), the payload is written through it and read straight back, and the two must agree byte-for-byte. |
+| `salvage.rs` | Added in Salvage Stage 1 Task 8 — the one target that treats arbitrary bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader. Spools its input to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does, with no destination (`dest: None`), so it exercises parsing and verification honesty rather than the filesystem write path — already covered via `chain.rs`'s `entries::list`. Has **no seeded corpus** (see "Corpus and running locally" below) — the only target of the five that runs unseeded even in CI. |
 
-Every decode path in all four is bounded (`DecodeOpts::memory_limit`,
+Every decode path in all five is bounded (`DecodeOpts::memory_limit`,
 a capped output read) for the same reason the codec's own conformance
 harness bounds decode: an unbounded pre-flight allocation or an
 unconditional `read_to_end` on a decompression bomb would turn every
@@ -416,19 +435,31 @@ cases.
 
 ### The oracle lives in the library, not in the targets
 
-`stuffr-core/src/honesty.rs` holds the four invariants the targets assert —
+`stuffr-core/src/honesty.rs` holds the five invariants the targets assert —
 `check_error_is_classified`, `check_entry_size`, `check_entry_count`,
-`check_fidelity_claim` — re-exported through `stuffr_core::testing` (gated
+`check_fidelity_claim` (Phase 3a), and `check_salvage_claim` (Salvage Stage 1
+Task 8) — re-exported through `stuffr_core::testing` (gated
 `#[cfg(any(test, feature = "testing"))]`) rather than written inline in a
 fuzz target. The reason is structural, not a style preference: **a fuzz
 target's checks cannot be unit-tested, so a harness that runs clean is
 indistinguishable from one whose invariants are vacuous** — "ran 30 seconds,
 found nothing" looks identical either way, whether the target is genuinely
-clean or the assertion inside it never fires. Because the four functions
+clean or the assertion inside it never fires. Because the five functions
 live in an ordinary library module, each has a `mod broken_honesty` double
 proving it *can* fail — the same `broken_codecs`/`broken_containers` pattern
 the conformance harnesses already use — so a vacuous check is caught the
 same way a vacuous conformance property would be.
+
+`check_salvage_claim` is narrower than its four siblings by construction:
+`SalvageStatus::Partial` is a unit variant in `stuffr-core`, so the oracle
+can only ever refuse a false `Intact` claim (one made without checking a
+checksum), never distinguish *why* an entry is `Partial` — that distinction
+lives one crate up, in `stuffr::entries::PartialCause`, derived from a
+second decode the core layer never runs. See `honesty.rs`'s own doc comment
+on `check_salvage_claim` for the boundary this draws, and `salvage.rs`'s
+module doc for the consequence it leaves open (a regression returning
+`Partial` for a fully decodable entry, without ever comparing, would be
+invisible to this oracle).
 
 The first invariant, `check_error_is_classified`, guards `Error::exit_code`'s
 `_ => 1` wildcard: hostile bytes may be refused, but never as exit 1, which
