@@ -21,7 +21,7 @@ help:
 	@echo '  make hooks    install the commit-msg hook (once per clone)'
 	@echo '  make clean    remove build artefacts'
 	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip}'
-	@echo '  make fuzz     short, seeded smoke pass over the four targets (mirrors CI)'
+	@echo '  make fuzz     short, seeded smoke pass over the five targets (mirrors CI)'
 
 # Ordered so the cheapest gate fails first.
 check: fmt-check lint test test-pure release
@@ -238,9 +238,14 @@ miri:
 # than asking once.
 FUZZ_RUNS = 2000
 FUZZ_SEED = 1
+# `salvage` (Salvage Stage 1 Task 8) has no seeded corpus of its own — see
+# `fuzz-corpus`'s own loop below, deliberately NOT widened to include it,
+# since no `generate_corpus` case exists for this target yet. libFuzzer runs
+# it from an empty corpus instead, which still executes real iterations; it
+# just starts unseeded.
 fuzz: fuzz-corpus
 	@status=0; \
-	for target in codec container chain roundtrip; do \
+	for target in codec container chain roundtrip salvage; do \
 	  cmd="cargo +nightly fuzz run $$target -- -runs=$(FUZZ_RUNS) -seed=$(FUZZ_SEED)"; \
 	  echo "==> $$cmd"; \
 	  tmp=$$(mktemp); \

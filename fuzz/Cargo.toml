@@ -11,6 +11,13 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 stuffr = { path = "../crates/stuffr", features = ["testing", "legacy"] }
 stuffr-core = { path = "../crates/stuffr-core", features = ["testing"] }
+# `salvage.rs`'s only use of this crate directly: a second, independent call
+# to `zip_salvage::salvage_zip` over the identical bytes `entries::salvage`
+# (via `stuffr`) already scanned, purely to recover each scan position's byte
+# OFFSET — `entries::salvage`'s own `SalvagedRecord` does not carry one. Same
+# deliberate-duplication reasoning as `container.rs`'s independent EOCD
+# re-parse, immediately below.
+stuffr-formats = { path = "../crates/stuffr-formats", features = ["zip"] }
 tempfile = "3"
 # Only for `container.rs`'s independent EOCD re-parse (Ruling A's second
 # guard) — opens a SECOND `zip::ZipArchive` over the same bytes stuffr's own
@@ -46,6 +53,19 @@ bench = false
 [[bin]]
 name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# Salvage Stage 1 Task 8. Arbitrary bytes as a damaged ARCHIVE, unlike every
+# target above: those all treat bytes as CONTENT fed to a decoder or
+# container reader; this one is the one place bytes are handed to a scanner
+# built to expect them hostile by construction (a truncated, mutated or
+# outright fabricated zip). Fifth target — see the Makefile's own note on why
+# its "four targets" language needed a hand-edit here.
+[[bin]]
+name = "salvage"
+path = "fuzz_targets/salvage.rs"
 test = false
 doc = false
 bench = false

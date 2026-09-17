@@ -24,6 +24,7 @@ pub use crate::container_conformance::{
 };
 pub use crate::honesty::{
     check_entry_count, check_entry_size, check_error_is_classified, check_fidelity_claim,
+    check_salvage_claim,
 };
 
 /// The fuzzer's codec selector table: byte `n % CODEC_SLOTS.len()` names a

@@ -6,6 +6,7 @@
 //! looks identical either way. Here each one has a broken double proving it
 //! can fail, exactly as `conformance.rs`'s `broken_codecs` does.
 
+use crate::salvage::SalvageStatus;
 use crate::{EntryKind, Error, Fidelity, FidelityReport};
 
 /// Hostile bytes may be refused, but never as an internal error.
@@ -153,6 +154,42 @@ pub fn check_fidelity_claim(report: &FidelityReport, approximated: bool) -> Resu
              but something was",
             report.rung
         ));
+    }
+    Ok(())
+}
+
+/// Never report `Intact` for an entry whose checksum was not actually
+/// checked.
+///
+/// This lives in the library rather than inside the fuzz target because a
+/// fuzz target's own checks cannot be unit-tested, so a harness that runs
+/// clean is indistinguishable from one whose invariants are vacuous — the
+/// same reason the four checks above it live here.
+///
+/// **Only `Intact` is constrained.** [`SalvageStatus::Complete`] asserts the
+/// OPPOSITE of "a checksum agreed" — the format carries no checksum at all,
+/// so nothing was there to check — and requiring `verifier_was_checked` for
+/// it would be wrong, not stricter: an over-strict oracle demanding a
+/// checksum for `Complete` would refuse every tar, cpio or ar entry this
+/// engine has ever recovered, none of which carries one. `Partial` is
+/// deliberately loose in `stuffr-core`'s own enum: `zip_salvage.rs`'s
+/// `stream_verify` folds "the payload ran out or the decoder failed
+/// mid-stream" (no comparison was ever reached) and "every byte decoded but
+/// disagreed with the checksum" (a comparison WAS reached and failed) into
+/// the one status, so `verifier_was_checked` cannot be constrained either
+/// way for it without splitting that status — which this project's own
+/// `entries.rs::PartialCause` already does one layer up, by re-deriving the
+/// cause from a second decode rather than widening this enum. `Unverified`
+/// asserts its own opposite explicitly (nothing about the content was
+/// verified, for either of its two causes), so it needs no constraint here
+/// either — its own variant name already carries the claim this function
+/// exists to police for `Intact`.
+pub fn check_salvage_claim(
+    status: SalvageStatus,
+    verifier_was_checked: bool,
+) -> Result<(), String> {
+    if status == SalvageStatus::Intact && !verifier_was_checked {
+        return Err("reported Intact without checking a checksum".into());
     }
     Ok(())
 }
@@ -324,5 +361,52 @@ mod broken_honesty {
             "must say what was claimed: {msg}"
         );
         assert!(check_fidelity_claim(&clean, false).is_ok());
+    }
+
+    #[test]
+    fn an_intact_status_whose_checksum_was_never_checked_is_refused() {
+        // The base assertion, and what reddens under the neutered-to-`Ok(())`
+        // edit: `SalvageStatus::Intact` is a claim that a checksum agreed,
+        // and `verifier_was_checked = false` says outright that no
+        // comparison ever ran. Neutering `check_salvage_claim` to `Ok(())`
+        // makes this `expect_err` panic instead — observed red before this
+        // was restored; see the task report.
+        let msg = check_salvage_claim(SalvageStatus::Intact, false)
+            .expect_err("Intact without a checked checksum must be refused");
+        assert!(msg.contains("Intact"), "must name the status: {msg}");
+        // The honest counterpart is permitted.
+        assert!(check_salvage_claim(SalvageStatus::Intact, true).is_ok());
+    }
+
+    #[test]
+    fn a_status_asserting_no_checksum_exists_is_permitted_unchecked() {
+        // Over-strictness guard, the same shape as
+        // `a_symlink_whose_target_was_consumed_eagerly_is_permitted` above:
+        // `Complete` is the status a format with NO checksum at all reports
+        // (tar, cpio, ar), and `Unverified` asserts nothing was verified for
+        // either of its two causes — neither claims a checksum agreed, so
+        // neither may be constrained by `verifier_was_checked`. An
+        // over-strict edit requiring `verifier_was_checked` for every status
+        // (not just `Intact`) would refuse both of these, and has been made
+        // and observed red — see the task report. Neutering
+        // `check_salvage_claim` to `Ok(())` makes this pass HARDER, which is
+        // why the sibling test above is the one that catches that edit.
+        assert!(check_salvage_claim(SalvageStatus::Complete, false).is_ok());
+        assert!(
+            check_salvage_claim(
+                SalvageStatus::Unverified(crate::salvage::UnverifiedCause::UndecodableMethod),
+                false
+            )
+            .is_ok()
+        );
+        // `Partial` folds two causes into one status: a comparison that
+        // never ran (truncation) and a comparison that ran and disagreed
+        // (checksum mismatch). `stuffr-core` cannot tell which without
+        // `entries.rs`'s own re-decode (`PartialCause`, a crate up), so
+        // neither value of `verifier_was_checked` may be refused for it —
+        // an over-strict edit requiring `true` here would refuse every
+        // truncated-partial entry this engine has ever recovered.
+        assert!(check_salvage_claim(SalvageStatus::Partial, false).is_ok());
+        assert!(check_salvage_claim(SalvageStatus::Partial, true).is_ok());
     }
 }
