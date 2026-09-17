@@ -276,11 +276,13 @@
 //! invent a declared-but-absent payload was not changed to chase agreement
 //! with that result.
 
-use std::io::{self, Read, SeekFrom};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, UnverifiedCause,
-    Verifier, annotate_candidates, collect_candidates,
+    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry,
+    UnverifiedCause, Verifier, annotate_candidates, collect_candidates, stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
@@ -455,38 +457,39 @@ fn read_candidate_at(
         )
     };
 
+    // The payload's START is computed unconditionally — even for a
+    // data-descriptor entry with no `declared_len` at all — because a
+    // consumer (`entries.rs`'s salvage write path) needs to know where a
+    // recovered entry's bytes begin regardless of whether this scan could
+    // also bound how many of them there are. It is already unfalsifiable at
+    // this point: the name `read_exact` and the `extra_len` skip above both
+    // fail on a short read, so reaching this line means the cursor sits at
+    // `payload_start` with `payload_start <= file_len`.
+    let Some(payload_start) = offset
+        .checked_add(LOCAL_HEADER_TOTAL)
+        .and_then(|v| v.checked_add(u64::from(name_len)))
+        .and_then(|v| v.checked_add(u64::from(extra_len)))
+    else {
+        // The header's own arithmetic overflowed u64 — nothing about this
+        // is a real record, so it stays a rejection.
+        return Ok(None);
+    };
+
     // Criterion 6: does the declared payload fit inside the source? A
     // candidate that does NOT fit is no longer rejected — it is reported
     // with `available_len` naming how many of its bytes are actually there.
     // See the module doc's "Criterion 6" section for the measurement that
     // changed this, and `Candidate::available_len`'s own doc for why the
     // declared figure is left untouched rather than reduced to what fits.
-    //
-    // The payload's START still has to be inside the file, and that is not
-    // checked here because it is already unfalsifiable at this point: the
-    // name `read_exact` and the `extra_len` skip above both fail on a short
-    // read, so reaching this line means the cursor sits at `payload_start`
-    // with `payload_start <= file_len`.
     let available_len = match declared_len {
         None => None,
-        Some(len) => {
-            let payload_start = offset
-                .checked_add(LOCAL_HEADER_TOTAL)
-                .and_then(|v| v.checked_add(u64::from(name_len)))
-                .and_then(|v| v.checked_add(u64::from(extra_len)));
-            match payload_start {
-                // The header's own arithmetic overflowed u64 — nothing
-                // about this is a real record, so it stays a rejection.
-                None => return Ok(None),
-                Some(start) => match start.checked_add(len) {
-                    Some(end) if end <= file_len => None,
-                    // Either the declared end overflows, or it runs past
-                    // the source. Both mean the same thing to a reader:
-                    // fewer bytes are present than the header promises.
-                    _ => Some(file_len.saturating_sub(start)),
-                },
-            }
-        }
+        Some(len) => match payload_start.checked_add(len) {
+            Some(end) if end <= file_len => None,
+            // Either the declared end overflows, or it runs past the
+            // source. Both mean the same thing to a reader: fewer bytes are
+            // present than the header promises.
+            _ => Some(file_len.saturating_sub(payload_start)),
+        },
     };
 
     // A zip directory entry is a zero-length entry whose name ends in `/`
@@ -506,6 +509,7 @@ fn read_candidate_at(
 
     Ok(Some(Candidate {
         offset,
+        payload_start,
         meta,
         declared_len,
         verifier,
@@ -680,6 +684,69 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
     })
 }
 
+/// A fresh handle onto `archive_path`, seeked to `start` and bounded to at
+/// most `len` bytes — a new [`File`] per call rather than sharing one
+/// across entries, the same trade `entries.rs`'s salvage write path always
+/// made: a little overhead for never threading a mutable handle (and its
+/// current seek position) through the call graph.
+fn open_bounded_payload(archive_path: &Path, start: u64, len: u64) -> Result<impl Read> {
+    let mut f = File::open(archive_path)?;
+    f.seek(SeekFrom::Start(start))?;
+    Ok(f.take(len))
+}
+
+/// Reads one entry's payload and writes its RECOVERED (decoded) bytes to
+/// `out`. Returns whether the decode reached the entry's own declared
+/// length ([`EntryMeta::size`]) — `entries.rs`'s own signal for
+/// `PartialCause`.
+///
+/// Uses [`SalvagedEntry::payload_start`] directly — computed once by
+/// [`read_candidate_at`]/[`candidate_from_cd_record`] at discovery time —
+/// rather than re-parsing a local header here. Before Task 3c this
+/// function (then living in `entries.rs`) re-read a 30-byte zip local
+/// header from `entry.offset` on every call, which was silently WRONG for
+/// any other format's candidate: an ARC entry near end-of-file made that
+/// read run past EOF and raise `Error::Io` (exit 1) rather than anything
+/// classified. Locating the payload is now this scanner's own job, decided
+/// once, and never repeated (or mis-repeated) by a generic caller.
+///
+/// Dispatches on `entry.meta.codec` — filled by both discovery sites above.
+/// `store` and `deflate` are the only two `Some` values it is ever filled
+/// with: every other method already reports
+/// [`stuffr_core::salvage::SalvageStatus::Unverified`] from this module's
+/// own `verify_candidate`, which callers already refuse before reaching
+/// here. The `_` arm below (`None`, or any other value) is therefore
+/// defensive rather than reachable in practice.
+pub fn write_payload(
+    archive_path: &Path,
+    entry: &SalvagedEntry,
+    compressed_len: u64,
+    out: &mut dyn Write,
+) -> Result<bool> {
+    let expected = entry.meta.size.unwrap_or(compressed_len);
+
+    match entry.meta.codec {
+        Some(id) if id == FormatId::new("store") => {
+            let reader = open_bounded_payload(archive_path, entry.payload_start, compressed_len)?;
+            stream_bounded_copy(reader, expected, out)
+        }
+        Some(id) if id == FormatId::new("deflate") => {
+            let reader = open_bounded_payload(archive_path, entry.payload_start, compressed_len)?;
+            // The same `flate2::read::DeflateDecoder` backend
+            // `verify_candidate` above already uses to check this exact
+            // entry's CRC-32 — not a second decompression stack.
+            let decoded = flate2::read::DeflateDecoder::new(reader);
+            stream_bounded_copy(decoded, expected, out)
+        }
+        other => Err(Error::Unsupported(format!(
+            "entry `{}` carries codec {other:?}, which this build's salvage writer does \
+             not decode (only Stored and Deflate; every other method already reports as \
+             Unverified before reaching here)",
+            entry.meta.name
+        ))),
+    }
+}
+
 /// A `Sized` `Read + Seek` wrapper around a `&mut dyn SeekRead`, needed
 /// purely so `walk_central_directory<R: Read + Seek>` — generic over a
 /// SIZED reader, since it is `pub` API `zip.rs` also calls with concrete
@@ -796,18 +863,19 @@ fn candidate_from_cd_record(
     // record's own extra field is a different field of a different length.
     let name_len = u64::from(u16::from_le_bytes([fixed[26], fixed[27]]));
     let extra_len = u64::from(u16::from_le_bytes([fixed[28], fixed[29]]));
-    let payload_start = record
+    let payload_start = match record
         .local_header_offset
         .checked_add(LOCAL_HEADER_TOTAL)
         .and_then(|v| v.checked_add(name_len))
-        .and_then(|v| v.checked_add(extra_len));
-    let available_len = match payload_start {
+        .and_then(|v| v.checked_add(extra_len))
+    {
         None => return Ok(None),
         Some(start) if start > file_len => return Ok(None),
-        Some(start) => match start.checked_add(record.compressed_size) {
-            Some(end) if end <= file_len => None,
-            _ => Some(file_len.saturating_sub(start)),
-        },
+        Some(start) => start,
+    };
+    let available_len = match payload_start.checked_add(record.compressed_size) {
+        Some(end) if end <= file_len => None,
+        _ => Some(file_len.saturating_sub(payload_start)),
     };
 
     let kind = if record.name.ends_with('/') {
@@ -826,6 +894,7 @@ fn candidate_from_cd_record(
 
     Ok(Some(Candidate {
         offset: record.local_header_offset,
+        payload_start,
         meta,
         declared_len: Some(record.compressed_size),
         verifier: Some(Verifier::Crc32(record.crc32)),

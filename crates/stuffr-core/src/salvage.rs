@@ -74,6 +74,8 @@
 //! annotate the merged list exactly once, rather than annotating twice and
 //! reconciling two already-decided outcomes.
 
+use std::io::{Read, Write};
+
 use crate::archive::EntryMeta;
 use crate::error::{Error, Result};
 use crate::source::SeekRead;
@@ -96,6 +98,24 @@ pub enum Verifier {
 pub struct Candidate {
     /// Byte offset of the record's header in the archive.
     pub offset: u64,
+    /// Byte offset where this record's PAYLOAD begins — past whatever
+    /// fixed and variable-length header fields this format's record
+    /// carries (a zip local header's name/extra fields, ARC's fixed
+    /// 28-byte record, and so on).
+    ///
+    /// Task 3c added this field after `entries.rs`'s write path hardcoded
+    /// a ZIP local header's own 30-byte-plus-name-plus-extra layout as
+    /// the way to locate every format's payload — which crashed
+    /// (`Error::Io`, exit 1, the wildcard this project treats as a
+    /// defect) the moment a non-zip scanner (ARC) reported a candidate
+    /// near the end of the file, because reading 30 bytes from ITS offset
+    /// ran past EOF. Each scanner already computes this value once, at
+    /// discovery, to know where ITS OWN payload begins — this field
+    /// carries that computation forward instead of a consumer re-deriving
+    /// (and mis-deriving) it later. A future scanner (zoo, lha, arj) fills
+    /// this the same way; nothing outside the scanner that discovered a
+    /// candidate needs to know its record's own layout at all.
+    pub payload_start: u64,
     pub meta: EntryMeta,
     /// Declared payload length. `None` when the header does not carry one.
     pub declared_len: Option<u64>,
@@ -202,6 +222,10 @@ pub struct SalvagedEntry {
     /// on `salvage` names a scan position, not a list index).
     pub scan_position: usize,
     pub offset: u64,
+    /// Carried forward from [`Candidate::payload_start`] — see that
+    /// field's doc for why a consumer must use this rather than
+    /// re-deriving a payload's location from `offset` itself.
+    pub payload_start: u64,
     pub meta: EntryMeta,
     pub status: SalvageStatus,
     /// Set when this record's `(name, declared_len, verifier)` all agree
@@ -486,6 +510,7 @@ pub fn annotate_candidates(
         entries.push(SalvagedEntry {
             scan_position,
             offset: candidate.offset,
+            payload_start: candidate.payload_start,
             meta: candidate.meta,
             status,
             shadows,
@@ -494,6 +519,48 @@ pub fn annotate_candidates(
     }
 
     Ok(SalvageOutcome { entries })
+}
+
+/// Streams `reader` into `out`, bounded to `expected_len` bytes — the
+/// entry's own declared uncompressed size — so a small compressed input
+/// cannot expand arbitrarily far past what its own header claims. Never
+/// buffers a growable copy of the payload, only a fixed 64 KiB window, and
+/// never trusts the decoder to stop on its own.
+///
+/// Returns `true` when exactly `expected_len` bytes were produced, `false`
+/// when `reader` ran out or errored first — [`crate`]'s own convention
+/// throughout this module: "did not fully recover" is a fact a caller
+/// reports (as [`SalvageStatus::Partial`]'s own two causes already are),
+/// never an [`Error`] that aborts the whole run over one entry.
+///
+/// Lives here, rather than duplicated once per format module, because it
+/// has no format-specific knowledge at all — only `Read`/`Write` and a byte
+/// count. Task 3c moved it up from `entries.rs`, where it was zip-shaped
+/// plumbing bolted onto a zip-only write path; every [`SalvageScan`]
+/// implementation's own `write_payload` (zip's, ARC's, and any later
+/// format's) calls this same function once it has a decoded reader in
+/// hand, so a truncated or overrunning decode is reported identically
+/// regardless of which format produced it.
+pub fn stream_bounded_copy(
+    mut reader: impl Read,
+    expected_len: u64,
+    out: &mut dyn Write,
+) -> Result<bool> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut produced = 0u64;
+    loop {
+        if produced >= expected_len {
+            return Ok(true);
+        }
+        let want = ((expected_len - produced) as usize).min(buf.len());
+        let n = match reader.read(&mut buf[..want]) {
+            Ok(0) => return Ok(false),
+            Ok(n) => n,
+            Err(_) => return Ok(false),
+        };
+        out.write_all(&buf[..n])?;
+        produced += n as u64;
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +633,7 @@ mod tests {
             }
             Ok(Some(Candidate {
                 offset: 0,
+                payload_start: 0,
                 meta: EntryMeta::file("absurd"),
                 declared_len: Some(self.0),
                 verifier: None,
@@ -594,6 +662,7 @@ mod tests {
             }
             Ok(Some(Candidate {
                 offset: 0,
+                payload_start: 0,
                 meta: EntryMeta::file("cut-short"),
                 declared_len: Some(self.declared),
                 verifier: Some(Verifier::Crc32(1)),
@@ -755,6 +824,7 @@ mod tests {
             self.next += 1;
             Ok(Some(Candidate {
                 offset,
+                payload_start: offset,
                 meta: EntryMeta::file(name),
                 declared_len,
                 verifier,

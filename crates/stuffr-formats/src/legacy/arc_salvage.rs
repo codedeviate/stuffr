@@ -87,13 +87,15 @@
 //! the first real exercise of `stream_verify`'s `Verifier::Crc16` arm
 //! outside its own unit tests.
 
-use std::io::{self, SeekFrom};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, UnverifiedCause,
-    Verifier, salvage_all,
+    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry,
+    UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
 };
-use stuffr_core::{EntryKind, EntryMeta, Result, SeekRead};
+use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
 use super::arc::{
     ArcHeader, HEADER_LEN, MARKER, Method, arc_mtime, decode, refuse_if_over_ceiling,
@@ -253,14 +255,42 @@ fn read_candidate_at(
     meta.compressed_size = Some(compressed_size);
     meta.kind = EntryKind::File;
     meta.mtime = arc_mtime(header.packed_datetime);
+    // Fix round (Task 3c): previously left `None` unconditionally, which
+    // made a real write of an `Intact`/`Complete`/`Partial` ARC entry
+    // silently no-op as `SkippedNotBuiltIn` — `entries.rs`'s write dispatch
+    // reads this field to decide how to decode, the same way it already did
+    // for zip's `codec_for_method`, and an ARC candidate never populated it.
+    meta.codec = codec_for_arc_method(record[0]);
 
     Ok(Some(Candidate {
         offset,
+        payload_start,
         meta,
         declared_len: Some(compressed_size),
         verifier: Some(Verifier::Crc16(header.crc16)),
         available_len,
     }))
+}
+
+/// Maps an ARC method byte to the [`FormatId`] [`EntryMeta::codec`] carries
+/// for it — the same role `zip_salvage.rs`'s own `codec_for_method` plays,
+/// naming ARC's five DECODABLE methods (`arc.rs`'s own [`Method`] enum;
+/// see its module doc's method table) rather than a zip compression method.
+/// `None` for the six methods this build recognises but cannot decode —
+/// those candidates already report
+/// [`SalvageStatus::Unverified`]`(`[`UnverifiedCause::UndecodableMethod`]`)`
+/// from [`verify_candidate`], which `entries.rs`'s write path refuses
+/// before ever reading this field, so `None` here is never reached by a
+/// write attempt in practice.
+fn codec_for_arc_method(method_byte: u8) -> Option<FormatId> {
+    match method_byte {
+        1 | 2 => Some(FormatId::new("arc-stored")),
+        3 => Some(FormatId::new("arc-rle90")),
+        4 => Some(FormatId::new("arc-squeezed")),
+        8 => Some(FormatId::new("arc-crunched")),
+        9 => Some(FormatId::new("arc-squashed")),
+        _ => None,
+    }
 }
 
 /// Decides [`SalvageStatus`] for one candidate by re-reading the header at
@@ -358,6 +388,98 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         u64::from(header.original_size),
         &Verifier::Crc16(expected_crc),
     ))
+}
+
+/// Maps [`EntryMeta::codec`] (as [`codec_for_arc_method`] filled it) back
+/// to the [`Method`] [`super::arc::decode`] dispatches on.
+///
+/// `None` covers the same "never reached in practice" cases
+/// `codec_for_arc_method`'s own doc names: a `None` codec, or one this
+/// module never produces. [`write_payload`] treats it exactly like an
+/// unrecognised zip method — [`Error::Unsupported`], defensive rather than
+/// reachable.
+fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
+    match codec {
+        Some(id) if id == FormatId::new("arc-stored") => Some(Method::Stored),
+        Some(id) if id == FormatId::new("arc-rle90") => Some(Method::Rle90),
+        Some(id) if id == FormatId::new("arc-squeezed") => Some(Method::Squeezed),
+        Some(id) if id == FormatId::new("arc-crunched") => Some(Method::Crunched),
+        Some(id) if id == FormatId::new("arc-squashed") => Some(Method::Squashed),
+        _ => None,
+    }
+}
+
+/// Reads one entry's compressed payload and writes its RECOVERED (decoded)
+/// bytes to `out`. Returns whether the decode reached the entry's own
+/// declared length ([`EntryMeta::size`]) — `entries.rs`'s own signal for
+/// `PartialCause`, matching `zip_salvage.rs`'s own `write_payload` exactly.
+///
+/// Uses [`SalvagedEntry::payload_start`] directly, computed once by
+/// [`read_candidate_at`] at discovery time — see that field's own doc for
+/// why a consumer must never re-derive a payload's location from `offset`
+/// itself. Before Task 3c, `entries.rs`'s salvage write path did exactly
+/// that, unconditionally as if every candidate were zip-shaped: it read 30
+/// bytes from `entry.offset` as a zip local header, which for an ARC entry
+/// near end-of-file ran past EOF and raised `Error::Io` (exit 1) — the
+/// wildcard this project treats as a defect — rather than anything
+/// classified. Locating the payload is this scanner's own job now, decided
+/// once by [`read_candidate_at`] and never repeated here.
+///
+/// An entry reaching this function was already reported `Intact`,
+/// `Complete` or `Partial` by [`verify_candidate`] — never `Unverified`,
+/// which `entries.rs`'s `place_salvaged_file` already refuses before
+/// calling this. So a compressed-byte read or a decode that fails here is
+/// re-running the IDENTICAL bytes `verify_candidate` already examined, and
+/// is folded into `Ok(false)` ("did not complete") for the same reason that
+/// function folds the same failures into `SalvageStatus::Partial` rather
+/// than an `Err`: one entry's damage must never abort the recovery of every
+/// other entry in the archive. The sole exception, matching
+/// `verify_candidate`'s own one exception, is
+/// [`super::arc::refuse_if_over_ceiling`] — propagated rather than folded,
+/// though unreachable in practice here too, since `verify_candidate` already
+/// checked the identical field before this entry could reach any status
+/// other than `Unverified`.
+pub fn write_payload(
+    archive_path: &Path,
+    entry: &SalvagedEntry,
+    compressed_len: u64,
+    out: &mut dyn Write,
+) -> Result<bool> {
+    let Some(method) = method_for_codec(entry.meta.codec) else {
+        return Err(Error::Unsupported(format!(
+            "entry `{}` carries codec {:?}, which this build's salvage writer does not \
+             decode (every ARC method it cannot decode already reports as Unverified \
+             before reaching here)",
+            entry.meta.name, entry.meta.codec
+        )));
+    };
+
+    super::arc::refuse_if_over_ceiling(&entry.meta.name, compressed_len, "compressed data")?;
+
+    let mut f = File::open(archive_path)?;
+    if f.seek(SeekFrom::Start(entry.payload_start)).is_err() {
+        return Ok(false);
+    }
+    let mut payload = vec![0u8; compressed_len as usize];
+    if f.read_exact(&mut payload).is_err() {
+        // Fewer compressed bytes are actually on disk than this entry
+        // declared — the same "ran out" fact `stream_bounded_copy` reports
+        // for a streaming format, just discovered up front here because
+        // ARC's decoders need the whole buffer in hand before they can
+        // start.
+        return Ok(false);
+    }
+
+    let decoded = match super::arc::decode(method, &payload, &entry.meta.name) {
+        Ok(decoded) => decoded,
+        // Malformed compressed data — deterministically the same failure
+        // `verify_candidate` already saw and reported as `Partial`. Not
+        // propagated, for the reason this function's own doc gives.
+        Err(_) => return Ok(false),
+    };
+
+    let expected = entry.meta.size.unwrap_or(compressed_len);
+    stream_bounded_copy(io::Cursor::new(decoded), expected, out)
 }
 
 /// Runs [`ArcSalvage`] over `src` and annotates the result — the whole
