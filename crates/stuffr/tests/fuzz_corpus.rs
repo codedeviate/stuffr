@@ -95,13 +95,33 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// constant IS the manifest and `generate_corpus` matches on it
 /// exhaustively. Unlike `CHAIN_SHAPES`, a salvage seed DOES carry a leading
 /// selector byte as of Stage 2 Task 3b (see the module doc's own bullet on
-/// `salvage.rs`) — every shape below happens to select the same slot,
-/// `zip`, because that is still the only format this generator seeds.
-/// `arc` gained its own scanner (Stage 2 Task 3) and its own
-/// `SALVAGE_SLOTS` entry (Task 3b) but no seed here yet: unlike zip's
-/// Stage 1 history below, `arc`'s unseeded reachability has not been
-/// measured either way, so seeding it is left for whoever measures it
-/// rather than guessed at here.
+/// `salvage.rs`), and as of Stage 2 Task 4 they do NOT all select the same
+/// slot: a shape named `zoo-*` carries `SALVAGE_SLOTS`'s `zoo` index and
+/// every other shape carries its `zip` index.
+///
+/// **`arc` still has no seed and `zoo` now does, and that asymmetry is a
+/// MEASUREMENT rather than an oversight.** Task 4 measured what earlier
+/// revisions of this comment said had not been measured either way, by
+/// running the built binary's `salvage --format <slot> --list` over all
+/// 4,726 inputs a 200,000-run `salvage` session accumulated, split by the
+/// slot each one's own selector byte chooses:
+///
+/// ```text
+/// slot   inputs   >=1 salvaged row   >=1 Intact row
+/// zip      3171               2677              593
+/// arc       679                529               52
+/// zoo       876                  0                0
+/// ```
+///
+/// `arc` reaches its scanner unseeded because its anchor is two bytes (a
+/// marker plus a method drawn from eleven values, a coincidence roughly
+/// every 8 KiB), so mutation from zip seeds finds ARC headers by accident.
+/// ZOO's is a FOUR-byte tag behind a full record gate, and 876 inputs
+/// produced **not one salvaged record of any status** — the identical
+/// vacuity this constant's own history section below describes, reproduced
+/// for one slot inside an otherwise well-seeded target. `check_salvage_claim`
+/// fires only on `Intact`, so the `zoo` slot's share of every run was
+/// proving nothing at all.
 ///
 /// **This target ran unseeded until the final whole-branch review**, and
 /// `make fuzz` reported `target 'salvage': 2000 executions — OK` the whole
@@ -134,6 +154,20 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// - `crc-mismatch` — one payload byte flipped, sizes and index intact:
 ///   `Partial(ChecksumMismatch)`, the one shape where the checksum is what
 ///   fails rather than the structure.
+///
+/// The two ZOO shapes are BORROWED BYTES rather than built ones, since this
+/// project has no ZOO encoder at all, and both reach `Intact` — which is
+/// what `every_salvage_seed_produces_records_and_at_least_one_intact`
+/// requires of every shape, damaged or not: a seed is something the fuzzer
+/// degrades FROM, not something already past the check.
+///
+/// - `zoo-healthy` — `store.zoo` verbatim, the one borrowed fixture whose
+///   payload IS its content.
+/// - `zoo-zeroed-chain` — the same archive with its first record's `next`
+///   link zeroed. Four bytes, and `stuffr list` refuses the whole 11 KiB
+///   archive at exit 5 while the scanner still recovers the entry `Intact`:
+///   the motivating shape for the whole ZOO scanner, and a seed whose
+///   structure is already damaged where its record is not.
 const SALVAGE_SHAPES: &[&str] = &[
     "healthy",
     "distinct-duplicates",
@@ -141,6 +175,8 @@ const SALVAGE_SHAPES: &[&str] = &[
     "zeroed-central-directory",
     "truncated-tail",
     "crc-mismatch",
+    "zoo-healthy",
+    "zoo-zeroed-chain",
 ];
 
 /// Builds one small sample tree every container/chain seed packs: a file at
@@ -698,11 +734,12 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // --- salvage/ --------------------------------------------------------
     // Leading selector byte as of Stage 2 Task 3b — `salvage.rs` reads it,
     // maps it through `SALVAGE_SLOTS`, and hands the REST of the bytes to a
-    // temp file for that slot's scanner via `SalvageOpts::format`. Six
-    // shapes, matching `SALVAGE_SHAPES`; see that constant for why this
-    // target is seeded at all and what each shape is for. Every shape here
-    // is a zip, so every seed carries `SALVAGE_SLOTS`'s own `zip` index —
-    // `arc` has no seed of its own yet (see `SALVAGE_SHAPES`'s own doc).
+    // temp file for that slot's scanner via `SalvageOpts::format`. The
+    // shapes are `SALVAGE_SHAPES`; see that constant for why this target is
+    // seeded at all and what each shape is for. A shape named `zoo-*`
+    // carries `SALVAGE_SLOTS`'s `zoo` index and every other shape its `zip`
+    // index — see `SALVAGE_SHAPES`'s own doc for the measurement that put
+    // ZOO seeds here and left `arc` without one.
     //
     // Unlike `chain/`'s deliberately well-formed-only seeds, four of these
     // six are DAMAGED on purpose, and that is not the same trade. The rule
@@ -713,10 +750,12 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // outcome the suite already pins end to end.
     let healthy = healthy_salvage_seed();
     let mut salvage_count = 0usize;
-    let salvage_zip_selector = SALVAGE_SLOTS
-        .iter()
-        .position(|&s| s == "zip")
-        .expect("SALVAGE_SLOTS must list zip") as u8;
+    let salvage_selector = |slot: &str| {
+        SALVAGE_SLOTS
+            .iter()
+            .position(|&s| s == slot)
+            .unwrap_or_else(|| panic!("SALVAGE_SLOTS must list {slot}")) as u8
+    };
     for shape in SALVAGE_SHAPES {
         let bytes = match *shape {
             "healthy" => healthy.clone(),
@@ -758,9 +797,33 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
                 bytes[at] ^= 0xFF;
                 bytes
             }
+            // Borrowed bytes: this project has no ZOO encoder, and a
+            // decades-old archive nothing here produced is stronger seed
+            // material than one this crate could have written anyway.
+            "zoo-healthy" => read_all(&legacy_fixture_path("zoo/store.zoo"))?,
+            // Four bytes: the first record's `next` link zeroed, which turns
+            // that record into a terminator and makes `stuffr list` refuse
+            // the whole archive — while the raw record, and its payload, are
+            // untouched.
+            "zoo-zeroed-chain" => {
+                let mut bytes = read_all(&legacy_fixture_path("zoo/store.zoo"))?;
+                // `zoo.h`: ZSTART_I 24 in the archive header, NEXT_I 6 in a
+                // directory record.
+                let record =
+                    u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]) as usize;
+                for b in &mut bytes[record + 6..record + 10] {
+                    *b = 0;
+                }
+                bytes
+            }
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
-        let mut seed = vec![salvage_zip_selector];
+        let slot = if shape.starts_with("zoo-") {
+            "zoo"
+        } else {
+            "zip"
+        };
+        let mut seed = vec![salvage_selector(slot)];
         seed.extend_from_slice(&bytes);
         std::fs::write(salvage_dir.join(format!("{shape}.seed")), &seed)?;
         salvage_count += 1;

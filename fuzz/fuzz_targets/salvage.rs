@@ -5,7 +5,7 @@ use std::io::Cursor;
 use stuffr::entries::{self, SalvageOpts};
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
 use stuffr_core::testing::{SALVAGE_SLOTS, check_error_is_classified, check_salvage_claim};
-use stuffr_formats::legacy::arc_salvage;
+use stuffr_formats::legacy::{arc_salvage, zoo_salvage};
 use stuffr_formats::zip_salvage;
 
 /// Local file header layout, duplicated deliberately rather than imported —
@@ -20,6 +20,9 @@ const SIG_LOCAL_HEADER: [u8; 4] = *b"PK\x03\x04";
 /// sizes live in a trailing data descriptor instead of the local header.
 const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 const LOCAL_HEADER_TOTAL: usize = 30;
+/// `zoo.h`: `#define ZOO_TAG ((unsigned long) 0xFDC4A7DCL)`, little-endian.
+/// Duplicated here for the same reason the zip constants above are.
+const ZOO_TAG_BYTES: [u8; 4] = 0xFDC4_A7DCu32.to_le_bytes();
 
 /// Whether the local header at `offset` in `data` directly carries a
 /// checksum for a method this build's salvage engine can decode (Store = 0,
@@ -73,6 +76,32 @@ fn arc_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
         return None;
     }
     Some((1..=11).contains(&method))
+}
+
+/// Mirrors the two functions above, for the `zoo` slot (Stage 2 Task 4).
+///
+/// ZOO has no deferral either: `zoo.h`'s directory entry carries `crc` as a
+/// `u16` at offset 18 of a record that opens with `ZOO_TAG`, so a record
+/// that is real at all carries its CRC-16 inline, unconditionally —
+/// `zoo_salvage.rs`'s own `read_candidate_at` never constructs a
+/// `Candidate` with `verifier: None`. Rather than trust that module's doc,
+/// this re-derives the two cheap, non-allocating structural facts its own
+/// discovery gate checks before it will trust a tag sighting: the four-byte
+/// tag itself, and a packing method inside `zoo.h`'s `#define MAX_PACK 2`.
+/// `None` when the tag does not match — inconclusive, not a violation, same
+/// as the two above.
+///
+/// The record `type` byte at offset 4 is deliberately NOT re-checked here:
+/// it decides the record's LENGTH, not whether a checksum exists, and this
+/// function answers only the latter.
+fn zoo_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
+    let at = usize::try_from(offset).ok()?;
+    let tag = data.get(at..at.checked_add(4)?)?;
+    if tag != ZOO_TAG_BYTES {
+        return None;
+    }
+    let method = *data.get(at.checked_add(5)?)?;
+    Some(method <= 2)
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -173,6 +202,17 @@ fuzz_target!(|data: &[u8]| {
                 HashMap::new()
             }
         },
+        "zoo" => match zoo_salvage::salvage_zoo(&mut cursor, &opts.policy) {
+            Ok(scan) => scan
+                .entries
+                .into_iter()
+                .map(|e| (e.scan_position, e.offset))
+                .collect(),
+            Err(e) => {
+                check_error_is_classified(&e).expect("independent scan error classification");
+                HashMap::new()
+            }
+        },
         _ => HashMap::new(),
     };
 
@@ -191,6 +231,7 @@ fuzz_target!(|data: &[u8]| {
         let offers_crc = match name {
             "zip" => locally_offers_checkable_crc(payload, offset),
             "arc" => arc_locally_offers_checkable_crc(payload, offset),
+            "zoo" => zoo_locally_offers_checkable_crc(payload, offset),
             _ => None,
         };
         if let Some(offers_crc) = offers_crc {
