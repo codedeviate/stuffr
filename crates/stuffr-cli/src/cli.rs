@@ -255,17 +255,31 @@ pub enum Command {
         ///
         /// `stuffr list` on the same archive can print FEWER rows than this:
         /// a record a later one shadows is invisible to `list`, which only
-        /// ever sees what the central directory's own name index kept.
+        /// ever sees what the central directory's own name index kept. Works
+        /// with no destination at all (neither `-C` nor `-o`) — listing is
+        /// not recovering, and this is the diagnostic half of the feature:
+        /// seeing what an archive holds without extracting anything.
         #[arg(long)]
         list: bool,
         /// Recover entries into this directory.
         ///
-        /// Required: unlike `unpack`, salvage has no single-stream mode, so
-        /// there is always somewhere recovered content must land.
+        /// One of `-C`, `-o` or `--list` is required. Mutually exclusive
+        /// with `-o`: a directory tree and one named file are two different
+        /// destinations.
         #[arg(short = 'C', long, value_name = "DIR")]
         directory: Option<String>,
+        /// Recover exactly one entry's bytes to this file, naming it with
+        /// exactly one `--index N`.
+        ///
+        /// A `Partial` entry still lands under `FILE.partial`, never `FILE`
+        /// itself — the same rule `-C` follows, for the same reason: a
+        /// truncated file under the name you asked for would be
+        /// indistinguishable from a whole one. Refused (exit 2) with more
+        /// than one `--index`, or together with `-C`.
+        #[arg(short = 'o', long, value_name = "FILE")]
+        output: Option<String>,
         /// Recover only the record at this SCAN position instead of every
-        /// one found. Repeatable.
+        /// one found. Repeatable with `-C`; `-o` takes exactly one.
         ///
         /// A scan position is 0-based and counts every record the scan
         /// found, shadowed ones included — a DIFFERENT numbering from

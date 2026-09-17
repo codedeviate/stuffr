@@ -8854,20 +8854,76 @@ fn salvage_index_names_a_scan_position_not_a_list_index() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // Fix round 1, REQUIRED 2: `--list` always reports the FULL scan, even
+    // under `--index` — `--index` narrows what is WRITTEN, never what
+    // `--list` shows. All 8 rows must still be present, with every position
+    // `--index` excluded tagged `[not selected]` and the selected one (6)
+    // still showing its own, more permanent `[shadowed: ...]` annotation.
     let stdout = String::from_utf8(out.stdout).unwrap();
     let rows: Vec<&str> = stdout.lines().collect();
     assert_eq!(
         rows.len(),
-        1,
-        "--index 6 must select exactly the one record at scan position 6: {stdout}"
+        8,
+        "--list must keep showing the full scan under --index too: {stdout}"
     );
+    for (pos, row) in rows.iter().enumerate() {
+        assert!(
+            row.starts_with(&format!("{pos} ")),
+            "row {pos} must lead with its own scan position: {stdout}"
+        );
+        match pos {
+            // Selected, and shadows #2 — shadow detection runs BEFORE
+            // `select` (a shadow is a permanent fact about the entry, unlike
+            // selection), so this shows its shadow annotation, not
+            // "not selected", even though it happens to be the one entry
+            // `--index 6` did ask for.
+            6 => assert!(
+                row.contains("[shadowed: dup of #2]") && !row.contains("[not selected]"),
+                "the selected row must show its shadow annotation, not a not-selected one: \
+                 {row}"
+            ),
+            // Not selected, but ALSO a shadow (of #3) — same reasoning as
+            // above, from the other direction: the shadow annotation wins
+            // over "not selected" regardless of which one selection alone
+            // would have produced.
+            7 => assert!(
+                row.contains("[shadowed: dup of #3]") && !row.contains("[not selected]"),
+                "an unselected shadow must still show its shadow annotation: {row}"
+            ),
+            _ => assert!(
+                row.contains("[not selected]"),
+                "every non-shadow position other than the selected one must be tagged \
+                 not selected: {row}"
+            ),
+        }
+    }
+
+    // The measurement that exposed REQUIRED 1: `--index` must select what
+    // is WRITTEN, not just what is reported. Scan position 0 (`one.txt`) is
+    // NOT a shadow, so this is the clean case that proves the fix rather
+    // than one where nothing would be written either way.
+    let out_dir2 = dir.join("recovered2");
+    let out2 = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir2.to_str().unwrap(),
+        "--index",
+        "0",
+    ]);
     assert!(
-        rows[0].starts_with("6 "),
-        "the selected row must be scan position 6: {stdout}"
+        out2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
     );
-    assert!(
-        rows[0].contains("[shadowed: dup of #2]"),
-        "scan position 6 is the shadow of scan position 2 on this fixture: {stdout}"
+    let names: Vec<String> = std::fs::read_dir(&out_dir2)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["one.txt".to_string()],
+        "-C DIR --index 0 must leave ONLY the selected record in DIR; found {names:?}"
     );
 
     // Naming rule: an out-of-range request must say "scan position", never
@@ -9078,4 +9134,158 @@ fn salvage_list_names_partial_and_unverified_causes() {
     );
     assert!(!out_dir.join("mismatched.bin").exists());
     assert!(!out_dir.join("undecodable.bin").exists());
+}
+
+/// Fix round 1, REQUIRED 3: a `--partial=skip` entry must still name its
+/// cause in `--list`, not fall through to bare "Partial" — the gap the fix
+/// brief singled out because it hits exactly the entries the flag caused to
+/// be dropped, in a verb whose whole selling point is per-entry honesty.
+#[test]
+fn salvage_skipped_partial_names_its_cause() {
+    let dir = tmp_dir();
+    let path = dir.join("mixed.zip");
+    std::fs::write(&path, build_partial_and_unverified_zip_fixture()).unwrap();
+    let out_dir = dir.join("recovered");
+
+    let out = run_output(&[
+        "salvage",
+        path.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+        "--partial=skip",
+        "--list",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows.len(), 2, "{stdout}");
+    assert!(
+        rows[0].contains("Partial (checksum mismatch)"),
+        "--partial=skip must still name the cause, not fall back to bare \"Partial\": {stdout}"
+    );
+    // `--partial=skip` means the entry is never written at all, cause known
+    // or not.
+    assert!(!out_dir.join("mismatched.bin").exists());
+    assert!(!out_dir.join("mismatched.bin.partial").exists());
+}
+
+/// Fix round 1, REQUIRED 2 (first surface form): `--list` must work with NO
+/// destination at all — listing is not recovering, and this is the
+/// diagnostic half of the feature that answers "what does this archive
+/// hold" without extracting anything.
+#[test]
+fn salvage_list_works_with_no_destination() {
+    let dir = tmp_dir();
+    let archive = write_shadowing_zip_fixture(&dir);
+
+    let out = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().count(),
+        8,
+        "a report-only run must still list the full scan: {stdout}"
+    );
+    // Nothing was created anywhere: no `-C` directory, and no directory
+    // named after the archive either.
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        1,
+        "report-only `--list` must touch nothing on disk but the archive itself"
+    );
+}
+
+/// Fix round 1, REQUIRED 2 (second surface form): `-o FILE --index N`
+/// recovers exactly one entry's bytes to a named file, with no `-C`
+/// directory involved at all.
+#[test]
+fn salvage_output_recovers_one_entry_to_a_named_file() {
+    let dir = tmp_dir();
+    let archive = write_shadowing_zip_fixture(&dir);
+    let out_file = dir.join("recovered-one.txt");
+
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-o",
+        out_file.to_str().unwrap(),
+        "--index",
+        "0",
+    ]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(&out_file).unwrap(), b"payload for entry one");
+
+    // Refused: more than one selected record.
+    let too_many = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-o",
+        out_file.to_str().unwrap(),
+        "--index",
+        "0",
+        "--index",
+        "1",
+    ]);
+    assert_eq!(too_many.status.code(), Some(2));
+
+    // Refused: -o together with -C.
+    let both = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-o",
+        out_file.to_str().unwrap(),
+        "-C",
+        dir.join("out").to_str().unwrap(),
+        "--index",
+        "0",
+    ]);
+    assert_eq!(both.status.code(), Some(2));
+}
+
+/// `-o` against a Partial entry lands under `FILE.partial`, never `FILE` —
+/// the same rule `-C` follows, applied to a caller-named path.
+#[test]
+fn salvage_output_suffixes_a_partial_entry() {
+    let dir = tmp_dir();
+    let path = dir.join("mixed.zip");
+    std::fs::write(&path, build_partial_and_unverified_zip_fixture()).unwrap();
+    let out_file = dir.join("wanted.bin");
+
+    let out = run_output(&[
+        "salvage",
+        path.to_str().unwrap(),
+        "-o",
+        out_file.to_str().unwrap(),
+        "--index",
+        "0",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out_file.exists(),
+        "a Partial entry must never land under the literal -o path"
+    );
+    let partial_path = dir.join("wanted.bin.partial");
+    assert_eq!(
+        std::fs::read(&partial_path).unwrap(),
+        b"this payload's crc field below is wrong on purpose"
+    );
 }

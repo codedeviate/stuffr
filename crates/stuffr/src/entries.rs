@@ -1027,13 +1027,41 @@ pub fn cat(
 /// `dest` lives here rather than as a sibling parameter (unlike [`extract`]'s
 /// `dest: &Path`) because [`salvage`]'s own interface is fixed by this
 /// task's brief as a two-argument function; bundling it costs nothing since
-/// nobody constructs a `SalvageOpts` without knowing where recovery should
-/// land.
+/// nobody constructs a `SalvageOpts` without deciding where recovery should
+/// land, if anywhere.
+///
+/// Fix round 1, REQUIRED 1/2: `dest` widened to `Option<PathBuf>` and
+/// `select` added. Before this round the CLI approximated both by calling
+/// `salvage` unconditionally (writing every recoverable entry) and then
+/// filtering the RETURNED report — which never touched what actually landed
+/// on disk, so `--index N -C DIR` measurably left every other entry in `DIR`
+/// too. Both now gate the write itself, inside [`place_salvaged_entry`],
+/// before anything is ever opened for writing.
 pub struct SalvageOpts {
-    /// Where recovered entries land. Created if it does not exist — the same
-    /// contract [`extract`] gives its own destination.
-    pub dest: PathBuf,
+    /// Where recovered entries land, as a directory tree — one file (or
+    /// `.partial` file) per entry, named by the entry's own relative name,
+    /// created if it does not exist.
+    ///
+    /// `None` is report-only: every record's status, shadow relationship and
+    /// — for a `Partial` entry — its [`PartialCause`] are still computed
+    /// exactly as they would be otherwise, but nothing touches the
+    /// filesystem at all, not even to create a directory. This is what lets
+    /// `stuffr salvage --list ARCHIVE` answer "what does this archive hold"
+    /// with no `-C` at all — listing is not recovering.
+    pub dest: Option<PathBuf>,
     pub policy: stuffr_core::salvage::SalvagePolicy,
+    /// Restricts which scan positions may be written at all.
+    ///
+    /// `None` recovers every eligible entry, as before. `Some(set)` reports
+    /// every scan position NOT in `set` as
+    /// [`SalvageDisposition::NotSelected`] — checked in
+    /// [`place_salvaged_entry`] right after shadow detection (which stays
+    /// first, unchanged: a shadow is never written regardless of selection,
+    /// and that is a more permanent fact about the entry than what the
+    /// caller happened to ask for) and before any path is ever joined
+    /// against `dest`, so an unselected entry can never touch a pre-existing
+    /// file of the same name sitting in `dest` already.
+    pub select: Option<HashSet<usize>>,
 }
 
 /// Why a `Partial` entry is `Partial` — see Ruling R-J. Both land the entry
@@ -1080,7 +1108,17 @@ pub enum SalvageDisposition {
     /// library function, not a terminal), so `Ask` is read conservatively
     /// as `Skip` rather than silently upgraded to `Keep` — the safe
     /// direction to err in when a decision cannot actually be asked for.
-    SkippedPartial,
+    ///
+    /// Fix round 1, REQUIRED 3: carries the same [`PartialCause`]
+    /// [`SalvageDisposition::WrittenPartial`] does, rather than a bare unit —
+    /// a `--partial=skip` run used to report "Partial" with no "why" on
+    /// exactly the entries the flag caused to be dropped, in a verb whose
+    /// whole selling point is per-entry honesty. Determined the same way a
+    /// KEPT partial's cause is (decode once, observe whether the declared
+    /// length was reached), except the decoded bytes go to [`std::io::sink`]
+    /// rather than a file — nothing is persisted for an entry this policy
+    /// declined, but the cause costs nothing extra to learn.
+    SkippedPartial(PartialCause),
     /// Not written: [`stuffr_core::salvage::SalvageStatus::Unverified`] —
     /// nothing about this entry's content was verified, for either of that
     /// status's two causes (Ruling R-M): this build recognises the entry's
@@ -1110,6 +1148,25 @@ pub enum SalvageDisposition {
     /// kept for the same reason [`extract`]'s own match keeps a skip arm:
     /// `EntryKind` is `#[non_exhaustive]`.
     SkippedUnsupportedKind,
+    /// Fix round 1, REQUIRED 1: not written because [`SalvageOpts::select`]
+    /// is `Some` and this scan position is not in it — the caller asked for
+    /// a different, narrower set of entries. Distinct from every `Skipped*`
+    /// variant above: those are all facts about the ENTRY (its content, its
+    /// method, its relationship to an earlier one); this one is purely about
+    /// what the caller asked for, and reported on every position `select`
+    /// excludes so `--list` can still show the full scan.
+    NotSelected,
+    /// Fix round 1, REQUIRED 2: not written because [`SalvageOpts::dest`] is
+    /// `None` — report-only mode (`stuffr salvage --list` with neither `-C`
+    /// nor `-o`). This entry was otherwise eligible (not a shadow, not
+    /// `Unverified`, not excluded by `select`, and — if `Partial` — the
+    /// policy in effect would have kept it), but there is no destination for
+    /// its bytes to land in. A `Partial` entry that reaches this point
+    /// instead of here — see [`place_salvaged_file`] — still resolves to
+    /// `SkippedPartial` with its cause, since "no destination" and "policy
+    /// declined it" both mean nothing is decoded to a real file, and the
+    /// cause is worth reporting either way.
+    NotWritten,
 }
 
 /// One scanned record, plus what the ops layer did with it.
@@ -1157,6 +1214,13 @@ pub struct SalvageOutcome {
 /// own remedy — a rebuild, or `--features c-backed` — where 4 only says
 /// "degraded". A user who can fix their build should be told that before
 /// being told something was lossy.
+///
+/// **Fix round 1: `NotSelected` and `NotWritten` count toward neither
+/// bucket**, deliberately, alongside `Written`/`Directory`. Both are facts
+/// about what the CALLER asked for (a narrower `--index` selection, or no
+/// destination at all in report-only mode) rather than anything wrong with
+/// the archive or the recovery — so selecting fewer entries, or only ever
+/// listing, must never by itself turn a clean run into exit 4.
 pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
     if outcome.entries.is_empty() {
         return 5;
@@ -1166,10 +1230,13 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
     let mut any_degraded = false;
     for record in &outcome.entries {
         match &record.disposition {
-            SalvageDisposition::Written(_) | SalvageDisposition::Directory(_) => {}
+            SalvageDisposition::Written(_)
+            | SalvageDisposition::Directory(_)
+            | SalvageDisposition::NotSelected
+            | SalvageDisposition::NotWritten => {}
             SalvageDisposition::SkippedUnverified => any_unverified = true,
             SalvageDisposition::WrittenPartial { .. }
-            | SalvageDisposition::SkippedPartial
+            | SalvageDisposition::SkippedPartial(_)
             | SalvageDisposition::SkippedNotBuiltIn
             | SalvageDisposition::SkippedShadow(_)
             | SalvageDisposition::SkippedUnsupportedKind => any_degraded = true,
@@ -1243,11 +1310,13 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
         stuffr_formats::zip_salvage::salvage_zip(&mut file, &opts.policy)?
     };
 
-    std::fs::create_dir_all(&opts.dest)?;
+    if let Some(dest) = &opts.dest {
+        std::fs::create_dir_all(dest)?;
+    }
 
     let mut entries = Vec::with_capacity(scan.entries.len());
     for entry in &scan.entries {
-        let disposition = place_salvaged_entry(path, &opts.dest, &opts.policy, entry)?;
+        let disposition = place_salvaged_entry(path, opts, entry)?;
         entries.push(SalvagedRecord {
             scan_position: entry.scan_position,
             name: entry.meta.name.clone(),
@@ -1272,27 +1341,43 @@ pub fn salvage(_path: &Path, _opts: &SalvageOpts) -> Result<SalvageOutcome> {
 /// happens to one scanned record.
 ///
 /// Shadow detection is checked FIRST, before anything else, including
-/// containment: a shadowed record contributes nothing that was not already
-/// recovered under its earliest occurrence, so there is nothing to gain by
-/// even looking at its name.
+/// `select` and containment: a shadowed record contributes nothing that was
+/// not already recovered under its earliest occurrence, so there is nothing
+/// to gain by even looking at its name — and this is a permanent fact about
+/// the entry's own content, unlike selection, which is only about what the
+/// caller asked for.
+///
+/// `select` is checked SECOND, before containment: an unselected scan
+/// position is skipped before [`salvage_contained_target`] ever runs, so it
+/// can never touch a pre-existing file of the same name sitting in
+/// `opts.dest` already (fix round 1, REQUIRED 1).
 #[cfg(feature = "zip")]
 fn place_salvaged_entry(
     archive_path: &Path,
-    dest: &Path,
-    policy: &stuffr_core::salvage::SalvagePolicy,
+    opts: &SalvageOpts,
     entry: &stuffr_core::salvage::SalvagedEntry,
 ) -> Result<SalvageDisposition> {
     if let Some(earlier) = entry.shadows {
         return Ok(SalvageDisposition::SkippedShadow(earlier));
     }
+    if let Some(select) = &opts.select
+        && !select.contains(&entry.scan_position)
+    {
+        return Ok(SalvageDisposition::NotSelected);
+    }
 
     match entry.meta.kind {
-        EntryKind::Dir => {
-            let target = salvage_contained_target(dest, entry)?;
-            std::fs::create_dir_all(&target)?;
-            Ok(SalvageDisposition::Directory(target))
-        }
-        EntryKind::File => place_salvaged_file(archive_path, dest, policy, entry),
+        EntryKind::Dir => match &opts.dest {
+            Some(dest) => {
+                let target = salvage_contained_target(dest, entry)?;
+                std::fs::create_dir_all(&target)?;
+                Ok(SalvageDisposition::Directory(target))
+            }
+            // Report-only: nothing to create, and nothing worth a path —
+            // there is no `dest` for one to be relative to.
+            None => Ok(SalvageDisposition::NotWritten),
+        },
+        EntryKind::File => place_salvaged_file(archive_path, &opts.dest, &opts.policy, entry),
         _ => Ok(SalvageDisposition::SkippedUnsupportedKind),
     }
 }
@@ -1300,10 +1385,15 @@ fn place_salvaged_entry(
 /// [`place_salvaged_entry`]'s `EntryKind::File` arm: decides whether this
 /// entry is written at all, and under which name, before touching
 /// containment or the filesystem.
+///
+/// `dest: &Option<PathBuf>` rather than `&Path`, because whether a
+/// destination exists at all is a THIRD reason (alongside policy and
+/// `Unverified`) this function may end up not writing real bytes anywhere —
+/// see the `dest.is_none()` arm below.
 #[cfg(feature = "zip")]
 fn place_salvaged_file(
     archive_path: &Path,
-    dest: &Path,
+    dest: &Option<PathBuf>,
     policy: &stuffr_core::salvage::SalvagePolicy,
     entry: &stuffr_core::salvage::SalvagedEntry,
 ) -> Result<SalvageDisposition> {
@@ -1335,19 +1425,49 @@ fn place_salvaged_file(
     };
 
     let is_partial = entry.status == SalvageStatus::Partial;
-    if is_partial {
-        // `strict` overrides `partial` wholesale (Ruling: "demand proof:
-        // partial skipped"), never the other way — `partial: Keep` under
-        // `strict: true` still skips.
+    // `strict` overrides `partial` wholesale (Ruling: "demand proof: partial
+    // skipped"), never the other way — `partial: Keep` under `strict: true`
+    // still skips. Moot when `is_partial` is false.
+    let policy_would_keep = !is_partial || {
         let effective = if policy.strict {
             PartialPolicy::Skip
         } else {
             policy.partial
         };
-        if !matches!(effective, PartialPolicy::Keep) {
-            return Ok(SalvageDisposition::SkippedPartial);
-        }
+        matches!(effective, PartialPolicy::Keep)
+    };
+
+    if is_partial && !(policy_would_keep && dest.is_some()) {
+        // No real bytes will land anywhere for this entry — either the
+        // policy declined it, or there is no destination at all
+        // (report-only `--list`). Fix round 1, REQUIRED 3: the cause is
+        // still knowable without persisting anything, by decoding once into
+        // `io::sink()` rather than a file — the exact same observation
+        // `write_payload`'s caller below makes for a KEPT partial, just
+        // discarded rather than kept.
+        return Ok(
+            match write_payload(archive_path, entry, compressed_len, &mut std::io::sink()) {
+                Ok(completed) => {
+                    let cause = if completed {
+                        PartialCause::ChecksumMismatch
+                    } else {
+                        PartialCause::Truncated
+                    };
+                    SalvageDisposition::SkippedPartial(cause)
+                }
+                Err(Error::FormatNotEnabled(_) | Error::Unsupported(_)) => {
+                    SalvageDisposition::SkippedNotBuiltIn
+                }
+                Err(e) => return Err(e),
+            },
+        );
     }
+
+    let Some(dest) = dest else {
+        // Not `Partial` (Intact/Complete), and there is no destination:
+        // nothing to decode a cause for, nothing to write.
+        return Ok(SalvageDisposition::NotWritten);
+    };
 
     // Contained target, computed only now that this entry really will be
     // written in some form — see `salvage`'s own doc for why an entry
@@ -3498,8 +3618,9 @@ mod salvage_tests {
 
         let out_dir = tempfile::tempdir().unwrap();
         let opts = SalvageOpts {
-            dest: out_dir.path().to_path_buf(),
+            dest: Some(out_dir.path().to_path_buf()),
             policy: SalvagePolicy::default(),
+            select: None,
         };
         let outcome = salvage(&archive, &opts)
             .expect("a corrupted-but-well-formed entry must not abort the run");
@@ -3567,8 +3688,9 @@ mod salvage_tests {
 
         let out_dir = tempfile::tempdir().unwrap();
         let opts = SalvageOpts {
-            dest: out_dir.path().to_path_buf(),
+            dest: Some(out_dir.path().to_path_buf()),
             policy: SalvagePolicy::default(),
+            select: None,
         };
         let outcome = salvage(&archive, &opts)
             .expect("a truncated-but-well-formed entry must not abort the run");
@@ -3601,8 +3723,9 @@ mod salvage_tests {
 
         let out_dir = tempfile::tempdir().unwrap();
         let opts = SalvageOpts {
-            dest: out_dir.path().join("dest"),
+            dest: Some(out_dir.path().join("dest")),
             policy: SalvagePolicy::default(),
+            select: None,
         };
         let err = salvage(&archive, &opts).expect_err("an escaping name must refuse the whole run");
         assert_eq!(err.exit_code(), 7);
@@ -3628,11 +3751,12 @@ mod salvage_tests {
 
         let out_dir = tempfile::tempdir().unwrap();
         let opts = SalvageOpts {
-            dest: out_dir.path().to_path_buf(),
+            dest: Some(out_dir.path().to_path_buf()),
             policy: SalvagePolicy {
                 strict: true,
                 ..SalvagePolicy::default()
             },
+            select: None,
         };
         let outcome = salvage(&archive, &opts).unwrap();
 
@@ -3640,7 +3764,10 @@ mod salvage_tests {
         assert_eq!(outcome.entries[0].status, SalvageStatus::Partial);
         assert_eq!(
             outcome.entries[0].disposition,
-            SalvageDisposition::SkippedPartial
+            // The corrupted payload decodes to its full declared length (a
+            // Stored copy cannot run short here), so the cause is a
+            // checksum disagreement, not a truncation.
+            SalvageDisposition::SkippedPartial(PartialCause::ChecksumMismatch)
         );
         assert!(
             std::fs::read_dir(out_dir.path()).unwrap().next().is_none(),
@@ -3663,8 +3790,9 @@ mod salvage_tests {
 
         let out_dir = tempfile::tempdir().unwrap();
         let opts = SalvageOpts {
-            dest: out_dir.path().to_path_buf(),
+            dest: Some(out_dir.path().to_path_buf()),
             policy: SalvagePolicy::default(),
+            select: None,
         };
         let outcome = salvage(&archive, &opts).unwrap();
 
@@ -3675,6 +3803,61 @@ mod salvage_tests {
         };
         assert_eq!(path, &out_dir.path().join("fine.txt"));
         assert_eq!(std::fs::read(path).unwrap(), data);
+    }
+
+    /// Fix round 1, REQUIRED 1. Before this round, `SalvageOpts` had no
+    /// `select` at all: the CLI approximated `--index` by writing every
+    /// eligible entry and then filtering the REPORT, so `salvage archive.zip
+    /// -C out --index 0` left `excluded.txt` sitting in `out/` right next to
+    /// `kept.txt` — measured directly against a shipped build, `out/` held
+    /// BOTH files after selecting only scan position 0. `select` must gate
+    /// the WRITE itself: only the selected scan position may ever reach
+    /// disk, and every other one reports `NotSelected` rather than being
+    /// silently written anyway.
+    #[test]
+    fn select_gates_what_is_written_not_just_what_is_reported() {
+        let kept = b"this one was selected".to_vec();
+        let excluded = b"this one was not selected and must never reach disk".to_vec();
+        let mut bytes = local_header_entry("kept.txt", &kept, crc32(&kept));
+        bytes.extend(local_header_entry(
+            "excluded.txt",
+            &excluded,
+            crc32(&excluded),
+        ));
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: Some(HashSet::from([0])),
+        };
+        let outcome = salvage(&archive, &opts).unwrap();
+
+        assert_eq!(outcome.entries.len(), 2);
+        assert_eq!(outcome.entries[0].scan_position, 0);
+        assert!(matches!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::Written(_)
+        ));
+        assert_eq!(outcome.entries[1].scan_position, 1);
+        assert_eq!(
+            outcome.entries[1].disposition,
+            SalvageDisposition::NotSelected,
+            "scan position 1 was not in `select` and must be reported as such"
+        );
+
+        // The measurement that exposed the bug: the directory listing, not
+        // merely a count.
+        let names: Vec<String> = std::fs::read_dir(out_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["kept.txt".to_string()],
+            "`out/` must hold ONLY the selected entry; found {names:?}"
+        );
     }
 
     /// Fix round 1, REQUIRED 3 (Ruling R-N): the aggregation rule, pinned
@@ -3742,6 +3925,42 @@ mod salvage_tests {
             "3 must outrank 4 when a run has BOTH a Partial and an Unverified entry — \
              the actionable diagnosis (rebuild, or --features c-backed) wins over the \
              merely-degraded one"
+        );
+
+        // Fix round 1: neither `NotSelected` nor `NotWritten` counts as a
+        // degradation — both are facts about what the CALLER asked for
+        // (`--index`, or no destination at all), never about the archive or
+        // the recovery.
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![
+                    record(SalvageDisposition::Written(PathBuf::from("a"))),
+                    record(SalvageDisposition::NotSelected),
+                    record(SalvageDisposition::NotSelected),
+                ],
+            }),
+            0,
+            "an entry excluded by --index must not turn a clean selective run into exit 4"
+        );
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(SalvageDisposition::NotWritten); 3],
+            }),
+            0,
+            "a report-only run (--list with no destination) must exit 0 when nothing is \
+             actually wrong with any entry"
+        );
+
+        // A `SkippedPartial` still degrades the run, cause attached or not —
+        // the new payload must not accidentally exempt it from bucket 4.
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(SalvageDisposition::SkippedPartial(
+                    PartialCause::Truncated
+                ))],
+            }),
+            4,
+            "a policy-skipped Partial entry is still bucket 4, cause attached or not"
         );
     }
 }

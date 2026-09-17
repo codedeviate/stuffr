@@ -1,5 +1,6 @@
 //! The `stuffr` command.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -534,6 +535,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             input,
             list,
             directory,
+            output,
             index,
             partial,
             max_entry,
@@ -544,6 +546,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 input,
                 list,
                 directory,
+                output,
                 index,
                 partial,
                 max_entry,
@@ -569,6 +572,20 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // `SalvageOutcome` exists at all (see `salvage_exit_code`'s own
             // doc), and the `?` above already propagated those through the
             // normal `Error::exit_code` path.
+            //
+            // Safe despite every `--list` row having already gone to stdout
+            // by this point: `std::io::Stdout` is an unconditional
+            // `LineWriter`, never block-buffered even for a pipe (unlike C's
+            // stdio), and every row this module prints ends in `\n` — so the
+            // bytes are already on the fd before `process::exit` runs.
+            // Measured directly, not merely reasoned about: 8 rows and 501
+            // rows (a 500-file archive), through both a pipe and a file
+            // redirect, landed every row with the correct trailing content
+            // and exit code. The safety is INCIDENTAL to every write ending
+            // in a newline, not structural — a future edit that writes a
+            // partial line on this path (a `write!` in place of a
+            // `writeln!`) would silently reintroduce the hazard, with
+            // nothing here to catch it.
             if code == 0 {
                 Ok(())
             } else {
@@ -581,12 +598,13 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
 /// One record's status, named the way [`stuffr::salvage::SalvageStatus`]
 /// itself is proven, before anything the write side decided is layered on.
 ///
-/// `Partial` carries no cause on the status alone (only
-/// [`entries::SalvageDisposition::WrittenPartial`] does, and only once an
-/// entry was actually re-decoded to place it — see that variant's own doc)
-/// — so a `Partial` entry `--partial=skip` declined has no cause to report
-/// here, and none is fabricated. `Unverified` is different: its cause is
-/// part of the status itself, proven at scan time, so it is always known.
+/// `Partial` carries no cause on the status alone — [`describe_salvage_row`]
+/// overrides it with one whenever [`entries::SalvageDisposition::
+/// WrittenPartial`] or (fix round 1, REQUIRED 3)
+/// [`entries::SalvageDisposition::SkippedPartial`] has one to give, which is
+/// always, now that both variants carry a cause. `Unverified` is different:
+/// its cause is part of the status itself, proven at scan time, so it is
+/// always known here directly.
 fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static str {
     use stuffr::salvage::{SalvageStatus, UnverifiedCause};
     match status {
@@ -603,29 +621,36 @@ fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static s
 }
 
 /// One `--list` row: scan position, status (refined with a `Partial` cause
-/// when [`entries::SalvageDisposition::WrittenPartial`] has one to give),
-/// name, and — the naming rule this whole feature is built around — a
-/// `[shadowed: dup of #N]` suffix naming the EARLIER scan position, never
-/// "index", when this record shadows one.
+/// whenever the disposition has one to give — [`entries::SalvageDisposition::
+/// WrittenPartial`] or, since fix round 1's REQUIRED 3,
+/// [`entries::SalvageDisposition::SkippedPartial`] too, so `--partial=skip
+/// --list` no longer shows bare "Partial" with no "why" on exactly the
+/// entries the flag caused to be dropped), name, and — the naming rule this
+/// whole feature is built around — a `[shadowed: dup of #N]` suffix naming
+/// the EARLIER scan position, never "index", when this record shadows one.
+/// `[not selected]` marks a scan position `--index` excluded.
 fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     let status = match &record.disposition {
-        entries::SalvageDisposition::WrittenPartial { cause, .. } => match cause {
+        entries::SalvageDisposition::WrittenPartial { cause, .. }
+        | entries::SalvageDisposition::SkippedPartial(cause) => match cause {
             entries::PartialCause::Truncated => "Partial (truncated)",
             entries::PartialCause::ChecksumMismatch => "Partial (checksum mismatch)",
         },
         entries::SalvageDisposition::Written(_)
         | entries::SalvageDisposition::Directory(_)
-        | entries::SalvageDisposition::SkippedPartial
         | entries::SalvageDisposition::SkippedUnverified
         | entries::SalvageDisposition::SkippedNotBuiltIn
         | entries::SalvageDisposition::SkippedShadow(_)
-        | entries::SalvageDisposition::SkippedUnsupportedKind => {
-            describe_salvage_status(record.status)
-        }
+        | entries::SalvageDisposition::SkippedUnsupportedKind
+        | entries::SalvageDisposition::NotSelected
+        | entries::SalvageDisposition::NotWritten => describe_salvage_status(record.status),
     };
     let mut line = format!("{:<4} {:<32} {}", record.scan_position, status, record.name);
     if let Some(earlier) = record.shadows {
         line.push_str(&format!(" [shadowed: dup of #{earlier}]"));
+    }
+    if matches!(record.disposition, entries::SalvageDisposition::NotSelected) {
+        line.push_str(" [not selected]");
     }
     line
 }
@@ -633,63 +658,186 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
 /// `--list`: one line per scanned record, to stdout — the same destination
 /// `stuffr list` itself writes to, and for the same reason (`stuffr salvage
 /// … --list | head` is as legitimate a pipeline as `stuffr list x | head`).
-fn print_salvage_list(records: &[&entries::SalvagedRecord]) -> stuffr::Result<()> {
+///
+/// Fix round 1, REQUIRED 2: always the FULL scan (`&outcome.entries`
+/// directly, never a caller-filtered slice) — `--index` narrows what is
+/// WRITTEN, never what `--list` reports, so a selection is visible here only
+/// as the `[not selected]` tag [`describe_salvage_row`] adds.
+fn print_salvage_list(entries: &[entries::SalvagedRecord]) -> stuffr::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout();
-    for record in records {
+    for record in entries {
         writeln!(out, "{}", describe_salvage_row(record))?;
     }
     Ok(())
 }
 
 /// The default (non-`--list`) report: counts only, to stderr — the same
-/// destination `unpack`'s and `test`'s own summary lines use.
-fn print_salvage_summary(records: &[&entries::SalvagedRecord]) {
-    let (mut written, mut partial, mut dirs, mut skipped, mut unverified) = (0, 0, 0, 0, 0);
-    for record in records {
+/// destination `unpack`'s and `test`'s own summary lines use. Takes whatever
+/// slice the caller passes — [`dispatch_salvage`] narrows it to `--index`'s
+/// selection when one was given, unlike [`print_salvage_list`], which always
+/// takes the full scan.
+fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
+    let (mut written, mut partial, mut skipped, mut unverified, mut not_selected, mut not_written) =
+        (0, 0, 0, 0, 0, 0);
+    for record in entries {
         match &record.disposition {
-            entries::SalvageDisposition::Written(_) => written += 1,
+            entries::SalvageDisposition::Written(_) | entries::SalvageDisposition::Directory(_) => {
+                written += 1;
+            }
             entries::SalvageDisposition::WrittenPartial { .. } => partial += 1,
-            entries::SalvageDisposition::Directory(_) => dirs += 1,
-            entries::SalvageDisposition::SkippedUnverified => unverified += 1,
-            entries::SalvageDisposition::SkippedPartial
+            entries::SalvageDisposition::SkippedPartial(_)
             | entries::SalvageDisposition::SkippedNotBuiltIn
             | entries::SalvageDisposition::SkippedShadow(_)
             | entries::SalvageDisposition::SkippedUnsupportedKind => skipped += 1,
+            entries::SalvageDisposition::SkippedUnverified => unverified += 1,
+            entries::SalvageDisposition::NotSelected => not_selected += 1,
+            entries::SalvageDisposition::NotWritten => not_written += 1,
         }
     }
     eprintln!(
-        "salvage -> {} scanned: {written} written, {partial} written as .partial, {dirs} \
-         director{}, {skipped} skipped, {unverified} unverified",
-        records.len(),
-        if dirs == 1 { "y" } else { "ies" }
+        "salvage -> {} scanned: {written} written, {partial} written as .partial, {skipped} \
+         skipped, {unverified} unverified, {not_selected} not selected, {not_written} not \
+         written (no destination)",
+        entries.len()
     );
 }
 
-/// Validates `--index` against the scan positions the archive actually has,
-/// naming the mistake as a scan position — never "index" — per this
-/// feature's own naming rule: `stuffr list`'s numbering and salvage's are two
-/// different things, and a message that said "index" here could be misread
-/// as `list`'s.
+/// Validates `--index` against the scan positions the archive actually has.
+///
+/// Lenient the same way `unpack --index`/`cat --index` already are (see
+/// `entries::extract`'s own `Selection::missed`): refuses only when NONE of
+/// the requested positions exist at all, rather than the first one that
+/// doesn't — a mix of a real position and a typo silently recovers the real
+/// one, the same bargain `unpack` already makes. Names the mistake as a scan
+/// position — never "index" — per this feature's own naming rule: `stuffr
+/// list`'s numbering and salvage's are two different things, and a message
+/// that said "index" here could be misread as `list`'s.
 fn validate_scan_positions(requested: &[usize], total: usize) -> stuffr::Result<()> {
-    for &pos in requested {
-        if pos >= total {
-            return Err(stuffr::Error::Usage(format!(
-                "scan position {pos} does not exist; this archive's scan found {total} \
-                 record(s) (valid scan positions are 0-{})",
-                total.saturating_sub(1)
-            )));
-        }
+    if !requested.is_empty() && requested.iter().all(|&pos| pos >= total) {
+        return Err(stuffr::Error::Usage(format!(
+            "no requested scan position exists; this archive's scan found {total} record(s) \
+             (valid scan positions are 0-{})",
+            total.saturating_sub(1)
+        )));
     }
     Ok(())
 }
 
+/// Removes a temporary directory when dropped. `-o FILE` recovers into one
+/// of these (via [`entries::salvage`]'s ordinary directory mode, `select`
+/// narrowed to the one requested entry) and then moves the single result
+/// out to `FILE`; wrapping the directory in a guard means an early return
+/// through `?` anywhere in between — a validation failure, an I/O error —
+/// still cleans it up, without a `remove_dir_all` at every return site.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A fresh, empty directory under the system temp root, for [`TempDirGuard`]
+/// to own. No dependency on the `tempfile` crate: that is a dev-dependency
+/// of `stuffr` (used by `entries.rs`'s own unit tests), not available to
+/// this crate's production code.
+fn fresh_temp_dir(label: &str) -> stuffr::Result<TempDirGuard> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut dir = std::env::temp_dir();
+    dir.push(format!(
+        "stuffr-salvage-{label}-{}-{nanos}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir)?;
+    Ok(TempDirGuard(dir))
+}
+
+/// `-o FILE`'s second half: given the outcome of a `select = {scan_position}`
+/// run into a temporary directory, moves that one entry's recovered bytes
+/// (if any) out to `output_path` and reports what happened.
+///
+/// A `Partial` entry still lands under `output_path` with `.partial`
+/// appended, never `output_path` itself — the exact rule `-C` already
+/// follows (see [`entries::salvage`]'s own doc and Ruling R-J), applied to a
+/// caller-named path instead of an entry-named one for the identical reason:
+/// a truncated file under the name asked for is indistinguishable from a
+/// whole one to every tool downstream.
+fn finish_single_file_recovery(
+    outcome: &entries::SalvageOutcome,
+    scan_position: usize,
+    output_path: &Path,
+) -> stuffr::Result<()> {
+    let record = outcome
+        .entries
+        .iter()
+        .find(|r| r.scan_position == scan_position)
+        .expect("validate_scan_positions already confirmed this scan position was scanned");
+
+    let (from, is_partial) = match &record.disposition {
+        entries::SalvageDisposition::Written(path) => (path.clone(), false),
+        entries::SalvageDisposition::WrittenPartial { path, .. } => (path.clone(), true),
+        entries::SalvageDisposition::Directory(_) => {
+            return Err(stuffr::Error::Usage(format!(
+                "scan position {scan_position} is a directory entry; -o recovers one file's \
+                 bytes — use -C to recover a directory"
+            )));
+        }
+        entries::SalvageDisposition::SkippedShadow(_)
+        | entries::SalvageDisposition::SkippedUnverified
+        | entries::SalvageDisposition::SkippedNotBuiltIn
+        | entries::SalvageDisposition::SkippedPartial(_)
+        | entries::SalvageDisposition::SkippedUnsupportedKind
+        | entries::SalvageDisposition::NotSelected
+        | entries::SalvageDisposition::NotWritten => {
+            eprintln!(
+                "salvage -> nothing written for scan position {scan_position}: {}",
+                describe_salvage_row(record)
+            );
+            return Ok(());
+        }
+    };
+
+    let mut final_path = output_path.to_path_buf();
+    if is_partial {
+        let mut name = final_path
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(".partial");
+        final_path = final_path.with_file_name(name);
+    }
+    if let Some(parent) = final_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    // No `--force` concept exists for salvage, same as `-C`'s own write path:
+    // recovery is meant to be re-run, and a stale file from a previous
+    // attempt must not block this one.
+    let _ = std::fs::remove_file(&final_path);
+    if std::fs::rename(&from, &final_path).is_err() {
+        // `from` lives in a temp directory that may sit on a different
+        // filesystem than `final_path`'s — `rename(2)` refuses that
+        // (`EXDEV`), so fall back to copying the bytes across and removing
+        // the source.
+        std::fs::copy(&from, &final_path)?;
+        std::fs::remove_file(&from)?;
+    }
+    eprintln!("salvage -> wrote {}", final_path.display());
+    Ok(())
+}
+
 /// [`Command::Salvage`]'s fields, bundled so [`dispatch_salvage`] takes one
-/// argument instead of eight (clippy's own `too_many_arguments` threshold).
+/// argument instead of nine (clippy's own `too_many_arguments` threshold).
 struct SalvageArgs {
     input: String,
     list: bool,
     directory: Option<String>,
+    output: Option<String>,
     index: Vec<usize>,
     partial: Option<String>,
     max_entry: Option<String>,
@@ -704,11 +852,43 @@ struct SalvageArgs {
 /// A plain function rather than inlined in the `dispatch` arm purely so the
 /// arm above reads as a dispatch table, matching the shape every other verb
 /// here already has.
+///
+/// # The three surface forms (fix round 1, REQUIRED 2)
+///
+/// - `--list` alone: report-only, `dest: None` — nothing touches the
+///   filesystem, not even to create a directory.
+/// - `-C DIR`: recover a whole tree (optionally narrowed by `--index`,
+///   repeatable) into `DIR`.
+/// - `-o FILE --index N`: recover exactly the one entry at scan position `N`
+///   to `FILE`. There is no separate single-file write path in
+///   `entries.rs`: this still goes through `entries::salvage`'s ordinary
+///   directory mode, into a [`TempDirGuard`]'s temporary directory with
+///   `select` narrowed to `{N}`, and [`finish_single_file_recovery`] moves
+///   the single result out to `FILE` afterward.
+///
+/// # `--list` reports the full scan; the summary and exit code report the selection
+///
+/// `entries::salvage` always returns a record for every scan position, `-o`
+/// included — an unselected one comes back `NotSelected` rather than
+/// omitted. `--list` prints exactly that full outcome, unfiltered, because a
+/// diagnostic listing must not narrow just because `--index` narrowed what
+/// gets WRITTEN. The default summary and the exit code below are the other
+/// way around: both are filtered down to `select` when one was given
+/// (`None` when it was not, so the whole scan either way), because those two
+/// answer "how did the entries I asked to recover fare", not "what does this
+/// archive hold" — `--index 6` on an otherwise-clean archive reports
+/// `1 scanned, 1 skipped` and exits 4 even though the archive's OTHER seven
+/// entries are all fine, because entry 6 is the only one the caller asked
+/// about.
+///
+/// At least one of `-C`, `-o` or `--list` is required; `-C` and `-o` are
+/// mutually exclusive; `-o` requires exactly one `--index`.
 fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     let SalvageArgs {
         input,
         list,
         directory,
+        output,
         index,
         partial,
         max_entry,
@@ -723,11 +903,25 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
              source `--format` can select"
         )));
     }
-    let Some(dir) = directory else {
+    if directory.is_some() && output.is_some() {
         return Err(stuffr::Error::Usage(
-            "salvage always recovers into a directory; pass -C DIR to say where".into(),
+            "-C and -o both name a destination; pass one or the other, not both".into(),
         ));
-    };
+    }
+    if directory.is_none() && output.is_none() && !list {
+        return Err(stuffr::Error::Usage(
+            "pass -C DIR to recover into a directory, -o FILE to recover one entry by \
+             --index, or --list to see what the scan found without writing anything"
+                .into(),
+        ));
+    }
+    if output.is_some() && index.len() != 1 {
+        return Err(stuffr::Error::Usage(
+            "-o recovers exactly one entry; pass exactly one --index N naming its scan \
+             position"
+                .into(),
+        ));
+    }
     let path = match input_of(&input) {
         Input::Path(p) => p,
         Input::Stdin => {
@@ -757,15 +951,37 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
         policy.max_entry = stuffr_cli::size::parse_size(&raw).map_err(stuffr::Error::Usage)?;
     }
 
+    let select: Option<HashSet<usize>> = if index.is_empty() {
+        None
+    } else {
+        Some(index.iter().copied().collect())
+    };
+
+    // `-o` recovers into a throwaway directory (cleaned up on every path out
+    // of this function, including an early `?`, by `TempDirGuard`'s `Drop`)
+    // and moves the one result out afterward; `-C` recovers directly into
+    // the caller's own directory; `--list` alone recovers nowhere.
+    let temp_guard = if output.is_some() {
+        Some(fresh_temp_dir("one")?)
+    } else {
+        None
+    };
+    let dest = match (&directory, &temp_guard) {
+        (Some(dir), _) => Some(PathBuf::from(dir)),
+        (None, Some(guard)) => Some(guard.0.clone()),
+        (None, None) => None,
+    };
+
     let opts = SalvageOpts {
-        dest: PathBuf::from(&dir),
+        dest,
         policy,
+        select: select.clone(),
     };
     let outcome = entries::salvage(&path, &opts)?;
 
-    // Computed on the FULL scan, before `--index` filters anything: "nothing
-    // recoverable at all" is a fact about the archive, not about which scan
-    // positions the caller happened to ask for.
+    // Computed on the FULL scan: "nothing recoverable at all" is a fact
+    // about the archive, not about which scan positions the caller happened
+    // to ask for.
     if entries::salvage_exit_code(&outcome) == 5 {
         eprintln!("salvage -> the scan found nothing recoverable in this archive");
         return Ok(5);
@@ -773,26 +989,46 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
 
     validate_scan_positions(&index, outcome.entries.len())?;
 
-    let subset: Vec<&entries::SalvagedRecord> = if index.is_empty() {
-        outcome.entries.iter().collect()
-    } else {
-        outcome
-            .entries
-            .iter()
-            .filter(|r| index.contains(&r.scan_position))
-            .collect()
-    };
-
+    // `--list` always reports the FULL scan, `--index` included — narrowing
+    // WHAT IS WRITTEN must never narrow what a diagnostic listing shows.
     if list {
-        print_salvage_list(&subset)?;
-    } else {
+        print_salvage_list(&outcome.entries)?;
+    }
+
+    if let Some(output_path) = &output {
+        finish_single_file_recovery(&outcome, index[0], Path::new(output_path))?;
+    } else if !list {
+        // The default summary — like the exit code below — reports on what
+        // the CALLER asked about: the whole scan when no `--index` was
+        // given, or just the selected subset when it was. `--list` above is
+        // the one place the full scan is shown regardless of `--index`.
+        let subset: Vec<entries::SalvagedRecord> = match &select {
+            None => outcome.entries.clone(),
+            Some(set) => outcome
+                .entries
+                .iter()
+                .filter(|r| set.contains(&r.scan_position))
+                .cloned()
+                .collect(),
+        };
         print_salvage_summary(&subset);
     }
 
-    let selected = entries::SalvageOutcome {
-        entries: subset.into_iter().cloned().collect(),
+    // Same reasoning as the summary: the exit code is about what the caller
+    // asked to recover, not the whole archive. `-o` already narrowed
+    // `select` to exactly the one requested entry, so this naturally
+    // matches what `finish_single_file_recovery` just reported.
+    let subset: Vec<entries::SalvagedRecord> = match &select {
+        None => outcome.entries,
+        Some(set) => outcome
+            .entries
+            .into_iter()
+            .filter(|r| set.contains(&r.scan_position))
+            .collect(),
     };
-    Ok(entries::salvage_exit_code(&selected))
+    Ok(entries::salvage_exit_code(&entries::SalvageOutcome {
+        entries: subset,
+    }))
 }
 
 /// Prints what an operation approximated, and fails under --strict-fidelity.
