@@ -53,3 +53,13 @@ mod dos;
 pub mod lha;
 #[cfg(feature = "zoo")]
 pub mod zoo;
+// Salvage Stage 2 Task 4: scans a ZOO archive for directory records
+// directly, rather than following the linked list of absolute file offsets
+// `zoo.rs`'s own reader walks — when the chain itself is the damage, that
+// walk is what cannot be trusted. Reuses `zoo.rs`'s own `read_dir_entry`,
+// `DirEntry`, `Method` and `decode` rather than carrying a second copy of
+// the 56-byte record layout, which is the exact figure `unarc-rs` gets
+// wrong; see that module's doc for why several of its items are
+// `pub(super)`.
+#[cfg(feature = "zoo")]
+pub mod zoo_salvage;

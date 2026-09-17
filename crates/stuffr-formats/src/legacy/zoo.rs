@@ -287,7 +287,7 @@ pub const ZOO: FormatId = FormatId::new("zoo");
 /// `zoo.h`: `#define ZOO_TAG ((unsigned long) 0xFDC4A7DCL)`. It opens the
 /// archive header at offset 20 and every directory entry at its own offset
 /// 0 — "a random choice", in the source's own words.
-const ZOO_TAG: u32 = 0xFDC4_A7DC;
+pub(super) const ZOO_TAG: u32 = 0xFDC4_A7DC;
 
 /// `zoo.h`: `#define MINZOOHSIZ 34` — the smallest archive header, and the
 /// prefix every version shares. Newer archives carry eight more bytes
@@ -308,12 +308,24 @@ const FIXED_OFFSET: u32 = 34;
 
 /// `zoo.h`: `#define SIZ_DIR 51` — a type-0/1 directory entry, which ends
 /// at `fname` with no `var_dir_len`, `tz` or `dir_crc` behind it.
-const SIZ_DIR: usize = 51;
+pub(super) const SIZ_DIR: usize = 51;
 
 /// `zoo.h`: `#define SIZ_DIRL 56` — a type-2 directory entry, five bytes
 /// longer. See this module's doc for the measurements that rule out
 /// `unarc-rs`'s 59.
-const SIZ_DIRL: usize = 56;
+pub(super) const SIZ_DIRL: usize = 56;
+
+/// `zoo.h`: `#define SIZ_FLDR 5` — "4 chars plus null", the width of the
+/// `FILE_LEADER "@)#("` that sits between a directory entry and the payload
+/// it describes.
+///
+/// This container's own reader never needs it: `offset` is an ABSOLUTE file
+/// position and is the only thing consulted to find an entry's data. It is
+/// `pub(super)` for `../zoo_salvage.rs`, which has no chain to trust and
+/// therefore computes a payload's position STRUCTURALLY, from the record's
+/// own end — `zooadd.c`'s own arithmetic, `direntry.offset = this_dir_offset
+/// + SIZ_DIRL + var_dir_len + SIZ_FLDR`, read forwards.
+pub(super) const SIZ_FLDR: u64 = 5;
 
 /// `zoo.h`: `#define FNM_SIZ 13`, at `#define FNAME_I 38`.
 const FNAME_I: usize = 38;
@@ -458,7 +470,7 @@ impl Seek for ZooSeekAdapter {
 /// hostile or merely corrupt `u32` header field could otherwise force this
 /// build to allocate for one entry. Fixed rather than derived from
 /// `DecodeOpts::memory_limit` — see this module's doc.
-const MAX_ZOO_ENTRY_LEN: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_ZOO_ENTRY_LEN: u64 = 256 * 1024 * 1024;
 
 /// Refuses a length past [`MAX_ZOO_ENTRY_LEN`] before anything is allocated
 /// for it.
@@ -506,7 +518,7 @@ fn le16(b: &[u8], i: usize) -> u16 {
 /// The packing methods this build decodes. `zoo.h`'s `#define MAX_PACK 2`
 /// is the whole space the format ever assigned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Method {
+pub(super) enum Method {
     /// 0 — the payload IS the content.
     Stored,
     /// 1 — zoo's own `lzd` LZW.
@@ -516,7 +528,14 @@ enum Method {
 }
 
 impl Method {
-    fn from_byte(b: u8, name: &str) -> Result<Self> {
+    /// The highest method byte the format ever assigned — `zoo.h`'s
+    /// `#define MAX_PACK 2`, which is the WHOLE method space: zoo itself
+    /// refuses anything higher. `../zoo_salvage.rs`'s discovery gate reads
+    /// this rather than re-deriving a second list of its own, the same way
+    /// `../arc_salvage.rs` mirrors `arc.rs`'s `ARC_MAGIC` table.
+    pub(super) const MAX_PACK: u8 = 2;
+
+    pub(super) fn from_byte(b: u8, name: &str) -> Result<Self> {
         match b {
             0 => Ok(Method::Stored),
             1 => Ok(Method::Lzw),
@@ -527,29 +546,99 @@ impl Method {
             ))),
         }
     }
+
+    /// The [`FormatId`] `../zoo_salvage.rs` records in a candidate's
+    /// [`EntryMeta::codec`] for this method, and dispatches its own
+    /// `write_payload` on.
+    ///
+    /// The single fact about each variant that both directions of that
+    /// mapping derive from — `codec_for_zoo_method` is
+    /// `Self::from_byte(..).ok().map(Self::codec)` and `method_for_codec`
+    /// searches [`Self::all`] for the variant whose `codec()` matches —
+    /// rather than two hand-maintained tables beside [`Self::from_byte`]'s
+    /// own. `arc.rs`'s [`super::arc::Method::codec`] carries the full
+    /// argument for why (Ruling S-K), and the cost of getting it wrong is
+    /// the one this seam exists to prevent: an unmapped method makes every
+    /// entry using it a silent `SalvageDisposition::SkippedNotBuiltIn`.
+    ///
+    /// **A fourth decodable method is a COMPILE ERROR until three `match`es
+    /// in this file name it** — [`Self::from_byte`]'s, this one, and
+    /// [`Self::next`]'s.
+    pub(super) fn codec(self) -> FormatId {
+        match self {
+            Method::Stored => FormatId::new("zoo-stored"),
+            Method::Lzw => FormatId::new("zoo-lzw"),
+            Method::Lh5 => FormatId::new("zoo-lh5"),
+        }
+    }
+
+    /// The variant after `self` in declaration order, `None` past the last.
+    ///
+    /// Exists only to drive [`Self::all`], and is an exhaustive `match` for
+    /// exactly one reason: **a fourth variant added to [`Method`] without an
+    /// arm here does not compile.** Its ARC twin replaced a hand-written
+    /// `const DECODABLE: [Method; 5]` that the compiler could not check —
+    /// see [`super::arc::Method::next`] for what forgetting it cost there.
+    const fn next(self) -> Option<Self> {
+        match self {
+            Method::Stored => Some(Method::Lzw),
+            Method::Lzw => Some(Method::Lh5),
+            Method::Lh5 => None,
+        }
+    }
+
+    /// Every decodable method, in declaration order — seeded from the first
+    /// variant and driven by [`Self::next`]'s exhaustive `match`.
+    ///
+    /// **The chain is compiler-checked; the SEED is not**, the identical
+    /// asymmetry [`super::arc::Method::all`] documents: a variant added at
+    /// the END cannot be forgotten, one added at the FRONT compiles cleanly
+    /// and is silently absent. The front door is closed by
+    /// `zoo_salvage.rs`'s `every_method_the_reader_decodes_can_be_written_back`,
+    /// which round-trips **every byte `from_byte` accepts** rather than
+    /// iterating this function.
+    pub(super) fn all() -> impl Iterator<Item = Self> {
+        std::iter::successors(Some(Method::Stored), |method| method.next())
+    }
 }
 
 /// One directory entry, parsed out of its fixed record and the variable
 /// part behind it.
-struct DirEntry {
+///
+/// `pub(super)`, as are [`read_dir_entry`], [`Method`], [`decode`],
+/// [`zoo_mtime`] and the layout constants above: Salvage Stage 2 Task 4's
+/// `../zoo_salvage.rs` is a sibling module under `legacy`, not a descendant
+/// of this one, and reuses this container's own record parse and decoders
+/// rather than carrying a second copy of the 56-byte layout. **That reuse is
+/// the point, not a convenience** — the layout is the exact thing
+/// `unarc-rs` got wrong (59 bytes; see this module's doc), so a scanner with
+/// its own copy of it would be one edit away from disagreeing with the
+/// reader beside it and nothing would fail to say so.
+///
+/// The test-only `raw_entries` in this file's own `tests` module stays
+/// INDEPENDENT of both, deliberately: it establishes the borrowed fixtures'
+/// ground truth, and a manifest derived from the parser under test would
+/// agree with it by construction. Reuse flows from reader to scanner, never
+/// into the witness.
+pub(super) struct DirEntry {
     /// Total bytes the fixed record occupies: [`SIZ_DIR`] or [`SIZ_DIRL`].
-    fixed_len: usize,
+    pub(super) fixed_len: usize,
     /// Fixed part plus variable part — what `dir_to_b` writes, and where the
     /// next thing in the file begins.
-    record_len: u64,
+    pub(super) record_len: u64,
     /// `Some((computed, recorded))` when this record's own `dir_crc`
     /// disagrees with its bytes. `None` for a record that checks out AND for
     /// a type-0/1 record, which carries no such field at all.
-    dir_crc_mismatch: Option<(u16, u16)>,
-    method_byte: u8,
-    next: u32,
-    offset: u32,
-    packed_datetime: u32,
-    crc16: u16,
-    org_size: u32,
-    size_now: u32,
-    deleted: bool,
-    name: String,
+    pub(super) dir_crc_mismatch: Option<(u16, u16)>,
+    pub(super) method_byte: u8,
+    pub(super) next: u32,
+    pub(super) offset: u32,
+    pub(super) packed_datetime: u32,
+    pub(super) crc16: u16,
+    pub(super) org_size: u32,
+    pub(super) size_now: u32,
+    pub(super) deleted: bool,
+    pub(super) name: String,
 }
 
 /// Reads one directory entry at `pos`, variable part included.
@@ -558,7 +647,7 @@ struct DirEntry {
 /// if `type == 2` — rather than as one blind fixed-size read, because the
 /// format has two record lengths and reading the longer one over a type-1
 /// entry would consume the first five bytes of whatever follows it.
-fn read_dir_entry(src: &mut ZooSeekAdapter, pos: u64) -> Result<DirEntry> {
+pub(super) fn read_dir_entry(src: &mut dyn SeekRead, pos: u64) -> Result<DirEntry> {
     src.seek(SeekFrom::Start(pos)).map_err(classify_zoo_io)?;
     let mut rec = [0u8; SIZ_DIRL];
     src.read_exact(&mut rec[..SIZ_DIR])
@@ -670,7 +759,7 @@ fn read_dir_entry(src: &mut ZooSeekAdapter, pos: u64) -> Result<DirEntry> {
 /// how an entry with no timestamp at all reports itself. The calendar
 /// arithmetic is [`super::dos`]'s, shared with `arc` and `arj`; only the
 /// unpacking is here.
-fn zoo_mtime(packed: u32) -> Option<SystemTime> {
+pub(super) fn zoo_mtime(packed: u32) -> Option<SystemTime> {
     let date = (packed & 0xFFFF) as u16;
     let time = (packed >> 16) as u16;
     dos::mtime(
@@ -854,7 +943,7 @@ impl ZooRead {
 
             let method = Method::from_byte(header.method_byte, &header.name)?;
             let payload = self.read_payload(&header)?;
-            let decoded = decode(method, &payload, &header)?;
+            let decoded = decode(method, &payload, &header.name, header.org_size)?;
             check_declared_size(&header, decoded.len())?;
             let got = crc16_arc(&decoded);
             if got != header.crc16 {
@@ -967,11 +1056,17 @@ fn check_declared_size(header: &DirEntry, produced: usize) -> Result<()> {
 }
 
 /// Runs one entry's payload through the decoder its method names.
-fn decode(method: Method, payload: &[u8], header: &DirEntry) -> Result<Vec<u8>> {
+///
+/// Takes `name` and `org_size` rather than a whole [`DirEntry`] because
+/// `../zoo_salvage.rs`'s write path has neither in hand as a record — it
+/// reconstructs both from the [`stuffr_core::salvage::SalvagedEntry`] its
+/// own scan produced — and those two fields are all any of the three
+/// decoders ever reads.
+pub(super) fn decode(method: Method, payload: &[u8], name: &str, org_size: u32) -> Result<Vec<u8>> {
     match method {
         Method::Stored => Ok(payload.to_vec()),
-        Method::Lzw => lzw_decode(payload, &header.name),
-        Method::Lh5 => lh5_decode(payload, header),
+        Method::Lzw => lzw_decode(payload, name),
+        Method::Lh5 => lh5_decode(payload, name, org_size),
     }
 }
 
@@ -983,19 +1078,24 @@ fn decode(method: Method, payload: &[u8], header: &DirEntry) -> Result<Vec<u8>> 
 /// LHA header: it is the raw compressed body, which is why the decoder is
 /// constructed directly rather than through `LhaDecodeReader`.
 ///
-/// `org_size` has already been bounded by [`ZooRead::read_payload`] before
-/// this is called, which is what makes the `vec![0; org_size]` below safe.
+/// **`org_size` must already have been bounded against
+/// [`MAX_ZOO_ENTRY_LEN`] by the caller**, which is what makes the
+/// `vec![0; org_size]` below safe — it is a `u32`, so an unbounded one is a
+/// 4 GiB allocation from a header field. Two callers do that now, in two
+/// different ways and for the same reason: [`ZooRead::read_payload`] refuses
+/// over-ceiling with [`Error::ResourceLimit`], and `../zoo_salvage.rs`
+/// answers `Unverified(OverEntryCeiling)` — a per-entry STATUS, because an
+/// `Err` out of a salvage scanner aborts the whole run.
 /// `fill_buffer` fills the WHOLE buffer or errors, so a stream that runs
 /// out early is `UnexpectedEof` — folded to [`Error::Corrupt`], since the
 /// reader here is an in-memory slice and cannot produce a genuine source
 /// failure at all.
-fn lh5_decode(payload: &[u8], header: &DirEntry) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; header.org_size as usize];
+fn lh5_decode(payload: &[u8], name: &str, org_size: u32) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; org_size as usize];
     let mut decoder = Lh5Decoder::new(payload);
     decoder.fill_buffer(&mut out).map_err(|e| {
         Error::Corrupt(format!(
-            "entry `{}` is LH5-compressed and did not decode: {e}",
-            header.name
+            "entry `{name}` is LH5-compressed and did not decode: {e}"
         ))
     })?;
     Ok(out)
@@ -1156,8 +1256,183 @@ fn guard_output(name: &str, len: usize) -> Result<()> {
     refuse_if_over_ceiling(name, len as u64, "decompressed data")
 }
 
+/// The ZOO archive BUILDER, shared by this module's own tests and by
+/// `../zoo_salvage.rs`'s.
+///
+/// Lifted out of `mod tests` in Salvage Stage 2 Task 4 rather than copied:
+/// a second hand-written copy of the 56-byte record layout in the scanner's
+/// test module is exactly how a fixture and its expectation drift apart, and
+/// the 56-versus-59 question this format's whole module doc is about makes
+/// that risk concrete rather than theoretical.
+///
+/// Everything the original doc comment on [`build_zoo`] says still holds and
+/// is repeated there: an archive built here is evidence about BEHAVIOUR,
+/// never about LAYOUT, because the builder and the reader share an author.
+/// Layout is settled by the four borrowed fixtures and by zoo 2.10's own
+/// source.
+#[cfg(test)]
+pub(super) mod test_archives {
+    use super::*;
+
+    /// One entry to assemble into a synthesised archive.
+    #[derive(Clone)]
+    pub(in crate::legacy) struct Spec {
+        pub(in crate::legacy) name: &'static str,
+        pub(in crate::legacy) dir_type: u8,
+        pub(in crate::legacy) method: u8,
+        pub(in crate::legacy) payload: Vec<u8>,
+        /// `None` means "declare exactly what the payload is", which is the
+        /// honest case; `Some` is how a header is made to lie.
+        pub(in crate::legacy) declared_org: Option<u32>,
+        /// `None` means "the real CRC-16 of the payload", so a test of the
+        /// SIZE guard cannot accidentally be passing on the checksum's back.
+        pub(in crate::legacy) crc16: Option<u16>,
+        pub(in crate::legacy) deleted: bool,
+        pub(in crate::legacy) long_name: Option<&'static str>,
+        /// Overrides the `next` link this entry would otherwise get, which
+        /// is how a cyclic chain is built.
+        pub(in crate::legacy) next_override: Option<u32>,
+        /// Replaces the variable part wholesale, for shapes the fields
+        /// above cannot express.
+        pub(in crate::legacy) var_override: Option<Vec<u8>>,
+    }
+
+    impl Spec {
+        pub(in crate::legacy) fn stored(name: &'static str, payload: &[u8]) -> Self {
+            Spec {
+                name,
+                dir_type: 2,
+                method: 0,
+                payload: payload.to_vec(),
+                declared_org: None,
+                crc16: None,
+                deleted: false,
+                long_name: None,
+                next_override: None,
+                var_override: None,
+            }
+        }
+    }
+
+    /// Assembles a complete ZOO archive: a 42-byte header, one record plus
+    /// leader plus payload per spec, and the trailing terminator `zooadd.c`
+    /// writes.
+    ///
+    /// **This builder and the reader above share an author, and that is the
+    /// weakest evidence class in this phase.** Offsets, `next` links and each
+    /// record's `dir_crc` are filled in from the real byte positions — which
+    /// keeps the builder self-consistent, and self-consistency is precisely
+    /// what it cannot vouch for: a field both sides read from the same wrong
+    /// offset would agree here and be wrong on disk. Every archive built
+    /// here is therefore evidence about BEHAVIOUR (a cycle is refused, a
+    /// deleted entry is skipped, a size lie is caught) and never about
+    /// LAYOUT. Layout is settled by the four borrowed fixtures and by zoo
+    /// 2.10's own source, which is why
+    /// `a_directory_entrys_own_crc_confirms_the_fifty_six_byte_record` walks
+    /// the real archives with a parser written out longhand instead.
+    pub(in crate::legacy) fn build_zoo(specs: &[Spec]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut text = [0u8; 20];
+        text[..18].copy_from_slice(b"ZOO 2.10 Archive.\x1a");
+        out.extend_from_slice(&text);
+        out.extend_from_slice(&ZOO_TAG.to_le_bytes());
+        out.extend_from_slice(&42u32.to_le_bytes()); // zoo_start
+        out.extend_from_slice(&42i32.wrapping_neg().to_le_bytes()); // zoo_minus
+        out.extend_from_slice(&[2, 0]); // major/minor
+        out.push(1); // header type
+        out.extend_from_slice(&0u32.to_le_bytes()); // acmt_pos
+        out.extend_from_slice(&0u16.to_le_bytes()); // acmt_len
+        out.push(3); // vdata
+        assert_eq!(out.len(), 42, "SIZ_ZOOH");
+
+        // `(record start, fixed+variable length)` per record, so the
+        // `dir_crc` pass below can cover exactly what `dir_to_b` covers.
+        let mut records: Vec<(usize, usize)> = Vec::new();
+        let mut dir_at: Vec<usize> = Vec::new();
+        for spec in specs {
+            let at = out.len();
+            dir_at.push(at);
+            let fixed = if spec.dir_type == 2 {
+                SIZ_DIRL
+            } else {
+                SIZ_DIR
+            };
+            let mut rec = vec![0u8; fixed];
+            rec[0..4].copy_from_slice(&ZOO_TAG.to_le_bytes());
+            rec[4] = spec.dir_type;
+            rec[5] = spec.method;
+            let crc = spec.crc16.unwrap_or_else(|| crc16_arc(&spec.payload));
+            rec[18..20].copy_from_slice(&crc.to_le_bytes());
+            let org = spec.declared_org.unwrap_or(spec.payload.len() as u32);
+            rec[20..24].copy_from_slice(&org.to_le_bytes());
+            rec[24..28].copy_from_slice(&(spec.payload.len() as u32).to_le_bytes());
+            rec[28] = 1;
+            rec[30] = u8::from(spec.deleted);
+            let n = spec.name.len().min(FNM_SIZ);
+            rec[FNAME_I..FNAME_I + n].copy_from_slice(&spec.name.as_bytes()[..n]);
+
+            let var: Vec<u8> = match (&spec.var_override, spec.long_name) {
+                (Some(v), _) => v.clone(),
+                (None, Some(long)) => {
+                    // `dir_to_b`: namlen, dirlen, lfname, dirname, then the
+                    // eight bytes of system_id/fattr/vflag/version_no. The
+                    // NUL is counted, as `dirlen = 3` for `..` shows.
+                    let mut v = vec![long.len() as u8 + 1, 0];
+                    v.extend_from_slice(long.as_bytes());
+                    v.push(0);
+                    v.extend_from_slice(&[0u8; 8]);
+                    v
+                }
+                (None, None) => Vec::new(),
+            };
+            if fixed == SIZ_DIRL {
+                rec[51..53].copy_from_slice(&(var.len() as u16).to_le_bytes());
+                rec[53] = 127; // NO_TZ
+            }
+            records.push((at, fixed + var.len()));
+            out.extend_from_slice(&rec);
+            out.extend_from_slice(&var);
+            out.extend_from_slice(b"@)#(\0"); // FILE_LEADER + SIZ_FLDR
+            let payload_at = out.len() as u32;
+            out.extend_from_slice(&spec.payload);
+            out[at + 10..at + 14].copy_from_slice(&payload_at.to_le_bytes());
+        }
+
+        let term_at = out.len() as u32;
+        let mut term = vec![0u8; SIZ_DIRL];
+        term[0..4].copy_from_slice(&ZOO_TAG.to_le_bytes());
+        term[4] = 2;
+        term[53] = 127; // NO_TZ, as `newdir` sets it
+        records.push((term_at as usize, SIZ_DIRL));
+        out.extend_from_slice(&term);
+
+        for (i, &at) in dir_at.iter().enumerate() {
+            let next = specs[i]
+                .next_override
+                .unwrap_or_else(|| dir_at.get(i + 1).map(|&n| n as u32).unwrap_or(term_at));
+            out[at + 6..at + 10].copy_from_slice(&next.to_le_bytes());
+        }
+
+        // LAST, because `dir_to_b` computes the record's checksum once every
+        // other field is final — and `next` is only final after the pass
+        // above. A builder that hashed each record as it wrote it would
+        // produce archives that warn about themselves.
+        for (at, len) in records {
+            if out[at + 4] != 2 {
+                continue; // a type-0/1 record carries no `dir_crc` field
+            }
+            out[at + 54] = 0;
+            out[at + 55] = 0;
+            let crc = crc16_arc(&out[at..at + len]);
+            out[at + 54..at + 56].copy_from_slice(&crc.to_le_bytes());
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_archives::{Spec, build_zoo};
     use super::*;
     use std::time::UNIX_EPOCH;
     use stuffr_core::testing::{ContainerFixture, ExpectedEntry, assert_container_conforms_with};
@@ -1322,163 +1597,6 @@ mod tests {
             out.push((name, data));
         }
         Ok(out)
-    }
-
-    // ---- building archives no borrowed fixture provides ----
-
-    /// One entry to assemble into a synthesised archive.
-    #[derive(Clone)]
-    struct Spec {
-        name: &'static str,
-        dir_type: u8,
-        method: u8,
-        payload: Vec<u8>,
-        /// `None` means "declare exactly what the payload is", which is the
-        /// honest case; `Some` is how a header is made to lie.
-        declared_org: Option<u32>,
-        /// `None` means "the real CRC-16 of the payload", so a test of the
-        /// SIZE guard cannot accidentally be passing on the checksum's back.
-        crc16: Option<u16>,
-        deleted: bool,
-        long_name: Option<&'static str>,
-        /// Overrides the `next` link this entry would otherwise get, which
-        /// is how a cyclic chain is built.
-        next_override: Option<u32>,
-        /// Replaces the variable part wholesale, for shapes the fields
-        /// above cannot express.
-        var_override: Option<Vec<u8>>,
-    }
-
-    impl Spec {
-        fn stored(name: &'static str, payload: &[u8]) -> Self {
-            Spec {
-                name,
-                dir_type: 2,
-                method: 0,
-                payload: payload.to_vec(),
-                declared_org: None,
-                crc16: None,
-                deleted: false,
-                long_name: None,
-                next_override: None,
-                var_override: None,
-            }
-        }
-    }
-
-    /// Assembles a complete ZOO archive: a 42-byte header, one record plus
-    /// leader plus payload per spec, and the trailing terminator `zooadd.c`
-    /// writes.
-    ///
-    /// **This builder and the reader above share an author, and that is the
-    /// weakest evidence class in this phase.** Offsets, `next` links and each
-    /// record's `dir_crc` are filled in from the real byte positions — which
-    /// keeps the builder self-consistent, and self-consistency is precisely
-    /// what it cannot vouch for: a field both sides read from the same wrong
-    /// offset would agree here and be wrong on disk. Every archive built
-    /// here is therefore evidence about BEHAVIOUR (a cycle is refused, a
-    /// deleted entry is skipped, a size lie is caught) and never about
-    /// LAYOUT. Layout is settled by the four borrowed fixtures and by zoo
-    /// 2.10's own source, which is why
-    /// `a_directory_entrys_own_crc_confirms_the_fifty_six_byte_record` walks
-    /// the real archives with a parser written out longhand instead.
-    fn build_zoo(specs: &[Spec]) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::new();
-        let mut text = [0u8; 20];
-        text[..18].copy_from_slice(b"ZOO 2.10 Archive.\x1a");
-        out.extend_from_slice(&text);
-        out.extend_from_slice(&ZOO_TAG.to_le_bytes());
-        out.extend_from_slice(&42u32.to_le_bytes()); // zoo_start
-        out.extend_from_slice(&42i32.wrapping_neg().to_le_bytes()); // zoo_minus
-        out.extend_from_slice(&[2, 0]); // major/minor
-        out.push(1); // header type
-        out.extend_from_slice(&0u32.to_le_bytes()); // acmt_pos
-        out.extend_from_slice(&0u16.to_le_bytes()); // acmt_len
-        out.push(3); // vdata
-        assert_eq!(out.len(), 42, "SIZ_ZOOH");
-
-        // `(record start, fixed+variable length)` per record, so the
-        // `dir_crc` pass below can cover exactly what `dir_to_b` covers.
-        let mut records: Vec<(usize, usize)> = Vec::new();
-        let mut dir_at: Vec<usize> = Vec::new();
-        for spec in specs {
-            let at = out.len();
-            dir_at.push(at);
-            let fixed = if spec.dir_type == 2 {
-                SIZ_DIRL
-            } else {
-                SIZ_DIR
-            };
-            let mut rec = vec![0u8; fixed];
-            rec[0..4].copy_from_slice(&ZOO_TAG.to_le_bytes());
-            rec[4] = spec.dir_type;
-            rec[5] = spec.method;
-            let crc = spec.crc16.unwrap_or_else(|| crc16_arc(&spec.payload));
-            rec[18..20].copy_from_slice(&crc.to_le_bytes());
-            let org = spec.declared_org.unwrap_or(spec.payload.len() as u32);
-            rec[20..24].copy_from_slice(&org.to_le_bytes());
-            rec[24..28].copy_from_slice(&(spec.payload.len() as u32).to_le_bytes());
-            rec[28] = 1;
-            rec[30] = u8::from(spec.deleted);
-            let n = spec.name.len().min(FNM_SIZ);
-            rec[FNAME_I..FNAME_I + n].copy_from_slice(&spec.name.as_bytes()[..n]);
-
-            let var: Vec<u8> = match (&spec.var_override, spec.long_name) {
-                (Some(v), _) => v.clone(),
-                (None, Some(long)) => {
-                    // `dir_to_b`: namlen, dirlen, lfname, dirname, then the
-                    // eight bytes of system_id/fattr/vflag/version_no. The
-                    // NUL is counted, as `dirlen = 3` for `..` shows.
-                    let mut v = vec![long.len() as u8 + 1, 0];
-                    v.extend_from_slice(long.as_bytes());
-                    v.push(0);
-                    v.extend_from_slice(&[0u8; 8]);
-                    v
-                }
-                (None, None) => Vec::new(),
-            };
-            if fixed == SIZ_DIRL {
-                rec[51..53].copy_from_slice(&(var.len() as u16).to_le_bytes());
-                rec[53] = 127; // NO_TZ
-            }
-            records.push((at, fixed + var.len()));
-            out.extend_from_slice(&rec);
-            out.extend_from_slice(&var);
-            out.extend_from_slice(b"@)#(\0"); // FILE_LEADER + SIZ_FLDR
-            let payload_at = out.len() as u32;
-            out.extend_from_slice(&spec.payload);
-            out[at + 10..at + 14].copy_from_slice(&payload_at.to_le_bytes());
-        }
-
-        let term_at = out.len() as u32;
-        let mut term = vec![0u8; SIZ_DIRL];
-        term[0..4].copy_from_slice(&ZOO_TAG.to_le_bytes());
-        term[4] = 2;
-        term[53] = 127; // NO_TZ, as `newdir` sets it
-        records.push((term_at as usize, SIZ_DIRL));
-        out.extend_from_slice(&term);
-
-        for (i, &at) in dir_at.iter().enumerate() {
-            let next = specs[i]
-                .next_override
-                .unwrap_or_else(|| dir_at.get(i + 1).map(|&n| n as u32).unwrap_or(term_at));
-            out[at + 6..at + 10].copy_from_slice(&next.to_le_bytes());
-        }
-
-        // LAST, because `dir_to_b` computes the record's checksum once every
-        // other field is final — and `next` is only final after the pass
-        // above. A builder that hashed each record as it wrote it would
-        // produce archives that warn about themselves.
-        for (at, len) in records {
-            if out[at + 4] != 2 {
-                continue; // a type-0/1 record carries no `dir_crc` field
-            }
-            out[at + 54] = 0;
-            out[at + 55] = 0;
-            let crc = crc16_arc(&out[at..at + len]);
-            out[at + 54..at + 56].copy_from_slice(&crc.to_le_bytes());
-        }
-        out
     }
 
     // ---- the fixtures' own ground truth, established with no decoder ----
