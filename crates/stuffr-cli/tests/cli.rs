@@ -9823,13 +9823,21 @@ fn duplicate_first_central_directory_record(healthy: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Damage catalogue row 1/5: a truncated tail. Cutting the archive partway
-/// through its LAST entry's payload (dropping the central directory along
-/// with the missing bytes) must recover the two earlier entries `Intact`
-/// and must NOT invent the last one: criterion 6 of `zip_salvage.rs`'s own
-/// validation gate refuses a candidate whose declared length runs past the
-/// end of the source, so the truncated entry is simply absent from the
-/// scan — never reported as damaged content that was never actually read.
+/// Damage catalogue row 1/5: a truncated tail — the canonical damaged zip,
+/// an interrupted download. Cutting the archive partway through its LAST
+/// entry's payload (dropping the central directory along with the missing
+/// bytes) must recover the two earlier entries `Intact`, must NOT invent
+/// the missing bytes of the third, and must SAY SO.
+///
+/// **This test asserted the opposite until the final whole-branch review**:
+/// that the truncated entry was absent from the scan entirely. That was the
+/// behaviour, and it was a correct refusal (`zip -FF` fabricates the
+/// missing bytes and reports success — see `zip_salvage.rs`'s module doc)
+/// implemented as silence. A three-header archive reported "2 scanned: 2
+/// written" at exit 0, at every one of six truncation points swept across
+/// the last entry, for a file the user reached for `salvage` precisely
+/// because it was truncated. The refusal to invent is unchanged; what the
+/// run says about it is not.
 #[test]
 fn damage_catalogue_truncated_tail() {
     let dir = tmp_dir();
@@ -9853,9 +9861,9 @@ fn damage_catalogue_truncated_tail() {
     let rows = salvage_list_rows(&path);
     assert_eq!(
         rows.len(),
-        2,
-        "the truncated last entry must be ABSENT from the scan entirely, not merely marked \
-         damaged: {rows:?}"
+        3,
+        "all three local headers are there, and the third one being uncompletable is a \
+         fact worth a row: {rows:?}"
     );
     assert!(
         rows[0].contains("alpha.txt") && rows[0].contains("Intact"),
@@ -9865,6 +9873,111 @@ fn damage_catalogue_truncated_tail() {
         rows[1].contains("beta.txt") && rows[1].contains("Intact"),
         "{rows:?}"
     );
+    assert!(
+        rows[2].contains("gamma.bin") && rows[2].contains("Partial (truncated)"),
+        "the truncated entry must be named, and named as truncated rather than as a bad \
+         checksum — the payload ran out, nothing disagreed: {rows:?}"
+    );
+
+    // And the run must not exit 0. Recovering into a directory writes the
+    // genuine prefix under `.partial`, never under the entry's real name.
+    let out_dir = dir.join("recovered");
+    let out = run_output(&[
+        "salvage",
+        path.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "a run that dropped something must not exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut names: Vec<String> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["alpha.txt", "beta.txt", "gamma.bin.partial"],
+        "the surviving prefix lands under `.partial`, never under `gamma.bin`"
+    );
+
+    // Not one invented byte: what is on disk is exactly the prefix that
+    // survived the cut, and strictly shorter than the entry declared.
+    let recovered = std::fs::read(out_dir.join("gamma.bin.partial")).unwrap();
+    let declared = gamma.payload.len();
+    assert!(
+        !recovered.is_empty() && recovered.len() < declared,
+        "{} recovered bytes against a declared {declared}",
+        recovered.len()
+    );
+    assert_eq!(
+        recovered[..],
+        healthy[gamma.payload.start..cut],
+        "every recovered byte must come from the truncated file itself — `zip -FF` fills \
+         the gap from its own buffer and calls the result fixed"
+    );
+}
+
+/// The sweep the whole-branch review ran, as a test: every truncation point
+/// inside the last entry's payload must produce a row and a non-zero exit.
+///
+/// One point would not be enough. The defect this closes was uniform — 100,
+/// 500, 2000, 3000, 4030 and 4043 bytes of the last payload present all
+/// reported "2 scanned" at exit 0 — and a single sample could pass on a
+/// boundary while the interior stayed silent.
+#[test]
+fn every_truncation_point_inside_the_last_entry_is_reported() {
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let healthy = std::fs::read(&archive).unwrap();
+    let real_entries = parse_real_zip_local_entries(&healthy);
+    let gamma = &real_entries[2];
+    let declared = gamma.payload.len();
+
+    // Both ends included: 0 surviving payload bytes (the header alone) and
+    // one byte short of complete.
+    for keep in [0, 1, declared / 4, declared / 2, declared - 1] {
+        let path = dir.join(format!("truncated-{keep}.zip"));
+        std::fs::write(&path, &healthy[..gamma.payload.start + keep]).unwrap();
+
+        let rows = salvage_list_rows(&path);
+        assert_eq!(
+            rows.len(),
+            3,
+            "keep={keep}: the third header is there and must be counted: {rows:?}"
+        );
+        assert!(
+            rows[2].contains("Partial (truncated)"),
+            "keep={keep}: {rows:?}"
+        );
+
+        let out_dir = dir.join(format!("out-{keep}"));
+        let out = run_output(&[
+            "salvage",
+            path.to_str().unwrap(),
+            "-C",
+            out_dir.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "keep={keep}: must not exit 0: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // The complement, so none of the above can pass by reporting everything
+    // as truncated: the UNCUT archive still exits 0 with three clean rows.
+    let whole = dir.join("whole.zip");
+    std::fs::write(&whole, &healthy).unwrap();
+    let out = run_output(&["salvage", whole.to_str().unwrap(), "--list"]);
+    assert_eq!(out.status.code(), Some(0));
+    let rows = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(rows.matches("Partial").count(), 0, "{rows}");
 }
 
 /// Damage catalogue row 2/5: a zeroed central directory. With the index

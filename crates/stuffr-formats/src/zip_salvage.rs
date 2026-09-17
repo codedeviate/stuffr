@@ -48,7 +48,7 @@
 //!    is ever sized or allocated from `declared_len` to reach this check —
 //!    it is pure arithmetic against the source's own length.
 //!
-//! Any failure at 2-6 is not an error: it means this four-byte match was a
+//! Any failure at 2-5 is not an error: it means this four-byte match was a
 //! coincidence, not a header, so the scan simply resumes searching one byte
 //! past it. That is a deliberate departure from `zip.rs`'s central-directory
 //! walk, where a signature match past the EOCD is already trusted enough
@@ -56,6 +56,41 @@
 //! `Error::Corrupt` — this scan has no such anchor at all, so nothing found
 //! here can be corruption; it can only be noise or a real header, and the
 //! gate's whole job is telling the two apart.
+//!
+//! # Criterion 6 reports, it does not reject
+//!
+//! **Criterion 6 is the one that is not a rejection**, and it used to be.
+//! A candidate whose declared payload runs past the end of the source is
+//! reported with [`Candidate::available_len`] naming how many of its bytes
+//! are actually present, and [`verify_candidate`] answers `Partial` for it
+//! without decoding anything.
+//!
+//! It was a rejection until the final whole-branch review measured what
+//! that cost. A truncated archive — an interrupted download, the single
+//! most common damaged zip there is — was the one shape salvage reported
+//! NOTHING about: swept across six truncation points inside a three-header
+//! archive's last entry, every one printed "2 scanned: 2 written" at exit
+//! 0. The third header was intact, about half its payload survived, and the
+//! tool said nothing was wrong. Refusing to INVENT the missing bytes is
+//! correct and is what the "Cross-checked against Info-Zip's `zip -FF`"
+//! section below defends at length; implementing that refusal as SILENCE is
+//! a different thing, and is what changed.
+//!
+//! Nothing about the anti-noise argument above is weakened by this. The
+//! gate's power against a coincidental four-byte match comes from criteria
+//! 2, 3 and 5 (a plausible version, a recognised method, a strictly
+//! UTF-8-decodable name — jointly on the order of one in millions per
+//! magic hit, against one magic hit per 4 GiB of random data); criterion 6
+//! was a structural sanity check, not a filter. `salvage_over_random_bytes_
+//! finds_nothing` still finds nothing, with the same five seeded
+//! coincidences, and still would if criterion 6 were deleted outright.
+//!
+//! What criterion 6 still does is bound. A truncated candidate's
+//! `available_len` — never its declared length — is what
+//! [`stuffr_core::salvage::collect_candidates`] checks against
+//! `policy.max_entry` and what the scan advances by, so a garbage length in
+//! a tail that is not there cannot abort a run at exit 6 and take every
+//! recovered entry with it.
 //!
 //! # General-purpose bit 3 — the data-descriptor case
 //!
@@ -184,10 +219,15 @@
 //! on anything this project controls — points at Info-Zip's tool, not this
 //! one, being the one that is wrong:
 //!
-//! - This module (via [`salvage_zip`]'s raw scan) correctly reports the
-//!   truncated entry as ABSENT: criterion 6 of the validation gate (this
-//!   module's opening section) refuses a candidate whose declared length runs
-//!   past the end of the source, so a truncated last entry is never invented.
+//! - This module (via [`salvage_zip`]'s raw scan) never invents the missing
+//!   bytes. It reports the truncated entry as `Partial`, recovers the
+//!   genuine prefix that survived as `NAME.partial`, and exits 4. **When
+//!   this section was written it reported the entry as ABSENT instead**,
+//!   and said nothing at all at exit 0 — see "Criterion 6 reports, it does
+//!   not reject" above for the measurement that changed that. The
+//!   comparison against `zip -FF` below is unaffected: what is being
+//!   contrasted is fabricating content versus not fabricating it, and
+//!   neither version of this module ever fabricated any.
 //! - `zip -FF`, run against the IDENTICAL bytes (a Stored, `-X` archive whose
 //!   third entry's 48-byte payload was cut to 24 bytes, dropping the central
 //!   directory with it), printed `copying: gamma.bin (48 bytes)` — the
@@ -402,17 +442,39 @@ fn read_candidate_at(
         )
     };
 
-    if let Some(len) = declared_len {
-        let fits = offset
-            .checked_add(LOCAL_HEADER_TOTAL)
-            .and_then(|v| v.checked_add(u64::from(name_len)))
-            .and_then(|v| v.checked_add(u64::from(extra_len)))
-            .and_then(|start| start.checked_add(len))
-            .is_some_and(|end| end <= file_len);
-        if !fits {
-            return Ok(None);
+    // Criterion 6: does the declared payload fit inside the source? A
+    // candidate that does NOT fit is no longer rejected — it is reported
+    // with `available_len` naming how many of its bytes are actually there.
+    // See the module doc's "Criterion 6" section for the measurement that
+    // changed this, and `Candidate::available_len`'s own doc for why the
+    // declared figure is left untouched rather than reduced to what fits.
+    //
+    // The payload's START still has to be inside the file, and that is not
+    // checked here because it is already unfalsifiable at this point: the
+    // name `read_exact` and the `extra_len` skip above both fail on a short
+    // read, so reaching this line means the cursor sits at `payload_start`
+    // with `payload_start <= file_len`.
+    let available_len = match declared_len {
+        None => None,
+        Some(len) => {
+            let payload_start = offset
+                .checked_add(LOCAL_HEADER_TOTAL)
+                .and_then(|v| v.checked_add(u64::from(name_len)))
+                .and_then(|v| v.checked_add(u64::from(extra_len)));
+            match payload_start {
+                // The header's own arithmetic overflowed u64 — nothing
+                // about this is a real record, so it stays a rejection.
+                None => return Ok(None),
+                Some(start) => match start.checked_add(len) {
+                    Some(end) if end <= file_len => None,
+                    // Either the declared end overflows, or it runs past
+                    // the source. Both mean the same thing to a reader:
+                    // fewer bytes are present than the header promises.
+                    _ => Some(file_len.saturating_sub(start)),
+                },
+            }
         }
-    }
+    };
 
     // A zip directory entry is a zero-length entry whose name ends in `/`
     // (`zip.rs`'s `entry_meta` documents the same convention) — the one kind
@@ -434,6 +496,7 @@ fn read_candidate_at(
         meta,
         declared_len,
         verifier,
+        available_len,
     }))
 }
 
@@ -537,6 +600,25 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         // method is unverified, just a different cause of it.
         return Ok(SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength));
     };
+
+    // The payload is PROVABLY incomplete — the source ends before the
+    // header's declared length does — so nothing needs decoding to know the
+    // answer. `Partial` is exactly "the payload ran out", its own first
+    // clause, and it is decided here rather than left to fall out of a
+    // short read below so the verdict does not depend on a decoder's
+    // behaviour at end-of-input.
+    //
+    // This arm sits ABOVE the method dispatch on purpose: a truncated
+    // payload under a method this build cannot decode is still truncated,
+    // and `Partial` (proven missing) is a stronger and more useful claim
+    // than `Unverified` (nothing was attempted). The bytes that ARE present
+    // are still a genuine prefix, and `entries.rs`'s write path recovers
+    // them as `NAME.partial` — never inventing the rest, which is what
+    // `zip -FF` does and what this module's own doc refuses at length.
+    if candidate.available_len.is_some() {
+        return Ok(SalvageStatus::Partial);
+    }
+
     let Some(Verifier::Crc32(expected)) = candidate.verifier else {
         // Zip only ever reports `Crc32` (see `read_candidate_at`); anything
         // else reaching here is unreachable in practice, and `Complete` is
@@ -779,6 +861,9 @@ fn candidate_from_cd_record(
         )));
     }
 
+    let Ok(file_len) = src.seek(SeekFrom::End(0)) else {
+        return Ok(None);
+    };
     if src
         .seek(SeekFrom::Start(record.local_header_offset))
         .is_err()
@@ -792,6 +877,29 @@ fn candidate_from_cd_record(
     if fixed[0..4] != SIG_LOCAL_HEADER {
         return Ok(None);
     }
+    // The central directory's declared length can run past the end of the
+    // file too — a truncated archive whose index nonetheless survived
+    // (a zip written with its central directory first, or one truncated
+    // between the payload and an appended index). Same treatment as the raw
+    // scan's own criterion 6: report the shortfall, never fold it into the
+    // declared figure. `name_len`/`extra_len` come from the LOCAL header,
+    // which is where the payload actually begins — a central-directory
+    // record's own extra field is a different field of a different length.
+    let name_len = u64::from(u16::from_le_bytes([fixed[26], fixed[27]]));
+    let extra_len = u64::from(u16::from_le_bytes([fixed[28], fixed[29]]));
+    let payload_start = record
+        .local_header_offset
+        .checked_add(LOCAL_HEADER_TOTAL)
+        .and_then(|v| v.checked_add(name_len))
+        .and_then(|v| v.checked_add(extra_len));
+    let available_len = match payload_start {
+        None => return Ok(None),
+        Some(start) if start > file_len => return Ok(None),
+        Some(start) => match start.checked_add(record.compressed_size) {
+            Some(end) if end <= file_len => None,
+            _ => Some(file_len.saturating_sub(start)),
+        },
+    };
 
     let kind = if record.name.ends_with('/') {
         EntryKind::Dir
@@ -812,6 +920,7 @@ fn candidate_from_cd_record(
         meta,
         declared_len: Some(record.compressed_size),
         verifier: Some(Verifier::Crc32(record.crc32)),
+        available_len,
     }))
 }
 
@@ -1085,8 +1194,15 @@ mod tests {
         );
     }
 
+    /// Criterion 6 REPORTS rather than rejects — see this module's
+    /// "Criterion 6 reports, it does not reject" section. This test
+    /// asserted `is_none()` until the final whole-branch review: a header
+    /// promising payload the file cannot deliver was dropped, so a
+    /// truncated archive's last entry vanished with no row and exit 0.
+    /// The declared figure is left exactly as the header stated it and the
+    /// shortfall is reported separately, so both numbers stay visible.
     #[test]
-    fn a_declared_length_running_past_the_file_is_rejected() {
+    fn a_declared_length_running_past_the_file_is_reported_not_dropped() {
         let mut bytes = minimal_local_header(20, 0, "hello.txt", b"hi");
         // Declare a compressed size far larger than what actually follows,
         // without changing the bytes present — the header now promises
@@ -1094,11 +1210,48 @@ mod tests {
         let absurd = 1_000_000u32.to_le_bytes();
         bytes[18..22].copy_from_slice(&absurd);
         let mut scan = ZipSalvage::new();
-        assert!(
-            scan.next_candidate(&mut Cursor::new(bytes), 0)
-                .unwrap()
-                .is_none()
+        let candidate = scan
+            .next_candidate(&mut Cursor::new(bytes), 0)
+            .unwrap()
+            .expect("a header found but not completable is still a header");
+        assert_eq!(
+            candidate.declared_len,
+            Some(1_000_000),
+            "the declared figure is reported as the header stated it, never reduced to \
+             what fits — a truncated entry must not become indistinguishable from a whole \
+             one of the smaller size"
         );
+        assert_eq!(
+            candidate.available_len,
+            Some(2),
+            "and the two bytes that ARE there are named separately"
+        );
+    }
+
+    /// The complement: an untruncated header reports no shortfall at all.
+    /// Without this, an `available_len` that was always `Some` would pass
+    /// the test above and mark every healthy entry as truncated.
+    #[test]
+    fn a_declared_length_that_fits_reports_no_shortfall() {
+        let bytes = minimal_local_header(20, 0, "hello.txt", b"hi");
+        let mut scan = ZipSalvage::new();
+        let candidate = scan
+            .next_candidate(&mut Cursor::new(bytes), 0)
+            .unwrap()
+            .expect("an ordinary header");
+        assert_eq!(candidate.declared_len, Some(2));
+        assert_eq!(candidate.available_len, None);
+    }
+
+    /// A truncated candidate is `Partial`, decided without decoding —
+    /// "the payload ran out", `SalvageStatus::Partial`'s own first clause.
+    #[test]
+    fn a_truncated_candidate_verifies_as_partial() {
+        let mut bytes = minimal_local_header(20, 0, "hello.txt", b"hi");
+        bytes[18..22].copy_from_slice(&1_000_000u32.to_le_bytes());
+        let out = salvage(&bytes);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(out.entries[0].status, SalvageStatus::Partial);
     }
 
     /// General-purpose bit 3 set: the header's own crc32/sizes are

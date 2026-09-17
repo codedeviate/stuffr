@@ -103,6 +103,31 @@ pub struct Candidate {
     /// `None` is what produces the intact/complete split honestly, rather
     /// than by a per-format convention someone has to remember.
     pub verifier: Option<Verifier>,
+    /// How many of `declared_len`'s bytes the SOURCE actually holds, when
+    /// it holds fewer — the truncated-tail case. `None` means the declared
+    /// payload is entirely present (the ordinary case) or nothing was
+    /// declared at all; `Some(n)` always means `n < declared_len`.
+    ///
+    /// # Why a scanner reports this instead of dropping the candidate
+    ///
+    /// A truncated archive — an interrupted download — is the single most
+    /// common damaged zip there is, and it was the one shape salvage said
+    /// nothing at all about. `zip_salvage.rs`'s validation gate refused any
+    /// candidate whose declared payload ran past the end of the file, which
+    /// is a correct refusal to INVENT the missing bytes (`zip -FF`
+    /// fabricates them and reports success) implemented as SILENCE: no row,
+    /// no note, no non-zero exit. Swept across six truncation points inside
+    /// a three-header archive's last entry, every one reported "2 scanned"
+    /// at exit 0 — the third header was not even counted.
+    ///
+    /// Reporting the candidate with this field set is what turns the
+    /// refusal into a statement. Nothing is invented: the declared length
+    /// stays exactly what the header said, so a reader can see both figures,
+    /// and the bytes that ARE present are still a genuine prefix. What a
+    /// scanner must NOT do is fold the shortfall into `declared_len` — that
+    /// would make a truncated entry indistinguishable from a whole one of
+    /// the smaller size, which is the same mistake in a different place.
+    pub available_len: Option<u64>,
 }
 
 /// Why an entry is [`SalvageStatus::Unverified`].
@@ -315,7 +340,18 @@ pub fn collect_candidates(
     let mut from = 0u64;
 
     while let Some(candidate) = scan.next_candidate(src, from)? {
-        if let Some(len) = candidate.declared_len
+        // The ceiling is checked against what could actually be READ, not
+        // against what the header DECLARED, and the two differ only for a
+        // truncated candidate ([`Candidate::available_len`]). That is not a
+        // loosening: this ceiling exists to refuse before anything is sized
+        // from an attacker-controlled figure, and for a truncated candidate
+        // nothing can ever be sized past the bytes that exist — the source
+        // ends first. Checking the declared figure instead would abort the
+        // WHOLE run (exit 6) over a garbage length in a tail the scan has
+        // already established is not there, which is exactly the archive a
+        // caller reached for salvage to rescue.
+        let bounded_len = candidate.available_len.or(candidate.declared_len);
+        if let Some(len) = bounded_len
             && len > policy.max_entry
         {
             return Err(Error::ResourceLimit(format!(
@@ -327,8 +363,12 @@ pub fn collect_candidates(
 
         // Advance strictly past this candidate so the scan always makes
         // progress, regardless of what the scanner reported `from` as or
-        // whether it declared a length at all.
-        let advance = candidate.declared_len.unwrap_or(1).max(1);
+        // whether it declared a length at all. A truncated candidate
+        // advances past the bytes that EXIST, not past the ones it claimed:
+        // advancing by the declared figure would skip the rest of the file
+        // (there is none) either way, but the available one keeps the loop's
+        // arithmetic honest about where it actually is.
+        let advance = bounded_len.unwrap_or(1).max(1);
         from = candidate.offset.saturating_add(advance);
 
         candidates.push(candidate);
@@ -502,6 +542,35 @@ mod tests {
                 meta: EntryMeta::file("absurd"),
                 declared_len: Some(self.0),
                 verifier: None,
+                available_len: None,
+            }))
+        }
+    }
+
+    /// A scanner reporting one candidate whose header DECLARES `declared`
+    /// bytes while the source holds only `available` of them — the
+    /// truncated-tail shape, the one a real scanner reports by setting
+    /// [`Candidate::available_len`].
+    struct DeclaresMoreThanIsThere {
+        declared: u64,
+        available: u64,
+    }
+
+    impl SalvageScan for DeclaresMoreThanIsThere {
+        fn next_candidate(
+            &mut self,
+            _src: &mut dyn SeekRead,
+            from: u64,
+        ) -> Result<Option<Candidate>> {
+            if from > 0 {
+                return Ok(None);
+            }
+            Ok(Some(Candidate {
+                offset: 0,
+                meta: EntryMeta::file("cut-short"),
+                declared_len: Some(self.declared),
+                verifier: Some(Verifier::Crc32(1)),
+                available_len: Some(self.available),
             }))
         }
     }
@@ -554,6 +623,71 @@ mod tests {
         assert_eq!(entry.collides_with, None);
     }
 
+    /// A truncated candidate is COLLECTED, not dropped — the whole point of
+    /// [`Candidate::available_len`]. Before it existed, `zip_salvage.rs`
+    /// refused such a candidate outright and a truncated archive's last
+    /// entry vanished with no row, no note and exit 0.
+    #[test]
+    fn a_candidate_whose_payload_ran_out_is_still_collected() {
+        let mut scan = DeclaresMoreThanIsThere {
+            declared: 4000,
+            available: 1950,
+        };
+        let out = salvage_all(
+            &mut scan,
+            &mut panicking_reader(4096),
+            &SalvagePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.entries.len(),
+            1,
+            "a header found but not completable is a fact worth reporting"
+        );
+    }
+
+    /// The ceiling is checked against what could be READ, not against what
+    /// a truncated header CLAIMED. Otherwise a garbage length in a tail the
+    /// scan has already established is not there would abort the entire run
+    /// at exit 6 — losing every earlier entry over an absent one, in the
+    /// verb that exists to rescue exactly that archive.
+    #[test]
+    fn a_truncated_candidate_is_bounded_by_what_is_there_not_by_what_it_claimed() {
+        let mut scan = DeclaresMoreThanIsThere {
+            declared: u64::MAX,
+            available: 2048,
+        };
+        let out = salvage_all(
+            &mut scan,
+            &mut panicking_reader(4096),
+            &SalvagePolicy::default(),
+        )
+        .expect("an absent tail must not abort a run that recovered real entries");
+        assert_eq!(out.entries.len(), 1);
+    }
+
+    /// The complement, so the rule above cannot be read as "truncated
+    /// candidates are never bounded": what IS there is still bounded, and a
+    /// truncated candidate holding more available bytes than the ceiling
+    /// allows is refused exactly as an untruncated one would be.
+    #[test]
+    fn a_truncated_candidate_whose_available_bytes_exceed_the_ceiling_is_refused() {
+        let mut scan = DeclaresMoreThanIsThere {
+            declared: u64::MAX,
+            available: 4096,
+        };
+        let err = salvage_all(
+            &mut scan,
+            &mut panicking_reader(4096),
+            &SalvagePolicy {
+                max_entry: 1024,
+                ..SalvagePolicy::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 6);
+    }
+
     #[test]
     fn the_default_policy_is_recovery_biased() {
         let policy = SalvagePolicy::default();
@@ -597,6 +731,7 @@ mod tests {
                 meta: EntryMeta::file(name),
                 declared_len,
                 verifier,
+                available_len: None,
             }))
         }
 
