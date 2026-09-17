@@ -53,7 +53,7 @@ zoo = ["stuffr/zoo"]
 # way to build the `stuffr` binary without `legacy` any more — see the dead
 # projection this made in `crates/stuffr-cli/tests/cli.rs`.
 [dependencies]
-stuffr = { path = "../stuffr", version = "0.4.2", features = ["serde"] }
+stuffr = { path = "../stuffr", version = "0.5.0", features = ["serde"] }
 clap = { workspace = true }
 serde_json = "1"
 
