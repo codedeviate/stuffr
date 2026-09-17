@@ -273,6 +273,8 @@ use stuffr_core::salvage::{
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
+use crate::salvage_verify::stream_verify;
+
 /// Local file header. What every zip entry starts with (`zip.rs`'s private
 /// `SIG_LOCAL_HEADER`, duplicated here rather than exported: it is a magic
 /// number, not an API either module should have to expose to the other).
@@ -563,15 +565,6 @@ fn skip_forward(src: &mut dyn SeekRead, n: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Bytes read per verification chunk. Fixed and small so a candidate's
-/// declared length — up to `policy.max_entry`, 4 GiB by default — never
-/// determines how much memory verification uses: both decode branches below
-/// stream through a window this size and discard it once hashed, never
-/// materialising a whole compressed or decompressed copy of the payload.
-/// See the module doc's "Verification" section for the allocation defect
-/// this closes.
-const VERIFY_CHUNK: usize = 64 * 1024;
-
 /// Decides [`SalvageStatus`] for one candidate by re-reading the local
 /// header at its own `offset` — see this module's doc comment for why that
 /// works identically for a scan-found or a central-directory-recovered
@@ -657,7 +650,7 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
     Ok(match method {
         // Stored: the payload IS the uncompressed bytes — stream it
         // straight through the hash, no decoder involved.
-        0 => stream_verify(bounded, declared_len, expected),
+        0 => stream_verify(bounded, declared_len, &Verifier::Crc32(expected)),
         // Deflate: `flate2::read::DeflateDecoder`, the same backend
         // `deflate.rs` already depends on for this exact format — see the
         // module doc's "Verification" section for why streaming this way is
@@ -666,7 +659,7 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         8 => stream_verify(
             flate2::read::DeflateDecoder::new(bounded),
             uncompressed_size,
-            expected,
+            &Verifier::Crc32(expected),
         ),
         // A method this verifier does not decode — see the module doc. The
         // declared bytes are confirmed present above; the format DOES carry
@@ -674,101 +667,6 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         // exactly what `Unverified` (as opposed to `Complete`) says.
         _ => SalvageStatus::Unverified(UnverifiedCause::UndecodableMethod),
     })
-}
-
-/// Streams `reader` to completion, hashing as it goes and never
-/// materialising a buffer: `expected_len` is the exact byte count `reader`
-/// must produce (the raw payload length for Stored, the header's own
-/// `uncompressed_size` for Deflate — [`verify_candidate`] passes the right
-/// one for its method). Exceeding it stops immediately rather than reading
-/// further — the bound that closes an unbounded decompression bomb, since
-/// nothing else on the OUTPUT side would otherwise stop a small compressed
-/// input expanding far past what its own header claims.
-fn stream_verify(mut reader: impl Read, expected_len: u64, expected_crc: u32) -> SalvageStatus {
-    let mut crc_state: u32 = 0xFFFF_FFFF;
-    let mut produced: u64 = 0;
-    let mut buf = [0u8; VERIFY_CHUNK];
-
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            // A short/failing read partway through — "the payload ran out,
-            // or the decoder failed mid-stream", `SalvageStatus::Partial`'s
-            // own words. Covers a malformed deflate stream, a source that
-            // ran out before `declared_len`, and a genuine I/O error alike
-            // (see `verify_candidate`'s doc for why the last of those is
-            // deliberate).
-            Err(_) => return SalvageStatus::Partial,
-        };
-        produced += n as u64;
-        if produced > expected_len {
-            // Produced more than the header's own declared size — refuse to
-            // keep decoding rather than trusting the decoder to stop on its
-            // own; this is the bound against a small input that legitimately
-            // (or maliciously) expands far past its own declared size.
-            return SalvageStatus::Partial;
-        }
-        crc_state = crc32_ieee_update(crc_state, &buf[..n]);
-    }
-
-    if produced != expected_len {
-        // Fewer bytes than declared were actually produced — the payload
-        // ran out before the header said it would.
-        return SalvageStatus::Partial;
-    }
-
-    if !crc_state == expected_crc {
-        SalvageStatus::Intact
-    } else {
-        // Every declared byte decoded, but the result does not match the
-        // checksum the original writer computed — not proven whole, so
-        // `Partial`, never `Complete` (which would claim nothing had been
-        // checked at all) and never `Intact`.
-        SalvageStatus::Partial
-    }
-}
-
-/// CRC-32/ISO-HDLC (reflected polynomial 0xEDB88320, init and xorout
-/// 0xFFFFFFFF) — the checksum a zip local/central header's `crc32` field
-/// carries, over the entry's UNCOMPRESSED bytes.
-///
-/// Written here rather than taken from `crc32fast` (already in this
-/// workspace's dependency tree via `zip`/`flate2`, but not a direct
-/// dependency of this crate): `legacy/arj.rs`'s `crc32_ieee` makes the
-/// identical argument for the identical algorithm — pulling in a crate for
-/// one 12-line routine adds a dependency for no capability. Pinned to the
-/// algorithm's published check value below, so a transcription error in the
-/// polynomial cannot hide behind this project's own expectations. Not reused
-/// from `legacy/arj.rs` directly: that module is feature-gated behind
-/// `arj`/`arc`/`zoo`/`lha`, none of which `zip` implies, so a `zip`-only
-/// build must not depend on it.
-///
-/// `#[cfg(test)]`: production verification calls the incremental
-/// [`crc32_ieee_update`] directly (see [`stream_verify`]) and never needs a
-/// whole-buffer convenience wrapper; this exists to pin the algorithm
-/// against its published check value in one place, no different from
-/// `legacy/arj.rs`'s own copy.
-#[cfg(test)]
-fn crc32_ieee(data: &[u8]) -> u32 {
-    !crc32_ieee_update(0xFFFF_FFFF, data)
-}
-
-/// The same CRC, resumed from a running (not-yet-finalized) state — the
-/// state `stream_verify` threads across chunks so hashing a payload never
-/// needs it whole in memory at once. `crc32_ieee(data)` is exactly
-/// `!crc32_ieee_update(0xFFFF_FFFF, data)`; the two are proven identical
-/// across a chunked split by `resuming_a_crc_matches_hashing_it_whole`.
-fn crc32_ieee_update(crc: u32, data: &[u8]) -> u32 {
-    let mut crc = crc;
-    for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    crc
 }
 
 /// A `Sized` `Read + Seek` wrapper around a `&mut dyn SeekRead`, needed
@@ -1833,33 +1731,6 @@ mod tests {
         );
     }
 
-    /// Pinned to the algorithm's published check value (CRC RevEng
-    /// catalogue: `CRC-32/ISO-HDLC`, ASCII `"123456789"` -> `0xCBF43926`) —
-    /// an external constant, so a transcription error in the polynomial
-    /// cannot hide behind this module's own expectations. The identical
-    /// value `legacy/arj.rs`'s own `crc32_ieee_matches_the_standard_check_value`
-    /// pins, for the identical algorithm under a separate implementation
-    /// (see this module's doc comment for why it is not shared code).
-    #[test]
-    fn crc32_ieee_matches_the_standard_check_value() {
-        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
-    }
-
-    /// The incremental form must be indistinguishable from hashing the whole
-    /// run at once — `stream_verify` depends on this to hash a payload
-    /// chunk-by-chunk without ever holding it whole. Same reasoning
-    /// `legacy/crc.rs`'s own `resuming_a_crc_matches_hashing_the_whole_run`
-    /// gives for CRC-16/ARC, checked here for CRC-32/ISO-HDLC.
-    #[test]
-    fn resuming_a_crc_matches_hashing_it_whole() {
-        let data = b"123456789";
-        for split in 0..=data.len() {
-            let (a, b) = data.split_at(split);
-            let resumed = !crc32_ieee_update(crc32_ieee_update(0xFFFF_FFFF, a), b);
-            assert_eq!(resumed, crc32_ieee(data), "split at {split}");
-        }
-    }
-
     /// REQUIRED 3 (fix round 1): the CRC check that decides `Intact` was
     /// unpinned — `an_entry_whose_crc_agrees_is_intact` stayed green with
     /// the comparison replaced by `true`, and separately with the deflate
@@ -1896,8 +1767,9 @@ mod tests {
     // unmodified suite passes) now fails, where the pre-fix suite stayed
     // green at 20 passed under the identical edit. Not run automatically —
     // recorded in the task report with the quoted failing output; this
-    // comment is the pointer to where in the file that edit lands
-    // (`stream_verify`'s `if !crc_state == expected_crc`).
+    // comment is the pointer to where in the file that edit lands, now
+    // `salvage_verify.rs`'s `stream_verify` (`Verifier::Crc32(expected) =>
+    // !crc32_state == expected`), moved there by Salvage Stage 2 Task 1.
 
     /// A recognised-but-undecodable method (14 here — LZMA, which
     /// `is_known_method` accepts but this build's zip decoder path does not)

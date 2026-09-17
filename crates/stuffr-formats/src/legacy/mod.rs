@@ -28,8 +28,15 @@ pub mod arj;
 mod bits;
 #[cfg(feature = "compress")]
 pub mod compress_z;
-#[cfg(any(feature = "lha", feature = "arc", feature = "zoo"))]
-mod crc;
+// `zip` joined this gate in Salvage Stage 2 Task 1: `../salvage_verify.rs`'s
+// shared verifier resumes `crc16_arc_continued` from its `Verifier::Crc16`
+// arm regardless of which OTHER legacy format is enabled, since that match
+// is on a runtime value, not a feature — so this module must be reachable
+// whenever `zip` alone is, not only alongside `lha`/`arc`/`zoo`.
+// `pub(crate)`, not private: `../salvage_verify.rs` — a sibling of `legacy`,
+// not a descendant of it — is the second caller this task adds.
+#[cfg(any(feature = "lha", feature = "arc", feature = "zoo", feature = "zip"))]
+pub(crate) mod crc;
 // The DOS packed-timestamp helper every date-carrying legacy container uses.
 // `lha` joined this list in Phase 3c Task 6: its encoder is the first
 // thing here that has to WRITE a DOS timestamp rather than only parse one.

@@ -14,6 +14,15 @@
 //! builder. LHA's `-lh5-` ENCODER is that production caller: an LHA header
 //! records the CRC-16/ARC of the entry's UNCOMPRESSED bytes, and nothing in
 //! `delharc` computes one, because `delharc` cannot write.
+// Dead in a build enabling `zip` but none of `lha`/`arc`/`zoo`: Salvage
+// Stage 2 Task 1 widened this module's own `#[cfg]` gate (see `mod.rs`) so
+// `salvage_verify.rs` can reach `crc16_arc_continued` below, but that
+// module's tests are the only caller of the whole-buffer form in such a
+// build, and a non-test `cargo check`/`build` does not compile test code.
+// Every OTHER build this crate supports keeps a production caller (lha's
+// `-lh5-` encoder, or a test fixture), so this is scoped to the one gap the
+// widened gate opened rather than a general suppression.
+#[allow(dead_code)]
 pub(crate) fn crc16_arc(data: &[u8]) -> u16 {
     crc16_arc_continued(0, data)
 }

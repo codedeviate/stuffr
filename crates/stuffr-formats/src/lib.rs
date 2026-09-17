@@ -26,12 +26,20 @@ pub mod cpio;
 pub mod deflate;
 #[cfg(feature = "gzip")]
 pub mod gzip;
+// `zip` joined this gate in Salvage Stage 2 Task 1: `salvage_verify.rs`
+// (below) reaches `legacy::crc::crc16_arc_continued` from its `Verifier::
+// Crc16` arm unconditionally — the match is on a runtime value, not a
+// feature — so `legacy::crc` must compile whenever `salvage_verify` does,
+// even in a `zip`-only build with no other legacy format enabled. Verified:
+// `cargo check -p stuffr-formats --no-default-features --features zip`
+// compiled cleanly before this task and must keep doing so after it.
 #[cfg(any(
     feature = "lha",
     feature = "arj",
     feature = "compress",
     feature = "arc",
-    feature = "zoo"
+    feature = "zoo",
+    feature = "zip"
 ))]
 pub mod legacy;
 #[cfg(feature = "lz4")]
@@ -54,6 +62,12 @@ pub mod xz_pure;
 pub mod zip;
 #[cfg(feature = "zip")]
 pub mod zip_salvage;
+// The format-agnostic streaming verifier `zip_salvage.rs` now delegates to.
+// Gated on `zip` alone in this task, since zip is its only consumer so far —
+// Salvage Stage 2's later tasks (lha, arc, zoo) widen this the same way each
+// migrates onto it.
+#[cfg(feature = "zip")]
+mod salvage_verify;
 #[cfg(feature = "zlib")]
 pub mod zlib;
 #[cfg(feature = "zstd-c")]
