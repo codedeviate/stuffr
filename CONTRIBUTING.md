@@ -408,7 +408,7 @@ libFuzzer through `cargo fuzz`:
 | `container.rs` | One container's reader, both ladder rungs — the selector's high bit picks seekable vs. `ForwardOnly` so both walk paths get fuzzed, not just the seekable one. Also runs an independent EOCD re-parse and a second forward-only walk as cross-checks (see the module doc for why each is not redundant with the honesty oracle below). |
 | `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the five. |
 | `roundtrip.rs` | The WRITE side, added in Phase 3c Task 8 — the only target that runs an encoder at all. The input is the archive's CONTENT, not its bytes: a selector picks a writable slot (its high bit selects `CODEC_SLOTS` over `CONTAINER_SLOTS`; there is no ladder rung to choose when writing), the payload is written through it and read straight back, and the two must agree byte-for-byte. |
-| `salvage.rs` | Added in Salvage Stage 1 Task 8 — the one target that treats arbitrary bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader. Spools its input to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does, with no destination (`dest: None`), so it exercises parsing and verification honesty rather than the filesystem write path — already covered via `chain.rs`'s `entries::list`. Seeded from six hand-built zips (`SALVAGE_SHAPES` in `crates/stuffr/tests/fuzz_corpus.rs`): a healthy archive, two duplicate-name shapes (differing and byte-identical), a zeroed central directory, a truncated tail and a flipped payload byte. It ran **unseeded** until the Salvage Stage 1 final fix wave, and that was not a budget problem — see "Corpus and running locally" below for the measurement. |
+| `salvage.rs` | Added in Salvage Stage 1 Task 8, pinned to `zip` until Salvage Stage 2 Task 3b — a selector byte now picks the format from [`SALVAGE_SLOTS`](#the-slot-tables-are-append-only) (`zip`, `arc` as of this writing), the same leading-byte shape `codec.rs` uses, so every format with a real scanner is fuzzed rather than only the first one. The one target that treats the REST of its bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader. Spools that payload to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does, with no destination (`dest: None`), so it exercises parsing and verification honesty rather than the filesystem write path — already covered via `chain.rs`'s `entries::list`. Seeded from six hand-built zips (`SALVAGE_SHAPES` in `crates/stuffr/tests/fuzz_corpus.rs`, each now carrying `SALVAGE_SLOTS`'s own `zip` index): a healthy archive, two duplicate-name shapes (differing and byte-identical), a zeroed central directory, a truncated tail and a flipped payload byte. `arc` has no seed of its own yet — see that constant's own doc. It ran **unseeded** until the Salvage Stage 1 final fix wave, and that was not a budget problem — see "Corpus and running locally" below for the measurement. |
 
 Every decode path in all five is bounded (`DecodeOpts::memory_limit`,
 a capped output read) for the same reason the codec's own conformance
@@ -471,14 +471,18 @@ by-design refusal. It is now exit 3.
 
 ### The slot tables are append-only
 
-`CODEC_SLOTS` and `CONTAINER_SLOTS` (`stuffr-core`'s `testing` module) map a
-fuzz input's selector byte to a format name. **Append only — never reorder,
-never remove; retire a slot by leaving it in place.** The ordering is the
-wire format of every corpus seed on disk: a seed minimised against `bzip2`
+`CODEC_SLOTS`, `CONTAINER_SLOTS` and, since Salvage Stage 2 Task 3b,
+`SALVAGE_SLOTS` (`stuffr-core`'s `testing` module) map a fuzz input's
+selector byte to a format name. **Append only — never reorder, never
+remove; retire a slot by leaving it in place.** The ordering is the wire
+format of every corpus seed on disk: a seed minimised against `bzip2`
 is a seed whose selector byte, modulo the table's length, happens to land on
 `bzip2`'s current index. Reorder the table and that same seed silently
 starts feeding a different codec — nothing fails to tell you, and a corpus
 built to cover twelve codecs quietly stops covering one of them.
+`SALVAGE_SLOTS` lists only formats `entries::salvage_scan` actually
+dispatches to a real scanner (`zip`, `arc`), never a format merely
+registered as an ordinary container — see that constant's own doc.
 
 ### Corpus and running locally
 

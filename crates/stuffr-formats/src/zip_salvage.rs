@@ -88,9 +88,20 @@
 //! What criterion 6 still does is bound. A truncated candidate's
 //! `available_len` — never its declared length — is what
 //! [`stuffr_core::salvage::collect_candidates`] checks against
-//! `policy.max_entry` and what the scan advances by, so a garbage length in
-//! a tail that is not there cannot abort a run at exit 6 and take every
-//! recovered entry with it.
+//! `policy.max_entry`, so a garbage length in a tail that is not there
+//! cannot abort a run at exit 6 and take every recovered entry with it.
+//! **It is no longer what the scan advances by.** Task 3's fix round found
+//! that advancing by `available_len` let one coincidental phantom header —
+//! a marker+name match sitting on top of noise, with a garbage declared
+//! length far past the file — jump the scan straight to EOF in a single
+//! step and silently drop every real entry between it and the end of the
+//! file: no error, no `Partial`, no note, in the one verb whose entire job
+//! is not losing entries silently. `collect_candidates` now advances a
+//! truncated candidate past only its own marker byte, so the very next byte
+//! is still examined for another header; an untruncated candidate (whose
+//! declared length was just checked against the file, so it is not a lie)
+//! still advances by that declared length, unchanged. See
+//! `collect_candidates`'s own doc comment for the full reasoning.
 //!
 //! # General-purpose bit 3 — the data-descriptor case
 //!

@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use stuffr::entries::{self, SalvageOpts};
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
-use stuffr_core::testing::{check_error_is_classified, check_salvage_claim};
+use stuffr_core::testing::{SALVAGE_SLOTS, check_error_is_classified, check_salvage_claim};
+use stuffr_formats::legacy::arc_salvage;
 use stuffr_formats::zip_salvage;
 
 /// Local file header layout, duplicated deliberately rather than imported —
@@ -50,7 +51,48 @@ fn locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
     Some(matches!(method, 0 | 8))
 }
 
+/// Mirrors `locally_offers_checkable_crc` above, for the `arc` slot.
+///
+/// ARC's header has no data-descriptor-style deferral the way zip's does:
+/// `marker(1) + method(1) + name(13) + compressed_size(4) + date(2) +
+/// time(2) + crc16(2) + original_size(4)` (`arc.rs`'s own `HEADER_LEN` doc)
+/// is the WHOLE record, so a header that is real at all carries its CRC-16
+/// inline, unconditionally — `arc_salvage.rs`'s own `read_candidate_at`
+/// never constructs a `Candidate` with `verifier: None`. Rather than trust
+/// that module's doc comment, this re-derives the two cheap, non-allocating
+/// structural facts its own discovery gate checks before it will trust a
+/// marker sighting at all: the marker byte itself, and a method byte drawn
+/// from the eleven values ARC ever assigned (`arc.rs`'s own `ARC_MAGIC`
+/// table). `None` when neither holds — inconclusive, not a violation, same
+/// as the zip version above.
+fn arc_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
+    let at = usize::try_from(offset).ok()?;
+    let marker = *data.get(at)?;
+    let method = *data.get(at.checked_add(1)?)?;
+    if marker != 0x1A {
+        return None;
+    }
+    Some((1..=11).contains(&method))
+}
+
 fuzz_target!(|data: &[u8]| {
+    // Task 3b: the leading byte selects a format from `SALVAGE_SLOTS`,
+    // mirroring `container.rs`'s own leading-selector-byte shape rather than
+    // inventing a second one. Before this, `opts.format` was pinned to
+    // `zip` alone — correct at the time (Stage 1 measured 20000 executions
+    // with `format: None` reaching `zip_salvage` zero times, because
+    // arbitrary bytes essentially never carry real zip magic and
+    // `resolve_chain` rejected them first), but a pin means only zip is ever
+    // fuzzed. `arc` landed with its own scanner in Stage 2 Task 3, and this
+    // project's fuzzing has found a real bug in every hand-written binary
+    // parser it has been pointed at, so a second pinned target is worse than
+    // this one selector byte spending a small, bounded fraction of each
+    // corpus seed on which format the rest of `data` is interpreted as.
+    let Some((&selector, payload)) = data.split_first() else {
+        return;
+    };
+    let name = SALVAGE_SLOTS[selector as usize % SALVAGE_SLOTS.len()];
+
     // `entries::salvage` takes a path, not a `Source` — the same reason
     // `chain.rs`'s `entries::list` and `container.rs`'s seekable branch both
     // spool to a real file: salvage is inherently seek-bound (a resync scan
@@ -58,7 +100,7 @@ fuzz_target!(|data: &[u8]| {
     // real caller's `stuffr salvage ARCHIVE` takes.
     let tmp = tempfile::tempdir().expect("tempdir");
     let path = tmp.path().join("input");
-    std::fs::write(&path, data).expect("write temp input");
+    std::fs::write(&path, payload).expect("write temp input");
 
     // `dest: None` — report-only. This target is about parsing and
     // verification honesty (no panic, every `Err` classified, every
@@ -66,20 +108,24 @@ fuzz_target!(|data: &[u8]| {
     // filesystem write/containment path `extract`'s own fuzzing already
     // covers via `chain.rs`.
     //
-    // `format: Some(zip)` — Task 2 added format dispatch to `entries::
-    // salvage`, resolving a format from the input's own magic/extension
-    // when this is `None`. Arbitrary fuzzer bytes almost never carry a real
-    // zip magic (`PK\x03\x04`) or a `.zip`-named path, so auto-detection
-    // would reject nearly every input as `Error::UnknownFormat` before it
-    // ever reached `zip_salvage`'s own parser — collapsing this target's
-    // coverage of exactly the code the independent second pass below cross-
-    // checks. The explicit hint bypasses detection and preserves this
-    // target's original job: feed raw bytes straight to the zip scanner.
+    // `format: Some(name)` — bypasses auto-detection exactly as the old
+    // pinned `Some(zip)` did, and for the identical reason: arbitrary
+    // fuzzer bytes essentially never carry a real magic for WHATEVER format
+    // the selector byte chose, so auto-detection would reject nearly every
+    // input as `Error::UnknownFormat` before it ever reached a scanner —
+    // collapsing this target's coverage of exactly the code the independent
+    // second pass below cross-checks. Naming a format `salvage_scan` has no
+    // scanner for (every slot outside `SALVAGE_SLOTS`) or has not compiled
+    // in (a build missing the `zip`/`arc` feature) both answer through the
+    // ordinary `Err` arm below — `Error::Unsupported` and
+    // `Error::FormatNotEnabled` respectively, both classified exit codes,
+    // never a panic — so `SALVAGE_SLOTS` needs no separate "not compiled"
+    // branch of its own.
     let opts = SalvageOpts {
         dest: None,
         policy: SalvagePolicy::default(),
         select: None,
-        format: Some(stuffr_core::FormatId::new("zip")),
+        format: Some(stuffr_core::FormatId::new(name)),
     };
 
     let outcome = match entries::salvage(&path, &opts) {
@@ -97,18 +143,37 @@ fuzz_target!(|data: &[u8]| {
     // weaker approximation of the ops layer's own scan, it is the identical
     // computation run a second time from outside — the same "second
     // independent walk" shape `container.rs`'s `forward_entry_count` uses
-    // for its own cross-check.
-    let mut cursor = Cursor::new(data.to_vec());
-    let offsets: HashMap<usize, u64> = match zip_salvage::salvage_zip(&mut cursor, &opts.policy) {
-        Ok(scan) => scan
-            .entries
-            .into_iter()
-            .map(|e| (e.scan_position, e.offset))
-            .collect(),
-        Err(e) => {
-            check_error_is_classified(&e).expect("independent scan error classification");
-            HashMap::new()
-        }
+    // for its own cross-check. Dispatched on `name` because each format's
+    // scanner has its own entry point and its own raw-byte cross-check
+    // below; a slot appended to `SALVAGE_SLOTS` without a matching arm here
+    // simply skips this cross-check (the `_` arms below), which is an
+    // honest "not built yet", not a silent pass — `check_error_is_classified`
+    // above still ran on `entries::salvage`'s own outcome regardless of slot.
+    let mut cursor = Cursor::new(payload.to_vec());
+    let offsets: HashMap<usize, u64> = match name {
+        "zip" => match zip_salvage::salvage_zip(&mut cursor, &opts.policy) {
+            Ok(scan) => scan
+                .entries
+                .into_iter()
+                .map(|e| (e.scan_position, e.offset))
+                .collect(),
+            Err(e) => {
+                check_error_is_classified(&e).expect("independent scan error classification");
+                HashMap::new()
+            }
+        },
+        "arc" => match arc_salvage::salvage_arc(&mut cursor, &opts.policy) {
+            Ok(scan) => scan
+                .entries
+                .into_iter()
+                .map(|e| (e.scan_position, e.offset))
+                .collect(),
+            Err(e) => {
+                check_error_is_classified(&e).expect("independent scan error classification");
+                HashMap::new()
+            }
+        },
+        _ => HashMap::new(),
     };
 
     for record in &outcome.entries {
@@ -123,7 +188,12 @@ fuzz_target!(|data: &[u8]| {
         let Some(&offset) = offsets.get(&record.scan_position) else {
             continue;
         };
-        if let Some(offers_crc) = locally_offers_checkable_crc(data, offset) {
+        let offers_crc = match name {
+            "zip" => locally_offers_checkable_crc(payload, offset),
+            "arc" => arc_locally_offers_checkable_crc(payload, offset),
+            _ => None,
+        };
+        if let Some(offers_crc) = offers_crc {
             check_salvage_claim(record.status, offers_crc)
                 .expect("salvage claim: Intact without a checkable checksum");
         }

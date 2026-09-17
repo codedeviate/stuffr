@@ -37,11 +37,17 @@
 //!   below exist to put one live payload in front of every WRITABLE slot,
 //!   so the fuzzer's first mutations start from a shape that already
 //!   completes a round trip rather than from nothing.
-//! - `salvage.rs` (Salvage Stage 1) takes no selector either, same as
-//!   `chain.rs`: the raw bytes become a temp file handed to
-//!   `entries::salvage`, so a salvage seed is just the bytes of some zip.
-//!   See [`SALVAGE_SHAPES`] for the six of them and for the measurement
-//!   that made seeding this target necessary rather than optional.
+//! - `salvage.rs` (Salvage Stage 1, converted to a selector byte in Stage 2
+//!   Task 3b) reads a leading selector byte, maps it through
+//!   `SALVAGE_SLOTS[selector as usize % SALVAGE_SLOTS.len()]`, and hands the
+//!   REST of the bytes — written to a temp file — to that slot's scanner
+//!   via `SalvageOpts::format`. So a salvage seed is
+//!   `[slot_index] ++ <that format's own archive bytes>`, the same shape a
+//!   codec seed takes. See [`SALVAGE_SHAPES`] for the six of them and for
+//!   the measurement that made seeding this target necessary rather than
+//!   optional; every one of the six is still built as a zip (the only slot
+//!   this generator seeds today), so each carries `SALVAGE_SLOTS`'s own
+//!   `zip` index rather than a literal `0`.
 //!
 //! Phase 3b added three READ-ONLY slots (`lha`, `arj` and, at the time,
 //! `compress`) and Phase 3c a fourth container (`arc`), none of which this
@@ -74,7 +80,7 @@ use std::path::{Path, PathBuf};
 use stuffr::entries;
 use stuffr::ops::{self, CompressOpts, Input, Output};
 use stuffr_core::FormatId;
-use stuffr_core::testing::{CODEC_SLOTS, CONTAINER_SLOTS};
+use stuffr_core::testing::{CODEC_SLOTS, CONTAINER_SLOTS, SALVAGE_SLOTS};
 
 /// The chain target's seeds carry no selector byte, so there is no slot
 /// table to derive an expected count from the way `codec`/`container` do.
@@ -85,9 +91,17 @@ use stuffr_core::testing::{CODEC_SLOTS, CONTAINER_SLOTS};
 /// apart the way a duplicated literal could.
 const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 
-/// The `salvage` target's seeds, same discipline as [`CHAIN_SHAPES`]: no
-/// selector byte, so this constant IS the manifest and `generate_corpus`
-/// matches on it exhaustively.
+/// The `salvage` target's seeds, same discipline as [`CHAIN_SHAPES`]: this
+/// constant IS the manifest and `generate_corpus` matches on it
+/// exhaustively. Unlike `CHAIN_SHAPES`, a salvage seed DOES carry a leading
+/// selector byte as of Stage 2 Task 3b (see the module doc's own bullet on
+/// `salvage.rs`) — every shape below happens to select the same slot,
+/// `zip`, because that is still the only format this generator seeds.
+/// `arc` gained its own scanner (Stage 2 Task 3) and its own
+/// `SALVAGE_SLOTS` entry (Task 3b) but no seed here yet: unlike zip's
+/// Stage 1 history below, `arc`'s unseeded reachability has not been
+/// measured either way, so seeding it is left for whoever measures it
+/// rather than guessed at here.
 ///
 /// **This target ran unseeded until the final whole-branch review**, and
 /// `make fuzz` reported `target 'salvage': 2000 executions — OK` the whole
@@ -148,6 +162,27 @@ fn read_all(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Strips the leading `SALVAGE_SLOTS` selector byte a generated `salvage/`
+/// seed carries as of Stage 2 Task 3b, and writes the remaining archive
+/// bytes to a fresh file under `scratch` — the same split
+/// `salvage.rs`'s own `data.split_first()` performs before `entries::salvage`
+/// ever sees a byte, so a direct-read test over these seeds exercises the
+/// identical archive the fuzz target itself would scan.
+fn salvage_payload_path(seed_path: &Path, scratch: &Path) -> PathBuf {
+    let bytes = read_all(seed_path).expect("read salvage seed");
+    let payload = bytes
+        .split_first()
+        .expect("salvage seed must carry a selector byte")
+        .1;
+    let out = scratch.join(
+        seed_path
+            .file_name()
+            .expect("salvage seed path must have a file name"),
+    );
+    std::fs::write(&out, payload).expect("write stripped salvage payload");
+    out
 }
 
 /// `CODEC_SLOTS` entries this build's registry actually has an encoder for,
@@ -661,10 +696,13 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     }
 
     // --- salvage/ --------------------------------------------------------
-    // No selector byte — `salvage.rs` writes the raw bytes to a temp file
-    // and hands the path to `entries::salvage`, exactly as `chain.rs` does.
-    // Six shapes, matching `SALVAGE_SHAPES`; see that constant for why this
-    // target is seeded at all and what each shape is for.
+    // Leading selector byte as of Stage 2 Task 3b — `salvage.rs` reads it,
+    // maps it through `SALVAGE_SLOTS`, and hands the REST of the bytes to a
+    // temp file for that slot's scanner via `SalvageOpts::format`. Six
+    // shapes, matching `SALVAGE_SHAPES`; see that constant for why this
+    // target is seeded at all and what each shape is for. Every shape here
+    // is a zip, so every seed carries `SALVAGE_SLOTS`'s own `zip` index —
+    // `arc` has no seed of its own yet (see `SALVAGE_SHAPES`'s own doc).
     //
     // Unlike `chain/`'s deliberately well-formed-only seeds, four of these
     // six are DAMAGED on purpose, and that is not the same trade. The rule
@@ -675,6 +713,10 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // outcome the suite already pins end to end.
     let healthy = healthy_salvage_seed();
     let mut salvage_count = 0usize;
+    let salvage_zip_selector = SALVAGE_SLOTS
+        .iter()
+        .position(|&s| s == "zip")
+        .expect("SALVAGE_SLOTS must list zip") as u8;
     for shape in SALVAGE_SHAPES {
         let bytes = match *shape {
             "healthy" => healthy.clone(),
@@ -718,7 +760,9 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
             }
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
-        std::fs::write(salvage_dir.join(format!("{shape}.seed")), &bytes)?;
+        let mut seed = vec![salvage_zip_selector];
+        seed.extend_from_slice(&bytes);
+        std::fs::write(salvage_dir.join(format!("{shape}.seed")), &seed)?;
         salvage_count += 1;
     }
 
@@ -814,11 +858,18 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
 
     let dir = tempfile::tempdir().unwrap();
     generate_corpus(dir.path()).unwrap();
+    // Every `salvage/` seed now carries a leading `SALVAGE_SLOTS` selector
+    // byte (Stage 2 Task 3b) that `entries::salvage` — which takes a path to
+    // a real archive, not a fuzz-target-shaped blob — knows nothing about;
+    // `salvage_payload_path` strips it into its own scratch file first, the
+    // same split the fuzz target itself performs.
+    let scratch = tempfile::tempdir().unwrap();
 
     let mut intact_seeds = 0usize;
     let mut seen = 0usize;
     for shape in SALVAGE_SHAPES {
-        let path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let path = salvage_payload_path(&seed_path, scratch.path());
         let outcome = entries::salvage(
             &path,
             &entries::SalvageOpts {
@@ -858,7 +909,8 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
         ("truncated-tail", SalvageStatus::Partial),
         ("crc-mismatch", SalvageStatus::Partial),
     ] {
-        let path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let path = salvage_payload_path(&seed_path, scratch.path());
         let outcome = entries::salvage(
             &path,
             &entries::SalvageOpts {
@@ -879,7 +931,8 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
     // The two duplicate shapes must reach their own annotation, and not
     // each other's — the distinction the previous commit introduced.
     let duplicates = |shape: &str| {
-        let path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let path = salvage_payload_path(&seed_path, scratch.path());
         entries::salvage(
             &path,
             &entries::SalvageOpts {
