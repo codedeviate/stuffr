@@ -1496,9 +1496,10 @@ fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatI
 /// `fn(&mut dyn SeekRead, &SalvagePolicy) -> Result<SalvageOutcome>` (the
 /// [`stuffr_core::salvage::SalvageOutcome`] the shared engine produces, not
 /// this module's own [`SalvageOutcome`] report) — so each later task's own
-/// scanner (zoo, lha, arj) drops in as one more arm here, gated on its own
-/// feature, alongside the task that adds it. `zip` (Task 2) and `arc`
-/// (Task 3, [`stuffr_formats::legacy::arc_salvage::salvage_arc`]) are wired;
+/// scanner (lha, arj) drops in as one more arm here, gated on its own
+/// feature, alongside the task that adds it. `zip` (Task 2), `arc`
+/// (Task 3, [`stuffr_formats::legacy::arc_salvage::salvage_arc`]) and `zoo`
+/// (Task 4, [`stuffr_formats::legacy::zoo_salvage::salvage_zoo`]) are wired;
 /// every other format — including one this build has fully registered as an
 /// ordinary container, like `tar` — answers [`Error::Unsupported`] (exit 3)
 /// **naming the format**, never a silent empty
@@ -1507,8 +1508,8 @@ fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatI
 /// the ARCHIVE; the truth here is a claim about this BUILD — it never
 /// tried. `tar`, `ar` and `cpio` answer this way for a structural reason
 /// (Stage 3, if it ever comes: a false-positive scan over their headers is
-/// undetectable by construction); `zoo`, `lha` and `arj` answer this way
-/// only until their own task lands a scanner.
+/// undetectable by construction); `lha` and `arj` answer this way only until
+/// their own task lands a scanner.
 fn salvage_scan(
     format: FormatId,
     src: &mut dyn SeekRead,
@@ -1523,6 +1524,10 @@ fn salvage_scan(
         "arc" => stuffr_formats::legacy::arc_salvage::salvage_arc(src, policy),
         #[cfg(not(feature = "arc"))]
         "arc" => Err(Error::FormatNotEnabled(FormatId::new("arc"))),
+        #[cfg(feature = "zoo")]
+        "zoo" => stuffr_formats::legacy::zoo_salvage::salvage_zoo(src, policy),
+        #[cfg(not(feature = "zoo"))]
+        "zoo" => Err(Error::FormatNotEnabled(FormatId::new("zoo"))),
         other => Err(Error::Unsupported(format!(
             "salvage has no scanner for `{other}` archives in this build"
         ))),
@@ -2039,8 +2044,9 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// never populated in the first place, so even a successful read would have
 /// fallen through to `SkippedNotBuiltIn` rather than really being written.
 /// Locating a payload and decoding it are now each format's own job —
-/// [`stuffr_formats::zip_salvage::write_payload`] and
-/// [`stuffr_formats::legacy::arc_salvage::write_payload`] — using
+/// [`stuffr_formats::zip_salvage::write_payload`],
+/// [`stuffr_formats::legacy::arc_salvage::write_payload`] and
+/// [`stuffr_formats::legacy::zoo_salvage::write_payload`] — using
 /// [`stuffr_core::salvage::SalvagedEntry::payload_start`], which every
 /// scanner now computes once, at discovery, instead of a generic caller
 /// re-deriving (and mis-deriving) it later.
@@ -2067,9 +2073,8 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// that forgets this half fails a test rather than shipping silently. A
 /// `SalvageScan::write_payload` trait method would make this a compile
 /// error instead and was considered; deferred rather than taken mid-phase,
-/// since it would have to land ahead of the three scanners (zoo, lha, arj)
-/// still to come, before its right shape is known from more than one
-/// example.
+/// since it would have to land ahead of the two scanners (lha, arj) still to
+/// come, before its right shape is known from more than one example.
 fn write_salvaged_payload(
     format: FormatId,
     archive_path: &Path,
@@ -2093,6 +2098,15 @@ fn write_salvaged_payload(
         ),
         #[cfg(not(feature = "arc"))]
         "arc" => Err(Error::FormatNotEnabled(FormatId::new("arc"))),
+        #[cfg(feature = "zoo")]
+        "zoo" => stuffr_formats::legacy::zoo_salvage::write_payload(
+            archive_path,
+            entry,
+            compressed_len,
+            out,
+        ),
+        #[cfg(not(feature = "zoo"))]
+        "zoo" => Err(Error::FormatNotEnabled(FormatId::new("zoo"))),
         // Unreachable in practice: `salvage_scan` already refuses any other
         // format before a single candidate is ever produced, so `salvage()`
         // never reaches a per-entry write for one.

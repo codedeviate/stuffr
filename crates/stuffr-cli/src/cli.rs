@@ -334,9 +334,11 @@ pub enum Command {
         /// Selects among the formats this build's salvage can attempt to
         /// scan — `zip`, `tar`, `ar`, `cpio`, `arc`, `zoo`, `lha`, `arj` — not
         /// merely accepted or rejected as in an earlier stage. Naming one
-        /// this build has no salvage scanner for yet (only `zip` is wired so
-        /// far) is refused at exit 3, exactly as an undetected archive of
-        /// that same format would be.
+        /// this build has no salvage scanner for yet (`zip`, `arc` and `zoo`
+        /// are wired; `tar`, `ar` and `cpio` are a structural refusal rather
+        /// than an unfinished one, and `lha`/`arj` are still to come) is
+        /// refused at exit 3, exactly as an undetected archive of that same
+        /// format would be.
         #[arg(long)]
         format: Option<String>,
     },

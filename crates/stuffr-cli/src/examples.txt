@@ -707,8 +707,10 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   `salvage` is the one recovery-biased verb in this tool. `list`, `cat`,
   `unpack` and `test` all stay exactly as uncompromising as they already
   are — it is salvage's willingness to accept less-than-proven content
-  that buys them that freedom. Stage 1 recovers zip archives only. Three
-  surface forms, one of which is required:
+  that buys them that freedom. It recovers `zip`, `arc` and `zoo`
+  archives; naming any other format with --format is exit 3, a statement
+  about this build rather than about the archive. Three surface forms,
+  one of which is required:
 
   stuffr salvage broken.zip --list
       Reports on the scan with NO destination at all — listing is not
