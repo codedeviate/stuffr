@@ -9441,6 +9441,41 @@ fn mutate_zeroed_central_directory(healthy: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// Flips 10 bytes in the MIDDLE (`beta.txt`) entry's payload — its declared
+/// length and its own CRC-32 field are untouched, and the central directory
+/// is untouched too, so this is a shape a reference tool can check with a
+/// plain `unzip -t`, no `-FF` recovery step needed at all. Shared between
+/// the damage catalogue's own row for this mutation and the external-
+/// witness test (fix round 1, REQUIRED 1), since both need the identical
+/// damaged bytes.
+fn mutate_hole_punched_mid_payload(healthy: &[u8]) -> Vec<u8> {
+    let mut bytes = healthy.to_vec();
+    let real_entries = parse_real_zip_local_entries(&bytes);
+    let beta = &real_entries[1];
+    assert!(
+        beta.payload.len() >= 15,
+        "sanity: room to punch a hole without running past this entry's own payload"
+    );
+    for b in &mut bytes[beta.payload.start + 5..beta.payload.start + 15] {
+        *b ^= 0xFF;
+    }
+    bytes
+}
+
+/// Flips a byte of the FIRST (`alpha.txt`) entry's LOCAL-header `crc32`
+/// field only — its payload and the central directory's own copy of the
+/// checksum are untouched, so (like the hole-punch mutation above) this is
+/// checkable with a plain `unzip -t`. Shared between the damage catalogue's
+/// own row for this mutation and the external-witness test (fix round 1,
+/// REQUIRED 1).
+fn mutate_one_crc_corrupted(healthy: &[u8]) -> Vec<u8> {
+    let mut bytes = healthy.to_vec();
+    let real_entries = parse_real_zip_local_entries(&bytes);
+    let alpha_crc_offset = real_entries[0].crc_offset;
+    bytes[alpha_crc_offset] ^= 0xFF;
+    bytes
+}
+
 /// Appends a byte-identical physical copy of the FIRST entry's local
 /// record, and splices a matching duplicate central-directory record
 /// (pointing at the copy) into the index — 4 physical records over 3
@@ -9572,18 +9607,9 @@ fn damage_catalogue_zeroed_central_directory() {
 fn damage_catalogue_hole_punched_mid_payload() {
     let dir = tmp_dir();
     let (archive, _entries) = build_real_healthy_zip(&dir);
-    let mut bytes = std::fs::read(&archive).unwrap();
-    let real_entries = parse_real_zip_local_entries(&bytes);
-    let beta = &real_entries[1];
-    assert!(
-        beta.payload.len() >= 15,
-        "sanity: room to punch a hole without running past this entry's own payload"
-    );
-    for b in &mut bytes[beta.payload.start + 5..beta.payload.start + 15] {
-        *b ^= 0xFF;
-    }
+    let healthy = std::fs::read(&archive).unwrap();
     let path = dir.join("hole_punched.zip");
-    std::fs::write(&path, &bytes).unwrap();
+    std::fs::write(&path, mutate_hole_punched_mid_payload(&healthy)).unwrap();
 
     let rows = salvage_list_rows(&path);
     assert_eq!(rows.len(), 3, "{rows:?}");
@@ -9610,12 +9636,9 @@ fn damage_catalogue_hole_punched_mid_payload() {
 fn damage_catalogue_one_crc_corrupted() {
     let dir = tmp_dir();
     let (archive, _entries) = build_real_healthy_zip(&dir);
-    let mut bytes = std::fs::read(&archive).unwrap();
-    let real_entries = parse_real_zip_local_entries(&bytes);
-    let alpha_crc_offset = real_entries[0].crc_offset;
-    bytes[alpha_crc_offset] ^= 0xFF;
+    let healthy = std::fs::read(&archive).unwrap();
     let path = dir.join("crc_corrupted.zip");
-    std::fs::write(&path, &bytes).unwrap();
+    std::fs::write(&path, mutate_one_crc_corrupted(&healthy)).unwrap();
 
     let rows = salvage_list_rows(&path);
     assert_eq!(rows.len(), 3, "{rows:?}");
@@ -9712,15 +9735,49 @@ fn run_zip_ff(zip_bin: &Path, archive: &Path, out: &Path) -> std::process::Outpu
     output
 }
 
-/// Step 3: the external witness. Info-ZIP's `zip -FF` is a genuine second
-/// implementation of zip recovery, cross-checked here on the ONE shape
-/// where the two tools were found to agree — a zeroed central directory,
-/// which forces BOTH tools onto a raw local-header scan with nothing to
-/// reconcile against. `zip_salvage.rs`'s own module doc records the ONE
-/// shape found where they do NOT agree (a truncated last entry, where
-/// `zip -FF` was measured fabricating bytes for content that no longer
-/// exists) and why that is Info-Zip's tool being the one that is wrong,
-/// rather than tuned away here.
+/// Runs `unzip -t ARCHIVE` directly — no `-FF` recovery step and no
+/// interactive prompt, because the two mutations this is used for
+/// (fix round 1, REQUIRED 1) leave the central directory untouched, so
+/// `unzip` reads the index exactly as it would for a healthy archive and
+/// only its PER-ENTRY decode/CRC-32 check can fail. Returns stdout, one
+/// line per entry (plus header/footer lines). Exit status is deliberately
+/// not asserted here: a damaged entry makes `unzip -t` exit non-zero by
+/// design, and the callers below check per-entry lines, not the process
+/// exit code.
+fn unzip_test_lines(unzip_bin: &Path, archive: &Path) -> Vec<String> {
+    let out = Command::new(unzip_bin)
+        .args(["-t", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The line naming `name` within `unzip -t`'s output — panics (never
+/// silently returns nothing) if `name` is missing entirely, since that
+/// would mean the reference tool lost the entry outright rather than
+/// merely disagreeing about its checksum.
+fn unzip_test_line_for<'a>(lines: &'a [String], name: &str) -> &'a str {
+    lines
+        .iter()
+        .map(String::as_str)
+        .find(|l| l.contains(name))
+        .unwrap_or_else(|| panic!("`unzip -t` must still report on `{name}`: {lines:?}"))
+}
+
+/// Step 3: the external witness, row 1/3. Info-Zip's `zip -FF` is a
+/// genuine second implementation of zip recovery, cross-checked here on
+/// the zeroed-central-directory shape — the one damage catalogue row that
+/// forces BOTH tools onto a raw local-header scan with nothing to
+/// reconcile against, so it needs `zip -FF`'s own recovery step (unlike
+/// the two sibling tests below it, which check a reference tool directly
+/// with no recovery step at all). `zip_salvage.rs`'s own module doc
+/// records the ONE shape found where the two tools do NOT agree (a
+/// truncated last entry, where `zip -FF` was measured fabricating bytes
+/// for content that no longer exists) and why that is Info-Zip's tool
+/// being the one that is wrong, rather than tuned away here.
 #[cfg(unix)]
 #[test]
 fn info_zip_recovers_the_same_entries_we_do() {
@@ -9772,6 +9829,89 @@ fn info_zip_recovers_the_same_entries_we_do() {
             line.contains("OK"),
             "we call `{name}` Intact; Info-Zip's own independent recovery must agree it \
              decodes cleanly: {line}"
+        );
+    }
+}
+
+/// Step 3: the external witness, row 2/3 (fix round 1, REQUIRED 1). A hole
+/// punched mid-payload leaves the central directory untouched, so — unlike
+/// the zeroed-CD test above — this needs no `zip -FF` recovery step and no
+/// interactive prompt at all: plain `unzip -t` reads the same intact index
+/// stuffr's own central-directory reconciliation would, and only its
+/// per-entry CRC-32 check can disagree.
+#[cfg(unix)]
+#[test]
+fn info_zip_agrees_on_a_hole_punched_payload() {
+    let unzip_bin = require_bin("unzip");
+
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let healthy = std::fs::read(&archive).unwrap();
+    let path = dir.join("hole_punched_for_witness.zip");
+    std::fs::write(&path, mutate_hole_punched_mid_payload(&healthy)).unwrap();
+
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let lines = unzip_test_lines(&unzip_bin, &path);
+    for (name, intact) in [
+        ("alpha.txt", true),
+        ("beta.txt", false),
+        ("gamma.bin", true),
+    ] {
+        let our_row = rows
+            .iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("our own recovery must still report `{name}`: {rows:?}"));
+        assert_eq!(
+            our_row.contains("Intact"),
+            intact,
+            "our own verdict for `{name}`: {our_row}"
+        );
+        let their_line = unzip_test_line_for(&lines, name);
+        assert_eq!(
+            their_line.contains("OK"),
+            intact,
+            "Info-Zip's own independent verdict for `{name}` must agree with ours: {their_line}"
+        );
+    }
+}
+
+/// Step 3: the external witness, row 3/3 (fix round 1, REQUIRED 1). One
+/// CRC corrupted leaves the central directory untouched too — same
+/// reasoning as the hole-punch test above, no `zip -FF` step needed.
+#[cfg(unix)]
+#[test]
+fn info_zip_agrees_on_a_corrupted_crc() {
+    let unzip_bin = require_bin("unzip");
+
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let healthy = std::fs::read(&archive).unwrap();
+    let path = dir.join("crc_corrupted_for_witness.zip");
+    std::fs::write(&path, mutate_one_crc_corrupted(&healthy)).unwrap();
+
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    let lines = unzip_test_lines(&unzip_bin, &path);
+    for (name, intact) in [
+        ("alpha.txt", false),
+        ("beta.txt", true),
+        ("gamma.bin", true),
+    ] {
+        let our_row = rows
+            .iter()
+            .find(|r| r.contains(name))
+            .unwrap_or_else(|| panic!("our own recovery must still report `{name}`: {rows:?}"));
+        assert_eq!(
+            our_row.contains("Intact"),
+            intact,
+            "our own verdict for `{name}`: {our_row}"
+        );
+        let their_line = unzip_test_line_for(&lines, name);
+        assert_eq!(
+            their_line.contains("OK"),
+            intact,
+            "Info-Zip's own independent verdict for `{name}` must agree with ours: {their_line}"
         );
     }
 }

@@ -198,8 +198,25 @@
 //!   central-directory-record signature and fields from elsewhere in the
 //!   SAME original archive, bytes that do not exist anywhere in the
 //!   truncated input `zip -FF` was actually given. Only a SEPARATE `unzip -t`
-//!   pass on its output caught the result: `bad CRC 0f6603ba (should be
-//!   77067d78)`.
+//!   pass on its output caught the result: a bad-CRC line naming the
+//!   fabricated content.
+//!
+//! **The fabricated bytes are deterministic in KIND, not in VALUE — this was
+//! independently re-verified and is worth a reader knowing before rerunning
+//! the repro above.** Every run agrees the injected 24 bytes begin
+//! `50 4b 01 02` and are a real central-directory record copied verbatim
+//! from elsewhere in the SAME archive (one independent rerun confirmed the
+//! injected bytes are `alpha.txt`'s own central-directory record, CRC
+//! `20 c1 53 56` matching exactly) — but the exact bad-CRC VALUE `unzip -t`
+//! reports for `gamma.bin` was measured differently across runs (`0f6603ba`
+//! in one run, `506fb50e` in another, both against the identical repro
+//! recipe). That is consistent with this section's own caveat that the
+//! fabrication comes from `zip -FF`'s own internal buffer state (a stale or
+//! reused read-ahead buffer, not a fixed offset into the file), so it is
+//! expected to vary run to run and is not itself the load-bearing part of
+//! this finding. What is load-bearing, and reproduced identically every
+//! time: `zip -FF` reports success and a warning-free "fixed" archive for an
+//! entry whose payload it could not actually deliver.
 //!
 //! So on a truncated tail, `zip -FF` is not merely less informative than this
 //! module (it reports "fixed" or not, with no per-entry status tier at all)
