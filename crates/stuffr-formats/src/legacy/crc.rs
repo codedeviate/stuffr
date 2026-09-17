@@ -17,12 +17,18 @@
 // Dead in a build enabling `zip` but none of `lha`/`arc`/`zoo`: Salvage
 // Stage 2 Task 1 widened this module's own `#[cfg]` gate (see `mod.rs`) so
 // `salvage_verify.rs` can reach `crc16_arc_continued` below, but that
-// module's tests are the only caller of the whole-buffer form in such a
-// build, and a non-test `cargo check`/`build` does not compile test code.
-// Every OTHER build this crate supports keeps a production caller (lha's
-// `-lh5-` encoder, or a test fixture), so this is scoped to the one gap the
-// widened gate opened rather than a general suppression.
-#[allow(dead_code)]
+// leaves the WHOLE-BUFFER form (this function) with no production caller in
+// such a build — its real callers are the `arc`/`lha` encoders (`arc.rs`'s
+// own `next_entry`, `lha.rs`'s `-lh5-` encoder), and `salvage_verify.rs`
+// itself uses `crc16_arc_continued` only. `#[allow(dead_code)]` used to sit
+// here instead of this `cfg`, which suppresses the warning in every build
+// rather than compiling the function out of the one tree that has nothing
+// to call it — and this crate's own gate runs `-D warnings`, so a
+// suppressed warning is a liability the day something nearby genuinely goes
+// dead. Narrower than the module's own gate (which also admits `zip` alone,
+// for `crc16_arc_continued`'s sake): only the three formats that actually
+// call this whole-buffer form.
+#[cfg(any(feature = "lha", feature = "arc", feature = "zoo"))]
 pub(crate) fn crc16_arc(data: &[u8]) -> u16 {
     crc16_arc_continued(0, data)
 }

@@ -19,6 +19,13 @@
 
 #[cfg(feature = "arc")]
 pub mod arc;
+// Salvage Stage 2 Task 3: scans an ARC archive for entry headers directly,
+// the way `../zip_salvage.rs` does for zip, rather than trusting a single
+// linear pass that stops at the first damaged record. Reuses `arc.rs`'s own
+// `ArcHeader::parse`, `Method` and `decode` — see that module's doc for why
+// several of its items are `pub(super)` rather than private.
+#[cfg(feature = "arc")]
+pub mod arc_salvage;
 #[cfg(feature = "arj")]
 pub mod arj;
 // The least-significant-bit-first bit reader ARC's two bitstreams and ZOO's

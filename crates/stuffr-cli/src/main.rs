@@ -1512,3 +1512,42 @@ fn print_formats() -> stuffr::Result<()> {
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `salvage_format_by_name`'s own doc explains why its table cannot be
+    /// gated by feature (naming an uncompiled format must still answer
+    /// `Unsupported`/`FormatNotEnabled`, never `Usage`) — but that also
+    /// means nothing has ever forced the table to grow alongside the
+    /// registry it stands in for. It was a hand-maintained eight-name list
+    /// with no test pinning it to anything live. Salvage Stage 2 Task 3
+    /// wired a real scanner behind the `arc` entry the table already held,
+    /// which is exactly the moment such drift would have gone unnoticed —
+    /// so this derives the expectation from the LIVE registry instead of
+    /// restating the list by hand: the next container format to register
+    /// (`zoo`, most likely) fails THIS test the day it lands, rather than
+    /// silently falling through to salvage's own `Usage` catch-all forever.
+    #[test]
+    fn salvage_format_by_name_recognises_every_registered_container() {
+        let containers: Vec<_> = stuffr::registry()
+            .matrix()
+            .into_iter()
+            .filter(|row| row.kind == stuffr::FormatKind::Container)
+            .collect();
+        assert!(
+            !containers.is_empty(),
+            "sanity: this build must register at least one container format"
+        );
+        for row in &containers {
+            let name = row.id.as_str();
+            assert!(
+                salvage_format_by_name(name).is_ok(),
+                "salvage_format_by_name does not recognise `{name}`, which this build's own \
+                 registry reports as a live container — `salvage_format_by_name` needs a new \
+                 arm for it"
+            );
+        }
+    }
+}

@@ -62,11 +62,12 @@ pub mod xz_pure;
 pub mod zip;
 #[cfg(feature = "zip")]
 pub mod zip_salvage;
-// The format-agnostic streaming verifier `zip_salvage.rs` now delegates to.
-// Gated on `zip` alone in this task, since zip is its only consumer so far —
-// Salvage Stage 2's later tasks (lha, arc, zoo) widen this the same way each
-// migrates onto it.
-#[cfg(feature = "zip")]
+// The format-agnostic streaming verifier `zip_salvage.rs` and
+// `legacy::arc_salvage` now delegate to. Gated on `zip` alone when Task 1
+// landed it, since zip was its only consumer then; Task 3 (`arc`) is the
+// first to widen it, exactly as that task's own doc comment predicted —
+// `lha` and `zoo` widen it further as each migrates onto it.
+#[cfg(any(feature = "zip", feature = "arc"))]
 mod salvage_verify;
 #[cfg(feature = "zlib")]
 pub mod zlib;

@@ -194,11 +194,11 @@ pub const ARC: FormatId = FormatId::new("arc");
 /// The marker byte every entry header opens with. `0x1A` is DOS's own
 /// end-of-file character, which is exactly why ARC chose it: a `TYPE`d
 /// archive stopped at the first entry instead of spraying the terminal.
-const MARKER: u8 = 0x1A;
+pub(super) const MARKER: u8 = 0x1A;
 
 /// The fixed record following the marker: `method(1) + name(13) +
 /// compressed_size(4) + date(2) + time(2) + crc16(2) + original_size(4)`.
-const HEADER_LEN: usize = 28;
+pub(super) const HEADER_LEN: usize = 28;
 
 /// The NUL-padded name field's width inside that record.
 const NAME_LEN: usize = 13;
@@ -346,7 +346,7 @@ impl Container for Arc {
 /// allocate for one entry. Fixed rather than derived from
 /// `DecodeOpts::memory_limit`, because a container is opened through
 /// `OpenOpts`, which has no memory field to read.
-const MAX_ARC_ENTRY_LEN: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_ARC_ENTRY_LEN: u64 = 256 * 1024 * 1024;
 
 /// Refuses a length past [`MAX_ARC_ENTRY_LEN`] before anything is allocated
 /// for it.
@@ -357,7 +357,7 @@ const MAX_ARC_ENTRY_LEN: u64 = 256 * 1024 * 1024;
 /// grows. `original_size` is deliberately NOT a third site — nothing is
 /// sized by it, and the output check below measures bytes actually
 /// produced, which is strictly stronger than trusting the declaration.
-fn refuse_if_over_ceiling(name: &str, declared: u64, field: &str) -> Result<()> {
+pub(super) fn refuse_if_over_ceiling(name: &str, declared: u64, field: &str) -> Result<()> {
     if declared > MAX_ARC_ENTRY_LEN {
         return Err(Error::ResourceLimit(format!(
             "entry `{name}` declares {declared} bytes of {field}, past the \
@@ -388,7 +388,7 @@ fn classify_arc_io(e: io::Error) -> Error {
 /// The compression methods this build decodes. Everything else is refused
 /// by [`Method::from_byte`] as a capability limit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Method {
+pub(super) enum Method {
     /// Method 1 or 2 — the payload IS the content.
     Stored,
     /// Method 3 — RLE90 alone.
@@ -417,7 +417,7 @@ impl Method {
     /// for a shape nobody here has seen a byte of; the cost if it resolves
     /// the other way is one extra branch, added once a real method-1
     /// archive exists to test it against.
-    fn from_byte(b: u8, name: &str) -> Result<Self> {
+    pub(super) fn from_byte(b: u8, name: &str) -> Result<Self> {
         match b {
             1 | 2 => Ok(Method::Stored),
             3 => Ok(Method::Rle90),
@@ -444,17 +444,24 @@ impl Method {
 }
 
 /// One entry header, parsed out of the 28 bytes following a marker.
-struct ArcHeader {
-    method_byte: u8,
-    name: String,
-    compressed_size: u32,
-    packed_datetime: u32,
-    crc16: u16,
-    original_size: u32,
+///
+/// `pub(super)` (as are `MARKER`, `HEADER_LEN`, `Method`, `decode` and
+/// `refuse_if_over_ceiling` below): Salvage Stage 2 Task 3's
+/// `../arc_salvage.rs` is a sibling module under `legacy`, not a descendant
+/// of this one, and reuses this container's own header parse and decoders
+/// rather than re-deriving either — the same "consume, do not re-derive"
+/// discipline `salvage_verify.rs` already applies to `crc::crc16_arc`.
+pub(super) struct ArcHeader {
+    pub(super) method_byte: u8,
+    pub(super) name: String,
+    pub(super) compressed_size: u32,
+    pub(super) packed_datetime: u32,
+    pub(super) crc16: u16,
+    pub(super) original_size: u32,
 }
 
 impl ArcHeader {
-    fn parse(record: &[u8; HEADER_LEN]) -> Self {
+    pub(super) fn parse(record: &[u8; HEADER_LEN]) -> Self {
         let name_field = &record[1..1 + NAME_LEN];
         let end = name_field
             .iter()
@@ -484,7 +491,7 @@ impl ArcHeader {
 /// halves are this way round and not `unarc-rs`'s. `None` whenever the
 /// packed value carries no valid calendar date, which is how an entry with
 /// no timestamp at all reports itself.
-fn arc_mtime(packed: u32) -> Option<SystemTime> {
+pub(super) fn arc_mtime(packed: u32) -> Option<SystemTime> {
     let date = (packed & 0xFFFF) as u16;
     let time = (packed >> 16) as u16;
     dos::mtime(
@@ -682,7 +689,7 @@ fn check_declared_size(header: &ArcHeader, produced: usize) -> Result<()> {
 }
 
 /// Runs one entry's payload through the decoder its method names.
-fn decode(method: Method, payload: &[u8], name: &str) -> Result<Vec<u8>> {
+pub(super) fn decode(method: Method, payload: &[u8], name: &str) -> Result<Vec<u8>> {
     match method {
         Method::Stored => Ok(payload.to_vec()),
         Method::Rle90 => unpack_rle90(payload, name),

@@ -1363,27 +1363,19 @@ fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatI
 /// `fn(&mut dyn SeekRead, &SalvagePolicy) -> Result<SalvageOutcome>` (the
 /// [`stuffr_core::salvage::SalvageOutcome`] the shared engine produces, not
 /// this module's own [`SalvageOutcome`] report) — so each later task's own
-/// scanner (arc, zoo, lha, arj) drops in as one more arm here, gated on its
-/// own feature, alongside the task that adds it. `zip` is the only arm
-/// Task 2 wires; every other format — including one this build has fully
-/// registered as an ordinary container, like `tar` — answers
-/// [`Error::Unsupported`] (exit 3) **naming the format**, never a silent
-/// empty [`stuffr_core::salvage::SalvageOutcome`]. An empty outcome would
-/// reach the CLI as "the scan found nothing recoverable" (exit 5), a claim
-/// about the ARCHIVE; the truth here is a claim about this BUILD — it never
+/// scanner (zoo, lha, arj) drops in as one more arm here, gated on its own
+/// feature, alongside the task that adds it. `zip` (Task 2) and `arc`
+/// (Task 3, [`stuffr_formats::legacy::arc_salvage::salvage_arc`]) are wired;
+/// every other format — including one this build has fully registered as an
+/// ordinary container, like `tar` — answers [`Error::Unsupported`] (exit 3)
+/// **naming the format**, never a silent empty
+/// [`stuffr_core::salvage::SalvageOutcome`]. An empty outcome would reach
+/// the CLI as "the scan found nothing recoverable" (exit 5), a claim about
+/// the ARCHIVE; the truth here is a claim about this BUILD — it never
 /// tried. `tar`, `ar` and `cpio` answer this way for a structural reason
 /// (Stage 3, if it ever comes: a false-positive scan over their headers is
-/// undetectable by construction); `arc`, `zoo`, `lha` and `arj` answer this
-/// way only until their own task lands a scanner.
-///
-/// `allow(unused_variables)` is temporary and self-correcting: it only fires
-/// on a build with `zip` off and no other format's arm wired yet (e.g.
-/// `--no-default-features --features legacy`, which `make check`'s
-/// `release` step compiles), where every arm genuinely ignores `src` and
-/// `policy`. Task 3's `arc` arm reads them in exactly that combination, so
-/// this attribute has nothing left to silence the moment it lands — remove
-/// it then rather than carrying it forward out of habit.
-#[allow(unused_variables)]
+/// undetectable by construction); `zoo`, `lha` and `arj` answer this way
+/// only until their own task lands a scanner.
 fn salvage_scan(
     format: FormatId,
     src: &mut dyn SeekRead,
@@ -1394,6 +1386,10 @@ fn salvage_scan(
         "zip" => stuffr_formats::zip_salvage::salvage_zip(src, policy),
         #[cfg(not(feature = "zip"))]
         "zip" => Err(Error::FormatNotEnabled(FormatId::new("zip"))),
+        #[cfg(feature = "arc")]
+        "arc" => stuffr_formats::legacy::arc_salvage::salvage_arc(src, policy),
+        #[cfg(not(feature = "arc"))]
+        "arc" => Err(Error::FormatNotEnabled(FormatId::new("arc"))),
         other => Err(Error::Unsupported(format!(
             "salvage has no scanner for `{other}` archives in this build"
         ))),
@@ -4246,10 +4242,10 @@ mod salvage_dispatch_tests {
         header
     }
 
-    /// A tar is a container this stage cannot salvage (Task 2 wires zip
-    /// only; `arc`/`zoo`/`lha`/`arj` each get their own scanner in a later
-    /// task, and tar itself never will — see `CLAUDE.md`'s State section on
-    /// the Stage 3 deferral). The refusal is [`Error::Unsupported`] (exit 3)
+    /// A tar is a container this stage cannot salvage (Task 2 wires zip,
+    /// Task 3 wires `arc`; `zoo`/`lha`/`arj` each get their own scanner in a
+    /// later task, and tar itself never will — see `CLAUDE.md`'s State
+    /// section on the Stage 3 deferral). The refusal is [`Error::Unsupported`] (exit 3)
     /// naming the format — never a silent empty [`SalvageOutcome`], which
     /// would read to a caller as "the scan found nothing recoverable" (exit
     /// 5): a claim about the ARCHIVE, where the truth here is a claim about
