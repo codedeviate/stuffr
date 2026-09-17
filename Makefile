@@ -20,7 +20,7 @@ help:
 	@echo '  make miri     Miri over the two unsafe regions (tar.rs, ar.rs)'
 	@echo '  make hooks    install the commit-msg hook (once per clone)'
 	@echo '  make clean    remove build artefacts'
-	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip}'
+	@echo '  make fuzz-corpus  (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage}'
 	@echo '  make fuzz     short, seeded smoke pass over the five targets (mirrors CI)'
 
 # Ordered so the cheapest gate fails first.
@@ -238,11 +238,15 @@ miri:
 # than asking once.
 FUZZ_RUNS = 2000
 FUZZ_SEED = 1
-# `salvage` (Salvage Stage 1 Task 8) has no seeded corpus of its own — see
-# `fuzz-corpus`'s own loop below, deliberately NOT widened to include it,
-# since no `generate_corpus` case exists for this target yet. libFuzzer runs
-# it from an empty corpus instead, which still executes real iterations; it
-# just starts unseeded.
+# All five targets are seeded. `salvage` was the exception until the Salvage
+# Stage 1 final fix wave, and the measurement is worth keeping: unseeded, it
+# plateaued at `cov: 217` after 100,000 runs, and the binary's own
+# `salvage --list` over all 64 accumulated corpus inputs produced not one
+# salvaged record — so its only oracle call (`check_salvage_claim`, which
+# fires on `SalvageStatus::Intact` alone, and `Intact` needs a CRC-32 that
+# matches its payload) was unreachable by construction. `target 'salvage':
+# 2000 executions — OK` was true and proved nothing. See `SALVAGE_SHAPES` in
+# `crates/stuffr/tests/fuzz_corpus.rs` for what the six seeds are for.
 fuzz: fuzz-corpus
 	@status=0; \
 	for target in codec container chain roundtrip salvage; do \
@@ -275,7 +279,7 @@ hooks:
 	@echo '✓ commit-msg hook active (core.hooksPath = .githooks)'
 
 # Regenerates fuzz/fuzz-run seed corpus under
-# fuzz/corpus/{codec,container,chain,roundtrip}.
+# fuzz/corpus/{codec,container,chain,roundtrip,salvage}.
 #
 # NOT part of `check`: this WRITES real files under `fuzz/corpus/`, which is
 # generated and gitignored (`fuzz/.gitignore`'s `/corpus`) rather than
@@ -324,14 +328,14 @@ fuzz-corpus:
 	  echo "  (a cargo test filter that matches nothing exits 0; this is the guard that turns that into a failure)" >&2; \
 	  exit 1; \
 	fi; \
-	for target in codec container chain roundtrip; do \
+	for target in codec container chain roundtrip salvage; do \
 	  dir=fuzz/corpus/$$target; \
 	  if [ -z "$$(find $$dir -type f -size +0c 2>/dev/null | head -1)" ]; then \
 	    echo "make fuzz-corpus: $$dir holds no non-empty seed after a run the generator reported as passing" >&2; \
 	    exit 1; \
 	  fi; \
 	done; \
-	echo "✓ corpus regenerated ($$ran generator test(s) ran; all four target corpora non-empty)"
+	echo "✓ corpus regenerated ($$ran generator test(s) ran; all five target corpora non-empty)"
 
 clean:
 	$(CARGO) clean

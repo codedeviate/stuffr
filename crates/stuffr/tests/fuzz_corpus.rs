@@ -37,6 +37,11 @@
 //!   below exist to put one live payload in front of every WRITABLE slot,
 //!   so the fuzzer's first mutations start from a shape that already
 //!   completes a round trip rather than from nothing.
+//! - `salvage.rs` (Salvage Stage 1) takes no selector either, same as
+//!   `chain.rs`: the raw bytes become a temp file handed to
+//!   `entries::salvage`, so a salvage seed is just the bytes of some zip.
+//!   See [`SALVAGE_SHAPES`] for the six of them and for the measurement
+//!   that made seeding this target necessary rather than optional.
 //!
 //! Phase 3b added three READ-ONLY slots (`lha`, `arj` and, at the time,
 //! `compress`) and Phase 3c a fourth container (`arc`), none of which this
@@ -79,6 +84,50 @@ use stuffr_core::testing::{CODEC_SLOTS, CONTAINER_SLOTS};
 /// against its `len()`, not a hand-copied number — so the two cannot drift
 /// apart the way a duplicated literal could.
 const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
+
+/// The `salvage` target's seeds, same discipline as [`CHAIN_SHAPES`]: no
+/// selector byte, so this constant IS the manifest and `generate_corpus`
+/// matches on it exhaustively.
+///
+/// **This target ran unseeded until the final whole-branch review**, and
+/// `make fuzz` reported `target 'salvage': 2000 executions — OK` the whole
+/// time, truthfully and while proving nothing. Measured harder: 100,000
+/// runs plateaued at `cov: 217`, and running the binary's `salvage --list`
+/// over all 64 accumulated corpus inputs produced **not one salvaged
+/// record** — not an `Intact`, `Complete`, `Partial` or `Unverified` row
+/// anywhere. The target's only oracle call, `check_salvage_claim`, fires
+/// only on `SalvageStatus::Intact`, which needs a CRC-32 that matches its
+/// payload; random mutation from an EMPTY corpus will not produce one, so
+/// the assertion was unreachable by construction rather than merely
+/// unlucky. This is Phase 3a's "ran clean, never completed an iteration"
+/// in a subtler form: the iterations completed, they just never reached
+/// the check.
+///
+/// The shapes are chosen so mutation starts from something that already
+/// reaches `Intact` and can degrade away from it in each of the directions
+/// the status tiers exist to describe:
+///
+/// - `healthy` — three Stored entries, every CRC correct. The baseline the
+///   oracle actually fires on.
+/// - `distinct-duplicates` / `identical-duplicates` — eight records under
+///   six names, differing and byte-identical respectively. The two
+///   annotation paths (`collides_with`, `shadows`) and the write side's
+///   disambiguation.
+/// - `zeroed-central-directory` — the raw scan alone, with no index to
+///   reconcile against.
+/// - `truncated-tail` — cut mid-payload of the last entry: the
+///   `available_len` path and `Partial(Truncated)`.
+/// - `crc-mismatch` — one payload byte flipped, sizes and index intact:
+///   `Partial(ChecksumMismatch)`, the one shape where the checksum is what
+///   fails rather than the structure.
+const SALVAGE_SHAPES: &[&str] = &[
+    "healthy",
+    "distinct-duplicates",
+    "identical-duplicates",
+    "zeroed-central-directory",
+    "truncated-tail",
+    "crc-mismatch",
+];
 
 /// Builds one small sample tree every container/chain seed packs: a file at
 /// the top level and a nested one in a subdirectory, so a packed archive
@@ -191,6 +240,178 @@ pub struct CorpusCounts {
     pub container: usize,
     pub chain: usize,
     pub roundtrip: usize,
+    pub salvage: usize,
+}
+
+// ---------------------------------------------------------------------
+// The `salvage` target's seeds: hand-built Stored zips.
+//
+// Hand-built rather than written through `entries::create_archive`,
+// because every shape below needs something this project's own writer
+// will not produce: two records under one name, a zeroed index, a payload
+// that disagrees with its own checksum. Stored (method 0) throughout, so
+// a local header's declared compressed size IS the whole payload and
+// every offset is arithmetic rather than something a deflate encoder
+// decides — the same reasoning `zip.rs`'s own fixture builder records.
+// ---------------------------------------------------------------------
+
+/// CRC-32/ISO-HDLC, the checksum a zip header carries over an entry's
+/// uncompressed bytes. Written here for the same reason `zip_salvage.rs`
+/// and `legacy/arj.rs` each carry their own copy: a dependency for one
+/// twelve-line routine buys no capability. Pinned against the algorithm's
+/// published check value by `the_corpus_builders_crc_matches_the_published_
+/// check_value` below.
+fn seed_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// One Stored local file header plus its payload, and where it was written.
+struct SeedRecord {
+    offset: u32,
+    name: String,
+    crc: u32,
+    len: u32,
+    bytes: Vec<u8>,
+}
+
+fn seed_local_record(offset: u32, name: &str, payload: &[u8]) -> SeedRecord {
+    let crc = seed_crc32(payload);
+    let len = u32::try_from(payload.len()).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PK\x03\x04");
+    bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // method: Stored
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // mod time
+    bytes.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    bytes.extend_from_slice(&len.to_le_bytes()); // compressed size
+    bytes.extend_from_slice(&len.to_le_bytes()); // uncompressed size
+    bytes.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // extra length
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(payload);
+    SeedRecord {
+        offset,
+        name: name.to_string(),
+        crc,
+        len,
+        bytes,
+    }
+}
+
+fn seed_central_record(r: &SeedRecord) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"PK\x01\x02");
+    bytes.extend_from_slice(&20u16.to_le_bytes()); // version made by
+    bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // method: Stored
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // mod time
+    bytes.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+    bytes.extend_from_slice(&r.crc.to_le_bytes());
+    bytes.extend_from_slice(&r.len.to_le_bytes());
+    bytes.extend_from_slice(&r.len.to_le_bytes());
+    bytes.extend_from_slice(&u16::try_from(r.name.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // extra length
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // external attrs
+    bytes.extend_from_slice(&r.offset.to_le_bytes());
+    bytes.extend_from_slice(r.name.as_bytes());
+    bytes
+}
+
+/// Assembles an archive from `(name, payload)` pairs, in file order, with a
+/// central directory declaring every one of them. A repeated name is
+/// perfectly legal here and is the whole point of two of the shapes.
+fn build_seed_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut recs = Vec::new();
+    for (name, payload) in entries {
+        let r = seed_local_record(u32::try_from(out.len()).unwrap(), name, payload);
+        out.extend_from_slice(&r.bytes);
+        recs.push(r);
+    }
+    let cd_start = u32::try_from(out.len()).unwrap();
+    for r in &recs {
+        out.extend_from_slice(&seed_central_record(r));
+    }
+    let cd_size = u32::try_from(out.len()).unwrap() - cd_start;
+    let total = u16::try_from(recs.len()).unwrap();
+    out.extend_from_slice(b"PK\x05\x06");
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk with cd start
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    out
+}
+
+/// The three-entry archive every salvage seed is derived from. Payloads
+/// differ in length and content so no two records' headers are
+/// interchangeable, and none is empty (a zero-length entry's checksum is a
+/// fixed constant and proves nothing — see `stuffr_core::salvage`'s own
+/// degenerate-case note).
+fn healthy_salvage_seed() -> Vec<u8> {
+    build_seed_zip(&[
+        ("alpha.txt", b"alpha payload for the salvage fuzz corpus"),
+        ("beta.txt", b"beta payload, a different length entirely"),
+        (
+            "gamma.bin",
+            b"gamma payload, deliberately the longest of the three so a cut inside it has room",
+        ),
+    ])
+}
+
+/// Byte offset at which the LAST local record's payload begins, derived
+/// from that record's own header rather than from arithmetic over the
+/// builder's constants — so changing a name or a payload above cannot
+/// silently move a truncation point out of the payload it is meant to land
+/// inside.
+fn last_payload_span(bytes: &[u8]) -> (usize, usize) {
+    let at = (0..bytes.len().saturating_sub(4))
+        .rev()
+        .find(|&i| bytes[i..i + 4] == *b"PK\x03\x04")
+        .expect("a seed archive holds at least one local header");
+    let declared = u32::from_le_bytes([
+        bytes[at + 18],
+        bytes[at + 19],
+        bytes[at + 20],
+        bytes[at + 21],
+    ]) as usize;
+    let name_len = u16::from_le_bytes([bytes[at + 26], bytes[at + 27]]) as usize;
+    let extra_len = u16::from_le_bytes([bytes[at + 28], bytes[at + 29]]) as usize;
+    (at + 30 + name_len + extra_len, declared)
+}
+
+/// Overwrites the central directory's bytes with zeros, leaving the EOCD
+/// and every local record intact — the shape that forces `salvage_zip` onto
+/// its raw local-header scan with no index to reconcile against.
+fn zero_the_central_directory(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let eocd = out.len() - 22;
+    let cd_start = u32::from_le_bytes([
+        out[eocd + 16],
+        out[eocd + 17],
+        out[eocd + 18],
+        out[eocd + 19],
+    ]) as usize;
+    for b in &mut out[cd_start..eocd] {
+        *b = 0;
+    }
+    out
 }
 
 /// The payload every `roundtrip` seed carries after its selector byte.
@@ -242,10 +463,12 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     let container_dir = root.join("container");
     let chain_dir = root.join("chain");
     let roundtrip_dir = root.join("roundtrip");
+    let salvage_dir = root.join("salvage");
     std::fs::create_dir_all(&codec_dir)?;
     std::fs::create_dir_all(&container_dir)?;
     std::fs::create_dir_all(&chain_dir)?;
     std::fs::create_dir_all(&roundtrip_dir)?;
+    std::fs::create_dir_all(&salvage_dir)?;
 
     // Scratch area for building each seed before its bytes are read back and
     // (re-)written with a selector prefix under the real target directories.
@@ -437,11 +660,74 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
         roundtrip_count += 1;
     }
 
+    // --- salvage/ --------------------------------------------------------
+    // No selector byte — `salvage.rs` writes the raw bytes to a temp file
+    // and hands the path to `entries::salvage`, exactly as `chain.rs` does.
+    // Six shapes, matching `SALVAGE_SHAPES`; see that constant for why this
+    // target is seeded at all and what each shape is for.
+    //
+    // Unlike `chain/`'s deliberately well-formed-only seeds, four of these
+    // six are DAMAGED on purpose, and that is not the same trade. The rule
+    // `chain/` follows is "do not seed a known-unfixed finding", not "do not
+    // seed damage": salvage's whole input domain is damaged archives, its
+    // every status tier below `Intact` describes a kind of damage, and none
+    // of the four shapes below reaches a known-unfixed defect — each is an
+    // outcome the suite already pins end to end.
+    let healthy = healthy_salvage_seed();
+    let mut salvage_count = 0usize;
+    for shape in SALVAGE_SHAPES {
+        let bytes = match *shape {
+            "healthy" => healthy.clone(),
+            // Eight records, six names, duplicates carrying DIFFERENT bytes
+            // — reaches `collides_with` and the write side's disambiguation.
+            "distinct-duplicates" => build_seed_zip(&[
+                ("one.txt", b"payload one"),
+                ("dup.txt", b"the first record under this name"),
+                ("two.txt", b"payload two"),
+                ("dup.txt", b"a SECOND record, different bytes!"),
+                ("three.txt", b"payload three"),
+                ("five.txt", b"the first five"),
+                ("six.txt", b"payload six"),
+                ("five.txt", b"a different five"),
+            ]),
+            // The same shape with byte-identical duplicates — reaches
+            // `shadows` and the skip path instead.
+            "identical-duplicates" => build_seed_zip(&[
+                ("one.txt", b"payload one"),
+                ("dup.txt", b"the first record under this name"),
+                ("two.txt", b"payload two"),
+                ("dup.txt", b"the first record under this name"),
+                ("three.txt", b"payload three"),
+            ]),
+            "zeroed-central-directory" => zero_the_central_directory(&healthy),
+            // Cut partway through the LAST entry's payload, taking the
+            // central directory with it — `available_len` and
+            // `Partial(Truncated)`.
+            "truncated-tail" => {
+                let (start, declared) = last_payload_span(&healthy);
+                healthy[..start + declared / 2].to_vec()
+            }
+            // One payload byte flipped, every size and the whole index left
+            // alone — the one shape where the CHECKSUM is what fails, so
+            // `Partial(ChecksumMismatch)` rather than a structural verdict.
+            "crc-mismatch" => {
+                let mut bytes = healthy.clone();
+                let at = 30 + "alpha.txt".len() + 4;
+                bytes[at] ^= 0xFF;
+                bytes
+            }
+            other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
+        };
+        std::fs::write(salvage_dir.join(format!("{shape}.seed")), &bytes)?;
+        salvage_count += 1;
+    }
+
     Ok(CorpusCounts {
         codec: codec_count,
         container: container_count,
         chain: chain_count,
         roundtrip: roundtrip_count,
+        salvage: salvage_count,
     })
 }
 
@@ -461,12 +747,14 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
     let expected_container = registered_container_slots().len() * 2;
     let expected_chain = CHAIN_SHAPES.len();
     let expected_roundtrip = writable_codec_slots().len() + writable_container_slots().len();
+    let expected_salvage = SALVAGE_SHAPES.len();
 
     for (target, got, expected) in [
         ("codec", counts.codec, expected_codec),
         ("container", counts.container, expected_container),
         ("chain", counts.chain, expected_chain),
         ("roundtrip", counts.roundtrip, expected_roundtrip),
+        ("salvage", counts.salvage, expected_salvage),
     ] {
         assert!(
             expected > 0,
@@ -498,6 +786,115 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
 /// gate. The `fuzz-corpus` Makefile target runs this one test explicitly
 /// with `--ignored`. `fuzz/.gitignore`'s `/corpus` already excludes the
 /// output, so nothing this writes is ever committed.
+/// `seed_crc32` is pinned against CRC-32/ISO-HDLC's published check value
+/// (`0xCBF43926` over `123456789`), not against anything this project
+/// computed. A wrong polynomial would otherwise make every "healthy" seed
+/// silently carry a checksum no reader agrees with — and the salvage
+/// corpus's whole purpose is to start from an archive that reaches
+/// `Intact`.
+#[test]
+fn the_corpus_builders_crc_matches_the_published_check_value() {
+    assert_eq!(seed_crc32(b"123456789"), 0xCBF4_3926);
+}
+
+/// **The claim the salvage corpus is actually making.** Its seeds exist so
+/// the fuzz target's only oracle call — `check_salvage_claim`, which fires
+/// on `SalvageStatus::Intact` alone — is reachable at all. Before seeding,
+/// all 64 accumulated corpus inputs produced not one salvaged record of
+/// any status, so the target executed cleanly and proved nothing.
+///
+/// Asserting "the generator wrote six files" would reproduce exactly that
+/// failure. This runs the real engine over every seed and checks what the
+/// scan actually reports, so a seed that stopped reaching `Intact` (a
+/// builder bug, a shape that drifted) fails here rather than going quiet
+/// in a fuzz run nobody reads.
+#[test]
+fn every_salvage_seed_produces_records_and_at_least_one_intact() {
+    use stuffr_core::salvage::SalvageStatus;
+
+    let dir = tempfile::tempdir().unwrap();
+    generate_corpus(dir.path()).unwrap();
+
+    let mut intact_seeds = 0usize;
+    let mut seen = 0usize;
+    for shape in SALVAGE_SHAPES {
+        let path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let outcome = entries::salvage(
+            &path,
+            &entries::SalvageOpts {
+                dest: None,
+                policy: stuffr_core::salvage::SalvagePolicy::default(),
+                select: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("seed {shape} must scan without erroring: {e}"));
+        assert!(
+            !outcome.entries.is_empty(),
+            "seed {shape} produced no salvaged record at all — the exact state the whole \
+             corpus was in before it was seeded"
+        );
+        seen += 1;
+        if outcome
+            .entries
+            .iter()
+            .any(|r| r.status == SalvageStatus::Intact)
+        {
+            intact_seeds += 1;
+        }
+    }
+    assert_eq!(seen, SALVAGE_SHAPES.len());
+    assert_eq!(
+        intact_seeds,
+        SALVAGE_SHAPES.len(),
+        "every shape must reach `Intact` on at least one of its records: that status is \
+         the only one `check_salvage_claim` fires on, and a damaged shape is meant to be \
+         a healthy archive the fuzzer can degrade FROM, not one already past the check"
+    );
+
+    // And the damaged shapes must genuinely be damaged, or the corpus is
+    // six copies of one healthy archive wearing different names.
+    for (shape, expected) in [
+        ("truncated-tail", SalvageStatus::Partial),
+        ("crc-mismatch", SalvageStatus::Partial),
+    ] {
+        let path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let outcome = entries::salvage(
+            &path,
+            &entries::SalvageOpts {
+                dest: None,
+                policy: stuffr_core::salvage::SalvagePolicy::default(),
+                select: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            outcome.entries.iter().any(|r| r.status == expected),
+            "seed {shape} must reach {expected:?}: {:?}",
+            outcome.entries.iter().map(|r| r.status).collect::<Vec<_>>()
+        );
+    }
+
+    // The two duplicate shapes must reach their own annotation, and not
+    // each other's — the distinction the previous commit introduced.
+    let duplicates = |shape: &str| {
+        let path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        entries::salvage(
+            &path,
+            &entries::SalvageOpts {
+                dest: None,
+                policy: stuffr_core::salvage::SalvagePolicy::default(),
+                select: None,
+            },
+        )
+        .unwrap()
+    };
+    let distinct = duplicates("distinct-duplicates");
+    assert!(distinct.entries.iter().any(|r| r.collides_with.is_some()));
+    assert!(distinct.entries.iter().all(|r| r.shadows.is_none()));
+    let identical = duplicates("identical-duplicates");
+    assert!(identical.entries.iter().any(|r| r.shadows.is_some()));
+}
+
 #[test]
 #[ignore = "writes fuzz/corpus/*; run explicitly via `make fuzz-corpus`"]
 fn generate_corpus_writes_the_real_seed_corpus() {
@@ -506,7 +903,11 @@ fn generate_corpus_writes_the_real_seed_corpus() {
     let corpus_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus");
     let counts = generate_corpus(&corpus_root).unwrap();
     assert!(
-        counts.codec > 0 && counts.container > 0 && counts.chain > 0 && counts.roundtrip > 0,
+        counts.codec > 0
+            && counts.container > 0
+            && counts.chain > 0
+            && counts.roundtrip > 0
+            && counts.salvage > 0,
         "wrote an empty corpus for at least one target: {counts:?}"
     );
 }

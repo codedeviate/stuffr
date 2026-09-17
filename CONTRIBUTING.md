@@ -408,7 +408,7 @@ libFuzzer through `cargo fuzz`:
 | `container.rs` | One container's reader, both ladder rungs — the selector's high bit picks seekable vs. `ForwardOnly` so both walk paths get fuzzed, not just the seekable one. Also runs an independent EOCD re-parse and a second forward-only walk as cross-checks (see the module doc for why each is not redundant with the honesty oracle below). |
 | `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the five. |
 | `roundtrip.rs` | The WRITE side, added in Phase 3c Task 8 — the only target that runs an encoder at all. The input is the archive's CONTENT, not its bytes: a selector picks a writable slot (its high bit selects `CODEC_SLOTS` over `CONTAINER_SLOTS`; there is no ladder rung to choose when writing), the payload is written through it and read straight back, and the two must agree byte-for-byte. |
-| `salvage.rs` | Added in Salvage Stage 1 Task 8 — the one target that treats arbitrary bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader. Spools its input to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does, with no destination (`dest: None`), so it exercises parsing and verification honesty rather than the filesystem write path — already covered via `chain.rs`'s `entries::list`. Has **no seeded corpus** (see "Corpus and running locally" below) — the only target of the five that runs unseeded even in CI. |
+| `salvage.rs` | Added in Salvage Stage 1 Task 8 — the one target that treats arbitrary bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader. Spools its input to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does, with no destination (`dest: None`), so it exercises parsing and verification honesty rather than the filesystem write path — already covered via `chain.rs`'s `entries::list`. Seeded from six hand-built zips (`SALVAGE_SHAPES` in `crates/stuffr/tests/fuzz_corpus.rs`): a healthy archive, two duplicate-name shapes (differing and byte-identical), a zeroed central directory, a truncated tail and a flipped payload byte. It ran **unseeded** until the Salvage Stage 1 final fix wave, and that was not a budget problem — see "Corpus and running locally" below for the measurement. |
 
 Every decode path in all five is bounded (`DecodeOpts::memory_limit`,
 a capped output read) for the same reason the codec's own conformance
@@ -485,7 +485,7 @@ built to cover twelve codecs quietly stops covering one of them.
 The corpus is generated, not committed (`fuzz/.gitignore`'s `/corpus`):
 
 ```bash
-make fuzz-corpus   # (re)generate fuzz/corpus/{codec,container,chain,roundtrip}
+make fuzz-corpus   # (re)generate fuzz/corpus/{codec,container,chain,roundtrip,salvage}
 make fuzz          # short, seeded smoke pass — the local equivalent of CI's fuzz-smoke job
 ```
 
@@ -496,6 +496,27 @@ that silently returns early on every input can't pass by doing nothing. (Not
 runs that block under `bash -e -o pipefail` where a no-match grep would abort
 the script before the check it feeds. The Makefile runs under a plain `sh`
 and must not. Both files say so; do not tidy either into matching the other.)
+
+**An unseeded target can execute cleanly and prove nothing, and `salvage`
+did.** Its only oracle call, `check_salvage_claim`, fires on
+`SalvageStatus::Intact` alone, and `Intact` requires a CRC-32 that matches
+its payload — which random mutation from an EMPTY corpus will not produce.
+So the assertion was unreachable by construction, not merely unlucky.
+Measured before it was seeded: 100,000 runs plateaued at `cov: 217` with a
+38-file corpus, and running the binary's own `salvage --list` over all 64
+accumulated inputs produced **not one salvaged record** — no `Intact`, no
+`Complete`, no `Partial`, no `Unverified`, anywhere. `make fuzz` reported
+`target 'salvage': 2000 executions — OK` throughout, truthfully.
+
+Measured after seeding, same budget: `cov: 574`, and 345 of 548 accumulated
+corpus inputs produce at least one salvaged record with 117 reaching
+`Intact`. This is the same lesson as "a new target must be shown to complete
+an iteration" one section up, one level deeper: here the iterations DID
+complete, they just never reached the check. The generator's own
+`every_salvage_seed_produces_records_and_at_least_one_intact` test is what
+keeps it that way — it runs the real engine over every seed rather than
+counting files, because counting files is exactly the assertion that would
+have passed on the empty state.
 
 **A fixed `-runs` and `-seed` do not make either run deterministic, and a
 green one is not proof of absence.** Measured on the `container` target with
