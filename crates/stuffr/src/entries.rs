@@ -1,9 +1,13 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
+#[cfg(feature = "zip")]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "zip")]
+use stuffr_core::ReaderSource;
 use stuffr_core::{
     ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts,
     EncodeOpts, Entry, EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields,
@@ -1014,6 +1018,504 @@ pub fn cat(
         fidelity: ar.fidelity().clone(),
         notes: Vec::new(),
     })
+}
+
+/// What [`salvage`] may do beyond the engine's own recovery-biased default —
+/// [`stuffr_core::salvage::SalvagePolicy::default()`] is `partial: Keep`,
+/// `max_entry: MAX_SALVAGE_ENTRY` (4 GiB), `strict: false`.
+///
+/// `dest` lives here rather than as a sibling parameter (unlike [`extract`]'s
+/// `dest: &Path`) because [`salvage`]'s own interface is fixed by this
+/// task's brief as a two-argument function; bundling it costs nothing since
+/// nobody constructs a `SalvageOpts` without knowing where recovery should
+/// land.
+pub struct SalvageOpts {
+    /// Where recovered entries land. Created if it does not exist — the same
+    /// contract [`extract`] gives its own destination.
+    pub dest: PathBuf,
+    pub policy: stuffr_core::salvage::SalvagePolicy,
+}
+
+/// Why a `Partial` entry is `Partial` — see Ruling R-J. Both land the entry
+/// as `name.partial` (or, under a policy that skips partials, not at all)
+/// and both set the caller up for exit 4, but the two causes are different
+/// diagnoses and a report that could not tell them apart would be less
+/// useful than the status alone.
+///
+/// Computed without a second checksum pass: [`stuffr_formats::zip_salvage`]
+/// already proved the entry `Partial` (a decode that ran out, or one that
+/// completed and disagreed with the CRC-32). This ops layer's own re-decode
+/// (needed regardless, to produce bytes worth writing) only has to observe
+/// whether it too reached the entry's declared length — reaching it means
+/// the earlier disagreement can only have been the checksum, since a
+/// deterministic decoder given the same bytes a second time does not
+/// truncate where it did not before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialCause {
+    /// The payload ran out before its declared length, or the decoder
+    /// failed mid-stream.
+    Truncated,
+    /// Every declared byte decoded, but the result disagreed with the
+    /// checksum the original writer computed.
+    ChecksumMismatch,
+}
+
+/// What became of one scanned record once the ops layer acted on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SalvageDisposition {
+    /// Written under its own name — `Intact` or `Complete`.
+    Written(PathBuf),
+    /// Written under `name.partial`, never under the entry's real name —
+    /// the load-bearing rule that makes recovering `Partial` entries by
+    /// default safe rather than reckless (see this module's `salvage` doc
+    /// and Ruling R-J).
+    WrittenPartial { path: PathBuf, cause: PartialCause },
+    /// A directory entry: created, never suffixed `.partial` — a directory
+    /// carries no payload to disagree with a checksum.
+    Directory(PathBuf),
+    /// Not written: `Partial`, and the policy in effect (`--partial=skip`,
+    /// or `--strict`, which forces every `Partial` entry to skip regardless
+    /// of `partial`) declined it. `--partial=ask` is folded into this
+    /// variant too: there is no interactive channel at this layer (a
+    /// library function, not a terminal), so `Ask` is read conservatively
+    /// as `Skip` rather than silently upgraded to `Keep` — the safe
+    /// direction to err in when a decision cannot actually be asked for.
+    SkippedPartial,
+    /// Not written: [`stuffr_core::salvage::SalvageStatus::Unverified`] —
+    /// this build recognises the entry's compression method but cannot
+    /// decode it (Ruling R-K). Extracting the raw undecoded bytes is a
+    /// different feature, not Stage 1's.
+    SkippedUnverified,
+    /// Not written: this build's codec registry does not have a decoder for
+    /// the method this entry needs, even though
+    /// [`stuffr_formats::zip_salvage`] already proved its content (e.g. a
+    /// build with `zip` enabled but `deflate` compiled out). A build
+    /// configuration gap, not an archive defect — distinct from
+    /// `SkippedUnverified`, which is the archive using a method no build of
+    /// this project decodes at all.
+    SkippedNotBuiltIn,
+    /// Not written: the entry carries no declared payload length (a zip
+    /// data descriptor, general-purpose bit 3) for this ops layer to bound
+    /// a read against. `stuffr_formats::zip_salvage`'s `verify` reports such
+    /// an entry `Complete` (nothing contradicted it), but "nothing to
+    /// contradict" is not the same fact as "safe to write", and this layer
+    /// only ever reads a payload by a length it can bound in advance.
+    SkippedNoDeclaredLength,
+    /// Not written: `SalvagedEntry::shadows` — this record's
+    /// `(name, declared_len, verifier)` triple duplicates an EARLIER one
+    /// (named by its scan position), which already recovered the identical
+    /// content.
+    SkippedShadow(usize),
+    /// Not written: a kind this build has no entry shape for. Not reachable
+    /// from the zip scanner today (it only ever reports `Dir` or `File`),
+    /// kept for the same reason [`extract`]'s own match keeps a skip arm:
+    /// `EntryKind` is `#[non_exhaustive]`.
+    SkippedUnsupportedKind,
+}
+
+/// One scanned record, plus what the ops layer did with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SalvagedRecord {
+    /// This record's position in SCAN order — see
+    /// [`stuffr_core::salvage::SalvagedEntry::scan_position`].
+    pub scan_position: usize,
+    pub name: String,
+    pub status: stuffr_core::salvage::SalvageStatus,
+    pub shadows: Option<usize>,
+    pub disposition: SalvageDisposition,
+}
+
+/// The report [`salvage`] returns: what the scan found and what became of
+/// each record on disk.
+#[derive(Debug)]
+pub struct SalvageOutcome {
+    pub entries: Vec<SalvagedRecord>,
+}
+
+/// Recovers what [`stuffr_formats::zip_salvage::salvage_zip`] finds in a
+/// damaged archive at `path`, writing what can safely be written into
+/// `opts.dest`.
+///
+/// # The governing principle
+///
+/// Salvage is the one recovery-biased verb in this tool; `list`, `cat`,
+/// `unpack` and `test` stay exactly as uncompromising as they already are.
+/// So a `Partial` entry is written **by default** (`--partial=keep`), but
+/// never under its real name — always `name.partial` — because a truncated
+/// file under its real name is indistinguishable from a whole one to every
+/// tool downstream. An `Unverified` entry (Ruling R-K) is never written at
+/// all: this build never decoded it, so there is no recovered content to
+/// write, only raw bytes a different feature would extract.
+///
+/// # Containment is reused, never reimplemented
+///
+/// Every entry this function decides to place on disk goes through
+/// [`safe_join`] and [`refuse_symlinked_ancestors`] — the SAME calls
+/// [`extract`] makes, in the same order, including the `target == dest`
+/// refusal for a non-directory entry. A hostile name escaping `opts.dest`
+/// aborts the whole run with [`Error::UnsafePath`] (exit 7), exactly as it
+/// aborts `unpack`; salvage's permissiveness is about WHAT gets written for
+/// damaged content, never about WHERE.
+///
+/// An entry this function has already decided not to write for some other
+/// reason (a shadow, `Unverified`, a skipped partial) never reaches
+/// containment at all: refusing to write something buys no protection by
+/// also refusing to look at its name, and aborting the recovery of an
+/// entire archive over one entry's hostile name that was never going to be
+/// written would be exactly backwards for a recovery-biased verb.
+///
+/// # Payload decoding reuses the codec registry
+///
+/// Stage 1 has one scanner ([`stuffr_formats::zip_salvage`]), so a build
+/// without the `zip` feature has nothing to salvage from — the
+/// `#[cfg(not(feature = "zip"))]` sibling below says so plainly. A zip local
+/// header's compression method decides how this function reads an entry's
+/// payload: method 0 (Stored) copies the raw bytes; method 8 (Deflate) goes
+/// through [`crate::registry`]'s own decoder for `deflate`, the identical
+/// codec [`stuffr_formats::deflate::Deflate`] every other deflate-consuming
+/// path in this crate uses — no new decompression stack is added here.
+/// Every other recognised method already reports
+/// [`stuffr_core::salvage::SalvageStatus::Unverified`] (`zip_salvage.rs`'s
+/// own `verify_candidate` never proves anything for one), so this function
+/// never has to decide what to do with one: the dispatch below never
+/// reaches past Stored/Deflate for anything this ops layer would try to
+/// write.
+#[cfg(feature = "zip")]
+pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
+    let scan = {
+        let mut file = std::fs::File::open(path)?;
+        stuffr_formats::zip_salvage::salvage_zip(&mut file, &opts.policy)?
+    };
+
+    std::fs::create_dir_all(&opts.dest)?;
+
+    let mut entries = Vec::with_capacity(scan.entries.len());
+    for entry in &scan.entries {
+        let disposition = place_salvaged_entry(path, &opts.dest, &opts.policy, entry)?;
+        entries.push(SalvagedRecord {
+            scan_position: entry.scan_position,
+            name: entry.meta.name.clone(),
+            status: entry.status,
+            shadows: entry.shadows,
+            disposition,
+        });
+    }
+    Ok(SalvageOutcome { entries })
+}
+
+/// A build with no zip salvage scanner at all has nothing to run `path`
+/// through — reported as [`Error::FormatNotEnabled`] (exit 3, "this build
+/// cannot do that") rather than failing to compile a feature this task
+/// never touches.
+#[cfg(not(feature = "zip"))]
+pub fn salvage(_path: &Path, _opts: &SalvageOpts) -> Result<SalvageOutcome> {
+    Err(Error::FormatNotEnabled(FormatId::new("zip")))
+}
+
+/// Decides — and, for everything but a shadow/skip, carries out — what
+/// happens to one scanned record.
+///
+/// Shadow detection is checked FIRST, before anything else, including
+/// containment: a shadowed record contributes nothing that was not already
+/// recovered under its earliest occurrence, so there is nothing to gain by
+/// even looking at its name.
+#[cfg(feature = "zip")]
+fn place_salvaged_entry(
+    archive_path: &Path,
+    dest: &Path,
+    policy: &stuffr_core::salvage::SalvagePolicy,
+    entry: &stuffr_core::salvage::SalvagedEntry,
+) -> Result<SalvageDisposition> {
+    if let Some(earlier) = entry.shadows {
+        return Ok(SalvageDisposition::SkippedShadow(earlier));
+    }
+
+    match entry.meta.kind {
+        EntryKind::Dir => {
+            let target = salvage_contained_target(dest, entry)?;
+            std::fs::create_dir_all(&target)?;
+            Ok(SalvageDisposition::Directory(target))
+        }
+        EntryKind::File => place_salvaged_file(archive_path, dest, policy, entry),
+        _ => Ok(SalvageDisposition::SkippedUnsupportedKind),
+    }
+}
+
+/// [`place_salvaged_entry`]'s `EntryKind::File` arm: decides whether this
+/// entry is written at all, and under which name, before touching
+/// containment or the filesystem.
+#[cfg(feature = "zip")]
+fn place_salvaged_file(
+    archive_path: &Path,
+    dest: &Path,
+    policy: &stuffr_core::salvage::SalvagePolicy,
+    entry: &stuffr_core::salvage::SalvagedEntry,
+) -> Result<SalvageDisposition> {
+    use stuffr_core::salvage::{PartialPolicy, SalvageStatus};
+
+    // R-K: never written, regardless of any policy. This build recognised
+    // the entry's method but never decoded it, so there is no recovered
+    // content — only raw bytes a different feature would extract.
+    if entry.status == SalvageStatus::Unverified {
+        return Ok(SalvageDisposition::SkippedUnverified);
+    }
+
+    let Some(compressed_len) = entry.meta.compressed_size else {
+        // A data-descriptor entry (see `SkippedNoDeclaredLength`'s own doc):
+        // `zip_salvage.rs` reports it `Complete` (nothing contradicted it),
+        // but this layer only ever reads a payload by a length it can bound
+        // in advance, and this entry declares none.
+        return Ok(SalvageDisposition::SkippedNoDeclaredLength);
+    };
+
+    let is_partial = entry.status == SalvageStatus::Partial;
+    if is_partial {
+        // `strict` overrides `partial` wholesale (Ruling: "demand proof:
+        // partial skipped"), never the other way — `partial: Keep` under
+        // `strict: true` still skips.
+        let effective = if policy.strict {
+            PartialPolicy::Skip
+        } else {
+            policy.partial
+        };
+        if !matches!(effective, PartialPolicy::Keep) {
+            return Ok(SalvageDisposition::SkippedPartial);
+        }
+    }
+
+    // Contained target, computed only now that this entry really will be
+    // written in some form — see `salvage`'s own doc for why an entry
+    // declined above never reaches this call.
+    let target = salvage_contained_target(dest, entry)?;
+    let write_target = if is_partial {
+        partial_path(&target)
+    } else {
+        target.clone()
+    };
+
+    // No `--force` concept exists for salvage (not in this feature's flag
+    // list) and none is needed: recovery is meant to be re-run, and a stale
+    // `.partial` (or a stale real-named file) from a previous attempt must
+    // not block this one. `true` unconditionally, unlike `extract`'s own
+    // `o.force`. `replace_conflicting` is reused rather than a bare
+    // `File::create` specifically because it also removes a pre-existing
+    // SYMLINK sitting at the target — `File::create` would instead follow
+    // it, landing the recovered bytes wherever it points.
+    replace_conflicting(&write_target, true)?;
+    create_parent(&write_target)?;
+    let mut out = std::fs::File::create(&write_target)?;
+    let completed = match write_payload(archive_path, entry, compressed_len, &mut out) {
+        Ok(completed) => completed,
+        Err(Error::FormatNotEnabled(_) | Error::Unsupported(_)) => {
+            drop(out);
+            let _ = std::fs::remove_file(&write_target);
+            return Ok(SalvageDisposition::SkippedNotBuiltIn);
+        }
+        Err(e) => return Err(e),
+    };
+    out.flush()?;
+
+    if is_partial {
+        let cause = if completed {
+            PartialCause::ChecksumMismatch
+        } else {
+            PartialCause::Truncated
+        };
+        Ok(SalvageDisposition::WrittenPartial {
+            path: write_target,
+            cause,
+        })
+    } else if completed {
+        Ok(SalvageDisposition::Written(write_target))
+    } else {
+        // The scan already proved this entry `Intact`/`Complete` — a
+        // deterministic re-decode of the same bytes should reach the same
+        // length every time. Reaching here means the archive changed on
+        // disk between the scan and this write, or a real device fault
+        // interrupted it; either way, writing a short file under the
+        // entry's REAL name would recreate the exact hazard `.partial`
+        // naming exists to prevent, through a different door. Refused
+        // instead, and the half-written file is not left behind.
+        let _ = std::fs::remove_file(&write_target);
+        Err(Error::Corrupt(format!(
+            "entry `{}` decoded short on write after the scan reported it {:?}; the \
+             archive may have changed on disk between scanning and salvage",
+            entry.meta.name, entry.status
+        )))
+    }
+}
+
+/// [`safe_join`] plus the same two refinements [`extract`] applies before
+/// any filesystem call for an entry — reused verbatim, not reimplemented,
+/// per this task's own governing rule.
+#[cfg(feature = "zip")]
+fn salvage_contained_target(
+    dest: &Path,
+    entry: &stuffr_core::salvage::SalvagedEntry,
+) -> Result<PathBuf> {
+    let target = safe_join(dest, &entry.meta.name)?;
+    // A post-condition on `safe_join`, asserted rather than assumed — see
+    // `extract`'s identical check for why.
+    if !target.starts_with(dest) {
+        return Err(Error::UnsafePath {
+            path: entry.meta.name.clone(),
+            reason: "resolved outside the destination",
+        });
+    }
+    if target == dest && !matches!(entry.meta.kind, EntryKind::Dir) {
+        return Err(Error::UnsafePath {
+            path: entry.meta.name.clone(),
+            reason: "only a directory entry may name the destination itself",
+        });
+    }
+    refuse_symlinked_ancestors(dest, &target, &entry.meta.name)?;
+    Ok(target)
+}
+
+/// `name` becomes `name.partial` — appended to the WHOLE final component,
+/// not replacing an existing extension, so `report.txt` becomes
+/// `report.txt.partial` rather than `report.partial`.
+#[cfg(feature = "zip")]
+fn partial_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".partial");
+    target.with_file_name(name)
+}
+
+/// Bytes of a zip local file header up to (not including) the name/extra
+/// fields and the payload that follow it.
+///
+/// Duplicated from `zip_salvage.rs`'s own identical constant rather than
+/// imported: [`stuffr_core::salvage::Candidate`] and
+/// [`stuffr_core::EntryMeta`] carry no compression-method field at all, so
+/// this ops layer — scoped to this file alone — has no way to learn a
+/// record's method except by re-reading its local header a third time
+/// (`zip.rs`'s central-directory parse and `zip_salvage.rs`'s own two
+/// internal reads are the other two). Accepted as this task's cost rather
+/// than widening its file scope to expose the field from an earlier task.
+#[cfg(feature = "zip")]
+const SALVAGE_LOCAL_HEADER_TOTAL: u64 = 30;
+
+/// Reads the method and computes the payload's start offset from the local
+/// header at `offset` — the two facts [`write_payload`] needs that neither
+/// [`stuffr_core::EntryMeta`] nor [`stuffr_core::salvage::SalvagedEntry`]
+/// carries directly (size and compressed size, which ARE carried, are read
+/// from `entry.meta` instead of here).
+#[cfg(feature = "zip")]
+fn read_local_header_layout(archive_path: &Path, offset: u64) -> Result<(u16, u64)> {
+    let mut f = std::fs::File::open(archive_path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut fixed = [0u8; SALVAGE_LOCAL_HEADER_TOTAL as usize];
+    f.read_exact(&mut fixed).map_err(Error::from_decode_io)?;
+    let method = u16::from_le_bytes([fixed[8], fixed[9]]);
+    let name_len = u64::from(u16::from_le_bytes([fixed[26], fixed[27]]));
+    let extra_len = u64::from(u16::from_le_bytes([fixed[28], fixed[29]]));
+    let payload_start = offset
+        .saturating_add(SALVAGE_LOCAL_HEADER_TOTAL)
+        .saturating_add(name_len)
+        .saturating_add(extra_len);
+    Ok((method, payload_start))
+}
+
+/// A fresh handle onto `archive_path`, seeked to `start` and bounded to at
+/// most `len` bytes — a new [`std::fs::File`] per call rather than sharing
+/// one across entries, trading a little overhead for never having to thread
+/// a mutable handle (and its current seek position) through this module's
+/// call graph.
+#[cfg(feature = "zip")]
+fn open_bounded_payload(
+    archive_path: &Path,
+    start: u64,
+    len: u64,
+) -> Result<impl Read + Send + 'static> {
+    let mut f = std::fs::File::open(archive_path)?;
+    f.seek(SeekFrom::Start(start))?;
+    Ok(f.take(len))
+}
+
+/// Reads one entry's payload and writes its RECOVERED (decoded) bytes to
+/// `out`. Returns whether the decode reached the entry's own declared
+/// length (`entry.meta.size`) — [`place_salvaged_file`]'s signal for
+/// [`PartialCause`].
+///
+/// Method 0 (Stored) and method 8 (Deflate) are the only two branches: every
+/// other method a zip local header can declare already reports
+/// [`stuffr_core::salvage::SalvageStatus::Unverified`] from
+/// `zip_salvage.rs`'s own `verify_candidate`, which [`place_salvaged_file`]
+/// already refused before calling this. The `_` arm below is therefore
+/// defensive rather than reachable in practice — see its own comment.
+#[cfg(feature = "zip")]
+fn write_payload(
+    archive_path: &Path,
+    entry: &stuffr_core::salvage::SalvagedEntry,
+    compressed_len: u64,
+    out: &mut dyn Write,
+) -> Result<bool> {
+    let (method, payload_start) = read_local_header_layout(archive_path, entry.offset)?;
+    let expected = entry.meta.size.unwrap_or(compressed_len);
+
+    match method {
+        0 => {
+            let reader = open_bounded_payload(archive_path, payload_start, compressed_len)?;
+            stream_bounded_copy(reader, expected, out)
+        }
+        8 => {
+            let reader = open_bounded_payload(archive_path, payload_start, compressed_len)?;
+            // The same `deflate` codec every other deflate-consuming path in
+            // this crate uses — not a new decompression stack. `FormatId::
+            // new("deflate")` rather than `stuffr_formats::deflate::DEFLATE`
+            // so this compiles whether or not the `deflate` feature (and
+            // therefore that module) is enabled; when it is not, the
+            // registry lookup below fails with `FormatNotEnabled`, which
+            // `place_salvaged_file` turns into `SkippedNotBuiltIn` rather
+            // than aborting the whole salvage run.
+            let decoded = crate::registry()
+                .require_decoder(FormatId::new("deflate"))?
+                .decoder(Box::new(ReaderSource::new(reader)), &DecodeOpts::default())?;
+            stream_bounded_copy(decoded, expected, out)
+        }
+        _ => Err(Error::Unsupported(format!(
+            "entry `{}` declares compression method {method}, which this build's salvage \
+             writer does not decode (only Stored and Deflate; every other recognised \
+             method already reports as Unverified before reaching here)",
+            entry.meta.name
+        ))),
+    }
+}
+
+/// Streams `reader` into `out`, bounded to `expected_len` bytes — the
+/// entry's own declared uncompressed size — so a small compressed input
+/// cannot expand arbitrarily far past what its own header claims. Same
+/// hazard, same fixed-window discipline, as `zip_salvage.rs`'s own
+/// `stream_verify`: never buffers a growable copy of the payload, only a
+/// fixed 64 KiB window, and never trusts the decoder to stop on its own.
+///
+/// Returns `true` when exactly `expected_len` bytes were produced, `false`
+/// when `reader` ran out or errored first.
+#[cfg(feature = "zip")]
+fn stream_bounded_copy(
+    mut reader: impl Read,
+    expected_len: u64,
+    out: &mut dyn Write,
+) -> Result<bool> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut produced = 0u64;
+    loop {
+        if produced >= expected_len {
+            return Ok(true);
+        }
+        let want = ((expected_len - produced) as usize).min(buf.len());
+        let n = match reader.read(&mut buf[..want]) {
+            Ok(0) => return Ok(false),
+            Ok(n) => n,
+            Err(_) => return Ok(false),
+        };
+        out.write_all(&buf[..n])?;
+        produced += n as u64;
+    }
 }
 
 /// Collects `paths` into a new `container` archive at `dst`, optionally
@@ -2803,5 +3305,203 @@ mod tests {
             );
         }
         assert!(sized.warning("x").is_some());
+    }
+}
+
+/// Task 5's own required tests, plus the containment falsification the
+/// brief names by hand. Gated on `feature = "zip"`: Stage 1 has exactly one
+/// salvage scanner, so a build without it has nothing for `salvage` to run
+/// against.
+#[cfg(all(test, feature = "zip"))]
+mod salvage_tests {
+    use super::*;
+    use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
+
+    /// CRC-32/ISO-HDLC — the same algorithm `zip_salvage.rs`'s own
+    /// `crc32_ieee` computes, reimplemented here rather than reused because
+    /// that function is private to a different crate. A fixture builder is
+    /// the one place in this test module that legitimately needs it; the
+    /// production code above never recomputes a checksum at all (see
+    /// `PartialCause`'s own doc for why).
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// One zip local file header (method 0, Stored) plus its payload — no
+    /// central directory, no end-of-central-directory record. The raw
+    /// scanner (`ZipSalvage::next_candidate`) needs neither: this is exactly
+    /// the "index destroyed or absent" shape salvage exists for, and
+    /// building only what the scan actually reads keeps a fixture's shape
+    /// legible rather than incidentally exercising the reconciliation path
+    /// this task does not touch.
+    fn local_header_entry(name: &str, data: &[u8], declared_crc: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&20u16.to_le_bytes()); // version needed to extract
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags: no data descriptor
+        out.extend_from_slice(&0u16.to_le_bytes()); // method: 0 = Stored
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        out.extend_from_slice(&0u16.to_le_bytes()); // mod date
+        out.extend_from_slice(&declared_crc.to_le_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // compressed size
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // uncompressed size
+        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn write_archive(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("damaged.zip");
+        std::fs::write(&archive, bytes).unwrap();
+        (dir, archive)
+    }
+
+    /// The brief's first required test. A Stored entry whose header
+    /// declares the CRC of the ORIGINAL payload, with one payload byte
+    /// flipped afterwards — so the scan finds a well-formed candidate
+    /// (nothing about the header disagrees with itself) but
+    /// `zip_salvage.rs`'s own CRC check disagrees with the corrupted
+    /// content, reporting `Partial`.
+    #[test]
+    fn a_partial_recovery_lands_under_a_partial_name() {
+        let original = b"hello, this is the real content".to_vec();
+        let crc = crc32(&original);
+        let mut corrupted = original.clone();
+        corrupted[5] ^= 0xFF;
+        let bytes = local_header_entry("report.txt", &corrupted, crc);
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: out_dir.path().to_path_buf(),
+            policy: SalvagePolicy::default(),
+        };
+        let outcome = salvage(&archive, &opts)
+            .expect("a corrupted-but-well-formed entry must not abort the run");
+
+        assert_eq!(outcome.entries.len(), 1);
+        let record = &outcome.entries[0];
+        assert_eq!(record.status, SalvageStatus::Partial);
+
+        let SalvageDisposition::WrittenPartial { path, cause } = &record.disposition else {
+            panic!("expected WrittenPartial, got {:?}", record.disposition);
+        };
+        assert_eq!(*cause, PartialCause::ChecksumMismatch);
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with(".partial"),
+            "must land under `name.partial`, not `{}`",
+            path.display()
+        );
+        assert!(path.exists(), "the .partial file must actually be on disk");
+        assert_eq!(std::fs::read(path).unwrap(), corrupted);
+
+        let real_name_path = out_dir.path().join("report.txt");
+        assert!(
+            !real_name_path.exists(),
+            "a partial recovery must NEVER land under the entry's real name — that is \
+             what makes recovering it by default safe rather than reckless"
+        );
+    }
+
+    /// The brief's second required test. A well-formed (CRC-correct) Stored
+    /// entry whose NAME tries to escape `dest` via `..` traversal.
+    #[test]
+    fn a_recovered_name_that_escapes_the_destination_is_refused() {
+        let data = b"pwned".to_vec();
+        let crc = crc32(&data);
+        let bytes = local_header_entry("../escaped.txt", &data, crc);
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: out_dir.path().join("dest"),
+            policy: SalvagePolicy::default(),
+        };
+        let err = salvage(&archive, &opts).expect_err("an escaping name must refuse the whole run");
+        assert_eq!(err.exit_code(), 7);
+
+        // Nothing escaped: neither the (never-created) destination nor its
+        // parent gained the file the hostile name asked for.
+        assert!(!out_dir.path().join("escaped.txt").exists());
+        assert!(!out_dir.path().join("dest").join("escaped.txt").exists());
+    }
+
+    /// The brief's third required test. The same corrupted-CRC fixture as
+    /// the first test, but under `--strict`: a `Partial` entry must be
+    /// skipped even though the default policy (`partial: Keep`) would have
+    /// written it.
+    #[test]
+    fn strict_mode_skips_what_it_cannot_prove() {
+        let original = b"hello, this is the real content".to_vec();
+        let crc = crc32(&original);
+        let mut corrupted = original.clone();
+        corrupted[5] ^= 0xFF;
+        let bytes = local_header_entry("report.txt", &corrupted, crc);
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: out_dir.path().to_path_buf(),
+            policy: SalvagePolicy {
+                strict: true,
+                ..SalvagePolicy::default()
+            },
+        };
+        let outcome = salvage(&archive, &opts).unwrap();
+
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Partial);
+        assert_eq!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::SkippedPartial
+        );
+        assert!(
+            std::fs::read_dir(out_dir.path()).unwrap().next().is_none(),
+            "strict mode must write nothing at all for an unprovable entry"
+        );
+    }
+
+    /// A clean, uncorrupted entry is written under its own name, at the top
+    /// tier the engine reports (`Complete`, since Stored has no checksum
+    /// concept beyond CRC agreement — see `zip_salvage.rs`'s own doc for why
+    /// a Stored/agreeing entry reports `Intact`, not `Complete`; pinned here
+    /// so a regression in the write path cannot hide behind only ever
+    /// testing the damaged cases above).
+    #[test]
+    fn an_intact_entry_is_written_under_its_own_name() {
+        let data = b"nothing wrong with this one".to_vec();
+        let crc = crc32(&data);
+        let bytes = local_header_entry("fine.txt", &data, crc);
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: out_dir.path().to_path_buf(),
+            policy: SalvagePolicy::default(),
+        };
+        let outcome = salvage(&archive, &opts).unwrap();
+
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Intact);
+        let SalvageDisposition::Written(path) = &outcome.entries[0].disposition else {
+            panic!("expected Written, got {:?}", outcome.entries[0].disposition);
+        };
+        assert_eq!(path, &out_dir.path().join("fine.txt"));
+        assert_eq!(std::fs::read(path).unwrap(), data);
     }
 }
