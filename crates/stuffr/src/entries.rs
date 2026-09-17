@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 #[cfg(feature = "zip")]
 use std::io::{Seek, SeekFrom};
@@ -1093,6 +1093,48 @@ pub enum PartialCause {
 pub enum SalvageDisposition {
     /// Written under its own name — `Intact` or `Complete`.
     Written(PathBuf),
+    /// Written under a DISAMBIGUATED name, because an earlier record in this
+    /// same run already wrote the name this one asks for.
+    ///
+    /// # Why this exists
+    ///
+    /// The final whole-branch review measured what happened without it, on
+    /// an 8-record archive holding two pairs of same-named records with
+    /// DIFFERENT payloads: `salvage -C out` printed `8 scanned: 8 written`
+    /// at exit 0 and left **six files**, with `out/dup.txt` holding the
+    /// later record's bytes and the earlier record's gone — while `salvage
+    /// --index 2 -o f` returned that earlier record correctly, proving it
+    /// was recoverable the whole time. A scripted `salvage broken.zip -C out
+    /// && rm broken.zip` therefore lost data and reported success, in the
+    /// one verb whose entire purpose is not losing things.
+    ///
+    /// # The principle applied
+    ///
+    /// The same one [`Self::WrittenPartial`] already stands on: **recover by
+    /// default, and let the filesystem carry the distinction.** A truncated
+    /// file under its real name is indistinguishable from a whole one to
+    /// every tool downstream, so it gets `.partial`; a second record under a
+    /// name already taken is indistinguishable from the first, so it gets a
+    /// suffix naming its own SCAN POSITION — which maps straight back to the
+    /// `--list` row a user just read, and is unique by construction.
+    ///
+    /// Not a fidelity warning and not a skip: both records exist, both
+    /// verify, and both are worth having. The run still reports it and still
+    /// exits non-zero (bucket 4, see [`salvage_exit_code`]), because a
+    /// caller who scripted this needs to know a name had to be changed.
+    WrittenDisambiguated {
+        /// Where the bytes actually landed — the suffixed name, plus
+        /// `.partial` on top of it when [`Self::partial`] is `Some`.
+        path: PathBuf,
+        /// The EARLIER scan position that wrote this entry's own name first.
+        taken_by: usize,
+        /// `Some` when this record is ALSO `Partial`, carrying the same
+        /// cause [`Self::WrittenPartial`] would. The two facts are
+        /// independent — a record can need disambiguating and be truncated —
+        /// so they compose here rather than forcing a choice between two
+        /// dispositions that are both true.
+        partial: Option<PartialCause>,
+    },
     /// Written under `name.partial`, never under the entry's real name —
     /// the load-bearing rule that makes recovering `Partial` entries by
     /// default safe rather than reckless (see this module's `salvage` doc
@@ -1215,10 +1257,16 @@ pub struct SalvageOutcome {
 /// ```text
 /// 5  nothing recoverable at all (no entries were even scanned)
 /// 3  any entry Unverified
-/// 4  any entry Partial (written or skipped), or any entry skipped for any
-///    other reason
+/// 4  any entry Partial (written or skipped), any entry skipped for any
+///    other reason, or any entry written under a disambiguated name
 /// 0  every entry Intact or Complete
 /// ```
+///
+/// **A disambiguated write is in bucket 4 even though nothing was lost**,
+/// and that is deliberate: the archive held two records under one name and
+/// only one of them can have it, so a caller scripting `salvage -C out &&
+/// rm broken.zip` needs the run to say something happened. Exit 0 is
+/// reserved for a recovery that reproduced the archive's own names exactly.
 ///
 /// **3 outranks 4 deliberately.** `Unverified` is actionable and names its
 /// own remedy — a rebuild, or `--features c-backed` — where 4 only says
@@ -1245,7 +1293,8 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
             | SalvageDisposition::NotSelected
             | SalvageDisposition::NotWritten => {}
             SalvageDisposition::SkippedUnverified => any_unverified = true,
-            SalvageDisposition::WrittenPartial { .. }
+            SalvageDisposition::WrittenDisambiguated { .. }
+            | SalvageDisposition::WrittenPartial { .. }
             | SalvageDisposition::SkippedPartial(_)
             | SalvageDisposition::SkippedNotBuiltIn
             | SalvageDisposition::SkippedShadow(_)
@@ -1324,9 +1373,18 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
         std::fs::create_dir_all(dest)?;
     }
 
+    // Every destination path an earlier entry IN THIS RUN has already
+    // written, mapped to the scan position that claimed it. Salvage is the
+    // one verb whose input can legitimately name the same file twice (that
+    // is the whole feature), so "already there" has to mean "written by this
+    // run", not "exists on disk" — a stale file from a previous attempt must
+    // still be replaced, which is what `replace_conflicting(.., true)` in
+    // `place_salvaged_file` is for and why it is NOT what closes this.
+    let mut claimed: HashMap<PathBuf, usize> = HashMap::new();
+
     let mut entries = Vec::with_capacity(scan.entries.len());
     for entry in &scan.entries {
-        let disposition = place_salvaged_entry(path, opts, entry)?;
+        let disposition = place_salvaged_entry(path, opts, entry, &mut claimed)?;
         entries.push(SalvagedRecord {
             scan_position: entry.scan_position,
             name: entry.meta.name.clone(),
@@ -1367,6 +1425,7 @@ fn place_salvaged_entry(
     archive_path: &Path,
     opts: &SalvageOpts,
     entry: &stuffr_core::salvage::SalvagedEntry,
+    claimed: &mut HashMap<PathBuf, usize>,
 ) -> Result<SalvageDisposition> {
     if let Some(earlier) = entry.shadows {
         return Ok(SalvageDisposition::SkippedShadow(earlier));
@@ -1378,6 +1437,11 @@ fn place_salvaged_entry(
     }
 
     match entry.meta.kind {
+        // A directory entry is NOT tracked in `claimed` and is never
+        // disambiguated: `create_dir_all` over a directory that already
+        // exists is idempotent, so a repeated directory entry costs nothing
+        // and destroys nothing — unlike a repeated FILE entry, where the
+        // second write replaces the first record's bytes.
         EntryKind::Dir => match &opts.dest {
             Some(dest) => {
                 let target = salvage_contained_target(dest, entry)?;
@@ -1388,7 +1452,9 @@ fn place_salvaged_entry(
             // there is no `dest` for one to be relative to.
             None => Ok(SalvageDisposition::NotWritten),
         },
-        EntryKind::File => place_salvaged_file(archive_path, &opts.dest, &opts.policy, entry),
+        EntryKind::File => {
+            place_salvaged_file(archive_path, &opts.dest, &opts.policy, entry, claimed)
+        }
         _ => Ok(SalvageDisposition::SkippedUnsupportedKind),
     }
 }
@@ -1407,6 +1473,7 @@ fn place_salvaged_file(
     dest: &Option<PathBuf>,
     policy: &stuffr_core::salvage::SalvagePolicy,
     entry: &stuffr_core::salvage::SalvagedEntry,
+    claimed: &mut HashMap<PathBuf, usize>,
 ) -> Result<SalvageDisposition> {
     use stuffr_core::salvage::{PartialPolicy, SalvageStatus};
 
@@ -1484,11 +1551,34 @@ fn place_salvaged_file(
     // written in some form — see `salvage`'s own doc for why an entry
     // declined above never reaches this call.
     let target = salvage_contained_target(dest, entry)?;
-    let write_target = if is_partial {
-        partial_path(&target)
-    } else {
-        target.clone()
+
+    // An EARLIER entry in this same run already wrote this path: the
+    // archive holds two records under one name, and only one of them can
+    // have it. Recover both and let the filesystem carry the distinction —
+    // see `SalvageDisposition::WrittenDisambiguated` for the measurement
+    // that made this necessary and for why the suffix names the scan
+    // position.
+    let taken_by = claimed.get(&target).copied();
+    let base_target = match taken_by {
+        Some(_) => disambiguated_path(&target, entry.scan_position),
+        None => target.clone(),
     };
+    let write_target = if is_partial {
+        partial_path(&base_target)
+    } else {
+        base_target
+    };
+    // Both the name the entry ASKED for and the name it actually got are
+    // claimed. The first is what makes a later record under the same name
+    // disambiguate; the second matters because an archive is free to
+    // contain a real entry literally named `x.salvaged-6`, and two records
+    // landing on one path is the defect being closed, not a shape to leave
+    // one door open on. `or_insert` keeps the EARLIEST claimant, which is
+    // the position `taken_by` must name.
+    claimed.entry(target).or_insert(entry.scan_position);
+    claimed
+        .entry(write_target.clone())
+        .or_insert(entry.scan_position);
 
     // No `--force` concept exists for salvage (not in this feature's flag
     // list) and none is needed: recovery is meant to be re-run, and a stale
@@ -1498,6 +1588,12 @@ fn place_salvaged_file(
     // `File::create` specifically because it also removes a pre-existing
     // SYMLINK sitting at the target — `File::create` would instead follow
     // it, landing the recovered bytes wherever it points.
+    //
+    // It is deliberately NOT what stops one salvage run overwriting its own
+    // earlier output: "replace what was already on disk" and "two records
+    // in this archive want one name" are different facts, and conflating
+    // them is exactly how eight recovered records became six files at exit
+    // 0. `claimed` above is what separates them.
     replace_conflicting(&write_target, true)?;
     create_parent(&write_target)?;
     let mut out = std::fs::File::create(&write_target)?;
@@ -1512,12 +1608,22 @@ fn place_salvaged_file(
     };
     out.flush()?;
 
-    if is_partial {
-        let cause = if completed {
-            PartialCause::ChecksumMismatch
-        } else {
-            PartialCause::Truncated
-        };
+    let partial_cause = is_partial.then_some(if completed {
+        PartialCause::ChecksumMismatch
+    } else {
+        PartialCause::Truncated
+    });
+
+    if let Some(taken_by) = taken_by {
+        // Disambiguation and partiality are independent facts and both can
+        // be true at once, so the one disposition carries both rather than
+        // forcing a choice between two variants that are each correct.
+        Ok(SalvageDisposition::WrittenDisambiguated {
+            path: write_target,
+            taken_by,
+            partial: partial_cause,
+        })
+    } else if let Some(cause) = partial_cause {
         Ok(SalvageDisposition::WrittenPartial {
             path: write_target,
             cause,
@@ -1579,6 +1685,29 @@ fn partial_path(target: &Path) -> PathBuf {
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
     name.push(".partial");
+    target.with_file_name(name)
+}
+
+/// `name` becomes `name.salvaged-N`, where `N` is the record's own SCAN
+/// POSITION — appended to the whole final component, exactly as
+/// [`partial_path`] appends `.partial`, and for the identical reason.
+///
+/// The scan position is what makes the name both unique (no two records
+/// share one) and traceable: it is the number in the first column of the
+/// `stuffr salvage --list` row a user just read, so a file on disk maps
+/// back to the record it came from with no second lookup. A bare counter
+/// (`.1`, `.2`) would be unique too and would name nothing.
+///
+/// Composes with `.partial` rather than competing with it: a disambiguated
+/// partial lands as `name.salvaged-6.partial`, with `.partial` LAST so the
+/// suffix every downstream tool is being warned by stays the final one.
+#[cfg(feature = "zip")]
+fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(format!(".salvaged-{scan_position}"));
     target.with_file_name(name)
 }
 
@@ -3871,6 +4000,28 @@ mod salvage_tests {
         );
     }
 
+    /// The two suffixes compose in one order only: the disambiguating one
+    /// goes on first and `.partial` goes on LAST, so the marker every
+    /// downstream tool is being warned by stays the final extension. Also
+    /// pins that neither replaces an existing extension — `report.txt`
+    /// becomes `report.txt.salvaged-6`, never `report.salvaged-6`.
+    #[cfg(feature = "zip")]
+    #[test]
+    fn a_disambiguated_partial_keeps_dot_partial_last() {
+        let target = PathBuf::from("/out/report.txt");
+        let renamed = disambiguated_path(&target, 6);
+        assert_eq!(renamed, PathBuf::from("/out/report.txt.salvaged-6"));
+        assert_eq!(
+            partial_path(&renamed),
+            PathBuf::from("/out/report.txt.salvaged-6.partial")
+        );
+        // A record that needed neither is untouched by either.
+        assert_eq!(
+            partial_path(&target),
+            PathBuf::from("/out/report.txt.partial")
+        );
+    }
+
     /// Fix round 1, REQUIRED 3 (Ruling R-N): the aggregation rule, pinned
     /// against constructed `SalvageOutcome`s rather than full end-to-end
     /// archives — the rule is pure arithmetic over dispositions, and a
@@ -3921,6 +4072,22 @@ mod salvage_tests {
             }),
             3,
             "an Unverified entry alone is bucket 3"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![
+                    record(SalvageDisposition::Written(PathBuf::from("a"))),
+                    record(SalvageDisposition::WrittenDisambiguated {
+                        path: PathBuf::from("a.salvaged-1"),
+                        taken_by: 0,
+                        partial: None,
+                    }),
+                ],
+            }),
+            4,
+            "nothing was lost, but a name the archive declared could not be honoured — a \
+             script that ran `salvage -C out && rm broken.zip` has to be told"
         );
 
         assert_eq!(

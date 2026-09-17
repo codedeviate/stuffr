@@ -8898,6 +8898,114 @@ fn the_duplicate_name_fixture_reads_the_same_as_the_identical_one() {
     );
 }
 
+/// The finding this closes, reproduced as a FILE COUNT and a BYTE
+/// COMPARISON, which is how it was found and the only way it shows up at
+/// all: before the fix, `salvage -C` on an archive whose duplicates differ
+/// printed `8 scanned: 8 written` at exit 0 and left SIX files, with
+/// `shadowed-a.bin` holding record 6's payload and record 2's gone —
+/// while `salvage --index 2 -o f` returned record 2 correctly the whole
+/// time. No error code was involved anywhere; a test asserting on one
+/// would have passed through the defect untouched.
+#[test]
+fn salvage_recovers_both_records_under_a_repeated_name() {
+    let dir = tmp_dir();
+    let archive = write_duplicate_name_zip_fixture(&dir);
+    let out_dir = dir.join("recovered");
+
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "a run that had to change a name must not exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let mut names: Vec<String> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "five.txt",
+            "one.txt",
+            "shadowed-a.bin",
+            "shadowed-a.bin.salvaged-6",
+            "shadowed-b.bin",
+            "shadowed-b.bin.salvaged-7",
+            "six.txt",
+            "two.txt",
+        ],
+        "eight records written must be eight files, with the later record of each pair \
+         under a name derived from its own scan position"
+    );
+
+    // The bytes, not just the count: the record that owns the name keeps
+    // it, and the later one is beside it rather than on top of it.
+    let first = std::fs::read(out_dir.join("shadowed-a.bin")).unwrap();
+    let second = std::fs::read(out_dir.join("shadowed-a.bin.salvaged-6")).unwrap();
+    assert_eq!(
+        first, b"payload for the first record that will be shadowed",
+        "record 2 must keep its own name and its own bytes"
+    );
+    assert_eq!(
+        second, b"DIFFERENT bytes under the first duplicated name!!!",
+        "record 6's bytes must be on disk too, not lost to an overwrite"
+    );
+    assert_ne!(first, second, "the fixture's whole premise");
+
+    let summary = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        summary.contains("8 written"),
+        "every written record is counted, and now there are eight files to match: {summary}"
+    );
+    assert!(
+        summary.contains("2 renamed to avoid a name collision"),
+        "the summary must say a name had to be changed: {summary}"
+    );
+}
+
+/// The complement, and the reason the identical-duplicate fixture is kept:
+/// when a duplicate IS a proven copy, nothing is renamed and nothing is
+/// written twice — recovering the same bytes under a second name would be
+/// noise, not a service. Without this, a fix that renamed every repeated
+/// name would pass the test above and quietly double every shadowing
+/// archive's output.
+#[test]
+fn a_proven_duplicate_is_still_skipped_rather_than_renamed() {
+    let dir = tmp_dir();
+    let archive = write_shadowing_zip_fixture(&dir);
+    let out_dir = dir.join("recovered");
+
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    assert_eq!(
+        std::fs::read_dir(&out_dir).unwrap().count(),
+        6,
+        "six distinct names, and the two byte-identical duplicates add nothing"
+    );
+    let summary = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        summary.contains("2 skipped"),
+        "a proven copy is skipped, as it always was: {summary}"
+    );
+    assert!(
+        summary.contains("0 renamed to avoid a name collision"),
+        "and nothing needed renaming: {summary}"
+    );
+}
+
 /// The two annotations, measured against each other on the two fixtures.
 ///
 /// On the identical-duplicate archive the duplicates are PROVEN copies and

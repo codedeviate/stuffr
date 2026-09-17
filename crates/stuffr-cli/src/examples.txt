@@ -720,9 +720,16 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       rows than `stuffr list` on the same archive: a zip whose central
       directory declares two records under one name (`zip.rs`'s own
       last-record-wins collapse — see "WHAT THIS BUILD CAN DO" below) makes
-      `list` show one of them and `salvage --list` show both, the second
-      annotated `[shadowed: dup of #N]` naming the EARLIER scan position it
-      duplicates.
+      `list` show one of them and `salvage --list` show both.
+
+      A record repeating an earlier record's name is annotated one of two
+      ways, and they mean different things. `[shadowed: dup of #N]` is a
+      MEASUREMENT: name, declared length and checksum all agree with record
+      N, so that record is a copy and writing it again would add nothing.
+      `[name collision: #N uses this name too]` is the weaker fact: the
+      name repeats but the content was NOT proven identical, so both
+      records are real and both are worth recovering — `-C` writes the
+      second as `NAME.salvaged-N` (see below) rather than over the first.
 
   stuffr salvage broken.zip -C out/
       Scans broken.zip for zip local file headers directly, rather than
@@ -733,9 +740,21 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       full decode, is still written, but under `NAME.partial`, never its
       real name — a truncated file under its real name would be
       indistinguishable from a whole one to every tool downstream. A
-      shadowed record is never written a second time. The default
-      (non---list) report — counts only — goes to stderr, the same
-      destination `unpack`'s and `test`'s own summary lines use.
+      shadowed record — one MEASURED to be a byte-identical copy of an
+      earlier one — is never written a second time.
+
+      A record whose name an earlier one already took, without being proven
+      a copy of it, is a different case and is recovered too: it lands as
+      `NAME.salvaged-N`, where N is its own scan position (the number in
+      the first column of `--list`). The same principle as `.partial`, for
+      the same reason — recover by default, and let the filesystem carry
+      the distinction. The run exits 4 and the summary's last field counts
+      how many names had to be changed, so a scripted
+      `stuffr salvage broken.zip -C out/ && rm broken.zip` is told rather
+      than quietly losing a record to an overwrite.
+
+      The default (non---list) report — counts only — goes to stderr, the
+      same destination `unpack`'s and `test`'s own summary lines use.
 
   stuffr salvage broken.zip -o recovered.bin --index 4
       Recovers exactly ONE entry's bytes to a named file — no `-C`
@@ -802,7 +821,8 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   with no length to reconcile against a central directory) — outranks 4
   deliberately, since it names its own remedy (a rebuild, or
   --features c-backed) where 4 only says "degraded". 4 — any entry written
-  as `.partial`, or any entry skipped for any other reason (a shadow,
+  as `.partial`, any entry written under a disambiguated
+  `NAME.salvaged-N`, or any entry skipped for any other reason (a shadow,
   --partial=skip, a kind this build has no shape for). 5 — the scan found
   nothing recoverable in the archive at all, regardless of `--index`. 6 and
   7 (a declaration over --max-entry, or a hostile path escaping -C or -o)
@@ -1018,8 +1038,9 @@ EXIT CODES
      declared length to bound the payload against)
   4  fidelity degraded under strict mode, or a `salvage` run left something
      less than fully recovered (an entry written only as `NAME.partial`,
-     or skipped for any reason — a shadow, --partial=skip, a kind this
-     build has no shape for)
+     an entry written under a disambiguated `NAME.salvaged-N` because an
+     earlier record already took its name, or skipped for any reason — a
+     shadow, --partial=skip, a kind this build has no shape for)
   5  archive or stream is corrupt, or a `salvage` scan found nothing
      recoverable in the archive at all
   6  resource limit exceeded (--max-ratio or --memory-limit tripped,

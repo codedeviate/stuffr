@@ -641,11 +641,16 @@ fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static s
 fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     let status = match &record.disposition {
         entries::SalvageDisposition::WrittenPartial { cause, .. }
-        | entries::SalvageDisposition::SkippedPartial(cause) => match cause {
+        | entries::SalvageDisposition::SkippedPartial(cause)
+        | entries::SalvageDisposition::WrittenDisambiguated {
+            partial: Some(cause),
+            ..
+        } => match cause {
             entries::PartialCause::Truncated => "Partial (truncated)",
             entries::PartialCause::ChecksumMismatch => "Partial (checksum mismatch)",
         },
-        entries::SalvageDisposition::Written(_)
+        entries::SalvageDisposition::WrittenDisambiguated { partial: None, .. }
+        | entries::SalvageDisposition::Written(_)
         | entries::SalvageDisposition::Directory(_)
         | entries::SalvageDisposition::SkippedUnverified
         | entries::SalvageDisposition::SkippedNotBuiltIn
@@ -660,6 +665,14 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     }
     if let Some(earlier) = record.collides_with {
         line.push_str(&format!(" [name collision: #{earlier} uses this name too]"));
+    }
+    // The path actually written, named only when it is NOT the entry's own
+    // name — a row a user reads to find their file must say where it went.
+    if let entries::SalvageDisposition::WrittenDisambiguated { path, .. } = &record.disposition {
+        line.push_str(&format!(
+            " [written as {}]",
+            path.file_name().unwrap_or(path.as_os_str()).display()
+        ));
     }
     if matches!(record.disposition, entries::SalvageDisposition::NotSelected) {
         line.push_str(" [not selected]");
@@ -692,10 +705,24 @@ fn print_salvage_list(entries: &[entries::SalvagedRecord]) -> stuffr::Result<()>
 fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
     let (mut written, mut partial, mut skipped, mut unverified, mut not_selected, mut not_written) =
         (0, 0, 0, 0, 0, 0);
+    // An ADDITIONAL tally, not a bucket of its own: a disambiguated record
+    // is already counted as written (or as a `.partial`), so the first six
+    // counts still sum to the number of rows. Disambiguation is a fact
+    // ABOUT a write, the same way a `Partial` cause is a fact about one —
+    // giving it its own bucket would make the summary stop adding up, which
+    // is precisely the defect this whole change exists to fix.
+    let mut renamed = 0;
     for record in entries {
         match &record.disposition {
             entries::SalvageDisposition::Written(_) | entries::SalvageDisposition::Directory(_) => {
                 written += 1;
+            }
+            entries::SalvageDisposition::WrittenDisambiguated { partial: cause, .. } => {
+                renamed += 1;
+                match cause {
+                    Some(_) => partial += 1,
+                    None => written += 1,
+                }
             }
             entries::SalvageDisposition::WrittenPartial { .. } => partial += 1,
             entries::SalvageDisposition::SkippedPartial(_)
@@ -710,7 +737,7 @@ fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
     eprintln!(
         "salvage -> {} scanned: {written} written, {partial} written as .partial, {skipped} \
          skipped, {unverified} unverified, {not_selected} not selected, {not_written} not \
-         written (no destination)",
+         written (no destination), {renamed} renamed to avoid a name collision",
         entries.len()
     );
 }
@@ -792,6 +819,17 @@ fn finish_single_file_recovery(
     let (from, is_partial) = match &record.disposition {
         entries::SalvageDisposition::Written(path) => (path.clone(), false),
         entries::SalvageDisposition::WrittenPartial { path, .. } => (path.clone(), true),
+        // Unreachable in practice — `-o` narrows `select` to exactly one
+        // scan position and recovers into a FRESH temporary directory, so
+        // no earlier entry in the run can have claimed a name. Handled
+        // rather than lumped into the "nothing written" arm below, which
+        // would silently report a recovered file as not recovered if that
+        // ever stopped being true. The disambiguated on-disk name does not
+        // survive the move: `-o FILE` means FILE, and the caller named one
+        // entry, so there is nothing left to disambiguate against.
+        entries::SalvageDisposition::WrittenDisambiguated { path, partial, .. } => {
+            (path.clone(), partial.is_some())
+        }
         entries::SalvageDisposition::Directory(_) => {
             return Err(stuffr::Error::Usage(format!(
                 "scan position {scan_position} is a directory entry; -o recovers one file's \

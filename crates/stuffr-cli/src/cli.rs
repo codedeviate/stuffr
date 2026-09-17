@@ -259,9 +259,10 @@ pub enum Command {
         /// with record N, so nothing is lost by not writing this one.
         /// `[name collision: #N uses this name too]` is the weaker fact:
         /// the name repeats but the content was not proven identical, so
-        /// both records are worth having. It is the marker `stuffr list`'s
-        /// own "repeat a name … and are shadowed" fidelity warning
-        /// corresponds to.
+        /// both records are worth having and `-C` writes the second one as
+        /// `name.salvaged-N`, never over the first. It is the marker
+        /// `stuffr list`'s own "repeat a name … and are shadowed" fidelity
+        /// warning corresponds to.
         ///
         /// `stuffr list` on the same archive can print FEWER rows than this:
         /// a record a later one shadows is invisible to `list`, which only
@@ -276,6 +277,12 @@ pub enum Command {
         /// One of `-C`, `-o` or `--list` is required. Mutually exclusive
         /// with `-o`: a directory tree and one named file are two different
         /// destinations.
+        ///
+        /// A damaged archive can hold two records under one name. The
+        /// second one recovered lands as `name.salvaged-N`, where N is its
+        /// scan position, rather than over the first — both records exist,
+        /// both are worth having, and the run exits 4 so a script knows a
+        /// name had to be changed.
         #[arg(short = 'C', long, value_name = "DIR")]
         directory: Option<String>,
         /// Recover exactly one entry's bytes to this file, naming it with
