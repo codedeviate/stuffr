@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use stuffr_core::{
     ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts,
     EncodeOpts, Entry, EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields,
-    OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR, RatioGuard, ReaderSource, Registry, Result, Rung,
-    SeekRead, Sink, Source, SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain,
+    OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead,
+    Sink, Source, SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain,
     resolve_chain_deep_with, safe_join,
 };
 
@@ -1468,7 +1468,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
 
     let mut entries = Vec::with_capacity(scan.entries.len());
     for entry in &scan.entries {
-        let disposition = place_salvaged_entry(path, opts, entry, &mut claimed)?;
+        let disposition = place_salvaged_entry(path, opts, entry, &mut claimed, format)?;
         entries.push(SalvagedRecord {
             scan_position: entry.scan_position,
             name: entry.meta.name.clone(),
@@ -1500,6 +1500,7 @@ fn place_salvaged_entry(
     opts: &SalvageOpts,
     entry: &stuffr_core::salvage::SalvagedEntry,
     claimed: &mut std::collections::HashMap<PathBuf, usize>,
+    format: FormatId,
 ) -> Result<SalvageDisposition> {
     if let Some(earlier) = entry.shadows {
         return Ok(SalvageDisposition::SkippedShadow(earlier));
@@ -1526,9 +1527,14 @@ fn place_salvaged_entry(
             // there is no `dest` for one to be relative to.
             None => Ok(SalvageDisposition::NotWritten),
         },
-        EntryKind::File => {
-            place_salvaged_file(archive_path, &opts.dest, &opts.policy, entry, claimed)
-        }
+        EntryKind::File => place_salvaged_file(
+            archive_path,
+            &opts.dest,
+            &opts.policy,
+            entry,
+            claimed,
+            format,
+        ),
         _ => Ok(SalvageDisposition::SkippedUnsupportedKind),
     }
 }
@@ -1547,6 +1553,7 @@ fn place_salvaged_file(
     policy: &stuffr_core::salvage::SalvagePolicy,
     entry: &stuffr_core::salvage::SalvagedEntry,
     claimed: &mut std::collections::HashMap<PathBuf, usize>,
+    format: FormatId,
 ) -> Result<SalvageDisposition> {
     use stuffr_core::salvage::{PartialPolicy, SalvageStatus};
 
@@ -1597,7 +1604,13 @@ fn place_salvaged_file(
         // `write_payload`'s caller below makes for a KEPT partial, just
         // discarded rather than kept.
         return Ok(
-            match write_payload(archive_path, entry, compressed_len, &mut std::io::sink()) {
+            match write_salvaged_payload(
+                format,
+                archive_path,
+                entry,
+                compressed_len,
+                &mut std::io::sink(),
+            ) {
                 Ok(completed) => {
                     let cause = if completed {
                         PartialCause::ChecksumMismatch
@@ -1670,15 +1683,16 @@ fn place_salvaged_file(
     replace_conflicting(&write_target, true)?;
     create_parent(&write_target)?;
     let mut out = std::fs::File::create(&write_target)?;
-    let completed = match write_payload(archive_path, entry, compressed_len, &mut out) {
-        Ok(completed) => completed,
-        Err(Error::FormatNotEnabled(_) | Error::Unsupported(_)) => {
-            drop(out);
-            let _ = std::fs::remove_file(&write_target);
-            return Ok(SalvageDisposition::SkippedNotBuiltIn);
-        }
-        Err(e) => return Err(e),
-    };
+    let completed =
+        match write_salvaged_payload(format, archive_path, entry, compressed_len, &mut out) {
+            Ok(completed) => completed,
+            Err(Error::FormatNotEnabled(_) | Error::Unsupported(_)) => {
+                drop(out);
+                let _ = std::fs::remove_file(&write_target);
+                return Ok(SalvageDisposition::SkippedNotBuiltIn);
+            }
+            Err(e) => return Err(e),
+        };
     out.flush()?;
 
     let partial_cause = is_partial.then_some(if completed {
@@ -1781,142 +1795,56 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// Bytes of a zip local file header up to (not including) the name/extra
-/// fields and the payload that follow it.
+/// Dispatches to the format's own salvage payload writer — matching
+/// [`salvage_scan`]'s own dispatch exactly, so each later task's own
+/// scanner (zoo, lha, arj) drops in as one more arm here too, alongside the
+/// arm it already adds there.
 ///
-/// Duplicated from `zip_salvage.rs`'s own identical constant rather than
-/// imported: `name_len`/`extra_len` — needed here purely to locate where a
-/// payload BEGINS — are not carried by [`stuffr_core::salvage::Candidate`]
-/// or [`stuffr_core::EntryMeta`] either, and re-deriving `entry.meta.name`'s
-/// byte length would silently disagree with the header's own `name_len` for
-/// a CD-reconciled entry whose name was decoded LOSSILY (`zip.rs`'s
-/// `CdRecord::name`, `String::from_utf8_lossy`) — a non-UTF-8 byte becomes a
-/// 3-byte U+FFFD, changing the byte count. So this one read stays.
-///
-/// The compression METHOD is a different fact, and — fix round 1, REQUIRED
-/// 4 — is no longer re-derived here at all: `EntryMeta::codec`, filled at
-/// both of `zip_salvage.rs`'s discovery sites, is what [`write_payload`]
-/// dispatches on instead. This constant and this function exist only to
-/// locate the payload, not to learn what compresses it.
-const SALVAGE_LOCAL_HEADER_TOTAL: u64 = 30;
-
-/// Computes the payload's start offset from the local header at `offset` —
-/// see this constant's own doc for why `name_len`/`extra_len` still have to
-/// be read from the archive rather than derived from `entry.meta`.
-fn zip_payload_start(archive_path: &Path, offset: u64) -> Result<u64> {
-    let mut f = std::fs::File::open(archive_path)?;
-    f.seek(SeekFrom::Start(offset))?;
-    let mut fixed = [0u8; SALVAGE_LOCAL_HEADER_TOTAL as usize];
-    f.read_exact(&mut fixed).map_err(Error::from_decode_io)?;
-    let name_len = u64::from(u16::from_le_bytes([fixed[26], fixed[27]]));
-    let extra_len = u64::from(u16::from_le_bytes([fixed[28], fixed[29]]));
-    Ok(offset
-        .saturating_add(SALVAGE_LOCAL_HEADER_TOTAL)
-        .saturating_add(name_len)
-        .saturating_add(extra_len))
-}
-
-/// A fresh handle onto `archive_path`, seeked to `start` and bounded to at
-/// most `len` bytes — a new [`std::fs::File`] per call rather than sharing
-/// one across entries, trading a little overhead for never having to thread
-/// a mutable handle (and its current seek position) through this module's
-/// call graph.
-fn open_bounded_payload(
-    archive_path: &Path,
-    start: u64,
-    len: u64,
-) -> Result<impl Read + Send + 'static> {
-    let mut f = std::fs::File::open(archive_path)?;
-    f.seek(SeekFrom::Start(start))?;
-    Ok(f.take(len))
-}
-
-/// Reads one entry's payload and writes its RECOVERED (decoded) bytes to
-/// `out`. Returns whether the decode reached the entry's own declared
-/// length (`entry.meta.size`) — [`place_salvaged_file`]'s signal for
-/// [`PartialCause`].
-///
-/// Dispatches on `entry.meta.codec` — filled by `zip_salvage.rs` at
-/// discovery time (fix round 1, REQUIRED 4), not re-derived from the
-/// header here. `store` and `deflate` are the only two `Some` values that
-/// codec is ever filled with: every other method a zip local header can
-/// declare already reports
-/// [`stuffr_core::salvage::SalvageStatus::Unverified`] from
-/// `zip_salvage.rs`'s own `verify_candidate`, which [`place_salvaged_file`]
-/// already refused before calling this. The `_` arm below (`None`, or any
-/// other value) is therefore defensive rather than reachable in practice —
-/// see its own comment.
-fn write_payload(
+/// Task 3c replaced what used to be one zip-shaped `write_payload` here: it
+/// unconditionally read a 30-byte zip local header from `entry.offset` to
+/// locate a payload, and dispatched decoding through a `store`/`deflate`
+/// match that had no arm for anything else. Both were fine for zip, the
+/// only wired scanner at the time, and both broke the moment ARC (Task 3)
+/// added a second one — an ARC candidate near end-of-file made that 30-byte
+/// read run past EOF and raise `Error::Io` (exit 1, the wildcard this
+/// project treats as a defect), and an ARC entry's `EntryMeta::codec` was
+/// never populated in the first place, so even a successful read would have
+/// fallen through to `SkippedNotBuiltIn` rather than really being written.
+/// Locating a payload and decoding it are now each format's own job —
+/// [`stuffr_formats::zip_salvage::write_payload`] and
+/// [`stuffr_formats::legacy::arc_salvage::write_payload`] — using
+/// [`stuffr_core::salvage::SalvagedEntry::payload_start`], which every
+/// scanner now computes once, at discovery, instead of a generic caller
+/// re-deriving (and mis-deriving) it later.
+fn write_salvaged_payload(
+    format: FormatId,
     archive_path: &Path,
     entry: &stuffr_core::salvage::SalvagedEntry,
     compressed_len: u64,
     out: &mut dyn Write,
 ) -> Result<bool> {
-    let payload_start = zip_payload_start(archive_path, entry.offset)?;
-    let expected = entry.meta.size.unwrap_or(compressed_len);
-
-    match entry.meta.codec {
-        Some(id) if id == FormatId::new("store") => {
-            let reader = open_bounded_payload(archive_path, payload_start, compressed_len)?;
-            stream_bounded_copy(reader, expected, out)
+    match format.as_str() {
+        #[cfg(feature = "zip")]
+        "zip" => {
+            stuffr_formats::zip_salvage::write_payload(archive_path, entry, compressed_len, out)
         }
-        Some(id) if id == FormatId::new("deflate") => {
-            let reader = open_bounded_payload(archive_path, payload_start, compressed_len)?;
-            // The same `deflate` codec every other deflate-consuming path in
-            // this crate uses — not a new decompression stack. `FormatId::
-            // new("deflate")` rather than `stuffr_formats::deflate::DEFLATE`
-            // so this compiles whether or not the `deflate` feature (and
-            // therefore that module) is enabled; when it is not, the
-            // registry lookup below fails with `FormatNotEnabled`, which
-            // `place_salvaged_file` turns into `SkippedNotBuiltIn` rather
-            // than aborting the whole salvage run.
-            let decoded = crate::registry()
-                .require_decoder(FormatId::new("deflate"))?
-                .decoder(Box::new(ReaderSource::new(reader)), &DecodeOpts::default())?;
-            stream_bounded_copy(decoded, expected, out)
-        }
-        // Defensive only: `place_salvaged_file` already refused every
-        // `Unverified` entry, and `codec_for_method` in `zip_salvage.rs`
-        // only ever fills `Some("store")`/`Some("deflate")` for anything
-        // this engine does NOT report `Unverified`. Reaching here means
-        // that invariant no longer holds between the two crates.
+        #[cfg(not(feature = "zip"))]
+        "zip" => Err(Error::FormatNotEnabled(FormatId::new("zip"))),
+        #[cfg(feature = "arc")]
+        "arc" => stuffr_formats::legacy::arc_salvage::write_payload(
+            archive_path,
+            entry,
+            compressed_len,
+            out,
+        ),
+        #[cfg(not(feature = "arc"))]
+        "arc" => Err(Error::FormatNotEnabled(FormatId::new("arc"))),
+        // Unreachable in practice: `salvage_scan` already refuses any other
+        // format before a single candidate is ever produced, so `salvage()`
+        // never reaches a per-entry write for one.
         other => Err(Error::Unsupported(format!(
-            "entry `{}` carries codec {other:?}, which this build's salvage writer does \
-             not decode (only Stored and Deflate; every other method already reports as \
-             Unverified before reaching here)",
-            entry.meta.name
+            "salvage has no payload writer for `{other}` archives in this build"
         ))),
-    }
-}
-
-/// Streams `reader` into `out`, bounded to `expected_len` bytes — the
-/// entry's own declared uncompressed size — so a small compressed input
-/// cannot expand arbitrarily far past what its own header claims. Same
-/// hazard, same fixed-window discipline, as `zip_salvage.rs`'s own
-/// `stream_verify`: never buffers a growable copy of the payload, only a
-/// fixed 64 KiB window, and never trusts the decoder to stop on its own.
-///
-/// Returns `true` when exactly `expected_len` bytes were produced, `false`
-/// when `reader` ran out or errored first.
-fn stream_bounded_copy(
-    mut reader: impl Read,
-    expected_len: u64,
-    out: &mut dyn Write,
-) -> Result<bool> {
-    let mut buf = [0u8; 64 * 1024];
-    let mut produced = 0u64;
-    loop {
-        if produced >= expected_len {
-            return Ok(true);
-        }
-        let want = ((expected_len - produced) as usize).min(buf.len());
-        let n = match reader.read(&mut buf[..want]) {
-            Ok(0) => return Ok(false),
-            Ok(n) => n,
-            Err(_) => return Ok(false),
-        };
-        out.write_all(&buf[..n])?;
-        produced += n as u64;
     }
 }
 
@@ -4276,6 +4204,109 @@ mod salvage_dispatch_tests {
         assert!(
             err.to_string().contains("tar"),
             "the message must name the format it refused: {err}"
+        );
+    }
+}
+
+/// Task 3c's own regression test: an ARC entry positioned such that the
+/// OLD, zip-shaped payload lookup (`entries.rs`'s since-removed
+/// `zip_payload_start`, which unconditionally read 30 bytes from
+/// `entry.offset` as if it were a zip local header) runs past end-of-file.
+///
+/// This is the crash the Stage 2 salvage fuzz target needed 20,000
+/// iterations to surface (past the 2,000-run smoke budget `make fuzz`
+/// checks) once it could select ARC — reproduced here directly, with no
+/// fuzzing at all, because a defect only a long fuzz run can see is one the
+/// suite should be able to see on its own. Gated on `feature = "arc"`
+/// alone (not `zip`, unlike `salvage_tests` above): the whole point is
+/// that ARC's own write path must not borrow zip's.
+#[cfg(all(test, feature = "arc"))]
+mod arc_salvage_tests {
+    use super::*;
+    use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
+
+    const ARC_MARKER: u8 = 0x1A;
+    const ARC_NAME_LEN: usize = 13;
+
+    /// CRC-16/ARC — the same algorithm `arc_salvage.rs`'s own `crc16_arc`
+    /// computes, reimplemented here rather than reused because that
+    /// function is private to a different crate. The one place in this
+    /// module that legitimately needs it: building a header whose CRC-16
+    /// deliberately disagrees with its payload, to force
+    /// `SalvageStatus::Partial` without needing a truncated fixture.
+    fn crc16_arc(data: &[u8]) -> u16 {
+        let mut crc: u16 = 0;
+        for &b in data {
+            crc ^= u16::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xA001 & mask);
+            }
+        }
+        crc
+    }
+
+    /// One ARC entry: the marker byte plus the fixed 28-byte record,
+    /// followed by `payload`. `stored_crc` is supplied by the caller rather
+    /// than computed from `payload`, so a fixture can deliberately
+    /// disagree with its own content.
+    fn arc_entry(method: u8, name: &str, payload: &[u8], stored_crc: u16) -> Vec<u8> {
+        let mut out = vec![ARC_MARKER, method];
+        let mut field = [0u8; ARC_NAME_LEN];
+        field[..name.len()].copy_from_slice(name.as_bytes());
+        out.extend_from_slice(&field);
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // compressed_size
+        out.extend_from_slice(&0u32.to_le_bytes()); // date/time
+        out.extend_from_slice(&stored_crc.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // original_size
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A one-entry, 29-byte ARC archive (marker + 28-byte record + a
+    /// zero-byte payload) whose CRC-16 deliberately disagrees, so the entry
+    /// is `Partial` — which is what makes `--list` (no destination at all)
+    /// still call the payload writer: `place_salvaged_file` decodes into
+    /// `io::sink()` for ANY partial entry, regardless of `dest`, purely to
+    /// learn whether the cause is a checksum mismatch or a truncation. That
+    /// is exactly the call the original bug report's `salvage --format arc
+    /// --list <file>` reached.
+    ///
+    /// The archive is only 29 bytes long, so `entry.offset + 30` (the old
+    /// `zip_payload_start`'s unconditional read size) already runs past
+    /// end of file at the FIRST and only entry — no need for a second entry
+    /// or any padding to force it near EOF.
+    #[test]
+    fn a_partial_arc_entry_near_eof_does_not_crash_the_salvage_write_path() {
+        let wrong_crc = crc16_arc(b"not the payload");
+        let bytes = arc_entry(1, "x", b"", wrong_crc);
+        assert_eq!(
+            bytes.len(),
+            29,
+            "the fixture must be shorter than the 30 bytes the old zip-shaped lookup read \
+             unconditionally from entry.offset"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("tiny.arc");
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let opts = SalvageOpts {
+            dest: None,
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: Some(FormatId::new("arc")),
+        };
+        let outcome = salvage(&archive, &opts).expect(
+            "a damaged-but-well-formed ARC entry must never abort the whole salvage run with \
+             an unclassified i/o error (the pre-fix behaviour: Error::Io, exit 1)",
+        );
+
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Partial);
+        assert_eq!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::SkippedPartial(PartialCause::ChecksumMismatch)
         );
     }
 }
