@@ -945,14 +945,10 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
         strict,
         format,
     } = args;
-    if let Some(name) = format.as_deref()
-        && name != "zip"
-    {
-        return Err(stuffr::Error::Unsupported(format!(
-            "salvage recovers zip archives only in this build; `{name}` names no salvage \
-             source `--format` can select"
-        )));
-    }
+    let format = match format.as_deref() {
+        Some(name) => Some(salvage_format_by_name(name)?),
+        None => None,
+    };
     if directory.is_some() && output.is_some() {
         return Err(stuffr::Error::Usage(
             "-C and -o both name a destination; pass one or the other, not both".into(),
@@ -1026,6 +1022,7 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
         dest,
         policy,
         select: select.clone(),
+        format,
     };
     let outcome = entries::salvage(&path, &opts)?;
 
@@ -1412,6 +1409,42 @@ fn format_by_name(name: &str) -> stuffr::Result<FormatId> {
                 }
             ))
         })
+}
+
+/// Resolves `salvage --format` against the set of container formats salvage
+/// could ever be asked to scan — deliberately NOT [`format_by_name`], which
+/// only recognises what THIS build's live registry has compiled.
+///
+/// Salvage's own contract (Task 2) is that naming a format this build has
+/// not compiled is still [`stuffr::Error::Unsupported`]/[`stuffr::Error::
+/// FormatNotEnabled`] (exit 3, "this build cannot do that") — the same
+/// build-capability shape `require_container_writer` answers with elsewhere
+/// — never [`stuffr::Error::Usage`] (exit 2, "you typed something wrong").
+/// `format_by_name` cannot make that distinction: an uncompiled format is
+/// simply absent from its registry lookup, so it reports "unknown format"
+/// exactly as it would for a genuine typo. Matching against this fixed,
+/// static table instead is also what sidesteps `FormatId`'s `'static`
+/// requirement without leaking the runtime `String` — see
+/// `format_by_name`'s own doc for the leak this avoids.
+///
+/// A name outside this table names no archive format `stuffr salvage` will
+/// ever recognise, compiled or not, so that case stays [`stuffr::Error::
+/// Usage`] — a caller typo, not a build limitation.
+fn salvage_format_by_name(name: &str) -> stuffr::Result<FormatId> {
+    match name {
+        "zip" => Ok(FormatId::new("zip")),
+        "tar" => Ok(FormatId::new("tar")),
+        "ar" => Ok(FormatId::new("ar")),
+        "cpio" => Ok(FormatId::new("cpio")),
+        "arc" => Ok(FormatId::new("arc")),
+        "zoo" => Ok(FormatId::new("zoo")),
+        "lha" => Ok(FormatId::new("lha")),
+        "arj" => Ok(FormatId::new("arj")),
+        other => Err(stuffr::Error::Usage(format!(
+            "unknown format `{other}`; salvage recognizes: zip, tar, ar, cpio, arc, zoo, lha, \
+             arj"
+        ))),
+    }
 }
 
 /// Writes through `std::io::stdout()` and propagates a write failure rather

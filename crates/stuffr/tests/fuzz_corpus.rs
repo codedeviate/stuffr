@@ -825,6 +825,7 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
                 dest: None,
                 policy: stuffr_core::salvage::SalvagePolicy::default(),
                 select: None,
+                format: None,
             },
         )
         .unwrap_or_else(|e| panic!("seed {shape} must scan without erroring: {e}"));
@@ -864,6 +865,7 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
                 dest: None,
                 policy: stuffr_core::salvage::SalvagePolicy::default(),
                 select: None,
+                format: None,
             },
         )
         .unwrap();
@@ -884,6 +886,7 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
                 dest: None,
                 policy: stuffr_core::salvage::SalvagePolicy::default(),
                 select: None,
+                format: None,
             },
         )
         .unwrap()

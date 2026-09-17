@@ -331,8 +331,12 @@ pub enum Command {
         strict: bool,
         /// Use this format instead of detecting one.
         ///
-        /// Stage 1 recovers zip archives only, so the only accepted value is
-        /// `zip`.
+        /// Selects among the formats this build's salvage can attempt to
+        /// scan — `zip`, `tar`, `ar`, `cpio`, `arc`, `zoo`, `lha`, `arj` — not
+        /// merely accepted or rejected as in an earlier stage. Naming one
+        /// this build has no salvage scanner for yet (only `zip` is wired so
+        /// far) is refused at exit 3, exactly as an undetected archive of
+        /// that same format would be.
         #[arg(long)]
         format: Option<String>,
     },

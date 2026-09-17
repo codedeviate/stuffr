@@ -65,10 +65,21 @@ fuzz_target!(|data: &[u8]| {
     // `Intact` backed by a real checksum comparison), not about the
     // filesystem write/containment path `extract`'s own fuzzing already
     // covers via `chain.rs`.
+    //
+    // `format: Some(zip)` — Task 2 added format dispatch to `entries::
+    // salvage`, resolving a format from the input's own magic/extension
+    // when this is `None`. Arbitrary fuzzer bytes almost never carry a real
+    // zip magic (`PK\x03\x04`) or a `.zip`-named path, so auto-detection
+    // would reject nearly every input as `Error::UnknownFormat` before it
+    // ever reached `zip_salvage`'s own parser — collapsing this target's
+    // coverage of exactly the code the independent second pass below cross-
+    // checks. The explicit hint bypasses detection and preserves this
+    // target's original job: feed raw bytes straight to the zip scanner.
     let opts = SalvageOpts {
         dest: None,
         policy: SalvagePolicy::default(),
         select: None,
+        format: Some(stuffr_core::FormatId::new("zip")),
     };
 
     let outcome = match entries::salvage(&path, &opts) {

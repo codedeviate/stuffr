@@ -1,18 +1,15 @@
 use std::collections::HashSet;
-use std::io::{Read, Write};
-#[cfg(feature = "zip")]
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(feature = "zip")]
-use stuffr_core::ReaderSource;
 use stuffr_core::{
     ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts,
     EncodeOpts, Entry, EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields,
-    OpenOpts, PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source,
-    SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain_deep_with, safe_join,
+    OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR, RatioGuard, ReaderSource, Registry, Result, Rung,
+    SeekRead, Sink, Source, SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain,
+    resolve_chain_deep_with, safe_join,
 };
 
 use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
@@ -1062,6 +1059,17 @@ pub struct SalvageOpts {
     /// against `dest`, so an unselected entry can never touch a pre-existing
     /// file of the same name sitting in `dest` already.
     pub select: Option<HashSet<usize>>,
+    /// Forces which format [`salvage`] scans `path` as, instead of detecting
+    /// one from its magic bytes and extension ([`resolve_salvage_format`]).
+    ///
+    /// `None` is the common case: detect. `Some` is Task 2's `--format`,
+    /// widened from Stage 1's accept-or-reject-`zip` scaffolding to select
+    /// among whichever scanners this build actually has wired — naming one
+    /// this build has registered but has no salvage scanner for yet (a
+    /// `tar`, or a legacy container before its own task lands) is
+    /// [`Error::Unsupported`] (exit 3), exactly as an undetected archive of
+    /// the same format would be; naming it explicitly never bypasses that.
+    pub format: Option<FormatId>,
 }
 
 /// Why a `Partial` entry is `Partial` — see Ruling R-J. Both land the entry
@@ -1311,8 +1319,89 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
     }
 }
 
-/// Recovers what [`stuffr_formats::zip_salvage::salvage_zip`] finds in a
-/// damaged archive at `path`, writing what can safely be written into
+/// Identifies which container format [`salvage`] should scan `path` as —
+/// `opts.format`'s hint if one was given (Task 2 widens `--format` from
+/// Stage 1's accept-or-reject-`zip` scaffolding into this selector), else
+/// detected from `path`'s magic bytes and extension.
+///
+/// Reuses [`resolve_chain`] — the SAME magic+extension resolution every
+/// other read verb (`list`, `cat`, `test`, `unpack`) builds on — rather than
+/// a salvage-private sniffer, so a format this build recognises at all is
+/// recognised identically here. Deliberately the SHALLOW resolver, never
+/// [`resolve_chain_deep_with`]: salvage has no use for decoding through a
+/// codec layer to find a container beneath it, and, more importantly, never
+/// asks a container to OPEN itself to be identified — `resolve_chain` reads
+/// a bounded prefix and matches it against registered magic/extension
+/// tables only, so a truncated central directory or a zeroed header cannot
+/// prevent format detection the way actually opening the container could.
+/// [`Chain::container`] is what makes a compressed container (`.tar.gz`,
+/// were salvage ever extended to one) and a bare one answer alike; a chain
+/// that resolves no container at all (a bare codec stream, or raw bytes) is
+/// [`Error::NotAnArchive`] — salvage has nothing with entries to scan.
+fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatId> {
+    if let Some(id) = hint {
+        return Ok(id);
+    }
+    let mut file = std::fs::File::open(path)?;
+    let mut prefix = vec![0u8; PROBE_LEN];
+    let mut filled = 0;
+    loop {
+        match file.read(&mut prefix[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    prefix.truncate(filled);
+    let chain = resolve_chain(crate::registry(), Some(path), &prefix)?;
+    chain.container().ok_or_else(|| Error::NotAnArchive {
+        chain: chain.describe(),
+    })
+}
+
+/// Dispatches a resolved container format to its salvage scanner, matching
+/// [`stuffr_formats::zip_salvage::salvage_zip`]'s own signature exactly —
+/// `fn(&mut dyn SeekRead, &SalvagePolicy) -> Result<SalvageOutcome>` (the
+/// [`stuffr_core::salvage::SalvageOutcome`] the shared engine produces, not
+/// this module's own [`SalvageOutcome`] report) — so each later task's own
+/// scanner (arc, zoo, lha, arj) drops in as one more arm here, gated on its
+/// own feature, alongside the task that adds it. `zip` is the only arm
+/// Task 2 wires; every other format — including one this build has fully
+/// registered as an ordinary container, like `tar` — answers
+/// [`Error::Unsupported`] (exit 3) **naming the format**, never a silent
+/// empty [`stuffr_core::salvage::SalvageOutcome`]. An empty outcome would
+/// reach the CLI as "the scan found nothing recoverable" (exit 5), a claim
+/// about the ARCHIVE; the truth here is a claim about this BUILD — it never
+/// tried. `tar`, `ar` and `cpio` answer this way for a structural reason
+/// (Stage 3, if it ever comes: a false-positive scan over their headers is
+/// undetectable by construction); `arc`, `zoo`, `lha` and `arj` answer this
+/// way only until their own task lands a scanner.
+///
+/// `allow(unused_variables)` is temporary and self-correcting: it only fires
+/// on a build with `zip` off and no other format's arm wired yet (e.g.
+/// `--no-default-features --features legacy`, which `make check`'s
+/// `release` step compiles), where every arm genuinely ignores `src` and
+/// `policy`. Task 3's `arc` arm reads them in exactly that combination, so
+/// this attribute has nothing left to silence the moment it lands — remove
+/// it then rather than carrying it forward out of habit.
+#[allow(unused_variables)]
+fn salvage_scan(
+    format: FormatId,
+    src: &mut dyn SeekRead,
+    policy: &stuffr_core::salvage::SalvagePolicy,
+) -> Result<stuffr_core::salvage::SalvageOutcome> {
+    match format.as_str() {
+        #[cfg(feature = "zip")]
+        "zip" => stuffr_formats::zip_salvage::salvage_zip(src, policy),
+        #[cfg(not(feature = "zip"))]
+        "zip" => Err(Error::FormatNotEnabled(FormatId::new("zip"))),
+        other => Err(Error::Unsupported(format!(
+            "salvage has no scanner for `{other}` archives in this build"
+        ))),
+    }
+}
+
+/// Recovers what this build's per-format scanner ([`salvage_scan`]) finds in
+/// a damaged archive at `path`, writing what can safely be written into
 /// `opts.dest`.
 ///
 /// # The governing principle
@@ -1348,25 +1437,24 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
 ///
 /// # Payload decoding reuses the codec registry
 ///
-/// Stage 1 has one scanner ([`stuffr_formats::zip_salvage`]), so a build
-/// without the `zip` feature has nothing to salvage from — the
-/// `#[cfg(not(feature = "zip"))]` sibling below says so plainly. A zip local
-/// header's compression method decides how this function reads an entry's
-/// payload: method 0 (Stored) copies the raw bytes; method 8 (Deflate) goes
-/// through [`crate::registry`]'s own decoder for `deflate`, the identical
-/// codec [`stuffr_formats::deflate::Deflate`] every other deflate-consuming
-/// path in this crate uses — no new decompression stack is added here.
-/// Every other recognised method already reports
-/// [`stuffr_core::salvage::SalvageStatus::Unverified`] (`zip_salvage.rs`'s
-/// own `verify_candidate` never proves anything for one), so this function
-/// never has to decide what to do with one: the dispatch below never
-/// reaches past Stored/Deflate for anything this ops layer would try to
-/// write.
-#[cfg(feature = "zip")]
+/// Stage 2 still has exactly one WIRED scanner ([`stuffr_formats::zip_salvage`]
+/// — see [`salvage_scan`] for the dispatch every other format refuses
+/// through). A zip local header's compression method decides how this
+/// function reads an entry's payload: method 0 (Stored) copies the raw
+/// bytes; method 8 (Deflate) goes through [`crate::registry`]'s own decoder
+/// for `deflate`, the identical codec [`stuffr_formats::deflate::Deflate`]
+/// every other deflate-consuming path in this crate uses — no new
+/// decompression stack is added here. Every other recognised method already
+/// reports [`stuffr_core::salvage::SalvageStatus::Unverified`]
+/// (`zip_salvage.rs`'s own `verify_candidate` never proves anything for
+/// one), so this function never has to decide what to do with one: the
+/// dispatch below never reaches past Stored/Deflate for anything this ops
+/// layer would try to write.
 pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
+    let format = resolve_salvage_format(path, opts.format)?;
     let scan = {
         let mut file = std::fs::File::open(path)?;
-        stuffr_formats::zip_salvage::salvage_zip(&mut file, &opts.policy)?
+        salvage_scan(format, &mut file, &opts.policy)?
     };
 
     if let Some(dest) = &opts.dest {
@@ -1397,15 +1485,6 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     Ok(SalvageOutcome { entries })
 }
 
-/// A build with no zip salvage scanner at all has nothing to run `path`
-/// through — reported as [`Error::FormatNotEnabled`] (exit 3, "this build
-/// cannot do that") rather than failing to compile a feature this task
-/// never touches.
-#[cfg(not(feature = "zip"))]
-pub fn salvage(_path: &Path, _opts: &SalvageOpts) -> Result<SalvageOutcome> {
-    Err(Error::FormatNotEnabled(FormatId::new("zip")))
-}
-
 /// Decides — and, for everything but a shadow/skip, carries out — what
 /// happens to one scanned record.
 ///
@@ -1420,7 +1499,6 @@ pub fn salvage(_path: &Path, _opts: &SalvageOpts) -> Result<SalvageOutcome> {
 /// position is skipped before [`salvage_contained_target`] ever runs, so it
 /// can never touch a pre-existing file of the same name sitting in
 /// `opts.dest` already (fix round 1, REQUIRED 1).
-#[cfg(feature = "zip")]
 fn place_salvaged_entry(
     archive_path: &Path,
     opts: &SalvageOpts,
@@ -1467,7 +1545,6 @@ fn place_salvaged_entry(
 /// destination exists at all is a THIRD reason (alongside policy and
 /// `Unverified`) this function may end up not writing real bytes anywhere —
 /// see the `dest.is_none()` arm below.
-#[cfg(feature = "zip")]
 fn place_salvaged_file(
     archive_path: &Path,
     dest: &Option<PathBuf>,
@@ -1651,7 +1728,6 @@ fn place_salvaged_file(
 /// [`safe_join`] plus the same two refinements [`extract`] applies before
 /// any filesystem call for an entry — reused verbatim, not reimplemented,
 /// per this task's own governing rule.
-#[cfg(feature = "zip")]
 fn salvage_contained_target(
     dest: &Path,
     entry: &stuffr_core::salvage::SalvagedEntry,
@@ -1678,7 +1754,6 @@ fn salvage_contained_target(
 /// `name` becomes `name.partial` — appended to the WHOLE final component,
 /// not replacing an existing extension, so `report.txt` becomes
 /// `report.txt.partial` rather than `report.partial`.
-#[cfg(feature = "zip")]
 fn partial_path(target: &Path) -> PathBuf {
     let mut name = target
         .file_name()
@@ -1701,7 +1776,6 @@ fn partial_path(target: &Path) -> PathBuf {
 /// Composes with `.partial` rather than competing with it: a disambiguated
 /// partial lands as `name.salvaged-6.partial`, with `.partial` LAST so the
 /// suffix every downstream tool is being warned by stays the final one.
-#[cfg(feature = "zip")]
 fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
     let mut name = target
         .file_name()
@@ -1728,13 +1802,11 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// both of `zip_salvage.rs`'s discovery sites, is what [`write_payload`]
 /// dispatches on instead. This constant and this function exist only to
 /// locate the payload, not to learn what compresses it.
-#[cfg(feature = "zip")]
 const SALVAGE_LOCAL_HEADER_TOTAL: u64 = 30;
 
 /// Computes the payload's start offset from the local header at `offset` —
 /// see this constant's own doc for why `name_len`/`extra_len` still have to
 /// be read from the archive rather than derived from `entry.meta`.
-#[cfg(feature = "zip")]
 fn zip_payload_start(archive_path: &Path, offset: u64) -> Result<u64> {
     let mut f = std::fs::File::open(archive_path)?;
     f.seek(SeekFrom::Start(offset))?;
@@ -1753,7 +1825,6 @@ fn zip_payload_start(archive_path: &Path, offset: u64) -> Result<u64> {
 /// one across entries, trading a little overhead for never having to thread
 /// a mutable handle (and its current seek position) through this module's
 /// call graph.
-#[cfg(feature = "zip")]
 fn open_bounded_payload(
     archive_path: &Path,
     start: u64,
@@ -1779,7 +1850,6 @@ fn open_bounded_payload(
 /// already refused before calling this. The `_` arm below (`None`, or any
 /// other value) is therefore defensive rather than reachable in practice —
 /// see its own comment.
-#[cfg(feature = "zip")]
 fn write_payload(
     archive_path: &Path,
     entry: &stuffr_core::salvage::SalvagedEntry,
@@ -1832,7 +1902,6 @@ fn write_payload(
 ///
 /// Returns `true` when exactly `expected_len` bytes were produced, `false`
 /// when `reader` ran out or errored first.
-#[cfg(feature = "zip")]
 fn stream_bounded_copy(
     mut reader: impl Read,
     expected_len: u64,
@@ -3761,6 +3830,7 @@ mod salvage_tests {
             dest: Some(out_dir.path().to_path_buf()),
             policy: SalvagePolicy::default(),
             select: None,
+            format: None,
         };
         let outcome = salvage(&archive, &opts)
             .expect("a corrupted-but-well-formed entry must not abort the run");
@@ -3831,6 +3901,7 @@ mod salvage_tests {
             dest: Some(out_dir.path().to_path_buf()),
             policy: SalvagePolicy::default(),
             select: None,
+            format: None,
         };
         let outcome = salvage(&archive, &opts)
             .expect("a truncated-but-well-formed entry must not abort the run");
@@ -3866,6 +3937,7 @@ mod salvage_tests {
             dest: Some(out_dir.path().join("dest")),
             policy: SalvagePolicy::default(),
             select: None,
+            format: None,
         };
         let err = salvage(&archive, &opts).expect_err("an escaping name must refuse the whole run");
         assert_eq!(err.exit_code(), 7);
@@ -3897,6 +3969,7 @@ mod salvage_tests {
                 ..SalvagePolicy::default()
             },
             select: None,
+            format: None,
         };
         let outcome = salvage(&archive, &opts).unwrap();
 
@@ -3933,6 +4006,7 @@ mod salvage_tests {
             dest: Some(out_dir.path().to_path_buf()),
             policy: SalvagePolicy::default(),
             select: None,
+            format: None,
         };
         let outcome = salvage(&archive, &opts).unwrap();
 
@@ -3971,6 +4045,7 @@ mod salvage_tests {
             dest: Some(out_dir.path().to_path_buf()),
             policy: SalvagePolicy::default(),
             select: Some(HashSet::from([0])),
+            format: None,
         };
         let outcome = salvage(&archive, &opts).unwrap();
 
@@ -4140,6 +4215,71 @@ mod salvage_tests {
             }),
             4,
             "a policy-skipped Partial entry is still bucket 4, cause attached or not"
+        );
+    }
+}
+
+/// Task 2's own required test: dispatch on a resolved format this build has
+/// no scanner for yet. Deliberately NOT inside [`salvage_tests`] above, which
+/// is gated on `feature = "zip"` — the whole point of this dispatch is that
+/// it must answer correctly even in a build with no salvage scanner wired
+/// at all, so its own test must not depend on one either. Gated on
+/// `feature = "tar"` purely to build a fixture the registry's magic table
+/// recognises: `tar` is part of the `pure` feature bundle, which both the
+/// default feature set and the pure-tier build (`--no-default-features
+/// --features pure`) include, so this runs on all three tiers `make check`
+/// exercises.
+#[cfg(all(test, feature = "tar"))]
+mod salvage_dispatch_tests {
+    use super::*;
+    use stuffr_core::salvage::SalvagePolicy;
+
+    /// A minimal `ustar` header — enough for [`resolve_chain`]'s magic match
+    /// (`b"ustar"` at offset 257) to identify the file as `tar`, nothing
+    /// else filled in. [`salvage`]'s own format resolution never opens the
+    /// container to identify it (see [`resolve_salvage_format`]'s doc), so
+    /// this is sufficient: the dispatch this test pins never reaches far
+    /// enough to care whether the rest of the header is well-formed.
+    fn tar_like_bytes() -> Vec<u8> {
+        let mut header = vec![0u8; 512];
+        header[257..262].copy_from_slice(b"ustar");
+        header
+    }
+
+    /// A tar is a container this stage cannot salvage (Task 2 wires zip
+    /// only; `arc`/`zoo`/`lha`/`arj` each get their own scanner in a later
+    /// task, and tar itself never will — see `CLAUDE.md`'s State section on
+    /// the Stage 3 deferral). The refusal is [`Error::Unsupported`] (exit 3)
+    /// naming the format — never a silent empty [`SalvageOutcome`], which
+    /// would read to a caller as "the scan found nothing recoverable" (exit
+    /// 5): a claim about the ARCHIVE, where the truth here is a claim about
+    /// this BUILD — it never tried.
+    #[test]
+    fn salvage_refuses_a_format_it_cannot_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        std::fs::write(&archive, tar_like_bytes()).unwrap();
+
+        let opts = SalvageOpts {
+            dest: None,
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let err = salvage(&archive, &opts)
+            .expect_err("a format with no salvage scanner must refuse, not report empty");
+        assert_eq!(
+            err.exit_code(),
+            3,
+            "must be exit 3 (a build-capability limit), never a silent exit 5 empty outcome"
+        );
+        assert!(
+            matches!(err, Error::Unsupported(_)),
+            "expected Error::Unsupported, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("tar"),
+            "the message must name the format it refused: {err}"
         );
     }
 }
