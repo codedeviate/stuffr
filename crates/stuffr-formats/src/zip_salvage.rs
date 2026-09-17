@@ -717,6 +717,28 @@ fn open_bounded_payload(archive_path: &Path, start: u64, len: u64) -> Result<imp
 /// own `verify_candidate`, which callers already refuse before reaching
 /// here. The `_` arm below (`None`, or any other value) is therefore
 /// defensive rather than reachable in practice.
+///
+/// # A real behaviour change (fix round 1, MEDIUM-3): Deflate decodes via
+/// `flate2` directly, not the codec registry
+///
+/// Before Task 3c, this function's Deflate arm lived in `entries.rs` and
+/// went through `crate::registry().require_decoder("deflate")` — the
+/// facade crate's own registry, which requires the standalone `deflate`
+/// feature to have registered a decoder at all. Moving `write_payload`
+/// into this module (which already depends on `flate2` directly for the
+/// identical decode `verify_candidate` above performs, to check a
+/// candidate's CRC-32) means this arm now calls
+/// `flate2::read::DeflateDecoder::new` directly instead. `stuffr`'s `zip`
+/// feature does not imply `deflate` (`crates/stuffr/Cargo.toml`), so a
+/// `--no-default-features --features zip` build used to report a Deflate
+/// zip entry `SkippedNotBuiltIn` (`Error::FormatNotEnabled`) and now
+/// decodes and writes it — an improvement, since `verify_candidate`
+/// already decoded such an entry via `flate2` and already called it
+/// `Intact`, so the scan and the write used to disagree about whether this
+/// build could really decode the entry. Recorded here, and in
+/// `entries.rs`'s own `salvage` doc, because a silent behaviour change on
+/// a published crate's feature matrix is exactly the kind of thing
+/// `CLAUDE.md`'s Publishing section warns costs more than it looks like.
 pub fn write_payload(
     archive_path: &Path,
     entry: &SalvagedEntry,

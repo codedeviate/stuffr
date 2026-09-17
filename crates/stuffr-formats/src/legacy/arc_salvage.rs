@@ -366,8 +366,13 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
     // in this module that actually allocates one.
     refuse_if_over_ceiling(&header.name, declared_len, "compressed data")?;
 
-    let payload_start = candidate.offset + 1 + HEADER_LEN as u64;
-    if src.seek(SeekFrom::Start(payload_start)).is_err() {
+    // Fix round 1, LOW-1: use the field the candidate already carries
+    // rather than re-deriving it — `Candidate::payload_start`'s own doc
+    // exists precisely so nothing else in this crate has to recompute a
+    // payload's location from `offset` (and risk it drifting, as this raw
+    // `offset + 1 + HEADER_LEN` did from `read_candidate_at`'s own
+    // `checked_add`-built value).
+    if src.seek(SeekFrom::Start(candidate.payload_start)).is_err() {
         return Ok(SalvageStatus::Partial);
     }
     let mut payload = vec![0u8; declared_len as usize];
@@ -428,17 +433,48 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// An entry reaching this function was already reported `Intact`,
 /// `Complete` or `Partial` by [`verify_candidate`] — never `Unverified`,
 /// which `entries.rs`'s `place_salvaged_file` already refuses before
-/// calling this. So a compressed-byte read or a decode that fails here is
-/// re-running the IDENTICAL bytes `verify_candidate` already examined, and
-/// is folded into `Ok(false)` ("did not complete") for the same reason that
-/// function folds the same failures into `SalvageStatus::Partial` rather
-/// than an `Err`: one entry's damage must never abort the recovery of every
-/// other entry in the archive. The sole exception, matching
-/// `verify_candidate`'s own one exception, is
-/// [`super::arc::refuse_if_over_ceiling`] — propagated rather than folded,
-/// though unreachable in practice here too, since `verify_candidate` already
-/// checked the identical field before this entry could reach any status
-/// other than `Unverified`.
+/// calling this. So a decode that fails here is re-running bytes
+/// `verify_candidate` already examined (or a genuine prefix of them — see
+/// below), and is folded into `Ok(false)` ("did not complete") for the same
+/// reason that function folds the same failures into
+/// `SalvageStatus::Partial` rather than an `Err`: one entry's damage must
+/// never abort the recovery of every other entry in the archive.
+///
+/// # Fix round 1, HIGH-1 and MEDIUM-1: bound the read by what is PRESENT,
+/// never by what `compressed_len` DECLARES
+///
+/// The first version of this function called
+/// [`super::arc::refuse_if_over_ceiling`] on `compressed_len` directly —
+/// the header's own declaration — and then `read_exact`'d exactly that many
+/// bytes. For a `Partial` entry whose payload is TRUNCATED,
+/// [`verify_candidate`] returns `Partial` at its very first line, before
+/// its OWN ceiling check ever runs — so a truncated header could declare an
+/// arbitrary multi-hundred-megabyte figure and reach this function with
+/// nothing having bounded it yet. That reproduced, in a second code path,
+/// the exact failure mode [`stuffr_core::salvage::collect_candidates`]'s
+/// own doc already argues against at length: checking a DECLARED length
+/// against a ceiling "would abort the WHOLE run (exit 6) over a garbage
+/// length in a tail the scan has already established is not there, which
+/// is exactly the archive a caller reached for salvage to rescue". A
+/// second, smaller consequence of the same bug: even where the ceiling was
+/// not hit, `read_exact` on the full declared length simply failed outright
+/// for a truncated Stored entry, writing NOTHING — discarding a genuinely
+/// recoverable prefix that zip's own `write_payload` (a `Read`-bounded
+/// `.take(compressed_len)`) already recovers.
+///
+/// Both are closed the same way: `readable_len` below is bounded by the
+/// SOURCE's own remaining length, computed from a fresh `seek(End(0))`,
+/// never by the header's declaration alone. The ceiling check runs against
+/// that bounded figure — so a genuinely huge PRESENT entry is still
+/// refused, before its buffer is allocated, exactly as before — and the
+/// subsequent `read_exact` can no longer fail on a truncated entry's own
+/// short length, so a truncated Stored (or Rle90) entry's genuine surviving
+/// bytes now reach [`super::arc::decode`] and are written, same as zip's
+/// truncated-tail case. The non-streamable methods (`Squeezed`, `Crunched`,
+/// `Squashed`) still legitimately produce nothing on a truncated input —
+/// they decode whole, like `arc.rs`'s own reader, and a mid-stream cut
+/// Huffman tree or LZW chain has no defined partial decode — so `Ok(false)`
+/// with nothing written stays the honest answer for those.
 pub fn write_payload(
     archive_path: &Path,
     entry: &SalvagedEntry,
@@ -454,27 +490,45 @@ pub fn write_payload(
         )));
     };
 
-    super::arc::refuse_if_over_ceiling(&entry.meta.name, compressed_len, "compressed data")?;
-
     let mut f = File::open(archive_path)?;
+    let Ok(file_len) = f.seek(SeekFrom::End(0)) else {
+        return Ok(false);
+    };
     if f.seek(SeekFrom::Start(entry.payload_start)).is_err() {
         return Ok(false);
     }
-    let mut payload = vec![0u8; compressed_len as usize];
+
+    // Bound by what the SOURCE actually holds, never by `compressed_len`
+    // alone — see this function's own doc above (fix round 1, HIGH-1).
+    let available = file_len.saturating_sub(entry.payload_start);
+    let readable_len = compressed_len.min(available);
+
+    // Checked against the BOUNDED figure: a genuinely huge but PRESENT
+    // entry is still refused here, before the buffer it would size is
+    // allocated; a truncated entry's lie about its own size no longer is.
+    super::arc::refuse_if_over_ceiling(&entry.meta.name, readable_len, "compressed data")?;
+
+    // Fix round 1, MEDIUM-1: reading exactly `readable_len` bytes — never
+    // more than the file actually holds — means this `read_exact` no
+    // longer fails on a truncated entry, so its genuine surviving prefix
+    // reaches `decode` below rather than the whole read failing and
+    // nothing being written at all.
+    let mut payload = vec![0u8; readable_len as usize];
     if f.read_exact(&mut payload).is_err() {
-        // Fewer compressed bytes are actually on disk than this entry
-        // declared — the same "ran out" fact `stream_bounded_copy` reports
-        // for a streaming format, just discovered up front here because
-        // ARC's decoders need the whole buffer in hand before they can
-        // start.
+        // A genuine race (the archive changed on disk between the scan and
+        // this write) rather than a length mismatch, which `readable_len`
+        // has already ruled out above.
         return Ok(false);
     }
 
     let decoded = match super::arc::decode(method, &payload, &entry.meta.name) {
         Ok(decoded) => decoded,
-        // Malformed compressed data — deterministically the same failure
-        // `verify_candidate` already saw and reported as `Partial`. Not
-        // propagated, for the reason this function's own doc gives.
+        // Malformed or genuinely truncated compressed data — a
+        // non-streamable method decoding whole has no defined partial
+        // result for a mid-stream cut, and a malformed stream is
+        // deterministically the same failure `verify_candidate` already
+        // saw and reported as `Partial`. Not propagated, for the reason
+        // this function's own doc gives.
         Err(_) => return Ok(false),
     };
 

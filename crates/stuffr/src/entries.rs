@@ -1431,21 +1431,40 @@ fn salvage_scan(
 /// entire archive over one entry's hostile name that was never going to be
 /// written would be exactly backwards for a recovery-biased verb.
 ///
-/// # Payload decoding reuses the codec registry
+/// # Payload decoding is each format's own job (rewritten, Task 3c)
 ///
-/// Stage 2 still has exactly one WIRED scanner ([`stuffr_formats::zip_salvage`]
-/// — see [`salvage_scan`] for the dispatch every other format refuses
-/// through). A zip local header's compression method decides how this
-/// function reads an entry's payload: method 0 (Stored) copies the raw
-/// bytes; method 8 (Deflate) goes through [`crate::registry`]'s own decoder
-/// for `deflate`, the identical codec [`stuffr_formats::deflate::Deflate`]
-/// every other deflate-consuming path in this crate uses — no new
-/// decompression stack is added here. Every other recognised method already
-/// reports [`stuffr_core::salvage::SalvageStatus::Unverified`]
-/// (`zip_salvage.rs`'s own `verify_candidate` never proves anything for
-/// one), so this function never has to decide what to do with one: the
-/// dispatch below never reaches past Stored/Deflate for anything this ops
-/// layer would try to write.
+/// Stage 2 now has TWO wired scanners — [`stuffr_formats::zip_salvage`] and
+/// [`stuffr_formats::legacy::arc_salvage`]; see [`salvage_scan`] for the
+/// scan-side dispatch and [`write_salvaged_payload`] for the write-side
+/// one, every format outside both refuses through. This function itself
+/// never decodes anything: it hands each entry to
+/// [`write_salvaged_payload`], which hands it on to the resolved format's
+/// own `write_payload` — [`stuffr_formats::zip_salvage::write_payload`] or
+/// [`stuffr_formats::legacy::arc_salvage::write_payload`] today, one more
+/// per format as zoo/lha/arj each land.
+///
+/// This section used to say the opposite of all three of those facts —
+/// "exactly one wired scanner", decoding "goes through
+/// [`crate::registry`]'s own decoder for `deflate`", and "the dispatch
+/// below never reaches past Stored/Deflate" — because it was written when
+/// zip really was the only scanner and its write path really did live
+/// inline, below, dispatching through the registry. Task 3c moved the
+/// write path out to each scanner's own module and, along with it, changed
+/// how zip's own Deflate entries decode: **`zip_salvage.rs::write_payload`
+/// now calls `flate2::read::DeflateDecoder` directly, the same backend its
+/// own `verify_candidate` already used to check the entry's CRC-32, rather
+/// than going through `crate::registry().require_decoder("deflate")`.**
+/// That is a real, user-visible behaviour change, not only an internal
+/// one: `stuffr`'s `zip` feature does NOT imply `deflate`
+/// (`crates/stuffr/Cargo.toml`), so on a `--no-default-features --features
+/// zip` build, a Deflate zip entry that used to report
+/// [`SalvageDisposition::SkippedNotBuiltIn`] (`FormatNotEnabled`, because
+/// the registry had no `deflate` decoder registered) now decodes and
+/// writes normally. This is judged an improvement, not a regression:
+/// `verify_candidate` already used `flate2` directly and already reported
+/// such an entry `Intact`, so the two halves of salvage — deciding a
+/// status and then acting on it — used to disagree about whether this
+/// build could really decode the entry, and now agree.
 pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     let format = resolve_salvage_format(path, opts.format)?;
     let scan = {
@@ -1816,6 +1835,32 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// [`stuffr_core::salvage::SalvagedEntry::payload_start`], which every
 /// scanner now computes once, at discovery, instead of a generic caller
 /// re-deriving (and mis-deriving) it later.
+///
+/// # Fix round 1, MEDIUM-2: this table and [`salvage_scan`]'s are two
+/// independent `match`es, coupled only by convention
+///
+/// Nothing — neither the type system nor, before this fix round, a test —
+/// stops a later task from adding a scanner arm to [`salvage_scan`] and
+/// forgetting the matching arm here. The result is not a compile error or
+/// even a loud runtime one: an unmatched format falls to the `other =>` arm
+/// below, [`place_salvaged_file`] maps that `Error::Unsupported` to
+/// [`SalvageDisposition::SkippedNotBuiltIn`], and the run reports `N
+/// scanned: 0 written … N skipped` at exit 4 — a scan that silently never
+/// writes anything, which is the EXACT companion gap ARC itself shipped
+/// with in Task 3 (a real scanner, an unpopulated `EntryMeta::codec`,
+/// every entry quietly `SkippedNotBuiltIn`) recurring through the seam
+/// built to close it. `salvage_dispatch_tests`'s
+/// `every_salvage_slot_reaches_a_real_payload_writer` pins the positive
+/// set — every name in [`stuffr_core::testing::SALVAGE_SLOTS`] (the same
+/// list the fuzz corpus generator and `entries::salvage`'s own dispatch
+/// table are checked against elsewhere) must reach a real per-format arm
+/// here, never this function's own fallback — so the NEXT scanner task
+/// that forgets this half fails a test rather than shipping silently. A
+/// `SalvageScan::write_payload` trait method would make this a compile
+/// error instead and was considered; deferred rather than taken mid-phase,
+/// since it would have to land ahead of the three scanners (zoo, lha, arj)
+/// still to come, before its right shape is known from more than one
+/// example.
 fn write_salvaged_payload(
     format: FormatId,
     archive_path: &Path,
@@ -4251,15 +4296,32 @@ mod arc_salvage_tests {
     /// than computed from `payload`, so a fixture can deliberately
     /// disagree with its own content.
     fn arc_entry(method: u8, name: &str, payload: &[u8], stored_crc: u16) -> Vec<u8> {
+        arc_entry_declaring(method, name, payload.len() as u32, payload, stored_crc)
+    }
+
+    /// Like [`arc_entry`], but the header's declared `compressed_size` (and
+    /// `original_size`, set to the identical figure — this module never
+    /// needs the two to differ) may be LARGER than the number of bytes
+    /// `actual_payload` actually supplies — the shape of a truncated entry,
+    /// where the header's own declaration has nothing real behind it. Fix
+    /// round 1's HIGH-1 and MEDIUM-1 regression tests both need exactly
+    /// this: a header that claims more than the file goes on to deliver.
+    fn arc_entry_declaring(
+        method: u8,
+        name: &str,
+        declared_size: u32,
+        actual_payload: &[u8],
+        stored_crc: u16,
+    ) -> Vec<u8> {
         let mut out = vec![ARC_MARKER, method];
         let mut field = [0u8; ARC_NAME_LEN];
         field[..name.len()].copy_from_slice(name.as_bytes());
         out.extend_from_slice(&field);
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // compressed_size
+        out.extend_from_slice(&declared_size.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // date/time
         out.extend_from_slice(&stored_crc.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // original_size
-        out.extend_from_slice(payload);
+        out.extend_from_slice(&declared_size.to_le_bytes()); // original_size
+        out.extend_from_slice(actual_payload);
         out
     }
 
@@ -4308,5 +4370,212 @@ mod arc_salvage_tests {
             outcome.entries[0].disposition,
             SalvageDisposition::SkippedPartial(PartialCause::ChecksumMismatch)
         );
+    }
+
+    /// Fix round 1, HIGH-1. A healthy `a.txt` followed by a truncated
+    /// header declaring a 512 MiB payload that never follows (the file
+    /// ends right after the header) — the reviewer's own 60-byte
+    /// reproducer, reproduced here rather than paraphrased. Before the
+    /// fix, `write_payload` checked this DECLARED figure against ARC's
+    /// 256 MiB ceiling before bounding it against what the file actually
+    /// held, so the whole run aborted with `Error::ResourceLimit` (exit 6)
+    /// — destroying `a.txt`, which decodes perfectly well on its own, along
+    /// with it. `salvage()` must now succeed, and `a.txt` must actually be
+    /// recovered, not merely reported as such.
+    #[test]
+    fn a_truncated_entry_declaring_an_oversized_length_does_not_abort_the_whole_run() {
+        let a_payload = b"hi";
+        let a_crc = crc16_arc(a_payload);
+        let entry_a = arc_entry(1, "a.txt", a_payload, a_crc);
+
+        // Header only (29 bytes) — the declared 512 MiB payload never
+        // follows. The stored CRC is irrelevant: a truncated candidate is
+        // decided `Partial` before any checksum comparison ever runs.
+        const OVERSIZED: u32 = 512 * 1024 * 1024;
+        let entry_b = arc_entry_declaring(1, "b.dat", OVERSIZED, b"", 0);
+
+        let mut bytes = entry_a.clone();
+        bytes.extend_from_slice(&entry_b);
+        assert_eq!(
+            bytes.len(),
+            60,
+            "matches the reviewer's own 60-byte reproducer byte for byte"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("huge-tail.arc");
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: Some(FormatId::new("arc")),
+        };
+        let outcome = salvage(&archive, &opts).expect(
+            "a truncated entry declaring an oversized length must never abort the WHOLE \
+             run — doing so destroys every entry already recovered, which is exactly the \
+             archive salvage exists to rescue (fix round 1, HIGH-1)",
+        );
+
+        assert_eq!(outcome.entries.len(), 2);
+        assert_eq!(outcome.entries[0].name, "a.txt");
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Intact);
+        assert_eq!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::Written(out_dir.path().join("a.txt")),
+            "a.txt must be WRITTEN, not lost as collateral damage from b.dat's lie"
+        );
+        assert_eq!(
+            std::fs::read(out_dir.path().join("a.txt")).unwrap(),
+            a_payload,
+            "a.txt must actually be recovered on disk, not merely reported recovered"
+        );
+
+        assert_eq!(outcome.entries[1].name, "b.dat");
+        assert_eq!(outcome.entries[1].status, SalvageStatus::Partial);
+    }
+
+    /// Fix round 1, MEDIUM-1. A Stored entry whose header declares a
+    /// 36-byte payload but whose file only carries the first 20 of those
+    /// bytes — a genuinely truncated mid-payload cut, not merely a missing
+    /// tail. Before the fix, `write_payload` allocated a buffer sized by
+    /// the DECLARED 36 bytes and `read_exact`'d it, which failed outright
+    /// on the short read and wrote nothing at all: `salvage` reported
+    /// `Partial (truncated)` and produced an EMPTY `.partial` file, even
+    /// though 20 genuine bytes of the original content were sitting right
+    /// there on disk. That is exactly the contract zip's own truncated-tail
+    /// handling already honours and `CLAUDE.md`'s salvage section states in
+    /// so many words: recover the genuine surviving prefix, invent nothing.
+    #[test]
+    fn a_truncated_entry_recovers_its_genuine_surviving_prefix() {
+        let full: &[u8] = b"HELLO-WORLD-THIS-IS-THE-PAYLOAD!!!!!";
+        assert_eq!(full.len(), 36);
+        let prefix = &full[..20];
+
+        // The header's own claimed CRC-16 — over the FULL, never-delivered
+        // payload. Irrelevant here: truncation is decided from the byte
+        // count alone, before any checksum comparison runs.
+        let claimed_crc = crc16_arc(full);
+        let bytes = arc_entry_declaring(1, "cut.txt", 36, prefix, claimed_crc);
+        assert_eq!(bytes.len(), 29 + 20);
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("cut.arc");
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: Some(FormatId::new("arc")),
+        };
+        let outcome = salvage(&archive, &opts).unwrap();
+
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Partial);
+        let SalvageDisposition::WrittenPartial { path, cause } = &outcome.entries[0].disposition
+        else {
+            panic!(
+                "expected WrittenPartial, got {:?}",
+                outcome.entries[0].disposition
+            );
+        };
+        assert_eq!(*cause, PartialCause::Truncated);
+
+        let recovered = std::fs::read(path).unwrap();
+        assert_eq!(
+            recovered, prefix,
+            "the genuine surviving 20-byte prefix must be written, not an empty file \
+             (fix round 1, MEDIUM-1)"
+        );
+        assert!(!recovered.is_empty());
+    }
+
+    /// LOW (fix round 1, taken): no existing test asserted the BYTES a
+    /// clean ARC entry recovers to disk are correct — only that a
+    /// disposition of `Written` was reported. A `write_payload` that
+    /// decoded to the wrong bytes would have passed every test in this
+    /// module until now.
+    #[test]
+    fn an_intact_entry_recovers_its_exact_bytes_to_disk() {
+        let payload = b"hello from a real arc entry";
+        let crc = crc16_arc(payload);
+        let bytes = arc_entry(1, "hi.txt", payload, crc);
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("hi.arc");
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: Some(FormatId::new("arc")),
+        };
+        let outcome = salvage(&archive, &opts).unwrap();
+
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Intact);
+        let SalvageDisposition::Written(path) = &outcome.entries[0].disposition else {
+            panic!("expected Written, got {:?}", outcome.entries[0].disposition);
+        };
+        assert_eq!(std::fs::read(path).unwrap(), payload);
+    }
+}
+
+/// Fix round 1, MEDIUM-2: `salvage_scan`'s dispatch table and
+/// `write_salvaged_payload`'s are two independent `match`es, coupled only
+/// by convention — nothing stops a later scanner task from adding the
+/// first arm and forgetting the second, which reproduces the exact
+/// companion gap ARC itself shipped with in Task 3 (a real scanner, an
+/// unpopulated codec, every entry quietly `SkippedNotBuiltIn`). This pins
+/// the positive set the review asked for: every name
+/// `stuffr_core::testing::SALVAGE_SLOTS` lists must reach a REAL
+/// per-format arm of `write_salvaged_payload`, never its own fallback.
+#[cfg(test)]
+mod salvage_seam_tests {
+    use super::*;
+    use stuffr_core::salvage::{SalvageStatus, SalvagedEntry};
+    use stuffr_core::testing::SALVAGE_SLOTS;
+
+    #[test]
+    fn every_salvage_slot_reaches_a_real_payload_writer() {
+        for &name in SALVAGE_SLOTS {
+            let format = FormatId::new(name);
+            // `meta.codec` is `None` on purpose: every real per-format
+            // `write_payload` refuses a `None` codec itself, with its own,
+            // differently-worded error, WITHOUT ever opening
+            // `archive_path` first — so a path that does not exist is safe
+            // to use, and the two failure messages are trivially
+            // distinguishable from each other.
+            let entry = SalvagedEntry {
+                scan_position: 0,
+                offset: 0,
+                payload_start: 0,
+                meta: EntryMeta::file("probe"),
+                status: SalvageStatus::Complete,
+                shadows: None,
+                collides_with: None,
+            };
+            let err = write_salvaged_payload(
+                format,
+                Path::new("/nonexistent-salvage-seam-probe"),
+                &entry,
+                0,
+                &mut std::io::sink(),
+            )
+            .expect_err("a codec-less probe entry must always be refused");
+            let message = err.to_string();
+            assert!(
+                !message.contains("has no payload writer for"),
+                "SALVAGE_SLOTS names `{name}`, which `salvage_scan` dispatches to a real \
+                 scanner, but `write_salvaged_payload` fell through to its own fallback \
+                 for it instead of a real per-format arm: {message}"
+            );
+        }
     }
 }
