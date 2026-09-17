@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{Read, Write};
 #[cfg(feature = "zip")]
 use std::io::{Seek, SeekFrom};
@@ -1380,7 +1380,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     // run", not "exists on disk" — a stale file from a previous attempt must
     // still be replaced, which is what `replace_conflicting(.., true)` in
     // `place_salvaged_file` is for and why it is NOT what closes this.
-    let mut claimed: HashMap<PathBuf, usize> = HashMap::new();
+    let mut claimed: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
 
     let mut entries = Vec::with_capacity(scan.entries.len());
     for entry in &scan.entries {
@@ -1425,7 +1425,7 @@ fn place_salvaged_entry(
     archive_path: &Path,
     opts: &SalvageOpts,
     entry: &stuffr_core::salvage::SalvagedEntry,
-    claimed: &mut HashMap<PathBuf, usize>,
+    claimed: &mut std::collections::HashMap<PathBuf, usize>,
 ) -> Result<SalvageDisposition> {
     if let Some(earlier) = entry.shadows {
         return Ok(SalvageDisposition::SkippedShadow(earlier));
@@ -1473,7 +1473,7 @@ fn place_salvaged_file(
     dest: &Option<PathBuf>,
     policy: &stuffr_core::salvage::SalvagePolicy,
     entry: &stuffr_core::salvage::SalvagedEntry,
-    claimed: &mut HashMap<PathBuf, usize>,
+    claimed: &mut std::collections::HashMap<PathBuf, usize>,
 ) -> Result<SalvageDisposition> {
     use stuffr_core::salvage::{PartialPolicy, SalvageStatus};
 

@@ -36,8 +36,8 @@ read list.
 > as well as `list`'s own duplicate-name warning. See
 > [CONTRIBUTING.md](CONTRIBUTING.md#fuzzing) for the fuzz harness's new
 > fifth target, and `crates/stuffr-cli/src/examples.txt`'s "RECOVERING A
-> DAMAGED ARCHIVE" section for the worked examples. **1130** tests under
-> `--all-features`, **1065** on the default tier.
+> DAMAGED ARCHIVE" section for the worked examples. **1153** tests under
+> `--all-features`, **1088** on the default tier.
 >
 > **Status: Phase 3c is complete at `0.4.2` — twelve round-trip codecs
 > (`compress` joined them in Task 5) and six round-trip containers
