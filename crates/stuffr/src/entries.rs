@@ -1200,10 +1200,38 @@ pub enum SalvageDisposition {
     /// kept for the same reason [`extract`]'s own match keeps a skip arm:
     /// `EntryKind` is `#[non_exhaustive]`.
     SkippedUnsupportedKind,
-    /// Not written: this entry's content was fine, but its BYTES could not
-    /// be put on disk — the destination refused the path this entry's own
-    /// name asks for, or the filesystem itself failed. `reason` is the
-    /// underlying error, printed on the entry's own row.
+    /// Not written: this entry's content was fine, but recovering it failed
+    /// on an i/o error — the destination refused the path this entry's own
+    /// name asks for, the filesystem itself failed, or (see below) the
+    /// archive could not be re-read for this one entry. `reason` is the
+    /// underlying error; the CLI names it on the entry's own `--list` row
+    /// AND on stderr every run, which is what makes the fold's cost visible
+    /// rather than merely documented.
+    ///
+    /// # It is not only the DESTINATION (fix round 5, NEW-H)
+    ///
+    /// The fold catches `Error::Io` out of the whole payload write, and a
+    /// payload writer re-opens the ARCHIVE to read this entry's bytes
+    /// (`zip_salvage.rs`'s `open_bounded_payload`, `arc_salvage.rs`'s own
+    /// `File::open`). So a source that vanishes or faults mid-run lands
+    /// here too — N rows of `No such file or directory` at exit 4 rather
+    /// than one exit-1 failure. That is consistent with the rule (a failure
+    /// while recovering THIS entry is THIS entry's outcome) and is an
+    /// improvement, but it is wider than "its bytes could not be put on
+    /// disk", which is what this doc used to say. `reason` always names the
+    /// real error, so nothing about the cause is hidden.
+    ///
+    /// # `reason` is a rendered OS message — do not compare it (NEW-J)
+    ///
+    /// [`SalvageDisposition`] derives `PartialEq`, so two of these compare
+    /// their rendered text, and that text is platform-dependent:
+    /// `ENAMETOOLONG` is `os error 63` on macOS and `36` on Linux, with
+    /// libc's own wording. Nothing in this tree compares one (every use is
+    /// `{ .. }` or a destructure, and the regression test asserts the
+    /// reason is NON-EMPTY rather than equal to anything) — but an
+    /// `assert_eq!` against a literal `reason` will pass on one platform and
+    /// fail in CI on the other. Match the variant, then assert on the
+    /// `reason` loosely.
     ///
     /// # Why this exists (fix round 4, NEW-B)
     ///
@@ -1242,14 +1270,55 @@ pub enum SalvageDisposition {
     /// and the skip is named, not silent.
     ///
     /// The cost, stated rather than hidden: a genuinely run-wide
-    /// destination failure (a full disk) now reports one skipped row per
-    /// entry, each naming `No space left on device`, and exits 4 instead of
-    /// 1. Nothing is silent and nothing already written is lost.
+    /// destination failure (a full disk) now reports one skipped entry per
+    /// row, each naming `No space left on device`, and exits 4 where it
+    /// used to exit 1. Nothing already written is lost, and — since fix
+    /// round 5 — the reasons print on **stderr every run**, not only under
+    /// `--list`, which is what makes "nothing is silent" a fact rather than
+    /// a claim: for one round it was true only for the invocation nobody
+    /// types. See `stuffr-cli`'s `print_salvage_write_failures`.
     ///
-    /// Containment is NOT folded: a name escaping `dest` is still
-    /// `Error::UnsafePath` (exit 7) and still aborts, exactly as
-    /// [`salvage`]'s own doc and `examples.txt` promise. Refusing to WRITE
-    /// somewhere is a different decision from failing to write here.
+    /// # The two things this fold deliberately does NOT cover
+    ///
+    /// Both end the run, and neither is an oversight. The commit that
+    /// introduced this variant is subject-lined "never end a salvage run
+    /// because one entry cannot be written", which is a claim about the
+    /// WRITE path; read as a blanket guarantee it would be false, so the
+    /// two exceptions are stated here rather than left to be inferred.
+    ///
+    /// **Containment — `Error::UnsafePath`, exit 7.** A name escaping `dest`
+    /// still aborts, exactly as [`salvage`]'s own doc and `examples.txt`
+    /// promise. Refusing to write SOMEWHERE is a different decision from
+    /// failing to write HERE: one is about permission to act, the other
+    /// about the act failing. Pinned in both directions by
+    /// `salvage_tests::an_escaping_name_still_refuses_the_run_even_though_an_unwritable_one_does_not`.
+    ///
+    /// **An `Intact` entry that decodes SHORT on write — `Error::Corrupt`,
+    /// exit 5** (see [`place_salvaged_file`]'s closing arm). This one was
+    /// genuinely open until fix round 5 decided it, and the decision is:
+    /// **keep the abort, because it is not a fact about one entry.** The
+    /// scan already proved these exact bytes decode to their full length,
+    /// and a deterministic decoder re-reading them cannot disagree — so
+    /// reaching that arm means the SOURCE CHANGED UNDER THE RUN (or a read
+    /// fault did; `stream_bounded_copy` folds reader errors to
+    /// "incomplete", so the two are indistinguishable here). If the archive
+    /// is not the file the scan measured, every offset every other entry is
+    /// waiting on was computed against bytes that are gone: continuing
+    /// would recover entries from positions that no longer mean what they
+    /// meant, and entries already written may have come from a different
+    /// file. That invalidates the run's own premise, which is exactly what
+    /// separates it from every failure this variant does fold — those are
+    /// "this entry is bad, the others are fine".
+    ///
+    /// Two costs of that ruling, recorded rather than hidden: a genuine
+    /// device read fault mid-payload is reported as the archive changing
+    /// (exit 5, "the archive may have changed on disk"), because the io
+    /// error does not survive `stream_bounded_copy`'s fold; and it remains
+    /// the one per-entry-shaped site that ends a run. Distinguishing them
+    /// means changing `stream_bounded_copy`'s contract in `stuffr-core` —
+    /// published API, and a change that would ripple through every
+    /// scanner's `write_payload` — which is more than this round should
+    /// spend to separate two cases that both mean "stop, the ground moved".
     SkippedUnwritable { reason: String },
     /// Fix round 1, REQUIRED 1: not written because [`SalvageOpts::select`]
     /// is `Some` and this scan position is not in it — the caller asked for
@@ -1826,6 +1895,22 @@ fn place_salvaged_file(
         // entry's REAL name would recreate the exact hazard `.partial`
         // naming exists to prevent, through a different door. Refused
         // instead, and the half-written file is not left behind.
+        //
+        // **And the refusal ENDS THE RUN, deliberately — fix round 5,
+        // NEW-I.** Every other per-entry failure on this path folds into
+        // `SalvageDisposition::SkippedUnwritable` rather than aborting, so
+        // this arm is the one place the rule does not apply and the reason
+        // has to be written down rather than inferred. It is not a fact
+        // about one entry: if the source is no longer the file the scan
+        // measured, every OTHER entry's offset was computed against bytes
+        // that are gone, and entries already written may have come from a
+        // different file. Continuing would be recovering from positions
+        // that no longer mean what they meant — the run's own premise is
+        // what failed, not this record. See
+        // `SalvageDisposition::SkippedUnwritable`'s doc for the full
+        // argument and for the two costs it accepts (a device read fault
+        // is reported as the archive changing, because the io error does
+        // not survive `stream_bounded_copy`'s fold).
         let _ = std::fs::remove_file(&write_target);
         Err(Error::Corrupt(format!(
             "entry `{}` decoded short on write after the scan reported it {:?}; the \

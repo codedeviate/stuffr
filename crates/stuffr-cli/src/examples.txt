@@ -846,8 +846,10 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   An entry whose NAME the destination filesystem refuses — a component past
   its limit (255 bytes nearly everywhere), a name colliding with something
-  it cannot replace — is skipped the same way, with the reason on its own
-  row: `[not written: ...]`. It used to end the run at exit 1, losing every
+  it cannot replace — is skipped the same way. Every such entry is named
+  on stderr as the run happens (`salvage -> N entries could not be
+  written:`, then one line each), and tagged on its own --list row as
+  `[not written: ...]`. It used to end the run at exit 1, losing every
   entry after it, on a name the ARCHIVE chose. A name that would escape -C
   is a different matter and still refuses outright at exit 7: not being able
   to write a file here is not the same as not being allowed to.

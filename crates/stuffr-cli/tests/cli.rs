@@ -10317,3 +10317,91 @@ fn info_zip_agrees_on_a_corrupted_crc() {
         );
     }
 }
+
+/// Fix round 5, NEW-G. **A salvage entry that could not be written must be
+/// named on stderr by the invocation a user actually types** — plain `-C`,
+/// with no `--list`.
+///
+/// Task 3c's fix round 4 turned a filesystem failure from an aborted run
+/// (exit 1, on a name the ARCHIVE chose) into a per-entry skip, and rested
+/// that ruling on "the reason is on its own row, so nothing is silent". The
+/// row only existed under `--list`. Measured on the shipped binary against a
+/// read-only destination and a genuine ENOSPC volume, plain `salvage -C DIR`
+/// printed `3 scanned: 0 written … 3 skipped` at exit 4 and **nothing on
+/// stderr at all** — so a user could not tell a full disk from one entry the
+/// archive made unwritable, which is the exact question that ruling's trade
+/// turns on.
+///
+/// The fixture is the one from `entries.rs`'s own regression test: three
+/// healthy Stored entries with a 404-character name in the middle, longer
+/// than `NAME_MAX` on every filesystem this project builds for (255 on APFS,
+/// ext4 and XFS), so `File::create` refuses it deterministically and without
+/// needing a special volume, a permission trick or a `root` check.
+///
+/// Asserts the whole shape, because each half was separately wrong at some
+/// point in this task's history: the run COMPLETES (exit 4, not 1), the
+/// entries on either side are on disk with their real bytes, and the failure
+/// is NAMED on stderr without `--list`.
+#[test]
+fn a_salvage_entry_that_cannot_be_written_is_named_on_stderr_without_list() {
+    fn stored_local_record(name: &str, payload: &[u8]) -> Vec<u8> {
+        let crc = salvage_fixture_crc32(payload);
+        let len = u32::try_from(payload.len()).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+        bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // Stored
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        bytes.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(&len.to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    let dir = tmp_dir();
+    let long_name = format!("{}.txt", "L".repeat(400));
+    let mut zip = stored_local_record("a.txt", b"AAAA");
+    zip.extend_from_slice(&stored_local_record(&long_name, b"BBBB"));
+    zip.extend_from_slice(&stored_local_record("z.txt", b"ZZZZ"));
+    let archive = dir.join("unwritable-name.zip");
+    std::fs::write(&archive, &zip).unwrap();
+
+    let out_dir = dir.join("recovered");
+    // No `--list`: this is the invocation the finding is about.
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "--format",
+        "zip",
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "one unwritable name is a degraded run, never a failed one (and never exit 1, the \
+         code reserved for stuffr itself failing, on input the archive chose): {stderr}"
+    );
+    assert!(
+        stderr.contains("could not be written"),
+        "the run must SAY an entry was not written, on stderr, without --list — the whole \
+         fold rests on this not being silent: {stderr}"
+    );
+    assert!(
+        stderr.contains("#1"),
+        "and it must name WHICH entry by scan position, or a user cannot act on it: {stderr}"
+    );
+
+    // The survivors on either side, byte-for-byte — `z.txt` is the one the
+    // pre-round-4 abort lost entirely.
+    assert_eq!(std::fs::read(out_dir.join("a.txt")).unwrap(), b"AAAA");
+    assert_eq!(std::fs::read(out_dir.join("z.txt")).unwrap(), b"ZZZZ");
+}

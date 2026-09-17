@@ -733,6 +733,75 @@ fn print_salvage_list(entries: &[entries::SalvagedRecord]) -> stuffr::Result<()>
     Ok(())
 }
 
+/// Names every entry this run could not place on disk, on **stderr, every
+/// run** — not only under `--list`.
+///
+/// # Why this exists (fix round 5, NEW-G)
+///
+/// Task 3c's fix round 4 made a filesystem failure a per-entry skip instead
+/// of an aborted run, and rested that ruling on "the reason is on its own
+/// row, so nothing is silent". It was on its own row **only under
+/// `--list`**. Measured on the shipped binary against a `chmod 555`
+/// destination and against a genuine ENOSPC volume, plain `salvage -C DIR`
+/// — the invocation somebody recovering an archive actually types —
+/// printed:
+///
+/// ```text
+/// salvage -> 3 scanned: 0 written, … 3 skipped, 0 unverified, …
+/// exit=4                                          # and nothing else
+/// ```
+///
+/// A wholly unusable destination was a bare `3 skipped`, where before the
+/// fold it was `stuffr: i/o error: Permission denied (os error 13)` at
+/// exit 1 — so a user could not tell a full disk from an entry the archive
+/// itself made unwritable, which is the exact question the fold's own trade
+/// turns on. A skip nobody can see is Stage 1's vanishing truncated tail
+/// wearing a different hat.
+///
+/// `pack`'s directory walk is the precedent the ruling already cited, and it
+/// prints its skips on stderr every run — which is what makes `CLAUDE.md`'s
+/// "the skip is named, not silent" true there. This is the same, in the same
+/// shape [`report_fidelity`] uses for the same reason: a count, up to ten
+/// lines, then how many were elided.
+///
+/// **Printed even under `--list`, which also tags these rows.** The rows go
+/// to stdout and this goes to stderr, so `salvage --list … | less` still
+/// shows the failure, and a terminal user reading both sees one restated
+/// fact rather than a missing one.
+///
+/// Takes the FULL scan rather than `--index`'s subset, and nothing is lost
+/// by that: an unselected position is reported `NotSelected` and never
+/// reaches a filesystem call, so it can never be one of these.
+fn print_salvage_write_failures(entries: &[entries::SalvagedRecord]) {
+    let failed: Vec<&entries::SalvagedRecord> = entries
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.disposition,
+                entries::SalvageDisposition::SkippedUnwritable { .. }
+            )
+        })
+        .collect();
+    if failed.is_empty() {
+        return;
+    }
+    const SHOWN: usize = 10;
+    eprintln!(
+        "salvage -> {} entr{} could not be written:",
+        failed.len(),
+        if failed.len() == 1 { "y" } else { "ies" }
+    );
+    for record in failed.iter().take(SHOWN) {
+        let entries::SalvageDisposition::SkippedUnwritable { reason } = &record.disposition else {
+            unreachable!("filtered above");
+        };
+        eprintln!("  - #{} {}: {reason}", record.scan_position, record.name);
+    }
+    if let Some(rest) = failed.len().checked_sub(SHOWN).filter(|n| *n > 0) {
+        eprintln!("  … and {rest} more");
+    }
+}
+
 /// The default (non-`--list`) report: counts only, to stderr — the same
 /// destination `unpack`'s and `test`'s own summary lines use. Takes whatever
 /// slice the caller passes — [`dispatch_salvage`] narrows it to `--index`'s
@@ -1076,6 +1145,12 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     }
 
     validate_scan_positions(&index, outcome.entries.len())?;
+
+    // Before anything else this run prints: an entry that could not be put
+    // on disk is named on stderr on EVERY invocation, not only under
+    // `--list`. See `print_salvage_write_failures` for what a missing
+    // stderr line measured before this existed.
+    print_salvage_write_failures(&outcome.entries);
 
     // `--list` always reports the FULL scan, `--index` included — narrowing
     // WHAT IS WRITTEN must never narrow what a diagnostic listing shows.
