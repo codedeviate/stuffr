@@ -89,6 +89,28 @@ pub struct Candidate {
     pub verifier: Option<Verifier>,
 }
 
+/// Why an entry is [`SalvageStatus::Unverified`].
+///
+/// Two causes, and the STATUS does not distinguish them because the decision
+/// they lead to is identical (listed, not written, exit 3) — the same split
+/// [`crate::salvage`]'s consumers apply to [`SalvageStatus::Partial`] via
+/// their own cause type (`entries.rs`'s `PartialCause`, one crate up): **a
+/// tier carries a decision, a message carries a cause.**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnverifiedCause {
+    /// This build recognises the entry's compression method but cannot
+    /// decode it (zip method 99 is AES, 14 is LZMA — recognised, not
+    /// decoded).
+    UndecodableMethod,
+    /// No length was available to bound the payload, so it was never read —
+    /// a data-descriptor entry the raw scan found with no central-directory
+    /// record to reconcile against. A CD-reconciled data-descriptor entry
+    /// gets a real declared length and CRC from the central directory and
+    /// does NOT reach this cause; see `zip_salvage.rs`'s
+    /// `candidate_from_cd_record`.
+    NoDeclaredLength,
+}
+
 /// What was proven about an entry AFTER decoding it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SalvageStatus {
@@ -100,20 +122,27 @@ pub enum SalvageStatus {
     /// format that DOES carry one; see [`SalvageStatus::Unverified`] for
     /// that case, which this status is not permitted to stand in for.
     Complete,
-    /// Every declared byte was present, but this build could not decode the
-    /// payload to check the checksum the format DOES carry — an unsupported
-    /// compression method, most concretely an encrypted (AES, method 99)
-    /// zip entry this build cannot decrypt. Distinct from [`Self::Complete`]
-    /// ("the format offers no way to prove it") and from [`Self::Partial`]
-    /// ("this build tried and it disagreed, or ran out"): "the format CAN
-    /// prove it and this build did not even try" is a third, different
-    /// fact, and it is the one a user can act on (a rebuild, a different
-    /// feature set) where the other two are not. Reported for a found entry
-    /// using a method this build cannot decode — the exit-code table this
-    /// status exists to keep honest reserves exit 3 for exactly that case,
-    /// never exit 0, which is what reporting `Complete` for an undecodable
-    /// method would have routed it to.
-    Unverified,
+    /// Nothing about this entry's content was verified.
+    ///
+    /// Two causes ([`UnverifiedCause`]), and the tier does not distinguish
+    /// them because the decision is identical — the entry is listed, not
+    /// written, and the run exits 3:
+    ///   * this build could not decode the method (zip 99 is AES, 14 is
+    ///     LZMA);
+    ///   * no length was available to bound the payload, so it was never
+    ///     read (a data-descriptor entry the raw scan found with no
+    ///     central-directory record to reconcile against).
+    ///
+    /// Distinct from [`Self::Complete`], which asserts every DECLARED byte
+    /// was present — a claim that requires something to have been declared
+    /// in the first place. Reporting `Complete` for either cause above was
+    /// this enum's third instance of "nothing to disprove" being read as
+    /// "proven" (after the Task 1 hardcoded placeholder and the Task 4
+    /// undecodable-method case this variant was originally added for) — the
+    /// exit-code table this status exists to keep honest reserves exit 3 for
+    /// both causes, never exit 0, which is what `Complete` would have routed
+    /// either one to.
+    Unverified(UnverifiedCause),
     /// The payload ran out, the decoder failed mid-stream, or the content
     /// decoded whole and disagreed with the checksum the original writer
     /// computed. All three are the same fact from a caller's perspective —

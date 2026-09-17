@@ -66,7 +66,14 @@
 //! lie, so a candidate found this way carries `declared_len: None` and
 //! `verifier: None` instead: an honest "found a header, cannot bound or
 //! verify its payload from here" — the same asymmetry [`Candidate::verifier`]
-//! documents for a format with no checksum at all.
+//! documents for a format with no checksum at all. [`verify_candidate`]
+//! reports such a candidate `Unverified(NoDeclaredLength)` — NOT `Complete`,
+//! which this module reported here until Ruling R-M: `Complete` asserts
+//! every DECLARED byte was present, and a data-descriptor candidate declares
+//! none, so there was nothing whose presence had been confirmed. A
+//! CD-reconciled data-descriptor entry is a different case entirely — see
+//! [`candidate_from_cd_record`], which trusts the central directory's own
+//! length and CRC and can honestly reach `Intact` or `Partial`.
 //!
 //! # Verification, and the two methods it actually checks (Task 4)
 //!
@@ -87,7 +94,7 @@
 //!   already makes, used directly here because the entries this module
 //!   exists to recover (a shadowed record, a CP437-named one) are precisely
 //!   the ones the `zip` crate's own indexed reader cannot reach at all.
-//! - **Anything else**: [`SalvageStatus::Unverified`]. This build's zip
+//! - **Anything else**: `Unverified(UndecodableMethod)`. This build's zip
 //!   codec registers more methods than this verifier decodes (method 99,
 //!   AES, is the sharpest instance — an entry salvage cannot decrypt); a
 //!   candidate using one is still correctly discovered and bounded, but its
@@ -95,7 +102,9 @@
 //!   format DOES carry a checksum here, this build only failed to check it,
 //!   and `Complete` is reserved for a format with no checksum to offer at
 //!   all (see `SalvageStatus`'s own doc comment for why the two must not
-//!   share a word).
+//!   share a word). The SAME status, with the OTHER cause
+//!   (`NoDeclaredLength`), covers an unreconciled data-descriptor candidate
+//!   — see the "General-purpose bit 3" section above.
 //!
 //! Both decode branches are STREAMED, never buffered: `verify_candidate`
 //! reads through a fixed-size window, updating a running CRC-32 and a
@@ -153,10 +162,10 @@
 use std::io::{self, Read, SeekFrom};
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, Verifier,
-    annotate_candidates, collect_candidates,
+    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, UnverifiedCause,
+    Verifier, annotate_candidates, collect_candidates,
 };
-use stuffr_core::{EntryKind, EntryMeta, Error, Result, SeekRead};
+use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
 /// Local file header. What every zip entry starts with (`zip.rs`'s private
 /// `SIG_LOCAL_HEADER`, duplicated here rather than exported: it is a magic
@@ -352,6 +361,7 @@ fn read_candidate_at(
     meta.size = size;
     meta.compressed_size = declared_len;
     meta.kind = kind;
+    meta.codec = codec_for_method(method);
 
     Ok(Some(Candidate {
         offset,
@@ -385,6 +395,29 @@ fn is_known_method(method: u16) -> bool {
         method,
         0 | 1 | 2..=5 | 6 | 8 | 9 | 12 | 14 | 93 | 95 | 98 | 99
     )
+}
+
+/// Maps a zip local-header compression method to the [`FormatId`] this
+/// project's codec registry uses for it — mirroring `zip.rs`'s own private
+/// `codec_for`/`STORE` (both genuinely unreachable from here: neither is
+/// `pub` or `pub(crate)`), not inventing a second convention for the same
+/// two strings. Filled at both discovery sites ([`read_candidate_at`] and
+/// [`candidate_from_cd_record`]) so `entries.rs`'s ops layer can consume
+/// [`EntryMeta::codec`] directly instead of re-parsing this same local-header
+/// layout a third time (fix round 1, REQUIRED 4).
+///
+/// Deliberately narrow: this module only ever DECODES method 0 (Stored) and
+/// method 8 (Deflate) — see [`verify_candidate`]'s own dispatch — so those
+/// are the only two methods mapped to a real `FormatId`. Every other
+/// recognised-but-undecodable method maps to `None` rather than a guessed
+/// identifier: nothing here ever decodes them, and a speculative `FormatId`
+/// no caller consumes is exactly the risk this fix round's own review named.
+fn codec_for_method(method: u16) -> Option<FormatId> {
+    match method {
+        0 => Some(FormatId::new("store")),
+        8 => Some(FormatId::new("deflate")),
+        _ => None,
+    }
 }
 
 /// Reads and discards exactly `n` bytes, failing on a short read rather than
@@ -428,10 +461,15 @@ const VERIFY_CHUNK: usize = 64 * 1024;
 fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<SalvageStatus> {
     let Some(declared_len) = candidate.declared_len else {
         // A data-descriptor entry: no declared length, no verifier (see the
-        // module doc's "general-purpose bit 3" section) — nothing here to
-        // check, so `Complete` is the honest claim: the header parsed and
-        // nothing is known to be missing, but there is no way to prove it.
-        return Ok(SalvageStatus::Complete);
+        // module doc's "general-purpose bit 3" section). `Complete` used to
+        // be reported here — wrong, per Ruling R-M: `Complete` asserts every
+        // DECLARED byte was present, and nothing was declared, so there is
+        // nothing whose presence could have been confirmed. "Nothing to
+        // disprove" was being read as "proven". `Unverified` is honest
+        // instead: nothing about this entry's content was verified, for the
+        // same reason (no length to bound a read against) an undecodable
+        // method is unverified, just a different cause of it.
+        return Ok(SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength));
     };
     let Some(Verifier::Crc32(expected)) = candidate.verifier else {
         // Zip only ever reports `Crc32` (see `read_candidate_at`); anything
@@ -486,7 +524,7 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         // declared bytes are confirmed present above; the format DOES carry
         // a checksum here, this build simply did not check it, which is
         // exactly what `Unverified` (as opposed to `Complete`) says.
-        _ => SalvageStatus::Unverified,
+        _ => SalvageStatus::Unverified(UnverifiedCause::UndecodableMethod),
     })
 }
 
@@ -698,6 +736,10 @@ fn candidate_from_cd_record(
     meta.size = Some(record.uncompressed_size);
     meta.compressed_size = Some(record.compressed_size);
     meta.kind = kind;
+    // The CENTRAL DIRECTORY'S own method field, already parsed by
+    // `zip.rs`'s record walk — no need to re-read the local header's copy
+    // of it, which this function only touches at all to confirm the magic.
+    meta.codec = codec_for_method(record.method);
 
     Ok(Some(Candidate {
         offset: record.local_header_offset,
@@ -1406,13 +1448,23 @@ mod tests {
         );
     }
 
-    /// [`ZipSalvage::verify`] on a data-descriptor candidate (no declared
-    /// length, no verifier — see the module's own "general-purpose bit 3"
-    /// section) must answer `Complete`, never `Intact` (nothing was
-    /// checked) and never `Partial` (nothing is known to be missing
-    /// either).
+    /// [`ZipSalvage::verify`] on an UNRECONCILED data-descriptor candidate
+    /// (no declared length, no verifier — see the module's own
+    /// "general-purpose bit 3" section) must answer
+    /// `Unverified(NoDeclaredLength)` (Ruling R-M, fix round 1) — never
+    /// `Complete`, which asserts every DECLARED byte was present, and
+    /// nothing was declared here for anything to have confirmed; never
+    /// `Intact` (nothing was checked); never `Partial` (nothing is known to
+    /// be missing either, since nothing was ever bounded in the first
+    /// place).
+    ///
+    /// This test used to assert `Complete` — the exact false claim R-M's
+    /// fix-round finding named: "nothing to disprove" was being read as
+    /// "proven", the third instance of that shape in this enum. See the
+    /// task report for this fixed round's falsification (reverting this one
+    /// line and confirming this test names the regression).
     #[test]
-    fn a_data_descriptor_candidate_verifies_as_complete() {
+    fn an_unreconciled_data_descriptor_candidate_verifies_as_unverified() {
         let mut bytes = minimal_local_header(20, 8, "streamed.bin", b"");
         bytes[6..8].copy_from_slice(&FLAG_DATA_DESCRIPTOR.to_le_bytes());
         let mut scan = ZipSalvage::new();
@@ -1421,7 +1473,10 @@ mod tests {
             .unwrap()
             .expect("the header itself is well-formed and must still be found");
         let status = scan.verify(&mut Cursor::new(bytes), &candidate).unwrap();
-        assert_eq!(status, SalvageStatus::Complete);
+        assert_eq!(
+            status,
+            SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength)
+        );
     }
 
     /// Pinned to the algorithm's published check value (CRC RevEng
@@ -1508,7 +1563,10 @@ mod tests {
         let status = scan
             .verify(&mut Cursor::new(bytes), &candidate)
             .expect("verify never hard-errors");
-        assert_eq!(status, SalvageStatus::Unverified);
+        assert_eq!(
+            status,
+            SalvageStatus::Unverified(UnverifiedCause::UndecodableMethod)
+        );
     }
 
     /// REQUIRED 6 (fix round 1), end-to-end: an archive shaped like an

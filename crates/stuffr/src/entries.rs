@@ -1082,9 +1082,15 @@ pub enum SalvageDisposition {
     /// direction to err in when a decision cannot actually be asked for.
     SkippedPartial,
     /// Not written: [`stuffr_core::salvage::SalvageStatus::Unverified`] —
-    /// this build recognises the entry's compression method but cannot
-    /// decode it (Ruling R-K). Extracting the raw undecoded bytes is a
-    /// different feature, not Stage 1's.
+    /// nothing about this entry's content was verified, for either of that
+    /// status's two causes (Ruling R-M): this build recognises the entry's
+    /// compression method but cannot decode it, or no length was available
+    /// to bound a read against (an unreconciled zip data descriptor). The
+    /// cause is not repeated here — it already lives on
+    /// `SalvagedRecord::status`, this variant is only the DECISION ("listed,
+    /// not written"), which is identical for both causes. Extracting the raw
+    /// undecoded bytes of an undecodable-method entry is a different
+    /// feature, not Stage 1's.
     SkippedUnverified,
     /// Not written: this build's codec registry does not have a decoder for
     /// the method this entry needs, even though
@@ -1094,13 +1100,6 @@ pub enum SalvageDisposition {
     /// `SkippedUnverified`, which is the archive using a method no build of
     /// this project decodes at all.
     SkippedNotBuiltIn,
-    /// Not written: the entry carries no declared payload length (a zip
-    /// data descriptor, general-purpose bit 3) for this ops layer to bound
-    /// a read against. `stuffr_formats::zip_salvage`'s `verify` reports such
-    /// an entry `Complete` (nothing contradicted it), but "nothing to
-    /// contradict" is not the same fact as "safe to write", and this layer
-    /// only ever reads a payload by a length it can bound in advance.
-    SkippedNoDeclaredLength,
     /// Not written: `SalvagedEntry::shadows` — this record's
     /// `(name, declared_len, verifier)` triple duplicates an EARLIER one
     /// (named by its scan position), which already recovered the identical
@@ -1132,6 +1131,60 @@ pub struct SalvageOutcome {
     pub entries: Vec<SalvagedRecord>,
 }
 
+/// Ruling R-N (fix round 1): the exit-code bucket a COMPLETED salvage run's
+/// outcome maps to. Written here once so Task 6's CLI consumes this rule
+/// rather than re-deriving one — nine [`SalvageDisposition`] variants
+/// collapse onto five exit-code buckets, and until this fix round no
+/// aggregation policy was recorded anywhere.
+///
+/// **Exit 6 (over the ceiling) and exit 7 (path escape) are NOT covered
+/// here.** Both are errors that abort the run — `salvage` returns `Err`
+/// before a `SalvageOutcome` ever exists — so there is nothing to
+/// aggregate for them; this function is only meaningful for a `salvage()`
+/// call that returned `Ok`.
+///
+/// Among a completed run's entries, the HIGHEST applicable bucket wins:
+///
+/// ```text
+/// 5  nothing recoverable at all (no entries were even scanned)
+/// 3  any entry Unverified
+/// 4  any entry Partial (written or skipped), or any entry skipped for any
+///    other reason
+/// 0  every entry Intact or Complete
+/// ```
+///
+/// **3 outranks 4 deliberately.** `Unverified` is actionable and names its
+/// own remedy — a rebuild, or `--features c-backed` — where 4 only says
+/// "degraded". A user who can fix their build should be told that before
+/// being told something was lossy.
+pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
+    if outcome.entries.is_empty() {
+        return 5;
+    }
+
+    let mut any_unverified = false;
+    let mut any_degraded = false;
+    for record in &outcome.entries {
+        match &record.disposition {
+            SalvageDisposition::Written(_) | SalvageDisposition::Directory(_) => {}
+            SalvageDisposition::SkippedUnverified => any_unverified = true,
+            SalvageDisposition::WrittenPartial { .. }
+            | SalvageDisposition::SkippedPartial
+            | SalvageDisposition::SkippedNotBuiltIn
+            | SalvageDisposition::SkippedShadow(_)
+            | SalvageDisposition::SkippedUnsupportedKind => any_degraded = true,
+        }
+    }
+
+    if any_unverified {
+        3
+    } else if any_degraded {
+        4
+    } else {
+        0
+    }
+}
+
 /// Recovers what [`stuffr_formats::zip_salvage::salvage_zip`] finds in a
 /// damaged archive at `path`, writing what can safely be written into
 /// `opts.dest`.
@@ -1143,9 +1196,12 @@ pub struct SalvageOutcome {
 /// So a `Partial` entry is written **by default** (`--partial=keep`), but
 /// never under its real name — always `name.partial` — because a truncated
 /// file under its real name is indistinguishable from a whole one to every
-/// tool downstream. An `Unverified` entry (Ruling R-K) is never written at
-/// all: this build never decoded it, so there is no recovered content to
-/// write, only raw bytes a different feature would extract.
+/// tool downstream. An `Unverified` entry (Ruling R-K, widened by Ruling
+/// R-M) is never written at all, for either of its two causes: this build
+/// never decoded an undecodable method, and never even had a length to
+/// bound a read against for an unreconciled data descriptor — either way
+/// there is no recovered content to write, only raw bytes a different
+/// feature would extract.
 ///
 /// # Containment is reused, never reimplemented
 ///
@@ -1253,19 +1309,29 @@ fn place_salvaged_file(
 ) -> Result<SalvageDisposition> {
     use stuffr_core::salvage::{PartialPolicy, SalvageStatus};
 
-    // R-K: never written, regardless of any policy. This build recognised
-    // the entry's method but never decoded it, so there is no recovered
-    // content — only raw bytes a different feature would extract.
-    if entry.status == SalvageStatus::Unverified {
+    // R-K, widened by Ruling R-M: never written, regardless of any policy,
+    // for EITHER cause `Unverified` now carries — an undecodable method, or
+    // (since the fix-round-1 engine change) an unreconciled data descriptor
+    // with no length to bound a read against. This build never decoded the
+    // content either way, so there is nothing recovered to write.
+    if matches!(entry.status, SalvageStatus::Unverified(_)) {
         return Ok(SalvageDisposition::SkippedUnverified);
     }
 
     let Some(compressed_len) = entry.meta.compressed_size else {
-        // A data-descriptor entry (see `SkippedNoDeclaredLength`'s own doc):
-        // `zip_salvage.rs` reports it `Complete` (nothing contradicted it),
-        // but this layer only ever reads a payload by a length it can bound
-        // in advance, and this entry declares none.
-        return Ok(SalvageDisposition::SkippedNoDeclaredLength);
+        // Defensive only, and should be unreachable: with Ruling R-M,
+        // `zip_salvage.rs::verify_candidate` reports `Unverified` for every
+        // candidate with no declared length, which the check above already
+        // caught. Reaching here means that engine invariant no longer
+        // holds — refused rather than guessing at a length to bound a read
+        // against, the same "never write from an unbounded declaration"
+        // discipline this whole module follows.
+        return Err(Error::Corrupt(format!(
+            "entry `{}` carries no declared length but was not reported \
+             Unverified; the salvage engine's own invariant (Ruling R-M) \
+             does not hold for it",
+            entry.meta.name
+        )));
     };
 
     let is_partial = entry.status == SalvageStatus::Partial;
@@ -1389,35 +1455,37 @@ fn partial_path(target: &Path) -> PathBuf {
 /// fields and the payload that follow it.
 ///
 /// Duplicated from `zip_salvage.rs`'s own identical constant rather than
-/// imported: [`stuffr_core::salvage::Candidate`] and
-/// [`stuffr_core::EntryMeta`] carry no compression-method field at all, so
-/// this ops layer — scoped to this file alone — has no way to learn a
-/// record's method except by re-reading its local header a third time
-/// (`zip.rs`'s central-directory parse and `zip_salvage.rs`'s own two
-/// internal reads are the other two). Accepted as this task's cost rather
-/// than widening its file scope to expose the field from an earlier task.
+/// imported: `name_len`/`extra_len` — needed here purely to locate where a
+/// payload BEGINS — are not carried by [`stuffr_core::salvage::Candidate`]
+/// or [`stuffr_core::EntryMeta`] either, and re-deriving `entry.meta.name`'s
+/// byte length would silently disagree with the header's own `name_len` for
+/// a CD-reconciled entry whose name was decoded LOSSILY (`zip.rs`'s
+/// `CdRecord::name`, `String::from_utf8_lossy`) — a non-UTF-8 byte becomes a
+/// 3-byte U+FFFD, changing the byte count. So this one read stays.
+///
+/// The compression METHOD is a different fact, and — fix round 1, REQUIRED
+/// 4 — is no longer re-derived here at all: `EntryMeta::codec`, filled at
+/// both of `zip_salvage.rs`'s discovery sites, is what [`write_payload`]
+/// dispatches on instead. This constant and this function exist only to
+/// locate the payload, not to learn what compresses it.
 #[cfg(feature = "zip")]
 const SALVAGE_LOCAL_HEADER_TOTAL: u64 = 30;
 
-/// Reads the method and computes the payload's start offset from the local
-/// header at `offset` — the two facts [`write_payload`] needs that neither
-/// [`stuffr_core::EntryMeta`] nor [`stuffr_core::salvage::SalvagedEntry`]
-/// carries directly (size and compressed size, which ARE carried, are read
-/// from `entry.meta` instead of here).
+/// Computes the payload's start offset from the local header at `offset` —
+/// see this constant's own doc for why `name_len`/`extra_len` still have to
+/// be read from the archive rather than derived from `entry.meta`.
 #[cfg(feature = "zip")]
-fn read_local_header_layout(archive_path: &Path, offset: u64) -> Result<(u16, u64)> {
+fn zip_payload_start(archive_path: &Path, offset: u64) -> Result<u64> {
     let mut f = std::fs::File::open(archive_path)?;
     f.seek(SeekFrom::Start(offset))?;
     let mut fixed = [0u8; SALVAGE_LOCAL_HEADER_TOTAL as usize];
     f.read_exact(&mut fixed).map_err(Error::from_decode_io)?;
-    let method = u16::from_le_bytes([fixed[8], fixed[9]]);
     let name_len = u64::from(u16::from_le_bytes([fixed[26], fixed[27]]));
     let extra_len = u64::from(u16::from_le_bytes([fixed[28], fixed[29]]));
-    let payload_start = offset
+    Ok(offset
         .saturating_add(SALVAGE_LOCAL_HEADER_TOTAL)
         .saturating_add(name_len)
-        .saturating_add(extra_len);
-    Ok((method, payload_start))
+        .saturating_add(extra_len))
 }
 
 /// A fresh handle onto `archive_path`, seeked to `start` and bounded to at
@@ -1441,12 +1509,16 @@ fn open_bounded_payload(
 /// length (`entry.meta.size`) — [`place_salvaged_file`]'s signal for
 /// [`PartialCause`].
 ///
-/// Method 0 (Stored) and method 8 (Deflate) are the only two branches: every
-/// other method a zip local header can declare already reports
+/// Dispatches on `entry.meta.codec` — filled by `zip_salvage.rs` at
+/// discovery time (fix round 1, REQUIRED 4), not re-derived from the
+/// header here. `store` and `deflate` are the only two `Some` values that
+/// codec is ever filled with: every other method a zip local header can
+/// declare already reports
 /// [`stuffr_core::salvage::SalvageStatus::Unverified`] from
 /// `zip_salvage.rs`'s own `verify_candidate`, which [`place_salvaged_file`]
-/// already refused before calling this. The `_` arm below is therefore
-/// defensive rather than reachable in practice — see its own comment.
+/// already refused before calling this. The `_` arm below (`None`, or any
+/// other value) is therefore defensive rather than reachable in practice —
+/// see its own comment.
 #[cfg(feature = "zip")]
 fn write_payload(
     archive_path: &Path,
@@ -1454,15 +1526,15 @@ fn write_payload(
     compressed_len: u64,
     out: &mut dyn Write,
 ) -> Result<bool> {
-    let (method, payload_start) = read_local_header_layout(archive_path, entry.offset)?;
+    let payload_start = zip_payload_start(archive_path, entry.offset)?;
     let expected = entry.meta.size.unwrap_or(compressed_len);
 
-    match method {
-        0 => {
+    match entry.meta.codec {
+        Some(id) if id == FormatId::new("store") => {
             let reader = open_bounded_payload(archive_path, payload_start, compressed_len)?;
             stream_bounded_copy(reader, expected, out)
         }
-        8 => {
+        Some(id) if id == FormatId::new("deflate") => {
             let reader = open_bounded_payload(archive_path, payload_start, compressed_len)?;
             // The same `deflate` codec every other deflate-consuming path in
             // this crate uses — not a new decompression stack. `FormatId::
@@ -1477,10 +1549,15 @@ fn write_payload(
                 .decoder(Box::new(ReaderSource::new(reader)), &DecodeOpts::default())?;
             stream_bounded_copy(decoded, expected, out)
         }
-        _ => Err(Error::Unsupported(format!(
-            "entry `{}` declares compression method {method}, which this build's salvage \
-             writer does not decode (only Stored and Deflate; every other recognised \
-             method already reports as Unverified before reaching here)",
+        // Defensive only: `place_salvaged_file` already refused every
+        // `Unverified` entry, and `codec_for_method` in `zip_salvage.rs`
+        // only ever fills `Some("store")`/`Some("deflate")` for anything
+        // this engine does NOT report `Unverified`. Reaching here means
+        // that invariant no longer holds between the two crates.
+        other => Err(Error::Unsupported(format!(
+            "entry `{}` carries codec {other:?}, which this build's salvage writer does \
+             not decode (only Stored and Deflate; every other method already reports as \
+             Unverified before reaching here)",
             entry.meta.name
         ))),
     }
@@ -3335,29 +3412,66 @@ mod salvage_tests {
         !crc
     }
 
-    /// One zip local file header (method 0, Stored) plus its payload — no
-    /// central directory, no end-of-central-directory record. The raw
-    /// scanner (`ZipSalvage::next_candidate`) needs neither: this is exactly
-    /// the "index destroyed or absent" shape salvage exists for, and
-    /// building only what the scan actually reads keeps a fixture's shape
-    /// legible rather than incidentally exercising the reconciliation path
-    /// this task does not touch.
-    fn local_header_entry(name: &str, data: &[u8], declared_crc: u32) -> Vec<u8> {
+    /// One zip local file header plus its payload — no central directory,
+    /// no end-of-central-directory record. The raw scanner
+    /// (`ZipSalvage::next_candidate`) needs neither: this is exactly the
+    /// "index destroyed or absent" shape salvage exists for, and building
+    /// only what the scan actually reads keeps a fixture's shape legible
+    /// rather than incidentally exercising the reconciliation path this task
+    /// does not touch.
+    ///
+    /// `payload` is exactly what is written to disk (raw bytes for Stored,
+    /// compressed bytes for Deflate); `uncompressed_size` and `declared_crc`
+    /// are independent fields, so a caller can build a header whose
+    /// `uncompressed_size` disagrees with what `payload` actually decodes to
+    /// — the shape a truncated/corrupted Deflate fixture needs.
+    fn local_header_entry_with_method(
+        name: &str,
+        method: u16,
+        payload: &[u8],
+        uncompressed_size: u32,
+        declared_crc: u32,
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"PK\x03\x04");
         out.extend_from_slice(&20u16.to_le_bytes()); // version needed to extract
         out.extend_from_slice(&0u16.to_le_bytes()); // flags: no data descriptor
-        out.extend_from_slice(&0u16.to_le_bytes()); // method: 0 = Stored
+        out.extend_from_slice(&method.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // mod time
         out.extend_from_slice(&0u16.to_le_bytes()); // mod date
         out.extend_from_slice(&declared_crc.to_le_bytes());
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // compressed size
-        out.extend_from_slice(&(data.len() as u32).to_le_bytes()); // uncompressed size
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // compressed size
+        out.extend_from_slice(&uncompressed_size.to_le_bytes());
         out.extend_from_slice(&(name.len() as u16).to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes()); // extra len
         out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(data);
+        out.extend_from_slice(payload);
         out
+    }
+
+    /// [`local_header_entry_with_method`] specialised to Stored (method 0),
+    /// where the payload IS the uncompressed bytes — every test this task
+    /// originally shipped uses this shape.
+    fn local_header_entry(name: &str, data: &[u8], declared_crc: u32) -> Vec<u8> {
+        local_header_entry_with_method(name, 0, data, data.len() as u32, declared_crc)
+    }
+
+    /// Compresses `data` through this crate's own `deflate` codec (the
+    /// registry, not a direct `flate2` dependency — `stuffr` does not depend
+    /// on `flate2` at all, unlike `stuffr-formats`) so a fixture can carry a
+    /// REAL Deflate-method entry rather than a hand-rolled approximation.
+    #[cfg(feature = "deflate")]
+    fn deflate_compress(data: &[u8]) -> Vec<u8> {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let codec = crate::registry()
+            .require_encoder(FormatId::new("deflate"))
+            .expect("this test is gated on `feature = \"deflate\"`");
+        let mut sink = codec
+            .encoder(Box::new(buf.clone()), &EncodeOpts::default())
+            .unwrap();
+        sink.write_all(data).unwrap();
+        sink.finish().unwrap();
+        buf.contents()
     }
 
     fn write_archive(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
@@ -3415,6 +3529,64 @@ mod salvage_tests {
             !real_name_path.exists(),
             "a partial recovery must NEVER land under the entry's real name — that is \
              what makes recovering it by default safe rather than reckless"
+        );
+    }
+
+    /// Fix round 1, REQUIRED 2: `PartialCause::Truncated` had no test — only
+    /// `ChecksumMismatch` (above) was pinned. A REAL Deflate stream (built
+    /// through this crate's own `deflate` codec, not a hand-rolled
+    /// approximation), cut in half AFTER compression, so the redecode runs
+    /// out partway through rather than completing and merely disagreeing
+    /// with its CRC. The header's declared `uncompressed_size` and CRC are
+    /// both the ORIGINAL, uncut payload's — a real writer's values, which is
+    /// what makes this "ran out", not "the header lied about its own size".
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn a_truncated_decode_is_marked_truncated_not_checksum_mismatch() {
+        let plaintext = b"this payload needs to be long enough that cutting the compressed \
+             stream in half leaves flate2 well short of the declared uncompressed length, \
+             rather than coincidentally still landing on a valid end-of-stream marker"
+            .to_vec();
+        let crc = crc32(&plaintext);
+        let compressed = deflate_compress(&plaintext);
+        assert!(
+            compressed.len() > 8,
+            "the payload must actually compress to something with a middle to cut"
+        );
+        let cut = compressed.len() / 2;
+        let truncated_compressed = &compressed[..cut];
+
+        let bytes = local_header_entry_with_method(
+            "big.bin",
+            8, // Deflate
+            truncated_compressed,
+            plaintext.len() as u32,
+            crc,
+        );
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: out_dir.path().to_path_buf(),
+            policy: SalvagePolicy::default(),
+        };
+        let outcome = salvage(&archive, &opts)
+            .expect("a truncated-but-well-formed entry must not abort the run");
+
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Partial);
+        let SalvageDisposition::WrittenPartial { cause, .. } = &outcome.entries[0].disposition
+        else {
+            panic!(
+                "expected WrittenPartial, got {:?}",
+                outcome.entries[0].disposition
+            );
+        };
+        assert_eq!(
+            *cause,
+            PartialCause::Truncated,
+            "a decode that never reached the declared length must be Truncated, not \
+             ChecksumMismatch — the branch this test exists to pin"
         );
     }
 
@@ -3503,5 +3675,73 @@ mod salvage_tests {
         };
         assert_eq!(path, &out_dir.path().join("fine.txt"));
         assert_eq!(std::fs::read(path).unwrap(), data);
+    }
+
+    /// Fix round 1, REQUIRED 3 (Ruling R-N): the aggregation rule, pinned
+    /// against constructed `SalvageOutcome`s rather than full end-to-end
+    /// archives — the rule is pure arithmetic over dispositions, and a
+    /// fixture-based test would only be testing the fixture as much as the
+    /// rule.
+    #[test]
+    fn exit_code_precedence_follows_ruling_r_n() {
+        let record = |disposition: SalvageDisposition| SalvagedRecord {
+            scan_position: 0,
+            name: "x".into(),
+            status: SalvageStatus::Intact,
+            shadows: None,
+            disposition,
+        };
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome { entries: vec![] }),
+            5,
+            "nothing recoverable at all"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![
+                    record(SalvageDisposition::Written(PathBuf::from("a"))),
+                    record(SalvageDisposition::Directory(PathBuf::from("b"))),
+                ],
+            }),
+            0,
+            "every entry Intact/Complete and written must be clean"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(SalvageDisposition::WrittenPartial {
+                    path: PathBuf::from("a.partial"),
+                    cause: PartialCause::ChecksumMismatch,
+                })],
+            }),
+            4,
+            "a Partial entry alone is bucket 4"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(SalvageDisposition::SkippedUnverified)],
+            }),
+            3,
+            "an Unverified entry alone is bucket 3"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![
+                    record(SalvageDisposition::WrittenPartial {
+                        path: PathBuf::from("a.partial"),
+                        cause: PartialCause::Truncated,
+                    }),
+                    record(SalvageDisposition::SkippedUnverified),
+                ],
+            }),
+            3,
+            "3 must outrank 4 when a run has BOTH a Partial and an Unverified entry — \
+             the actionable diagnosis (rebuild, or --features c-backed) wins over the \
+             merely-degraded one"
+        );
     }
 }
