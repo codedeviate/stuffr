@@ -158,6 +158,55 @@
 //! `a_non_utf8_name_the_scan_rejects_is_still_recovered_through_the_central_directory`
 //! below, whose falsification (skip the central-directory fallback) is
 //! recorded in the task report.
+//!
+//! # Cross-checked against Info-Zip's `zip -FF` (Task 7)
+//!
+//! `crates/stuffr-cli/tests/cli.rs`'s damage catalogue (Task 7, Step 2) builds
+//! one real, undamaged three-entry archive with the SYSTEM `zip` binary (never
+//! this project's own writer), damages it in the shapes this module's
+//! [`SalvageStatus`] tiers exist to describe, and — for the external-witness
+//! test (Step 3) — compares against Info-ZIP's own `zip -FF` ("salvage what
+//! can") run against the identical bytes.
+//!
+//! **Agreement, verified.** With the archive's central directory zeroed out
+//! entirely (this module falls back to the raw scan alone, exactly as
+//! "Central-directory reconciliation" above describes when there is no index
+//! to reconcile against), `zip -FF` also recovers all three entries by
+//! scanning local headers directly, and a follow-up `unzip -t` on its output
+//! confirms every one decodes and checks out — the same `Intact` verdict this
+//! module reaches, in the same pass, with no second tool needed to confirm it.
+//!
+//! **Disagreement found, and recorded here rather than tuned away.**
+//! Truncating the archive partway through its LAST entry's payload (so the
+//! central directory is lost along with the missing tail) is where the two
+//! tools diverge, and manual reproduction — not automated in the test suite,
+//! because it depends on `zip -FF`'s own internal buffer handling rather than
+//! on anything this project controls — points at Info-Zip's tool, not this
+//! one, being the one that is wrong:
+//!
+//! - This module (via [`salvage_zip`]'s raw scan) correctly reports the
+//!   truncated entry as ABSENT: criterion 6 of the validation gate (this
+//!   module's opening section) refuses a candidate whose declared length runs
+//!   past the end of the source, so a truncated last entry is never invented.
+//! - `zip -FF`, run against the IDENTICAL bytes (a Stored, `-X` archive whose
+//!   third entry's 48-byte payload was cut to 24 bytes, dropping the central
+//!   directory with it), printed `copying: gamma.bin (48 bytes)` — the
+//!   entry's full DECLARED size, not the 24 genuine bytes available — with no
+//!   warning at all. The archive it produced decodes that entry's first 24
+//!   bytes correctly, followed by 24 bytes that are neither zero nor
+//!   repeated: byte-for-byte, they are `50 4b 01 02 ...` — the
+//!   central-directory-record signature and fields from elsewhere in the
+//!   SAME original archive, bytes that do not exist anywhere in the
+//!   truncated input `zip -FF` was actually given. Only a SEPARATE `unzip -t`
+//!   pass on its output caught the result: `bad CRC 0f6603ba (should be
+//!   77067d78)`.
+//!
+//! So on a truncated tail, `zip -FF` is not merely less informative than this
+//! module (it reports "fixed" or not, with no per-entry status tier at all)
+//! — it fabricates plausible-looking bytes for content that no longer
+//! exists and reports success while doing it. This module's own refusal to
+//! invent a declared-but-absent payload was not changed to chase agreement
+//! with that result.
 
 use std::io::{self, Read, SeekFrom};
 
@@ -1126,6 +1175,103 @@ mod tests {
     fn salvage(bytes: &[u8]) -> SalvageOutcome {
         salvage_zip(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
             .expect("a healthy or merely-damaged zip must salvage without a hard error")
+    }
+
+    // -------------------------------------------------------------------
+    // Task 7, Step 1: salvage of an UNDAMAGED archive must agree exactly
+    // with `list` — checked here against `crate::zip::walk_central_directory`,
+    // the same central-directory walk `list` itself is built from (this
+    // crate has no dependency on the `stuffr` facade crate `list` actually
+    // lives in, so the comparison is made against the shared read path
+    // rather than the CLI verb by name — the identical reasoning
+    // `salvage_finds_every_local_header_in_a_real_archive` above already
+    // gives for cross-checking against this same function rather than
+    // hand-copied expected values). Any divergence on a healthy file is a
+    // scanner bug, caught with no damage constructed at all.
+    // -------------------------------------------------------------------
+
+    /// Builds several distinct healthy archives via the `zip` crate — a
+    /// single Stored entry, a single Deflated one, and a mixed multi-entry
+    /// archive carrying an empty file and a directory — and asserts, for
+    /// each, that [`salvage_zip`] finds exactly what the central-directory
+    /// walk finds: the same names in the same order, every one `Intact`,
+    /// none shadowing another.
+    #[test]
+    fn salvage_of_a_healthy_archive_agrees_with_list() {
+        fn check(bytes: Vec<u8>, fixture: &str) {
+            let cd_records = crate::zip::walk_central_directory(&mut Cursor::new(&bytes))
+                .unwrap_or_else(|| {
+                    panic!("{fixture}: this fixture's own central directory must walk cleanly")
+                });
+            let out = salvage(&bytes);
+            assert_eq!(
+                out.entries.len(),
+                cd_records.len(),
+                "{fixture}: salvage must find exactly what the central-directory walk (what \
+                 `list` is built from) finds"
+            );
+            for (entry, record) in out.entries.iter().zip(cd_records.iter()) {
+                assert_eq!(
+                    entry.meta.name, record.name,
+                    "{fixture}: salvage and the central-directory walk disagree on a name"
+                );
+                assert_eq!(
+                    entry.status,
+                    SalvageStatus::Intact,
+                    "{fixture}: an undamaged entry (`{}`) must verify Intact, found {:?}",
+                    entry.meta.name,
+                    entry.status
+                );
+                assert_eq!(
+                    entry.shadows, None,
+                    "{fixture}: nothing here is a duplicate of anything else"
+                );
+            }
+        }
+
+        // A single Stored entry.
+        {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let mut cursor = Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut cursor);
+                w.start_file("solo.txt", opts).unwrap();
+                w.write_all(b"a single stored entry, nothing damaged")
+                    .unwrap();
+                w.finish().unwrap();
+            }
+            check(cursor.into_inner(), "single Stored entry");
+        }
+
+        // A single Deflated entry — the same builder Task 4's own
+        // truncation test uses, undamaged this time.
+        {
+            let payload = b"deflate me please, more than once. ".repeat(30);
+            let (bytes, _span) = build_deflated_single_entry_zip("solo.bin", &payload);
+            check(bytes, "single Deflated entry");
+        }
+
+        // Several entries: mixed methods, an empty file, and a directory.
+        {
+            let stored = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let deflated = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            let mut cursor = Cursor::new(Vec::new());
+            {
+                let mut w = zip::ZipWriter::new(&mut cursor);
+                w.start_file("one.txt", stored).unwrap();
+                w.write_all(b"first entry, stored").unwrap();
+                w.start_file("two.bin", deflated).unwrap();
+                w.write_all(b"second entry, deflated, deflated, deflated, deflated")
+                    .unwrap();
+                w.add_directory("adir/", stored).unwrap();
+                w.start_file("empty.txt", stored).unwrap();
+                w.finish().unwrap();
+            }
+            check(cursor.into_inner(), "mixed multi-entry archive");
+        }
     }
 
     /// Task 4's first required test, verbatim from the brief. This is the

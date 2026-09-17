@@ -9289,3 +9289,489 @@ fn salvage_output_suffixes_a_partial_entry() {
         b"this payload's crc field below is wrong on purpose"
     );
 }
+
+// ---------------------------------------------------------------------
+// Task 7: the evidence.
+//
+// A damage catalogue built over ONE archive the REAL `zip` binary wrote
+// (never this project's own writer), an external witness (`zip -FF`)
+// cross-checked against the identical bytes, and — from the other
+// direction — the healthy-archive-agrees-with-list property, proven inside
+// `stuffr-formats` itself: see `zip_salvage.rs`'s
+// `salvage_of_a_healthy_archive_agrees_with_list`, which this crate has no
+// way to duplicate (it does not depend on `stuffr-formats`'s internals, on
+// purpose, matching this section's own choice below to hand-parse a real
+// zip rather than pull in a second zip-writing/reading stack).
+//
+// The reference archive: three Stored (`-0`, no compression to reason
+// about), no-extra-field (`-X`) entries, so a payload byte or a CRC-32
+// field can be mutated in place without moving any offset or length
+// anywhere else in the file. What went in is known because THIS TEST chose
+// the three files' names and bytes, not recovered from the archive after
+// the fact — "the expectation is the pre-damage state, written by zip, not
+// by us."
+// ---------------------------------------------------------------------
+
+/// One real local file header, parsed directly out of bytes the SYSTEM
+/// `zip` wrote — a minimal, test-local mirror of the fixed 30-byte layout
+/// `crates/stuffr-formats/src/zip_salvage.rs`'s own scanner reads (see that
+/// module for the full field-by-field account). Hand-rolled here, rather
+/// than depending on `stuffr-formats` at all, for the same reason this
+/// file's `salvage_fixture_local_record` above hand-ASSEMBLES a local
+/// header instead of reaching for a zip-writing crate: this test binary
+/// has never depended on a second zip stack.
+struct RealZipLocalEntry {
+    /// Byte offset of this record's `PK\x03\x04` signature.
+    offset: usize,
+    name: String,
+    /// Byte offset of the 4-byte `crc32` field within this record.
+    crc_offset: usize,
+    /// Byte range of this entry's (Stored, so uncompressed) payload.
+    payload: std::ops::Range<usize>,
+    /// Byte length of the WHOLE physical record (header + name + extra +
+    /// payload) — what a byte-identical duplicate of this record must copy.
+    record_len: usize,
+}
+
+/// Walks every local file header in `bytes` in file order — the same shape
+/// `zip_salvage.rs`'s own raw scan performs, hand-rolled here so this test
+/// binary never has to depend on that crate to damage the fixture below.
+fn parse_real_zip_local_entries(bytes: &[u8]) -> Vec<RealZipLocalEntry> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 30 <= bytes.len() && bytes[i..i + 4] == [0x50, 0x4b, 0x03, 0x04] {
+        let compressed_size =
+            u32::from_le_bytes(bytes[i + 18..i + 22].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes([bytes[i + 26], bytes[i + 27]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[i + 28], bytes[i + 29]]) as usize;
+        let name_start = i + 30;
+        let name = String::from_utf8(bytes[name_start..name_start + name_len].to_vec())
+            .expect("this section's own fixture names are plain ASCII");
+        let payload_start = name_start + name_len + extra_len;
+        let payload = payload_start..payload_start + compressed_size;
+        let record_len = payload.end - i;
+        out.push(RealZipLocalEntry {
+            offset: i,
+            name,
+            crc_offset: i + 14,
+            payload,
+            record_len,
+        });
+        i += record_len;
+    }
+    out
+}
+
+/// Byte offset of the end-of-central-directory record. This section's own
+/// fixture never carries an archive comment, so it is simply the last
+/// four-byte match.
+fn find_real_zip_eocd(bytes: &[u8]) -> usize {
+    bytes
+        .windows(4)
+        .rposition(|w| w == b"PK\x05\x06")
+        .expect("every archive this section builds must carry an EOCD record")
+}
+
+/// Builds the catalogue's one healthy archive — see this section's own
+/// header comment for why it is Stored and carries no extra field. Written
+/// by the SYSTEM `zip` binary, never by this project's own writer, so every
+/// mutation below is damage applied to a tool-verified-good archive, not to
+/// one only this project has ever agreed with itself is well-formed.
+fn build_real_healthy_zip(dir: &Path) -> (PathBuf, [(&'static str, &'static [u8]); 3]) {
+    let entries: [(&str, &[u8]); 3] = [
+        ("alpha.txt", b"alpha entry payload, first in the archive"),
+        ("beta.txt", b"beta entry payload, sits in the middle"),
+        (
+            "gamma.bin",
+            b"gamma entry payload, the last one in the archive",
+        ),
+    ];
+    let src = dir.join("src");
+    std::fs::create_dir(&src).unwrap();
+    for (name, data) in &entries {
+        std::fs::write(src.join(name), data).unwrap();
+    }
+    let zip_bin = require_bin("zip");
+    let archive = dir.join("healthy.zip");
+    run_tool(
+        &zip_bin,
+        &[
+            os(&"-q"),
+            os(&"-0"),
+            os(&"-X"),
+            os(&archive),
+            os(&"alpha.txt"),
+            os(&"beta.txt"),
+            os(&"gamma.bin"),
+        ],
+        &src,
+        b"",
+    );
+    (archive, entries)
+}
+
+/// Runs `stuffr salvage ARCHIVE --list` (report-only: no `-C`, nothing is
+/// ever written to disk) and returns its stdout, one string per row — the
+/// same rows `describe_salvage_row` builds, in scan order, so `rows[N]`
+/// below is scan position `N` whenever every damage catalogue mutation
+/// leaves the earlier records discoverable (true of every mutation but the
+/// truncated-tail one, which is checked by row COUNT instead).
+fn salvage_list_rows(archive: &Path) -> Vec<String> {
+    let out = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Zeroes every byte from the central directory onward (the CD itself and
+/// the EOCD both) — the index destroyed entirely, the shape
+/// `zip_salvage.rs`'s "Central-directory reconciliation" section calls the
+/// scan's own reason to exist. Shared between the damage catalogue's own
+/// row for this mutation and the external-witness test, since both need
+/// the identical damaged bytes.
+fn mutate_zeroed_central_directory(healthy: &[u8]) -> Vec<u8> {
+    let mut bytes = healthy.to_vec();
+    let eocd = find_real_zip_eocd(&bytes);
+    let cd_offset = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    for b in &mut bytes[cd_offset..] {
+        *b = 0;
+    }
+    bytes
+}
+
+/// Appends a byte-identical physical copy of the FIRST entry's local
+/// record, and splices a matching duplicate central-directory record
+/// (pointing at the copy) into the index — 4 physical records over 3
+/// names, the small sibling of `stuffr-formats/src/zip.rs`'s own
+/// `build_shadowing_zip` fixture (8 records, 6 names) and this file's own
+/// `build_shadowing_zip_fixture` above, built here over an archive the
+/// SYSTEM `zip` wrote instead of one this project hand-assembled from
+/// nothing.
+fn duplicate_first_central_directory_record(healthy: &[u8]) -> Vec<u8> {
+    let bytes = healthy.to_vec();
+    let eocd = find_real_zip_eocd(&bytes);
+    let disk_no = u16::from_le_bytes(bytes[eocd + 4..eocd + 6].try_into().unwrap());
+    let disk_cd = u16::from_le_bytes(bytes[eocd + 6..eocd + 8].try_into().unwrap());
+    let cd_total = u16::from_le_bytes(bytes[eocd + 10..eocd + 12].try_into().unwrap());
+    let cd_size = u32::from_le_bytes(bytes[eocd + 12..eocd + 16].try_into().unwrap()) as usize;
+    let cd_offset = u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let comment_len = u16::from_le_bytes(bytes[eocd + 20..eocd + 22].try_into().unwrap());
+
+    let real_entries = parse_real_zip_local_entries(&bytes);
+    let first = &real_entries[0];
+    let duplicate_record = bytes[first.offset..first.offset + first.record_len].to_vec();
+
+    let old_cd = bytes[cd_offset..cd_offset + cd_size].to_vec();
+    assert_eq!(
+        &old_cd[0..4],
+        &[0x50, 0x4b, 0x01, 0x02],
+        "sanity: the central directory's first record"
+    );
+    let name_len = u16::from_le_bytes(old_cd[28..30].try_into().unwrap()) as usize;
+    let extra_len = u16::from_le_bytes(old_cd[30..32].try_into().unwrap()) as usize;
+    let comment_len_rec = u16::from_le_bytes(old_cd[32..34].try_into().unwrap()) as usize;
+    let first_cd_len = 46 + name_len + extra_len + comment_len_rec;
+    let mut duplicate_cd_record = old_cd[0..first_cd_len].to_vec();
+
+    // The duplicate physical record lands exactly where the OLD central
+    // directory used to start — that is where this function inserts it.
+    let new_local_offset = cd_offset as u32;
+    duplicate_cd_record[42..46].copy_from_slice(&new_local_offset.to_le_bytes());
+
+    let new_cd_start = cd_offset + duplicate_record.len();
+    let mut new_cd = old_cd.clone();
+    new_cd.extend_from_slice(&duplicate_cd_record);
+    let new_total = cd_total + 1;
+
+    let mut out = bytes[..cd_offset].to_vec();
+    out.extend_from_slice(&duplicate_record);
+    out.extend_from_slice(&new_cd);
+    out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+    out.extend_from_slice(&disk_no.to_le_bytes());
+    out.extend_from_slice(&disk_cd.to_le_bytes());
+    out.extend_from_slice(&new_total.to_le_bytes());
+    out.extend_from_slice(&new_total.to_le_bytes());
+    out.extend_from_slice(&(new_cd.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(new_cd_start as u32).to_le_bytes());
+    out.extend_from_slice(&comment_len.to_le_bytes());
+    out
+}
+
+/// Damage catalogue row 1/5: a truncated tail. Cutting the archive partway
+/// through its LAST entry's payload (dropping the central directory along
+/// with the missing bytes) must recover the two earlier entries `Intact`
+/// and must NOT invent the last one: criterion 6 of `zip_salvage.rs`'s own
+/// validation gate refuses a candidate whose declared length runs past the
+/// end of the source, so the truncated entry is simply absent from the
+/// scan — never reported as damaged content that was never actually read.
+#[test]
+fn damage_catalogue_truncated_tail() {
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let healthy = std::fs::read(&archive).unwrap();
+
+    let real_entries = parse_real_zip_local_entries(&healthy);
+    assert_eq!(
+        real_entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha.txt", "beta.txt", "gamma.bin"],
+        "sanity: the reference archive's own three entries, in file order"
+    );
+    let gamma = &real_entries[2];
+    let cut = gamma.payload.start + gamma.payload.len() / 2;
+    let path = dir.join("truncated.zip");
+    std::fs::write(&path, &healthy[..cut]).unwrap();
+
+    let rows = salvage_list_rows(&path);
+    assert_eq!(
+        rows.len(),
+        2,
+        "the truncated last entry must be ABSENT from the scan entirely, not merely marked \
+         damaged: {rows:?}"
+    );
+    assert!(
+        rows[0].contains("alpha.txt") && rows[0].contains("Intact"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[1].contains("beta.txt") && rows[1].contains("Intact"),
+        "{rows:?}"
+    );
+}
+
+/// Damage catalogue row 2/5: a zeroed central directory. With the index
+/// destroyed entirely, `salvage_zip` falls back to the raw local-header
+/// scan alone and must still find and verify all three entries.
+#[test]
+fn damage_catalogue_zeroed_central_directory() {
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let healthy = std::fs::read(&archive).unwrap();
+    let path = dir.join("zeroed_cd.zip");
+    std::fs::write(&path, mutate_zeroed_central_directory(&healthy)).unwrap();
+
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    for (row, name) in rows.iter().zip(["alpha.txt", "beta.txt", "gamma.bin"]) {
+        assert!(
+            row.contains(name) && row.contains("Intact"),
+            "every entry must still be found by the raw scan and verify Intact: {row}"
+        );
+    }
+}
+
+/// Damage catalogue row 3/5: a hole punched mid-payload. Only the MIDDLE
+/// entry's content is damaged (its declared length and its own CRC-32
+/// field are untouched), so its neighbours must be unaffected and it alone
+/// must come back `Partial`.
+#[test]
+fn damage_catalogue_hole_punched_mid_payload() {
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let mut bytes = std::fs::read(&archive).unwrap();
+    let real_entries = parse_real_zip_local_entries(&bytes);
+    let beta = &real_entries[1];
+    assert!(
+        beta.payload.len() >= 15,
+        "sanity: room to punch a hole without running past this entry's own payload"
+    );
+    for b in &mut bytes[beta.payload.start + 5..beta.payload.start + 15] {
+        *b ^= 0xFF;
+    }
+    let path = dir.join("hole_punched.zip");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(
+        rows[0].contains("alpha.txt") && rows[0].contains("Intact"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[1].contains("beta.txt") && rows[1].contains("Partial"),
+        "the punched entry's content no longer matches its own declared CRC-32: {rows:?}"
+    );
+    assert!(
+        rows[2].contains("gamma.bin") && rows[2].contains("Intact"),
+        "{rows:?}"
+    );
+}
+
+/// Damage catalogue row 4/5: one CRC corrupted. Only the FIRST entry's
+/// LOCAL-HEADER `crc32` field is flipped — its payload and the central
+/// directory's own copy of the checksum are untouched — so the raw scan
+/// (which builds its verifier from the LOCAL header, not the central
+/// directory) reports a checksum that no longer matches the real content.
+#[test]
+fn damage_catalogue_one_crc_corrupted() {
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let mut bytes = std::fs::read(&archive).unwrap();
+    let real_entries = parse_real_zip_local_entries(&bytes);
+    let alpha_crc_offset = real_entries[0].crc_offset;
+    bytes[alpha_crc_offset] ^= 0xFF;
+    let path = dir.join("crc_corrupted.zip");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(
+        rows[0].contains("alpha.txt") && rows[0].contains("Partial"),
+        "the corrupted entry's declared checksum no longer matches its (untouched) payload: \
+         {rows:?}"
+    );
+    assert!(
+        rows[1].contains("beta.txt") && rows[1].contains("Intact"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[2].contains("gamma.bin") && rows[2].contains("Intact"),
+        "{rows:?}"
+    );
+}
+
+/// Damage catalogue row 5/5: a duplicated record. 8 records over 6 names is
+/// `build_shadowing_zip_fixture`'s own shape; this is its 4-records-over-3-
+/// names sibling, built over an archive the SYSTEM `zip` wrote.
+#[test]
+fn damage_catalogue_duplicated_record() {
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let healthy = std::fs::read(&archive).unwrap();
+    let path = dir.join("duplicated.zip");
+    std::fs::write(&path, duplicate_first_central_directory_record(&healthy)).unwrap();
+
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), 4, "3 names, 4 physical records: {rows:?}");
+    assert!(
+        rows[0].contains("alpha.txt") && rows[0].contains("Intact"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[1].contains("beta.txt") && rows[1].contains("Intact"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[2].contains("gamma.bin") && rows[2].contains("Intact"),
+        "{rows:?}"
+    );
+    assert!(
+        rows[3].contains("alpha.txt")
+            && rows[3].contains("Intact")
+            && rows[3].contains("[shadowed: dup of #0]"),
+        "the extra physical copy must be reported Intact (nothing in it is damaged) AND \
+         flagged as shadowing scan position 0: {rows:?}"
+    );
+}
+
+/// Runs Info-Zip's `zip -FF` against `archive`, answering its `y/n` prompt
+/// ("Is this a single-disk archive?" — the only one any fixture in this
+/// section provokes) with `y`. Guards against a real failure mode measured
+/// while designing this test: given a fully closed stdin instead, `zip -FF`
+/// treats the immediate EOF as a blank line at its OWN "try again" prompt
+/// and loops forever re-printing its default-answer menu rather than
+/// exiting — a hang, not a slow pass, in the REFERENCE tool's own handling
+/// of EOF, so a watchdog thread kills the child if it is still running past
+/// a generous bound rather than letting a run hang indefinitely.
+#[cfg(unix)]
+fn run_zip_ff(zip_bin: &Path, archive: &Path, out: &Path) -> std::process::Output {
+    let mut child = Command::new(zip_bin)
+        .args([os(&"-FF"), os(&archive), os(&"--out"), os(&out)])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"y\ny\ny\ny\ny\n")
+        .unwrap();
+
+    let pid = child.id();
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let finished_for_watchdog = finished.clone();
+    let watchdog = std::thread::spawn(move || {
+        for _ in 0..200 {
+            if finished_for_watchdog.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    });
+
+    let output = child.wait_with_output().unwrap();
+    finished.store(true, Ordering::Relaxed);
+    watchdog.join().unwrap();
+    output
+}
+
+/// Step 3: the external witness. Info-ZIP's `zip -FF` is a genuine second
+/// implementation of zip recovery, cross-checked here on the ONE shape
+/// where the two tools were found to agree — a zeroed central directory,
+/// which forces BOTH tools onto a raw local-header scan with nothing to
+/// reconcile against. `zip_salvage.rs`'s own module doc records the ONE
+/// shape found where they do NOT agree (a truncated last entry, where
+/// `zip -FF` was measured fabricating bytes for content that no longer
+/// exists) and why that is Info-Zip's tool being the one that is wrong,
+/// rather than tuned away here.
+#[cfg(unix)]
+#[test]
+fn info_zip_recovers_the_same_entries_we_do() {
+    let zip_bin = require_bin("zip");
+    let unzip_bin = require_bin("unzip");
+
+    let dir = tmp_dir();
+    let (archive, _entries) = build_real_healthy_zip(&dir);
+    let healthy = std::fs::read(&archive).unwrap();
+    let damaged = dir.join("zeroed_cd_for_witness.zip");
+    std::fs::write(&damaged, mutate_zeroed_central_directory(&healthy)).unwrap();
+
+    // Our own recovery.
+    let rows = salvage_list_rows(&damaged);
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    for (row, name) in rows.iter().zip(["alpha.txt", "beta.txt", "gamma.bin"]) {
+        assert!(
+            row.contains(name) && row.contains("Intact"),
+            "our own recovery must find every entry, Intact: {row}"
+        );
+    }
+
+    // Info-Zip's own recovery.
+    let fixed = dir.join("witness_fixed.zip");
+    let out = run_zip_ff(&zip_bin, &damaged, &fixed);
+    assert!(
+        out.status.success(),
+        "zip -FF failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let test_out = Command::new(&unzip_bin)
+        .args(["-t", fixed.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        test_out.status.success(),
+        "unzip -t reported a problem with zip -FF's own recovered archive: {}",
+        String::from_utf8_lossy(&test_out.stdout)
+    );
+    let test_text = String::from_utf8_lossy(&test_out.stdout);
+    for name in ["alpha.txt", "beta.txt", "gamma.bin"] {
+        let line = test_text
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| {
+                panic!("zip -FF's own recovery must still contain `{name}`: {test_text}")
+            });
+        assert!(
+            line.contains("OK"),
+            "we call `{name}` Intact; Info-Zip's own independent recovery must agree it \
+             decodes cleanly: {line}"
+        );
+    }
+}
