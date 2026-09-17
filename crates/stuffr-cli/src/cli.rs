@@ -235,4 +235,68 @@ pub enum Command {
         #[arg(long)]
         strict_fidelity: bool,
     },
+    /// Recover what a damaged zip's scan can prove, even where its central
+    /// directory alone would show less — or would wrongly unify two records
+    /// that happen to share a name.
+    ///
+    /// The one recovery-biased verb in this tool. `list`, `cat`, `unpack` and
+    /// `test` all stay exactly as uncompromising as they already are, and it
+    /// is salvage's willingness to accept less-than-proven content that buys
+    /// them that freedom.
+    Salvage {
+        /// Input path.
+        ///
+        /// Salvage scans back and forth over the archive, which needs real
+        /// random access — unlike every other verb here, this one does not
+        /// accept `-` for stdin.
+        input: String,
+        /// Print every record the scan found, including ones this build
+        /// never writes (a shadow, a skipped partial, an unverified entry).
+        ///
+        /// `stuffr list` on the same archive can print FEWER rows than this:
+        /// a record a later one shadows is invisible to `list`, which only
+        /// ever sees what the central directory's own name index kept.
+        #[arg(long)]
+        list: bool,
+        /// Recover entries into this directory.
+        ///
+        /// Required: unlike `unpack`, salvage has no single-stream mode, so
+        /// there is always somewhere recovered content must land.
+        #[arg(short = 'C', long, value_name = "DIR")]
+        directory: Option<String>,
+        /// Recover only the record at this SCAN position instead of every
+        /// one found. Repeatable.
+        ///
+        /// A scan position is 0-based and counts every record the scan
+        /// found, shadowed ones included — a DIFFERENT numbering from
+        /// `stuffr list`'s own index, which never counts a shadowed record at
+        /// all. On an archive where a name is duplicated, `list --index 6`
+        /// and `salvage --index 6` can name different entries, or `list`'s
+        /// may not exist at all. Always a scan position, never a list index.
+        #[arg(long, value_name = "N")]
+        index: Vec<usize>,
+        /// What to do with an entry whose payload could not be fully proven:
+        /// `keep` (default) writes it as `name.partial`, never under its
+        /// real name; `skip` recovers nothing for it; `ask` has no terminal
+        /// to ask from at this layer and is read conservatively as `skip`.
+        #[arg(long, value_name = "POLICY")]
+        partial: Option<String>,
+        /// Raise the structural ceiling on a single entry's declared length,
+        /// e.g. 8G. A declaration over the ceiling is refused before
+        /// anything is allocated on its say-so, either way.
+        #[arg(long, value_name = "SIZE")]
+        max_entry: Option<String>,
+        /// Demand proof: skip every partial entry regardless of `--partial`,
+        /// and accept nothing this build cannot verify. The strict path
+        /// every other verb in this tool already stands on, applied here on
+        /// request instead of by default.
+        #[arg(long)]
+        strict: bool,
+        /// Use this format instead of detecting one.
+        ///
+        /// Stage 1 recovers zip archives only, so the only accepted value is
+        /// `zip`.
+        #[arg(long)]
+        format: Option<String>,
+    },
 }

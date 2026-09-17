@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
 use stuffr::FormatId;
-use stuffr::entries::{self, ExtractOpts, Selection};
+use stuffr::entries::{self, ExtractOpts, SalvageOpts, Selection};
 use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output};
 use stuffr_cli::cli::{Cli, Command};
 
@@ -75,6 +75,10 @@ fn destination_is_stdout(cmd: &Command) -> bool {
         Command::Cat { .. } | Command::Info { .. } | Command::Formats | Command::List { .. } => {
             true
         }
+        // Only the `--list` row-per-record report is the "big data to
+        // stdout" shape `Cat`/`List` are; the default summary line goes to
+        // stderr the same way `unpack`/`test` print theirs.
+        Command::Salvage { list, .. } => *list,
         Command::Pack {
             output: Some(o), ..
         }
@@ -526,7 +530,269 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             );
             report_fidelity(&out.fidelity, strict_fidelity)
         }
+        Command::Salvage {
+            input,
+            list,
+            directory,
+            index,
+            partial,
+            max_entry,
+            strict,
+            format,
+        } => {
+            let code = dispatch_salvage(SalvageArgs {
+                input,
+                list,
+                directory,
+                index,
+                partial,
+                max_entry,
+                strict,
+                format,
+            })?;
+            // `code` is the aggregate bucket `entries::salvage_exit_code`
+            // computed over a run that COMPLETED (`Ok`) — 0, 3, 4 or 5, per
+            // Ruling R-N. It is not an `Error`: a completed salvage run that
+            // recovered something partial or skipped a shadow is not this
+            // program failing, so there is no `stuffr::Error` variant to
+            // carry the number honestly (every existing one whose exit code
+            // matches also carries a Display string tied to a DIFFERENT
+            // shape, e.g. `FidelityDegraded`'s "under strict mode", which
+            // salvage's own `--strict` does not mean). `run`'s own
+            // Ok/Err-to-`ExitCode` mapping has no third option, so a
+            // non-zero bucket here exits directly rather than round-tripping
+            // through it — the report was already printed by
+            // `dispatch_salvage`, so nothing is lost by not returning.
+            //
+            // Exit 6 (over the ceiling) and exit 7 (path escape) never reach
+            // here: `entries::salvage` raises them as `Err` before a
+            // `SalvageOutcome` exists at all (see `salvage_exit_code`'s own
+            // doc), and the `?` above already propagated those through the
+            // normal `Error::exit_code` path.
+            if code == 0 {
+                Ok(())
+            } else {
+                std::process::exit(code)
+            }
+        }
     }
+}
+
+/// One record's status, named the way [`stuffr::salvage::SalvageStatus`]
+/// itself is proven, before anything the write side decided is layered on.
+///
+/// `Partial` carries no cause on the status alone (only
+/// [`entries::SalvageDisposition::WrittenPartial`] does, and only once an
+/// entry was actually re-decoded to place it — see that variant's own doc)
+/// — so a `Partial` entry `--partial=skip` declined has no cause to report
+/// here, and none is fabricated. `Unverified` is different: its cause is
+/// part of the status itself, proven at scan time, so it is always known.
+fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static str {
+    use stuffr::salvage::{SalvageStatus, UnverifiedCause};
+    match status {
+        SalvageStatus::Intact => "Intact",
+        SalvageStatus::Complete => "Complete",
+        SalvageStatus::Partial => "Partial",
+        SalvageStatus::Unverified(UnverifiedCause::UndecodableMethod) => {
+            "Unverified (undecodable method)"
+        }
+        SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength) => {
+            "Unverified (no declared length)"
+        }
+    }
+}
+
+/// One `--list` row: scan position, status (refined with a `Partial` cause
+/// when [`entries::SalvageDisposition::WrittenPartial`] has one to give),
+/// name, and — the naming rule this whole feature is built around — a
+/// `[shadowed: dup of #N]` suffix naming the EARLIER scan position, never
+/// "index", when this record shadows one.
+fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
+    let status = match &record.disposition {
+        entries::SalvageDisposition::WrittenPartial { cause, .. } => match cause {
+            entries::PartialCause::Truncated => "Partial (truncated)",
+            entries::PartialCause::ChecksumMismatch => "Partial (checksum mismatch)",
+        },
+        entries::SalvageDisposition::Written(_)
+        | entries::SalvageDisposition::Directory(_)
+        | entries::SalvageDisposition::SkippedPartial
+        | entries::SalvageDisposition::SkippedUnverified
+        | entries::SalvageDisposition::SkippedNotBuiltIn
+        | entries::SalvageDisposition::SkippedShadow(_)
+        | entries::SalvageDisposition::SkippedUnsupportedKind => {
+            describe_salvage_status(record.status)
+        }
+    };
+    let mut line = format!("{:<4} {:<32} {}", record.scan_position, status, record.name);
+    if let Some(earlier) = record.shadows {
+        line.push_str(&format!(" [shadowed: dup of #{earlier}]"));
+    }
+    line
+}
+
+/// `--list`: one line per scanned record, to stdout — the same destination
+/// `stuffr list` itself writes to, and for the same reason (`stuffr salvage
+/// … --list | head` is as legitimate a pipeline as `stuffr list x | head`).
+fn print_salvage_list(records: &[&entries::SalvagedRecord]) -> stuffr::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    for record in records {
+        writeln!(out, "{}", describe_salvage_row(record))?;
+    }
+    Ok(())
+}
+
+/// The default (non-`--list`) report: counts only, to stderr — the same
+/// destination `unpack`'s and `test`'s own summary lines use.
+fn print_salvage_summary(records: &[&entries::SalvagedRecord]) {
+    let (mut written, mut partial, mut dirs, mut skipped, mut unverified) = (0, 0, 0, 0, 0);
+    for record in records {
+        match &record.disposition {
+            entries::SalvageDisposition::Written(_) => written += 1,
+            entries::SalvageDisposition::WrittenPartial { .. } => partial += 1,
+            entries::SalvageDisposition::Directory(_) => dirs += 1,
+            entries::SalvageDisposition::SkippedUnverified => unverified += 1,
+            entries::SalvageDisposition::SkippedPartial
+            | entries::SalvageDisposition::SkippedNotBuiltIn
+            | entries::SalvageDisposition::SkippedShadow(_)
+            | entries::SalvageDisposition::SkippedUnsupportedKind => skipped += 1,
+        }
+    }
+    eprintln!(
+        "salvage -> {} scanned: {written} written, {partial} written as .partial, {dirs} \
+         director{}, {skipped} skipped, {unverified} unverified",
+        records.len(),
+        if dirs == 1 { "y" } else { "ies" }
+    );
+}
+
+/// Validates `--index` against the scan positions the archive actually has,
+/// naming the mistake as a scan position — never "index" — per this
+/// feature's own naming rule: `stuffr list`'s numbering and salvage's are two
+/// different things, and a message that said "index" here could be misread
+/// as `list`'s.
+fn validate_scan_positions(requested: &[usize], total: usize) -> stuffr::Result<()> {
+    for &pos in requested {
+        if pos >= total {
+            return Err(stuffr::Error::Usage(format!(
+                "scan position {pos} does not exist; this archive's scan found {total} \
+                 record(s) (valid scan positions are 0-{})",
+                total.saturating_sub(1)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// [`Command::Salvage`]'s fields, bundled so [`dispatch_salvage`] takes one
+/// argument instead of eight (clippy's own `too_many_arguments` threshold).
+struct SalvageArgs {
+    input: String,
+    list: bool,
+    directory: Option<String>,
+    index: Vec<usize>,
+    partial: Option<String>,
+    max_entry: Option<String>,
+    strict: bool,
+    format: Option<String>,
+}
+
+/// Implements `salvage` end to end: builds the policy, runs the scan-and-
+/// recover engine (`entries::salvage`), prints the report, and returns the
+/// aggregate exit-code bucket (0/3/4/5) for the calling match arm to act on.
+///
+/// A plain function rather than inlined in the `dispatch` arm purely so the
+/// arm above reads as a dispatch table, matching the shape every other verb
+/// here already has.
+fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
+    let SalvageArgs {
+        input,
+        list,
+        directory,
+        index,
+        partial,
+        max_entry,
+        strict,
+        format,
+    } = args;
+    if let Some(name) = format.as_deref()
+        && name != "zip"
+    {
+        return Err(stuffr::Error::Unsupported(format!(
+            "salvage recovers zip archives only in this build; `{name}` names no salvage \
+             source `--format` can select"
+        )));
+    }
+    let Some(dir) = directory else {
+        return Err(stuffr::Error::Usage(
+            "salvage always recovers into a directory; pass -C DIR to say where".into(),
+        ));
+    };
+    let path = match input_of(&input) {
+        Input::Path(p) => p,
+        Input::Stdin => {
+            return Err(stuffr::Error::Usage(
+                "salvage scans back and forth over the archive, which needs a real seekable \
+                 file; pass a path, not `-`"
+                    .into(),
+            ));
+        }
+    };
+    let partial_policy = match partial.as_deref() {
+        None | Some("keep") => stuffr::salvage::PartialPolicy::Keep,
+        Some("skip") => stuffr::salvage::PartialPolicy::Skip,
+        Some("ask") => stuffr::salvage::PartialPolicy::Ask,
+        Some(other) => {
+            return Err(stuffr::Error::Usage(format!(
+                "unknown --partial value `{other}`; expected keep, skip or ask"
+            )));
+        }
+    };
+    let mut policy = stuffr::salvage::SalvagePolicy {
+        partial: partial_policy,
+        strict,
+        ..Default::default()
+    };
+    if let Some(raw) = max_entry {
+        policy.max_entry = stuffr_cli::size::parse_size(&raw).map_err(stuffr::Error::Usage)?;
+    }
+
+    let opts = SalvageOpts {
+        dest: PathBuf::from(&dir),
+        policy,
+    };
+    let outcome = entries::salvage(&path, &opts)?;
+
+    // Computed on the FULL scan, before `--index` filters anything: "nothing
+    // recoverable at all" is a fact about the archive, not about which scan
+    // positions the caller happened to ask for.
+    if entries::salvage_exit_code(&outcome) == 5 {
+        eprintln!("salvage -> the scan found nothing recoverable in this archive");
+        return Ok(5);
+    }
+
+    validate_scan_positions(&index, outcome.entries.len())?;
+
+    let subset: Vec<&entries::SalvagedRecord> = if index.is_empty() {
+        outcome.entries.iter().collect()
+    } else {
+        outcome
+            .entries
+            .iter()
+            .filter(|r| index.contains(&r.scan_position))
+            .collect()
+    };
+
+    if list {
+        print_salvage_list(&subset)?;
+    } else {
+        print_salvage_summary(&subset);
+    }
+
+    let selected = entries::SalvageOutcome {
+        entries: subset.into_iter().cloned().collect(),
+    };
+    Ok(entries::salvage_exit_code(&selected))
 }
 
 /// Prints what an operation approximated, and fails under --strict-fidelity.

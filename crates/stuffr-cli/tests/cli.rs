@@ -8600,3 +8600,482 @@ fn no_document_carries_a_stale_round_trip_or_read_only_count() {
         docs.len()
     );
 }
+
+// ---------------------------------------------------------------------
+// `salvage`.
+//
+// The fixture below is a hand-assembled zip, not one built through
+// `stuffr pack` (which never writes a duplicate record) or through the
+// `zip` crate (no dev-dependency on it here, deliberately — see
+// `write_zip_via_pack`'s own doc for why these tests avoid depending on a
+// second zip-writing stack). It reproduces the exact shape
+// `stuffr-formats/src/zip.rs`'s own `build_shadowing_zip` fixture does
+// (that one is `pub(crate)` to `stuffr-formats` and unreachable from here):
+// six distinct names, Stored (so a local header's declared compressed size
+// is the whole payload, no deflate framing to reason about), with
+// `shadowed-a.bin` and `shadowed-b.bin` each written a SECOND time — a
+// byte-identical local header and payload, appended after the six
+// originals — and a central directory carrying all EIGHT records (the six
+// originals, then a duplicate central record for each shadowed name,
+// pointing at the SECOND physical copy). A last-record-wins reader (`zip`,
+// and so `stuffr list`) collapses that to 6 names; `stuffr salvage`'s raw
+// scan walks local headers in FILE ORDER and finds all 8, so scan
+// positions 6 and 7 are the two shadows of scan positions 2 and 3.
+// ---------------------------------------------------------------------
+
+/// CRC-32 (IEEE 802.3 — the same polynomial zip's own local/central headers
+/// use), bit-by-bit. No crate needed for six known-plaintext payloads, and
+/// pulling in a dependency for this one computation would be a heavier fix
+/// than the six lines below.
+fn salvage_fixture_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// One Stored local file header plus its payload, and the offset it was
+/// written at (needed to build the central-directory record alongside it).
+struct SalvageFixtureLocalRecord {
+    offset: u32,
+    name: &'static str,
+    crc: u32,
+    len: u32,
+    bytes: Vec<u8>,
+}
+
+fn salvage_fixture_local_record(
+    offset: u32,
+    name: &'static str,
+    payload: &'static [u8],
+) -> SalvageFixtureLocalRecord {
+    let crc = salvage_fixture_crc32(payload);
+    let len = u32::try_from(payload.len()).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]); // local file header signature
+    bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed to extract
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // general purpose flags
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // compression method: Stored
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // mod time
+    bytes.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    bytes.extend_from_slice(&len.to_le_bytes()); // compressed size
+    bytes.extend_from_slice(&len.to_le_bytes()); // uncompressed size
+    bytes.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // extra field length
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(payload);
+    SalvageFixtureLocalRecord {
+        offset,
+        name,
+        crc,
+        len,
+        bytes,
+    }
+}
+
+fn salvage_fixture_central_record(rec: &SalvageFixtureLocalRecord) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]); // central header signature
+    bytes.extend_from_slice(&20u16.to_le_bytes()); // version made by
+    bytes.extend_from_slice(&20u16.to_le_bytes()); // version needed to extract
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // general purpose flags
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // compression method: Stored
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // mod time
+    bytes.extend_from_slice(&0x21u16.to_le_bytes()); // mod date
+    bytes.extend_from_slice(&rec.crc.to_le_bytes());
+    bytes.extend_from_slice(&rec.len.to_le_bytes()); // compressed size
+    bytes.extend_from_slice(&rec.len.to_le_bytes()); // uncompressed size
+    bytes.extend_from_slice(&u16::try_from(rec.name.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // extra field length
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // comment length
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // disk number start
+    bytes.extend_from_slice(&0u16.to_le_bytes()); // internal file attrs
+    bytes.extend_from_slice(&0u32.to_le_bytes()); // external file attrs
+    bytes.extend_from_slice(&rec.offset.to_le_bytes()); // local header offset
+    bytes.extend_from_slice(rec.name.as_bytes());
+    bytes
+}
+
+/// Builds the shadowing fixture this section's own doc comment describes:
+/// 6 names, 8 physical local records, a central directory declaring all 8.
+fn build_shadowing_zip_fixture() -> Vec<u8> {
+    let originals_src: [(&str, &[u8]); 6] = [
+        ("one.txt", b"payload for entry one"),
+        ("two.txt", b"payload for entry two"),
+        (
+            "shadowed-a.bin",
+            b"payload for the first record that will be shadowed",
+        ),
+        (
+            "shadowed-b.bin",
+            b"payload for the second record that will be shadowed",
+        ),
+        ("five.txt", b"payload for entry five"),
+        ("six.txt", b"payload for entry six"),
+    ];
+
+    let mut out = Vec::new();
+    let mut originals = Vec::new();
+    for (name, payload) in originals_src {
+        let rec = salvage_fixture_local_record(u32::try_from(out.len()).unwrap(), name, payload);
+        out.extend_from_slice(&rec.bytes);
+        originals.push(rec);
+    }
+
+    // The two physical duplicates, appended AFTER every original local
+    // record — this is what puts their scan positions at 6 and 7.
+    let dup_a = salvage_fixture_local_record(
+        u32::try_from(out.len()).unwrap(),
+        "shadowed-a.bin",
+        originals_src[2].1,
+    );
+    out.extend_from_slice(&dup_a.bytes);
+    let dup_b = salvage_fixture_local_record(
+        u32::try_from(out.len()).unwrap(),
+        "shadowed-b.bin",
+        originals_src[3].1,
+    );
+    out.extend_from_slice(&dup_b.bytes);
+
+    let cd_start = u32::try_from(out.len()).unwrap();
+    for rec in &originals {
+        out.extend_from_slice(&salvage_fixture_central_record(rec));
+    }
+    out.extend_from_slice(&salvage_fixture_central_record(&dup_a));
+    out.extend_from_slice(&salvage_fixture_central_record(&dup_b));
+    let cd_size = u32::try_from(out.len()).unwrap() - cd_start;
+
+    out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]); // end of central directory signature
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk number
+    out.extend_from_slice(&0u16.to_le_bytes()); // disk with the start of the cd
+    out.extend_from_slice(&8u16.to_le_bytes()); // cd records on this disk
+    out.extend_from_slice(&8u16.to_le_bytes()); // cd records total
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+
+    out
+}
+
+fn write_shadowing_zip_fixture(dir: &Path) -> PathBuf {
+    let path = dir.join("shadowing.zip");
+    std::fs::write(&path, build_shadowing_zip_fixture()).unwrap();
+    path
+}
+
+/// `--list` prints every record the scan found — 8, on the fixture above —
+/// where plain `list` prints only the 6 names its central-directory reader
+/// collapses onto. The two shadows are annotated `[shadowed: dup of #N]`,
+/// naming the EARLIER scan position they duplicate.
+#[test]
+fn salvage_list_reaches_every_record() {
+    let dir = tmp_dir();
+    let archive = write_shadowing_zip_fixture(&dir);
+
+    let listing =
+        String::from_utf8(run_output(&["list", archive.to_str().unwrap()]).stdout).unwrap();
+    assert_eq!(
+        listing.lines().count(),
+        6,
+        "sanity check on the fixture itself: `list` must collapse to 6 rows: {listing}"
+    );
+
+    let out_dir = dir.join("recovered");
+    let salvage_out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+        "--list",
+    ]);
+    let stdout = String::from_utf8(salvage_out.stdout).unwrap();
+    assert_eq!(
+        stdout.lines().count(),
+        8,
+        "`salvage --list` must reach every scanned record, shadowed ones included: {stdout}"
+    );
+    let shadow_lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains("[shadowed: dup of #"))
+        .collect();
+    assert_eq!(
+        shadow_lines.len(),
+        2,
+        "exactly the two duplicate records must be annotated as shadows: {stdout}"
+    );
+    assert!(
+        shadow_lines[0].contains("[shadowed: dup of #2]"),
+        "the first shadow must name scan position 2 (shadowed-a.bin) as its original: {stdout}"
+    );
+    assert!(
+        shadow_lines[1].contains("[shadowed: dup of #3]"),
+        "the second shadow must name scan position 3 (shadowed-b.bin) as its original: {stdout}"
+    );
+}
+
+/// `--index` on `salvage` selects by SCAN position, a different numbering
+/// from `list`'s own index — `list --index 6` cannot even reach a row (the
+/// listing this fixture prints has only 6 rows, 0-5), while `salvage --index
+/// 6` reaches the shadow of scan position 2. Any message naming this
+/// numbering must say "scan position", never "index".
+#[test]
+fn salvage_index_names_a_scan_position_not_a_list_index() {
+    let dir = tmp_dir();
+    let archive = write_shadowing_zip_fixture(&dir);
+
+    let list_out = run_output(&["list", archive.to_str().unwrap(), "--index", "6"]);
+    assert!(
+        !list_out.status.success(),
+        "list's own numbering has only 6 rows (0-5); --index 6 must not succeed"
+    );
+
+    let out_dir = dir.join("recovered");
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+        "--index",
+        "6",
+        "--list",
+    ]);
+    // Scan position 6 IS the shadow, so selecting only it selects a record
+    // this run skips — exit 4 (Ruling R-N: any entry skipped, for any
+    // reason, is a degraded run), not 0.
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "--index 6 must select exactly the one record at scan position 6: {stdout}"
+    );
+    assert!(
+        rows[0].starts_with("6 "),
+        "the selected row must be scan position 6: {stdout}"
+    );
+    assert!(
+        rows[0].contains("[shadowed: dup of #2]"),
+        "scan position 6 is the shadow of scan position 2 on this fixture: {stdout}"
+    );
+
+    // Naming rule: an out-of-range request must say "scan position", never
+    // "index" — this project's own conformance harness ended up with
+    // colliding property numbers by letting two numbering schemes share a
+    // word, and this feature exists specifically not to repeat that.
+    let bad = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+        "--index",
+        "99",
+    ]);
+    assert!(!bad.status.success());
+    let stderr = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        stderr.contains("scan position"),
+        "an out-of-range --index must name it a scan position: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains("index "),
+        "the message must never say \"index\", to avoid being read as list's numbering: {stderr}"
+    );
+}
+
+/// `salvage` without `-C` is refused: it has no single-stream mode, so
+/// there is always somewhere recovered content must land.
+#[test]
+fn salvage_without_directory_is_refused() {
+    let dir = tmp_dir();
+    let archive = write_shadowing_zip_fixture(&dir);
+    let out = run_output(&["salvage", archive.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert_eq!(out.status.code(), Some(2), "missing -C is a usage error");
+}
+
+/// A default (non-`--list`) run recovers every non-shadowed entry, prints
+/// its summary to stderr, and exits 4 — not 0 — because two of the eight
+/// scanned records are shadows this run skips (Ruling R-N: any entry
+/// skipped, for any reason, is a degraded run).
+#[test]
+fn salvage_default_run_recovers_and_reports_the_shadow_skips() {
+    let dir = tmp_dir();
+    let archive = write_shadowing_zip_fixture(&dir);
+    let out_dir = dir.join("recovered");
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "the default report goes to stderr, not stdout: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("8 scanned")
+            && stderr.contains("6 written")
+            && stderr.contains("2 skipped"),
+        "the summary must count the two shadow skips: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("one.txt")).unwrap(),
+        b"payload for entry one"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("shadowed-a.bin")).unwrap(),
+        b"payload for the first record that will be shadowed"
+    );
+    // The two shadows recover nothing under their own name a second time —
+    // `place_salvaged_entry` checks `shadows` before ever computing a
+    // target, so there is no second write, partial or otherwise, to find.
+    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 6);
+}
+
+/// A single Stored local record, with the method and CRC-32 field callers
+/// choose explicitly rather than derived from the payload — so a fixture
+/// can build a record whose declared checksum does not match what it holds
+/// (`Partial`/checksum mismatch), or one using a recognised-but-undecodable
+/// method (`Unverified`/undecodable method), the two `--list` cause labels
+/// [`salvage_list_names_partial_and_unverified_causes`] checks for.
+fn salvage_fixture_local_record_with(
+    offset: u32,
+    name: &'static str,
+    payload: &'static [u8],
+    method: u16,
+    crc: u32,
+) -> SalvageFixtureLocalRecord {
+    let len = u32::try_from(payload.len()).unwrap();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
+    bytes.extend_from_slice(&20u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&method.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0x21u16.to_le_bytes());
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(&u16::try_from(name.len()).unwrap().to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(payload);
+    SalvageFixtureLocalRecord {
+        offset,
+        name,
+        crc,
+        len,
+        bytes,
+    }
+}
+
+/// Builds a two-entry zip: scan position 0 is Stored with a CRC-32 field
+/// that disagrees with its payload (`Partial`, checksum-mismatch cause);
+/// scan position 1 declares method 99 (AES — recognised by
+/// `is_known_method`, not decoded by this build's salvage verifier), with a
+/// correct CRC over ITS OWN bytes so only the method is what makes it
+/// unverifiable (`Unverified`, undecodable-method cause).
+fn build_partial_and_unverified_zip_fixture() -> Vec<u8> {
+    let mismatched_payload: &[u8] = b"this payload's crc field below is wrong on purpose";
+    let undecodable_payload: &[u8] = b"this method is recognised but this build cannot decode it";
+
+    let mut out = Vec::new();
+    let rec0 = salvage_fixture_local_record_with(
+        u32::try_from(out.len()).unwrap(),
+        "mismatched.bin",
+        mismatched_payload,
+        0, // Stored
+        0xDEAD_BEEF,
+    );
+    out.extend_from_slice(&rec0.bytes);
+    let rec1 = salvage_fixture_local_record_with(
+        u32::try_from(out.len()).unwrap(),
+        "undecodable.bin",
+        undecodable_payload,
+        99, // AES — recognised, not decoded
+        salvage_fixture_crc32(undecodable_payload),
+    );
+    out.extend_from_slice(&rec1.bytes);
+
+    let cd_start = u32::try_from(out.len()).unwrap();
+    out.extend_from_slice(&salvage_fixture_central_record(&rec0));
+    out.extend_from_slice(&salvage_fixture_central_record(&rec1));
+    let cd_size = u32::try_from(out.len()).unwrap() - cd_start;
+
+    out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&2u16.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+/// The status column must name a `Partial`/`Unverified` entry's CAUSE, not
+/// just its tier — "ran out" and "checksum disagreed" are different
+/// diagnoses, and so are "this build cannot decode the method" and "no
+/// length was available to bound the payload".
+#[test]
+fn salvage_list_names_partial_and_unverified_causes() {
+    let dir = tmp_dir();
+    let path = dir.join("mixed.zip");
+    std::fs::write(&path, build_partial_and_unverified_zip_fixture()).unwrap();
+    let out_dir = dir.join("recovered");
+
+    let out = run_output(&[
+        "salvage",
+        path.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+        "--list",
+    ]);
+    // Exit 3 (any Unverified entry) outranks exit 4 (Ruling R-N) even though
+    // this run also has a Partial entry.
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows.len(), 2, "{stdout}");
+    assert!(
+        rows[0].contains("Partial (checksum mismatch)"),
+        "a full decode that disagrees with the declared CRC-32 must name that cause: {stdout}"
+    );
+    assert!(
+        rows[1].contains("Unverified (undecodable method)"),
+        "a recognised-but-undecodable method must name that cause: {stdout}"
+    );
+    // `--partial=keep` is the default, so the mismatched entry is still
+    // written — under `name.partial`, never its real name.
+    assert_eq!(
+        std::fs::read(out_dir.join("mismatched.bin.partial")).unwrap(),
+        b"this payload's crc field below is wrong on purpose"
+    );
+    assert!(!out_dir.join("mismatched.bin").exists());
+    assert!(!out_dir.join("undecodable.bin").exists());
+}

@@ -702,6 +702,84 @@ EXTRACTING AN ARCHIVE'S ENTRIES
       nothing. Raise it to decode a file that genuinely needs more.
 
 
+RECOVERING A DAMAGED ARCHIVE (SALVAGE)
+
+  `salvage` is the one recovery-biased verb in this tool. `list`, `cat`,
+  `unpack` and `test` all stay exactly as uncompromising as they already
+  are — it is salvage's willingness to accept less-than-proven content
+  that buys them that freedom. Stage 1 recovers zip archives only.
+
+  stuffr salvage broken.zip -C out/
+      Scans broken.zip for zip local file headers directly, rather than
+      trusting its central directory (which may be truncated, zeroed, or
+      simply WRONG — see the next example), and recovers what it can prove
+      into out/, created if it does not exist. Default policy
+      (--partial=keep): an entry whose payload ran out early, or whose CRC-
+      32 disagreed after a full decode, is still written, but under
+      `NAME.partial`, never its real name — a truncated file under its real
+      name would be indistinguishable from a whole one to every tool
+      downstream. The default (non---list) report — counts only — goes to
+      stderr, the same destination `unpack`'s and `test`'s own summary
+      lines use.
+
+  stuffr salvage broken.zip -C out/ --list
+      Prints every record the scan found, one per line: SCAN POSITION,
+      status (Intact, Complete, Partial with its cause, or Unverified with
+      its cause), and name. This can show MORE rows than `stuffr list` on
+      the same archive: a zip whose central directory declares two records
+      under one name (`zip.rs`'s own last-record-wins collapse — see
+      "WHAT THIS BUILD CAN DO" below) makes `list` show one of them and
+      `salvage --list` show both, the second annotated
+      `[shadowed: dup of #N]` naming the EARLIER scan position it
+      duplicates. A shadowed record is never written a second time.
+
+  stuffr salvage broken.zip -C out/ --index 6
+      --index selects by SCAN POSITION — 0-based, counting every record the
+      raw scan found, shadowed ones included — and this is a DIFFERENT
+      numbering from `list`'s own index (see "LISTING AND TESTING AN
+      ARCHIVE" above), which never counts a shadowed record at all. On an
+      archive where a name is duplicated, `list --index 6` and
+      `salvage --index 6` can name different entries, or `list`'s may not
+      exist at all. Every message naming this numbering says "scan
+      position", never "index", so it cannot be misread as `list`'s.
+      Repeatable; an out-of-range position is a usage error (exit 2) naming
+      how many scan positions the archive actually has.
+
+  stuffr salvage broken.zip -C out/ --partial=skip
+      Recovers nothing for a Partial entry instead of writing it as
+      `NAME.partial`. `--partial=ask` has no terminal to ask from at this
+      layer, so it is read conservatively as `skip` rather than silently
+      upgraded to `keep`.
+
+  stuffr salvage broken.zip -C out/ --max-entry 8G
+      Raises the structural ceiling on a single entry's declared length for
+      an archive known to hold something genuinely that large. Refused
+      before allocation either way — this is the same "never size a buffer
+      from an untrusted, possibly corrupt declaration" discipline
+      --memory-limit and container entry limits already apply elsewhere on
+      this page.
+
+  stuffr salvage broken.zip -C out/ --strict
+      Demands proof: every Partial entry is skipped regardless of
+      --partial, and nothing this build cannot verify is ever written.
+      Salvage's own strict path, applied on request rather than by default
+      — unlike the rest of this tool, where uncompromising IS the default
+      and salvage is the one exception.
+
+  Exit codes for a COMPLETED salvage run (see "EXIT CODES" below for the
+  full table): 0 — every entry Intact or Complete. 3 — any entry
+  Unverified (an undecodable compression method, or a data-descriptor entry
+  with no length to reconcile against a central directory) — outranks 4
+  deliberately, since it names its own remedy (a rebuild, or
+  --features c-backed) where 4 only says "degraded". 4 — any entry written
+  as `.partial`, or any entry skipped for any other reason (a shadow,
+  --partial=skip, a kind this build has no shape for). 5 — the scan found
+  nothing recoverable in the archive at all. 6 and 7 (a declaration over
+  --max-entry, or a hostile path escaping -C) abort the run outright,
+  exactly as they do for `unpack -C`, rather than being counted among the
+  entries above.
+
+
 WHAT THIS BUILD CAN DO
 
   stuffr formats
@@ -905,12 +983,20 @@ EXIT CODES
      neither -C nor an entry name, or a pattern matching no entry) — every
      one of these is "you pointed the command at the wrong thing", and
      they all share the one code
-  3  format not available in this build
-  4  fidelity degraded under strict mode
-  5  archive or stream is corrupt
-  6  resource limit exceeded (--max-ratio or --memory-limit tripped, or
-     archive nesting exceeded the depth stuffr will peel through)
-  7  unsafe path refused
+  3  format not available in this build, or a `salvage` run found an entry
+     it could not verify (an undecodable compression method, or no
+     declared length to bound the payload against)
+  4  fidelity degraded under strict mode, or a `salvage` run left something
+     less than fully recovered (an entry written only as `NAME.partial`,
+     or skipped for any reason — a shadow, --partial=skip, a kind this
+     build has no shape for)
+  5  archive or stream is corrupt, or a `salvage` scan found nothing
+     recoverable in the archive at all
+  6  resource limit exceeded (--max-ratio or --memory-limit tripped,
+     archive nesting exceeded the depth stuffr will peel through, or a
+     `salvage` entry's declared length exceeded --max-entry)
+  7  unsafe path refused (including a `salvage` entry whose name would
+     escape -C)
 
 
 NOT YET
