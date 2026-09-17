@@ -20,11 +20,17 @@ read list.
 > archive where a name is duplicated, `salvage --index 6` and `list --index
 > 6` can name different entries, or `list`'s may not exist at all — and
 > every message says "scan position", never "index", so the two cannot be
-> confused. Cross-checked against Info-Zip's `zip -FF`: on a truncated
-> archive, `-FF` copies a central-directory record from elsewhere in the
-> same file into the payload gap and reports success, where `stuffr salvage`
-> reports the entry absent — a real disagreement, recorded rather than tuned
-> away, since the fabrication is Info-Zip's own bug, not a shape to chase.
+> confused. A damaged archive can hold two records under one name; where
+> their content differs, both are recovered and the second lands as
+> `NAME.salvaged-N` rather than over the first — the same reasoning that
+> gives an unproven payload `.partial`: recover by default, and let the
+> filesystem carry the distinction. Cross-checked against Info-Zip's `zip
+> -FF`: on a truncated archive, `-FF` copies a central-directory record from
+> elsewhere in the same file into the payload gap and reports success, where
+> `stuffr salvage` invents nothing — it reports the entry `Partial
+> (truncated)`, writes the genuine surviving prefix as `NAME.partial`, and
+> exits 4. A real disagreement, recorded rather than tuned away, since the
+> fabrication is Info-Zip's own bug, not a shape to chase.
 > This reverses a Phase 2 ruling ("declared, not recovered"): the
 > central-directory parse that ruling declined to build now serves recovery
 > as well as `list`'s own duplicate-name warning. See

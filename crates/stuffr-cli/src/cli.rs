@@ -96,10 +96,16 @@ pub enum Command {
         ///
         /// 0-BASED, counting in archive order — the same number `stuffr list`
         /// prints in its first column. This is how you reach an entry whose
-        /// name you cannot type: two entries sharing a name in a zip's index,
-        /// or `Makefile` and `makefile` from a case-sensitive filesystem on a
-        /// case-insensitive one. Needs -C, like PATTERNS, and cannot be
-        /// combined with them — they are two ways of saying the same thing.
+        /// name you cannot type: `Makefile` and `makefile` from a
+        /// case-sensitive filesystem on a case-insensitive one. Needs -C,
+        /// like PATTERNS, and cannot be combined with them — they are two
+        /// ways of saying the same thing.
+        ///
+        /// It does NOT reach a record a zip's own index shadows: `unpack`
+        /// counts the entries the index enumerates, so a record a later one
+        /// hides is not at any index here — it has no number at all. `stuffr
+        /// salvage --list` finds those, and `salvage --index N` selects them
+        /// by SCAN position, which is a different numbering.
         #[arg(long, value_name = "N")]
         index: Vec<usize>,
         /// Extract the archive's entries into this directory.
