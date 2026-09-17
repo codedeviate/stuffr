@@ -238,7 +238,21 @@ fn read_candidate_at(
     }
 
     let compressed_size = u64::from(header.compressed_size);
-    let payload_start = offset + 1 + HEADER_LEN as u64;
+    // Fix round 2, NEW-3: built with `checked_add` like every other offset
+    // computation in this module (and like `zip_salvage.rs`'s own
+    // equivalent) — a raw `+` here was the actual finding; a comment
+    // claiming it already used `checked_add` was not enough to make it
+    // true. `offset` is a scanner-discovered marker position and `1 +
+    // HEADER_LEN` is a small constant, so overflow is not reachable on any
+    // real archive, but a candidate whose arithmetic overflows is refused
+    // the same way every other malformed candidate in this function is:
+    // `Ok(None)`, never a panic or a wrapped value.
+    let Some(payload_start) = offset
+        .checked_add(1)
+        .and_then(|v| v.checked_add(HEADER_LEN as u64))
+    else {
+        return Ok(None);
+    };
     let available_len = match payload_start.checked_add(compressed_size) {
         Some(end) if end <= file_len => None,
         // Either the declared end overflows `u64`, or it runs past the
@@ -282,15 +296,12 @@ fn read_candidate_at(
 /// from [`verify_candidate`], which `entries.rs`'s write path refuses
 /// before ever reading this field, so `None` here is never reached by a
 /// write attempt in practice.
+///
+/// Fix round 2, Ruling S-K: derives from [`Method::from_byte`] and
+/// [`Method::codec`] rather than hand-copying the byte ranges a second
+/// time — see [`Method::codec`]'s own doc for why.
 fn codec_for_arc_method(method_byte: u8) -> Option<FormatId> {
-    match method_byte {
-        1 | 2 => Some(FormatId::new("arc-stored")),
-        3 => Some(FormatId::new("arc-rle90")),
-        4 => Some(FormatId::new("arc-squeezed")),
-        8 => Some(FormatId::new("arc-crunched")),
-        9 => Some(FormatId::new("arc-squashed")),
-        _ => None,
-    }
+    Method::from_byte(method_byte, "").ok().map(Method::codec)
 }
 
 /// Decides [`SalvageStatus`] for one candidate by re-reading the header at
@@ -369,9 +380,10 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
     // Fix round 1, LOW-1: use the field the candidate already carries
     // rather than re-deriving it — `Candidate::payload_start`'s own doc
     // exists precisely so nothing else in this crate has to recompute a
-    // payload's location from `offset` (and risk it drifting, as this raw
-    // `offset + 1 + HEADER_LEN` did from `read_candidate_at`'s own
-    // `checked_add`-built value).
+    // payload's location from `offset` at all, let alone risk a second
+    // derivation drifting from `read_candidate_at`'s own (fix round 2,
+    // NEW-3: also `checked_add`-built, not the raw `+` an earlier version
+    // of this comment claimed).
     if src.seek(SeekFrom::Start(candidate.payload_start)).is_err() {
         return Ok(SalvageStatus::Partial);
     }
@@ -403,15 +415,23 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 /// module never produces. [`write_payload`] treats it exactly like an
 /// unrecognised zip method — [`Error::Unsupported`], defensive rather than
 /// reachable.
+///
+/// Fix round 2, Ruling S-K: searches the five decodable variants for the
+/// one whose [`Method::codec`] matches, rather than hand-copying the same
+/// five strings a second time in the opposite direction — see that
+/// method's own doc.
 fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
-    match codec {
-        Some(id) if id == FormatId::new("arc-stored") => Some(Method::Stored),
-        Some(id) if id == FormatId::new("arc-rle90") => Some(Method::Rle90),
-        Some(id) if id == FormatId::new("arc-squeezed") => Some(Method::Squeezed),
-        Some(id) if id == FormatId::new("arc-crunched") => Some(Method::Crunched),
-        Some(id) if id == FormatId::new("arc-squashed") => Some(Method::Squashed),
-        _ => None,
-    }
+    const DECODABLE: [Method; 5] = [
+        Method::Stored,
+        Method::Rle90,
+        Method::Squeezed,
+        Method::Crunched,
+        Method::Squashed,
+    ];
+    let codec = codec?;
+    DECODABLE
+        .into_iter()
+        .find(|&method| method.codec() == codec)
 }
 
 /// Reads one entry's compressed payload and writes its RECOVERED (decoded)
@@ -464,22 +484,62 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 ///
 /// Both are closed the same way: `readable_len` below is bounded by the
 /// SOURCE's own remaining length, computed from a fresh `seek(End(0))`,
-/// never by the header's declaration alone. The ceiling check runs against
-/// that bounded figure — so a genuinely huge PRESENT entry is still
-/// refused, before its buffer is allocated, exactly as before — and the
-/// subsequent `read_exact` can no longer fail on a truncated entry's own
-/// short length, so a truncated Stored (or Rle90) entry's genuine surviving
-/// bytes now reach [`super::arc::decode`] and are written, same as zip's
-/// truncated-tail case. The non-streamable methods (`Squeezed`, `Crunched`,
-/// `Squashed`) still legitimately produce nothing on a truncated input —
-/// they decode whole, like `arc.rs`'s own reader, and a mid-stream cut
-/// Huffman tree or LZW chain has no defined partial decode — so `Ok(false)`
-/// with nothing written stays the honest answer for those.
+/// never by the header's declaration alone. The subsequent `read_exact`
+/// can no longer fail on a truncated entry's own short length, so a
+/// truncated Stored (or Rle90) entry's genuine surviving bytes now reach
+/// [`super::arc::decode`] and are written, same as zip's truncated-tail
+/// case. The non-streamable methods (`Squeezed`, `Crunched`, `Squashed`)
+/// still legitimately produce nothing on a truncated input — they decode
+/// whole, like `arc.rs`'s own reader, and a mid-stream cut Huffman tree or
+/// LZW chain has no defined partial decode — so `Ok(false)` with nothing
+/// written stays the honest answer for those.
+///
+/// # Fix round 2, HIGH-1 residual: what is PRESENT can itself exceed the
+/// ceiling, and that must be a per-entry skip, not a whole-run abort
+///
+/// Round 1's bound closed the common case (a truncated header lying about
+/// a payload that never follows) but left the ceiling CHECK propagating a
+/// real `Err` when the bytes that genuinely exist are themselves still
+/// over [`super::arc::MAX_ARC_ENTRY_LEN`] — measured, on a 283 MB archive
+/// whose only fault was one entry's truncated tail also being larger than
+/// the ceiling, `salvage --list` still aborted at exit 6 with NO rows
+/// printed at all, the exact symptom HIGH-1 was raised about, on the same
+/// input class. [`write_payload_bounded`] below now folds that refusal
+/// into `Ok(false)` instead — reported as this one entry not completing,
+/// never propagated as an `Err` that takes every other entry in the
+/// archive down with it, matching every other unrecoverable condition this
+/// function already reports this way.
 pub fn write_payload(
     archive_path: &Path,
     entry: &SalvagedEntry,
     compressed_len: u64,
     out: &mut dyn Write,
+) -> Result<bool> {
+    write_payload_bounded(
+        archive_path,
+        entry,
+        compressed_len,
+        out,
+        super::arc::MAX_ARC_ENTRY_LEN,
+    )
+}
+
+/// [`write_payload`]'s whole body, parameterised over the ceiling it
+/// refuses an oversized read against.
+///
+/// Split out purely so a unit test can exercise the fold-into-`Ok(false)`
+/// behaviour above with a SMALL ceiling and a small fixture —
+/// `an_entry_whose_present_bytes_alone_exceed_the_ceiling_is_folded_into_ok_false`
+/// below — rather than needing a multi-hundred-megabyte file to reach
+/// ARC's real 256 MiB [`super::arc::MAX_ARC_ENTRY_LEN`], which would make
+/// this the single most expensive thing in a gate that already runs
+/// 35-60s, twice, for a branch whose own logic is one comparison.
+fn write_payload_bounded(
+    archive_path: &Path,
+    entry: &SalvagedEntry,
+    compressed_len: u64,
+    out: &mut dyn Write,
+    ceiling: u64,
 ) -> Result<bool> {
     let Some(method) = method_for_codec(entry.meta.codec) else {
         return Err(Error::Unsupported(format!(
@@ -503,10 +563,33 @@ pub fn write_payload(
     let available = file_len.saturating_sub(entry.payload_start);
     let readable_len = compressed_len.min(available);
 
-    // Checked against the BOUNDED figure: a genuinely huge but PRESENT
-    // entry is still refused here, before the buffer it would size is
-    // allocated; a truncated entry's lie about its own size no longer is.
-    super::arc::refuse_if_over_ceiling(&entry.meta.name, readable_len, "compressed data")?;
+    // Fix round 2, HIGH-1 residual: folded into `Ok(false)`, never
+    // propagated — see this function's own doc above for why. Checked
+    // against the BOUNDED figure, so a genuinely huge but PRESENT entry is
+    // still refused here, before the buffer it would size is allocated;
+    // a truncated entry's lie about its own declared size no longer
+    // decides this on its own.
+    if readable_len > ceiling {
+        return Ok(false);
+    }
+
+    // Fix round 2, NEW-1: decided from the two lengths alone, BEFORE the
+    // read — if fewer compressed bytes are present than the header
+    // declared, this entry's compressed payload is truncated, full stop,
+    // regardless of what `stream_bounded_copy` below goes on to report.
+    // Needed because `expected` (the declared UNCOMPRESSED size, read
+    // below) can be small enough that a truncated entry's own partial
+    // decode still satisfies it: measured, a header declaring 36
+    // compressed bytes and an `original_size` of 10 with only 20
+    // compressed bytes actually present decoded its available prefix to
+    // exactly 10 bytes and reported "completed" — relabelling a
+    // truncation as `PartialCause::ChecksumMismatch` even though no
+    // checksum comparison ever ran. A tier carries a decision (already
+    // correct: `verify_candidate` reported this entry `Partial` before
+    // `write_payload` is ever called); a message carries a cause, and the
+    // cause must not contradict the reason the entry is `Partial` in the
+    // first place.
+    let truncated = readable_len < compressed_len;
 
     // Fix round 1, MEDIUM-1: reading exactly `readable_len` bytes — never
     // more than the file actually holds — means this `read_exact` no
@@ -533,7 +616,12 @@ pub fn write_payload(
     };
 
     let expected = entry.meta.size.unwrap_or(compressed_len);
-    stream_bounded_copy(io::Cursor::new(decoded), expected, out)
+    let completed = stream_bounded_copy(io::Cursor::new(decoded), expected, out)?;
+    // Fix round 2, NEW-1: a truncated compressed payload is never
+    // "completed", whatever `stream_bounded_copy` reports against a
+    // possibly-too-small declared `original_size` — see this function's
+    // own doc above.
+    Ok(completed && !truncated)
 }
 
 /// Runs [`ArcSalvage`] over `src` and annotates the result — the whole
@@ -1008,6 +1096,65 @@ mod tests {
         .expect("a modest, merely truncated size must not be resource-limited");
         assert_eq!(out.entries.len(), 1);
         assert_eq!(out.entries[0].status, SalvageStatus::Partial);
+    }
+
+    // -------------------------------------------------------------------
+    // Fix round 2, HIGH-1 residual: what is genuinely PRESENT can itself
+    // exceed a ceiling, and `write_payload_bounded` must fold that into
+    // `Ok(false)` rather than propagate an `Err` that would abort the
+    // whole salvage run. Exercised with a SMALL ceiling and a small
+    // fixture rather than the real 256 MiB `MAX_ARC_ENTRY_LEN` — see
+    // `write_payload_bounded`'s own doc for why building a
+    // multi-hundred-megabyte fixture here would be the wrong fix.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn an_entry_whose_present_bytes_alone_exceed_the_ceiling_is_folded_into_ok_false() {
+        // The header declares far more (10,000) than either the tiny test
+        // ceiling below or the 100 bytes actually written to disk; what
+        // matters is `available` — computed by `write_payload_bounded`
+        // from the real file length — which is exactly the 100 bytes
+        // present, comfortably over the 50-byte ceiling this test passes.
+        let present = vec![0xABu8; 100];
+        let bytes = build_arc_entry_declaring(1, "BIG.BIN", &present, 10_000, 100);
+
+        let path = std::env::temp_dir().join(format!(
+            "stuffr-arc-salvage-ceiling-{}-{:p}.arc",
+            std::process::id(),
+            &bytes
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let entry = SalvagedEntry {
+            scan_position: 0,
+            offset: 0,
+            payload_start: 1 + HEADER_LEN as u64,
+            meta: {
+                let mut m = EntryMeta::file("BIG.BIN");
+                m.codec = codec_for_arc_method(1);
+                m.size = Some(100);
+                m.compressed_size = Some(10_000);
+                m
+            },
+            status: SalvageStatus::Partial,
+            shadows: None,
+            collides_with: None,
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let result = write_payload_bounded(&path, &entry, 10_000, &mut sink, 50);
+        let _ = std::fs::remove_file(&path);
+
+        let completed = result.expect(
+            "an over-ceiling-but-present read must be folded into Ok(false), never \
+             propagated as an Err that would abort the whole salvage run (fix round 2, \
+             HIGH-1 residual)",
+        );
+        assert!(!completed, "must report as not completed, never an Err");
+        assert!(
+            sink.is_empty(),
+            "nothing should be written once the bounded read is refused before allocating"
+        );
     }
 
     // -------------------------------------------------------------------

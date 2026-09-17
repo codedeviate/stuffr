@@ -441,6 +441,31 @@ impl Method {
             ))),
         }
     }
+
+    /// The [`FormatId`] `../arc_salvage.rs` records in a candidate's
+    /// `EntryMeta::codec` for this method, and dispatches its own
+    /// `write_payload` on.
+    ///
+    /// Fix round 2, Ruling S-K: `arc_salvage.rs` used to hand-copy this
+    /// method-to-codec mapping in its own `codec_for_arc_method`, and its
+    /// exact inverse in a second `method_for_codec` — two independently
+    /// maintained tables beside [`Self::from_byte`]'s own byte-to-method
+    /// one, for what is really a single fact about each variant. Both now
+    /// derive from this one method instead: `codec_for_arc_method` is
+    /// `Self::from_byte(..).ok().map(Self::codec)`, and `method_for_codec`
+    /// searches the five variants for the one whose `codec()` matches.
+    /// Adding a sixth decodable method now means extending exactly two
+    /// `match`es in this file (this one and `from_byte`'s), not four
+    /// spread across two files.
+    pub(super) fn codec(self) -> FormatId {
+        match self {
+            Method::Stored => FormatId::new("arc-stored"),
+            Method::Rle90 => FormatId::new("arc-rle90"),
+            Method::Squeezed => FormatId::new("arc-squeezed"),
+            Method::Crunched => FormatId::new("arc-crunched"),
+            Method::Squashed => FormatId::new("arc-squashed"),
+        }
+    }
 }
 
 /// One entry header, parsed out of the 28 bytes following a marker.

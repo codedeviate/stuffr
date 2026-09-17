@@ -1849,7 +1849,7 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// writes anything, which is the EXACT companion gap ARC itself shipped
 /// with in Task 3 (a real scanner, an unpopulated `EntryMeta::codec`,
 /// every entry quietly `SkippedNotBuiltIn`) recurring through the seam
-/// built to close it. `salvage_dispatch_tests`'s
+/// built to close it. `salvage_seam_tests`'s
 /// `every_salvage_slot_reaches_a_real_payload_writer` pins the positive
 /// set — every name in [`stuffr_core::testing::SALVAGE_SLOTS`] (the same
 /// list the fuzz corpus generator and `entries::salvage`'s own dispatch
@@ -4299,13 +4299,13 @@ mod arc_salvage_tests {
         arc_entry_declaring(method, name, payload.len() as u32, payload, stored_crc)
     }
 
-    /// Like [`arc_entry`], but the header's declared `compressed_size` (and
-    /// `original_size`, set to the identical figure — this module never
-    /// needs the two to differ) may be LARGER than the number of bytes
-    /// `actual_payload` actually supplies — the shape of a truncated entry,
-    /// where the header's own declaration has nothing real behind it. Fix
-    /// round 1's HIGH-1 and MEDIUM-1 regression tests both need exactly
-    /// this: a header that claims more than the file goes on to deliver.
+    /// Like [`arc_entry`], but the header's declared `compressed_size` may
+    /// be LARGER than the number of bytes `actual_payload` actually
+    /// supplies — the shape of a truncated entry, where the header's own
+    /// declaration has nothing real behind it. `original_size` is set to
+    /// the identical `declared_size` figure; use
+    /// [`arc_entry_declaring_sizes`] when a test needs the two to differ
+    /// (fix round 2's NEW-1 regression test does, on purpose).
     fn arc_entry_declaring(
         method: u8,
         name: &str,
@@ -4313,14 +4313,37 @@ mod arc_salvage_tests {
         actual_payload: &[u8],
         stored_crc: u16,
     ) -> Vec<u8> {
+        arc_entry_declaring_sizes(
+            method,
+            name,
+            declared_size,
+            declared_size,
+            actual_payload,
+            stored_crc,
+        )
+    }
+
+    /// [`arc_entry_declaring`], with `compressed_size` and `original_size`
+    /// independently controlled — needed for fix round 2's NEW-1
+    /// regression test, which requires a declared `original_size` SMALLER
+    /// than the declared `compressed_size` (a shape no other test in this
+    /// module needed before it).
+    fn arc_entry_declaring_sizes(
+        method: u8,
+        name: &str,
+        declared_compressed: u32,
+        declared_original: u32,
+        actual_payload: &[u8],
+        stored_crc: u16,
+    ) -> Vec<u8> {
         let mut out = vec![ARC_MARKER, method];
         let mut field = [0u8; ARC_NAME_LEN];
         field[..name.len()].copy_from_slice(name.as_bytes());
         out.extend_from_slice(&field);
-        out.extend_from_slice(&declared_size.to_le_bytes());
+        out.extend_from_slice(&declared_compressed.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes()); // date/time
         out.extend_from_slice(&stored_crc.to_le_bytes());
-        out.extend_from_slice(&declared_size.to_le_bytes()); // original_size
+        out.extend_from_slice(&declared_original.to_le_bytes());
         out.extend_from_slice(actual_payload);
         out
     }
@@ -4524,6 +4547,56 @@ mod arc_salvage_tests {
             panic!("expected Written, got {:?}", outcome.entries[0].disposition);
         };
         assert_eq!(std::fs::read(path).unwrap(), payload);
+    }
+
+    /// Fix round 2, NEW-1. A Stored entry whose header declares
+    /// `compressed_size = 36` and `original_size = 10`, with only 20 bytes
+    /// physically present — genuinely truncated at the compressed level,
+    /// the same shape the HIGH-1/MEDIUM-1 fixtures use, except this one's
+    /// declared `original_size` is small enough that the bounded read's
+    /// own partial decode still satisfies it. Before this fix,
+    /// `write_payload` reported this as `PartialCause::ChecksumMismatch`
+    /// — no checksum comparison ever ran — because `stream_bounded_copy`
+    /// stopped at the declared 10 bytes and reported "completed". The
+    /// tier is already correct (`verify_candidate` reports `Partial` from
+    /// the byte count alone, before any of this runs); the cause must not
+    /// contradict the reason the entry is `Partial` in the first place.
+    #[test]
+    fn a_truncated_entry_with_a_small_declared_original_size_still_reports_truncated() {
+        let present: &[u8] = b"01234567890123456789"; // 20 bytes, a genuine prefix
+        assert_eq!(present.len(), 20);
+        let bytes = arc_entry_declaring_sizes(1, "mis.txt", 36, 10, present, 0);
+        assert_eq!(bytes.len(), 29 + 20);
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("mis.arc");
+        std::fs::write(&archive, &bytes).unwrap();
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: Some(FormatId::new("arc")),
+        };
+        let outcome = salvage(&archive, &opts).unwrap();
+
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Partial);
+        let SalvageDisposition::WrittenPartial { cause, .. } = &outcome.entries[0].disposition
+        else {
+            panic!(
+                "expected WrittenPartial, got {:?}",
+                outcome.entries[0].disposition
+            );
+        };
+        assert_eq!(
+            *cause,
+            PartialCause::Truncated,
+            "a compressed payload with fewer bytes present than declared must always \
+             report Truncated, regardless of how small the declared original_size is \
+             (fix round 2, NEW-1)"
+        );
     }
 }
 
