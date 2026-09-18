@@ -5,7 +5,7 @@ use std::io::Cursor;
 use stuffr::entries::{self, SalvageOpts};
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
 use stuffr_core::testing::{SALVAGE_SLOTS, check_error_is_classified, check_salvage_claim};
-use stuffr_formats::legacy::{arc_salvage, zoo_salvage};
+use stuffr_formats::legacy::{arc_salvage, lha_salvage, zoo_salvage};
 use stuffr_formats::zip_salvage;
 
 /// Local file header layout, duplicated deliberately rather than imported —
@@ -102,6 +102,49 @@ fn zoo_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
     }
     let method = *data.get(at.checked_add(5)?)?;
     Some(method <= 2)
+}
+
+/// The `-lh*-`/`-lz*-` identifiers this build can actually decode a payload
+/// for, plus `-lhd-`, whose payload is empty BY DEFINITION and whose CRC-16
+/// is therefore still compared against something. Duplicated here rather
+/// than imported for the same reason the zip and zoo constants above are:
+/// `lha_salvage.rs`'s own `Method` table is `pub(super)`, and a divergence
+/// between this copy and the library's own is itself the finding this
+/// cross-check exists to surface.
+const LHA_CHECKABLE: [&[u8; 5]; 10] = [
+    b"-lhd-", b"-lh0-", b"-lh1-", b"-lh4-", b"-lh5-", b"-lh6-", b"-lh7-", b"-lzs-", b"-lz4-",
+    b"-lz5-",
+];
+
+/// Mirrors the three functions above, for the `lha` slot (Stage 2 Task 5).
+///
+/// LHA has no deferral either: every level-0/1 entry header carries a
+/// CRC-16/ARC over the UNCOMPRESSED file inline, immediately behind the
+/// filename, so a header that is real at all carries its checksum —
+/// `lha_salvage.rs`'s own `read_candidate_at` never constructs a `Candidate`
+/// with `verifier: None`. What decides whether that checksum is CHECKABLE is
+/// the method: `-lhx-` is recognised by the format and compiled out of this
+/// build (`delharc` with `std`, `lh1`, `lz`), so nothing is ever decoded for
+/// it and nothing compared — `Some(false)`, which is exactly the claim
+/// `check_salvage_claim` refuses to see alongside `Intact`.
+///
+/// `None` — inconclusive, not a violation — when the five bytes at offset 2
+/// are not an identifier this table names at all, the same discipline the
+/// three functions above follow for their own "can't tell" case.
+///
+/// The header CHECKSUM at offset 1 is deliberately NOT re-checked here: it
+/// decides whether these bytes are a header, not whether a file checksum
+/// exists, and this function answers only the latter.
+fn lha_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
+    let at = usize::try_from(offset).ok()?;
+    let id = data.get(at.checked_add(2)?..at.checked_add(7)?)?;
+    if id == b"-lhx-" {
+        return Some(false);
+    }
+    LHA_CHECKABLE
+        .iter()
+        .any(|known| known.as_slice() == id)
+        .then_some(true)
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -213,6 +256,17 @@ fuzz_target!(|data: &[u8]| {
                 HashMap::new()
             }
         },
+        "lha" => match lha_salvage::salvage_lha(&mut cursor, &opts.policy) {
+            Ok(scan) => scan
+                .entries
+                .into_iter()
+                .map(|e| (e.scan_position, e.offset))
+                .collect(),
+            Err(e) => {
+                check_error_is_classified(&e).expect("independent scan error classification");
+                HashMap::new()
+            }
+        },
         _ => HashMap::new(),
     };
 
@@ -232,6 +286,7 @@ fuzz_target!(|data: &[u8]| {
             "zip" => locally_offers_checkable_crc(payload, offset),
             "arc" => arc_locally_offers_checkable_crc(payload, offset),
             "zoo" => zoo_locally_offers_checkable_crc(payload, offset),
+            "lha" => lha_locally_offers_checkable_crc(payload, offset),
             _ => None,
         };
         if let Some(offers_crc) = offers_crc {

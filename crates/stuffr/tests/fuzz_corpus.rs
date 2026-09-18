@@ -46,10 +46,10 @@
 //!   codec seed takes. See [`SALVAGE_SHAPES`] for what each shape is, and
 //!   for the two measurements behind them — the one that made seeding this
 //!   target necessary at all (Stage 1) and the one that put ZOO seeds in it
-//!   (Stage 2 Task 4). **Two slots are seeded**: a `zoo-*` shape carries
-//!   `SALVAGE_SLOTS`'s `zoo` index, every other shape its `zip` index —
-//!   looked up, never a literal `0`, so appending a slot cannot silently
-//!   re-point an existing seed.
+//!   (Stage 2 Task 4). **Three slots are seeded**: a `zoo-*` shape carries
+//!   `SALVAGE_SLOTS`'s `zoo` index, an `lha-*` shape its `lha` index, and
+//!   every other shape its `zip` index — looked up, never a literal `0`, so
+//!   appending a slot cannot silently re-point an existing seed.
 //!
 //! Phase 3b added three READ-ONLY slots (`lha`, `arj` and, at the time,
 //! `compress`) and Phase 3c a fourth container (`arc`), none of which this
@@ -98,8 +98,9 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// exhaustively. Unlike `CHAIN_SHAPES`, a salvage seed DOES carry a leading
 /// selector byte as of Stage 2 Task 3b (see the module doc's own bullet on
 /// `salvage.rs`), and as of Stage 2 Task 4 they do NOT all select the same
-/// slot: a shape named `zoo-*` carries `SALVAGE_SLOTS`'s `zoo` index and
-/// every other shape carries its `zip` index.
+/// slot: a shape named `zoo-*` carries `SALVAGE_SLOTS`'s `zoo` index, one
+/// named `lha-*` its `lha` index (Stage 2 Task 5), and every other shape
+/// carries its `zip` index.
 ///
 /// **`arc` still has no seed and `zoo` now does, and that asymmetry is a
 /// MEASUREMENT rather than an oversight.** Task 4 measured what earlier
@@ -170,6 +171,25 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 ///   archive at exit 5 while the scanner still recovers the entry `Intact`:
 ///   the motivating shape for the whole ZOO scanner, and a seed whose
 ///   structure is already damaged where its record is not.
+///
+/// The two LHA shapes (Stage 2 Task 5) are seeded for the reason ZOO's
+/// were, applied BEFORE the measurement rather than after it. LHA's anchor
+/// is a FIVE-byte ASCII method identifier behind a header-checksum gate —
+/// about one coincidence per 93 GiB of random bytes, against ZOO's one per
+/// 4 GiB and ARC's one per 8 KiB — so mutation from zip seeds cannot
+/// plausibly reach an LHA header at all, and an unseeded `lha` slot would
+/// spend its whole share of every run the way the `zoo` slot measurably
+/// spent its 876 inputs: producing not one salvaged record. Both shapes are
+/// `sample.lzh`, which `lhasa` verified and no encoder here produced.
+///
+/// - `lha-healthy` — `sample.lzh` verbatim, two `-lh0-` entries, both
+///   `Intact`.
+/// - `lha-destroyed-first-header` — the same archive with the first
+///   header's LENGTH and CHECKSUM bytes wiped. Two bytes, and the ordinary
+///   reader can no longer reach any entry at all (LHA has no index: entry 2
+///   is reachable only by having parsed entry 1), while the scanner still
+///   recovers the second entry `Intact`. The motivating shape for the whole
+///   LHA scanner.
 const SALVAGE_SHAPES: &[&str] = &[
     "healthy",
     "distinct-duplicates",
@@ -179,6 +199,8 @@ const SALVAGE_SHAPES: &[&str] = &[
     "crc-mismatch",
     "zoo-healthy",
     "zoo-zeroed-chain",
+    "lha-healthy",
+    "lha-destroyed-first-header",
 ];
 
 /// Builds one small sample tree every container/chain seed packs: a file at
@@ -818,10 +840,27 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
                 }
                 bytes
             }
+            // Borrowed-in-spirit bytes: `sample.lzh` is hand-built from the
+            // level-1 layout and independently verified by `lhasa`, an
+            // implementation sharing no code with `delharc` — so it is not
+            // this project's own encoder's output either.
+            "lha-healthy" => read_all(&legacy_fixture_path("sample.lzh"))?,
+            // Two bytes: the first header's length and checksum. LHA has no
+            // index, so a reader that cannot parse header 1 never reaches
+            // entry 2 — while entry 2's own header, payload and CRC-16 are
+            // untouched.
+            "lha-destroyed-first-header" => {
+                let mut bytes = read_all(&legacy_fixture_path("sample.lzh"))?;
+                bytes[0] = 0xFF;
+                bytes[1] = 0xFF;
+                bytes
+            }
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
         let slot = if shape.starts_with("zoo-") {
             "zoo"
+        } else if shape.starts_with("lha-") {
+            "lha"
         } else {
             "zip"
         };

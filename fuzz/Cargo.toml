@@ -13,15 +13,16 @@ stuffr = { path = "../crates/stuffr", features = ["testing", "legacy"] }
 stuffr-core = { path = "../crates/stuffr-core", features = ["testing"] }
 # `salvage.rs`'s only use of this crate directly: a second, independent call
 # to `zip_salvage::salvage_zip`/`legacy::arc_salvage::salvage_arc`/
-# `legacy::zoo_salvage::salvage_zoo` over the identical bytes
+# `legacy::zoo_salvage::salvage_zoo`/`legacy::lha_salvage::salvage_lha` over
+# the identical bytes
 # `entries::salvage` (via `stuffr`) already scanned, purely to recover each
 # scan position's byte OFFSET — `entries::salvage`'s own `SalvagedRecord`
 # does not carry one. Same deliberate-duplication reasoning as
 # `container.rs`'s independent EOCD re-parse, immediately below. `arc`
 # joined `zip` here when Task 3b converted `salvage.rs` from a pinned format
-# to `SALVAGE_SLOTS`'s selector byte, and `zoo` joined both in Stage 2 Task
-# 4 — the same three formats that selector lists.
-stuffr-formats = { path = "../crates/stuffr-formats", features = ["zip", "arc", "zoo"] }
+# to `SALVAGE_SLOTS`'s selector byte, `zoo` joined both in Stage 2 Task 4 and
+# `lha` in Task 5 — the same four formats that selector lists.
+stuffr-formats = { path = "../crates/stuffr-formats", features = ["zip", "arc", "zoo", "lha"] }
 tempfile = "3"
 # Only for `container.rs`'s independent EOCD re-parse (Ruling A's second
 # guard) — opens a SECOND `zip::ZipArchive` over the same bytes stuffr's own
