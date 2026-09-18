@@ -5,7 +5,7 @@ use std::io::Cursor;
 use stuffr::entries::{self, SalvageOpts};
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
 use stuffr_core::testing::{SALVAGE_SLOTS, check_error_is_classified, check_salvage_claim};
-use stuffr_formats::legacy::{arc_salvage, lha_salvage, zoo_salvage};
+use stuffr_formats::legacy::{arc_salvage, arj_salvage, lha_salvage, zoo_salvage};
 use stuffr_formats::zip_salvage;
 
 /// Local file header layout, duplicated deliberately rather than imported —
@@ -23,6 +23,19 @@ const LOCAL_HEADER_TOTAL: usize = 30;
 /// `zoo.h`: `#define ZOO_TAG ((unsigned long) 0xFDC4A7DCL)`, little-endian.
 /// Duplicated here for the same reason the zip constants above are.
 const ZOO_TAG_BYTES: [u8; 4] = 0xFDC4_A7DCu32.to_le_bytes();
+
+/// The two bytes every ARJ header opens with — spec, both header tables:
+/// "header id (main and local file header) = 0x60 0xEA". Duplicated here for
+/// the same reason every constant above is.
+const ARJ_HEADER_ID: [u8; 2] = [0x60, 0xEA];
+/// Bytes from an ARJ header's own first byte to its `method` field: the
+/// two-byte id plus the `u16` basic header size (4), then the content's own
+/// `method` at offset 5.
+const ARJ_METHOD_OFFSET: usize = 4 + 5;
+/// The same, for the content's `file type` at offset 6.
+const ARJ_FILE_TYPE_OFFSET: usize = 4 + 6;
+/// Spec, LOCAL file header table: "file type ... (3 = directory)".
+const ARJ_FILE_TYPE_DIRECTORY: u8 = 3;
 
 /// Whether the local header at `offset` in `data` directly carries a
 /// checksum for a method this build's salvage engine can decode (Store = 0,
@@ -147,6 +160,76 @@ fn lha_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
         .then_some(true)
 }
 
+/// Mirrors the four functions above, for the `arj` slot (Stage 2 Task 6).
+///
+/// ARJ has no deferral either: every local file header carries a CRC-32 over
+/// the ORIGINAL file inline, at content offset 20, so a header that is real
+/// at all carries its checksum — `arj_salvage.rs`'s own `read_candidate_at`
+/// never constructs a `Candidate` with `verifier: None`. What decides whether
+/// that checksum is CHECKABLE is the METHOD: `unarj-rs` names methods 8 and 9
+/// (`NO DATA`, `NO DATA NO CRC`) and has a decoder for neither, so nothing is
+/// ever decoded for them and nothing compared — `Some(false)`, which is
+/// exactly the claim `check_salvage_claim` refuses to see alongside `Intact`.
+/// That is the `-lhx-` case one function up, in ARJ's own spelling.
+///
+/// **A DIRECTORY entry answers `Some(true)` regardless of its method byte**,
+/// and that is not a loophole: ARJ records the kind in a field of its own, so
+/// a directory's payload is empty BY DEFINITION and its CRC-32 is still
+/// compared — against the checksum of zero bytes. The identical treatment
+/// `LHA_CHECKABLE` gives `-lhd-`, for the identical reason. Without it this
+/// function would cry wolf on the one shape where `Intact` is honest and the
+/// method byte says nothing.
+///
+/// `None` — inconclusive, not a violation — when the two-byte id is absent or
+/// the method byte is one the format never assigned, the same discipline the
+/// four functions above follow for their own "can't tell" case.
+///
+/// The basic header CRC-32 is deliberately NOT re-checked here: it decides
+/// whether these bytes are a header, not whether a FILE checksum exists, and
+/// this function answers only the latter.
+fn arj_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
+    let at = usize::try_from(offset).ok()?;
+    let id = data.get(at..at.checked_add(ARJ_HEADER_ID.len())?)?;
+    if id != ARJ_HEADER_ID {
+        return None;
+    }
+    if *data.get(at.checked_add(ARJ_FILE_TYPE_OFFSET)?)? == ARJ_FILE_TYPE_DIRECTORY {
+        return Some(true);
+    }
+    match *data.get(at.checked_add(ARJ_METHOD_OFFSET)?)? {
+        0..=4 => Some(true),
+        8 | 9 => Some(false),
+        _ => None,
+    }
+}
+
+/// What a slot with no cross-check arm below gets: a loud abort, never a
+/// silent skip.
+///
+/// **Stage 2 Task 6's fix round 1, and it is this project's signature defect
+/// caught one task after `CLAUDE.md` recorded it.** Both `match name` blocks
+/// below used to end `_ => HashMap::new()` / `_ => None`, with a comment
+/// calling that "an honest 'not built yet', not a silent pass". It is honest
+/// about the TARGET and says nothing to anyone reading a REPORT: Task 6
+/// appended `arj` to `SALVAGE_SLOTS` and seeded its corpus without adding
+/// either arm, so `check_salvage_claim` was unreachable for that slot on
+/// every input, forever — while `make fuzz` reported `target 'salvage': OK`
+/// and the task report claimed the oracle was firing.
+///
+/// A panic here cannot be reached by hostile INPUT: the selector byte is
+/// reduced `% SALVAGE_SLOTS.len()`, so every one of the 256 values names a
+/// listed slot. It is reachable only by appending a slot without its arm,
+/// which is precisely the state that must stop being quiet.
+fn no_cross_check_arm(name: &str) -> ! {
+    panic!(
+        "SALVAGE_SLOTS names `{name}`, which `entries::salvage` dispatches to a real scanner, \
+         but this target has no cross-check arm for it — so `check_salvage_claim` can never \
+         fire for that slot and its whole share of every run proves nothing. Add both arms \
+         (the independent-scan dispatch and `offers_crc`) in the same commit that appends the \
+         slot."
+    )
+}
+
 fuzz_target!(|data: &[u8]| {
     // Task 3b: the leading byte selects a format from `SALVAGE_SLOTS`,
     // mirroring `container.rs`'s own leading-selector-byte shape rather than
@@ -218,9 +301,11 @@ fuzz_target!(|data: &[u8]| {
     // for its own cross-check. Dispatched on `name` because each format's
     // scanner has its own entry point and its own raw-byte cross-check
     // below; a slot appended to `SALVAGE_SLOTS` without a matching arm here
-    // simply skips this cross-check (the `_` arms below), which is an
-    // honest "not built yet", not a silent pass — `check_error_is_classified`
-    // above still ran on `entries::salvage`'s own outcome regardless of slot.
+    // ABORTS the run (`no_cross_check_arm`) rather than skipping this
+    // cross-check. That used to be a `_` arm returning an empty map, on the
+    // reasoning that skipping is "an honest 'not built yet', not a silent
+    // pass" — see `no_cross_check_arm`'s own doc for the task that shipped
+    // exactly that state and reported the opposite.
     let mut cursor = Cursor::new(payload.to_vec());
     let offsets: HashMap<usize, u64> = match name {
         "zip" => match zip_salvage::salvage_zip(&mut cursor, &opts.policy) {
@@ -267,7 +352,18 @@ fuzz_target!(|data: &[u8]| {
                 HashMap::new()
             }
         },
-        _ => HashMap::new(),
+        "arj" => match arj_salvage::salvage_arj(&mut cursor, &opts.policy) {
+            Ok(scan) => scan
+                .entries
+                .into_iter()
+                .map(|e| (e.scan_position, e.offset))
+                .collect(),
+            Err(e) => {
+                check_error_is_classified(&e).expect("independent scan error classification");
+                HashMap::new()
+            }
+        },
+        other => no_cross_check_arm(other),
     };
 
     for record in &outcome.entries {
@@ -287,7 +383,8 @@ fuzz_target!(|data: &[u8]| {
             "arc" => arc_locally_offers_checkable_crc(payload, offset),
             "zoo" => zoo_locally_offers_checkable_crc(payload, offset),
             "lha" => lha_locally_offers_checkable_crc(payload, offset),
-            _ => None,
+            "arj" => arj_locally_offers_checkable_crc(payload, offset),
+            other => no_cross_check_arm(other),
         };
         if let Some(offers_crc) = offers_crc {
             check_salvage_claim(record.status, offers_crc)
