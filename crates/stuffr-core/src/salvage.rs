@@ -156,6 +156,41 @@ pub struct Candidate {
     /// would make a truncated entry indistinguishable from a whole one of
     /// the smaller size, which is the same mistake in a different place.
     pub available_len: Option<u64>,
+    /// The archive's own record marks this entry DELETED — the format's
+    /// owner removed it and the writer left the record, and its payload,
+    /// in place.
+    ///
+    /// `false` for every format that has no such flag (zip, tar, ar, cpio,
+    /// arc), which is why it is a plain `bool` rather than an `Option`:
+    /// "this format cannot express deletion" and "this record is not
+    /// deleted" lead to the identical, unannotated row, and a third state
+    /// would be a distinction no consumer could act on.
+    ///
+    /// # Why a scanner reports one rather than dropping it (Ruling S-R)
+    ///
+    /// Salvage Stage 2 Task 4, for ZOO — the first format here with the
+    /// flag. `zoo d` marks an entry `deleted = 1` and leaves it whole in the
+    /// file; `zoolist.c` neither lists nor extracts it, and `legacy::zoo`'s
+    /// reader follows that exactly. The flag is ONE BYTE, so in a damaged
+    /// archive a bit flip turns a live entry into one no ordinary verb will
+    /// ever hand back — which is precisely the archive this verb exists for.
+    /// So the scanner reports it.
+    ///
+    /// **And the report carries a marker, which is the part that took a
+    /// review to get right.** Everywhere else salvage accepts less than an
+    /// ordinary entry it says so on the artifact or in the row: a `Partial`
+    /// lands as `NAME.partial` and never under its real name, a second
+    /// record under a taken name lands as `NAME.salvaged-N`, a proven copy
+    /// prints `[shadowed]`. A deleted record reported `Intact` under its
+    /// real name at exit 0 was the one place that leniency was invisible —
+    /// four verbs call the archive empty and the fifth writes the file, with
+    /// nothing telling a user which it was.
+    ///
+    /// **The exit code deliberately does NOT move.** Recovering a deleted
+    /// record is this verb working as designed, not degraded fidelity — see
+    /// `stuffr::entries`'s own exit-code aggregation, which this field is
+    /// invisible to.
+    pub marked_deleted: bool,
 }
 
 /// Why an entry is [`SalvageStatus::Unverified`].
@@ -321,6 +356,12 @@ pub struct SalvagedEntry {
     /// earlier record used this name — never that one did and this could
     /// not tell.
     pub collides_with: Option<usize>,
+    /// Carried forward unchanged from [`Candidate::marked_deleted`] — see
+    /// that field for the whole ruling. Unlike [`Self::shadows`] and
+    /// [`Self::collides_with`], this is not something this module MEASURES:
+    /// it is a fact the archive's own record states, which only the scanner
+    /// that read that record can know.
+    pub marked_deleted: bool,
 }
 
 /// The result of a scan: every entry the scanner recovered, in scan order.
@@ -667,6 +708,7 @@ pub fn annotate_candidates(
             status,
             shadows,
             collides_with,
+            marked_deleted: candidate.marked_deleted,
         });
     }
 
@@ -790,6 +832,7 @@ mod tests {
                 declared_len: Some(self.0),
                 verifier: None,
                 available_len: None,
+                marked_deleted: false,
             }))
         }
     }
@@ -819,6 +862,7 @@ mod tests {
                 declared_len: Some(self.declared),
                 verifier: Some(Verifier::Crc32(1)),
                 available_len: Some(self.available),
+                marked_deleted: false,
             }))
         }
     }
@@ -891,6 +935,7 @@ mod tests {
                     declared_len: Some(len),
                     verifier: Some(Verifier::Crc32(len as u32)),
                     available_len: None,
+                    marked_deleted: false,
                 }))
             }
         }
@@ -940,6 +985,7 @@ mod tests {
                     declared_len: Some(2048),
                     verifier: Some(Verifier::Crc32(7)),
                     available_len: None,
+                    marked_deleted: false,
                 }))
             }
             fn max_whole_entry(&self) -> u64 {
@@ -1108,6 +1154,7 @@ mod tests {
                 declared_len,
                 verifier,
                 available_len: None,
+                marked_deleted: false,
             }))
         }
 

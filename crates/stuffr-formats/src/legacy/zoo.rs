@@ -327,9 +327,17 @@ pub(super) const SIZ_DIRL: usize = 56;
 /// + SIZ_DIRL + var_dir_len + SIZ_FLDR`, read forwards.
 pub(super) const SIZ_FLDR: u64 = 5;
 
+/// `zoo.h`: `#define VARDIRLEN_I 51` and `#define DCRC_I 54` — the `u16`
+/// length of the variable part and the record's own CRC-16, both inside the
+/// 56-byte fixed record. `pub(super)` for `../zoo_salvage.rs`'s tests, which
+/// build and damage records and must not hand-copy the two numbers this
+/// module's entire doc is about.
+pub(super) const VARDIRLEN_I: usize = 51;
+pub(super) const DCRC_I: usize = 54;
+
 /// `zoo.h`: `#define FNM_SIZ 13`, at `#define FNAME_I 38`.
-const FNAME_I: usize = 38;
-const FNM_SIZ: usize = 13;
+pub(super) const FNAME_I: usize = 38;
+pub(super) const FNM_SIZ: usize = 13;
 
 /// The archive header's own tag sits at `zoo.h`'s `#define ZTAG_I 20`.
 ///
@@ -695,7 +703,7 @@ pub(super) fn read_dir_entry(src: &mut dyn SeekRead, pos: u64) -> Result<DirEntr
         // The variable part. `var_dir_len` is a `u16`, so this allocation is
         // bounded by 64 KiB by the field's own type and needs no ceiling of
         // its own — unlike `size_now`/`org_size`, which are `u32`.
-        let var_len = usize::from(le16(&rec, 51));
+        let var_len = usize::from(le16(&rec, VARDIRLEN_I));
         if var_len > 0 {
             var = vec![0u8; var_len];
             src.read_exact(&mut var).map_err(classify_zoo_io)?;
@@ -722,10 +730,10 @@ pub(super) fn read_dir_entry(src: &mut dyn SeekRead, pos: u64) -> Result<DirEntr
         // result back into it. Recomputed the same way and COMPARED, never
         // enforced — see [`Fidelity::DirectoryRecordChecksum`] for why a
         // record checksum warns where a content checksum refuses.
-        let recorded = le16(&rec, 54);
+        let recorded = le16(&rec, DCRC_I);
         let mut zeroed = rec;
-        zeroed[54] = 0;
-        zeroed[55] = 0;
+        zeroed[DCRC_I] = 0;
+        zeroed[DCRC_I + 1] = 0;
         let mut computed = crc16_arc(&zeroed);
         if !var.is_empty() {
             computed = crc16_arc_continued(computed, &var);

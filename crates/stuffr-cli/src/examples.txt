@@ -707,10 +707,13 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   `salvage` is the one recovery-biased verb in this tool. `list`, `cat`,
   `unpack` and `test` all stay exactly as uncompromising as they already
   are — it is salvage's willingness to accept less-than-proven content
-  that buys them that freedom. It recovers `zip`, `arc` and `zoo`
-  archives; naming any other format with --format is exit 3, a statement
-  about this build rather than about the archive. Three surface forms,
-  one of which is required:
+  that buys them that freedom. Naming with --format a format this build
+  has no scanner for is exit 3, a statement about this build rather than
+  about the archive.
+
+  Scanners exist for: zip, arc, zoo.
+
+  Three surface forms, one of which is required:
 
   stuffr salvage broken.zip --list
       Reports on the scan with NO destination at all — listing is not
@@ -1372,8 +1375,15 @@ LEGACY FORMATS
       rather than parsing forward the way `lha` and `arc` do. A chain that
       does not advance — a self-referential or cyclic `next` link — is
       `Error::Corrupt` (exit 5), which is zoo's own verdict on the same
-      shape. A deleted entry stays in the chain and is skipped, neither
-      listed nor extracted, again matching zoo.
+      shape. A deleted entry stays in the chain and is skipped by `list`,
+      `cat`, `test` and `unpack`, neither listed nor extracted, again
+      matching zoo — but NOT by `salvage`, which is the one verb that
+      recovers it. Its payload is still whole in the file and the flag is
+      a single byte, so in a damaged archive a flipped bit turns a live
+      entry into one no other verb will ever give back. The row says so:
+      `[deleted: the archive marks this entry removed]`. The exit code
+      does not change for it — recovering a deleted record is salvage
+      doing its job, not a fidelity loss.
 
       This container is READ-ONLY: `stuffr pack notes.txt --format zoo`
       fails with `Error::CapabilityUnavailable` (exit 3), the same one

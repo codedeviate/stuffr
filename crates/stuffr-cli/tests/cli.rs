@@ -10405,3 +10405,118 @@ fn a_salvage_entry_that_cannot_be_written_is_named_on_stderr_without_list() {
     assert_eq!(std::fs::read(out_dir.join("a.txt")).unwrap(), b"AAAA");
     assert_eq!(std::fs::read(out_dir.join("z.txt")).unwrap(), b"ZZZZ");
 }
+
+/// **Fix round 1's LOW: the prose about which formats salvage actually
+/// scans had no guard, and had just gone stale once.**
+///
+/// `salvage_format_by_name`'s *table* is already pinned against the live
+/// registry (`main.rs`'s
+/// `salvage_format_by_name_recognises_every_registered_container`), but that
+/// table says only which names are *recognised* — every registered container
+/// is, compiled scanner or not. Which of them this build can actually SCAN
+/// was hand-maintained prose in two places, and both said "only zip" from
+/// Salvage Stage 1 until Stage 2 Task 4 noticed: `arc` had been wired for a
+/// whole task with neither document mentioning it.
+///
+/// So this derives the truth from the BINARY rather than from any list.
+/// Every name `--format` accepts is run against a junk file: a wired format
+/// reaches its own scanner and finds nothing (`the scan found nothing
+/// recoverable`, exit 5), an unwired one is refused by `salvage_scan`'s own
+/// fallback (`salvage has no scanner for`, exit 3). Those two messages are
+/// the discriminator, and they are `entries.rs`'s own words, not this
+/// test's guess at them.
+///
+/// Both documents carry one machine-readable sentence — `Scanners exist
+/// for: …` — and both must name exactly that set. A scanner landing without
+/// its documentation, or documentation naming a scanner that does not exist,
+/// fails here.
+#[test]
+fn the_documented_salvage_scanner_list_matches_what_the_binary_actually_scans() {
+    /// Pulls the comma-separated list out of the one marker sentence both
+    /// documents carry.
+    fn documented(text: &str, label: &str) -> Vec<String> {
+        let at = text
+            .find("Scanners exist for:")
+            .unwrap_or_else(|| panic!("{label} must carry a `Scanners exist for:` sentence"));
+        let rest = &text[at + "Scanners exist for:".len()..];
+        let end = rest.find('.').unwrap_or_else(|| {
+            panic!("{label}'s `Scanners exist for:` sentence must end in a `.`")
+        });
+        let mut names: Vec<String> = rest[..end]
+            .split(',')
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        names.sort();
+        names
+    }
+
+    let tmp = tmp_dir();
+    let junk = tmp.join("salvage-doc-guard-not-an-archive.bin");
+    std::fs::write(&junk, b"these bytes are no format's magic at all\n").unwrap();
+
+    // Every name `salvage_format_by_name` accepts — taken from its own
+    // `Usage` message rather than restated here, so a ninth name cannot be
+    // added to that table without this test seeing it.
+    let usage = run_output(&[
+        "salvage",
+        "--format",
+        "definitely-not-a-format",
+        junk.to_str().unwrap(),
+        "--list",
+    ]);
+    let usage_text = String::from_utf8_lossy(&usage.stderr).to_string();
+    let recognised: Vec<String> = usage_text
+        .split_once("salvage recognizes:")
+        .unwrap_or_else(|| panic!("expected the `salvage recognizes:` usage message: {usage_text}"))
+        .1
+        .split(',')
+        .map(|n| n.trim().trim_end_matches('\n').to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    assert!(
+        recognised.len() >= 8,
+        "the parse found {recognised:?}; if that is short the scan is broken, not the table"
+    );
+
+    let mut wired: Vec<String> = Vec::new();
+    for name in &recognised {
+        let out = run_output(&[
+            "salvage",
+            "--format",
+            name,
+            junk.to_str().unwrap(),
+            "--list",
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let unwired = stderr.contains("salvage has no scanner for");
+        if !unwired {
+            assert!(
+                stderr.contains("found nothing recoverable"),
+                "`--format {name}` over junk answered neither refusal nor an empty scan, so \
+                 this test can no longer tell wired from unwired: {stderr}"
+            );
+            wired.push(name.clone());
+        }
+    }
+    wired.sort();
+    assert!(
+        !wired.is_empty(),
+        "no format scanned at all — the discriminator is broken, not the docs"
+    );
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let examples = std::fs::read_to_string(manifest_dir.join("src").join("examples.txt")).unwrap();
+    let help = String::from_utf8_lossy(&run_output(&["salvage", "--help"]).stdout).to_string();
+
+    assert_eq!(
+        documented(&examples, "examples.txt"),
+        wired,
+        "`examples.txt` names a different set of salvage scanners than this binary has"
+    );
+    assert_eq!(
+        documented(&help, "`salvage --format`'s help"),
+        wired,
+        "`--format`'s help names a different set of salvage scanners than this binary has"
+    );
+}

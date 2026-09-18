@@ -30,6 +30,22 @@
 //! consulting anything else — see [`Candidate::payload_start`], computed
 //! once here and never re-derived downstream.
 //!
+//! **What that proof does and does not cover.** It covers the **type-2**
+//! record, which is what all four borrowed fixtures carry and what every
+//! zoo 2.10 writes. It says nothing about the **type-0/1** record —
+//! `zoo.h`'s `SIZ_DIR`, 51 bytes with no `var_dir_len`, `tz` or `dir_crc`
+//! behind it — which this scanner also accepts and for which it computes
+//! the same `record_len + SIZ_FLDR`. That extends `zooadd.c`'s
+//! `SIZ_DIRL + var_dir_len + SIZ_FLDR` formula to a record shape the
+//! formula does not name, and **no borrowed byte witnesses it**: `zoo.rs`'s
+//! own module doc already lists the 51-byte record among the three readings
+//! nothing in this project's possession can check, and `raw_entries` asserts
+//! every fixture is type 2. `zoo.rs`'s READER does not depend on the
+//! arithmetic at all — it follows the record's own absolute `offset` — so
+//! this is a gap the scanner introduces and the reader does not have.
+//! Nothing is known to be wrong; there is simply no evidence either way, and
+//! the first type-0/1 ZOO archive anyone finds is what would settle it.
+//!
 //! **This scanner computes that position STRUCTURALLY, where `zoo.rs`'s
 //! reader uses the record's own `offset` field, and the difference is
 //! deliberate.** `offset` is an absolute file position: for a zoo-written
@@ -148,17 +164,32 @@
 //! or could not check is [`SalvageStatus::Unverified`] — a tier carries a
 //! decision, a message carries a cause.
 //!
-//! # A deleted record IS reported
+//! # A deleted record IS reported, and it carries a marker (Ruling S-R)
 //!
 //! `zoo d` marks an entry `deleted = 1` and leaves it, payload and all, in
 //! the file; `zoolist.c` does not list it and `zoo x` does not extract it,
 //! and `zoo.rs`'s reader follows that exactly. This scanner does not, and
 //! the asymmetry is deliberate: the bytes are present and recoverable, the
-//! flag is bookkeeping about the CHAIN rather than about whether the content
-//! exists, and this project's own second-commonest defect is an entry lost
-//! silently. Salvage is the one recovery-biased verb; a deleted record is
-//! precisely the content the ordinary reader will not give back.
-//! `a_deleted_record_is_still_reported_by_the_scan` pins it.
+//! flag is ONE BYTE — so in a damaged archive a flipped bit turns a live
+//! entry into one no ordinary verb will ever hand back — and this project's
+//! own second-commonest defect is an entry lost silently. Salvage is the one
+//! recovery-biased verb; a deleted record is precisely the content the
+//! ordinary reader will not give back.
+//!
+//! **Reporting it was right and reporting it BARE was not**, which is fix
+//! round 1's reframing of the question. Everywhere else salvage accepts less
+//! than an ordinary entry it says so on the artifact or in the row: a
+//! `Partial` lands as `NAME.partial` and never under its real name, a second
+//! record under a taken name lands as `NAME.salvaged-N`, a proven copy
+//! prints `[shadowed]`. A deleted record reported `Intact` under its real
+//! name at exit 0 was the single place that leniency was invisible — four
+//! verbs call the archive empty and the fifth writes the file, with nothing
+//! telling a user which it was. The candidate now carries
+//! [`Candidate::marked_deleted`], the CLI row prints
+//! `[deleted: the archive marks this entry removed]`, and **the exit code
+//! does not move**: recovering a deleted record is this verb working as
+//! designed, not degraded fidelity.
+//! `a_deleted_record_is_reported_and_annotated` pins both halves.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -416,6 +447,10 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
         declared_len: Some(declared),
         verifier: Some(Verifier::Crc16(header.crc16)),
         available_len,
+        // Ruling S-R. Reported, not dropped — and ANNOTATED, which is the
+        // half a review had to add: see this module's own section below and
+        // `Candidate::marked_deleted`'s doc.
+        marked_deleted: header.deleted,
     })
 }
 
@@ -438,8 +473,9 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
 /// `annotate_candidates` bounds `declared_len` — ZOO's `size_now`, the
 /// COMPRESSED length — against [`ZooSalvage::max_whole_entry`] before this
 /// runs, so the payload buffer below needs no check of its own. `org_size`
-/// is a SECOND, independent `u32` the engine never sees, and `decode`'s LH5
-/// arm sizes its output buffer from it: left unbounded that is a 4 GiB
+/// is a SECOND, independent `u32` the engine never sees (it reaches
+/// [`EntryMeta::size`] and nothing the engine compares), and [`decode`]'s
+/// LH5 arm sizes its output buffer from it: left unbounded that is a 4 GiB
 /// allocation from a header field.
 ///
 /// It is answered as a per-entry [`UnverifiedCause::OverEntryCeiling`],
@@ -449,6 +485,44 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
 /// owners, each able to abort a run. This is a different quantity, with one
 /// owner, and its refusal is a status — so it cannot cost the entries
 /// around it.
+///
+/// # The bound belongs to the ARM that allocates, not to the entry
+///
+/// Fix round 1's HIGH finding, and the reason this section exists rather
+/// than the paragraph above standing alone. The check first shipped
+/// unconditional, for all three methods — and only [`Method::Lh5`]
+/// allocates from `org_size`. [`Method::Stored`] copies the payload;
+/// [`Method::Lzw`] grows its own output under `zoo.rs`'s `guard_output`.
+/// Measured at the CLI on `store.zoo` with `org_size` alone corrupted to
+/// `0xAAAA_AAAA` and its `dir_crc` refreshed, so all 11,357 stored bytes
+/// are present and byte-identical to the healthy fixture:
+///
+/// ```text
+/// $ stuffr salvage bigorg.zoo --list
+/// 0    Unverified (over the ceiling)    license [needs 2863311530 bytes; …]
+/// exit=3
+/// $ stuffr salvage bigorg.zoo -C out      # out/ is EMPTY
+/// salvage -> 1 scanned: 0 written, …, 1 unverified, …
+/// exit=3
+/// ```
+///
+/// `entries.rs`'s `place_salvaged_file` never writes an `Unverified` entry,
+/// so one corrupted four-byte field cost a completely recoverable payload —
+/// in the verb that exists for exactly that archive. Gated on the LH5 arm
+/// the same record is `Partial`, and `license.partial` holds all 11,357
+/// bytes at exit 4.
+///
+/// **`org_size` has no "bounded" counterpart the way `size_now` does**, and
+/// that is worth stating rather than leaving as an apparent exception to
+/// `annotate_candidates`'s "the bounded length, never the declared one"
+/// rule. `size_now` describes a byte range in the FILE, so
+/// [`Candidate::available_len`] can say how much of it is really there;
+/// `org_size` describes the DECODED length, which no byte range bounds. The
+/// figure compared is therefore necessarily the declared one — and that is
+/// sound here precisely because it is not a proxy for anything: it is
+/// literally the length `lh5_decode` is about to pass to `vec![0u8; _]`. A
+/// truncated candidate never reaches this comparison at all; it returned
+/// `Partial` at this function's first line.
 fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<SalvageStatus> {
     // The payload is PROVABLY incomplete — nothing needs decoding to know
     // the answer. Sits above the method dispatch for the reason
@@ -465,7 +539,18 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         return Ok(SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength));
     };
     let Some(Verifier::Crc16(expected_crc)) = candidate.verifier else {
-        // Likewise unreachable: every ZOO candidate carries a CRC-16.
+        // Likewise unreachable: `read_candidate_at` gives every ZOO
+        // candidate a `Verifier::Crc16`, because the format mandates one.
+        //
+        // `NoDeclaredLength` is the NEAREST cause this enum offers and not
+        // an accurate one — a length was declared; a checksum was not — and
+        // saying so is better than either inventing a variant for a branch
+        // nothing reaches or answering `Complete`, which would claim the
+        // format has no checksum to offer when ZOO's whole point here is
+        // that it does. All three `Unverified` causes lead to the same
+        // decision (listed, not written, exit 3), so the tier is right even
+        // where the message would be imprecise; see `UnverifiedCause`'s own
+        // doc, "a tier carries a decision, a message carries a cause".
         return Ok(SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength));
     };
 
@@ -490,9 +575,13 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
     };
 
     let org_size = u64::from(header.org_size);
-    if org_size > MAX_ZOO_ENTRY_LEN {
-        // See this function's doc: the engine bounds `declared_len`, never
-        // this second field, and `decode`'s LH5 arm allocates from it.
+    // **Only the arm that allocates from this field is bounded by it.** See
+    // this function's doc for the whole rule, and fix round 1 (HIGH) for
+    // what applying it to all three methods cost: a `Stored` entry whose
+    // 11,357 bytes were all present, and whose method never reads
+    // `org_size` for an allocation at all, was reported `Unverified (over
+    // the ceiling)` and written nowhere.
+    if method == Method::Lh5 && org_size > MAX_ZOO_ENTRY_LEN {
         return Ok(SalvageStatus::Unverified(
             UnverifiedCause::OverEntryCeiling {
                 needed: org_size,
@@ -562,9 +651,10 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 ///   rather than the whole `read_exact` failing and nothing being written;
 /// - what is genuinely PRESENT can itself still exceed the ceiling, and that
 ///   is folded into `Ok(false)`, never propagated;
-/// - `org_size` is bounded too, because [`decode`]'s LH5 arm sizes its
-///   output buffer from it — the same second field [`verify_candidate`]'s
-///   own doc explains.
+/// - `org_size` is bounded too — **on the LH5 arm alone**, because that is
+///   the only arm of [`decode`] that sizes a buffer from it. See
+///   [`verify_candidate`]'s own doc for the field, and fix round 1 (HIGH)
+///   for what bounding all three arms by it cost.
 ///
 /// Through `stuffr::entries::salvage` the ceiling branches are unreachable
 /// (the engine's own `max_whole_entry` refuses such an entry before any
@@ -624,15 +714,21 @@ fn write_payload_bounded(
     }
 
     let expected = entry.meta.size.unwrap_or(readable_len);
-    if expected > ceiling {
-        // `decode`'s LH5 arm sizes `vec![0u8; org_size]` from this figure.
+    // Bounded on the LH5 arm ALONE, the twin of `verify_candidate`'s own
+    // check and for the same reason: `decode`'s LH5 arm sizes
+    // `vec![0u8; org_size]` from this figure and the other two arms never
+    // read it. Fix round 1 (HIGH): applying it to all three refused a
+    // `Stored` entry whose bytes were entirely present, writing nothing.
+    if method == Method::Lh5 && expected > ceiling {
         return Ok(false);
     }
-    let Ok(org_size) = u32::try_from(expected) else {
-        // Unreachable: `ceiling` is at most `MAX_ZOO_ENTRY_LEN` (256 MiB),
-        // well inside a `u32`. Refused rather than truncated by a cast.
-        return Ok(false);
-    };
+    // Saturating rather than refusing, because for `Stored` and `Lzw` this
+    // value is passed to `decode` and never read — only the LH5 arm reads
+    // it, and the comparison above has already bounded that arm well inside
+    // a `u32`. Refusing here instead would reintroduce the same defect one
+    // line down: a `Stored` entry declaring an absurd `org_size` would go
+    // unwritten for a figure its own method ignores.
+    let org_size = u32::try_from(expected).unwrap_or(u32::MAX);
 
     // Decided from the two lengths alone, BEFORE the read: if fewer
     // compressed bytes are present than the header declared, this entry's
@@ -685,6 +781,16 @@ mod tests {
     const DEFAULT_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/default.zoo");
     const HIGH_PER_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/high_per.zoo");
     const WRONGCRC16_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/wrongcrc16.zoo");
+
+    /// Where `build_zoo` puts its first directory record: straight after the
+    /// 42-byte `SIZ_ZOOH` archive header it writes. Named once rather than
+    /// spelled `42` at each site — the builder's own `assert_eq!(out.len(),
+    /// 42, "SIZ_ZOOH")` is what keeps the two in step.
+    const FIRST_RECORD: usize = 42;
+
+    /// `zoo.h`'s `SIZNOW_I 24` within a directory record — the compressed
+    /// length, which several tests below raise to a lie.
+    const SIZE_NOW_I: usize = 24;
 
     fn scan(bytes: &[u8]) -> SalvageOutcome {
         salvage_zoo(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
@@ -888,6 +994,18 @@ mod tests {
                  must equal the absolute `offset` the archive's own record declares — a \
                  59-byte fixed record puts it exactly three bytes late"
             );
+            // Every borrowed fixture is type 2, which is why this proves
+            // nothing about the 51-byte type-0/1 record the scanner also
+            // accepts — see this module's own doc. Asserted rather than
+            // left implicit, so the day a type-0/1 fixture arrives this
+            // test says out loud that its coverage just changed.
+            assert_eq!(
+                read_dir_entry(&mut Cursor::new(bytes.to_vec()), candidate.offset)
+                    .unwrap()
+                    .fixed_len,
+                super::super::zoo::SIZ_DIRL,
+                "{label}: the claim above covers the type-2 record and nothing else"
+            );
             assert_eq!(
                 candidate.available_len, None,
                 "{label}: a healthy fixture's payload is entirely present"
@@ -971,8 +1089,9 @@ mod tests {
     #[test]
     fn a_non_printable_name_with_a_broken_dir_crc_is_rejected() {
         let mut bytes = build_zoo(&[Spec::stored("NAME.TXT", b"payload")]);
-        let at = 42; // the first record, straight after the 42-byte header
-        bytes[at + 38..at + 41].copy_from_slice(&[0xC4, 0xD9, 0xB3]);
+        let at = FIRST_RECORD;
+        bytes[at + super::super::zoo::FNAME_I..at + super::super::zoo::FNAME_I + 3]
+            .copy_from_slice(&[0xC4, 0xD9, 0xB3]);
         // `dir_crc` deliberately NOT refreshed.
         assert!(
             scan(&bytes).entries.is_empty(),
@@ -984,19 +1103,27 @@ mod tests {
     /// that record's own `dir_crc` the way `portable.c`'s `dir_to_b` does —
     /// the field itself zeroed, CRC-16/ARC over `SIZ_DIRL + var_dir_len`
     /// bytes.
+    /// Every offset below is `zoo.rs`'s own constant, never a literal — fix
+    /// round 1's LOW finding, and the one file where it matters most: the
+    /// whole subject here is that `unarc-rs` hand-copied `56` and got it
+    /// wrong.
     fn overwrite_name_and_refresh_dir_crc(bytes: &mut [u8], raw: &[u8]) {
         use super::super::crc::crc16_arc;
-        let at = 42; // the first record, straight after the 42-byte header
-        for b in &mut bytes[at + 38..at + 51] {
+        use super::super::zoo::{DCRC_I, FNAME_I, FNM_SIZ, SIZ_DIRL, VARDIRLEN_I};
+        let at = FIRST_RECORD;
+        for b in &mut bytes[at + FNAME_I..at + FNAME_I + FNM_SIZ] {
             *b = 0;
         }
-        bytes[at + 38..at + 38 + raw.len()].copy_from_slice(raw);
-        let var_len = usize::from(u16::from_le_bytes([bytes[at + 51], bytes[at + 52]]));
-        let len = 56 + var_len;
-        bytes[at + 54] = 0;
-        bytes[at + 55] = 0;
+        bytes[at + FNAME_I..at + FNAME_I + raw.len()].copy_from_slice(raw);
+        let var_len = usize::from(u16::from_le_bytes([
+            bytes[at + VARDIRLEN_I],
+            bytes[at + VARDIRLEN_I + 1],
+        ]));
+        let len = SIZ_DIRL + var_len;
+        bytes[at + DCRC_I] = 0;
+        bytes[at + DCRC_I + 1] = 0;
         let crc = crc16_arc(&bytes[at..at + len]);
-        bytes[at + 54..at + 56].copy_from_slice(&crc.to_le_bytes());
+        bytes[at + DCRC_I..at + DCRC_I + 2].copy_from_slice(&crc.to_le_bytes());
     }
 
     // -------------------------------------------------------------------
@@ -1026,11 +1153,11 @@ mod tests {
         );
     }
 
-    /// `zoo.rs`'s reader skips a deleted record; this scanner reports it.
-    /// See this module's doc for the ruling — the bytes are present and
-    /// recoverable, and salvage is the one recovery-biased verb.
+    /// Ruling S-R, both halves. `zoo.rs`'s reader skips a deleted record;
+    /// this scanner reports it AND annotates it, because this was the one
+    /// place salvage's leniency carried no marker — see this module's doc.
     #[test]
-    fn a_deleted_record_is_still_reported_by_the_scan() {
+    fn a_deleted_record_is_reported_and_annotated() {
         let mut spec = Spec::stored("GONE.TXT", b"deleted but still here");
         spec.deleted = true;
         let out = scan(&build_zoo(&[spec]));
@@ -1041,6 +1168,20 @@ mod tests {
              what the ordinary reader will not"
         );
         assert_eq!(out.entries[0].status, SalvageStatus::Intact);
+        assert!(
+            out.entries[0].marked_deleted,
+            "reporting it bare, as an ordinary `Intact` row, is what fix round 1 rejected"
+        );
+    }
+
+    /// The negative double for the annotation: an ordinary record must never
+    /// be marked. Without this, a `marked_deleted` hardcoded to `true` would
+    /// satisfy the test above.
+    #[test]
+    fn an_ordinary_record_is_not_marked_deleted() {
+        let out = scan(&build_zoo(&[Spec::stored("LIVE.TXT", b"still here")]));
+        assert_eq!(out.entries.len(), 1);
+        assert!(!out.entries[0].marked_deleted);
     }
 
     /// A `Read + Seek` mock that:
@@ -1104,8 +1245,8 @@ mod tests {
     #[test]
     fn refuses_an_absurd_size_now_before_the_allocation_it_would_size() {
         let mut bytes = build_zoo(&[Spec::stored("BIG.BIN", b"")]);
-        let at = 42;
-        bytes[at + 24..at + 28].copy_from_slice(&ABSURD_SIZE.to_le_bytes());
+        let at = FIRST_RECORD;
+        bytes[at + SIZE_NOW_I..at + SIZE_NOW_I + 4].copy_from_slice(&ABSURD_SIZE.to_le_bytes());
         let mut src = LyingLenPanicsOnBigRead {
             inner: Cursor::new(bytes),
             reported_len: u64::from(ABSURD_SIZE) * 4,
@@ -1133,12 +1274,34 @@ mod tests {
     }
 
     /// The SECOND declared length — `org_size`, which the engine never sees
-    /// and which `decode`'s LH5 arm sizes its output buffer from. Refused
-    /// as a per-entry status by `verify_candidate`, with the same panicking
-    /// reader proving nothing was allocated for it.
+    /// and which [`decode`]'s **LH5 arm alone** sizes its output buffer
+    /// from.
+    ///
+    /// # Why this one needs a different instrument from its sibling
+    ///
+    /// Fix round 1's MEDIUM finding.
+    /// `refuses_an_absurd_size_now_before_the_allocation_it_would_size`
+    /// above is genuinely proven by [`LyingLenPanicsOnBigRead`]: there the
+    /// oversized figure becomes a `read_exact` **against the source**, which
+    /// is exactly what that mock watches. Here it does not. The allocation
+    /// is `vec![0u8; org_size as usize]` inside `zoo.rs`'s `lh5_decode`,
+    /// over an **in-memory slice** the source never sees — so neutering the
+    /// check to `if false && …` left this test failing on its STATUS
+    /// assertion (`left: Partial`) and never on the reader's guard, with the
+    /// 2,863,311,530-byte buffer allocated and the run carrying on. The two
+    /// tests looked identical and were not.
+    ///
+    /// [`crate::alloc_probe`] is what can see it: a `#[cfg(test)]` recording
+    /// allocator with a thread-local maximum. The lying `seek(End(0))` is
+    /// still needed (without it the candidate short-circuits to `Partial`
+    /// before the ceiling is ever consulted), so the mock stays — but its
+    /// panic guard is inert for this test and the allocation ceiling below
+    /// is what carries it.
     #[test]
-    fn an_absurd_org_size_is_refused_before_the_allocation_it_would_size() {
-        // Method 2 (LH5) is the arm that allocates from `org_size`.
+    fn an_absurd_org_size_on_lh5_is_refused_before_the_allocation_it_would_size() {
+        // Method 2 (LH5) is the ONLY arm that allocates from `org_size` —
+        // see `verify_candidate`'s own doc, and the Stored test below for
+        // what bounding the other two by it cost.
         let mut spec = Spec::stored("BIG.LH5", b"");
         spec.method = 2;
         spec.declared_org = Some(ABSURD_SIZE);
@@ -1147,8 +1310,22 @@ mod tests {
             reported_len: u64::from(ABSURD_SIZE) * 4,
             max_single_read: 128 * 1024,
         };
-        let out = salvage_zoo(&mut src, &SalvagePolicy::default())
-            .expect("an absurd org_size is one entry's problem, not the run's");
+        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            salvage_zoo(&mut src, &SalvagePolicy::default())
+                .expect("an absurd org_size is one entry's problem, not the run's")
+        });
+        // **Asserted BEFORE the status**, deliberately: with the ceiling
+        // neutered, the status assertion fires first and hides the finding
+        // this test exists for — which is exactly how the old version of
+        // this test came to pass while the buffer was allocated. The scan
+        // itself allocates a `SCAN_CHUNK` buffer and a window of the same
+        // order, so this ceiling sits well above those and three orders of
+        // magnitude below `ABSURD_SIZE` (~2.86 GiB).
+        assert!(
+            largest <= 1 << 20,
+            "largest single allocation was {largest} bytes — `org_size` was allocated from \
+             before anything refused it, which no source-side mock in this crate can see"
+        );
         assert_eq!(out.entries.len(), 1);
         assert_eq!(
             out.entries[0].status,
@@ -1156,6 +1333,54 @@ mod tests {
                 needed: u64::from(ABSURD_SIZE),
                 ceiling: MAX_ZOO_ENTRY_LEN,
             })
+        );
+    }
+
+    /// **Fix round 1, HIGH.** The `org_size` ceiling used to run for all
+    /// three methods, and only [`Method::Lh5`] allocates from the field:
+    /// `Stored` copies its payload and `Lzw` grows its own output under
+    /// `zoo.rs`'s `guard_output`. So a Stored entry whose bytes were
+    /// entirely present was reported `Unverified (over the ceiling)` and —
+    /// because `entries.rs` never writes an `Unverified` entry — recovered
+    /// nowhere, for a figure its own method never reads.
+    ///
+    /// Measured at the CLI on `store.zoo` with `org_size` alone corrupted:
+    /// `1 scanned: 0 written`, an empty destination, exit 3. Gated on the
+    /// LH5 arm the same record is `Partial` and `license.partial` holds all
+    /// 11,357 bytes at exit 4.
+    #[test]
+    fn an_absurd_org_size_on_a_stored_entry_does_not_cost_its_recoverable_payload() {
+        let content = b"every one of these bytes is present and recoverable".repeat(3);
+        let mut spec = Spec::stored("BIG.TXT", &content);
+        spec.declared_org = Some(ABSURD_SIZE);
+        let bytes = build_zoo(&[spec]);
+
+        let out = scan(&bytes);
+        assert_eq!(out.entries.len(), 1);
+        assert_eq!(
+            out.entries[0].status,
+            SalvageStatus::Partial,
+            "a Stored entry never allocates from `org_size`, so an absurd one is a header \
+             disagreeing with its contents — not this build refusing to allocate"
+        );
+
+        // And the payload really is recovered, which is what the old
+        // behaviour cost: `Unverified` is never written at all.
+        let path = temp_archive(&bytes, "stored-bigorg");
+        let entry = &out.entries[0];
+        let mut sink: Vec<u8> = Vec::new();
+        let completed = write_payload(&path, entry, entry.meta.compressed_size.unwrap(), &mut sink)
+            .expect("an absurd org_size must not error the write path");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            !completed,
+            "the entry cannot be `completed`: its own header declares a length the content \
+             does not reach"
+        );
+        assert_eq!(
+            sink, content,
+            "but every present byte is recovered — this is the entry the unconditional \
+             ceiling threw away"
         );
     }
 
@@ -1174,8 +1399,8 @@ mod tests {
     #[test]
     fn a_modest_declared_size_with_no_data_behind_it_is_partial_not_over_ceiling() {
         let mut bytes = build_zoo(&[Spec::stored("SHORT.BIN", b"")]);
-        let at = 42;
-        bytes[at + 24..at + 28].copy_from_slice(&64u32.to_le_bytes());
+        let at = FIRST_RECORD;
+        bytes[at + SIZE_NOW_I..at + SIZE_NOW_I + 4].copy_from_slice(&64u32.to_le_bytes());
         let out = scan(&bytes);
         assert_eq!(out.entries.len(), 1);
         assert_eq!(out.entries[0].status, SalvageStatus::Partial);
@@ -1196,7 +1421,7 @@ mod tests {
         // own record starts right after the first entry's record, leader and
         // payload; locate it by its name rather than by arithmetic.
         let at = find_record_by_name(&bytes, "PHANTOM.BIN");
-        bytes[at + 24..at + 28].copy_from_slice(&50_000_000u32.to_le_bytes());
+        bytes[at + SIZE_NOW_I..at + SIZE_NOW_I + 4].copy_from_slice(&50_000_000u32.to_le_bytes());
 
         let out = scan(&bytes);
         let names: Vec<&str> = out.entries.iter().map(|e| e.meta.name.as_str()).collect();
@@ -1214,11 +1439,12 @@ mod tests {
     /// `name`, by walking tag sightings rather than by re-deriving record
     /// arithmetic a test has no business knowing.
     fn find_record_by_name(bytes: &[u8], name: &str) -> usize {
-        for at in 0..bytes.len().saturating_sub(56) {
+        use super::super::zoo::{FNAME_I, FNM_SIZ, SIZ_DIRL};
+        for at in 0..bytes.len().saturating_sub(SIZ_DIRL) {
             if bytes[at..at + 4] != TAG_BYTES {
                 continue;
             }
-            let field = &bytes[at + 38..at + 51];
+            let field = &bytes[at + FNAME_I..at + FNAME_I + FNM_SIZ];
             let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
             if &field[..end] == name.as_bytes() {
                 return at;

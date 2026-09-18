@@ -6,6 +6,100 @@
 
 use stuffr_core::Registry;
 
+/// A recording allocator, for the one test-only question no reader-shaped
+/// mock in this crate can answer: **did a buffer get sized from a header
+/// field before anything refused it?**
+///
+/// Every other guard of that shape in this project uses a source that panics
+/// on an oversized `read` (`arc.rs`'s `PanicsOnBigRead`, `cpio.rs`'s and
+/// `zoo.rs`'s equivalents, `zoo_salvage.rs`'s `LyingLenPanicsOnBigRead`),
+/// and those instruments are exact where the declared figure becomes a
+/// `read_exact` **against the source**. They are blind where it does not.
+/// Salvage Stage 2 Task 4's fix round 1 measured that blindness directly:
+/// `zoo_salvage.rs`'s `org_size` ceiling protects a
+/// `vec![0u8; org_size as usize]` inside `zoo.rs`'s `lh5_decode`, over an
+/// **in-memory slice**, so neutering the check left the test green with a
+/// 2,863,311,530-byte zeroed buffer allocated — a test asserting only the
+/// STATUS, standing directly beneath a mock whose own doc says that is the
+/// entire defect this class of test exists to catch.
+///
+/// This closes that gap and nothing else. It is `#[cfg(test)]`, so it exists
+/// only in this crate's own lib-test binary; it never fails an allocation
+/// and never changes behaviour, it only records.
+///
+/// **The record is THREAD-LOCAL**, which is what makes it usable at all:
+/// `cargo test` runs tests in parallel threads, so a process-wide maximum
+/// would be whatever some other test happened to allocate. The cell is
+/// `const`-initialised and holds a `usize`, so it allocates nothing itself
+/// and registers no destructor — a recording allocator that allocated would
+/// recurse forever.
+#[cfg(test)]
+pub(crate) mod alloc_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Largest single allocation this thread has been asked for since
+        /// the last [`largest_single_allocation`] reset.
+        static LARGEST: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) struct Probe;
+
+    // SAFETY: every method forwards to `System` unchanged; `note` only
+    // reads and writes a `Cell<usize>` in a `const`-initialised
+    // thread-local, which allocates nothing and cannot re-enter.
+    unsafe impl GlobalAlloc for Probe {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            note(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            note(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    fn note(size: usize) {
+        // `try_with`, not `with`: during thread teardown a local can be
+        // gone while an allocation is still in flight, and a panic from
+        // inside the allocator would abort the process rather than fail a
+        // test. Losing a measurement there costs nothing — no test is
+        // measuring during teardown.
+        let _ = LARGEST.try_with(|largest| {
+            if size > largest.get() {
+                largest.set(size);
+            }
+        });
+    }
+
+    /// Runs `f` and reports the largest single allocation requested **on
+    /// this thread** while it ran.
+    ///
+    /// A ceiling assertion on that figure is the only thing in this crate
+    /// that can tell "refused before the allocation" from "allocated, then
+    /// the status came out right anyway".
+    pub(crate) fn largest_single_allocation<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        LARGEST.with(|largest| largest.set(0));
+        let out = f();
+        (out, LARGEST.with(|largest| largest.get()))
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static PROBE_ALLOCATOR: alloc_probe::Probe = alloc_probe::Probe;
+
 #[cfg(any(feature = "lzma-c", feature = "lzma-pure"))]
 mod lzma_shared;
 mod normalize;

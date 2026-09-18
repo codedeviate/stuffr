@@ -520,6 +520,10 @@ fn read_candidate_at(
         declared_len,
         verifier,
         available_len,
+        // ZIP has no deleted flag at all — see
+        // `Candidate::marked_deleted`'s own doc for why that is a plain
+        // `false` rather than an `Option`.
+        marked_deleted: false,
     }))
 }
 
@@ -933,6 +937,10 @@ fn candidate_from_cd_record(
         declared_len: Some(record.compressed_size),
         verifier: Some(Verifier::Crc32(record.crc32)),
         available_len,
+        // ZIP has no deleted flag at all — see
+        // `Candidate::marked_deleted`'s own doc for why that is a plain
+        // `false` rather than an `Option`.
+        marked_deleted: false,
     }))
 }
 

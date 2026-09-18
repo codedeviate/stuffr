@@ -654,6 +654,18 @@ fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static s
 /// was measurable: on an archive whose duplicates differ, `stuffr list`
 /// warned that two records repeat a name and were shadowed, while this row
 /// marked nothing at all.
+///
+/// `[deleted: the archive marks this entry removed]` is Ruling S-R (Salvage
+/// Stage 2 Task 4). ZOO is the first format here whose records carry a
+/// deleted flag, and `salvage` reports such a record where every other verb
+/// skips it — `zoo d` leaves the payload in the file, and one flipped byte
+/// in that flag turns a live entry into one the ordinary reader will never
+/// hand back. Reporting it is right; reporting it as a bare `Intact` under
+/// its real name at exit 0 was not, because it made this the ONE place
+/// salvage's leniency carried no marker at all. **The exit code does not
+/// move** — recovering a deleted record is the verb working as designed,
+/// not degraded fidelity — so the annotation is the whole signal, which is
+/// why it is worth having.
 fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     let status = match &record.disposition {
         entries::SalvageDisposition::WrittenPartial { cause, .. }
@@ -682,6 +694,9 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     }
     if let Some(earlier) = record.collides_with {
         line.push_str(&format!(" [name collision: #{earlier} uses this name too]"));
+    }
+    if record.marked_deleted {
+        line.push_str(" [deleted: the archive marks this entry removed]");
     }
     // The path actually written, named only when it is NOT the entry's own
     // name — a row a user reads to find their file must say where it went.

@@ -43,11 +43,13 @@
 //!   REST of the bytes — written to a temp file — to that slot's scanner
 //!   via `SalvageOpts::format`. So a salvage seed is
 //!   `[slot_index] ++ <that format's own archive bytes>`, the same shape a
-//!   codec seed takes. See [`SALVAGE_SHAPES`] for the six of them and for
-//!   the measurement that made seeding this target necessary rather than
-//!   optional; every one of the six is still built as a zip (the only slot
-//!   this generator seeds today), so each carries `SALVAGE_SLOTS`'s own
-//!   `zip` index rather than a literal `0`.
+//!   codec seed takes. See [`SALVAGE_SHAPES`] for what each shape is, and
+//!   for the two measurements behind them — the one that made seeding this
+//!   target necessary at all (Stage 1) and the one that put ZOO seeds in it
+//!   (Stage 2 Task 4). **Two slots are seeded**: a `zoo-*` shape carries
+//!   `SALVAGE_SLOTS`'s `zoo` index, every other shape its `zip` index —
+//!   looked up, never a literal `0`, so appending a slot cannot silently
+//!   re-point an existing seed.
 //!
 //! Phase 3b added three READ-ONLY slots (`lha`, `arj` and, at the time,
 //! `compress`) and Phase 3c a fourth container (`arc`), none of which this
@@ -741,13 +743,13 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // index — see `SALVAGE_SHAPES`'s own doc for the measurement that put
     // ZOO seeds here and left `arc` without one.
     //
-    // Unlike `chain/`'s deliberately well-formed-only seeds, four of these
-    // six are DAMAGED on purpose, and that is not the same trade. The rule
+    // Unlike `chain/`'s deliberately well-formed-only seeds, most of these
+    // are DAMAGED on purpose, and that is not the same trade. The rule
     // `chain/` follows is "do not seed a known-unfixed finding", not "do not
     // seed damage": salvage's whole input domain is damaged archives, its
-    // every status tier below `Intact` describes a kind of damage, and none
-    // of the four shapes below reaches a known-unfixed defect — each is an
-    // outcome the suite already pins end to end.
+    // every status tier below `Intact` describes a kind of damage, and no
+    // shape below reaches a known-unfixed defect — each is an outcome the
+    // suite already pins end to end.
     let healthy = healthy_salvage_seed();
     let mut salvage_count = 0usize;
     let salvage_selector = |slot: &str| {
@@ -910,7 +912,7 @@ fn the_corpus_builders_crc_matches_the_published_check_value() {
 /// all 64 accumulated corpus inputs produced not one salvaged record of
 /// any status, so the target executed cleanly and proved nothing.
 ///
-/// Asserting "the generator wrote six files" would reproduce exactly that
+/// Asserting "the generator wrote N files" would reproduce exactly that
 /// failure. This runs the real engine over every seed and checks what the
 /// scan actually reports, so a seed that stopped reaching `Intact` (a
 /// builder bug, a shape that drifted) fails here rather than going quiet
@@ -967,7 +969,7 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
     );
 
     // And the damaged shapes must genuinely be damaged, or the corpus is
-    // six copies of one healthy archive wearing different names.
+    // several copies of one healthy archive wearing different names.
     for (shape, expected) in [
         ("truncated-tail", SalvageStatus::Partial),
         ("crc-mismatch", SalvageStatus::Partial),

@@ -37,6 +37,12 @@ use stuffr_core::salvage::SalvagePolicy;
 const ZSTART_I: usize = 24;
 /// `zoo.h`'s `NEXT_I 6` within a directory record.
 const NEXT_I: usize = 6;
+/// `zoo.h`'s `DELETE_I 30` within a directory record.
+const DELETE_I: usize = 30;
+/// `zoo.h`'s `VARDIRLEN_I 51` and `DCRC_I 54`, needed only to re-stamp a
+/// record's own checksum after a test damages one byte of it.
+const VARDIRLEN_I: usize = 51;
+const DCRC_I: usize = 54;
 
 fn fixture_bytes() -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -172,4 +178,92 @@ fn an_archive_whose_chain_was_zeroed_still_salvages_its_entry() {
         );
     };
     assert_eq!(std::fs::read(path).unwrap(), expected);
+}
+
+/// CRC-16/ARC, reimplemented here rather than reused because
+/// `legacy::crc`'s is private to another crate. Needed only so a test can
+/// damage one byte of a record and leave the record's own `dir_crc` honest,
+/// which is what keeps the scanner's gate from rejecting it for the wrong
+/// reason.
+fn crc16_arc(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &b in data {
+        crc ^= u16::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xA001 & mask);
+        }
+    }
+    crc
+}
+
+/// Sets the first record's `deleted` flag and re-stamps that record's own
+/// `dir_crc` (`portable.c`'s `dir_to_b`: the field itself zeroed, CRC-16/ARC
+/// over `SIZ_DIRL + var_dir_len` bytes), so the archive is byte-perfect
+/// apart from the one flag — exactly what `zoo d` leaves behind.
+fn mark_first_record_deleted(bytes: &mut [u8]) {
+    let record = u32::from_le_bytes([
+        bytes[ZSTART_I],
+        bytes[ZSTART_I + 1],
+        bytes[ZSTART_I + 2],
+        bytes[ZSTART_I + 3],
+    ]) as usize;
+    bytes[record + DELETE_I] = 1;
+    let var_len = usize::from(u16::from_le_bytes([
+        bytes[record + VARDIRLEN_I],
+        bytes[record + VARDIRLEN_I + 1],
+    ]));
+    bytes[record + DCRC_I] = 0;
+    bytes[record + DCRC_I + 1] = 0;
+    let crc = crc16_arc(&bytes[record..record + 56 + var_len]);
+    bytes[record + DCRC_I..record + DCRC_I + 2].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// **Ruling S-R, end to end.** A deleted record is recovered — `list` hands
+/// back nothing for the same archive — and the report says so, while the
+/// exit code stays 0.
+///
+/// The exit code is the half worth pinning at this layer: recovering a
+/// deleted record is this verb working as designed, not degraded fidelity,
+/// so `salvage_exit_code` must never read `marked_deleted`. A future change
+/// that routed the annotation through the exit-code aggregation would be
+/// invisible to the scanner's own unit tests and fails here.
+#[test]
+fn a_deleted_record_is_recovered_annotated_and_does_not_move_the_exit_code() {
+    let scratch = Scratch::new("deleted");
+    let mut bytes = fixture_bytes();
+    let expected = stored_payload(&bytes);
+    mark_first_record_deleted(&mut bytes);
+
+    let archive = scratch.0.join("deleted.zoo");
+    std::fs::write(&archive, &bytes).unwrap();
+
+    // The control: every ordinary verb reports an empty archive.
+    let (rows, _) = entries::list(stuffr::ops::Input::Path(archive.clone()), u64::MAX, None)
+        .expect("a deleted-only archive is not damaged, just empty to the reader");
+    assert!(
+        rows.is_empty(),
+        "the control failed: the ordinary reader listed {} entries",
+        rows.len()
+    );
+
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone())))
+        .expect("a deleted record is content salvage exists to give back");
+    assert_eq!(outcome.entries.len(), 1);
+    let record = &outcome.entries[0];
+    assert!(
+        record.marked_deleted,
+        "the one place salvage's leniency used to carry no marker at all"
+    );
+    let SalvageDisposition::Written(path) = &record.disposition else {
+        panic!("expected a written entry, got {:?}", record.disposition);
+    };
+    assert_eq!(std::fs::read(path).unwrap(), expected);
+    assert_eq!(
+        entries::salvage_exit_code(&outcome),
+        0,
+        "recovering a deleted record is this verb working, not degraded fidelity — the \
+         annotation is the whole signal, and that is deliberate"
+    );
 }

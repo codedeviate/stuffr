@@ -310,6 +310,9 @@ fn read_candidate_at(
         declared_len: Some(compressed_size),
         verifier: Some(Verifier::Crc16(header.crc16)),
         available_len,
+        // ARC has no deleted flag — `arc.rs`'s `ArcHeader` carries no such
+        // field. See `Candidate::marked_deleted`'s own doc.
+        marked_deleted: false,
     }))
 }
 
@@ -1282,6 +1285,7 @@ mod tests {
             status: SalvageStatus::Partial,
             shadows: None,
             collides_with: None,
+            marked_deleted: false,
         };
 
         let mut sink: Vec<u8> = Vec::new();

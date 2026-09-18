@@ -1360,6 +1360,14 @@ pub struct SalvagedRecord {
     /// what happens on disk: two records under one name with two different
     /// payloads cannot both land on one path.
     pub collides_with: Option<usize>,
+    /// The archive's own record marks this entry DELETED — see
+    /// [`stuffr_core::salvage::Candidate::marked_deleted`] for Ruling S-R in
+    /// full. `false` for every format with no such flag.
+    ///
+    /// It reaches the CLI row as an annotation and **does not touch the exit
+    /// code**: recovering a deleted record is this verb working, not
+    /// degraded fidelity, so [`salvage_exit_code`] never reads it.
+    pub marked_deleted: bool,
     pub disposition: SalvageDisposition,
 }
 
@@ -1632,6 +1640,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
             status: entry.status,
             shadows: entry.shadows,
             collides_with: entry.collides_with,
+            marked_deleted: entry.marked_deleted,
             disposition,
         });
     }
@@ -4397,6 +4406,7 @@ mod salvage_tests {
             status: SalvageStatus::Intact,
             shadows: None,
             collides_with: None,
+            marked_deleted: false,
             disposition,
         };
 
@@ -5082,6 +5092,7 @@ mod salvage_seam_tests {
                 status: SalvageStatus::Complete,
                 shadows: None,
                 collides_with: None,
+                marked_deleted: false,
             };
             let err = write_salvaged_payload(
                 format,
