@@ -127,9 +127,43 @@
 //! chain uses 4-byte length counters instead of 2, and its first two bytes
 //! must read `4, 0` (`parser.rs:259-264`, `333-338`). It does carry the same
 //! common-header CRC-16, so the gate exists for it too — the work is the
-//! second layout, not the gate. `a_level_3_header_is_not_recognised_by_this_scanner`
-//! pins the current state so the day a level-3 parser lands, the coverage
-//! change is said out loud.
+//! second layout, not the gate.
+//!
+//! # What a scan SAYS about a shape it cannot gate (Ruling S-V)
+//!
+//! **Ruling S-U closed a population and left its own class open**, and this
+//! is the correction. Two shapes still met the reader and not the scanner —
+//! a level-2 header with no common extension header, and a level-3 header —
+//! and on a HEALTHY archive of either, `stuffr list` printed the entry at
+//! exit 0 while `stuffr salvage --list` answered `the scan found nothing
+//! recoverable in this archive` at **exit 5**. Same defect, narrower
+//! population: a claim about the ARCHIVE where the truth is a claim about
+//! the BUILD. `examples.txt` documenting it was not enough — nothing at
+//! runtime told a user which of the two situations they were in.
+//!
+//! [`UngateableSightings`] records such a sighting and [`salvage_lha`] turns
+//! a run that recovered NOTHING while seeing one into
+//! [`Error::Unsupported`] — **exit 3**, the code `entries.rs`'s own
+//! `salvage_scan` already spends on precisely this distinction — naming the
+//! level, naming what is missing, and saying that the ordinary verbs still
+//! read the archive.
+//!
+//! Two things about that which are not obvious:
+//!
+//! - **A sighting needs structure, never plausibility.** A false one would
+//!   replace an honest "nothing recoverable" with a confident, wrong claim
+//!   about header levels, so level 3 needs `delharc`'s own mandated `4, 0`
+//!   prefix behind the five-byte identifier (about one chance in 2^56 in
+//!   random bytes) and level 2 needs a full parse that succeeded at
+//!   everything except the checksum. `noise_never_produces_an_ungateable_sighting`
+//!   is the standing double.
+//! - **Only when the run recovered nothing.** An `Err` discards every entry
+//!   already recovered, which is the one thing this verb exists not to do.
+//!   A MIXED archive therefore still reports what it got, at its ordinary
+//!   exit code — an incompleteness rather than a contradiction, since
+//!   nothing false is claimed. Closing that too would need a note channel
+//!   [`SalvageOutcome`] does not have, and no LHA writer mixes header levels
+//!   within one archive.
 //!
 //! # The validation gate
 //!
@@ -165,6 +199,17 @@
 //! Any failure at 2-6 is not an error — it means these five bytes were a
 //! coincidence, not a header, and the scan resumes one byte past the method
 //! identifier itself, never past a whole assumed header.
+//!
+//! **A level-2 chain can also RESTATE both sizes (Ruling S-W).** An
+//! `EXT_HEADER_MSDOS_SIZE` (`0x42`) header carries a 64-bit compressed and
+//! decoded length that override the base header's `u32`s at level >= 2 —
+//! that is how the format expresses an entry past 4 GiB — and `delharc`
+//! honours it (`parser.rs:325-330`). This scanner ignored it until fix round
+//! 2, so `stuffr list` and `stuffr salvage` reported two different sizes for
+//! one healthy entry (measured: 5,000 against 100), which the CRC gate kept
+//! from ever becoming a false `Intact` but which is the self-contradiction
+//! this project refuses on principle. [`ExtraChain::msdos_size`] carries it
+//! now, and the delharc cross-check has a fixture for it.
 //!
 //! **Reported, never rejected:** a declared payload length whose bytes do
 //! not all fit inside the source. That is `zip_salvage.rs`'s "criterion 6
@@ -547,7 +592,11 @@ struct EntryHeader {
     /// minus every byte of the extra-header chain — the one level where the
     /// field means something else (`parser.rs:365-368`).
     declared_len: u64,
-    original_size: u32,
+    /// The entry's DECODED length. A `u64` rather than the base header's own
+    /// `u32` because a level-2 `EXT_HEADER_MSDOS_SIZE` header overrides it
+    /// with a 64-bit figure — Ruling S-W, and the whole reason that header
+    /// exists.
+    original_size: u64,
     file_crc: u16,
     /// Decoded here rather than carried raw, because the field does not mean
     /// the same thing at every level: levels 0 and 1 pack an MS-DOS date/time
@@ -568,11 +617,18 @@ struct EntryHeader {
 /// itself receives — the same shape `ZipSalvage`, `ArcSalvage` and
 /// `ZooSalvage` have.
 #[derive(Debug, Default)]
-pub struct LhaSalvage;
+pub struct LhaSalvage {
+    /// Header shapes this scan recognised and cannot gate — Ruling S-V. The
+    /// one piece of state this scanner carries between calls, and it exists
+    /// so [`salvage_lha`] can tell "this archive holds nothing recoverable"
+    /// apart from "this build cannot gate what this archive holds". See
+    /// [`UngateableSightings`].
+    seen: UngateableSightings,
+}
 
 impl LhaSalvage {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -587,7 +643,7 @@ impl SalvageScan for LhaSalvage {
                 return Ok(None);
             };
             let offset = at - METHOD_I as u64;
-            match read_candidate_at(src, offset, file_len) {
+            match read_candidate_at(src, offset, file_len, &mut self.seen) {
                 Some(candidate) => return Ok(Some(candidate)),
                 // The identifier matched and the gate rejected everything
                 // around it: a coincidence, not a header. Resume one byte
@@ -705,7 +761,12 @@ fn checksum_of(counted: &[u8]) -> u8 {
 /// checksum bytes with one `u16` total size, moves every field behind the
 /// (absent) filename, and is gated on a 16-bit CRC in an extension header
 /// instead. Level 3 is not scanned — see this module's doc.
-fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<EntryHeader> {
+fn parse_header_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    seen: &mut UngateableSightings,
+) -> Option<EntryHeader> {
     // Criterion 3, first half: read at most one base header's worth, and
     // never past the end of the source. A fixed 257-byte read — the whole
     // range a `u8` length field can describe, and comfortably more than
@@ -726,8 +787,108 @@ fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option
     // Criterion 2.
     match base[HEADER_LEVEL_I] {
         level @ (0 | 1) => parse_level_0_or_1(src, offset, file_len, &base, method, level),
-        2 => parse_level_2(src, offset, file_len, &base, method),
+        2 => match parse_level_2(src, offset, file_len, &base, method) {
+            Level2::Header(header) => Some(header),
+            Level2::NoCommonHeader => {
+                seen.level_2_without_common_header = true;
+                None
+            }
+            Level2::NotAHeader => None,
+        },
+        3 => {
+            // **Ruling S-V.** Level 3 is not parsed — see this module's doc
+            // — but it IS recognised, on evidence strong enough that saying
+            // so cannot be a coincidence. `delharc` requires a level-3
+            // header to open with the bytes `4, 0` (`parser.rs:259-264`
+            // raises "invalid header" otherwise: the word-size field is
+            // always 4 and the byte after it always 0), so a sighting needs
+            // the five-byte method identifier AND sixteen more structural
+            // bits — about one chance in 2^56 in random bytes.
+            //
+            // Recognised, never reported as a candidate: there is no level-3
+            // parser here, so there is no payload position to hand back.
+            // What it buys is a RUN that can name the limitation instead of
+            // answering "nothing recoverable in this archive".
+            if base[HEADER_LEN_I] == 4 && base[HEADER_CSUM_I] == 0 {
+                seen.level_3 = true;
+            }
+            None
+        }
         _ => None,
+    }
+}
+
+/// Header shapes the scan RECOGNISED and has no gate for — Ruling S-V.
+///
+/// # Why this exists rather than a silent `None`
+///
+/// Ruling S-U closed a population and left its own class open. On a HEALTHY
+/// archive whose headers this scanner cannot gate, `stuffr list` printed the
+/// entry at exit 0 while `stuffr salvage --list` answered `the scan found
+/// nothing recoverable in this archive` at **exit 5** — a claim about the
+/// ARCHIVE where the truth is a claim about the BUILD, which inverts this
+/// project's own convention (`entries.rs`'s `salvage_scan` spends exit 3 on
+/// exactly that distinction, "a statement about this build rather than about
+/// the archive"). Documenting it in `examples.txt` was not enough: nothing
+/// at runtime told a user which of the two situations they were in.
+///
+/// [`salvage_lha`] now turns a scan that recovered NOTHING while seeing one
+/// of these into [`Error::Unsupported`] — exit 3 — naming the level and what
+/// is missing.
+///
+/// # Both flags are set on strong structural evidence, never on a guess
+///
+/// That matters more here than anywhere else in this module: a false
+/// sighting would turn an honest "this archive holds nothing recoverable"
+/// into a confident, wrong claim about header levels. So
+/// [`Self::level_3`] needs `delharc`'s own mandated `4, 0` prefix behind the
+/// method identifier, and [`Self::level_2_without_common_header`] needs a
+/// full level-2 parse to have succeeded at everything EXCEPT the checksum —
+/// the declared total consistent, the extension chain terminating exactly
+/// where the header said, and a name recovered from it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UngateableSightings {
+    /// A level-2 header whose extension chain carried no `EXT_HEADER_COMMON`
+    /// (`0x00`) header, and therefore no checksum at any strength.
+    level_2_without_common_header: bool,
+    /// A level-3 header, which this build has no parser for at all.
+    level_3: bool,
+}
+
+impl UngateableSightings {
+    fn any(self) -> bool {
+        self.level_2_without_common_header || self.level_3
+    }
+
+    /// The sentence a run reports when it recovered nothing and saw one of
+    /// these. Names the level and what is missing, and says plainly that
+    /// the ordinary verbs still read the archive — which is the whole
+    /// difference between this and "nothing recoverable".
+    fn refusal(self) -> String {
+        let mut shapes: Vec<&str> = Vec::new();
+        if self.level_2_without_common_header {
+            shapes.push(
+                "level-2 headers carrying no `common` (0x00) extension header, which is where \
+                 the CRC-16 this scan gates on lives",
+            );
+        }
+        if self.level_3 {
+            shapes.push(
+                "level-3 headers, whose 32-bit length fields and 4-byte extension counters need \
+                 a parser this build does not have",
+            );
+        }
+        format!(
+            "this build's LHA salvage scanner recognised {} but has no gate for {}; the \
+             archive itself may be perfectly readable — `stuffr list` and `stuffr unpack` \
+             handle these headers normally, and it is the SCAN that stops here",
+            if shapes.len() == 1 {
+                "a header shape"
+            } else {
+                "header shapes"
+            },
+            shapes.join("; and "),
+        )
     }
 }
 
@@ -844,7 +1005,9 @@ fn parse_level_0_or_1(
     Some(EntryHeader {
         method,
         declared_len,
-        original_size,
+        // Levels 0 and 1 have no 64-bit override; the base header's `u32` is
+        // the whole of what they can say.
+        original_size: u64::from(original_size),
         file_crc,
         mtime: lha_mtime(last_modified),
         name,
@@ -910,9 +1073,22 @@ fn parse_level_2(
     file_len: u64,
     base: &[u8],
     method: Method,
-) -> Option<EntryHeader> {
+) -> Level2 {
+    // Every `?` in the body below means "that field is not there", which is
+    // the same answer as every other structural failure: not a header.
+    // Folded once, here, rather than spelled out at each site.
+    parse_level_2_inner(src, offset, file_len, base, method).unwrap_or(Level2::NotAHeader)
+}
+
+fn parse_level_2_inner(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    base: &[u8],
+    method: Method,
+) -> Option<Level2> {
     if base.len() < LEVEL2_BASE_LEN {
-        return None;
+        return Some(Level2::NotAHeader);
     }
     // Level 2 spends the two bytes levels 0 and 1 give to a length and a
     // checksum on ONE `u16` total header size (`parser.rs:257`:
@@ -923,7 +1099,7 @@ fn parse_level_2(
     // Criterion 3: the declared header has to be at least a base header, and
     // all of it has to be present.
     if total < LEVEL2_BASE_LEN as u64 || offset.checked_add(total)? > file_len {
-        return None;
+        return Some(Level2::NotAHeader);
     }
 
     let compressed_size = u32::from_le_bytes(
@@ -971,31 +1147,50 @@ fn parse_level_2(
         // `parser.rs:349-354`: the only other shape `delharc` tolerates is
         // the Osk packers' — a total that does not count its own two bytes.
         // Anything else is a header contradicting its own declared size.
-        return None;
+        return Some(Level2::NotAHeader);
+    }
+
+    // Criterion 5's analogue, checked BEFORE the checksum so a nameless run
+    // of bytes is never reported as a gateable header shape this build
+    // lacks — see [`Level2`] for why that ordering matters. Level 2 carries
+    // no name in the base header at all, so an empty one means the chain
+    // held no `0x01` and no `0x02` header, which no real writer produces.
+    let name = lha_name_from_parts(&walk.path, &walk.name);
+    if name.is_empty() {
+        return Some(Level2::NotAHeader);
     }
 
     // **Criterion 4 for level 2, and the one Step 5's level-2 twin
     // falsifies.** Mandatory: no common header means no checksum, and no
     // checksum means nothing separates this from five coincidental bytes.
-    if walk.common_crc? != running {
-        return None;
+    let Some(declared_crc) = walk.common_crc else {
+        // Everything structural held and there is simply no checksum to
+        // check — a shape this BUILD cannot gate rather than one this
+        // archive got wrong. Ruling S-V: reported upward so the run can say
+        // so by name instead of answering "nothing recoverable".
+        return Some(Level2::NoCommonHeader);
+    };
+    if declared_crc != running {
+        return Some(Level2::NotAHeader);
     }
 
-    // Criterion 5's analogue. Level 2 carries no name in the base header at
-    // all, so an empty one means the chain held no `0x01` and no `0x02`
-    // header — which no real writer produces.
-    let name = lha_name_from_parts(&walk.path, &walk.name);
-    if name.is_empty() {
-        return None;
-    }
+    // **Ruling S-W.** A `0x42` extension header overrides BOTH base fields
+    // at level >= 2 — that is how the format expresses an entry past the
+    // 4 GiB its `u32`s can hold — and `delharc` honours it, so `list` and
+    // `salvage` reported two different sizes for one healthy entry until
+    // this did too (measured: 5,000 against 100).
+    let (compressed_size, original_size) = match walk.msdos_size {
+        Some((compressed, original)) => (compressed, original),
+        None => (u64::from(compressed_size), u64::from(original_size)),
+    };
 
-    Some(EntryHeader {
+    Some(Level2::Header(EntryHeader {
         method,
         // NOT reduced by the chain: level 1's size field is the skip size and
         // level 2's is the compressed length itself, which is exactly why
         // `delharc` subtracts the extras for level 1 ALONE
         // (`parser.rs:365-368`).
-        declared_len: u64::from(compressed_size),
+        declared_len: compressed_size,
         original_size,
         file_crc,
         // A Unix timestamp in seconds, not an MS-DOS word — `delharc`'s
@@ -1003,7 +1198,24 @@ fn parse_level_2(
         mtime: Some(UNIX_EPOCH + Duration::from_secs(u64::from(unix_time))),
         name,
         payload_start: offset.checked_add(consumed)?,
-    })
+    }))
+}
+
+/// What [`parse_level_2`] made of the bytes at an offset.
+///
+/// Three answers rather than two, because Ruling S-V turns on the middle
+/// one: "these bytes are not a header" and "these bytes ARE a header this
+/// build has no gate for" lead to opposite things being said to a user, and
+/// an `Option` cannot tell them apart.
+enum Level2 {
+    Header(EntryHeader),
+    /// Everything structural held — the declared total is consistent, the
+    /// extension chain walked to its terminator exactly where the header
+    /// said it would, and a name came out of it — and the chain carried no
+    /// `EXT_HEADER_COMMON` header, so there is no checksum at any strength
+    /// to gate on. See [`UngateableSightings`].
+    NoCommonHeader,
+    NotAHeader,
 }
 
 /// What an extra-header chain walk recovered.
@@ -1021,6 +1233,20 @@ struct ExtraChain {
     /// practice and for a level-2 one whose writer omitted it — which
     /// [`parse_level_2`] refuses, since that is its entire gate.
     common_crc: Option<u16>,
+    /// The `0x42` ("MS-DOS size") extra header's `(compressed, original)`
+    /// pair, if the chain carried one — Ruling S-W. **64-bit**, where the
+    /// base header's own fields are `u32`, which is the entire reason the
+    /// header exists: it is how a level-2 archive expresses an entry past
+    /// 4 GiB. `delharc` lets it override BOTH base fields at level >= 2
+    /// (`parser.rs:325-330`), and [`parse_level_2`] now does the same.
+    ///
+    /// Read from `buf[1..]` — the header INCLUDING its trailing next-length
+    /// field — rather than from the name/path arms' `buf[..len - 2]`,
+    /// because that is the slice `delharc` matches on for this arm. The two
+    /// splits are different on purpose: `raw_pathname` reads names through
+    /// `iter_extra`, which strips the counter, and `LhaHeader::read` reads
+    /// this one through the full buffer, which does not.
+    msdos_size: Option<(u64, u64)>,
     /// The running CRC-16/ARC over every byte walked, continued from the
     /// caller's seed, **with the common header's own two checksum bytes
     /// replaced by zeros** — the order and the substitution `delharc`'s
@@ -1054,6 +1280,7 @@ fn walk_extra_headers(
         name: Vec::new(),
         path: Vec::new(),
         common_crc: None,
+        msdos_size: None,
         crc: crc_seed,
     };
     let mut pos = start;
@@ -1095,15 +1322,38 @@ fn walk_extra_headers(
                 // The checksum covers the header with its OWN two bytes
                 // zeroed, so they are lifted out and zeroed before this
                 // header joins the running sum — `parser.rs:306-317`.
-                // A common header too short to hold them carries no CRC at
-                // all, which for level 2 is a refusal one line up in
-                // `parse_level_2` rather than a decision here.
+                //
+                // The `get` cannot fail: `MIN_EXTRA_HEADER` is 3, so `buf`
+                // always holds these two bytes. On a MINIMAL 3-byte common
+                // header they are the trailing next-length field rather than
+                // a checksum — **and `delharc` reads exactly the same two
+                // bytes** (`data.get_mut(0..2)` over a `data` that includes
+                // that field, `parser.rs:311-316`), then terminates the
+                // chain on the zeroed value. Mirrored rather than corrected:
+                // a divergence here is a divergence from the reader beside
+                // us, which is worse than sharing its quirk.
                 let crc_bytes = buf.get(1..3)?;
                 chain.common_crc = Some(u16::from_le_bytes(crc_bytes.try_into().ok()?));
                 buf[1] = 0;
                 buf[2] = 0;
             }
             _ => {}
+        }
+        // **Ruling S-W**, and matched on the FULL buffer rather than the
+        // name/path arms' `buf[..len - 2]`, because that is the slice
+        // `delharc`'s own `LhaHeader::read` matches for this header
+        // (`parser.rs:325-330`, `data.len() >= 16` over a `data` that
+        // includes the trailing next-length field). Mirrored exactly,
+        // overlap and all: diverging here is how `list` and `salvage` came
+        // to report two different sizes for one healthy entry.
+        if buf[0] == delharc::header::ext::EXT_HEADER_MSDOS_SIZE
+            && let Some(data) = buf.get(1..len)
+            && data.len() >= 16
+        {
+            chain.msdos_size = Some((
+                u64::from_le_bytes(data[0..8].try_into().ok()?),
+                u64::from_le_bytes(data[8..16].try_into().ok()?),
+            ));
         }
         chain.crc = crc16_arc_continued(chain.crc, &buf[..len]);
 
@@ -1115,8 +1365,13 @@ fn walk_extra_headers(
 }
 
 /// Turns a gated [`EntryHeader`] into the [`Candidate`] the engine annotates.
-fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<Candidate> {
-    let header = parse_header_at(src, offset, file_len)?;
+fn read_candidate_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    seen: &mut UngateableSightings,
+) -> Option<Candidate> {
+    let header = parse_header_at(src, offset, file_len, seen)?;
 
     let declared = header.declared_len;
     let available_len = match header.payload_start.checked_add(declared) {
@@ -1135,7 +1390,7 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
     };
 
     let mut meta = EntryMeta::file(header.name.clone());
-    meta.size = Some(u64::from(header.original_size));
+    meta.size = Some(header.original_size);
     meta.compressed_size = Some(declared);
     meta.kind = if header.method.is_directory() {
         EntryKind::Dir
@@ -1524,7 +1779,29 @@ fn recover_the_last_chunk(
 /// raw scan is the only source there is.
 pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
     let mut scanner = LhaSalvage::new();
-    salvage_all(&mut scanner, src, policy)
+    let outcome = salvage_all(&mut scanner, src, policy)?;
+
+    // **Ruling S-V.** A run that recovered NOTHING while recognising a
+    // header shape it cannot gate must not fall through to the engine's
+    // empty-outcome path, which the CLI reports as `the scan found nothing
+    // recoverable in this archive` at exit 5 — a claim about the ARCHIVE
+    // where the truth is a claim about the BUILD. `Error::Unsupported` is
+    // exit 3, the code `entries.rs`'s own `salvage_scan` already spends on
+    // exactly this distinction.
+    //
+    // **Only when nothing came back**, and that condition is load-bearing
+    // rather than defensive: an `Err` out of here discards every entry the
+    // run recovered, which is the one thing this verb exists not to do. A
+    // MIXED archive — some headers gateable, some not — therefore still
+    // reports what it recovered, at its ordinary exit code. That is an
+    // incompleteness rather than a contradiction: nothing false is claimed,
+    // where exit 5 on a healthy file was. Saying more would need a note
+    // channel [`SalvageOutcome`] does not have, and no LHA writer mixes
+    // header levels within one archive.
+    if outcome.entries.is_empty() && scanner.seen.any() {
+        return Err(Error::Unsupported(scanner.seen.refusal()));
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -1656,6 +1933,95 @@ mod tests {
 
     fn build_level2(name: &[u8], method: &[u8; 5], content: &[u8]) -> Vec<u8> {
         build_level2_with(name, method, content, true)
+    }
+
+    /// A level-2 archive whose chain carries an `EXT_HEADER_MSDOS_SIZE`
+    /// (`0x42`) header declaring the REAL lengths, while the base header's
+    /// own `u32` fields declare `base_lie` — Ruling S-W's fixture, and the
+    /// review's own numbers.
+    ///
+    /// The `0x42` payload is two little-endian `u64`s, compressed first, and
+    /// the whole header goes inside the common CRC exactly like every other.
+    fn build_level2_with_msdos_size(name: &[u8], content: &[u8], base_lie: u32) -> Vec<u8> {
+        let common_len = 1 + 2 + 2;
+        let size_len = 1 + 16 + 2;
+        let name_len = 1 + name.len() + 2;
+        let total = LEVEL2_BASE_LEN + common_len + size_len + name_len;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&(total as u16).to_le_bytes());
+        header.extend_from_slice(b"-lh0-");
+        header.extend_from_slice(&base_lie.to_le_bytes());
+        header.extend_from_slice(&base_lie.to_le_bytes());
+        header.extend_from_slice(&1_000_000_000u32.to_le_bytes());
+        header.push(0x20);
+        header.push(2);
+        header.extend_from_slice(&crc16_arc(content).to_le_bytes());
+        header.push(b'U');
+        header.extend_from_slice(&(common_len as u16).to_le_bytes());
+        assert_eq!(header.len(), LEVEL2_BASE_LEN);
+
+        header.push(delharc::header::ext::EXT_HEADER_COMMON);
+        header.extend_from_slice(&0u16.to_le_bytes());
+        header.extend_from_slice(&(size_len as u16).to_le_bytes());
+
+        header.push(delharc::header::ext::EXT_HEADER_MSDOS_SIZE);
+        header.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        header.extend_from_slice(&(content.len() as u64).to_le_bytes());
+        header.extend_from_slice(&(name_len as u16).to_le_bytes());
+
+        header.push(delharc::header::ext::EXT_HEADER_FILENAME);
+        header.extend_from_slice(name);
+        header.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(header.len(), total);
+
+        let crc = crc16_arc(&header);
+        header[LEVEL2_BASE_LEN + 1..LEVEL2_BASE_LEN + 3].copy_from_slice(&crc.to_le_bytes());
+
+        let mut out = header;
+        out.extend_from_slice(content);
+        out.push(0);
+        out
+    }
+
+    /// A LEVEL-3 header — the shape this scanner deliberately does not parse
+    /// (Ruling S-V), built only so the refusal can be tested against an
+    /// archive `delharc` genuinely reads.
+    ///
+    /// Layout from `delharc`'s own parser, which is all this builder needs
+    /// to be right about: the first two bytes are the mandated `4, 0`
+    /// (`parser.rs:259-264`), the base header is the level-0/1 one through
+    /// OS-TYPE, and then TWO `u32`s — the whole header's length and the
+    /// first extension header's — where level 2 has one `u16`
+    /// (`parser.rs:260-262`). Extension headers use 4-byte counters at this
+    /// level, so the chain's terminator is a `u32` zero.
+    fn build_level3(name: &[u8], content: &[u8]) -> Vec<u8> {
+        let name_len = 1 + name.len() + 4;
+        let total = 32 + name_len;
+
+        let mut out = Vec::new();
+        out.push(4); // word size, mandated
+        out.push(0); // and the byte after it, likewise
+        out.extend_from_slice(b"-lh0-");
+        out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        out.extend_from_slice(&1_000_000_000u32.to_le_bytes());
+        out.push(0x20); // reserved
+        out.push(3); // header level
+        out.extend_from_slice(&crc16_arc(content).to_le_bytes());
+        out.push(b'U'); // OS-TYPE
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&(name_len as u32).to_le_bytes());
+        assert_eq!(out.len(), 32);
+
+        out.push(delharc::header::ext::EXT_HEADER_FILENAME);
+        out.extend_from_slice(name);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(out.len(), total);
+
+        out.extend_from_slice(content);
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
     }
 
     /// A level-1 entry carrying a real extra-header chain: a `0x02` path
@@ -1983,10 +2349,16 @@ mod tests {
     /// The one place this scanner is deliberately STRICTER than `delharc`:
     /// a level-2 header carrying no common extension header at all parses
     /// fine for the reader and is refused here, because there is then no
-    /// checksum to tell a real header from five coincidental bytes. Recorded
-    /// as a test so the narrowing is visible rather than implied.
+    /// checksum to tell a real header from five coincidental bytes.
+    ///
+    /// **Ruling S-V changed what the refusal SAYS, not whether it happens.**
+    /// The strictness is upheld; what was wrong was answering it with the
+    /// engine's empty outcome, which the CLI reports as `the scan found
+    /// nothing recoverable in this archive` at exit 5 — a claim about the
+    /// archive, on a file `stuffr list` reads at exit 0. It is now
+    /// `Error::Unsupported` (exit 3), naming the level and what is missing.
     #[test]
-    fn a_level_2_header_with_no_common_extension_header_is_not_scanned() {
+    fn a_level_2_header_with_no_common_extension_header_is_refused_by_name() {
         let bytes = build_level2(b"nocrc.txt", b"-lh0-", b"payload");
         // Point the base header's first-extra-header field straight at the
         // FILENAME header, skipping the common one, and shorten the declared
@@ -2008,10 +2380,108 @@ mod tests {
                 .expect("delharc accepts a level-2 header with no common CRC")
                 .is_some()
         );
+        let err = salvage_lha(&mut Cursor::new(trimmed.clone()), &SalvagePolicy::default())
+            .expect_err(
+                "a recognised header shape with no gate must be NAMED, never answered with the \
+             empty outcome the CLI reports as `nothing recoverable` at exit 5",
+            );
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("level-2"), "{message}");
+        assert!(message.contains("common"), "{message}");
         assert!(
-            scan(&trimmed).entries.is_empty(),
-            "no common CRC-16 means no gate, and a scanner with no gate is worse than none"
+            message.contains("stuffr list"),
+            "the message must say the archive itself may be fine: {message}"
         );
+    }
+
+    /// **Ruling S-V's other half.** A healthy LEVEL-3 archive: `delharc`
+    /// reads it, so `stuffr list` prints the entry at exit 0, and this
+    /// scanner has no parser for it. Before the ruling that combination
+    /// produced `the scan found nothing recoverable in this archive` at exit
+    /// 5 — the tool contradicting itself on a file with nothing wrong with
+    /// it, which is precisely the defect Ruling S-U named and closed for one
+    /// population only.
+    #[test]
+    fn a_level_3_header_is_refused_by_name_rather_than_reported_as_an_empty_archive() {
+        let bytes = build_level3(b"level3.txt", b"level three payload");
+
+        // The CONTROL, and the whole point: `delharc` — the parser
+        // `stuffr list` reads through — accepts this archive.
+        assert!(
+            delharc::header::LhaHeader::read(&mut Cursor::new(bytes.clone()))
+                .expect("delharc reads level 3")
+                .is_some()
+        );
+
+        let err = salvage_lha(&mut Cursor::new(bytes), &SalvagePolicy::default()).expect_err(
+            "a level-3 archive the reader handles must not be reported as holding nothing",
+        );
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("level-3"), "{message}");
+        assert!(message.contains("stuffr list"), "{message}");
+    }
+
+    /// The negative double for both refusals above, and the one that keeps
+    /// them from being a new way to lie: a sighting must rest on structure,
+    /// never on a plausible-looking byte. Random noise carrying method
+    /// identifiers must still answer the ordinary empty outcome — if it did
+    /// not, `salvage` would start confidently naming header levels in files
+    /// that hold none.
+    #[test]
+    fn noise_never_produces_an_ungateable_sighting() {
+        let noise = noise_with_seeded_methods(1 << 20);
+        let out = salvage_lha(&mut Cursor::new(noise), &SalvagePolicy::default()).expect(
+            "noise must reach the ordinary empty outcome, never a confident claim about \
+             header levels this build cannot gate",
+        );
+        assert!(out.entries.is_empty());
+    }
+
+    /// **Ruling S-W.** A `0x42` (`EXT_HEADER_MSDOS_SIZE`) extension header
+    /// overrides BOTH size fields at level >= 2, and `delharc` honours it —
+    /// so until this did too, `stuffr list` and `stuffr salvage` reported
+    /// two different sizes for one healthy entry (measured: 5,000 against
+    /// 100).
+    ///
+    /// The base header here declares 100 and the `0x42` header 5,000, which
+    /// is the review's own fixture. Both figures are asserted, because
+    /// getting only the compressed one right would still leave `-C` writing
+    /// the wrong number of bytes.
+    #[test]
+    fn a_level_2_msdos_size_header_overrides_both_base_fields() {
+        let content = vec![0xEEu8; 5_000];
+        let bytes = build_level2_with_msdos_size(b"big.txt", &content, 100);
+        let out = scan(&bytes);
+        assert_eq!(out.entries.len(), 1, "{:?}", out.entries);
+        assert_eq!(
+            out.entries[0].meta.compressed_size,
+            Some(5_000),
+            "the 0x42 header's 64-bit compressed length must win over the base header's u32"
+        );
+        assert_eq!(
+            out.entries[0].meta.size,
+            Some(5_000),
+            "and so must its decoded length — `-C` sizes the written file from this"
+        );
+        assert_eq!(
+            out.entries[0].status,
+            SalvageStatus::Intact,
+            "with the right length the payload verifies; with the base header's 100 it could \
+             not have"
+        );
+    }
+
+    /// The other side of the branch: with no `0x42` header the base fields
+    /// stand, so the test above cannot be passing because the override runs
+    /// unconditionally.
+    #[test]
+    fn without_an_msdos_size_header_the_base_fields_stand() {
+        let bytes = build_level2(b"small.txt", b"-lh0-", b"0123456789");
+        let out = scan(&bytes);
+        assert_eq!(out.entries[0].meta.compressed_size, Some(10));
+        assert_eq!(out.entries[0].meta.size, Some(10));
     }
 
     /// Level 3 is deliberately out of scope — see this module's doc. Pinned
@@ -2088,11 +2558,16 @@ mod tests {
                 build_level2(b"dir\xffdeep.txt", b"-lh0-", b""),
                 "built level 2, empty payload and a path-shaped name",
             ),
+            (
+                build_level2_with_msdos_size(b"big.txt", &vec![0xEEu8; 5_000], 100),
+                "built level 2 with an EXT_HEADER_MSDOS_SIZE override (Ruling S-W)",
+            ),
         ];
 
         for (bytes, label) in cases {
             let mut ours = Cursor::new(bytes.clone());
-            let mine = parse_header_at(&mut ours, 0, bytes.len() as u64)
+            let mut seen = UngateableSightings::default();
+            let mine = parse_header_at(&mut ours, 0, bytes.len() as u64, &mut seen)
                 .unwrap_or_else(|| panic!("{label}: this module's parser must accept it"));
 
             let mut theirs = Cursor::new(bytes.clone());
@@ -2119,8 +2594,7 @@ mod tests {
                 "{label}: compressed payload length (level 1's skip size minus its chain)"
             );
             assert_eq!(
-                u64::from(mine.original_size),
-                header.original_size,
+                mine.original_size, header.original_size,
                 "{label}: original size"
             );
             assert_eq!(mine.file_crc, header.file_crc, "{label}: file CRC-16");

@@ -718,14 +718,21 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   `list` reaches entry N only by having parsed entries 1..N and ONE
   damaged header ends the archive for everything behind it. `salvage`
   finds each header on its own. Header levels 0, 1 and 2 are scanned.
-  Two limits worth knowing before you meet them: header level 3 is not
-  scanned (it re-sizes every length field to 32 bits and is a different
-  parser — `list`/`unpack` still read it normally), and an entry using a
-  compression method this build has no decoder for (`-lhx-`) is reported
-  but never written, as `[unverified: undecodable method]` at exit 3.
-  A level-2 header with no "common" extension header is not scanned
-  either: that header carries the CRC-16 this scan gates on, and without
-  it there is nothing to tell a real header from five coincidental bytes.
+
+  Two header shapes are not, and `salvage` now SAYS SO rather than
+  reporting an empty archive: header level 3 (it re-sizes every length
+  field to 32 bits and needs a different parser), and a level-2 header
+  carrying no "common" extension header (that header holds the CRC-16
+  this scan gates on, and without it there is nothing to tell a real
+  header from five coincidental bytes). Meeting either is exit 3 with a
+  message naming the level — a statement about this build, never about
+  your archive, which `list` and `unpack` still read normally. Exit 5,
+  "the scan found nothing recoverable", is reserved for an archive that
+  really does hold nothing this build can recover.
+
+  One more limit: an entry using a compression method this build has no
+  decoder for (`-lhx-`) is reported but never written, as
+  `[unverified: undecodable method]` at exit 3.
 
   Three surface forms, one of which is required:
 

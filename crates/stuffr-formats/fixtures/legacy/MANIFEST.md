@@ -806,3 +806,35 @@ the raw bytes themselves, not introduced by this measurement. **The
 anti-vacuity double is present and confirmed for both formats — Ruling D's
 concern (that only the ZOO side might have one) does not hold: `unarc-rs`
 ships the ARC-side twin too, and it was borrowed.**
+
+---
+
+## `tools/build_level_2_and_3_lha.py` — a generator, not a fixture
+
+Salvage Stage 2 Task 5, fix round 2. **Nothing under `tools/` is a fixture
+and nothing here is committed output**: this script writes throwaway LHA
+**level-2 and level-3** archives, and the repository holds no committed
+archive of either level (`sample.lzh` is level 1).
+
+It is checked in because the task report cited it as a third, independent
+derivation of the level-2/3 header layout — and evidence a future reader
+cannot re-run is not evidence. The other two derivations are `delharc
+0.6.2`'s `src/header/parser.rs`, cited by line in `legacy/lha_salvage.rs`'s
+module doc, and that module's own parser.
+
+**Its provenance is the weakest kind this directory carries**, and is stated
+rather than implied: hand-written from the published layout, by the same
+author as the parser it was used to check — the same standing `sample.arj`
+has above. It is a second reading, not an outside witness. What IS an outside
+check runs on every build: `lha_salvage.rs`'s
+`the_header_geometry_agrees_with_delharcs_own_parser` parses the same shapes
+with `delharc` as well as with this project's parser and requires byte-exact
+agreement on where each payload starts.
+
+Nothing in the test suite runs this script. It exists so the CLI-level
+measurements in the task report — `stuffr list` against `stuffr salvage`, on
+healthy level-2 and level-3 files — can be reproduced:
+
+```
+python3 crates/stuffr-formats/fixtures/legacy/tools/build_level_2_and_3_lha.py OUTDIR
+```
