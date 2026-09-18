@@ -385,7 +385,7 @@ impl Seek for ArjSeekAdapter {
 /// otherwise force this build to allocate for one entry. Fixed rather than
 /// derived from `DecodeOpts::memory_limit`; see this module's doc for why a
 /// container has no such knob to read.
-const MAX_ARJ_ENTRY_LEN: u64 = 256 * 1024 * 1024;
+pub(super) const MAX_ARJ_ENTRY_LEN: u64 = 256 * 1024 * 1024;
 
 /// Refuses a header field that would drive an allocation past
 /// [`MAX_ARJ_ENTRY_LEN`], before that allocation is ever attempted.
@@ -421,7 +421,7 @@ fn classify_arj_io(e: io::Error) -> Error {
 /// `legacy::arc`; only the unpacking of ARJ's own fields is here, because
 /// the two formats pack the halves of their `u32` in opposite orders and
 /// that is the detail each container has to get right for itself.
-fn dos_mtime(dt: DosDateTime) -> Option<SystemTime> {
+pub(super) fn dos_mtime(dt: DosDateTime) -> Option<SystemTime> {
     dos::mtime(
         i64::from(dt.year()),
         u32::from(dt.month()),
@@ -623,7 +623,7 @@ impl ArchiveRead for ArjRead {
 /// 30 is also at or below `unarj-rs`'s own `STD_HDR_SIZE` (30) and
 /// `FIRST_HDR_SIZE` (34) thresholds, so that crate reads neither header's
 /// conditional extension block — which is why this writer emits none.
-const ARJ_FIRST_HDR_SIZE: u8 = 30;
+pub(super) const ARJ_FIRST_HDR_SIZE: u8 = 30;
 
 /// Spec, both header tables: "maximum header size is 2600" — of the *basic
 /// header size*, i.e. `first_hdr_size + strlen(filename) + 1 +
@@ -634,7 +634,7 @@ const ARJ_FIRST_HDR_SIZE: u8 = 30;
 /// `unarj_rs::arj_archive::read_header` enforces the same ceiling on the way
 /// in ("Header size is too big", `io::ErrorKind::InvalidData`), so an
 /// archive written past it would be one stuffr itself reports as corrupt.
-const MAX_ARJ_HEADER_SIZE: usize = 2600;
+pub(super) const MAX_ARJ_HEADER_SIZE: usize = 2600;
 
 /// The longest name this writer will store, from the identity above with an
 /// empty comment: 2600 - 30 (`first_hdr_size`) - 1 (name NUL) - 1 (comment
@@ -650,7 +650,7 @@ const MAX_ARJ_NAME_LEN: usize = MAX_ARJ_HEADER_SIZE - ARJ_FIRST_HDR_SIZE as usiz
 /// Chosen for what it means to a READER of `file access mode`: that field is
 /// host-defined, and only `2` makes it a unix mode. See [`unix_mode`], the
 /// read-side twin of this choice.
-const HOST_OS_UNIX: u8 = 2;
+pub(super) const HOST_OS_UNIX: u8 = 2;
 
 /// Spec, MAIN header table only: "file type (must equal 2)".
 ///
@@ -658,7 +658,7 @@ const HOST_OS_UNIX: u8 = 2;
 /// `MainHeader::file_type` and never looks at it — which is how Phase 3b
 /// shipped a fixture with `0` here that every test in this repository
 /// accepted. Pinned by `spec_constraints_the_reader_never_checks`.
-const MAIN_HEADER_FILE_TYPE: u8 = 2;
+pub(super) const MAIN_HEADER_FILE_TYPE: u8 = 2;
 
 /// Spec, LOCAL file header table: "arj flags ... (0x10 = PATHSYM_FLAG)
 /// indicates filename translated ("\" changed to "/")".
@@ -681,7 +681,7 @@ const METHOD_STORED: u8 = 0;
 /// Spec, LOCAL file header table: "file type (0 = binary, 1 = 7-bit text)
 /// (3 = directory, 4 = volume label)".
 const FILE_TYPE_BINARY: u8 = 0;
-const FILE_TYPE_DIRECTORY: u8 = 3;
+pub(super) const FILE_TYPE_DIRECTORY: u8 = 3;
 
 /// `filespec position in filename` — 2 bytes in BOTH header tables, written
 /// as 0 by this encoder on every header, and that is a RULING, not an
@@ -757,7 +757,7 @@ const FILESPEC_POSITION: u16 = 0;
 /// makes for its own copy. Both are pinned to the identical published check
 /// value, so a transcription error in one cannot silently agree with a
 /// transcription error in the other.
-fn crc32_ieee(data: &[u8]) -> u32 {
+pub(super) fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
         crc ^= u32::from(b);

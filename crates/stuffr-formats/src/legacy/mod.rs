@@ -28,6 +28,16 @@ pub mod arc;
 pub mod arc_salvage;
 #[cfg(feature = "arj")]
 pub mod arj;
+// Salvage Stage 2 Task 6: scans an ARJ archive for local file headers
+// directly, rather than walking forward from the main header the way
+// `unarj_rs::ArjArchieve` does — one damaged header ends that walk and every
+// entry behind it with it. Owns its own header parser for the reason
+// `lha_salvage.rs` does: `arj.rs` delegates every read to `unarj-rs`, whose
+// `LocalFileHeader::load_from` indexes unconditionally and cannot be pointed
+// at hostile bytes, and whose basic-header CRC-32 is the gate this crate has
+// to be able to falsify.
+#[cfg(feature = "arj")]
+pub mod arj_salvage;
 // The least-significant-bit-first bit reader ARC's two bitstreams and ZOO's
 // `lzd` all read through. See its own module doc for why THIS is shared
 // where the LZW engines built on it are deliberately not.
@@ -42,7 +52,18 @@ pub mod compress_z;
 // whenever `zip` alone is, not only alongside `lha`/`arc`/`zoo`.
 // `pub(crate)`, not private: `../salvage_verify.rs` — a sibling of `legacy`,
 // not a descendant of it — is the second caller this task adds.
-#[cfg(any(feature = "lha", feature = "arc", feature = "zoo", feature = "zip"))]
+// `arj` joined in Task 6, for the same reason `zip` did: its salvage scanner
+// goes through `../salvage_verify.rs`, whose `Verifier::Crc16` arm reaches
+// `crc16_arc_continued` on a RUNTIME match rather than a feature one — so
+// this module must compile whenever that one does, even though no ARJ header
+// carries a CRC-16 of its own.
+#[cfg(any(
+    feature = "lha",
+    feature = "arc",
+    feature = "zoo",
+    feature = "zip",
+    feature = "arj"
+))]
 pub(crate) mod crc;
 // The DOS packed-timestamp helper every date-carrying legacy container uses.
 // `lha` joined this list in Phase 3c Task 6: its encoder is the first

@@ -228,15 +228,21 @@ pub mod zip_salvage;
 // Task 3 (`arc`) was the first to widen it and Task 4 (`zoo`) the second,
 // exactly as that task's own doc comment predicted.
 //
-// **`lha` was added in Task 6, and its absence was a real, measured build
-// break, not a tidy-up.** `legacy::lha_salvage` (Task 5)
+// **`lha` and `arj` were added in Task 6, and `lha`'s absence was a real,
+// measured build break, not a tidy-up.** `legacy::lha_salvage` (Task 5)
 // calls `crate::salvage_verify::stream_verify` and the gate above never
 // named `lha`, so `cargo check -p stuffr-formats --no-default-features
 // --features lha` failed with `cannot find salvage_verify in crate` —
 // invisible to `make check`, whose two legs are `--all-features` and the
 // facade's `pure` tier, and neither builds this crate with one legacy
 // format alone.
-#[cfg(any(feature = "zip", feature = "arc", feature = "zoo", feature = "lha"))]
+#[cfg(any(
+    feature = "zip",
+    feature = "arc",
+    feature = "zoo",
+    feature = "lha",
+    feature = "arj"
+))]
 mod salvage_verify;
 #[cfg(feature = "zlib")]
 pub mod zlib;
