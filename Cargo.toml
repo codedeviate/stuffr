@@ -201,10 +201,9 @@ clap = { version = "4", features = ["derive"] }
 # will not reach us until the MSRV moves; revisit this pin when it does, not
 # before.
 #
-# `unarj-rs` — TWO reasons now, and the second is load-bearing behaviour, not
-# just an MSRV guard. Enumerated rather than summarised, the way `ar = "=0.9.0"`
-# enumerates its eight, because a fact nobody wrote down is a fact that desyncs
-# silently:
+# `unarj-rs` — THREE reasons now, and only the first is an MSRV guard.
+# Enumerated rather than summarised, the way `ar = "=0.9.0"` enumerates its
+# eight, because a fact nobody wrote down is a fact that desyncs silently:
 #
 #   1. It declares no `rust-version` at all, so a patch release can raise the
 #      MSRV with nothing to announce it (the `ruzstd` 0.8.2 failure mode under
@@ -226,6 +225,19 @@ clap = { version = "4", features = ["derive"] }
 #      this is documentation of an unobvious dependency rather than an open
 #      hole — but do not loosen the pin without re-reading `arj_archive.rs`
 #      for that comparison.
+#   3. This exact version PANICS on four CLI-reachable inputs, the smallest
+#      eleven bytes long: `main_header.rs:68`, `local_file_header.rs:95`,
+#      `local_file_header.rs:128`/`:129` and `decode_fastest.rs:38`. Salvage
+#      Stage 2 Task 6b put a guard in front of all four
+#      (`legacy/arj.rs`'s `ArjGuardedReader`), and that guard mirrors SIX
+#      private facts of 0.2.1 — enumerated in its own doc comment, not here,
+#      because they are read alongside the code that depends on them. Five
+#      fail safe if this pin moves: a panic returns, loudly, and a named test
+#      goes red. **Fact 1 does not** — `read_header`'s scan consumes both
+#      bytes of a `0x60` whose successor is not `0xEA`, and a guard that
+#      stopped agreeing would refuse VALID archives. Before loosening this
+#      pin, re-read `read_header`, both `load_from`s and `decode_fastest`
+#      line by line against the new source.
 delharc = { version = "=0.6.2", default-features = false, features = ["std", "lh1", "lz"] }
 unarj-rs = "=0.2.1"
 newtua-lzw-z = "=0.1.0"

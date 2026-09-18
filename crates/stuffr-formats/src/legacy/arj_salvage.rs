@@ -1096,16 +1096,19 @@ fn decoded_reader<'a, R: io::Read + 'a>(
 /// reaches the subtraction at all: the loop is `while res.len() <
 /// original_size` and the read fails first.
 ///
-/// **`arj.rs`'s ORDINARY reader is exposed to the same panic and this does
-/// not close it**: `ArjArchieve::read` performs the whole decode behind one
-/// call, with no way for a caller to inspect the payload's first byte first,
-/// so `stuffr list`/`cat`/`unpack` on a crafted method-4 archive still abort
-/// at exit 101. Recorded in this task's report as a finding for a follow-up
-/// rather than fixed here, because closing it means restructuring that
-/// reader off `ArjArchieve::read`, which is a change to the READ path and
-/// not to this scanner.
+/// **`arj.rs`'s ORDINARY reader was exposed to the same panic and now is
+/// not** — Task 6b. The bit itself lives there, in
+/// [`super::arj::opens_with_a_backreference`], and this function is its
+/// slice-shaped caller: one predicate, two readers, so a correction to the
+/// bit cannot reach `salvage` and miss `list`. That task also closed three
+/// further panics in the same crate's HEADER parsers, which is why the
+/// scanner's own gate (criteria 5 and 6) is no longer the only thing
+/// standing between `unarj-rs` and hostile bytes.
 fn starts_with_a_backreference(data: &[u8], original_size: u64) -> bool {
-    original_size > 0 && data.first().is_some_and(|b| b & 0x80 != 0)
+    original_size > 0
+        && data
+            .first()
+            .is_some_and(|&b| super::arj::opens_with_a_backreference(b))
 }
 
 /// Decides [`SalvageStatus`] for one candidate by decoding its payload

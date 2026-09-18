@@ -223,7 +223,9 @@
 //! routes `entries.rs`'s `by_index` fallback to a counted forward walk,
 //! the same as `tar`/`ar`/`cpio` deliberately raising `Unsupported` on a
 //! seekable source with no index of their own.
+use std::cell::RefCell;
 use std::io::{self, Read, Seek, SeekFrom};
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use unarj_rs::arj_archive::ArjArchieve;
@@ -241,12 +243,20 @@ use stuffr_core::{
 
 pub const ARJ: FormatId = FormatId::new("arj");
 
+/// The two bytes every ARJ header opens with — spec, both header tables:
+/// "header id (main and local file header) = 0x60 0xEA".
+///
+/// One table, three readers: the magic rule below, the end-of-archive
+/// marker the writer emits ([`ARJ_END_OF_ARCHIVE`]), and the guard's own
+/// scan ([`seek_past_the_next_header_id`]).
+const ARJ_HEADER_ID: [u8; 2] = [0x60, 0xEA];
+
 /// ARJ's header id, at offset 0 of both the main header and every local
 /// file header — see `fixtures/legacy/MANIFEST.md` for the full envelope
 /// this frames.
 const ARJ_MAGIC: &[MagicRule] = &[MagicRule {
     offset: 0,
-    bytes: &[0x60, 0xEA],
+    bytes: &ARJ_HEADER_ID,
     format: ARJ,
 }];
 
@@ -312,10 +322,16 @@ impl Container for Arj {
 
     fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
         let Resolved { source, report, .. } = resolved;
-        let adapter = ArjSeekAdapter(source);
-        let archive = ArjArchieve::new(adapter).map_err(classify_arj_io)?;
+        let src: SharedSource = Rc::new(RefCell::new(ArjGuardedReader { inner: source }));
+        // The MAIN header is parsed by `ArjArchieve::new` itself, by a
+        // parser of its own with its own fixed-prefix rule, and panics on
+        // the same two shapes a local header does — see
+        // `refuse_a_header_unarj_would_panic_on`.
+        refuse_a_header_unarj_would_panic_on(&mut src.borrow_mut(), HeaderShape::Main)?;
+        let archive = ArjArchieve::new(ArjSeekAdapter(Rc::clone(&src))).map_err(classify_arj_io)?;
         Ok(Box::new(ArjRead {
             archive,
+            src,
             report,
             done: false,
         }))
@@ -356,22 +372,405 @@ impl Container for Arj {
 /// unreachable in practice; it is reported as an I/O error rather than a
 /// panic because `Seek` has no other channel — the same choice `zip.rs`'s
 /// own `SeekAdapter` makes for the identical situation.
-struct ArjSeekAdapter(Box<dyn Source>);
+struct ArjSeekAdapter(SharedSource);
 
 impl Read for ArjSeekAdapter {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        self.0.borrow_mut().read(buf)
     }
 }
 
 impl Seek for ArjSeekAdapter {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.0.borrow_mut().seek(pos)
+    }
+}
+
+/// The ladder's source, shared between the [`ArjSeekAdapter`] that
+/// `ArjArchieve` owns and the [`ArjRead`] that owns the archive.
+///
+/// **This is what lets a guard run at all.** `ArjArchieve<T>` takes its
+/// reader by value into a PRIVATE field and exposes no accessor, so without
+/// this handle `ArjRead` could not look at one byte of the archive it is
+/// reading — and every guard below is a look at bytes `unarj-rs` is about
+/// to parse. `Rc`/`RefCell` rather than `Arc`/`Mutex` because the two
+/// holders live and die together inside one `Box<dyn ArchiveRead>`, which
+/// carries no `Send` bound, and because no call below holds a borrow across
+/// a call into the crate.
+type SharedSource = Rc<RefCell<ArjGuardedReader>>;
+
+/// Sits between the ladder's source and `unarj-rs` for the archive's whole
+/// lifetime, so every header that crate is about to parse — and the first
+/// byte of every method-4 payload it is about to decode — is inspected
+/// first. The shape `ar.rs`'s [`ArGuardedReader`] established, on a
+/// container that can seek.
+///
+/// [`ArGuardedReader`]: crate::ar
+///
+/// # Why a guard rather than a fix upstream
+///
+/// `unarj-rs` 0.2.1 panics on four distinct CLI-reachable inputs, and a
+/// panic is the one failure shape `stuffr_core::testing::
+/// check_error_is_classified` can NEVER see: it is not an `Error`, so the
+/// fuzz target aborts before the oracle runs. That is how all four survived
+/// a format fuzzed at 200,000 executions, and it is the same lesson
+/// `ar.rs`'s own 68-byte panic taught.
+///
+/// # The private facts of `unarj-rs` 0.2.1 this guard mirrors
+///
+/// The crate is pinned `=0.2.1` (see `Cargo.toml`'s own note, which pins it
+/// for a second reason: it declares no `rust-version`). **A `0.2.x` patch
+/// release that changes any of the six facts below desyncs this guard
+/// silently**, and the two failure directions are not equally bad:
+///
+/// 1. `arj_archive::read_header` finds a header by SCANNING for `0x60
+///    0xEA`, one byte at a time, resuming after the PAIR when the second
+///    byte is not `0xEA` — so `60 60 EA` holds no header id as far as that
+///    crate is concerned. [`seek_past_the_next_header_id`] reproduces that
+///    acceptance exactly; a scanner that merely looked for a two-byte
+///    window would find a header where the crate finds none, validate the
+///    wrong bytes, and could REFUSE A VALID ARCHIVE.
+/// 2. That scan runs from the reader's CURRENT position, and the position
+///    when `get_next_entry` is called is where the previous entry's payload
+///    ended — which is why the guard runs at exactly the two call sites
+///    below and not once over the whole file.
+/// 3. `read_header` answers an EMPTY content for a declared size of zero
+///    (end of archive), refuses a declared size over 2600 itself
+///    ([`MAX_ARJ_HEADER_SIZE`]), and verifies the content's CRC-32 BEFORE
+///    handing it to a parser. The guard reproduces all three so that it
+///    refuses only inputs the crate would otherwise reach a parser with —
+///    every other shape keeps the crate's own error, unchanged.
+/// 4. `MainHeader::load_from` consumes 30 fixed bytes, plus 4 more when the
+///    content's first byte (`first_hdr_size`) is >= 34.
+/// 5. `LocalFileHeader::load_from` consumes 30 fixed bytes, plus 4 more
+///    when `first_hdr_size` is > 30, plus 12 more when it is >= 46 — a
+///    DIFFERENT rule from the main header's, and not the spec's "the name
+///    starts at `first_hdr_size`" either (see `arj_salvage.rs`'s module
+///    doc, which does not call `load_from` at all for exactly this reason).
+///    Both parsers then read two NUL-terminated strings with a `while
+///    $x[0] != 0` loop that is bounded by nothing.
+/// 6. `decode_fastest` compares `back_ptr > res.len() - 1` with `res` empty
+///    on the first iteration — see
+///    [`refuse_a_method_4_payload_unarj_would_panic_on`].
+///
+/// The safe direction, if the pin ever moves and a fact goes stale, is a
+/// guard that refuses LESS than it should: a panic returns, loudly, and the
+/// tests named in each guard's doc go red. The unsafe direction is fact 1,
+/// which is why it is the one with a test of its own
+/// ([`tests::a_payload_holding_a_false_header_id_is_still_read`]).
+struct ArjGuardedReader {
+    inner: Box<dyn Source>,
+}
+
+impl ArjGuardedReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let seek: &mut dyn SeekRead = self
-            .0
+            .inner
             .as_seek()
             .ok_or_else(|| io::Error::other("arj: source reported seekable but cannot seek"))?;
         seek.seek(pos)
     }
+
+    /// Where `unarj-rs` will read from next. Only ever called between calls
+    /// into that crate, never during one.
+    fn position(&mut self) -> io::Result<u64> {
+        self.seek(SeekFrom::Current(0))
+    }
+
+    /// Fills `buf` exactly, or answers `false` — including for a genuine
+    /// I/O failure. Every caller below is a GUARD, and a guard that cannot
+    /// read the bytes it wanted to inspect has nothing to say: the crate
+    /// meets the same source a moment later and raises its own error for
+    /// it, which is the answer a user should get.
+    fn read_exactly(&mut self, buf: &mut [u8]) -> bool {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.read(&mut buf[filled..]) {
+                Ok(0) => return false,
+                Ok(n) => filled += n,
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+}
+
+/// Bytes read per [`seek_past_the_next_header_id`] chunk, so the scan's
+/// memory use does not depend on how far away the next header id is. The
+/// crate's own scan reads ONE byte per `read` call; this one reads the same
+/// bytes and reaches the same verdict, in fewer calls.
+const HEADER_SCAN_CHUNK: usize = 64 * 1024;
+
+/// Which of `unarj-rs`'s two header parsers is about to run, which is the
+/// only thing the guard needs to tell them apart for: they consume
+/// DIFFERENT numbers of fixed bytes before the two NUL-terminated strings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderShape {
+    /// `MainHeader::load_from`, which `ArjArchieve::new` runs on the first
+    /// header of the archive and on no other.
+    Main,
+    /// `LocalFileHeader::load_from`, which `get_next_entry` runs on every
+    /// header after it.
+    Local,
+}
+
+impl HeaderShape {
+    /// How many bytes this parser consumes before it reaches the name — the
+    /// figure a content shorter than which makes it index past its own
+    /// slice. Facts 4 and 5 of [`ArjGuardedReader`]'s doc, transcribed from
+    /// `main_header.rs:66-94` and `local_file_header.rs:93-126`.
+    fn fixed_prefix(self, first_hdr_size: u8) -> usize {
+        match self {
+            // `if header_size >= FIRST_HDR_SIZE (34) { 4 more }`.
+            HeaderShape::Main if first_hdr_size >= 34 => 34,
+            HeaderShape::Main => 30,
+            // `if header_size > STD_HDR_SIZE (30) { 4 more; if header_size
+            // >= R9_HDR_SIZE (46) { 12 more } }`.
+            HeaderShape::Local if first_hdr_size >= 46 => 46,
+            HeaderShape::Local if first_hdr_size > 30 => 34,
+            HeaderShape::Local => 30,
+        }
+    }
+}
+
+/// Refuses, as [`Error::Corrupt`] (exit 5), a header `unarj-rs` would index
+/// past the end of while parsing — and leaves every other shape to the
+/// crate's own error, byte for byte.
+///
+/// Two of the four panics this task closed are here: a CRC-VALID basic
+/// header shorter than the 30-byte structure both parsers walk
+/// unconditionally (`local_file_header.rs:95`, `main_header.rs:68`), and
+/// one whose content holds no NUL for the parser's `while $x[0] != 0` loop
+/// to stop at (`local_file_header.rs:128`). Exit 5 rather than 6 by
+/// `Error::exit_code`'s own rule, written once there: nothing was
+/// allocated on the header's say-so and no larger machine could make the
+/// archive readable — the header contradicts the fixed structure it
+/// declares itself to have.
+///
+/// The cursor is always restored, so the crate reads exactly the bytes it
+/// would have read had this function not run.
+fn refuse_a_header_unarj_would_panic_on(
+    src: &mut ArjGuardedReader,
+    shape: HeaderShape,
+) -> Result<()> {
+    let resume = src.position().map_err(Error::Io)?;
+    let verdict = match content_unarj_will_parse(src) {
+        Some(content) => refuse_unparseable_content(&content, shape),
+        None => Ok(()),
+    };
+    src.seek(SeekFrom::Start(resume)).map_err(Error::Io)?;
+    verdict
+}
+
+/// The basic-header content `unarj_rs::arj_archive::read_header` is about
+/// to hand one of its two parsers, or `None` for every shape that function
+/// answers for itself — no header id before the end of the source, the
+/// zero-size end-of-archive marker, a declared size past
+/// [`MAX_ARJ_HEADER_SIZE`], a content the source is too short for, and a
+/// content whose recorded CRC-32 does not reproduce.
+///
+/// Fact 3 of [`ArjGuardedReader`]'s doc. Every `None` above is a case the
+/// crate either accepts or refuses in its own words, and the guard staying
+/// silent for all of them is what keeps its refusals a strict subset of
+/// "would have panicked".
+fn content_unarj_will_parse(src: &mut ArjGuardedReader) -> Option<Vec<u8>> {
+    seek_past_the_next_header_id(src)?;
+
+    let mut size_buf = [0u8; 2];
+    if !src.read_exactly(&mut size_buf) {
+        return None;
+    }
+    let declared = usize::from(u16::from_le_bytes(size_buf));
+    if declared == 0 || declared > MAX_ARJ_HEADER_SIZE {
+        return None;
+    }
+
+    // Bounded by the 2600-byte ceiling checked one line above, which is the
+    // crate's own and the spec's — never by a figure the file supplies.
+    let mut content = vec![0u8; declared];
+    if !src.read_exactly(&mut content) {
+        return None;
+    }
+    let mut recorded = [0u8; 4];
+    if !src.read_exactly(&mut recorded) {
+        return None;
+    }
+    if crc32_ieee(&content) != u32::from_le_bytes(recorded) {
+        return None;
+    }
+    Some(content)
+}
+
+/// Leaves the source positioned just past the next `0x60 0xEA` pair
+/// `unarj_rs::arj_archive::read_header` would find, or `None` when that
+/// function would run out of input first.
+///
+/// **Fact 1 of [`ArjGuardedReader`]'s doc, and the one worth reading the
+/// crate's loop for:**
+///
+/// ```text
+/// loop {
+///     reader.read_exact(&mut u8_buf)?;
+///     if u8_buf[0] != ARJ_MAGIC_1 { continue; }
+///     reader.read_exact(&mut u8_buf)?;
+///     if u8_buf[0] == ARJ_MAGIC_2 { break; }
+/// }
+/// ```
+///
+/// A `0x60` whose successor is not `0xEA` consumes BOTH bytes, so the scan
+/// resumes past the pair rather than re-examining the second byte — and
+/// `60 60 EA` therefore holds no header id at all for this crate. The index
+/// rule below reproduces exactly that, chunked;
+/// [`tests::a_payload_holding_a_false_header_id_is_still_read`] is what
+/// would notice if it ever stopped agreeing.
+fn seek_past_the_next_header_id(src: &mut ArjGuardedReader) -> Option<u64> {
+    let mut base = src.position().ok()?;
+    let mut buf = vec![0u8; HEADER_SCAN_CHUNK];
+    let mut expect_second_byte = false;
+    loop {
+        let n = match src.read(&mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => n,
+        };
+        for (i, &b) in buf[..n].iter().enumerate() {
+            if expect_second_byte {
+                expect_second_byte = false;
+                if b == ARJ_HEADER_ID[1] {
+                    let past = base.checked_add(i as u64)?.checked_add(1)?;
+                    src.seek(SeekFrom::Start(past)).ok()?;
+                    return Some(past);
+                }
+            } else if b == ARJ_HEADER_ID[0] {
+                expect_second_byte = true;
+            }
+        }
+        base = base.checked_add(n as u64)?;
+    }
+}
+
+/// Refuses a basic-header content that the parser named by `shape` would
+/// index past the end of.
+///
+/// The three refusals are the three ways `load_from` runs off its own
+/// slice, and each names the figure the header itself declared, because a
+/// user reading exit 5 deserves the contradiction rather than the verdict
+/// alone.
+fn refuse_unparseable_content(content: &[u8], shape: HeaderShape) -> Result<()> {
+    let Some(&first_hdr_size) = content.first() else {
+        // Unreachable through `content_unarj_will_parse`: `read_header`
+        // answers an EMPTY content only for a declared size of zero, which
+        // it reports as end-of-archive and never parses. Refused rather
+        // than assumed away, since the alternative is the panic this whole
+        // function exists to stop.
+        return Err(Error::Corrupt(
+            "ARJ header declares no content at all; there is nothing to parse".into(),
+        ));
+    };
+
+    let fixed = shape.fixed_prefix(first_hdr_size);
+    if content.len() < fixed {
+        return Err(Error::Corrupt(format!(
+            "ARJ header declares {} bytes of content but its `first_hdr_size` of \
+             {first_hdr_size} puts the entry name at byte {fixed}; the header is shorter \
+             than the fixed structure it claims to have",
+            content.len()
+        )));
+    }
+
+    let strings = &content[fixed..];
+    let Some(name_nul) = strings.iter().position(|&b| b == 0) else {
+        return Err(Error::Corrupt(format!(
+            "ARJ header's {} bytes of name and comment hold no NUL terminator; the name \
+             runs past the end of the header that declared it",
+            strings.len()
+        )));
+    };
+    if !strings[name_nul + 1..].contains(&0) {
+        return Err(Error::Corrupt(format!(
+            "ARJ header's comment runs past the end of the header: {} byte(s) follow the \
+             name's terminator and none of them is a NUL",
+            strings.len() - name_nul - 1
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a method-4 (`CompressedFastest`) stream opens with a
+/// back-reference, from its first byte alone.
+///
+/// # This is a real panic in a dependency, on one bit of input
+///
+/// `unarj_rs::decode_fastest` (0.2.1, `decode_fastest.rs:38`) evaluates
+/// `back_ptr > res.len() - 1` for every token that is not a literal, and
+/// `res` is EMPTY on the first iteration — so a stream whose first token is
+/// a match underflows a `usize` and aborts the process (`attempt to
+/// subtract with overflow` in a debug build; a wrapped comparison and then
+/// an out-of-range index at `decode_fastest.rs:46` in a release one).
+///
+/// The predicate is exactly one BIT. `decode_val(r, 0, 7)` reads one bit
+/// and breaks immediately on a zero, answering `len == 0` — a literal; any
+/// other first bit means a match. The stream is MSB-first
+/// (`BitReader::endian(data, BigEndian)`), so "the first token is a match"
+/// is precisely `first & 0x80 != 0`.
+///
+/// **Refusing on this bit never costs a decodable entry**, which is what
+/// makes a one-bit guard defensible in front of a whole decoder: with `res`
+/// empty, every stream reaching the match branch either underflows there or
+/// runs out of bits before it, and the second answers
+/// `io::ErrorKind::UnexpectedEof` — `Error::Corrupt`, exit 5, the same
+/// verdict this guard gives. Swept over all 256 first-byte values by
+/// [`tests::the_method_4_guard_is_exact_over_every_first_payload_byte`].
+pub(super) const fn opens_with_a_backreference(first: u8) -> bool {
+    first & 0x80 != 0
+}
+
+/// Refuses, as [`Error::Corrupt`] (exit 5), the method-4 payload
+/// `unarj_rs::decode_fastest` would underflow a `usize` on — the third of
+/// the four panics, and the only one that is not a header.
+///
+/// This is the "cheap local guard" rather than another pass of the header
+/// wrapper above, because everything it needs is already in hand: the
+/// header `get_next_entry` just returned, and a source positioned at the
+/// first payload byte (`get_next_entry` leaves it there — fact 2 of
+/// [`ArjGuardedReader`]'s doc — which is the same position
+/// `ArjArchieve::read` itself reads the payload from).
+///
+/// Exit 5, not 6, by `Error::exit_code`'s rule: the bytes were read and
+/// found to contradict themselves — a back-reference into an output that
+/// does not exist yet — and nothing was allocated on their say-so.
+///
+/// A `compressed_size` or `original_size` of zero is left alone: the crate
+/// never reaches the subtraction for either (`while res.len() <
+/// original_size` does not run for the second, and an empty `data` fails
+/// its first bit read for the first).
+fn refuse_a_method_4_payload_unarj_would_panic_on(
+    src: &mut ArjGuardedReader,
+    name: &str,
+    header: &LocalFileHeader,
+) -> Result<()> {
+    if header.compression_method != CompressionMethod::CompressedFastest
+        || header.original_size == 0
+        || header.compressed_size == 0
+    {
+        return Ok(());
+    }
+
+    let resume = src.position().map_err(Error::Io)?;
+    let mut first = [0u8; 1];
+    let read_it = src.read_exactly(&mut first);
+    src.seek(SeekFrom::Start(resume)).map_err(Error::Io)?;
+
+    if read_it && opens_with_a_backreference(first[0]) {
+        return Err(Error::Corrupt(format!(
+            "entry `{name}` is stored with ARJ method 4 and its stream opens with a \
+             back-reference, which would copy from an output that does not exist yet"
+        )));
+    }
+    Ok(())
 }
 
 /// See this module's doc for why `compressed_size` matters here as much as
@@ -460,6 +859,9 @@ fn unix_mode(header: &LocalFileHeader) -> Option<u32> {
 
 struct ArjRead {
     archive: ArjArchieve<ArjSeekAdapter>,
+    /// The same source the archive reads through — see [`SharedSource`] for
+    /// why a second handle to it is what makes every guard below possible.
+    src: SharedSource,
     report: FidelityReport,
     /// Set once `get_next_entry` answers `Ok(None)` (clean end of archive)
     /// or any error was raised — either way, nothing more will be read.
@@ -470,6 +872,18 @@ impl ArchiveRead for ArjRead {
     fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
         if self.done {
             return Ok(None);
+        }
+
+        // THE HEADER GUARD — `get_next_entry` parses the header it reads
+        // with `LocalFileHeader::load_from`, which indexes past the end of
+        // its own slice on two shapes rather than answering an error. Runs
+        // here, against the source's CURRENT position, because that is
+        // where the crate's own scan is about to start.
+        if let Err(e) =
+            refuse_a_header_unarj_would_panic_on(&mut self.src.borrow_mut(), HeaderShape::Local)
+        {
+            self.done = true;
+            return Err(e);
         }
 
         let header = match self.archive.get_next_entry() {
@@ -549,6 +963,20 @@ impl ArchiveRead for ArjRead {
         if let Err(e) = refuse_if_over_ceiling(&name, header.compressed_size, "compressed data")
             .and_then(|()| refuse_if_over_ceiling(&name, header.original_size, "decompressed data"))
         {
+            self.done = true;
+            return Err(e);
+        }
+
+        // THE PAYLOAD GUARD — `ArjArchieve::read` hands a method-4 payload
+        // straight to `decode_fastest`, which underflows a `usize` when the
+        // stream's first token is a back-reference. The source sits at the
+        // first payload byte right now, which is the only moment this is
+        // visible from outside the crate.
+        if let Err(e) = refuse_a_method_4_payload_unarj_would_panic_on(
+            &mut self.src.borrow_mut(),
+            &name,
+            &header,
+        ) {
             self.done = true;
             return Err(e);
         }
@@ -883,7 +1311,7 @@ fn build_main_header() -> Vec<u8> {
 /// a well-formed archive readable at all, so there is no version of the
 /// "writing an optional trailer hides truncation" argument `lha.rs`'s
 /// `finish` makes to have here.
-const ARJ_END_OF_ARCHIVE: [u8; 4] = [0x60, 0xEA, 0x00, 0x00];
+const ARJ_END_OF_ARCHIVE: [u8; 4] = [ARJ_HEADER_ID[0], ARJ_HEADER_ID[1], 0x00, 0x00];
 
 /// An entry payload this build refuses, because ARJ's size fields are `u32`.
 fn check_u32_size(name: &str, size: u64) -> Result<u32> {
@@ -1934,18 +2362,367 @@ mod tests {
         assert_eq!(m.extensions, &["arj"]);
     }
 
-    fn open_seekable(bytes: &[u8]) -> Box<dyn ArchiveRead> {
+    /// A seekable `Source` over `bytes`, through a temp file that is
+    /// unlinked the moment it is open.
+    ///
+    /// The name carries a process-wide counter rather than the address of
+    /// `bytes`, which is what it used to carry: two `Vec`s in two threads
+    /// can share an address once the first is dropped, and the sweep in
+    /// [`the_method_4_guard_is_exact_over_every_first_payload_byte`] builds
+    /// 256 of them.
+    fn seekable_source(bytes: &[u8]) -> Box<dyn Source> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "stuffr-arj-seekable-{}-{:p}.arj",
+            "stuffr-arj-seekable-{}-{}.arj",
             std::process::id(),
-            bytes
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, bytes).unwrap();
         let src: Box<dyn Source> = Box::new(stuffr_core::FileSource::open(&path).unwrap());
         let _ = std::fs::remove_file(&path);
-        let resolved = stuffr_core::resolve(src, ARJ, Arj.caps(), &StreamPolicy::default())
-            .expect("resolve over a seekable source");
-        Arj.open(resolved, &OpenOpts::default()).expect("open")
+        src
+    }
+
+    /// `Arj::open` over a seekable source, errors and all — the main header
+    /// is parsed inside `open`, so a test for a main-header refusal has to
+    /// be able to see what `open` itself returns.
+    fn try_open_seekable(bytes: &[u8]) -> Result<Box<dyn ArchiveRead>> {
+        let resolved = stuffr_core::resolve(
+            seekable_source(bytes),
+            ARJ,
+            Arj.caps(),
+            &StreamPolicy::default(),
+        )
+        .expect("resolve over a seekable source");
+        Arj.open(resolved, &OpenOpts::default())
+    }
+
+    fn open_seekable(bytes: &[u8]) -> Box<dyn ArchiveRead> {
+        try_open_seekable(bytes).expect("open")
+    }
+
+    // -------------------------------------------------------------------
+    // Task 6b: the four panics `unarj-rs` 0.2.1 raises on hostile input.
+    //
+    // Every reproducer below reached `stuffr list`, `test`, `unpack` and
+    // `cat` at EXIT 101 before the guards in `ArjGuardedReader`'s doc
+    // existed — a panic, which is the one failure shape
+    // `check_error_is_classified` can never see, and the reason all four
+    // survived a format fuzzed at 200,000 executions.
+    //
+    // Each test asserts the CLASSIFIED error, not merely that nothing
+    // panicked: a guard that turned a crash into a wrong answer would pass
+    // the weaker assertion. Each is falsifiable by deleting its named
+    // guard; the task report records the panic each deletion brings back.
+    // -------------------------------------------------------------------
+
+    /// The error a hostile archive raises, from whichever of `open` or
+    /// `next_entry` raises it — the MAIN header is parsed inside
+    /// `ArjArchieve::new` (i.e. inside `Arj::open`) and every later header
+    /// inside `get_next_entry`, so a caller cannot know which in advance.
+    ///
+    /// **Every error this returns is put through the fuzz harness's own
+    /// oracle first**, which is the point of the whole task rather than a
+    /// flourish: `check_error_is_classified` is what the `container` fuzz
+    /// target asserts on hostile input, and it can NEVER see a panic — the
+    /// process aborts before it runs. Running it here says the same thing
+    /// the target would now be able to say, at gate speed, and it fails in
+    /// the one direction a hand-written `matches!` would not: an error that
+    /// became `Error::Io` (exit 1, "stuffr failed") rather than a refusal.
+    fn read_expecting_error(bytes: &[u8]) -> Error {
+        let err = raise_from(bytes);
+        stuffr_core::testing::check_error_is_classified(&err)
+            .expect("hostile ARJ input must be refused with a classified error");
+        err
+    }
+
+    fn raise_from(bytes: &[u8]) -> Error {
+        let mut ar = match try_open_seekable(bytes) {
+            Ok(ar) => ar,
+            Err(e) => return e,
+        };
+        loop {
+            match ar.next_entry() {
+                Ok(Some(mut entry)) => {
+                    let mut sink = Vec::new();
+                    if let Err(e) = entry.reader().read_to_end(&mut sink) {
+                        return Error::Io(e);
+                    }
+                }
+                Ok(None) => panic!("this archive must be refused, not read cleanly to its end"),
+                Err(e) => return e,
+            }
+        }
+    }
+
+    /// A local file header with the `method`, sizes and payload the test
+    /// chooses — `build_local_file_entry` fixes all three at `Stored`, and
+    /// method 4 is the only one with a panicking decoder behind it.
+    fn build_method_4_entry(name: &str, original_size: u32, payload: &[u8]) -> Vec<u8> {
+        let mut header = vec![
+            30u8, // header_size (inner byte; no extension)
+            0,    // archiver_version_number
+            0,    // min_version_to_extract
+            2,    // host_os = Unix
+            0,    // arj_flags
+            4,    // compression_method = CompressedFastest
+            0,    // file_type = Binary
+            0,    // reserved
+        ];
+        header.extend_from_slice(&0u32.to_le_bytes()); // date_time_modified
+        header.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // compressed_size
+        header.extend_from_slice(&original_size.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes()); // original_crc32
+        header.extend_from_slice(&0u16.to_le_bytes()); // file_spec_position
+        header.extend_from_slice(&0u16.to_le_bytes()); // file_access_mode
+        header.push(0); // first_chapter
+        header.push(0); // last_chapter
+        assert_eq!(header.len(), 30, "must match the inner header_size byte");
+        header.extend_from_slice(name.as_bytes());
+        header.push(0); // name terminator
+        header.push(0); // comment terminator
+        let mut out = fixture_wrap_header(&header);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// An archive holding exactly one hand-built header, whose CONTENT is
+    /// the test's to malform — the envelope around it is always correct, so
+    /// the header reaches `LocalFileHeader::load_from` with every check
+    /// `read_header` makes already passed.
+    fn archive_with_one_local_content(content: &[u8]) -> Vec<u8> {
+        let mut bytes = fixture_main_header();
+        bytes.extend_from_slice(&fixture_wrap_header(content));
+        bytes.extend_from_slice(&ARJ_END_OF_ARCHIVE);
+        bytes
+    }
+
+    /// **Panic 1 of 4 — `main_header.rs:68`, and the one that was not in
+    /// the task's own table.** A CRC-valid MAIN header of one byte:
+    /// `MainHeader::load_from` walks 30 fixed bytes unconditionally and
+    /// takes the second of them from a slice of length zero. Eleven bytes
+    /// of file, exit 101, from `stuffr list` on the `0.5.0` binary.
+    #[test]
+    fn a_main_header_shorter_than_its_own_parser_is_corrupt_rather_than_a_panic() {
+        let bytes = fixture_wrap_header(&[30]);
+        assert_eq!(
+            bytes.len(),
+            11,
+            "the whole reproducer: id, a declared content size of 1, that byte, its CRC-32 \
+             and an empty extended-header chain"
+        );
+        let err = read_expecting_error(&bytes);
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "see `Error::exit_code`'s own 5-vs-6 rule"
+        );
+        assert!(
+            err.to_string().contains("shorter than the fixed structure"),
+            "the refusal must name the contradiction, not just the verdict: {err}"
+        );
+    }
+
+    /// **Panic 2 of 4 — `local_file_header.rs:95`.** The same one-byte
+    /// content behind a valid main header, which reaches the OTHER of the
+    /// crate's two parsers.
+    #[test]
+    fn a_local_file_header_shorter_than_its_own_parser_is_corrupt_rather_than_a_panic() {
+        let err = read_expecting_error(&archive_with_one_local_content(&[30]));
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 5);
+        assert!(
+            err.to_string().contains("shorter than the fixed structure"),
+            "{err}"
+        );
+    }
+
+    /// **Panic 3 of 4 — `local_file_header.rs:128.`** A content of exactly
+    /// 30 bytes: every fixed field parses, and then `convert_string!`'s
+    /// `while $x[0] != 0` loop indexes an empty slice looking for the name's
+    /// terminator.
+    #[test]
+    fn a_header_whose_name_has_no_terminator_is_corrupt_rather_than_a_panic() {
+        let mut content = vec![b'A'; 30];
+        content[0] = 30; // first_hdr_size
+        let err = read_expecting_error(&archive_with_one_local_content(&content));
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 5);
+        assert!(err.to_string().contains("no NUL terminator"), "{err}");
+    }
+
+    /// The same loop one string later (`local_file_header.rs:129`): the
+    /// name terminates, and the COMMENT runs off the end of the header.
+    /// Distinct from the test above because the guard has a distinct arm
+    /// for it, and a single-arm guard would pass the other one.
+    #[test]
+    fn a_header_whose_comment_has_no_terminator_is_corrupt_rather_than_a_panic() {
+        let mut content = vec![0u8; 30];
+        content[0] = 30;
+        content.extend_from_slice(b"a.txt");
+        content.push(0); // the name's terminator, and the last byte there is
+        let err = read_expecting_error(&archive_with_one_local_content(&content));
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 5);
+        assert!(
+            err.to_string().contains("comment runs past the end"),
+            "{err}"
+        );
+    }
+
+    /// **Panic 4 of 4 — `decode_fastest.rs:38`** (`attempt to subtract with
+    /// overflow` in a debug build; an out-of-range index at `:46` in a
+    /// release one). A method-4 stream whose first token is a match, with
+    /// no output yet to copy from.
+    #[test]
+    fn a_method_4_stream_opening_with_a_backreference_is_corrupt_rather_than_a_panic() {
+        let mut bytes = fixture_main_header();
+        bytes.extend_from_slice(&build_method_4_entry(
+            "a.txt",
+            64,
+            &[0x80, 0, 0, 0, 0, 0, 0, 0],
+        ));
+        bytes.extend_from_slice(&ARJ_END_OF_ARCHIVE);
+        let err = read_expecting_error(&bytes);
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 5);
+        assert!(err.to_string().contains("back-reference"), "{err}");
+    }
+
+    /// The method-4 predicate is ONE BIT, and this pins it over all 256
+    /// first-payload-byte values rather than over the two the test above
+    /// would reach.
+    ///
+    /// Two separate claims, and the second is what stops the guard from
+    /// being tightened into a refusal of decodable entries: every byte
+    /// exits 5 (nothing panics, nothing reports exit 1), and the guard's
+    /// own message appears for exactly the high-bit half —
+    /// `0x80`-`0xFF` refused here, `0x00`-`0x7F` reaching `decode_fastest`
+    /// and failing inside it, which is the crate's own `UnexpectedEof` and
+    /// also exit 5. The two halves were measured 128/128 at the CLI before
+    /// this guard existed, as exit 5 and exit 101; that split is now a
+    /// message split at one exit code.
+    #[test]
+    fn the_method_4_guard_is_exact_over_every_first_payload_byte() {
+        for first in 0u8..=u8::MAX {
+            let mut bytes = fixture_main_header();
+            bytes.extend_from_slice(&build_method_4_entry(
+                "a.txt",
+                64,
+                &[first, 0, 0, 0, 0, 0, 0, 0],
+            ));
+            bytes.extend_from_slice(&ARJ_END_OF_ARCHIVE);
+            let err = read_expecting_error(&bytes);
+            assert_eq!(err.exit_code(), 5, "first payload byte {first:#04X}: {err}");
+            assert_eq!(
+                err.to_string().contains("back-reference"),
+                opens_with_a_backreference(first),
+                "first payload byte {first:#04X} must be refused by the guard if and only if \
+                 its top bit is set: {err}"
+            );
+        }
+    }
+
+    /// **The guard's own scan must accept exactly what `read_header`'s
+    /// accepts, and this is the test that would notice if it stopped** —
+    /// fact 1 of [`ArjGuardedReader`]'s doc, and the only one of the six
+    /// whose drift refuses a VALID archive rather than letting a panic
+    /// back.
+    ///
+    /// The decoy is a lone `0x60` in front of a complete, CRC-valid header
+    /// envelope whose content is one byte. `read_header` consumes that
+    /// `0x60` AND the `0x60` after it, resumes at the `0xEA`, and walks
+    /// straight past the whole decoy to the real header behind it — so this
+    /// archive reads cleanly, and did before Task 6b too. A guard scanning
+    /// for a two-byte window instead would match the decoy's own id, find a
+    /// one-byte content with a CRC that reproduces, and refuse this archive
+    /// at exit 5.
+    #[test]
+    fn a_false_header_id_unarj_walks_past_never_refuses_the_archive_behind_it() {
+        let mut bytes = fixture_main_header();
+        bytes.push(0x60);
+        bytes.extend_from_slice(&fixture_wrap_header(&[30]));
+        bytes.extend_from_slice(&build_local_file_entry("kept.txt", b"alpha"));
+        bytes.extend_from_slice(&ARJ_END_OF_ARCHIVE);
+
+        let got = read_meta(&bytes);
+        assert_eq!(got.len(), 1, "the real entry behind the decoy must survive");
+        assert_eq!(got[0].name, "kept.txt");
+    }
+
+    /// The same fact, asserted directly on the scanner rather than through
+    /// an archive: `60 60 EA 60 EA` holds TWO two-byte windows and exactly
+    /// ONE header id, because the crate's loop consumes the pair it
+    /// rejects.
+    #[test]
+    fn the_header_id_scan_consumes_the_pair_it_rejects() {
+        let mut src = ArjGuardedReader {
+            inner: seekable_source(b"\x60\x60\xEA\x60\xEA"),
+        };
+        assert_eq!(
+            seek_past_the_next_header_id(&mut src),
+            Some(5),
+            "the id at 3..5 is the one `read_header` finds; a window scan would answer 3 \
+             (the pair at 1..3)"
+        );
+    }
+
+    /// `MainHeader::load_from` and `LocalFileHeader::load_from` walk
+    /// DIFFERENT numbers of fixed bytes for the same `first_hdr_size`
+    /// (facts 4 and 5), and a guard applying one rule to the other header
+    /// would refuse archives the crate reads. Pinned as a table rather than
+    /// discovered from a failure.
+    #[test]
+    fn each_header_shape_keeps_its_own_fixed_prefix_rule() {
+        for (first_hdr_size, main, local) in [
+            (0u8, 30usize, 30usize),
+            (30, 30, 30),
+            (31, 30, 34),
+            (33, 30, 34),
+            (34, 34, 34),
+            (45, 34, 34),
+            (46, 34, 46),
+            (255, 34, 46),
+        ] {
+            assert_eq!(
+                HeaderShape::Main.fixed_prefix(first_hdr_size),
+                main,
+                "main header, first_hdr_size {first_hdr_size}"
+            );
+            assert_eq!(
+                HeaderShape::Local.fixed_prefix(first_hdr_size),
+                local,
+                "local file header, first_hdr_size {first_hdr_size}"
+            );
+        }
+    }
+
+    /// The guard refuses only what would have panicked: every OTHER shape
+    /// keeps the crate's own error, in the crate's own words. Without this
+    /// the guard could quietly become the thing that answers for a
+    /// truncated or checksum-broken archive, and the crate's messages would
+    /// stop being reachable at all.
+    #[test]
+    fn a_header_the_crate_refuses_itself_keeps_the_crates_own_error() {
+        // A basic header whose recorded CRC-32 does not reproduce. Its
+        // content is one byte, i.e. exactly the shape the guard refuses —
+        // so if the guard ran ahead of the crate's checksum check, this
+        // would carry the guard's message instead.
+        let mut bytes = fixture_main_header();
+        let mut envelope = fixture_wrap_header(&[30]);
+        let crc_at = envelope.len() - 6;
+        envelope[crc_at] ^= 0xFF;
+        bytes.extend_from_slice(&envelope);
+        bytes.extend_from_slice(&ARJ_END_OF_ARCHIVE);
+
+        let err = read_expecting_error(&bytes);
+        assert!(matches!(err, Error::Corrupt(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 5);
+        assert!(
+            err.to_string().contains("Header checksum is invalid"),
+            "the crate's own verdict must survive the guard: {err}"
+        );
     }
 
     /// `by_index` has exactly one answer on this container, on every source
