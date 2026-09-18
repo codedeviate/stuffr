@@ -1504,10 +1504,12 @@ fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatI
 /// `fn(&mut dyn SeekRead, &SalvagePolicy) -> Result<SalvageOutcome>` (the
 /// [`stuffr_core::salvage::SalvageOutcome`] the shared engine produces, not
 /// this module's own [`SalvageOutcome`] report) — so each later task's own
-/// scanner (lha, arj) drops in as one more arm here, gated on its own
+/// scanner drops in as one more arm here, gated on its own
 /// feature, alongside the task that adds it. `zip` (Task 2), `arc`
-/// (Task 3, [`stuffr_formats::legacy::arc_salvage::salvage_arc`]) and `zoo`
-/// (Task 4, [`stuffr_formats::legacy::zoo_salvage::salvage_zoo`]) are wired;
+/// (Task 3, [`stuffr_formats::legacy::arc_salvage::salvage_arc`]), `zoo`
+/// (Task 4, [`stuffr_formats::legacy::zoo_salvage::salvage_zoo`]), `lha`
+/// (Task 5) and `arj`
+/// (Task 6, [`stuffr_formats::legacy::arj_salvage::salvage_arj`]) are wired;
 /// every other format — including one this build has fully registered as an
 /// ordinary container, like `tar` — answers [`Error::Unsupported`] (exit 3)
 /// **naming the format**, never a silent empty
@@ -1516,8 +1518,8 @@ fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatI
 /// the ARCHIVE; the truth here is a claim about this BUILD — it never
 /// tried. `tar`, `ar` and `cpio` answer this way for a structural reason
 /// (Stage 3, if it ever comes: a false-positive scan over their headers is
-/// undetectable by construction); `lha` and `arj` answer this way only until
-/// their own task lands a scanner.
+/// undetectable by construction), and with `arj` wired in Task 6 they are
+/// now the whole of that set.
 fn salvage_scan(
     format: FormatId,
     src: &mut dyn SeekRead,
@@ -1540,6 +1542,10 @@ fn salvage_scan(
         "lha" => stuffr_formats::legacy::lha_salvage::salvage_lha(src, policy),
         #[cfg(not(feature = "lha"))]
         "lha" => Err(Error::FormatNotEnabled(FormatId::new("lha"))),
+        #[cfg(feature = "arj")]
+        "arj" => stuffr_formats::legacy::arj_salvage::salvage_arj(src, policy),
+        #[cfg(not(feature = "arj"))]
+        "arj" => Err(Error::FormatNotEnabled(FormatId::new("arj"))),
         other => Err(Error::Unsupported(format!(
             "salvage has no scanner for `{other}` archives in this build"
         ))),
@@ -2042,9 +2048,9 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 }
 
 /// Dispatches to the format's own salvage payload writer — matching
-/// [`salvage_scan`]'s own dispatch exactly, so each later task's own
-/// scanner (zoo, lha, arj) drops in as one more arm here too, alongside the
-/// arm it already adds there.
+/// [`salvage_scan`]'s own dispatch exactly, so each scanner task's own
+/// scanner drops in as one more arm here too, alongside the
+/// arm it already adds there. All five of Stage 2's are wired as of Task 6.
 ///
 /// Task 3c replaced what used to be one zip-shaped `write_payload` here: it
 /// unconditionally read a 30-byte zip local header from `entry.offset` to
@@ -2059,8 +2065,9 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// Locating a payload and decoding it are now each format's own job —
 /// [`stuffr_formats::zip_salvage::write_payload`],
 /// [`stuffr_formats::legacy::arc_salvage::write_payload`],
-/// [`stuffr_formats::legacy::zoo_salvage::write_payload`] and
-/// [`stuffr_formats::legacy::lha_salvage::write_payload`] — using
+/// [`stuffr_formats::legacy::zoo_salvage::write_payload`],
+/// [`stuffr_formats::legacy::lha_salvage::write_payload`] and
+/// [`stuffr_formats::legacy::arj_salvage::write_payload`] — using
 /// [`stuffr_core::salvage::SalvagedEntry::payload_start`], which every
 /// scanner now computes once, at discovery, instead of a generic caller
 /// re-deriving (and mis-deriving) it later.
@@ -2087,8 +2094,10 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// that forgets this half fails a test rather than shipping silently. A
 /// `SalvageScan::write_payload` trait method would make this a compile
 /// error instead and was considered; deferred rather than taken mid-phase,
-/// since it would have to land ahead of the scanners (lha in Task 5, arj
-/// still to come) whose shapes it would have to fit.
+/// since it would have had to land ahead of the scanners (lha in Task 5, arj
+/// in Task 6) whose shapes it would have to fit. All five now exist, so a
+/// later stage can make the change against real shapes rather than
+/// anticipated ones.
 fn write_salvaged_payload(
     format: FormatId,
     archive_path: &Path,
@@ -2130,6 +2139,15 @@ fn write_salvaged_payload(
         ),
         #[cfg(not(feature = "lha"))]
         "lha" => Err(Error::FormatNotEnabled(FormatId::new("lha"))),
+        #[cfg(feature = "arj")]
+        "arj" => stuffr_formats::legacy::arj_salvage::write_payload(
+            archive_path,
+            entry,
+            compressed_len,
+            out,
+        ),
+        #[cfg(not(feature = "arj"))]
+        "arj" => Err(Error::FormatNotEnabled(FormatId::new("arj"))),
         // Unreachable in practice: `salvage_scan` already refuses any other
         // format before a single candidate is ever produced, so `salvage()`
         // never reaches a per-entry write for one.

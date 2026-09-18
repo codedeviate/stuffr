@@ -711,7 +711,7 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   has no scanner for is exit 3, a statement about this build rather than
   about the archive.
 
-  Scanners exist for: zip, arc, zoo, lha.
+  Scanners exist for: zip, arc, zoo, lha, arj.
 
   LHA is the one of the four where the ordinary reader has no fallback at
   all: the format carries no index, no entry count and no trailer, so

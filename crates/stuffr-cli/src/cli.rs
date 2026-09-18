@@ -339,7 +339,7 @@ pub enum Command {
         /// `tar`, `ar` and `cpio` are a structural refusal rather than an
         /// unfinished one, and `arj` is still to come.
         ///
-        /// Scanners exist for: zip, arc, zoo, lha.
+        /// Scanners exist for: zip, arc, zoo, lha, arj.
         #[arg(long)]
         format: Option<String>,
     },
