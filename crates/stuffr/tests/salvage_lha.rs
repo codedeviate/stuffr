@@ -182,6 +182,110 @@ fn an_archive_whose_first_header_was_destroyed_still_salvages_the_rest() {
     );
 }
 
+/// **Ruling S-U, at the layer where the finding was made.** The review did
+/// not find the level-2 gap by reading the scanner; it found it by running
+/// two verbs over one healthy file and getting two answers — `stuffr list`
+/// exit 0 printing the entry, `stuffr salvage --list` exit 5 saying nothing
+/// was recoverable. So the regression guard belongs here, phrased as the
+/// agreement rather than as either half: **the ordinary reader and the
+/// recovery verb must not contradict each other about an undamaged
+/// archive.**
+///
+/// The level-2 builder is local and duplicates a layout `lha_salvage.rs`
+/// owns — unavoidable across two crates and two module boundaries, the same
+/// trade `salvage_zoo.rs`'s offset block makes. It is safe here because
+/// `entries::list` is the test's own CONTROL: a builder that got the layout
+/// wrong fails the control before it can make the scanner look right.
+#[test]
+fn list_and_salvage_agree_about_a_healthy_level_2_archive() {
+    let scratch = Scratch::new("level2");
+    let content: &[u8] = b"level two payload, thirty bytes";
+    let archive = scratch.0.join("level2.lzh");
+    std::fs::write(&archive, build_level2(b"level2.txt", content)).unwrap();
+
+    // The CONTROL, and the half the ruling is about: the ordinary reader
+    // does read this file.
+    let (rows, _) = entries::list(stuffr::ops::Input::Path(archive.clone()), u64::MAX, None)
+        .expect("a healthy level-2 archive is not damaged");
+    assert_eq!(rows.len(), 1, "the control failed: {rows:?}");
+    assert_eq!(rows[0].name, "level2.txt");
+
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone())))
+        .expect("and neither is it unreadable to salvage");
+    assert_eq!(
+        outcome.entries.len(),
+        1,
+        "`list` reads this archive and `salvage` must not answer `nothing recoverable` for \
+         it — one tool contradicting itself across two lines, on a file with nothing wrong \
+         with it, is what Ruling S-U closed"
+    );
+    let record = &outcome.entries[0];
+    assert_eq!(record.name, "level2.txt");
+    let SalvageDisposition::Written(path) = &record.disposition else {
+        panic!("expected a written entry, got {:?}", record.disposition);
+    };
+    assert_eq!(std::fs::read(path).unwrap(), content);
+    assert_eq!(entries::salvage_exit_code(&outcome), 0);
+}
+
+/// A minimal but genuine level-2 archive: a `u16` total header size where
+/// levels 0 and 1 keep a length byte and a checksum byte, no filename in the
+/// base header, and the two extension headers a real level-2 writer emits —
+/// `0x00` (the common header, carrying a CRC-16 over the whole header) and
+/// `0x01` (the filename).
+///
+/// The CRC-16 is CRC-16/ARC, reimplemented here rather than reused because
+/// `legacy::crc`'s is private to another crate — the same reason
+/// `salvage_zoo.rs` carries its own copy.
+fn build_level2(name: &[u8], content: &[u8]) -> Vec<u8> {
+    fn crc16_arc(data: &[u8]) -> u16 {
+        let mut crc: u16 = 0;
+        for &b in data {
+            crc ^= u16::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xA001 & mask);
+            }
+        }
+        crc
+    }
+
+    const BASE_LEN: usize = 26;
+    let common_len = 5usize;
+    let name_len = 1 + name.len() + 2;
+    let total = BASE_LEN + common_len + name_len;
+
+    let mut h: Vec<u8> = Vec::new();
+    h.extend_from_slice(&(total as u16).to_le_bytes());
+    h.extend_from_slice(b"-lh0-");
+    h.extend_from_slice(&(content.len() as u32).to_le_bytes());
+    h.extend_from_slice(&(content.len() as u32).to_le_bytes());
+    h.extend_from_slice(&1_000_000_000u32.to_le_bytes());
+    h.push(0x20);
+    h.push(2);
+    h.extend_from_slice(&crc16_arc(content).to_le_bytes());
+    h.push(b'U');
+    h.extend_from_slice(&(common_len as u16).to_le_bytes());
+    assert_eq!(h.len(), BASE_LEN);
+
+    h.push(0x00);
+    h.extend_from_slice(&0u16.to_le_bytes()); // the header CRC, still zero
+    h.extend_from_slice(&(name_len as u16).to_le_bytes());
+    h.push(0x01);
+    h.extend_from_slice(name);
+    h.extend_from_slice(&0u16.to_le_bytes());
+    assert_eq!(h.len(), total);
+
+    let crc = crc16_arc(&h);
+    h[BASE_LEN + 1..BASE_LEN + 3].copy_from_slice(&crc.to_le_bytes());
+
+    let mut out = h;
+    out.extend_from_slice(content);
+    out.push(0); // end-of-archive marker
+    out
+}
+
 /// A truncated download, the commonest damaged archive there is: the last
 /// entry's payload is cut short, so it lands as `NAME.partial` rather than
 /// under its real name, and the run reports it rather than exiting 0 in

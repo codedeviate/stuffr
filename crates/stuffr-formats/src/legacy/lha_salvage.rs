@@ -39,7 +39,9 @@
 //!    (`lha.rs`'s `lhasa_reads_what_we_write`). [`LEVEL1_HEADER_OVERHEAD`]
 //!    is imported from it rather than re-spelled here.
 //!
-//! The layout, for a **level 0 or 1** header beginning at byte `H`:
+//! The layout, for a **level 0 or 1** header beginning at byte `H` (level
+//! 2's is a separate, fixed 26 bytes — see [`LEVEL2_BASE_LEN`] and its
+//! neighbours, cited the same way):
 //!
 //! | offset | size | field | source |
 //! |---|---|---|---|
@@ -55,7 +57,17 @@
 //! | `H+22` | `F` | filename | spec; `parser.rs:212` |
 //! | `H+22+F` | 2 | CRC-16/ARC of the UNCOMPRESSED file, LE | spec; `parser.rs:219` |
 //! | `H+24+F` | 1 | OS-TYPE (level 1 only) | spec; `parser.rs:223` |
-//! | `H+25+F` | 2 | first extra-header length, LE (level 1 only) | spec; `parser.rs:254` |
+//! | `H+25+F`† | 2 | first extra-header length, LE (level 1 only) | spec; `parser.rs:254` |
+//!
+//! † **the one row this module deliberately does NOT read at its stated
+//! offset**, and Ruling F is about the table rather than the code, so it is
+//! said here too. `delharc` accepts an optional *extended area* of
+//! `header_len - min_len` bytes between the OS-TYPE byte and this field
+//! (`parser.rs:227-245`), so `H+25+F` is where it sits only when that area is
+//! empty — which is every archive this project writes and every one it has a
+//! fixture for, and not a guarantee. [`parse_level_0_or_1`] reads it as the
+//! LAST two bytes of the base header (`base_len - 2`) instead, which is
+//! correct either way.
 //!
 //! and the one derived fact everything downstream stands on:
 //!
@@ -71,27 +83,53 @@
 //! `LhaHeader::read` returns, over every fixture and every shape these
 //! tests build.
 //!
-//! # Levels 2 and 3 are NOT scanned, and that is a stated limitation
+//! # Levels 0, 1 and 2 are scanned; level 3 is not (Ruling S-U)
 //!
-//! `delharc` reads all four header levels and so, through it, does
-//! `stuffr list`/`unpack`. This scanner recognises **levels 0 and 1 only**.
-//! Two reasons, and the second is the load-bearing one:
+//! **This module shipped scanning levels 0 and 1 alone, on a premise that
+//! was false, and the correction is worth keeping rather than quietly
+//! folding in.** The original reasoning was that "levels 2 and 3 carry no
+//! header checksum", so admitting them would weaken the gate. That is true
+//! of a level-2 BASE header and false of a level-2 header: the base header's
+//! 8-bit sum is replaced by an `EXT_HEADER_COMMON` (`0x00`) extension header
+//! carrying a **CRC-16 over the whole header**, which `delharc` already
+//! parses and validates (`parser.rs:306-317`, `356-360`). Sixteen bits
+//! against levels 0 and 1's eight. Scanning level 2 makes this scanner's
+//! weakest gate STRONGER.
 //!
-//! - A level-2 base header carries no filename at all (the name lives in an
-//!   extension header) and a level-3 one is a different shape again, so
-//!   supporting them is a second parser, not a wider `if`.
-//! - **Levels 2 and 3 carry no header checksum.** The checksum is half of
-//!   this scanner's validation gate — see below — and it is what keeps the
-//!   noise corpus empty. Admitting a header shape that cannot be checked
-//!   would weaken the gate for every archive, to reach a shape the ordinary
-//!   reader already handles whenever the archive is intact enough to walk.
+//! What settled it is what a user saw. On a HEALTHY, undamaged level-2
+//! archive the `0.5.0` binary answered:
 //!
-//! So `stuffr salvage` on a damaged level-2 archive reports nothing found.
-//! That is a real gap, recorded rather than papered over: it is the one
-//! shape where this verb's answer ("nothing recoverable") understates what
-//! a future task could recover. Closing it means giving level 2 a gate of
-//! its own strength — the extension-header chain walking exactly to the
-//! declared total header size — not relaxing this one.
+//! ```text
+//! $ stuffr list level2.lzh            # exit 0:  0  30  level2.txt
+//! $ stuffr salvage level2.lzh --list
+//! salvage -> the scan found nothing recoverable in this archive
+//! exit=5
+//! ```
+//!
+//! One tool contradicting itself across two lines on a file with nothing
+//! wrong with it — and pointed the wrong way besides, since exit 5 is a
+//! claim about the ARCHIVE where the truth was a claim about the BUILD (this
+//! project spends exit 3 on that, and `entries.rs`'s `salvage_scan` says so
+//! in those words for a format it has no scanner for at all).
+//!
+//! **Level 2's gate is MANDATORY where `delharc`'s is advisory**, and that
+//! is the one deliberate narrowing: `LhaHeader::read` accepts a level-2
+//! header with no common extension header (there is simply nothing to
+//! compare), and [`parse_level_2`] refuses one, because a scanner with no
+//! checksum has nothing to tell a real header from five coincidental bytes.
+//! `a_level_2_header_with_no_common_extension_header_is_not_scanned` pins
+//! both halves, `delharc`'s acceptance included, so the narrowing is visible
+//! rather than implied.
+//!
+//! **Level 3 is still not scanned**, and for the reason level 2's premise
+//! turned out not to be: it is materially a different parser rather than a
+//! wider `if`. Its header length lives in a `u32` at `H+24`, its extension
+//! chain uses 4-byte length counters instead of 2, and its first two bytes
+//! must read `4, 0` (`parser.rs:259-264`, `333-338`). It does carry the same
+//! common-header CRC-16, so the gate exists for it too — the work is the
+//! second layout, not the gate. `a_level_3_header_is_not_recognised_by_this_scanner`
+//! pins the current state so the day a level-3 parser lands, the coverage
+//! change is said out loud.
 //!
 //! # The validation gate
 //!
@@ -102,19 +140,27 @@
 //! 1. The five-byte method identifier at `H+2` is one the format assigned
 //!    ([`Method::from_identifier`]). Recognised, not necessarily DECODABLE —
 //!    see [`Method::decodable`].
-//! 2. The header level at `H+20` is 0 or 1 (see above).
+//! 2. The header level at `H+20` is 0, 1 or 2 (see above).
 //! 3. The declared header length reaches at least as far as the fields the
-//!    level in question requires, and the whole `2 + header_len` bytes are
-//!    present in the source.
-//! 4. **The header checksum reproduces**: `sum(H+2 .. H+2+header_len) mod
-//!    256` equals the byte at `H+1`. See [`checksum_of`].
-//! 5. The filename length is non-zero. A zero-length name is not a shape any
-//!    LHA writer produces, and it is what a run of zeroed bytes behind a
+//!    level in question requires, and the whole header is present in the
+//!    source — `2 + header_len` bytes for levels 0 and 1, the `u16` total at
+//!    `H+0` for level 2.
+//! 4. **A checksum over the header reproduces.** For levels 0 and 1 that is
+//!    the 8-bit sum: `sum(H+2 .. H+2+header_len) mod 256` equals the byte at
+//!    `H+1` ([`checksum_of`]). For level 2 it is the `EXT_HEADER_COMMON`
+//!    extension header's **CRC-16 over the whole header** with its own two
+//!    checksum bytes zeroed ([`walk_extra_headers`], [`parse_level_2`]) —
+//!    sixteen bits rather than eight, and mandatory.
+//! 5. There is a name. Levels 0 and 1 require a non-zero filename length in
+//!    the base header; level 2 requires the chain to have yielded a `0x01`
+//!    or `0x02` extension header. A nameless entry is not a shape any LHA
+//!    writer produces, and it is what a run of zeroed bytes behind a
 //!    coincidental method string looks like.
-//! 6. For level 1, the extra-header chain walks to its terminator inside the
-//!    source, inside [`MAX_EXTRA_CHAIN`], and inside the skip size the
-//!    header itself declared — which is what makes the compressed payload
-//!    length (`skip size` minus the chain) computable at all.
+//! 6. For levels 1 and 2, the extra-header chain walks to its terminator
+//!    inside the source, inside [`MAX_EXTRA_CHAIN`], and inside the budget
+//!    the header itself declared — the skip size for level 1 (which is what
+//!    makes the compressed payload length, `skip size` minus the chain,
+//!    computable at all) and the total header size for level 2.
 //!
 //! Any failure at 2-6 is not an error — it means these five bytes were a
 //! coincidence, not a header, and the scan resumes one byte past the method
@@ -137,11 +183,21 @@
 //! That strength is exactly why the checksum has to be shown to be load-
 //! bearing rather than assumed to be: with criteria 1-3 as strong as they
 //! are, a gate that had quietly stopped checking the checksum would still
-//! find nothing in noise, and nothing would say so. The noise corpus
-//! therefore carries a **spliced archive whose only defect is its checksum
-//! byte** ([`tests::CHECKSUM_ONLY_DEFECT_OFFSET`]) — so deleting the check
-//! turns that one splice into a phantom entry and the anti-vacuity test goes
-//! red. The task report records that run.
+//! find nothing in noise, and nothing would say so. **Measured during the
+//! fix round, not reasoned about:** with criterion 4 removed entirely, the
+//! six bare seeded identifiers in the corpus produced ZERO phantoms — the
+//! remaining criteria rejected every one — so an unspliced corpus would have
+//! gone quietly vacuous with every test green.
+//!
+//! The noise corpus therefore carries **two spliced archives, one per
+//! checksum**: [`tests::CHECKSUM_ONLY_DEFECT_OFFSET`] is a level-1 archive
+//! whose only defect is its 8-bit header checksum, and
+//! [`tests::LEVEL2_CRC_ONLY_DEFECT_OFFSET`] a level-2 one whose only defect
+//! is its common-header CRC-16. Deleting either check turns that splice into
+//! a phantom entry and the anti-vacuity test goes red. Two splices rather
+//! than one because criterion 4 is two different comparisons — a single
+//! splice would have left the other silently disableable, which is the same
+//! vacuity one level down. The task report records both runs.
 //!
 //! # Verification reuses `delharc`'s own decoders, never a second stack
 //!
@@ -178,6 +234,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use delharc::decode::{Decoder, DecoderAny};
 use delharc::header::CompressionMethod;
@@ -188,6 +245,7 @@ use stuffr_core::salvage::{
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
+use super::crc::{crc16_arc, crc16_arc_continued};
 use super::lha::{LEVEL1_HEADER_OVERHEAD, lha_mtime, lha_name_from_parts};
 
 /// Bytes read per [`find_next_method`] chunk. O(1) memory regardless of how
@@ -226,9 +284,31 @@ const NAME_I: usize = 22;
 /// production writer counts with.
 const LEVEL0_HEADER_OVERHEAD: usize = 22;
 
-/// The smallest a level-1 extra header can be: one identifier byte plus the
-/// two-byte length of the next one. `delharc`'s own parser rejects anything
-/// smaller (`parser.rs`'s `min_header_len` for level < 3).
+/// The whole of a level-**2** base header, which is a fixed 26 bytes: the
+/// `u16` total header size at `H+0` (level 2 spends the length and checksum
+/// bytes on one figure), the 5-byte method, three `u32` fields, a reserved
+/// byte, the level byte, the `u16` file CRC-16, the OS-TYPE byte and the
+/// `u16` first-extra-header length. **No filename and no filename length** —
+/// a level-2 name lives in a `0x01` extension header, which is why this is a
+/// fixed figure where levels 0 and 1 declare theirs.
+///
+/// Read off `delharc 0.6.2`'s `parser.rs` exactly as the level-0/1 table in
+/// this module's doc was: the packed `LhaRawBaseHeader` (line 70), the
+/// filename read SKIPPED for `lha_level >= 2` (line 207), the file CRC-16
+/// (218), OS-TYPE (221-224, level > 0), and `first_header_len` (258).
+const LEVEL2_BASE_LEN: usize = 26;
+
+/// `H+21`: the level-2 file CRC-16. Levels 0 and 1 put it behind the
+/// filename, at a position only the name length can locate; level 2 has no
+/// name in the base header, so it is fixed.
+const LEVEL2_CRC_I: usize = 21;
+
+/// `H+24`: the level-2 `u16` first-extra-header length.
+const LEVEL2_FIRST_EXTRA_I: usize = 24;
+
+/// The smallest a level-1 or level-2 extra header can be: one identifier
+/// byte plus the two-byte length of the next one. `delharc`'s own parser
+/// rejects anything smaller (`parser.rs`'s `min_header_len` for level < 3).
 const MIN_EXTRA_HEADER: u64 = 3;
 
 /// The most bytes this scanner will walk through a level-1 extra-header
@@ -463,15 +543,20 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 struct EntryHeader {
     method: Method,
     /// The compressed payload's own length: the header's `compressed size`
-    /// field for level 0, and for level 1 that field (the SKIP size) minus
-    /// every byte of the extra-header chain.
+    /// field for levels 0 and 2, and for level 1 that field (the SKIP size)
+    /// minus every byte of the extra-header chain — the one level where the
+    /// field means something else (`parser.rs:365-368`).
     declared_len: u64,
     original_size: u32,
     file_crc: u16,
-    last_modified: u32,
+    /// Decoded here rather than carried raw, because the field does not mean
+    /// the same thing at every level: levels 0 and 1 pack an MS-DOS date/time
+    /// word, level 2 a Unix timestamp in seconds (`delharc`'s own
+    /// `parse_last_modified` makes the identical split).
+    mtime: Option<SystemTime>,
     name: String,
     /// Absolute position of the first compressed payload byte — the base
-    /// header plus, for level 1, the whole extra-header chain.
+    /// header plus, for levels 1 and 2, the whole extra-header chain.
     payload_start: u64,
 }
 
@@ -613,11 +698,19 @@ fn checksum_of(counted: &[u8]) -> u8 {
 /// `None` for ANY gate failure, including a genuine read error: to a SCANNER
 /// they all mean the same thing — these bytes are not a header — so they
 /// fold here rather than propagating and ending a run over one coincidence.
+///
+/// Dispatches on the header LEVEL, because the three shapes agree on almost
+/// nothing behind their shared method identifier: level 0 and level 1 share a
+/// base header and an 8-bit checksum, level 2 replaces the length and
+/// checksum bytes with one `u16` total size, moves every field behind the
+/// (absent) filename, and is gated on a 16-bit CRC in an extension header
+/// instead. Level 3 is not scanned — see this module's doc.
 fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<EntryHeader> {
     // Criterion 3, first half: read at most one base header's worth, and
     // never past the end of the source. A fixed 257-byte read — the whole
-    // range a `u8` length field can describe — so nothing here is sized from
-    // anything the file declares.
+    // range a `u8` length field can describe, and comfortably more than
+    // level 2's fixed 26 — so nothing here is sized from anything the file
+    // declares.
     let want = MAX_BASE_HEADER.min(usize::try_from(file_len.checked_sub(offset)?).ok()?);
     if want < NAME_I {
         return None;
@@ -631,11 +724,24 @@ fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option
     let method = Method::from_identifier(&base[METHOD_I..METHOD_I + 5].try_into().ok()?)?;
 
     // Criterion 2.
-    let level = base[HEADER_LEVEL_I];
-    if level > 1 {
-        return None;
+    match base[HEADER_LEVEL_I] {
+        level @ (0 | 1) => parse_level_0_or_1(src, offset, file_len, &base, method, level),
+        2 => parse_level_2(src, offset, file_len, &base, method),
+        _ => None,
     }
+}
 
+/// The level-0/1 half of [`parse_header_at`] — everything from criterion 3's
+/// second half onward, for the two levels that share a base header and an
+/// 8-bit header checksum.
+fn parse_level_0_or_1(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    base: &[u8],
+    method: Method,
+    level: u8,
+) -> Option<EntryHeader> {
     // Criterion 3, second half.
     let header_len = usize::from(base[HEADER_LEN_I]);
     let base_len = METHOD_I.checked_add(header_len)?;
@@ -701,7 +807,14 @@ fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option
         // this module's doc for why `2 + header_len` bounds the whole base
         // header for both levels.
         let first = u16::from_le_bytes(base.get(base_len - 2..base_len)?.try_into().ok()?);
-        let walk = walk_extra_headers(src, base_end, file_len, u64::from(first), skip_size)?;
+        let walk = walk_extra_headers(
+            src,
+            base_end,
+            file_len,
+            u64::from(first),
+            u64::from(skip_size),
+            0,
+        )?;
         (
             base_end.checked_add(walk.total)?,
             walk.total,
@@ -733,44 +846,215 @@ fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option
         declared_len,
         original_size,
         file_crc,
-        last_modified,
+        mtime: lha_mtime(last_modified),
         name,
         payload_start,
     })
 }
 
-/// What a level-1 extra-header chain walk recovered.
+/// The level-**2** half of [`parse_header_at`].
+///
+/// # Why level 2 is scanned at all, and what gates it (Ruling S-U)
+///
+/// The first version of this module scanned levels 0 and 1 only, on the
+/// stated reasoning that levels 2 and 3 "carry no header checksum" and that
+/// admitting them would weaken the gate. **The premise was false of level 2
+/// and the cost was measured.** On a HEALTHY, undamaged level-2 archive the
+/// `0.5.0` binary answered:
+///
+/// ```text
+/// $ stuffr list level2.lzh          # exit 0:  0  30  level2.txt
+/// $ stuffr salvage level2.lzh --list
+/// salvage -> the scan found nothing recoverable in this archive
+/// exit=5
+/// ```
+///
+/// Two lines of one tool contradicting each other on an undamaged file, and
+/// the message pointed the wrong way besides: exit 5 is a claim about the
+/// ARCHIVE, where the truth was a claim about the BUILD (this project spends
+/// exit 3 on that, and `salvage_scan`'s own refusal says so in those words).
+///
+/// **And a stronger gate than level 0/1's was available the whole time.** A
+/// level-2 header conventionally carries an `EXT_HEADER_COMMON` (`0x00`)
+/// extension header holding a **CRC-16 over the whole header** — base bytes,
+/// every extension header, and the padding byte, with its own two checksum
+/// bytes zeroed while the sum is taken (`delharc 0.6.2`'s
+/// `parser.rs:306-317` extracts and zeroes it, `356-360` validates it).
+/// Sixteen bits against levels 0 and 1's 8-bit sum-mod-256: a coincidence
+/// roughly every 65,536 candidate positions rather than every 256. Scanning
+/// level 2 makes this scanner's weakest gate *stronger*, not weaker.
+///
+/// **This gate is MANDATORY where `delharc`'s is advisory**, and that is the
+/// one deliberate narrowing. `LhaHeader::read` accepts a level-2 header with
+/// no common extension header at all (`header_crc` stays `None` and the
+/// comparison is skipped); this function refuses one, because a scanner with
+/// no checksum to check has nothing to tell a real header from five
+/// coincidental bytes. Every level-2 writer in practice emits the common
+/// header; one that does not is not scanned, and that is a narrower gap than
+/// the one this ruling closed.
+///
+/// # The CRC-16 is `legacy::crc`'s own, and that is checked rather than assumed
+///
+/// `delharc`'s `Crc16` (`src/crc.rs`) is a table-driven CRC-16/ARC — its
+/// table's second entry is `0xc0c1`, the reflected-`0xA001` signature, with
+/// init 0 and no final xor — i.e. bit-for-bit
+/// [`super::crc::crc16_arc`], which this crate already pins against the
+/// published RevEng check value. So this computes the identical sum with
+/// this crate's own function rather than reaching into `delharc`'s, which is
+/// what keeps the gate falsifiable: a check that lives inside the dependency
+/// cannot be disabled to prove it is load-bearing, and that is the whole
+/// reason this module owns a parser at all.
+fn parse_level_2(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    base: &[u8],
+    method: Method,
+) -> Option<EntryHeader> {
+    if base.len() < LEVEL2_BASE_LEN {
+        return None;
+    }
+    // Level 2 spends the two bytes levels 0 and 1 give to a length and a
+    // checksum on ONE `u16` total header size (`parser.rs:257`:
+    // `long_header_len = u16::from_le_bytes([header_len, csum])`).
+    let total = u64::from(u16::from_le_bytes(
+        base.get(HEADER_LEN_I..HEADER_LEN_I + 2)?.try_into().ok()?,
+    ));
+    // Criterion 3: the declared header has to be at least a base header, and
+    // all of it has to be present.
+    if total < LEVEL2_BASE_LEN as u64 || offset.checked_add(total)? > file_len {
+        return None;
+    }
+
+    let compressed_size = u32::from_le_bytes(
+        base.get(COMPRESSED_SIZE_I..COMPRESSED_SIZE_I + 4)?
+            .try_into()
+            .ok()?,
+    );
+    let original_size = u32::from_le_bytes(
+        base.get(ORIGINAL_SIZE_I..ORIGINAL_SIZE_I + 4)?
+            .try_into()
+            .ok()?,
+    );
+    let unix_time = u32::from_le_bytes(
+        base.get(LAST_MODIFIED_I..LAST_MODIFIED_I + 4)?
+            .try_into()
+            .ok()?,
+    );
+    let file_crc = u16::from_le_bytes(base.get(LEVEL2_CRC_I..LEVEL2_CRC_I + 2)?.try_into().ok()?);
+    let first = u16::from_le_bytes(
+        base.get(LEVEL2_FIRST_EXTRA_I..LEVEL2_FIRST_EXTRA_I + 2)?
+            .try_into()
+            .ok()?,
+    );
+
+    // The running CRC-16 covers the header from its very first byte, in the
+    // order `delharc`'s parser reads it — so it is seeded over the whole
+    // fixed base header and carried through the chain walk.
+    let seed = crc16_arc(&base[..LEVEL2_BASE_LEN]);
+    let base_end = offset.checked_add(LEVEL2_BASE_LEN as u64)?;
+    let walk = walk_extra_headers(src, base_end, file_len, u64::from(first), total, seed)?;
+
+    let mut consumed = LEVEL2_BASE_LEN as u64 + walk.total;
+    let mut running = walk.crc;
+    if consumed.checked_add(1)? == total {
+        // `parser.rs:344-348`: level 2 alone may carry ONE padding byte
+        // between the last extension header and the payload, and it is
+        // inside the CRC's range.
+        src.seek(SeekFrom::Start(offset.checked_add(consumed)?))
+            .ok()?;
+        let mut pad = [0u8; 1];
+        src.read_exact(&mut pad).ok()?;
+        running = crc16_arc_continued(running, &pad);
+        consumed += 1;
+    } else if consumed != total && consumed != total.checked_add(2)? {
+        // `parser.rs:349-354`: the only other shape `delharc` tolerates is
+        // the Osk packers' — a total that does not count its own two bytes.
+        // Anything else is a header contradicting its own declared size.
+        return None;
+    }
+
+    // **Criterion 4 for level 2, and the one Step 5's level-2 twin
+    // falsifies.** Mandatory: no common header means no checksum, and no
+    // checksum means nothing separates this from five coincidental bytes.
+    if walk.common_crc? != running {
+        return None;
+    }
+
+    // Criterion 5's analogue. Level 2 carries no name in the base header at
+    // all, so an empty one means the chain held no `0x01` and no `0x02`
+    // header — which no real writer produces.
+    let name = lha_name_from_parts(&walk.path, &walk.name);
+    if name.is_empty() {
+        return None;
+    }
+
+    Some(EntryHeader {
+        method,
+        // NOT reduced by the chain: level 1's size field is the skip size and
+        // level 2's is the compressed length itself, which is exactly why
+        // `delharc` subtracts the extras for level 1 ALONE
+        // (`parser.rs:365-368`).
+        declared_len: u64::from(compressed_size),
+        original_size,
+        file_crc,
+        // A Unix timestamp in seconds, not an MS-DOS word — `delharc`'s
+        // `parse_last_modified` makes the same split at the same level.
+        mtime: Some(UNIX_EPOCH + Duration::from_secs(u64::from(unix_time))),
+        name,
+        payload_start: offset.checked_add(consumed)?,
+    })
+}
+
+/// What an extra-header chain walk recovered.
 struct ExtraChain {
-    /// Total bytes the chain occupies, which is both what separates the base
-    /// header from the payload and what must be subtracted from the skip
-    /// size to get the payload's own length.
+    /// Total bytes the chain occupies, which is what separates the base
+    /// header from the payload — and, for level 1 alone, what must be
+    /// subtracted from the skip size to get the payload's own length.
     total: u64,
     /// The `0x01` (filename) extra header's data, if the chain carried one.
     name: Vec<u8>,
     /// The `0x02` (path) extra header's data, if the chain carried one.
     path: Vec<u8>,
+    /// The `0x00` ("common") extra header's declared CRC-16 over the WHOLE
+    /// header, if the chain carried one. `None` for every level-1 archive in
+    /// practice and for a level-2 one whose writer omitted it — which
+    /// [`parse_level_2`] refuses, since that is its entire gate.
+    common_crc: Option<u16>,
+    /// The running CRC-16/ARC over every byte walked, continued from the
+    /// caller's seed, **with the common header's own two checksum bytes
+    /// replaced by zeros** — the order and the substitution `delharc`'s
+    /// `parser.rs:306-331` performs.
+    crc: u16,
 }
 
-/// Walks a level-1 extra-header chain from `start`, per this module's gate
+/// Walks an extra-header chain from `start`, per this module's gate
 /// criterion 6. `None` — a rejected candidate, never an error — if the chain
-/// runs off the end of the source, past [`MAX_EXTRA_CHAIN`], past the skip
-/// size the header itself declared, or through a header too small to carry
-/// its own terminator.
+/// runs off the end of the source, past [`MAX_EXTRA_CHAIN`], past `budget`
+/// (the skip size for level 1, the declared total header size for level 2),
+/// or through a header too small to carry its own terminator.
 ///
 /// Each header is read into a buffer sized by that header's own `u16` length
 /// field, so the largest allocation this function can be made to request is
 /// 65,535 bytes regardless of what any other field says.
+///
+/// `crc_seed` is the running CRC-16/ARC over whatever the caller has already
+/// walked (level 2's fixed base header); level 1 passes `0` and ignores the
+/// result, because no level-1 gate uses it.
 fn walk_extra_headers(
     src: &mut dyn SeekRead,
     start: u64,
     file_len: u64,
     first_len: u64,
-    skip_size: u32,
+    budget: u64,
+    crc_seed: u16,
 ) -> Option<ExtraChain> {
     let mut chain = ExtraChain {
         total: 0,
         name: Vec::new(),
         path: Vec::new(),
+        common_crc: None,
+        crc: crc_seed,
     };
     let mut pos = start;
     let mut next = first_len;
@@ -781,7 +1065,7 @@ fn walk_extra_headers(
             return None;
         }
         chain.total = chain.total.checked_add(next)?;
-        if chain.total > MAX_EXTRA_CHAIN || chain.total > u64::from(skip_size) {
+        if chain.total > MAX_EXTRA_CHAIN || chain.total > budget {
             return None;
         }
         let end = pos.checked_add(next)?;
@@ -798,12 +1082,30 @@ fn walk_extra_headers(
         // trailing two-byte "next length" field, identifier byte first —
         // `[EXT_HEADER_FILENAME, data @ ..]` in `lha.rs`'s `raw_pathname`.
         // This mirrors that split rather than inventing a second one.
-        let content = &buf[..len - 2];
-        match content {
+        match &buf[..len - 2] {
             [delharc::header::ext::EXT_HEADER_FILENAME, data @ ..] => chain.name = data.to_vec(),
             [delharc::header::ext::EXT_HEADER_PATH, data @ ..] => chain.path = data.to_vec(),
+            [delharc::header::ext::EXT_HEADER_COMMON, ..] => {
+                // `delharc` raises "double common CRC-16 header" for a second
+                // one rather than letting either win; a scanner refuses the
+                // candidate for the same reason.
+                if chain.common_crc.is_some() {
+                    return None;
+                }
+                // The checksum covers the header with its OWN two bytes
+                // zeroed, so they are lifted out and zeroed before this
+                // header joins the running sum — `parser.rs:306-317`.
+                // A common header too short to hold them carries no CRC at
+                // all, which for level 2 is a refusal one line up in
+                // `parse_level_2` rather than a decision here.
+                let crc_bytes = buf.get(1..3)?;
+                chain.common_crc = Some(u16::from_le_bytes(crc_bytes.try_into().ok()?));
+                buf[1] = 0;
+                buf[2] = 0;
+            }
             _ => {}
         }
+        chain.crc = crc16_arc_continued(chain.crc, &buf[..len]);
 
         next = u64::from(u16::from_le_bytes(buf[len - 2..].try_into().ok()?));
         pos = end;
@@ -840,7 +1142,7 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
     } else {
         EntryKind::File
     };
-    meta.mtime = lha_mtime(header.last_modified);
+    meta.mtime = header.mtime;
     meta.codec = Some(header.method.codec());
 
     Some(Candidate {
@@ -1162,11 +1464,12 @@ pub fn write_payload(
 /// difference between recovering a prefix and recovering nothing: the last
 /// [`DECODE_CHUNK`] bytes requested are simply lost, **and for any entry
 /// smaller than one chunk that is the entire payload**. Measured before this
-/// existed, on a 144-byte stored entry cut 31 bytes short: `NAME.partial`
-/// held 0 bytes, at exit 4, for an entry whose first 113 bytes were sitting
-/// in the file. That is `arc_salvage.rs`'s fix rounds 1 and 2 recurring
-/// through a different decoder API, and it is the one thing this verb exists
-/// not to do.
+/// existed, on a 144-byte stored entry cut 30 payload bytes short:
+/// `NAME.partial` held 0 bytes, at exit 4, for an entry whose first **114**
+/// bytes were sitting in the file (`got 0 of the 114 that are in the file`,
+/// which is what the test prints when the second pass is disabled). That is
+/// `arc_salvage.rs`'s fix rounds 1 and 2 recurring through a different
+/// decoder API, and it is the one thing this verb exists not to do.
 ///
 /// # Why it is a second pass rather than a smaller chunk
 ///
@@ -1287,6 +1590,74 @@ mod tests {
         out
     }
 
+    /// A LEVEL-2 header (Ruling S-U), the shape with no length byte, no
+    /// checksum byte, no filename in the base header and a mandatory
+    /// `EXT_HEADER_COMMON` CRC-16 over the whole thing.
+    ///
+    /// Layout from this module's own level-2 table, and — like the level-0
+    /// builder — checked rather than trusted:
+    /// [`the_header_geometry_agrees_with_delharcs_own_parser`] parses
+    /// everything this builds with `delharc`'s `LhaHeader::read` too and
+    /// requires byte-exact agreement on where the payload starts. A builder
+    /// and a parser written by one author agreeing with each other proves
+    /// nothing; `delharc` is the third party that makes it evidence.
+    ///
+    /// `refresh_common_crc` decides whether the common header's checksum is
+    /// left correct — `false` builds the crafted defect whose ONLY fault is
+    /// that checksum, which is what makes Step 5's level-2 falsification
+    /// about the CRC rather than about some other malformation.
+    fn build_level2_with(
+        name: &[u8],
+        method: &[u8; 5],
+        content: &[u8],
+        refresh_common_crc: bool,
+    ) -> Vec<u8> {
+        // `0x00` + the CRC-16 + the next header's length.
+        let common_len = 1 + 2 + 2;
+        // `0x01` + the name + the next header's length (zero: chain ends).
+        let name_len = 1 + name.len() + 2;
+        let total = LEVEL2_BASE_LEN + common_len + name_len;
+
+        let mut header = Vec::new();
+        header.extend_from_slice(&(total as u16).to_le_bytes()); // H+0
+        header.extend_from_slice(method); // H+2
+        header.extend_from_slice(&(content.len() as u32).to_le_bytes()); // H+7
+        header.extend_from_slice(&(content.len() as u32).to_le_bytes()); // H+11
+        header.extend_from_slice(&1_000_000_000u32.to_le_bytes()); // H+15, Unix
+        header.push(0x20); // H+19, reserved
+        header.push(2); // H+20, level
+        header.extend_from_slice(&crc16_arc(content).to_le_bytes()); // H+21
+        header.push(b'U'); // H+23, OS-TYPE
+        header.extend_from_slice(&(common_len as u16).to_le_bytes()); // H+24
+        assert_eq!(header.len(), LEVEL2_BASE_LEN);
+
+        header.push(delharc::header::ext::EXT_HEADER_COMMON);
+        header.extend_from_slice(&0u16.to_le_bytes()); // the CRC, zeroed
+        header.extend_from_slice(&(name_len as u16).to_le_bytes());
+        header.push(delharc::header::ext::EXT_HEADER_FILENAME);
+        header.extend_from_slice(name);
+        header.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(header.len(), total);
+
+        // Over the WHOLE header with the common header's own two bytes still
+        // zero, which is exactly the state they are in right now.
+        let crc = if refresh_common_crc {
+            crc16_arc(&header)
+        } else {
+            crc16_arc(&header).wrapping_add(1)
+        };
+        header[LEVEL2_BASE_LEN + 1..LEVEL2_BASE_LEN + 3].copy_from_slice(&crc.to_le_bytes());
+
+        let mut out = header;
+        out.extend_from_slice(content);
+        out.push(0); // end-of-archive marker
+        out
+    }
+
+    fn build_level2(name: &[u8], method: &[u8; 5], content: &[u8]) -> Vec<u8> {
+        build_level2_with(name, method, content, true)
+    }
+
     /// A level-1 entry carrying a real extra-header chain: a `0x02` path
     /// header and a `0x01` filename header, the two `lha.rs`'s `raw_pathname`
     /// consults. The base header's own filename field holds `fallback`, which
@@ -1393,6 +1764,13 @@ mod tests {
     /// exact failure mode this project keeps rediscovering.
     const CHECKSUM_ONLY_DEFECT_OFFSET: usize = 500_000;
 
+    /// The level-2 twin of [`CHECKSUM_ONLY_DEFECT_OFFSET`], added with Ruling
+    /// S-U: level 2 has its own criterion 4 (the `EXT_HEADER_COMMON` CRC-16),
+    /// so it needs its own crafted splice, or disabling THAT check would go
+    /// unnoticed exactly the way disabling the level-0/1 one would have
+    /// without the splice above.
+    const LEVEL2_CRC_ONLY_DEFECT_OFFSET: usize = 700_000;
+
     fn checksum_only_defect() -> Vec<u8> {
         let mut bytes = build_level1(b"OK.TXT", b"-lh0-", b"payload");
         // Every other criterion still holds; only the checksum is wrong.
@@ -1400,14 +1778,21 @@ mod tests {
         bytes
     }
 
+    fn level2_crc_only_defect() -> Vec<u8> {
+        build_level2_with(b"OK2.TXT", b"-lh0-", b"payload", false)
+    }
+
     fn noise_with_seeded_methods(len: usize) -> Vec<u8> {
         let mut noise = deterministic_noise(len);
         for &at in &SEEDED_METHOD_OFFSETS {
             noise[at..at + 5].copy_from_slice(Method::Lh5.identifier());
         }
-        let defect = checksum_only_defect();
-        noise[CHECKSUM_ONLY_DEFECT_OFFSET..CHECKSUM_ONLY_DEFECT_OFFSET + defect.len()]
-            .copy_from_slice(&defect);
+        for (at, defect) in [
+            (CHECKSUM_ONLY_DEFECT_OFFSET, checksum_only_defect()),
+            (LEVEL2_CRC_ONLY_DEFECT_OFFSET, level2_crc_only_defect()),
+        ] {
+            noise[at..at + defect.len()].copy_from_slice(&defect);
+        }
         noise
     }
 
@@ -1440,11 +1825,11 @@ mod tests {
             .windows(5)
             .filter(|w| Method::from_identifier(&[w[0], w[1], w[2], w[3], w[4]]).is_some())
             .count();
-        // The six deliberately seeded identifiers, plus the spliced
-        // archive's own. `>=` rather than `==`: this does not also assert
-        // the LCG produces no INCIDENTAL identifier of its own, which would
-        // only be one more coincidence for the gate to reject.
-        let seeded = SEEDED_METHOD_OFFSETS.len() + 1;
+        // The six deliberately seeded identifiers, plus one for each of the
+        // two spliced archives. `>=` rather than `==`: this does not also
+        // assert the LCG produces no INCIDENTAL identifier of its own, which
+        // would only be one more coincidence for the gate to reject.
+        let seeded = SEEDED_METHOD_OFFSETS.len() + 2;
         assert!(
             hits >= seeded,
             "expected at least the {seeded} deliberately placed identifiers, found {hits}"
@@ -1536,18 +1921,109 @@ mod tests {
         assert_eq!(out.entries[0].status, SalvageStatus::Intact);
     }
 
-    /// Levels 2 and 3 are deliberately out of scope — see this module's doc.
-    /// Pinned rather than left implicit, so the day a level-2 parser lands
-    /// this test says out loud that the coverage just changed.
+    /// **Ruling S-U, the positive half.** A healthy level-2 archive is
+    /// recovered. Before the ruling this scanner refused every level-2
+    /// header, so `stuffr list` printed the entry and `stuffr salvage
+    /// --list` answered "the scan found nothing recoverable" at exit 5 — one
+    /// tool contradicting itself across two lines, on an UNDAMAGED file.
     #[test]
-    fn a_level_2_header_is_not_recognised_by_this_scanner() {
-        let mut bytes = build_level1(b"NEW.TXT", b"-lh0-", b"payload");
-        bytes[HEADER_LEVEL_I] = 2;
-        let counted_len = usize::from(bytes[HEADER_LEN_I]);
-        bytes[HEADER_CSUM_I] = checksum_of(&bytes[METHOD_I..METHOD_I + counted_len]);
+    fn a_healthy_level_2_archive_is_recovered() {
+        let bytes = build_level2(b"level2.txt", b"-lh0-", b"level two payload");
+        let out = scan(&bytes);
+        assert_eq!(out.entries.len(), 1, "{:?}", out.entries);
+        assert_eq!(out.entries[0].meta.name, "level2.txt");
+        assert_eq!(out.entries[0].status, SalvageStatus::Intact);
+        assert_eq!(out.entries[0].meta.codec, Some(FormatId::new("lha-lh0")));
+        assert_eq!(
+            out.entries[0].meta.mtime,
+            Some(UNIX_EPOCH + Duration::from_secs(1_000_000_000)),
+            "a level-2 timestamp is Unix seconds, not an MS-DOS word — reading one as the \
+             other is a silent decades-wide error, never a parse failure"
+        );
+    }
+
+    /// **Ruling S-U, the recovery half.** The same damage the level-1
+    /// reproducer uses, applied to level 2: destroy the first header's own
+    /// declared size and the entry behind it is unreachable to any forward
+    /// reader, while the scanner finds the second header on its own.
+    #[test]
+    fn a_level_2_archive_with_a_destroyed_first_header_still_salvages_the_rest() {
+        let first = build_level2(b"gone.txt", b"-lh0-", b"first payload");
+        let second = build_level2(b"survivor.txt", b"-lh0-", b"second payload");
+        let mut bytes = first[..first.len() - 1].to_vec();
+        bytes.extend_from_slice(&second);
+        // Wipe the first header's `u16` total size. Its method identifier is
+        // untouched, so the scan still SEES it and the gate still rejects it.
+        bytes[HEADER_LEN_I] = 0xFF;
+        bytes[HEADER_LEN_I + 1] = 0xFF;
+
+        let out = scan(&bytes);
+        let names: Vec<&str> = out.entries.iter().map(|e| e.meta.name.as_str()).collect();
+        assert_eq!(names, vec!["survivor.txt"], "{names:?}");
+        assert_eq!(out.entries[0].status, SalvageStatus::Intact);
+    }
+
+    /// **The level-2 arm of Step 5's falsification**, and the reason
+    /// `LEVEL2_CRC_ONLY_DEFECT_OFFSET` exists: this archive clears every
+    /// other level-2 criterion and fails only on the `EXT_HEADER_COMMON`
+    /// CRC-16, so deleting that comparison turns it into a phantom in the
+    /// noise corpus.
+    #[test]
+    fn the_level_2_crc_only_defect_is_rejected_by_the_common_crc_alone() {
+        assert!(
+            scan(&level2_crc_only_defect()).entries.is_empty(),
+            "a level-2 header whose common CRC-16 does not reproduce must be rejected"
+        );
+        // The identical archive with the CRC left correct IS found, which is
+        // what makes the assertion above about the checksum.
+        let healthy = build_level2_with(b"OK2.TXT", b"-lh0-", b"payload", true);
+        assert_eq!(scan(&healthy).entries.len(), 1);
+    }
+
+    /// The one place this scanner is deliberately STRICTER than `delharc`:
+    /// a level-2 header carrying no common extension header at all parses
+    /// fine for the reader and is refused here, because there is then no
+    /// checksum to tell a real header from five coincidental bytes. Recorded
+    /// as a test so the narrowing is visible rather than implied.
+    #[test]
+    fn a_level_2_header_with_no_common_extension_header_is_not_scanned() {
+        let bytes = build_level2(b"nocrc.txt", b"-lh0-", b"payload");
+        // Point the base header's first-extra-header field straight at the
+        // FILENAME header, skipping the common one, and shorten the declared
+        // total to match the chain that remains.
+        let common_len = 5usize;
+        let mut trimmed = bytes[..LEVEL2_BASE_LEN].to_vec();
+        trimmed.extend_from_slice(&bytes[LEVEL2_BASE_LEN + common_len..]);
+        let name_len = 1 + b"nocrc.txt".len() + 2;
+        let total = LEVEL2_BASE_LEN + name_len;
+        trimmed[HEADER_LEN_I..HEADER_LEN_I + 2].copy_from_slice(&(total as u16).to_le_bytes());
+        trimmed[LEVEL2_FIRST_EXTRA_I..LEVEL2_FIRST_EXTRA_I + 2]
+            .copy_from_slice(&(name_len as u16).to_le_bytes());
+
+        // The CONTROL: `delharc` — the parser `stuffr list` reads through —
+        // accepts this archive, which is what makes the refusal below a
+        // deliberate narrowing rather than a shared limitation.
+        assert!(
+            delharc::header::LhaHeader::read(&mut Cursor::new(trimmed.clone()))
+                .expect("delharc accepts a level-2 header with no common CRC")
+                .is_some()
+        );
+        assert!(
+            scan(&trimmed).entries.is_empty(),
+            "no common CRC-16 means no gate, and a scanner with no gate is worse than none"
+        );
+    }
+
+    /// Level 3 is deliberately out of scope — see this module's doc. Pinned
+    /// rather than left implicit, so the day a level-3 parser lands this test
+    /// says out loud that the coverage just changed.
+    #[test]
+    fn a_level_3_header_is_not_recognised_by_this_scanner() {
+        let mut bytes = build_level2(b"lvl3.txt", b"-lh0-", b"payload");
+        bytes[HEADER_LEVEL_I] = 3;
         assert!(
             scan(&bytes).entries.is_empty(),
-            "a level-2 header carries no checksum to gate on and is not scanned"
+            "level 3 re-sizes every length field to 32 bits and is a different parser"
         );
     }
 
@@ -1604,6 +2080,14 @@ mod tests {
                 build_level1_with_extras(b"IGNORED", b"dir\xff", b"real.txt", b"chained"),
                 "built level 1 with an extra-header chain",
             ),
+            (
+                build_level2(b"level2.txt", b"-lh0-", b"level two"),
+                "built level 2 (Ruling S-U)",
+            ),
+            (
+                build_level2(b"dir\xffdeep.txt", b"-lh0-", b""),
+                "built level 2, empty payload and a path-shaped name",
+            ),
         ];
 
         for (bytes, label) in cases {
@@ -1640,10 +2124,23 @@ mod tests {
                 "{label}: original size"
             );
             assert_eq!(mine.file_crc, header.file_crc, "{label}: file CRC-16");
-            assert_eq!(
-                mine.last_modified, header.last_modified,
-                "{label}: MS-DOS timestamp word"
-            );
+            // The timestamp is asserted for LEVEL 2 alone, and deliberately.
+            // At levels 0 and 1 the only figure to compare against is
+            // `lha_mtime`'s own output — this module's function — which
+            // would be a tautology; `lha.rs`'s
+            // `a_packed_dos_timestamp_round_trips_through_its_own_inverse`
+            // pins that one against the production WRITER instead. Level 2
+            // is different: the field is raw Unix seconds, so `delharc`'s
+            // own `last_modified` is an independent figure to check against,
+            // and reading a level-2 stamp as an MS-DOS word (or the reverse)
+            // is a silent decades-wide error rather than a parse failure.
+            if header.level >= 2 {
+                assert_eq!(
+                    mine.mtime,
+                    Some(UNIX_EPOCH + Duration::from_secs(u64::from(header.last_modified))),
+                    "{label}: a level-2 timestamp is Unix seconds"
+                );
+            }
             assert_eq!(
                 mine.name,
                 super::super::lha::test_archives::pathname(&header),
@@ -1896,6 +2393,21 @@ mod tests {
             largest <= 1 << 20,
             "largest single allocation was {largest} bytes — a 4 GiB header field became a \
              buffer, which is what `max_whole_entry`'s `u64::MAX` says cannot happen"
+        );
+        // **The LOWER bound, and it is not decoration.** Fix round 1's
+        // MEDIUM: an assertion that is only an upper bound cannot notice the
+        // PROBE's own absence — detach `alloc_probe`'s `#[global_allocator]`
+        // and `largest_single_allocation` reports `0`, which satisfies
+        // `<= 1 << 20` perfectly while measuring nothing. Measured: with the
+        // attribute patched to `#[cfg(any())]`, this test passed and its
+        // sibling below failed. `find_next_method` allocates a
+        // `SCAN_CHUNK`-sized read buffer on every scan, so that figure is a
+        // floor the probe cannot report unless it is actually attached.
+        assert!(
+            largest >= SCAN_CHUNK,
+            "largest single allocation was only {largest} bytes, below the {SCAN_CHUNK}-byte \
+             buffer every scan allocates — the recording allocator is not attached, so the \
+             ceiling above is measuring nothing"
         );
         assert_eq!(out.entries.len(), 1);
         assert_eq!(
@@ -2164,10 +2676,11 @@ mod tests {
     /// rather than the degenerate one above, where the fine region is the
     /// whole entry.
     ///
-    /// Without the second pass this recovers `4 * DECODE_CHUNK` bytes and
-    /// stops 1,614 short; without `fine_from` it would recover the same
-    /// bytes at 20,000 single-byte `fill_buffer` calls instead of four
-    /// chunked ones plus a few hundred.
+    /// Measured with the second pass disabled: `got 16384 of the 19990 bytes
+    /// that are in the file` — it recovers `4 * DECODE_CHUNK` and stops
+    /// **3,606** short. Without `fine_from` it would recover the same bytes
+    /// at 19,990 single-byte `fill_buffer` calls instead of four chunked ones
+    /// plus a few thousand.
     #[test]
     fn write_payload_recovers_a_truncated_entry_past_the_first_whole_chunk() {
         let content: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
