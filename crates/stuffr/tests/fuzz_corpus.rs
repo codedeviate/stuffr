@@ -47,7 +47,8 @@
 //!   for the two measurements behind them — the one that made seeding this
 //!   target necessary at all (Stage 1) and the one that put ZOO seeds in it
 //!   (Stage 2 Task 4). **Three slots are seeded**: a `zoo-*` shape carries
-//!   `SALVAGE_SLOTS`'s `zoo` index, an `lha-*` shape its `lha` index, and
+//!   `SALVAGE_SLOTS`'s `zoo` index, an `lha-*` shape its `lha` index, an
+//!   `arj-*` shape its `arj` index, and
 //!   every other shape its `zip` index — looked up, never a literal `0`, so
 //!   appending a slot cannot silently re-point an existing seed.
 //!
@@ -99,8 +100,9 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// selector byte as of Stage 2 Task 3b (see the module doc's own bullet on
 /// `salvage.rs`), and as of Stage 2 Task 4 they do NOT all select the same
 /// slot: a shape named `zoo-*` carries `SALVAGE_SLOTS`'s `zoo` index, one
-/// named `lha-*` its `lha` index (Stage 2 Task 5), and every other shape
-/// carries its `zip` index.
+/// named `lha-*` its `lha` index (Stage 2 Task 5), one named `arj-*` its
+/// `arj` index (Stage 2 Task 6), and every other shape carries its `zip`
+/// index.
 ///
 /// **`arc` still has no seed and `zoo` now does, and that asymmetry is a
 /// MEASUREMENT rather than an oversight.** Task 4 measured what earlier
@@ -190,6 +192,32 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 ///   is reachable only by having parsed entry 1), while the scanner still
 ///   recovers the second entry `Intact`. The motivating shape for the whole
 ///   LHA scanner.
+///
+/// The two ARJ shapes (Stage 2 Task 6) are seeded for the opposite reason to
+/// LHA's, and it is worth stating because the conclusion is the same while
+/// the argument inverts. ARJ's anchor is the WEAKEST of the five — two
+/// bytes, `0x60 0xEA`, one coincidence per 64 KiB — so mutation from zip
+/// seeds reaches an apparent ARJ header constantly. What it cannot reach is
+/// a REPORTED one: every candidate must carry a basic header CRC-32 that
+/// reproduces over its own content, and every `Intact` one a second CRC-32
+/// over its decoded payload. Two independent 32-bit checksums are not
+/// something random mutation produces, so an unseeded `arj` slot would spend
+/// its whole share of every run exactly the way the `zoo` slot measurably
+/// spent its 876 inputs. Both shapes are `sample.arj`, which no encoder here
+/// produced — hand-built in Phase 3b from the published header tables, and
+/// the weakest-provenance fixture in this tree (`MANIFEST.md` says so; so
+/// does `legacy::arj_salvage`'s module doc).
+///
+/// - `arj-healthy` — `sample.arj` verbatim, two `Stored` entries, both
+///   `Intact`.
+/// - `arj-destroyed-main-header` — the same archive with the MAIN header's
+///   `u16` basic header size raised past the spec's 2600-byte maximum. Two
+///   bytes, and `unarj_rs::ArjArchieve::new` refuses to open the archive at
+///   all ("Header size is too big"), so `stuffr list` cannot reach one entry
+///   — while both local file headers, their payloads and their CRC-32s are
+///   untouched and the scanner recovers both `Intact`. The motivating shape
+///   for the whole ARJ scanner, and a sharper one than LHA's: there the
+///   damage costs the entries BEHIND it, here it costs the whole archive.
 const SALVAGE_SHAPES: &[&str] = &[
     "healthy",
     "distinct-duplicates",
@@ -201,6 +229,8 @@ const SALVAGE_SHAPES: &[&str] = &[
     "zoo-zeroed-chain",
     "lha-healthy",
     "lha-destroyed-first-header",
+    "arj-healthy",
+    "arj-destroyed-main-header",
 ];
 
 /// Builds one small sample tree every container/chain seed packs: a file at
@@ -855,12 +885,32 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
                 bytes[1] = 0xFF;
                 bytes
             }
+            // Hand-built from the published ARJ header tables in Phase 3b —
+            // the weakest-provenance fixture in this tree, and still not
+            // this project's encoder's output, which is what the corpus
+            // wants of a seed.
+            "arj-healthy" => read_all(&legacy_fixture_path("sample.arj"))?,
+            // Two bytes: the MAIN header's `u16` basic header size, raised
+            // past the spec's 2600-byte maximum. `ArjArchieve::new` refuses
+            // the archive outright ("Header size is too big"), so the
+            // ordinary reader reaches NO entry — while both local file
+            // headers and both payloads are untouched. The `60 EA` magic at
+            // offset 0 is deliberately left alone so format detection still
+            // resolves this as an ARJ.
+            "arj-destroyed-main-header" => {
+                let mut bytes = read_all(&legacy_fixture_path("sample.arj"))?;
+                bytes[2] = 0xFF;
+                bytes[3] = 0xFF;
+                bytes
+            }
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
         let slot = if shape.starts_with("zoo-") {
             "zoo"
         } else if shape.starts_with("lha-") {
             "lha"
+        } else if shape.starts_with("arj-") {
+            "arj"
         } else {
             "zip"
         };
