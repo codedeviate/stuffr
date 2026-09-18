@@ -89,10 +89,76 @@ pub(crate) mod alloc_probe {
     /// A ceiling assertion on that figure is the only thing in this crate
     /// that can tell "refused before the allocation" from "allocated, then
     /// the status came out right anyway".
+    /// Measures the **calling thread only**. Nothing in this crate hands a
+    /// closure work on another thread, but an allocation made on one a
+    /// caller spawned would be invisible here — stated because this probe
+    /// has one caller today and the limitation is not obvious from the
+    /// signature.
     pub(crate) fn largest_single_allocation<T>(f: impl FnOnce() -> T) -> (T, usize) {
         LARGEST.with(|largest| largest.set(0));
         let out = f();
         (out, LARGEST.with(|largest| largest.get()))
+    }
+
+    /// The instrument's own anti-vacuity double — the pattern
+    /// `stuffr-core`'s `broken_codecs` and `broken_honesty` already carry,
+    /// applied to the thing measuring them.
+    ///
+    /// **Detach the `#[global_allocator]` below and this module goes
+    /// silent, not wrong**: [`largest_single_allocation`] reports `0`,
+    /// every ceiling assertion written against it passes, and the whole
+    /// `stuffr-formats` lib suite stays green — measured, 619 passed / 2
+    /// ignored with the attribute patched to `#[cfg(any())]`. That is the
+    /// exact shape this project has now found in four separate places
+    /// (`broken_codecs`, `broken_honesty`, Stage 1's salvage target, and
+    /// the source-side mock this probe was built to replace): an instrument
+    /// that stops measuring and reports success. A probe whose only
+    /// assertions are UPPER bounds cannot notice its own absence, so the
+    /// double has to be a LOWER one.
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A figure far above anything the suite allocates incidentally and
+        /// far below the multi-gigabyte requests the ceilings are about, so
+        /// neither can be mistaken for the other.
+        const KNOWN: usize = 4 << 20;
+
+        #[test]
+        fn the_probe_observes_an_allocation_it_is_pointed_at() {
+            let (capacity, largest) = largest_single_allocation(|| {
+                // `black_box` so nothing may reason the allocation away;
+                // the test profile is unoptimised, and relying on that
+                // would make this double depend on a build setting.
+                let buf: Vec<u8> = Vec::with_capacity(KNOWN);
+                std::hint::black_box(buf.capacity())
+            });
+            assert!(capacity >= KNOWN);
+            assert!(
+                largest >= KNOWN,
+                "the probe reported {largest} bytes for a {KNOWN}-byte allocation — it is \
+                 not installed, and every ceiling assertion written against it is passing \
+                 on silence"
+            );
+        }
+
+        /// The other half: a probe that only ever grew would also pass the
+        /// test above forever, and would then report one test's allocation
+        /// as the next one's.
+        #[test]
+        fn the_probe_resets_between_measurements() {
+            let (_, first) = largest_single_allocation(|| {
+                std::hint::black_box(Vec::<u8>::with_capacity(KNOWN).capacity())
+            });
+            assert!(first >= KNOWN);
+            let (_, second) = largest_single_allocation(|| std::hint::black_box(0usize));
+            assert!(
+                second < KNOWN,
+                "the record carried {second} bytes into a measurement that allocated \
+                 nothing — every ceiling assertion after a large allocation would fail \
+                 for the wrong reason"
+            );
+        }
     }
 }
 

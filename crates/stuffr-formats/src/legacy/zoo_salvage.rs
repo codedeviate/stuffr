@@ -1555,6 +1555,125 @@ mod tests {
         );
     }
 
+    /// **Fix round 2, NEW-1.** The write side's own `org_size` ceiling had
+    /// no test at all: neutering it entirely left 619 passed / 2 ignored in
+    /// this crate and 3 passed in `stuffr`'s `salvage_zoo.rs`, all green.
+    ///
+    /// The Stored regression test above proves the LH5 GATE's placement on
+    /// that line (drop `method == Method::Lh5 &&` and it fails), and
+    /// `an_entry_whose_present_bytes_alone_exceed_the_ceiling_…` exercises
+    /// `readable_len > ceiling`, one branch earlier — so the
+    /// `expected > ceiling` arm had never executed, and the
+    /// `vec![0u8; org_size]` inside `zoo.rs`'s `lh5_decode` was reachable
+    /// from this `pub` function with a figure up to 4 GiB.
+    ///
+    /// # Why this drives `write_payload`, not `write_payload_bounded`
+    ///
+    /// `write_payload_bounded` exists so a SMALL ceiling can be passed; that
+    /// is the right instrument for the `readable_len` branch, whose fixture
+    /// would otherwise have to be 256 MiB of real bytes. This branch needs
+    /// no such trick — `expected` comes from the entry's own
+    /// [`EntryMeta::size`], which a caller sets freely — so the test uses
+    /// the REAL ceiling through the REAL public entry point, which is
+    /// exactly the population `write_payload`'s own doc says the check is
+    /// kept for: a direct caller supplying its own [`SalvagedEntry`].
+    /// Through `stuffr::entries::salvage` the branch is unreachable (an
+    /// over-ceiling entry is `Unverified` at verify time and
+    /// `place_salvaged_file` never writes one).
+    ///
+    /// [`crate::alloc_probe`] is what makes this a guard rather than a
+    /// restatement of the return value: neutered, the assertion that fires
+    /// is the ALLOCATION one, because `Ok(false)` alone is also what a
+    /// failed decode answers.
+    #[test]
+    fn an_absurd_org_size_is_refused_before_the_allocation_it_would_size_on_the_write_side() {
+        // Any bytes at all: the ceiling refuses before a single one is read,
+        // which is the point. A real LH5 payload is not needed and could not
+        // be built here — `zoo.rs` has no encoder.
+        let path = temp_archive(&[0u8; 64], "write-ceiling");
+
+        let entry = SalvagedEntry {
+            scan_position: 0,
+            offset: 0,
+            payload_start: 0,
+            meta: {
+                let mut m = EntryMeta::file("BIG.LH5");
+                m.codec = codec_for_zoo_method(2); // the arm that allocates
+                m.size = Some(u64::from(ABSURD_SIZE));
+                m.compressed_size = Some(8);
+                m
+            },
+            status: SalvageStatus::Partial,
+            shadows: None,
+            collides_with: None,
+            marked_deleted: false,
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let (result, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            write_payload(&path, &entry, 8, &mut sink)
+        });
+        let _ = std::fs::remove_file(&path);
+
+        // Asserted FIRST, for the reason its verify-side twin is: with the
+        // ceiling neutered the `Ok(false)`/empty-sink assertions still hold
+        // (the decode fails on garbage and answers `Ok(false)` too), so they
+        // would hide the finding this test exists for.
+        assert!(
+            largest <= 1 << 20,
+            "largest single allocation was {largest} bytes — `org_size` reached \
+             `lh5_decode`'s `vec![0u8; _]` from a `pub` entry point with nothing bounding it"
+        );
+        let completed = result.expect(
+            "an over-ceiling `org_size` must fold into Ok(false), never an Err that would \
+             abort the whole salvage run",
+        );
+        assert!(!completed);
+        assert!(sink.is_empty());
+    }
+
+    /// The other side of the branch, so the test above cannot be satisfied
+    /// by a ceiling that refuses everything: an LH5 entry whose declared
+    /// `org_size` is UNDER the ceiling passes the comparison and reaches
+    /// `decode`, which then fails on bytes that are not an LH5 stream. Both
+    /// answer `Ok(false)`; only the allocation tells them apart, which is
+    /// why the probe is the discriminator here too.
+    #[test]
+    fn an_org_size_under_the_ceiling_reaches_the_decoder_rather_than_being_refused() {
+        let path = temp_archive(&[0u8; 64], "write-under-ceiling");
+        let modest = 64 * 1024u32;
+
+        let entry = SalvagedEntry {
+            scan_position: 0,
+            offset: 0,
+            payload_start: 0,
+            meta: {
+                let mut m = EntryMeta::file("SMALL.LH5");
+                m.codec = codec_for_zoo_method(2);
+                m.size = Some(u64::from(modest));
+                m.compressed_size = Some(8);
+                m
+            },
+            status: SalvageStatus::Partial,
+            shadows: None,
+            collides_with: None,
+            marked_deleted: false,
+        };
+
+        let mut sink: Vec<u8> = Vec::new();
+        let (result, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            write_payload(&path, &entry, 8, &mut sink)
+        });
+        let _ = std::fs::remove_file(&path);
+        result.expect("a modest org_size must not error either");
+        assert!(
+            largest >= usize::try_from(modest).unwrap(),
+            "an org_size UNDER the ceiling must reach `lh5_decode` and be allocated — \
+             {largest} bytes says the ceiling is refusing entries it should pass, which \
+             would make the test above pass for the wrong reason"
+        );
+    }
+
     /// Every method a real ZOO record can produce must survive the round
     /// trip salvage's write path depends on — `from_byte` → `Method::codec`
     /// → `method_for_codec`. Driven from `from_byte` over the WHOLE byte

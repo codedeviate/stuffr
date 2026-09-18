@@ -28,12 +28,38 @@ use stuffr::entries::{self, SalvageDisposition, SalvageOpts};
 use stuffr_core::FormatId;
 use stuffr_core::salvage::SalvagePolicy;
 
+// ---------------------------------------------------------------------
+// `zoo.h`'s record layout, hand-copied — and that IS a copy, which this
+// comment used to deny.
+//
+// **Fix round 2, NEW-2.** An earlier version of this block said "two field
+// offsets are read by hand in this file and no more … deliberately not a
+// copy of the 56-byte record layout". Ruling S-R's test then added three
+// more offsets, a CRC-16/ARC reimplementation and the literal `56`, and the
+// sentence became the counterexample it cited. Corrected rather than
+// restored, because the property cannot be restored from here:
+// `legacy::zoo`'s `SIZ_DIRL`, `VARDIRLEN_I` and `DCRC_I` are all
+// `pub(super)` inside `stuffr-formats::legacy`, and this file is an
+// integration test of `stuffr` — a different crate, two module boundaries
+// away. Widening them to `pub` to satisfy a test would put ZOO's private
+// record layout in the published API of a crate whose own doc calls that
+// layout the thing `unarc-rs` got wrong.
+//
+// What IS held: every number lives here, named, in one block — never
+// inline in an expression — so the whole copy is one place to check
+// against `zoo.rs` if either ever moves. `zoo_salvage.rs`'s own tests, one
+// crate down, use `zoo.rs`'s constants directly and copy nothing.
+//
+// Nothing below is load-bearing for the SCANNER's correctness: these
+// offsets exist only to damage a fixture in a specific way (zero a `next`
+// link, set a `deleted` flag) and to re-stamp the record's own checksum
+// afterwards so the scanner's gate does not reject it for the wrong
+// reason. A wrong offset here makes a test fail to reproduce the damage it
+// names — it cannot make a broken scanner look correct.
+// ---------------------------------------------------------------------
+
 /// The archive's own `zoo_start` (`zoo.h`'s `ZSTART_I 24`) — the absolute
 /// position of the first directory record.
-///
-/// Two field offsets are read by hand in this file and no more; that is
-/// deliberately not a copy of the 56-byte record layout the scanner and
-/// `zoo.rs` share, only the two pointers one test needs to damage.
 const ZSTART_I: usize = 24;
 /// `zoo.h`'s `NEXT_I 6` within a directory record.
 const NEXT_I: usize = 6;
@@ -43,6 +69,13 @@ const DELETE_I: usize = 30;
 /// record's own checksum after a test damages one byte of it.
 const VARDIRLEN_I: usize = 51;
 const DCRC_I: usize = 54;
+/// `zoo.h`'s `SIZ_DIRL 56` — the fixed part of a type-2 directory record,
+/// which `dir_to_b`'s checksum covers along with the variable part.
+///
+/// **The number this format's entire module doc is about**, and the one
+/// `unarc-rs` models as 59. It appeared here as a bare literal inside a
+/// slice expression; named, it is one site rather than one hiding place.
+const SIZ_DIRL: usize = 56;
 
 fn fixture_bytes() -> Vec<u8> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -215,7 +248,7 @@ fn mark_first_record_deleted(bytes: &mut [u8]) {
     ]));
     bytes[record + DCRC_I] = 0;
     bytes[record + DCRC_I + 1] = 0;
-    let crc = crc16_arc(&bytes[record..record + 56 + var_len]);
+    let crc = crc16_arc(&bytes[record..record + SIZ_DIRL + var_len]);
     bytes[record + DCRC_I..record + DCRC_I + 2].copy_from_slice(&crc.to_le_bytes());
 }
 
