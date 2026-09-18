@@ -51,6 +51,18 @@ pub(crate) mod crc;
 mod dos;
 #[cfg(feature = "lha")]
 pub mod lha;
+// Salvage Stage 2 Task 5: scans an LHA/LZH archive for entry headers
+// directly, rather than following the chain of `skip size` hops `lha.rs`'s
+// reader walks from the front of the file — LHA has no index, no entry count
+// and no trailer, so one damaged header ends the archive for any ordinary
+// reader and every entry behind it with it. Unlike its ARC and ZOO siblings
+// this one owns its own header parser: `lha.rs` delegates every read to
+// `delharc`, and the level-0/1 HEADER CHECKSUM has to be a gate criterion
+// this crate can falsify. See that module's doc for where each byte offset
+// comes from, and for the cross-check that pins the parser against
+// `delharc`'s own.
+#[cfg(feature = "lha")]
+pub mod lha_salvage;
 #[cfg(feature = "zoo")]
 pub mod zoo;
 // Salvage Stage 2 Task 4: scans a ZOO archive for directory records

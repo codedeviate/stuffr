@@ -451,6 +451,23 @@ fn raw_pathname(header: &LhaHeader) -> String {
         ext_name
     };
 
+    lha_name_from_parts(dir, base)
+}
+
+/// The second half of [`raw_pathname`]: joins a path extra header's bytes to
+/// the entry's own name bytes and applies the escaping this module reports
+/// names with.
+///
+/// Split out of [`raw_pathname`] in Salvage Stage 2 Task 5 so
+/// [`super::lha_salvage`] reports a recovered entry under **exactly** the
+/// name `stuffr list` shows for the same record. That matters more here than
+/// it looks: this mapping is deliberately NOT `delharc`'s (three documented
+/// differences — see [`raw_pathname`]'s own table), and name matching in this
+/// project is EXACT, so a scanner carrying its own second copy of the
+/// escaping would report `na%c3me.txt` where `list` reports `na%C3me.txt` and
+/// `salvage --pattern` would silently match neither. One function, two
+/// callers, no second copy.
+pub(super) fn lha_name_from_parts(dir: &[u8], base: &[u8]) -> String {
     let mut raw: Vec<u8> = Vec::with_capacity(dir.len() + base.len() + 1);
     raw.extend_from_slice(dir);
     // A path extra header conventionally ends with the separator already;
@@ -703,7 +720,7 @@ const METHOD_LHD: [u8; 5] = *b"-lhd-";
 /// byte in front of it are excluded, which is also why
 /// [`write_level1_header`] computes the wrapping checksum over exactly this
 /// run. `delharc`'s parser makes the same split at `parser.rs:190`.
-const LEVEL1_HEADER_OVERHEAD: usize = 25;
+pub(super) const LEVEL1_HEADER_OVERHEAD: usize = 25;
 
 /// The longest name a level-1 header can carry, because the header length is
 /// a single byte and [`LEVEL1_HEADER_OVERHEAD`] of it is already spoken for.
@@ -759,6 +776,35 @@ fn dos_timestamp(t: SystemTime) -> Option<u32> {
     Some((year << 25) | (month << 21) | (day << 16) | (hour << 11) | (minute << 5) | (second / 2))
 }
 
+/// The inverse of [`dos_timestamp`]: unpacks a level-0/1 header's
+/// `last_modified` field into a [`SystemTime`].
+///
+/// The READER does not use this — `LhaRead::next_entry` takes the timestamp
+/// from `delharc`'s own `parse_last_modified`, which also consults the
+/// level-2 Unix-time extra header this function knows nothing about.
+/// [`super::lha_salvage`] parses a level-0/1 base header directly and so
+/// needs the base field decoded on its own; it lives HERE, beside the writer
+/// that packs the same field, so the two can be pinned as inverses
+/// (`a_packed_dos_timestamp_round_trips_through_its_own_inverse`) rather
+/// than each being read against prose.
+///
+/// Note the halves: the DATE is the HIGH 16 bits and the TIME the low ones,
+/// which is the opposite order from `zoo.rs`'s `zoo_mtime` — that format
+/// packs the same two words the other way round, and reading one layout into
+/// the other is a silent 100-year error, never a parse failure.
+pub(super) fn lha_mtime(packed: u32) -> Option<SystemTime> {
+    let date = (packed >> 16) as u16;
+    let time = (packed & 0xFFFF) as u16;
+    dos::mtime(
+        1980 + i64::from(date >> 9),
+        u32::from((date >> 5) & 0x0F),
+        u32::from(date & 0x1F),
+        u32::from(time >> 11),
+        u32::from((time >> 5) & 0x3F),
+        u32::from(time & 0x1F) * 2,
+    )
+}
+
 /// Appends one LHA **level-1** header to `out`.
 ///
 /// Level 1 rather than 0 or 2 for two reasons, both about who can read the
@@ -774,7 +820,7 @@ fn dos_timestamp(t: SystemTime) -> Option<u32> {
 /// so the two are equal here — stated rather than assumed, because adding one
 /// extra header later without adjusting this field would desynchronise every
 /// reader from the second entry onward.
-fn write_level1_header(
+pub(super) fn write_level1_header(
     out: &mut Vec<u8>,
     method: &[u8; 5],
     name: &[u8],
@@ -1022,6 +1068,69 @@ impl ArchiveWrite for LhaWrite {
     }
 }
 
+/// Test-only helpers this module shares with [`super::lha_salvage`], which
+/// is a SIBLING under `legacy` rather than a descendant of this module and
+/// therefore cannot reach into `mod tests`.
+///
+/// Lifted out of `mod tests` in Salvage Stage 2 Task 5 rather than copied.
+/// Each one exists because the scanner's tests need something only this
+/// module can do: produce a real `-lh5-` archive (this crate's encoder lives
+/// here), walk one with the ORDINARY reader (so "the ordinary reader cannot
+/// get past this damage" is measured rather than asserted), and report a
+/// name through [`raw_pathname`] (so the scanner's own name mapping is
+/// compared against the reader's, not against a second copy of it).
+#[cfg(test)]
+pub(super) mod test_archives {
+    use super::*;
+    use stuffr_core::{OpenOpts, PlainSink, ReaderSource, StreamPolicy};
+
+    /// Builds an archive through the real writer, the way every write-side
+    /// test and the conformance harness itself reaches it. Every entry goes
+    /// out as `-lh5-`, the one method this build writes.
+    pub(in crate::legacy) fn build_lha(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Lha
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        for (name, data) in entries {
+            w.add(&EntryMeta::file(*name), &mut io::Cursor::new(*data))
+                .expect("add");
+        }
+        w.finish().expect("finish").finish().expect("sink finish");
+        buf.contents()
+    }
+
+    /// Walks `bytes` with the ORDINARY reader and reports the entry names it
+    /// reached, or the error that stopped it.
+    pub(in crate::legacy) fn read_entry_names(
+        bytes: &[u8],
+    ) -> std::result::Result<Vec<String>, String> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(io::Cursor::new(bytes.to_vec())));
+        let resolved = stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default())
+            .map_err(|e| format!("resolve: {e}"))?;
+        let mut ar = Lha
+            .open(resolved, &OpenOpts::default())
+            .map_err(|e| format!("open: {e}"))?;
+        let mut out = Vec::new();
+        loop {
+            match ar.next_entry() {
+                Ok(Some(entry)) => out.push(entry.meta().name.clone()),
+                Ok(None) => return Ok(out),
+                Err(e) => return Err(format!("next_entry: {e}")),
+            }
+        }
+    }
+
+    /// [`raw_pathname`], reachable from the scanner's tests — so the two
+    /// name mappings are compared rather than each being read against prose.
+    pub(in crate::legacy) fn pathname(header: &LhaHeader) -> String {
+        raw_pathname(header)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::crc::crc16_arc;
@@ -1084,22 +1193,11 @@ mod tests {
     }
 
     /// Builds an archive through the real writer, the way every write-side
-    /// test and the conformance harness itself reaches it.
-    fn build_lha(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let buf = stuffr_core::testing::SharedBuf::new();
-        let mut w = Lha
-            .create(
-                PlainSink::new(Box::new(buf.clone())),
-                &CreateOpts::default(),
-            )
-            .expect("create");
-        for (name, data) in entries {
-            w.add(&EntryMeta::file(*name), &mut io::Cursor::new(*data))
-                .expect("add");
-        }
-        w.finish().expect("finish").finish().expect("sink finish");
-        buf.contents()
-    }
+    /// test and the conformance harness itself reaches it. Lives in
+    /// [`super::test_archives`] rather than here because
+    /// `super::super::lha_salvage`'s own tests need it too, and a second copy
+    /// would be a second writer's worth of assumptions.
+    use super::test_archives::build_lha;
 
     /// The FULL thirteen-property harness, not the fixture-driven one — LHA
     /// graduated when `ContainerCaps::write` became true in Phase 3c Task 6.
@@ -1874,6 +1972,51 @@ mod tests {
         // And one that IS in range, so the guard is pinned to the boundary
         // rather than to "timestamps do not work".
         assert!(dos_timestamp(UNIX_EPOCH + Duration::from_secs(981_173_107)).is_some());
+    }
+
+    /// [`lha_mtime`] is the inverse of [`dos_timestamp`], pinned as such
+    /// rather than each being read against prose — the reader never calls
+    /// the first (it takes `delharc`'s `parse_last_modified` instead), so
+    /// without this the salvage scanner's only check on the field's own
+    /// bit layout would be its own author.
+    ///
+    /// Swept across the whole expressible range rather than at one point:
+    /// the DATE is the HIGH half and the TIME the low one, and the twin
+    /// layout in `zoo.rs` packs them the other way round — reading one into
+    /// the other is a silent decades-wide error, never a parse failure, so
+    /// a single sample could agree by luck on an hour field alone.
+    #[test]
+    fn a_packed_dos_timestamp_round_trips_through_its_own_inverse() {
+        // 1980-01-01 00:00:00 (the first instant the format can express),
+        // then one sample per year to 2107, each at a different month, day
+        // and time so no field is held constant across the sweep.
+        let mut checked = 0;
+        for year in 0..=127u32 {
+            let month = (year % 12) + 1;
+            let day = (year % 28) + 1;
+            let hour = year % 24;
+            let minute = (year * 7) % 60;
+            let second = (year * 2) % 60;
+            let packed = (year << 25)
+                | (month << 21)
+                | (day << 16)
+                | (hour << 11)
+                | (minute << 5)
+                | (second / 2);
+            let when = lha_mtime(packed).unwrap_or_else(|| {
+                panic!("{}-{month:02}-{day:02} must decode", 1980 + year);
+            });
+            assert_eq!(
+                dos_timestamp(when),
+                Some(packed),
+                "packing {when:?} back must reproduce the exact word it came from"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 128, "the whole 7-bit year field was swept");
+        // The "no timestamp" word every minimal archive carries: month 0 and
+        // day 0 are not a date, so there is nothing to report.
+        assert_eq!(lha_mtime(0), None);
     }
 
     /// An entry payload that expands under `-lh5-` is still written as
