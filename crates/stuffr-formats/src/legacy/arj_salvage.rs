@@ -138,6 +138,13 @@
 //! honestly-empty archive into `Error::Unsupported` at exit 3 for a scan
 //! working exactly as designed.
 //!
+//! **A CLI user is told, which fix round 1 found they were not** (F3).
+//! `examples.txt`'s salvage section spends two paragraphs on LHA's
+//! equivalent narrowings and said nothing at all about this one, so an
+//! archive holding a genuine comment header showed an entry silently absent
+//! from `salvage --list` with no note anywhere. It now carries ARJ's three
+//! limits beside LHA's.
+//!
 //! # The validation gate
 //!
 //! A candidate is reported only once ALL of the following hold, checked in an
@@ -239,6 +246,24 @@
 //! file header carries a CRC-32 over the original file, so a candidate this
 //! build did not or could not check is [`SalvageStatus::Unverified`] — a tier
 //! carries a decision, a message carries a cause.
+//!
+//! # A guard-refused method-4 entry is labelled `Partial (truncated)`
+//!
+//! **Fix round 1's F4, recorded where a reader meets it rather than fixed.**
+//! [`starts_with_a_backreference`] refuses a method-4 stream before decoding,
+//! which reaches `stuffr salvage --list` as `Partial (truncated)` and writes
+//! `NAME.partial` holding nothing — on an entry whose payload is entirely
+//! present and not truncated at all.
+//!
+//! Nothing false is written (the prefix really is empty, and nothing is
+//! invented), but the WORD is wrong, and it is not this module's to correct:
+//! `stuffr_core::salvage::SalvageStatus::Partial` is a unit variant, and the
+//! two-cause distinction lives one crate up in `stuffr::entries::PartialCause`
+//! — derived from a SECOND decode `entries.rs` runs, which for this shape also
+//! produces nothing, so `Truncated` is what it derives. That is the limitation
+//! `CLAUDE.md` already records under "`salvage`, and its sharp edges",
+//! surfacing on a new shape rather than a new defect. `examples.txt`'s ARJ
+//! limits say the same thing in a CLI user's words.
 //!
 //! # The whole-entry ceiling, and why ARJ has one where LHA does not
 //!
@@ -870,9 +895,25 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
         }
     };
 
+    let is_dir = matches!(header.kind, EntryKind::Dir);
     let mut meta = EntryMeta::file(header.name.clone());
-    meta.size = Some(header.original_size);
-    meta.compressed_size = Some(declared);
+    // **Both sizes are reported as `arj.rs`'s own reader reports them**, which
+    // for a DIRECTORY means zero regardless of what its header declares — fix
+    // round 1's F5. ARJ records the kind in a field of its own, so a directory
+    // has no payload whatever its `compressed size` and `original size` fields
+    // say, and `ArjRead::next_entry` hands back `Some(0)` for both. Reporting
+    // the raw figures here instead was a second place `stuffr list` and
+    // `stuffr salvage --list` could print different numbers for one archive,
+    // which is the thing [`ArjSalvage::max_whole_entry`]'s own doc argues
+    // hardest against.
+    //
+    // `Candidate::declared_len` below is deliberately NOT zeroed with them: it
+    // is the record's byte SPAN in the file, which is what the engine advances
+    // the scan by and what `available_len` is measured against, so a directory
+    // whose declared payload runs past the end of the source is still reported
+    // truncated rather than silently whole.
+    meta.size = Some(if is_dir { 0 } else { header.original_size });
+    meta.compressed_size = Some(if is_dir { 0 } else { declared });
     meta.kind = header.kind;
     meta.mtime = header.mtime;
     meta.mode = header.mode;
@@ -1915,6 +1956,54 @@ mod tests {
         assert_eq!(scanned.entries.len(), 1);
         assert_eq!(scanned.entries[0].meta.kind, EntryKind::Dir);
         assert_eq!(scanned.entries[0].status, SalvageStatus::Intact);
+        assert_eq!(scanned.entries[0].meta.size, Some(0));
+        assert_eq!(scanned.entries[0].meta.compressed_size, Some(0));
+    }
+
+    /// **Fix round 1, F5.** A directory whose header declares sizes must
+    /// still report ZERO for both, because `arj.rs`'s own reader does — ARJ
+    /// records the kind in a field of its own, so a directory has no payload
+    /// whatever its size fields say, and two verbs printing two numbers for
+    /// one archive is the shape this module's own `max_whole_entry` doc
+    /// argues hardest against.
+    ///
+    /// The raw figures are what this scanner used to report, so this test
+    /// fails against the pre-fix code rather than merely restating it.
+    #[test]
+    fn a_directory_reports_the_same_sizes_the_ordinary_reader_reports() {
+        let payload = b"a directory has no payload, whatever its header says";
+        let mut out = wrap(&local_content(
+            b"tree",
+            Method::Stored.byte(),
+            FILE_TYPE_DIRECTORY,
+            payload.len() as u32,
+            payload.len() as u32,
+            crc32_ieee(&[]),
+        ));
+        out.extend_from_slice(payload);
+
+        let scanned = scan(&out);
+        assert_eq!(scanned.entries.len(), 1);
+        assert_eq!(
+            (
+                scanned.entries[0].meta.size,
+                scanned.entries[0].meta.compressed_size
+            ),
+            (Some(0), Some(0)),
+            "`arj.rs`'s `next_entry` answers `Some(0)` for both on a Dir entry"
+        );
+        // And the record's byte SPAN is still honoured, which is what stops a
+        // zeroed size from turning a directory declaring a payload past the
+        // end of the file into a silently whole one.
+        let mut cut = out.clone();
+        cut.truncate(cut.len() - 10);
+        let truncated = scan(&cut);
+        assert_eq!(truncated.entries.len(), 1);
+        assert_eq!(
+            truncated.entries[0].status,
+            SalvageStatus::Partial,
+            "the declared span still runs past the source, so the record is truncated"
+        );
     }
 
     /// `file type` 4 (volume label) and 5 (chapter label) are neither files

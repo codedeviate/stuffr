@@ -713,11 +713,15 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   Scanners exist for: zip, arc, zoo, lha, arj.
 
-  LHA is the one of the four where the ordinary reader has no fallback at
-  all: the format carries no index, no entry count and no trailer, so
-  `list` reaches entry N only by having parsed entries 1..N and ONE
-  damaged header ends the archive for everything behind it. `salvage`
-  finds each header on its own. Header levels 0, 1 and 2 are scanned.
+  LHA and ARJ are the two where the ordinary reader has no fallback at
+  all, and ARJ's is the sharper of them. LHA carries no index, no entry
+  count and no trailer, so `list` reaches entry N only by having parsed
+  entries 1..N and ONE damaged header ends the archive for everything
+  BEHIND it. An ARJ archive opens with a main header the reader must
+  parse before it will hand back a single entry, so two damaged bytes
+  THERE cost the whole archive — `stuffr list` exits 5 over a file whose
+  every entry is intact. `salvage` finds each header on its own in both.
+  For LHA, header levels 0, 1 and 2 are scanned.
 
   Two header shapes are not, and `salvage` now SAYS SO rather than
   reporting an empty archive: header level 3 (it re-sizes every length
@@ -730,9 +734,32 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   "the scan found nothing recoverable", is reserved for an archive that
   really does hold nothing this build can recover.
 
-  One more limit: an entry using a compression method this build has no
-  decoder for (`-lhx-`) is reported but never written, as
+  One more LHA limit: an entry using a compression method this build has
+  no decoder for (`-lhx-`) is reported but never written, as
   `[unverified: undecodable method]` at exit 3.
+
+  ARJ has three limits of its own, all deliberate:
+
+    * An entry whose `file type` is 2 is never reported. That value
+      means "comment header" in an entry and "must equal 2" in the
+      ARCHIVE's own main header, and the two headers are otherwise
+      byte-for-byte the same shape — so nothing can tell them apart in a
+      damaged archive. Reporting a main header as an entry would claim a
+      payload of whatever the archive's timestamp field happens to
+      encode, at exit 0, on every ARJ ever written; the cost of refusing
+      that is that a genuine comment header is not recovered either.
+      Comment headers are rare and carry no file content.
+    * Methods 8 and 9 ("no data") have no decoder here, so an entry
+      using one is reported and never written, as
+      `[unverified: undecodable method]` at exit 3 — the `-lhx-` case in
+      ARJ's own spelling.
+    * A method 4 ("compressed fastest") entry whose compressed stream
+      opens with a back-reference is refused before decoding, and the
+      row reads `Partial (truncated)` even though nothing is truncated.
+      The refusal is right — such a stream would copy from a history
+      that does not exist — but "truncated" is the wrong word for it:
+      `stuffr` can only tell you that nothing was recovered, not why,
+      for a partial entry. Nothing is invented either way.
 
   Three surface forms, one of which is required:
 
