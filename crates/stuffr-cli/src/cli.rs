@@ -337,9 +337,9 @@ pub enum Command {
         /// this build has no salvage scanner for yet is refused at exit 3,
         /// exactly as an undetected archive of that same format would be:
         /// `tar`, `ar` and `cpio` are a structural refusal rather than an
-        /// unfinished one, and `lha`/`arj` are still to come.
+        /// unfinished one, and `arj` is still to come.
         ///
-        /// Scanners exist for: zip, arc, zoo.
+        /// Scanners exist for: zip, arc, zoo, lha.
         #[arg(long)]
         format: Option<String>,
     },

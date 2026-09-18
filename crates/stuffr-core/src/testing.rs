@@ -78,10 +78,10 @@ pub const CONTAINER_SLOTS: &[&str] = &[
 /// already uses, rather than a second one invented for this target.
 ///
 /// Lists only formats `stuffr::entries::salvage_scan` actually dispatches to
-/// a real scanner: `zip` (Salvage Stage 1), `arc` (Stage 2 Task 3) and `zoo`
-/// (Stage 2 Task 4). Every OTHER registered container — `tar`, `ar`, `cpio`,
-/// `lha`, `arj` as of this writing — still answers `Error::Unsupported` from
-/// that dispatch (a claim about this BUILD, not the archive; see
+/// a real scanner: `zip` (Salvage Stage 1), `arc` (Stage 2 Task 3), `zoo`
+/// (Stage 2 Task 4) and `lha` (Stage 2 Task 5). Every OTHER registered
+/// container — `tar`, `ar`, `cpio`, `arj` as of this writing — still answers
+/// `Error::Unsupported` from that dispatch (a claim about this BUILD, not the archive; see
 /// `salvage_scan`'s own doc), so listing one here before its own scanner
 /// lands would spend a share of every fuzzing run proving nothing but that
 /// already-known refusal. Append a name in the same commit that wires its
@@ -91,7 +91,7 @@ pub const CONTAINER_SLOTS: &[&str] = &[
 /// carry, for the identical reason: the index is the wire format of every
 /// corpus seed already on disk.** Never reorder, never remove — retire a
 /// slot by leaving it in place.
-pub const SALVAGE_SLOTS: &[&str] = &["zip", "arc", "zoo"];
+pub const SALVAGE_SLOTS: &[&str] = &["zip", "arc", "zoo", "lha"];
 
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
 pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");

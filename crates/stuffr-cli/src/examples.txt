@@ -711,7 +711,18 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   has no scanner for is exit 3, a statement about this build rather than
   about the archive.
 
-  Scanners exist for: zip, arc, zoo.
+  Scanners exist for: zip, arc, zoo, lha.
+
+  LHA is the one of the four where the ordinary reader has no fallback at
+  all: the format carries no index, no entry count and no trailer, so
+  `list` reaches entry N only by having parsed entries 1..N and ONE
+  damaged header ends the archive for everything behind it. `salvage`
+  finds each header on its own. Two limits worth knowing before you meet
+  them: header levels 2 and 3 are not scanned (they carry no header
+  checksum, which is half of what keeps the scan from reporting
+  phantoms — `list`/`unpack` still read them normally), and an entry using
+  a compression method this build has no decoder for (`-lhx-`) is reported
+  but never written, as `[unverified: undecodable method]` at exit 3.
 
   Three surface forms, one of which is required:
 

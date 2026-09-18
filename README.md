@@ -581,9 +581,11 @@ six round-trip containers
 containment and bomb limits on by default. `convert` and `install-links`
 are not implemented yet. `pack` walks a directory tree, and
 `pack -o bundle.tar.gz` composes a container on top of a codec in one pass.
-`salvage` (Salvage Stage 1) recovers zip archives only — the one
-recovery-biased verb, everything else here stays as uncompromising as it
-was before it existed.*
+`salvage` is the one recovery-biased verb, and everything else here stays
+as uncompromising as it was before it existed. It recovered zip archives
+only in Stage 1; Stage 2 adds a scanner per legacy container, `arc` and
+`zoo` and `lha` so far. Naming any other format with `--format` is exit 3 —
+a statement about this build, never about the archive.*
 
 ```
 stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
@@ -593,7 +595,7 @@ stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a p
 stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
 stuffr formats                             # capability matrix for THIS build
 stuffr test     ARCHIVE                    # integrity check, no extraction
-stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip recovery; scan position, not list's index
+stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha; scan position, not list's index
 stuffr convert  IN -o OUT                  # recompress without staging to disk
 stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
 ```

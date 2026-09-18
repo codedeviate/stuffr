@@ -1536,6 +1536,10 @@ fn salvage_scan(
         "zoo" => stuffr_formats::legacy::zoo_salvage::salvage_zoo(src, policy),
         #[cfg(not(feature = "zoo"))]
         "zoo" => Err(Error::FormatNotEnabled(FormatId::new("zoo"))),
+        #[cfg(feature = "lha")]
+        "lha" => stuffr_formats::legacy::lha_salvage::salvage_lha(src, policy),
+        #[cfg(not(feature = "lha"))]
+        "lha" => Err(Error::FormatNotEnabled(FormatId::new("lha"))),
         other => Err(Error::Unsupported(format!(
             "salvage has no scanner for `{other}` archives in this build"
         ))),
@@ -2054,8 +2058,9 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// fallen through to `SkippedNotBuiltIn` rather than really being written.
 /// Locating a payload and decoding it are now each format's own job —
 /// [`stuffr_formats::zip_salvage::write_payload`],
-/// [`stuffr_formats::legacy::arc_salvage::write_payload`] and
-/// [`stuffr_formats::legacy::zoo_salvage::write_payload`] — using
+/// [`stuffr_formats::legacy::arc_salvage::write_payload`],
+/// [`stuffr_formats::legacy::zoo_salvage::write_payload`] and
+/// [`stuffr_formats::legacy::lha_salvage::write_payload`] — using
 /// [`stuffr_core::salvage::SalvagedEntry::payload_start`], which every
 /// scanner now computes once, at discovery, instead of a generic caller
 /// re-deriving (and mis-deriving) it later.
@@ -2082,8 +2087,8 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// that forgets this half fails a test rather than shipping silently. A
 /// `SalvageScan::write_payload` trait method would make this a compile
 /// error instead and was considered; deferred rather than taken mid-phase,
-/// since it would have to land ahead of the two scanners (lha, arj) still to
-/// come, before its right shape is known from more than one example.
+/// since it would have to land ahead of the scanners (lha in Task 5, arj
+/// still to come) whose shapes it would have to fit.
 fn write_salvaged_payload(
     format: FormatId,
     archive_path: &Path,
@@ -2116,6 +2121,15 @@ fn write_salvaged_payload(
         ),
         #[cfg(not(feature = "zoo"))]
         "zoo" => Err(Error::FormatNotEnabled(FormatId::new("zoo"))),
+        #[cfg(feature = "lha")]
+        "lha" => stuffr_formats::legacy::lha_salvage::write_payload(
+            archive_path,
+            entry,
+            compressed_len,
+            out,
+        ),
+        #[cfg(not(feature = "lha"))]
+        "lha" => Err(Error::FormatNotEnabled(FormatId::new("lha"))),
         // Unreachable in practice: `salvage_scan` already refuses any other
         // format before a single candidate is ever produced, so `salvage()`
         // never reaches a per-entry write for one.
