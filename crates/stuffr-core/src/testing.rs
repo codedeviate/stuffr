@@ -94,6 +94,30 @@ pub const CONTAINER_SLOTS: &[&str] = &[
 /// slot by leaving it in place.
 pub const SALVAGE_SLOTS: &[&str] = &["zip", "arc", "zoo", "lha", "arj"];
 
+/// The per-entry ceiling the `salvage` fuzz target runs under, in place of
+/// [`crate::salvage::SalvagePolicy`]'s own 4 GiB default.
+///
+/// It lives here rather than in `fuzz/fuzz_targets/salvage.rs` for the same
+/// reason [`SALVAGE_SLOTS`] does: `fuzz/` is excluded from the workspace, so
+/// nothing the gate runs can see a constant declared there — and a ceiling
+/// only the fuzz target knows is a ceiling no test can check a seed against.
+/// Stage 2 Task 8 shipped it as a target-local constant and the review found
+/// the consequence immediately: a future seed carrying an entry over it would
+/// be silently `Unverified(OverEntryCeiling)` inside every run, contributing
+/// nothing, with the whole suite green.
+/// `crates/stuffr/tests/fuzz_corpus.rs`'s
+/// `every_salvage_seed_is_scanned_the_way_the_fuzz_target_scans_it` now
+/// asserts against this figure directly.
+///
+/// **256 KiB, and the number is a DISK bound, not only an allocation one**,
+/// because that target writes what it recovers into a real destination
+/// (Ruling S-O). It sits more than an order of magnitude above the largest
+/// entry any seed carries, so nothing the corpus starts from is refused for
+/// its size; an entry a mutation inflated past it is reported
+/// `Unverified(OverEntryCeiling)` — a per-entry STATUS, never an error, so it
+/// cannot end a run or take the entries around it with it.
+pub const SALVAGE_FUZZ_MAX_ENTRY: u64 = 256 * 1024;
+
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
 pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");
 

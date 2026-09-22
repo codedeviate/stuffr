@@ -1327,6 +1327,103 @@ fn every_salvage_slot_carries_at_least_one_seed() {
     }
 }
 
+/// Counts the regular files anywhere under `dir`, which may be empty or
+/// absent. Salvage nests a recovered entry under its own archive path
+/// (`sample/hello.txt`), so a flat `read_dir` would miss most of them.
+fn files_under(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => files_under(&e.path()),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Runs the engine over every seed with the EXACT configuration
+/// `fuzz/fuzz_targets/salvage.rs` uses — a real destination and
+/// [`SALVAGE_FUZZ_MAX_ENTRY`] — rather than the report-only one its sibling
+/// above uses.
+///
+/// **This is the only thing in `make check` that covers either of the two
+/// changes Stage 2 Task 8 made to that target**, and it exists because the
+/// review found that nothing did.
+/// [`every_salvage_seed_produces_records_and_at_least_one_intact`] passes
+/// `dest: None` and `SalvagePolicy::default()` (4 GiB), so neither the write
+/// path nor the ceiling was in any test's view, in a task whose whole
+/// deliverable was the honesty of its own measurement.
+///
+/// Two assertions, and each fails for its own reason:
+///
+/// - **Every seed places at least one file.** A `dest` that is not created,
+///   not written into, or silently dropped makes this zero. It is what
+///   replaces the implementer's temporary `assert_eq!(placed, 0)` probe with
+///   something permanent.
+/// - **No seed's entry is refused for its size at that ceiling.** The
+///   margin today is real but accidental — the largest seed is 11,530 bytes
+///   against a 256 KiB ceiling, 23x under — so a future seed carrying a
+///   bigger entry would be `Unverified(OverEntryCeiling)` inside every fuzz
+///   run, contributing nothing, with nothing failing. This turns the
+///   coincidence into an assertion, which is why the constant had to move
+///   into `stuffr-core` where a workspace test can see it.
+///
+/// `format: None` deliberately, matching the sibling test: the seeds' own
+/// magic resolves them, which is the property
+/// [`every_salvage_seed_is_recognised_as_the_slot_its_shape_names`] pins.
+#[test]
+fn every_salvage_seed_is_scanned_the_way_the_fuzz_target_scans_it() {
+    use stuffr_core::salvage::{SalvagePolicy, SalvageStatus, UnverifiedCause};
+    use stuffr_core::testing::SALVAGE_FUZZ_MAX_ENTRY;
+
+    let dir = tempfile::tempdir().unwrap();
+    generate_corpus(dir.path()).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let dests = tempfile::tempdir().unwrap();
+
+    for shape in SALVAGE_SHAPES {
+        let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let path = salvage_payload_path(&seed_path, scratch.path());
+        let dest = dests.path().join(shape);
+        let outcome = entries::salvage(
+            &path,
+            &entries::SalvageOpts {
+                dest: Some(dest.clone()),
+                policy: SalvagePolicy {
+                    max_entry: SALVAGE_FUZZ_MAX_ENTRY,
+                    ..SalvagePolicy::default()
+                },
+                select: None,
+                format: None,
+            },
+        )
+        .unwrap_or_else(|e| panic!("seed {shape} must scan without erroring: {e}"));
+
+        for record in &outcome.entries {
+            assert!(
+                !matches!(
+                    record.status,
+                    SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling { .. })
+                ),
+                "seed {shape}'s entry {:?} is over the fuzz target's own per-entry ceiling of \
+                 {SALVAGE_FUZZ_MAX_ENTRY} bytes, so every fuzz run would report it \
+                 `Unverified(OverEntryCeiling)` and recover nothing from it",
+                record.name
+            );
+        }
+
+        let placed = files_under(&dest);
+        assert!(
+            placed > 0,
+            "seed {shape} placed no file under a real destination — the fuzz target runs with \
+             `dest: Some(..)` precisely so the write path is in the oracle's view, and a \
+             destination nothing reaches puts it back out of view"
+        );
+    }
+}
+
 /// Each seed's own bytes must identify it as the format its shape names.
 ///
 /// **This is the guard on `salvage.rs`'s `slot_from_payload`** (Ruling S-S):

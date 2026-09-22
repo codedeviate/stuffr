@@ -5,7 +5,9 @@ use std::io::Cursor;
 use std::sync::OnceLock;
 use stuffr::entries::{self, SalvageOpts};
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
-use stuffr_core::testing::{SALVAGE_SLOTS, check_error_is_classified, check_salvage_claim};
+use stuffr_core::testing::{
+    SALVAGE_FUZZ_MAX_ENTRY, SALVAGE_SLOTS, check_error_is_classified, check_salvage_claim,
+};
 use stuffr_formats::legacy::{arc_salvage, arj_salvage, lha_salvage, zoo_salvage};
 use stuffr_formats::zip_salvage;
 
@@ -235,27 +237,34 @@ fn no_cross_check_arm(name: &str) -> ! {
     )
 }
 
-/// The per-entry ceiling this target runs under, in place of
-/// [`SalvagePolicy::default`]'s 4 GiB.
+/// Why the per-entry ceiling is [`SALVAGE_FUZZ_MAX_ENTRY`] rather than
+/// [`SalvagePolicy::default`]'s 4 GiB, and what actually bounds one
+/// iteration.
 ///
 /// Stage 2 Task 8 gave this target a real `dest` (Ruling S-O), which turns
 /// every ceiling in the policy into a DISK bound as well as an allocation
 /// one: a few-KiB input declaring a 4 GiB entry, or a Deflate payload
 /// expanding towards its 1032:1 maximum, is now something the target tries
-/// to place in a FILE rather than merely to verify in memory. 256 KiB sits
-/// more than an order of magnitude above the largest entry any seed carries
-/// (`store.zoo`'s 11,357-byte payload), so nothing the corpus starts from is
-/// refused for its size, while an entry a mutation inflated is reported
-/// `Unverified(OverEntryCeiling)` — a per-entry STATUS, never an error, so
-/// it cannot end a run or take the entries around it with it.
+/// to place in a FILE rather than merely to verify in memory. The figure
+/// itself, and why 256 KiB, live on the constant — in `stuffr-core`, so the
+/// corpus generator's own test can assert every seed against it. It was a
+/// constant in THIS file when Task 8 first shipped, and the review found the
+/// consequence at once: `fuzz/` is excluded from the workspace, so nothing
+/// the gate runs could see the figure, and a future seed carrying a larger
+/// entry would have been silently refused inside every run with the whole
+/// suite green.
 ///
-/// This bounds one entry, not one iteration: a mutated archive can carry
-/// many candidates. What bounds the iteration is that `dest` lives inside
-/// the same `tempfile::tempdir()` as the input and is removed when that
-/// handle drops, at the end of every iteration — nothing accumulates across
-/// runs.
-const FUZZ_MAX_ENTRY: u64 = 256 * 1024;
-
+/// **That bounds one ENTRY. One ITERATION is bounded by the input's own
+/// size, and the number is worth stating because it is the one that decides
+/// whether a run can fill a disk.** Nothing caps the candidate COUNT —
+/// `SalvagePolicy` has no such field, and a mutated archive can carry many
+/// headers — but every byte written comes from the input, and libFuzzer
+/// resolves `-max_len` to the largest file in the corpus, **measured at
+/// 11,530 bytes** over the seeded corpus. The only inflation vector is a
+/// codec, capped near 1032:1 by Deflate, so the worst case is roughly
+/// **11 MB per iteration**, removed with the tempdir at the end of it. That
+/// figure MOVES the day a seed larger than ~11 KB is added: it is a property
+/// of the corpus, not of this file.
 /// Which slot the PAYLOAD ITSELF names, independently of the selector byte —
 /// `None` when this project's own format detection does not recognise the
 /// bytes as an archive in a format `SALVAGE_SLOTS` lists.
@@ -305,6 +314,21 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|&slot| slot == container.as_str())
+}
+
+/// Runs [`check_salvage_claim`] and reports that one call was made.
+///
+/// **The count is the RESULT of performing the check, never a statement
+/// beside it**, and the difference is this project's signature defect in
+/// miniature: an `oracle += 1;` sitting next to the call survives an edit
+/// that deletes the call, and the trace then reports oracle activity for a
+/// harness that has none — the same detached-instrument shape as Stage 1's
+/// unreachable oracle and Task 6's missing `arj` arm. Here the only way to
+/// obtain the increment is to have called the oracle.
+fn run_oracle(status: SalvageStatus, offers_crc: bool) -> usize {
+    check_salvage_claim(status, offers_crc)
+        .expect("salvage claim: Intact without a checkable checksum");
+    1
 }
 
 /// One line per input on stderr when `STUFFR_FUZZ_SALVAGE_TRACE` is set in
@@ -412,10 +436,10 @@ fuzz_target!(|data: &[u8]| {
     // branch of its own.
     let opts = SalvageOpts {
         dest: Some(tmp.path().join("recovered")),
-        // `max_entry` narrowed from the default 4 GiB — see
-        // `FUZZ_MAX_ENTRY`, which is a disk bound now that `dest` is real.
+        // `max_entry` narrowed from the default 4 GiB — see the comment
+        // above `slot_from_payload`, and `SALVAGE_FUZZ_MAX_ENTRY` itself.
         policy: SalvagePolicy {
-            max_entry: FUZZ_MAX_ENTRY,
+            max_entry: SALVAGE_FUZZ_MAX_ENTRY,
             ..SalvagePolicy::default()
         },
         select: None,
@@ -532,11 +556,7 @@ fuzz_target!(|data: &[u8]| {
             other => no_cross_check_arm(other),
         };
         match offers_crc {
-            Some(offers_crc) => {
-                oracle += 1;
-                check_salvage_claim(record.status, offers_crc)
-                    .expect("salvage claim: Intact without a checkable checksum");
-            }
+            Some(offers_crc) => oracle += run_oracle(record.status, offers_crc),
             None => inconclusive += 1,
         }
     }
