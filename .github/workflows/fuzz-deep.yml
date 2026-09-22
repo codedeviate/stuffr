@@ -80,10 +80,13 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       # Generated, not committed (`fuzz/.gitignore`'s `/corpus`) — regenerated
       # fresh for every scheduled run, exactly as ci.yml's smoke job does.
-      # `salvage` (Salvage Stage 1 Task 8) is not part of this step: it has no
-      # seed generator, so its matrix entry below runs from an empty corpus
-      # directory (`cargo fuzz run` creates one if it is missing) — real
-      # wall-clock iterations, just unseeded, same as ci.yml's smoke job.
+      # This step seeds ALL FIVE matrix entries, `salvage` included. It said
+      # otherwise ("`salvage` ... has no seed generator, so its matrix entry
+      # below runs from an empty corpus directory") from Salvage Stage 1 Task
+      # 8 until Stage 2 Task 8, and it was false from the moment that task's
+      # own fix wave added `SALVAGE_SHAPES` — see ci.yml's copy of this
+      # correction for why a stale "it is unseeded" comment is worse than no
+      # comment.
       - run: make fuzz-corpus
       # Real time, not a fixed `-runs=`, unlike the smoke job: this workflow
       # exists specifically to spend wall-clock time the smoke job's Ruling-G
@@ -134,19 +137,30 @@ jobs:
              no longer reproduces.
 
           3. The panic message names the invariant that failed — one of
-             check_error_is_classified, check_entry_size, check_entry_count or
-             check_fidelity_claim. Read that function's doc comment in
+             check_error_is_classified, check_entry_size, check_entry_count,
+             check_fidelity_claim or check_salvage_claim. Read that function's
+             doc comment in
              crates/stuffr-core/src/honesty.rs FIRST: each one states what it
              deliberately permits, and several findings in this project's
              history were the oracle being too strict rather than the code
              being wrong.
 
-          4. To reproduce at the CLI instead: the `codec` and `container`
-             targets' inputs carry a leading SELECTOR byte that is not part of
-             the stream — its low 7 bits index CODEC_SLOTS/CONTAINER_SLOTS
+          4. To reproduce at the CLI instead: the `codec`, `container`,
+             `roundtrip` and `salvage` targets' inputs carry a leading
+             SELECTOR byte that is not part of the stream — for `codec` and
+             `container` its low 7 bits index CODEC_SLOTS/CONTAINER_SLOTS
              (crates/stuffr-core/src/testing.rs) and its high bit picks the
-             seekable rung. Strip it (`tail -c +2`) to get the bytes stuffr
+             seekable rung; for `salvage` it indexes SALVAGE_SLOTS modulo that
+             table's length. Strip it (`tail -c +2`) to get the bytes stuffr
              itself would read. `chain` inputs carry no selector byte.
+
+             For a `salvage` input the selector may not be the format that
+             actually ran: as of Stage 2 Task 8 the target asks the payload's
+             own magic first (`slot_from_payload`) and falls back to the
+             selector only when detection says nothing. Run
+             `STUFFR_FUZZ_SALVAGE_TRACE=1 cargo +nightly fuzz run salvage
+             PATH/TO/INPUT` and read the `slot=` and `routed=` fields rather
+             than deriving the format from the byte.
 
           5. Crash artifacts are kept for 30 days. Copy the input out of the
              artifact before then, or the finding is lost with it.

@@ -310,12 +310,16 @@ jobs:
           FUZZ_RUNS=2000
           FUZZ_SEED=1
           status=0
-          # `salvage` (Salvage Stage 1 Task 8) has no seeded corpus of its own
-          # — `make fuzz-corpus` deliberately does not generate one, since no
-          # generator here produces a plausible damaged zip to seed from — so
-          # it runs from nothing here, same as every local `make fuzz`. It
-          # still executes real libFuzzer iterations and the count check
-          # below still applies to it.
+          # Every one of the five is SEEDED by the `make fuzz-corpus` step
+          # above, `salvage` included. This comment said the opposite —
+          # "`salvage` has no seeded corpus of its own ... it runs from
+          # nothing here" — from Salvage Stage 1 Task 8 until Stage 2 Task 8,
+          # and it was already false when written: that same task's final fix
+          # wave added `SALVAGE_SHAPES` precisely because an unseeded salvage
+          # target reported `2000 executions — OK` while never once reaching
+          # its own oracle. A stale comment claiming a target is unseeded is
+          # exactly how the next reader concludes a low coverage figure is
+          # expected.
           for target in codec container chain roundtrip salvage; do
             cmd="cargo fuzz run $target -- -runs=$FUZZ_RUNS -seed=$FUZZ_SEED"
             echo "==> $cmd"

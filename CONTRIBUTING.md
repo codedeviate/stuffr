@@ -420,7 +420,7 @@ libFuzzer through `cargo fuzz`:
 | `container.rs` | One container's reader, both ladder rungs — the selector's high bit picks seekable vs. `ForwardOnly` so both walk paths get fuzzed, not just the seekable one. Also runs an independent EOCD re-parse and a second forward-only walk as cross-checks (see the module doc for why each is not redundant with the honesty oracle below). |
 | `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the five. |
 | `roundtrip.rs` | The WRITE side, added in Phase 3c Task 8 — the only target that runs an encoder at all. The input is the archive's CONTENT, not its bytes: a selector picks a writable slot (its high bit selects `CODEC_SLOTS` over `CONTAINER_SLOTS`; there is no ladder rung to choose when writing), the payload is written through it and read straight back, and the two must agree byte-for-byte. |
-| `salvage.rs` | Added in Salvage Stage 1 Task 8, pinned to `zip` until Salvage Stage 2 Task 3b — a selector byte now picks the format from [`SALVAGE_SLOTS`](#the-slot-tables-are-append-only) (`zip`, `arc` as of this writing), the same leading-byte shape `codec.rs` uses, so every format with a real scanner is fuzzed rather than only the first one. The one target that treats the REST of its bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader. Spools that payload to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does, with no destination (`dest: None`), so it exercises parsing and verification honesty rather than the filesystem write path — already covered via `chain.rs`'s `entries::list`. Seeded from six hand-built zips (`SALVAGE_SHAPES` in `crates/stuffr/tests/fuzz_corpus.rs`, each now carrying `SALVAGE_SLOTS`'s own `zip` index): a healthy archive, two duplicate-name shapes (differing and byte-identical), a zeroed central directory, a truncated tail and a flipped payload byte. `arc` has no seed of its own yet — see that constant's own doc. It ran **unseeded** until the Salvage Stage 1 final fix wave, and that was not a budget problem — see "Corpus and running locally" below for the measurement. |
+| `salvage.rs` | Added in Salvage Stage 1 Task 8, pinned to `zip` until Salvage Stage 2 Task 3b. The one target that treats the REST of its bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader: it spools that payload to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does. **Which format's scanner gets it is decided by the PAYLOAD'S OWN MAGIC where there is one** (Stage 2 Task 8, Ruling S-S — `slot_from_payload` runs the same `resolve_chain` a real `stuffr salvage ARCHIVE` runs), and by a leading selector byte over [`SALVAGE_SLOTS`](#the-slot-tables-are-append-only) — `zip`, `arc`, `zoo`, `lha`, `arj` — for everything else. **`dest` is a real directory** (Stage 2 Task 8, Ruling S-O), so the filesystem write path is in the oracle's view; it said `dest: None` until then, and that gap is why a 404-character entry name made `salvage -C` exit 1 mid-run and survived a whole stage. `SalvagePolicy::max_entry` is narrowed to 256 KiB for the same reason: with a `dest` every ceiling is a disk bound. Seeded from fifteen shapes (`SALVAGE_SHAPES` in `crates/stuffr/tests/fuzz_corpus.rs`), at least one per slot — six hand-built zips (healthy, two duplicate-name shapes, a zeroed central directory, a truncated tail, a flipped payload byte) plus two each of ARC, ZOO, LHA and three ARJ. It ran **unseeded** until the Salvage Stage 1 final fix wave, and that was not a budget problem — see "Corpus and running locally" below for the measurement. |
 
 Every decode path in all five is bounded (`DecodeOpts::memory_limit`,
 a capped output read) for the same reason the codec's own conformance
@@ -493,8 +493,14 @@ is a seed whose selector byte, modulo the table's length, happens to land on
 starts feeding a different codec — nothing fails to tell you, and a corpus
 built to cover twelve codecs quietly stops covering one of them.
 `SALVAGE_SLOTS` lists only formats `entries::salvage_scan` actually
-dispatches to a real scanner (`zip`, `arc`), never a format merely
-registered as an ordinary container — see that constant's own doc.
+dispatches to a real scanner (`zip`, `arc`, `zoo`, `lha`, `arj`), never a
+format merely registered as an ordinary container — see that constant's own
+doc. Two tests in `crates/stuffr/tests/fuzz_corpus.rs` keep the table and the
+corpus in step: `every_salvage_slot_carries_at_least_one_seed` fails the
+build for a slot nobody wrote a seed shape for, and
+`every_salvage_seed_is_recognised_as_the_slot_its_shape_names` fails for a
+seed whose own bytes do not detect as the format its shape claims — which is
+what `salvage.rs`'s magic-first routing depends on.
 
 ### Corpus and running locally
 
@@ -533,6 +539,49 @@ complete, they just never reached the check. The generator's own
 keeps it that way — it runs the real engine over every seed rather than
 counting files, because counting files is exactly the assertion that would
 have passed on the empty state.
+
+**The `salvage` target reports its own oracle-call count, on request.** Three
+tasks in a row have had to measure "is the oracle actually firing?" by
+hand-patching `salvage.rs`, taking a number, and reverting the patch — which
+leaves the figure in a report and no way to reproduce it. It is now a
+property of the harness, gated on an environment variable so an ordinary run
+is unchanged:
+
+```bash
+STUFFR_FUZZ_SALVAGE_TRACE=1 cargo +nightly fuzz run salvage -- -runs=0 2>&1 \
+  | grep '^salvage-trace '
+```
+
+`-runs=0` still executes every corpus file exactly once, so the output is one
+line per input: the slot it reached, whether its own magic or its selector
+byte chose that slot (`routed=magic` / `routed=selector`), how many rows the
+scan produced, how many reached `Intact`, how many times
+`check_salvage_claim` was actually called, and how many `Intact` rows the
+target's raw-byte cross-check could not reach a verdict on. **`intact` and
+`oracle` are different numbers and conflating them is the error two
+consecutive tasks each made once**: the oracle call is skipped when the
+independent second scan did not report that scan position, and when the
+cross-check is inconclusive.
+
+**Per-slot oracle counts vary by an order of magnitude between runs, so do
+not read one run's table as a ranking.** Measured at Stage 2 Task 8, three
+independent 100,000-run sessions each grown from the same fifteen seeds
+(`-runs=100000`, `-seed=1` and `-seed=2`), then traced with `-runs=0` — total
+`check_salvage_claim` calls per slot, `zip/arc/zoo/lha/arj`: selector-only
+routing `3501/71/2/5/119`; magic-first routing `3902/83/25/6/11` and
+`6000/138/2/8/30`. The `zoo` slot Ruling S-S was raised about reaches the
+oracle on both, which Task 4's `876 inputs, 0 records` did not — and running
+the magic-first binary over the selector-grown corpus reproduces that
+corpus's own per-slot table almost exactly (`661/225/68/83/96` inputs against
+`663/225/68/80/97`), with 1,023 of its 1,133 inputs — 90% — routed by magic
+rather than by their selector byte (`zoo` the outlier at 38%). **libFuzzer's
+coverage feedback was already doing most of the work the selector byte was
+blamed for**: an input whose selector sent it to a scanner that finds nothing
+produces no new coverage and is not kept. What the magic-first routing buys
+is therefore not a measured coverage win — it is that a seeded archive
+reaches its own scanner by construction rather than by that feedback
+happening to preserve one byte, which is a guarantee the corpus generator's
+own tests can then pin.
 
 **A fixed `-runs` and `-seed` do not make either run deterministic, and a
 green one is not proof of absence.** Measured on the `container` target with

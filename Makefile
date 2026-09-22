@@ -246,7 +246,13 @@ FUZZ_SEED = 1
 # fires on `SalvageStatus::Intact` alone, and `Intact` needs a CRC-32 that
 # matches its payload) was unreachable by construction. `target 'salvage':
 # 2000 executions — OK` was true and proved nothing. See `SALVAGE_SHAPES` in
-# `crates/stuffr/tests/fuzz_corpus.rs` for what the six seeds are for.
+# `crates/stuffr/tests/fuzz_corpus.rs` for what each of the fifteen seeds is
+# for — at least one per `SALVAGE_SLOTS` entry as of Stage 2 Task 8, which
+# `every_salvage_slot_carries_at_least_one_seed` now fails the build over.
+#
+# An execution count still is not evidence, and this recipe's check is only
+# that a target ran. To measure whether the salvage oracle actually FIRES,
+# see CONTRIBUTING.md's `STUFFR_FUZZ_SALVAGE_TRACE` recipe.
 fuzz: fuzz-corpus
 	@status=0; \
 	for target in codec container chain roundtrip salvage; do \
