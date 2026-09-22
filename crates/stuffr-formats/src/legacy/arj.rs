@@ -322,7 +322,7 @@ impl Container for Arj {
 
     fn open(&self, resolved: Resolved, _o: &OpenOpts) -> Result<Box<dyn ArchiveRead>> {
         let Resolved { source, report, .. } = resolved;
-        let src: SharedSource = Rc::new(RefCell::new(ArjGuardedReader { inner: source }));
+        let src: SharedSource = Rc::new(RefCell::new(ArjGuardedReader::new(source)));
         // The MAIN header is parsed by `ArjArchieve::new` itself, by a
         // parser of its own with its own fixed-prefix rule, and panics on
         // the same two shapes a local header does — see
@@ -456,13 +456,43 @@ type SharedSource = Rc<RefCell<ArjGuardedReader>>;
 /// The safe direction, if the pin ever moves and a fact goes stale, is a
 /// guard that refuses LESS than it should: a panic returns, loudly, and the
 /// tests named in each guard's doc go red. The unsafe direction is fact 1,
-/// which is why it is the one with a test of its own
-/// ([`tests::a_payload_holding_a_false_header_id_is_still_read`]).
+/// which is why it is the fact
+/// [`tests::a_false_header_id_unarj_walks_past_never_refuses_the_archive_behind_it`]
+/// was written for.
+///
+/// **None of those tests is what actually pins the mirror, though**, and the
+/// distinction is the one this task's review corrected: they stand on
+/// hand-built inputs, so a drift they do not happen to exercise fails
+/// nothing. [`tests::the_guard_refuses_exactly_what_unarj_panics_on`] is the
+/// real instrument — it asserts the equivalence "this guard refuses X ⟺ the
+/// UNGUARDED crate panics on X" over a generated corpus, which needs no
+/// access to the offset `read_header` chose and therefore survives a patch
+/// bump. That is the remedy `CLAUDE.md` prescribes for the identical
+/// `ar = "=0.9.0"` hazard and has never had there.
 struct ArjGuardedReader {
     inner: Box<dyn Source>,
+    /// The scan window [`seek_past_the_next_header_id`] reads through,
+    /// allocated ONCE per archive rather than once per header.
+    ///
+    /// The first shipped version of this guard allocated and zeroed
+    /// [`HEADER_SCAN_CHUNK`] inside the scan, which runs once per
+    /// `next_entry` — measured in release on archives of 8-byte Stored
+    /// entries, `stuffr list` went 0.07s -> 0.20s at 20,000 entries and
+    /// 0.85s -> 2.78s at 160,000. Linear, not the quadratic shape
+    /// `cpio.rs`'s per-entry `PeekSource` had, but a 3-4x constant for
+    /// nothing. Reused here, the shape `CpioSource` and `ArGuardedReader`
+    /// each already have for the same reason.
+    scan_buf: Vec<u8>,
 }
 
 impl ArjGuardedReader {
+    fn new(inner: Box<dyn Source>) -> Self {
+        ArjGuardedReader {
+            inner,
+            scan_buf: vec![0u8; HEADER_SCAN_CHUNK],
+        }
+    }
+
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
@@ -504,6 +534,12 @@ impl ArjGuardedReader {
 /// crate's own scan reads ONE byte per `read` call; this one reads the same
 /// bytes and reaches the same verdict, in fewer calls.
 const HEADER_SCAN_CHUNK: usize = 64 * 1024;
+
+/// The first read [`scan_window`] issues, before the growth to
+/// [`HEADER_SCAN_CHUNK`]. A header id normally sits at the scan's own first
+/// byte, so this is the size that decides what a well-formed archive pays
+/// per entry — see [`scan_window`]'s doc.
+const FIRST_SCAN_READ: usize = 512;
 
 /// Which of `unarj-rs`'s two header parsers is about to run, which is the
 /// only thing the guard needs to tell them apart for: they consume
@@ -625,18 +661,47 @@ fn content_unarj_will_parse(src: &mut ArjGuardedReader) -> Option<Vec<u8>> {
 /// resumes past the pair rather than re-examining the second byte — and
 /// `60 60 EA` therefore holds no header id at all for this crate. The index
 /// rule below reproduces exactly that, chunked;
-/// [`tests::a_payload_holding_a_false_header_id_is_still_read`] is what
-/// would notice if it ever stopped agreeing.
+/// [`tests::the_guard_refuses_exactly_what_unarj_panics_on`] is what would
+/// notice if it ever stopped agreeing, and
+/// [`tests::a_false_header_id_unarj_walks_past_never_refuses_the_archive_behind_it`]
+/// is the hand-built case that names the shape.
+///
+/// The window is [`ArjGuardedReader::scan_buf`], borrowed out and put back
+/// rather than allocated here — see that field's own doc for what allocating
+/// it per header measured.
 fn seek_past_the_next_header_id(src: &mut ArjGuardedReader) -> Option<u64> {
+    // `scan_buf` cannot stay borrowed from `src` while `src.read` runs, so
+    // it is taken and restored. Every `?` below is inside `scan_window`, so
+    // the buffer always comes back.
+    let mut window = std::mem::take(&mut src.scan_buf);
+    if window.len() != HEADER_SCAN_CHUNK {
+        window.resize(HEADER_SCAN_CHUNK, 0);
+    }
+    let found = scan_window(src, &mut window);
+    src.scan_buf = window;
+    found
+}
+
+/// [`seek_past_the_next_header_id`]'s loop, with the window supplied.
+///
+/// The read GROWS from [`FIRST_SCAN_READ`] to the window's full size rather
+/// than asking for 64 KiB every time, and that is the second half of LOW-1:
+/// on a healthy archive the id is at the scan's very first byte, so a 64 KiB
+/// read per header moves three orders of magnitude more bytes than the
+/// answer needs — and the guard then seeks back over all of it. The growth
+/// keeps a long walk through a damaged region cheap without charging a
+/// well-formed archive for it.
+fn scan_window(src: &mut ArjGuardedReader, window: &mut [u8]) -> Option<u64> {
     let mut base = src.position().ok()?;
-    let mut buf = vec![0u8; HEADER_SCAN_CHUNK];
     let mut expect_second_byte = false;
+    let mut want = FIRST_SCAN_READ.min(window.len());
     loop {
-        let n = match src.read(&mut buf) {
+        let n = match src.read(&mut window[..want]) {
             Ok(0) | Err(_) => return None,
             Ok(n) => n,
         };
-        for (i, &b) in buf[..n].iter().enumerate() {
+        want = (want * 2).min(window.len());
+        for (i, &b) in window[..n].iter().enumerate() {
             if expect_second_byte {
                 expect_second_byte = false;
                 if b == ARJ_HEADER_ID[1] {
@@ -2657,9 +2722,7 @@ mod tests {
     /// rejects.
     #[test]
     fn the_header_id_scan_consumes_the_pair_it_rejects() {
-        let mut src = ArjGuardedReader {
-            inner: seekable_source(b"\x60\x60\xEA\x60\xEA"),
-        };
+        let mut src = ArjGuardedReader::new(in_memory_source(b"\x60\x60\xEA\x60\xEA"));
         assert_eq!(
             seek_past_the_next_header_id(&mut src),
             Some(5),
@@ -2722,6 +2785,451 @@ mod tests {
         assert!(
             err.to_string().contains("Header checksum is invalid"),
             "the crate's own verdict must survive the guard: {err}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // The drift test: the instrument fact 1 needs, and the one the first
+    // round of this task declared impossible.
+    //
+    // That claim rested on a true premise and a false conclusion.
+    // `ArjArchieve` really does not expose the offset its scan chose — but
+    // THE OFFSET IS NOT THE OBSERVABLE. The property the mirror has to hold
+    // is
+    //
+    //     this guard refuses X  <=>  the UNGUARDED crate panics on X
+    //
+    // and "does the unguarded crate panic" is directly observable through
+    // `catch_unwind`, with no private field and no new dependency. Every
+    // piece is already in this module: `ArjSeekAdapter` and
+    // `ArjGuardedReader` are its own types, and `ArjArchieve::new`,
+    // `get_next_entry`, `skip` and `read` are all public.
+    //
+    // This is the remedy `CLAUDE.md` prescribes for the identical
+    // `ar = "=0.9.0"` mirror ("replace the mirror with a drift test") and has
+    // never had there. It is worth more than the two hand-built fact-1 tests
+    // combined, because a drift those two do not happen to exercise fails
+    // nothing at all.
+    // -------------------------------------------------------------------
+
+    /// A seekable [`Source`] over bytes already in memory.
+    ///
+    /// The drift test builds thousands of archives and walks each one twice;
+    /// [`seekable_source`]'s temp file would make that two filesystem writes
+    /// per archive and turn a sub-second test into a slow one.
+    struct InMemorySource(io::Cursor<Vec<u8>>);
+
+    impl Read for InMemorySource {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Source for InMemorySource {
+        fn caps(&self) -> stuffr_core::SourceCaps {
+            stuffr_core::SourceCaps {
+                seekable: true,
+                len: Some(self.0.get_ref().len() as u64),
+            }
+        }
+
+        fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
+            Some(&mut self.0)
+        }
+    }
+
+    fn in_memory_source(bytes: &[u8]) -> Box<dyn Source> {
+        Box::new(InMemorySource(io::Cursor::new(bytes.to_vec())))
+    }
+
+    /// What a walk over one archive ended in.
+    ///
+    /// The four outcomes are kept apart because the property below is not
+    /// the naive "refuses ⟺ panics" — see
+    /// [`the_guard_refuses_exactly_what_unarj_panics_on`]'s own doc for the
+    /// case that disproved that version on the generator's first run.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Walk {
+        /// One of this module's two guards refused the archive.
+        GuardRefused,
+        /// `unarj-rs` panicked — the shape this whole task exists to stop,
+        /// and the one `check_error_is_classified` can never see.
+        Panicked,
+        /// The crate raised its own error, carrying the exit code stuffr
+        /// would report for it (`classify_arj_io`'s answer). Distinct from
+        /// [`Walk::Completed`] because a guard that refuses where the crate
+        /// would merely have errored costs a user nothing, while a guard
+        /// that refuses where the crate would have SUCCEEDED is the false
+        /// refusal `CLAUDE.md` calls the worst kind.
+        CrateError(i32),
+        /// The ordinary reader's own refusal — an undecodable method, or a
+        /// size past [`MAX_ARJ_ENTRY_LEN`]. Identical with the guards in or
+        /// out, since neither guard is involved.
+        ReaderStopped,
+        /// Walked to the archive's clean end.
+        Completed,
+    }
+
+    /// Walks `bytes` exactly as [`ArjRead::next_entry`] does, with this
+    /// module's guards either in or out, and reports which of the three ways
+    /// it ended.
+    ///
+    /// **The two configurations must differ in NOTHING but the guards**, or
+    /// the equivalence below stops being about them: the method refusal and
+    /// both entry ceilings are mirrored here so that an unguarded walk
+    /// cannot allocate 4 GiB from a header field the ordinary reader would
+    /// have refused.
+    fn walk_archive(bytes: &[u8], guards: bool) -> Walk {
+        let mut outcome = Walk::Completed;
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let src: SharedSource =
+                Rc::new(RefCell::new(ArjGuardedReader::new(in_memory_source(bytes))));
+            if guards
+                && refuse_a_header_unarj_would_panic_on(&mut src.borrow_mut(), HeaderShape::Main)
+                    .is_err()
+            {
+                outcome = Walk::GuardRefused;
+                return;
+            }
+            let mut archive = match ArjArchieve::new(ArjSeekAdapter(Rc::clone(&src))) {
+                Ok(a) => a,
+                Err(e) => {
+                    outcome = Walk::CrateError(classify_arj_io(e).exit_code());
+                    return;
+                }
+            };
+            loop {
+                if guards
+                    && refuse_a_header_unarj_would_panic_on(
+                        &mut src.borrow_mut(),
+                        HeaderShape::Local,
+                    )
+                    .is_err()
+                {
+                    outcome = Walk::GuardRefused;
+                    return;
+                }
+                let header = match archive.get_next_entry() {
+                    Ok(Some(h)) => h,
+                    Ok(None) => return,
+                    Err(e) => {
+                        outcome = Walk::CrateError(classify_arj_io(e).exit_code());
+                        return;
+                    }
+                };
+                if header.file_type == FileType::Directory {
+                    if let Err(e) = archive.skip(&header) {
+                        outcome = Walk::CrateError(classify_arj_io(e).exit_code());
+                        return;
+                    }
+                    continue;
+                }
+                if matches!(
+                    header.compression_method,
+                    CompressionMethod::NoData
+                        | CompressionMethod::NoDataNoCrc
+                        | CompressionMethod::Unknown(_)
+                ) || u64::from(header.compressed_size) > MAX_ARJ_ENTRY_LEN
+                    || u64::from(header.original_size) > MAX_ARJ_ENTRY_LEN
+                {
+                    outcome = Walk::ReaderStopped;
+                    return;
+                }
+                if guards
+                    && refuse_a_method_4_payload_unarj_would_panic_on(
+                        &mut src.borrow_mut(),
+                        &header.name,
+                        &header,
+                    )
+                    .is_err()
+                {
+                    outcome = Walk::GuardRefused;
+                    return;
+                }
+                if let Err(e) = archive.read(&header) {
+                    outcome = Walk::CrateError(classify_arj_io(e).exit_code());
+                    return;
+                }
+            }
+        }));
+        match ran {
+            Err(_) => Walk::Panicked,
+            Ok(()) => outcome,
+        }
+    }
+
+    /// xorshift64*, seeded by the caller — a deterministic generator with no
+    /// dependency, so a failure here reproduces exactly.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+
+        fn byte(&mut self) -> u8 {
+            (self.next_u64() >> 33) as u8
+        }
+    }
+
+    /// One header CONTENT, biased hard toward the boundaries that decide
+    /// whether `load_from` runs off its own slice.
+    ///
+    /// Half the time it is well-formed (a 30-byte fixed prefix, a name, two
+    /// NULs); the rest of the time its length and its `first_hdr_size` are
+    /// drawn from a set that straddles 30, 34 and 46, which is what makes a
+    /// generated corpus reach the panics at all rather than bouncing off the
+    /// CRC-32 gate.
+    fn generated_content(rng: &mut Rng, main: bool) -> Vec<u8> {
+        if rng.below(2) == 0 {
+            // Well-formed: exactly the shape the fixture builders emit.
+            let mut c = vec![
+                30u8,
+                0,
+                0,
+                2,
+                0,
+                if main {
+                    0
+                } else {
+                    METHOD_BYTES[rng.below(METHOD_BYTES.len() as u64) as usize]
+                },
+                if main { 2 } else { (rng.below(6)) as u8 },
+                0,
+            ];
+            c.extend_from_slice(&0u32.to_le_bytes()); // date_time_modified
+            let payload = rng.below(9) as u32; // compressed_size
+            c.extend_from_slice(&payload.to_le_bytes());
+            c.extend_from_slice(&(rng.below(9) as u32).to_le_bytes()); // original_size
+            c.extend_from_slice(&0u32.to_le_bytes()); // crc
+            c.extend_from_slice(&0u16.to_le_bytes());
+            c.extend_from_slice(&0u16.to_le_bytes());
+            c.push(0);
+            c.push(0);
+            assert_eq!(c.len(), 30);
+            c.extend_from_slice(b"g.txt");
+            c.push(0);
+            c.push(0);
+            return c;
+        }
+        const LENGTHS: &[usize] = &[1, 8, 29, 30, 31, 33, 34, 35, 45, 46, 47, 60];
+        const FIRST: &[u8] = &[0, 1, 29, 30, 31, 33, 34, 45, 46, 47, 255];
+        let len = LENGTHS[rng.below(LENGTHS.len() as u64) as usize];
+        let mut c = vec![0u8; len];
+        for b in c.iter_mut() {
+            // Mostly non-zero, so a NUL terminator is present only sometimes
+            // — the whole point of the `convert_string!` sites.
+            *b = match rng.below(4) {
+                0 => 0,
+                _ => rng.byte() | 1,
+            };
+        }
+        c[0] = FIRST[rng.below(FIRST.len() as u64) as usize];
+        c
+    }
+
+    /// The method bytes a generated well-formed header picks from: the five
+    /// `unarj-rs` decodes, the two it names but cannot, and one it does not
+    /// know at all.
+    const METHOD_BYTES: &[u8] = &[0, 1, 2, 3, 4, 8, 9, 7];
+
+    /// One generated archive: a main header, zero to two local headers with
+    /// payloads, and — this is the part fact 1 needs — decoy bytes between
+    /// them that a two-byte-window scan would read as header ids and
+    /// `read_header` walks straight past.
+    fn generated_archive(rng: &mut Rng) -> Vec<u8> {
+        let mut out = fixture_wrap_header(&generated_content(rng, true));
+        for _ in 0..rng.below(3) {
+            match rng.below(8) {
+                // A lone `0x60`, which makes the NEXT header's own `0x60` the
+                // second byte of a pair the crate rejects and consumes.
+                0 => out.push(0x60),
+                1 => out.extend_from_slice(&[0x60, 0x60]),
+                // A complete, CRC-valid decoy header one byte behind a
+                // `0x60`: the crate never sees it, and a window scan does.
+                2 => {
+                    out.push(0x60);
+                    out.extend_from_slice(&fixture_wrap_header(&generated_content(rng, false)));
+                }
+                _ => {}
+            }
+            let content = generated_content(rng, false);
+            out.extend_from_slice(&fixture_wrap_header(&content));
+            for _ in 0..rng.below(10) {
+                out.push(rng.byte());
+            }
+        }
+        if rng.below(4) != 0 {
+            out.extend_from_slice(&ARJ_END_OF_ARCHIVE);
+        }
+        out
+    }
+
+    /// **The drift test**, and the instrument fact 1 has had none of until
+    /// now. It walks each generated archive twice — once with this module's
+    /// guards, once without — and compares the two outcomes.
+    ///
+    /// # Why this survives a patch bump and the two hand-built fact tests do not
+    ///
+    /// It never names an offset, a threshold or a line number. It runs the
+    /// REAL dependency and compares it against itself, so the day a `0.2.x`
+    /// release changes `read_header`'s scan, some generated archive breaks
+    /// one of the three properties below and this test says which — where
+    /// [`a_false_header_id_unarj_walks_past_never_refuses_the_archive_behind_it`]
+    /// only notices a drift its one hand-built decoy happens to exercise.
+    ///
+    /// # The property is NOT "refuses ⟺ panics", and the generator proved it
+    ///
+    /// That was the shape this test was first written in, and it failed on
+    /// its first run — correctly. The archive it produced ends in a method-4
+    /// entry whose single payload byte is `0xD1`: top bit set, so
+    /// [`opens_with_a_backreference`] refuses it, while `decode_fastest`
+    /// reaches the match branch and then runs out of BITS before the
+    /// subtraction, answering `UnexpectedEof` rather than panicking. The
+    /// one-bit guard is deliberately a shade eager — its own doc says so —
+    /// and an equivalence that called that a defect would have been a
+    /// wrong test, not a found bug.
+    ///
+    /// So the three properties asserted are the ones that actually matter,
+    /// and together they are stronger than the equivalence:
+    ///
+    /// 1. **No missed panic.** The unguarded crate panicking implies the
+    ///    guard refused. This is the direction a guard grown too lax breaks.
+    /// 2. **No false refusal, and no changed verdict.** The guard refusing
+    ///    implies the unguarded crate would have panicked or raised its own
+    ///    error *with the same exit code the guard reports* (5). It can
+    ///    never imply [`Walk::Completed`] — refusing an archive the crate
+    ///    reads successfully is fact 1's own failure mode and the one
+    ///    `CLAUDE.md` calls "the worst kind". Asserting the exit code too is
+    ///    what makes the guard's eagerness provably free: a user cannot tell
+    ///    the two apart.
+    /// 3. **The two walks agree exactly whenever no guard fires**, so a
+    ///    guard cannot change an outcome by some route other than refusing.
+    ///
+    /// And [`Walk::Panicked`] never appears in the guarded configuration at
+    /// all — the task's whole claim, over generated input rather than over
+    /// four reproducers.
+    ///
+    /// # Non-vacuity
+    ///
+    /// A generator producing only boring archives would satisfy all three
+    /// trivially, which is the failure this project keeps rediscovering
+    /// (`broken_codecs`, the unseeded `salvage` target). The floors below
+    /// are asserted, not printed: the corpus must actually panic the
+    /// unguarded crate on a real share of its archives AND walk a real share
+    /// of them to a clean end.
+    #[test]
+    fn the_guard_refuses_exactly_what_unarj_panics_on() {
+        // The gate reads this test's stderr; a few thousand deliberate
+        // panics would bury everything else in it. Other threads keep the
+        // default behaviour, so a genuine panic in a test running beside
+        // this one still prints.
+        let ours = std::thread::current().id();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() != ours {
+                eprintln!("{info}");
+            }
+        }));
+
+        let mut rng = Rng(0x5EED_A5EE_D5EE_DA5E);
+        let mut panicked = 0usize;
+        let mut refused = 0usize;
+        let mut completed = 0usize;
+        let mut refused_where_the_crate_only_errored = 0usize;
+        let mut broken: Vec<(Vec<u8>, Walk, Walk, &'static str)> = Vec::new();
+
+        const ARCHIVES: usize = 4000;
+        for _ in 0..ARCHIVES {
+            let bytes = generated_archive(&mut rng);
+            let guarded = walk_archive(&bytes, true);
+            let bare = walk_archive(&bytes, false);
+
+            let broke = if guarded == Walk::Panicked {
+                Some("the GUARDED walk panicked — a guard has stopped covering a panic site")
+            } else if bare == Walk::Panicked && guarded != Walk::GuardRefused {
+                Some("property 1: the unguarded crate panicked and no guard refused")
+            } else if guarded == Walk::GuardRefused
+                && !matches!(bare, Walk::Panicked | Walk::CrateError(5))
+            {
+                Some(
+                    "property 2: a guard refused where the unguarded crate neither panicked \
+                     nor raised an exit-5 error of its own — a FALSE REFUSAL, or a changed \
+                     verdict",
+                )
+            } else if guarded != Walk::GuardRefused && guarded != bare {
+                Some("property 3: no guard fired, yet the two walks disagree")
+            } else {
+                None
+            };
+            if let Some(why) = broke {
+                broken.push((bytes, guarded, bare, why));
+                break;
+            }
+
+            match guarded {
+                Walk::GuardRefused => {
+                    refused += 1;
+                    if bare != Walk::Panicked {
+                        refused_where_the_crate_only_errored += 1;
+                    }
+                }
+                Walk::Completed => completed += 1,
+                _ => {}
+            }
+            if bare == Walk::Panicked {
+                panicked += 1;
+            }
+        }
+
+        std::panic::set_hook(previous);
+
+        if let Some((bytes, guarded, bare, why)) = broken.pop() {
+            panic!(
+                "{why}\nguarded walk: {guarded:?}\nunguarded walk: {bare:?}\nthe mirror in \
+                 `ArjGuardedReader`'s doc has drifted from `unarj-rs 0.2.1` — archive:\n\
+                 {bytes:02X?}"
+            );
+        }
+
+        // Non-vacuity. The floors sit a long way below what this seed
+        // actually produces, so they pin that the corpus is doing work
+        // without pinning the generator's exact behaviour — a test that
+        // asserted the exact counts would have to be edited for every
+        // harmless change to the generator, and would stop being read.
+        assert!(
+            panicked >= ARCHIVES / 20,
+            "only {panicked} of {ARCHIVES} archives panicked the unguarded crate — the \
+             generator has stopped reaching the panic sites, so property 1 is vacuous"
+        );
+        assert!(
+            completed >= ARCHIVES / 20,
+            "only {completed} of {ARCHIVES} archives walked to a clean end — the generator \
+             has stopped producing READABLE archives, so property 2 (no false refusal) is \
+             vacuous"
+        );
+        assert!(
+            refused >= panicked,
+            "every panic must have been refused, so refusals ({refused}) cannot be fewer \
+             than panics ({panicked})"
+        );
+        // Not an assertion about a number, but the reason this test cannot
+        // be an equivalence: the method-4 guard is one bit and refuses a
+        // little more than `decode_fastest` panics on, at the same exit
+        // code. Printed so a reader can see the margin rather than infer it.
+        println!(
+            "drift: {ARCHIVES} archives, {panicked} panicked unguarded, {refused} refused by \
+             a guard ({refused_where_the_crate_only_errored} of them where the crate would \
+             have raised its own exit-5 error), {completed} walked to a clean end"
         );
     }
 

@@ -225,18 +225,30 @@ clap = { version = "4", features = ["derive"] }
 #      this is documentation of an unobvious dependency rather than an open
 #      hole — but do not loosen the pin without re-reading `arj_archive.rs`
 #      for that comparison.
-#   3. This exact version PANICS on four CLI-reachable inputs, the smallest
-#      eleven bytes long: `main_header.rs:68`, `local_file_header.rs:95`,
-#      `local_file_header.rs:128`/`:129` and `decode_fastest.rs:38`. Salvage
-#      Stage 2 Task 6b put a guard in front of all four
-#      (`legacy/arj.rs`'s `ArjGuardedReader`), and that guard mirrors SIX
-#      private facts of 0.2.1 — enumerated in its own doc comment, not here,
-#      because they are read alongside the code that depends on them. Five
-#      fail safe if this pin moves: a panic returns, loudly, and a named test
-#      goes red. **Fact 1 does not** — `read_header`'s scan consumes both
-#      bytes of a `0x60` whose successor is not `0xEA`, and a guard that
-#      stopped agreeing would refuse VALID archives. Before loosening this
-#      pin, re-read `read_header`, both `load_from`s and `decode_fastest`
+#   3. This exact version PANICS on CLI-reachable input, the smallest
+#      reproducer eleven bytes long. FOUR CLASSES, not four line numbers —
+#      a 4,000-archive sweep of this task's review hit 42 distinct panic
+#      lines, and stating the reproducers as if they were the set is how a
+#      future reader meeting `local_file_header.rs:104` in a bug report
+#      concludes it is new. The classes: a MAIN header shorter than
+#      `MainHeader::load_from`'s fixed prefix, a LOCAL header shorter than
+#      `LocalFileHeader::load_from`'s (a different rule), either parser's
+#      two unbounded `convert_string!` loops, and `decode_fastest`'s
+#      `back_ptr > res.len() - 1` on an empty output. Salvage Stage 2 Task
+#      6b put a guard in front of all four classes (`legacy/arj.rs`'s
+#      `ArjGuardedReader`), and that guard mirrors SIX private facts of
+#      0.2.1 — enumerated in its own doc comment, not here, because they are
+#      read alongside the code that depends on them. Five fail safe if this
+#      pin moves: a panic returns, loudly, and a named test goes red.
+#      **Fact 1 does not** — `read_header`'s scan consumes both bytes of a
+#      `0x60` whose successor is not `0xEA`, and a guard that stopped
+#      agreeing would refuse VALID archives. That one now has a real
+#      instrument rather than prose:
+#      `legacy::arj::tests::the_guard_refuses_exactly_what_unarj_panics_on`
+#      walks 4,000 generated archives through THIS crate twice, with the
+#      guards in and out, and compares the outcomes — so it needs no private
+#      offset and survives a patch bump. Before loosening this pin, run it;
+#      then re-read `read_header`, both `load_from`s and `decode_fastest`
 #      line by line against the new source.
 delharc = { version = "=0.6.2", default-features = false, features = ["std", "lh1", "lz"] }
 unarj-rs = "=0.2.1"
