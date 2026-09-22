@@ -251,19 +251,41 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// local header validly declares method 4, with that header's CRC-32
 /// recomputed over the edit, hands libFuzzer a payload it can mutate freely
 /// behind a header that keeps parsing: the only route into `unarj-rs`'s
-/// `decode_fastest`, and (through ARJ methods 1/2/3) into `delharc`'s `Lh6`
-/// decoder, which `lha.rs` can never reach because it compiles `delharc` for
-/// `lh1`/`lz` while `unarj-rs` pulls that crate's default features. **`Lh6`
-/// has never been executed by anything in this project.** Entry 1 is left
+/// `decode_fastest`. **ARJ method 4 has no encoder anywhere in reach** — not
+/// in this workspace, not in any dependency, and no `arj` binary is
+/// obtainable on any platform this project builds for — so without a seed
+/// that declares it over bytes the fuzzer owns, only that decoder's
+/// refusals are ever exercised and never its interior. Entry 1 is left
 /// method 0 and untouched, so the shape still reaches `Intact` the way every
 /// other seed must.
 ///
-/// That the route is live is measured, not assumed: on the unedited
-/// `sample.arj` both entries read at exit 0, and on this shape `stuffr list`
-/// answers `Invalid back_ptr` at exit 5 — a message from inside
-/// `decode_fastest`'s back-reference handling, which nothing in this
-/// repository had ever reached — while `stuffr salvage --list` reports
-/// `0 Intact sample/hello.txt` and `1 Partial (decode failed)` at exit 4.
+/// **An earlier version of this paragraph also claimed the shape was the
+/// only route into `delharc`'s `Lh6` decoder, which `lha.rs` supposedly
+/// could not reach, and that `Lh6` had never been executed by anything in
+/// this project. All three halves were false**, and the correction is kept
+/// here rather than quietly deleted because the claim travelled from a
+/// review aside into a task brief into this file as permanent
+/// documentation — the exact failure class the three tasks before this one
+/// were spent correcting. Measured against the sources: `delharc` 0.6.2's
+/// own manifest declares `default = ["std", "lh1", "lz"]`, character for
+/// character the set the root `Cargo.toml` pins, so the two feature sets are
+/// identical (and Cargo unifies features per crate-version anyway, so a
+/// difference could not have partitioned reachability); `Lh6` is behind no
+/// feature at all (`delharc-0.6.2/src/decode.rs:382` is unconditional) and
+/// `lha_salvage.rs` routes `-lh6-` straight into it; and
+/// `legacy/arj_salvage.rs`'s
+/// `a_compressed_entry_decodes_through_the_same_delharc_decoder_the_reader_uses`
+/// has encoded and decoded a real `-lh6-` stream on BOTH legs of every gate
+/// since Task 6.
+///
+/// That the method-4 route is live IS measured, and that half survived the
+/// correction: on the unedited `sample.arj` both entries read at exit 0, and
+/// on this shape `stuffr list` answers `Invalid back_ptr` at exit 5 — a
+/// message from inside `decode_fastest`'s back-reference handling — while
+/// `stuffr salvage --list` reports `0 Intact sample/hello.txt` and
+/// `1 Partial (decode failed)` at exit 4. **How OFTEN mutation reaches that
+/// decoder is not measured by anything**, here or in CI; the seed makes the
+/// route reachable, and nothing counts arrivals.
 const SALVAGE_SHAPES: &[&str] = &[
     "healthy",
     "distinct-duplicates",
@@ -1062,10 +1084,11 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
             }
             // Task 6b's MEDIUM-3: the header CRC-32 gates the header, not
             // the payload, so a valid method-4 declaration is the one route
-            // into `decode_fastest` — and, via ARJ methods 1/2/3, into
-            // `delharc`'s `Lh6`, which nothing in this project has ever
-            // executed. The SECOND entry is the one edited, so the first
-            // stays `Intact`.
+            // into `decode_fastest`, which no encoder in reach can produce
+            // input for. The SECOND entry is the one edited, so the first
+            // stays `Intact`. (This comment also claimed a `delharc` `Lh6`
+            // gap that does not exist — see `SALVAGE_SHAPES`'s own doc for
+            // the correction and the three measurements behind it.)
             "arj-method4-payload" => {
                 arj_set_local_method(&read_all(&legacy_fixture_path("sample.arj"))?, 1, 4)
             }
