@@ -1995,7 +1995,7 @@ mod tests {
     /// first extension header's — where level 2 has one `u16`
     /// (`parser.rs:260-262`). Extension headers use 4-byte counters at this
     /// level, so the chain's terminator is a `u32` zero.
-    fn build_level3(name: &[u8], content: &[u8]) -> Vec<u8> {
+    pub(super) fn build_level3(name: &[u8], content: &[u8]) -> Vec<u8> {
         let name_len = 1 + name.len() + 4;
         let total = 32 + name_len;
 
@@ -3261,5 +3261,357 @@ mod tests {
             Some(0),
             "but the name repeats, which is the weaker fact"
         );
+    }
+}
+
+// -------------------------------------------------------------------------
+// Salvage Stage 2 Task 7: the damage catalogue.
+//
+// **Every expectation here is the PRE-DAMAGE state, and none of it comes
+// from this scanner.** The base archive is `fixtures/legacy/sample.lzh`,
+// the one legacy fixture an implementation OUTSIDE this project has agreed
+// with: hand-assembled (nothing on any reachable machine can CREATE an
+// `.lzh` — `lhasa` is decode-only and `delharc` has no writer), then
+// independently confirmed by `lhasa`, a decoder sharing no code with
+// `delharc`. `fixtures/legacy/MANIFEST.md` records both facts.
+//
+// **The live external witness runs at the CLI**, not here: `cli.rs`'s
+// `lhasa_agrees_with_the_lha_damage_catalogue` builds an archive, has
+// `lha t` pronounce it good BEFORE any damage, damages one entry, and has
+// `lha t` name that same entry bad — so the damage is real by an outside
+// account, not only by ours. This module is the fast half of the same
+// catalogue.
+//
+// Note what a mid-payload flip produces: the TIER is `Partial` always, but
+// the CAUSE one crate up (`stuffr::entries::PartialCause`) depends on the
+// codec — `-lh0-` decodes whole and disagrees (`ChecksumMismatch`), while a
+// compressed method usually aborts mid-stream (`Truncated`). That is the
+// documented meaning of `Truncated` ("the payload ran out, OR the decoder
+// failed mid-stream"), not a defect, and it is why the rows below assert
+// the tier rather than the cause.
+// -------------------------------------------------------------------------
+#[cfg(test)]
+mod damage_catalogue {
+    use std::io::Cursor;
+
+    use stuffr_core::Error;
+    use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
+
+    use super::super::lha::test_archives::{build_lha, read_entry_names};
+    use super::salvage_lha;
+    use super::tests::build_level3;
+
+    /// Two `-lh0-` (Stored) level-1 entries — `sample/hello.txt` (6 bytes)
+    /// and `sample/sub/b.bin` (5 bytes) — whose CRC-16s `lhasa` has
+    /// independently verified. See `fixtures/legacy/MANIFEST.md`.
+    const SAMPLE_LZH: &[u8] = include_bytes!("../../fixtures/legacy/sample.lzh");
+
+    /// One level-1 header's geometry, parsed out of the raw bytes by this
+    /// test: `header_len(1) + checksum(1) + method(5) + skip_size(u32) +
+    /// original_size(u32) + …`, with the payload beginning
+    /// `header_len + 2` bytes past the header's own start.
+    ///
+    /// Hand-rolled rather than reusing this module's own parser, for the
+    /// reason `cli.rs`'s `parse_real_zip_local_entries` is hand-rolled: an
+    /// expectation read through the code under test is not an expectation.
+    struct Header {
+        offset: usize,
+        /// Byte offset of the five-byte method identifier.
+        method_at: usize,
+        /// Byte offset of the one-byte header checksum.
+        checksum_at: usize,
+        payload: std::ops::Range<usize>,
+    }
+
+    fn headers(bytes: &[u8]) -> Vec<Header> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        // A zero `header_len` byte is LHA's optional end-of-archive marker.
+        while at + 21 < bytes.len() && bytes[at] != 0 {
+            let header_len = bytes[at] as usize;
+            let skip = u32::from_le_bytes(bytes[at + 7..at + 11].try_into().unwrap()) as usize;
+            let start = at + header_len + 2;
+            out.push(Header {
+                offset: at,
+                method_at: at + 2,
+                checksum_at: at + 1,
+                payload: start..start + skip,
+            });
+            at = start + skip;
+        }
+        out
+    }
+
+    fn salvaged(bytes: &[u8]) -> Vec<(String, SalvageStatus)> {
+        salvage_lha(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
+            .expect("a damaged archive must never abort the run")
+            .entries
+            .iter()
+            .map(|e| (e.meta.name.clone(), e.status))
+            .collect()
+    }
+
+    fn names(rows: &[(String, SalvageStatus)]) -> Vec<&str> {
+        rows.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// A three-entry archive from the PRODUCTION writer, with payloads big
+    /// enough that a mid-payload flip has somewhere to land. Its external
+    /// witness is `cli.rs`'s `lha t` pass over the same shape; here it is
+    /// the multi-entry base the `sample.lzh` fixture (11 payload bytes in
+    /// total) is too small to be.
+    fn three_entries() -> Vec<u8> {
+        build_lha(&[
+            (
+                "one.txt",
+                b"first entry payload, repeated. ".repeat(20).as_slice(),
+            ),
+            (
+                "two.txt",
+                b"second entry payload, repeated. ".repeat(20).as_slice(),
+            ),
+            (
+                "three.txt",
+                b"third entry payload, repeated. ".repeat(20).as_slice(),
+            ),
+        ])
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 1: the agreement property.
+    // ---------------------------------------------------------------------
+
+    /// **Salvage of an UNDAMAGED archive must agree exactly with what the
+    /// ordinary reader enumerates** — same names, same order, every entry
+    /// `Intact`, nothing shadowing anything.
+    ///
+    /// `read_entry_names` walks through `delharc`, which is the parser
+    /// `stuffr list`/`cat`/`unpack`/`test` all read the archive with, while
+    /// this scanner owns a SECOND, independent header parser (see this
+    /// module's own doc for why). So the property compares two parsers
+    /// written from the same spec and not from each other — the closest
+    /// thing to an in-process second opinion LHA has.
+    #[test]
+    fn salvage_of_a_healthy_archive_agrees_with_the_ordinary_reader() {
+        let built = three_entries();
+        for (label, bytes) in [
+            ("sample.lzh (lhasa-verified)", SAMPLE_LZH),
+            ("three entries, production writer", &built[..]),
+        ] {
+            let read = read_entry_names(bytes)
+                .unwrap_or_else(|e| panic!("{label}: the ordinary reader must walk it: {e}"));
+            let rows = salvaged(bytes);
+            assert_eq!(
+                rows.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                read,
+                "{label}: salvage and the ordinary reader must enumerate the same names in \
+                 the same order"
+            );
+            assert_eq!(
+                headers(bytes).len(),
+                read.len(),
+                "{label}: and both must agree with the header geometry this test parsed \
+                 longhand out of the archive's own bytes"
+            );
+            for (name, status) in &rows {
+                assert_eq!(
+                    *status,
+                    SalvageStatus::Intact,
+                    "{label}: an undamaged entry (`{name}`) must verify Intact"
+                );
+            }
+        }
+    }
+
+    /// **Ruling S-V, pinned on the side this module could not see.** A
+    /// level-2 header with no common extension header, and a level-3
+    /// header, are both refused by the SCAN at `Error::Unsupported` (exit 3,
+    /// naming the limitation) — `a_level_2_header_with_no_common_extension_
+    /// header_is_refused_by_name` and its level-3 sibling above assert that,
+    /// with `delharc` itself as the control.
+    ///
+    /// What they do NOT assert is the other half of the asymmetry: that the
+    /// ORDINARY reader — the whole `Lha` container, not just `delharc`'s
+    /// header parser — really does list these archives normally. Without
+    /// that, "refused at exit 3, naming the limitation" could be describing
+    /// an archive nothing in this project can read, where exit 5 would have
+    /// been right after all. Exit 3 is a claim about the BUILD, and this is
+    /// what makes it one.
+    #[test]
+    fn the_header_levels_this_scanner_refuses_are_ones_the_reader_lists() {
+        let level3 = build_level3(b"level3.txt", b"level three payload");
+        assert_eq!(
+            read_entry_names(&level3).expect("the ordinary reader must list a level-3 archive"),
+            ["level3.txt"],
+            "exit 3 says `this build cannot scan it`, which is only honest while the reader \
+             CAN read it"
+        );
+        assert!(
+            matches!(
+                salvage_lha(&mut Cursor::new(level3), &SalvagePolicy::default()),
+                Err(Error::Unsupported(_))
+            ),
+            "and the scan must refuse it by name, never report an empty archive"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 2: the mutation catalogue.
+    // ---------------------------------------------------------------------
+
+    /// Row 1/3 — **a truncated tail**, over the externally-witnessed fixture
+    /// and over the three-entry archive, swept across the last payload
+    /// rather than sampled at one point.
+    #[test]
+    fn damage_catalogue_a_truncated_tail() {
+        let built = three_entries();
+        for (label, bytes, expected) in [
+            (
+                "sample.lzh",
+                SAMPLE_LZH,
+                vec!["sample/hello.txt", "sample/sub/b.bin"],
+            ),
+            (
+                "three entries",
+                &built[..],
+                vec!["one.txt", "two.txt", "three.txt"],
+            ),
+        ] {
+            let g = headers(bytes);
+            assert_eq!(
+                g.len(),
+                expected.len(),
+                "{label}: sanity, the pre-damage record count"
+            );
+            let last = g.last().unwrap().payload.clone();
+            let declared = last.len();
+            for keep in [0, 1, declared / 2, declared - 1] {
+                let rows = salvaged(&bytes[..last.start + keep]);
+                assert_eq!(
+                    names(&rows),
+                    expected,
+                    "{label}/keep={keep}: the cut entry's header is still there and its \
+                     being uncompletable is a fact worth a row, never silence"
+                );
+                for (i, (name, status)) in rows.iter().enumerate() {
+                    let want = if i + 1 == rows.len() {
+                        SalvageStatus::Partial
+                    } else {
+                        SalvageStatus::Intact
+                    };
+                    assert_eq!(*status, want, "{label}/keep={keep}: `{name}`");
+                }
+            }
+            assert!(
+                salvaged(bytes)
+                    .iter()
+                    .all(|(_, s)| *s == SalvageStatus::Intact),
+                "{label}: the UNCUT archive must still come back entirely Intact"
+            );
+        }
+    }
+
+    /// Row 2/3 — **a byte flipped mid-payload.** That entry `Partial`, every
+    /// neighbour `Intact`, with every entry taking its turn as the damaged
+    /// one so a scanner that stopped at the first damaged record could not
+    /// pass.
+    #[test]
+    fn damage_catalogue_a_byte_flipped_mid_payload() {
+        let built = three_entries();
+        for (label, healthy, expected) in [
+            (
+                "sample.lzh",
+                SAMPLE_LZH.to_vec(),
+                vec!["sample/hello.txt", "sample/sub/b.bin"],
+            ),
+            (
+                "three entries",
+                built,
+                vec!["one.txt", "two.txt", "three.txt"],
+            ),
+        ] {
+            let g = headers(&healthy);
+            for (damaged, header) in g.iter().enumerate() {
+                let mut bytes = healthy.clone();
+                let range = header.payload.clone();
+                bytes[range.start + range.len() / 2] ^= 0xFF;
+
+                let rows = salvaged(&bytes);
+                assert_eq!(
+                    names(&rows),
+                    expected,
+                    "{label}: a flipped payload byte moves no header"
+                );
+                for (i, (name, status)) in rows.iter().enumerate() {
+                    let want = if i == damaged {
+                        SalvageStatus::Partial
+                    } else {
+                        SalvageStatus::Intact
+                    };
+                    assert_eq!(
+                        *status, want,
+                        "{label}: `{name}` with entry {damaged} damaged"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Row 3/3 — **a header field corrupted.** That entry absent, its
+    /// neighbours surviving, in every position. Corrupting the FIRST
+    /// header is the interesting direction: LHA has no index at all, so an
+    /// ordinary forward reader reaches entry 2 only by having parsed entry
+    /// 1 — losing one header loses the whole archive for it, and the
+    /// scanner recovering the rest is this module's entire reason to exist.
+    #[test]
+    fn damage_catalogue_a_corrupted_header_field() {
+        let healthy = three_entries();
+        let g = headers(&healthy);
+        let all = ["one.txt", "two.txt", "three.txt"];
+        assert_eq!(g.len(), all.len(), "sanity: the pre-damage record count");
+
+        for damaged in 0..g.len() {
+            let survivors: Vec<&str> = all
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != damaged)
+                .map(|(_, n)| *n)
+                .collect();
+
+            // (a) the five-byte method identifier — a spelling LHA never
+            // assigned.
+            let mut bytes = healthy.clone();
+            bytes[g[damaged].method_at + 2] = b'X';
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                survivors,
+                "an unassigned method identifier must drop `{}` and nothing else",
+                all[damaged]
+            );
+
+            // (b) the header checksum — the gate that separates a real
+            // header from a coincidental method identifier inside a
+            // payload.
+            let mut bytes = healthy.clone();
+            bytes[g[damaged].checksum_at] ^= 0xFF;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                survivors,
+                "a header whose own checksum no longer vouches for it must drop `{}` and \
+                 nothing else",
+                all[damaged]
+            );
+
+            // (c) the declared header length, which moves where the name,
+            // the checksum's coverage and the payload all begin.
+            let mut bytes = healthy.clone();
+            bytes[g[damaged].offset] = 0xFE;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                survivors,
+                "a corrupted header length must drop `{}` and nothing else",
+                all[damaged]
+            );
+        }
     }
 }
