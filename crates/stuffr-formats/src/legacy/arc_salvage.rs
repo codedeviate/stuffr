@@ -1329,3 +1329,494 @@ mod tests {
         );
     }
 }
+
+// -------------------------------------------------------------------------
+// Salvage Stage 2 Task 7: the damage catalogue.
+//
+// **Every expectation here is the PRE-DAMAGE state, and none of it comes
+// from this scanner.** The archives are the borrowed `unarc-rs` 0.6.3
+// corpus (`fixtures/legacy/arc/`, see `fixtures/legacy/MANIFEST.md`): bytes
+// written by DOS-era archivers decades before this project existed, each
+// entry carrying the CRC-16/ARC its ORIGINAL writer computed. Damage is
+// applied on top of those bytes, and what each mutation must produce is
+// derived from the record geometry this module parses LONGHAND below —
+// never from what `salvage_arc` currently returns.
+//
+// That is the strongest evidence class in this phase, and it is also the
+// only external witness ARC has: no `arc`/`pak` binary is obtainable on any
+// platform in reach (measured: `which arc` finds nothing, and no Homebrew
+// formula ships one), so the stored CRC-16 IS the witness. It is a good
+// one — it was computed by another program, over the original content, with
+// no knowledge of this project.
+// -------------------------------------------------------------------------
+#[cfg(test)]
+mod damage_catalogue {
+    use std::io::Cursor;
+
+    use stuffr_core::salvage::{SalvagePolicy, SalvageStatus, UnverifiedCause};
+    use stuffr_core::{Container, OpenOpts, ReaderSource, Source, StreamPolicy};
+
+    use super::super::arc::{ARC, Arc};
+    use super::salvage_arc;
+
+    /// Two borrowed entries, `DDTZ.COM` (method 4, Squeezed) then
+    /// `READ.COM` (method 3, RLE90) — the ONE fixture in the corpus with
+    /// more than a single entry, which is what makes "neighbours unaffected"
+    /// a claim this catalogue can make at all.
+    const CPM_ARC: &[u8] = include_bytes!("../../fixtures/legacy/arc/cpm.arc");
+    /// One borrowed entry, method 2 (Unpacked) — its payload IS its
+    /// content, so a flipped byte reaches the CRC-16 comparison with no
+    /// decoder in between.
+    const STORE_ARC: &[u8] = include_bytes!("../../fixtures/legacy/arc/store.arc");
+    /// One borrowed entry, method 11 (Distilled) — a method this build
+    /// recognises and does not decode. The asymmetry row.
+    const LICENSE_PAK: &[u8] = include_bytes!("../../fixtures/legacy/arc/license.pak");
+
+    /// One record's geometry, parsed out of the raw archive bytes by this
+    /// test and nothing else: `0x1A` marker, then the 28-byte fixed record
+    /// (`method(1) + name(13) + compressed(u32) + datetime(u32) + crc16(u16)
+    /// + original(u32)`), then `compressed` payload bytes.
+    ///
+    /// Hand-rolled here rather than reusing `ArcHeader::parse` — the module
+    /// under test — for the reason `cli.rs`'s own
+    /// `parse_real_zip_local_entries` is hand-rolled: an expectation read
+    /// through the parser being tested is not an expectation.
+    struct Record {
+        offset: usize,
+        name: String,
+        /// Byte offset of the method byte, one past the marker.
+        method_at: usize,
+        /// Byte offset of the first name byte.
+        name_at: usize,
+        payload: std::ops::Range<usize>,
+        stored_crc: u16,
+    }
+
+    fn records(bytes: &[u8]) -> Vec<Record> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        // `method == 0` right after a marker is the end-of-archive marker,
+        // which is where this walk stops — the same rule `arc.rs`'s reader
+        // follows, and the reason the four `.pak` fixtures' ten trailing
+        // bytes are never reached (see MANIFEST.md).
+        while at + 29 <= bytes.len() && bytes[at] == 0x1A && bytes[at + 1] != 0 {
+            let compressed = u32::from_le_bytes(bytes[at + 15..at + 19].try_into().unwrap());
+            let stored_crc = u16::from_le_bytes(bytes[at + 23..at + 25].try_into().unwrap());
+            // NUL-TERMINATED, not NUL-padded: several borrowed fixtures
+            // carry leftover bytes after the terminator (`squashed.arc`
+            // reads `LICENSE\0$$$$$`), so a trailing-NUL trim would
+            // produce a name no reader ever reports.
+            let field = &bytes[at + 2..at + 15];
+            let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+            let name = String::from_utf8_lossy(&field[..end]).to_string();
+            let start = at + 29;
+            out.push(Record {
+                offset: at,
+                name,
+                method_at: at + 1,
+                name_at: at + 2,
+                payload: start..start + compressed as usize,
+                stored_crc,
+            });
+            at = start + compressed as usize;
+        }
+        out
+    }
+
+    /// CRC-16/ARC written out longhand, independent of
+    /// `super::super::crc::crc16_arc` — the same double-entry discipline
+    /// `stuffr_core::container_conformance`'s own `crc16_arc_witness` uses,
+    /// and pinned to the published RevEng check value by
+    /// [`the_witness_checksum_matches_the_published_check_value`] below so a
+    /// transcription error here cannot agree with one there.
+    fn crc16_witness(data: &[u8]) -> u16 {
+        let mut crc: u16 = 0;
+        for &b in data {
+            crc ^= u16::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xA001
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc
+    }
+
+    #[test]
+    fn the_witness_checksum_matches_the_published_check_value() {
+        assert_eq!(
+            crc16_witness(b"123456789"),
+            0xBB3D,
+            "CRC-16/ARC's own published check value — without this the witness below is only \
+             this test agreeing with itself"
+        );
+    }
+
+    /// What the ORDINARY reader enumerates, or the error that stopped it.
+    /// The comparison target for the agreement property: `list`, `cat`,
+    /// `test` and `unpack` are all built on this walk.
+    fn reader_entries(bytes: &[u8]) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(Cursor::new(bytes.to_vec())));
+        let resolved = stuffr_core::resolve(src, ARC, Arc.caps(), &StreamPolicy::default())
+            .map_err(|e| format!("resolve: {e}"))?;
+        let mut ar = Arc
+            .open(resolved, &OpenOpts::default())
+            .map_err(|e| format!("open: {e}"))?;
+        let mut out = Vec::new();
+        loop {
+            match ar.next_entry() {
+                Ok(Some(mut entry)) => {
+                    let name = entry.meta().name.clone();
+                    let mut data = Vec::new();
+                    entry
+                        .reader()
+                        .read_to_end(&mut data)
+                        .map_err(|e| format!("read {name}: {e}"))?;
+                    out.push((name, data));
+                }
+                Ok(None) => return Ok(out),
+                Err(e) => return Err(format!("next_entry: {e}")),
+            }
+        }
+    }
+
+    /// `(name, status)` per salvaged entry, in scan order.
+    fn salvaged(bytes: &[u8]) -> Vec<(String, SalvageStatus)> {
+        salvage_arc(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
+            .expect("a damaged archive must never abort the run")
+            .entries
+            .iter()
+            .map(|e| (e.meta.name.clone(), e.status))
+            .collect()
+    }
+
+    fn names(rows: &[(String, SalvageStatus)]) -> Vec<&str> {
+        rows.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 1: the agreement property.
+    // ---------------------------------------------------------------------
+
+    /// **Salvage of an UNDAMAGED archive must agree exactly with what the
+    /// ordinary reader enumerates** — same names, same order, every entry
+    /// `Intact`, nothing shadowing anything, over every borrowed fixture
+    /// this build can decode.
+    ///
+    /// This is the highest-value row in the catalogue: it catches a scanner
+    /// bug with no damage constructed at all, and it ties `salvage` to the
+    /// well-tested read path instead of leaving it a parallel universe. It
+    /// is also the first time `arc_salvage.rs` has been run against the
+    /// borrowed corpus at ALL — every positive test it shipped with used
+    /// this module's own `build_arc`, i.e. bytes this project wrote.
+    ///
+    /// The third leg is what makes it evidence rather than a tautology: the
+    /// bytes the READER produced are checked against the CRC-16 the
+    /// ARCHIVE's own header records, through [`crc16_witness`] — an
+    /// implementation independent of `legacy::crc`'s. So "salvage says
+    /// Intact" and "the reader's output is what the original writer
+    /// checksummed" are two separate observations, and the property links
+    /// them.
+    #[test]
+    fn salvage_of_a_healthy_archive_agrees_with_the_ordinary_reader() {
+        for (label, bytes) in [
+            ("store.arc", STORE_ARC),
+            (
+                "crunch.arc",
+                &include_bytes!("../../fixtures/legacy/arc/crunch.arc")[..],
+            ),
+            (
+                "crunch2.arc",
+                &include_bytes!("../../fixtures/legacy/arc/crunch2.arc")[..],
+            ),
+            (
+                "squashed.arc",
+                &include_bytes!("../../fixtures/legacy/arc/squashed.arc")[..],
+            ),
+            ("cpm.arc", CPM_ARC),
+        ] {
+            let read = reader_entries(bytes)
+                .unwrap_or_else(|e| panic!("{label}: the ordinary reader must walk it: {e}"));
+            let rows = salvaged(bytes);
+            let geometry = records(bytes);
+
+            assert_eq!(
+                rows.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                read.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "{label}: salvage and the ordinary reader must enumerate the same names in \
+                 the same order"
+            );
+            assert_eq!(
+                geometry.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+                read.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "{label}: and both must agree with the record geometry this test parsed \
+                 longhand out of the archive's own bytes"
+            );
+            for (name, status) in &rows {
+                assert_eq!(
+                    *status,
+                    SalvageStatus::Intact,
+                    "{label}: an undamaged entry (`{name}`) must verify Intact"
+                );
+            }
+            for ((name, content), record) in read.iter().zip(geometry.iter()) {
+                assert_eq!(
+                    crc16_witness(content),
+                    record.stored_crc,
+                    "{label}: the reader's output for `{name}` must match the CRC-16 the \
+                     archive's own header records — otherwise `Intact` above is agreement \
+                     between two wrongs"
+                );
+            }
+        }
+    }
+
+    /// The documented asymmetry, pinned rather than left to a reader to
+    /// rediscover: **ARC decodes an entry WHOLE**, so `stuffr list` on one
+    /// of these can itself fail where the other six containers' `list`
+    /// never reads a payload. `license.pak`'s single entry uses method 11
+    /// (Distilled), which this build recognises and does not decode.
+    ///
+    /// The ordinary reader therefore raises `Unsupported` (exit 3) and
+    /// enumerates nothing; salvage reports the entry as
+    /// `Unverified(UndecodableMethod)` — listed, not written, exit 3. **Not
+    /// `Complete`**, which would claim the format offers no checksum at all,
+    /// and not `Intact`, which would claim one agreed.
+    #[test]
+    fn a_method_this_build_cannot_decode_is_the_documented_asymmetry() {
+        let err = reader_entries(LICENSE_PAK)
+            .expect_err("method 11 is recognised and not decoded, so the reader must refuse");
+        assert!(
+            err.contains("does not decode"),
+            "the reader's refusal must name the cause: {err}"
+        );
+
+        let rows = salvaged(LICENSE_PAK);
+        assert_eq!(names(&rows), ["LICENSE"]);
+        assert_eq!(
+            rows[0].1,
+            SalvageStatus::Unverified(UnverifiedCause::UndecodableMethod),
+            "a tier carries a decision: nothing was proven about this content, and \
+             `Complete` (the format offers NO checksum) would be a lie about a format \
+             that carries a CRC-16 in every header"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 2: the mutation catalogue.
+    // ---------------------------------------------------------------------
+
+    /// Row 1/3 — **a truncated tail.** The canonical damaged archive: an
+    /// interrupted download. Cut partway through the LAST entry's payload
+    /// and the earlier entry must still verify `Intact`, while the cut one
+    /// is reported `Partial` rather than silently dropped.
+    ///
+    /// The expectation is the pre-damage state: `cpm.arc` holds exactly
+    /// `DDTZ.COM` then `READ.COM`, asserted from the geometry BEFORE
+    /// anything is cut.
+    #[test]
+    fn damage_catalogue_a_truncated_tail() {
+        let geometry = records(CPM_ARC);
+        assert_eq!(
+            geometry.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["DDTZ.COM", "READ.COM"],
+            "sanity: the borrowed fixture's own two entries, in file order"
+        );
+        let last = &geometry[1];
+
+        // Both ends included: the header alone with no payload at all, and
+        // one byte short of complete. A single sample can pass on a
+        // boundary while the interior stays silent — the sweep
+        // `zip_salvage`'s own catalogue row learned to run.
+        let declared = last.payload.len();
+        for keep in [0, 1, declared / 2, declared - 1] {
+            let cut = last.payload.start + keep;
+            let rows = salvaged(&CPM_ARC[..cut]);
+            assert_eq!(
+                names(&rows),
+                ["DDTZ.COM", "READ.COM"],
+                "keep={keep}: the truncated entry's header is still there and its being \
+                 uncompletable is a fact worth a row, never silence"
+            );
+            assert_eq!(
+                rows[0].1,
+                SalvageStatus::Intact,
+                "keep={keep}: the entry BEFORE the cut is untouched"
+            );
+            assert_eq!(
+                rows[1].1,
+                SalvageStatus::Partial,
+                "keep={keep}: the cut entry's declared bytes are not all present"
+            );
+        }
+
+        // The complement, so none of the above can pass by reporting
+        // everything as damaged.
+        let whole = salvaged(CPM_ARC);
+        assert_eq!(
+            whole
+                .iter()
+                .filter(|(_, s)| *s == SalvageStatus::Intact)
+                .count(),
+            2,
+            "the UNCUT archive must still come back entirely Intact"
+        );
+    }
+
+    /// Row 2/3 — **a byte flipped mid-payload.** That entry alone must come
+    /// back `Partial`; its neighbours must be untouched.
+    ///
+    /// Run in BOTH directions (first entry damaged, then last), because a
+    /// scanner that stopped at the first damaged record would pass the
+    /// second arrangement and fail the first.
+    ///
+    /// The tier is the decision and is asserted; the CAUSE is not asserted
+    /// here and the reason is a measured one recorded in the task report: a
+    /// flipped byte in a COMPRESSED payload may abort the decoder
+    /// mid-stream (`PartialCause::Truncated`, one crate up) or decode whole
+    /// and disagree (`ChecksumMismatch`) depending entirely on the codec —
+    /// measured across these formats, ARC's Squeezed and RLE90 complete
+    /// while ZOO's `lzd` aborts. Both are `Partial`; neither is `Intact`,
+    /// and that is what this row is about.
+    #[test]
+    fn damage_catalogue_a_byte_flipped_mid_payload() {
+        let geometry = records(CPM_ARC);
+        for (damaged, intact) in [(0usize, 1usize), (1, 0)] {
+            let target = &geometry[damaged];
+            let mut bytes = CPM_ARC.to_vec();
+            let at = target.payload.start + target.payload.len() / 2;
+            bytes[at] ^= 0xFF;
+
+            let rows = salvaged(&bytes);
+            assert_eq!(
+                names(&rows),
+                ["DDTZ.COM", "READ.COM"],
+                "a flipped payload byte moves no header, so both records are still found"
+            );
+            assert_eq!(
+                rows[damaged].1,
+                SalvageStatus::Partial,
+                "`{}`'s content no longer matches the CRC-16 its own header records",
+                target.name
+            );
+            assert_eq!(
+                rows[intact].1,
+                SalvageStatus::Intact,
+                "`{}` was not touched and must not be implicated",
+                geometry[intact].name
+            );
+        }
+    }
+
+    /// Row 2/3, the no-decoder variant. `store.arc`'s single entry is method
+    /// 2 (Unpacked): its payload IS its content, so a flipped byte reaches
+    /// the CRC-16 comparison with nothing in between — the one arrangement
+    /// where `Partial` can only mean "the checksum disagreed".
+    ///
+    /// The pre-damage expectation is the stored CRC-16 itself, checked
+    /// against the flipped bytes through the independent [`crc16_witness`]:
+    /// the flip really does change the checksum, so `Partial` is the right
+    /// answer and not an accident.
+    #[test]
+    fn damage_catalogue_a_flipped_byte_in_a_stored_payload() {
+        let record = &records(STORE_ARC)[0];
+        let mut bytes = STORE_ARC.to_vec();
+        let at = record.payload.start + record.payload.len() / 2;
+        bytes[at] ^= 0xFF;
+
+        assert_ne!(
+            crc16_witness(&bytes[record.payload.clone()]),
+            record.stored_crc,
+            "the flip must actually change the checksum, or this row proves nothing"
+        );
+        assert_eq!(
+            salvaged(&bytes),
+            vec![("LICENSE".to_string(), SalvageStatus::Partial)]
+        );
+        // And the same archive UNFLIPPED still agrees with its own witness.
+        assert_eq!(
+            crc16_witness(&STORE_ARC[record.payload.clone()]),
+            record.stored_crc
+        );
+        assert_eq!(
+            salvaged(STORE_ARC),
+            vec![("LICENSE".to_string(), SalvageStatus::Intact)]
+        );
+    }
+
+    /// Row 3/3 — **a header field corrupted.** That entry must be absent or
+    /// refused; its neighbours must survive.
+    ///
+    /// Three fields, each refused by a DIFFERENT criterion of this module's
+    /// validation gate, and each run against BOTH records — including the
+    /// FIRST, which is the interesting direction: corrupting the first
+    /// record's header destroys the length that says where the second one
+    /// begins, so recovering the second is the resync this whole scanner
+    /// exists for. An ordinary forward reader recovers neither.
+    #[test]
+    fn damage_catalogue_a_corrupted_header_field() {
+        let geometry = records(CPM_ARC);
+        for (damaged, survivor) in [(0usize, 1usize), (1, 0)] {
+            let target = &geometry[damaged];
+            let survivor_name = geometry[survivor].name.as_str();
+
+            // (a) the method byte — a value ARC never assigned.
+            let mut bytes = CPM_ARC.to_vec();
+            bytes[target.method_at] = 0x7F;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                [survivor_name],
+                "an unassigned method byte must drop `{}` and nothing else",
+                target.name
+            );
+
+            // (b) the name field — a control byte, which no DOS-era archive
+            // name ever carried.
+            let mut bytes = CPM_ARC.to_vec();
+            bytes[target.name_at] = 0x01;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                [survivor_name],
+                "a non-printable name must drop `{}` and nothing else",
+                target.name
+            );
+
+            // (c) the marker byte itself.
+            let mut bytes = CPM_ARC.to_vec();
+            bytes[target.offset] = 0x00;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                [survivor_name],
+                "a destroyed marker must drop `{}` and nothing else",
+                target.name
+            );
+        }
+    }
+
+    /// The header field that is NOT absent-or-refused, kept as its own row
+    /// because it is the one a reader would expect to behave like the three
+    /// above and does not. A corrupted `compressed_size` still names a real
+    /// entry — the record's own method, name and CRC-16 all still check out
+    /// — so the candidate is REPORTED, with its payload bounded by what the
+    /// file actually holds, and comes back `Partial`. The record behind it
+    /// is unaffected, which is the part that would break if the scanner
+    /// trusted the lie and skipped forward by it.
+    #[test]
+    fn damage_catalogue_a_corrupted_declared_length_is_reported_not_believed() {
+        let geometry = records(CPM_ARC);
+        let mut bytes = CPM_ARC.to_vec();
+        bytes[geometry[0].offset + 15..geometry[0].offset + 19]
+            .copy_from_slice(&999_999u32.to_le_bytes());
+
+        let rows = salvaged(&bytes);
+        assert_eq!(
+            names(&rows),
+            ["DDTZ.COM", "READ.COM"],
+            "a lying length must not swallow the entry behind it"
+        );
+        assert_eq!(rows[0].1, SalvageStatus::Partial);
+        assert_eq!(rows[1].1, SalvageStatus::Intact);
+    }
+}
