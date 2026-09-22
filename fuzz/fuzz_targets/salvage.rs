@@ -2,6 +2,7 @@
 use libfuzzer_sys::fuzz_target;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::sync::OnceLock;
 use stuffr::entries::{self, SalvageOpts};
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
 use stuffr_core::testing::{SALVAGE_SLOTS, check_error_is_classified, check_salvage_claim};
@@ -234,6 +235,27 @@ fn no_cross_check_arm(name: &str) -> ! {
     )
 }
 
+/// The per-entry ceiling this target runs under, in place of
+/// [`SalvagePolicy::default`]'s 4 GiB.
+///
+/// Stage 2 Task 8 gave this target a real `dest` (Ruling S-O), which turns
+/// every ceiling in the policy into a DISK bound as well as an allocation
+/// one: a few-KiB input declaring a 4 GiB entry, or a Deflate payload
+/// expanding towards its 1032:1 maximum, is now something the target tries
+/// to place in a FILE rather than merely to verify in memory. 256 KiB sits
+/// more than an order of magnitude above the largest entry any seed carries
+/// (`store.zoo`'s 11,357-byte payload), so nothing the corpus starts from is
+/// refused for its size, while an entry a mutation inflated is reported
+/// `Unverified(OverEntryCeiling)` — a per-entry STATUS, never an error, so
+/// it cannot end a run or take the entries around it with it.
+///
+/// This bounds one entry, not one iteration: a mutated archive can carry
+/// many candidates. What bounds the iteration is that `dest` lives inside
+/// the same `tempfile::tempdir()` as the input and is removed when that
+/// handle drops, at the end of every iteration — nothing accumulates across
+/// runs.
+const FUZZ_MAX_ENTRY: u64 = 256 * 1024;
+
 /// Which slot the PAYLOAD ITSELF names, independently of the selector byte —
 /// `None` when this project's own format detection does not recognise the
 /// bytes as an archive in a format `SALVAGE_SLOTS` lists.
@@ -308,26 +330,19 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
 /// that scan position, or when this target's own raw-byte cross-check cannot
 /// tell whether a checksum was checkable (`inconclusive`). Conflating the
 /// two is the error the last two tasks each made once.
-/// The per-entry ceiling this target runs under, in place of
-/// [`SalvagePolicy::default`]'s 4 GiB.
-///
-/// Stage 2 Task 8 gave this target a real `dest` (Ruling S-O), which turns
-/// every ceiling in the policy into a DISK bound as well as an allocation
-/// one: a few-KiB input declaring a 4 GiB entry, or a Deflate payload
-/// expanding towards its 1032:1 maximum, is now something the target tries
-/// to place in a FILE rather than merely to verify in memory. 256 KiB sits
-/// more than an order of magnitude above the largest entry any seed carries
-/// (`store.zoo`'s 11,357-byte payload), so nothing the corpus starts from is
-/// refused for its size, while an entry a mutation inflated is reported
-/// `Unverified(OverEntryCeiling)` — a per-entry STATUS, never an error, so
-/// it cannot end a run or take the entries around it with it.
-///
-/// This bounds one entry, not one iteration: a mutated archive can carry
-/// many candidates. What bounds the iteration is that `dest` lives inside
-/// the same `tempfile::tempdir()` as the input and is removed when that
-/// handle drops, at the end of every iteration — nothing accumulates across
-/// runs.
-const FUZZ_MAX_ENTRY: u64 = 256 * 1024;
+/// `routed` says which of the two decided the slot — `magic` when the
+/// payload named itself and `selector` when it fell back to the leading byte
+/// — so the effect of Ruling S-S's change is measurable on its own rather
+/// than only visible as a shift in the totals.
+fn trace(slot: &str, routed: &str, rows: usize, intact: usize, oracle: usize, inconclusive: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("STUFFR_FUZZ_SALVAGE_TRACE").is_some()) {
+        eprintln!(
+            "salvage-trace slot={slot} routed={routed} rows={rows} intact={intact} \
+             oracle={oracle} inconclusive={inconclusive}"
+        );
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     // Task 3b: the leading byte selects a format from `SALVAGE_SLOTS`,
@@ -347,8 +362,13 @@ fuzz_target!(|data: &[u8]| {
     };
     // Ruling S-S: the payload's own magic wins where there is one, and the
     // selector byte decides for everything else. See `slot_from_payload`.
-    let name = slot_from_payload(payload)
-        .unwrap_or(SALVAGE_SLOTS[selector as usize % SALVAGE_SLOTS.len()]);
+    let (name, routed) = match slot_from_payload(payload) {
+        Some(name) => (name, "magic"),
+        None => (
+            SALVAGE_SLOTS[selector as usize % SALVAGE_SLOTS.len()],
+            "selector",
+        ),
+    };
 
     // `entries::salvage` takes a path, not a `Source` — the same reason
     // `chain.rs`'s `entries::list` and `container.rs`'s seekable branch both
@@ -406,6 +426,7 @@ fuzz_target!(|data: &[u8]| {
         Ok(o) => o,
         Err(e) => {
             check_error_is_classified(&e).expect("salvage error classification");
+            trace(name, routed, 0, 0, 0, 0);
             return;
         }
     };
@@ -485,16 +506,21 @@ fuzz_target!(|data: &[u8]| {
         other => no_cross_check_arm(other),
     };
 
+    let mut intact = 0usize;
+    let mut oracle = 0usize;
+    let mut inconclusive = 0usize;
     for record in &outcome.entries {
         if record.status != SalvageStatus::Intact {
             continue;
         }
+        intact += 1;
         // A scan position the independent pass did not also report is not
         // this check's job (the two disagreeing on structure would be a
         // different finding, over a determinism assumption this target does
         // not otherwise test) — skip rather than assert something neither
         // scan actually observed.
         let Some(&offset) = offsets.get(&record.scan_position) else {
+            inconclusive += 1;
             continue;
         };
         let offers_crc = match name {
@@ -505,9 +531,21 @@ fuzz_target!(|data: &[u8]| {
             "arj" => arj_locally_offers_checkable_crc(payload, offset),
             other => no_cross_check_arm(other),
         };
-        if let Some(offers_crc) = offers_crc {
-            check_salvage_claim(record.status, offers_crc)
-                .expect("salvage claim: Intact without a checkable checksum");
+        match offers_crc {
+            Some(offers_crc) => {
+                oracle += 1;
+                check_salvage_claim(record.status, offers_crc)
+                    .expect("salvage claim: Intact without a checkable checksum");
+            }
+            None => inconclusive += 1,
         }
     }
+    trace(
+        name,
+        routed,
+        outcome.entries.len(),
+        intact,
+        oracle,
+        inconclusive,
+    );
 });
