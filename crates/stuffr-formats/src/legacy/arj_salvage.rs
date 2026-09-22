@@ -247,23 +247,25 @@
 //! build did not or could not check is [`SalvageStatus::Unverified`] — a tier
 //! carries a decision, a message carries a cause.
 //!
-//! # A guard-refused method-4 entry is labelled `Partial (truncated)`
+//! # A guard-refused method-4 entry is labelled `Partial (decode failed)`
 //!
-//! **Fix round 1's F4, recorded where a reader meets it rather than fixed.**
-//! [`starts_with_a_backreference`] refuses a method-4 stream before decoding,
-//! which reaches `stuffr salvage --list` as `Partial (truncated)` and writes
-//! `NAME.partial` holding nothing — on an entry whose payload is entirely
-//! present and not truncated at all.
+//! **Fix round 1's F4, RECORDED here and then fixed one crate up in Task 7's
+//! fix round (Ruling S-AA).** [`starts_with_a_backreference`] refuses a
+//! method-4 stream before decoding, on an entry whose payload is entirely
+//! present and not truncated at all. That reached `stuffr salvage --list` as
+//! `Partial (truncated)` — the right refusal under the wrong word, since
+//! nothing had been cut from the file.
 //!
-//! Nothing false is written (the prefix really is empty, and nothing is
-//! invented), but the WORD is wrong, and it is not this module's to correct:
-//! `stuffr_core::salvage::SalvageStatus::Partial` is a unit variant, and the
-//! two-cause distinction lives one crate up in `stuffr::entries::PartialCause`
-//! — derived from a SECOND decode `entries.rs` runs, which for this shape also
-//! produces nothing, so `Truncated` is what it derives. That is the limitation
-//! `CLAUDE.md` already records under "`salvage`, and its sharp edges",
-//! surfacing on a new shape rather than a new defect. `examples.txt`'s ARJ
-//! limits say the same thing in a CLI user's words.
+//! This module's own reading of why it could not be fixed here was correct
+//! and is worth keeping: `stuffr_core::salvage::SalvageStatus::Partial` is a
+//! unit variant, and the cause lives one crate up in
+//! `stuffr::entries::PartialCause`, derived from a SECOND decode
+//! `entries.rs` runs — which for this shape also produces nothing. What was
+//! missing was a THIRD cause. `entries.rs` now distinguishes "the file is
+//! short" (`Truncated`) from "every declared byte is here and did not yield
+//! the declared content" (`DecodeFailed`) by measuring the archive's own
+//! length, so this shape reports the second and reads correctly at the CLI.
+//! `examples.txt`'s ARJ limits say the same thing in a CLI user's words.
 //!
 //! # The whole-entry ceiling, and why ARJ has one where LHA does not
 //!
@@ -2875,6 +2877,25 @@ mod damage_catalogue {
         out
     }
 
+    /// Recomputes the basic header's own CRC-32 over `record`'s header
+    /// content, in place — through [`crc32_witness`], never `arj.rs`'s
+    /// `crc32_ieee`.
+    ///
+    /// **This is what makes a row about the field it names.** Fix round 1's
+    /// F1: the basic-header CRC-32 covers every byte of the basic header, so
+    /// mutating a field inside it and leaving the checksum alone means
+    /// criterion 4 (the CRC) refuses the record before criterion 7 (the
+    /// `file_type` rule) or criterion 8 (the method table) is ever consulted.
+    /// Measured by the review: deleting criterion 8 outright left all six
+    /// ARJ catalogue tests green, including the sub-case whose message
+    /// claimed "an unassigned method byte must drop X". A row refused by the
+    /// wrong gate is a row that cannot fail for the reason it states.
+    fn refresh_header_crc(bytes: &mut [u8], record: &Record) {
+        let content = record.offset + 4;
+        let crc = crc32_witness(&bytes[content..record.header_crc_at]);
+        bytes[record.header_crc_at..record.header_crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+
     fn reader_entries(bytes: &[u8]) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
         let src: Box<dyn Source> = Box::new(ReaderSource::new(Cursor::new(bytes.to_vec())));
         let resolved = stuffr_core::resolve(src, ARJ, Arj.caps(), &StreamPolicy::default())
@@ -3167,13 +3188,37 @@ mod damage_catalogue {
                 all[damaged]
             );
 
-            // (b) the method byte — a value past the five ARJ assigned.
+            // (b) the method byte — a value past the five ARJ assigned,
+            // with the basic header's CRC-32 RECOMPUTED so that criterion 8
+            // (the method table) is what refuses it and not criterion 4.
+            // See `refresh_header_crc` for what this row measured before
+            // the refresh existed.
+            // `200`, the byte the module's own
+            // `an_unassigned_method_byte_is_not_a_candidate` uses — NOT 8 or
+            // 9, which ARJ really did assign ("no data") and which this
+            // build therefore REPORTS, as `Unverified`, rather than
+            // dropping. Measured: `= 9` here leaves all three entries in
+            // the scan, which is correct behaviour and the wrong fixture.
             let mut bytes = healthy.clone();
-            bytes[g[damaged].method_at] = 9;
+            bytes[g[damaged].method_at] = 200;
+            refresh_header_crc(&mut bytes, &g[damaged]);
             assert_eq!(
                 names(&salvaged(&bytes)),
                 survivors,
                 "an unassigned method byte must drop `{}` and nothing else",
+                all[damaged]
+            );
+            // The complement, in the same breath: the identical edit with a
+            // method the format DID assign leaves the record standing — so
+            // the assertion above is about the method table and not about
+            // having touched the header at all.
+            let mut bytes = healthy.clone();
+            bytes[g[damaged].method_at] = Method::Stored.byte();
+            refresh_header_crc(&mut bytes, &g[damaged]);
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                all.to_vec(),
+                "a REASSIGNED but assigned method must keep `{}`",
                 all[damaged]
             );
 
@@ -3191,11 +3236,12 @@ mod damage_catalogue {
 
             // (d) the `file_type` field, set to the main header's value —
             // the asymmetry above reached as DAMAGE rather than as a
-            // deliberate construction. The header CRC-32 is not refreshed,
-            // so this is refused by (c)'s gate rather than by the file-type
-            // rule; both drop the entry, which is what this row claims.
+            // deliberate construction. The CRC-32 is refreshed here too, so
+            // criterion 7 (the main-header rule) is what refuses it; without
+            // that this row was a second copy of (c).
             let mut bytes = healthy.clone();
             bytes[g[damaged].file_type_at] = 2;
+            refresh_header_crc(&mut bytes, &g[damaged]);
             assert_eq!(
                 names(&salvaged(&bytes)),
                 survivors,
