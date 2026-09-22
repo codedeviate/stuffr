@@ -1715,3 +1715,445 @@ mod tests {
         assert_eq!(found, Some(at as u64));
     }
 }
+
+// -------------------------------------------------------------------------
+// Salvage Stage 2 Task 7: the damage catalogue.
+//
+// **Every expectation here is the PRE-DAMAGE state, and none of it comes
+// from this scanner.** The content, the compression methods and the
+// CRC-16/ARC values all come from the borrowed `unarc-rs` 0.6.3 corpus
+// (`fixtures/legacy/zoo/`, see `fixtures/legacy/MANIFEST.md`) — bytes zoo
+// 2.10 wrote decades before this project existed, each record carrying the
+// checksum its ORIGINAL writer computed over the original content.
+//
+// **The one compromise, stated rather than hidden.** Every borrowed ZOO
+// fixture holds exactly ONE entry, and "neighbours unaffected" is a claim
+// that needs at least two. ZOO's directory is a CHAIN of records carrying
+// ABSOLUTE `next` and payload offsets, so two archives cannot simply be
+// concatenated. [`two_borrowed_entries`] therefore re-FRAMES two borrowed
+// records into one archive through `zoo.rs`'s own `build_zoo`: the framing
+// (the 42-byte header, the chain links, the `dir_crc`s) is this project's,
+// while each entry's PAYLOAD BYTES, METHOD, ORIGINAL SIZE and CRC-16 are
+// the borrowed corpus's, carried across unchanged. So the evidence that
+// matters — "does this scanner's verdict agree with a checksum another
+// program computed?" — is still borrowed; only the envelope is ours. The
+// single-entry rows below run against the untouched fixtures for the same
+// reason, so nothing rests on the re-framing alone.
+//
+// No external tool witnesses this: no `zoo` binary is obtainable on any
+// platform in reach (measured: `which zoo` finds nothing). The stored
+// CRC-16 IS the witness, and it is a good one.
+// -------------------------------------------------------------------------
+#[cfg(test)]
+mod damage_catalogue {
+    use std::io::Cursor;
+
+    use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
+    use stuffr_core::{Container, OpenOpts, ReaderSource, Source, StreamPolicy};
+
+    use super::super::zoo::test_archives::{Spec, build_zoo};
+    use super::super::zoo::{ZOO, Zoo, read_dir_entry};
+    use super::salvage_zoo;
+
+    const STORE_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/store.zoo");
+    const DEFAULT_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/default.zoo");
+    const HIGH_PER_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/high_per.zoo");
+
+    /// CRC-16/ARC written out longhand, independent of
+    /// `super::super::crc::crc16_arc` — the same double-entry discipline
+    /// `stuffr_core::container_conformance`'s own `crc16_arc_witness` uses.
+    /// Pinned to the published RevEng check value below.
+    fn crc16_witness(data: &[u8]) -> u16 {
+        let mut crc: u16 = 0;
+        for &b in data {
+            crc ^= u16::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xA001
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc
+    }
+
+    #[test]
+    fn the_witness_checksum_matches_the_published_check_value() {
+        assert_eq!(crc16_witness(b"123456789"), 0xBB3D);
+    }
+
+    /// One borrowed record's own declarations, read out of the archive's
+    /// first directory entry: `(method, crc16, original size, payload
+    /// bytes)`. This is the only place the borrowed corpus is consulted,
+    /// and it reads DECLARATIONS — never a decoder's output.
+    fn borrowed_record(bytes: &[u8]) -> (u8, u16, u32, Vec<u8>) {
+        let d = read_dir_entry(&mut Cursor::new(bytes.to_vec()), 42)
+            .expect("every borrowed fixture's first record parses");
+        let start = d.offset as usize;
+        (
+            d.method_byte,
+            d.crc16,
+            d.org_size,
+            bytes[start..start + d.size_now as usize].to_vec(),
+        )
+    }
+
+    /// Two borrowed records, re-framed into one archive — see this module's
+    /// header comment for exactly which parts are borrowed and which are
+    /// ours. Entry 1 is `store.zoo`'s method-0 (Stored) record, entry 2 is
+    /// `high_per.zoo`'s method-2 (`-lh5-`) one; both carry the CRC-16
+    /// `0xB065` zoo 2.10 computed over the same 11,357-byte content.
+    fn two_borrowed_entries() -> Vec<u8> {
+        let (m1, c1, o1, p1) = borrowed_record(STORE_ZOO);
+        let (m2, c2, o2, p2) = borrowed_record(HIGH_PER_ZOO);
+        let mut first = Spec::stored("store.lic", &p1);
+        first.method = m1;
+        first.crc16 = Some(c1);
+        first.declared_org = Some(o1);
+        let mut second = Spec::stored("high.lic", &p2);
+        second.method = m2;
+        second.crc16 = Some(c2);
+        second.declared_org = Some(o2);
+        build_zoo(&[first, second])
+    }
+
+    /// `(record offset, payload range)` per entry, walked along the
+    /// archive's own `next` chain — the geometry every mutation below is
+    /// aimed with, read from the archive rather than from a salvage result.
+    fn geometry(bytes: &[u8]) -> Vec<(u64, std::ops::Range<usize>)> {
+        let mut out = Vec::new();
+        let mut at = 42u64;
+        loop {
+            let d = match read_dir_entry(&mut Cursor::new(bytes.to_vec()), at) {
+                Ok(d) => d,
+                Err(_) => return out,
+            };
+            if d.name.is_empty() {
+                return out; // the terminator record
+            }
+            let start = d.offset as usize;
+            out.push((at, start..start + d.size_now as usize));
+            if d.next == 0 {
+                return out;
+            }
+            at = u64::from(d.next);
+        }
+    }
+
+    fn reader_entries(bytes: &[u8]) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(Cursor::new(bytes.to_vec())));
+        let resolved = stuffr_core::resolve(src, ZOO, Zoo.caps(), &StreamPolicy::default())
+            .map_err(|e| format!("resolve: {e}"))?;
+        let mut ar = Zoo
+            .open(resolved, &OpenOpts::default())
+            .map_err(|e| format!("open: {e}"))?;
+        let mut out = Vec::new();
+        loop {
+            match ar.next_entry() {
+                Ok(Some(mut entry)) => {
+                    let name = entry.meta().name.clone();
+                    let mut data = Vec::new();
+                    entry
+                        .reader()
+                        .read_to_end(&mut data)
+                        .map_err(|e| format!("read {name}: {e}"))?;
+                    out.push((name, data));
+                }
+                Ok(None) => return Ok(out),
+                Err(e) => return Err(format!("next_entry: {e}")),
+            }
+        }
+    }
+
+    fn salvaged(bytes: &[u8]) -> Vec<(String, SalvageStatus)> {
+        salvage_zoo(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
+            .expect("a damaged archive must never abort the run")
+            .entries
+            .iter()
+            .map(|e| (e.meta.name.clone(), e.status))
+            .collect()
+    }
+
+    fn names(rows: &[(String, SalvageStatus)]) -> Vec<&str> {
+        rows.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 1: the agreement property.
+    // ---------------------------------------------------------------------
+
+    /// **Salvage of an UNDAMAGED archive must agree exactly with what the
+    /// ordinary reader enumerates** — same names, same order, every entry
+    /// `Intact` — over all three decodable borrowed fixtures and over the
+    /// re-framed two-entry archive.
+    ///
+    /// The third leg is what stops this being two implementations agreeing
+    /// with each other: the bytes the READER produced are checked against
+    /// the CRC-16 each record DECLARES, through [`crc16_witness`], an
+    /// implementation independent of `legacy::crc`'s.
+    #[test]
+    fn salvage_of_a_healthy_archive_agrees_with_the_ordinary_reader() {
+        let spliced = two_borrowed_entries();
+        for (label, bytes) in [
+            ("store.zoo", STORE_ZOO),
+            ("default.zoo", DEFAULT_ZOO),
+            ("high_per.zoo", HIGH_PER_ZOO),
+            ("two borrowed records, re-framed", &spliced[..]),
+        ] {
+            let read = reader_entries(bytes)
+                .unwrap_or_else(|e| panic!("{label}: the ordinary reader must walk it: {e}"));
+            let rows = salvaged(bytes);
+            assert_eq!(
+                rows.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                read.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "{label}: salvage and the ordinary reader must enumerate the same names in \
+                 the same order"
+            );
+            for (name, status) in &rows {
+                assert_eq!(
+                    *status,
+                    SalvageStatus::Intact,
+                    "{label}: an undamaged entry (`{name}`) must verify Intact"
+                );
+            }
+            // Each record's own declared CRC-16, against the reader's own
+            // output, through an independent implementation.
+            let mut at = 42u64;
+            for (name, content) in &read {
+                let d = read_dir_entry(&mut Cursor::new(bytes.to_vec()), at).unwrap();
+                assert_eq!(
+                    crc16_witness(content),
+                    d.crc16,
+                    "{label}: the reader's output for `{name}` must match the CRC-16 the \
+                     record itself declares — otherwise `Intact` above is agreement between \
+                     two wrongs"
+                );
+                at = u64::from(d.next);
+            }
+        }
+    }
+
+    /// **Ruling S-R, pinned on BOTH sides in one test.** A record the
+    /// archive marks deleted is SKIPPED by `zoo.rs`'s reader (following
+    /// `zoolist.c`) and REPORTED by salvage, annotated `marked_deleted` —
+    /// because the flag is one byte, and in a damaged archive a bit flip
+    /// turns a live entry into one no ordinary verb will ever hand back.
+    ///
+    /// Asserting only the salvage half would leave the interesting claim —
+    /// that the two verbs deliberately disagree — untested.
+    #[test]
+    fn a_deleted_record_is_the_documented_asymmetry() {
+        let (m1, c1, o1, p1) = borrowed_record(STORE_ZOO);
+        let (m2, c2, o2, p2) = borrowed_record(HIGH_PER_ZOO);
+        let mut first = Spec::stored("store.lic", &p1);
+        first.method = m1;
+        first.crc16 = Some(c1);
+        first.declared_org = Some(o1);
+        first.deleted = true;
+        let mut second = Spec::stored("high.lic", &p2);
+        second.method = m2;
+        second.crc16 = Some(c2);
+        second.declared_org = Some(o2);
+        let bytes = build_zoo(&[first, second]);
+
+        let read = reader_entries(&bytes).expect("the reader walks past a deleted record");
+        assert_eq!(
+            read.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["high.lic"],
+            "the ordinary reader must not list a deleted record"
+        );
+
+        let outcome = salvage_zoo(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+        assert_eq!(
+            outcome
+                .entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.status, e.marked_deleted))
+                .collect::<Vec<_>>(),
+            [
+                ("store.lic", SalvageStatus::Intact, true),
+                ("high.lic", SalvageStatus::Intact, false),
+            ],
+            "salvage must recover the deleted record, verify it, and SAY it was deleted"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 2: the mutation catalogue.
+    // ---------------------------------------------------------------------
+
+    /// Row 1/3 — **a truncated tail.** The earlier entry `Intact`, the cut
+    /// one `Partial`, swept across the whole payload rather than sampled at
+    /// one point.
+    #[test]
+    fn damage_catalogue_a_truncated_tail() {
+        let bytes = two_borrowed_entries();
+        let g = geometry(&bytes);
+        assert_eq!(g.len(), 2, "sanity: two records before anything is cut");
+        let last = g[1].1.clone();
+
+        let declared = last.len();
+        for keep in [0, 1, declared / 2, declared - 1] {
+            let rows = salvaged(&bytes[..last.start + keep]);
+            assert_eq!(
+                names(&rows),
+                ["store.lic", "high.lic"],
+                "keep={keep}: the cut record's header is still there and must be counted"
+            );
+            assert_eq!(rows[0].1, SalvageStatus::Intact, "keep={keep}");
+            assert_eq!(rows[1].1, SalvageStatus::Partial, "keep={keep}");
+        }
+
+        let whole = salvaged(&bytes);
+        assert!(
+            whole.iter().all(|(_, s)| *s == SalvageStatus::Intact),
+            "the UNCUT archive must still come back entirely Intact"
+        );
+    }
+
+    /// Row 2/3 — **a byte flipped mid-payload.** That entry `Partial`, its
+    /// neighbour untouched, run in both directions.
+    #[test]
+    fn damage_catalogue_a_byte_flipped_mid_payload() {
+        let healthy = two_borrowed_entries();
+        let g = geometry(&healthy);
+        for (damaged, intact) in [(0usize, 1usize), (1, 0)] {
+            let mut bytes = healthy.clone();
+            let range = g[damaged].1.clone();
+            bytes[range.start + range.len() / 2] ^= 0xFF;
+
+            let rows = salvaged(&bytes);
+            assert_eq!(names(&rows), ["store.lic", "high.lic"]);
+            assert_eq!(
+                rows[damaged].1,
+                SalvageStatus::Partial,
+                "the damaged record's content no longer matches its own CRC-16"
+            );
+            assert_eq!(
+                rows[intact].1,
+                SalvageStatus::Intact,
+                "the untouched record must not be implicated"
+            );
+        }
+    }
+
+    /// Row 2/3, the no-decoder variant: `store.zoo`'s single entry is method
+    /// 0 (Stored), so a flipped byte reaches the CRC-16 comparison with
+    /// nothing in between — the arrangement where `Partial` can only mean
+    /// "the checksum disagreed". The flip is proven to change the checksum
+    /// first, through the independent witness, so the row cannot pass for
+    /// the wrong reason.
+    #[test]
+    fn damage_catalogue_a_flipped_byte_in_a_stored_payload() {
+        let range = geometry(STORE_ZOO)[0].1.clone();
+        let declared = read_dir_entry(&mut Cursor::new(STORE_ZOO.to_vec()), 42)
+            .unwrap()
+            .crc16;
+        assert_eq!(
+            crc16_witness(&STORE_ZOO[range.clone()]),
+            declared,
+            "a Stored payload IS its content, so the borrowed CRC-16 must match it directly"
+        );
+
+        let mut bytes = STORE_ZOO.to_vec();
+        bytes[range.start + range.len() / 2] ^= 0xFF;
+        assert_ne!(
+            crc16_witness(&bytes[range.clone()]),
+            declared,
+            "the flip must actually change the checksum, or this row proves nothing"
+        );
+        assert_eq!(
+            salvaged(&bytes),
+            vec![("license".to_string(), SalvageStatus::Partial)]
+        );
+        assert_eq!(
+            salvaged(STORE_ZOO),
+            vec![("license".to_string(), SalvageStatus::Intact)]
+        );
+    }
+
+    /// Row 3/3 — **a header field corrupted.** That record absent, its
+    /// neighbour surviving, in both directions. Corrupting the FIRST
+    /// record is the interesting one: ZOO's directory is a chain, so
+    /// destroying a link is exactly what makes every record behind it
+    /// unreachable to the ordinary reader.
+    #[test]
+    fn damage_catalogue_a_corrupted_header_field() {
+        let healthy = two_borrowed_entries();
+        let g = geometry(&healthy);
+        let all = ["store.lic", "high.lic"];
+
+        for (damaged, survivor) in [(0usize, 1usize), (1, 0)] {
+            let at = g[damaged].0 as usize;
+
+            // (a) the four-byte record tag — the signature the scan looks
+            // for at all.
+            let mut bytes = healthy.clone();
+            bytes[at] ^= 0xFF;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                [all[survivor]],
+                "a destroyed record tag must drop `{}` and nothing else",
+                all[damaged]
+            );
+
+            // (b) the method byte — a value past `zoo.h`'s `MAX_PACK`.
+            let mut bytes = healthy.clone();
+            bytes[at + 5] = 200;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                [all[survivor]],
+                "an unassigned method byte must drop `{}` and nothing else",
+                all[damaged]
+            );
+
+            // (c) the record's own `dir_crc`, which is the gate that lets a
+            // non-printable name through and the one a coincidental tag
+            // cannot forge.
+            let mut bytes = healthy.clone();
+            bytes[at + 54] ^= 0xFF;
+            bytes[at + 38] = 0x01; // a control byte in the name field
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                [all[survivor]],
+                "a name no reader would report, behind a `dir_crc` that no longer vouches \
+                 for it, must drop `{}` and nothing else",
+                all[damaged]
+            );
+        }
+    }
+
+    /// The header field that is NOT absent-or-refused, for the same reason
+    /// ARC's is not: a lying compressed length still sits behind a record
+    /// whose tag, method, name and `dir_crc` all check out, so the candidate
+    /// is REPORTED with its payload bounded by what the file holds — and,
+    /// critically, the record behind it is not swallowed by the lie.
+    #[test]
+    fn damage_catalogue_a_corrupted_declared_length_is_reported_not_believed() {
+        let healthy = two_borrowed_entries();
+        let g = geometry(&healthy);
+        let mut bytes = healthy.clone();
+        let at = g[0].0 as usize;
+        bytes[at + 24..at + 28].copy_from_slice(&9_999_999u32.to_le_bytes());
+        // `dir_crc` covers the record, so it has to be refreshed or the
+        // record is refused by criterion (c) above instead — which would
+        // make this row a duplicate of that one rather than its complement.
+        bytes[at + 54] = 0;
+        bytes[at + 55] = 0;
+        let len = read_dir_entry(&mut Cursor::new(bytes.clone()), at as u64)
+            .unwrap()
+            .record_len as usize;
+        let fresh = crc16_witness(&bytes[at..at + len]);
+        bytes[at + 54..at + 56].copy_from_slice(&fresh.to_le_bytes());
+
+        let rows = salvaged(&bytes);
+        assert_eq!(
+            names(&rows),
+            ["store.lic", "high.lic"],
+            "a lying length must not swallow the record behind it"
+        );
+        assert_eq!(rows[0].1, SalvageStatus::Partial);
+        assert_eq!(rows[1].1, SalvageStatus::Intact);
+    }
+}
