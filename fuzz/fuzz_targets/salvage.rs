@@ -216,10 +216,14 @@ fn arj_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
 /// every input, forever — while `make fuzz` reported `target 'salvage': OK`
 /// and the task report claimed the oracle was firing.
 ///
-/// A panic here cannot be reached by hostile INPUT: the selector byte is
-/// reduced `% SALVAGE_SLOTS.len()`, so every one of the 256 values names a
-/// listed slot. It is reachable only by appending a slot without its arm,
-/// which is precisely the state that must stop being quiet.
+/// A panic here cannot be reached by hostile INPUT, and that still holds
+/// after Stage 2 Task 8 gave the slot a second source: the selector byte is
+/// reduced `% SALVAGE_SLOTS.len()`, so every one of its 256 values names a
+/// listed slot, and [`slot_from_payload`] answers only names it found by
+/// searching `SALVAGE_SLOTS` itself — a payload detecting as `tar` yields
+/// `None` and falls back to the selector rather than reaching here. So the
+/// panic is reachable only by appending a slot without its arm, which is
+/// precisely the state that must stop being quiet.
 fn no_cross_check_arm(name: &str) -> ! {
     panic!(
         "SALVAGE_SLOTS names `{name}`, which `entries::salvage` dispatches to a real scanner, \
@@ -230,6 +234,80 @@ fn no_cross_check_arm(name: &str) -> ! {
     )
 }
 
+/// Which slot the PAYLOAD ITSELF names, independently of the selector byte —
+/// `None` when this project's own format detection does not recognise the
+/// bytes as an archive in a format `SALVAGE_SLOTS` lists.
+///
+/// **Ruling S-S, and the structural half of Stage 2 Task 8.** The slot used
+/// to be `selector % SALVAGE_SLOTS.len()` and nothing else, which made the
+/// selector byte fight its own corpus: one mutated byte moves a seeded
+/// archive onto a different format's scanner, that input explores different
+/// code, libFuzzer keeps it for the new coverage, and the slot a seed was
+/// written for fills up with other formats' bodies. Measured at Task 4 over
+/// the 4,726 inputs a 200,000-run session accumulated: the `zoo` slot held
+/// 876 of them and **not one produced a salvaged record of any status**,
+/// with two real ZOO seeds in the corpus the whole time. There are five
+/// slots now, so the pressure is 4-in-5 rather than 2-in-3.
+///
+/// Deriving the slot from the bytes is self-correcting where a selector byte
+/// is not: mutation preserves a ZOO archive's four-byte tag at offset 20 far
+/// more often than it preserves one chosen byte at offset 0, so a descendant
+/// of a ZOO seed keeps reaching the ZOO scanner, and — the half that matters
+/// as much — a descendant of a ZIP seed stops squatting on the ZOO slot.
+///
+/// It reuses [`stuffr_core::resolve_chain`] over `stuffr`'s own registry
+/// rather than re-deriving each format's magic here, deliberately and
+/// unlike every `*_locally_offers_checkable_crc` function above: those exist
+/// to be an INDEPENDENT reading of the same bytes, so duplication is their
+/// whole value, while this one only has to route an input and gains nothing
+/// from disagreeing with the library about what a ZOO archive looks like.
+/// It is the same call `entries::salvage`'s own `resolve_salvage_format`
+/// makes for a real `stuffr salvage ARCHIVE` with no `--format`, minus the
+/// path (the temp file is named `input`, so an extension would say nothing).
+///
+/// **The cost is named rather than hidden: cross-feeding narrows.** An input
+/// carrying real zip magic can no longer be handed to the ARC scanner by a
+/// selector byte, and `arc`'s measured 529-of-679 salvaged rows at Task 4
+/// came exactly that way — from mutated zip bodies whose two-byte ARC anchor
+/// (`0x1A` plus a method in `1..=11`, one coincidence per ~8 KiB) matched by
+/// accident. That route is traded for real ARC seeds, which Task 8 adds in
+/// the same change; feeding one format's scanner another format's bytes
+/// stays reachable for every input whose magic this function does NOT
+/// recognise, which after mutation is the overwhelming majority.
+fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
+    let prefix = &payload[..payload.len().min(stuffr_core::PROBE_LEN)];
+    let container = stuffr_core::resolve_chain(stuffr::registry(), None, prefix)
+        .ok()?
+        .container()?;
+    SALVAGE_SLOTS
+        .iter()
+        .copied()
+        .find(|&slot| slot == container.as_str())
+}
+
+/// One line per input on stderr when `STUFFR_FUZZ_SALVAGE_TRACE` is set in
+/// the environment, and nothing at all otherwise.
+///
+/// **An execution count is not evidence, and this is what replaces it.**
+/// Stage 1's target truthfully reported `2000 executions — OK` while zero of
+/// its inputs produced a salvaged record of any status, so its only oracle
+/// call was unreachable by construction. The two tasks since each measured
+/// the difference by hand-patching this file and reverting the patch, which
+/// leaves the number in a report and no way to reproduce it. Gated tracing
+/// makes the measurement a property of the harness instead:
+///
+/// ```text
+/// STUFFR_FUZZ_SALVAGE_TRACE=1 cargo +nightly fuzz run salvage -- -runs=0 2>&1 \
+///   | grep '^salvage-trace '
+/// ```
+///
+/// `-runs=0` still executes every corpus file exactly once, so the lines are
+/// one per input and can be summed per slot. `oracle` counts calls to
+/// [`check_salvage_claim`], which is a DIFFERENT number from `intact`:
+/// the call is skipped when the independent second scan did not also report
+/// that scan position, or when this target's own raw-byte cross-check cannot
+/// tell whether a checksum was checkable (`inconclusive`). Conflating the
+/// two is the error the last two tasks each made once.
 /// The per-entry ceiling this target runs under, in place of
 /// [`SalvagePolicy::default`]'s 4 GiB.
 ///
@@ -267,7 +345,10 @@ fuzz_target!(|data: &[u8]| {
     let Some((&selector, payload)) = data.split_first() else {
         return;
     };
-    let name = SALVAGE_SLOTS[selector as usize % SALVAGE_SLOTS.len()];
+    // Ruling S-S: the payload's own magic wins where there is one, and the
+    // selector byte decides for everything else. See `slot_from_payload`.
+    let name = slot_from_payload(payload)
+        .unwrap_or(SALVAGE_SLOTS[selector as usize % SALVAGE_SLOTS.len()]);
 
     // `entries::salvage` takes a path, not a `Source` — the same reason
     // `chain.rs`'s `entries::list` and `container.rs`'s seekable branch both
