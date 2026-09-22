@@ -1995,6 +1995,32 @@ mod tests {
     /// first extension header's — where level 2 has one `u16`
     /// (`parser.rs:260-262`). Extension headers use 4-byte counters at this
     /// level, so the chain's terminator is a `u32` zero.
+    /// A level-2 archive whose extension-header chain starts at the
+    /// FILENAME header, so the COMMON header — the one carrying the header
+    /// CRC this scanner gates on — is absent. `delharc` reads it; this
+    /// scanner refuses it by name at `Error::Unsupported`.
+    ///
+    /// Lifted out of `a_level_2_header_with_no_common_extension_header_is_
+    /// refused_by_name` in Task 7's fix round (F2) so the whole-container
+    /// control in `damage_catalogue::the_header_levels_this_scanner_refuses_
+    /// are_ones_the_reader_lists` can run over the identical bytes rather
+    /// than a second hand-built approximation of them.
+    pub(super) fn build_level2_without_common_header() -> Vec<u8> {
+        let bytes = build_level2(b"nocrc.txt", b"-lh0-", b"payload");
+        // Point the base header's first-extra-header field straight at the
+        // FILENAME header, skipping the common one, and shorten the declared
+        // total to match the chain that remains.
+        let common_len = 5usize;
+        let mut trimmed = bytes[..LEVEL2_BASE_LEN].to_vec();
+        trimmed.extend_from_slice(&bytes[LEVEL2_BASE_LEN + common_len..]);
+        let name_len = 1 + b"nocrc.txt".len() + 2;
+        let total = LEVEL2_BASE_LEN + name_len;
+        trimmed[HEADER_LEN_I..HEADER_LEN_I + 2].copy_from_slice(&(total as u16).to_le_bytes());
+        trimmed[LEVEL2_FIRST_EXTRA_I..LEVEL2_FIRST_EXTRA_I + 2]
+            .copy_from_slice(&(name_len as u16).to_le_bytes());
+        trimmed
+    }
+
     pub(super) fn build_level3(name: &[u8], content: &[u8]) -> Vec<u8> {
         let name_len = 1 + name.len() + 4;
         let total = 32 + name_len;
@@ -2359,18 +2385,7 @@ mod tests {
     /// `Error::Unsupported` (exit 3), naming the level and what is missing.
     #[test]
     fn a_level_2_header_with_no_common_extension_header_is_refused_by_name() {
-        let bytes = build_level2(b"nocrc.txt", b"-lh0-", b"payload");
-        // Point the base header's first-extra-header field straight at the
-        // FILENAME header, skipping the common one, and shorten the declared
-        // total to match the chain that remains.
-        let common_len = 5usize;
-        let mut trimmed = bytes[..LEVEL2_BASE_LEN].to_vec();
-        trimmed.extend_from_slice(&bytes[LEVEL2_BASE_LEN + common_len..]);
-        let name_len = 1 + b"nocrc.txt".len() + 2;
-        let total = LEVEL2_BASE_LEN + name_len;
-        trimmed[HEADER_LEN_I..HEADER_LEN_I + 2].copy_from_slice(&(total as u16).to_le_bytes());
-        trimmed[LEVEL2_FIRST_EXTRA_I..LEVEL2_FIRST_EXTRA_I + 2]
-            .copy_from_slice(&(name_len as u16).to_le_bytes());
+        let trimmed = build_level2_without_common_header();
 
         // The CONTROL: `delharc` — the parser `stuffr list` reads through —
         // accepts this archive, which is what makes the refusal below a
@@ -3282,24 +3297,30 @@ mod tests {
 // account, not only by ours. This module is the fast half of the same
 // catalogue.
 //
-// Note what a mid-payload flip produces: the TIER is `Partial` always, but
-// the CAUSE one crate up (`stuffr::entries::PartialCause`) depends on the
-// codec — `-lh0-` decodes whole and disagrees (`ChecksumMismatch`), while a
-// compressed method usually aborts mid-stream (`Truncated`). That is the
-// documented meaning of `Truncated` ("the payload ran out, OR the decoder
-// failed mid-stream"), not a defect, and it is why the rows below assert
-// the tier rather than the cause.
+// Note what a mid-payload flip produces: the TIER is `Partial` always, and
+// the rows below assert that, because the CAUSE one crate up
+// (`stuffr::entries::PartialCause`) depends on the CODEC rather than on the
+// damage — `-lh0-` decodes whole and disagrees (`ChecksumMismatch`), while
+// `-lh5-` usually aborts mid-stream. That difference is real and worth
+// reporting; what was WRONG, and what Ruling S-AA fixed in this fix round,
+// is that the aborting case printed `Partial (truncated)` over an archive
+// from which nothing had been cut. There are three causes now, and the CLI
+// asserts the exact one (`cli.rs`'s
+// `damage_catalogue_the_three_partial_causes_are_distinguishable`); this
+// layer cannot see `PartialCause` at all, so the tier is still what it
+// pins.
 // -------------------------------------------------------------------------
 #[cfg(test)]
 mod damage_catalogue {
     use std::io::Cursor;
 
-    use stuffr_core::Error;
     use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
+    use stuffr_core::{Container, Error, OpenOpts, ReaderSource, Source, StreamPolicy};
 
     use super::super::lha::test_archives::{build_lha, read_entry_names};
+    use super::super::lha::{LHA, Lha};
     use super::salvage_lha;
-    use super::tests::build_level3;
+    use super::tests::{build_level2_without_common_header, build_level3};
 
     /// Two `-lh0-` (Stored) level-1 entries — `sample/hello.txt` (6 bytes)
     /// and `sample/sub/b.bin` (5 bytes) — whose CRC-16s `lhasa` has
@@ -3321,25 +3342,88 @@ mod damage_catalogue {
         /// Byte offset of the one-byte header checksum.
         checksum_at: usize,
         payload: std::ops::Range<usize>,
+        /// The CRC-16/ARC the header declares over this entry's ORIGINAL
+        /// content — a level-0/1 header carries it immediately after the
+        /// filename. Fix round 1, F5: without it this module had no way to
+        /// check the reader's decoded bytes against anything the archive
+        /// itself states, which made LHA the one agreement property of four
+        /// with no content leg.
+        declared_crc: u16,
     }
 
     fn headers(bytes: &[u8]) -> Vec<Header> {
         let mut out = Vec::new();
         let mut at = 0usize;
         // A zero `header_len` byte is LHA's optional end-of-archive marker.
-        while at + 21 < bytes.len() && bytes[at] != 0 {
+        while at + 22 < bytes.len() && bytes[at] != 0 {
             let header_len = bytes[at] as usize;
             let skip = u32::from_le_bytes(bytes[at + 7..at + 11].try_into().unwrap()) as usize;
+            let name_len = bytes[at + 21] as usize;
+            let crc_at = at + 22 + name_len;
+            let declared_crc = u16::from_le_bytes(bytes[crc_at..crc_at + 2].try_into().unwrap());
             let start = at + header_len + 2;
             out.push(Header {
                 offset: at,
                 method_at: at + 2,
                 checksum_at: at + 1,
                 payload: start..start + skip,
+                declared_crc,
             });
             at = start + skip;
         }
         out
+    }
+
+    /// CRC-16/ARC written out longhand, independent of
+    /// `super::super::crc::crc16_arc` — the same witness `arc_salvage.rs`
+    /// and `zoo_salvage.rs` carry, and pinned to the published RevEng check
+    /// value below for the same reason.
+    fn crc16_witness(data: &[u8]) -> u16 {
+        let mut crc: u16 = 0;
+        for &b in data {
+            crc ^= u16::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xA001
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        crc
+    }
+
+    #[test]
+    fn the_witness_checksum_matches_the_published_check_value() {
+        assert_eq!(crc16_witness(b"123456789"), 0xBB3D);
+    }
+
+    /// What the ORDINARY reader enumerates AND decodes — `read_entry_names`
+    /// reports names alone, which is why the agreement property below needed
+    /// this instead (fix round 1, F5).
+    fn reader_entries(bytes: &[u8]) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(Cursor::new(bytes.to_vec())));
+        let resolved = stuffr_core::resolve(src, LHA, Lha.caps(), &StreamPolicy::default())
+            .map_err(|e| format!("resolve: {e}"))?;
+        let mut ar = Lha
+            .open(resolved, &OpenOpts::default())
+            .map_err(|e| format!("open: {e}"))?;
+        let mut out = Vec::new();
+        loop {
+            match ar.next_entry() {
+                Ok(Some(mut entry)) => {
+                    let name = entry.meta().name.clone();
+                    let mut data = Vec::new();
+                    entry
+                        .reader()
+                        .read_to_end(&mut data)
+                        .map_err(|e| format!("read {name}: {e}"))?;
+                    out.push((name, data));
+                }
+                Ok(None) => return Ok(out),
+                Err(e) => return Err(format!("next_entry: {e}")),
+            }
+        }
     }
 
     fn salvaged(bytes: &[u8]) -> Vec<(String, SalvageStatus)> {
@@ -3398,17 +3482,26 @@ mod damage_catalogue {
             ("sample.lzh (lhasa-verified)", SAMPLE_LZH),
             ("three entries, production writer", &built[..]),
         ] {
-            let read = read_entry_names(bytes)
+            let read = reader_entries(bytes)
                 .unwrap_or_else(|e| panic!("{label}: the ordinary reader must walk it: {e}"));
             let rows = salvaged(bytes);
+            let geometry = headers(bytes);
             assert_eq!(
                 rows.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
-                read,
+                read.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                 "{label}: salvage and the ordinary reader must enumerate the same names in \
                  the same order"
             );
+            // `read_entry_names` is the reader route the module's other
+            // tests use; asserted equal here so the two never drift apart
+            // and the content leg below is known to be over the same walk.
             assert_eq!(
-                headers(bytes).len(),
+                read_entry_names(bytes).expect("the name-only reader route must agree"),
+                read.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "{label}: the two reader routes must enumerate the same entries"
+            );
+            assert_eq!(
+                geometry.len(),
                 read.len(),
                 "{label}: and both must agree with the header geometry this test parsed \
                  longhand out of the archive's own bytes"
@@ -3418,6 +3511,23 @@ mod damage_catalogue {
                     *status,
                     SalvageStatus::Intact,
                     "{label}: an undamaged entry (`{name}`) must verify Intact"
+                );
+            }
+            // **The content leg (fix round 1, F5).** Without this, "every
+            // entry Intact" above is salvage's own verdict with nothing
+            // corroborating it: `read_entry_names` reads no payload, so the
+            // two sides agreed about names and about nothing else. The
+            // reader's DECODED bytes are checked against the CRC-16 the
+            // header itself declares, through an implementation independent
+            // of `legacy::crc`'s — the same third leg ARC, ZOO and ARJ each
+            // already had.
+            for ((name, content), header) in read.iter().zip(geometry.iter()) {
+                assert_eq!(
+                    crc16_witness(content),
+                    header.declared_crc,
+                    "{label}: the reader's output for `{name}` must match the CRC-16 the \
+                     header declares — otherwise `Intact` above is agreement between two \
+                     wrongs"
                 );
             }
         }
@@ -3439,20 +3549,37 @@ mod damage_catalogue {
     /// what makes it one.
     #[test]
     fn the_header_levels_this_scanner_refuses_are_ones_the_reader_lists() {
-        let level3 = build_level3(b"level3.txt", b"level three payload");
-        assert_eq!(
-            read_entry_names(&level3).expect("the ordinary reader must list a level-3 archive"),
-            ["level3.txt"],
-            "exit 3 says `this build cannot scan it`, which is only honest while the reader \
-             CAN read it"
-        );
-        assert!(
-            matches!(
-                salvage_lha(&mut Cursor::new(level3), &SalvagePolicy::default()),
-                Err(Error::Unsupported(_))
+        for (label, bytes, expected) in [
+            (
+                "level 3",
+                build_level3(b"level3.txt", b"level three payload"),
+                "level3.txt",
             ),
-            "and the scan must refuse it by name, never report an empty archive"
-        );
+            // F2: the shape the module's own worked example shows a user
+            // hitting. It had only `delharc`'s header parser as its
+            // control; this is the whole-container half, over the IDENTICAL
+            // bytes the refusal test uses.
+            (
+                "level 2 with no common header",
+                build_level2_without_common_header(),
+                "nocrc.txt",
+            ),
+        ] {
+            assert_eq!(
+                read_entry_names(&bytes)
+                    .unwrap_or_else(|e| panic!("{label}: the ordinary reader must list it: {e}")),
+                [expected],
+                "{label}: exit 3 says `this build cannot scan it`, which is only honest \
+                 while the reader CAN read it"
+            );
+            assert!(
+                matches!(
+                    salvage_lha(&mut Cursor::new(bytes), &SalvagePolicy::default()),
+                    Err(Error::Unsupported(_))
+                ),
+                "{label}: and the scan must refuse it by name, never report an empty archive"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------
