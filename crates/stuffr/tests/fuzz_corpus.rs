@@ -218,6 +218,52 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 ///   untouched and the scanner recovers both `Intact`. The motivating shape
 ///   for the whole ARJ scanner, and a sharper one than LHA's: there the
 ///   damage costs the entries BEHIND it, here it costs the whole archive.
+///
+/// The two ARC shapes (Stage 2 Task 8) close the last unseeded slot, and the
+/// reason they were left out until now stopped being true in the same
+/// change. Task 4 measured `arc` reaching its scanner without a seed at all
+/// — 529 of 679 inputs producing a salvaged row — because mutated ZIP bodies
+/// hit its two-byte anchor by accident roughly every 8 KiB. That route
+/// depended on the selector byte alone deciding the slot; `salvage.rs`'s
+/// `slot_from_payload` now lets a payload carrying real zip magic name
+/// `zip` itself, so those accidental ARC sightings stay on the `zip` slot
+/// and `arc` needs seeds of its own. Both are borrowed bytes from
+/// `unarc-rs`'s corpus (see `legacy_container_fixture`'s own doc for why a
+/// borrowed archive is stronger evidence than one built here).
+///
+/// - `arc-healthy` — `cpm.arc` verbatim: two entries under two different
+///   compression methods, so a mutation has more than one header and more
+///   than one decoder to land in.
+/// - `arc-derailed-first-size` — the same archive with the FIRST header's
+///   declared `compressed_size` cut to 256, so entry 1's Squeezed payload
+///   runs out under the decoder and the walk stops there. ARC's analogue of
+///   `lha-destroyed-first-header`: the format carries no index, so every
+///   entry is reachable only by having parsed the one before it. Measured:
+///   `stuffr list` answers `entry `DDTZ.COM` declares 256 Huffman nodes but
+///   carries only 254 bytes of node table` at exit 5 and reaches NEITHER
+///   entry, while `stuffr salvage --list` reports `0 Partial (decode
+///   failed)` and `1 Intact READ.COM` at exit 4.
+///
+/// `arj-method4-payload` (Stage 2 Task 8) is the one shape here that exists
+/// to reach a DECODER rather than a scanner, and it closes Task 6b's
+/// MEDIUM-3. ARJ's basic header carries a CRC-32 over its own content, which
+/// gates the HEADER — and nothing gates the PAYLOAD. So a seed whose second
+/// local header validly declares method 4, with that header's CRC-32
+/// recomputed over the edit, hands libFuzzer a payload it can mutate freely
+/// behind a header that keeps parsing: the only route into `unarj-rs`'s
+/// `decode_fastest`, and (through ARJ methods 1/2/3) into `delharc`'s `Lh6`
+/// decoder, which `lha.rs` can never reach because it compiles `delharc` for
+/// `lh1`/`lz` while `unarj-rs` pulls that crate's default features. **`Lh6`
+/// has never been executed by anything in this project.** Entry 1 is left
+/// method 0 and untouched, so the shape still reaches `Intact` the way every
+/// other seed must.
+///
+/// That the route is live is measured, not assumed: on the unedited
+/// `sample.arj` both entries read at exit 0, and on this shape `stuffr list`
+/// answers `Invalid back_ptr` at exit 5 — a message from inside
+/// `decode_fastest`'s back-reference handling, which nothing in this
+/// repository had ever reached — while `stuffr salvage --list` reports
+/// `0 Intact sample/hello.txt` and `1 Partial (decode failed)` at exit 4.
 const SALVAGE_SHAPES: &[&str] = &[
     "healthy",
     "distinct-duplicates",
@@ -231,7 +277,32 @@ const SALVAGE_SHAPES: &[&str] = &[
     "lha-destroyed-first-header",
     "arj-healthy",
     "arj-destroyed-main-header",
+    "arc-healthy",
+    "arc-derailed-first-size",
+    "arj-method4-payload",
 ];
+
+/// The `SALVAGE_SLOTS` name a shape's seed carries in its selector byte: the
+/// part of the shape's name before its first `-` when that names a slot, and
+/// `zip` otherwise (`healthy`, `truncated-tail`, `crc-mismatch` and the two
+/// duplicate shapes are all zips).
+///
+/// Derived rather than written out as a chain of `starts_with` arms, which
+/// is what this was until Stage 2 Task 8: an arm per slot means appending a
+/// slot and naming its shapes `<slot>-*` silently routes them to `zip`, with
+/// nothing failing to say so — the exact shape of the defect that shipped an
+/// `arj` slot whose oracle arm was missing. Now a shape named for a slot
+/// reaches that slot by construction, and
+/// [`every_salvage_slot_carries_at_least_one_seed`] fails the build for a
+/// slot nobody wrote a shape for.
+fn salvage_shape_slot(shape: &str) -> &'static str {
+    let prefix = shape.split('-').next().unwrap_or_default();
+    SALVAGE_SLOTS
+        .iter()
+        .copied()
+        .find(|&slot| slot == prefix)
+        .unwrap_or("zip")
+}
 
 /// Builds one small sample tree every container/chain seed packs: a file at
 /// the top level and a nested one in a subdirectory, so a packed archive
@@ -539,6 +610,92 @@ fn zero_the_central_directory(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Rewrites the FIRST ARC entry header's declared `compressed_size`, so a
+/// sequential walk lands inside that entry's own payload instead of on the
+/// next header.
+///
+/// The layout is `legacy/arc.rs`'s own, transcribed rather than imported —
+/// `MARKER` and `HEADER_LEN` are `pub(super)` and this is a different crate:
+/// `marker(1) + method(1) + name(13) + compressed_size(4) + date(2) +
+/// time(2) + crc16(2) + original_size(4)`, so the size field is at file
+/// offset 15. The marker and method bytes at offsets 0 and 1 are left alone
+/// deliberately: they are ARC's whole registered magic, and a shape whose
+/// magic no longer resolves would be a seed the fuzz target's own
+/// `slot_from_payload` could not route to the ARC scanner at all.
+///
+/// 256 rather than something enormous: `collect_candidates` advances by what
+/// it could actually READ, so a declaration past the end of the file walks
+/// the scan straight to EOF and past the second header this shape exists to
+/// leave recoverable.
+fn derail_first_arc_entry(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out[15..19].copy_from_slice(&256u32.to_le_bytes());
+    out
+}
+
+/// File offset of every ARJ header envelope, in order: the main header
+/// first, then one per local file entry.
+///
+/// ARJ's envelope, traced from `legacy/arj.rs`'s own `fixture_wrap_header`
+/// and duplicated here for the same reason the ARC layout above is (that
+/// builder is a `#[cfg(test)]` item of another crate): magic `60 EA`, a
+/// little-endian `u16` content length, the content, a little-endian `u32`
+/// CRC-32 over the content, then a `u16` extended-header terminator. A
+/// length of zero is the end-of-archive marker. A LOCAL header is followed
+/// by its payload, whose length is the `compressed_size` at content offset
+/// 12; the main header is not.
+fn arj_header_offsets(bytes: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut at = 0usize;
+    loop {
+        assert_eq!(
+            bytes[at..at + 2],
+            [0x60, 0xEA],
+            "ARJ header at {at} does not open with the format's magic"
+        );
+        let len = u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+        if len == 0 {
+            return offsets;
+        }
+        let content = at + 4;
+        let mut next = content + len + 4 + 2;
+        if !offsets.is_empty() {
+            next += u32::from_le_bytes([
+                bytes[content + 12],
+                bytes[content + 13],
+                bytes[content + 14],
+                bytes[content + 15],
+            ]) as usize;
+        }
+        offsets.push(at);
+        at = next;
+    }
+}
+
+/// Sets the `local_index`-th local file header's `compression_method` and
+/// recomputes that header's own CRC-32, leaving every other byte — the
+/// payload very much included — exactly as it was.
+///
+/// The recomputation is the whole point of the shape: ARJ's basic header
+/// CRC-32 covers the header's content and NOTHING ELSE, so an edited method
+/// byte with a refreshed CRC gives libFuzzer a header that keeps parsing
+/// over a payload it may mutate at will. `seed_crc32` is the same
+/// CRC-32/ISO-HDLC ARJ specifies, pinned against the published check value
+/// by `the_corpus_builders_crc_matches_the_published_check_value`.
+fn arj_set_local_method(bytes: &[u8], local_index: usize, method: u8) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let offsets = arj_header_offsets(&out);
+    let at = offsets[1 + local_index];
+    let len = u16::from_le_bytes([out[at + 2], out[at + 3]]) as usize;
+    let content = at + 4;
+    // `legacy/arj.rs`'s `build_local_file_entry`: content offset 5 is
+    // `compression_method`.
+    out[content + 5] = method;
+    let crc = seed_crc32(&out[content..content + len]);
+    out[content + len..content + len + 4].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
 /// The payload every `roundtrip` seed carries after its selector byte.
 ///
 /// Deliberately compressible and deliberately not a round number of bytes:
@@ -790,10 +947,10 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // maps it through `SALVAGE_SLOTS`, and hands the REST of the bytes to a
     // temp file for that slot's scanner via `SalvageOpts::format`. The
     // shapes are `SALVAGE_SHAPES`; see that constant for why this target is
-    // seeded at all and what each shape is for. A shape named `zoo-*`
-    // carries `SALVAGE_SLOTS`'s `zoo` index and every other shape its `zip`
-    // index — see `SALVAGE_SHAPES`'s own doc for the measurement that put
-    // ZOO seeds here and left `arc` without one.
+    // seeded at all and what each shape is for. A shape named for a slot
+    // carries that slot's index and every other shape carries `zip`'s — see
+    // `salvage_shape_slot`, and `every_salvage_slot_carries_at_least_one_
+    // seed` for the guard that a slot cannot go unseeded again.
     //
     // Unlike `chain/`'s deliberately well-formed-only seeds, most of these
     // are DAMAGED on purpose, and that is not the same trade. The rule
@@ -903,17 +1060,30 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
                 bytes[3] = 0xFF;
                 bytes
             }
+            // Task 6b's MEDIUM-3: the header CRC-32 gates the header, not
+            // the payload, so a valid method-4 declaration is the one route
+            // into `decode_fastest` — and, via ARJ methods 1/2/3, into
+            // `delharc`'s `Lh6`, which nothing in this project has ever
+            // executed. The SECOND entry is the one edited, so the first
+            // stays `Intact`.
+            "arj-method4-payload" => {
+                arj_set_local_method(&read_all(&legacy_fixture_path("sample.arj"))?, 1, 4)
+            }
+            // Borrowed bytes again: `cpm.arc` is the two-entry, two-method
+            // fixture the container corpus already uses, for the same
+            // reason — more than one header and more than one decoder for a
+            // mutation to land in.
+            "arc-healthy" => read_all(&legacy_fixture_path("arc/cpm.arc"))?,
+            // Four bytes: the first header's declared payload length. ARC
+            // has no index, so a reader that walks off entry 1 never reaches
+            // entry 2 — while entry 2's own header, payload and CRC-16 are
+            // untouched.
+            "arc-derailed-first-size" => {
+                derail_first_arc_entry(&read_all(&legacy_fixture_path("arc/cpm.arc"))?)
+            }
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
-        let slot = if shape.starts_with("zoo-") {
-            "zoo"
-        } else if shape.starts_with("lha-") {
-            "lha"
-        } else if shape.starts_with("arj-") {
-            "arj"
-        } else {
-            "zip"
-        };
+        let slot = salvage_shape_slot(shape);
         let mut seed = vec![salvage_selector(slot)];
         seed.extend_from_slice(&bytes);
         std::fs::write(salvage_dir.join(format!("{shape}.seed")), &seed)?;
@@ -1103,6 +1273,73 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
     assert!(distinct.entries.iter().all(|r| r.shadows.is_none()));
     let identical = duplicates("identical-duplicates");
     assert!(identical.entries.iter().any(|r| r.shadows.is_some()));
+}
+
+/// Every `SALVAGE_SLOTS` entry must have a seed of its own.
+///
+/// **Ruling S-S's other half.** Until Stage 2 Task 8 the `arc` slot had no
+/// seed at all, on a measurement that it reached its scanner anyway: mutated
+/// ZIP bodies hit ARC's two-byte anchor by accident often enough to produce
+/// 529 salvaged rows across 679 inputs. That measurement depended on the
+/// selector byte alone choosing the slot, which is exactly what
+/// `salvage.rs`'s `slot_from_payload` changed — so the accidental route is
+/// gone and a slot without a seed now spends its whole share of every run on
+/// whatever mutation hands it.
+///
+/// Asserted against `SALVAGE_SLOTS` rather than against a count, so
+/// appending a slot fails here until somebody writes it a shape.
+#[test]
+fn every_salvage_slot_carries_at_least_one_seed() {
+    for &slot in SALVAGE_SLOTS {
+        let shapes: Vec<&&str> = SALVAGE_SHAPES
+            .iter()
+            .filter(|shape| salvage_shape_slot(shape) == slot)
+            .collect();
+        assert!(
+            !shapes.is_empty(),
+            "SALVAGE_SLOTS names `{slot}` but SALVAGE_SHAPES has no shape for it — that slot's \
+             whole share of every fuzz run starts from whatever mutation hands it, which is the \
+             state the `zoo` slot was measured in (876 inputs, not one salvaged record)"
+        );
+    }
+}
+
+/// Each seed's own bytes must identify it as the format its shape names.
+///
+/// **This is the guard on `salvage.rs`'s `slot_from_payload`** (Ruling S-S):
+/// that function routes an input by asking this project's own format
+/// detection what the payload is, and falls back to the selector byte only
+/// when detection says nothing. A seed whose damage destroyed its magic
+/// would fall through to the selector and drift off its slot under mutation
+/// again — silently, since the seed would still be written, still be
+/// scanned, and still produce records under whichever slot the byte named.
+///
+/// The detection call here is deliberately the same one the fuzz target
+/// makes, with the same `None` path, so the two cannot disagree about what a
+/// seed is.
+#[test]
+fn every_salvage_seed_is_recognised_as_the_slot_its_shape_names() {
+    let dir = tempfile::tempdir().unwrap();
+    generate_corpus(dir.path()).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+
+    for shape in SALVAGE_SHAPES {
+        let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let payload = read_all(&salvage_payload_path(&seed_path, scratch.path())).unwrap();
+        let prefix = &payload[..payload.len().min(stuffr_core::PROBE_LEN)];
+        let detected = stuffr_core::resolve_chain(stuffr::registry(), None, prefix)
+            .unwrap_or_else(|e| panic!("seed {shape}'s own bytes must resolve to a format: {e}"))
+            .container()
+            .unwrap_or_else(|| panic!("seed {shape} must resolve to a CONTAINER, not a codec"));
+        assert_eq!(
+            detected.as_str(),
+            salvage_shape_slot(shape),
+            "seed {shape} carries the selector for `{}` but its own bytes detect as \
+             `{detected}` — the fuzz target routes by the bytes, so this seed would be \
+             scanned by the wrong format's scanner",
+            salvage_shape_slot(shape)
+        );
+    }
 }
 
 #[test]
