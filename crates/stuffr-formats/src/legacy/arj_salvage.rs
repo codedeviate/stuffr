@@ -1451,7 +1451,7 @@ mod tests {
     /// The spec's envelope: id, `u16` content length, content, CRC-32 over
     /// the content, and the `u16` zero that terminates the extended-header
     /// chain.
-    fn wrap(content: &[u8]) -> Vec<u8> {
+    pub(super) fn wrap(content: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&HEADER_ID);
         out.extend_from_slice(&(content.len() as u16).to_le_bytes());
@@ -1462,7 +1462,7 @@ mod tests {
     }
 
     /// A local file header's content, with every field at its spec offset.
-    fn local_content(
+    pub(super) fn local_content(
         name: &[u8],
         method: u8,
         file_type: u8,
@@ -1531,7 +1531,7 @@ mod tests {
     }
 
     /// A whole archive: main header, the entries, end-of-archive marker.
-    fn build_archive(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+    pub(super) fn build_archive(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut out = main_header();
         for (name, payload) in entries {
             out.extend_from_slice(&stored_entry(name, payload));
@@ -2729,6 +2729,479 @@ mod tests {
         assert_eq!(names, ["one.txt", "two.bin"]);
         for entry in &out.entries {
             assert_eq!(entry.status, SalvageStatus::Intact);
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Salvage Stage 2 Task 7: the damage catalogue.
+//
+// **ARJ HAS NO EXTERNAL WITNESS, and this module says so rather than
+// leaving a reader to infer parity with its three siblings.** No
+// `arj`/`unarj` binary is obtainable on any platform in reach (measured:
+// `which arj`, `which unarj` — neither exists, and no Homebrew formula
+// ships either). ARC and ZOO are checked against CRC-16s DOS-era archivers
+// computed decades ago; LHA is checked against `lhasa`, a decoder sharing
+// no code with `delharc`. ARJ has neither. `fixtures/legacy/sample.arj` was
+// hand-built from this project's own reading of the ARJ specification and
+// of `unarj-rs`'s parser, so a test here can only prove that the parser
+// agrees with our own transcription — and if both sides share a
+// misreading, every test in this repository stays green. Phase 3c's docs
+// already record the gap on the read and write sides; this is the same gap,
+// restated where the salvage catalogue would otherwise imply it does not
+// exist.
+//
+// **What is done about it, since it cannot be closed here.** Every
+// expectation below is still the PRE-DAMAGE state: the archive is built (or
+// the fixture read), its geometry parsed LONGHAND out of the raw bytes by
+// this module, the content's CRC-32 recomputed through an INDEPENDENT
+// implementation ([`crc32_witness`], pinned to the published check value),
+// and only then is anything damaged. That is double-entry against our own
+// transcription, which is strictly more than a round trip through one
+// parser — and strictly less than an outside opinion.
+// -------------------------------------------------------------------------
+#[cfg(test)]
+mod damage_catalogue {
+    use std::io::Cursor;
+
+    use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
+    use stuffr_core::{Container, OpenOpts, ReaderSource, Source, StreamPolicy};
+
+    use super::super::arj::{ARJ, Arj};
+    use super::Method;
+    use super::salvage_arj;
+    use super::tests::{build_archive, local_content, wrap};
+
+    /// Two `Stored` entries, `sample/hello.txt` (6 bytes) and
+    /// `sample/sub/b.bin` (5 bytes). The weakest provenance in the phase —
+    /// see this module's own header comment.
+    const SAMPLE_ARJ: &[u8] = include_bytes!("../../fixtures/legacy/sample.arj");
+
+    /// CRC-32/ISO-HDLC written out longhand, independent of `arj.rs`'s own
+    /// `crc32_ieee` — the double-entry discipline
+    /// `stuffr_core::container_conformance`'s `crc16_arc_witness` applies to
+    /// the CRC-16 formats, applied here to the one format with nothing else
+    /// vouching for it. Pinned to the published check value below.
+    fn crc32_witness(data: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn the_witness_checksum_matches_the_published_check_value() {
+        assert_eq!(
+            crc32_witness(b"123456789"),
+            0xCBF4_3926,
+            "CRC-32/ISO-HDLC's own published check value — without this, the one independent \
+             opinion ARJ has is only this test agreeing with itself"
+        );
+    }
+
+    /// One local file header's geometry, parsed out of the raw archive
+    /// bytes by this test: the two-byte id, a `u16` basic-header length,
+    /// that many bytes of header, a `u32` header CRC-32, then the extended-
+    /// header chain, then the payload.
+    ///
+    /// Hand-rolled rather than reusing this module's own parser, for the
+    /// reason `cli.rs`'s `parse_real_zip_local_entries` is hand-rolled: an
+    /// expectation read through the code under test is not an expectation.
+    struct Record {
+        offset: usize,
+        /// Byte offset of the `file_type` field within the basic header.
+        file_type_at: usize,
+        /// Byte offset of the `method` field within the basic header.
+        method_at: usize,
+        /// Byte offset of the four-byte header CRC-32 that follows the
+        /// basic header.
+        header_crc_at: usize,
+        /// The CRC-32 the header declares for this entry's CONTENT.
+        declared_content_crc: u32,
+        payload: std::ops::Range<usize>,
+    }
+
+    /// Walks every local file header, skipping the main header (`file_type
+    /// == 2`, the archive's own record) and stopping at the end-of-archive
+    /// marker (a basic-header length of zero).
+    fn records(bytes: &[u8]) -> Vec<Record> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at + 4 <= bytes.len() && bytes[at..at + 2] == [0x60, 0xEA] {
+            let basic_len = u16::from_le_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+            if basic_len == 0 {
+                return out; // end-of-archive marker
+            }
+            let content = at + 4;
+            let header_crc_at = content + basic_len;
+            // The extended-header chain: `u16` length, that many bytes, a
+            // `u32` CRC-32 each, terminated by a zero length.
+            let mut ext = header_crc_at + 4;
+            loop {
+                let len = u16::from_le_bytes([bytes[ext], bytes[ext + 1]]) as usize;
+                ext += 2;
+                if len == 0 {
+                    break;
+                }
+                ext += len + 4;
+            }
+            let file_type = bytes[content + 6];
+            let compressed =
+                u32::from_le_bytes(bytes[content + 12..content + 16].try_into().unwrap()) as usize;
+            let declared_content_crc =
+                u32::from_le_bytes(bytes[content + 20..content + 24].try_into().unwrap());
+            if file_type != 2 {
+                out.push(Record {
+                    offset: at,
+                    file_type_at: content + 6,
+                    method_at: content + 5,
+                    header_crc_at,
+                    declared_content_crc,
+                    payload: ext..ext + compressed,
+                });
+                at = ext + compressed;
+            } else {
+                at = ext;
+            }
+        }
+        out
+    }
+
+    fn reader_entries(bytes: &[u8]) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
+        let src: Box<dyn Source> = Box::new(ReaderSource::new(Cursor::new(bytes.to_vec())));
+        let resolved = stuffr_core::resolve(src, ARJ, Arj.caps(), &StreamPolicy::default())
+            .map_err(|e| format!("resolve: {e}"))?;
+        let mut ar = Arj
+            .open(resolved, &OpenOpts::default())
+            .map_err(|e| format!("open: {e}"))?;
+        let mut out = Vec::new();
+        loop {
+            match ar.next_entry() {
+                Ok(Some(mut entry)) => {
+                    let name = entry.meta().name.clone();
+                    let mut data = Vec::new();
+                    entry
+                        .reader()
+                        .read_to_end(&mut data)
+                        .map_err(|e| format!("read {name}: {e}"))?;
+                    out.push((name, data));
+                }
+                Ok(None) => return Ok(out),
+                Err(e) => return Err(format!("next_entry: {e}")),
+            }
+        }
+    }
+
+    fn salvaged(bytes: &[u8]) -> Vec<(String, SalvageStatus)> {
+        salvage_arj(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
+            .expect("a damaged archive must never abort the run")
+            .entries
+            .iter()
+            .map(|e| (e.meta.name.clone(), e.status))
+            .collect()
+    }
+
+    fn names(rows: &[(String, SalvageStatus)]) -> Vec<&str> {
+        rows.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// A three-entry `Stored` archive with payloads big enough for a
+    /// mid-payload flip to have somewhere to land.
+    fn three_entries() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let payloads: Vec<Vec<u8>> = vec![
+            b"first entry payload, repeated. ".repeat(20),
+            b"second entry payload, repeated. ".repeat(20),
+            b"third entry payload, repeated. ".repeat(20),
+        ];
+        let bytes = build_archive(&[
+            (b"one.txt", &payloads[0]),
+            (b"two.txt", &payloads[1]),
+            (b"three.txt", &payloads[2]),
+        ]);
+        (bytes, payloads)
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 1: the agreement property.
+    // ---------------------------------------------------------------------
+
+    /// **Salvage of an UNDAMAGED archive must agree exactly with what the
+    /// ordinary reader enumerates** — same names, same order, every entry
+    /// `Intact`.
+    ///
+    /// The third leg is what keeps it from being `unarj-rs` agreeing with
+    /// itself: the bytes the READER produced are checked against the CRC-32
+    /// the HEADER declares, through [`crc32_witness`], an implementation
+    /// independent of `arj.rs`'s own. That is still our transcription on
+    /// both sides of the archive — see this module's header comment — but
+    /// it is no longer one implementation vouching for itself.
+    #[test]
+    fn salvage_of_a_healthy_archive_agrees_with_the_ordinary_reader() {
+        let (built, _) = three_entries();
+        for (label, bytes) in [
+            ("sample.arj", SAMPLE_ARJ),
+            ("three entries, hand-built", &built[..]),
+        ] {
+            let read = reader_entries(bytes)
+                .unwrap_or_else(|e| panic!("{label}: the ordinary reader must walk it: {e}"));
+            let rows = salvaged(bytes);
+            let geometry = records(bytes);
+
+            assert_eq!(
+                rows.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                read.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "{label}: salvage and the ordinary reader must enumerate the same names in \
+                 the same order"
+            );
+            assert_eq!(
+                geometry.len(),
+                read.len(),
+                "{label}: and both must agree with the header geometry this test parsed \
+                 longhand out of the archive's own bytes"
+            );
+            for (name, status) in &rows {
+                assert_eq!(
+                    *status,
+                    SalvageStatus::Intact,
+                    "{label}: an undamaged entry (`{name}`) must verify Intact"
+                );
+            }
+            for ((name, content), record) in read.iter().zip(geometry.iter()) {
+                assert_eq!(
+                    crc32_witness(content),
+                    record.declared_content_crc,
+                    "{label}: the reader's output for `{name}` must match the CRC-32 the \
+                     header declares — otherwise `Intact` above is agreement between two \
+                     wrongs"
+                );
+            }
+        }
+    }
+
+    /// **The documented asymmetry, measured in Task 6b's review and pinned
+    /// here.** An entry whose `file_type` is `2` — the value the format
+    /// reserves for the archive's own MAIN header — is listed by the
+    /// ordinary reader as a perfectly normal entry at exit 0, and is dropped
+    /// by the scan, which reads `file_type == 2` as "this is a main header,
+    /// not an entry".
+    ///
+    /// Asserted on BOTH sides, because the claim is that the two verbs
+    /// disagree. Its record's header CRC-32 is recomputed by `wrap`, so the
+    /// header is entirely well-formed — the difference is the field's
+    /// meaning, not damage.
+    #[test]
+    fn a_file_type_of_two_is_the_documented_asymmetry() {
+        let payload = b"an entry claiming to be a main header";
+        let mut entry = wrap(&local_content(
+            b"impostor.txt",
+            Method::Stored.byte(),
+            2,
+            payload.len() as u32,
+            payload.len() as u32,
+            crc32_witness(payload),
+        ));
+        entry.extend_from_slice(payload);
+
+        let mut bytes = build_archive(&[(b"ordinary.txt", b"an ordinary entry")]);
+        // Splice it in ahead of the end-of-archive marker (the last four
+        // bytes `build_archive` appends).
+        let marker_at = bytes.len() - 4;
+        bytes.splice(marker_at..marker_at, entry);
+
+        assert_eq!(
+            reader_entries(&bytes)
+                .expect("the ordinary reader must walk it")
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            ["ordinary.txt", "impostor.txt"],
+            "`list` reports a file_type-2 entry as an ordinary entry, at exit 0"
+        );
+        assert_eq!(
+            names(&salvaged(&bytes)),
+            ["ordinary.txt"],
+            "the scan drops it — a fact worth pinning rather than rediscovering, since it \
+             means `salvage` can recover strictly less than `list` enumerates for this one \
+             field value"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Step 2: the mutation catalogue.
+    // ---------------------------------------------------------------------
+
+    /// Row 1/3 — **a truncated tail**, over the checked-in fixture and over
+    /// the three-entry archive, swept across the last payload.
+    #[test]
+    fn damage_catalogue_a_truncated_tail() {
+        let (built, _) = three_entries();
+        for (label, bytes, expected) in [
+            (
+                "sample.arj",
+                SAMPLE_ARJ,
+                vec!["sample/hello.txt", "sample/sub/b.bin"],
+            ),
+            (
+                "three entries",
+                &built[..],
+                vec!["one.txt", "two.txt", "three.txt"],
+            ),
+        ] {
+            let g = records(bytes);
+            assert_eq!(
+                g.len(),
+                expected.len(),
+                "{label}: sanity, the pre-damage record count"
+            );
+            let last = g.last().unwrap().payload.clone();
+            let declared = last.len();
+            for keep in [0, 1, declared / 2, declared - 1] {
+                let rows = salvaged(&bytes[..last.start + keep]);
+                assert_eq!(
+                    names(&rows),
+                    expected,
+                    "{label}/keep={keep}: the cut entry's header is still there and its \
+                     being uncompletable is a fact worth a row, never silence"
+                );
+                for (i, (name, status)) in rows.iter().enumerate() {
+                    let want = if i + 1 == rows.len() {
+                        SalvageStatus::Partial
+                    } else {
+                        SalvageStatus::Intact
+                    };
+                    assert_eq!(*status, want, "{label}/keep={keep}: `{name}`");
+                }
+            }
+            assert!(
+                salvaged(bytes)
+                    .iter()
+                    .all(|(_, s)| *s == SalvageStatus::Intact),
+                "{label}: the UNCUT archive must still come back entirely Intact"
+            );
+        }
+    }
+
+    /// Row 2/3 — **a byte flipped mid-payload.** That entry `Partial`, every
+    /// neighbour `Intact`, with every entry taking its turn as the damaged
+    /// one.
+    ///
+    /// The flip is proven to change the checksum FIRST, through the
+    /// independent witness against the payload that went in — so `Partial`
+    /// is the right answer here for a reason established before the scan
+    /// ran, not because the scan said so.
+    #[test]
+    fn damage_catalogue_a_byte_flipped_mid_payload() {
+        let (healthy, payloads) = three_entries();
+        let g = records(&healthy);
+        for damaged in 0..g.len() {
+            let range = g[damaged].payload.clone();
+            assert_eq!(
+                crc32_witness(&healthy[range.clone()]),
+                g[damaged].declared_content_crc,
+                "these entries are Stored, so the payload IS the content and the declared \
+                 CRC-32 must match it directly"
+            );
+            assert_eq!(&healthy[range.clone()], &payloads[damaged][..]);
+
+            let mut bytes = healthy.clone();
+            bytes[range.start + range.len() / 2] ^= 0xFF;
+            assert_ne!(
+                crc32_witness(&bytes[range.clone()]),
+                g[damaged].declared_content_crc,
+                "the flip must actually change the checksum, or this row proves nothing"
+            );
+
+            let rows = salvaged(&bytes);
+            assert_eq!(
+                names(&rows),
+                ["one.txt", "two.txt", "three.txt"],
+                "a flipped payload byte moves no header"
+            );
+            for (i, (name, status)) in rows.iter().enumerate() {
+                let want = if i == damaged {
+                    SalvageStatus::Partial
+                } else {
+                    SalvageStatus::Intact
+                };
+                assert_eq!(*status, want, "`{name}` with entry {damaged} damaged");
+            }
+        }
+    }
+
+    /// Row 3/3 — **a header field corrupted.** That entry absent, its
+    /// neighbours surviving, in every position. Corrupting the FIRST
+    /// header is the interesting direction: `unarj_rs::ArjArchieve` walks
+    /// forward from the main header, so one damaged header ends that walk
+    /// and every entry behind it with it.
+    #[test]
+    fn damage_catalogue_a_corrupted_header_field() {
+        let (healthy, _) = three_entries();
+        let g = records(&healthy);
+        let all = ["one.txt", "two.txt", "three.txt"];
+        assert_eq!(g.len(), all.len(), "sanity: the pre-damage record count");
+
+        for damaged in 0..g.len() {
+            let survivors: Vec<&str> = all
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != damaged)
+                .map(|(_, n)| *n)
+                .collect();
+
+            // (a) the two-byte header id — the signature the scan looks for
+            // at all.
+            let mut bytes = healthy.clone();
+            bytes[g[damaged].offset] ^= 0xFF;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                survivors,
+                "a destroyed header id must drop `{}` and nothing else",
+                all[damaged]
+            );
+
+            // (b) the method byte — a value past the five ARJ assigned.
+            let mut bytes = healthy.clone();
+            bytes[g[damaged].method_at] = 9;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                survivors,
+                "an unassigned method byte must drop `{}` and nothing else",
+                all[damaged]
+            );
+
+            // (c) the basic header's own CRC-32 — the gate that separates a
+            // real header from a coincidental `60 EA` inside a payload.
+            let mut bytes = healthy.clone();
+            bytes[g[damaged].header_crc_at] ^= 0xFF;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                survivors,
+                "a header whose own CRC-32 no longer vouches for it must drop `{}` and \
+                 nothing else",
+                all[damaged]
+            );
+
+            // (d) the `file_type` field, set to the main header's value —
+            // the asymmetry above reached as DAMAGE rather than as a
+            // deliberate construction. The header CRC-32 is not refreshed,
+            // so this is refused by (c)'s gate rather than by the file-type
+            // rule; both drop the entry, which is what this row claims.
+            let mut bytes = healthy.clone();
+            bytes[g[damaged].file_type_at] = 2;
+            assert_eq!(
+                names(&salvaged(&bytes)),
+                survivors,
+                "a corrupted file_type must drop `{}` and nothing else",
+                all[damaged]
+            );
         }
     }
 }
