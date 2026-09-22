@@ -10984,3 +10984,126 @@ fn no_dedicated_arj_tool_is_obtainable_to_witness_this_catalogue() {
          provenance before trusting anything this catalogue asserts"
     );
 }
+
+/// **Ruling S-AA, falsified at the surface a user actually reads.**
+///
+/// Three damaged copies of the SAME borrowed ZOO corpus, differing only in
+/// what was done to them, must print three different causes:
+///
+/// | damage | cause | what a user should do about it |
+/// |---|---|---|
+/// | the file cut mid-payload | `truncated` | find a longer copy; the bytes are gone |
+/// | a byte flipped in an `lzd` payload | `decode failed` | the bytes present are damaged |
+/// | a byte flipped in a `Stored` payload | `checksum mismatch` | you have every byte and they are wrong |
+///
+/// **Two of those three rows read `Partial (truncated)` before this fix
+/// round**, over archives from which nothing had been cut — the `lzd` one
+/// because its decoder aborts where the damage is, which the old two-cause
+/// split could not distinguish from a short file. `stuffr::entries::
+/// PartialCause`'s own doc carries the ruling; this is the test that makes
+/// it falsifiable: forcing `declared_payload_is_all_present` either way
+/// collapses two of these rows onto one string.
+///
+/// The first and third rows are the CONTROL for the second. All three run
+/// over `unarc-rs`'s borrowed corpus — bytes zoo 2.10 wrote — and the
+/// difference between `store.zoo` and `default.zoo` is the packing method
+/// alone (0 vs 1), so nothing but the codec and the damage varies.
+#[test]
+fn damage_catalogue_the_three_partial_causes_are_distinguishable() {
+    let dir = tmp_dir();
+    let stored = std::fs::read(legacy_fixture("zoo/store.zoo")).unwrap();
+    let lzd = std::fs::read(legacy_fixture("zoo/default.zoo")).unwrap();
+
+    // Both fixtures' single record puts its payload at the offset its own
+    // directory entry declares (`zoo.h`'s `SIZ_DIR`-relative field at +10),
+    // read here rather than hardcoded so a fixture change cannot make this
+    // test aim at the wrong bytes.
+    let payload_at = |bytes: &[u8]| -> usize {
+        u32::from_le_bytes(bytes[42 + 10..42 + 14].try_into().unwrap()) as usize
+    };
+    let declared_len = |bytes: &[u8]| -> usize {
+        u32::from_le_bytes(bytes[42 + 24..42 + 28].try_into().unwrap()) as usize
+    };
+
+    // 1. The FILE is short: 100 of the declared bytes present.
+    let cut = dir.join("cut.zoo");
+    std::fs::write(&cut, &stored[..payload_at(&stored) + 100]).unwrap();
+
+    // 2. Every declared byte present, one flipped inside an `lzd` stream —
+    //    the decoder stops where the damage is.
+    let mut bytes = lzd.clone();
+    let at = payload_at(&lzd) + declared_len(&lzd) / 2;
+    bytes[at] ^= 0xFF;
+    let damaged_lzd = dir.join("lzd.zoo");
+    std::fs::write(&damaged_lzd, &bytes).unwrap();
+
+    // 3. Every declared byte present, one flipped inside a Stored payload —
+    //    it all decodes and disagrees with the recorded CRC-16.
+    let mut bytes = stored.clone();
+    let at = payload_at(&stored) + declared_len(&stored) / 2;
+    bytes[at] ^= 0xFF;
+    let damaged_stored = dir.join("stored.zoo");
+    std::fs::write(&damaged_stored, &bytes).unwrap();
+
+    for (path, cause, why) in [
+        (
+            &cut,
+            "Partial (truncated)",
+            "bytes this entry declares are genuinely missing from the file",
+        ),
+        (
+            &damaged_lzd,
+            "Partial (decode failed)",
+            "every declared byte is present and the decoder could not turn them into the \
+             declared content — saying `truncated` here sent a user looking for a longer \
+             copy of a file that is not short",
+        ),
+        (
+            &damaged_stored,
+            "Partial (checksum mismatch)",
+            "every declared byte is present, it all decoded, and it is not what was written",
+        ),
+    ] {
+        let rows = salvage_list_rows(path);
+        assert_eq!(rows.len(), 1, "{}: {rows:?}", path.display());
+        assert!(
+            rows[0].contains(cause),
+            "{}: expected `{cause}` — {why}: {}",
+            path.display(),
+            rows[0]
+        );
+        // And no row may carry a DIFFERENT cause as well, which is what
+        // would happen if two of the three strings were prefixes of each
+        // other or if the match above were satisfied by a substring.
+        for other in [
+            "Partial (truncated)",
+            "Partial (decode failed)",
+            "Partial (checksum mismatch)",
+        ] {
+            if other != cause {
+                assert!(
+                    !rows[0].contains(other),
+                    "{}: row claims `{other}` as well as `{cause}`: {}",
+                    path.display(),
+                    rows[0]
+                );
+            }
+        }
+    }
+
+    // The complement: none of the three fixtures is damaged in a way this
+    // test merely assumed. Undamaged, all three verify.
+    for (label, bytes) in [("store.zoo", &stored), ("default.zoo", &lzd)] {
+        let whole = dir.join(format!("whole-{label}"));
+        std::fs::write(&whole, bytes).unwrap();
+        let rows = salvage_list_rows(&whole);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].contains("Intact"),
+            "{label} must be healthy before anything is done to it: {}",
+            rows[0]
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

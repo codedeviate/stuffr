@@ -755,11 +755,12 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       ARJ's own spelling.
     * A method 4 ("compressed fastest") entry whose compressed stream
       opens with a back-reference is refused before decoding, and the
-      row reads `Partial (truncated)` even though nothing is truncated.
-      The refusal is right — such a stream would copy from a history
-      that does not exist — but "truncated" is the wrong word for it:
-      `stuffr` can only tell you that nothing was recovered, not why,
-      for a partial entry. Nothing is invented either way.
+      row reads `Partial (decode failed)`. The refusal is right — such a
+      stream would copy from a history that does not exist — and the
+      word is now right too: nothing is missing from the FILE, so the
+      row no longer says `truncated` and no longer sends you looking for
+      a longer copy of an archive that is not short. Nothing is
+      invented either way.
 
   Three surface forms, one of which is required:
 
@@ -847,8 +848,9 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   stuffr salvage broken.zip -C out/ --partial=skip
       Recovers nothing for a Partial entry instead of writing it as
-      `NAME.partial` — its cause (truncated, or checksum mismatch) is still
-      named under `--list`, exactly as a WRITTEN partial's is. `--partial=
+      `NAME.partial` — its cause (truncated, decode failed, or checksum
+      mismatch) is still named under `--list`, exactly as a WRITTEN
+      partial's is. `--partial=
       ask` has no terminal to ask from at this layer, so it is read
       conservatively as `skip` rather than silently upgraded to `keep`.
 

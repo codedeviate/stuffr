@@ -675,6 +675,12 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
             ..
         } => match cause {
             entries::PartialCause::Truncated => "Partial (truncated)",
+            // Ruling S-AA. Distinct from `truncated` because nothing is
+            // missing from the FILE — every declared byte is there and the
+            // decoder could not turn them into the declared content. The
+            // row used to say `truncated` for this, over archives from
+            // which nothing had been cut.
+            entries::PartialCause::DecodeFailed => "Partial (decode failed)",
             entries::PartialCause::ChecksumMismatch => "Partial (checksum mismatch)",
         },
         entries::SalvageDisposition::WrittenDisambiguated { partial: None, .. }

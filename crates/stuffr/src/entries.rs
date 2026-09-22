@@ -1072,28 +1072,129 @@ pub struct SalvageOpts {
     pub format: Option<FormatId>,
 }
 
-/// Why a `Partial` entry is `Partial` — see Ruling R-J. Both land the entry
-/// as `name.partial` (or, under a policy that skips partials, not at all)
-/// and both set the caller up for exit 4, but the two causes are different
+/// Why a `Partial` entry is `Partial` — see Ruling R-J. All three land the
+/// entry as `name.partial` (or, under a policy that skips partials, not at
+/// all) and all three set the caller up for exit 4, but they are different
 /// diagnoses and a report that could not tell them apart would be less
 /// useful than the status alone.
 ///
-/// Computed without a second checksum pass: [`stuffr_formats::zip_salvage`]
+/// Computed without a second checksum pass: the format's own scanner
 /// already proved the entry `Partial` (a decode that ran out, or one that
-/// completed and disagreed with the CRC-32). This ops layer's own re-decode
-/// (needed regardless, to produce bytes worth writing) only has to observe
-/// whether it too reached the entry's declared length — reaching it means
-/// the earlier disagreement can only have been the checksum, since a
+/// completed and disagreed with its checksum). This ops layer's own
+/// re-decode (needed regardless, to produce bytes worth writing) only has to
+/// observe whether it too reached the entry's declared length — reaching it
+/// means the earlier disagreement can only have been the checksum, since a
 /// deterministic decoder given the same bytes a second time does not
 /// truncate where it did not before.
+///
+/// # Ruling S-AA: three causes, because two conflated a fact about the FILE
+/// with a fact about the BYTES
+///
+/// Until Salvage Stage 2 Task 7's fix round there were two, and
+/// [`Self::Truncated`]'s own doc said "the payload ran out **or the decoder
+/// failed mid-stream**" — so `stuffr salvage --list` printed
+/// `Partial (truncated)` over an archive from which **nothing was missing**.
+/// Measured, one flipped byte mid-payload, every declared byte present on
+/// disk: ZOO's `lzd` and LHA's `-lh5-` both reported `Partial (truncated)`,
+/// while ARC's Squeezed and ZOO's `-lh5-` reported
+/// `Partial (checksum mismatch)` for the identical damage — the difference
+/// being only whether that codec's decoder happens to survive to the end.
+/// By this project's own rule (*a tier carries a decision, a message carries
+/// a cause*) that is a wrong cause, the same class as Task 3c's NEW-1 and
+/// Task 6's F4, and `arj_salvage.rs`'s module doc and `examples.txt` each
+/// carried a paragraph apologising for it.
+///
+/// The discriminator was available the whole time and is not a checksum: an
+/// entry's declared payload either fits inside the archive file or it does
+/// not ([`declared_payload_is_all_present`], the ops-layer twin of
+/// [`stuffr_core::salvage::Candidate::available_len`] — measured
+/// independently here rather than carried across, so the two are two
+/// observations rather than one restated). Each variant now names a
+/// different thing a user can act on:
+///
+/// * [`Self::Truncated`] — the FILE is short. Find a longer copy; the bytes
+///   are not here.
+/// * [`Self::DecodeFailed`] — every declared byte is here and they do not
+///   yield the declared content. The bytes you have are damaged.
+/// * [`Self::ChecksumMismatch`] — every declared byte is here, it all
+///   decoded, and it is not what was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartialCause {
-    /// The payload ran out before its declared length, or the decoder
-    /// failed mid-stream.
+    /// **The archive file is shorter than this entry's own header
+    /// declares**: fewer bytes are physically present than the entry says
+    /// its payload occupies. The genuine surviving prefix is recovered and
+    /// nothing is invented, but the missing bytes are missing from the file,
+    /// not merely undecodable.
+    ///
+    /// Narrowed by Ruling S-AA (see this enum's own doc): it used to also
+    /// cover a decoder that failed over a payload that was entirely
+    /// present, which is now [`Self::DecodeFailed`].
     Truncated,
+    /// **Every declared byte is present, and decoding them did not produce
+    /// the entry's declared content.** A compressed stream corrupted
+    /// mid-payload is the common case — the decoder stops where the damage
+    /// is — and a header overstating its own `original_size` is the other.
+    /// Either way nothing is missing from the FILE, which is what separates
+    /// this from [`Self::Truncated`], and no checksum comparison ever
+    /// completed, which is what separates it from
+    /// [`Self::ChecksumMismatch`].
+    ///
+    /// Also the honest answer for an entry a format's own guard refuses
+    /// before decoding — ARJ's method-4 back-reference check is the one in
+    /// tree — where the payload is whole and this build declines to decode
+    /// it. That shape used to print `Partial (truncated)`; `arj_salvage.rs`
+    /// documented the wrong word rather than fixing it, and Ruling S-AA is
+    /// what retired that paragraph.
+    DecodeFailed,
     /// Every declared byte decoded, but the result disagreed with the
     /// checksum the original writer computed.
     ChecksumMismatch,
+}
+
+/// Whether the archive on disk still holds every byte this entry's own
+/// header declared for its payload — the ops-layer observation Ruling S-AA
+/// splits [`PartialCause`] on.
+///
+/// **Measured here rather than carried down from the scan.**
+/// [`stuffr_core::salvage::Candidate::available_len`] records the identical
+/// fact at discovery, but it is not on [`stuffr_core::salvage::SalvagedEntry`]
+/// and adding it there would be a breaking change to a published crate for
+/// something this layer can observe in two lines — and observing it here
+/// makes the cause an INDEPENDENT reading of the file rather than a restated
+/// one, which is the discipline `check_fidelity_claim` already demands of
+/// its own `approximated` argument.
+///
+/// `false` when the archive cannot be stated at all: that is the answer that
+/// claims the LEAST (it never asserts bytes were present), and it preserves
+/// the pre-ruling verdict for a case no caller can reach anyway — the
+/// payload writer opens the same file a line later.
+fn declared_payload_is_all_present(
+    archive_path: &Path,
+    entry: &stuffr_core::salvage::SalvagedEntry,
+    compressed_len: u64,
+) -> bool {
+    let Ok(meta) = std::fs::metadata(archive_path) else {
+        return false;
+    };
+    entry
+        .payload_start
+        .checked_add(compressed_len)
+        .is_some_and(|end| end <= meta.len())
+}
+
+/// The one place [`PartialCause`] is decided, so the report-only path and
+/// the written path cannot come to disagree about one entry — they used to
+/// carry two copies of the same two-branch `if`, which is how a third
+/// branch would have reached only one of them.
+///
+/// `completed` is what the format's own `write_payload` reported: whether
+/// the re-decode delivered the entry's whole declared content.
+fn partial_cause(completed: bool, all_declared_bytes_present: bool) -> PartialCause {
+    match (completed, all_declared_bytes_present) {
+        (true, _) => PartialCause::ChecksumMismatch,
+        (false, true) => PartialCause::DecodeFailed,
+        (false, false) => PartialCause::Truncated,
+    }
 }
 
 /// What became of one scanned record once the ops layer acted on it.
@@ -1793,14 +1894,10 @@ fn place_salvaged_file(
                 compressed_len,
                 &mut std::io::sink(),
             ) {
-                Ok(completed) => {
-                    let cause = if completed {
-                        PartialCause::ChecksumMismatch
-                    } else {
-                        PartialCause::Truncated
-                    };
-                    SalvageDisposition::SkippedPartial(cause)
-                }
+                Ok(completed) => SalvageDisposition::SkippedPartial(partial_cause(
+                    completed,
+                    declared_payload_is_all_present(archive_path, entry, compressed_len),
+                )),
                 Err(Error::FormatNotEnabled(_) | Error::Unsupported(_)) => {
                     SalvageDisposition::SkippedNotBuiltIn
                 }
@@ -1888,10 +1985,11 @@ fn place_salvaged_file(
         return Ok(unwritable(Error::Io(e)));
     }
 
-    let partial_cause = is_partial.then_some(if completed {
-        PartialCause::ChecksumMismatch
-    } else {
-        PartialCause::Truncated
+    let partial_cause = is_partial.then(|| {
+        partial_cause(
+            completed,
+            declared_payload_is_all_present(archive_path, entry, compressed_len),
+        )
     });
 
     if let Some(taken_by) = taken_by {
@@ -4096,17 +4194,23 @@ mod salvage_tests {
         );
     }
 
-    /// Fix round 1, REQUIRED 2: `PartialCause::Truncated` had no test — only
-    /// `ChecksumMismatch` (above) was pinned. A REAL Deflate stream (built
-    /// through this crate's own `deflate` codec, not a hand-rolled
-    /// approximation), cut in half AFTER compression, so the redecode runs
-    /// out partway through rather than completing and merely disagreeing
-    /// with its CRC. The header's declared `uncompressed_size` and CRC are
-    /// both the ORIGINAL, uncut payload's — a real writer's values, which is
-    /// what makes this "ran out", not "the header lied about its own size".
+    /// **Ruling S-AA's first half, and the test that moved when the ruling
+    /// landed.** A REAL Deflate stream (built through this crate's own
+    /// `deflate` codec, not a hand-rolled approximation), cut in half AFTER
+    /// compression, with the local header declaring the CUT length — so
+    /// every byte the archive says it holds IS on disk, and the re-decode
+    /// still runs out partway through rather than completing and merely
+    /// disagreeing with its CRC.
+    ///
+    /// This asserted `PartialCause::Truncated` from fix round 1 until Task
+    /// 7, and that was the wrong word for exactly the reason Ruling S-AA
+    /// names: nothing had been cut from the FILE. Its sibling below cuts the
+    /// file instead, over the identical stream, and still gets `Truncated` —
+    /// the pair is what proves the two branches are separated by the file's
+    /// own length and by nothing else.
     #[test]
     #[cfg(feature = "deflate")]
-    fn a_truncated_decode_is_marked_truncated_not_checksum_mismatch() {
+    fn a_decode_that_fails_over_a_whole_payload_is_not_called_truncated() {
         let plaintext = b"this payload needs to be long enough that cutting the compressed \
              stream in half leaves flate2 well short of the declared uncompressed length, \
              rather than coincidentally still landing on a valid end-of-stream marker"
@@ -4150,9 +4254,75 @@ mod salvage_tests {
         };
         assert_eq!(
             *cause,
+            PartialCause::DecodeFailed,
+            "every byte this entry declares is on disk, so nothing was truncated — the \
+             decoder could not turn the bytes present into the declared content, and \
+             saying `truncated` here sent a user looking for a longer copy of a file \
+             that is not short (Ruling S-AA)"
+        );
+    }
+
+    /// **Ruling S-AA's second half: the same damaged stream, cut from the
+    /// FILE instead, is still `Truncated`.**
+    ///
+    /// Byte-for-byte the same Deflate stream as the test above and the same
+    /// declared `uncompressed_size` and CRC — the ONE difference is that
+    /// here the local header declares the stream's FULL compressed length
+    /// while only half of it is on disk. So the two tests differ in exactly
+    /// the observation `partial_cause` splits on, and nothing else.
+    ///
+    /// This is the falsification the ruling needs: forcing
+    /// `declared_payload_is_all_present` to `true` turns this red, forcing
+    /// it to `false` turns its sibling red, and neither edit can turn both
+    /// green.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn the_same_damaged_stream_cut_from_the_file_is_truncated() {
+        let plaintext = b"this payload needs to be long enough that cutting the compressed \
+             stream in half leaves flate2 well short of the declared uncompressed length, \
+             rather than coincidentally still landing on a valid end-of-stream marker"
+            .to_vec();
+        let crc = crc32(&plaintext);
+        let compressed = deflate_compress(&plaintext);
+        let cut = compressed.len() / 2;
+
+        // The header declares the WHOLE compressed stream...
+        let bytes = local_header_entry_with_method(
+            "big.bin",
+            8, // Deflate
+            &compressed,
+            plaintext.len() as u32,
+            crc,
+        );
+        // ...and the file stops halfway through it.
+        let short = &bytes[..bytes.len() - (compressed.len() - cut)];
+        let (_archive_dir, archive) = write_archive(short);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let outcome = salvage(&archive, &opts)
+            .expect("a truncated-but-well-formed entry must not abort the run");
+
+        assert_eq!(outcome.entries.len(), 1);
+        assert_eq!(outcome.entries[0].status, SalvageStatus::Partial);
+        let SalvageDisposition::WrittenPartial { cause, .. } = &outcome.entries[0].disposition
+        else {
+            panic!(
+                "expected WrittenPartial, got {:?}",
+                outcome.entries[0].disposition
+            );
+        };
+        assert_eq!(
+            *cause,
             PartialCause::Truncated,
-            "a decode that never reached the declared length must be Truncated, not \
-             ChecksumMismatch — the branch this test exists to pin"
+            "bytes this entry declares are genuinely absent from the file — this is the \
+             shape `Truncated` is narrowed to, and the only difference from its sibling \
+             above is the file's own length"
         );
     }
 

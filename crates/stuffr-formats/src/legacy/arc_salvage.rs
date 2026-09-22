@@ -1672,14 +1672,17 @@ mod damage_catalogue {
     /// scanner that stopped at the first damaged record would pass the
     /// second arrangement and fail the first.
     ///
-    /// The tier is the decision and is asserted; the CAUSE is not asserted
-    /// here and the reason is a measured one recorded in the task report: a
+    /// The tier is the decision and is what this layer asserts — it cannot
+    /// see `stuffr::entries::PartialCause` at all, which lives one crate up.
+    /// The CAUSE does vary with the CODEC rather than with the damage: a
     /// flipped byte in a COMPRESSED payload may abort the decoder
-    /// mid-stream (`PartialCause::Truncated`, one crate up) or decode whole
-    /// and disagree (`ChecksumMismatch`) depending entirely on the codec —
-    /// measured across these formats, ARC's Squeezed and RLE90 complete
-    /// while ZOO's `lzd` aborts. Both are `Partial`; neither is `Intact`,
-    /// and that is what this row is about.
+    /// mid-stream or decode whole and disagree, and measured across these
+    /// formats ARC's Squeezed and RLE90 complete while ZOO's `lzd` aborts.
+    /// Both are `Partial`; neither is `Intact`, and that is what this row is
+    /// about. (The aborting case printed `Partial (truncated)` over an
+    /// archive nothing had cut until Ruling S-AA; `cli.rs`'s
+    /// `damage_catalogue_the_three_partial_causes_are_distinguishable` now
+    /// asserts the exact cause where it is visible.)
     #[test]
     fn damage_catalogue_a_byte_flipped_mid_payload() {
         let geometry = records(CPM_ARC);
