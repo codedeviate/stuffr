@@ -230,6 +230,27 @@ fn no_cross_check_arm(name: &str) -> ! {
     )
 }
 
+/// The per-entry ceiling this target runs under, in place of
+/// [`SalvagePolicy::default`]'s 4 GiB.
+///
+/// Stage 2 Task 8 gave this target a real `dest` (Ruling S-O), which turns
+/// every ceiling in the policy into a DISK bound as well as an allocation
+/// one: a few-KiB input declaring a 4 GiB entry, or a Deflate payload
+/// expanding towards its 1032:1 maximum, is now something the target tries
+/// to place in a FILE rather than merely to verify in memory. 256 KiB sits
+/// more than an order of magnitude above the largest entry any seed carries
+/// (`store.zoo`'s 11,357-byte payload), so nothing the corpus starts from is
+/// refused for its size, while an entry a mutation inflated is reported
+/// `Unverified(OverEntryCeiling)` — a per-entry STATUS, never an error, so
+/// it cannot end a run or take the entries around it with it.
+///
+/// This bounds one entry, not one iteration: a mutated archive can carry
+/// many candidates. What bounds the iteration is that `dest` lives inside
+/// the same `tempfile::tempdir()` as the input and is removed when that
+/// handle drops, at the end of every iteration — nothing accumulates across
+/// runs.
+const FUZZ_MAX_ENTRY: u64 = 256 * 1024;
+
 fuzz_target!(|data: &[u8]| {
     // Task 3b: the leading byte selects a format from `SALVAGE_SLOTS`,
     // mirroring `container.rs`'s own leading-selector-byte shape rather than
@@ -257,11 +278,23 @@ fuzz_target!(|data: &[u8]| {
     let path = tmp.path().join("input");
     std::fs::write(&path, payload).expect("write temp input");
 
-    // `dest: None` — report-only. This target is about parsing and
-    // verification honesty (no panic, every `Err` classified, every
-    // `Intact` backed by a real checksum comparison), not about the
-    // filesystem write/containment path `extract`'s own fuzzing already
-    // covers via `chain.rs`.
+    // **`dest: Some(...)` as of Stage 2 Task 8 — Ruling S-O.** This said
+    // `dest: None`, on the reasoning that the target was "about parsing and
+    // verification honesty, not about the filesystem write/containment path
+    // `extract`'s own fuzzing already covers via `chain.rs`". That reasoning
+    // was measurably wrong twice over: `chain.rs` drives `entries::list`,
+    // which places nothing on disk at all, and salvage's write side is not
+    // `extract`'s — it owns disambiguation (`NAME.salvaged-N`), the
+    // `.partial` spelling, and a per-run claimed-path map none of which
+    // exists anywhere else. What the gap cost is on the record: a zip entry
+    // with a 404-character name made `salvage -C` print `i/o error: File
+    // name too long` and exit **1** — the one exit code this project treats
+    // as never acceptable for hostile input — abandoning every entry behind
+    // it, and it survived a whole stage of fuzzing because nothing in view
+    // of the oracle ever asked the filesystem for anything.
+    //
+    // The destination is a sibling of the input inside the same tempdir, so
+    // it is removed with it at the end of every iteration.
     //
     // `format: Some(name)` — bypasses auto-detection exactly as the old
     // pinned `Some(zip)` did, and for the identical reason: arbitrary
@@ -277,8 +310,13 @@ fuzz_target!(|data: &[u8]| {
     // never a panic — so `SALVAGE_SLOTS` needs no separate "not compiled"
     // branch of its own.
     let opts = SalvageOpts {
-        dest: None,
-        policy: SalvagePolicy::default(),
+        dest: Some(tmp.path().join("recovered")),
+        // `max_entry` narrowed from the default 4 GiB — see
+        // `FUZZ_MAX_ENTRY`, which is a disk bound now that `dest` is real.
+        policy: SalvagePolicy {
+            max_entry: FUZZ_MAX_ENTRY,
+            ..SalvagePolicy::default()
+        },
         select: None,
         format: Some(stuffr_core::FormatId::new(name)),
     };
