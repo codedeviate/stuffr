@@ -1740,6 +1740,31 @@ mod tests {
 // single-entry rows below run against the untouched fixtures for the same
 // reason, so nothing rests on the re-framing alone.
 //
+// **What makes `build_zoo`'s envelope credible rather than merely
+// self-consistent**, and the mitigation this header used to omit (fix round
+// 1, F6): `the_structural_payload_position_agrees_with_the_records_own_offset
+// _field`, in this module's own `tests`, already checks the 56-byte type-2
+// record model against ALL FOUR borrowed fixtures — the structural payload
+// position against the absolute offset zoo 2.10 itself wrote. The framing
+// the rows below corrupt is therefore a framing an outside archiver has
+// agreed with, even though this particular archive's bytes are ours. Worth
+// knowing the shape precisely rather than reading the paragraph above
+// generously: of the nine rows here, two run over an untouched fixture
+// (the agreement property and the Stored-payload flip) and one over
+// `wrongcrc16.zoo`; every mutation row runs on `build_zoo`'s envelope.
+//
+// **One discipline this module does NOT follow, named rather than left to
+// be noticed:** [`borrowed_record`] and [`geometry`] below parse through
+// `zoo::read_dir_entry` — the same function `salvage_zoo` itself calls.
+// ARC, LHA and ARJ each parse their geometry LONGHAND in the test, on the
+// rule that an expectation read through the parser being tested is not an
+// expectation. ZOO's records are a linked chain with absolute offsets and a
+// per-record `dir_crc`, so a second longhand walk here would be a third copy
+// of a layout `zoo.rs` and this scanner already share. The mitigation is
+// that `read_dir_entry` is the READER's parser, not the scanner's verdict —
+// and that the test named above pins it against the borrowed bytes
+// independently.
+//
 // No external tool witnesses this: no `zoo` binary is obtainable on any
 // platform in reach (measured: `which zoo` finds nothing). The stored
 // CRC-16 IS the witness, and it is a good one.
@@ -1758,6 +1783,10 @@ mod damage_catalogue {
     const STORE_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/store.zoo");
     const DEFAULT_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/default.zoo");
     const HIGH_PER_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/high_per.zoo");
+    /// The borrowed corpus's negative twin: one record whose recorded
+    /// CRC-16 does not describe the payload behind it. See
+    /// `a_deliberately_wrong_checksum_is_the_documented_asymmetry`.
+    const WRONGCRC16_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/wrongcrc16.zoo");
 
     /// CRC-16/ARC written out longhand, independent of
     /// `super::super::crc::crc16_arc` — the same double-entry discipline
@@ -1976,6 +2005,62 @@ mod damage_catalogue {
                 ("high.lic", SalvageStatus::Intact, false),
             ],
             "salvage must recover the deleted record, verify it, and SAY it was deleted"
+        );
+    }
+
+    /// **The fourth asymmetry, and the only row in this phase whose
+    /// `Partial` is proven against a checksum ANOTHER PROGRAM deliberately
+    /// got wrong** (fix round 1, F3).
+    ///
+    /// ZOO decodes an entry WHOLE — `zoo.rs`'s own module doc says so in as
+    /// many words — so unlike six of the eight containers here, `stuffr
+    /// list` on a ZOO archive really does read every payload and can itself
+    /// fail. `wrongcrc16.zoo` is the borrowed corpus's negative twin
+    /// (`fixtures/legacy/MANIFEST.md`): a record whose recorded CRC-16 does
+    /// not describe the bytes behind it. The ordinary reader refuses the
+    /// archive outright (`Error::Corrupt`, exit 5 at the CLI, naming both
+    /// figures); salvage reports the entry `Partial` and recovers what is
+    /// there.
+    ///
+    /// ARC's sibling row (`arc_salvage.rs`'s
+    /// `a_method_this_build_cannot_decode_is_the_documented_asymmetry`)
+    /// pins the same "decodes whole, so `list` itself can fail" fact through
+    /// an undecodable METHOD; this pins it through a wrong CHECKSUM, which
+    /// is the half no construction of ours could supply honestly.
+    ///
+    /// The independent leg: the record is method 0 (Stored), so its payload
+    /// IS its content and [`crc16_witness`] can settle, with no decoder in
+    /// the loop, that the recorded value really is wrong for these bytes —
+    /// so `Partial` is right for a reason established before the scan ran.
+    #[test]
+    fn a_deliberately_wrong_checksum_is_the_documented_asymmetry() {
+        let record = read_dir_entry(&mut Cursor::new(WRONGCRC16_ZOO.to_vec()), 42).unwrap();
+        assert_eq!(
+            record.method_byte, 0,
+            "Stored — the payload IS the content, which is what lets the witness below \
+             settle this with no decoder in the loop"
+        );
+        let payload = &WRONGCRC16_ZOO
+            [record.offset as usize..record.offset as usize + record.size_now as usize];
+        assert_ne!(
+            crc16_witness(payload),
+            record.crc16,
+            "the fixture's whole point is a recorded CRC-16 that does not describe its \
+             payload; if these agreed the row below would prove nothing"
+        );
+
+        let err = reader_entries(WRONGCRC16_ZOO)
+            .expect_err("ZOO decodes an entry whole, so the ordinary reader must refuse this");
+        assert!(
+            err.contains("CRC-16"),
+            "the reader's refusal must name the cause: {err}"
+        );
+
+        assert_eq!(
+            salvaged(WRONGCRC16_ZOO),
+            vec![("license".to_string(), SalvageStatus::Partial)],
+            "salvage recovers what is there and says it could not prove it — never \
+             `Intact`, and never `Complete`, which would claim ZOO offers no checksum"
         );
     }
 
