@@ -20,9 +20,24 @@ stuffr-core = { path = "../crates/stuffr-core", features = ["testing"] }
 # does not carry one. Same deliberate-duplication reasoning as
 # `container.rs`'s independent EOCD re-parse, immediately below. `arc`
 # joined `zip` here when Task 3b converted `salvage.rs` from a pinned format
-# to `SALVAGE_SLOTS`'s selector byte, `zoo` joined both in Stage 2 Task 4 and
-# `lha` in Task 5 — the same four formats that selector lists.
-stuffr-formats = { path = "../crates/stuffr-formats", features = ["zip", "arc", "zoo", "lha"] }
+# to `SALVAGE_SLOTS`'s selector byte, `zoo` joined both in Stage 2 Task 4,
+# `lha` in Task 5 and `arj` in Task 8 — the same five formats that selector
+# lists.
+#
+# `arj` was MISSING from this list from Task 6 (which added the
+# `arj_salvage::salvage_arj` arm) until Task 8, and the target compiled
+# anyway: Cargo unifies features across the graph, and `stuffr`'s own
+# `legacy` above already turns on `stuffr-formats/arj`. Naming it here is
+# not decoration — it stops this crate's own build from depending on a
+# sibling dependency's feature set, which is exactly the shape that breaks
+# silently the day `legacy` is narrowed.
+stuffr-formats = { path = "../crates/stuffr-formats", features = [
+    "zip",
+    "arc",
+    "zoo",
+    "lha",
+    "arj",
+] }
 tempfile = "3"
 # Only for `container.rs`'s independent EOCD re-parse (Ruling A's second
 # guard) — opens a SECOND `zip::ZipArchive` over the same bytes stuffr's own
