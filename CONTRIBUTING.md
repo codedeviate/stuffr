@@ -28,6 +28,50 @@ redundant with the first build: it proves `stuffr-core` still compiles with no
 optional features, which is the guarantee behind "installing `stuffr` needs no C
 toolchain".
 
+### What the gate costs, and the trap in the answer
+
+**Two regimes, and the slow one is not this project's code.**
+
+- **~5 minutes when nothing was relinked.** Measured on an Apple Silicon Mac
+  at Salvage Stage 2 Task 8: **289 s** total — `fmt-check` 1 s, `lint` 1 s,
+  `test` (`--all-features`) 112 s, `test-pure` 175 s, `release` 0 s.
+  Real test EXECUTION inside that is only **29.8 s** and **42.2 s** per leg
+  (summed from libtest's own `finished in` figures); the rest is cargo's own
+  work, doc-test compilation most visibly.
+- **20-40 minutes on the first gate after anything relinked**, including the
+  first gate of a session, after a dependency or feature change, and always
+  after `cargo clean`.
+
+**The difference is macOS evaluating every newly-linked unsigned binary the
+first time it is executed** — `/usr/libexec/syspolicyd`, Gatekeeper's policy
+daemon, observed at 27-70% CPU throughout. `cargo test` links ~24 test
+binaries per leg and each pays it once. Three measurements, all with `--list`
+so that libtest runs no tests at all:
+
+| what | wall clock |
+|---|---|
+| first execution of a newly-linked test binary | **164.86 s** |
+| second execution of that same binary | **0.05 s** |
+| a byte-identical COPY of it, at a new path | **81.59 s** |
+
+The cost follows the FILE, not the code: the same file never pays twice, a
+fresh copy pays again. That is the signature of first-execution
+notarisation/Gatekeeper evaluation, and it is why a 41-minute gate and a
+5-minute gate can both be healthy.
+
+**The actionable part: do NOT `cargo clean` to "fix" a slow gate.** That is
+the one action guaranteed to buy the expensive regime, and an implementer who
+reads a stale "the gate takes under a minute" somewhere will reach for it.
+Re-run the gate instead; with nothing changed it drops straight back to ~5
+minutes.
+
+For the record, the slowest actual TEST is
+`lzma_pure::tests::corruption_sweep_is_detected_almost_everywhere` at
+**19.17 s** — 91% of the slowest binary's wall time on the `--all-features`
+leg. That cost is deliberate and documented (an exhaustive 128-byte sweep
+over a pure-Rust codec in an unoptimised profile); it is not the thing to
+chase.
+
 ## Commit messages
 
 [Conventional Commits](https://www.conventionalcommits.org/). The `commit-msg`
@@ -420,7 +464,7 @@ libFuzzer through `cargo fuzz`:
 | `container.rs` | One container's reader, both ladder rungs — the selector's high bit picks seekable vs. `ForwardOnly` so both walk paths get fuzzed, not just the seekable one. Also runs an independent EOCD re-parse and a second forward-only walk as cross-checks (see the module doc for why each is not redundant with the honesty oracle below). |
 | `chain.rs` | No selector at all — arbitrary bytes go straight at format detection (`resolve_chain_deep`) and `entries::list`'s container dispatch, the DETECTION layer a real `curl \| stuffr cat -` goes through, and where a silent wrong-format bug once lived. It stops there: no target runs `ops::decompress` itself, so `cat`'s own payload read is not covered by any of the five. |
 | `roundtrip.rs` | The WRITE side, added in Phase 3c Task 8 — the only target that runs an encoder at all. The input is the archive's CONTENT, not its bytes: a selector picks a writable slot (its high bit selects `CODEC_SLOTS` over `CONTAINER_SLOTS`; there is no ladder rung to choose when writing), the payload is written through it and read straight back, and the two must agree byte-for-byte. |
-| `salvage.rs` | Added in Salvage Stage 1 Task 8, pinned to `zip` until Salvage Stage 2 Task 3b. The one target that treats the REST of its bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader: it spools that payload to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does. **Which format's scanner gets it is decided by the PAYLOAD'S OWN MAGIC where there is one** (Stage 2 Task 8, Ruling S-S — `slot_from_payload` runs the same `resolve_chain` a real `stuffr salvage ARCHIVE` runs), and by a leading selector byte over [`SALVAGE_SLOTS`](#the-slot-tables-are-append-only) — `zip`, `arc`, `zoo`, `lha`, `arj` — for everything else. **`dest` is a real directory** (Stage 2 Task 8, Ruling S-O), so the filesystem write path is in the oracle's view; it said `dest: None` until then, and that gap is why a 404-character entry name made `salvage -C` exit 1 mid-run and survived a whole stage. `SalvagePolicy::max_entry` is narrowed to 256 KiB for the same reason: with a `dest` every ceiling is a disk bound. Seeded from fifteen shapes (`SALVAGE_SHAPES` in `crates/stuffr/tests/fuzz_corpus.rs`), at least one per slot — six hand-built zips (healthy, two duplicate-name shapes, a zeroed central directory, a truncated tail, a flipped payload byte) plus two each of ARC, ZOO, LHA and three ARJ. It ran **unseeded** until the Salvage Stage 1 final fix wave, and that was not a budget problem — see "Corpus and running locally" below for the measurement. |
+| `salvage.rs` | Added in Salvage Stage 1 Task 8, pinned to `zip` until Salvage Stage 2 Task 3b. The one target that treats the REST of its bytes as a damaged ARCHIVE rather than as content fed to a decoder or container reader: it spools that payload to a real tempfile (salvage needs genuine random access) and calls the same `entries::salvage` path the CLI does. **Which format's scanner gets it is decided by the PAYLOAD'S OWN MAGIC where there is one** (Stage 2 Task 8, Ruling S-S — `slot_from_payload` runs the same `resolve_chain` a real `stuffr salvage ARCHIVE` runs), and by a leading selector byte over [`SALVAGE_SLOTS`](#the-slot-tables-are-append-only) — `zip`, `arc`, `zoo`, `lha`, `arj` — for everything else. **`dest` is a real directory** (Stage 2 Task 8, Ruling S-O), so the filesystem write path is in the oracle's view; it said `dest: None` until then, and that gap is why a 404-character entry name made `salvage -C` exit 1 mid-run and survived a whole stage. `SalvagePolicy::max_entry` is narrowed to `stuffr_core::testing::SALVAGE_FUZZ_MAX_ENTRY` (256 KiB) for the same reason: with a `dest` every ceiling is a disk bound. That constant lives in `stuffr-core` rather than in the target, because `fuzz/` is excluded from the workspace and a ceiling only the target can see is a ceiling no test can check a seed against — `every_salvage_seed_is_scanned_the_way_the_fuzz_target_scans_it` now runs the engine with the target's exact configuration and asserts both halves (every seed places a file; no seed's entry is over the ceiling). Seeded from eighteen shapes (`SALVAGE_SHAPES` in `crates/stuffr/tests/fuzz_corpus.rs`), at least one per slot — six hand-built zips (healthy, two duplicate-name shapes, a zeroed central directory, a truncated tail, a flipped payload byte) plus three each of ARC and LHA, four of ARJ and two of ZOO — every slot but ZOO now has a checksum-corrupted shape, and that one exception is a property of the borrowed fixtures (all four hold a single entry), stated in `SALVAGE_SHAPES`'s own doc. It ran **unseeded** until the Salvage Stage 1 final fix wave, and that was not a budget problem — see "Corpus and running locally" below for the measurement. |
 
 Every decode path in all five is bounded (`DecodeOpts::memory_limit`,
 a capped output read) for the same reason the codec's own conformance
@@ -500,7 +544,11 @@ corpus in step: `every_salvage_slot_carries_at_least_one_seed` fails the
 build for a slot nobody wrote a seed shape for, and
 `every_salvage_seed_is_recognised_as_the_slot_its_shape_names` fails for a
 seed whose own bytes do not detect as the format its shape claims — which is
-what `salvage.rs`'s magic-first routing depends on.
+what `salvage.rs`'s magic-first routing depends on. A third,
+`every_salvage_seed_is_scanned_the_way_the_fuzz_target_scans_it`, is the only
+thing in `make check` that runs the engine with the target's OWN
+configuration (a real destination and `SALVAGE_FUZZ_MAX_ENTRY`) rather than
+the report-only one.
 
 ### Corpus and running locally
 
@@ -582,6 +630,31 @@ is therefore not a measured coverage win — it is that a seeded archive
 reaches its own scanner by construction rather than by that feedback
 happening to preserve one byte, which is a guarantee the corpus generator's
 own tests can then pin.
+
+**`arj` is structurally last, and no amount of seeding moves it.** Read the
+table above and the temptation is to chase `arj … 11` beside `zip … 3902`;
+do not. `legacy/arj_salvage.rs`'s candidate gate requires every basic header
+to reproduce a CRC-32 over its own content, so a mutation landing in a header
+is rejected with probability ~1 − 2⁻³² — and the mutations that DO survive
+are the ones in the payload, which that CRC does not cover, so they break the
+entry's own file CRC-32 and yield `Partial`. `check_salvage_claim` fires on
+`Intact` alone. **11-30 oracle calls is therefore the ceiling for that slot,
+not a seeding gap**, and the two formats with the weakest anchors behave the
+opposite way for the same structural reason: ARC's two-byte anchor makes
+almost any bytes produce candidates, which is why a session seeded with
+nothing but ARJ archives ended up 650 of its 782 accumulated inputs on the
+`arc` slot.
+
+**Two things this harness does not measure, named so the next reader does not
+assume otherwise.** First, **how often mutation reaches a given decoder**:
+`arj-method4-payload` exists to make `unarj-rs`'s `decode_fastest` reachable
+behind a header that keeps parsing (measured live — `stuffr list` on the seed
+answers `Invalid back_ptr` at exit 5), and nothing counts arrivals there or
+anywhere else; a decoder can be reachable and starved at once and no figure
+in this section would say so. Second, **the corpus's composition after a
+session is not a coverage statement**: an input is kept because it produced
+new coverage somewhere, which need not be in the slot its selector or its
+magic names.
 
 **A fixed `-runs` and `-seed` do not make either run deterministic, and a
 green one is not proof of absence.** Measured on the `container` target with
