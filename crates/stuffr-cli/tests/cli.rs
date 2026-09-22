@@ -10553,7 +10553,7 @@ fn the_documented_salvage_scanner_list_matches_what_the_binary_actually_scans() 
 //   names the damaged entry AFTER, so the damage is real by an outside
 //   account and not only by ours.
 // * **ARJ** — **no `arj`/`unarj` binary is obtainable anywhere in reach.**
-//   `the_arj_damage_catalogue_still_has_no_external_witness` is the
+//   `no_dedicated_arj_tool_is_obtainable_to_witness_this_catalogue` is the
 //   tripwire that keeps that from being quietly forgotten.
 // ---------------------------------------------------------------------
 
@@ -10924,7 +10924,15 @@ fn lhasa_agrees_with_the_lha_damage_catalogue() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// **The tripwire, not a skip.**
+/// **The tripwire, not a skip — and named for what it measures.**
+///
+/// Fix round 1, F7: this was `the_arj_damage_catalogue_still_has_no_external
+/// _witness`, which claims more than the body checks. p7zip reading ARJ is a
+/// documented fact, so "no external witness exists" is already false as a
+/// statement about the world; what is true, and what decides whether this
+/// catalogue can be strengthened, is that **no dedicated ARJ tool is
+/// obtainable here**. The name now says that, and the exclusion of `7z` is
+/// argued below rather than hidden behind a stronger claim.
 ///
 /// ARJ's whole damage catalogue — here and in
 /// `crates/stuffr-formats/src/legacy/arj_salvage.rs` — rests on
@@ -10951,7 +10959,7 @@ fn lhasa_agrees_with_the_lha_damage_catalogue() {
 /// reputation. If someone does that measurement, `7z` becomes a better
 /// answer than this test and this test should go.
 #[test]
-fn the_arj_damage_catalogue_still_has_no_external_witness() {
+fn no_dedicated_arj_tool_is_obtainable_to_witness_this_catalogue() {
     for candidate in ["arj", "unarj", "arj32"] {
         assert!(
             which(candidate).is_none(),
