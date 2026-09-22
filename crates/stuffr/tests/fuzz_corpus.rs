@@ -286,6 +286,35 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// `1 Partial (decode failed)` at exit 4. **How OFTEN mutation reaches that
 /// decoder is not measured by anything**, here or in CI; the seed makes the
 /// route reachable, and nothing counts arrivals.
+///
+/// **`arc-crc-mismatch`, `lha-crc-mismatch` and `arj-crc-mismatch` close the
+/// letter of the brief's Step 1** — "healthy, truncated, and
+/// checksum-corrupted per format" — which until now only `zip` met, through
+/// `crc-mismatch`. Each takes its format's own healthy fixture and corrupts
+/// the FIRST entry's recorded file checksum only, leaving every size, every
+/// name and every other entry alone, so the shape reaches
+/// `Partial(ChecksumMismatch)` on entry 1 and `Intact` on entry 2. That
+/// boundary — a candidate that parses perfectly and then fails its
+/// comparison — is the one `check_salvage_claim` exists for, and it was the
+/// one no legacy slot could start a mutation from.
+///
+/// Two of the three need a second checksum refreshed, because the file CRC
+/// sits UNDER a header-level one: LHA's level-1 header checksum is a plain
+/// byte sum over the base header (`sum(bytes[2..2 + header_size]) & 0xFF`,
+/// verified against `sample.lzh`'s own `0xE0` before being used), and ARJ's
+/// basic header carries a CRC-32 over its content. Without that refresh the
+/// record stops being a candidate at all and the shape would silently
+/// degrade into "the scanner finds nothing", which is the failure the whole
+/// corpus exists to avoid. ARC needs neither: its header carries no checksum
+/// over itself.
+///
+/// **`zoo` deliberately gets no such shape, and the reason is a property of
+/// the fixtures rather than a shortcut**: all four borrowed ZOO archives
+/// hold exactly ONE entry, so corrupting its checksum leaves the shape with
+/// no `Intact` record anywhere — which
+/// [`every_salvage_seed_produces_records_and_at_least_one_intact`] forbids,
+/// on the rule that a seed is something the fuzzer degrades FROM. It needs a
+/// two-entry ZOO archive this project cannot write and has not borrowed.
 const SALVAGE_SHAPES: &[&str] = &[
     "healthy",
     "distinct-duplicates",
@@ -302,6 +331,9 @@ const SALVAGE_SHAPES: &[&str] = &[
     "arc-healthy",
     "arc-derailed-first-size",
     "arj-method4-payload",
+    "arc-crc-mismatch",
+    "lha-crc-mismatch",
+    "arj-crc-mismatch",
 ];
 
 /// The `SALVAGE_SLOTS` name a shape's seed carries in its selector byte: the
@@ -718,6 +750,70 @@ fn arj_set_local_method(bytes: &[u8], local_index: usize, method: u8) -> Vec<u8>
     out
 }
 
+/// Flips the FIRST ARC entry header's recorded CRC-16, leaving every size,
+/// name and later entry untouched.
+///
+/// The field is at file offset 23: `marker(1) + method(1) + name(13) +
+/// compressed_size(4) + date(2) + time(2)` is 23 bytes, and `crc16` follows
+/// (`arc.rs`'s own `HEADER_LEN` doc). ARC's header carries no checksum over
+/// ITSELF, so nothing else has to be refreshed — the record is still found,
+/// parsed and read, and only its comparison fails.
+fn corrupt_first_arc_file_crc(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out[23] ^= 0xFF;
+    out[24] ^= 0xFF;
+    out
+}
+
+/// Flips the FIRST LHA entry header's recorded CRC-16 and refreshes the
+/// header's own checksum byte so the record is still a candidate.
+///
+/// Level-0/1 base header, transcribed from `legacy/lha.rs`'s own layout:
+/// `header_size(1) + checksum(1) + method(5) + compressed(4) + original(4) +
+/// time(2) + date(2) + attr(1) + level(1) + name_len(1) + name(n)`, so the
+/// file CRC-16 is at `22 + name_len`. The checksum at byte 1 is a plain
+/// `sum(bytes[2..2 + header_size]) & 0xFF` — verified against `sample.lzh`'s
+/// own `0xE0` before this function was written, so a wrong formula would
+/// have shown up as a fixture that no longer parses rather than as a silent
+/// pass.
+fn corrupt_first_lha_file_crc(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let header_size = out[0] as usize;
+    let name_len = out[21] as usize;
+    let crc_at = 22 + name_len;
+    out[crc_at] ^= 0xFF;
+    out[crc_at + 1] ^= 0xFF;
+    let sum = out[2..2 + header_size]
+        .iter()
+        .fold(0u8, |acc, b| acc.wrapping_add(*b));
+    out[1] = sum;
+    out
+}
+
+/// Flips the `local_index`-th ARJ local file header's recorded CRC-32 over
+/// the ORIGINAL file, and recomputes that header's own basic-header CRC-32
+/// so it still parses.
+///
+/// Content offset 20, from `legacy/arj.rs`'s `build_local_file_entry`:
+/// eight single-byte fields, then `date_time_modified(4)`,
+/// `compressed_size(4)`, `original_size(4)`, then `original_crc32`. The
+/// header CRC refresh is what separates this from the payload edits the
+/// fuzzer makes on its own — without it the candidate is rejected at
+/// `arj_salvage.rs`'s header gate and the shape recovers nothing.
+fn arj_corrupt_local_file_crc(bytes: &[u8], local_index: usize) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let offsets = arj_header_offsets(&out);
+    let at = offsets[1 + local_index];
+    let len = u16::from_le_bytes([out[at + 2], out[at + 3]]) as usize;
+    let content = at + 4;
+    for b in &mut out[content + 20..content + 24] {
+        *b ^= 0xFF;
+    }
+    let crc = seed_crc32(&out[content..content + len]);
+    out[content + len..content + len + 4].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
 /// The payload every `roundtrip` seed carries after its selector byte.
 ///
 /// Deliberately compressible and deliberately not a round number of bytes:
@@ -1104,6 +1200,21 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
             "arc-derailed-first-size" => {
                 derail_first_arc_entry(&read_all(&legacy_fixture_path("arc/cpm.arc"))?)
             }
+            // The letter of Step 1, for the three legacy slots whose own
+            // fixtures carry more than one entry: entry 1's recorded file
+            // checksum flipped and nothing else, so the record still parses
+            // and only its comparison fails. See `SALVAGE_SHAPES`'s own doc
+            // for why two of the three refresh a second checksum, and why
+            // `zoo` has no such shape.
+            "arc-crc-mismatch" => {
+                corrupt_first_arc_file_crc(&read_all(&legacy_fixture_path("arc/cpm.arc"))?)
+            }
+            "lha-crc-mismatch" => {
+                corrupt_first_lha_file_crc(&read_all(&legacy_fixture_path("sample.lzh"))?)
+            }
+            "arj-crc-mismatch" => {
+                arj_corrupt_local_file_crc(&read_all(&legacy_fixture_path("sample.arj"))?, 0)
+            }
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
         let slot = salvage_shape_slot(shape);
@@ -1255,6 +1366,15 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
     for (shape, expected) in [
         ("truncated-tail", SalvageStatus::Partial),
         ("crc-mismatch", SalvageStatus::Partial),
+        // The three legacy checksum shapes: each must reach the SAME
+        // boundary `crc-mismatch` reaches for zip — a record that parsed
+        // perfectly and then failed its comparison. Without this the three
+        // could silently degrade into "the scanner found the second entry
+        // and lost the first", which passes every other assertion in this
+        // test.
+        ("arc-crc-mismatch", SalvageStatus::Partial),
+        ("lha-crc-mismatch", SalvageStatus::Partial),
+        ("arj-crc-mismatch", SalvageStatus::Partial),
     ] {
         let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
         let path = salvage_payload_path(&seed_path, scratch.path());
@@ -1434,9 +1554,14 @@ fn every_salvage_seed_is_scanned_the_way_the_fuzz_target_scans_it() {
 /// again — silently, since the seed would still be written, still be
 /// scanned, and still produce records under whichever slot the byte named.
 ///
-/// The detection call here is deliberately the same one the fuzz target
-/// makes, with the same `None` path, so the two cannot disagree about what a
-/// seed is.
+/// The detection call here is the same one the fuzz target makes, with the
+/// same `None` path — **duplicated deliberately, because `fuzz/` is excluded
+/// from the workspace and nothing in the gate can call that function; a
+/// divergence between this copy and the target's own is itself the finding
+/// this test would surface.** That is the same standing this project gives
+/// `container.rs`'s duplicated EOCD re-parse and `salvage.rs`'s own
+/// raw-byte cross-checks. It pins the PROPERTY (a seed detects as its own
+/// slot), not the function.
 #[test]
 fn every_salvage_seed_is_recognised_as_the_slot_its_shape_names() {
     let dir = tempfile::tempdir().unwrap();
