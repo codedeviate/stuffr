@@ -10520,3 +10520,459 @@ fn the_documented_salvage_scanner_list_matches_what_the_binary_actually_scans() 
         "`--format`'s help names a different set of salvage scanners than this binary has"
     );
 }
+
+// ---------------------------------------------------------------------
+// Salvage Stage 2 Task 7: the legacy damage catalogue, end to end.
+//
+// The fast half of this catalogue lives beside each scanner — see
+// `crates/stuffr-formats/src/legacy/{arc,zoo,lha,arj}_salvage.rs`'s own
+// `mod damage_catalogue`, which owns the agreement property (salvage of an
+// UNDAMAGED archive must agree exactly with what the ordinary reader
+// enumerates) and the full mutation table (truncated tail, a byte flipped
+// mid-payload, a header field corrupted, each run with every entry taking
+// its turn as the damaged one). Those tests reach parsers and geometry this
+// binary deliberately cannot see, exactly as `zip_salvage.rs`'s own
+// `salvage_of_a_healthy_archive_agrees_with_list` does for zip.
+//
+// What this file adds is the part only a process can state: the ROWS a user
+// reads, the EXIT CODE a script branches on, and — the claim that separates
+// this tool from `zip -FF` — that the bytes on disk after a recovery are a
+// genuine prefix of what went in, with nothing invented to fill the gap.
+//
+// **The evidence behind each format is NOT equal, and these tests say so
+// rather than presenting four identical-looking rows:**
+//
+// * **ARC and ZOO** — the archives are the borrowed `unarc-rs` 0.6.3
+//   corpus, written by DOS-era archivers decades before this project
+//   existed, each entry carrying the CRC-16 its ORIGINAL writer computed.
+//   That checksum is the witness, and no `arc`/`zoo` binary is obtainable
+//   on any platform in reach to add a second one.
+// * **LHA** — `lhasa` exists, reads `.lzh`, and shares no code with
+//   `delharc`. `lhasa_agrees_with_the_lha_damage_catalogue` below uses it
+//   as a live witness: it pronounces the archive good BEFORE any damage and
+//   names the damaged entry AFTER, so the damage is real by an outside
+//   account and not only by ours.
+// * **ARJ** — **no `arj`/`unarj` binary is obtainable anywhere in reach.**
+//   `the_arj_damage_catalogue_still_has_no_external_witness` is the
+//   tripwire that keeps that from being quietly forgotten.
+// ---------------------------------------------------------------------
+
+/// A checked-in legacy fixture, by path relative to
+/// `crates/stuffr-formats/fixtures/legacy/`. `CARGO_MANIFEST_DIR` bakes an
+/// absolute path at compile time — see `workspace_source_files` above for
+/// the same hazard and the same fix.
+fn legacy_fixture(rel: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("stuffr-formats")
+        .join("fixtures")
+        .join("legacy")
+        .join(rel)
+}
+
+/// Runs the truncated-tail catalogue row end to end over one archive.
+///
+/// `drop_bytes` is cut from the END of the file, which lands inside the
+/// LAST entry's payload for every fixture named below (each format's
+/// trailer — ARC's two-byte marker, ZOO's 56-byte terminator record, LHA's
+/// one-byte marker, ARJ's four-byte marker — is smaller than the amount
+/// cut).
+///
+/// **The expectation is the pre-damage state throughout.** `expected_names`
+/// is what the archive held before anything was cut, asserted against the
+/// HEALTHY file first; the recovered prefix is compared against the healthy
+/// archive's own content for that entry, read back with `cat --index`
+/// before the cut is made.
+fn legacy_truncated_tail_row(
+    label: &str,
+    fixture: &str,
+    drop_bytes: usize,
+    expected_names: &[&str],
+) {
+    let dir = tmp_dir();
+    let healthy_path = legacy_fixture(fixture);
+    let healthy = std::fs::read(&healthy_path).unwrap();
+
+    // 1. The pre-damage state, established before anything is damaged.
+    let rows = salvage_list_rows(&healthy_path);
+    assert_eq!(
+        rows.len(),
+        expected_names.len(),
+        "{label}: sanity, the UNDAMAGED archive's own row count: {rows:?}"
+    );
+    for (row, name) in rows.iter().zip(expected_names) {
+        assert!(
+            row.contains(name) && row.contains("Intact"),
+            "{label}: every entry of the undamaged archive must verify Intact: {row}"
+        );
+    }
+    let last_index = expected_names.len() - 1;
+    let out = run_output(&[
+        "cat",
+        "--index",
+        &last_index.to_string(),
+        healthy_path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{label}: the undamaged archive's last entry must read back cleanly: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let went_in = out.stdout;
+    assert!(
+        !went_in.is_empty(),
+        "{label}: the last entry must carry a payload for this row to mean anything"
+    );
+
+    // 2. The damage.
+    let cut = healthy.len() - drop_bytes;
+    let damaged = dir.join(format!("truncated-{}", fixture.replace('/', "-")));
+    std::fs::write(&damaged, &healthy[..cut]).unwrap();
+
+    // 3. Every earlier entry still Intact, the cut one named and named as
+    //    TRUNCATED rather than as a bad checksum — the payload ran out,
+    //    nothing disagreed.
+    let rows = salvage_list_rows(&damaged);
+    assert_eq!(
+        rows.len(),
+        expected_names.len(),
+        "{label}: the cut entry's header is still there and its being uncompletable is a \
+         fact worth a row, never silence: {rows:?}"
+    );
+    for (i, (row, name)) in rows.iter().zip(expected_names).enumerate() {
+        assert!(row.contains(name), "{label}: {row}");
+        if i == last_index {
+            assert!(
+                row.contains("Partial (truncated)"),
+                "{label}: the cut entry must be named as truncated: {row}"
+            );
+        } else {
+            assert!(
+                row.contains("Intact"),
+                "{label}: an entry before the cut is untouched: {row}"
+            );
+        }
+    }
+
+    // 4. The run must not exit 0, and the surviving prefix lands under
+    //    `.partial` — never under the entry's real name.
+    let out_dir = dir.join(format!("recovered-{}", fixture.replace('/', "-")));
+    let out = run_output(&[
+        "salvage",
+        damaged.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{label}: a run that could not complete something must not exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let partial = out_dir.join(format!("{}.partial", expected_names[last_index]));
+    assert!(
+        partial.is_file(),
+        "{label}: expected {} on disk",
+        partial.display()
+    );
+    assert!(
+        !out_dir.join(expected_names[last_index]).exists(),
+        "{label}: an incomplete entry must never land under its real name"
+    );
+    for name in &expected_names[..last_index] {
+        let recovered = std::fs::read(out_dir.join(name)).unwrap_or_else(|e| {
+            panic!("{label}: an entry before the cut must be recovered whole: {e}")
+        });
+        assert!(!recovered.is_empty(), "{label}: `{name}` came back empty");
+    }
+
+    // 5. **Not one invented byte.** What is on disk is exactly a prefix of
+    //    what went in, and strictly shorter than it. `zip -FF` fills the
+    //    gap from its own buffer and calls the result fixed; this is the
+    //    assertion that says stuffr does not.
+    let recovered = std::fs::read(&partial).unwrap();
+    assert!(
+        !recovered.is_empty() && recovered.len() < went_in.len(),
+        "{label}: {} recovered bytes against {} that went in",
+        recovered.len(),
+        went_in.len()
+    );
+    assert_eq!(
+        recovered[..],
+        went_in[..recovered.len()],
+        "{label}: every recovered byte must be one the archive itself still held"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// ARC. Two borrowed entries (`cpm.arc`, `DDTZ.COM` then `READ.COM`) so the
+/// "earlier entries untouched" half of the row is a real claim, and the
+/// witness is the CRC-16 each entry's own header records.
+#[test]
+fn damage_catalogue_arc_truncated_tail() {
+    legacy_truncated_tail_row("arc", "arc/cpm.arc", 40, &["DDTZ.COM", "READ.COM"]);
+}
+
+/// ARC again, over the one borrowed fixture whose payload IS its content
+/// (`store.arc`, method 2, Unpacked): with no decoder between the archive
+/// and the file on disk, "the recovered bytes are a prefix of what went in"
+/// is a statement about the archive's own bytes.
+#[test]
+fn damage_catalogue_arc_truncated_tail_over_a_stored_entry() {
+    legacy_truncated_tail_row("arc/stored", "arc/store.arc", 5_000, &["LICENSE"]);
+}
+
+/// ZOO. `store.zoo`'s single method-0 entry, same reasoning as
+/// `store.arc` above — and the same witness, a CRC-16 zoo 2.10 computed.
+#[test]
+fn damage_catalogue_zoo_truncated_tail() {
+    legacy_truncated_tail_row("zoo", "zoo/store.zoo", 5_000, &["license"]);
+}
+
+/// LHA. `sample.lzh` — the one legacy fixture an implementation outside
+/// this project has agreed with (`lhasa`; see
+/// `crates/stuffr-formats/fixtures/legacy/MANIFEST.md`). Two `-lh0-`
+/// entries, so both halves of the row are real claims.
+#[test]
+fn damage_catalogue_lha_truncated_tail() {
+    legacy_truncated_tail_row(
+        "lha",
+        "sample.lzh",
+        4,
+        &["sample/hello.txt", "sample/sub/b.bin"],
+    );
+}
+
+/// ARJ. `sample.arj`, and **nothing outside this project has ever agreed
+/// with these bytes** — see `the_arj_damage_catalogue_still_has_no_
+/// external_witness` below, and this section's own header comment.
+#[test]
+fn damage_catalogue_arj_truncated_tail() {
+    legacy_truncated_tail_row(
+        "arj",
+        "sample.arj",
+        7,
+        &["sample/hello.txt", "sample/sub/b.bin"],
+    );
+}
+
+/// **The external witness for LHA, and the only live one in this
+/// catalogue.**
+///
+/// `lhasa` shares no code with `delharc` (the parser stuffr reads `.lzh`
+/// through) and none at all with `lha_salvage.rs`'s own second header
+/// parser. Here it does two jobs no assertion of ours can do:
+///
+/// 1. It pronounces the archive GOOD before any damage — so "the
+///    expectation is the pre-damage state" rests on an outside opinion,
+///    not only on stuffr having written the file itself.
+/// 2. It names the damaged entry AFTER — so the damage is real, and
+///    localised to the entry this test aimed at, by an outside account.
+///
+/// Only then is `stuffr salvage`'s own verdict compared against it: the
+/// entry `lhasa` calls bad is the entry salvage calls `Partial`, and every
+/// entry `lhasa` calls good is one salvage calls `Intact`.
+#[test]
+fn lhasa_agrees_with_the_lha_damage_catalogue() {
+    let lha_bin = require_lhasa();
+    let banner = lhasa_banner(&lha_bin);
+    let dir = tmp_dir();
+    std::fs::create_dir_all(dir.join("tree/sub")).unwrap();
+    let alpha = b"alpha payload, the first entry, repeated often.\n".repeat(120);
+    let beta = b"beta payload, the middle entry, repeated often.\n".repeat(90);
+    let gamma = b"gamma payload, the last entry, repeated often.\n".repeat(70);
+    std::fs::write(dir.join("tree/alpha.txt"), &alpha).unwrap();
+    std::fs::write(dir.join("tree/beta.txt"), &beta).unwrap();
+    std::fs::write(dir.join("tree/sub/gamma.bin"), &gamma).unwrap();
+    let archive = dir.join("healthy.lzh");
+
+    let packed = run_output(&[
+        "pack",
+        dir.join("tree").to_str().unwrap(),
+        "--format",
+        "lha",
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert_eq!(packed.status.code(), Some(0));
+
+    /// Every entry `lha t` reported on, and whether it passed. lhasa writes
+    /// one `NAME\t- Tested` or `NAME\t- CRC error` phrase per entry; the
+    /// `\r`-driven progress it interleaves means a phrase can share a line
+    /// with earlier progress text, so this scans phrases rather than lines.
+    fn lhasa_verdicts(output: &[u8]) -> Vec<(String, bool)> {
+        let text = String::from_utf8_lossy(output).replace('\r', "\n");
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for chunk in text.split('\n') {
+            for (marker, ok) in [("\t- Tested", true), ("\t- CRC error", false)] {
+                if let Some(at) = chunk.find(marker) {
+                    let name = chunk[..at].rsplit(':').next().unwrap().trim().to_string();
+                    if !name.is_empty() && !out.iter().any(|(n, _)| *n == name) {
+                        out.push((name, ok));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // 1. The outside opinion on the PRE-DAMAGE archive.
+    let healthy_test = Command::new(&lha_bin)
+        .arg("t")
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(
+        healthy_test.status.success(),
+        "{banner} must accept the undamaged archive: {}{}",
+        String::from_utf8_lossy(&healthy_test.stdout),
+        String::from_utf8_lossy(&healthy_test.stderr)
+    );
+    let mut combined = healthy_test.stdout.clone();
+    combined.extend_from_slice(&healthy_test.stderr);
+    let before = lhasa_verdicts(&combined);
+    assert_eq!(
+        before
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        "tree/alpha.txt,tree/beta.txt,tree/sub/gamma.bin",
+        "sanity: {banner} must report on all three entries — otherwise the comparison below \
+         is against a partial account"
+    );
+    assert!(
+        before.iter().all(|(_, ok)| *ok),
+        "{banner} must call every entry of the undamaged archive good: {before:?}"
+    );
+
+    // 2. The damage: one byte inside the MIDDLE entry's compressed payload.
+    //    Located by searching for the entry's own `-lh5-` header, so this
+    //    test never asks stuffr where anything is.
+    let healthy = std::fs::read(&archive).unwrap();
+    let beta_header = healthy
+        .windows(5)
+        .enumerate()
+        .filter(|(_, w)| *w == b"-lh5-")
+        .map(|(i, _)| i)
+        .nth(1)
+        .expect("the middle entry's own method identifier");
+    let mut bytes = healthy.clone();
+    // Past the header (`header_len` byte, plus its two framing bytes, plus
+    // the name and the rest), a few bytes into the payload itself.
+    let beta_start = beta_header - 2;
+    let payload_at = beta_start + bytes[beta_start] as usize + 2 + 4;
+    bytes[payload_at] ^= 0xFF;
+    let damaged = dir.join("damaged.lzh");
+    std::fs::write(&damaged, &bytes).unwrap();
+
+    // 3. The outside opinion on the DAMAGED archive: one entry bad, and
+    //    which one.
+    let damaged_test = Command::new(&lha_bin)
+        .arg("t")
+        .arg(&damaged)
+        .output()
+        .unwrap();
+    assert!(
+        !damaged_test.status.success(),
+        "{banner} must refuse the damaged archive, or this test proved nothing"
+    );
+    let mut combined = damaged_test.stdout.clone();
+    combined.extend_from_slice(&damaged_test.stderr);
+    let after = lhasa_verdicts(&combined);
+    let condemned: Vec<&str> = after
+        .iter()
+        .filter(|(_, ok)| !*ok)
+        .map(|(n, _)| n.as_str())
+        .collect();
+    assert_eq!(
+        condemned,
+        ["tree/beta.txt"],
+        "{banner} must condemn exactly the entry this test damaged: {after:?}"
+    );
+
+    // 4. And stuffr must agree with it, entry by entry.
+    let rows = salvage_list_rows(&damaged);
+    assert_eq!(
+        rows.len(),
+        5,
+        "three files and two directory entries: {rows:?}"
+    );
+    for (name, ok) in &after {
+        let row = rows
+            .iter()
+            .find(|r| r.contains(name.as_str()))
+            .unwrap_or_else(|| {
+                panic!("salvage lost `{name}` that {banner} still reports: {rows:?}")
+            });
+        if *ok {
+            assert!(
+                row.contains("Intact"),
+                "{banner} calls `{name}` good and salvage does not: {row}"
+            );
+        } else {
+            assert!(
+                row.contains("Partial"),
+                "{banner} calls `{name}` bad and salvage calls it whole: {row}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **The tripwire, not a skip.**
+///
+/// ARJ's whole damage catalogue — here and in
+/// `crates/stuffr-formats/src/legacy/arj_salvage.rs` — rests on
+/// `unarj-rs` plus this project's own reading of the ARJ specification.
+/// `fixtures/legacy/sample.arj` was hand-built from that same reading, so a
+/// test can only prove the parser agrees with our own transcription; if
+/// both sides share a misreading, every test in this repository stays
+/// green. Phase 3c recorded the gap on the read and the write sides, and
+/// the brief for this task asked that it be RESTATED rather than quietly
+/// forgotten once a catalogue exists.
+///
+/// This is that restatement, made falsifiable: the day an `arj` or `unarj`
+/// binary becomes obtainable, this test goes red and names what to do about
+/// it. It is deliberately NOT a `require_bin`-shaped skip — there is
+/// nothing to require — and deliberately not a comment, because a comment
+/// cannot notice the world changing.
+///
+/// **`7z` is deliberately NOT in the list below**, though p7zip is
+/// documented as reading ARJ. Two reasons, both about what this tripwire is
+/// for: it is present on some CI images and absent on others, so naming it
+/// would turn "the world changed" into "this runner differs from that one";
+/// and nothing in this project has ever measured p7zip against an ARJ
+/// stuffr wrote, so promoting it would be adopting a witness on its
+/// reputation. If someone does that measurement, `7z` becomes a better
+/// answer than this test and this test should go.
+#[test]
+fn the_arj_damage_catalogue_still_has_no_external_witness() {
+    for candidate in ["arj", "unarj", "arj32"] {
+        assert!(
+            which(candidate).is_none(),
+            "`{candidate}` is on PATH now. ARJ's catalogue has been checked against nothing \
+             but this project's own reading of the spec since Phase 3b — promote \
+             `damage_catalogue_arj_truncated_tail` and \
+             `legacy::arj_salvage`'s own `mod damage_catalogue` to use this tool as a real \
+             external witness (the shape `lhasa_agrees_with_the_lha_damage_catalogue` \
+             above already has), and delete this test."
+        );
+    }
+
+    // And the fixture the catalogue stands on is still the hand-built one,
+    // unchanged — so the gap this test names is the gap that actually
+    // exists, not a stale description of a fixture somebody has since
+    // replaced with tool-written bytes.
+    let sample = std::fs::read(legacy_fixture("sample.arj")).unwrap();
+    assert_eq!(
+        sample.len(),
+        173,
+        "`sample.arj` is no longer the 173-byte fixture MANIFEST.md describes; re-read its \
+         provenance before trusting anything this catalogue asserts"
+    );
+}
