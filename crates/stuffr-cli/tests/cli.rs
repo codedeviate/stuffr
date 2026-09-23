@@ -8817,6 +8817,67 @@ fn build_duplicating_zip_fixture(duplicates: SalvageFixtureDuplicates) -> Vec<u8
     out
 }
 
+/// The final whole-branch review's F3, end to end: an ordinary one-entry
+/// zip whose entry name holds interior NUL bytes — `zt\0ee\0a.txt`, the
+/// exact shape a zeroed run inside `ztree/a.txt` produces, and what the
+/// reviewer's sweep actually hit on a mutated `stuffr pack` output.
+///
+/// Before the fix:
+///
+/// ```text
+/// $ stuffr list   nul.zip     # exit 0
+/// $ stuffr test   nul.zip     # exit 0, "exact fidelity"
+/// $ stuffr unpack nul.zip -C out
+/// stuffr: i/o error: file name contained an unexpected NUL byte
+/// exit=1                      # "stuffr itself failed", on input the
+///                             # archive chose
+/// ```
+///
+/// It was the ONLY exit 1 in a 31,460-invocation corruption sweep over
+/// 2,860 mutated archives in all five salvageable formats. `list` and
+/// `test` still exit 0 here and that is correct — neither turns a name into
+/// a path, so neither can see the problem; the same asymmetry zip's
+/// declared-size lie already has.
+#[test]
+fn unpack_refuses_a_nul_bearing_entry_name_rather_than_failing() {
+    let dir = tmp_dir();
+    let rec = salvage_fixture_local_record(0, "zt\0ee\0a.txt", b"hello world\n");
+    let mut out = rec.bytes.clone();
+    let cd_start = u32::try_from(out.len()).unwrap();
+    out.extend_from_slice(&salvage_fixture_central_record(&rec));
+    let cd_size = u32::try_from(out.len()).unwrap() - cd_start;
+    out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06]);
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&cd_size.to_le_bytes());
+    out.extend_from_slice(&cd_start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    let archive = dir.join("nul.zip");
+    std::fs::write(&archive, &out).unwrap();
+
+    let listed = run_output(&["list", archive.to_str().unwrap()]);
+    assert_eq!(listed.status.code(), Some(0), "list reads the archive fine");
+
+    let unpacked = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dir.join("out").to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8(unpacked.stderr).unwrap();
+    assert_eq!(
+        unpacked.status.code(),
+        Some(7),
+        "hostile input must never be exit 1: {stderr}"
+    );
+    assert!(
+        stderr.contains("NUL"),
+        "and the refusal must name what it refused: {stderr}"
+    );
+}
+
 fn write_shadowing_zip_fixture(dir: &Path) -> PathBuf {
     let path = dir.join("shadowing.zip");
     std::fs::write(&path, build_shadowing_zip_fixture()).unwrap();

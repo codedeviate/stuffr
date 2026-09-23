@@ -52,7 +52,17 @@ read list.
 > `--index 0 --index 2` recovered both. **Nothing about the refusal itself
 > changed** — an escaping name is never written, and a run that meets one
 > still exits 7, which now outranks every other salvage exit code.
-
+>
+> Third, and not a salvage change at all: **an entry name (or symlink
+> target) containing a NUL byte is now refused at exit 7** rather than
+> reaching `std::fs`, which rejects an interior NUL and left `stuffr unpack`
+> ending at **exit 1** — the code reserved for stuffr itself having failed,
+> on a name the archive chose. It is not an attack shape: a zeroed run
+> inside an ordinary name produces it, and it was the only exit 1 in a
+> 31,460-invocation corruption sweep over 2,860 mutated archives in all five
+> salvageable formats. `list` and `test` still exit 0 on such an archive —
+> neither turns a name into a path — and `salvage` skips that one entry and
+> recovers the rest, at 7 where it used to report 4.
 >
 > A ZOO note worth carrying, because a future reader meeting `unarc-rs` will
 > meet the wrong number: **ZOO's fixed directory-entry record is 56 bytes,

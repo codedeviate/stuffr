@@ -34,6 +34,50 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
             reason: "empty entry name",
         });
     }
+    // A name no path can hold, refused HERE rather than by the filesystem —
+    // the final whole-branch review's F3.
+    //
+    // `std::fs` rejects an interior NUL as `io::ErrorKind::InvalidInput`,
+    // which becomes `Error::Io` and falls through `Error::exit_code`'s
+    // `_ => 1` wildcard. Measured on a mutated `stuffr pack` zip whose entry
+    // name is `zt\0ee\0a.txt` (an ordinary zeroed run): `stuffr list` and
+    // `stuffr test` both exited 0, and `stuffr unpack -C out` answered
+    //
+    //     stuffr: i/o error: file name contained an unexpected NUL byte
+    //     exit=1
+    //
+    // — the code this project reserves for *stuffr* failing, on input the
+    // archive chose. It was the ONLY exit 1 in the review's 31,460-run
+    // corruption sweep across all five salvageable formats, and closing it
+    // makes that result a clean zero.
+    //
+    // # Why here, and why `UnsafePath`
+    //
+    // `Error::exit_code`'s own doc says a wrong code landing in that
+    // wildcard is as likely to mean the wrong VARIANT was constructed
+    // upstream as it is to mean the match is wrong, and that is the case
+    // here: `Error::Io` is not what an unrepresentable archive-supplied name
+    // is. The alternative — matching `io::ErrorKind` at the extraction call
+    // site — is the fix-the-site shape Task 3c shipped twice and had to undo
+    // twice.
+    //
+    // This function is the single decision point for whether an entry name
+    // may become a path under `dest`, it is pure, and every refusal it
+    // already makes is `UnsafePath`: absolute, traversal, net-zero
+    // traversal, and — the exact precedent — an EMPTY name, which is no more
+    // an escape attempt than this is. Splitting one function's verdict
+    // across two exit codes would leave a caller unable to predict either.
+    // Exit 7 at the CLI reads "an entry's name was refused and nothing was
+    // written under it", which is precisely what happens. Exit 5 was
+    // considered and rejected: it claims the ARCHIVE is corrupt, a stronger
+    // claim than stuffr can make from a name alone, and `list`/`test` verify
+    // the same file's bytes without complaint.
+    if entry_name.contains('\0') {
+        return Err(Error::UnsafePath {
+            path: entry_name.to_string(),
+            reason: "entry name contains a NUL byte",
+        });
+    }
 
     let mut out = PathBuf::new();
     // Tracks whether any real (`Normal`) component was ever pushed, as
@@ -148,6 +192,18 @@ fn walk_within(
 /// than the link's own depth below `dest`.
 pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Result<()> {
     let target_path = Path::new(target);
+    // The sibling door to `safe_join`'s own NUL refusal, closed in the same
+    // change and for the same reason: `std::os::unix::fs::symlink` rejects
+    // an interior NUL as `InvalidInput`, so a symlink TARGET carrying one
+    // reached the identical `Error::Io`/exit-1 path an entry NAME did.
+    // Closing only the half the review measured would leave the class open
+    // through a door two lines away.
+    if target.contains('\0') {
+        return Err(Error::UnsafePath {
+            path: target.to_string(),
+            reason: "symlink target contains a NUL byte",
+        });
+    }
     // Checked before the walk purely so the reason names symlinks — the
     // walk's own `RootDir` arm would refuse it anyway.
     if target_path.is_absolute() {
@@ -265,20 +321,53 @@ mod tests {
         );
     }
 
+    /// A name carrying a NUL is refused outright, and a symlink target
+    /// carrying one is too.
+    ///
+    /// **This test asserted the opposite for its first shape until the final
+    /// whole-branch review's F3**: `safe.txt\0..` used to be ACCEPTED and
+    /// joined verbatim, on the reasoning that a NUL-poisoned segment is
+    /// classified `Normal` rather than `ParentDir` (classification is
+    /// exact-string equality), so the injection buys an attacker no
+    /// traversal. That reasoning was and is correct — it is simply not the
+    /// whole question. The accepted path then reached `std::fs`, which
+    /// rejects an interior NUL as `InvalidInput`, and `stuffr unpack` ended
+    /// at **exit 1** — the code reserved for stuffr itself failing — on a
+    /// name the ARCHIVE chose. That was the only exit 1 in the review's
+    /// 31,460-run corruption sweep.
+    ///
+    /// A refusal is strictly stronger than the property this test used to
+    /// pin, so nothing is lost by the change: `walk_within` is never reached
+    /// with a NUL-bearing string from either public entry point any more,
+    /// because both refuse one first.
     #[test]
-    fn embedded_nul_does_not_disguise_a_traversal_component() {
+    fn a_nul_bearing_name_or_symlink_target_is_refused_before_the_filesystem_sees_it() {
         let dest = Path::new("/tmp/out");
-        // A NUL-poisoned segment that merely CONTAINS ".." is still classified
-        // Normal, not ParentDir, because classification is exact-string
-        // equality — a null-byte injection buys the attacker nothing here.
-        assert_eq!(
-            super::safe_join(dest, "safe.txt\0..").unwrap(),
-            dest.join("safe.txt\0..")
-        );
-        // Nor can a poisoned segment hide a REAL `..` component in a
-        // different `/`-separated position: each segment is classified on
-        // its own regardless of what a sibling segment contains.
-        assert!(super::safe_join(dest, "a\0/../../etc/passwd").is_err());
+        for name in ["safe.txt\0..", "a\0/../../etc/passwd", "zt\0ee\0a.txt"] {
+            match super::safe_join(dest, name) {
+                Err(Error::UnsafePath { path, reason }) => {
+                    assert_eq!(path, name);
+                    assert!(
+                        // The second shape holds a genuine `..` component as
+                        // well, and either refusal is correct for it — what
+                        // must never happen is an `Ok`.
+                        reason == "entry name contains a NUL byte"
+                            || reason == "path traversal above the destination",
+                        "unexpected reason for {name:?}: {reason}"
+                    );
+                }
+                other => panic!("expected UnsafePath for {name:?}, got {other:?}"),
+            }
+        }
+        // The sibling door: a symlink TARGET reaches `symlink(2)`, which
+        // rejects an interior NUL the same way `File::create` does.
+        match super::check_symlink_target(dest, &dest.join("sub/link"), "tar\0get") {
+            Err(Error::UnsafePath { path, reason }) => {
+                assert_eq!(path, "tar\0get");
+                assert_eq!(reason, "symlink target contains a NUL byte");
+            }
+            other => panic!("expected UnsafePath, got {other:?}"),
+        }
     }
 
     /// The Phase 2 final review's I1. `sub/top -> ..` is a symlink pointing

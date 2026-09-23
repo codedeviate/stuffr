@@ -621,6 +621,15 @@ EXTRACTING AN ARCHIVE'S ENTRIES
   named `.` or `./` IS accepted: it names the destination directory itself,
   and it is the first entry `tar cf x.tar .` emits.
 
+  An entry name (or symlink target) containing a NUL byte is refused there
+  too, at the same exit 7, and it is worth knowing because it is not an
+  attack — it is what a zeroed run inside an ordinary name looks like after
+  corruption. It used to reach the filesystem instead, which rejects an
+  interior NUL, and `unpack` then ended at exit 1: the code reserved for
+  stuffr itself having failed, on a name the archive chose. `list` and
+  `test` still exit 0 on such an archive, because neither turns a name into
+  a path; `salvage` skips just that entry and recovers the rest.
+
   A symlink whose target resolves TO the destination is accepted too, for
   the same reason: `sub/top -> ..` points at the extraction root, and the
   root is inside the root. One step further out (`sub/top -> ../..`) is an
