@@ -186,8 +186,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.3.0` | Phase 2c and its follow-ups — write-side composition (`pack -o bundle.tar.gz` in one pass) and directory walking, so the read/write symmetry claim becomes true for archives; plus entry selection by index (`list`'s index column, `cat --index`, `unpack --index`), `list` reporting fidelity and gaining `--strict-fidelity`, the declaration of zip central-directory records shadowed by a duplicate name, and the guard refusing a pack that would replace a good archive with an empty one. |
 | `0.4.0` | Phase 3a–3b — the fuzzing harness, the honesty oracle and the exit-code corrections it found, plus three read-only legacy formats (`compress`, `lha`, `arj`), each proven against the fixture-driven conformance harness Phase 3b's Task 1 introduced for read-only containers. |
 | `0.5.0` | Salvage Stage 1 — the `salvage` verb and zip's central-directory recovery scan (`SalvageScan`, `Candidate`, `SalvageStatus`, `salvage_all`), reversing Phase 2's "declared, not recovered" ruling for zip: the shadowed-record parse that ruling declined to build now serves recovery, not only `list`'s warning. |
-| `0.6.0` (next) | Salvage Stage 2 — legacy scanners (ARC first), and the per-entry salvage seam that came with them. A MINOR, not a `0.5.x` patch: `0.5.0` is PUBLISHED (crates.io, 2026-09-17) and Stage 2 breaks its `stuffr-core::salvage` API — `collect_candidates`/`annotate_candidates` both change signature, `UnverifiedCause` and `SalvageDisposition` both gain variants. Cargo reads a `0.x` middle number as the major, so a break to a published `0.5.0` cannot ship as `0.5.x`. |
-| `0.6.x`/later | Remaining Salvage stages (a `Complete` tier genuinely exercised by tar/cpio/ar, not only zip) and Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
+| `0.6.0` | Salvage Stage 2 — four more salvage scanners (`arc`, `zoo`, `lha`, `arj`, joining `zip`), dispatch by resolved archive format, the shared `stream_verify` both CRC widths go through, and the per-entry write seam that came with them. A MINOR, not a `0.5.x` patch: `0.5.0` is PUBLISHED (crates.io, 2026-09-17) and Stage 2 breaks its `stuffr-core::salvage` API — `collect_candidates`/`annotate_candidates` both change signature, `UnverifiedCause` and `SalvageDisposition` both gain variants, `PartialCause::Truncated` is NARROWED and `DecodeFailed` added beside it, and `Candidate`/`SalvagedEntry`/`SalvageOutcome` are closed with `#[non_exhaustive]` plus constructors. Cargo reads a `0.x` middle number as the major, so a break to a published `0.5.0` cannot ship as `0.5.x`. |
+| `0.7.x`/later | Salvage Stage 3 (`tar`, `cpio`, `ar` — the three where a false positive is undetectable by construction, and the only place a `Complete` tier is genuinely reachable) and Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -285,6 +285,20 @@ so the next release is `0.6.0`. **Check crates.io, never a sentence in this
 repository**: this is the second versioning argument a stale in-repo
 publication claim has misled (see `CLAUDE.md`'s Ruling P for the first).
 
+**The `0.6.0` row then LANDED rather than being revised**, and that
+distinction is worth stating because every entry above it is a revision.
+The row was written ahead of the work, as a claim about what Stage 2 would
+break; when Stage 2 shipped it broke MORE than the row predicted
+(`PartialCause::Truncated` narrowed and `DecodeFailed` added beside it in
+`36c964d`, and two further `!`-marked commits, `5b57cb9` and `0a98c45`,
+reshaping the same `stuffr-core::salvage` surface), so the row was widened
+to say what actually shipped — the same treatment `0.3.0`'s row got, for the
+same reason, and not a renumbering. The number it predicted was already
+right, and was re-argued from the diff rather than inherited: see
+`CLAUDE.md`'s Versioning section for that argument and for the dated
+reverse-dependency measurement behind it. The `0.5.x`/later row moved on to
+`0.7.x`, since `0.6.0` is now spent.
+
 After 1.0, normal semver applies: breaking changes to any public API in
 `stuffr-core` or the `stuffr` facade require a major bump.
 
@@ -366,13 +380,72 @@ on `stuffr-core` (crates.io reverse-dependency API, verified 2026-09-16), and
 none enabling `testing`; a later release cannot assume the same, which is why
 the check is dated wherever it is recorded.
 
+### The third shape: constructed downstream, through OUR constructor
+
+The rule above has two answers — open (downstream constructs) and closed
+(downstream only destructures) — and Salvage needed a third, because
+`stuffr-core::salvage`'s `Candidate` is a struct downstream MUST construct
+and MUST NOT be broken by a new field. `SalvageScan::next_candidate` returns
+`Result<Option<Candidate>>`, so every out-of-crate scanner builds one; five
+do inside this workspace and, since `0.5.0` is published, an external one is
+no longer hypothetical. Under the open rule, each field Stage 2 added broke
+all of them at once.
+
+`#[non_exhaustive]` **alone** would have been the wrong fix, for exactly the
+reason the capability structs stay open: it forbids `..` construction from
+another crate, and `..Default::default()` is what an implementor would have
+reached for. It only works **paired with a constructor the defining crate
+owns** — the `ExpectedEntry::new`/`with_crc` shape, scaled up. So
+`Candidate` carries `#[non_exhaustive]` plus `Candidate::new(offset,
+payload_start, meta)` and four `with_*` setters, `SalvagedEntry` carries
+`SalvagedEntry::new(..)` plus three, and `SalvageOutcome` carries the
+attribute with no constructor at all (nothing outside this crate builds
+one — `salvage_all` does).
+
+**That is why the change waited.** It was raised as Ruling S-I in Stage 2
+Task 1 and deliberately deferred to Task 9: designing a constructor for a
+trait's return type from ONE caller guesses at the shape, and four more
+scanners (`arc`, `zoo`, `lha`, `arj`) were due to land. All five now read
+through it, with whichever fields a scanner does not set defaulting to the
+answers that assert the least (no declared length, nothing to verify with,
+nothing missing, nothing deleted).
+
+**The opposite call, on the same day, for `stuffr::entries::PartialCause`:
+it stays OPEN, deliberately.** It is an enum, so "enums carry it" would seem
+to settle it — but `stuffr-cli` matches it exhaustively to render each cause
+as its own words (`Partial (truncated)`, `Partial (decode failed)`, `Partial
+(checksum mismatch)`), and that is the whole reason the enum exists.
+`#[non_exhaustive]` would force a wildcard arm there, and a future variant
+would then print another cause's words with nothing failing to say so —
+turning a compile error into a wrong sentence on a user's terminal. That is
+the same trade as `Rung` and `StreamPolicy` in the section below: a closed
+domain where an exhaustive `match` downstream is the point rather than the
+hazard. `36c964d` added a variant to it in this very release and paid the
+breaking change knowingly.
+
 ### Which enums are open, which are closed
 
-"Enums carry it" above is not quite universal either: four public enums —
-`Rung`, `StreamPolicy`, `FormatKind`, `SpillPolicy` — do **not** carry
-`#[non_exhaustive]`, deliberately. The distinction is whether the enum names
-an open-ended set that formats will keep adding to, or a closed domain fixed
-by the crate's own design:
+"Enums carry it" above is not quite universal either. This paragraph said
+"four public enums" until Salvage Stage 2's own release measured it; the
+figure is **fourteen**, across `stuffr-core` and the facade, and the command
+that answers it is worth keeping because the sentence went stale once
+already:
+
+```bash
+find crates/stuffr-core/src crates/stuffr/src -name '*.rs' | sort | while read f; do
+  awk -v F="$f" '/^#\[non_exhaustive\]/{ne=1}
+                 /^pub enum /{printf "%s %s %s\n", (ne?"CLOSED":"OPEN"), F, $3}
+                 /^pub (struct|enum|fn)/{ne=0}' "$f"
+done | grep OPEN
+```
+
+(It reads only the two crates whose types other crates consume, and only
+top-level `pub enum`s, which is where the question arises. `find` rather
+than a `src/*.rs` glob: `SpillPolicy` lives in `src/source/spill.rs`, and a
+flat glob misses it — which is how the old count was short by more than the
+salvage enums alone.) The distinction
+is whether the enum names an open-ended set that formats will keep adding
+to, or a closed domain fixed by the crate's own design:
 
 - **Open — carry the attribute.** `Error`, `Fidelity`, `EntryKind`, `Chain`.
   Each is expected to grow as formats are added: `EntryKind` gains
@@ -388,6 +461,19 @@ by the crate's own design:
   - `StreamPolicy`, `SpillPolicy` — user-facing choices, where an exhaustive
     `match` in a caller (e.g. a CLI flag mapping) is desirable rather than a
     hazard: the point is that the caller sees every option there is.
+  - `PartialCause`, `SalvageStatus`, `UnverifiedCause`, `SalvageDisposition`,
+    `PartialPolicy`, `Verifier` — the salvage vocabulary, and the same
+    reasoning as `StreamPolicy` one bullet up, sharpened by what `stuffr-cli`
+    does with them. It renders each one as its OWN words on a `salvage
+    --list` row, so an exhaustive `match` is how a new cause is guaranteed
+    to arrive with a sentence rather than inheriting a neighbour's under a
+    wildcard. `36c964d` added `PartialCause::DecodeFailed` in `0.6.0` and
+    paid the breaking change knowingly; see "The third shape" above for the
+    full argument, and for the opposite call made the same day on
+    `Candidate`.
+  - `CorruptionDetection`, `Selection`, `Input`, `Output` — closed for the
+    same reason: each is a fixed set the crate's own design fixes, and each
+    is matched exhaustively by a consumer that must handle every arm.
 
 A closed enum can still gain variants later, but doing so is a deliberate,
 documented redesign — the same bar `0.y.0` milestones already clear — not the

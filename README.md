@@ -9,6 +9,58 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
+> **Status: Salvage Stage 2 is complete at `0.6.0` — `stuffr salvage` now
+> covers FIVE formats: `zip`, `arc`, `zoo`, `lha` and `arj`.** Each finds its
+> own records by scanning for them, so an archive whose index, main header or
+> one damaged entry costs the ordinary reader everything behind it still
+> gives up what it holds. LHA and ARJ are the sharpest cases: LHA carries no
+> index, no entry count and no trailer, so one bad header ends `list` for
+> every entry behind it, and an ARJ archive opens with a main header the
+> reader must parse before it hands back a single entry — two damaged bytes
+> there and `stuffr list` exits 5 over a file whose every entry is intact.
+> `salvage` finds each header on its own in both. **`tar`, `cpio` and `ar`
+> are deliberately NOT here**, and that is a design decision rather than a
+> backlog item: none of the three records a per-entry checksum, so a
+> plausible-looking header found mid-payload cannot be told from a real one
+> by any evidence the format carries — a false positive is undetectable by
+> construction. They are Stage 3's problem, and they are the only place
+> `SalvageStatus::Complete` ("every declared byte was present, and the format
+> offers nothing to check them against") can honestly be reached: **no
+> registered format reaches it today**, because all five salvageable ones
+> carry a checksum and answer `Intact` or `Partial` instead.
+>
+> Two user-visible changes on archives that already exist. First, `salvage
+> --list` no longer calls an intact-length archive truncated: `Partial
+> (truncated)` now means the archive FILE is shorter than the entry's own
+> header declares, and a new `Partial (decode failed)` means every declared
+> byte is present and did not yield the declared content. Each names
+> something different to do about it — find a longer copy, or accept that the
+> bytes you have are damaged. Measured before the fix, with one flipped byte
+> mid-payload and every declared byte present on disk: ZOO's `lzd` and LHA's
+> `-lh5-` said `truncated` while ARC's Squeezed and ZOO's `-lh5-` said
+> `checksum mismatch`, for identical damage — the difference being only
+> whether that codec's decoder survives to the end of the stream, which is
+> not a fact about the archive. Second, one entry can no longer end a
+> run: an entry over the size ceiling, and an entry the filesystem refuses to
+> write, are both per-entry outcomes on their own row now, where either used
+> to abort the archive and take every recovered entry with it — in the one
+> verb whose whole purpose is not losing things.
+>
+> A ZOO note worth carrying, because a future reader meeting `unarc-rs` will
+> meet the wrong number: **ZOO's fixed directory-entry record is 56 bytes,
+> not the 59 that crate models.** `zoo.h`'s `SIZ_DIRL` is 56; 59 is reached
+> by three separate modelling errors that happen to cancel (`var_dir_len` as
+> a `u8`, `dir_crc` as a `u32`, and `namlen`/`dirlen` pulled into the fixed
+> part). A reader built on 59 computes every payload position three bytes
+> late and tolerates three bytes of genuine truncation on *every* archive.
+> Verified three ways, including by reading a real fixture with no stuffr in
+> the loop: the record's own `offset` field says 116, the 56-byte model
+> computes 116 and the 59-byte model 119. See
+> `crates/stuffr-formats/src/legacy/zoo.rs`'s module doc for all five
+> measurements. **1371** tests under `--all-features`, **1306** on the
+> default tier — measured from this bump's own `make check`, `GATE_EXIT=0`,
+> never carried forward.
+>
 > **Status: Salvage Stage 1 is complete at `0.5.0` — `stuffr salvage`
 > recovers what a damaged zip's raw local-header scan can prove, even where
 > its central directory alone would show less.** `list`, `cat`, `unpack` and
@@ -595,7 +647,7 @@ stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a p
 stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
 stuffr formats                             # capability matrix for THIS build
 stuffr test     ARCHIVE                    # integrity check, no extraction
-stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha; scan position, not list's index
+stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha/arj; scan position, not list's index
 stuffr convert  IN -o OUT                  # recompress without staging to disk
 stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
 ```
