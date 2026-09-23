@@ -722,6 +722,36 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   Scanners exist for: zip, arc, zoo, lha, arj.
 
+  HOW MUCH TO TRUST AN `Intact` ROW IS NOT THE SAME ANSWER FOR EACH.
+  `Intact` always means the same thing mechanically — this build decoded
+  the entry's payload and it agreed with the checksum the archive carries.
+  What differs is how much evidence outside this project stands behind the
+  code that read it, and `salvage` exists to tell you which recovered
+  bytes you can rely on, so the difference belongs here rather than only
+  in the source:
+
+    * arc and zoo — strongest. Their test archives are a borrowed corpus,
+      and the checksum in each archive's own header was computed by a
+      DOS-era archiver decades ago with no knowledge of stuffr. Agreeing
+      with that number is genuinely independent evidence.
+
+    * lha — strong. Checked against `lhasa`, a live external decoder
+      sharing no code with the reader used here.
+
+    * arj — stuffr alone. No `arj` or `unarj` binary is obtainable on any
+      platform in reach, so the test archive, the reader, the writer, the
+      salvage scanner and the checksum comparison are all stuffr's reading
+      of an unofficial specification plus one Rust crate's parser. A
+      misreading shared between those two leaves every test in this
+      project green. It has never been checked against an implementation
+      that was not ours. Treat an `Intact` arj row as this build's best
+      reading rather than a second opinion, and keep the damaged original
+      where the bytes matter.
+
+  zip is not in that list because it needs no such caveat: it is checked
+  against Info-ZIP on this machine and in CI, and the whole world writes
+  it.
+
   tar, cpio and ar have none, and that is a decision rather than a gap
   waiting to be filled. None of the three records a checksum for an
   entry, so a header-shaped run of bytes found in the middle of some

@@ -64,6 +64,27 @@ read list.
 > neither turns a name into a path — and `salvage` skips that one entry and
 > recovers the rest, at 7 where it used to report 4.
 >
+> **How much to trust a recovered entry is not the same answer for all five
+> formats, and the difference is worth knowing before you rely on one.** An
+> `Intact` row means this build decoded the entry's payload and it agreed
+> with the checksum the archive carries. What differs is how much
+> independent evidence stands behind the code that read it:
+>
+> * **ARC and ZOO — strongest.** Their fixtures are a borrowed corpus, and
+>   the CRC in each archive's own header was computed by a DOS-era archiver
+>   decades ago with no knowledge of this project. Agreeing with that number
+>   is genuinely independent evidence.
+> * **LHA — strong.** Checked against `lhasa`, a live external decoder that
+>   shares no code with the `delharc` reader used here.
+> * **ARJ — this project alone.** No `arj` or `unarj` binary is obtainable
+>   on any platform in reach, so the fixture, the reader, the encoder, the
+>   salvage scanner and the CRC-32 comparison are all stuffr's reading of an
+>   unofficial specification plus one Rust crate's parser. A misreading
+>   shared between those two leaves every test in this repository green. It
+>   has never been checked against an implementation that was not ours.
+>   Treat an `Intact` ARJ row as this build's best reading, not as a second
+>   opinion; where the bytes matter, keep the damaged original.
+>
 > A ZOO note worth carrying, because a future reader meeting `unarc-rs` will
 > meet the wrong number: **ZOO's fixed directory-entry record is 56 bytes,
 > not the 59 that crate models.** `zoo.h`'s `SIZ_DIRL` is 56; 59 is reached
