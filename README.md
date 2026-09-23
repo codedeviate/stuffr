@@ -84,6 +84,14 @@ read list.
 >   has never been checked against an implementation that was not ours.
 >   Treat an `Intact` ARJ row as this build's best reading, not as a second
 >   opinion; where the bytes matter, keep the damaged original.
+> * **zip — strong, and differently evidenced from the other four.** Its
+>   scanner is checked against Info-ZIP's own `unzip`/`zip -FF`, and the
+>   comparison found `zip -FF` fabricating bytes on a truncated archive —
+>   copying a central-directory record from elsewhere in the same file into
+>   a payload that no longer exists, reporting success. stuffr writes the
+>   genuine surviving prefix as `NAME.partial` instead and never invents.
+>   So zip's evidence is a live external tool, like LHA's, rather than a
+>   decades-old checksum like ARC's and ZOO's.
 >
 > A ZOO note worth carrying, because a future reader meeting `unarc-rs` will
 > meet the wrong number: **ZOO's fixed directory-entry record is 56 bytes,

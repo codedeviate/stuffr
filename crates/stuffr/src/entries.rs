@@ -1600,6 +1600,17 @@ pub struct SalvageOutcome {
 /// destination at all in report-only mode) rather than anything wrong with
 /// the archive or the recovery — so selecting fewer entries, or only ever
 /// listing, must never by itself turn a clean run into exit 4.
+///
+/// **An archive this scan found nothing in reports 5, and a legitimately
+/// EMPTY archive is caught by that too.** The whole-branch review raised it
+/// and it is parked rather than fixed, with the reason recorded here because
+/// nowhere else survives: telling the two apart means a second, independent
+/// reader pass *inside the recovery verb*, across all five formats, to
+/// establish that an archive genuinely declares zero entries rather than
+/// having had them destroyed. Answering 0 without that pass is the worse
+/// error — it would report a destroyed archive as clean, in the one verb
+/// whose entire purpose is not losing things quietly. A valid empty archive
+/// meeting `salvage` is a real but harmless misreport; the reverse is not.
 pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
     if outcome.entries.is_empty() {
         return 5;
