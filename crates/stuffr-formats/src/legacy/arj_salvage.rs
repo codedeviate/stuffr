@@ -1323,7 +1323,23 @@ pub fn write_payload(
     // the reason the entry is `Partial` in the first place).
     let truncated = readable_len < compressed_len;
 
-    let expected = entry.meta.size.unwrap_or(0);
+    // NOT `unwrap_or(0)` — the final whole-branch review's F7. With
+    // `expected == 0`, `stream_bounded_copy` returns `Ok(true)` having
+    // written nothing, so a fallback that ever fired would report the entry
+    // `Written` at exit 0 with a zero-byte file: the declared-vs-produced
+    // lie this project refuses everywhere else, arrived at through a
+    // default. Unreachable today — this scanner sets `meta.size`
+    // unconditionally — which is exactly why the honest spelling costs
+    // nothing: it names the broken invariant instead of inventing a length,
+    // the same shape `entries::place_salvaged_file` already uses for a
+    // missing `compressed_size`.
+    let Some(expected) = entry.meta.size else {
+        return Err(Error::Corrupt(format!(
+            "entry `{}` carries no declared uncompressed size; this scanner sets one for \
+             every candidate, so its own invariant does not hold for this entry",
+            entry.meta.name
+        )));
+    };
     if method.allocates_from_original_size()
         && !matches!(entry.meta.kind, EntryKind::Dir)
         && (expected > MAX_ARJ_ENTRY_LEN || readable_len > MAX_ARJ_ENTRY_LEN)

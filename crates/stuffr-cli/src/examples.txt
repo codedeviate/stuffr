@@ -929,7 +929,11 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   stuffr salvage broken.zip -C out/ --strict
       Demands proof: every Partial entry is skipped regardless of
-      --partial, and nothing this build cannot verify is ever written.
+      --partial. That is ALL it does, stated precisely because the wording
+      here used to add "and nothing this build cannot verify is ever
+      written" — true, but not this flag's doing: an Unverified entry is
+      never written under any policy, with or without --strict. Nor does
+      --strict fix the ceiling; --max-entry is honoured either way.
       Salvage's own strict path, applied on request rather than by default
       — unlike the rest of this tool, where uncompromising IS the default
       and salvage is the one exception.

@@ -547,7 +547,23 @@ pub struct SalvagePolicy {
     /// format that decodes an entry whole; the two compose as a minimum and
     /// are applied together, once, in [`annotate_candidates`].
     pub max_entry: u64,
-    /// Demand proof: partial skipped, ceiling fixed, nothing unverifiable.
+    /// Demand proof: every [`SalvageStatus::Partial`] entry is skipped,
+    /// whatever [`Self::partial`] says.
+    ///
+    /// **That is the whole of it, and this doc claimed three things until
+    /// the final whole-branch review's F5.** It read "partial skipped,
+    /// ceiling fixed, nothing unverifiable", and only the first clause was
+    /// this flag's doing. The ceiling is NOT fixed under `strict`:
+    /// [`Self::max_entry`] applies identically with and without it, and
+    /// `--max-entry` is honoured either way. And an
+    /// [`SalvageStatus::Unverified`] entry is never written under any
+    /// policy at all — that is the ops layer's unconditional rule, not
+    /// something `strict` causes — so crediting it here made a flag look
+    /// load-bearing for a guarantee that holds without it.
+    ///
+    /// The one true clause is enough to justify the flag: `salvage` is this
+    /// tool's single recovery-biased verb, so `strict` is how a caller asks
+    /// for the discipline every other verb applies by default.
     pub strict: bool,
 }
 
