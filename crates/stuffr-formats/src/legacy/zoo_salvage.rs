@@ -273,6 +273,22 @@ impl SalvageScan for ZooSalvage {
     fn verify(&self, src: &mut dyn SeekRead, candidate: &Candidate) -> Result<SalvageStatus> {
         verify_candidate(src, candidate)
     }
+
+    /// The write half of this scanner's seam, declared beside the scan half
+    /// (final whole-branch review, F2). Delegates to this module's own free
+    /// [`write_payload`], which is still `pub` and is what `entries.rs`'s
+    /// dispatch and this module's tests both reach — the method exists so
+    /// the trait DECLARES a scanner's write path rather than leaving it to
+    /// a private `match` on a format name.
+    fn write_payload(
+        &self,
+        archive_path: &std::path::Path,
+        entry: &SalvagedEntry,
+        compressed_len: u64,
+        out: &mut dyn std::io::Write,
+    ) -> Result<bool> {
+        write_payload(archive_path, entry, compressed_len, out)
+    }
 }
 
 /// Searches forward from `from` for the next four-byte [`TAG_BYTES`] match,

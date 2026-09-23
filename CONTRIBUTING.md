@@ -186,7 +186,7 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.3.0` | Phase 2c and its follow-ups — write-side composition (`pack -o bundle.tar.gz` in one pass) and directory walking, so the read/write symmetry claim becomes true for archives; plus entry selection by index (`list`'s index column, `cat --index`, `unpack --index`), `list` reporting fidelity and gaining `--strict-fidelity`, the declaration of zip central-directory records shadowed by a duplicate name, and the guard refusing a pack that would replace a good archive with an empty one. |
 | `0.4.0` | Phase 3a–3b — the fuzzing harness, the honesty oracle and the exit-code corrections it found, plus three read-only legacy formats (`compress`, `lha`, `arj`), each proven against the fixture-driven conformance harness Phase 3b's Task 1 introduced for read-only containers. |
 | `0.5.0` | Salvage Stage 1 — the `salvage` verb and zip's central-directory recovery scan (`SalvageScan`, `Candidate`, `SalvageStatus`, `salvage_all`), reversing Phase 2's "declared, not recovered" ruling for zip: the shadowed-record parse that ruling declined to build now serves recovery, not only `list`'s warning. |
-| `0.6.0` | Salvage Stage 2 — four more salvage scanners (`arc`, `zoo`, `lha`, `arj`, joining `zip`), dispatch by resolved archive format, the shared `stream_verify` both CRC widths go through, and the per-entry write seam that came with them. A MINOR, not a `0.5.x` patch: `0.5.0` is PUBLISHED (crates.io, 2026-09-17) and Stage 2 breaks its `stuffr-core::salvage` API — `collect_candidates`/`annotate_candidates` both change signature, `UnverifiedCause` and `SalvageDisposition` both gain variants, `PartialCause::Truncated` is NARROWED and `DecodeFailed` added beside it, and `Candidate`/`SalvagedEntry`/`SalvageOutcome` are closed with `#[non_exhaustive]` plus constructors. Cargo reads a `0.x` middle number as the major, so a break to a published `0.5.0` cannot ship as `0.5.x`. |
+| `0.6.0` | Salvage Stage 2 — four more salvage scanners (`arc`, `zoo`, `lha`, `arj`, joining `zip`), dispatch by resolved archive format, the shared `stream_verify` both CRC widths go through, and the per-entry write seam that came with them. A MINOR, not a `0.5.x` patch: `0.5.0` is PUBLISHED (crates.io, 2026-09-17) and Stage 2 breaks its `stuffr-core::salvage` API — `collect_candidates`/`annotate_candidates` both change signature, `UnverifiedCause` and `SalvageDisposition` both gain variants, `PartialCause::Truncated` is NARROWED and `DecodeFailed` added beside it, and `Candidate`/`SalvagedEntry`/`SalvageOutcome` are closed with `#[non_exhaustive]` plus constructors. Cargo reads a `0.x` middle number as the major, so a break to a published `0.5.0` cannot ship as `0.5.x`. The final fix wave adds to that set: `SalvageDisposition` gains a further variant (`SkippedUnsafePath` — a containment refusal is a per-entry outcome now, not a run abort), `SalvageScan` gains a `write_payload` method (defaulted, so additive for an implementor), `stuffr-formats::salvage_verify` becomes a `pub mod` so `stream_verify` is reachable at all, and `safe_join`/`check_symlink_target` refuse a NUL-bearing name at exit 7 where it used to reach the filesystem and exit 1. |
 | `0.7.x`/later | Salvage Stage 3 (`tar`, `cpio`, `ar` — the three where a false positive is undetectable by construction, and the only place a `Complete` tier is genuinely reachable) and Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
@@ -409,6 +409,26 @@ scanners (`arc`, `zoo`, `lha`, `arj`) were due to land. All five now read
 through it, with whichever fields a scanner does not set defaulting to the
 answers that assert the least (no declared length, nothing to verify with,
 nothing missing, nothing deleted).
+
+**And the extension point protected here has to actually be reachable, or
+the whole argument is spent on nothing.** The final whole-branch review
+found it was not: `Verifier` was public and the only thing that turns one
+plus a reader into a `SalvageStatus` — `salvage_verify::stream_verify` —
+was `pub(crate)` in a **private** module, so an out-of-tree scanner had to
+reimplement a streaming CRC-16/ARC and CRC-32 comparison to reach the
+statuses `SalvageStatus` describes. That module is `pub` now, and
+`SalvageScan` carries a defaulted `write_payload` so a scanner's write half
+is declared beside its scan half rather than living only in the ops layer's
+private dispatch. `crates/stuffr-formats/tests/salvage_seam.rs` implements a
+sixth scanner from the published surface alone — an INTEGRATION test, so
+everything it touches has to be genuinely `pub`.
+
+**One half is still open and is Stage 3's, stated here rather than left
+implied:** `stuffr salvage` resolves a format NAME to a scanner, with no
+registration point a third party can add itself to, so an out-of-tree
+scanner reaches `salvage_all` and none of `.partial` naming, `NAME.salvaged-N`
+disambiguation, containment or `salvage_exit_code`. Closing that means a
+salvage registry.
 
 **The opposite call, on the same day, for `stuffr::entries::PartialCause`:
 it stays OPEN, deliberately.** It is an enum, so "enums carry it" would seem

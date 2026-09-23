@@ -44,6 +44,22 @@
 //! (`state == expected`) — and getting that backwards is exactly the shape
 //! Step 6's falsification exists to catch.
 //!
+//! # Public, because a sixth scanner cannot be written without it
+//!
+//! The final whole-branch review's F2. `0.6.0` spends a real breaking
+//! release specifically to make [`stuffr_core::salvage::SalvageScan`]
+//! implementable from outside — `Candidate` and `SalvagedEntry` closed with
+//! `#[non_exhaustive]` and constructors, a whole "third shape" section in
+//! `CONTRIBUTING.md` arguing for it — and then left the one thing that
+//! turns a public [`Verifier`] into a public [`SalvageStatus`] behind a
+//! `pub(crate)` fn in a private module. An outside scanner had to reimplement
+//! a streaming CRC-16/ARC and CRC-32 comparison to reach the statuses the
+//! public enum describes, which is the opposite of an open seam.
+//!
+//! This module is now `pub` and [`stream_verify`] with it. Nothing else
+//! here is: `crc32_ieee_update` is an implementation detail of the Crc32
+//! arm, and publishing a CRC table is not what the gap was about.
+//!
 //! # Why this lives in `stuffr-formats`, not `stuffr-core`
 //!
 //! `stuffr-core` carries zero format dependencies (see this crate's own
@@ -80,7 +96,7 @@ const VERIFY_CHUNK: usize = 64 * 1024;
 /// `verify_candidate` documents (salvage exists to recover as much of a
 /// damaged archive as it can; a caller-visible `Err` here would abort the
 /// entire run over one bad entry).
-pub(crate) fn stream_verify(
+pub fn stream_verify(
     mut reader: impl Read,
     expected_len: u64,
     verifier: &Verifier,

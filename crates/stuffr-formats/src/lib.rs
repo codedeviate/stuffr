@@ -243,7 +243,7 @@ pub mod zip_salvage;
     feature = "lha",
     feature = "arj"
 ))]
-mod salvage_verify;
+pub mod salvage_verify;
 #[cfg(feature = "zlib")]
 pub mod zlib;
 #[cfg(feature = "zstd-c")]

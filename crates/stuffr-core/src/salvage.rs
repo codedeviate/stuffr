@@ -78,9 +78,10 @@
 //! rather than a [`crate::Error`] anywhere.
 
 use std::io::{Read, Write};
+use std::path::Path;
 
 use crate::archive::EntryMeta;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::source::SeekRead;
 
 /// 4 GiB. A scanned length is untrustworthy TWICE over — attacker-controlled
@@ -637,6 +638,60 @@ pub trait SalvageScan {
     /// compare it against [`Candidate::verifier`].
     fn verify(&self, _src: &mut dyn SeekRead, _candidate: &Candidate) -> Result<SalvageStatus> {
         Ok(SalvageStatus::Complete)
+    }
+
+    /// Decode one salvaged entry's payload out of the archive at
+    /// `archive_path` and into `out`, answering whether the entry's whole
+    /// declared length was produced.
+    ///
+    /// # Why this is on the trait at all (final whole-branch review, F2)
+    ///
+    /// `0.6.0` spends a breaking release making this trait implementable
+    /// from outside. It was implementable and not USABLE: the ops layer's
+    /// payload dispatch was a private `match` on a [`crate::FormatId`]
+    /// string, so a scanner written outside this workspace got
+    /// [`salvage_all`] and none of the behaviour that makes `salvage` what
+    /// it is. This method is where a scanner's write half now DECLARES
+    /// itself, beside the scan half, in one place a reader can see both.
+    ///
+    /// **It does not by itself make an out-of-tree scanner reachable from
+    /// `stuffr salvage`, and pretending otherwise would be the same
+    /// over-claim F2 named.** The ops layer still resolves a format to a
+    /// scanner by name, with no registration point for a third party to add
+    /// one; closing that needs a salvage registry and is Stage 3's. What
+    /// changed is that the seam is now declared rather than scattered — the
+    /// five in-tree scanners implement this method and the ops layer calls
+    /// it, so the next one has a signature to fit rather than a convention
+    /// to guess.
+    ///
+    /// # The contract
+    ///
+    /// `Ok(true)` means every declared byte was produced; `Ok(false)` means
+    /// the payload ran short or the decoder stopped early, which the caller
+    /// renders as a `.partial` write. **`Err` is reserved for the same
+    /// narrow set [`Self::verify`] reserves it for** — with one addition
+    /// the ops layer relies on: [`crate::Error::Io`] here is treated as a
+    /// fact about THIS entry (the archive could not be re-opened or read
+    /// for it, the destination refused the bytes) and folded into that
+    /// entry's own outcome, never the run's. A size refusal is never an
+    /// `Err`: it belongs to [`Self::max_whole_entry`], which the engine
+    /// applies before `verify` is ever called.
+    ///
+    /// The default refuses. A scanner that only ever reports
+    /// [`SalvageStatus::Unverified`] has nothing to write, and inheriting a
+    /// refusal is the honest answer for it; the alternative — a required
+    /// method — would be a breaking change to every implementation for no
+    /// gain to one that cannot write anything anyway.
+    fn write_payload(
+        &self,
+        _archive_path: &Path,
+        _entry: &SalvagedEntry,
+        _compressed_len: u64,
+        _out: &mut dyn Write,
+    ) -> Result<bool> {
+        Err(Error::Unsupported(
+            "this salvage scanner has no payload writer".to_string(),
+        ))
     }
 }
 

@@ -2317,13 +2317,20 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// list the fuzz corpus generator and `entries::salvage`'s own dispatch
 /// table are checked against elsewhere) must reach a real per-format arm
 /// here, never this function's own fallback — so the NEXT scanner task
-/// that forgets this half fails a test rather than shipping silently. A
-/// `SalvageScan::write_payload` trait method would make this a compile
-/// error instead and was considered; deferred rather than taken mid-phase,
-/// since it would have had to land ahead of the scanners (lha in Task 5, arj
-/// in Task 6) whose shapes it would have to fit. All five now exist, so a
-/// later stage can make the change against real shapes rather than
-/// anticipated ones.
+/// that forgets this half fails a test rather than shipping silently.
+///
+/// `SalvageScan::write_payload` now EXISTS (final whole-branch review, F2)
+/// and every arm below calls it, so a scanner's write half is declared on
+/// the trait beside its scan half rather than only in this private table.
+/// **That does not make this table redundant and does not make the guard
+/// above unnecessary**, which is worth stating rather than leaving a reader
+/// to assume the seam closed more than it did: the method has a DEFAULT
+/// implementation (a refusal), deliberately, so a scanner that forgets to
+/// override it still compiles — and this table still resolves a format NAME
+/// to a scanner type, with no registration point an out-of-tree scanner
+/// could add itself to. Making the omission a compile error means a
+/// REQUIRED trait method; making an out-of-tree scanner reachable from
+/// `stuffr salvage` at all means a salvage registry. Both are Stage 3's.
 fn write_salvaged_payload(
     format: FormatId,
     archive_path: &Path,
@@ -2331,15 +2338,28 @@ fn write_salvaged_payload(
     compressed_len: u64,
     out: &mut dyn Write,
 ) -> Result<bool> {
+    // Every arm below reaches its format's writer through
+    // `SalvageScan::write_payload` rather than the free function beside it
+    // (final whole-branch review, F2). The call is identical — each trait
+    // impl delegates to that same free function — and the point is that the
+    // seam a sixth scanner implements is the seam this layer actually
+    // calls, rather than a trait method nothing in-tree exercises. The
+    // scanners are constructed here and dropped immediately because none of
+    // the five carries write-side state; `LhaSalvage`'s `seen` is scan-side
+    // only.
+    use stuffr_core::salvage::SalvageScan as _;
     match format.as_str() {
         #[cfg(feature = "zip")]
-        "zip" => {
-            stuffr_formats::zip_salvage::write_payload(archive_path, entry, compressed_len, out)
-        }
+        "zip" => stuffr_formats::zip_salvage::ZipSalvage::new().write_payload(
+            archive_path,
+            entry,
+            compressed_len,
+            out,
+        ),
         #[cfg(not(feature = "zip"))]
         "zip" => Err(Error::FormatNotEnabled(FormatId::new("zip"))),
         #[cfg(feature = "arc")]
-        "arc" => stuffr_formats::legacy::arc_salvage::write_payload(
+        "arc" => stuffr_formats::legacy::arc_salvage::ArcSalvage::new().write_payload(
             archive_path,
             entry,
             compressed_len,
@@ -2348,7 +2368,7 @@ fn write_salvaged_payload(
         #[cfg(not(feature = "arc"))]
         "arc" => Err(Error::FormatNotEnabled(FormatId::new("arc"))),
         #[cfg(feature = "zoo")]
-        "zoo" => stuffr_formats::legacy::zoo_salvage::write_payload(
+        "zoo" => stuffr_formats::legacy::zoo_salvage::ZooSalvage::new().write_payload(
             archive_path,
             entry,
             compressed_len,
@@ -2357,7 +2377,7 @@ fn write_salvaged_payload(
         #[cfg(not(feature = "zoo"))]
         "zoo" => Err(Error::FormatNotEnabled(FormatId::new("zoo"))),
         #[cfg(feature = "lha")]
-        "lha" => stuffr_formats::legacy::lha_salvage::write_payload(
+        "lha" => stuffr_formats::legacy::lha_salvage::LhaSalvage::new().write_payload(
             archive_path,
             entry,
             compressed_len,
@@ -2366,7 +2386,7 @@ fn write_salvaged_payload(
         #[cfg(not(feature = "lha"))]
         "lha" => Err(Error::FormatNotEnabled(FormatId::new("lha"))),
         #[cfg(feature = "arj")]
-        "arj" => stuffr_formats::legacy::arj_salvage::write_payload(
+        "arj" => stuffr_formats::legacy::arj_salvage::ArjSalvage::new().write_payload(
             archive_path,
             entry,
             compressed_len,
