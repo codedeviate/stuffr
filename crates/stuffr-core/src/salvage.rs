@@ -102,7 +102,26 @@ pub enum Verifier {
 }
 
 /// A record a scanner believes it found, before anything is decoded.
+///
+/// # Why this is `#[non_exhaustive]` AND has a constructor
+///
+/// Ruling S-I, deferred from Salvage Stage 2 Task 1 to Task 9 on purpose:
+/// this struct is the one shape [`SalvageScan::next_candidate`] *forces* an
+/// external implementor to build, so every field added to it used to break
+/// every out-of-crate scanner at once — and at `0.5.0` all four crates are
+/// published, so "out-of-crate" is not hypothetical. The attribute alone
+/// would have been the wrong fix (`CONTRIBUTING.md`'s `#[non_exhaustive]`
+/// section says why: it forbids `..` construction from another crate, which
+/// is exactly what an implementor must do), which is why it waited for
+/// [`Candidate::new`] — and for all five in-tree scanners to exist, so the
+/// constructor's shape could be read off real callers rather than guessed.
+///
+/// The three arguments [`Candidate::new`] takes are the three facts every
+/// scanner knows the instant it recognises a record. The four `with_*`
+/// setters cover the rest, each taking the field's own type unchanged so
+/// nothing is hidden behind a conversion.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct Candidate {
     /// Byte offset of the record's header in the archive.
     pub offset: u64,
@@ -191,6 +210,76 @@ pub struct Candidate {
     /// `stuffr::entries`'s own exit-code aggregation, which this field is
     /// invisible to.
     pub marked_deleted: bool,
+}
+
+impl Candidate {
+    /// A candidate at `offset`, whose payload begins at `payload_start`,
+    /// carrying `meta`.
+    ///
+    /// Nothing else is claimed. The four fields this does not take default
+    /// to the answers that assert the least:
+    ///
+    /// * `declared_len: None` — the header carries no length, so nothing
+    ///   bounds the payload and [`annotate_candidates`] reports
+    ///   [`UnverifiedCause::NoDeclaredLength`] rather than reading it.
+    /// * `verifier: None` — the format offers nothing to prove the content
+    ///   with, so no shadow is ever claimed for this record (see
+    ///   [`SalvagedEntry::shadows`], which needs a verifier to compare).
+    /// * `available_len: None` — every declared byte is present, which is
+    ///   the ordinary case; a scanner sets this only when it has MEASURED a
+    ///   shortfall.
+    /// * `marked_deleted: false` — the format has no deleted flag, or this
+    ///   record is not marked. Four of the five in-tree scanners leave it.
+    ///
+    /// One default is worth naming because it is the lenient direction, not
+    /// the strict one: with no `verifier`, [`SalvageScan::verify`]'s own
+    /// default answers [`SalvageStatus::Complete`]. That is correct for a
+    /// format with no checksum at all and wrong for one that has a checksum
+    /// this scanner forgot to report — but a scanner carrying a checksum has
+    /// to write its own `verify` regardless (the default checks nothing),
+    /// and that `verify` reads this very field, so the omission fails in the
+    /// scanner's own first test rather than silently.
+    pub fn new(offset: u64, payload_start: u64, meta: EntryMeta) -> Self {
+        Self {
+            offset,
+            payload_start,
+            meta,
+            declared_len: None,
+            verifier: None,
+            available_len: None,
+            marked_deleted: false,
+        }
+    }
+
+    /// Sets [`Self::declared_len`].
+    #[must_use]
+    pub fn with_declared_len(mut self, declared_len: Option<u64>) -> Self {
+        self.declared_len = declared_len;
+        self
+    }
+
+    /// Sets [`Self::verifier`].
+    #[must_use]
+    pub fn with_verifier(mut self, verifier: Option<Verifier>) -> Self {
+        self.verifier = verifier;
+        self
+    }
+
+    /// Sets [`Self::available_len`] — the truncated-tail case, and only
+    /// when the shortfall was measured. See that field's doc for why a
+    /// scanner must never fold it into [`Self::declared_len`] instead.
+    #[must_use]
+    pub fn with_available_len(mut self, available_len: Option<u64>) -> Self {
+        self.available_len = available_len;
+        self
+    }
+
+    /// Sets [`Self::marked_deleted`] — Ruling S-R. See that field's doc.
+    #[must_use]
+    pub fn with_marked_deleted(mut self, marked_deleted: bool) -> Self {
+        self.marked_deleted = marked_deleted;
+        self
+    }
 }
 
 /// Why an entry is [`SalvageStatus::Unverified`].
@@ -308,7 +397,14 @@ pub enum SalvageStatus {
 }
 
 /// One entry the scan recovered.
+///
+/// `#[non_exhaustive]` plus [`SalvagedEntry::new`], for the same reason
+/// [`Candidate`] carries both — see that type's own doc. This one is built
+/// by [`annotate_candidates`] in ordinary use, but every per-format scanner
+/// crate builds one directly to drive its `write_payload` seam, so the
+/// literal it used to need was an out-of-crate literal all the same.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SalvagedEntry {
     /// This entry's position in SCAN order — not an index any container's
     /// own format assigns, and never renumbered by what `list` would show.
@@ -364,10 +460,70 @@ pub struct SalvagedEntry {
     pub marked_deleted: bool,
 }
 
+impl SalvagedEntry {
+    /// An entry at scan position `scan_position`, found at `offset`, whose
+    /// payload begins at `payload_start`, carrying `meta` and proven to
+    /// `status`.
+    ///
+    /// The three fields this does not take default to "nothing was
+    /// observed": no shadow, no name collision, not marked deleted. All
+    /// three are annotations [`annotate_candidates`] adds (or, for
+    /// `marked_deleted`, carries forward from [`Candidate`]), so a caller
+    /// building one directly — every per-format `write_payload` test does —
+    /// wants exactly those defaults.
+    pub fn new(
+        scan_position: usize,
+        offset: u64,
+        payload_start: u64,
+        meta: EntryMeta,
+        status: SalvageStatus,
+    ) -> Self {
+        Self {
+            scan_position,
+            offset,
+            payload_start,
+            meta,
+            status,
+            shadows: None,
+            collides_with: None,
+            marked_deleted: false,
+        }
+    }
+
+    /// Sets [`Self::shadows`] — the byte-identical duplicate, and only
+    /// that. See the field's own doc for what separates it from
+    /// [`Self::collides_with`].
+    #[must_use]
+    pub fn with_shadows(mut self, shadows: Option<usize>) -> Self {
+        self.shadows = shadows;
+        self
+    }
+
+    /// Sets [`Self::collides_with`] — the weaker, name-only annotation.
+    #[must_use]
+    pub fn with_collides_with(mut self, collides_with: Option<usize>) -> Self {
+        self.collides_with = collides_with;
+        self
+    }
+
+    /// Sets [`Self::marked_deleted`], carried forward from
+    /// [`Candidate::marked_deleted`] rather than measured here.
+    #[must_use]
+    pub fn with_marked_deleted(mut self, marked_deleted: bool) -> Self {
+        self.marked_deleted = marked_deleted;
+        self
+    }
+}
+
 /// The result of a scan: every entry the scanner recovered, in scan order.
 ///
-/// Later tasks may extend this struct; the `entries` field stays public.
+/// Later tasks may extend this struct; the `entries` field stays public,
+/// and `#[non_exhaustive]` is what makes "extend" honest. No constructor is
+/// paired with it, unlike [`Candidate`] and [`SalvagedEntry`]: this struct
+/// is built by [`salvage_all`] alone, in this crate, and no scanner — in
+/// this workspace or outside it — has any reason to build one.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SalvageOutcome {
     pub entries: Vec<SalvagedEntry>,
 }
@@ -700,16 +856,19 @@ pub fn annotate_candidates(
             names_seen.push((candidate.meta.name.clone(), scan_position));
         }
 
-        entries.push(SalvagedEntry {
-            scan_position,
-            offset: candidate.offset,
-            payload_start: candidate.payload_start,
-            meta: candidate.meta,
-            status,
-            shadows,
-            collides_with,
-            marked_deleted: candidate.marked_deleted,
-        });
+        let marked_deleted = candidate.marked_deleted;
+        entries.push(
+            SalvagedEntry::new(
+                scan_position,
+                candidate.offset,
+                candidate.payload_start,
+                candidate.meta,
+                status,
+            )
+            .with_shadows(shadows)
+            .with_collides_with(collides_with)
+            .with_marked_deleted(marked_deleted),
+        );
     }
 
     Ok(SalvageOutcome { entries })
@@ -1478,5 +1637,64 @@ mod tests {
             Some(0),
             "but the name repeats, which needs no verifier to observe"
         );
+    }
+
+    /// Ruling S-I. `Candidate` is `#[non_exhaustive]`, so an out-of-crate
+    /// scanner reaches it only through `new` plus the `with_*` setters —
+    /// which means the DEFAULTS are now public API, not an implementation
+    /// detail of six struct literals. Each of the four must assert the
+    /// least: nothing declared, nothing to verify with, nothing missing,
+    /// nothing deleted.
+    #[test]
+    fn a_new_candidate_claims_nothing_it_was_not_told() {
+        let c = Candidate::new(7, 42, EntryMeta::file("probe"));
+        assert_eq!(c.offset, 7);
+        assert_eq!(c.payload_start, 42);
+        assert_eq!(c.declared_len, None, "no length was declared");
+        assert_eq!(c.verifier, None, "nothing can prove the content");
+        assert_eq!(
+            c.available_len, None,
+            "a shortfall is MEASURED, never assumed"
+        );
+        assert!(!c.marked_deleted, "no record is deleted until one says so");
+    }
+
+    /// The four setters are the only route to those fields from another
+    /// crate, so each one is pinned rather than trusted to the compiler.
+    #[test]
+    fn each_candidate_setter_reaches_its_own_field() {
+        let c = Candidate::new(0, 0, EntryMeta::file("probe"))
+            .with_declared_len(Some(9))
+            .with_verifier(Some(Verifier::Crc16(0xbeef)))
+            .with_available_len(Some(4))
+            .with_marked_deleted(true);
+        assert_eq!(c.declared_len, Some(9));
+        assert_eq!(c.verifier, Some(Verifier::Crc16(0xbeef)));
+        assert_eq!(c.available_len, Some(4));
+        assert!(c.marked_deleted);
+    }
+
+    /// Same ruling, same reason, for the type every per-format
+    /// `write_payload` test builds directly. Its three defaults are the
+    /// annotations `annotate_candidates` adds, so an entry built by hand
+    /// must carry none of them.
+    #[test]
+    fn a_new_salvaged_entry_carries_no_annotations() {
+        let e = SalvagedEntry::new(3, 7, 42, EntryMeta::file("probe"), SalvageStatus::Complete);
+        assert_eq!(e.scan_position, 3);
+        assert_eq!(e.offset, 7);
+        assert_eq!(e.payload_start, 42);
+        assert_eq!(e.status, SalvageStatus::Complete);
+        assert_eq!(e.shadows, None);
+        assert_eq!(e.collides_with, None);
+        assert!(!e.marked_deleted);
+
+        let annotated = SalvagedEntry::new(0, 0, 0, EntryMeta::file("p"), SalvageStatus::Intact)
+            .with_shadows(Some(1))
+            .with_collides_with(Some(2))
+            .with_marked_deleted(true);
+        assert_eq!(annotated.shadows, Some(1));
+        assert_eq!(annotated.collides_with, Some(2));
+        assert!(annotated.marked_deleted);
     }
 }

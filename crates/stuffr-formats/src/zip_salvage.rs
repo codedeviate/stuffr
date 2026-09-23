@@ -513,18 +513,15 @@ fn read_candidate_at(
     meta.kind = kind;
     meta.codec = codec_for_method(method);
 
-    Ok(Some(Candidate {
-        offset,
-        payload_start,
-        meta,
-        declared_len,
-        verifier,
-        available_len,
-        // ZIP has no deleted flag at all — see
-        // `Candidate::marked_deleted`'s own doc for why that is a plain
-        // `false` rather than an `Option`.
-        marked_deleted: false,
-    }))
+    // `marked_deleted` is left at `Candidate::new`'s `false`: ZIP has no
+    // deleted flag at all — see `Candidate::marked_deleted`'s own doc for
+    // why that is a plain `false` rather than an `Option`.
+    Ok(Some(
+        Candidate::new(offset, payload_start, meta)
+            .with_declared_len(declared_len)
+            .with_verifier(verifier)
+            .with_available_len(available_len),
+    ))
 }
 
 /// Whether a local header's "version needed to extract" field is one the
@@ -930,18 +927,15 @@ fn candidate_from_cd_record(
     // of it, which this function only touches at all to confirm the magic.
     meta.codec = codec_for_method(record.method);
 
-    Ok(Some(Candidate {
-        offset: record.local_header_offset,
-        payload_start,
-        meta,
-        declared_len: Some(record.compressed_size),
-        verifier: Some(Verifier::Crc32(record.crc32)),
-        available_len,
-        // ZIP has no deleted flag at all — see
-        // `Candidate::marked_deleted`'s own doc for why that is a plain
-        // `false` rather than an `Option`.
-        marked_deleted: false,
-    }))
+    // `marked_deleted` is left at `Candidate::new`'s `false`: ZIP has no
+    // deleted flag at all — see `Candidate::marked_deleted`'s own doc for
+    // why that is a plain `false` rather than an `Option`.
+    Ok(Some(
+        Candidate::new(record.local_header_offset, payload_start, meta)
+            .with_declared_len(Some(record.compressed_size))
+            .with_verifier(Some(Verifier::Crc32(record.crc32)))
+            .with_available_len(available_len),
+    ))
 }
 
 #[cfg(test)]

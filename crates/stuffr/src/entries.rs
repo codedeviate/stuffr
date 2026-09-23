@@ -5286,16 +5286,8 @@ mod salvage_seam_tests {
             // `archive_path` first — so a path that does not exist is safe
             // to use, and the two failure messages are trivially
             // distinguishable from each other.
-            let entry = SalvagedEntry {
-                scan_position: 0,
-                offset: 0,
-                payload_start: 0,
-                meta: EntryMeta::file("probe"),
-                status: SalvageStatus::Complete,
-                shadows: None,
-                collides_with: None,
-                marked_deleted: false,
-            };
+            let entry =
+                SalvagedEntry::new(0, 0, 0, EntryMeta::file("probe"), SalvageStatus::Complete);
             let err = write_salvaged_payload(
                 format,
                 Path::new("/nonexistent-salvage-seam-probe"),

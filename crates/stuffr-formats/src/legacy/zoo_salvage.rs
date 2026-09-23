@@ -440,18 +440,16 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
     meta.mtime = zoo_mtime(header.packed_datetime);
     meta.codec = codec_for_zoo_method(header.method_byte);
 
-    Some(Candidate {
-        offset,
-        payload_start,
-        meta,
-        declared_len: Some(declared),
-        verifier: Some(Verifier::Crc16(header.crc16)),
-        available_len,
-        // Ruling S-R. Reported, not dropped — and ANNOTATED, which is the
-        // half a review had to add: see this module's own section below and
-        // `Candidate::marked_deleted`'s doc.
-        marked_deleted: header.deleted,
-    })
+    Some(
+        Candidate::new(offset, payload_start, meta)
+            .with_declared_len(Some(declared))
+            .with_verifier(Some(Verifier::Crc16(header.crc16)))
+            .with_available_len(available_len)
+            // Ruling S-R. Reported, not dropped — and ANNOTATED, which is
+            // the half a review had to add: see this module's own section
+            // below and `Candidate::marked_deleted`'s doc.
+            .with_marked_deleted(header.deleted),
+    )
 }
 
 /// Decides [`SalvageStatus`] for one candidate by re-reading its record,
@@ -1592,22 +1590,19 @@ mod tests {
         // be built here — `zoo.rs` has no encoder.
         let path = temp_archive(&[0u8; 64], "write-ceiling");
 
-        let entry = SalvagedEntry {
-            scan_position: 0,
-            offset: 0,
-            payload_start: 0,
-            meta: {
+        let entry = SalvagedEntry::new(
+            0,
+            0,
+            0,
+            {
                 let mut m = EntryMeta::file("BIG.LH5");
                 m.codec = codec_for_zoo_method(2); // the arm that allocates
                 m.size = Some(u64::from(ABSURD_SIZE));
                 m.compressed_size = Some(8);
                 m
             },
-            status: SalvageStatus::Partial,
-            shadows: None,
-            collides_with: None,
-            marked_deleted: false,
-        };
+            SalvageStatus::Partial,
+        );
 
         let mut sink: Vec<u8> = Vec::new();
         let (result, largest) = crate::alloc_probe::largest_single_allocation(|| {
@@ -1643,22 +1638,19 @@ mod tests {
         let path = temp_archive(&[0u8; 64], "write-under-ceiling");
         let modest = 64 * 1024u32;
 
-        let entry = SalvagedEntry {
-            scan_position: 0,
-            offset: 0,
-            payload_start: 0,
-            meta: {
+        let entry = SalvagedEntry::new(
+            0,
+            0,
+            0,
+            {
                 let mut m = EntryMeta::file("SMALL.LH5");
                 m.codec = codec_for_zoo_method(2);
                 m.size = Some(u64::from(modest));
                 m.compressed_size = Some(8);
                 m
             },
-            status: SalvageStatus::Partial,
-            shadows: None,
-            collides_with: None,
-            marked_deleted: false,
-        };
+            SalvageStatus::Partial,
+        );
 
         let mut sink: Vec<u8> = Vec::new();
         let (result, largest) = crate::alloc_probe::largest_single_allocation(|| {

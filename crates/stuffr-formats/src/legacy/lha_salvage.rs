@@ -1400,20 +1400,19 @@ fn read_candidate_at(
     meta.mtime = header.mtime;
     meta.codec = Some(header.method.codec());
 
-    Some(Candidate {
-        offset,
-        // Computed ONCE, here, with `checked_add` throughout — see
-        // `Candidate::payload_start`'s own doc for why no consumer may
-        // re-derive it from `offset`.
-        payload_start: header.payload_start,
-        meta,
-        declared_len: Some(declared),
-        verifier: Some(Verifier::Crc16(header.file_crc)),
-        available_len,
-        // LHA has no deleted flag at all — see `Candidate::marked_deleted`'s
-        // own doc for why that is a plain `false` rather than an `Option`.
-        marked_deleted: false,
-    })
+    // `payload_start` is computed ONCE, at discovery, with `checked_add`
+    // throughout — see `Candidate::payload_start`'s own doc for why no
+    // consumer may re-derive it from `offset`.
+    //
+    // `marked_deleted` is left at `Candidate::new`'s `false`: LHA has no
+    // deleted flag at all — see `Candidate::marked_deleted`'s own doc for
+    // why that is a plain `false` rather than an `Option`.
+    Some(
+        Candidate::new(offset, header.payload_start, meta)
+            .with_declared_len(Some(declared))
+            .with_verifier(Some(Verifier::Crc16(header.file_crc)))
+            .with_available_len(available_len),
+    )
 }
 
 /// A `Read` over `delharc`'s all-or-nothing [`Decoder::fill_buffer`],
@@ -3224,16 +3223,7 @@ mod tests {
     /// exist.
     #[test]
     fn write_payload_refuses_a_codec_less_entry_without_opening_the_archive() {
-        let entry = SalvagedEntry {
-            scan_position: 0,
-            offset: 0,
-            payload_start: 0,
-            meta: EntryMeta::file("probe"),
-            status: SalvageStatus::Complete,
-            shadows: None,
-            collides_with: None,
-            marked_deleted: false,
-        };
+        let entry = SalvagedEntry::new(0, 0, 0, EntryMeta::file("probe"), SalvageStatus::Complete);
         let err = write_payload(
             Path::new("/nonexistent-lha-salvage-probe"),
             &entry,

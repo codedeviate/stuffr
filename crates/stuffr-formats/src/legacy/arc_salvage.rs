@@ -303,17 +303,15 @@ fn read_candidate_at(
     // for zip's `codec_for_method`, and an ARC candidate never populated it.
     meta.codec = codec_for_arc_method(record[0]);
 
-    Ok(Some(Candidate {
-        offset,
-        payload_start,
-        meta,
-        declared_len: Some(compressed_size),
-        verifier: Some(Verifier::Crc16(header.crc16)),
-        available_len,
-        // ARC has no deleted flag — `arc.rs`'s `ArcHeader` carries no such
-        // field. See `Candidate::marked_deleted`'s own doc.
-        marked_deleted: false,
-    }))
+    // `marked_deleted` is left at `Candidate::new`'s `false`: ARC has no
+    // deleted flag — `arc.rs`'s `ArcHeader` carries no such field. See
+    // `Candidate::marked_deleted`'s own doc.
+    Ok(Some(
+        Candidate::new(offset, payload_start, meta)
+            .with_declared_len(Some(compressed_size))
+            .with_verifier(Some(Verifier::Crc16(header.crc16)))
+            .with_available_len(available_len),
+    ))
 }
 
 /// Maps an ARC method byte to the [`FormatId`] [`EntryMeta::codec`] carries
@@ -1271,22 +1269,19 @@ mod tests {
         ));
         std::fs::write(&path, &bytes).unwrap();
 
-        let entry = SalvagedEntry {
-            scan_position: 0,
-            offset: 0,
-            payload_start: 1 + HEADER_LEN as u64,
-            meta: {
+        let entry = SalvagedEntry::new(
+            0,
+            0,
+            1 + HEADER_LEN as u64,
+            {
                 let mut m = EntryMeta::file("BIG.BIN");
                 m.codec = codec_for_arc_method(1);
                 m.size = Some(100);
                 m.compressed_size = Some(10_000);
                 m
             },
-            status: SalvageStatus::Partial,
-            shadows: None,
-            collides_with: None,
-            marked_deleted: false,
-        };
+            SalvageStatus::Partial,
+        );
 
         let mut sink: Vec<u8> = Vec::new();
         let result = write_payload_bounded(&path, &entry, 10_000, &mut sink, 50);
