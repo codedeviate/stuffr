@@ -56,6 +56,43 @@
 //! what `SynthZ` writes, and GNU `uncompress` decodes them byte-exactly.
 //! Reach for the crate as an oracle anywhere else; not there.
 //!
+//! ## A frozen dictionary's slot is not a code — and at `maxbits == 9` the
+//! stream can name it
+//!
+//! `free_ent` is the NEXT dictionary slot to be assigned, and
+//! [`LzwZReader::advance_running`] only ever assigns one while
+//! `free_ent < maxmaxcode`. So the moment `free_ent` reaches `maxmaxcode` the
+//! dictionary has FROZEN: slot `free_ent` will never be written, and no
+//! conforming encoder can emit a code naming it — this module's own
+//! [`LzwEncoder::push_byte`] stops learning pairs under the identical
+//! condition. **Every valid code is therefore `< maxmaxcode`**, which is also
+//! exactly the length of the `prefix`/`suffix` tables.
+//!
+//! The KwKwK guard admits `code == free_ent` by design, and at every
+//! `maxbits >= 10` that is harmless because such a code is not even
+//! REPRESENTABLE: the width settles at `n_bits == maxbits`, so the largest
+//! code the bit stream can carry is `maxmaxcode - 1`. `maxbits == 9` is the
+//! sole exception, for the reason [`synth_z`]'s doc sets out at length —
+//! `INIT_BITS == maxbits == 9`, so the `n_bits == maxbits` cap never fires and
+//! the width widens to **10** once the 512 entries are used up (correct, and
+//! externally confirmed against BSD `compress -b 9` + GNU `uncompress`). A
+//! 10-bit stream can carry 512, the guard let it through, and `code = oldcode`
+//! then latched 512 into `oldcode` — so a SECOND such code walked the
+//! unwinding loop with `code == 512` and indexed a 512-long table out of
+//! bounds. Measured on the 602-byte input the scheduled deep fuzz run's
+//! `chain` target found: `index out of bounds: the len is 512 but the index is
+//! 512`, exit 101 from `stuffr list`, `test` and `cat` alike — a panic, which
+//! is the one shape `stuffr_core::testing::check_error_is_classified` can
+//! never see, so the target aborted instead of reporting.
+//!
+//! `advance_running` now refuses `code >= maxmaxcode` outright. That is the
+//! GUARD being wrong rather than the table being too small: widening the
+//! tables would invent a 513th entry no encoder can ever define and no
+//! decoder can ever populate. It is `Error::Corrupt` (exit 5), not
+//! `ResourceLimit` (exit 6), per `stuffr_core::Error::exit_code`'s own rule —
+//! nothing was allocated or declined; the bytes were read and contradict
+//! themselves, and no larger machine changes that.
+//!
 //! ## Truncation: no error, but never garbage — measured, not assumed
 //!
 //! `CodecCaps::truncation_undetectable` is set for this codec, and it needed
@@ -717,10 +754,32 @@ impl<R: Read> LzwZReader<R> {
         if code > dict.free_ent {
             return Err(invalid_data("invalid LZW code in stream"));
         }
+        // The check above deliberately admits `code == free_ent` — the KwKwK
+        // case — and that is a real dictionary slot only while the dictionary
+        // is still growing. Once it has frozen (`free_ent == maxmaxcode`) the
+        // slot will never be assigned, and at `maxbits == 9` alone the code
+        // width has widened to 10 bits, so the stream can actually carry that
+        // value. See the module doc's "A frozen dictionary's slot is not a
+        // code" for the measurement and for why this is the guard's mistake
+        // and not the tables'.
+        if code >= dict.maxmaxcode {
+            return Err(invalid_data(
+                "invalid LZW code in stream (names a slot the frozen dictionary will never hold)",
+            ));
+        }
         if code == dict.free_ent {
             dict.stack.push(dict.finchar);
             code = dict.oldcode;
         }
+        // Both arms above leave `code` inside the tables: `incode` passed the
+        // guard, and `oldcode` is only ever assigned from a code that did (or
+        // from a literal below 256). This is the invariant the unwinding loop
+        // indexes on, stated where it is relied upon.
+        debug_assert!(
+            code < dict.maxmaxcode,
+            "unwinding loop entered with code {code} outside a {}-entry dictionary",
+            dict.maxmaxcode
+        );
         while code >= 256 {
             dict.stack.push(dict.suffix[code as usize]);
             code = dict.prefix[code as usize];
@@ -1442,6 +1501,180 @@ mod tests {
              documents. It returned {} bytes instead; re-read this test if the pin moved.",
             oracle.map_or(0, |v| v.len())
         );
+    }
+
+    /// Emits a `.Z` stream carrying `codes` VERBATIM — no LZW matching, no
+    /// plaintext — so a test can hand the decoder a code the real encoder
+    /// would never produce.
+    ///
+    /// The bit packing, code widths and group alignment come from the
+    /// PRODUCTION encoder's own [`LzwEncoder::output`], the one
+    /// [`the_stream_synthesiser_matches_the_system_encoder_byte_for_byte`]
+    /// proves byte-exact against the real `compress` binary at four `maxbits`
+    /// — a hand-rolled bit writer here would be a second, unvalidated
+    /// implementation of exactly the rule under test.
+    ///
+    /// The one thing this must mirror by hand is WHEN the dictionary grows:
+    /// [`LzwZReader::advance_running`] learns one entry per code after the
+    /// first (which is a bare literal) and stops at `maxmaxcode`, and
+    /// `output`'s width check reads `free_ent` as it stands AFTER that
+    /// increment — hence the bump before the call, not after it.
+    fn synth_raw_codes(maxbits: u32, codes: &[u32]) -> Vec<u8> {
+        let (mut enc, header) = LzwEncoder::new(maxbits);
+        let mut out = header.to_vec();
+        for (i, &code) in codes.iter().enumerate() {
+            if i > 0 && enc.free_ent < enc.maxmaxcode {
+                enc.free_ent += 1;
+            }
+            enc.output(code, &mut out);
+        }
+        if enc.acc_bits > 0 {
+            let bytes = enc.acc_bits.div_ceil(8);
+            enc.flush_group(bytes, &mut out);
+        }
+        out
+    }
+
+    /// The literal-then-fill code sequence that drives `maxbits`'s dictionary
+    /// from its initial `CLEAR + 1` entries to exactly `maxmaxcode`, at which
+    /// point it freezes. `maxmaxcode - 256` codes: one bare literal, then one
+    /// per new entry.
+    fn codes_that_fill_the_dictionary(maxbits: u32) -> Vec<u32> {
+        vec![0u32; (1usize << maxbits) - 256]
+    }
+
+    /// Decodes with the raw reader so the test can read the dictionary state
+    /// the stream left behind, which the public `Codec::decoder` path hides.
+    fn decode_and_inspect(bytes: &[u8]) -> (io::Result<Vec<u8>>, u32, u32) {
+        let mut reader = LzwZReader::new(std::io::Cursor::new(bytes.to_vec()));
+        let mut out = Vec::new();
+        let result = reader.read_to_end(&mut out).map(|_| out);
+        let dict = reader.dict.as_ref().expect("header parsed");
+        (result, dict.free_ent, dict.n_bits)
+    }
+
+    /// Regression test for a CLI-reachable PANIC — `index out of bounds: the
+    /// len is 512 but the index is 512`, exit 101 from `stuffr list`, `test`
+    /// and `cat` alike — found by the scheduled deep fuzz run's `chain`
+    /// target on a 602-byte input beginning `1f 9d e9` (`maxbits == 9`).
+    ///
+    /// The stream here is the minimised equivalent, 294 bytes, built from the
+    /// codes rather than from the fuzzer's bytes so that every step of the
+    /// mechanism is stated rather than implied: fill the 512-entry dictionary
+    /// exactly, then emit code 512 twice. The first 512 used to pass the
+    /// KwKwK guard (`code == free_ent`) and latch itself into `oldcode`; the
+    /// second then entered the unwinding loop with `code == 512` and indexed
+    /// a 512-long table. See the module doc's "A frozen dictionary's slot is
+    /// not a code" for why the guard, and not the table size, was wrong.
+    ///
+    /// Asserting the CLASSIFIED error and not merely "does not panic" is the
+    /// point: a guard that turned the crash into a wrong answer would pass
+    /// the weaker assertion. The exit code is asserted here rather than
+    /// through a process spawn because `Error::exit_code` lives in
+    /// `stuffr-core` for exactly that reason — see its own doc comment, which
+    /// is also where the exit-5-versus-exit-6 rule this site follows is
+    /// written down once.
+    #[test]
+    fn a_code_naming_the_frozen_dictionarys_slot_is_corrupt_not_a_panic() {
+        let fill = codes_that_fill_the_dictionary(9);
+        let healthy = synth_raw_codes(9, &fill);
+
+        // The same stream WITHOUT the two offending codes must decode
+        // cleanly, or the test would be proving its own construction wrong
+        // rather than the decoder's guard.
+        let (decoded, free_ent, n_bits) = decode_and_inspect(&healthy);
+        assert_eq!(
+            decoded.expect("the dictionary-filling prefix is a valid maxbits=9 stream"),
+            vec![0u8; fill.len()]
+        );
+        assert_eq!(free_ent, 512, "the 512-entry dictionary must have frozen");
+        assert_eq!(n_bits, 10, "maxbits=9 widens to 10-bit codes once frozen");
+
+        let mut codes = fill.clone();
+        codes.push(512);
+        codes.push(512);
+        let packed = synth_raw_codes(9, &codes);
+        assert_eq!(packed.len(), 294);
+
+        let err = decompress(&packed)
+            .expect_err("a code naming the frozen dictionary's slot must be refused");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::InvalidData,
+            "malformed input must be reported as InvalidData, or it classifies as a full \
+             disk rather than a corrupt file — got {err}"
+        );
+        let classified = Error::from_decode_io(err);
+        assert!(
+            matches!(classified, Error::Corrupt(_)),
+            "expected Error::Corrupt, got {classified:?}"
+        );
+        assert_eq!(classified.exit_code(), 5);
+    }
+
+    /// The sibling-boundary sweep: a fix that closed `maxbits == 9` and left
+    /// 10 through 16 open would be the "fixed the named site" failure this
+    /// project has paid for repeatedly.
+    ///
+    /// What it measures, per width: the dictionary really does freeze at
+    /// `maxmaxcode`, and the code width it freezes AT decides whether the
+    /// stream can even carry `maxmaxcode` as a code. `maxbits == 9` is the
+    /// sole width where it can (`INIT_BITS == maxbits`, so the
+    /// `n_bits == maxbits` cap never fires and the width reaches 10); every
+    /// other width settles at `n_bits == maxbits`, whose largest code is
+    /// `maxmaxcode - 1` — a real, assigned entry, asserted here to still
+    /// decode rather than merely assumed unreachable.
+    #[test]
+    fn only_maxbits_9_can_represent_the_frozen_dictionarys_slot() {
+        for maxbits in INIT_BITS..=MAX_MAXBITS {
+            let maxmaxcode = 1u32 << maxbits;
+            let fill = codes_that_fill_the_dictionary(maxbits);
+            let (decoded, free_ent, n_bits) = decode_and_inspect(&synth_raw_codes(maxbits, &fill));
+            assert!(
+                decoded.is_ok(),
+                "maxbits={maxbits}: the dictionary-filling prefix must decode"
+            );
+            assert_eq!(
+                free_ent, maxmaxcode,
+                "maxbits={maxbits}: the dictionary must have frozen"
+            );
+            let widest = (1u32 << n_bits) - 1;
+
+            if maxbits == INIT_BITS {
+                assert_eq!(
+                    n_bits,
+                    maxbits + 1,
+                    "maxbits=9 is the width that overshoots"
+                );
+                assert!(widest >= maxmaxcode);
+                let mut codes = fill.clone();
+                codes.push(maxmaxcode);
+                codes.push(maxmaxcode);
+                let err = decompress(&synth_raw_codes(maxbits, &codes))
+                    .expect_err("maxbits=9: a code naming the frozen slot must be refused");
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(Error::from_decode_io(err).exit_code(), 5);
+            } else {
+                assert_eq!(
+                    n_bits, maxbits,
+                    "maxbits={maxbits}: the width must cap at maxbits"
+                );
+                assert_eq!(
+                    widest,
+                    maxmaxcode - 1,
+                    "maxbits={maxbits}: code {maxmaxcode} is not representable, which is \
+                     what keeps the frozen slot unreachable at this width"
+                );
+                let mut codes = fill.clone();
+                codes.push(widest);
+                codes.push(widest);
+                assert!(
+                    decompress(&synth_raw_codes(maxbits, &codes)).is_ok(),
+                    "maxbits={maxbits}: the largest representable code is the frozen \
+                     dictionary's LAST assigned entry and must still decode"
+                );
+            }
+        }
     }
 
     /// Before this test, NO test in the repo exercised the block-mode CLEAR
