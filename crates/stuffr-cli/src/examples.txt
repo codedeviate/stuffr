@@ -907,11 +907,11 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   `NAME.salvaged-N`, or any entry skipped for any other reason (a shadow,
   --partial=skip, a kind this build has no shape for, or a name this
   filesystem will not hold). 5 — the scan found
-  nothing recoverable in the archive at all, regardless of `--index`. 7 (a
-  hostile path escaping -C or -o) aborts the run outright, exactly as it
-  does for `unpack -C`, rather than being counted among the entries above.
-  Exit 6 no longer reaches `salvage` at all: an entry over --max-entry is
-  reported and skipped like any other, never allowed to end the run.
+  nothing recoverable in the archive at all, regardless of `--index`. 7 —
+  any entry refused by containment (a hostile path escaping -C or -o, an
+  empty entry name, a symlinked ancestor), which OUTRANKS every code above
+  it. Exit 6 no longer reaches `salvage` at all: an entry over --max-entry
+  is reported and skipped like any other, never allowed to end the run.
 
   An entry whose NAME the destination filesystem refuses — a component past
   its limit (255 bytes nearly everywhere), a name colliding with something
@@ -919,9 +919,22 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   on stderr as the run happens (`salvage -> N entries could not be
   written:`, then one line each), and tagged on its own --list row as
   `[not written: ...]`. It used to end the run at exit 1, losing every
-  entry after it, on a name the ARCHIVE chose. A name that would escape -C
-  is a different matter and still refuses outright at exit 7: not being able
-  to write a file here is not the same as not being allowed to.
+  entry after it, on a name the ARCHIVE chose.
+
+  A name that would escape -C is refused too, and NOTHING is ever written
+  under it — but since the final fix wave it is refused the same way: that
+  one entry is skipped with `[refused: unsafe entry path: ...]` on its row
+  and on stderr, every later record is still recovered, and the run's exit
+  code is 7. This text said the opposite for a whole phase ("aborts the run
+  outright, exactly as it does for `unpack -C`"), and that claim was made by
+  analogy rather than measured. `unpack` aborting is right, because it has
+  no per-entry vocabulary to report a refusal with. `salvage` does. On a
+  228-byte zip whose MIDDLE record simply has an empty name — one corrupted
+  length byte, not an attack — the old behaviour wrote the first entry,
+  stopped at exit 7, never attempted the third, and printed no summary at
+  all, while `--index 0 --index 2` recovered both. Not being able to write a
+  file here is still not the same as not being allowed to: the two are told
+  apart by the row's own wording and by the exit code.
 
 
 WHAT THIS BUILD CAN DO
@@ -1142,8 +1155,10 @@ EXIT CODES
      `salvage` entry over --max-entry: that is reported per entry as
      `Unverified (over the ceiling)` and lands in 3, because one
      oversized declaration must never cost a caller the rest of the archive
-  7  unsafe path refused (including a `salvage` entry whose name would
-     escape -C)
+  7  unsafe path refused. In a `salvage` run it is the entry that is
+     refused, never the run: the rest of the archive is still recovered
+     and the summary still prints, and 7 outranks 3 and 4 so a caller
+     scripting against a hostile archive still sees it
 
 
 NOT YET

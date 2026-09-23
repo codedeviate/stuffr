@@ -691,6 +691,7 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
         | entries::SalvageDisposition::SkippedShadow(_)
         | entries::SalvageDisposition::SkippedUnsupportedKind
         | entries::SalvageDisposition::SkippedUnwritable { .. }
+        | entries::SalvageDisposition::SkippedUnsafePath { .. }
         | entries::SalvageDisposition::NotSelected
         | entries::SalvageDisposition::NotWritten => describe_salvage_status(record.status),
     };
@@ -733,6 +734,14 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     // exit 1, on a name the ARCHIVE chose.
     if let entries::SalvageDisposition::SkippedUnwritable { reason } = &record.disposition {
         line.push_str(&format!(" [not written: {reason}]"));
+    }
+    // Final fix wave, F1: the same shape, for the refusal stuffr makes
+    // itself rather than the one the OS hands back. Worded "refused" rather
+    // than "not written" precisely so the two are distinguishable on a row:
+    // one is a destination that would not take the name, the other is this
+    // tool declining to write outside where it was pointed.
+    if let entries::SalvageDisposition::SkippedUnsafePath { reason } = &record.disposition {
+        line.push_str(&format!(" [refused: unsafe entry path: {reason}]"));
     }
     line
 }
@@ -794,12 +803,18 @@ fn print_salvage_list(entries: &[entries::SalvagedRecord]) -> stuffr::Result<()>
 /// by that: an unselected position is reported `NotSelected` and never
 /// reaches a filesystem call, so it can never be one of these.
 fn print_salvage_write_failures(entries: &[entries::SalvagedRecord]) {
+    // Final fix wave, F1: BOTH placement failures, not only the OS's. A
+    // containment refusal used to end the run with its own message on
+    // stderr, so widening this filter alongside that change is what keeps
+    // "nothing is silent" true — a refusal that became a row and nothing
+    // else would be NEW-G's defect reintroduced through the door F1 opened.
     let failed: Vec<&entries::SalvagedRecord> = entries
         .iter()
         .filter(|r| {
             matches!(
                 r.disposition,
                 entries::SalvageDisposition::SkippedUnwritable { .. }
+                    | entries::SalvageDisposition::SkippedUnsafePath { .. }
             )
         })
         .collect();
@@ -813,8 +828,14 @@ fn print_salvage_write_failures(entries: &[entries::SalvagedRecord]) {
         if failed.len() == 1 { "y" } else { "ies" }
     );
     for record in failed.iter().take(SHOWN) {
-        let entries::SalvageDisposition::SkippedUnwritable { reason } = &record.disposition else {
-            unreachable!("filtered above");
+        // One arm each, no wildcard: a third placement outcome added later
+        // must decide how it prints rather than inheriting a default.
+        let reason = match &record.disposition {
+            entries::SalvageDisposition::SkippedUnwritable { reason } => reason.clone(),
+            entries::SalvageDisposition::SkippedUnsafePath { reason } => {
+                format!("refused: unsafe entry path: {reason}")
+            }
+            other => unreachable!("filtered above, got {other:?}"),
         };
         eprintln!("  - #{} {}: {reason}", record.scan_position, record.name);
     }
@@ -858,7 +879,11 @@ fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
             // Counted as skipped, not as a bucket of its own: the summary's
             // six counts must keep summing to the number of rows, and the
             // per-entry reason is on the row (`[not written: …]`).
-            | entries::SalvageDisposition::SkippedUnwritable { .. } => skipped += 1,
+            | entries::SalvageDisposition::SkippedUnwritable { .. }
+            // Counted as skipped for the same reason, and the exit code —
+            // not the summary — is what carries the severity: a containment
+            // refusal is bucket 7 in `salvage_exit_code`, above every other.
+            | entries::SalvageDisposition::SkippedUnsafePath { .. } => skipped += 1,
             entries::SalvageDisposition::SkippedUnverified => unverified += 1,
             entries::SalvageDisposition::NotSelected => not_selected += 1,
             entries::SalvageDisposition::NotWritten => not_written += 1,
@@ -972,6 +997,12 @@ fn finish_single_file_recovery(
         | entries::SalvageDisposition::SkippedPartial(_)
         | entries::SalvageDisposition::SkippedUnsupportedKind
         | entries::SalvageDisposition::SkippedUnwritable { .. }
+        // Final fix wave, F1. Reached under `-o FILE` the same way every
+        // other skip is: `describe_salvage_row` names the refusal, and the
+        // run still exits 7 because `salvage_exit_code` gives this variant
+        // its own bucket — so `-o` on an escaping name reports exactly what
+        // it did before, minus the aborted run.
+        | entries::SalvageDisposition::SkippedUnsafePath { .. }
         | entries::SalvageDisposition::NotSelected
         | entries::SalvageDisposition::NotWritten => {
             eprintln!(

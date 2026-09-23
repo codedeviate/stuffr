@@ -41,10 +41,18 @@ read list.
 > `checksum mismatch`, for identical damage — the difference being only
 > whether that codec's decoder survives to the end of the stream, which is
 > not a fact about the archive. Second, one entry can no longer end a
-> run: an entry over the size ceiling, and an entry the filesystem refuses to
-> write, are both per-entry outcomes on their own row now, where either used
+> run: an entry over the size ceiling, an entry the filesystem refuses to
+> write, and an entry whose name stuffr's own containment refuses are all
+> per-entry outcomes on their own row now, where any of the three used
 > to abort the archive and take every recovered entry with it — in the one
-> verb whose whole purpose is not losing things.
+> verb whose whole purpose is not losing things. The containment case is the
+> last of the three to fall, closed in the final fix wave: a 228-byte zip
+> whose middle record simply has an empty name recovered the first entry,
+> stopped at exit 7, lost the third and printed no summary at all, while
+> `--index 0 --index 2` recovered both. **Nothing about the refusal itself
+> changed** — an escaping name is never written, and a run that meets one
+> still exits 7, which now outranks every other salvage exit code.
+
 >
 > A ZOO note worth carrying, because a future reader meeting `unarc-rs` will
 > meet the wrong number: **ZOO's fixed directory-entry record is 56 bytes,

@@ -9297,6 +9297,75 @@ fn salvage_default_run_recovers_and_reports_the_shadow_skips() {
     assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 6);
 }
 
+/// The final whole-branch review's F1 reproducer, driven through the real
+/// binary: a **228-byte** zip of three Stored local headers whose MIDDLE
+/// name is EMPTY — one corrupted length byte, the shape the reviewer hit
+/// from ordinary random corruption of a real `stuffr pack` output.
+///
+/// Before the final fix wave this printed one line — `stuffr: unsafe entry
+/// path `` refused: empty entry name` — exited 7 with only `first.txt` on
+/// disk, **never attempted `third.txt`, and printed no summary at all**,
+/// while `--index 0 --index 2` recovered both. The unit test beside
+/// `entries::salvage`'s own code pins the dispositions; this one exists
+/// because three of the four things that were wrong are only observable at
+/// the CLI: the summary line, the per-entry stderr line, and the exit code
+/// a script reads.
+#[test]
+fn salvage_recovers_past_an_entry_whose_name_containment_refuses() {
+    let dir = tmp_dir();
+    let mut bytes = Vec::new();
+    for (name, payload) in [
+        ("first.txt", &b"AAAAAAAAAA"[..]),
+        ("", &b"BBBBBBBBBB"[..]),
+        ("third.txt", &b"CCCCCCCCCC"[..]),
+    ] {
+        let rec = salvage_fixture_local_record(u32::try_from(bytes.len()).unwrap(), name, payload);
+        bytes.extend_from_slice(&rec.bytes);
+    }
+    let archive = dir.join("midbad.zip");
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let out_dir = dir.join("recovered");
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "the hostile-path contract is unchanged — the RUN still answers 7: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("third.txt")).unwrap(),
+        b"CCCCCCCCCC",
+        "the record AFTER the refused one is exactly what the old behaviour lost"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("first.txt")).unwrap(),
+        b"AAAAAAAAAA"
+    );
+    assert_eq!(
+        std::fs::read_dir(&out_dir).unwrap().count(),
+        2,
+        "and nothing at all is written for the refused entry"
+    );
+    assert!(
+        stderr.contains("3 scanned")
+            && stderr.contains("2 written")
+            && stderr.contains("1 skipped"),
+        "the summary must print — a run that returns Err never prints one, so a user was \
+         never told what WAS recovered: {stderr}"
+    );
+    assert!(
+        stderr.contains("empty entry name"),
+        "and the refusal must still be named, on stderr, every run: {stderr}"
+    );
+}
+
 /// A single Stored local record, with the method and CRC-32 field callers
 /// choose explicitly rather than derived from the payload — so a fixture
 /// can build a record whose declared checksum does not match what it holds

@@ -1379,20 +1379,21 @@ pub enum SalvageDisposition {
     /// a claim: for one round it was true only for the invocation nobody
     /// types. See `stuffr-cli`'s `print_salvage_write_failures`.
     ///
-    /// # The two things this fold deliberately does NOT cover
+    /// # The one thing this fold deliberately does NOT cover
     ///
-    /// Both end the run, and neither is an oversight. The commit that
+    /// It ends the run, and it is not an oversight. The commit that
     /// introduced this variant is subject-lined "never end a salvage run
     /// because one entry cannot be written", which is a claim about the
     /// WRITE path; read as a blanket guarantee it would be false, so the
-    /// two exceptions are stated here rather than left to be inferred.
+    /// exception is stated here rather than left to be inferred.
     ///
-    /// **Containment — `Error::UnsafePath`, exit 7.** A name escaping `dest`
-    /// still aborts, exactly as [`salvage`]'s own doc and `examples.txt`
-    /// promise. Refusing to write SOMEWHERE is a different decision from
-    /// failing to write HERE: one is about permission to act, the other
-    /// about the act failing. Pinned in both directions by
-    /// `salvage_tests::an_escaping_name_still_refuses_the_run_even_though_an_unwritable_one_does_not`.
+    /// **This section used to name TWO, and containment was the other.** A
+    /// name escaping `dest` aborted the run at exit 7; the final
+    /// whole-branch review measured what that cost and it is now
+    /// [`Self::SkippedUnsafePath`] — still refused, still exit 7 for the
+    /// run, but a per-entry outcome like every other. See that variant for
+    /// the reproducer and for why it is a sibling rather than a member of
+    /// this fold.
     ///
     /// **An `Intact` entry that decodes SHORT on write — `Error::Corrupt`,
     /// exit 5** (see [`place_salvaged_file`]'s closing arm). This one was
@@ -1421,6 +1422,66 @@ pub enum SalvageDisposition {
     /// scanner's `write_payload` — which is more than this round should
     /// spend to separate two cases that both mean "stop, the ground moved".
     SkippedUnwritable { reason: String },
+    /// Not written: **stuffr itself refused this entry's name** —
+    /// [`Error::UnsafePath`], raised by [`safe_join`] or
+    /// [`refuse_symlinked_ancestors`] before any filesystem call. The entry
+    /// escapes `dest`, names `dest` itself without being a directory, is
+    /// empty, or reaches through a symlinked ancestor. Nothing is written
+    /// under it, ever.
+    ///
+    /// # Why this is a skip and not a run abort (final fix wave, F1)
+    ///
+    /// It ended the whole run until this wave, and the cost was measured on
+    /// a **228-byte** zip holding three `Intact` records whose MIDDLE name
+    /// is empty — one corrupted length byte, not a traversal attempt, and
+    /// reachable from ordinary random corruption of a real `stuffr pack`
+    /// output rather than only from a crafted file:
+    ///
+    /// ```text
+    /// $ stuffr salvage midbad.zip --list
+    /// 0    Intact                           first.txt
+    /// 1    Intact
+    /// 2    Intact                           third.txt
+    /// exit=0
+    /// $ stuffr salvage midbad.zip -C out
+    /// stuffr: unsafe entry path `` refused: empty entry name
+    /// exit=7                      # out/ holds first.txt; third.txt is gone,
+    ///                             # and NO summary line printed at all
+    /// $ stuffr salvage midbad.zip -C out --index 0 --index 2
+    /// salvage -> 2 scanned: 2 written, …
+    /// exit=0                      # both recoverable the whole time
+    /// ```
+    ///
+    /// Three things were wrong at once. The run returned `Err`, so the
+    /// summary never printed and a user was not told what *was* recovered.
+    /// `third.txt` was lost although nothing about it is unsafe. And the
+    /// asymmetry was indefensible from a user's seat: a name the
+    /// **filesystem** rejects had been a per-entry skip at exit 4 since fix
+    /// round 4 ([`Self::SkippedUnwritable`]), while a name **stuffr's own**
+    /// containment rejects ended the run. That distinction was made by
+    /// analogy to [`extract`] and never measured. `unpack` aborting is
+    /// right — it has no per-entry disposition vocabulary. `salvage` does.
+    ///
+    /// # Nothing about the hostile-path contract weakens
+    ///
+    /// The refusal is unchanged: an escaping entry is still never written,
+    /// and the run still **exits 7** — [`salvage_exit_code`] gives this
+    /// variant its own bucket, the highest one, so a run containing an
+    /// escaping name is still distinguishable at the process level from one
+    /// that was merely degraded. What changed is only that the other
+    /// entries survive and the summary prints.
+    ///
+    /// # Why its own variant rather than folding into `SkippedUnwritable`
+    ///
+    /// Two facts a user deciding whether to trust the output needs told
+    /// apart. `SkippedUnwritable` is *the OS refused*, and its `reason` is a
+    /// rendered, platform-dependent `errno` message. This is *stuffr
+    /// refused*, and its `reason` is the fixed `&'static str`
+    /// [`Error::UnsafePath`] already carries — stable across platforms and
+    /// safe to compare. Folding them would also have collapsed exit 7 into
+    /// exit 4, discarding the one signal that says an archive tried to write
+    /// outside where it was pointed.
+    SkippedUnsafePath { reason: &'static str },
     /// Fix round 1, REQUIRED 1: not written because [`SalvageOpts::select`]
     /// is `Some` and this scan position is not in it — the caller asked for
     /// a different, narrower set of entries. Distinct from every `Skipped*`
@@ -1485,10 +1546,14 @@ pub struct SalvageOutcome {
 /// collapse onto five exit-code buckets, and until this fix round no
 /// aggregation policy was recorded anywhere.
 ///
-/// **Exit 7 (path escape) is NOT covered here**: it is an error that
-/// aborts the run — `salvage` returns `Err` before a `SalvageOutcome` ever
-/// exists — so there is nothing to aggregate for it; this function is only
-/// meaningful for a `salvage()` call that returned `Ok`.
+/// **Exit 7 (path escape) IS covered here, and was not until the final fix
+/// wave's F1.** It used to be an error that aborted the run — `salvage`
+/// returned `Err` before a `SalvageOutcome` ever existed — so there was
+/// nothing to aggregate for it. A containment refusal is a per-entry
+/// outcome now ([`SalvageDisposition::SkippedUnsafePath`]), so it
+/// aggregates here like any other, and the run still exits 7. What changed
+/// is that the entries around it survive and this function is reached at
+/// all.
 ///
 /// **Exit 6 used to be in that sentence too, and is not any more** (Task 3c
 /// fix round 3). An entry past the run's entry ceiling was an
@@ -1503,11 +1568,20 @@ pub struct SalvageOutcome {
 ///
 /// ```text
 /// 5  nothing recoverable at all (no entries were even scanned)
+/// 7  any entry refused by containment
 /// 3  any entry Unverified
 /// 4  any entry Partial (written or skipped), any entry skipped for any
 ///    other reason, or any entry written under a disambiguated name
 /// 0  every entry Intact or Complete
 /// ```
+///
+/// **7 outranks both 3 and 4**, and that is what keeps the hostile-path
+/// contract exactly where it was: before F1 an escaping name ended the run
+/// at exit 7, so a caller scripting against 7 must still see 7 when one
+/// appears — the only thing that changed is that the rest of the archive is
+/// recovered first. It is also the most severe fact a run can report: a
+/// degraded entry is the archive being damaged, an escaping name is the
+/// archive trying to write somewhere it was not pointed.
 ///
 /// **A disambiguated write is in bucket 4 even though nothing was lost**,
 /// and that is deliberate: the archive held two records under one name and
@@ -1531,6 +1605,7 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
         return 5;
     }
 
+    let mut any_unsafe_path = false;
     let mut any_unverified = false;
     let mut any_degraded = false;
     for record in &outcome.entries {
@@ -1539,6 +1614,7 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
             | SalvageDisposition::Directory(_)
             | SalvageDisposition::NotSelected
             | SalvageDisposition::NotWritten => {}
+            SalvageDisposition::SkippedUnsafePath { .. } => any_unsafe_path = true,
             SalvageDisposition::SkippedUnverified => any_unverified = true,
             SalvageDisposition::WrittenDisambiguated { .. }
             | SalvageDisposition::WrittenPartial { .. }
@@ -1552,7 +1628,9 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
         }
     }
 
-    if any_unverified {
+    if any_unsafe_path {
+        7
+    } else if any_unverified {
         3
     } else if any_degraded {
         4
@@ -1677,9 +1755,20 @@ fn salvage_scan(
 /// [`safe_join`] and [`refuse_symlinked_ancestors`] — the SAME calls
 /// [`extract`] makes, in the same order, including the `target == dest`
 /// refusal for a non-directory entry. A hostile name escaping `opts.dest`
-/// aborts the whole run with [`Error::UnsafePath`] (exit 7), exactly as it
-/// aborts `unpack`; salvage's permissiveness is about WHAT gets written for
-/// damaged content, never about WHERE.
+/// is **refused and never written**, and the run **exits 7**; salvage's
+/// permissiveness is about WHAT gets written for damaged content, never
+/// about WHERE.
+///
+/// **What it does NOT do, since the final fix wave's F1, is end the run.**
+/// This paragraph used to say the refusal aborts "exactly as it aborts
+/// `unpack`", and that analogy was never measured: on a 228-byte zip whose
+/// middle record simply has an empty name, one entry was recovered, the
+/// third was silently lost and no summary printed at all. `unpack` aborting
+/// is right — it has no per-entry disposition vocabulary. `salvage` does,
+/// so the refusal is [`SalvageDisposition::SkippedUnsafePath`] on that
+/// entry's own row, every later record is still recovered, and
+/// [`salvage_exit_code`] still answers 7 for the run. See that variant for
+/// the full reproducer.
 ///
 /// An entry this function has already decided not to write for some other
 /// reason (a shadow, `Unverified`, a skipped partial) never reaches
@@ -1796,7 +1885,17 @@ fn place_salvaged_entry(
         // second write replaces the first record's bytes.
         EntryKind::Dir => match &opts.dest {
             Some(dest) => {
-                let target = salvage_contained_target(dest, entry)?;
+                // Folded exactly as the `File` arm folds its own — a
+                // directory entry's name is as archive-controlled as a
+                // file's, and this arm reached the identical abort. See
+                // `SalvageDisposition::SkippedUnsafePath`.
+                let target = match salvage_contained_target(dest, entry) {
+                    Ok(target) => target,
+                    Err(Error::UnsafePath { reason, .. }) => {
+                        return Ok(SalvageDisposition::SkippedUnsafePath { reason });
+                    }
+                    Err(e) => return Err(e),
+                };
                 // Folded, not propagated — see
                 // `SalvageDisposition::SkippedUnwritable`. A directory
                 // entry's name is as archive-controlled as a file's, and
@@ -1901,6 +2000,18 @@ fn place_salvaged_file(
                 Err(Error::FormatNotEnabled(_) | Error::Unsupported(_)) => {
                     SalvageDisposition::SkippedNotBuiltIn
                 }
+                // The same fold the real write path makes one screen below,
+                // and it was missing here (final fix wave, E9 of the
+                // enumeration — a site the review did not name). A payload
+                // writer's `Error::Io` is always about THIS entry: it
+                // re-opens the ARCHIVE to read the entry's bytes, so a
+                // source that vanishes or faults mid-run raised it. Decoding
+                // into `io::sink()` to learn a skipped partial's cause is the
+                // identical act with the destination discarded, so it cannot
+                // answer differently — it aborted the run where the write
+                // path skips the entry, which is the exact asymmetry three
+                // rounds of Task 3c were spent removing.
+                Err(Error::Io(e)) => unwritable(Error::Io(e)),
                 Err(e) => return Err(e),
             },
         );
@@ -1915,7 +2026,24 @@ fn place_salvaged_file(
     // Contained target, computed only now that this entry really will be
     // written in some form — see `salvage`'s own doc for why an entry
     // declined above never reaches this call.
-    let target = salvage_contained_target(dest, entry)?;
+    //
+    // A containment refusal is THIS entry's outcome, never the run's (final
+    // fix wave, F1). The refusal itself is unchanged — nothing is written
+    // under an escaping name, and the run still exits 7 — but the entries
+    // around it survive and the summary prints. `salvage_contained_target`
+    // raises `UnsafePath` and nothing else, provably: `safe_join` is pure
+    // and has no other error, and `refuse_symlinked_ancestors` swallows
+    // every filesystem failure it meets. The `Err(e)` arm below is
+    // therefore unreachable today and is kept rather than wildcarded so a
+    // later error added to either function has to be classified here rather
+    // than silently becoming a skip.
+    let target = match salvage_contained_target(dest, entry) {
+        Ok(target) => target,
+        Err(Error::UnsafePath { reason, .. }) => {
+            return Ok(SalvageDisposition::SkippedUnsafePath { reason });
+        }
+        Err(e) => return Err(e),
+    };
 
     // An EARLIER entry in this same run already wrote this path: the
     // archive holds two records under one name, and only one of them can
@@ -4326,8 +4454,15 @@ mod salvage_tests {
         );
     }
 
-    /// The brief's second required test. A well-formed (CRC-correct) Stored
-    /// entry whose NAME tries to escape `dest` via `..` traversal.
+    /// Stage 1's brief's second required test. A well-formed (CRC-correct)
+    /// Stored entry whose NAME tries to escape `dest` via `..` traversal.
+    ///
+    /// The REFUSAL is what this test is for and it is unchanged; the final
+    /// fix wave's F1 changed only how it is reported — a per-entry
+    /// disposition and a run that finishes, rather than an `Err` out of
+    /// `salvage()`. The exit code a caller sees is still 7, which is
+    /// asserted here through `salvage_exit_code` instead of through
+    /// `Error::exit_code`.
     #[test]
     fn a_recovered_name_that_escapes_the_destination_is_refused() {
         let data = b"pwned".to_vec();
@@ -4342,8 +4477,14 @@ mod salvage_tests {
             select: None,
             format: None,
         };
-        let err = salvage(&archive, &opts).expect_err("an escaping name must refuse the whole run");
-        assert_eq!(err.exit_code(), 7);
+        let outcome = salvage(&archive, &opts).expect("the refusal is per-entry, not run-wide");
+        assert_eq!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::SkippedUnsafePath {
+                reason: "path traversal above the destination"
+            }
+        );
+        assert_eq!(salvage_exit_code(&outcome), 7);
 
         // Nothing escaped: neither the (never-created) destination nor its
         // parent gained the file the hostile name asked for.
@@ -4422,28 +4563,151 @@ mod salvage_tests {
     }
 
     /// The complement, so the fold above cannot be read as "salvage writes
-    /// anywhere it is pointed": a name that ESCAPES the destination is a
-    /// different decision and still refuses the whole run at exit 7. The two
-    /// live side by side deliberately — one is "this path is not somewhere
-    /// this filesystem can hold", the other is "this path is somewhere I
-    /// must not write", and collapsing them would turn a containment
-    /// refusal into a per-entry skip.
+    /// anywhere it is pointed": a name that ESCAPES the destination is
+    /// still refused, is still never written, and the run still exits 7.
+    /// The two live side by side deliberately — one is "this path is not
+    /// somewhere this filesystem can hold", the other is "this path is
+    /// somewhere I must not write" — and they are still told apart, by two
+    /// dispositions and two exit-code buckets.
+    ///
+    /// **What this test asserted before the final fix wave's F1 was that
+    /// the refusal ABORTED THE RUN**, and that is the half that was wrong.
+    /// The entry AFTER the escaping one is asserted here now, because it is
+    /// exactly what the old behaviour lost.
     #[test]
-    fn an_escaping_name_still_refuses_the_run_even_though_an_unwritable_one_does_not() {
+    fn an_escaping_name_is_refused_without_ending_the_run() {
         let mut bytes = local_header_entry("a.txt", b"AAAA", crc32(b"AAAA"));
         bytes.extend_from_slice(&local_header_entry("../escaped.txt", b"XX", crc32(b"XX")));
+        bytes.extend_from_slice(&local_header_entry("z.txt", b"ZZZZ", crc32(b"ZZZZ")));
         let (_archive_dir, archive) = write_archive(&bytes);
 
         let out_dir = tempfile::tempdir().unwrap();
+        let dest = out_dir.path().join("dest");
         let opts = SalvageOpts {
-            dest: Some(out_dir.path().join("dest")),
+            dest: Some(dest.clone()),
             policy: SalvagePolicy::default(),
             select: None,
             format: None,
         };
-        let err = salvage(&archive, &opts).expect_err("containment still aborts");
-        assert_eq!(err.exit_code(), 7);
+        let outcome = salvage(&archive, &opts).expect(
+            "a containment refusal is ONE entry's outcome: it must not end the run, or every \
+             later record is lost and no summary ever prints",
+        );
+
+        assert_eq!(outcome.entries.len(), 3);
+        assert_eq!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::Written(dest.join("a.txt"))
+        );
+        assert_eq!(
+            outcome.entries[1].disposition,
+            SalvageDisposition::SkippedUnsafePath {
+                reason: "path traversal above the destination"
+            },
+            "the refusal must name itself as OURS, not as the OS's — a rendered errno message \
+             in SkippedUnwritable would say the filesystem declined a name we never offered it"
+        );
+        assert_eq!(
+            outcome.entries[2].disposition,
+            SalvageDisposition::Written(dest.join("z.txt")),
+            "the entry AFTER the escaping name is the one the old behaviour lost"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("z.txt")).unwrap(),
+            b"ZZZZ",
+            "and its bytes must be right, not merely reported written"
+        );
+
+        // Nothing about the hostile-path contract weakens: the escaping
+        // name is not on disk anywhere, and the RUN still answers 7.
         assert!(!out_dir.path().join("escaped.txt").exists());
+        assert!(!dest.join("escaped.txt").exists());
+        assert_eq!(
+            salvage_exit_code(&outcome),
+            7,
+            "exit 7 is what a caller scripting against a hostile archive already checks for; \
+             folding this into the degraded bucket would silently retire that signal"
+        );
+    }
+
+    /// The final whole-branch review's own F1 reproducer, byte for byte: a
+    /// **228-byte** zip with three `Intact` local headers whose MIDDLE name
+    /// is EMPTY. Distinct from the escaping-name test above and worth its
+    /// own fixture, because an empty name is not a traversal attempt at all
+    /// — it is one corrupted length byte, and the reviewer reached it from
+    /// ordinary random corruption of a real `stuffr pack` output rather
+    /// than from a crafted file.
+    ///
+    /// Before the fix: `--list` showed all three at exit 0, `-C out` wrote
+    /// `first.txt`, aborted at exit 7, never attempted `third.txt` and
+    /// printed no summary — while `--index 0 --index 2` recovered both,
+    /// proving nothing was unrecoverable.
+    #[test]
+    fn an_empty_entry_name_costs_that_entry_and_no_other() {
+        let (a, b, c) = (b"A".repeat(40), b"B".repeat(40), b"C".repeat(40));
+        let mut bytes = local_header_entry("first.txt", &a, crc32(&a));
+        bytes.extend_from_slice(&local_header_entry("", &b, crc32(&b)));
+        bytes.extend_from_slice(&local_header_entry("third.txt", &c, crc32(&c)));
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let opts = SalvageOpts {
+            dest: Some(out_dir.path().to_path_buf()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let outcome = salvage(&archive, &opts).expect("one empty name must not end the run");
+
+        assert_eq!(outcome.entries.len(), 3);
+        assert_eq!(
+            outcome.entries[1].disposition,
+            SalvageDisposition::SkippedUnsafePath {
+                reason: "empty entry name"
+            }
+        );
+        assert_eq!(
+            std::fs::read(out_dir.path().join("third.txt")).unwrap(),
+            b"C".repeat(40),
+            "the third record is what the review measured as lost"
+        );
+        assert_eq!(salvage_exit_code(&outcome), 7);
+    }
+
+    /// A DIRECTORY entry's name is as archive-controlled as a file's, and
+    /// `place_salvaged_entry`'s own `Dir` arm reached the identical abort
+    /// through a second, separate call to `salvage_contained_target`. The
+    /// enumeration this fix wave ran found it; fixing only the `File` arm
+    /// is exactly the shape that made Task 3c's ceiling take three rounds.
+    #[test]
+    fn an_escaping_directory_entry_is_refused_without_ending_the_run() {
+        let mut bytes = local_header_entry("../escaped/", b"", crc32(b""));
+        bytes.extend_from_slice(&local_header_entry("z.txt", b"ZZZZ", crc32(b"ZZZZ")));
+        let (_archive_dir, archive) = write_archive(&bytes);
+
+        let out_dir = tempfile::tempdir().unwrap();
+        let dest = out_dir.path().join("dest");
+        let opts = SalvageOpts {
+            dest: Some(dest.clone()),
+            policy: SalvagePolicy::default(),
+            select: None,
+            format: None,
+        };
+        let outcome = salvage(&archive, &opts).expect("a directory entry is no different");
+
+        assert_eq!(outcome.entries.len(), 2);
+        assert_eq!(
+            outcome.entries[0].disposition,
+            SalvageDisposition::SkippedUnsafePath {
+                reason: "path traversal above the destination"
+            }
+        );
+        assert_eq!(
+            outcome.entries[1].disposition,
+            SalvageDisposition::Written(dest.join("z.txt"))
+        );
+        assert!(!out_dir.path().join("escaped").exists());
+        assert_eq!(salvage_exit_code(&outcome), 7);
     }
 
     /// The brief's third required test. The same corrupted-CRC fixture as
@@ -4714,6 +4978,41 @@ mod salvage_tests {
             }),
             4,
             "a policy-skipped Partial entry is still bucket 4, cause attached or not"
+        );
+
+        // Final fix wave, F1: bucket 7, and the precedence that keeps the
+        // hostile-path signal exactly where it was. Before F1 a containment
+        // refusal ended the run, so `salvage()` returned `Err` and this
+        // function was never reached for one — a caller scripting against
+        // exit 7 must still see 7 now that the run finishes.
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(SalvageDisposition::SkippedUnsafePath {
+                    reason: "path traversal above the destination"
+                })],
+            }),
+            7,
+            "a containment refusal alone is bucket 7"
+        );
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![
+                    record(SalvageDisposition::Written(PathBuf::from("a"))),
+                    record(SalvageDisposition::SkippedUnverified),
+                    record(SalvageDisposition::WrittenPartial {
+                        path: PathBuf::from("b.partial"),
+                        cause: PartialCause::Truncated,
+                    }),
+                    record(SalvageDisposition::SkippedUnsafePath {
+                        reason: "empty entry name"
+                    }),
+                ],
+            }),
+            7,
+            "7 outranks BOTH 3 and 4: an archive that tried to write outside where it was \
+             pointed is a more severe fact than one that is merely damaged, and folding it \
+             into either bucket would silently retire the signal a hostile-archive script \
+             already checks for"
         );
     }
 }
