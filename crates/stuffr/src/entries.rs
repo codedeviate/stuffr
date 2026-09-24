@@ -177,8 +177,26 @@ impl std::io::Read for RatioGuardedSource {
         // refusal through a plain `io::Read`, reused here for a ratio
         // refusal. `RatioGuard::record`'s own message (naming the ratio,
         // the limit and `--max-ratio`) survives the round trip verbatim.
+        //
+        // Marked decode-side (`stuffr_core::source::mark_decode_side`), which
+        // is what makes that round trip actually happen below a CONTAINER.
+        // Unmarked, this error met a bare `?` — `SpillSource::materialize` for
+        // a `needs_seek` container, `Lha::open`'s peek, `cpio.rs`'s per-header
+        // read-ahead, `zip.rs`'s `read_fixed` — and became `Error::Io`, exit
+        // 1. Measured before the fix: a 60-byte zstd frame decoding to 1 MiB
+        // of ARJ-magic-prefixed zeros answered `stuffr: i/o error: expansion
+        // ratio 17476:1 exceeds the 10000:1 limit` at exit 1 from `stuffr
+        // list`, against exit 6 from `stuffr cat` on the identical bytes.
+        //
+        // Marking is right regardless of whether a codec layer is present: a
+        // ratio refusal is always a verdict on EXPANSION, never on the local
+        // filesystem, and with no codec above it the guard's two counters
+        // advance in lockstep and it cannot fire at all.
         if let Err(Error::ResourceLimit(msg)) = self.guard.record(n) {
-            return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, msg));
+            return Err(stuffr_core::source::mark_decode_side(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                msg,
+            )));
         }
         Ok(n)
     }

@@ -21,7 +21,7 @@ use crate::archive::DecodeOpts;
 use crate::error::{Error, Result};
 use crate::format::{FormatId, FormatKind};
 use crate::registry::Registry;
-use crate::source::{PeekSource, Source};
+use crate::source::{DecodeSideSource, PeekSource, Source};
 
 /// The detection window, per the spec.
 pub const PROBE_LEN: usize = 4096;
@@ -372,6 +372,43 @@ fn wrap_layers(layers: &[FormatId], innermost: Chain) -> Chain {
 /// `chain`'s innermost entry (a [`Chain::Container`] or [`Chain::Raw`])
 /// begins. A chain with no codec layers at all (a bare container) hands
 /// `src` back untouched.
+/// Builds one codec layer's decoder and marks its output as decode-side.
+///
+/// The ONE place in this crate that turns a [`Source`] into a decoded one, so
+/// it is also the one place that has to remember the marking — see
+/// [`crate::source::decode_side`] for why the marking exists at all, and for
+/// the four downstream `?`s it retroactively makes correct.
+///
+/// Two things happen here, and they cover the two moments a codec can fail:
+///
+/// * **Construction.** A codec that validates its header eagerly can fail
+///   inside `decoder()` itself, reading the source that is about to become
+///   decode-side but is not yet wrapped. That error is folded through
+///   [`Error::from_decode_io`] here. No registered codec takes this branch
+///   today (`CLAUDE.md`'s Phase 3c backlog records the same gap against
+///   `conformance.rs:393`), which is exactly why it is worth closing before
+///   one does: an unreached branch that is wrong by default is how this class
+///   keeps recurring.
+/// * **Reading.** Every later `read` is marked by [`DecodeSideSource`].
+///
+/// Wrapping is idempotent, so a three-layer chain pays one tag allocation per
+/// error rather than three.
+fn build_decoder(
+    reg: &Registry,
+    codec: FormatId,
+    src: Box<dyn Source>,
+    opts: &DecodeOpts,
+) -> Result<Box<dyn Source>> {
+    let decoded = reg
+        .require_codec(codec)?
+        .decoder(src, opts)
+        .map_err(|e| match e {
+            Error::Io(io_err) => Error::from_decode_io(io_err),
+            other => other,
+        })?;
+    Ok(DecodeSideSource::wrap(decoded))
+}
+
 fn decode_through_chain(
     reg: &Registry,
     chain: &Chain,
@@ -380,7 +417,7 @@ fn decode_through_chain(
 ) -> Result<Box<dyn Source>> {
     match chain {
         Chain::Codec { codec, inner } => {
-            let decoded = reg.require_codec(*codec)?.decoder(src, opts)?;
+            let decoded = build_decoder(reg, *codec, src, opts)?;
             decode_through_chain(reg, inner, decoded, opts)
         }
         Chain::Container { .. } | Chain::Raw => Ok(src),
@@ -474,7 +511,7 @@ pub fn resolve_chain_deep_with(
             });
         }
 
-        let decoded = reg.require_codec(current_codec)?.decoder(src, opts)?;
+        let decoded = build_decoder(reg, current_codec, src, opts)?;
         // This `probe` reads through a DECODER — unlike the one at the top
         // of this function, and unlike `resolve_chain_deep_with`'s own
         // `probe(src)` two calls up, both of which read the RAW,
@@ -500,6 +537,13 @@ pub fn resolve_chain_deep_with(
         // genuine i/o failure on the raw source (a real disk error, a
         // permission failure, a broken pipe) as `Corrupt`, which is a new
         // lie in the opposite direction.
+        //
+        // As of the decode-side marker (see `crate::source::decode_side`),
+        // `build_decoder` has already tagged this source, so `probe`'s own
+        // internal `?` would classify it anyway and this `map_err` sees an
+        // `Error::Corrupt` and passes it through. Kept rather than deleted:
+        // it is the site Task 4b's regression tests name, and a belt that
+        // does not depend on the marker being applied one call up.
         let (next_prefix, next_src) = probe(decoded).map_err(|e| match e {
             Error::Io(io_err) => Error::from_decode_io(io_err),
             other => other,
@@ -1386,6 +1430,86 @@ mod tests {
             ),
             Err(other) => panic!("expected Corrupt (a decoder-side read failed), got {other:?}"),
             Ok(_) => panic!("a decoder that always fails to read cannot resolve successfully"),
+        }
+    }
+
+    /// A codec that validates its header inside `decoder()` and REFUSES
+    /// there — before a single decoded byte exists, so before
+    /// [`crate::source::DecodeSideSource`] can mark anything — must still
+    /// report `Error::Corrupt`.
+    ///
+    /// No registered codec takes this branch today; `.Z` parses its header
+    /// lazily and every other decoder here is a `Read` adapter built without
+    /// touching the source. It is pinned anyway, and `build_decoder` folds it
+    /// anyway, because "unreached and wrong by default" is precisely the
+    /// shape this class keeps recurring in: Task 4b closed the re-probe call,
+    /// the ladder's spool was still open, and the enumeration that found the
+    /// spool found this too. `CLAUDE.md`'s Phase 3c backlog records the same
+    /// gap from the other side, against `conformance.rs:393`.
+    #[test]
+    fn a_decoder_that_refuses_at_construction_is_corrupt_not_an_io_failure() {
+        struct RefusesToBuild;
+
+        impl Codec for RefusesToBuild {
+            fn id(&self) -> FormatId {
+                FormatId::new("refuses-to-build")
+            }
+
+            fn caps(&self) -> CodecCaps {
+                CodecCaps {
+                    encode: false,
+                    decode: true,
+                    ..Default::default()
+                }
+            }
+
+            fn decoder(&self, _src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
+                Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the header is malformed and I will not build a decoder for it",
+                )))
+            }
+
+            fn encoder(
+                &self,
+                _dst: Box<dyn Write + Send>,
+                _o: &EncodeOpts,
+            ) -> Result<Box<dyn Sink>> {
+                unimplemented!("this test never encodes")
+            }
+        }
+
+        const REFUSES: FormatId = FormatId::new("refuses-to-build");
+        const REFUSES_MAGIC: &[MagicRule] = &[MagicRule {
+            offset: 0,
+            bytes: &[0xab, 0xcd],
+            format: REFUSES,
+        }];
+
+        let mut reg = Registry::new();
+        reg.register_codec(
+            Arc::new(RefusesToBuild),
+            FormatMeta::codec(REFUSES, &["refuse"], REFUSES_MAGIC),
+        );
+
+        // Both routes through `resolve_chain_deep_with` build a decoder — the
+        // path route via `decode_through_chain`, the pathless one via the
+        // re-probe loop — so both are checked, and both go through
+        // `build_decoder`.
+        for path in [None, Some(Path::new("thing.refuse"))] {
+            let bytes = vec![0xab, 0xcd, 0x00, 0x00];
+            match resolve_chain_deep(
+                &reg,
+                path,
+                Box::new(ReaderSource::new(io::Cursor::new(bytes))),
+            ) {
+                Err(Error::Corrupt(msg)) => assert!(
+                    msg.contains("malformed"),
+                    "must carry the codec's own message: {msg}"
+                ),
+                Err(other) => panic!("expected Corrupt for path {path:?}, got {other:?}"),
+                Ok(_) => panic!("a codec that refuses to build cannot resolve successfully"),
+            }
         }
     }
 

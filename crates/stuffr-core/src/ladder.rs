@@ -332,6 +332,96 @@ mod tests {
         assert!(r.report.is_lossless());
     }
 
+    /// Rung 3 drains its source into a spool, and until the decode-side
+    /// marker existed it did so through a bare `?` — so a codec reporting
+    /// malformed bytes to `SpillSource::materialize` became `Error::Io`, exit
+    /// 1, "stuffr failed".
+    ///
+    /// This is the site the release-blocking reproducer hit: a 21-byte zstd
+    /// frame whose decoded bytes open with ARJ's `60 EA` magic. ARJ declares
+    /// `needs_seek`, a decoder's output is never seekable, so the ladder
+    /// always takes this rung for that pair — `stuffr list` and `stuffr test`
+    /// exited 1 where `stuffr cat` on the identical bytes exited 5. Measured
+    /// from the backtrace, not inferred: `SpillSource::materialize` <-
+    /// `ladder::resolve` <- `entries::open_archive`.
+    ///
+    /// `Error::Corrupt`, exit 5 and not 6, per `Error::exit_code`'s own rule:
+    /// stuffr read the bytes and they contradict each other; no allocation was
+    /// ever in question.
+    #[test]
+    fn spilling_classifies_a_decode_side_failure_as_corruption() {
+        use crate::testing::decode_side_failing_source;
+
+        let err = resolve(
+            decode_side_failing_source(b"some good bytes", std::io::ErrorKind::InvalidData),
+            SQUASHFS,
+            squashfs_caps(),
+            &StreamPolicy::default(),
+        )
+        .expect_err("a source that fails part-way cannot spool");
+
+        assert!(
+            matches!(err, crate::Error::Corrupt(_)),
+            "a decoder's malformed-input report must not claim stuffr failed: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5);
+        assert!(
+            err.to_string()
+                .contains(crate::testing::FAILING_SOURCE_MESSAGE),
+            "the decoder's own wording must survive classification: {err}"
+        );
+    }
+
+    /// The hazard side, and the reason the fix is a marker rather than a
+    /// `map_err` at this call site: the IDENTICAL error kind, raised by a
+    /// source no decoder produced, must stay `Error::Io`. A spool drains
+    /// whatever the ladder was handed — a bare `.arj` arriving on a pipe is
+    /// the raw file — so classifying unconditionally here would report a disk
+    /// or pipe failure as a corrupt archive.
+    #[test]
+    fn spilling_leaves_a_raw_side_failure_as_an_io_error() {
+        use crate::testing::raw_failing_source;
+
+        let err = resolve(
+            raw_failing_source(b"some good bytes", std::io::ErrorKind::InvalidData),
+            SQUASHFS,
+            squashfs_caps(),
+            &StreamPolicy::default(),
+        )
+        .expect_err("a source that fails part-way cannot spool");
+
+        assert!(
+            matches!(err, crate::Error::Io(_)),
+            "only the marking separates this from the test above: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    /// A `--max-ratio` refusal below a container took the same route and the
+    /// same wrong turn. `RatioGuardedSource` raises `OutOfMemory` precisely so
+    /// the classification maps it to `ResourceLimit` (exit 6); unmarked, it
+    /// met this spool's bare `?` instead. Measured before the fix: `stuffr
+    /// list` on a 60-byte zstd frame expanding to 1 MiB of ARJ-magic-prefixed
+    /// zeros answered exit 1, against exit 6 from `stuffr cat`.
+    #[test]
+    fn spilling_classifies_a_decode_side_ratio_refusal_as_a_resource_limit() {
+        use crate::testing::decode_side_failing_source;
+
+        let err = resolve(
+            decode_side_failing_source(b"some good bytes", std::io::ErrorKind::OutOfMemory),
+            SQUASHFS,
+            squashfs_caps(),
+            &StreamPolicy::default(),
+        )
+        .expect_err("a source that fails part-way cannot spool");
+
+        assert!(
+            matches!(err, crate::Error::ResourceLimit(_)),
+            "a refused expansion is a limit, never corruption and never exit 1: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 6);
+    }
+
     #[test]
     fn default_policy_enables_every_rung() {
         match StreamPolicy::default() {

@@ -972,6 +972,71 @@ mod tests {
         CpioNewc.open(resolved, &OpenOpts::default()).expect("open")
     }
 
+    /// `next_entry` peeks 102 bytes before EVERY header, to check
+    /// `c_namesize` before `cpio::newc::Reader::new` can allocate on its say-
+    /// so — and `fill_header_prefix` read them through a bare `?`. Measured
+    /// from the backtrace of a real failure (`CpioSource::fill_header_prefix`
+    /// <- `CpioRead::next_entry` <- `entries::list`), a truncated codec
+    /// stream under a cpio archive therefore reported `i/o error`, exit 1,
+    /// "stuffr failed", for input that is simply corrupt.
+    ///
+    /// The comment on that call still says a read failure here "propagates as
+    /// `Error::Io` — property 10's source-error passthrough", and that is
+    /// still true of a RAW source: the test below this one is the same bytes
+    /// unmarked, and it still answers `Error::Io`. What changed is that the
+    /// two cases are now distinguishable, by `stuffr_core::source::
+    /// mark_decode_side` rather than by which `?` the author remembered.
+    #[test]
+    fn a_decode_side_failure_before_a_header_is_corruption_not_an_io_failure() {
+        use stuffr_core::testing::decode_side_failing_source;
+
+        let resolved = stuffr_core::resolve(
+            decode_side_failing_source(&[], std::io::ErrorKind::InvalidData),
+            CPIO,
+            CpioNewc.caps(),
+            &stuffr_core::StreamPolicy::default(),
+        )
+        .expect("a forward-parseable container resolves without reading");
+        let mut ar = CpioNewc
+            .open(resolved, &OpenOpts::default())
+            .expect("cpio's open reads nothing itself");
+
+        let err = ar
+            .next_entry()
+            .expect_err("the header peek must fail on this source");
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "a decoder's malformed-input report must not claim stuffr failed: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5);
+    }
+
+    /// The hazard side of the test above: the identical failure from a source
+    /// no decoder produced stays `Error::Io`, exit 1. This is the
+    /// source-error passthrough the container-conformance harness already
+    /// demands, restated here so the pair reads as one fact — only the
+    /// marking separates them.
+    #[test]
+    fn a_raw_side_failure_before_a_header_is_still_an_io_failure() {
+        use stuffr_core::testing::raw_failing_source;
+
+        let resolved = stuffr_core::resolve(
+            raw_failing_source(&[], std::io::ErrorKind::InvalidData),
+            CPIO,
+            CpioNewc.caps(),
+            &stuffr_core::StreamPolicy::default(),
+        )
+        .expect("resolve");
+        let mut ar = CpioNewc.open(resolved, &OpenOpts::default()).expect("open");
+
+        let err = ar.next_entry().expect_err("the header peek must fail");
+        assert!(
+            matches!(err, Error::Io(_)),
+            "a raw source failing is stuffr's environment failing: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 1);
+    }
+
     fn which(bin: &str) -> Option<std::path::PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path).find_map(|dir| {

@@ -2725,6 +2725,134 @@ fn list_reports_a_directory_as_an_io_failure_not_as_corrupt() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The 21 bytes the `chain` fuzz target's honesty oracle caught after the
+/// previous exit-1 defect in this series was fixed. A zstd frame whose
+/// DECODED bytes open with ARJ's `60 EA` magic, then run on for about a
+/// kilobyte before the frame's second block fails to parse.
+///
+/// Its route is the one Task 4b's fix does not cover, and cannot: the good
+/// prefix satisfies `resolve_chain_deep_with`'s re-probe window completely,
+/// so the `probe(decoded)` call Task 4b classified never sees a failure at
+/// all. The chain resolves cleanly to `arj` over `zstd`, ARJ declares
+/// `needs_seek`, a decoder's output is never seekable — so the ladder takes
+/// rung 3 and `SpillSource::materialize` drains the decoded stream into a
+/// spool. That drain read through a bare `?`.
+///
+/// Measured before the fix, on the `0.5.0` binary:
+///
+/// ```text
+/// stuffr list -> exit 1 :: stuffr: i/o error: Failed to parse/decode block body: ...
+/// stuffr test -> exit 1 :: same
+/// stuffr cat  -> exit 5 :: stuffr: archive is corrupt: ...
+/// ```
+///
+/// Exit 5 and not 6, per `Error::exit_code`'s own rule: stuffr read the bytes
+/// and they contradict each other, and no allocation was ever in question.
+///
+/// The bytes are embedded rather than generated because generating them means
+/// encoding zstd, which the default (pure) tier will not do without
+/// `--allow-weak-encoder` — and because a reproducer that is recomputed is a
+/// reproducer that can quietly stop reproducing.
+#[test]
+fn list_reports_a_zstd_stream_that_decodes_into_arj_magic_as_corrupt() {
+    const ZSTD_OVER_ARJ_MAGIC: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x24, 0x00, 0x30, 0x00, 0x00, 0x60, 0xea, 0x05, 0x06, 0x28, 0x0a,
+        0x0a, 0x0a, 0x0a, 0x0a, 0x70, 0x00,
+    ];
+
+    let dir = tmp_dir();
+    let repro = dir.join("repro.zst");
+    std::fs::write(&repro, ZSTD_OVER_ARJ_MAGIC).unwrap();
+    let path = repro.to_str().unwrap();
+
+    let cat_out = run_output(&["cat", path]);
+    assert_eq!(
+        cat_out.status.code(),
+        Some(5),
+        "cat was already right on these bytes and must stay right: {}",
+        String::from_utf8_lossy(&cat_out.stderr)
+    );
+
+    for verb in ["list", "test"] {
+        let out = run_output(&[verb, path]);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "`{verb}` must agree with cat on the SAME bytes — exit 1 here means stuffr claimed \
+             it failed, when the truth is the input is corrupt: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("archive is corrupt"),
+            "must be Error::Corrupt's own wording, not Error::Io's: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The second shape the same enumeration turned up, and one no fuzz target
+/// found: a `--max-ratio` refusal below a container.
+///
+/// 60 bytes of zstd expanding to 1 MiB of zeros behind ARJ's `60 EA` magic.
+/// `RatioGuardedSource` raises `io::ErrorKind::OutOfMemory` specifically so
+/// the classification maps it to `Error::ResourceLimit`, exit 6 — and below a
+/// container that conversion never ran, because the refusal met
+/// `SpillSource::materialize`'s bare `?` instead. Measured before the fix:
+///
+/// ```text
+/// stuffr list -> exit 1 :: stuffr: i/o error: expansion ratio 17476:1 exceeds the 10000:1 limit
+/// stuffr cat  -> exit 6 :: stuffr: resource limit exceeded: <same figures>
+/// ```
+///
+/// Exit 6 and not 5, the other side of `Error::exit_code`'s rule: a LIMIT
+/// decided the outcome, nothing was read that contradicts anything, and
+/// `--max-ratio` names the knob that changes the answer.
+///
+/// It fires under the DEFAULT ratio, so no flag is passed — the bomb is real,
+/// not a tightened bound arranged to trip.
+#[test]
+fn a_ratio_refusal_below_a_container_is_a_resource_limit_not_an_io_failure() {
+    const ZSTD_BOMB_OVER_ARJ_MAGIC: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0xa4, 0x02, 0x00, 0x10, 0x00, 0x5c, 0x00, 0x00, 0x18, 0x60, 0xea,
+        0x00, 0x01, 0x00, 0xfa, 0xff, 0x39, 0x18, 0x02, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10,
+        0x00, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00,
+        0x10, 0x00, 0x02, 0x00, 0x10, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0xbe, 0xb2, 0xa6, 0x83,
+    ];
+
+    let dir = tmp_dir();
+    let bomb = dir.join("bomb.zst");
+    std::fs::write(&bomb, ZSTD_BOMB_OVER_ARJ_MAGIC).unwrap();
+    let path = bomb.to_str().unwrap();
+
+    let cat_out = run_output(&["cat", path]);
+    assert_eq!(
+        cat_out.status.code(),
+        Some(6),
+        "cat was already right and must stay right: {}",
+        String::from_utf8_lossy(&cat_out.stderr)
+    );
+
+    for verb in ["list", "test"] {
+        let out = run_output(&[verb, path]);
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "`{verb}` must agree with cat: a refused expansion bomb is a limit, never \
+             \"stuffr failed\": {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("resource limit exceeded") && err.contains("--max-ratio"),
+            "must be Error::ResourceLimit's own wording, naming the knob: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------------------------------------------------------------------
 // `--max-ratio` on `list`/`test`: the codec layer beneath a container is
 // bounded the same way `unpack`/`cat` already bound a bare codec stream.

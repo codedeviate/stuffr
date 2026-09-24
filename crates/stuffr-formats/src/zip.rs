@@ -2311,6 +2311,72 @@ mod tests {
         try_open_seekable(bytes).expect("open")
     }
 
+    /// `read_fixed` and `skip` — the forward reader's two primitives — spell
+    /// the conversion out as `map_err(Error::from)`, and until the decode-side
+    /// marker existed that conversion could not tell a decoder's malformed
+    /// bytes from a disk failure. Measured from the backtrace of a real
+    /// failure (`zip::read_fixed` <- `ZipStreamed::next_entry` <-
+    /// `entries::list`): a truncated codec stream under a zip archive
+    /// reported `i/o error`, exit 1, where `stuffr cat` on the identical
+    /// bytes exited 5.
+    ///
+    /// This site's own doc comment says "a genuine source failure keeps its
+    /// own kind and exit code" — still true, and the test below is that half.
+    /// What it could not say before was WHICH source, and that is what the
+    /// marker records.
+    #[test]
+    fn a_decode_side_failure_in_the_forward_reader_is_corruption_not_an_io_failure() {
+        use stuffr_core::testing::decode_side_failing_source;
+
+        // HALF a local file header signature, then the stream dies, so the
+        // failure lands inside `read_fixed` itself. A COMPLETE signature
+        // would be satisfied from the prefix and the failure would move on to
+        // `read_zipfile_from_stream`, which `classify_zip_error` already
+        // folds — i.e. the test would pass without the fix and prove nothing.
+        let resolved = stuffr_core::resolve(
+            decode_side_failing_source(b"PK", std::io::ErrorKind::InvalidData),
+            ZIP,
+            Zip.caps(),
+            &StreamPolicy::default(),
+        )
+        .expect("zip forward-parses, so resolving reads nothing");
+        let mut ar = Zip
+            .open(resolved, &OpenOpts::default())
+            .expect("zip's forward open reads nothing itself");
+
+        let err = ar
+            .next_entry()
+            .expect_err("the signature read must fail on this source");
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "a decoder's malformed-input report must not claim stuffr failed: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5);
+    }
+
+    /// The hazard side: the identical failure from a source no decoder
+    /// produced stays `Error::Io`, exit 1. Only the marking separates them.
+    #[test]
+    fn a_raw_side_failure_in_the_forward_reader_is_still_an_io_failure() {
+        use stuffr_core::testing::raw_failing_source;
+
+        let resolved = stuffr_core::resolve(
+            raw_failing_source(b"PK", std::io::ErrorKind::InvalidData),
+            ZIP,
+            Zip.caps(),
+            &StreamPolicy::default(),
+        )
+        .expect("resolve");
+        let mut ar = Zip.open(resolved, &OpenOpts::default()).expect("open");
+
+        let err = ar.next_entry().expect_err("the signature read must fail");
+        assert!(
+            matches!(err, Error::Io(_)),
+            "a raw source failing is stuffr's environment failing: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 1);
+    }
+
     /// A one-entry archive whose central-directory record carries a zip64
     /// extended-information extra field (tag `0x0001`) declaring
     /// `header_start` as the entry's relative local-header offset.

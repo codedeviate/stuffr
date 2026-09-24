@@ -668,6 +668,75 @@ impl Write for SharedBuf {
     }
 }
 
+/// A [`Source`] that delivers `prefix` and then fails with `kind` forever.
+///
+/// The shape every "where does this error land, and how is it classified?"
+/// test needs: the prefix is what lets a container get far enough to reach the
+/// read that matters, and the failure is what that read then meets.
+///
+/// Pair it with [`decode_side_failing_source`] and [`raw_failing_source`],
+/// which are the same bytes with and without
+/// [`crate::source::mark_decode_side`] applied. Those two are the only
+/// difference the classification turns on, so a test that runs both proves the
+/// marking is what decided — not the error's kind, and not the call site.
+pub struct FailsAfterPrefix {
+    prefix: Vec<u8>,
+    pos: usize,
+    kind: std::io::ErrorKind,
+    message: &'static str,
+}
+
+impl Read for FailsAfterPrefix {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let n = (self.prefix.len() - self.pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.prefix[self.pos..self.pos + n]);
+            self.pos += n;
+            return Ok(n);
+        }
+        Err(std::io::Error::new(self.kind, self.message))
+    }
+}
+
+impl Source for FailsAfterPrefix {
+    fn caps(&self) -> crate::source::SourceCaps {
+        crate::source::SourceCaps {
+            seekable: false,
+            len: None,
+        }
+    }
+
+    fn as_seek(&mut self) -> Option<&mut dyn crate::source::SeekRead> {
+        None
+    }
+}
+
+/// The message [`decode_side_failing_source`] and [`raw_failing_source`] raise,
+/// so a test can assert the decoder's own wording survived classification.
+pub const FAILING_SOURCE_MESSAGE: &str = "the stream is malformed from here on";
+
+/// `prefix` bytes, then a failure of `kind`, **marked as decode-side**.
+///
+/// Models a codec decoder that produced good bytes and then met malformed
+/// input — the exact shape a 21-byte zstd frame whose decoded bytes open with
+/// ARJ's `60 EA` magic presents to everything above it.
+pub fn decode_side_failing_source(prefix: &[u8], kind: std::io::ErrorKind) -> Box<dyn Source> {
+    crate::source::DecodeSideSource::wrap(raw_failing_source(prefix, kind))
+}
+
+/// `prefix` bytes, then a failure of `kind`, **unmarked**.
+///
+/// Models the raw source failing — a disk error, a pipe that broke — which
+/// must stay [`crate::Error::Io`] however the failing read is spelled.
+pub fn raw_failing_source(prefix: &[u8], kind: std::io::ErrorKind) -> Box<dyn Source> {
+    Box::new(FailsAfterPrefix {
+        prefix: prefix.to_vec(),
+        pos: 0,
+        kind,
+        message: FAILING_SOURCE_MESSAGE,
+    })
+}
+
 /// A reader that returns at most `chunk` bytes per `read` call, so tests can
 /// exercise paths that only appear across several short reads. A `Cursor` hands
 /// over everything at once and hides them.

@@ -1,6 +1,7 @@
 //! Input abstraction. A container never opens a file — it asks a `Source` what
 //! it can do, and the ladder (see [`crate::ladder`]) supplies the best rung.
 
+pub mod decode_side;
 mod file;
 pub mod limit;
 mod reader;
@@ -8,6 +9,7 @@ mod seek_guard;
 pub mod spill;
 pub mod stream_only;
 
+pub use decode_side::{DecodeSideSource, is_decode_side, mark_decode_side};
 pub use file::FileSource;
 pub use limit::{Counting, CountingWriter, DEFAULT_MAX_RATIO, RATIO_FLOOR, RatioGuard};
 pub use reader::{PeekSource, ReaderSource};

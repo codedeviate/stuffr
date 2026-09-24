@@ -5,8 +5,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Stuffr's environment failed: a disk error, a permission failure, a
+    /// broken pipe. Exit 1, which this project reserves for "stuffr itself
+    /// failed" and nothing else.
+    ///
+    /// **Constructed through a hand-written `From` impl, not a derived one**
+    /// — see below `Error`'s own `impl` block. The derived `#[from]` was
+    /// blind to whether the failing read sat above or below a codec decoder,
+    /// which made a bare `?` below one wrong by default; four sites had it
+    /// wrong at once. [`crate::source::decode_side`] carries the whole
+    /// argument.
     #[error("i/o error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
 
     #[error("usage error: {0}")]
     Usage(String),
@@ -293,6 +303,37 @@ impl Error {
             std::io::ErrorKind::InvalidData => Error::Corrupt(e.to_string()),
             std::io::ErrorKind::OutOfMemory => Error::ResourceLimit(e.to_string()),
             _ => Error::Io(e),
+        }
+    }
+}
+
+/// The single conversion every `?` on a read path passes through.
+///
+/// Hand-written rather than derived with thiserror's `#[from]`, because the
+/// derived one could not see the one fact that decides the answer: whether the
+/// read that failed sat BELOW a codec decoder (the archive's fault) or above
+/// one (stuffr's environment failing). [`crate::source::mark_decode_side`]
+/// records that at the read, and this is where it is spent.
+///
+/// Before this existed, the distinction was carried by whether the author of a
+/// given `?` remembered to write `map_err(Error::from_decode_io)` instead — so
+/// the natural code was wrong by default, and four sites had it wrong at once
+/// (`spill.rs`'s ladder rung 3, `lha.rs`'s `Lha::open`, `cpio.rs`'s per-header
+/// read-ahead, `zip.rs`'s `read_fixed`/`skip`). A 21-byte zstd stream whose
+/// decoded bytes opened with ARJ's `60 EA` magic reached the first of them and
+/// reported `i/o error` — exit 1, "stuffr failed" — where `stuffr cat` on the
+/// identical bytes correctly said the archive was corrupt.
+///
+/// [`Error::from_decode_io`] folds only `InvalidData` and `OutOfMemory`, so
+/// this cannot mistake an environment failure for corruption even when one
+/// propagates up through a decoder: it keeps its own kind, so it stays
+/// [`Error::Io`].
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        if crate::source::is_decode_side(&e) {
+            Error::from_decode_io(e)
+        } else {
+            Error::Io(e)
         }
     }
 }

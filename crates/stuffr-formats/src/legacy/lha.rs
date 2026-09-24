@@ -1143,6 +1143,70 @@ mod tests {
 
     const SAMPLE_LZH: &[u8] = include_bytes!("../../fixtures/legacy/sample.lzh");
 
+    /// `Lha::open` peeks ONE byte before handing the source to `delharc`, to
+    /// tell an archive that declared itself empty with a leading `0` from a
+    /// real one — and `PeekSource::fill` reads it through a bare `?`.
+    /// Measured from the backtrace of a real failure (`PeekSource::fill` <-
+    /// `Lha::open` <- `entries::open_archive`), a truncated codec stream
+    /// under an LHA archive therefore reported `i/o error`, exit 1, for input
+    /// that is simply corrupt — while `stuffr cat` on the same bytes said
+    /// exit 5.
+    ///
+    /// Note this is the ONE site of the four that is not in a container's own
+    /// code at all: the read belongs to `stuffr-core`'s `PeekSource`, which is
+    /// shared by the probe and by three containers. A per-site `map_err` here
+    /// would have been a `map_err` in `PeekSource::fill` — which
+    /// `resolve_chain_deep_with`'s own doc comment forbids, because that same
+    /// function reads the RAW source two calls earlier. The marker resolves
+    /// the two readings without either call site choosing.
+    #[test]
+    fn a_decode_side_failure_in_lha_open_is_corruption_not_an_io_failure() {
+        use stuffr_core::testing::decode_side_failing_source;
+
+        let resolved = stuffr_core::resolve(
+            decode_side_failing_source(&[], io::ErrorKind::InvalidData),
+            LHA,
+            Lha.caps(),
+            &StreamPolicy::default(),
+        )
+        .expect("a forward-parseable container resolves without reading");
+
+        let err = match Lha.open(resolved, &OpenOpts::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("the one-byte peek must fail on this source"),
+        };
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "a decoder's malformed-input report must not claim stuffr failed: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5);
+    }
+
+    /// The hazard side: the identical failure from a source no decoder
+    /// produced stays `Error::Io`, exit 1. Only the marking separates the two.
+    #[test]
+    fn a_raw_side_failure_in_lha_open_is_still_an_io_failure() {
+        use stuffr_core::testing::raw_failing_source;
+
+        let resolved = stuffr_core::resolve(
+            raw_failing_source(&[], io::ErrorKind::InvalidData),
+            LHA,
+            Lha.caps(),
+            &StreamPolicy::default(),
+        )
+        .expect("resolve");
+
+        let err = match Lha.open(resolved, &OpenOpts::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("the one-byte peek must fail"),
+        };
+        assert!(
+            matches!(err, Error::Io(_)),
+            "a raw source failing is stuffr's environment failing: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 1);
+    }
+
     const LHA_EXPECTED: &[ExpectedEntry] = &[
         ExpectedEntry::new("sample/hello.txt", b"alpha\n"),
         ExpectedEntry::new("sample/sub/b.bin", b"beta\n"),
