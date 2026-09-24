@@ -104,9 +104,35 @@ read list.
 > the loop: the record's own `offset` field says 116, the 56-byte model
 > computes 116 and the 59-byte model 119. See
 > `crates/stuffr-formats/src/legacy/zoo.rs`'s module doc for all five
-> measurements. **1371** tests under `--all-features`, **1306** on the
+> measurements. **1408** tests under `--all-features`, **1343** on the
 > default tier — measured from this bump's own `make check`, `GATE_EXIT=0`,
 > never carried forward.
+>
+> **`0.6.1` closes four exit-code defects that `0.6.0` shipped**, all four
+> found by the scheduled deep fuzz run and none of them reachable by the
+> gate or by the 2,000-iteration smoke fuzz. Each was invisible until the
+> one before it was fixed, because the run aborts on its first crash:
+>
+> * A `.Z` stream at `maxbits = 9` could name a dictionary slot that can
+>   never be filled, and **panicked** — exit 101 from `list`, `test` and
+>   `cat` on a 602-byte file. Now `Corrupt`. Nine is the one width where
+>   this is reachable; 10 through 16 cannot represent the code at all.
+> * A zip64 extended-information field declaring a local-header offset
+>   above `i64::MAX` reached `lseek(2)` as a negative `off_t`, and the
+>   kernel's `EINVAL` surfaced as **exit 1**. Now `Corrupt`, refused before
+>   the syscall, for every seekable source rather than per container.
+> * A decoder's own error below a container reached **exit 1** on `list`
+>   and `test` while `cat` answered `5` on the same bytes — four sites,
+>   reached through five of the eight registered containers and four
+>   verbs, plus a `--max-ratio` refusal that reported 1 instead of 6.
+>   The conversion is now structural: an
+>   `io::Error` from a decoder cannot reach the exit-code wildcard, and a
+>   genuine disk or permission failure passing *through* a decoder still
+>   reports 1, so neither lie is available.
+>
+> None of these is a salvage defect; all four are read-path classification,
+> and the oldest predates Stage 2 entirely. They are listed because an exit
+> code is a promise this project keeps in writing.
 >
 > **Status: Salvage Stage 1 is complete at `0.5.0` — `stuffr salvage`
 > recovers what a damaged zip's raw local-header scan can prove, even where
