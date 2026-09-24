@@ -2,12 +2,16 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
-use super::{SeekRead, Source, SourceCaps};
+use super::{GuardedSeek, SeekRead, Source, SourceCaps};
 use crate::error::Result;
 
 /// A seekable source backed by a real file. The Exact rung.
 pub struct FileSource {
-    file: File,
+    /// Wrapped, never bare: a container seeks to positions the ARCHIVE
+    /// declares, and a `u64` above `i64::MAX` reaches `lseek(2)` as a
+    /// negative offset and comes back as an unclassified `EINVAL`. See
+    /// [`GuardedSeek`]'s module doc.
+    file: GuardedSeek<File>,
     len: u64,
 }
 
@@ -18,7 +22,10 @@ impl FileSource {
 
     pub fn from_file(file: File) -> Result<Self> {
         let len = file.metadata()?.len();
-        Ok(Self { file, len })
+        Ok(Self {
+            file: GuardedSeek::new(file),
+            len,
+        })
     }
 }
 

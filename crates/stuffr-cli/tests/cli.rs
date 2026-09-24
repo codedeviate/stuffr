@@ -2457,6 +2457,95 @@ fn test_catches_a_payload_truncation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The `container` fuzz target's own reproducer, minimised by `cargo fuzz
+/// tmin` from the 6,779-byte artefact to the 540 bytes below, asserted at
+/// the CLI because that is where the defect was user-visible.
+///
+/// **What it was:** `stuffr list`, `stuffr test` and `stuffr unpack` all
+/// exited **1** — `stuffr: i/o error: Invalid argument (os error 22)` —
+/// which in this project means *stuffr itself failed*. The oracle's own
+/// words were `next_entry error classification: "a decoder raised Io(Os {
+/// code: 22, kind: InvalidInput, message: \"Invalid argument\" }), which
+/// maps to exit code 1"`.
+///
+/// **Why:** a zip64 extended-information extra field (tag `0x0001`) in the
+/// central directory supplies an 8-byte relative local-header offset, and
+/// `zip-8.6.0` hands it straight to `Seek::seek(SeekFrom::Start(..))`. On
+/// unix `std` casts that `u64` to `off_t`, an `i64`, so anything above
+/// `i64::MAX` reaches `lseek(2)` NEGATIVE and the kernel answers `EINVAL` —
+/// a genuine errno that `Error::from_decode_io` does not fold.
+///
+/// The refusal now comes from `stuffr_core::source::GuardedSeek`, one layer
+/// below every container, so this is a class fix and not a zip patch. Exit 5
+/// rather than 6 by `error.rs`'s `exit_code` rule: nothing was allocated
+/// from the offset, and what is wrong is the file's agreement with itself.
+///
+/// The assertion is on the CLASSIFIED outcome, not merely on "not 1": a
+/// guard that turned one wrong answer into another would pass that.
+#[test]
+fn a_zip_declaring_an_unreachable_local_header_offset_exits_5_not_1() {
+    // Hex rather than a checked-in binary: 540 bytes of fuzzer output has no
+    // provenance a `fixtures/MANIFEST.md` entry could usefully describe, and
+    // inline bytes cannot drift away from the test that stands on them.
+    const MINIMISED_REPRODUCER: &str = concat!(
+        "4b4d4d00504b010214031400000000000a3b375d0000000000000000000001010101e900000000000000237718c33a17",
+        "fbe047df010101010101010166722066757a7a7403034b50ffff1304504b05060000000001000008f500040000000000",
+        "000000000000005da481a9000007054b5000000a3b375dbc6ab89d2a00000000000000000b00000000000000000000a4",
+        "81250000bf5907054b5047bbd19819f9938fb5527f0414d3000000000a3b375d000000000010000000004f0102141403",
+        "1400000008000a3b375d06ff880a7374756666722066757a7a7403034b50ffff1304504b05060000000001000008f500",
+        "0000ed000000000000000000005da481a900000081a90000001400000008000a3b375d06ff880a737475666672206675",
+        "7a7a7403034b50ffff1304504b05060000000001000008f5000000ed000000000000000000005da481a900000081a900",
+        "0000000000ed000000000000000000005da481a900000081a9000000a481a900000081a900000008000a3b375d06ff88",
+        "0a7374756666722066757a7a7403034b50ffff1304504b05060000000001000008005da481a900000081000000000000",
+        "5da481a900000081a9000000000000ed000000000000000000005da481a900000081a9000000a481a900000081a90000",
+        "00000000000000000000005da481a900000081a9000000000000ed000000000000000000005da481a900000081a90000",
+        "00a481a900000081a9000000",
+    );
+
+    let bytes: Vec<u8> = (0..MINIMISED_REPRODUCER.len() / 2)
+        .map(|i| u8::from_str_radix(&MINIMISED_REPRODUCER[i * 2..i * 2 + 2], 16).unwrap())
+        .collect();
+    assert_eq!(bytes.len(), 540, "the reproducer must be carried verbatim");
+
+    let dir = tmp_dir();
+    let archive = dir.join("unreachable-offset.zip");
+    std::fs::write(&archive, &bytes).unwrap();
+
+    for verb in ["list", "test"] {
+        let out = run_output(&[verb, archive.to_str().unwrap()]);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "`{verb}` must report the ARCHIVE as corrupt, never exit 1: {err}"
+        );
+        assert!(
+            err.contains("archive is corrupt")
+                && err.contains("largest position any file can hold"),
+            "the refusal must name what the archive declared, not an errno: {err}"
+        );
+        assert!(
+            !err.contains("os error 22"),
+            "a bare errno reaching the user is the defect itself: {err}"
+        );
+    }
+
+    let out = run_output(&[
+        "unpack",
+        "-C",
+        dir.join("out").to_str().unwrap(),
+        archive.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "`unpack` too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn list_refuses_a_plain_codec_stream_as_not_an_archive() {
     let dir = tmp_dir();

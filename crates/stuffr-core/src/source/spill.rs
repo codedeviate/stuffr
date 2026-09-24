@@ -6,7 +6,7 @@
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::PathBuf;
 
-use super::{SeekRead, Source, SourceCaps};
+use super::{GuardedSeek, SeekRead, Source, SourceCaps};
 use crate::error::{Error, Result};
 
 pub const DEFAULT_MEM_CAP: u64 = 64 * 1024 * 1024;
@@ -53,8 +53,8 @@ impl SpillPolicy {
 
 #[derive(Debug)]
 enum Backing {
-    Mem(Cursor<Vec<u8>>),
-    File(std::fs::File),
+    Mem(GuardedSeek<Cursor<Vec<u8>>>),
+    File(GuardedSeek<std::fs::File>),
 }
 
 /// A seekable source produced by draining a forward-only one.
@@ -93,7 +93,7 @@ impl SpillSource {
             if n == 0 {
                 return Ok(Self {
                     len: total,
-                    backing: Backing::Mem(Cursor::new(mem)),
+                    backing: Backing::Mem(GuardedSeek::new(Cursor::new(mem))),
                     on_disk: false,
                 });
             }
@@ -138,7 +138,7 @@ impl SpillSource {
         file.flush()?;
         file.seek(std::io::SeekFrom::Start(0))?;
         Ok(Self {
-            backing: Backing::File(file),
+            backing: Backing::File(GuardedSeek::new(file)),
             len: total,
             on_disk: true,
         })

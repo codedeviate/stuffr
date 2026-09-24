@@ -2311,6 +2311,140 @@ mod tests {
         try_open_seekable(bytes).expect("open")
     }
 
+    /// A one-entry archive whose central-directory record carries a zip64
+    /// extended-information extra field (tag `0x0001`) declaring
+    /// `header_start` as the entry's relative local-header offset.
+    ///
+    /// Hand-spliced onto a genuine `ZipWriter` archive rather than minimised
+    /// out of the fuzzer's own 6,779-byte artefact, because the mechanism is
+    /// three fields wide and naming them is worth more than a blob:
+    /// `zip-8.6.0`'s `Zip64ExtendedInformation::parse`
+    /// (`extra_fields/zip64_extended_information.rs`) overwrites
+    /// `ZipFileData::header_start` with this block's THIRD `u64` whenever the
+    /// block is 24 bytes or longer, and `ZipFileData::find_data_start`
+    /// (`types.rs:240`) then hands that value straight to
+    /// `Seek::seek(SeekFrom::Start(..))`. On unix `std` casts that `u64` to
+    /// `off_t`, an `i64`, so anything above `i64::MAX` reaches `lseek(2)`
+    /// NEGATIVE and the kernel answers `EINVAL` — a real
+    /// `Os { code: 22, kind: InvalidInput }`, which
+    /// `Error::from_decode_io` does not fold and which therefore reported
+    /// exit 1.
+    ///
+    /// Everything else about the archive is valid, which is the point: the
+    /// ONE thing separating it from an archive that reads cleanly is a
+    /// single declared offset.
+    fn build_zip_declaring_a_zip64_header_offset(header_start: u64) -> Vec<u8> {
+        let mut cursor = io::Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            w.start_file(
+                "a.txt",
+                SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+            )
+            .expect("start_file");
+            w.write_all(b"hi").expect("write payload");
+            w.finish().expect("finish");
+        }
+        let base = cursor.into_inner();
+
+        let declared =
+            read_declared_index(&mut io::Cursor::new(&base)).expect("base archive's EOCD reads");
+        let cd_start = usize::try_from(declared.cd_offset).expect("cd_offset fits usize");
+        assert_eq!(base[cd_start..cd_start + 4], SIG_CENTRAL_HEADER);
+        let name_len = le16(&base[cd_start + 28..]) as usize;
+        let extra_len = le16(&base[cd_start + 30..]) as usize;
+        assert_eq!(
+            extra_len, 0,
+            "the splice below assumes ZipWriter emitted no central extra field"
+        );
+
+        // Tag, block size, then the three `u64`s the parser reads in order.
+        let mut extra = Vec::with_capacity(28);
+        extra.extend_from_slice(&1u16.to_le_bytes());
+        extra.extend_from_slice(&24u16.to_le_bytes());
+        extra.extend_from_slice(&2u64.to_le_bytes()); // uncompressed size
+        extra.extend_from_slice(&2u64.to_le_bytes()); // compressed size
+        extra.extend_from_slice(&header_start.to_le_bytes());
+        assert_eq!(extra.len(), 28);
+
+        let mut out = base.clone();
+        // The extra field follows the record's name.
+        let insert_at = cd_start + 46 + name_len;
+        out.splice(insert_at..insert_at, extra.iter().copied());
+        out[cd_start + 30..cd_start + 32].copy_from_slice(&28u16.to_le_bytes());
+        // The 32-bit offset field carries the zip64 sentinel, the spelling a
+        // real archive uses when the extra field supplies the real one.
+        out[cd_start + 42..cd_start + 46].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        // The EOCD's declared central-directory SIZE grew with the record;
+        // its OFFSET did not move, and neither did the comment length, so
+        // both of `read_declared_index`'s guards still hold.
+        let eocd = out.len() - END_OF_CENTRAL_DIR_TOTAL;
+        assert_eq!(out[eocd..eocd + 4], SIG_END_OF_CENTRAL_DIR);
+        let cd_size = le32(&out[eocd + 12..]) + 28;
+        out[eocd + 12..eocd + 16].copy_from_slice(&cd_size.to_le_bytes());
+        out
+    }
+
+    /// An archive-declared local-header offset that no file could ever hold
+    /// must be the FILE's fault, not stuffr's.
+    ///
+    /// The `container` fuzz target's honesty oracle found this as
+    /// `next_entry error classification: "a decoder raised Io(Os { code: 22,
+    /// kind: InvalidInput, message: \"Invalid argument\" })"`, and the CLI
+    /// reproduced it directly: `stuffr list`, `test` and `unpack` all exited
+    /// **1** — "stuffr failed" — on a 6,779-byte file.
+    ///
+    /// `Error::Corrupt` (exit 5) rather than `ResourceLimit` (exit 6) by
+    /// `error.rs`'s `exit_code` rule, which is stated there once for every
+    /// bounding guard in the tree: exit 6 is "stuffr declined to ask the
+    /// allocator", exit 5 is "stuffr read the bytes and they contradict each
+    /// other". Nothing is allocated from this offset and no budget makes a
+    /// position past `i64::MAX` reachable — the record simply does not
+    /// describe a place in this file.
+    ///
+    /// The refusal is NOT raised in this module: it comes from
+    /// `stuffr_core::source::GuardedSeek`, one layer down, so every container
+    /// that seeks to an archive-declared offset is covered by the same guard.
+    /// See that module's doc for why it is there and not here.
+    #[test]
+    fn a_zip64_header_offset_past_the_addressable_range_is_corrupt_not_an_i_o_failure() {
+        // The reproducer's own declared value, transcribed from its central
+        // directory: file offset 1048 holds `bf590c4f0d2147bb`.
+        let bytes = build_zip_declaring_a_zip64_header_offset(0xBB47_210D_4F0C_59BF);
+        let mut ar = open_seekable(&bytes);
+        let err = ar
+            .next_entry()
+            .expect_err("an unreachable local-header offset must be refused");
+        assert!(
+            matches!(err, Error::Corrupt(_)),
+            "must be classified as the archive's own inconsistency, not Error::Io: {err:?}"
+        );
+        assert_eq!(err.exit_code(), 5, "{err}");
+        let text = err.to_string();
+        assert!(
+            text.contains("13494791149483481535"),
+            "the refusal must name the position the archive declared: {text}"
+        );
+    }
+
+    /// The controlled half of the test above: the identical splice with an
+    /// offset that IS addressable is not refused by the seek guard, so the
+    /// test above is measuring the offset and not the splice.
+    #[test]
+    fn the_same_splice_with_an_addressable_offset_is_not_refused_by_the_seek_guard() {
+        let bytes = build_zip_declaring_a_zip64_header_offset(0);
+        let mut ar = open_seekable(&bytes);
+        let mut entry = ar
+            .next_entry()
+            .expect("an addressable offset must reach the local header")
+            .expect("one entry");
+        assert_eq!(entry.meta().name, "a.txt");
+        let mut got = Vec::new();
+        entry.reader().read_to_end(&mut got).expect("payload reads");
+        assert_eq!(got, b"hi");
+    }
+
     /// Reads every entry through the ladder over a NON-seekable source, the
     /// same "as if from a pipe" setup the harness itself uses.
     ///
