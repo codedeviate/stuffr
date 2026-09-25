@@ -779,8 +779,21 @@ Neither `fuzz-corpus` nor `fuzz` is part of `make check`: `cargo
 fuzz` needs the nightly toolchain the gate does not assume, and generating
 the corpus writes real files under a gitignored directory rather than
 something every edit should refresh. A slower, wall-clock-budgeted pass runs
-weekly (and on demand) via `.github/workflows/fuzz-deep.yml`, independent of
-`ci.yml`.
+**on every `v*` tag**, weekly, and on demand via
+`.github/workflows/fuzz-deep.yml`, independent of `ci.yml`.
+
+**A tag's deep run must be green before anything is published from it**, and
+that rule was bought rather than assumed. `v0.6.0` was tagged after a clean
+`make check`, a green CI run, and a whole-branch review carrying an
+independent 31,460-invocation corruption sweep. A deep run dispatched by hand
+against that tag then found **four CLI-reachable defects in five rounds** — a
+panic (exit 101 on a 602-byte `.Z` file) and two separate exit-1 classes —
+and **none of them was reachable by `make check` or by the smoke fuzz here**.
+Each was hidden behind the previous one, because libFuzzer aborts on its
+first crash, so every fix opened ground the fuzzer had never reached.
+`v0.6.0` was never published; `v0.6.1` carries the fixes. crates.io cannot be
+unpublished, only yanked — a tag can simply be replaced, which is why the
+gate sits there.
 
 **A crash becomes an ordinary regression test, not a file left in
 `fuzz/artifacts/`.** Reduce the crashing input, understand which of the four

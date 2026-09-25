@@ -23,11 +23,35 @@ name: fuzz (deep, scheduled)
 # when it is.
 
 on:
+  # EVERY TAG. This workflow used to say, here, that deep fuzzing was
+  # "exploratory, not a release gate". `v0.6.0` falsified that, expensively
+  # enough to be worth writing down:
+  #
+  # It was tagged after a clean `make check`, a green CI run, and a
+  # whole-branch review that included an independent 31,460-invocation
+  # corruption sweep. A deep run dispatched by hand against that tag then
+  # found FOUR CLI-reachable defects in five rounds — including a PANIC
+  # (exit 101 from `list`/`test`/`cat` on a 602-byte `.Z` file) and two
+  # separate exit-1 classes. Not one was reachable by `make check` or by the
+  # 2000-iteration smoke fuzz in `ci.yml`.
+  #
+  # Each was hidden behind the previous one, because libFuzzer aborts on its
+  # first crash: every fix opened ground the fuzzer had never reached. Had
+  # the run not been dispatched manually, `0.6.0` would have gone to
+  # crates.io with the panic in it and the next SCHEDULED run would have
+  # reported it days later, to an inbox, after publication.
+  #
+  # crates.io cannot be unpublished, only yanked. So this runs on the tag —
+  # which is cheap to replace — and the rule is that a tag's deep run must
+  # be green before anything is published from it.
+  push:
+    tags:
+      - "v*"
   schedule:
-    # Once a week (Sunday, 03:17 UTC — off the hour to avoid the scheduling
-    # pile-up GitHub warns about at :00). Deep fuzzing is exploratory, not a
-    # release gate, so weekly is enough cadence to be worth the runner time
-    # without competing for capacity with `ci.yml` on every push.
+    # Still weekly as well (Sunday, 03:17 UTC — off the hour to avoid the
+    # scheduling pile-up GitHub warns about at :00). The tag trigger catches
+    # a release; the schedule keeps finding things between releases, which
+    # is how the first of those four defects surfaced in the first place.
     - cron: "17 3 * * 0"
   # Lets a maintainer kick off a deep run on demand (e.g. right after a
   # change to a codec/container's decode path) without waiting for Sunday.
@@ -48,7 +72,10 @@ jobs:
     # the first place unless a fork owner has separately enabled Actions and
     # recreated the schedule themselves, but `workflow_dispatch` above can be
     # triggered manually from a fork — this guard is what actually closes
-    # that gap, not the schedule trigger's own default behaviour.
+    # that gap, not the schedule trigger's own default behaviour. It covers
+    # the `push: tags` trigger too, which a fork gets for free by pushing any
+    # `v*` tag of its own; that one would otherwise burn a fork's runner
+    # minutes on five 20-minute jobs without being asked.
     if: github.repository == 'codedeviate/stuffr'
     strategy:
       fail-fast: false
