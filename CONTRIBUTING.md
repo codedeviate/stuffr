@@ -612,10 +612,16 @@ proving it *can* fail — the same `broken_codecs`/`broken_containers` pattern
 the conformance harnesses already use — so a vacuous check is caught the
 same way a vacuous conformance property would be.
 
-`check_salvage_claim` is narrower than its four siblings by construction:
-`SalvageStatus::Partial` is a unit variant in `stuffr-core`, so the oracle
-can only ever refuse a false `Intact` claim (one made without checking a
-checksum), never distinguish *why* an entry is `Partial` — that distinction
+`check_salvage_claim` refuses a status that claims more than the format or
+the scan supports. Since Salvage Stage 3 it takes the format's class of
+evidence as an `Attestation` (`ContentChecksum` for zip/arc/zoo/lha/arj,
+`HeaderChecksumOnly` for tar, `Nothing` for cpio/ar) and gives each
+claim-bearing tier exactly one class: `Intact` needs a content checksum that
+was checked, `Complete` a header checksum that was checked, `Unattested` a
+format with nothing to check. It is still narrower than its four siblings in
+one direction by construction: `SalvageStatus::Partial` is a unit variant in
+`stuffr-core`, so it can never distinguish *why* an entry is `Partial`, and
+`Partial` and `Unverified` stay unconstrained — that distinction
 lives one crate up, in `stuffr::entries::PartialCause`, derived from a
 second decode the core layer never runs. See `honesty.rs`'s own doc comment
 on `check_salvage_claim` for the boundary this draws, and `salvage.rs`'s
@@ -674,8 +680,8 @@ the script before the check it feeds. The Makefile runs under a plain `sh`
 and must not. Both files say so; do not tidy either into matching the other.)
 
 **An unseeded target can execute cleanly and prove nothing, and `salvage`
-did.** Its only oracle call, `check_salvage_claim`, fires on
-`SalvageStatus::Intact` alone, and `Intact` requires a CRC-32 that matches
+did.** Its only oracle call, `check_salvage_claim`, is made for
+`SalvageStatus::Intact` records alone, and `Intact` requires a CRC-32 that matches
 its payload — which random mutation from an EMPTY corpus will not produce.
 So the assertion was unreachable by construction, not merely unlucky.
 Measured before it was seeded: 100,000 runs plateaued at `cov: 217` with a
@@ -743,8 +749,8 @@ do not. `legacy/arj_salvage.rs`'s candidate gate requires every basic header
 to reproduce a CRC-32 over its own content, so a mutation landing in a header
 is rejected with probability ~1 − 2⁻³² — and the mutations that DO survive
 are the ones in the payload, which that CRC does not cover, so they break the
-entry's own file CRC-32 and yield `Partial`. `check_salvage_claim` fires on
-`Intact` alone. **11-30 oracle calls is therefore the ceiling for that slot,
+entry's own file CRC-32 and yield `Partial`. The target calls
+`check_salvage_claim` for `Intact` records alone. **11-30 oracle calls is therefore the ceiling for that slot,
 not a seeding gap**, and the two formats with the weakest anchors behave the
 opposite way for the same structural reason: ARC's two-byte anchor makes
 almost any bytes produce candidates, which is why a session seeded with

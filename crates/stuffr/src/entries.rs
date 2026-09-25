@@ -1301,6 +1301,27 @@ pub enum SalvageDisposition {
     /// undecoded bytes of an undecodable-method entry is a different
     /// feature, not Stage 1's.
     SkippedUnverified,
+    /// Not written: [`stuffr_core::salvage::SalvageStatus::Unattested`] under
+    /// [`stuffr_core::salvage::SalvagePolicy::strict`] (Ruling 3-H, Salvage
+    /// Stage 3 Task 1's fix round).
+    ///
+    /// An `Unattested` entry is WRITTEN by default, under its real name —
+    /// that is the user's decision for `cpio` and `ar`, whose formats carry
+    /// nothing that could prove a candidate is an entry, and it is what
+    /// makes those formats salvageable at all. `--strict` is documented as
+    /// "demand proof" (its help text said "accept nothing this build cannot
+    /// verify" until this ruling), and an `Unattested` entry is by
+    /// definition one nothing can prove; skipping it there honours
+    /// both the default and the documented opt-out. Directories included:
+    /// the header that named a directory is exactly as unattested as one
+    /// that named a file.
+    ///
+    /// Its own variant rather than `SkippedUnverified`, because the two are
+    /// different facts with different remedies: `Unverified` is "this build
+    /// could not use a checksum the format carries" (bucket 3 — a rebuild
+    /// may fix it), this is "the user asked for proof and the format has
+    /// none to give" (bucket 4 — dropping `--strict` recovers it).
+    SkippedUnattested,
     /// Not written: this build's codec registry does not have a decoder for
     /// the method this entry needs, even though
     /// [`stuffr_formats::zip_salvage`] already proved its content (e.g. a
@@ -1682,6 +1703,9 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
             | SalvageDisposition::SkippedNotBuiltIn
             | SalvageDisposition::SkippedShadow(_)
             | SalvageDisposition::SkippedUnsupportedKind
+            // Bucket 4, not 3: nothing is missing from this build — the
+            // caller asked for proof the format cannot give (Ruling 3-H).
+            | SalvageDisposition::SkippedUnattested
             // Bucket 4, beside the other skips: the entry's CONTENT was
             // proven (it is not `Unverified`), only its placement failed.
             | SalvageDisposition::SkippedUnwritable { .. } => any_degraded = true,
@@ -1935,6 +1959,14 @@ fn place_salvaged_entry(
         && !select.contains(&entry.scan_position)
     {
         return Ok(SalvageDisposition::NotSelected);
+    }
+    // Ruling 3-H: `--strict` accepts nothing unproven, and `Unattested` is
+    // unproven by the format's own construction. Decided here, above the
+    // kind dispatch, so a directory entry meets the identical rule — and
+    // regardless of `dest`, the way `SkippedUnverified` is, so `--list
+    // --strict` reports what a `-C --strict` run would decline.
+    if opts.policy.strict && entry.status == stuffr_core::salvage::SalvageStatus::Unattested {
+        return Ok(SalvageDisposition::SkippedUnattested);
     }
 
     match entry.meta.kind {
@@ -5798,5 +5830,139 @@ mod salvage_seam_tests {
                  for it instead of a real per-format arm: {message}"
             );
         }
+    }
+}
+
+/// Ruling 3-H (Salvage Stage 3 Task 1's fix round, F3): `--strict` skips an
+/// `Unattested` entry, and ONLY `--strict` does.
+///
+/// Driven through [`place_salvaged_entry`] over constructed entries rather
+/// than a real archive, because no scanner in this build returns
+/// `Unattested` yet — `cpio` and `ar` arrive in the tasks after this one.
+/// Deliberately NOT inside `salvage_tests`, which is gated on `zip`: the rule
+/// is format-agnostic and must hold in a build with no scanner at all.
+#[cfg(test)]
+mod salvage_strict_tests {
+    use super::*;
+    use stuffr_core::salvage::{SalvagePolicy, SalvageStatus, SalvagedEntry};
+
+    fn opts(strict: bool, dest: Option<PathBuf>) -> SalvageOpts {
+        SalvageOpts {
+            dest,
+            policy: SalvagePolicy {
+                strict,
+                ..SalvagePolicy::default()
+            },
+            select: None,
+            format: None,
+        }
+    }
+
+    fn entry(kind: EntryKind, status: SalvageStatus) -> SalvagedEntry {
+        let mut meta = EntryMeta::file("x");
+        meta.kind = kind;
+        // A declared length, so a non-strict `File` reaching
+        // `place_salvaged_file` takes the report-only `NotWritten` arm
+        // instead of its "no declared length" invariant refusal.
+        meta.compressed_size = Some(0);
+        SalvagedEntry::new(0, 0, 0, meta, status)
+    }
+
+    fn place(opts: &SalvageOpts, entry: &SalvagedEntry) -> SalvageDisposition {
+        place_salvaged_entry(
+            Path::new("/nonexistent-strict-probe"),
+            opts,
+            entry,
+            &mut std::collections::HashMap::new(),
+            FormatId::new("cpio"),
+        )
+        .expect("a placement decision, never a run-level error")
+    }
+
+    #[test]
+    fn strict_skips_an_unattested_entry_of_either_kind_with_or_without_a_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        for kind in [EntryKind::File, EntryKind::Dir] {
+            for dest in [None, Some(out.clone())] {
+                let got = place(
+                    &opts(true, dest.clone()),
+                    &entry(kind.clone(), SalvageStatus::Unattested),
+                );
+                assert_eq!(
+                    got,
+                    SalvageDisposition::SkippedUnattested,
+                    "{kind:?} with dest {dest:?}: --strict must decline what nothing can prove"
+                );
+            }
+        }
+        assert!(
+            !out.exists(),
+            "a strict-skipped entry must not touch the destination, not even to create it"
+        );
+    }
+
+    #[test]
+    fn without_strict_an_unattested_entry_is_still_placed() {
+        // The over-strictness half: the user's decision is that
+        // `Unattested` WRITES by default. An edit applying the strict rule
+        // unconditionally reddens here.
+        let dir = tempfile::tempdir().unwrap();
+        let got = place(
+            &opts(false, Some(dir.path().to_path_buf())),
+            &entry(EntryKind::Dir, SalvageStatus::Unattested),
+        );
+        assert!(
+            matches!(got, SalvageDisposition::Directory(_)),
+            "the default writes an Unattested entry, got {got:?}"
+        );
+        let got = place(
+            &opts(false, None),
+            &entry(EntryKind::File, SalvageStatus::Unattested),
+        );
+        assert_eq!(
+            got,
+            SalvageDisposition::NotWritten,
+            "report-only and not strict: listed, not skipped"
+        );
+    }
+
+    #[test]
+    fn strict_does_not_touch_a_complete_entry() {
+        // tar's `Complete` DID self-verify its header — that is the proof
+        // `--strict` asks for, so the rule must be keyed on `Unattested`
+        // alone, not on "any tier short of Intact".
+        let dir = tempfile::tempdir().unwrap();
+        let got = place(
+            &opts(true, Some(dir.path().to_path_buf())),
+            &entry(EntryKind::Dir, SalvageStatus::Complete),
+        );
+        assert!(
+            matches!(got, SalvageDisposition::Directory(_)),
+            "--strict must still write a Complete entry, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_strict_skipped_unattested_entry_is_bucket_four() {
+        // Not 3: nothing is missing from this build. The caller asked for
+        // proof the format cannot give, and dropping `--strict` recovers it.
+        let outcome = SalvageOutcome {
+            entries: vec![SalvagedRecord {
+                scan_position: 0,
+                name: "x".into(),
+                status: SalvageStatus::Unattested,
+                shadows: None,
+                collides_with: None,
+                marked_deleted: false,
+                disposition: SalvageDisposition::SkippedUnattested,
+            }],
+        };
+        assert_eq!(salvage_exit_code(&outcome), 4);
+        // And the disposition's own arm is load-bearing on its own, not only
+        // through the status-read bucket beside it.
+        let mut by_disposition_alone = outcome;
+        by_disposition_alone.entries[0].status = SalvageStatus::Complete;
+        assert_eq!(salvage_exit_code(&by_disposition_alone), 4);
     }
 }

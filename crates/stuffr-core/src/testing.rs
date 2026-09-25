@@ -23,8 +23,8 @@ pub use crate::container_conformance::{
     assert_container_conforms_with, assert_container_conforms_with_skipping, open_forward_only,
 };
 pub use crate::honesty::{
-    check_entry_count, check_entry_size, check_error_is_classified, check_fidelity_claim,
-    check_salvage_claim,
+    Attestation, check_entry_count, check_entry_size, check_error_is_classified,
+    check_fidelity_claim, check_salvage_claim,
 };
 
 /// The fuzzer's codec selector table: byte `n % CODEC_SLOTS.len()` names a

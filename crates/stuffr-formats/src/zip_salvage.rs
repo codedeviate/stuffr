@@ -655,21 +655,33 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         // else reaching here is unreachable in practice, and `Complete` is
         // the safe answer if it ever did.
         //
-        // **Salvage Stage 3 made this the one live `Complete` in the tree
-        // that its own oracle would refuse, and it is recorded rather than
-        // changed.** `stuffr_core::testing::check_salvage_claim` now holds
-        // that `Complete` needs a format offering an attestation AND that
-        // attestation to have been checked; zip offers one and this arm
-        // checked nothing, so `(offers = true, checked = false)` is exactly
-        // the shape the oracle calls a false claim. The arm stays because
-        // it is provably unreachable — `read_candidate_at` constructs every
-        // zip candidate's verifier as `Crc32` or `None`, and `None` was
-        // taken by the `declared_len` arm at the top of this function — and
-        // because the honest replacement is a new `UnverifiedCause` for
-        // "the format carries a checksum this candidate did not report",
-        // which is a public-enum change this task has no reachable code to
-        // justify. If a zip candidate ever CAN arrive with a non-`Crc32`
-        // verifier, this line is wrong before anything else is.
+        // **Salvage Stage 3 made this a `Complete` the oracle refuses, and it
+        // is recorded rather than changed.** `stuffr_core::testing::
+        // check_salvage_claim` holds that `Complete` belongs to
+        // `Attestation::HeaderChecksumOnly` alone (tar); zip is
+        // `Attestation::ContentChecksum`, whose honest tiers are `Intact`,
+        // `Partial` and `Unverified`, so the oracle refuses a zip `Complete`
+        // whatever `verifier_was_checked` says.
+        //
+        // **What was actually shown is narrower than "unreachable".** By
+        // reading, not by a test: both of this module's candidate
+        // construction sites (`read_candidate_at` and the central-directory
+        // reconciliation, `candidate_from_cd_record`) set `verifier` to
+        // `Some(Crc32)` exactly when `declared_len` is `Some`, and the
+        // `declared_len == None` case is taken by the first arm of this
+        // function. So through `salvage_zip` / `annotate_candidates` this
+        // arm is dead. It is NOT dead from the public API: `ZipSalvage` and
+        // `SalvageScan::verify` are both `pub`, so a caller hand-building a
+        // candidate with a declared length and a `Crc16` verifier reaches
+        // it and is told `Complete`. That needs a deliberately nonsensical
+        // external candidate, and nothing in-tree builds one, so it is
+        // left. (The fuzz target does NOT guard it: it drives the engine,
+        // which never builds such a candidate, and it consults the oracle
+        // only for `Intact` records.) The honest replacement is a new
+        // `UnverifiedCause` for "the format carries a checksum this
+        // candidate did not report", a public-enum change with no in-tree
+        // caller to justify it. If a zip candidate ever CAN arrive this way
+        // from the engine, this line is wrong before anything else is.
         return Ok(SalvageStatus::Complete);
     };
 

@@ -324,9 +324,10 @@ pub enum Command {
         #[arg(long, value_name = "SIZE")]
         max_entry: Option<String>,
         /// Demand proof: skip every partial entry regardless of `--partial`,
-        /// and accept nothing this build cannot verify. The strict path
-        /// every other verb in this tool already stands on, applied here on
-        /// request instead of by default.
+        /// and every unattested one (a format with no checksum and no header
+        /// self-check, whose entries are otherwise written under their real
+        /// names). The strict path every other verb in this tool already
+        /// stands on, applied here on request instead of by default.
         #[arg(long)]
         strict: bool,
         /// Use this format instead of detecting one.

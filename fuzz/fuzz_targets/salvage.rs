@@ -6,7 +6,8 @@ use std::sync::OnceLock;
 use stuffr::entries::{self, SalvageOpts};
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
 use stuffr_core::testing::{
-    SALVAGE_FUZZ_MAX_ENTRY, SALVAGE_SLOTS, check_error_is_classified, check_salvage_claim,
+    Attestation, SALVAGE_FUZZ_MAX_ENTRY, SALVAGE_SLOTS, check_error_is_classified,
+    check_salvage_claim,
 };
 use stuffr_formats::legacy::{arc_salvage, arj_salvage, lha_salvage, zoo_salvage};
 use stuffr_formats::zip_salvage;
@@ -316,22 +317,27 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
         .find(|&slot| slot == container.as_str())
 }
 
-/// Whether the FORMAT behind a slot offers anything that attests an entry —
-/// a checksum over the content, or a self-verifying header — which is
-/// [`check_salvage_claim`]'s third argument and a fact about the format, not
-/// about one candidate.
+/// Which class of evidence the FORMAT behind a slot offers — the
+/// [`Attestation`] that is [`check_salvage_claim`]'s third argument, and a
+/// fact about the format, not about one candidate.
 ///
-/// All five slots answer `true` today: zip carries a CRC-32, and ARC, ZOO,
-/// LHA and ARJ each carry a CRC of their own. It is written as a `match`
-/// rather than the constant `true` that would compute the same answer,
-/// because Salvage Stage 3 is adding `tar`, `cpio` and `ar` to
-/// [`SALVAGE_SLOTS`] and two of those three answer `false` — a constant
-/// would have carried the wrong answer into the exact slots the third
-/// argument exists for, silently, which is the shape [`no_cross_check_arm`]
-/// one screen up was written to stop.
-fn format_offers_verifier(name: &str) -> bool {
+/// All five slots are [`Attestation::ContentChecksum`] today: zip carries a
+/// CRC-32, and ARC, ZOO, LHA and ARJ each carry a CRC of their own. It is a
+/// `match` naming each slot rather than one constant, because Salvage Stage
+/// 3 is adding `tar` ([`Attestation::HeaderChecksumOnly`]) and `cpio`/`ar`
+/// ([`Attestation::Nothing`]) to [`SALVAGE_SLOTS`] — a constant would carry
+/// the wrong class into the exact slots the argument exists for, silently,
+/// which is the shape [`no_cross_check_arm`] one screen up was written to
+/// stop. Each scanner's class is stated here by name, where a reviewer
+/// reading the oracle call can see it.
+///
+/// It was a `bool` (`format_offers_verifier`) for one commit, and that
+/// could not tell a header-only checksum from a content one: a scanner in
+/// any of these five slots answering `Complete` after its CRC had been
+/// compared and disagreed passed the oracle. Ruling 3-G.
+fn attestation(name: &str) -> Attestation {
     match name {
-        "zip" | "arc" | "zoo" | "lha" | "arj" => true,
+        "zip" | "arc" | "zoo" | "lha" | "arj" => Attestation::ContentChecksum,
         other => no_cross_check_arm(other),
     }
 }
@@ -345,9 +351,9 @@ fn format_offers_verifier(name: &str) -> bool {
 /// harness that has none — the same detached-instrument shape as Stage 1's
 /// unreachable oracle and Task 6's missing `arj` arm. Here the only way to
 /// obtain the increment is to have called the oracle.
-fn run_oracle(status: SalvageStatus, offers_crc: bool, format_offers: bool) -> usize {
-    check_salvage_claim(&status, offers_crc, format_offers)
-        .expect("salvage claim: Intact without a checkable checksum");
+fn run_oracle(status: SalvageStatus, offers_crc: bool, attestation: Attestation) -> usize {
+    check_salvage_claim(&status, offers_crc, attestation)
+        .expect("salvage claim: a status claiming more than the format or the scan supports");
     1
 }
 
@@ -577,7 +583,7 @@ fuzz_target!(|data: &[u8]| {
         };
         match offers_crc {
             Some(offers_crc) => {
-                oracle += run_oracle(record.status, offers_crc, format_offers_verifier(name));
+                oracle += run_oracle(record.status, offers_crc, attestation(name));
             }
             None => inconclusive += 1,
         }

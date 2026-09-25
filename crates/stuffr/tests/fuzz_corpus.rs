@@ -134,8 +134,8 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// runs plateaued at `cov: 217`, and running the binary's `salvage --list`
 /// over all 64 accumulated corpus inputs produced **not one salvaged
 /// record** — not an `Intact`, `Complete`, `Partial` or `Unverified` row
-/// anywhere. The target's only oracle call, `check_salvage_claim`, fires
-/// only on `SalvageStatus::Intact`, which needs a CRC-32 that matches its
+/// anywhere. The target's only oracle call, `check_salvage_claim`, is made
+/// only for `SalvageStatus::Intact` records, which need a CRC-32 that matches its
 /// payload; random mutation from an EMPTY corpus will not produce one, so
 /// the assertion was unreachable by construction rather than merely
 /// unlucky. This is Phase 3a's "ran clean, never completed an iteration"
@@ -1300,8 +1300,9 @@ fn the_corpus_builders_crc_matches_the_published_check_value() {
 }
 
 /// **The claim the salvage corpus is actually making.** Its seeds exist so
-/// the fuzz target's only oracle call — `check_salvage_claim`, which fires
-/// on `SalvageStatus::Intact` alone — is reachable at all. Before seeding,
+/// the fuzz target's only oracle call — `check_salvage_claim`, which the
+/// target makes for `SalvageStatus::Intact` records alone — is reachable at
+/// all. Before seeding,
 /// all 64 accumulated corpus inputs produced not one salvaged record of
 /// any status, so the target executed cleanly and proved nothing.
 ///
@@ -1357,7 +1358,7 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
         intact_seeds,
         SALVAGE_SHAPES.len(),
         "every shape must reach `Intact` on at least one of its records: that status is \
-         the only one `check_salvage_claim` fires on, and a damaged shape is meant to be \
+         the only one the target calls `check_salvage_claim` for, and a damaged shape is meant to be \
          a healthy archive the fuzzer can degrade FROM, not one already past the check"
     );
 

@@ -385,8 +385,11 @@ pub enum SalvageStatus {
     /// They are [`SalvageStatus::Unattested`].
     ///
     /// [`crate::testing::check_salvage_claim`] is what holds the line: this
-    /// tier requires the format to offer an attestation AND that attestation
-    /// to have been checked, so the checksumless pair cannot reach it.
+    /// tier requires a format whose only checksum covers the HEADER
+    /// (`Attestation::HeaderChecksumOnly`) AND that checksum to have been
+    /// checked — so the checksumless pair cannot reach it, and neither can a
+    /// format with a content checksum, whose honest tiers are `Intact`,
+    /// `Partial` and `Unverified`.
     Complete,
     /// Nothing attests that this candidate is an entry AT ALL: the format
     /// carries **no checksum and no self-verifying header**, so a
@@ -603,10 +606,16 @@ pub struct SalvagePolicy {
     /// are applied together, once, in [`annotate_candidates`].
     pub max_entry: u64,
     /// Demand proof: every [`SalvageStatus::Partial`] entry is skipped,
-    /// whatever [`Self::partial`] says.
+    /// whatever [`Self::partial`] says, and so is every
+    /// [`SalvageStatus::Unattested`] one (Ruling 3-H, Salvage Stage 3).
     ///
-    /// **That is the whole of it, and this doc claimed three things until
-    /// the final whole-branch review's F5.** It read "partial skipped,
+    /// The second clause is this flag's doing, unlike the two refused
+    /// below: an `Unattested` entry is WRITTEN by default, under its real
+    /// name, and only `strict` declines it — the format carries nothing
+    /// that could prove it, which is exactly what "demand proof" asks for.
+    ///
+    /// **Those two are the whole of it, and this doc claimed three things
+    /// until the final whole-branch review's F5.** It read "partial skipped,
     /// ceiling fixed, nothing unverifiable", and only the first clause was
     /// this flag's doing. The ceiling is NOT fixed under `strict`:
     /// [`Self::max_entry`] applies identically with and without it, and
@@ -616,7 +625,7 @@ pub struct SalvagePolicy {
     /// something `strict` causes — so crediting it here made a flag look
     /// load-bearing for a guarantee that holds without it.
     ///
-    /// The one true clause is enough to justify the flag: `salvage` is this
+    /// The true clauses are enough to justify the flag: `salvage` is this
     /// tool's single recovery-biased verb, so `strict` is how a caller asks
     /// for the discipline every other verb applies by default.
     pub strict: bool,

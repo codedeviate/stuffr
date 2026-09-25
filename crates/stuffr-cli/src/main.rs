@@ -693,6 +693,7 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
         | entries::SalvageDisposition::Written(_)
         | entries::SalvageDisposition::Directory(_)
         | entries::SalvageDisposition::SkippedUnverified
+        | entries::SalvageDisposition::SkippedUnattested
         | entries::SalvageDisposition::SkippedNotBuiltIn
         | entries::SalvageDisposition::SkippedShadow(_)
         | entries::SalvageDisposition::SkippedUnsupportedKind
@@ -719,6 +720,15 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     // The entry is still written under its real name; the run exits 4.
     if record.status == stuffr::salvage::SalvageStatus::Unattested {
         line.push_str(" [no checksum and no header self-check in this format]");
+    }
+    // Ruling 3-H: the entry above was NOT written, and the reason is the
+    // caller's own flag rather than anything about the archive — so the row
+    // names the flag, which is also the remedy.
+    if matches!(
+        record.disposition,
+        entries::SalvageDisposition::SkippedUnattested
+    ) {
+        line.push_str(" [not written: --strict demands proof this format cannot give]");
     }
     // The path actually written, named only when it is NOT the entry's own
     // name — a row a user reads to find their file must say where it went.
@@ -865,6 +875,29 @@ fn print_salvage_write_failures(entries: &[entries::SalvagedRecord]) {
 /// selection when one was given, unlike [`print_salvage_list`], which always
 /// takes the full scan.
 fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
+    for line in salvage_summary_lines(entries) {
+        eprintln!("{line}");
+    }
+}
+
+/// [`print_salvage_summary`]'s text, separated from the printing so the
+/// lines themselves can be pinned by a unit test — `Unattested` is not
+/// reachable end to end from any scanner in this build, so a CLI test
+/// cannot observe what it prints yet.
+///
+/// # Why an `Unattested` run gets a line of its own (Salvage Stage 3 Task 1, F2)
+///
+/// An `Unattested` entry is WRITTEN, so it lands in the `written` count
+/// beside every clean entry, and the run exits 4. Without more, plain
+/// `salvage x.cpio -C out` would print "N written, 0 skipped" and exit 4
+/// with nothing on stderr saying why — the "exit code with empty stderr"
+/// shape Stage 2 already paid for once, when a full disk and one
+/// unwritable name printed the same skip count and a user could not tell
+/// which they had. The row tag carries the reason under `--list`; this
+/// carries it on the path most runs take. The `unattested` count is an
+/// ADDITIONAL tally, like `renamed`, so the first six counts still sum to
+/// the number of rows.
+fn salvage_summary_lines(entries: &[entries::SalvagedRecord]) -> Vec<String> {
     let (mut written, mut partial, mut skipped, mut unverified, mut not_selected, mut not_written) =
         (0, 0, 0, 0, 0, 0);
     // An ADDITIONAL tally, not a bucket of its own: a disambiguated record
@@ -874,7 +907,13 @@ fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
     // giving it its own bucket would make the summary stop adding up, which
     // is precisely the defect this whole change exists to fix.
     let mut renamed = 0;
+    // The same shape, for the same reason: `Unattested` is a fact about the
+    // FORMAT behind a record, whatever became of the record.
+    let mut unattested = 0;
     for record in entries {
+        if record.status == stuffr::salvage::SalvageStatus::Unattested {
+            unattested += 1;
+        }
         match &record.disposition {
             entries::SalvageDisposition::Written(_) | entries::SalvageDisposition::Directory(_) => {
                 written += 1;
@@ -891,6 +930,9 @@ fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
             | entries::SalvageDisposition::SkippedNotBuiltIn
             | entries::SalvageDisposition::SkippedShadow(_)
             | entries::SalvageDisposition::SkippedUnsupportedKind
+            // Ruling 3-H: declined under `--strict`. A skip, not a new
+            // bucket — the `unattested` tally already says what kind.
+            | entries::SalvageDisposition::SkippedUnattested
             // Counted as skipped, not as a bucket of its own: the summary's
             // six counts must keep summing to the number of rows, and the
             // per-entry reason is on the row (`[not written: …]`).
@@ -904,12 +946,23 @@ fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
             entries::SalvageDisposition::NotWritten => not_written += 1,
         }
     }
-    eprintln!(
+    let mut lines = vec![format!(
         "salvage -> {} scanned: {written} written, {partial} written as .partial, {skipped} \
          skipped, {unverified} unverified, {not_selected} not selected, {not_written} not \
-         written (no destination), {renamed} renamed to avoid a name collision",
+         written (no destination), {renamed} renamed to avoid a name collision, {unattested} \
+         unattested",
         entries.len()
-    );
+    )];
+    if unattested > 0 {
+        lines.push(format!(
+            "salvage -> {unattested} entr{} unattested: this format carries no checksum and no \
+             header self-check, so nothing proves a recovered record is a real entry rather \
+             than a coincidental header match — kept under the real name unless --strict, and \
+             the run exits 4",
+            if unattested == 1 { "y is" } else { "ies are" }
+        ));
+    }
+    lines
 }
 
 /// Validates `--index` against the scan positions the archive actually has.
@@ -1008,6 +1061,7 @@ fn finish_single_file_recovery(
         }
         entries::SalvageDisposition::SkippedShadow(_)
         | entries::SalvageDisposition::SkippedUnverified
+        | entries::SalvageDisposition::SkippedUnattested
         | entries::SalvageDisposition::SkippedNotBuiltIn
         | entries::SalvageDisposition::SkippedPartial(_)
         | entries::SalvageDisposition::SkippedUnsupportedKind
@@ -1732,6 +1786,82 @@ mod tests {
                  arm for it"
             );
         }
+    }
+
+    fn record(
+        status: stuffr::salvage::SalvageStatus,
+        disposition: entries::SalvageDisposition,
+    ) -> entries::SalvagedRecord {
+        entries::SalvagedRecord {
+            scan_position: 0,
+            name: "notes.txt".into(),
+            status,
+            shadows: None,
+            collides_with: None,
+            marked_deleted: false,
+            disposition,
+        }
+    }
+
+    /// Fix round 1, F2: a plain `salvage x.cpio -C out` must say WHY it exits
+    /// 4. An `Unattested` entry is written, so the counts alone read like a
+    /// clean run; without the second line the run would exit 4 with nothing
+    /// on stderr to explain it — the shape Stage 2 paid for with
+    /// `SkippedUnwritable`.
+    #[test]
+    fn an_unattested_run_says_why_on_the_default_summary() {
+        let written = entries::SalvageDisposition::Written(std::path::PathBuf::from("/o/n"));
+        let lines = salvage_summary_lines(&[
+            record(stuffr::salvage::SalvageStatus::Unattested, written.clone()),
+            record(stuffr::salvage::SalvageStatus::Unattested, written.clone()),
+        ]);
+        assert!(
+            lines[0].contains("2 written") && lines[0].contains("2 unattested"),
+            "the counts must still add up and name the tally: {lines:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            2,
+            "a reason line must follow the counts: {lines:?}"
+        );
+        assert!(
+            lines[1].contains("no checksum and no header self-check")
+                && lines[1].contains("exits 4"),
+            "the reason must name the format's shortcoming and the exit code: {lines:?}"
+        );
+
+        // Skipped under `--strict` still counts: the tally is about the
+        // format, the skip is about the flag.
+        let lines = salvage_summary_lines(&[record(
+            stuffr::salvage::SalvageStatus::Unattested,
+            entries::SalvageDisposition::SkippedUnattested,
+        )]);
+        assert!(
+            lines[0].contains("1 skipped") && lines[0].contains("1 unattested"),
+            "{lines:?}"
+        );
+
+        // And the line is specific to the tier: a clean run prints the
+        // counts alone, `0 unattested` included, and no reason line.
+        let lines =
+            salvage_summary_lines(&[record(stuffr::salvage::SalvageStatus::Complete, written)]);
+        assert_eq!(lines.len(), 1, "no reason line for a clean run: {lines:?}");
+        assert!(lines[0].contains("0 unattested"), "{lines:?}");
+    }
+
+    /// Ruling 3-H: a row `--strict` declined names the flag, which is also
+    /// the remedy.
+    #[test]
+    fn a_strict_skipped_unattested_row_names_the_flag() {
+        let row = describe_salvage_row(&record(
+            stuffr::salvage::SalvageStatus::Unattested,
+            entries::SalvageDisposition::SkippedUnattested,
+        ));
+        assert!(row.contains("Unattested"), "{row}");
+        assert!(
+            row.contains("--strict"),
+            "the row must name the flag: {row}"
+        );
     }
 
     /// Salvage Stage 3: the `Unattested` row names the FORMAT's shortcoming
