@@ -374,24 +374,74 @@ fn run_oracle(status: SalvageStatus, offers_crc: bool, attestation: Attestation)
 /// ```
 ///
 /// `-runs=0` still executes every corpus file exactly once, so the lines are
-/// one per input and can be summed per slot. `oracle` counts calls to
-/// [`check_salvage_claim`], which is a DIFFERENT number from `intact`:
-/// the call is skipped when the independent second scan did not also report
-/// that scan position, or when this target's own raw-byte cross-check cannot
-/// tell whether a checksum was checkable (`inconclusive`). Conflating the
-/// two is the error the last two tasks each made once.
+/// one per input and can be summed per slot. `claims` counts records in any
+/// of the three tiers the oracle can refuse (`Intact`, `Complete`,
+/// `Unattested` — see [`makes_a_claim`]), `intact` the first of them alone,
+/// and `oracle` counts calls to [`check_salvage_claim`], which is a
+/// DIFFERENT number from both: the call is skipped when the independent
+/// second scan did not also report that scan position, or when this
+/// target's own raw-byte cross-check cannot tell whether a checksum was
+/// checkable (`inconclusive`). Conflating the two is the error the last two
+/// tasks each made once. A claim the slot's class forbids outright is the
+/// one exception — it is checked with no cross-check at all (Ruling 3-I),
+/// and on a healthy scanner there are none, so on a healthy run `claims`
+/// minus `intact` is also the number of records whose tier needed a
+/// cross-check the checksummed slots do not have.
 /// `routed` says which of the two decided the slot — `magic` when the
 /// payload named itself and `selector` when it fell back to the leading byte
 /// — so the effect of Ruling S-S's change is measurable on its own rather
 /// than only visible as a shift in the totals.
-fn trace(slot: &str, routed: &str, rows: usize, intact: usize, oracle: usize, inconclusive: usize) {
+fn trace(slot: &str, routed: &str, rows: usize, tally: Tally) {
     static ON: OnceLock<bool> = OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("STUFFR_FUZZ_SALVAGE_TRACE").is_some()) {
         eprintln!(
-            "salvage-trace slot={slot} routed={routed} rows={rows} intact={intact} \
-             oracle={oracle} inconclusive={inconclusive}"
+            "salvage-trace slot={slot} routed={routed} rows={rows} intact={} claims={} \
+             oracle={} inconclusive={}",
+            tally.intact, tally.claims, tally.oracle, tally.inconclusive
         );
     }
+}
+
+/// What one input's loop counted, for [`trace`]. A struct rather than four
+/// positional `usize`s, because two of them (`claims` and `oracle`) are
+/// easy to transpose and the whole point of the line is that they differ.
+#[derive(Default)]
+struct Tally {
+    intact: usize,
+    claims: usize,
+    oracle: usize,
+    inconclusive: usize,
+}
+
+/// Whether `status` is one of the three tiers [`check_salvage_claim`] can
+/// refuse — the tiers that CLAIM something (a checksum agreed, a header
+/// self-verified, nothing attests the entry). `Unverified` and `Partial`
+/// are unconstrained by the oracle for every class, so consulting it for
+/// them would only inflate the `oracle` count with calls that cannot fail.
+///
+/// An exhaustive `match`, so a sixth tier added to [`SalvageStatus`] does
+/// not compile here until somebody decides whether it makes a claim.
+fn makes_a_claim(status: SalvageStatus) -> bool {
+    match status {
+        SalvageStatus::Intact | SalvageStatus::Complete | SalvageStatus::Unattested => true,
+        SalvageStatus::Unverified(_) | SalvageStatus::Partial => false,
+    }
+}
+
+/// Whether the oracle refuses `status` for a slot of class `class` under
+/// BOTH values of its checked flag — i.e. whether the claim is forbidden
+/// for the class outright, so that no independent cross-check could change
+/// the verdict.
+///
+/// **Asked of the oracle itself rather than restated as a table here.** A
+/// copy of the truth table in this file would be a second source that could
+/// drift from `honesty.rs`'s, and a drifted copy that thought a cell was
+/// permitted would silently skip exactly the call this function exists to
+/// make. These two calls are not counted: they decide whether the counted
+/// one — [`run_oracle`] — is made with or without a cross-check.
+fn refused_whatever_was_checked(status: SalvageStatus, class: Attestation) -> bool {
+    check_salvage_claim(&status, true, class).is_err()
+        && check_salvage_claim(&status, false, class).is_err()
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -476,7 +526,7 @@ fuzz_target!(|data: &[u8]| {
         Ok(o) => o,
         Err(e) => {
             check_error_is_classified(&e).expect("salvage error classification");
-            trace(name, routed, 0, 0, 0, 0);
+            trace(name, routed, 0, Tally::default());
             return;
         }
     };
@@ -557,13 +607,30 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut intact = 0usize;
+    let mut claims = 0usize;
     let mut oracle = 0usize;
     let mut inconclusive = 0usize;
+    let class = attestation(name);
     for record in &outcome.entries {
-        if record.status != SalvageStatus::Intact {
+        if !makes_a_claim(record.status) {
             continue;
         }
-        intact += 1;
+        claims += 1;
+        if record.status == SalvageStatus::Intact {
+            intact += 1;
+        }
+        // Ruling 3-I. A claim this slot's class never permits is refused
+        // whichever way the checked flag falls, so no cross-check below
+        // could rescue it and none is consulted: the call is made straight
+        // away, and it aborts. That is the `Complete`-after-a-disagreeing-
+        // CRC hole (exit 4 turned into exit 0) and a scanner that forgot to
+        // override `verify` (the trait default answers `Unattested`), for
+        // all five checksummed slots — neither of which this loop could see
+        // while it skipped every record that was not `Intact`.
+        if refused_whatever_was_checked(record.status, class) {
+            oracle += run_oracle(record.status, false, class);
+            continue;
+        }
         // A scan position the independent pass did not also report is not
         // this check's job (the two disagreeing on structure would be a
         // different finding, over a determinism assumption this target does
@@ -583,7 +650,7 @@ fuzz_target!(|data: &[u8]| {
         };
         match offers_crc {
             Some(offers_crc) => {
-                oracle += run_oracle(record.status, offers_crc, attestation(name));
+                oracle += run_oracle(record.status, offers_crc, class);
             }
             None => inconclusive += 1,
         }
@@ -592,8 +659,11 @@ fuzz_target!(|data: &[u8]| {
         name,
         routed,
         outcome.entries.len(),
-        intact,
-        oracle,
-        inconclusive,
+        Tally {
+            intact,
+            claims,
+            oracle,
+            inconclusive,
+        },
     );
 });

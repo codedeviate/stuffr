@@ -124,9 +124,12 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// ZOO's is a FOUR-byte tag behind a full record gate, and 876 inputs
 /// produced **not one salvaged record of any status** — the identical
 /// vacuity this constant's own history section below describes, reproduced
-/// for one slot inside an otherwise well-seeded target. `check_salvage_claim`
-/// fires only on `Intact`, so the `zoo` slot's share of every run was
-/// proving nothing at all.
+/// for one slot inside an otherwise well-seeded target. The target consults
+/// `check_salvage_claim` only for a record that makes a CLAIM — `Intact`,
+/// `Complete` or `Unattested` (it skipped everything but `Intact` until
+/// Salvage Stage 3 Task 2, Ruling 3-I) — so a slot producing no records at
+/// all, as `zoo` then did, spends its whole share of every run proving
+/// nothing.
 ///
 /// **This target ran unseeded until the final whole-branch review**, and
 /// `make fuzz` reported `target 'salvage': 2000 executions — OK` the whole
