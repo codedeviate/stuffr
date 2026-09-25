@@ -316,6 +316,26 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
         .find(|&slot| slot == container.as_str())
 }
 
+/// Whether the FORMAT behind a slot offers anything that attests an entry —
+/// a checksum over the content, or a self-verifying header — which is
+/// [`check_salvage_claim`]'s third argument and a fact about the format, not
+/// about one candidate.
+///
+/// All five slots answer `true` today: zip carries a CRC-32, and ARC, ZOO,
+/// LHA and ARJ each carry a CRC of their own. It is written as a `match`
+/// rather than the constant `true` that would compute the same answer,
+/// because Salvage Stage 3 is adding `tar`, `cpio` and `ar` to
+/// [`SALVAGE_SLOTS`] and two of those three answer `false` — a constant
+/// would have carried the wrong answer into the exact slots the third
+/// argument exists for, silently, which is the shape [`no_cross_check_arm`]
+/// one screen up was written to stop.
+fn format_offers_verifier(name: &str) -> bool {
+    match name {
+        "zip" | "arc" | "zoo" | "lha" | "arj" => true,
+        other => no_cross_check_arm(other),
+    }
+}
+
 /// Runs [`check_salvage_claim`] and reports that one call was made.
 ///
 /// **The count is the RESULT of performing the check, never a statement
@@ -325,8 +345,8 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
 /// harness that has none — the same detached-instrument shape as Stage 1's
 /// unreachable oracle and Task 6's missing `arj` arm. Here the only way to
 /// obtain the increment is to have called the oracle.
-fn run_oracle(status: SalvageStatus, offers_crc: bool) -> usize {
-    check_salvage_claim(status, offers_crc)
+fn run_oracle(status: SalvageStatus, offers_crc: bool, format_offers: bool) -> usize {
+    check_salvage_claim(&status, offers_crc, format_offers)
         .expect("salvage claim: Intact without a checkable checksum");
     1
 }
@@ -556,7 +576,9 @@ fuzz_target!(|data: &[u8]| {
             other => no_cross_check_arm(other),
         };
         match offers_crc {
-            Some(offers_crc) => oracle += run_oracle(record.status, offers_crc),
+            Some(offers_crc) => {
+                oracle += run_oracle(record.status, offers_crc, format_offers_verifier(name));
+            }
             None => inconclusive += 1,
         }
     }

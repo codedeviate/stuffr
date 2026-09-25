@@ -158,40 +158,120 @@ pub fn check_fidelity_claim(report: &FidelityReport, approximated: bool) -> Resu
     Ok(())
 }
 
-/// Never report `Intact` for an entry whose checksum was not actually
-/// checked.
+/// Never report a status that claims more evidence than the format offers
+/// or the scan actually gathered.
 ///
 /// This lives in the library rather than inside the fuzz target because a
 /// fuzz target's own checks cannot be unit-tested, so a harness that runs
 /// clean is indistinguishable from one whose invariants are vacuous — the
 /// same reason the four checks above it live here.
 ///
-/// **Only `Intact` is constrained.** [`SalvageStatus::Complete`] asserts the
-/// OPPOSITE of "a checksum agreed" — the format carries no checksum at all,
-/// so nothing was there to check — and requiring `verifier_was_checked` for
-/// it would be wrong, not stricter: an over-strict oracle demanding a
-/// checksum for `Complete` would refuse every tar, cpio or ar entry this
-/// engine has ever recovered, none of which carries one. `Partial` is
-/// deliberately loose in `stuffr-core`'s own enum: `zip_salvage.rs`'s
-/// `stream_verify` folds "the payload ran out or the decoder failed
-/// mid-stream" (no comparison was ever reached) and "every byte decoded but
-/// disagreed with the checksum" (a comparison WAS reached and failed) into
-/// the one status, so `verifier_was_checked` cannot be constrained either
-/// way for it without splitting that status — which this project's own
-/// `entries.rs::PartialCause` already does one layer up, by re-deriving the
-/// cause from a second decode rather than widening this enum. `Unverified`
-/// asserts its own opposite explicitly (nothing about the content was
-/// verified, for either of its two causes), so it needs no constraint here
-/// either — its own variant name already carries the claim this function
-/// exists to police for `Intact`.
+/// # What the two booleans mean
+///
+/// `format_offers_verifier` is **"this FORMAT offers something that attests
+/// an entry — a checksum over the content, OR a self-verifying header"**,
+/// and reading it as "a content checksum" alone makes the rules below
+/// inconsistent. `tar` answers `true` on the strength of its header
+/// checksum; `cpio` and `ar` answer `false`, because they carry neither.
+/// `verifier_was_checked` is whether that thing was actually compared for
+/// THIS candidate.
+///
+/// # The rules, and why each tier has one
+///
+/// * [`SalvageStatus::Intact`] — a checksum the original writer computed
+///   agreed. That needs a format offering one AND a comparison having run,
+///   so both booleans must be `true`. The `!verifier_was_checked` half is
+///   this function's original Stage 1 invariant, unchanged.
+/// * [`SalvageStatus::Complete`] — every declared byte was present *and the
+///   header self-verified*. The second clause is a check, so it needs the
+///   same two `true`s: something was offered, and it was checked. **This
+///   arm is what Salvage Stage 3 added and what the stage depends on.**
+///   Without it, a `cpio` or `ar` scanner answering `Complete` — asserting
+///   a header self-check those formats do not have — passes an oracle that
+///   only ever looked at `Intact`, and routes to exit 0. Note the two
+///   halves refuse different mistakes: `(false, _)` is the checksumless
+///   pair claiming a tier they cannot reach ([`SalvageStatus::Unattested`]
+///   is theirs), and `(true, false)` is a format that DOES offer an
+///   attestation reporting `Complete` without using it — for which the
+///   honest answer is [`SalvageStatus::Unverified`].
+/// * [`SalvageStatus::Unattested`] — the format offers nothing at all, so
+///   `format_offers_verifier` must be `false`. `verifier_was_checked` is
+///   deliberately NOT constrained here, in the direction that matters: this
+///   tier is what `cpio` and `ar` legitimately report on every entry they
+///   recover, and an oracle that refused it would fire on the first valid
+///   cpio the fuzzer built — the `check_entry_size` symlink lesson, in this
+///   function's own vocabulary.
+/// * [`SalvageStatus::Partial`] is deliberately loose in `stuffr-core`'s own
+///   enum: `zip_salvage.rs`'s `stream_verify` folds "the payload ran out or
+///   the decoder failed mid-stream" (no comparison was ever reached) and
+///   "every byte decoded but disagreed with the checksum" (a comparison WAS
+///   reached and failed) into the one status, so `verifier_was_checked`
+///   cannot be constrained either way for it without splitting that status —
+///   which this project's own `entries.rs::PartialCause` already does one
+///   layer up, by re-deriving the cause from a second decode rather than
+///   widening this enum.
+/// * [`SalvageStatus::Unverified`] asserts its own opposite explicitly
+///   (nothing about the content was verified, for any of its causes), so it
+///   needs no constraint — its own variant name already carries the claim
+///   this function exists to police for the three tiers above.
+///
+/// # What it still cannot see
+///
+/// One boolean cannot separate "a content checksum" from "a self-verifying
+/// header", so this function cannot tell a `tar` candidate's `Complete`
+/// from an `Intact` it has no way to earn. That boundary is held by each
+/// scanner's own tests, not here. What IS held here is the boundary this
+/// stage exists for: a format offering NOTHING can reach neither `Intact`
+/// nor `Complete`.
 pub fn check_salvage_claim(
-    status: SalvageStatus,
+    status: &SalvageStatus,
     verifier_was_checked: bool,
+    format_offers_verifier: bool,
 ) -> Result<(), String> {
-    if status == SalvageStatus::Intact && !verifier_was_checked {
-        return Err("reported Intact without checking a checksum".into());
+    match status {
+        SalvageStatus::Intact => {
+            if !format_offers_verifier {
+                return Err(
+                    "reported Intact — a checksum agreed — for a format that offers \
+                     nothing to check against"
+                        .into(),
+                );
+            }
+            if !verifier_was_checked {
+                return Err("reported Intact without checking a checksum".into());
+            }
+            Ok(())
+        }
+        SalvageStatus::Complete => {
+            if !format_offers_verifier {
+                return Err(
+                    "reported Complete — every declared byte present and the header \
+                     self-verified — for a format with no checksum and no self-verifying \
+                     header; Unattested is that format's tier"
+                        .into(),
+                );
+            }
+            if !verifier_was_checked {
+                return Err(
+                    "reported Complete without checking the attestation this format \
+                     offers; Unverified is the honest answer when it was not used"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        SalvageStatus::Unattested => {
+            if format_offers_verifier {
+                return Err(
+                    "reported Unattested — nothing attests this is an entry — for a \
+                     format that does offer an attestation"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        SalvageStatus::Unverified(_) | SalvageStatus::Partial => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -371,30 +451,117 @@ mod broken_honesty {
         // comparison ever ran. Neutering `check_salvage_claim` to `Ok(())`
         // makes this `expect_err` panic instead — observed red before this
         // was restored; see the task report.
-        let msg = check_salvage_claim(SalvageStatus::Intact, false)
+        let msg = check_salvage_claim(&SalvageStatus::Intact, false, true)
             .expect_err("Intact without a checked checksum must be refused");
         assert!(msg.contains("Intact"), "must name the status: {msg}");
         // The honest counterpart is permitted.
-        assert!(check_salvage_claim(SalvageStatus::Intact, true).is_ok());
+        assert!(check_salvage_claim(&SalvageStatus::Intact, true, true).is_ok());
+    }
+
+    #[test]
+    fn an_intact_status_over_a_format_with_nothing_to_check_is_refused() {
+        // Salvage Stage 3. The other half of `Intact`'s claim, and the one
+        // no argument can make true: a checksum cannot have agreed in a
+        // format that carries none. `verifier_was_checked = true` alongside
+        // `format_offers_verifier = false` is incoherent on its face — a
+        // scan reporting it has compared something the format never wrote.
+        let msg = check_salvage_claim(&SalvageStatus::Intact, true, false)
+            .expect_err("Intact over a format offering nothing must be refused");
+        assert!(msg.contains("Intact"), "must name the status: {msg}");
+    }
+
+    #[test]
+    fn complete_without_the_attestation_it_claims_is_refused() {
+        // Salvage Stage 3, and the brief's own first oracle test.
+        // `Complete` claims "every declared byte was present AND the header
+        // self-verified". The second clause is a CHECK, so a format that
+        // offers an attestation and did not use it has not earned the tier —
+        // `Unverified` is the honest answer there.
+        let err = check_salvage_claim(&SalvageStatus::Complete, false, true)
+            .expect_err("Complete over a format whose verifier went unchecked must be refused");
+        assert!(
+            err.contains("Complete"),
+            "the message must name the tier it refused: {err}"
+        );
+    }
+
+    #[test]
+    fn complete_over_a_format_that_attests_nothing_is_refused() {
+        // Salvage Stage 3, and the reason the stage needed this function
+        // widened at all. `cpio` and `ar` carry no checksum AND no
+        // self-verifying header, so a scanner answering `Complete` for one
+        // of their entries asserts a header self-check that does not exist —
+        // and `Complete` routes to exit 0, so the false claim would be
+        // invisible at the process level too. `Unattested` is their tier.
+        let err = check_salvage_claim(&SalvageStatus::Complete, false, false)
+            .expect_err("Complete over a format with no attestation at all must be refused");
+        assert!(err.contains("Complete"), "must name the tier: {err}");
+        assert!(
+            err.contains("Unattested"),
+            "must name the tier that IS honest here: {err}"
+        );
+    }
+
+    #[test]
+    fn unattested_is_refused_when_the_format_can_self_verify() {
+        // Salvage Stage 3, the brief's second oracle test. `tar` self-
+        // verifies its header, so it answers `format_offers_verifier = true`
+        // and a tar candidate is never `Unattested` — the tier asserts the
+        // format has NOTHING, which for tar is false.
+        let err = check_salvage_claim(&SalvageStatus::Unattested, false, true)
+            .expect_err("Unattested over a self-verifying format must be refused");
+        assert!(
+            err.contains("Unattested"),
+            "message must name the tier: {err}"
+        );
+    }
+
+    #[test]
+    fn unattested_is_permitted_where_nothing_attests() {
+        // Salvage Stage 3, the brief's third oracle test, and the
+        // OVER-STRICTNESS guard for the new tier — the same shape as
+        // `a_symlink_whose_target_was_consumed_eagerly_is_permitted` above.
+        // This is what `cpio` and `ar` legitimately report on every entry
+        // they recover, so an oracle refusing it would fire on the first
+        // valid cpio the fuzzer built and bury every real finding behind it.
+        // Neutering `check_salvage_claim` to `Ok(())` makes this pass
+        // HARDER; its falsification is the opposite edit — constraining the
+        // `Unattested` arm to refuse `verifier_was_checked == false` — and
+        // that has been made and observed red; see the task report.
+        check_salvage_claim(&SalvageStatus::Unattested, false, false)
+            .expect("cpio and ar have no verifier of any kind");
     }
 
     #[test]
     fn a_status_asserting_no_checksum_exists_is_permitted_unchecked() {
         // Over-strictness guard, the same shape as
-        // `a_symlink_whose_target_was_consumed_eagerly_is_permitted` above:
-        // `Complete` is the status a format with NO checksum at all reports
-        // (tar, cpio, ar), and `Unverified` asserts nothing was verified for
-        // either of its two causes — neither claims a checksum agreed, so
-        // neither may be constrained by `verifier_was_checked`. An
-        // over-strict edit requiring `verifier_was_checked` for every status
-        // (not just `Intact`) would refuse both of these, and has been made
-        // and observed red — see the task report. Neutering
-        // `check_salvage_claim` to `Ok(())` makes this pass HARDER, which is
-        // why the sibling test above is the one that catches that edit.
-        assert!(check_salvage_claim(SalvageStatus::Complete, false).is_ok());
+        // `a_symlink_whose_target_was_consumed_eagerly_is_permitted` above.
+        // `Complete` is the status a format with a self-verifying header and
+        // no content checksum reports once that header has been checked
+        // (tar), and `Unverified` asserts nothing was verified for any of
+        // its causes — neither claims a CONTENT checksum agreed, so neither
+        // may be constrained the way `Intact` is. An over-strict edit
+        // demanding `SalvageStatus::Intact`'s own rule of every status would
+        // refuse both of these, and has been made and observed red — see the
+        // task report. Neutering `check_salvage_claim` to `Ok(())` makes
+        // this pass HARDER, which is why the sibling tests above are the
+        // ones that catch that edit.
+        assert!(check_salvage_claim(&SalvageStatus::Complete, true, true).is_ok());
         assert!(
             check_salvage_claim(
-                SalvageStatus::Unverified(crate::salvage::UnverifiedCause::UndecodableMethod),
+                &SalvageStatus::Unverified(crate::salvage::UnverifiedCause::UndecodableMethod),
+                false,
+                true
+            )
+            .is_ok()
+        );
+        // `Unverified` is also what a format with NO attestation reports
+        // when this build cannot decode the method at all, so neither value
+        // of `format_offers_verifier` may be refused for it either.
+        assert!(
+            check_salvage_claim(
+                &SalvageStatus::Unverified(crate::salvage::UnverifiedCause::NoDeclaredLength),
+                false,
                 false
             )
             .is_ok()
@@ -406,7 +573,8 @@ mod broken_honesty {
         // neither value of `verifier_was_checked` may be refused for it —
         // an over-strict edit requiring `true` here would refuse every
         // truncated-partial entry this engine has ever recovered.
-        assert!(check_salvage_claim(SalvageStatus::Partial, false).is_ok());
-        assert!(check_salvage_claim(SalvageStatus::Partial, true).is_ok());
+        assert!(check_salvage_claim(&SalvageStatus::Partial, false, true).is_ok());
+        assert!(check_salvage_claim(&SalvageStatus::Partial, true, true).is_ok());
+        assert!(check_salvage_claim(&SalvageStatus::Partial, false, false).is_ok());
     }
 }

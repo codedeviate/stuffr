@@ -18,11 +18,14 @@
 //!
 //! - **Deciding [`SalvageStatus`]** is delegated to [`SalvageScan::verify`],
 //!   called once per candidate in [`annotate_candidates`]. The default
-//!   answers [`SalvageStatus::Complete`] — "every declared byte fit inside
-//!   the source and the header self-verified, but nothing checked its
-//!   content" — which is honest for a mock with no [`Candidate::verifier`]
-//!   to check, and for a real format with no checksum at all (tar, cpio,
-//!   ar). A format that DOES carry one (zip's CRC-32) overrides `verify` to
+//!   answers [`SalvageStatus::Unattested`] — "nothing attests that this
+//!   candidate is an entry at all" — which is the honest reading of a method
+//!   that reads nothing, and the right answer for a mock with no
+//!   [`Candidate::verifier`] and for a real format with neither a checksum
+//!   nor a self-verifying header (cpio, ar). A format with a self-verifying
+//!   header and no content checksum (tar) overrides it to answer
+//!   [`SalvageStatus::Complete`]. A format that carries a content checksum
+//!   (zip's CRC-32) overrides `verify` to
 //!   decode the payload and compare it, answering `Intact` on agreement and
 //!   `Partial` otherwise — never `Complete`, which is reserved for "no way
 //!   to prove", not "tried and it disagreed". Earlier revisions of this
@@ -232,14 +235,16 @@ impl Candidate {
     /// * `marked_deleted: false` — the format has no deleted flag, or this
     ///   record is not marked. Four of the five in-tree scanners leave it.
     ///
-    /// One default is worth naming because it is the lenient direction, not
-    /// the strict one: with no `verifier`, [`SalvageScan::verify`]'s own
-    /// default answers [`SalvageStatus::Complete`]. That is correct for a
-    /// format with no checksum at all and wrong for one that has a checksum
-    /// this scanner forgot to report — but a scanner carrying a checksum has
-    /// to write its own `verify` regardless (the default checks nothing),
-    /// and that `verify` reads this very field, so the omission fails in the
-    /// scanner's own first test rather than silently.
+    /// One default is worth naming because it decides a STATUS, not just a
+    /// field: with no `verifier`, [`SalvageScan::verify`]'s own default
+    /// answers [`SalvageStatus::Unattested`] — the tier that asserts the
+    /// least, matching the discipline of the four above. It answered
+    /// [`SalvageStatus::Complete`] until Salvage Stage 3, which was the
+    /// lenient direction: `Complete` claims a header self-check the default
+    /// never performs, and routes to exit 0. A scanner carrying a checksum
+    /// has to write its own `verify` regardless (the default checks
+    /// nothing), and that `verify` reads this very field, so the omission
+    /// fails in the scanner's own first test rather than silently.
     pub fn new(offset: u64, payload_start: u64, meta: EntryMeta) -> Self {
         Self {
             offset,
@@ -362,11 +367,61 @@ pub enum SalvageStatus {
     /// A checksum the original writer computed agrees.
     Intact,
     /// Every declared byte was present and the header self-verified, but the
-    /// format offers NO CHECKSUM AT ALL to prove the content — tar, cpio and
-    /// ar, in this project's own formats. Never the right answer for a
-    /// format that DOES carry one; see [`SalvageStatus::Unverified`] for
-    /// that case, which this status is not permitted to stand in for.
+    /// format offers NO CHECKSUM AT ALL to prove the content — `tar`, in
+    /// this project's own formats. Never the right answer for a format that
+    /// DOES carry one; see [`SalvageStatus::Unverified`] for that case,
+    /// which this status is not permitted to stand in for.
+    ///
+    /// # `cpio` and `ar` are NOT this tier, and were named here until Stage 3
+    ///
+    /// This doc said "tar, cpio and ar" from Stage 1 until Salvage Stage 3,
+    /// which is where the sentence's own *"and the header self-verified"*
+    /// clause was measured against the three formats it named. `tar` has a
+    /// header checksum and really does self-verify. **`cpio` and `ar` have
+    /// neither a content checksum nor a self-verifying header**, so for
+    /// those two the clause is not merely unproven — there is nothing in the
+    /// format it could ever be true of, and a scanner answering `Complete`
+    /// for one would be asserting a header self-check that does not exist.
+    /// They are [`SalvageStatus::Unattested`].
+    ///
+    /// [`crate::testing::check_salvage_claim`] is what holds the line: this
+    /// tier requires the format to offer an attestation AND that attestation
+    /// to have been checked, so the checksumless pair cannot reach it.
     Complete,
+    /// Nothing attests that this candidate is an entry AT ALL: the format
+    /// carries **no checksum and no self-verifying header**, so a
+    /// coincidental header match and a real entry are indistinguishable in
+    /// the bytes — `cpio` and `ar`, in this project's own formats.
+    ///
+    /// The entry is still WRITTEN, under its real name: `salvage` is the
+    /// recovery-biased verb, and a tier that refused to write would make
+    /// these two formats unsalvageable rather than honestly salvaged. What
+    /// the tier buys is that the run says so — `salvage_exit_code` answers
+    /// **4** for it (degraded fidelity, never 3: nothing was refused and no
+    /// capability was missing), and the `--list` row carries the reason
+    /// beside the entry. There is no flag to opt into or out of this; the
+    /// formats' own shape decides it.
+    ///
+    /// # Not [`Self::Unverified`] — and the near-miss name is the hazard
+    ///
+    /// The variant deliberately is NOT called `Unverifiable`: that is two
+    /// letters from the [`Self::Unverified`] this enum already has, in an
+    /// enum whose variants select exit codes, and a reviewer skimming match
+    /// arms would not reliably see the difference. The distinction, stated
+    /// wherever both appear:
+    ///
+    /// * [`Self::Unverified`] — the format *has* a checksum; this build
+    ///   could not use it (an undecodable method), or the header declared
+    ///   nothing to check.
+    /// * `Unattested` — the format has **no checksum and no self-verifying
+    ///   header**, so nothing attests that this candidate is an entry at
+    ///   all.
+    ///
+    /// The consequences differ as much as the claims do: `Unverified` is
+    /// NOT written and exits 3 (this build could not do it — a rebuild may
+    /// fix it), `Unattested` IS written and exits 4 (nothing can fix it;
+    /// the format carries no evidence to find).
+    Unattested,
     /// Nothing about this entry's content was verified.
     ///
     /// Two causes ([`UnverifiedCause`]), and the tier does not distinguish
@@ -645,15 +700,28 @@ pub trait SalvageScan {
     /// for anything above it. So an implementation that decodes whole may
     /// size a buffer from that length without re-checking it.
     ///
-    /// The default answers [`SalvageStatus::Complete`] unconditionally: a
-    /// scanner with no real checksum (or, in this module's own tests, a mock
-    /// that never populates [`Candidate::verifier`]) has nothing to check,
-    /// and `Complete` is the honest claim for that case. A format that DOES
-    /// carry a checksum overrides this to decode the payload — reusing its
-    /// own existing codec machinery, never inventing a new one here — and
-    /// compare it against [`Candidate::verifier`].
+    /// The default answers [`SalvageStatus::Unattested`] unconditionally,
+    /// which is the least this method can claim: it reads nothing, decodes
+    /// nothing and compares nothing, so "nothing attests that this candidate
+    /// is an entry at all" is exactly what happened. A format that carries a
+    /// checksum overrides this to decode the payload — reusing its own
+    /// existing codec machinery, never inventing a new one here — and
+    /// compare it against [`Candidate::verifier`]; a format that carries a
+    /// self-verifying HEADER and no content checksum (tar) overrides it to
+    /// check that header and answer [`SalvageStatus::Complete`].
+    ///
+    /// **It answered `Complete` until Salvage Stage 3**, and the change is
+    /// not cosmetic. `Complete` asserts that every declared byte was present
+    /// *and the header self-verified* — two claims this default has never
+    /// been in a position to make — and it routes to **exit 0**, so a
+    /// checksumless scanner that simply forgot to override was reporting a
+    /// clean recovery over candidates nothing had examined. `Unattested`
+    /// routes to exit 4 and says why on the row. The same argument
+    /// [`Candidate::new`] makes for its own four defaults: the default is
+    /// the answer that asserts the LEAST, so forgetting to override is
+    /// visible rather than flattering.
     fn verify(&self, _src: &mut dyn SeekRead, _candidate: &Candidate) -> Result<SalvageStatus> {
-        Ok(SalvageStatus::Complete)
+        Ok(SalvageStatus::Unattested)
     }
 
     /// Decode one salvaged entry's payload out of the archive at
@@ -1180,7 +1248,12 @@ mod tests {
         )
         .expect("one over-ceiling entry must never abort the run");
         assert_eq!(out.entries.len(), 2);
-        assert_eq!(out.entries[0].status, SalvageStatus::Complete);
+        // `TwoCandidates` does not override `verify`, so the first entry
+        // takes the trait's default — `Unattested` since Salvage Stage 3,
+        // where it was `Complete`. Neither figure is what this test is
+        // about: the point is that the SECOND entry's ceiling refusal did
+        // not cost the first entry its row.
+        assert_eq!(out.entries[0].status, SalvageStatus::Unattested);
         assert_eq!(
             out.entries[1].status,
             SalvageStatus::Unverified(UnverifiedCause::OverEntryCeiling {
@@ -1244,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn a_declared_length_within_the_ceiling_is_collected_as_complete() {
+    fn a_declared_length_within_the_ceiling_is_collected_rather_than_refused() {
         let mut scan = DeclaresLength(4096);
         let out = salvage_all(
             &mut scan,
@@ -1256,7 +1329,12 @@ mod tests {
         let entry = &out.entries[0];
         assert_eq!(entry.scan_position, 0);
         assert_eq!(entry.offset, 0);
-        assert_eq!(entry.status, SalvageStatus::Complete);
+        // `DeclaresLength` does not override `verify`, so this is the
+        // trait's default: `Unattested` since Salvage Stage 3, where it was
+        // `Complete`. The test is about the entry being COLLECTED — its
+        // declared length sits under the ceiling — not about which tier a
+        // mock that checks nothing lands in.
+        assert_eq!(entry.status, SalvageStatus::Unattested);
         assert_eq!(entry.shadows, None);
         assert_eq!(entry.collides_with, None);
     }

@@ -817,12 +817,15 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       recovering, and this is the diagnostic half of the feature: seeing
       what an archive holds without extracting anything, not even into a
       throwaway directory. Prints every record the scan found, one per
-      line: SCAN POSITION, status (Intact, Complete, Partial with its
-      cause, or Unverified with its cause), and name. `Complete` is
-      not reachable in this build and you will not see it: it means
-      "every declared byte was there, and the format offers nothing to
-      check them against", and every format with a scanner here carries
-      a checksum. It is reserved for the checksum-less formats named
+      line: SCAN POSITION, status (Intact, Complete, Unattested, Partial
+      with its cause, or Unverified with its cause), and name. Neither
+      `Complete` nor `Unattested` is reachable in this build and you will
+      not see either: `Complete` means "every declared byte was there, the
+      header self-verified, and the format offers no checksum to check the
+      CONTENT against", `Unattested` means "the format offers neither a
+      checksum nor a self-verifying header, so nothing attests this is an
+      entry at all" — and every format with a scanner here carries a
+      checksum. Both are reserved for the checksum-less formats named
       above. This can show MORE
       rows than `stuffr list` on the same archive: a zip whose central
       directory declares two records under one name (`zip.rs`'s own
@@ -949,7 +952,11 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   as `.partial`, any entry written under a disambiguated
   `NAME.salvaged-N`, or any entry skipped for any other reason (a shadow,
   --partial=skip, a kind this build has no shape for, or a name this
-  filesystem will not hold). 5 — the scan found
+  filesystem will not hold), or any entry whose status is Unattested (the
+  format carries neither a checksum nor a self-verifying header, so the
+  entry IS written under its real name and the run says so — there is no
+  flag to opt out of, and no rebuild that would change it, which is why it
+  is 4 and not 3). 5 — the scan found
   nothing recoverable in the archive at all, regardless of `--index`. 7 —
   any entry refused by containment (a hostile path escaping -C or -o, an
   empty entry name, a symlinked ancestor), which OUTRANKS every code above

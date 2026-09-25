@@ -1218,7 +1218,7 @@ fn partial_cause(completed: bool, all_declared_bytes_present: bool) -> PartialCa
 /// What became of one scanned record once the ops layer acted on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SalvageDisposition {
-    /// Written under its own name — `Intact` or `Complete`.
+    /// Written under its own name — `Intact`, `Complete` or `Unattested`.
     Written(PathBuf),
     /// Written under a DISAMBIGUATED name, because an earlier record in this
     /// same run already wrote the name this one asks for.
@@ -1588,10 +1588,34 @@ pub struct SalvageOutcome {
 /// 5  nothing recoverable at all (no entries were even scanned)
 /// 7  any entry refused by containment
 /// 3  any entry Unverified
-/// 4  any entry Partial (written or skipped), any entry skipped for any
-///    other reason, or any entry written under a disambiguated name
+/// 4  any entry Unattested, any entry Partial (written or skipped), any
+///    entry skipped for any other reason, or any entry written under a
+///    disambiguated name
 /// 0  every entry Intact or Complete
 /// ```
+///
+/// **`Unattested` is bucket 4, not 3, and that is Salvage Stage 3's own
+/// ruling** (`stuffr_core::salvage::SalvageStatus::Unattested`). It is the
+/// only bucket-4 member read off the STATUS rather than the disposition,
+/// because it is the only degraded outcome whose entry is WRITTEN, under
+/// its real name, with no `Skipped*` or `Written*` variant to key off: a
+/// `cpio` or `ar` entry recovers in full and lands on disk, and what is
+/// degraded is the EVIDENCE, not the bytes. 3 would have been wrong for the
+/// same reason it is right for `Unverified` — that code says "this build or
+/// this source cannot do it", which invites a rebuild, and no build of
+/// anything will put a checksum into a format that has none. 0 would have
+/// been worse than either: a run over a format where a coincidental header
+/// match and a real entry are indistinguishable must not report the same
+/// code as one over an archive whose every entry proved itself.
+///
+/// It is read off the status for every record the scan produced, including
+/// one whose disposition is `NotSelected` or `NotWritten` — the pair the
+/// paragraph below exempts. That is deliberate and is the same shape
+/// `Unverified` already has: `SkippedUnverified` is assigned before
+/// `place_salvaged_file` ever consults `dest`, so `salvage --list` over an
+/// archive full of undecodable entries exits 3 today. A `--list` over a
+/// `cpio` must likewise exit 4 — the fact is about the archive in front of
+/// the user, not about how much of it they asked to be written.
 ///
 /// **7 outranks both 3 and 4**, and that is what keeps the hostile-path
 /// contract exactly where it was: before F1 an escaping name ended the run
@@ -1638,6 +1662,13 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
     let mut any_unverified = false;
     let mut any_degraded = false;
     for record in &outcome.entries {
+        // Salvage Stage 3, and the one bucket read off the STATUS: an
+        // `Unattested` entry is WRITTEN, under its real name, so there is no
+        // disposition variant below that distinguishes it from a clean
+        // `Written`. See this function's own doc for why 4 and not 3 or 0.
+        if record.status == stuffr_core::salvage::SalvageStatus::Unattested {
+            any_degraded = true;
+        }
         match &record.disposition {
             SalvageDisposition::Written(_)
             | SalvageDisposition::Directory(_)
@@ -2047,8 +2078,8 @@ fn place_salvaged_file(
     }
 
     let Some(dest) = dest else {
-        // Not `Partial` (Intact/Complete), and there is no destination:
-        // nothing to decode a cause for, nothing to write.
+        // Not `Partial` (Intact/Complete/Unattested), and there is no
+        // destination: nothing to decode a cause for, nothing to write.
         return Ok(SalvageDisposition::NotWritten);
     };
 
@@ -2166,9 +2197,11 @@ fn place_salvaged_file(
     } else if completed {
         Ok(SalvageDisposition::Written(write_target))
     } else {
-        // The scan already proved this entry `Intact`/`Complete` — a
-        // deterministic re-decode of the same bytes should reach the same
-        // length every time. Reaching here means the archive changed on
+        // The scan already proved this entry `Intact`/`Complete`, or
+        // declared it `Unattested` over a format that offers nothing to
+        // prove it WITH — either way the declared length is a fact the
+        // header stated, and a deterministic re-decode of the same bytes
+        // should reach the same length every time. Reaching here means the archive changed on
         // disk between the scan and this write, or a real device fault
         // interrupted it; either way, writing a short file under the
         // entry's REAL name would recreate the exact hazard `.partial`
@@ -5062,6 +5095,119 @@ mod salvage_tests {
              pointed is a more severe fact than one that is merely damaged, and folding it \
              into either bucket would silently retire the signal a hostile-archive script \
              already checks for"
+        );
+    }
+
+    /// Salvage Stage 3: `Unattested` is bucket 4, and it is the one bucket
+    /// read off the STATUS rather than the disposition — a `cpio` or `ar`
+    /// entry recovers in full and lands on disk under its real name, so
+    /// every disposition it can carry is one that otherwise means "clean".
+    ///
+    /// Each assertion below pins a decision that could have gone the other
+    /// way, and two of them are the ones a later scanner could quietly
+    /// undo: that a `Written` `Unattested` entry is NOT exit 0, and that a
+    /// report-only run over such an archive is not exit 0 either.
+    #[test]
+    fn an_unattested_entry_is_bucket_four_whatever_became_of_it() {
+        let record = |status: SalvageStatus, disposition: SalvageDisposition| SalvagedRecord {
+            scan_position: 0,
+            name: "x".into(),
+            status,
+            shadows: None,
+            collides_with: None,
+            marked_deleted: false,
+            disposition,
+        };
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(
+                    SalvageStatus::Unattested,
+                    SalvageDisposition::Written(PathBuf::from("a")),
+                )],
+            }),
+            4,
+            "the entry IS written, under its real name, and the run must still say the \
+             format offered nothing to prove it with — exit 0 here is the whole defect \
+             this tier exists to prevent"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(
+                    SalvageStatus::Unattested,
+                    SalvageDisposition::NotWritten,
+                )],
+            }),
+            4,
+            "a report-only `salvage --list` over a checksumless archive reports the same \
+             fact: it is about the archive in front of the user, not about how much of \
+             it they asked to be written — the same shape `SkippedUnverified` already \
+             has, which exits 3 with or without a destination"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(
+                    SalvageStatus::Unattested,
+                    SalvageDisposition::Directory(PathBuf::from("d")),
+                )],
+            }),
+            4,
+            "a directory entry is as unattested as a file one in a format with no \
+             checksum: nothing says the header that named it was a header"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![
+                    record(
+                        SalvageStatus::Unattested,
+                        SalvageDisposition::Written(PathBuf::from("a")),
+                    ),
+                    record(
+                        SalvageStatus::Unverified(
+                            stuffr_core::salvage::UnverifiedCause::UndecodableMethod,
+                        ),
+                        SalvageDisposition::SkippedUnverified,
+                    ),
+                ],
+            }),
+            3,
+            "3 still outranks 4: `Unverified` names a remedy (a rebuild) and `Unattested` \
+             names none, so the actionable diagnosis is the one to report"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![
+                    record(
+                        SalvageStatus::Unattested,
+                        SalvageDisposition::Written(PathBuf::from("a")),
+                    ),
+                    record(
+                        SalvageStatus::Unattested,
+                        SalvageDisposition::SkippedUnsafePath {
+                            reason: "path traversal above the destination",
+                        },
+                    ),
+                ],
+            }),
+            7,
+            "and 7 still outranks everything: an archive trying to write outside where it \
+             was pointed is the more severe fact, checksumless format or not"
+        );
+
+        assert_eq!(
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![record(
+                    SalvageStatus::Complete,
+                    SalvageDisposition::Written(PathBuf::from("a")),
+                )],
+            }),
+            0,
+            "the over-strictness half: `Complete` — tar, whose header DID self-verify — \
+             is untouched by this bucket and still exits 0"
         );
     }
 }

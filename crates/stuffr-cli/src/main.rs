@@ -614,6 +614,12 @@ fn describe_salvage_status(status: stuffr::salvage::SalvageStatus) -> &'static s
     match status {
         SalvageStatus::Intact => "Intact",
         SalvageStatus::Complete => "Complete",
+        // Salvage Stage 3. The entry IS written, under its real name — the
+        // reason lands as a tag on the row rather than as a refusal, and
+        // the run exits 4. See [`describe_salvage_row`] for the tag, and
+        // [`stuffr::salvage::SalvageStatus::Unattested`] for why this sits
+        // beside `Unverified` and means something else entirely.
+        SalvageStatus::Unattested => "Unattested",
         SalvageStatus::Partial => "Partial",
         SalvageStatus::Unverified(UnverifiedCause::UndecodableMethod) => {
             "Unverified (undecodable method)"
@@ -704,6 +710,15 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     }
     if record.marked_deleted {
         line.push_str(" [deleted: the archive marks this entry removed]");
+    }
+    // Salvage Stage 3: a user meets the REASON where they meet the entry.
+    // The status column says `Unattested`, which names the tier but not why
+    // this archive is in it — and unlike every other tag on this row, this
+    // one is a fact about the FORMAT rather than about the record, so a
+    // user who has never met `cpio` or `ar` has nowhere else to learn it.
+    // The entry is still written under its real name; the run exits 4.
+    if record.status == stuffr::salvage::SalvageStatus::Unattested {
+        line.push_str(" [no checksum and no header self-check in this format]");
     }
     // The path actually written, named only when it is NOT the entry's own
     // name — a row a user reads to find their file must say where it went.
@@ -1717,5 +1732,59 @@ mod tests {
                  arm for it"
             );
         }
+    }
+
+    /// Salvage Stage 3: the `Unattested` row names the FORMAT's shortcoming
+    /// where the user meets the entry.
+    ///
+    /// Pinned as a unit test rather than end to end because the tier is not
+    /// reachable from any scanner this build has yet — `tar`, `cpio` and
+    /// `ar` arrive in the tasks after this one. Waiting for them would mean
+    /// shipping the rendering with nothing exercising it at all, which is
+    /// how a status reaches a user as a bare word with no explanation.
+    ///
+    /// Two facts, deliberately: the tier is NAMED (so the row is not just
+    /// the entry's name with a mystery column), and the REASON rides along
+    /// (because unlike every other tag on the row, this one is a property
+    /// of the format rather than of the record, and a user who has never
+    /// met `cpio` has nowhere else to learn it).
+    #[test]
+    fn an_unattested_row_carries_the_reason_beside_the_entry() {
+        let record = entries::SalvagedRecord {
+            scan_position: 3,
+            name: "notes.txt".into(),
+            status: stuffr::salvage::SalvageStatus::Unattested,
+            shadows: None,
+            collides_with: None,
+            marked_deleted: false,
+            disposition: entries::SalvageDisposition::Written(std::path::PathBuf::from(
+                "/out/notes.txt",
+            )),
+        };
+        let row = describe_salvage_row(&record);
+        assert!(
+            row.contains("Unattested"),
+            "the row must name the tier: {row}"
+        );
+        assert!(
+            row.contains("no checksum and no header self-check in this format"),
+            "the row must carry the reason, not just the tier: {row}"
+        );
+        assert!(
+            row.contains("notes.txt"),
+            "the row must name the entry: {row}"
+        );
+
+        // And the tag is specific to this tier, not to "any row salvage
+        // prints": a `Complete` entry (tar, whose header DID self-verify)
+        // must not be told its format has no header self-check.
+        let complete = entries::SalvagedRecord {
+            status: stuffr::salvage::SalvageStatus::Complete,
+            ..record
+        };
+        assert!(
+            !describe_salvage_row(&complete).contains("no checksum"),
+            "the reason tag must not leak onto a tier that does not have that problem"
+        );
     }
 }
