@@ -178,7 +178,7 @@ pub fn meta() -> FormatMeta {
 
 /// One tar block. Every header is one, and every payload is padded to a
 /// multiple of one.
-const BLOCK: usize = 512;
+pub(crate) const BLOCK: usize = 512;
 
 /// The `name` and `linkname` fields of a tar header. Anything longer needs a
 /// GNU extension entry ahead of it.
@@ -633,7 +633,7 @@ impl Read for EntryPayload<'_> {
 ///
 /// The legacy NUL typeflag needs no case of its own: `EntryType::new` maps
 /// both `\0` and `0` to `Regular`.
-fn is_regular_file(entry_type: tar::EntryType) -> bool {
+pub(crate) fn is_regular_file(entry_type: tar::EntryType) -> bool {
     entry_type.is_file() || entry_type.is_gnu_sparse() || entry_type == tar::EntryType::Continuous
 }
 
@@ -647,13 +647,37 @@ fn is_regular_file(entry_type: tar::EntryType) -> bool {
 /// can only refuse what it can still see.
 fn entry_meta(entry: &tar::Entry<'_, TrailerWatch>) -> EntryMeta {
     let header = entry.header();
-    let entry_type = header.entry_type();
-    let kind = if entry_type.is_dir() {
+    EntryMeta {
+        name: String::from_utf8_lossy(&entry.path_bytes()).into_owned(),
+        size: Some(entry.size()),
+        mtime: header_mtime(header),
+        mode: header.mode().ok(),
+        uid: header.uid().ok().and_then(|v| u32::try_from(v).ok()),
+        gid: header.gid().ok().and_then(|v| u32::try_from(v).ok()),
+        kind: entry_kind(header.entry_type(), || {
+            entry.link_name_bytes().map(|b| b.into_owned())
+        }),
+        ..Default::default()
+    }
+}
+
+/// The [`EntryKind`] a header's typeflag names — the ONE table both this
+/// module's reader and `tar_salvage.rs`'s scanner report through, so `stuffr
+/// list` and `stuffr salvage --list` cannot come to describe the same header
+/// differently.
+///
+/// `link_name` is asked for only when the typeflag is a symlink, and
+/// answers the link target AFTER any GNU `K` or pax `linkpath` extension —
+/// each caller knows its own extensions, this table does not.
+pub(crate) fn entry_kind(
+    entry_type: tar::EntryType,
+    link_name: impl FnOnce() -> Option<Vec<u8>>,
+) -> EntryKind {
+    if entry_type.is_dir() {
         EntryKind::Dir
     } else if entry_type.is_symlink() {
         EntryKind::Symlink {
-            target: entry
-                .link_name_bytes()
+            target: link_name()
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .unwrap_or_default(),
         }
@@ -664,21 +688,28 @@ fn entry_meta(entry: &tar::Entry<'_, TrailerWatch>) -> EntryMeta {
         // a later phase; until then `Other` is the honest answer and is not
         // silently turned into a regular file.
         EntryKind::Other
-    };
-
-    EntryMeta {
-        name: String::from_utf8_lossy(&entry.path_bytes()).into_owned(),
-        size: Some(entry.size()),
-        mtime: header
-            .mtime()
-            .ok()
-            .map(|secs| UNIX_EPOCH + Duration::from_secs(secs)),
-        mode: header.mode().ok(),
-        uid: header.uid().ok().and_then(|v| u32::try_from(v).ok()),
-        gid: header.gid().ok().and_then(|v| u32::try_from(v).ok()),
-        kind,
-        ..Default::default()
     }
+}
+
+/// A header's modification time, or `None` when the field does not parse
+/// OR names an instant [`SystemTime`] cannot represent.
+///
+/// **The second half is a panic this function replaced.** A tar `mtime`
+/// field is twelve bytes, and GNU's base-256 extension (a leading `0x80`)
+/// lets it carry any `u64` — `tar::Header::mtime` returns it unchecked. The
+/// reader used to compute `UNIX_EPOCH + Duration::from_secs(secs)`, and
+/// `SystemTime`'s `+` PANICS on overflow ("overflow when adding duration to
+/// instant"), so a 1024-byte archive whose one header declared an mtime past
+/// `i64::MAX` seconds made `stuffr list` exit **101**: measured, before the
+/// fix, with a correct header checksum and nothing else unusual about the
+/// file. A timestamp nothing can represent is a timestamp this layer does
+/// not know, which is what `None` already means for a field that fails to
+/// parse.
+pub(crate) fn header_mtime(header: &tar::Header) -> Option<SystemTime> {
+    header
+        .mtime()
+        .ok()
+        .and_then(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
 }
 
 struct TarWrite {
@@ -969,6 +1000,41 @@ mod tests {
         // other property runs — and the list is asserted, so one of them
         // going quiet fails here rather than in silence.
         assert_container_conforms_skipping(&Tar, &meta(), &[7]);
+    }
+
+    /// An `mtime` past what [`SystemTime`] can hold is an unknown timestamp,
+    /// never a panic — see [`header_mtime`] for the measurement (exit 101
+    /// from `stuffr list` over a 1024-byte archive).
+    ///
+    /// The header is built with the `tar` crate's own `set_mtime`, which
+    /// encodes a value this large in GNU base-256, and its own `set_cksum`,
+    /// so the only thing unusual about the archive is the one field.
+    #[test]
+    fn an_mtime_no_system_time_can_hold_is_unknown_not_a_panic() {
+        let mut header = tar::Header::new_gnu();
+        header.set_path("a.txt").unwrap();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_mtime(u64::MAX);
+        header.set_cksum();
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append(&header, &b"hello"[..]).unwrap();
+        let bytes = builder.into_inner().unwrap();
+        assert_eq!(
+            tar::Header::from_byte_slice(&bytes[..BLOCK])
+                .mtime()
+                .unwrap(),
+            u64::MAX,
+            "the fixture must really carry the out-of-range mtime"
+        );
+
+        let mut ar = open(&bytes);
+        let mut entry = ar.next_entry().expect("next_entry").expect("one entry");
+        assert_eq!(entry.meta().name, "a.txt");
+        assert_eq!(entry.meta().mtime, None);
+        let mut data = Vec::new();
+        entry.reader().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"hello");
     }
 
     /// The rung and the losses are two different questions, and a piped tar
