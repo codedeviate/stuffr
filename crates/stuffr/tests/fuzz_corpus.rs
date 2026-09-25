@@ -137,7 +137,7 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// runs plateaued at `cov: 217`, and running the binary's `salvage --list`
 /// over all 64 accumulated corpus inputs produced **not one salvaged
 /// record** — not an `Intact`, `Complete`, `Partial` or `Unverified` row
-/// anywhere. The target's only oracle call, `check_salvage_claim`, is made
+/// anywhere. The target's only oracle call, `check_salvage_claim`, was then made
 /// only for `SalvageStatus::Intact` records, which need a CRC-32 that matches its
 /// payload; random mutation from an EMPTY corpus will not produce one, so
 /// the assertion was unreachable by construction rather than merely
@@ -165,7 +165,7 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 ///
 /// The two ZOO shapes are BORROWED BYTES rather than built ones, since this
 /// project has no ZOO encoder at all, and both reach `Intact` — which is
-/// what `every_salvage_seed_produces_records_and_at_least_one_intact`
+/// what `every_salvage_seed_produces_records_and_reaches_its_top_tier`
 /// requires of every shape, damaged or not: a seed is something the fuzzer
 /// degrades FROM, not something already past the check.
 ///
@@ -315,7 +315,7 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// the fixtures rather than a shortcut**: all four borrowed ZOO archives
 /// hold exactly ONE entry, so corrupting its checksum leaves the shape with
 /// no `Intact` record anywhere — which
-/// [`every_salvage_seed_produces_records_and_at_least_one_intact`] forbids,
+/// [`every_salvage_seed_produces_records_and_reaches_its_top_tier`] forbids,
 /// on the rule that a seed is something the fuzzer degrades FROM. It needs a
 /// two-entry ZOO archive this project cannot write and has not borrowed.
 const SALVAGE_SHAPES: &[&str] = &[
@@ -337,6 +337,9 @@ const SALVAGE_SHAPES: &[&str] = &[
     "arc-crc-mismatch",
     "lha-crc-mismatch",
     "arj-crc-mismatch",
+    "tar-healthy",
+    "tar-destroyed-first-header",
+    "tar-truncated-tail",
 ];
 
 /// The `SALVAGE_SLOTS` name a shape's seed carries in its selector byte: the
@@ -380,6 +383,26 @@ fn read_all(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// The sample tree packed as a tar through `entries::create_archive` — the
+/// same writer `stuffr pack` uses. Its four entries (two directories, two
+/// files) end with `sample/subdir/nested.txt`, whose padded payload is the
+/// last block before the two-block end-of-archive marker, which is what
+/// `tar-truncated-tail` cuts into.
+fn salvage_tar_seed(work: &Path, sample_dir: &Path) -> stuffr_core::Result<Vec<u8>> {
+    let out = work.join("salvage-tar.out");
+    entries::create_archive(
+        std::slice::from_ref(&sample_dir.to_path_buf()),
+        Output::Path(out.clone()),
+        FormatId::new("tar"),
+        None,
+        &CompressOpts {
+            sync: false,
+            ..Default::default()
+        },
+    )?;
+    Ok(read_all(&out)?)
 }
 
 /// Strips the leading `SALVAGE_SLOTS` selector byte a generated `salvage/`
@@ -1081,6 +1104,7 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // shape below reaches a known-unfixed defect — each is an outcome the
     // suite already pins end to end.
     let healthy = healthy_salvage_seed();
+    let healthy_tar = salvage_tar_seed(work.path(), &sample_dir)?;
     let mut salvage_count = 0usize;
     let salvage_selector = |slot: &str| {
         SALVAGE_SLOTS
@@ -1218,6 +1242,25 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
             "arj-crc-mismatch" => {
                 arj_corrupt_local_file_crc(&read_all(&legacy_fixture_path("sample.arj"))?, 0)
             }
+            // Salvage Stage 3 Task 2. Written through this project's own
+            // writer, which is the one shape a tar seed cannot avoid — the
+            // borrowed-bytes argument above has no tar corpus to borrow
+            // from, and every tar tool on a machine writes the same format.
+            // The payload this scanner reaches is `Complete`, never
+            // `Intact`: tar has no content checksum.
+            "tar-healthy" => healthy_tar.clone(),
+            // One byte of the FIRST header's name: its checksum no longer
+            // agrees, so `stuffr list` refuses the whole archive at exit 5,
+            // while every later header is untouched. The magic at 257 is
+            // left alone so format detection still resolves this as a tar.
+            "tar-destroyed-first-header" => {
+                let mut bytes = healthy_tar.clone();
+                bytes[0] ^= 0x01;
+                bytes
+            }
+            // Cut six bytes into the LAST entry's payload: the block before
+            // the two-block end-of-archive marker is that payload, padded.
+            "tar-truncated-tail" => healthy_tar[..healthy_tar.len() - 3 * 512 + 6].to_vec(),
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
         let slot = salvage_shape_slot(shape);
@@ -1302,20 +1345,42 @@ fn the_corpus_builders_crc_matches_the_published_check_value() {
     assert_eq!(seed_crc32(b"123456789"), 0xCBF4_3926);
 }
 
+/// The strongest tier a slot's format can honestly reach — `Intact` for the
+/// five with a content checksum, `Complete` for `tar`, whose only checksum
+/// covers the header. It is the tier `check_salvage_claim` PERMITS for that
+/// slot's class, so a seed that reaches it is a seed the fuzz target's
+/// oracle call is live for.
+///
+/// A `match` naming every slot with a panic for the rest, the same shape as
+/// the fuzz target's own `attestation`: a slot appended without an arm
+/// here fails this file's tests rather than being judged against the wrong
+/// tier.
+fn top_tier(slot: &str) -> stuffr_core::salvage::SalvageStatus {
+    use stuffr_core::salvage::SalvageStatus;
+    match slot {
+        "zip" | "arc" | "zoo" | "lha" | "arj" => SalvageStatus::Intact,
+        "tar" => SalvageStatus::Complete,
+        other => panic!("SALVAGE_SLOTS names `{other}` but `top_tier` has no arm for it"),
+    }
+}
+
 /// **The claim the salvage corpus is actually making.** Its seeds exist so
-/// the fuzz target's only oracle call — `check_salvage_claim`, which the
-/// target makes for `SalvageStatus::Intact` records alone — is reachable at
-/// all. Before seeding,
+/// the fuzz target's oracle call — `check_salvage_claim`, which the target
+/// makes for every record that makes a claim (`Intact`, `Complete`,
+/// `Unattested`) — is reachable, and reachable on the tier each format is
+/// PERMITTED to reach ([`top_tier`]): a claim-bearing record the oracle
+/// refuses would abort the target, so the permitted one is what a healthy
+/// scanner produces and what a mutation degrades from. Before seeding,
 /// all 64 accumulated corpus inputs produced not one salvaged record of
 /// any status, so the target executed cleanly and proved nothing.
 ///
 /// Asserting "the generator wrote N files" would reproduce exactly that
 /// failure. This runs the real engine over every seed and checks what the
-/// scan actually reports, so a seed that stopped reaching `Intact` (a
+/// scan actually reports, so a seed that stopped reaching its top tier (a
 /// builder bug, a shape that drifted) fails here rather than going quiet
 /// in a fuzz run nobody reads.
 #[test]
-fn every_salvage_seed_produces_records_and_at_least_one_intact() {
+fn every_salvage_seed_produces_records_and_reaches_its_top_tier() {
     use stuffr_core::salvage::SalvageStatus;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1327,7 +1392,7 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
     // same split the fuzz target itself performs.
     let scratch = tempfile::tempdir().unwrap();
 
-    let mut intact_seeds = 0usize;
+    let mut top_tier_seeds = 0usize;
     let mut seen = 0usize;
     for shape in SALVAGE_SHAPES {
         let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
@@ -1348,21 +1413,20 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
              corpus was in before it was seeded"
         );
         seen += 1;
-        if outcome
-            .entries
-            .iter()
-            .any(|r| r.status == SalvageStatus::Intact)
-        {
-            intact_seeds += 1;
+        let tier = top_tier(salvage_shape_slot(shape));
+        if outcome.entries.iter().any(|r| r.status == tier) {
+            top_tier_seeds += 1;
+        } else {
+            eprintln!("seed {shape} never reaches {tier:?}");
         }
     }
     assert_eq!(seen, SALVAGE_SHAPES.len());
     assert_eq!(
-        intact_seeds,
+        top_tier_seeds,
         SALVAGE_SHAPES.len(),
-        "every shape must reach `Intact` on at least one of its records: that status is \
-         the only one the target calls `check_salvage_claim` for, and a damaged shape is meant to be \
-         a healthy archive the fuzzer can degrade FROM, not one already past the check"
+        "every shape must reach its format's top tier on at least one of its records: that \
+         is the claim `check_salvage_claim` PERMITS for the slot, and a damaged shape is meant \
+         to be a healthy archive the fuzzer can degrade FROM, not one already past the check"
     );
 
     // And the damaged shapes must genuinely be damaged, or the corpus is
@@ -1379,6 +1443,8 @@ fn every_salvage_seed_produces_records_and_at_least_one_intact() {
         ("arc-crc-mismatch", SalvageStatus::Partial),
         ("lha-crc-mismatch", SalvageStatus::Partial),
         ("arj-crc-mismatch", SalvageStatus::Partial),
+        // tar's cut: the one damage tar's own evidence can see.
+        ("tar-truncated-tail", SalvageStatus::Partial),
     ] {
         let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
         let path = salvage_payload_path(&seed_path, scratch.path());
@@ -1475,7 +1541,7 @@ fn files_under(dir: &Path) -> usize {
 /// **This is the only thing in `make check` that covers either of the two
 /// changes Stage 2 Task 8 made to that target**, and it exists because the
 /// review found that nothing did.
-/// [`every_salvage_seed_produces_records_and_at_least_one_intact`] passes
+/// [`every_salvage_seed_produces_records_and_reaches_its_top_tier`] passes
 /// `dest: None` and `SalvagePolicy::default()` (4 GiB), so neither the write
 /// path nor the ceiling was in any test's view, in a task whose whole
 /// deliverable was the honesty of its own measurement.

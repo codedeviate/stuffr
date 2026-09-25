@@ -11454,3 +11454,75 @@ fn damage_catalogue_the_three_partial_causes_are_distinguishable() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Salvage Stage 3 Task 2: `stuffr salvage` over a real tar, at the CLI.
+///
+/// The first header's name has one flipped byte, so `stuffr list` refuses
+/// the whole archive at exit 5 while every later header is untouched. The
+/// salvage run DETECTS the format from the `ustar` magic, reports each
+/// survivor `Complete` — the tier no registered format reached before tar,
+/// and never `Intact`, which would claim a content checksum tar does not
+/// carry — writes each one byte for byte, and exits 0.
+#[test]
+fn salvage_recovers_a_damaged_tar_as_complete() {
+    let dir = tmp_dir();
+    let good = write_fixture_tar(
+        &dir,
+        &[
+            ("first.txt", b"lost with its header"),
+            ("second.txt", b"recovered"),
+            ("third.txt", b"also recovered"),
+        ],
+    );
+    let mut bytes = std::fs::read(&good).unwrap();
+    bytes[0] ^= 0x01;
+    let archive = dir.join("damaged.tar");
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let listed = run_output(&["list", archive.to_str().unwrap()]);
+    assert_eq!(
+        listed.status.code(),
+        Some(5),
+        "the ordinary reader must refuse it: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    let out = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(stdout.lines().count(), 2, "{stdout}");
+    assert_eq!(stdout.matches("Complete").count(), 2, "{stdout}");
+    assert!(!stdout.contains("Intact"), "{stdout}");
+    assert!(
+        stdout.contains("second.txt") && stdout.contains("third.txt"),
+        "{stdout}"
+    );
+
+    let out_dir = dir.join("recovered");
+    let written = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        written.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&written.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("second.txt")).unwrap(),
+        b"recovered"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("third.txt")).unwrap(),
+        b"also recovered"
+    );
+    assert!(!out_dir.join("first.txt").exists());
+}

@@ -720,7 +720,7 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   has no scanner for is exit 3, a statement about this build rather than
   about the archive.
 
-  Scanners exist for: zip, arc, zoo, lha, arj.
+  Scanners exist for: zip, arc, zoo, lha, arj, tar.
 
   HOW MUCH TO TRUST AN `Intact` ROW IS NOT THE SAME ANSWER FOR EACH.
   `Intact` always means the same thing mechanically — this build decoded
@@ -752,14 +752,13 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   against Info-ZIP on this machine and in CI, and the whole world writes
   it.
 
-  tar, cpio and ar have none, and that is a decision rather than a gap
-  waiting to be filled. None of the three records a checksum for an
-  entry, so a header-shaped run of bytes found in the middle of some
-  other entry's payload cannot be told from a real header by anything
-  the format itself carries — the scan would report files that were
-  never in the archive and have no way to notice. Every scanner above
-  gates on a checksum for exactly that reason. Use `stuffr list` and
-  `stuffr unpack` on those three; they read a healthy archive fine.
+  tar records no checksum over an entry's CONTENT, only over each
+  512-byte header — so a tar entry is never `Intact`. One whose header
+  checks out and whose every declared byte is present is `Complete`, and
+  that is as far as the format's own evidence goes: a payload byte
+  flipped after the archive was written is invisible to it, exactly as
+  it is to `tar` itself. cpio and ar record neither, and have no scanner
+  yet; use `stuffr list` and `stuffr unpack` on those two.
 
   LHA and ARJ are the two where the ordinary reader has no fallback at
   all, and ARJ's is the sharper of them. LHA carries no index, no entry

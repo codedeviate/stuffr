@@ -10,7 +10,7 @@ use stuffr_core::testing::{
     check_salvage_claim,
 };
 use stuffr_formats::legacy::{arc_salvage, arj_salvage, lha_salvage, zoo_salvage};
-use stuffr_formats::zip_salvage;
+use stuffr_formats::{tar_salvage, zip_salvage};
 
 /// Local file header layout, duplicated deliberately rather than imported —
 /// `zip_salvage.rs`'s own constants are private, and `container.rs`'s
@@ -207,6 +207,59 @@ fn arj_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
     }
 }
 
+/// A tar header block's size, and where its checksum field sits in it:
+/// POSIX.1-1988 ustar's `chksum`, eight bytes after `name` (100), `mode`,
+/// `uid`, `gid` (8 each), `size` and `mtime` (12 each). Duplicated here for
+/// the same reason every constant above is — `tar_salvage.rs`'s own are
+/// private, and a divergence is itself the finding.
+const TAR_BLOCK: usize = 512;
+const TAR_CHECKSUM: std::ops::Range<usize> = 148..156;
+
+/// The `tar` slot's cross-check (Salvage Stage 3 Task 2), and a different
+/// QUESTION from the five above, because tar's class is
+/// [`Attestation::HeaderChecksumOnly`]: tar carries no content checksum, so
+/// what `check_salvage_claim` needs to know about a `Complete` record is
+/// whether the HEADER checksum it stands on really agrees.
+///
+/// **Recomputed here from the definition, never taken from the scanner.**
+/// Passing the scanner's own verdict as `verifier_was_checked` would be
+/// circular — the oracle would be checking the scanner's answer against the
+/// scanner's answer. This sums the 512 bytes at the record's offset with the
+/// checksum field counted as eight spaces, and compares that with the
+/// field's own text read as octal (up to its first NUL, trimmed — the
+/// spelling the `tar` crate's reader accepts, so a header `stuffr list`
+/// takes is one this takes).
+///
+/// `None` — inconclusive — only when fewer than 512 bytes sit at the
+/// offset. A field that is not a number is `Some(false)`: a header whose
+/// checksum does not agree is exactly what a `Complete` must never stand on.
+fn tar_header_checksum_agrees(data: &[u8], offset: u64) -> Option<bool> {
+    let at = usize::try_from(offset).ok()?;
+    let block = data.get(at..at.checked_add(TAR_BLOCK)?)?;
+    let field = &block[TAR_CHECKSUM];
+    let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+    let Some(recorded) = std::str::from_utf8(&field[..end])
+        .ok()
+        .and_then(|text| u64::from_str_radix(text.trim(), 8).ok())
+    else {
+        return Some(false);
+    };
+    let summed: u64 = block
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            if TAR_CHECKSUM.contains(&i) {
+                u64::from(b' ')
+            } else {
+                u64::from(b)
+            }
+        })
+        .sum();
+    // The recorded value is compared as the reader compares it, truncated
+    // to 32 bits; a sum of 512 bytes never exceeds 17.
+    Some(summed == u64::from(recorded as u32))
+}
+
 /// What a slot with no cross-check arm below gets: a loud abort, never a
 /// silent skip.
 ///
@@ -224,7 +277,7 @@ fn arj_locally_offers_checkable_crc(data: &[u8], offset: u64) -> Option<bool> {
 /// after Stage 2 Task 8 gave the slot a second source: the selector byte is
 /// reduced `% SALVAGE_SLOTS.len()`, so every one of its 256 values names a
 /// listed slot, and [`slot_from_payload`] answers only names it found by
-/// searching `SALVAGE_SLOTS` itself — a payload detecting as `tar` yields
+/// searching `SALVAGE_SLOTS` itself — a payload detecting as `cpio` yields
 /// `None` and falls back to the selector rather than reaching here. So the
 /// panic is reachable only by appending a slot without its arm, which is
 /// precisely the state that must stop being quiet.
@@ -321,12 +374,12 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
 /// [`Attestation`] that is [`check_salvage_claim`]'s third argument, and a
 /// fact about the format, not about one candidate.
 ///
-/// All five slots are [`Attestation::ContentChecksum`] today: zip carries a
-/// CRC-32, and ARC, ZOO, LHA and ARJ each carry a CRC of their own. It is a
-/// `match` naming each slot rather than one constant, because Salvage Stage
-/// 3 is adding `tar` ([`Attestation::HeaderChecksumOnly`]) and `cpio`/`ar`
-/// ([`Attestation::Nothing`]) to [`SALVAGE_SLOTS`] — a constant would carry
-/// the wrong class into the exact slots the argument exists for, silently,
+/// Five slots are [`Attestation::ContentChecksum`]: zip carries a CRC-32,
+/// and ARC, ZOO, LHA and ARJ each carry a CRC of their own. `tar` (Stage 3
+/// Task 2) is [`Attestation::HeaderChecksumOnly`]. It is a `match` naming
+/// each slot rather than one constant, because Salvage Stage 3 is adding
+/// `cpio`/`ar` ([`Attestation::Nothing`]) too — a constant would carry the
+/// wrong class into the exact slots the argument exists for, silently,
 /// which is the shape [`no_cross_check_arm`] one screen up was written to
 /// stop. Each scanner's class is stated here by name, where a reviewer
 /// reading the oracle call can see it.
@@ -338,6 +391,7 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
 fn attestation(name: &str) -> Attestation {
     match name {
         "zip" | "arc" | "zoo" | "lha" | "arj" => Attestation::ContentChecksum,
+        "tar" => Attestation::HeaderChecksumOnly,
         other => no_cross_check_arm(other),
     }
 }
@@ -603,6 +657,17 @@ fuzz_target!(|data: &[u8]| {
                 HashMap::new()
             }
         },
+        "tar" => match tar_salvage::salvage_tar(&mut cursor, &opts.policy) {
+            Ok(scan) => scan
+                .entries
+                .into_iter()
+                .map(|e| (e.scan_position, e.offset))
+                .collect(),
+            Err(e) => {
+                check_error_is_classified(&e).expect("independent scan error classification");
+                HashMap::new()
+            }
+        },
         other => no_cross_check_arm(other),
     };
 
@@ -640,17 +705,21 @@ fuzz_target!(|data: &[u8]| {
             inconclusive += 1;
             continue;
         };
-        let offers_crc = match name {
+        // Whether the checksum this slot's class offers was really there to
+        // be checked: a CONTENT checksum for the five checksummed slots, the
+        // HEADER checksum for tar — each re-derived from the raw bytes.
+        let checked = match name {
             "zip" => locally_offers_checkable_crc(payload, offset),
             "arc" => arc_locally_offers_checkable_crc(payload, offset),
             "zoo" => zoo_locally_offers_checkable_crc(payload, offset),
             "lha" => lha_locally_offers_checkable_crc(payload, offset),
             "arj" => arj_locally_offers_checkable_crc(payload, offset),
+            "tar" => tar_header_checksum_agrees(payload, offset),
             other => no_cross_check_arm(other),
         };
-        match offers_crc {
-            Some(offers_crc) => {
-                oracle += run_oracle(record.status, offers_crc, class);
+        match checked {
+            Some(checked) => {
+                oracle += run_oracle(record.status, checked, class);
             }
             None => inconclusive += 1,
         }
