@@ -81,10 +81,14 @@
 //!    the table above, applied exactly as `tar.rs` applies it. An all-zero
 //!    block (the end-of-archive marker, or padding) fails here: its field is
 //!    empty, and an empty field is not a number.
-//! 3. **The magic field reads `ustar` or is blank**: bytes `257..262` are
-//!    `ustar` (POSIX's `ustar\0` and GNU's `ustar ` both begin so), or all
-//!    eight bytes of magic and version are zero, as a pre-POSIX (v7) header
-//!    leaves them. See the next section for why this is part of the gate.
+//! 3. **The magic field reads `ustar`, or it is blank and the header is
+//!    provably not a shifted copy**: bytes `257..262` are `ustar` (POSIX's
+//!    `ustar\0` and GNU's `ustar ` both begin so); or all eight bytes of
+//!    magic and version are zero, as a pre-POSIX (v7) header leaves them,
+//!    AND the checksum field is spelled the way a measured writer spells it
+//!    ([`spelled_like_a_writer`]), AND no block up to seven bytes earlier
+//!    looks like the header this one would be a copy of
+//!    ([`looks_like_a_shifted_twin`]). See the next section for why.
 //! 4. The size field parses (`tar::Header::entry_size`), since without it
 //!    nothing locates the payload.
 //! 5. The name, after any extension, is not empty. A block of zeros whose
@@ -93,7 +97,9 @@
 //!    phantom, and neither is something a user could be handed.
 //!
 //! Any failure is not an error: it means these 512 bytes were not a header,
-//! and the scan resumes **one byte later**, never one block later.
+//! and the scan resumes **one byte later**, never one block later. One
+//! failure is also COUNTED (Ruling 3-J, below): a block that clears 2, 4
+//! and 5 and is refused by 3 alone.
 //!
 //! The checksum is the criterion with the strength against NOISE: the field
 //! must hold octal text (about ten byte values in 256 each), and that text
@@ -130,13 +136,51 @@
 //!
 //! The magic field is what a shift cannot carry: a shifted POSIX or GNU
 //! header reads `star` at 257, which is neither `ustar` nor blank.
-//! [`tests::SHIFTED_HEADER_OFFSET`] is the splice, and the task report the
-//! run with criterion 3 deleted. **What it costs**: a header whose magic
-//! area holds anything else — a v7 writer that left junk in its padding —
-//! is not recovered, where `tar.rs` reads it as an old-style header. **What
-//! it does not close**: a v7 header has no magic to shift, so a v7
-//! archive's headers keep the weakness, and around damage one can be
-//! revived a byte late the same way. v7 archives predate POSIX.1-1988.
+//! [`tests::SHIFTED_HEADER_OFFSET`] is the splice.
+//!
+//! **A v7 header has no magic to shift** — zeros before, zeros after — and
+//! the first version of this criterion accepted any blank magic, so Task 2's
+//! review reproduced the same phantom on a real writer: `gtar --format=v7`
+//! holding `a.txt` ("1st line"), `b.txt`, `c.txt` with byte 0 flipped came
+//! back as two `Complete` rows named `.txt` with shifted bytes, and `c.txt`
+//! was never reported. The coincidence is as ordinary as before; with GNU's
+//! NUL typeflag it needs `payload[0] == name[0] - 48`, so `a`→`1`.
+//!
+//! What a v7 shift DOES move is the checksum field's terminator (Ruling
+//! 3-J). Every measured writer ends its digits at index 6 or 7
+//! ([`spelled_like_a_writer`]'s table, measured on bsdtar 3.5.3, GNU tar
+//! 1.35, macOS `pax`, Python `tarfile` and the `tar` crate); a copy seen `k`
+//! bytes late has that terminator at `6 - k` or `7 - k`, inside the digits.
+//! The one exception — `%07o\0` with a space typeflag, one byte late — is
+//! closed by [`looks_like_a_shifted_twin`], which recognises the genuine
+//! header seven bytes or fewer upstream. Both layers are checked
+//! exhaustively over every typeflag byte, each with the other disabled, by
+//! [`tests::every_writer_spelling_refuses_its_own_shifted_copy`].
+//! [`tests::V7_SHIFTED_HEADER_OFFSET`] is the v7 splice.
+//!
+//! **What it costs** is headers this build cannot gate: a magic area
+//! holding anything but `ustar` or zeros, or a v7 checksum field spelled in
+//! a way no measured writer spells it. `tar.rs` reads both. The scan refuses
+//! them — admitting them readmits the shifted copies — and says so:
+//!
+//! # A header this build cannot gate is a sighting, not an absence (Ruling 3-J)
+//!
+//! A block that clears criteria 2, 4 and 5 — checksum agrees, size parses,
+//! name present — and is refused by criterion 3 alone, and is not
+//! [`looks_like_a_shifted_twin`], is COUNTED ([`UngateableSightings`]),
+//! never listed. A run that recovered nothing while counting one is
+//! [`Error::Unsupported`], **exit 3**, naming the shape and saying the
+//! ordinary verbs still read the archive — never "the scan found nothing
+//! recoverable" at exit 5, which is a claim about the archive where the
+//! truth is a claim about this build. A run that recovered something
+//! reports it at its ordinary code (Ruling S-X). This is Ruling S-V's shape,
+//! and `lha_salvage.rs`'s `UngateableSightings` is the template.
+//!
+//! Counted and never listed, because a listed candidate is one the engine
+//! advances past by its declared length — which is exactly how a phantom's
+//! payload jump used to carry the scan past a real header. And a twin is
+//! never counted: a damaged archive whose only header is a twin's source
+//! holds nothing recoverable, and says so.
 //!
 //! # Byte-granular, deliberately not 512-aligned
 //!
@@ -255,12 +299,196 @@ const MAGIC_AT: usize = 257;
 /// `magic: [u8; 6]` plus `version: [u8; 2]`.
 const MAGIC_AND_VERSION_LEN: usize = 8;
 
-/// Gate criterion 3 — see the module doc's section on the one-byte shift.
-fn magic_is_ustar_or_blank(block: &[u8]) -> bool {
+/// Whether the magic field begins `ustar` — POSIX's `ustar\0` and GNU's
+/// `ustar ` both do.
+fn magic_is_ustar(block: &[u8]) -> bool {
     block[MAGIC_AT..MAGIC_AT + 5] == *b"ustar"
-        || block[MAGIC_AT..MAGIC_AT + MAGIC_AND_VERSION_LEN]
-            .iter()
-            .all(|&b| b == 0)
+}
+
+/// Whether all eight bytes of magic and version are zero, as a pre-POSIX
+/// (v7) header leaves them.
+fn magic_is_blank(block: &[u8]) -> bool {
+    block[MAGIC_AT..MAGIC_AT + MAGIC_AND_VERSION_LEN]
+        .iter()
+        .all(|&b| b == 0)
+}
+
+fn magic_is_ustar_or_blank(block: &[u8]) -> bool {
+    magic_is_ustar(block) || magic_is_blank(block)
+}
+
+/// Whether an eight-byte checksum field is spelled the way a real tar writer
+/// spells it — the half of gate criterion 3 a blank-magic (v7) header must
+/// pass. See the module doc's section on the one-byte shift for why, and
+/// for the writers each spelling was measured on.
+///
+/// The spellings, each a run of optional leading spaces then at least one
+/// octal digit (the "body"), then a terminator:
+///
+/// | spelling | body | then | written by |
+/// |---|---|---|---|
+/// | `%06o\0 ` | 6 bytes | NUL, space | bsdtar `--format v7`, GNU tar `--format=v7`, and every ustar/GNU/pax header of both and of Python's `tarfile` |
+/// | `%6o\0 ` | 6 bytes, leading spaces | NUL, space | Seventh Edition `tar` itself (`sprintf("%6o")` over a field of spaces) |
+/// | `%07o\0` | 7 bytes | NUL | macOS `pax -x tar`; the `tar` crate (`octal_into`) |
+/// | `%07o ` | 7 bytes | space | macOS `pax -x ustar` |
+///
+/// **The spelling alone does not refuse every shifted copy, and the
+/// exhaustive test proved it.** A window `k` bytes late sees the field's
+/// bytes `k..8` followed by the typeflag, so the writer's terminator moves
+/// to `6 - k` or `7 - k`, inside the body — refused — EXCEPT one case:
+/// `%07o\0` seen one byte late reads as six digits and a NUL, and if the
+/// typeflag byte that slides in behind it is a SPACE, that is `%06o\0 `.
+/// No writer measured writes a space typeflag, but the property cannot rest
+/// on that, so [`clears_criterion_3`] also asks [`looks_like_a_shifted_twin`]
+/// for a blank-magic header. The two together are what
+/// [`tests::every_writer_spelling_refuses_its_own_shifted_copy`] checks
+/// exhaustively, over every typeflag byte.
+fn spelled_like_a_writer(field: &[u8]) -> bool {
+    let body_is_spaces_then_digits = |body: &[u8]| {
+        let digits = body.iter().skip_while(|&&b| b == b' ');
+        let mut any = false;
+        for &b in digits {
+            if !(b'0'..=b'7').contains(&b) {
+                return false;
+            }
+            any = true;
+        }
+        any
+    };
+    (body_is_spaces_then_digits(&field[..6]) && field[6] == 0 && field[7] == b' ')
+        || (body_is_spaces_then_digits(&field[..7]) && (field[7] == 0 || field[7] == b' '))
+}
+
+/// Gate criterion 3 for the block at `offset` — see the module doc's section
+/// on the one-byte shift.
+///
+/// A `ustar` magic is enough on its own: a shifted POSIX or GNU header reads
+/// `star` there. A BLANK magic is not, because a v7 header has zeros there
+/// and so does its shifted copy — so for those the checksum field must also
+/// be [`spelled_like_a_writer`], AND the block must not be
+/// [`looks_like_a_shifted_twin`] of a header up to seven bytes earlier.
+/// Anything else in the magic field is refused.
+fn clears_criterion_3(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8]) -> bool {
+    magic_is_ustar(block)
+        || (magic_is_blank(block)
+            && spelled_like_a_writer(&block[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN])
+            && !looks_like_a_shifted_twin(src, offset, file_len))
+}
+
+/// Whether the block at `offset` is a real header seen `k` bytes late, for
+/// some `k` in `1..=7`: the block `k` bytes EARLIER looks like the genuine
+/// header — a writer-spelled checksum field, a `ustar` or blank magic, and a
+/// mode and size field that both parse.
+///
+/// Two callers. [`clears_criterion_3`] asks it of every blank-magic header,
+/// because the checksum spelling alone lets one shifted shape through. And
+/// for a block criterion 3 has refused, [`sighting_at`] asks it to decide
+/// whether that refusal is an UNGATEABLE SIGHTING (Ruling 3-J) or the scan
+/// correctly declining a phantom. A twin is never a sighting: it is evidence
+/// of a header the scan has already met or already lost, not of one it
+/// cannot read.
+///
+/// # Why the mode and size fields are part of it
+///
+/// Because the checksum field alone mistook GENUINE headers for twins, twice
+/// over, in the first run of the tests that now pin it. The block `k` bytes
+/// before a genuine header has its checksum field at that header's own
+/// bytes `148 - k .. 156 - k` — the tail of its `mtime`, then the start of
+/// its checksum. bsdtar ends `mtime` with a space (`%011o `), so at `k = 1`
+/// that window reads ` 005013\0`: a spelled `%07o\0`. Seventh Edition
+/// `tar` starts its checksum with a space (`%6o`), so at `k = 7` the window
+/// reads the last six `mtime` digits, its NUL, and that space: a spelled
+/// `%06o\0 `. Both genuine headers were refused, and bsdtar's v7 archive
+/// came back as its first entry alone.
+///
+/// The earlier block's `mode` and `size` fields are what separate the two:
+/// in a real twin's source they are the genuine header's own, and parse; in
+/// the window before a genuine header they begin inside the NUL padding of
+/// its name field and the NUL terminator of its `gid` field, and do not.
+/// [`tests::every_writer_spelling_refuses_its_own_shifted_copy`] checks both
+/// halves for every spelling and typeflag, and the v7 writers test is the
+/// measurement on real archives.
+///
+/// The earlier block's own checksum is deliberately NOT required to agree:
+/// the case that produces a twin at all is the genuine header being damaged.
+fn looks_like_a_shifted_twin(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> bool {
+    (1..=7u64).any(|k| {
+        offset
+            .checked_sub(k)
+            .and_then(|at| read_block(src, at, file_len))
+            .is_some_and(|b| {
+                let earlier = tar::Header::from_byte_slice(&b);
+                spelled_like_a_writer(&b[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN])
+                    && magic_is_ustar_or_blank(&b)
+                    && earlier.mode().is_ok()
+                    && earlier.entry_size().is_ok()
+            })
+    })
+}
+
+/// A header shape the scan recognised and has no gate for — Ruling 3-J,
+/// this scanner's Ruling S-V (`lha_salvage.rs`'s `UngateableSightings` is
+/// the template).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ungateable {
+    /// A checksum-valid header whose magic field is neither `ustar` nor
+    /// blank, and which is not a shifted copy of a real header.
+    UnrecognisedMagic,
+    /// A checksum-valid v7 (blank-magic) header whose checksum field is not
+    /// spelled the way any writer this project measured spells it, and
+    /// which is not a shifted copy of a real header.
+    UnrecognisedV7Spelling,
+}
+
+/// What the scan saw and could not gate, counted per shape. Counted, never
+/// listed as a candidate: a candidate would be advanced past by its declared
+/// length (`salvage.rs`'s `collect_candidates`), and that is how a phantom
+/// used to jump the scan past a real header.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UngateableSightings {
+    unrecognised_magic: u64,
+    unrecognised_v7_spelling: u64,
+}
+
+impl UngateableSightings {
+    fn record(&mut self, kind: Ungateable) {
+        match kind {
+            Ungateable::UnrecognisedMagic => self.unrecognised_magic += 1,
+            Ungateable::UnrecognisedV7Spelling => self.unrecognised_v7_spelling += 1,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.unrecognised_magic > 0 || self.unrecognised_v7_spelling > 0
+    }
+
+    /// The sentence a run reports when it recovered nothing and saw one of
+    /// these — naming the shape, and saying that the ordinary verbs still
+    /// read the archive, which is the whole difference from "nothing
+    /// recoverable".
+    fn refusal(self) -> String {
+        let mut shapes: Vec<String> = Vec::new();
+        if self.unrecognised_magic > 0 {
+            shapes.push(format!(
+                "{} header(s) whose magic field (bytes 257..265) is neither `ustar` nor blank",
+                self.unrecognised_magic
+            ));
+        }
+        if self.unrecognised_v7_spelling > 0 {
+            shapes.push(format!(
+                "{} pre-POSIX (v7) header(s) whose checksum field is not spelled the way any \
+                 tar writer this build knows spells it",
+                self.unrecognised_v7_spelling
+            ));
+        }
+        format!(
+            "this build's tar salvage scanner found {} — each with a checksum that agrees, but \
+             in a shape it has no gate for, because a header seen one byte late takes exactly \
+             that shape; the archive itself may be perfectly readable — `stuffr list` and \
+             `stuffr unpack` read these headers normally, and it is the SCAN that stops here",
+            shapes.join(" and ")
+        )
+    }
 }
 
 /// Bytes read per [`find_next_header`] chunk. O(1) memory however far the
@@ -296,6 +524,8 @@ pub const SPARSE: FormatId = FormatId::new("tar-sparse");
 #[derive(Debug, Default)]
 pub struct TarSalvage {
     resume: Option<Resume>,
+    /// Header shapes this scan recognised and cannot gate — Ruling 3-J.
+    seen: UngateableSightings,
 }
 
 /// The last reported candidate whose payload fit in the file.
@@ -332,18 +562,23 @@ impl SalvageScan for TarSalvage {
                 return Ok(None);
             };
             match read_candidate_at(src, offset, file_len) {
-                Some(found) => {
+                Scanned::Found(found) => {
                     self.resume = found.next_header.map(|next_header| Resume {
                         header: found.candidate.offset,
                         next_header,
                     });
                     return Ok(Some(found.candidate));
                 }
+                // Counted, not reported — see `UngateableSightings`.
+                Scanned::Ungateable(kind) => {
+                    self.seen.record(kind);
+                    search_from = offset + 1;
+                }
                 // A checksum-valid block the rest of the gate refused, or an
                 // extension chain that reached no header. Resume one byte
                 // on, so a genuine header overlapping this one is never
                 // skipped.
-                None => search_from = offset + 1,
+                Scanned::NotAHeader => search_from = offset + 1,
             }
         }
     }
@@ -551,15 +786,65 @@ struct Found {
 /// second `L`, `K` or `x` for the same member, so three.
 const MAX_EXTENSIONS: usize = 3;
 
+/// What gating the block at one offset found.
+enum Scanned {
+    /// Boxed: a `Candidate` is far larger than the other two arms, and this
+    /// is built once per checksum-valid block, not in a hot loop.
+    Found(Box<Found>),
+    /// A checksum-valid block refused by criterion 3 alone, with a size and a
+    /// name, that is not a shifted copy of a real header — Ruling 3-J.
+    Ungateable(Ungateable),
+    NotAHeader,
+}
+
+/// Gates the block at `offset` and, if it is an extension, the chain it
+/// begins — see the module doc.
+fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Scanned {
+    if let Some(block) = read_block(src, offset, file_len)
+        && header_checksum_agrees(&block)
+        && !clears_criterion_3(src, offset, file_len, &block)
+    {
+        return sighting_at(src, offset, file_len, &block)
+            .map_or(Scanned::NotAHeader, Scanned::Ungateable);
+    }
+    gate_chain_at(src, offset, file_len)
+        .map_or(Scanned::NotAHeader, |found| Scanned::Found(Box::new(found)))
+}
+
+/// Whether a checksum-valid block that criterion 3 refused is an ungateable
+/// SIGHTING: it must carry the structure a header needs (a size that parses
+/// and a name), and it must not be a shifted copy of a real header.
+fn sighting_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    block: &[u8; BLOCK],
+) -> Option<Ungateable> {
+    let header = tar::Header::from_byte_slice(block);
+    if header.entry_size().is_err() || header.path_bytes().is_empty() {
+        return None;
+    }
+    if looks_like_a_shifted_twin(src, offset, file_len) {
+        return None;
+    }
+    // Reached only for a block criterion 3 refused and that is no twin, so a
+    // blank magic here means an unmeasured checksum spelling.
+    Some(if magic_is_blank(block) {
+        Ungateable::UnrecognisedV7Spelling
+    } else {
+        Ungateable::UnrecognisedMagic
+    })
+}
+
 /// Gates the header at `offset` and, if it is an extension, the chain it
 /// begins — see the module doc. `None` for anything that does not reach a
 /// real header.
-fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<Found> {
+fn gate_chain_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<Found> {
     let mut extensions = Extensions::default();
     let mut at = offset;
     for _ in 0..=MAX_EXTENSIONS {
         let block = read_block(src, at, file_len)?;
-        if !header_checksum_agrees(&block) || !magic_is_ustar_or_blank(&block) {
+        if !header_checksum_agrees(&block) || !clears_criterion_3(src, at, file_len, &block) {
             return None;
         }
         let header = tar::Header::from_byte_slice(&block);
@@ -697,8 +982,12 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
     // The header checked again, by this method. A block that no longer
     // agrees with itself (the source changed under the scan) has proven
     // nothing, and `Complete` is the one thing it must not be.
-    Ok(match read_block(src, candidate.offset, file_len) {
-        Some(block) if header_checksum_agrees(&block) && magic_is_ustar_or_blank(&block) => {
+    let block = read_block(src, candidate.offset, file_len);
+    Ok(match block {
+        Some(block)
+            if header_checksum_agrees(&block)
+                && clears_criterion_3(src, candidate.offset, file_len, &block) =>
+        {
             SalvageStatus::Complete
         }
         _ => SalvageStatus::Partial,
@@ -762,7 +1051,21 @@ pub fn write_payload(
 /// reconcile against: tar has none, so the raw scan is the only source.
 pub fn salvage_tar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
     let mut scanner = TarSalvage::new();
-    salvage_all(&mut scanner, src, policy)
+    let outcome = salvage_all(&mut scanner, src, policy)?;
+
+    // **Ruling 3-J** — this scanner's Ruling S-V. A run that recovered
+    // NOTHING while recognising a header shape it cannot gate must not fall
+    // through to the empty outcome the CLI reports as "the scan found nothing
+    // recoverable" (exit 5): that is a claim about the ARCHIVE, and the truth
+    // is a claim about this BUILD. `Error::Unsupported` is exit 3.
+    //
+    // **Only when nothing came back** (Ruling S-X): an `Err` discards every
+    // entry the run recovered, so a run that got something reports it at its
+    // ordinary exit code.
+    if outcome.entries.is_empty() && scanner.seen.any() {
+        return Err(Error::Unsupported(scanner.seen.refusal()));
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -778,8 +1081,10 @@ mod tests {
     use crate::tar::{TAR, Tar};
 
     fn scan(bytes: &[u8]) -> SalvageOutcome {
-        salvage_tar(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
-            .expect("a salvage scan must not error over any input")
+        salvage_tar(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default()).expect(
+            "a salvage scan must not error here — an `Err` is an ungateable sighting \
+                 (Ruling 3-J), which none of these inputs may produce",
+        )
     }
 
     // -------------------------------------------------------------------
@@ -922,9 +1227,10 @@ mod tests {
     }
 
     /// Where the `ustar` magic is forced, block-relative, with everything
-    /// around it left as noise. Not a gate criterion at all — v7 tars carry
-    /// no magic — and seeded to show that it is not: a scanner keying on the
-    /// magic would report six phantoms here.
+    /// around it left as noise. The magic is half of criterion 3, but it is
+    /// never ENOUGH — criterion 2, the checksum, comes first — and these are
+    /// seeded to show that: a scanner keying on the magic alone would report
+    /// six phantoms here.
     const SEEDED_MAGIC_OFFSETS: [usize; 6] = [65_536, 196_608, 344_064, 491_520, 638_976, 786_432];
 
     /// A complete GNU header plus payload whose ONLY defect is its recorded
@@ -947,6 +1253,15 @@ mod tests {
     /// payload byte are both `a`. Criterion 3's splice; see the module doc's
     /// section on the one-byte shift.
     pub(super) const SHIFTED_HEADER_OFFSET: usize = 900_000;
+
+    /// The v7 twin of [`SHIFTED_HEADER_OFFSET`]: a GNU-tar-style v7 header
+    /// (`%06o\0 ` checksum, NUL typeflag) with its first byte removed. It is
+    /// checksum-valid, because `a` (97) dropped and `1` (49) gained differ by
+    /// exactly the `0` (48) that slides out of the checksum field while the
+    /// NUL typeflag slides in — and its magic is blank. Criterion 3's v7 half,
+    /// the checksum-field spelling, is the only thing that refuses it (Ruling
+    /// 3-J; F1 of Task 2's review).
+    pub(super) const V7_SHIFTED_HEADER_OFFSET: usize = 960_000;
 
     fn checksum_only_defect() -> Vec<u8> {
         let mut block = header_block("CKSUMONLY.TXT", 7, tar::EntryType::Regular);
@@ -989,16 +1304,22 @@ mod tests {
         files(&[("a.txt", b"alpha")])[1..2 * BLOCK].to_vec()
     }
 
+    /// See [`V7_SHIFTED_HEADER_OFFSET`].
+    fn v7_shifted_header() -> Vec<u8> {
+        v7_archive(&[("a.txt", b"1st line\n")], V7_GNU_SPELLING)[1..2 * BLOCK].to_vec()
+    }
+
     fn noise_with_splices(len: usize) -> Vec<u8> {
         let mut noise = deterministic_noise(len);
         for &at in &SEEDED_MAGIC_OFFSETS {
             noise[at + 257..at + 262].copy_from_slice(b"ustar");
         }
-        let splices: [(usize, Vec<u8>); 4] = [
+        let splices: [(usize, Vec<u8>); 5] = [
             (CHECKSUM_ONLY_DEFECT_OFFSET, checksum_only_defect()),
             (EMPTY_NAME_OFFSET, empty_name_block().to_vec()),
             (UNPARSABLE_SIZE_OFFSET, unparsable_size_block().to_vec()),
             (SHIFTED_HEADER_OFFSET, shifted_header()),
+            (V7_SHIFTED_HEADER_OFFSET, v7_shifted_header()),
         ];
         for (at, splice) in splices {
             noise[at..at + splice.len()].copy_from_slice(&splice);
@@ -1014,7 +1335,7 @@ mod tests {
         let out = scan(&noise_with_splices(1 << 20));
         assert!(
             out.entries.is_empty(),
-            "1 MiB of noise with four near-miss headers spliced in produced {} phantom(s): {:?}",
+            "1 MiB of noise with five near-miss headers spliced in produced {} phantom(s): {:?}",
             out.entries.len(),
             out.entries
                 .iter()
@@ -1057,6 +1378,20 @@ mod tests {
 
         // Criteria 3, 4 and 5: each clears criterion 2, so each reaches the
         // part of the gate its name claims.
+        let v7_shifted = block_at(V7_SHIFTED_HEADER_OFFSET);
+        assert!(
+            header_checksum_agrees(v7_shifted),
+            "a plain sum survives the v7 shift too"
+        );
+        assert!(
+            magic_is_blank(v7_shifted),
+            "and a v7 magic is blank before and after"
+        );
+        assert!(
+            !spelled_like_a_writer(&v7_shifted[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN]),
+            "the checksum field's spelling is what the shift moved"
+        );
+        assert_eq!(&v7_shifted[..5], b".txt\0");
         let shifted = block_at(SHIFTED_HEADER_OFFSET);
         assert!(
             header_checksum_agrees(shifted),
@@ -1084,12 +1419,12 @@ mod tests {
                 .is_err()
         );
 
-        // The magic is there, six times over, and is not a criterion.
+        // The magic is there, six times over, and alone admits nothing.
         for &at in &SEEDED_MAGIC_OFFSETS {
             assert_eq!(&noise[at + 257..at + 262], b"ustar");
         }
 
-        // And nothing ELSE in the corpus clears criterion 2: the three
+        // And nothing ELSE in the corpus clears criterion 2: the four
         // splices above are the only checksum-valid blocks, so the empty
         // outcome is the gate rejecting them, not the noise never trying.
         let agreeing: Vec<usize> = (0..=noise.len() - BLOCK)
@@ -1100,7 +1435,8 @@ mod tests {
             vec![
                 EMPTY_NAME_OFFSET,
                 UNPARSABLE_SIZE_OFFSET,
-                SHIFTED_HEADER_OFFSET
+                SHIFTED_HEADER_OFFSET,
+                V7_SHIFTED_HEADER_OFFSET
             ]
         );
     }
@@ -1550,6 +1886,375 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["own-name.txt"]
         );
+    }
+
+    // -------------------------------------------------------------------
+    // v7 headers, the shifted twin, and ungateable sightings (Ruling 3-J)
+    // -------------------------------------------------------------------
+
+    /// Spells a checksum value into an eight-byte field.
+    type Spelling = fn(u32) -> [u8; 8];
+
+    /// GNU tar's and bsdtar's v7 checksum spelling, `%06o\0 `.
+    const V7_GNU_SPELLING: fn(u32) -> [u8; 8] = |v| {
+        let mut f = [0u8; 8];
+        f.copy_from_slice(format!("{v:06o}\0 ").as_bytes());
+        f
+    };
+
+    /// macOS `pax -x tar`'s spelling, `%07o\0`.
+    const V7_PAX_SPELLING: fn(u32) -> [u8; 8] = |v| {
+        let mut f = [0u8; 8];
+        f.copy_from_slice(format!("{v:07o}\0").as_bytes());
+        f
+    };
+
+    /// A spelling no writer this project measured uses — digits, then NULs.
+    /// `tar.rs`'s reader accepts it (the field is read up to its first NUL).
+    const UNMEASURED_SPELLING: fn(u32) -> [u8; 8] = |v| {
+        let mut f = [0u8; 8];
+        let text = format!("{v:o}");
+        f[..text.len()].copy_from_slice(text.as_bytes());
+        f
+    };
+
+    /// One v7 header, laid out the way GNU tar `--format=v7` lays it out —
+    /// mode, uid and gid as `%07o\0`, size and mtime as `%011o\0`, a NUL
+    /// typeflag, blank magic — with `magic` written over bytes 257..265 and
+    /// the checksum field spelled by `spell`. Built by hand, so it proves
+    /// agreement with this module's own reading of v7; the v7 writers test
+    /// is the witness.
+    fn v7_block(name: &str, size: u64, spell: fn(u32) -> [u8; 8], magic: [u8; 8]) -> [u8; BLOCK] {
+        let mut b = [0u8; BLOCK];
+        b[..name.len()].copy_from_slice(name.as_bytes());
+        b[100..108].copy_from_slice(b"0000644\0");
+        b[108..116].copy_from_slice(b"0000000\0");
+        b[116..124].copy_from_slice(b"0000000\0");
+        b[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+        b[136..148].copy_from_slice(b"14727046122\0");
+        b[MAGIC_AT..MAGIC_AT + MAGIC_AND_VERSION_LEN].copy_from_slice(&magic);
+        b[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN].fill(b' ');
+        let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+        b[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN].copy_from_slice(&spell(sum));
+        b
+    }
+
+    /// A whole v7 archive: each entry's header and padded payload, then the
+    /// two-block end-of-archive marker.
+    fn v7_archive(entries: &[(&str, &[u8])], spell: fn(u32) -> [u8; 8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, data) in entries {
+            out.extend_from_slice(&v7_block(name, data.len() as u64, spell, [0; 8]));
+            out.extend_from_slice(&padded(data));
+        }
+        out.extend_from_slice(&[0u8; 2 * BLOCK]);
+        out
+    }
+
+    /// The reviewer's reproducer, by hand: `gtar --format=v7`'s shape, three
+    /// files whose names start one digit-offset from their payloads. With
+    /// the first header's byte 0 flipped, the header seen one byte late
+    /// agrees with its own checksum — and before Ruling 3-J it came back as
+    /// two `Complete` rows named `.txt` holding shifted bytes, with `c.txt`
+    /// never reported.
+    #[test]
+    fn a_v7_header_seen_one_byte_late_is_not_revived() {
+        let files = [
+            ("a.txt", &b"1st line\n"[..]),
+            ("b.txt", b"2nd line\n"),
+            ("c.txt", b"third\n"),
+        ];
+        let healthy = v7_archive(&files, V7_GNU_SPELLING);
+        let reader = read_through_the_reader(&healthy).expect("the reader accepts v7");
+        let out = scan(&healthy);
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.status))
+                .collect::<Vec<_>>(),
+            reader
+                .iter()
+                .map(|(n, _, _, _)| (n.as_str(), SalvageStatus::Complete))
+                .collect::<Vec<_>>()
+        );
+
+        let mut damaged = healthy.clone();
+        damaged[0] ^= 0x01;
+        assert!(
+            header_checksum_agrees(&damaged[1..1 + BLOCK]),
+            "the fixture must really carry a checksum-valid twin one byte late"
+        );
+        let out = scan(&damaged);
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("b.txt", SalvageStatus::Complete),
+                ("c.txt", SalvageStatus::Complete)
+            ],
+            "the damaged entry is lost and nothing else is — no `.txt` twin, and `c.txt` found"
+        );
+        let written = write_back(&damaged, &out);
+        assert_eq!(written[0], (b"2nd line\n".to_vec(), true));
+        assert_eq!(written[1], (b"third\n".to_vec(), true));
+    }
+
+    /// **The property criterion 3's v7 half stands on**, checked
+    /// exhaustively rather than argued: for every checksum spelling a
+    /// measured writer uses, and every typeflag byte that header could
+    /// carry, the header itself clears criterion 3, and its copy seen `k`
+    /// bytes late (`k` in `1..=7`) does not.
+    ///
+    /// Run twice, once per layer, so that each layer is shown to carry
+    /// weight:
+    ///
+    /// - **with the genuine header intact**, every shifted copy is refused —
+    ///   and with [`looks_like_a_shifted_twin`] removed from
+    ///   [`clears_criterion_3`] this goes red, on the one shape the spelling
+    ///   alone lets through: `"0005017\0"` with a SPACE typeflag, seen one
+    ///   byte late, reads `"005017\0 "`, a perfectly spelled `%06o\0 `. This
+    ///   test found that case on its first run;
+    /// - **with the genuine header's mode field destroyed**, so that nothing
+    ///   upstream of the copy looks like a header and the twin layer cannot
+    ///   fire, every shifted copy is STILL refused except that one shape —
+    ///   and with [`spelled_like_a_writer`] removed, this goes red on every
+    ///   spelling. The residual is a `%07o\0` header with a space typeflag,
+    ///   which no measured writer produces, whose mode field is also gone.
+    #[test]
+    fn every_writer_spelling_refuses_its_own_shifted_copy() {
+        let spellings: [(&str, Spelling); 4] = [
+            ("%06o\\0 (bsdtar, GNU tar)", V7_GNU_SPELLING),
+            ("%6o\\0 (Seventh Edition)", |v| {
+                let mut f = [0u8; 8];
+                f.copy_from_slice(format!("{v:6o}\0 ").as_bytes());
+                f
+            }),
+            ("%07o\\0 (pax -x tar, the tar crate)", V7_PAX_SPELLING),
+            ("%07o  (pax -x ustar)", |v| {
+                let mut f = [0u8; 8];
+                f.copy_from_slice(format!("{v:07o} ").as_bytes());
+                f
+            }),
+        ];
+        let mut refused = 0usize;
+        let mut residual = Vec::new();
+        for destroy_mode in [false, true] {
+            for (label, spell) in spellings {
+                for typeflag in 0..=255u8 {
+                    let mut header = v7_block("a.txt", 9, spell, [0; 8]);
+                    header[156] = typeflag;
+                    if destroy_mode {
+                        header[100..108].copy_from_slice(b"garbage!");
+                    }
+                    header[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN].fill(b' ');
+                    let sum: u32 = header.iter().map(|&x| u32::from(x)).sum();
+                    header[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN].copy_from_slice(&spell(sum));
+                    // A zero block in front, as an archive's previous payload
+                    // padding would be, then the header and its payload.
+                    let mut bytes = vec![0u8; BLOCK];
+                    bytes.extend_from_slice(&header);
+                    bytes.extend_from_slice(&padded(b"1st line\n"));
+                    let len = bytes.len() as u64;
+                    let mut src = Cursor::new(bytes.clone());
+                    if !destroy_mode {
+                        assert!(
+                            clears_criterion_3(&mut src, BLOCK_U64, len, &bytes[BLOCK..2 * BLOCK]),
+                            "{label}, typeflag {typeflag}: the genuine header must clear it"
+                        );
+                    }
+                    for k in 1..=7usize {
+                        let at = BLOCK + k;
+                        if clears_criterion_3(&mut src, at as u64, len, &bytes[at..at + BLOCK]) {
+                            let read = String::from_utf8_lossy(
+                                &bytes[at + CHECKSUM_AT..at + CHECKSUM_AT + CHECKSUM_LEN],
+                            )
+                            .into_owned();
+                            assert!(
+                                destroy_mode,
+                                "{label}, typeflag {typeflag}: the copy seen {k} byte(s) late \
+                                 reads {read:?} and clears criterion 3"
+                            );
+                            residual.push((label, typeflag, k, read));
+                        } else {
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            residual
+                .iter()
+                .map(|(l, t, k, _)| (*l, *t, *k))
+                .collect::<Vec<_>>(),
+            vec![("%07o\\0 (pax -x tar, the tar crate)", b' ', 1)],
+            "exactly one shape may pass with no header upstream of it: {residual:?}"
+        );
+        assert_eq!(refused, 2 * 4 * 256 * 7 - 1);
+    }
+
+    /// Ruling 3-J, F2 of Task 2's review: a healthy archive `stuffr list`
+    /// reads, whose one header carries junk in its magic field, used to be
+    /// "nothing recoverable" (exit 5). It is an ungateable SIGHTING — exit 3,
+    /// naming the shape — and in a mixed archive, the gateable entries still
+    /// come back at their ordinary code.
+    #[test]
+    fn a_header_this_build_cannot_gate_is_a_sighting_not_an_absence() {
+        let mut junk = v7_block("j.txt", 4, V7_GNU_SPELLING, *b"JUNKJUNK").to_vec();
+        junk.extend_from_slice(&padded(b"junk"));
+        junk.extend_from_slice(&[0u8; 2 * BLOCK]);
+        let reader = read_through_the_reader(&junk).expect("the reader accepts it");
+        assert_eq!(reader.len(), 1);
+
+        let err = salvage_tar(&mut Cursor::new(junk.clone()), &SalvagePolicy::default())
+            .expect_err("nothing recoverable is not the truth here");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("magic field"), "{err}");
+
+        // A v7 header whose checksum field no measured writer spells like
+        // this: the other kind of sighting, named as such.
+        let mut odd = v7_archive(&[("o.txt", b"odd")], UNMEASURED_SPELLING);
+        assert!(read_through_the_reader(&odd).is_ok());
+        let err = salvage_tar(&mut Cursor::new(odd.clone()), &SalvagePolicy::default())
+            .expect_err("an unmeasured spelling is a sighting too");
+        assert!(err.to_string().contains("v7"), "{err}");
+
+        // Mixed: what CAN be gated comes back, at its ordinary code.
+        odd.truncate(2 * BLOCK);
+        odd.extend_from_slice(&files(&[("fine.txt", b"fine")]));
+        let out = scan(&odd);
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| e.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fine.txt"]
+        );
+    }
+
+    /// The half of Ruling 3-J that keeps the sighting honest: a header seen
+    /// one byte late is never counted as one. An archive whose ONLY header
+    /// is damaged, leaving nothing but its checksum-valid twin, really does
+    /// hold nothing recoverable — `Ok` and empty, the CLI's exit 5 — for the
+    /// ustar twin and the v7 twin alike.
+    #[test]
+    fn a_shifted_twin_is_never_a_sighting() {
+        let mut ustar = files(&[("a.txt", b"alpha")]);
+        let mut v7 = v7_archive(&[("a.txt", b"1st line\n")], V7_GNU_SPELLING);
+        for (label, bytes) in [("ustar", &mut ustar), ("v7", &mut v7)] {
+            bytes[0] ^= 0x01;
+            assert!(header_checksum_agrees(&bytes[1..1 + BLOCK]), "{label}");
+            let out = salvage_tar(&mut Cursor::new(bytes.clone()), &SalvagePolicy::default())
+                .unwrap_or_else(|e| panic!("{label}: a twin is not a sighting: {e}"));
+            assert!(out.entries.is_empty(), "{label}: {:?}", out.entries);
+        }
+    }
+
+    /// **The witness for the spelling rule.** Every v7-capable writer on this
+    /// machine — the platform `tar` and `gtar` with `--format=v7`, and `pax
+    /// -x tar` — writes three files; salvage must recover them whole, and
+    /// with the first header destroyed must lose that entry and nothing
+    /// else. A writer whose spelling the rule did not know would fail the
+    /// first half (its archive would be a sighting, not three entries).
+    /// Python's `tarfile` has no v7 format: every format it writes carries
+    /// `ustar` magic, and the reference-writer test covers those.
+    #[test]
+    fn every_v7_writer_s_archive_survives_a_destroyed_first_header() {
+        let dir = std::env::temp_dir().join(format!(
+            "stuffr-tar-salvage-v7-writers-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let contents: [(&str, &[u8]); 3] = [
+            ("a.txt", b"1st line\n"),
+            ("b.txt", b"2nd line\n"),
+            ("c.txt", b"third\n"),
+        ];
+        for (name, data) in contents {
+            std::fs::write(tree.join(name), data).unwrap();
+        }
+
+        let mut archives: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for bin in ["tar", "gtar"] {
+            let Some(tar_bin) = which(bin) else { continue };
+            let archive = dir.join(format!("{bin}-v7.tar"));
+            let status = std::process::Command::new(&tar_bin)
+                .env("COPYFILE_DISABLE", "1")
+                .arg("--format=v7")
+                .arg("-cf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&tree)
+                .args(["a.txt", "b.txt", "c.txt"])
+                .status()
+                .unwrap();
+            assert!(status.success(), "{bin} could not write a v7 archive");
+            archives.push((format!("{bin} --format=v7"), archive));
+        }
+        if let Some(pax) = which("pax") {
+            let archive = dir.join("pax-tar.tar");
+            let strip = format!(",^{}/,,", tree.display());
+            let status = std::process::Command::new(&pax)
+                .env("COPYFILE_DISABLE", "1")
+                .args(["-w", "-x", "tar", "-s", &strip, "-f"])
+                .arg(&archive)
+                .args(contents.iter().map(|(n, _)| tree.join(n)))
+                .status()
+                .unwrap();
+            assert!(status.success(), "pax could not write a v7 archive");
+            archives.push(("pax -x tar".into(), archive));
+        }
+        assert!(
+            !archives.is_empty(),
+            "no v7 writer found at all — this test proved nothing"
+        );
+
+        for (writer, archive) in &archives {
+            let healthy = std::fs::read(archive).unwrap();
+            assert!(
+                magic_is_blank(&healthy[..BLOCK]),
+                "{writer}: the fixture must really be v7"
+            );
+            let out = salvage_tar(&mut Cursor::new(healthy.clone()), &SalvagePolicy::default())
+                .unwrap_or_else(|e| {
+                    panic!("{writer}: its spelling is not one the rule knows: {e}")
+                });
+            assert_eq!(
+                out.entries
+                    .iter()
+                    .map(|e| (e.meta.name.as_str(), e.status))
+                    .collect::<Vec<_>>(),
+                contents
+                    .iter()
+                    .map(|(n, _)| (*n, SalvageStatus::Complete))
+                    .collect::<Vec<_>>(),
+                "{writer}"
+            );
+
+            let mut damaged = healthy;
+            damaged[0] ^= 0x01;
+            let out = scan(&damaged);
+            assert_eq!(
+                out.entries
+                    .iter()
+                    .map(|e| (e.meta.name.as_str(), e.status))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("b.txt", SalvageStatus::Complete),
+                    ("c.txt", SalvageStatus::Complete)
+                ],
+                "{writer}: a destroyed first header must cost that entry and nothing else"
+            );
+            let written = write_back(&damaged, &out);
+            assert_eq!(written[0], (b"2nd line\n".to_vec(), true), "{writer}");
+            assert_eq!(written[1], (b"third\n".to_vec(), true), "{writer}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -------------------------------------------------------------------

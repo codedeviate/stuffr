@@ -11526,3 +11526,40 @@ fn salvage_recovers_a_damaged_tar_as_complete() {
     );
     assert!(!out_dir.join("first.txt").exists());
 }
+
+/// Ruling 3-J at the CLI: Task 2's review reproduced `salvage` answering "the
+/// scan found nothing recoverable" at exit 5 over a healthy tar `list` reads
+/// at exit 0 — one v7-style header with junk in its magic field. It is exit 3
+/// now, naming the shape.
+#[test]
+fn salvage_says_exit_3_for_a_tar_header_it_cannot_gate() {
+    let dir = tmp_dir();
+    let mut b = vec![0u8; 512];
+    b[..5].copy_from_slice(b"j.txt");
+    b[100..108].copy_from_slice(b"0000644\0");
+    b[108..116].copy_from_slice(b"0000000\0");
+    b[116..124].copy_from_slice(b"0000000\0");
+    b[124..136].copy_from_slice(b"00000000004\0");
+    b[136..148].copy_from_slice(b"14727046122\0");
+    b[257..265].copy_from_slice(b"JUNKJUNK");
+    b[148..156].fill(b' ');
+    let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+    b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    b.extend_from_slice(b"junk");
+    b.resize(2048, 0);
+    let archive = dir.join("junkmagic.tar");
+    std::fs::write(&archive, &b).unwrap();
+
+    assert_eq!(run(&["list", archive.to_str().unwrap()]).code(), Some(0));
+    let out = run_output(&[
+        "salvage",
+        "--format",
+        "tar",
+        archive.to_str().unwrap(),
+        "--list",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("magic field"), "{stderr}");
+    assert!(!stderr.contains("nothing recoverable"), "{stderr}");
+}

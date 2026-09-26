@@ -182,3 +182,50 @@ fn a_truncated_tar_writes_its_genuine_prefix_as_partial() {
     );
     assert_eq!(entries::salvage_exit_code(&outcome), 4);
 }
+
+/// One v7-style header with `magic` over bytes 257..265, a correct
+/// checksum (`%06o\0 `, GNU tar's spelling), then `data` padded to a block and
+/// the two-block end-of-archive marker. Built by hand: nothing in reach
+/// writes junk into a v7 header's padding on purpose.
+fn one_entry_v7_tar(name: &str, data: &[u8], magic: &[u8; 8]) -> Vec<u8> {
+    let mut b = vec![0u8; 512];
+    b[..name.len()].copy_from_slice(name.as_bytes());
+    b[100..108].copy_from_slice(b"0000644\0");
+    b[108..116].copy_from_slice(b"0000000\0");
+    b[116..124].copy_from_slice(b"0000000\0");
+    b[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+    b[136..148].copy_from_slice(b"14727046122\0");
+    b[257..265].copy_from_slice(magic);
+    b[148..156].fill(b' ');
+    let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+    b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    b.extend_from_slice(data);
+    b.resize(1024, 0);
+    b.extend_from_slice(&[0u8; 1024]);
+    b
+}
+
+/// Ruling 3-J through the public path. A healthy archive `stuffr list`
+/// reads, whose only header carries junk in its magic field, is one the
+/// scan cannot tell from a header seen a byte late — so it refuses it, and
+/// the run says so at **exit 3** ("this build"), never "nothing recoverable"
+/// at exit 5 ("this archive"), which is what it said before.
+#[test]
+fn a_header_the_scan_cannot_gate_is_exit_3_not_nothing_recoverable() {
+    let scratch = Scratch::new("ungateable");
+    let archive = scratch.0.join("junkmagic.tar");
+    std::fs::write(&archive, one_entry_v7_tar("j.txt", b"junk", b"JUNKJUNK")).unwrap();
+
+    let (listed, _) = entries::list(
+        Input::Path(archive.clone()),
+        stuffr::DEFAULT_MAX_RATIO,
+        None,
+    )
+    .expect("the ordinary reader reads it");
+    assert_eq!(listed.len(), 1);
+
+    let err = entries::salvage(&archive, &opts(None, Some("tar")))
+        .expect_err("nothing recoverable is not the truth about this archive");
+    assert_eq!(err.exit_code(), 3, "{err}");
+    assert!(err.to_string().contains("stuffr list"), "{err}");
+}
