@@ -757,8 +757,14 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   checks out and whose every declared byte is present is `Complete`, and
   that is as far as the format's own evidence goes: a payload byte
   flipped after the archive was written is invisible to it, exactly as
-  it is to `tar` itself. cpio and ar record neither, and have no scanner
-  yet; use `stuffr list` and `stuffr unpack` on those two.
+  it is to `tar` itself. A tar header whose magic field holds anything
+  but `ustar` or zeros, or a pre-POSIX (v7) header whose checksum field
+  is spelled unlike any known writer's, is one the scan cannot tell from
+  a real header seen a byte late; it refuses it, and a run that recovers
+  nothing else says so at exit 3 rather than "nothing recoverable" —
+  `stuffr list` and `stuffr unpack` still read those headers. cpio and
+  ar record neither checksum, and have no scanner yet; use `stuffr list`
+  and `stuffr unpack` on those two.
 
   LHA and ARJ are the two where the ordinary reader has no fallback at
   all, and ARJ's is the sharper of them. LHA carries no index, no entry
@@ -817,15 +823,13 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       what an archive holds without extracting anything, not even into a
       throwaway directory. Prints every record the scan found, one per
       line: SCAN POSITION, status (Intact, Complete, Unattested, Partial
-      with its cause, or Unverified with its cause), and name. Neither
-      `Complete` nor `Unattested` is reachable in this build and you will
-      not see either: `Complete` means "every declared byte was there, the
-      header self-verified, and the format offers no checksum to check the
-      CONTENT against", `Unattested` means "the format offers neither a
-      checksum nor a self-verifying header, so nothing attests this is an
-      entry at all" — and every format with a scanner here carries a
-      checksum. Both are reserved for the checksum-less formats named
-      above. This can show MORE
+      with its cause, or Unverified with its cause), and name. `Complete`
+      means "every declared byte was there and the header self-verified,
+      but the format offers no checksum to check the CONTENT against" —
+      tar, and only tar, reaches it here. `Unattested` means "the format
+      offers neither a checksum nor a self-verifying header, so nothing
+      attests this is an entry at all"; it is reserved for cpio and ar,
+      which have no scanner yet, so you will not see it. This can show MORE
       rows than `stuffr list` on the same archive: a zip whose central
       directory declares two records under one name (`zip.rs`'s own
       last-record-wins collapse — see "WHAT THIS BUILD CAN DO" below) makes

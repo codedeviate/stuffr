@@ -676,8 +676,10 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         // it and is told `Complete`. That needs a deliberately nonsensical
         // external candidate, and nothing in-tree builds one, so it is
         // left. (The fuzz target does NOT guard it: it drives the engine,
-        // which never builds such a candidate, and it consults the oracle
-        // only for `Intact` records.) The honest replacement is a new
+        // which never builds such a candidate. It consults the oracle for
+        // every claiming record since Salvage Stage 3 Task 2 and would refuse
+        // a zip `Complete` outright — but only one the ENGINE produces.) The
+        // honest replacement is a new
         // `UnverifiedCause` for "the format carries a checksum this
         // candidate did not report", a public-enum change with no in-tree
         // caller to justify it. If a zip candidate ever CAN arrive this way

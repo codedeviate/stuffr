@@ -28,12 +28,20 @@ pub use crate::honesty::{
 };
 
 /// The fuzzer's codec selector table: byte `n % CODEC_SLOTS.len()` names a
-/// format, so this ordering is the wire format of every corpus seed on disk.
+/// format, so this ordering is the wire format of every GENERATED corpus seed.
 ///
 /// **Append only. NEVER reorder, never remove — retire a slot by leaving it in
-/// place.** Reordering silently changes what every existing corpus seed means:
-/// a seed minimised against `bzip2` would start feeding `brotli` instead, and
-/// nothing would fail to tell you.
+/// place.** Reordering silently changes what every generated seed means: a
+/// seed written for `bzip2` would start feeding `brotli` instead, and nothing
+/// would fail to tell you.
+///
+/// **What append-only protects is narrower than "every input on disk".** The
+/// generator writes each seed's canonical index, below `len`, which no append
+/// moves. An input the FUZZER accumulated carries whatever byte mutation left,
+/// and appending changes `len` and with it `n % len`: measured at Salvage
+/// Stage 3 Task 2's append to [`SALVAGE_SLOTS`], 4,491 of 12,013 accumulated
+/// `salvage` inputs (37%) now route to a different slot. That is harmless —
+/// `fuzz/corpus` is regenerated and gitignored — but it is not protected.
 ///
 /// This lives in `stuffr-core` rather than in the fuzz targets because a later
 /// task's corpus generator runs inside this crate and must write the *same*
@@ -43,7 +51,7 @@ pub use crate::honesty::{
 pub const CODEC_SLOTS: &[&str] = &[
     "gzip", "zlib", "deflate", "bzip2", "brotli", "lz4", "snappy", "zstd", "xz", "lzma", "lzip",
     // Phase 3b. APPENDED, never inserted: the index of each name is the
-    // selector byte of every corpus seed already on disk. `compress` is
+    // selector byte of every generated corpus seed. `compress` is
     // read-only, so its corpus seed comes from a committed fixture rather
     // than from encoding through this build's own code — see
     // `crates/stuffr/tests/fuzz_corpus.rs`.
@@ -90,8 +98,9 @@ pub const CONTAINER_SLOTS: &[&str] = &[
 ///
 /// **Append-only, the identical rule [`CODEC_SLOTS`] and [`CONTAINER_SLOTS`]
 /// carry, for the identical reason: the index is the wire format of every
-/// corpus seed already on disk.** Never reorder, never remove — retire a
-/// slot by leaving it in place.
+/// generated corpus seed** — and, as [`CODEC_SLOTS`] says, of nothing the
+/// fuzzer accumulated, whose `n % len` an append does move. Never reorder,
+/// never remove — retire a slot by leaving it in place.
 pub const SALVAGE_SLOTS: &[&str] = &["zip", "arc", "zoo", "lha", "arj", "tar"];
 
 /// The per-entry ceiling the `salvage` fuzz target runs under, in place of

@@ -18,16 +18,14 @@ read list.
 > every entry behind it, and an ARJ archive opens with a main header the
 > reader must parse before it hands back a single entry — two damaged bytes
 > there and `stuffr list` exits 5 over a file whose every entry is intact.
-> `salvage` finds each header on its own in both. **`tar`, `cpio` and `ar`
-> are deliberately NOT here**, and that is a design decision rather than a
-> backlog item: none of the three records a per-entry checksum, so a
-> plausible-looking header found mid-payload cannot be told from a real one
-> by any evidence the format carries — a false positive is undetectable by
-> construction. They are Stage 3's problem, and they are the only place
-> `SalvageStatus::Complete` ("every declared byte was present, and the format
-> offers nothing to check them against") can honestly be reached: **no
-> registered format reaches it today**, because all five salvageable ones
-> carry a checksum and answer `Intact` or `Partial` instead.
+> `salvage` finds each header on its own in both. **`tar` joined them in
+> Salvage Stage 3**, and it is the one format that reaches
+> `SalvageStatus::Complete` ("every declared byte was present and the header
+> self-verified, but the format offers nothing to check the content
+> against"): tar checksums each header and never its payload, so a tar entry
+> is never `Intact`. **`cpio` and `ar` are not here yet** — they record no
+> checksum of any kind, so a plausible-looking header found mid-payload
+> cannot be told from a real one by any evidence the format carries.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
