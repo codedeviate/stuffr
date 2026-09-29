@@ -1276,9 +1276,9 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
 
     validate_scan_positions(&index, outcome.entries.len())?;
 
-    // Before anything else this run prints: an entry that could not be put
-    // on disk is named on stderr on EVERY invocation, not only under
-    // `--list`. See `print_salvage_write_failures` for what a missing
+    // Before anything else this run prints but the sighting note above: an
+    // entry that could not be put on disk is named on stderr on EVERY
+    // invocation, not only under `--list`. See `print_salvage_write_failures` for what a missing
     // stderr line measured before this existed.
     print_salvage_write_failures(&outcome.entries);
 

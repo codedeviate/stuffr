@@ -11553,6 +11553,85 @@ fn salvage_says_exit_3_for_a_tar_header_it_cannot_gate() {
     assert!(!stderr.contains("nothing recoverable"), "{stderr}");
 }
 
+/// Task 2-N fix round 1, I1: a real ustar tar whose first header lost byte
+/// 0 to a NUL. `list` refuses it at exit 5, and so must `salvage`: the
+/// header's checksum-valid copy one byte late is a COPY, not a header this
+/// build cannot gate. It briefly said exit 3, "`stuffr list` and `stuffr
+/// unpack` read these headers normally" — false on both counts. With a
+/// second entry behind it the run recovers that one at exit 0 and prints no
+/// sighting note.
+#[test]
+fn salvage_calls_a_tar_whose_only_header_lost_byte_0_nothing_recoverable() {
+    let dir = tmp_dir();
+    for (label, files) in [
+        ("one", &[("a.txt", &b"alpha"[..])][..]),
+        (
+            "two",
+            &[("a.txt", &b"alpha"[..]), ("b.txt", &b"beta"[..])][..],
+        ),
+    ] {
+        let mut bytes: Vec<u8> = files
+            .iter()
+            .flat_map(|(name, data)| ustar_tar_entry(name, data))
+            .collect();
+        bytes.resize(bytes.len() + 1024, 0);
+        // The fixture must really carry a checksum-valid copy one byte late.
+        let late = &bytes[1..513];
+        let field = &late[148..156];
+        let digits = &field[..field.iter().position(|&x| x == 0).unwrap()];
+        let recorded = std::str::from_utf8(digits).unwrap();
+        let summed: u32 = late[..148]
+            .iter()
+            .chain(&late[156..])
+            .map(|&x| u32::from(x))
+            .sum::<u32>()
+            + 8 * 32;
+        assert_eq!(u32::from_str_radix(recorded, 8).unwrap(), summed, "{label}");
+        bytes[0] = 0;
+        let archive = dir.join(format!("nul0-{label}.tar"));
+        std::fs::write(&archive, &bytes).unwrap();
+
+        assert_eq!(
+            run(&["list", archive.to_str().unwrap()]).code(),
+            Some(5),
+            "{label}"
+        );
+        let out = run_output(&[
+            "salvage",
+            "--format",
+            "tar",
+            archive.to_str().unwrap(),
+            "--list",
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if label == "one" {
+            assert_eq!(out.status.code(), Some(5), "{label}: {stdout}{stderr}");
+            assert!(stderr.contains("nothing recoverable"), "{label}: {stderr}");
+        } else {
+            assert_eq!(out.status.code(), Some(0), "{label}: {stdout}{stderr}");
+            assert_eq!(stdout.lines().count(), 1, "{label}: {stdout}");
+            assert!(stdout.contains("b.txt"), "{label}: {stdout}");
+            assert_eq!(stderr, "", "{label}: no sighting note");
+        }
+        assert!(!stderr.contains("stuffr list"), "{label}: {stderr}");
+    }
+}
+
+/// One POSIX ustar entry, as Python's `tarfile` writes one (`ustar\0` `00`
+/// magic, typeflag `0`, `%06o\0 ` checksum): [`v7_tar_entry`] with the magic
+/// and typeflag set and the checksum recomputed. With a name and payload
+/// that start with the same byte, its header seen one byte late agrees with
+/// its own checksum — the plain-sum shift `tar_salvage.rs` documents.
+fn ustar_tar_entry(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut b = v7_tar_entry(name, data, b"ustar\x0000");
+    b[156] = b'0';
+    b[148..156].fill(b' ');
+    let sum: u32 = b[..512].iter().map(|&x| u32::from(x)).sum();
+    b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    b
+}
+
 /// One v7-style tar entry: a header with `magic` over bytes 257..265 and a
 /// correct `%06o\0 ` checksum (GNU tar's spelling), then `data` padded to a
 /// whole block. Built by hand: nothing in reach writes junk into a v7

@@ -1826,9 +1826,13 @@ pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     // MIXED archive — some headers gateable, some not — therefore still
     // reports what it recovered, at its ordinary exit code. That is an
     // incompleteness rather than a contradiction: nothing false is claimed,
-    // where exit 5 on a healthy file was. Saying more would need a note
-    // channel [`SalvageOutcome`] does not have, and no LHA writer mixes
-    // header levels within one archive.
+    // where exit 5 on a healthy file was. Saying more is now possible —
+    // [`SalvageOutcome::sightings`] is that channel since Salvage Stage 3's
+    // Task 2-N, and the CLI prints it — but this scanner does not yet emit
+    // [`stuffr_core::salvage::Sighting`]s: its two flags carry no offsets,
+    // so a mixed LHA run is still silent about them. Converting them is a
+    // recorded follow-up; no LHA writer mixes header levels within one
+    // archive.
     if outcome.entries.is_empty() && scanner.seen.any() {
         return Err(Error::Unsupported(scanner.seen.refusal()));
     }

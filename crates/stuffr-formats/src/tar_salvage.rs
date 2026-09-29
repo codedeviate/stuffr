@@ -381,7 +381,7 @@ fn clears_criterion_3(src: &mut dyn SeekRead, offset: u64, file_len: u64, block:
     magic_is_ustar(block)
         || (magic_is_blank(block)
             && spelled_like_a_writer(&block[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN])
-            && !looks_like_a_shifted_twin(src, offset, file_len))
+            && !looks_like_a_shifted_twin(src, offset, file_len, SourceMustName::Yes))
 }
 
 /// Whether the block at `offset` is a real header seen `k` bytes late, for
@@ -441,20 +441,42 @@ fn clears_criterion_3(src: &mut dyn SeekRead, offset: u64, file_len: u64, block:
 /// twin does not contain — the start of the source's name. So the earlier
 /// block must name something too.
 ///
-/// **The residual this costs**, stated: that damage empties the source's
-/// name only by writing a NUL into byte 0. A v7 header whose byte 0 became
-/// NUL, and whose one-byte-late copy also passes the checksum spelling (only
-/// the `%07o\0` + space-typeflag shape does, and no measured writer writes a
-/// space typeflag), is no longer recognised as a copy. With a `ustar` or junk
-/// magic the copy is refused by the magic alone either way, so there the cost
-/// is a sighting, never a row.
+/// **Only in criterion 3** ([`SourceMustName::Yes`]), where the answer
+/// decides whether a block is PROMOTED to a candidate — that is the one
+/// place N1's genuine header needs the stricter reading. [`sighting_at`]
+/// asks with [`SourceMustName::No`], the pre-2-N predicate, and must: there
+/// the answer decides between a sighting and a [`Scanned::Copy`] the grid
+/// rules on, and damage that writes a NUL into byte 0 of a genuine `ustar`
+/// header empties the source's name while leaving its one-byte-late copy
+/// checksum-valid. Asked strictly, that copy was an `UnrecognisedMagic`
+/// sighting, and a one-entry archive `stuffr list` refuses at exit 5 came
+/// back exit 3, "`stuffr list` and `stuffr unpack` read these headers
+/// normally" — false on both counts (Task 2-N fix round 1, I1). Asked
+/// leniently it is a copy, off the grid, and silent: exit 5 again.
+///
+/// **The residual the strict reading costs**, stated: damage empties the
+/// source's name only by writing a NUL into byte 0. A v7 header whose byte 0
+/// became NUL, and whose one-byte-late copy also passes the checksum
+/// spelling (only the `%07o\0` + space-typeflag shape does, and no measured
+/// writer writes a space typeflag), is no longer recognised as a copy in
+/// criterion 3 — so that copy CLEARS the gate and becomes a LISTED
+/// candidate: a phantom row, named without its first byte, whose declared
+/// length the engine then advances by (Ruling 3-J item 3's hazard). No
+/// writer on this machine produces it; it is recorded rather than closed.
+/// With a `ustar` or junk magic the copy fails criterion 3 on the magic
+/// alone, reaches [`sighting_at`], and is judged there leniently.
 ///
 /// When the bytes before the genuine header are payload rather than padding,
 /// the window DOES name something and the header is still refused;
 /// [`salvage_tar`] reports that refusal as a [`Sighting`] when the header
 /// sits on the recovered entries' block grid, which a real copy never does
 /// (`UngateableSightings::into_sightings`).
-fn looks_like_a_shifted_twin(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> bool {
+fn looks_like_a_shifted_twin(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    source_must_name: SourceMustName,
+) -> bool {
     (1..=7u64).any(|k| {
         offset
             .checked_sub(k)
@@ -465,9 +487,22 @@ fn looks_like_a_shifted_twin(src: &mut dyn SeekRead, offset: u64, file_len: u64)
                     && magic_is_ustar_or_blank(&b)
                     && earlier.mode().is_ok()
                     && earlier.entry_size().is_ok()
-                    && !earlier.path_bytes().is_empty()
+                    && (source_must_name == SourceMustName::No || !earlier.path_bytes().is_empty())
             })
     })
+}
+
+/// Whether [`looks_like_a_shifted_twin`] requires the earlier block to name
+/// something — see its "only in criterion 3" section for which caller asks
+/// which, and why the two must differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceMustName {
+    /// Criterion 3: a genuine header may be promoted to a candidate past a
+    /// window that names nothing (N1).
+    Yes,
+    /// [`sighting_at`]: the pre-2-N predicate, so a copy of a header whose
+    /// byte 0 became NUL is still a copy, and the grid decides it.
+    No,
 }
 
 /// A header shape the scan recognised and has no gate for — Ruling 3-J,
@@ -939,7 +974,7 @@ fn sighting_at(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8; 
     if header.entry_size().is_err() || header.path_bytes().is_empty() {
         return Scanned::NotAHeader;
     }
-    if looks_like_a_shifted_twin(src, offset, file_len) {
+    if looks_like_a_shifted_twin(src, offset, file_len, SourceMustName::No) {
         return Scanned::Copy;
     }
     // Reached only for a block criterion 3 refused and that is no twin, so a
@@ -2267,15 +2302,39 @@ mod tests {
     /// ustar twin and the v7 twin alike.
     #[test]
     fn a_shifted_twin_is_never_a_sighting() {
-        let mut ustar = files(&[("a.txt", b"alpha")]);
-        let mut v7 = v7_archive(&[("a.txt", b"1st line\n")], V7_GNU_SPELLING);
-        for (label, bytes) in [("ustar", &mut ustar), ("v7", &mut v7)] {
-            bytes[0] ^= 0x01;
-            assert!(header_checksum_agrees(&bytes[1..1 + BLOCK]), "{label}");
-            let out = salvage_tar(&mut Cursor::new(bytes.clone()), &SalvagePolicy::default())
-                .unwrap_or_else(|e| panic!("{label}: a twin is not a sighting: {e}"));
-            assert!(out.entries.is_empty(), "{label}: {:?}", out.entries);
-            assert!(out.sightings.is_empty(), "{label}: {:?}", out.sightings);
+        // Byte 0 flipped, and byte 0 zeroed (Task 2-N fix round 1, I1): a
+        // zeroed byte 0 leaves the damaged header naming NOTHING, which must
+        // not stop its checksum-valid copy one byte late from counting as a
+        // copy here — it used to make it an exit-3 "may be perfectly
+        // readable" sighting over an archive `stuffr list` refuses at exit 5.
+        for (damage, zero) in [("^0x01", false), ("=0", true)] {
+            let mut ustar = files(&[("a.txt", b"alpha")]);
+            let mut v7 = v7_archive(&[("a.txt", b"1st line\n")], V7_GNU_SPELLING);
+            for (label, bytes) in [("ustar", &mut ustar), ("v7", &mut v7)] {
+                let label = format!("{label} {damage}");
+                bytes[0] = if zero { 0 } else { bytes[0] ^ 0x01 };
+                assert!(header_checksum_agrees(&bytes[1..1 + BLOCK]), "{label}");
+                let out = salvage_tar(&mut Cursor::new(bytes.clone()), &SalvagePolicy::default())
+                    .unwrap_or_else(|e| panic!("{label}: a twin is not a sighting: {e}"));
+                assert!(out.entries.is_empty(), "{label}: {:?}", out.entries);
+                assert!(out.sightings.is_empty(), "{label}: {:?}", out.sightings);
+
+                // And in a mixed run the copy is no note either: it sits one
+                // byte off the grid the surviving entry is on.
+                let mut mixed = bytes.clone();
+                mixed.truncate(2 * BLOCK);
+                mixed.extend_from_slice(&files(&[("b.txt", b"beta")]));
+                let out = scan(&mixed);
+                assert_eq!(
+                    out.entries
+                        .iter()
+                        .map(|e| e.meta.name.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["b.txt"],
+                    "{label}"
+                );
+                assert!(out.sightings.is_empty(), "{label}: {:?}", out.sightings);
+            }
         }
     }
 
