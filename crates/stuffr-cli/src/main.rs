@@ -881,9 +881,9 @@ fn print_salvage_summary(entries: &[entries::SalvagedRecord]) {
 }
 
 /// [`print_salvage_summary`]'s text, separated from the printing so the
-/// lines themselves can be pinned by a unit test — `Unattested` is not
-/// reachable end to end from any scanner in this build, so a CLI test
-/// cannot observe what it prints yet.
+/// lines themselves can be pinned by a unit test. `Unattested` was
+/// reachable end to end from no scanner when this was written; `cpio`
+/// (Salvage Stage 3 Task 3) reaches it now, and `cli.rs` observes it too.
 ///
 /// # Why an `Unattested` run gets a line of its own (Salvage Stage 3 Task 1, F2)
 ///
@@ -954,15 +954,23 @@ fn salvage_summary_lines(entries: &[entries::SalvagedRecord]) -> Vec<String> {
         entries.len()
     )];
     if unattested > 0 {
-        lines.push(format!(
-            "salvage -> {unattested} entr{} unattested: this format carries no checksum and no \
-             header self-check, so nothing proves a recovered record is a real entry rather \
-             than a coincidental header match — kept under the real name unless --strict, and \
-             the run exits 4",
-            if unattested == 1 { "y is" } else { "ies are" }
-        ));
+        lines.push(unattested_note(unattested));
     }
     lines
+}
+
+/// Why `count` entries are `Unattested` — the one sentence both the
+/// default summary ([`salvage_summary_lines`]) and `-o FILE`
+/// ([`finish_single_file_recovery`]) print, so the two paths cannot explain
+/// the same exit 4 two ways.
+fn unattested_note(count: usize) -> String {
+    format!(
+        "salvage -> {count} entr{} unattested: this format carries no checksum and no header \
+         self-check, so nothing proves a recovered record is a real entry rather than a \
+         coincidental header match — kept under the real name unless --strict, and the run \
+         exits 4",
+        if count == 1 { "y is" } else { "ies are" }
+    )
 }
 
 /// Validates `--index` against the scan positions the archive actually has.
@@ -1109,6 +1117,13 @@ fn finish_single_file_recovery(
         std::fs::remove_file(&from)?;
     }
     eprintln!("salvage -> wrote {}", final_path.display());
+    // Salvage Stage 3 Task 3, R1 (routed from Task 1): an `Unattested`
+    // entry written through `-o` exits 4, and until this line nothing said
+    // why — `wrote FILE` alone, then a non-zero status. `-C` and `--list`
+    // already explain it; this is their sentence, not a third wording.
+    if record.status == stuffr::salvage::SalvageStatus::Unattested {
+        eprintln!("{}", unattested_note(1));
+    }
     Ok(())
 }
 
@@ -1877,11 +1892,13 @@ mod tests {
     /// Salvage Stage 3: the `Unattested` row names the FORMAT's shortcoming
     /// where the user meets the entry.
     ///
-    /// Pinned as a unit test rather than end to end because the tier is not
-    /// reachable from any scanner this build has yet — `tar`, `cpio` and
-    /// `ar` arrive in the tasks after this one. Waiting for them would mean
-    /// shipping the rendering with nothing exercising it at all, which is
-    /// how a status reaches a user as a bare word with no explanation.
+    /// Pinned as a unit test because, when it was written, the tier was not
+    /// reachable from any scanner. Waiting would have meant shipping the
+    /// rendering with nothing exercising it at all, which is how a status
+    /// reaches a user as a bare word with no explanation. `cpio` (Task 3)
+    /// reaches it now, and `cli.rs`'s
+    /// `salvage_recovers_a_damaged_cpio_as_unattested` pins the row end to
+    /// end as well.
     ///
     /// Two facts, deliberately: the tier is NAMED (so the row is not just
     /// the entry's name with a mystery column), and the REASON rides along

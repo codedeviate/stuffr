@@ -11738,3 +11738,182 @@ fn salvage_names_an_ungateable_tar_header_in_a_mixed_run() {
         "{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------
+// Salvage Stage 3 Task 3: cpio, the first format whose every entry is
+// `Unattested`.
+// ---------------------------------------------------------------------
+
+/// One `newc` entry built by hand — magic, thirteen 8-digit hex fields,
+/// the NUL-terminated name, padding to four, the payload, padding to four —
+/// so the fixture depends on nothing but the format's own layout.
+fn newc_entry(magic: &[u8; 6], name: &str, data: &[u8]) -> Vec<u8> {
+    let fields: [u32; 13] = [
+        1,
+        0o100644,
+        0,
+        0,
+        1,
+        0x5F00_0000,
+        data.len() as u32,
+        0,
+        0,
+        0,
+        0,
+        name.len() as u32 + 1,
+        0,
+    ];
+    let mut out = magic.to_vec();
+    for field in fields {
+        out.extend_from_slice(format!("{field:08X}").as_bytes());
+    }
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.resize(out.len().div_ceil(4) * 4, 0);
+    out.extend_from_slice(data);
+    out.resize(out.len().div_ceil(4) * 4, 0);
+    out
+}
+
+fn newc_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out: Vec<u8> = entries
+        .iter()
+        .flat_map(|(name, data)| newc_entry(b"070701", name, data))
+        .collect();
+    out.extend_from_slice(&newc_entry(b"070701", "TRAILER!!!", b""));
+    out
+}
+
+/// A cpio whose first header has one non-hex digit: `stuffr list` refuses
+/// the whole archive at exit 5, and salvage — format DETECTED from the
+/// untouched magic — recovers every entry behind it as `Unattested`, says
+/// why on each row and in the default summary, writes each byte for byte,
+/// and exits 4: nothing in `newc` can prove a recovered record is real.
+#[test]
+fn salvage_recovers_a_damaged_cpio_as_unattested() {
+    let dir = tmp_dir();
+    let mut bytes = newc_archive(&[
+        ("first.txt", b"lost with its header"),
+        ("second.txt", b"recovered"),
+        ("third.txt", b"also recovered"),
+    ]);
+    bytes[6] = b'x';
+    let archive = dir.join("damaged.cpio");
+    std::fs::write(&archive, &bytes).unwrap();
+
+    let listed = run_output(&["list", archive.to_str().unwrap()]);
+    assert_eq!(
+        listed.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+
+    let out = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows.len(), 2, "{stdout}");
+    for (row, name) in rows.iter().zip(["second.txt", "third.txt"]) {
+        assert!(row.contains("Unattested") && row.contains(name), "{row}");
+        assert!(
+            row.contains("[no checksum and no header self-check in this format]"),
+            "{row}"
+        );
+    }
+    assert!(
+        !stdout.contains("Complete") && !stdout.contains("Intact"),
+        "{stdout}"
+    );
+
+    let out_dir = dir.join("recovered");
+    let written = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&written.stderr);
+    assert_eq!(written.status.code(), Some(4), "{stderr}");
+    assert!(stderr.contains("2 entries are unattested"), "{stderr}");
+    assert_eq!(
+        std::fs::read(out_dir.join("second.txt")).unwrap(),
+        b"recovered"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("third.txt")).unwrap(),
+        b"also recovered"
+    );
+    assert!(!out_dir.join("first.txt").exists());
+}
+
+/// R1, routed from Task 1: `salvage --index N -o FILE` over an `Unattested`
+/// entry wrote the file and exited 4 with `salvage -> wrote FILE` as its
+/// only line — a non-zero status and no reason. It now prints the same
+/// sentence `-C` prints.
+#[test]
+fn salvage_says_why_an_unattested_entry_written_with_dash_o_exits_4() {
+    let dir = tmp_dir();
+    let archive = dir.join("healthy.cpio");
+    std::fs::write(
+        &archive,
+        newc_archive(&[("a.txt", b"one"), ("b.txt", b"two")]),
+    )
+    .unwrap();
+    let target = dir.join("picked.txt");
+    let out = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "--index",
+        "1",
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(stderr.contains("salvage -> wrote"), "{stderr}");
+    assert!(
+        stderr.contains("1 entry is unattested: this format carries no checksum"),
+        "exit 4 must say why: {stderr}"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"two");
+}
+
+/// A healthy cpio of a variant this build does not read is a claim about
+/// the BUILD: `list` refuses it at exit 3, and so does `salvage`, naming the
+/// variant — never "the scan found nothing recoverable" at exit 5.
+#[test]
+fn salvage_says_exit_3_for_a_cpio_variant_it_cannot_read() {
+    let dir = tmp_dir();
+    let mut crc: Vec<u8> = newc_entry(b"070702", "a.txt", b"alpha");
+    crc.extend_from_slice(&newc_entry(b"070702", "TRAILER!!!", b""));
+    let archive = dir.join("crc.cpio");
+    std::fs::write(&archive, &crc).unwrap();
+
+    assert_eq!(
+        run_output(&["list", archive.to_str().unwrap()])
+            .status
+            .code(),
+        Some(3)
+    );
+    let out = run_output(&[
+        "salvage",
+        "--format",
+        "cpio",
+        archive.to_str().unwrap(),
+        "--list",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(
+        stderr.contains("070702") && stderr.contains("newc-crc"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("nothing recoverable"), "{stderr}");
+    assert!(out.stdout.is_empty());
+}

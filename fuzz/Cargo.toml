@@ -31,12 +31,18 @@ stuffr-core = { path = "../crates/stuffr-core", features = ["testing"] }
 # not decoration — it stops this crate's own build from depending on a
 # sibling dependency's feature set, which is exactly the shape that breaks
 # silently the day `legacy` is narrowed.
+#
+# `tar` (Salvage Stage 3 Task 2) repeated `arj`'s omission and compiled for
+# the same reason — `stuffr`'s default features carry it — and `cpio` (Task
+# 3) would have too. Both are named now, with the scanner that needs them.
 stuffr-formats = { path = "../crates/stuffr-formats", features = [
     "zip",
     "arc",
     "zoo",
     "lha",
     "arj",
+    "tar",
+    "cpio",
 ] }
 tempfile = "3"
 # Only for `container.rs`'s independent EOCD re-parse (Ruling A's second

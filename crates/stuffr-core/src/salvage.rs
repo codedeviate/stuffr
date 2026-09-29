@@ -639,10 +639,18 @@ const SIGHTING_OFFSETS_SHOWN: usize = 8;
 
 /// The one sentence a caller prints for `sightings`, or `None` when there
 /// are none — how many headers of each shape were seen, where, and that the
-/// ordinary verbs may read them. It is the same wording family as each
-/// scanner's exit-3 refusal (its shape phrases are the scanner's own), and it
-/// is written here, once, so every scanner that records a [`Sighting`] gets
-/// the same report without a line of its own.
+/// ordinary verbs may read them or name the variant they are in. It is the
+/// same wording family as each scanner's exit-3 refusal (its shape phrases
+/// are the scanner's own), and it is written here, once, so every scanner
+/// that records a [`Sighting`] gets the same report without a line of its
+/// own.
+///
+/// **"Or name the variant" is cpio's clause (Salvage Stage 3 Task 3).** The
+/// tail said only "may read these headers normally", which is true of a tar
+/// header the scan cannot gate and false of a cpio `odc` or `newc-crc`
+/// header: `stuffr list` refuses both variants at exit 3, naming them. A note
+/// telling a user to expect `list` to read them would be the false "list
+/// reads it" claim Task 2-N's fix round removed from tar.
 pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
     if sightings.is_empty() {
         return None;
@@ -681,7 +689,8 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
     Some(format!(
         "this build's salvage scanner saw {} — each with the structure of a header, but in a \
          shape it has no gate for, so none is listed or recovered; `stuffr list` and \
-         `stuffr unpack` may read these headers normally, and it is the SCAN that stops there",
+         `stuffr unpack` may read these headers normally, or name the variant they are in, \
+         and it is the SCAN that stops there",
         parts.join("; and ")
     ))
 }

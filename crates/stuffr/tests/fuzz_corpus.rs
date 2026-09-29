@@ -340,6 +340,9 @@ const SALVAGE_SHAPES: &[&str] = &[
     "tar-healthy",
     "tar-destroyed-first-header",
     "tar-truncated-tail",
+    "cpio-healthy",
+    "cpio-destroyed-first-header",
+    "cpio-truncated-tail",
 ];
 
 /// The `SALVAGE_SLOTS` name a shape's seed carries in its selector byte: the
@@ -391,11 +394,26 @@ fn read_all(path: &Path) -> std::io::Result<Vec<u8>> {
 /// last block before the two-block end-of-archive marker, which is what
 /// `tar-truncated-tail` cuts into.
 fn salvage_tar_seed(work: &Path, sample_dir: &Path) -> stuffr_core::Result<Vec<u8>> {
-    let out = work.join("salvage-tar.out");
+    salvage_container_seed(work, sample_dir, "tar")
+}
+
+/// The sample tree packed as a `newc` cpio through the same writer — Salvage
+/// Stage 3 Task 3's seed, and for the same reason as tar's: there is no cpio
+/// corpus to borrow, and every cpio tool writes the same `newc` layout.
+fn salvage_cpio_seed(work: &Path, sample_dir: &Path) -> stuffr_core::Result<Vec<u8>> {
+    salvage_container_seed(work, sample_dir, "cpio")
+}
+
+fn salvage_container_seed(
+    work: &Path,
+    sample_dir: &Path,
+    format: &'static str,
+) -> stuffr_core::Result<Vec<u8>> {
+    let out = work.join(format!("salvage-{format}.out"));
     entries::create_archive(
         std::slice::from_ref(&sample_dir.to_path_buf()),
         Output::Path(out.clone()),
-        FormatId::new("tar"),
+        FormatId::new(format),
         None,
         &CompressOpts {
             sync: false,
@@ -1105,6 +1123,7 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     // suite already pins end to end.
     let healthy = healthy_salvage_seed();
     let healthy_tar = salvage_tar_seed(work.path(), &sample_dir)?;
+    let healthy_cpio = salvage_cpio_seed(work.path(), &sample_dir)?;
     let mut salvage_count = 0usize;
     let salvage_selector = |slot: &str| {
         SALVAGE_SLOTS
@@ -1261,6 +1280,28 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
             // Cut six bytes into the LAST entry's payload: the block before
             // the two-block end-of-archive marker is that payload, padded.
             "tar-truncated-tail" => healthy_tar[..healthy_tar.len() - 3 * 512 + 6].to_vec(),
+            // Salvage Stage 3 Task 3. The one tier a healthy `newc` entry can
+            // honestly reach is `Unattested`: the format carries no checksum
+            // and no header self-check.
+            "cpio-healthy" => healthy_cpio.clone(),
+            // The first digit of the FIRST header's `c_ino`: not hex, so the
+            // reader refuses the whole archive at exit 5, while every later
+            // header is untouched. The magic at 0 is left alone so format
+            // detection still resolves this as a cpio.
+            "cpio-destroyed-first-header" => {
+                let mut bytes = healthy_cpio.clone();
+                bytes[6] = b'x';
+                bytes
+            }
+            // Cut six bytes into the LAST entry's payload, found by its
+            // content rather than by arithmetic on a layout the writer owns.
+            "cpio-truncated-tail" => {
+                let at = healthy_cpio
+                    .windows(b"nested seed".len())
+                    .position(|w| w == b"nested seed")
+                    .expect("the sample tree's nested.txt is the last entry");
+                healthy_cpio[..at + 6].to_vec()
+            }
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
         let slot = salvage_shape_slot(shape);
@@ -1347,7 +1388,8 @@ fn the_corpus_builders_crc_matches_the_published_check_value() {
 
 /// The strongest tier a slot's format can honestly reach — `Intact` for the
 /// five with a content checksum, `Complete` for `tar`, whose only checksum
-/// covers the header. It is the tier `check_salvage_claim` PERMITS for that
+/// covers the header, and `Unattested` for `cpio`, which has none. It is the
+/// tier `check_salvage_claim` PERMITS for that
 /// slot's class, so a seed that reaches it is a seed the fuzz target's
 /// oracle call is live for.
 ///
@@ -1360,6 +1402,7 @@ fn top_tier(slot: &str) -> stuffr_core::salvage::SalvageStatus {
     match slot {
         "zip" | "arc" | "zoo" | "lha" | "arj" => SalvageStatus::Intact,
         "tar" => SalvageStatus::Complete,
+        "cpio" => SalvageStatus::Unattested,
         other => panic!("SALVAGE_SLOTS names `{other}` but `top_tier` has no arm for it"),
     }
 }
@@ -1445,6 +1488,8 @@ fn every_salvage_seed_produces_records_and_reaches_its_top_tier() {
         ("arj-crc-mismatch", SalvageStatus::Partial),
         // tar's cut: the one damage tar's own evidence can see.
         ("tar-truncated-tail", SalvageStatus::Partial),
+        // And cpio's, which is the ONLY damage cpio's evidence can see.
+        ("cpio-truncated-tail", SalvageStatus::Partial),
     ] {
         let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
         let path = salvage_payload_path(&seed_path, scratch.path());

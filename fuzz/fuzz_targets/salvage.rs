@@ -10,7 +10,7 @@ use stuffr_core::testing::{
     check_salvage_claim,
 };
 use stuffr_formats::legacy::{arc_salvage, arj_salvage, lha_salvage, zoo_salvage};
-use stuffr_formats::{tar_salvage, zip_salvage};
+use stuffr_formats::{cpio_salvage, tar_salvage, zip_salvage};
 
 /// Local file header layout, duplicated deliberately rather than imported —
 /// `zip_salvage.rs`'s own constants are private, and `container.rs`'s
@@ -260,6 +260,26 @@ fn tar_header_checksum_agrees(data: &[u8], offset: u64) -> Option<bool> {
     Some(summed == u64::from(recorded as u32))
 }
 
+/// The `cpio` slot's cross-check (Salvage Stage 3 Task 3). cpio's class is
+/// [`Attestation::Nothing`]: `newc` carries no checksum of any kind, so the
+/// honest answer to "was the verifier checked?" is `false` for every record,
+/// and that is what this returns — `Some(false)` — whenever the record's
+/// offset really does hold the `070701` magic the scanner found it by.
+///
+/// **What this can catch is the two claims the class forbids.** An `Intact`
+/// or a `Complete` is refused for this class whatever the flag says, so the
+/// loop checks those before reaching here; an `Unattested` passed with
+/// `true` would be refused too, so a future edit that sourced this flag from
+/// the scanner's own verdict (circular, as `tar_header_checksum_agrees`'s
+/// doc says) and got `true` would abort. The magic re-read is independent of
+/// the scanner — six bytes compared here, not by `cpio_salvage.rs` — and a
+/// record at an offset without it is `None` (inconclusive), counted in the
+/// trace rather than silently passed.
+fn cpio_offers_no_verifier(data: &[u8], offset: u64) -> Option<bool> {
+    let at = usize::try_from(offset).ok()?;
+    (data.get(at..at.checked_add(6)?)? == b"070701").then_some(false)
+}
+
 /// What a slot with no cross-check arm below gets: a loud abort, never a
 /// silent skip.
 ///
@@ -277,7 +297,7 @@ fn tar_header_checksum_agrees(data: &[u8], offset: u64) -> Option<bool> {
 /// after Stage 2 Task 8 gave the slot a second source: the selector byte is
 /// reduced `% SALVAGE_SLOTS.len()`, so every one of its 256 values names a
 /// listed slot, and [`slot_from_payload`] answers only names it found by
-/// searching `SALVAGE_SLOTS` itself — a payload detecting as `cpio` yields
+/// searching `SALVAGE_SLOTS` itself — a payload detecting as `ar` yields
 /// `None` and falls back to the selector rather than reaching here. So the
 /// panic is reachable only by appending a slot without its arm, which is
 /// precisely the state that must stop being quiet.
@@ -376,9 +396,10 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
 ///
 /// Five slots are [`Attestation::ContentChecksum`]: zip carries a CRC-32,
 /// and ARC, ZOO, LHA and ARJ each carry a CRC of their own. `tar` (Stage 3
-/// Task 2) is [`Attestation::HeaderChecksumOnly`]. It is a `match` naming
-/// each slot rather than one constant, because Salvage Stage 3 is adding
-/// `cpio`/`ar` ([`Attestation::Nothing`]) too — a constant would carry the
+/// Task 2) is [`Attestation::HeaderChecksumOnly`], and `cpio` (Task 3)
+/// [`Attestation::Nothing`]. It is a `match` naming each slot rather than
+/// one constant, because Salvage Stage 3 is adding `ar`
+/// ([`Attestation::Nothing`]) too — a constant would carry the
 /// wrong class into the exact slots the argument exists for, silently,
 /// which is the shape [`no_cross_check_arm`] one screen up was written to
 /// stop. Each scanner's class is stated here by name, where a reviewer
@@ -392,6 +413,7 @@ fn attestation(name: &str) -> Attestation {
     match name {
         "zip" | "arc" | "zoo" | "lha" | "arj" => Attestation::ContentChecksum,
         "tar" => Attestation::HeaderChecksumOnly,
+        "cpio" => Attestation::Nothing,
         other => no_cross_check_arm(other),
     }
 }
@@ -668,6 +690,17 @@ fuzz_target!(|data: &[u8]| {
                 HashMap::new()
             }
         },
+        "cpio" => match cpio_salvage::salvage_cpio(&mut cursor, &opts.policy) {
+            Ok(scan) => scan
+                .entries
+                .into_iter()
+                .map(|e| (e.scan_position, e.offset))
+                .collect(),
+            Err(e) => {
+                check_error_is_classified(&e).expect("independent scan error classification");
+                HashMap::new()
+            }
+        },
         other => no_cross_check_arm(other),
     };
 
@@ -707,7 +740,8 @@ fuzz_target!(|data: &[u8]| {
         };
         // Whether the checksum this slot's class offers was really there to
         // be checked: a CONTENT checksum for the five checksummed slots, the
-        // HEADER checksum for tar — each re-derived from the raw bytes.
+        // HEADER checksum for tar, nothing at all for cpio — each re-derived
+        // from the raw bytes.
         let checked = match name {
             "zip" => locally_offers_checkable_crc(payload, offset),
             "arc" => arc_locally_offers_checkable_crc(payload, offset),
@@ -715,6 +749,7 @@ fuzz_target!(|data: &[u8]| {
             "lha" => lha_locally_offers_checkable_crc(payload, offset),
             "arj" => arj_locally_offers_checkable_crc(payload, offset),
             "tar" => tar_header_checksum_agrees(payload, offset),
+            "cpio" => cpio_offers_no_verifier(payload, offset),
             other => no_cross_check_arm(other),
         };
         match checked {

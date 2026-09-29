@@ -720,7 +720,7 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   has no scanner for is exit 3, a statement about this build rather than
   about the archive.
 
-  Scanners exist for: zip, arc, zoo, lha, arj, tar.
+  Scanners exist for: zip, arc, zoo, lha, arj, tar, cpio.
 
   HOW MUCH TO TRUST AN `Intact` ROW IS NOT THE SAME ANSWER FOR EACH.
   `Intact` always means the same thing mechanically — this build decoded
@@ -766,8 +766,24 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   DOES recover other entries keeps its ordinary exit code and names every
   such header on stderr, with its offset (`salvage -> this build's
   salvage scanner saw 1 tar header(s) whose magic field ... at offset(s)
-  0`); it is never a row. cpio and ar record neither checksum, and have
-  no scanner yet; use `stuffr list` and `stuffr unpack` on those two.
+  0`); it is never a row.
+
+  cpio (`newc`) records NEITHER checksum — nothing over the content and
+  nothing over the header — so every cpio entry salvage recovers is
+  `Unattested`: written under its real name, tagged on its `--list` row,
+  and the run exits 4, because nothing in the format can prove a
+  recovered record is a real entry rather than a coincidental header
+  match. The scan's gate is plausibility alone (the `070701` magic,
+  thirteen hex-only fields, a name under 64 KiB that is NUL-terminated
+  UTF-8): against random or compressed bytes it essentially never
+  fires, but a real cpio stored inside a damaged entry's payload is
+  reported entry by entry, and nothing can tell. --strict declines every
+  such entry. A header of the odc (070707) or newc-crc (070702) variant,
+  which this build does not read, is never a row either: a run that
+  recovers nothing else says so at exit 3, and a run that recovers
+  something names each one on stderr with its offset. ar records no
+  checksum either, and has no scanner yet; use `stuffr list` and
+  `stuffr unpack` on it.
 
   LHA and ARJ are the two where the ordinary reader has no fallback at
   all, and ARJ's is the sharper of them. LHA carries no index, no entry
@@ -831,8 +847,8 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       but the format offers no checksum to check the CONTENT against" —
       tar, and only tar, reaches it here. `Unattested` means "the format
       offers neither a checksum nor a self-verifying header, so nothing
-      attests this is an entry at all"; it is reserved for cpio and ar,
-      which have no scanner yet, so you will not see it. This can show MORE
+      attests this is an entry at all" — cpio reaches it, and ar will
+      when it has a scanner. This can show MORE
       rows than `stuffr list` on the same archive: a zip whose central
       directory declares two records under one name (`zip.rs`'s own
       last-record-wins collapse — see "WHAT THIS BUILD CAN DO" below) makes

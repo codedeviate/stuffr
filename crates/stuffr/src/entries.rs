@@ -1779,16 +1779,17 @@ fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatI
 /// (Task 3, [`stuffr_formats::legacy::arc_salvage::salvage_arc`]), `zoo`
 /// (Task 4, [`stuffr_formats::legacy::zoo_salvage::salvage_zoo`]), `lha`
 /// (Task 5), `arj`
-/// (Task 6, [`stuffr_formats::legacy::arj_salvage::salvage_arj`]) and `tar`
+/// (Task 6, [`stuffr_formats::legacy::arj_salvage::salvage_arj`]), `tar`
 /// (Salvage Stage 3 Task 2, [`stuffr_formats::tar_salvage::salvage_tar`])
+/// and `cpio` (Stage 3 Task 3, [`stuffr_formats::cpio_salvage::salvage_cpio`])
 /// are wired; every other format — including one this build has fully
-/// registered as an ordinary container, like `cpio` — answers
+/// registered as an ordinary container, like `ar` — answers
 /// [`Error::Unsupported`] (exit 3) **naming the format**, never a silent
 /// empty [`stuffr_core::salvage::SalvageOutcome`]. An empty outcome would
 /// reach the CLI as "the scan found nothing recoverable" (exit 5), a claim
 /// about the ARCHIVE; the truth here is a claim about this BUILD — it never
-/// tried. `cpio` and `ar` are the whole of that set now, until their own
-/// Stage 3 tasks wire them.
+/// tried. `ar` is the whole of that set now, until its own Stage 3 task
+/// wires it.
 fn salvage_scan(
     format: FormatId,
     src: &mut dyn SeekRead,
@@ -1819,6 +1820,10 @@ fn salvage_scan(
         "tar" => stuffr_formats::tar_salvage::salvage_tar(src, policy),
         #[cfg(not(feature = "tar"))]
         "tar" => Err(Error::FormatNotEnabled(FormatId::new("tar"))),
+        #[cfg(feature = "cpio")]
+        "cpio" => stuffr_formats::cpio_salvage::salvage_cpio(src, policy),
+        #[cfg(not(feature = "cpio"))]
+        "cpio" => Err(Error::FormatNotEnabled(FormatId::new("cpio"))),
         other => Err(Error::Unsupported(format!(
             "salvage has no scanner for `{other}` archives in this build"
         ))),
@@ -2384,7 +2389,7 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// [`salvage_scan`]'s own dispatch exactly, so each scanner task's own
 /// scanner drops in as one more arm here too, alongside the
 /// arm it already adds there. All five of Stage 2's are wired as of Task 6,
-/// and Stage 3's `tar` as of its Task 2.
+/// and Stage 3's `tar` and `cpio` as of its Tasks 2 and 3.
 ///
 /// Task 3c replaced what used to be one zip-shaped `write_payload` here: it
 /// unconditionally read a 30-byte zip local header from `entry.offset` to
@@ -2511,6 +2516,15 @@ fn write_salvaged_payload(
         ),
         #[cfg(not(feature = "tar"))]
         "tar" => Err(Error::FormatNotEnabled(FormatId::new("tar"))),
+        #[cfg(feature = "cpio")]
+        "cpio" => stuffr_formats::cpio_salvage::CpioSalvage::new().write_payload(
+            archive_path,
+            entry,
+            compressed_len,
+            out,
+        ),
+        #[cfg(not(feature = "cpio"))]
+        "cpio" => Err(Error::FormatNotEnabled(FormatId::new("cpio"))),
         // Unreachable in practice: `salvage_scan` already refuses any other
         // format before a single candidate is ever produced, so `salvage()`
         // never reaches a per-entry write for one.
@@ -5291,35 +5305,35 @@ mod salvage_tests {
 /// is gated on `feature = "zip"` — the whole point of this dispatch is that
 /// it must answer correctly even in a build with no salvage scanner wired
 /// at all, so its own test must not depend on one either. Gated on
-/// `feature = "cpio"` purely to build a fixture the registry's magic table
-/// recognises: `cpio` is part of the `pure` feature bundle, which both the
+/// `feature = "ar"` purely to build a fixture the registry's magic table
+/// recognises: `ar` is part of the `pure` feature bundle, which both the
 /// default feature set and the pure-tier build (`--no-default-features
 /// --features pure`) include, so this runs on all three tiers `make check`
 /// exercises.
 ///
-/// **It used `tar` until Salvage Stage 3 Task 2 wired tar's scanner**, at
-/// which point a tar-shaped file stopped being refused and started being
-/// scanned. `cpio` is the next unwired container; its own Stage 3 task will
-/// have to move this test once more, to `ar`, and the one after that retire
-/// it — or keep it on a format registered only as a container.
-#[cfg(all(test, feature = "cpio"))]
+/// **It used `tar` until Salvage Stage 3 Task 2 wired tar's scanner, and
+/// `cpio` until Task 3 wired cpio's**, at which point each format's file
+/// stopped being refused and started being scanned. `ar` is the last
+/// unwired container; its own Stage 3 task will have to retire this test —
+/// or keep it on a format registered only as a container.
+#[cfg(all(test, feature = "ar"))]
 mod salvage_dispatch_tests {
     use super::*;
     use stuffr_core::salvage::SalvagePolicy;
 
-    /// The `newc` magic, `070701`, at offset 0 — enough for
-    /// [`resolve_chain`]'s magic match to identify the file as `cpio`,
-    /// nothing else filled in. [`salvage`]'s own format resolution never
-    /// opens the container to identify it (see [`resolve_salvage_format`]'s
-    /// doc), so this is sufficient: the dispatch this test pins never
-    /// reaches far enough to care whether the rest is well-formed.
-    fn cpio_like_bytes() -> Vec<u8> {
-        let mut header = vec![b'0'; 110];
-        header[..6].copy_from_slice(b"070701");
-        header
+    /// The `ar` global header, `!<arch>\n`, at offset 0 — enough for
+    /// [`resolve_chain`]'s magic match to identify the file as `ar`, nothing
+    /// else filled in. [`salvage`]'s own format resolution never opens the
+    /// container to identify it (see [`resolve_salvage_format`]'s doc), so
+    /// this is sufficient: the dispatch this test pins never reaches far
+    /// enough to care whether the rest is well-formed.
+    fn ar_like_bytes() -> Vec<u8> {
+        let mut bytes = b"!<arch>\n".to_vec();
+        bytes.resize(68, b' ');
+        bytes
     }
 
-    /// A cpio is a container this build cannot salvage yet. The refusal is
+    /// An ar is a container this build cannot salvage yet. The refusal is
     /// [`Error::Unsupported`] (exit 3) naming the format — never a silent
     /// empty [`SalvageOutcome`], which would read to a caller as "the scan
     /// found nothing recoverable" (exit 5): a claim about the ARCHIVE, where
@@ -5327,8 +5341,8 @@ mod salvage_dispatch_tests {
     #[test]
     fn salvage_refuses_a_format_it_cannot_scan() {
         let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("archive.cpio");
-        std::fs::write(&archive, cpio_like_bytes()).unwrap();
+        let archive = dir.path().join("archive.a");
+        std::fs::write(&archive, ar_like_bytes()).unwrap();
 
         let opts = SalvageOpts {
             dest: None,
@@ -5348,7 +5362,7 @@ mod salvage_dispatch_tests {
             "expected Error::Unsupported, got {err:?}"
         );
         assert!(
-            err.to_string().contains("cpio"),
+            err.to_string().contains("`ar`"),
             "the message must name the format it refused: {err}"
         );
     }
@@ -5882,8 +5896,9 @@ mod salvage_seam_tests {
 /// `Unattested` entry, and ONLY `--strict` does.
 ///
 /// Driven through [`place_salvaged_entry`] over constructed entries rather
-/// than a real archive, because no scanner in this build returns
-/// `Unattested` yet — `cpio` and `ar` arrive in the tasks after this one.
+/// than a real archive: written before any scanner returned `Unattested`.
+/// `cpio` does now (Task 3), and `tests/salvage_cpio.rs` observes `--strict`
+/// over a real one; this stays, because the rule is format-agnostic.
 /// Deliberately NOT inside `salvage_tests`, which is gated on `zip`: the rule
 /// is format-agnostic and must hold in a build with no scanner at all.
 #[cfg(test)]

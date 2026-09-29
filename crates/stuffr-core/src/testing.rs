@@ -87,9 +87,9 @@ pub const CONTAINER_SLOTS: &[&str] = &[
 ///
 /// Lists only formats `stuffr::entries::salvage_scan` actually dispatches to
 /// a real scanner: `zip` (Salvage Stage 1), `arc` (Stage 2 Task 3), `zoo`
-/// (Stage 2 Task 4), `lha` (Stage 2 Task 5), `arj` (Stage 2 Task 6) and `tar`
-/// (Stage 3 Task 2). Every OTHER registered container — `ar` and `cpio` as
-/// of this writing — still answers
+/// (Stage 2 Task 4), `lha` (Stage 2 Task 5), `arj` (Stage 2 Task 6), `tar`
+/// (Stage 3 Task 2) and `cpio` (Stage 3 Task 3). Every OTHER registered
+/// container — `ar` alone as of this writing — still answers
 /// `Error::Unsupported` from that dispatch (a claim about this BUILD, not the archive; see
 /// `salvage_scan`'s own doc), so listing one here before its own scanner
 /// lands would spend a share of every fuzzing run proving nothing but that
@@ -101,7 +101,7 @@ pub const CONTAINER_SLOTS: &[&str] = &[
 /// generated corpus seed** — and, as [`CODEC_SLOTS`] says, of nothing the
 /// fuzzer accumulated, whose `n % len` an append does move. Never reorder,
 /// never remove — retire a slot by leaving it in place.
-pub const SALVAGE_SLOTS: &[&str] = &["zip", "arc", "zoo", "lha", "arj", "tar"];
+pub const SALVAGE_SLOTS: &[&str] = &["zip", "arc", "zoo", "lha", "arj", "tar", "cpio"];
 
 /// The per-entry ceiling the `salvage` fuzz target runs under, in place of
 /// [`crate::salvage::SalvagePolicy`]'s own 4 GiB default.

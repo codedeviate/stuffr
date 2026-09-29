@@ -337,9 +337,9 @@ pub enum Command {
         /// merely accepted or rejected as in an earlier stage. Naming one
         /// this build has no salvage scanner for yet is refused at exit 3,
         /// exactly as an undetected archive of that same format would be:
-        /// `ar` and `cpio` are still to come.
+        /// `ar` is still to come.
         ///
-        /// Scanners exist for: zip, arc, zoo, lha, arj, tar.
+        /// Scanners exist for: zip, arc, zoo, lha, arj, tar, cpio.
         #[arg(long)]
         format: Option<String>,
     },
