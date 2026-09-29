@@ -182,6 +182,8 @@ pub mod brotli;
 pub mod bzip2;
 #[cfg(feature = "cpio")]
 pub mod cpio;
+#[cfg(feature = "cpio")]
+pub mod cpio_salvage;
 #[cfg(feature = "deflate")]
 pub mod deflate;
 #[cfg(feature = "gzip")]

@@ -273,7 +273,7 @@ impl Container for CpioNewc {
 /// Only variants that are genuinely cpio are listed. Anything else — bytes
 /// that are not cpio at all — falls through to the crate and is reported as
 /// corrupt, which is the right answer for it.
-const RECOGNISED_UNREADABLE_VARIANTS: &[(&[u8], &str)] = &[
+pub(crate) const RECOGNISED_UNREADABLE_VARIANTS: &[(&[u8], &str)] = &[
     (b"070707", "odc (POSIX \"old character\"/portable ASCII)"),
     (b"070702", "newc-crc (the CRC variant of new ASCII)"),
 ];
@@ -622,7 +622,7 @@ impl Read for CpioEntryPayload<'_> {
 /// `File` rather than `Other`: property 11's own fixture writes an explicit
 /// mode with no type bits at all, and a real caller doing the same expects a
 /// plain file back, not a skipped entry.
-fn entry_kind(mode: u32) -> EntryKind {
+pub(crate) fn entry_kind(mode: u32) -> EntryKind {
     match mode & MODE_TYPE_MASK {
         S_IFDIR => EntryKind::Dir,
         0o010000 | 0o020000 | 0o060000 | 0o140000 | S_IFLNK => EntryKind::Other,
@@ -631,7 +631,7 @@ fn entry_kind(mode: u32) -> EntryKind {
 }
 
 /// Whether a raw `st_mode`-shaped field names a symlink (`S_IFLNK`).
-fn is_symlink_mode(mode: u32) -> bool {
+pub(crate) fn is_symlink_mode(mode: u32) -> bool {
     mode & MODE_TYPE_MASK == S_IFLNK
 }
 
@@ -647,7 +647,7 @@ fn is_symlink_mode(mode: u32) -> bool {
 /// this cap, a hostile entry claiming an implausible `file_size` under an
 /// `S_IFLNK` mode could otherwise force an allocation of that size before
 /// any caller had asked to read anything.
-const MAX_SYMLINK_TARGET_LEN: u64 = 65_536;
+pub(crate) const MAX_SYMLINK_TARGET_LEN: u64 = 65_536;
 
 /// Offset, from the start of a `newc` header, of the byte immediately past
 /// `c_namesize` — the field this container must inspect before delegating
@@ -708,7 +708,7 @@ const CPIO_NAMESIZE_FIELD_END: usize = 6 + 8 * 12;
 /// entry name is exactly as path-shaped as a symlink target. Proven against
 /// a legitimate long, deeply-nested name well under this ceiling by
 /// `a_legitimate_long_name_still_round_trips`.
-const MAX_CPIO_NAME_LEN: u64 = 65_536;
+pub(crate) const MAX_CPIO_NAME_LEN: u64 = 65_536;
 
 /// Parses just the `c_namesize` field out of a raw header prefix, trusting
 /// nothing past it. `None` means the prefix is too short to contain the
