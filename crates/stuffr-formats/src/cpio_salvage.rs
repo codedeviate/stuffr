@@ -86,16 +86,52 @@
 //! [`tests::the_noise_corpus_reaches_each_criterion_it_claims_to`] and the
 //! task report's falsification table.
 //!
-//! # Byte-granular, and a whole entry's payload is jumped
+//! # Byte-granular, and a payload is jumped only when the jump is corroborated
 //!
 //! `newc` keeps every header on a multiple of four from the archive's own
 //! start, but the archive this verb exists for may have lost that alignment
 //! (a carved image, a download missing its first bytes), so the scan tests
-//! every offset. After a WHOLE candidate it resumes at the header after that
-//! entry's padded payload rather than inside it — see [`CpioSalvage`] — or
-//! a cpio stored inside a cpio (every initramfs that embeds one) would be
-//! reported as its contents. A truncated candidate is not believed about
-//! where anything ends, and the scan resumes one byte past it.
+//! every offset. After a whole candidate it can resume at the header after
+//! that entry's padded payload rather than inside it — see [`CpioSalvage`]
+//! — or a cpio stored inside a cpio (every initramfs that embeds one) would
+//! be reported as its contents.
+//!
+//! **But `c_filesize` is attested by nothing**, and that is the difference
+//! from tar, whose own jump this copies: tar's header checksum refuses a
+//! header whose size field changed, and `newc` has no such check. Task 3's
+//! review measured the cost of trusting it unconditionally: `one.txt` (16
+//! bytes), `two.txt`, `three.txt`, with ONE hex digit of `one.txt`'s size
+//! changed `0`→`F` — `two.txt` vanished, with no row and no note, and
+//! `one.txt` was written holding `two.txt`'s header. So the jump is taken
+//! only when the bytes it lands on corroborate the size
+//! ([`corroborates_the_size`]): a header of any cpio variant that clears its
+//! gate (the trailer included), EOF, or zero padding all the way to EOF.
+//! Anything else and the scan resumes **one byte past the header** — not at
+//! the engine's own `offset + declared_len`, which measures the same
+//! unattested number from the header and would skip neighbours when the
+//! damage makes a size LARGER.
+//!
+//! **What corroboration buys:** one damaged size costs at most its own
+//! entry's bytes (the entry is still reported, over what its header claims),
+//! never the entry behind it —
+//! [`tests::a_damaged_size_never_costs_the_entry_behind_it`] pins the
+//! review's reproducer and its larger-size twin. **What it still cannot
+//! catch:** a damaged size that happens to land exactly on another valid
+//! header — a size shrunk or grown by a whole number of entries, or landing
+//! on a header inside the payload's own data. The jump is then corroborated
+//! and taken, and whatever lies between is not scanned. **What it costs:**
+//! an entry whose next header is itself destroyed is not jumped, so a cpio
+//! stored in THAT entry's payload is reported entry by entry — real headers
+//! over real bytes, never invented. A truncated candidate is never believed
+//! about where anything ends, and the scan resumes one byte past it.
+//!
+//! **The entry with the uncorroborated size stays `Unattested`**, and that
+//! is a choice. An uncorroborated jump is not evidence the size is WRONG —
+//! the same thing happens when the NEXT header is the damaged one, and then
+//! this entry is perfectly whole. `Partial` would claim missing bytes (every
+//! declared byte is present), and `Unverified` would decline to write an
+//! entry that is, in that second case, intact. `Unattested` already says
+//! nothing attests the record — its size included — and routes to exit 4.
 //!
 //! # Variants this build does not read are sightings (Ruling 3-J)
 //!
@@ -434,13 +470,54 @@ fn find_next_magic(
     }
 }
 
-/// A candidate, and where the next header would begin if its payload is
-/// whole.
+/// A candidate, and where the scan resumes after it.
 struct Found {
     candidate: Candidate,
-    /// `None` for a truncated candidate, whose declared length is not
-    /// trusted to say where anything ends.
-    next_header: Option<u64>,
+    /// The header after this entry's padded payload when something there
+    /// CORROBORATES the size ([`corroborates_the_size`]); otherwise one byte
+    /// past this header, so every byte the size might have wrongly claimed
+    /// is scanned. A truncated candidate is never believed about where
+    /// anything ends, and resumes one byte on too.
+    resume_at: u64,
+}
+
+/// Whether the bytes at `next_header` — where this entry's `c_filesize`
+/// says the next header begins — back that size up: a header of any cpio
+/// variant that clears its gate (a trailer included), EOF, or zeros all the
+/// way to EOF (a writer's block padding). See the module doc's jump section
+/// for what this buys and what it still cannot catch.
+fn corroborates_the_size(src: &mut dyn SeekRead, next_header: u64, file_len: u64) -> bool {
+    if next_header >= file_len {
+        return true;
+    }
+    match read_at(src, next_header, MAGIC_LEN as u64, file_len)
+        .as_deref()
+        .and_then(magic_of)
+    {
+        Some(Magic::Newc | Magic::Crc) => gate_newc_at(src, next_header, file_len).is_ok(),
+        Some(Magic::Odc) => gate_odc_at(src, next_header, file_len).is_ok(),
+        None => zeros_to_eof(src, next_header, file_len),
+    }
+}
+
+/// Whether every byte from `from` to EOF is zero, read in [`SCAN_CHUNK`]s
+/// and stopping at the first that is not. A read error answers `false`: an
+/// uncorroborated jump costs a rescan, never an entry.
+fn zeros_to_eof(src: &mut dyn SeekRead, from: u64, file_len: u64) -> bool {
+    if src.seek(SeekFrom::Start(from)).is_err() {
+        return false;
+    }
+    let mut left = file_len.saturating_sub(from);
+    let mut buf = vec![0u8; SCAN_CHUNK];
+    while left > 0 {
+        let want = usize::try_from(left.min(SCAN_CHUNK as u64)).unwrap_or(SCAN_CHUNK);
+        match src.read(&mut buf[..want]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) if buf[..n].iter().any(|&b| b != 0) => return false,
+            Ok(n) => left -= n as u64,
+        }
+    }
+    true
 }
 
 /// What gating one magic hit found.
@@ -495,6 +572,12 @@ fn candidate_from(src: &mut dyn SeekRead, offset: u64, newc: Newc, file_len: u64
         // always means `n < declared_len`, per the field's contract.
         _ => (Some(file_len.saturating_sub(newc.payload_start)), None),
     };
+    // Task 3 review, I1: nothing attests `c_filesize`, so the jump past this
+    // payload is taken only where the landing point corroborates it.
+    let resume_at = match next_header {
+        Some(next) if corroborates_the_size(src, next, file_len) => next,
+        _ => offset + 1,
+    };
     let mode = newc.fields[MODE];
     // `cpio.rs`'s `entry_kind` answers `Other` for a symlink until its
     // reader has read the target; so does this, when there is no target to
@@ -522,14 +605,15 @@ fn candidate_from(src: &mut dyn SeekRead, offset: u64, newc: Newc, file_len: u64
         candidate: Candidate::new(offset, newc.payload_start, meta)
             .with_declared_len(Some(size))
             .with_available_len(available_len),
-        next_header,
+        resume_at,
     }
 }
 
 /// Scans a `newc` archive for headers directly — see the module doc.
 ///
-/// `resume` is where the last WHOLE candidate's payload ends, so the next
-/// scan starts there rather than inside it (tar's shape, for tar's reason).
+/// `resume` is where the scan carries on after the last candidate: past its
+/// payload when the size is corroborated, one byte past its header when it
+/// is not — see [`Found::resume_at`].
 /// `sightings` is every well-formed header of a variant this build does not
 /// read, in scan order.
 #[derive(Debug, Default)]
@@ -541,7 +625,7 @@ pub struct CpioSalvage {
 #[derive(Debug, Clone, Copy)]
 struct Resume {
     header: u64,
-    next_header: u64,
+    at: u64,
 }
 
 impl CpioSalvage {
@@ -553,12 +637,13 @@ impl CpioSalvage {
 impl SalvageScan for CpioSalvage {
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
-        // Any position the engine lands on strictly inside the last whole
-        // entry means "carry on after that entry". Taken, not peeked.
+        // The engine's own advance is `offset + declared_len` — the same
+        // unattested `c_filesize` — so after a candidate this scanner, not
+        // the engine, decides where to carry on. Taken, not peeked: it
+        // describes one candidate, and the engine always calls back with a
+        // `from` past that candidate's header.
         let mut search_from = match self.resume.take() {
-            Some(resume) if from > resume.header && from <= resume.next_header => {
-                resume.next_header
-            }
+            Some(resume) if from > resume.header => resume.at,
             _ => from,
         };
         loop {
@@ -567,9 +652,9 @@ impl SalvageScan for CpioSalvage {
             };
             match scan_at(src, offset, magic, file_len) {
                 Scanned::Found(found) => {
-                    self.resume = found.next_header.map(|next_header| Resume {
+                    self.resume = Some(Resume {
                         header: found.candidate.offset,
-                        next_header,
+                        at: found.resume_at,
                     });
                     return Ok(Some(found.candidate));
                 }
@@ -1296,6 +1381,53 @@ mod tests {
                 ("after.txt".to_string(), SalvageStatus::Unattested)
             ]
         );
+    }
+
+    /// Task 3 review, I1: `c_filesize` is attested by NOTHING, so the
+    /// payload jump must not trust it alone. The reviewer's reproducer,
+    /// exactly: `one.txt` holds 16 bytes, and the last hex digit of its
+    /// `c_filesize` is changed from `0` to `F` (0x10 → 0x1F). With the jump
+    /// unconditional, `two.txt` vanished — no row, no note — and `one.txt`
+    /// was written with `two.txt`'s header bytes inside it. The jump now
+    /// lands only where a header (or EOF, or zero padding to EOF)
+    /// corroborates it; otherwise the scan resumes one byte past the header.
+    ///
+    /// The second damage grows the size instead (0x10 → 0x410), which is
+    /// why the fallback is NOT the engine's own advance: that is `offset +
+    /// c_filesize`, the same unattested number, and would carry the scan
+    /// 1,040 bytes on — straight past `two.txt`.
+    #[test]
+    fn a_damaged_size_never_costs_the_entry_behind_it() {
+        let healthy = files(&[
+            ("one.txt", b"sixteen bytes..!"),
+            ("two.txt", b"the entry behind"),
+            ("three.txt", &[b'3'; 2000]),
+        ]);
+        assert_eq!(&healthy[field_at(FILESIZE)], b"00000010");
+        for (at, digit, declared) in [(7, b'F', 0x1F), (5, b'4', 0x410)] {
+            let mut bytes = healthy.clone();
+            bytes[field_at(FILESIZE).start + at] = digit;
+            assert!(read_through_the_reader(&bytes).is_err());
+            let out = scan(&bytes);
+            assert_eq!(
+                out.entries
+                    .iter()
+                    .map(|e| (e.meta.name.as_str(), e.meta.size))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("one.txt", Some(declared)),
+                    ("two.txt", Some(16)),
+                    ("three.txt", Some(2000))
+                ],
+                "size 0x{declared:X}: a damaged size must cost its own entry's bytes at most, \
+                 never the entry behind it"
+            );
+            let written = write_back(&bytes, &out);
+            assert_eq!(written[1], (b"the entry behind".to_vec(), true));
+            // What `one.txt` itself holds is the genuine prefix of what the
+            // header declared — its own sixteen bytes first, never padded.
+            assert_eq!(&written[0].0[..16], b"sixteen bytes..!");
+        }
     }
 
     /// Off its four-byte alignment (a carved image, a download missing its

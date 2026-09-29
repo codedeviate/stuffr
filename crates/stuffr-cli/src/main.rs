@@ -910,9 +910,22 @@ fn salvage_summary_lines(entries: &[entries::SalvagedRecord]) -> Vec<String> {
     // The same shape, for the same reason: `Unattested` is a fact about the
     // FORMAT behind a record, whatever became of the record.
     let mut unattested = 0;
+    // How many of those were actually put on disk — the note below says
+    // what was kept, and must not say it of an entry that was skipped (Task
+    // 3 review, M3: a skipped symlink was reported "kept").
+    let mut unattested_kept = 0;
     for record in entries {
         if record.status == stuffr::salvage::SalvageStatus::Unattested {
             unattested += 1;
+            if matches!(
+                record.disposition,
+                entries::SalvageDisposition::Written(_)
+                    | entries::SalvageDisposition::WrittenDisambiguated { .. }
+                    | entries::SalvageDisposition::WrittenPartial { .. }
+                    | entries::SalvageDisposition::Directory(_)
+            ) {
+                unattested_kept += 1;
+            }
         }
         match &record.disposition {
             entries::SalvageDisposition::Written(_) | entries::SalvageDisposition::Directory(_) => {
@@ -954,21 +967,30 @@ fn salvage_summary_lines(entries: &[entries::SalvagedRecord]) -> Vec<String> {
         entries.len()
     )];
     if unattested > 0 {
-        lines.push(unattested_note(unattested));
+        lines.push(unattested_note(unattested, unattested_kept));
     }
     lines
 }
 
-/// Why `count` entries are `Unattested` — the one sentence both the
-/// default summary ([`salvage_summary_lines`]) and `-o FILE`
-/// ([`finish_single_file_recovery`]) print, so the two paths cannot explain
-/// the same exit 4 two ways.
-fn unattested_note(count: usize) -> String {
+/// Why `count` entries are `Unattested`, of which `kept` were put on disk —
+/// the one sentence both the default summary ([`salvage_summary_lines`])
+/// and `-o FILE` ([`finish_single_file_recovery`]) print, so the two paths
+/// cannot explain the same exit 4 two ways. It says "kept under the real
+/// name" only of what was kept: an `Unattested` symlink is skipped like any
+/// other symlink, and `--strict` declines them all.
+fn unattested_note(count: usize, kept: usize) -> String {
+    let fate = if kept == count {
+        "kept under the real name unless --strict".to_string()
+    } else {
+        format!(
+            "{kept} kept under the real name and {} not written",
+            count - kept
+        )
+    };
     format!(
         "salvage -> {count} entr{} unattested: this format carries no checksum and no header \
          self-check, so nothing proves a recovered record is a real entry rather than a \
-         coincidental header match — kept under the real name unless --strict, and the run \
-         exits 4",
+         coincidental header match — {fate}, and the run exits 4",
         if count == 1 { "y is" } else { "ies are" }
     )
 }
@@ -1122,7 +1144,7 @@ fn finish_single_file_recovery(
     // why — `wrote FILE` alone, then a non-zero status. `-C` and `--list`
     // already explain it; this is their sentence, not a third wording.
     if record.status == stuffr::salvage::SalvageStatus::Unattested {
-        eprintln!("{}", unattested_note(1));
+        eprintln!("{}", unattested_note(1, 1));
     }
     Ok(())
 }
@@ -1872,6 +1894,40 @@ mod tests {
             salvage_summary_lines(&[record(stuffr::salvage::SalvageStatus::Complete, written)]);
         assert_eq!(lines.len(), 1, "no reason line for a clean run: {lines:?}");
         assert!(lines[0].contains("0 unattested"), "{lines:?}");
+    }
+
+    /// Task 3 review, M3: a healthy cpio holding a symlink printed "4
+    /// written … 1 skipped … 5 unattested" and then said all five were "kept
+    /// under the real name" — the skipped symlink was not kept at all. The
+    /// note names what was kept and what was not; the tally is unchanged.
+    #[test]
+    fn the_unattested_note_counts_only_what_was_kept() {
+        let written = entries::SalvageDisposition::Written(std::path::PathBuf::from("/o/n"));
+        let mut records =
+            vec![record(stuffr::salvage::SalvageStatus::Unattested, written.clone()); 4];
+        records.push(record(
+            stuffr::salvage::SalvageStatus::Unattested,
+            entries::SalvageDisposition::SkippedUnsupportedKind,
+        ));
+        let lines = salvage_summary_lines(&records);
+        assert!(
+            lines[0].contains("4 written") && lines[0].contains("5 unattested"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1].contains("5 entries are unattested")
+                && lines[1].contains("4 kept under the real name and 1 not written")
+                && !lines[1].contains("unless --strict"),
+            "{lines:?}"
+        );
+
+        // All kept: the sentence the other paths already print, unchanged.
+        let lines = salvage_summary_lines(&records[..4]);
+        assert!(
+            lines[1].contains("4 entries are unattested")
+                && lines[1].contains("kept under the real name unless --strict"),
+            "{lines:?}"
+        );
     }
 
     /// Ruling 3-H: a row `--strict` declined names the flag, which is also
