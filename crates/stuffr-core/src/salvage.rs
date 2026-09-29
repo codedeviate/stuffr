@@ -85,6 +85,7 @@ use std::path::Path;
 
 use crate::archive::EntryMeta;
 use crate::error::{Error, Result};
+use crate::format::FormatId;
 use crate::source::SeekRead;
 
 /// 4 GiB. A scanned length is untrustworthy TWICE over — attacker-controlled
@@ -585,6 +586,104 @@ impl SalvagedEntry {
 #[non_exhaustive]
 pub struct SalvageOutcome {
     pub entries: Vec<SalvagedEntry>,
+    /// Header shapes the scanner recognised and could not gate, in scan
+    /// order — see [`Sighting`]. Always empty from [`salvage_all`]: the
+    /// engine cannot know what its scanner refused, so a format's own
+    /// `salvage_*` entry point fills it in after the scan. A sighting is
+    /// never an entry, and never touches the run's exit code.
+    pub sightings: Vec<Sighting>,
+}
+
+/// A header a scanner SAW and has no gate for (Rulings S-V and 3-J): its
+/// structure is a header's, and something about it — a field this build
+/// cannot check, a shape a shifted copy also takes — leaves the scan unable
+/// to tell it from a phantom. So it is counted here and never becomes a
+/// [`Candidate`], because the engine advances past a candidate by its
+/// declared length and a phantom's length is how a scan jumps a real header.
+///
+/// **Why it has to be reported at all.** A run that recovers nothing while
+/// seeing one refuses with [`Error::Unsupported`] (exit 3) — the scanner's own
+/// job, since only it can name the shape. A run that recovered OTHER entries
+/// reports them at its ordinary exit code (Ruling S-X), and until Salvage
+/// Stage 3's Task 2-N it said nothing else: an entry `stuffr list` shows was
+/// simply absent from `salvage --list`, at exit 0, with an empty stderr. The
+/// sightings recorded here are what the caller prints instead
+/// ([`describe_sightings`]), in a mixed run as in any other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Sighting {
+    /// The scanner's format, for the sentence [`describe_sightings`] writes.
+    pub format: FormatId,
+    /// Where the header was seen.
+    pub offset: u64,
+    /// What was seen, as a plural noun phrase that follows a count —
+    /// `"header(s) whose magic field … is neither \`ustar\` nor blank"`. One
+    /// phrase per shape, shared with the scanner's own exit-3 refusal, so
+    /// the two can never describe one shape two ways.
+    pub shape: &'static str,
+}
+
+impl Sighting {
+    pub fn new(format: FormatId, offset: u64, shape: &'static str) -> Self {
+        Self {
+            format,
+            offset,
+            shape,
+        }
+    }
+}
+
+/// The most offsets [`describe_sightings`] lists per shape before it says
+/// how many more there were. The count itself is always the complete figure.
+const SIGHTING_OFFSETS_SHOWN: usize = 8;
+
+/// The one sentence a caller prints for `sightings`, or `None` when there
+/// are none — how many headers of each shape were seen, where, and that the
+/// ordinary verbs may read them. It is the same wording family as each
+/// scanner's exit-3 refusal (its shape phrases are the scanner's own), and it
+/// is written here, once, so every scanner that records a [`Sighting`] gets
+/// the same report without a line of its own.
+pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
+    if sightings.is_empty() {
+        return None;
+    }
+    // Grouped by (format, shape) in first-seen order: a handful of shapes
+    // at most, so a linear search beats a map and keeps the order stable.
+    let mut groups: Vec<((FormatId, &'static str), Vec<u64>)> = Vec::new();
+    for s in sightings {
+        let key = (s.format, s.shape);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, offsets)) => offsets.push(s.offset),
+            None => groups.push((key, vec![s.offset])),
+        }
+    }
+    let parts: Vec<String> = groups
+        .iter()
+        .map(|((format, shape), offsets)| {
+            let mut shown: Vec<String> = offsets
+                .iter()
+                .take(SIGHTING_OFFSETS_SHOWN)
+                .map(u64::to_string)
+                .collect();
+            if offsets.len() > SIGHTING_OFFSETS_SHOWN {
+                shown.push(format!(
+                    "and {} more",
+                    offsets.len() - SIGHTING_OFFSETS_SHOWN
+                ));
+            }
+            format!(
+                "{} {format} {shape} at offset(s) {}",
+                offsets.len(),
+                shown.join(", ")
+            )
+        })
+        .collect();
+    Some(format!(
+        "this build's salvage scanner saw {} — each with the structure of a header, but in a \
+         shape it has no gate for, so none is listed or recovered; `stuffr list` and \
+         `stuffr unpack` may read these headers normally, and it is the SCAN that stops there",
+        parts.join("; and ")
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1019,7 +1118,10 @@ pub fn annotate_candidates(
         );
     }
 
-    Ok(SalvageOutcome { entries })
+    Ok(SalvageOutcome {
+        entries,
+        sightings: Vec::new(),
+    })
 }
 
 /// Streams `reader` into `out`, bounded to `expected_len` bytes — the
@@ -1854,5 +1956,26 @@ mod tests {
         assert_eq!(annotated.shadows, Some(1));
         assert_eq!(annotated.collides_with, Some(2));
         assert!(annotated.marked_deleted);
+    }
+
+    /// Task 2-N: the note a caller prints for its sightings. None for none —
+    /// a run with nothing refused must print nothing — and otherwise one
+    /// group per (format, shape), each with its complete count and at most
+    /// [`SIGHTING_OFFSETS_SHOWN`] offsets, in the order first seen.
+    #[test]
+    fn describe_sightings_groups_by_shape_and_bounds_what_it_lists() {
+        assert_eq!(describe_sightings(&[]), None);
+
+        let f = FormatId::new("fmt");
+        let mut seen: Vec<Sighting> = (0..10u64)
+            .map(|i| Sighting::new(f, i * 512, "a(s)"))
+            .collect();
+        seen.insert(1, Sighting::new(f, 7, "b(s)"));
+        let note = describe_sightings(&seen).unwrap();
+        assert!(
+            note.contains("10 fmt a(s) at offset(s) 0, 512, 1024, 1536, 2048, 2560, 3072, 3584, and 2 more; and 1 fmt b(s) at offset(s) 7"),
+            "{note}"
+        );
+        assert!(note.contains("`stuffr list`"), "{note}");
     }
 }

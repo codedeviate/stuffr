@@ -1257,6 +1257,15 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     };
     let outcome = entries::salvage(&path, &opts)?;
 
+    // Task 2-N: a header the scanner SAW and could not gate is never a row
+    // and never moves the exit code (Ruling S-X), so this line is the only
+    // trace of it — printed on every run that has one, `--list`, `-C` and
+    // `-o` alike. Before it, a mixed run lost an entry `stuffr list` shows
+    // at exit 0 with an empty stderr. Nothing prints for a run with none.
+    if let Some(note) = stuffr::salvage::describe_sightings(&outcome.sightings) {
+        eprintln!("salvage -> {note}");
+    }
+
     // Computed on the FULL scan: "nothing recoverable at all" is a fact
     // about the archive, not about which scan positions the caller happened
     // to ask for.
@@ -1312,6 +1321,7 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     };
     Ok(entries::salvage_exit_code(&entries::SalvageOutcome {
         entries: subset,
+        sightings: outcome.sightings,
     }))
 }
 

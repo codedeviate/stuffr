@@ -1577,6 +1577,13 @@ pub struct SalvagedRecord {
 #[derive(Debug)]
 pub struct SalvageOutcome {
     pub entries: Vec<SalvagedRecord>,
+    /// What the scanner saw and could not gate, carried through from
+    /// [`stuffr_core::salvage::SalvageOutcome::sightings`] untouched. The CLI
+    /// prints [`stuffr_core::salvage::describe_sightings`] of it on stderr on
+    /// every run that has any (Task 2-N): a sighting is never an entry and
+    /// never moves [`salvage_exit_code`], so without that line a mixed run
+    /// would lose an entry `stuffr list` shows in silence.
+    pub sightings: Vec<stuffr_core::salvage::Sighting>,
 }
 
 /// Ruling R-N (fix round 1): the exit-code bucket a COMPLETED salvage run's
@@ -1931,7 +1938,10 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
             disposition,
         });
     }
-    Ok(SalvageOutcome { entries })
+    Ok(SalvageOutcome {
+        entries,
+        sightings: scan.sightings,
+    })
 }
 
 /// Decides — and, for everything but a shadow/skip, carries out — what
@@ -5004,13 +5014,17 @@ mod salvage_tests {
         };
 
         assert_eq!(
-            salvage_exit_code(&SalvageOutcome { entries: vec![] }),
+            salvage_exit_code(&SalvageOutcome {
+                entries: vec![],
+                sightings: Vec::new()
+            }),
             5,
             "nothing recoverable at all"
         );
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::Directory(PathBuf::from("b"))),
@@ -5022,6 +5036,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(SalvageDisposition::WrittenPartial {
                     path: PathBuf::from("a.partial"),
                     cause: PartialCause::ChecksumMismatch,
@@ -5033,6 +5048,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(SalvageDisposition::SkippedUnverified)],
             }),
             3,
@@ -5041,6 +5057,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::WrittenDisambiguated {
@@ -5057,6 +5074,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::WrittenPartial {
                         path: PathBuf::from("a.partial"),
@@ -5077,6 +5095,7 @@ mod salvage_tests {
         // the recovery.
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::NotSelected),
@@ -5088,6 +5107,7 @@ mod salvage_tests {
         );
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(SalvageDisposition::NotWritten); 3],
             }),
             0,
@@ -5099,6 +5119,7 @@ mod salvage_tests {
         // the new payload must not accidentally exempt it from bucket 4.
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(SalvageDisposition::SkippedPartial(
                     PartialCause::Truncated
                 ))],
@@ -5114,6 +5135,7 @@ mod salvage_tests {
         // exit 7 must still see 7 now that the run finishes.
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(SalvageDisposition::SkippedUnsafePath {
                     reason: "path traversal above the destination"
                 })],
@@ -5123,6 +5145,7 @@ mod salvage_tests {
         );
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::SkippedUnverified),
@@ -5166,6 +5189,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::Written(PathBuf::from("a")),
@@ -5179,6 +5203,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::NotWritten,
@@ -5193,6 +5218,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::Directory(PathBuf::from("d")),
@@ -5205,6 +5231,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![
                     record(
                         SalvageStatus::Unattested,
@@ -5225,6 +5252,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![
                     record(
                         SalvageStatus::Unattested,
@@ -5245,6 +5273,7 @@ mod salvage_tests {
 
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
+                sightings: Vec::new(),
                 entries: vec![record(
                     SalvageStatus::Complete,
                     SalvageDisposition::Written(PathBuf::from("a")),
@@ -5964,6 +5993,7 @@ mod salvage_strict_tests {
         // Not 3: nothing is missing from this build. The caller asked for
         // proof the format cannot give, and dropping `--strict` recovers it.
         let outcome = SalvageOutcome {
+            sightings: Vec::new(),
             entries: vec![SalvagedRecord {
                 scan_position: 0,
                 name: "x".into(),

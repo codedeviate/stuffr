@@ -762,9 +762,12 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   is spelled unlike any known writer's, is one the scan cannot tell from
   a real header seen a byte late; it refuses it, and a run that recovers
   nothing else says so at exit 3 rather than "nothing recoverable" —
-  `stuffr list` and `stuffr unpack` still read those headers. cpio and
-  ar record neither checksum, and have no scanner yet; use `stuffr list`
-  and `stuffr unpack` on those two.
+  `stuffr list` and `stuffr unpack` still read those headers. A run that
+  DOES recover other entries keeps its ordinary exit code and names every
+  such header on stderr, with its offset (`salvage -> this build's
+  salvage scanner saw 1 tar header(s) whose magic field ... at offset(s)
+  0`); it is never a row. cpio and ar record neither checksum, and have
+  no scanner yet; use `stuffr list` and `stuffr unpack` on those two.
 
   LHA and ARJ are the two where the ordinary reader has no fallback at
   all, and ARJ's is the sharper of them. LHA carries no index, no entry

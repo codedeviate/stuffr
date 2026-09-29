@@ -11534,18 +11534,7 @@ fn salvage_recovers_a_damaged_tar_as_complete() {
 #[test]
 fn salvage_says_exit_3_for_a_tar_header_it_cannot_gate() {
     let dir = tmp_dir();
-    let mut b = vec![0u8; 512];
-    b[..5].copy_from_slice(b"j.txt");
-    b[100..108].copy_from_slice(b"0000644\0");
-    b[108..116].copy_from_slice(b"0000000\0");
-    b[116..124].copy_from_slice(b"0000000\0");
-    b[124..136].copy_from_slice(b"00000000004\0");
-    b[136..148].copy_from_slice(b"14727046122\0");
-    b[257..265].copy_from_slice(b"JUNKJUNK");
-    b[148..156].fill(b' ');
-    let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
-    b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
-    b.extend_from_slice(b"junk");
+    let mut b = v7_tar_entry("j.txt", b"junk", b"JUNKJUNK");
     b.resize(2048, 0);
     let archive = dir.join("junkmagic.tar");
     std::fs::write(&archive, &b).unwrap();
@@ -11562,4 +11551,111 @@ fn salvage_says_exit_3_for_a_tar_header_it_cannot_gate() {
     assert_eq!(out.status.code(), Some(3), "{stderr}");
     assert!(stderr.contains("magic field"), "{stderr}");
     assert!(!stderr.contains("nothing recoverable"), "{stderr}");
+}
+
+/// One v7-style tar entry: a header with `magic` over bytes 257..265 and a
+/// correct `%06o\0 ` checksum (GNU tar's spelling), then `data` padded to a
+/// whole block. Built by hand: nothing in reach writes junk into a v7
+/// header's padding on purpose.
+fn v7_tar_entry(name: &str, data: &[u8], magic: &[u8; 8]) -> Vec<u8> {
+    let mut b = vec![0u8; 512];
+    b[..name.len()].copy_from_slice(name.as_bytes());
+    b[100..108].copy_from_slice(b"0000644\0");
+    b[108..116].copy_from_slice(b"0000000\0");
+    b[116..124].copy_from_slice(b"0000000\0");
+    b[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+    b[136..148].copy_from_slice(b"14727046122\0");
+    b[257..265].copy_from_slice(magic);
+    b[148..156].fill(b' ');
+    let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+    b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    b.extend_from_slice(data);
+    b.resize(b.len().div_ceil(512) * 512, 0);
+    b
+}
+
+/// Task 2-N, N3: in a MIXED run an ungateable header used to be completely
+/// silent. `JUNKJUNK` then a healthy `ok.txt`: `list` shows two entries,
+/// and `salvage` gave one row at exit 0 with an EMPTY stderr. The exit code
+/// is right (Ruling S-X: report what was got, at its ordinary code) and
+/// stays; what was missing is the sentence saying a header was seen, where,
+/// and that `list` may read it — under `--list` and under `-C` alike. It is
+/// still never a row. A healthy archive keeps an empty stderr under `--list`
+/// (and only `-C`'s own summary line under `-C`): the note must not fire
+/// where nothing was refused.
+#[test]
+fn salvage_names_an_ungateable_tar_header_in_a_mixed_run() {
+    let dir = tmp_dir();
+    let mut mixed = v7_tar_entry("j.txt", b"junk", b"JUNKJUNK");
+    let ok_at = mixed.len();
+    mixed.extend_from_slice(&v7_tar_entry("ok.txt", b"fine", &[0; 8]));
+    mixed.extend_from_slice(&[0u8; 1024]);
+    let healthy = mixed[ok_at..].to_vec();
+    let archive = dir.join("mixed.tar");
+    std::fs::write(&archive, &mixed).unwrap();
+    let whole = dir.join("healthy.tar");
+    std::fs::write(&whole, &healthy).unwrap();
+
+    let listed = run_output(&["list", archive.to_str().unwrap()]);
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&listed.stdout).lines().count(), 2);
+
+    let salvage_list =
+        |p: &Path| run_output(&["salvage", "--format", "tar", p.to_str().unwrap(), "--list"]);
+
+    let out = salvage_list(&archive);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("ok.txt") && !stdout.contains("j.txt"),
+        "{stdout}"
+    );
+    for needle in ["magic field", "offset(s) 0", "stuffr list"] {
+        assert!(stderr.contains(needle), "{needle:?} missing: {stderr}");
+    }
+
+    let out_dir = dir.join("recovered");
+    let written = run_output(&[
+        "salvage",
+        "--format",
+        "tar",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&written.stderr);
+    assert_eq!(written.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("magic field") && stderr.contains("offset(s) 0"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(out_dir.join("ok.txt")).unwrap(), b"fine");
+    assert!(!out_dir.join("j.txt").exists());
+
+    let out = salvage_list(&whole);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "",
+        "a healthy tar says nothing"
+    );
+    let healthy_dir = dir.join("healthy-out");
+    let written = run_output(&[
+        "salvage",
+        "--format",
+        "tar",
+        whole.to_str().unwrap(),
+        "-C",
+        healthy_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&written.stderr);
+    assert_eq!(written.status.code(), Some(0), "{stderr}");
+    // `-C`'s own summary line goes to stderr; it must be the only line.
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("1 scanned: 1 written") && !stderr.contains("stuffr list"),
+        "{stderr}"
+    );
 }

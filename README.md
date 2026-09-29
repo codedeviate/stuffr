@@ -9,23 +9,23 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: Salvage Stage 2 is complete at `0.6.0` — `stuffr salvage` now
-> covers FIVE formats: `zip`, `arc`, `zoo`, `lha` and `arj`.** Each finds its
-> own records by scanning for them, so an archive whose index, main header or
-> one damaged entry costs the ordinary reader everything behind it still
-> gives up what it holds. LHA and ARJ are the sharpest cases: LHA carries no
-> index, no entry count and no trailer, so one bad header ends `list` for
-> every entry behind it, and an ARJ archive opens with a main header the
-> reader must parse before it hands back a single entry — two damaged bytes
-> there and `stuffr list` exits 5 over a file whose every entry is intact.
-> `salvage` finds each header on its own in both. **`tar` joined them in
-> Salvage Stage 3**, and it is the one format that reaches
-> `SalvageStatus::Complete` ("every declared byte was present and the header
-> self-verified, but the format offers nothing to check the content
-> against"): tar checksums each header and never its payload, so a tar entry
-> is never `Intact`. **`cpio` and `ar` are not here yet** — they record no
-> checksum of any kind, so a plausible-looking header found mid-payload
-> cannot be told from a real one by any evidence the format carries.
+> **Status: `stuffr salvage` covers six formats — `zip`, `arc`, `zoo`, `lha`
+> and `arj` since Salvage Stage 2 (`0.6.0`), and `tar` since Salvage
+> Stage 3.** Each finds its own records by scanning for them, so an archive
+> whose index, main header or one damaged entry costs the ordinary reader everything
+> behind it still gives up what it holds. LHA and ARJ are the sharpest cases:
+> LHA carries no index, no entry count and no trailer, so one bad header ends
+> `list` for every entry behind it, and an ARJ archive opens with a main
+> header the reader must parse before it hands back a single entry — two
+> damaged bytes there and `stuffr list` exits 5 over a file whose every entry
+> is intact. `salvage` finds each header on its own in both. **`tar`**, the
+> Stage 3 addition, is the one format that reaches `SalvageStatus::Complete`
+> ("every declared byte was present and the header self-verified, but the
+> format offers nothing to check the content against"): tar checksums each
+> header and never its payload, so a tar entry is never `Intact`. **`cpio` and
+> `ar` are not here yet** — they record no checksum of any kind, so a
+> plausible-looking header found mid-payload cannot be told from a real one by
+> any evidence the format carries.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
@@ -718,7 +718,7 @@ stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a p
 stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
 stuffr formats                             # capability matrix for THIS build
 stuffr test     ARCHIVE                    # integrity check, no extraction
-stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha/arj; scan position, not list's index
+stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha/arj/tar; scan position, not list's index
 stuffr convert  IN -o OUT                  # recompress without staging to disk
 stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
 ```

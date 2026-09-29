@@ -173,14 +173,23 @@
 //! ordinary verbs still read the archive — never "the scan found nothing
 //! recoverable" at exit 5, which is a claim about the archive where the
 //! truth is a claim about this build. A run that recovered something
-//! reports it at its ordinary code (Ruling S-X). This is Ruling S-V's shape,
-//! and `lha_salvage.rs`'s `UngateableSightings` is the template.
+//! reports it at its ordinary code (Ruling S-X) — and, since Task 2-N,
+//! carries every sighting with its offset in
+//! [`SalvageOutcome::sightings`], which the CLI prints on stderr: before
+//! that, the mixed run was completely silent about a header `stuffr list`
+//! reads. This is Ruling S-V's shape, and `lha_salvage.rs`'s
+//! `UngateableSightings` is the template.
 //!
 //! Counted and never listed, because a listed candidate is one the engine
 //! advances past by its declared length — which is exactly how a phantom's
 //! payload jump used to carry the scan past a real header. And a twin is
 //! never counted: a damaged archive whose only header is a twin's source
-//! holds nothing recoverable, and says so.
+//! holds nothing recoverable, and says so. **One refused "twin" is**: a
+//! block the twin check matched that sits on the 512-byte grid of the
+//! entries the run recovered. A real copy lies 1..7 bytes off the grid its
+//! source is on, so a block ON it is a genuine header the check could not
+//! tell from the window before it (Task 2-N, N1) — reported, still never
+//! listed. See [`looks_like_a_shifted_twin`] for the layout that does this.
 //!
 //! # Byte-granular, deliberately not 512-aligned
 //!
@@ -274,12 +283,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry,
+    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry, Sighting,
     UnverifiedCause, salvage_all, stream_bounded_copy,
 };
 use stuffr_core::{EntryMeta, Error, FormatId, Result, SeekRead};
 
-use crate::tar::{BLOCK, entry_kind, header_mtime};
+use crate::tar::{BLOCK, TAR, entry_kind, header_mtime};
 
 /// [`BLOCK`] as the `u64` every offset below is.
 const BLOCK_U64: u64 = BLOCK as u64;
@@ -411,6 +420,40 @@ fn clears_criterion_3(src: &mut dyn SeekRead, offset: u64, file_len: u64, block:
 ///
 /// The earlier block's own checksum is deliberately NOT required to agree:
 /// the case that produces a twin at all is the genuine header being damaged.
+///
+/// # Why it must also name something (Task 2-N, N1)
+///
+/// Mode and size are not enough on a layout no measured writer uses, and
+/// Task 2's re-review built one: space-terminated numeric fields (`pax -x
+/// ustar`'s style), a 100-byte name ending in an octal digit, a measured
+/// `%06o\0 ` checksum. One byte before that header the window reads mode
+/// `70000644` (`name[99]` then the mode), size ` 00000000004` (`gid[7]`, a
+/// space, then the size) and checksum ` 030404\0` — every test passes, and
+/// the genuine header was judged a copy of ITSELF: as the middle of three
+/// entries it vanished from `salvage` at exit 0, with nothing said.
+///
+/// That window is not a header anything could have been copied from. Its
+/// name field begins with the `k` bytes BEFORE the genuine header, which in
+/// an archive are the previous entry's zero padding, so it names nothing —
+/// gate criterion 5, which every header this module reports must clear. A
+/// real twin's source is a real header, and it names something: the damage
+/// that leaves a checksum-valid twin behind is damage in the `k` bytes the
+/// twin does not contain — the start of the source's name. So the earlier
+/// block must name something too.
+///
+/// **The residual this costs**, stated: that damage empties the source's
+/// name only by writing a NUL into byte 0. A v7 header whose byte 0 became
+/// NUL, and whose one-byte-late copy also passes the checksum spelling (only
+/// the `%07o\0` + space-typeflag shape does, and no measured writer writes a
+/// space typeflag), is no longer recognised as a copy. With a `ustar` or junk
+/// magic the copy is refused by the magic alone either way, so there the cost
+/// is a sighting, never a row.
+///
+/// When the bytes before the genuine header are payload rather than padding,
+/// the window DOES name something and the header is still refused;
+/// [`salvage_tar`] reports that refusal as a [`Sighting`] when the header
+/// sits on the recovered entries' block grid, which a real copy never does
+/// (`UngateableSightings::into_sightings`).
 fn looks_like_a_shifted_twin(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> bool {
     (1..=7u64).any(|k| {
         offset
@@ -422,6 +465,7 @@ fn looks_like_a_shifted_twin(src: &mut dyn SeekRead, offset: u64, file_len: u64)
                     && magic_is_ustar_or_blank(&b)
                     && earlier.mode().is_ok()
                     && earlier.entry_size().is_ok()
+                    && !earlier.path_bytes().is_empty()
             })
     })
 }
@@ -440,47 +484,72 @@ enum Ungateable {
     UnrecognisedV7Spelling,
 }
 
-/// What the scan saw and could not gate, counted per shape. Counted, never
-/// listed as a candidate: a candidate would be advanced past by its declared
-/// length (`salvage.rs`'s `collect_candidates`), and that is how a phantom
-/// used to jump the scan past a real header.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+impl Ungateable {
+    /// The phrase for this shape, shared by the exit-3 refusal and the
+    /// [`Sighting`] a mixed run reports, so the two cannot describe one shape
+    /// two ways.
+    fn shape(self) -> &'static str {
+        match self {
+            Ungateable::UnrecognisedMagic => UNRECOGNISED_MAGIC_SHAPE,
+            Ungateable::UnrecognisedV7Spelling => UNRECOGNISED_V7_SPELLING_SHAPE,
+        }
+    }
+}
+
+/// [`Ungateable::UnrecognisedMagic`]'s phrase.
+const UNRECOGNISED_MAGIC_SHAPE: &str =
+    "header(s) whose magic field (bytes 257..265) is neither `ustar` nor blank";
+
+/// [`Ungateable::UnrecognisedV7Spelling`]'s phrase.
+const UNRECOGNISED_V7_SPELLING_SHAPE: &str = "pre-POSIX (v7) header(s) whose checksum field is \
+     not spelled the way any tar writer this build knows spells it";
+
+/// The phrase for a block refused as a shifted copy that sits on the
+/// recovered entries' own block boundaries — see
+/// [`UngateableSightings::into_sightings`].
+const POSSIBLE_SHIFTED_COPY_SHAPE: &str = "header(s) that read as a copy of another seen up to \
+     seven bytes earlier, yet sit on the block boundaries of the entries recovered around them";
+
+/// What the scan saw and could not gate, with where. Never listed as a
+/// candidate: a candidate would be advanced past by its declared length
+/// (`salvage.rs`'s `collect_candidates`), and that is how a phantom used to
+/// jump the scan past a real header.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct UngateableSightings {
-    unrecognised_magic: u64,
-    unrecognised_v7_spelling: u64,
+    /// Every ungateable header, in scan order.
+    seen: Vec<(u64, Ungateable)>,
+    /// Every block with a header's structure (checksum, size, name) that
+    /// was refused ONLY because [`looks_like_a_shifted_twin`] matched it.
+    /// Most are real copies and are dropped; see [`Self::into_sightings`]
+    /// for the ones that are not.
+    copies: Vec<u64>,
 }
 
 impl UngateableSightings {
-    fn record(&mut self, kind: Ungateable) {
-        match kind {
-            Ungateable::UnrecognisedMagic => self.unrecognised_magic += 1,
-            Ungateable::UnrecognisedV7Spelling => self.unrecognised_v7_spelling += 1,
-        }
+    fn any(&self) -> bool {
+        !self.seen.is_empty()
     }
 
-    fn any(self) -> bool {
-        self.unrecognised_magic > 0 || self.unrecognised_v7_spelling > 0
+    /// How many of `kind` were seen.
+    fn count(&self, kind: Ungateable) -> usize {
+        self.seen.iter().filter(|(_, k)| *k == kind).count()
     }
 
     /// The sentence a run reports when it recovered nothing and saw one of
     /// these — naming the shape, and saying that the ordinary verbs still
     /// read the archive, which is the whole difference from "nothing
     /// recoverable".
-    fn refusal(self) -> String {
-        let mut shapes: Vec<String> = Vec::new();
-        if self.unrecognised_magic > 0 {
-            shapes.push(format!(
-                "{} header(s) whose magic field (bytes 257..265) is neither `ustar` nor blank",
-                self.unrecognised_magic
-            ));
-        }
-        if self.unrecognised_v7_spelling > 0 {
-            shapes.push(format!(
-                "{} pre-POSIX (v7) header(s) whose checksum field is not spelled the way any \
-                 tar writer this build knows spells it",
-                self.unrecognised_v7_spelling
-            ));
-        }
+    fn refusal(&self) -> String {
+        let shapes: Vec<String> = [
+            Ungateable::UnrecognisedMagic,
+            Ungateable::UnrecognisedV7Spelling,
+        ]
+        .into_iter()
+        .filter_map(|kind| {
+            let n = self.count(kind);
+            (n > 0).then(|| format!("{n} {}", kind.shape()))
+        })
+        .collect();
         format!(
             "this build's tar salvage scanner found {} — each with a checksum that agrees, but \
              in a shape it has no gate for, because a header seen one byte late takes exactly \
@@ -488,6 +557,46 @@ impl UngateableSightings {
              `stuffr unpack` read these headers normally, and it is the SCAN that stops here",
             shapes.join(" and ")
         )
+    }
+
+    /// The [`Sighting`]s a run that recovered `entries` reports (Task 2-N):
+    /// every ungateable header, and every refused copy that sits on the
+    /// block boundaries of a recovered entry.
+    ///
+    /// **Why the boundary decides it.** Every header of one tar is a whole
+    /// number of blocks from every other, so a genuine header lies on the
+    /// recovered entries' 512-byte grid, and the copy of a damaged genuine
+    /// header lies 1..7 bytes OFF it — its source is the one on the grid. A
+    /// block the twin check refused that is ON the grid is therefore the
+    /// genuine header the check could not tell from the window before it
+    /// (N1's second shape), not a copy, and it must be reported rather than
+    /// vanish. It is still never listed: nothing in its bytes says which of
+    /// the two it is, only its position does, and a position is not a gate.
+    ///
+    /// A run that recovered nothing has no grid, so no copy is reported
+    /// there, and an archive whose only header is damaged still holds
+    /// nothing recoverable (exit 5) rather than a sighting (exit 3).
+    fn into_sightings(self, entries: &[SalvagedEntry]) -> Vec<Sighting> {
+        // One flag per position within a block, set once: a lookup per copy
+        // rather than a pass over every entry for each one.
+        let mut grid = [false; BLOCK];
+        for entry in entries {
+            grid[(entry.offset % BLOCK_U64) as usize] = true;
+        }
+        let on_grid = |offset: u64| grid[(offset % BLOCK_U64) as usize];
+        let mut sightings: Vec<Sighting> = self
+            .seen
+            .into_iter()
+            .map(|(offset, kind)| Sighting::new(TAR, offset, kind.shape()))
+            .chain(
+                self.copies
+                    .into_iter()
+                    .filter(|&offset| on_grid(offset))
+                    .map(|offset| Sighting::new(TAR, offset, POSSIBLE_SHIFTED_COPY_SHAPE)),
+            )
+            .collect();
+        sightings.sort_by_key(|s| s.offset);
+        sightings
     }
 }
 
@@ -571,7 +680,13 @@ impl SalvageScan for TarSalvage {
                 }
                 // Counted, not reported — see `UngateableSightings`.
                 Scanned::Ungateable(kind) => {
-                    self.seen.record(kind);
+                    self.seen.seen.push((offset, kind));
+                    search_from = offset + 1;
+                }
+                // Kept aside, and decided once the scan is over — see
+                // `UngateableSightings::into_sightings`.
+                Scanned::Copy => {
+                    self.seen.copies.push(offset);
                     search_from = offset + 1;
                 }
                 // A checksum-valid block the rest of the gate refused, or an
@@ -794,6 +909,10 @@ enum Scanned {
     /// A checksum-valid block refused by criterion 3 alone, with a size and a
     /// name, that is not a shifted copy of a real header — Ruling 3-J.
     Ungateable(Ungateable),
+    /// The same, except that it DOES look like a shifted copy of a header up
+    /// to seven bytes earlier — the one refusal whose verdict waits for the
+    /// end of the scan (Task 2-N, N1).
+    Copy,
     NotAHeader,
 }
 
@@ -804,8 +923,7 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Scan
         && header_checksum_agrees(&block)
         && !clears_criterion_3(src, offset, file_len, &block)
     {
-        return sighting_at(src, offset, file_len, &block)
-            .map_or(Scanned::NotAHeader, Scanned::Ungateable);
+        return sighting_at(src, offset, file_len, &block);
     }
     gate_chain_at(src, offset, file_len)
         .map_or(Scanned::NotAHeader, |found| Scanned::Found(Box::new(found)))
@@ -813,23 +931,20 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Scan
 
 /// Whether a checksum-valid block that criterion 3 refused is an ungateable
 /// SIGHTING: it must carry the structure a header needs (a size that parses
-/// and a name), and it must not be a shifted copy of a real header.
-fn sighting_at(
-    src: &mut dyn SeekRead,
-    offset: u64,
-    file_len: u64,
-    block: &[u8; BLOCK],
-) -> Option<Ungateable> {
+/// and a name), and it must not be a shifted copy of a real header — or, if
+/// it looks like one, it is a [`Scanned::Copy`], whose verdict waits for the
+/// end of the scan.
+fn sighting_at(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8; BLOCK]) -> Scanned {
     let header = tar::Header::from_byte_slice(block);
     if header.entry_size().is_err() || header.path_bytes().is_empty() {
-        return None;
+        return Scanned::NotAHeader;
     }
     if looks_like_a_shifted_twin(src, offset, file_len) {
-        return None;
+        return Scanned::Copy;
     }
     // Reached only for a block criterion 3 refused and that is no twin, so a
     // blank magic here means an unmeasured checksum spelling.
-    Some(if magic_is_blank(block) {
+    Scanned::Ungateable(if magic_is_blank(block) {
         Ungateable::UnrecognisedV7Spelling
     } else {
         Ungateable::UnrecognisedMagic
@@ -1051,7 +1166,7 @@ pub fn write_payload(
 /// reconcile against: tar has none, so the raw scan is the only source.
 pub fn salvage_tar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
     let mut scanner = TarSalvage::new();
-    let outcome = salvage_all(&mut scanner, src, policy)?;
+    let mut outcome = salvage_all(&mut scanner, src, policy)?;
 
     // **Ruling 3-J** — this scanner's Ruling S-V. A run that recovered
     // NOTHING while recognising a header shape it cannot gate must not fall
@@ -1061,10 +1176,13 @@ pub fn salvage_tar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     //
     // **Only when nothing came back** (Ruling S-X): an `Err` discards every
     // entry the run recovered, so a run that got something reports it at its
-    // ordinary exit code.
+    // ordinary exit code — and, since Task 2-N, carries what it saw and could
+    // not gate as `sightings`, which the caller prints. Before that, a mixed
+    // run said nothing at all about an entry `stuffr list` shows.
     if outcome.entries.is_empty() && scanner.seen.any() {
         return Err(Error::Unsupported(scanner.seen.refusal()));
     }
+    outcome.sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
     Ok(outcome)
 }
 
@@ -1076,6 +1194,8 @@ mod tests {
     use stuffr_core::{
         Container, CreateOpts, EntryKind, OpenOpts, PlainSink, ReaderSource, Source, StreamPolicy,
     };
+
+    use stuffr_core::salvage::describe_sightings;
 
     use super::*;
     use crate::tar::{TAR, Tar};
@@ -1996,6 +2116,11 @@ mod tests {
             ],
             "the damaged entry is lost and nothing else is — no `.txt` twin, and `c.txt` found"
         );
+        assert!(
+            out.sightings.is_empty(),
+            "a shifted copy is never a sighting: {:?}",
+            out.sightings
+        );
         let written = write_back(&damaged, &out);
         assert_eq!(written[0], (b"2nd line\n".to_vec(), true));
         assert_eq!(written[1], (b"third\n".to_vec(), true));
@@ -2150,7 +2275,146 @@ mod tests {
             let out = salvage_tar(&mut Cursor::new(bytes.clone()), &SalvagePolicy::default())
                 .unwrap_or_else(|e| panic!("{label}: a twin is not a sighting: {e}"));
             assert!(out.entries.is_empty(), "{label}: {:?}", out.entries);
+            assert!(out.sightings.is_empty(), "{label}: {:?}", out.sightings);
         }
+    }
+
+    /// Task 2-N, N3: in a MIXED run a sighting used to be completely silent —
+    /// the `JUNKJUNK` header `stuffr list` reads was simply absent, at exit
+    /// 0, with nothing said. The run still reports what it got at its
+    /// ordinary code (Ruling S-X), and the outcome now carries the sighting,
+    /// with where it was, for the caller to print. Still never a row.
+    #[test]
+    fn a_mixed_run_carries_its_sightings_and_still_lists_none_of_them() {
+        let mut bytes = v7_block("j.txt", 4, V7_GNU_SPELLING, *b"JUNKJUNK").to_vec();
+        bytes.extend_from_slice(&padded(b"junk"));
+        bytes.extend_from_slice(&files(&[("ok.txt", b"fine")]));
+        assert_eq!(read_through_the_reader(&bytes).unwrap().len(), 2);
+
+        let out = scan(&bytes);
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.status))
+                .collect::<Vec<_>>(),
+            vec![("ok.txt", SalvageStatus::Complete)]
+        );
+        assert_eq!(
+            out.sightings,
+            vec![Sighting::new(TAR, 0, UNRECOGNISED_MAGIC_SHAPE)]
+        );
+        let note = describe_sightings(&out.sightings).expect("a sighting has a note");
+        assert!(
+            note.contains("offset(s) 0") && note.contains("stuffr list"),
+            "{note}"
+        );
+
+        // And a healthy archive carries none — the note must never fire on
+        // an archive with nothing wrong in it.
+        let healthy = files(&[("a.txt", b"alpha"), ("b.txt", b"beta")]);
+        assert!(scan(&healthy).sightings.is_empty());
+        let v7 = v7_archive(&[("a.txt", b"1st line\n")], V7_GNU_SPELLING);
+        assert!(scan(&v7).sightings.is_empty());
+    }
+
+    /// Task 2's re-review, N1: a v7 header laid out with `pax -x ustar`'s
+    /// space-terminated numeric fields, a 100-byte name ending in an octal
+    /// digit, and a measured `%06o\0 ` checksum. The window one byte before
+    /// it then reads as a header of its own — mode `70000644`, size
+    /// ` 00000000004`, checksum ` 030404\0` (spelled), blank magic — so the
+    /// twin check judged the genuine header a shifted copy of ITSELF.
+    /// Hand-built; no writer on this machine produces it.
+    fn self_twin_block(size: u64) -> [u8; BLOCK] {
+        let mut b = [0u8; BLOCK];
+        b[..100].copy_from_slice(format!("{}7", "m".repeat(99)).as_bytes());
+        b[100..108].copy_from_slice(b"0000644 ");
+        b[108..116].copy_from_slice(b"0000000 ");
+        b[116..124].copy_from_slice(b"0000000 ");
+        b[124..136].copy_from_slice(format!("{size:011o} ").as_bytes());
+        b[136..148].copy_from_slice(b"14727046122 ");
+        b[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN].fill(b' ');
+        let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+        b[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN].copy_from_slice(&V7_GNU_SPELLING(sum));
+        b
+    }
+
+    /// `first`'s payload, then [`self_twin_block`] holding `middle`, then
+    /// `third.txt`, as one v7 archive.
+    fn self_twin_archive(first: &[u8], middle: &[u8]) -> (Vec<u8>, u64) {
+        let mut bytes = v7_block("first.txt", first.len() as u64, V7_GNU_SPELLING, [0; 8]).to_vec();
+        bytes.extend_from_slice(&padded(first));
+        let middle_at = bytes.len() as u64;
+        bytes.extend_from_slice(&self_twin_block(middle.len() as u64));
+        bytes.extend_from_slice(&padded(middle));
+        bytes.extend_from_slice(&v7_block("third.txt", 6, V7_GNU_SPELLING, [0; 8]));
+        bytes.extend_from_slice(&padded(b"third\n"));
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+        (bytes, middle_at)
+    }
+
+    /// N1, the reviewer's reproducer: as the middle of three entries, `list`
+    /// read all three and `salvage` returned two at exit 0 with nothing said.
+    /// A window whose name field begins in the previous entry's zero padding
+    /// names nothing, so it is no header a copy could have been taken from —
+    /// and the genuine header is recovered, `Complete`, with its own bytes.
+    #[test]
+    fn a_genuine_v7_header_is_never_judged_a_copy_of_itself() {
+        let (bytes, middle_at) = self_twin_archive(b"first\n", b"midd");
+        let window = &bytes[middle_at as usize - 1..middle_at as usize - 1 + BLOCK];
+        let seen_early = tar::Header::from_byte_slice(window);
+        assert!(
+            spelled_like_a_writer(&window[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN])
+                && seen_early.mode().is_ok()
+                && seen_early.entry_size().is_ok(),
+            "the fixture must really carry the window the old twin check matched"
+        );
+        let reader = read_through_the_reader(&bytes).expect("the reader accepts it");
+        assert_eq!(reader.len(), 3);
+
+        let out = scan(&bytes);
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.clone(), e.status))
+                .collect::<Vec<_>>(),
+            reader
+                .iter()
+                .map(|(n, _, _, _)| (n.clone(), SalvageStatus::Complete))
+                .collect::<Vec<_>>()
+        );
+        assert!(out.sightings.is_empty(), "{:?}", out.sightings);
+        let written = write_back(&bytes, &out);
+        assert_eq!(written[1], (b"midd".to_vec(), true));
+    }
+
+    /// N1's other half. When the byte before the genuine header is payload,
+    /// not padding, the window one byte earlier DOES name something, and
+    /// nothing in these bytes says which of the two is the copy — so the
+    /// header is still refused. But a real shifted copy sits 1..7 bytes off
+    /// the block boundaries of the archive it came from, and this one sits
+    /// ON the boundaries of the entry recovered before it: it is counted as
+    /// a sighting, which the run reports, instead of vanishing.
+    #[test]
+    fn a_header_refused_as_a_copy_on_the_archive_s_own_boundary_is_a_sighting() {
+        let first = vec![b'x'; BLOCK];
+        let (bytes, middle_at) = self_twin_archive(&first, b"midd");
+        assert_eq!(read_through_the_reader(&bytes).unwrap().len(), 3);
+
+        let out = scan(&bytes);
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("first.txt", SalvageStatus::Complete),
+                ("third.txt", SalvageStatus::Complete)
+            ]
+        );
+        assert_eq!(
+            out.sightings,
+            vec![Sighting::new(TAR, middle_at, POSSIBLE_SHIFTED_COPY_SHAPE)]
+        );
     }
 
     /// **The witness for the spelling rule.** Every v7-capable writer on this
@@ -2250,6 +2514,7 @@ mod tests {
                 ],
                 "{writer}: a destroyed first header must cost that entry and nothing else"
             );
+            assert!(out.sightings.is_empty(), "{writer}: {:?}", out.sightings);
             let written = write_back(&damaged, &out);
             assert_eq!(written[0], (b"2nd line\n".to_vec(), true), "{writer}");
             assert_eq!(written[1], (b"third\n".to_vec(), true), "{writer}");
