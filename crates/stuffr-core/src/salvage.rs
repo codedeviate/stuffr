@@ -742,19 +742,25 @@ pub struct WalkStop {
     pub cause: String,
 }
 
-/// The two stops a sequential walk can make, told apart by a measurement
-/// rather than a guess: whether enough bytes remain after the stop point for
-/// ANY further record to exist.
+/// The three stops a sequential walk can make, each told apart by what the
+/// scanner measured rather than guessed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkStopKind {
-    /// Fewer bytes remain than the format's smallest record header. The file
-    /// is cut short there, and no entry can be hiding after the stop point
-    /// — the common damage, and the one a sequential walk handles fully.
+    /// The file ends inside the record at the stop point — the reader ran
+    /// out of bytes mid-record, or fewer bytes remain than the format's
+    /// smallest record header. Everything from the stop point on belongs to
+    /// that incomplete record, so no entry can be hiding after it — the
+    /// common damage, and the one a sequential walk handles fully.
     CutShort,
     /// Enough bytes remain to hold further records, and the walk could not
     /// read the one at the stop point. Whatever those bytes hold is
     /// unreachable by construction.
     Unreadable,
+    /// The record at the stop point is one the scanner RECOGNISES — its
+    /// [`WalkStop::cause`] names it — in a shape this build cannot read (Task
+    /// 4 fix round 1: GNU `ar`'s Mach-O `__.SYMDEF` with a blank mode). Not
+    /// evidence of damage; what follows is unreachable to this scanner.
+    UnsupportedShape,
 }
 
 impl WalkStop {
@@ -777,13 +783,22 @@ impl WalkStop {
 
 /// The one sentence a caller prints for a [`WalkStop`] — written here, once,
 /// so every sequential-only scanner gets the same report without a line of
-/// its own, and so its two kinds can never be described four ways.
+/// its own, and so its kinds can never be described two ways each.
 ///
 /// An [`WalkStopKind::Unreadable`] stop says the entries after it are
 /// *unreachable by construction, not absent*, with the offset and the byte
 /// count; a [`WalkStopKind::CutShort`] one says that nothing after it is
-/// missing from the report, which is exactly as true — too few bytes remain
-/// for any further record.
+/// missing from the report, which is exactly as true — the file ended inside
+/// that record; an [`WalkStopKind::UnsupportedShape`] one names the shape and
+/// says it is not evidence of damage.
+///
+/// Two of the sentences say the walk goes "as `stuffr list` does". That is a
+/// contract on every scanner that reports a [`WalkStop`]: it walks with its
+/// format's ORDINARY reader, over the file's own bytes, repairing none of
+/// them. `ar`'s walk served its global header as `!<arch>\n` until Stage 3
+/// Task 4's fix round 1, which made the phrase false (a bad magic `list`
+/// refuses was walked past) — a scanner that needs a repair like that must
+/// get its own sentence here rather than borrow this one.
 pub fn describe_walk_stop(stop: &WalkStop) -> String {
     let WalkStop {
         format,
@@ -801,6 +816,13 @@ pub fn describe_walk_stop(stop: &WalkStop) -> String {
              to search for, so the scanner cannot find its way past a record it cannot read; \
              any entries in those {remaining} {bytes} are unreachable by construction — not \
              absent, and not counted in this report"
+        ),
+        WalkStopKind::UnsupportedShape => format!(
+            "this build's {format} salvage scanner walks the archive in order from its start, \
+             as `stuffr list` does, and stopped at offset {offset} with {remaining} {bytes} still \
+             to go: {cause}. That is a record shape this build does not read, not evidence of \
+             damage; any entries in those {remaining} {bytes} are unreachable to this scanner \
+             and not counted in this report"
         ),
         WalkStopKind::CutShort => format!(
             "this build's {format} salvage scanner walks the archive in order from its start, \
@@ -2133,5 +2155,15 @@ mod tests {
         assert!(cut.contains("1 byte into the record at offset 90"), "{cut}");
         assert!(cut.contains("cut short"), "{cut}");
         assert!(!cut.contains("unreachable"), "{cut}");
+        let shape = describe_walk_stop(&WalkStop::new(
+            f,
+            8,
+            600,
+            WalkStopKind::UnsupportedShape,
+            "the symbol table",
+        ));
+        assert!(shape.contains("the symbol table"), "{shape}");
+        assert!(shape.contains("not evidence of damage"), "{shape}");
+        assert!(!shape.contains("unreachable by construction"), "{shape}");
     }
 }
