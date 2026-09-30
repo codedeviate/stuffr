@@ -27,9 +27,10 @@
 //! - **A truncated tail — the common damage — is recovered fully.** Every
 //!   member before the cut is reported `Unattested`; a member whose payload
 //!   the cut runs through is `Partial` and its genuine surviving prefix is
-//!   written as `NAME.partial`, never padded; a cut inside a member HEADER
-//!   ends the walk with a [`WalkStopKind::CutShort`] stop, since fewer bytes
-//!   remain than any further member would need.
+//!   written as `NAME.partial`, never padded; a cut inside a member's
+//!   HEADER, its BSD `#1/N` name or a GNU `//` table ends the walk with a
+//!   [`WalkStopKind::CutShort`] stop — the reader ran out of bytes inside
+//!   that record, so nothing can follow it.
 //! - **A hole in the middle cannot be survived.** The walk stops at the
 //!   first header that does not read, and every member after it is
 //!   **unreachable by construction — not absent**. The run says exactly
@@ -64,11 +65,24 @@
 //! everything read before it is reported. Only a failure of the SOURCE itself
 //! (an I/O error no archive's bytes can produce) is an `Err`.
 //!
-//! The eight-byte global header `!<arch>\n` is the one thing this walk does
-//! NOT take from the file: it carries no information, and requiring it
-//! would make a destroyed first eight bytes cost every member behind them.
-//! Format detection still keys on it, so reaching an archive whose magic is
-//! damaged needs `--format ar`.
+//! **Two refusals are claims about this BUILD, exit 3, never a stop over a
+//! possibly healthy archive** (fix round 1):
+//!
+//! - A GNU **thin** archive (`!<thin>\n`) keeps each member's content in a
+//!   separate file, so the bytes after a header are the next header. Walked
+//!   as an ordinary archive, they would be written as a member's content.
+//! - A **symbol table** (`/`, `/SYM64/`, `__.SYMDEF`, `__.SYMDEF SORTED`)
+//!   whose header `ar 0.9.0` cannot parse — GNU `ar rcs` on Mach-O writes
+//!   `__.SYMDEF` with a blank mode, which the crate refuses — ends the walk
+//!   with a [`WalkStopKind::UnsupportedShape`] stop naming it; with nothing
+//!   recovered before it, the run is exit 3 rather than "nothing
+//!   recoverable". `stuffr list` still refuses that archive (a separate
+//!   follow-up).
+//!
+//! Any other global header that is not `!<arch>\n` is the ordinary reader's
+//! refusal: a stop at offset 0 and nothing recovered. An earlier version
+//! served `!<arch>\n` whatever the file held; that fabricated member content
+//! from thin archives, and was removed.
 //!
 //! # `ar` is `Unattested`, never `Complete`
 //!
@@ -105,9 +119,7 @@ use stuffr_core::salvage::{
 };
 use stuffr_core::{Error, FormatId, Result, SeekRead};
 
-use crate::ar::{
-    AR, AR_ENTRY_HEADER_LEN, ArGuardedReader, GLOBAL_HEADER, GuardObserver, entry_meta,
-};
+use crate::ar::{AR, AR_ENTRY_HEADER_LEN, ArGuardedReader, GuardObserver, entry_meta};
 
 /// The codec an `ar` member carries in [`stuffr_core::EntryMeta::codec`].
 /// **Setting it at all is load-bearing**: `entries.rs` hands it to
@@ -154,9 +166,12 @@ impl GuardObserver for SharedMarks {
 
 /// The source as the walk reads it: the file from offset 0, counting what it
 /// hands out (the guard reads exactly what the crate consumes, so after
-/// `next_entry` returns a member this is that member's payload offset), and
-/// with the global header served as `!<arch>\n` whatever the file holds
-/// there — see the module doc.
+/// `next_entry` returns a member this is that member's payload offset).
+///
+/// It served the global header as `!<arch>\n` whatever the file held until
+/// fix round 1 (I2): those eight bytes carry one fact, `!<thin>\n`, and
+/// overwriting it read a healthy GNU thin archive's next header as a
+/// member's content. The file's own bytes are what the crate sees now.
 struct WalkSource<'a> {
     src: &'a mut dyn SeekRead,
     pos: Rc<Cell<u64>>,
@@ -165,20 +180,60 @@ struct WalkSource<'a> {
 impl Read for WalkSource<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.src.read(buf)?;
-        let start = self.pos.get();
-        for (i, byte) in buf[..n].iter_mut().enumerate() {
-            let at = start + i as u64;
-            match usize::try_from(at)
-                .ok()
-                .and_then(|at| GLOBAL_HEADER.get(at))
-            {
-                Some(&magic) => *byte = magic,
-                None => break,
-            }
-        }
-        self.pos.set(start + n as u64);
+        self.pos.set(self.pos.get() + n as u64);
         Ok(n)
     }
+}
+
+/// A GNU thin archive's global header. Its members' contents live in other
+/// files, named by each header, so the bytes after a header are the NEXT
+/// header — never a payload.
+const THIN_GLOBAL_HEADER: &[u8; 8] = b"!<thin>\n";
+
+/// Every symbol-table member identifier the `ar` variants write: GNU's `/`
+/// and `/SYM64/`, BSD's `__.SYMDEF` and `__.SYMDEF SORTED` (inline or in the
+/// `#1/N` extended form).
+const SYMBOL_TABLE_NAMES: [&str; 4] = ["/", "/SYM64/", "__.SYMDEF", "__.SYMDEF SORTED"];
+
+/// The longest `#1/N` name worth reading to recognise a symbol table — the
+/// longest of [`SYMBOL_TABLE_NAMES`] rounded up to the four-byte padding BSD
+/// writers use, with room to spare. A longer name is no symbol table.
+const MAX_SYMBOL_TABLE_EXTENDED_LEN: u64 = 64;
+
+/// Which symbol table, if any, the member header at `offset` names. Read
+/// straight from the file, after the walk has stopped there: the crate
+/// refused the header, so there is no parsed identifier to consult.
+fn symbol_table_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<&'static str> {
+    let header = read_at(src, offset, AR_ENTRY_HEADER_LEN as u64, file_len)?;
+    let mut identifier = header[..16].to_vec();
+    while identifier.last() == Some(&b' ') {
+        identifier.pop();
+    }
+    if let Some(len) = identifier.strip_prefix(b"#1/") {
+        let len: u64 = std::str::from_utf8(len).ok()?.trim_end().parse().ok()?;
+        if len > MAX_SYMBOL_TABLE_EXTENDED_LEN {
+            return None;
+        }
+        identifier = read_at(src, offset + AR_ENTRY_HEADER_LEN as u64, len, file_len)?;
+        while identifier.last() == Some(&0) {
+            identifier.pop();
+        }
+    }
+    SYMBOL_TABLE_NAMES
+        .into_iter()
+        .find(|name| name.as_bytes() == identifier.as_slice())
+}
+
+/// `len` bytes at `at`, or `None` if the source does not hold them all (or
+/// cannot be read). Every caller has bounded `len` first.
+fn read_at(src: &mut dyn SeekRead, at: u64, len: u64, file_len: u64) -> Option<Vec<u8>> {
+    if at.checked_add(len)? > file_len {
+        return None;
+    }
+    src.seek(SeekFrom::Start(at)).ok()?;
+    let mut bytes = vec![0u8; usize::try_from(len).ok()?];
+    src.read_exact(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// Everything one walk found: the members, in order, and where it stopped
@@ -189,89 +244,103 @@ struct Walk {
 }
 
 /// Walks every member of the archive in `src`, in order — see the module
-/// doc. `Err` only for a failure of the source itself.
+/// doc. `Err` for a failure of the source itself, and for a GNU thin archive
+/// (exit 3), which is not a shape this walk can read at all.
 fn walk(src: &mut dyn SeekRead) -> Result<Walk> {
     let file_len = src.seek(SeekFrom::End(0))?;
+    if read_at(src, 0, THIN_GLOBAL_HEADER.len() as u64, file_len).as_deref()
+        == Some(THIN_GLOBAL_HEADER.as_slice())
+    {
+        return Err(Error::Unsupported(
+            "this is a GNU thin archive (`!<thin>`): each member's content lives in a \
+             separate file its header names, not in the archive, and this build's ar \
+             salvage does not read thin archives"
+                .to_string(),
+        ));
+    }
     src.seek(SeekFrom::Start(0))?;
     let pos = Rc::new(Cell::new(0u64));
     let marks = SharedMarks::default();
-    let guard = ArGuardedReader::observed(
-        WalkSource {
-            src,
-            pos: Rc::clone(&pos),
-        },
-        marks.clone(),
-    );
-    let mut archive = ar::Archive::new(guard);
     let mut candidates = Vec::new();
-    loop {
-        match archive.next_entry() {
-            None => {
-                return Ok(Walk {
-                    candidates,
-                    stop: None,
-                });
+    // The failure, if the walk stopped early, and the marks at that moment.
+    // Decided after `archive` is gone, since classifying it re-reads the
+    // source the archive borrows.
+    let failure: Option<(io::Error, Marks)> = {
+        let guard = ArGuardedReader::observed(
+            WalkSource {
+                src: &mut *src,
+                pos: Rc::clone(&pos),
+            },
+            marks.clone(),
+        );
+        let mut archive = ar::Archive::new(guard);
+        loop {
+            match archive.next_entry() {
+                None => break None,
+                // Dropped at the end of this arm, which is when the crate
+                // drains whatever of the payload is present — the walk reads
+                // nothing of it itself.
+                Some(Ok(entry)) => {
+                    let header_at = marks.get().header_at;
+                    let payload_start = pos.get();
+                    candidates.push(candidate(
+                        entry.header(),
+                        header_at,
+                        payload_start,
+                        file_len,
+                    ));
+                }
+                Some(Err(e)) => break Some((e, marks.get())),
             }
-            // Dropped at the end of this arm, which is when the crate drains
-            // whatever of the payload is present — the walk reads nothing of
-            // it itself.
-            Some(Ok(entry)) => {
-                let header_at = marks.get().header_at;
-                let payload_start = pos.get();
-                candidates.push(candidate(
-                    entry.header(),
-                    header_at,
-                    payload_start,
-                    file_len,
-                ));
-            }
-            Some(Err(e)) => match e.kind() {
-                // Everything the crate and the guard raise over an archive's
-                // own bytes: a field that does not parse, a bad pad byte or a
-                // `/N` past the name table (`InvalidData`), a ceiling the
-                // guard refused before the crate could allocate
-                // (`OutOfMemory`), and the file ending inside a record
-                // (`UnexpectedEof`).
-                io::ErrorKind::InvalidData
-                | io::ErrorKind::OutOfMemory
-                | io::ErrorKind::UnexpectedEof => {
-                    let at = marks.get();
-                    return Ok(Walk {
-                        candidates,
-                        stop: Some(stop_at(
-                            at.header_at.max(at.record_end),
-                            file_len,
-                            e.to_string(),
-                        )),
-                    });
+        }
+    };
+    let stop = match failure {
+        None => None,
+        Some((e, at)) => {
+            let offset = at.header_at.max(at.record_end);
+            let remaining = file_len.saturating_sub(offset);
+            let cause = e.to_string();
+            let kind = match e.kind() {
+                // The file ended inside the record at `offset` — a cut
+                // header, a cut `#1/N` name, a cut `//` table — so every byte
+                // from there on belongs to that one incomplete record
+                // (fix round 1, I1: this was decided by bytes remaining, and
+                // a cut name after a whole 60-byte header read as a hole).
+                io::ErrorKind::UnexpectedEof => WalkStopKind::CutShort,
+                // A field that does not parse, a bad pad byte or a `/N` past
+                // the name table (`InvalidData`), or a ceiling the guard
+                // refused before the crate could allocate (`OutOfMemory`).
+                io::ErrorKind::InvalidData | io::ErrorKind::OutOfMemory => {
+                    if remaining < AR_ENTRY_HEADER_LEN as u64 {
+                        WalkStopKind::CutShort
+                    } else if e.kind() == io::ErrorKind::InvalidData
+                        && let Some(table) = symbol_table_at(src, offset, file_len)
+                    {
+                        return Ok(Walk {
+                            candidates,
+                            stop: Some(WalkStop::new(
+                                AR,
+                                offset,
+                                remaining,
+                                WalkStopKind::UnsupportedShape,
+                                format!(
+                                    "the archive's symbol table (`{table}`) has a header this \
+                                     build's ar reader cannot parse ({cause})"
+                                ),
+                            )),
+                        });
+                    } else {
+                        WalkStopKind::Unreadable
+                    }
                 }
                 // No archive's bytes produce any other kind: this is the
                 // source failing, which is a fault of the run.
                 _ => return Err(Error::from(e)),
-            },
+            };
+            Some(WalkStop::new(AR, offset, remaining, kind, cause))
         }
-    }
-}
-
-/// The stop for a walk that could not read the record at `offset`.
-///
-/// `offset` is the later of the two marks, which is the record that failed
-/// either way: a header the crate started to read begins at or after the
-/// end of the last record, and when the failure came first — a pad byte
-/// that is not `\n` — no header has started since that record ended, so its
-/// end is where the pad byte sits.
-///
-/// Which kind is a measurement: with fewer bytes left than one member
-/// header, no member can follow, so the file is cut short there; otherwise
-/// those bytes are unreachable.
-fn stop_at(offset: u64, file_len: u64, cause: String) -> WalkStop {
-    let remaining = file_len.saturating_sub(offset);
-    let kind = if remaining < AR_ENTRY_HEADER_LEN as u64 {
-        WalkStopKind::CutShort
-    } else {
-        WalkStopKind::Unreadable
     };
-    WalkStop::new(AR, offset, remaining, kind, cause)
+    Ok(Walk { candidates, stop })
 }
 
 /// The candidate for one member the crate read, with the fields `ar.rs`'s own
@@ -357,6 +426,9 @@ fn verify_candidate(candidate: &Candidate) -> SalvageStatus {
     if candidate.available_len.is_some() {
         SalvageStatus::Partial
     } else if candidate.meta.codec != Some(STORED) {
+        // Unreachable from this scanner's own candidates (`candidate` always
+        // sets `STORED`); kept so a candidate built elsewhere cannot be
+        // called `Unattested` for bytes this writer would refuse.
         SalvageStatus::Unverified(UnverifiedCause::UndecodableMethod)
     } else {
         SalvageStatus::Unattested
@@ -411,7 +483,24 @@ pub fn write_payload(
 pub fn salvage_ar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
     let mut scanner = ArSalvage::new();
     let mut outcome = salvage_all(&mut scanner, src, policy)?;
-    outcome.walk_stop = scanner.stop.take();
+    let stop = scanner.stop.take();
+    // Fix round 1, I3: nothing recovered, and the walk stopped at a record
+    // it RECOGNISES in a shape this build cannot read — a claim about this
+    // BUILD (exit 3), never "nothing recoverable" about the archive (exit 5),
+    // which may be perfectly healthy. A mixed run keeps its ordinary code
+    // and carries the stop for the note (Ruling S-X).
+    if outcome.entries.is_empty()
+        && let Some(stop) = &stop
+        && stop.kind == WalkStopKind::UnsupportedShape
+    {
+        return Err(Error::Unsupported(format!(
+            "this build's ar salvage scanner stopped at offset {} before recovering anything: \
+             {}. That is a shape this build does not read, so this says nothing about damage \
+             — the archive may be perfectly healthy",
+            stop.offset, stop.cause
+        )));
+    }
+    outcome.walk_stop = stop;
     Ok(outcome)
 }
 
@@ -426,7 +515,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::ar::Ar;
+    use crate::ar::{Ar, GLOBAL_HEADER};
 
     fn scan(bytes: &[u8]) -> SalvageOutcome {
         salvage_ar(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
@@ -480,6 +569,22 @@ mod tests {
         if data.len() % 2 == 1 {
             out.push(b'\n');
         }
+        out
+    }
+
+    /// One header alone, with no payload behind it — a thin archive's shape.
+    fn member_header(identifier: &[u8], size: u64) -> Vec<u8> {
+        let mut out = member(identifier, 0, b"");
+        out[48..58].copy_from_slice(format!("{size:<10}").as_bytes());
+        out
+    }
+
+    /// One member whose MODE field is blank, as GNU `ar rcs` writes its
+    /// `__.SYMDEF` on Mach-O (fix round 1, I3) — `ar 0.9.0` requires a
+    /// non-empty octal mode and refuses it.
+    fn blank_mode_member(identifier: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut out = member(identifier, data.len() as u64, data);
+        out[40..48].copy_from_slice(&[b' '; 8]);
         out
     }
 
@@ -753,15 +858,36 @@ mod tests {
         assert!(stop.cause.contains("padding"), "{}", stop.cause);
     }
 
-    /// The global header carries no information, so a destroyed one costs
-    /// nothing — see the module doc.
+    /// Fix round 1, I2: the global header is taken from the file, not
+    /// repaired. A damaged one is the ordinary reader's refusal — a stop at
+    /// offset 0 and nothing recovered — because those eight bytes DO carry a
+    /// fact (`!<thin>\n` is a different format), and overwriting them wrote
+    /// a thin archive's next header as a member's content.
     #[test]
-    fn a_destroyed_global_header_costs_nothing() {
+    fn a_damaged_global_header_is_not_walked_past() {
         let mut bytes = build_ar(&FIVE);
         bytes[..8].copy_from_slice(b"XXXXXXXX");
         let out = scan(&bytes);
-        assert_eq!(out.entries.len(), 5);
-        assert!(out.walk_stop.is_none());
+        assert!(out.entries.is_empty(), "{:?}", names_and_statuses(&out));
+        let stop = out.walk_stop.expect("a stop");
+        assert_eq!(stop.offset, 0);
+        assert!(stop.cause.contains("global header"), "{}", stop.cause);
+    }
+
+    /// A GNU thin archive (`!<thin>\n`) stores only each member's header —
+    /// its content lives in another file — so reading one as an ordinary
+    /// archive reports the next header as a member's bytes. It is a shape
+    /// this build does not read: exit 3, naming it, and nothing written.
+    #[test]
+    fn a_thin_archive_is_refused_at_exit_3_naming_it() {
+        let mut bytes = b"!<thin>\n".to_vec();
+        bytes.extend(member_header(b"a.txt/", 18));
+        bytes.extend(member_header(b"bb.bin/", 7));
+        let err = salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default())
+            .expect_err("a thin archive is refused");
+        assert_eq!(err.exit_code(), 3, "{err}");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert!(err.to_string().contains("thin"), "{err}");
     }
 
     /// Fewer than eight bytes: the file ends inside the global header, which
@@ -964,6 +1090,131 @@ mod tests {
         );
     }
 
+    /// Fix round 1, I1: a cut anywhere inside a BSD `#1/N` extended NAME, or
+    /// inside a GNU `//` long-name table, is the file ending inside that
+    /// record — `CutShort`, never "unreachable". `FIVE`'s short names never
+    /// reached either shape, which is how the first sweep missed it.
+    #[test]
+    fn a_cut_inside_an_extended_name_or_a_name_table_is_cut_short() {
+        let bsd = build_ar(&[
+            ("a.txt", b"alpha"),
+            ("an-extended-name-past-sixteen-bytes.txt", b"payload"),
+        ]);
+        let last = bsd
+            .windows(3)
+            .rposition(|w| w == b"#1/")
+            .expect("the long name is stored `#1/N`");
+        let payload = bsd.windows(7).rposition(|w| w == b"payload").unwrap();
+        let table = "first-long-member-name.o/\nsecond-long-member-name.o/\n";
+        let mut gnu = GLOBAL_HEADER.to_vec();
+        let table_at = gnu.len();
+        gnu.extend(member(b"//", table.len() as u64, table.as_bytes()));
+        gnu.extend(member(b"/0", 2, b"AA"));
+        for (label, bytes, from, to) in [
+            ("bsd #1/N", &bsd, last + 1, payload),
+            ("gnu //", &gnu, table_at + 1, table_at + 60 + table.len()),
+        ] {
+            for cut in from..to {
+                let out = scan(&bytes[..cut]);
+                if let Some(stop) = &out.walk_stop {
+                    assert_eq!(
+                        stop.kind,
+                        WalkStopKind::CutShort,
+                        "{label} cut {cut}: {}",
+                        describe_walk_stop(stop)
+                    );
+                    assert!(!describe_walk_stop(stop).contains("unreachable"));
+                }
+            }
+        }
+    }
+
+    /// Fix round 1, I3: a symbol table whose header `ar 0.9.0` cannot parse
+    /// is a shape this build does not read. With nothing recovered before
+    /// it, exit 3 naming it — never exit 5 "nothing recoverable" over a
+    /// healthy archive.
+    #[test]
+    fn an_unparseable_symbol_table_first_is_exit_3_naming_it() {
+        for ident in [&b"__.SYMDEF"[..], b"__.SYMDEF SORTED"] {
+            let mut bytes = GLOBAL_HEADER.to_vec();
+            bytes.extend(blank_mode_member(ident, b"\0\0\0\0"));
+            bytes.extend(member(b"f.o", 3, b"fff"));
+            let err = salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default())
+                .expect_err("an unreadable symbol table with nothing before it is exit 3");
+            assert_eq!(err.exit_code(), 3, "{err}");
+            let name = std::str::from_utf8(ident).unwrap();
+            assert!(err.to_string().contains(name), "{err}");
+            assert!(err.to_string().contains("symbol table"), "{err}");
+        }
+        // The same table in the `#1/N` extended form BSD tools also write.
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        let mut ext = b"__.SYMDEF SORTED".to_vec();
+        ext.resize(20, 0);
+        let mut body = ext.clone();
+        body.extend_from_slice(b"\0\0\0\0");
+        let mut id = b"#1/".to_vec();
+        id.extend_from_slice(format!("{:<13}", 20).as_bytes());
+        bytes.extend(blank_mode_member(&id, &body));
+        let err =
+            salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default()).expect_err("exit 3");
+        assert_eq!(err.exit_code(), 3, "{err}");
+        assert!(err.to_string().contains("__.SYMDEF SORTED"), "{err}");
+    }
+
+    /// With members recovered before it, the stop names the symbol table as
+    /// its cause rather than calling it a hole.
+    #[test]
+    fn an_unparseable_symbol_table_after_members_is_named_in_the_stop() {
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend(member(b"a.o", 2, b"aa"));
+        let at = bytes.len() as u64;
+        bytes.extend(blank_mode_member(b"__.SYMDEF", b"\0\0\0\0"));
+        bytes.extend(member(b"b.o", 2, b"bb"));
+        let out = scan(&bytes);
+        assert_eq!(out.entries.len(), 1);
+        let stop = out.walk_stop.expect("a stop");
+        assert_eq!(stop.offset, at);
+        let note = describe_walk_stop(&stop);
+        assert!(note.contains("symbol table (`__.SYMDEF`)"), "{note}");
+        assert!(note.contains("not evidence of damage"), "{note}");
+        assert!(!note.contains("unreachable by construction"), "{note}");
+    }
+
+    /// The real writer behind I3, when this machine has it: GNU `ar rcs`
+    /// over Mach-O objects writes a `__.SYMDEF` with a blank mode. Needs the
+    /// keg-only GNU `ar` and a C compiler; the hand-built fixtures above pin
+    /// the same shape everywhere else.
+    #[test]
+    fn gnu_ar_s_mach_o_symbol_table_is_exit_3_not_5() {
+        let gnu = std::path::PathBuf::from("/opt/homebrew/opt/binutils/bin/ar");
+        let (true, Some(cc)) = (gnu.is_file(), which("cc")) else {
+            return;
+        };
+        let dir = tempfile_dir("symdef");
+        std::fs::write(dir.0.join("f.c"), "int f(void){return 1;}\n").unwrap();
+        let compiled = std::process::Command::new(cc)
+            .args(["-c", "-o", "f.o", "f.c"])
+            .current_dir(&dir.0)
+            .status()
+            .unwrap();
+        assert!(compiled.success());
+        let made = std::process::Command::new(&gnu)
+            .args(["rcs", "lib.a", "f.o"])
+            .current_dir(&dir.0)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let bytes = std::fs::read(dir.0.join("lib.a")).unwrap();
+        if !bytes[8..].starts_with(b"__.SYMDEF") {
+            // Not the Mach-O shape (an ELF host writes `/`); nothing to pin.
+            return;
+        }
+        let err = salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default())
+            .expect_err("GNU's Mach-O symbol table is a shape this build does not read");
+        assert_eq!(err.exit_code(), 3, "{err}");
+        assert!(err.to_string().contains("__.SYMDEF"), "{err}");
+    }
+
     // -------------------------------------------------------------------
     // Reference writers — the independent witnesses
     // -------------------------------------------------------------------
@@ -1019,17 +1270,22 @@ mod tests {
         let system = which("ar").unwrap_or_else(|| {
             panic!("no reference `ar` on PATH — this test proved nothing, which is worth knowing")
         });
-        let mut writers = vec![system];
+        // `(writer, extra args, must write a GNU `//` table)`. The keg-only GNU
+        // `ar` on macOS writes BSD `#1/N` names for its Mach-O default target
+        // (fix round 1, I4: measured — this leg covered `#1/N` twice), so it
+        // is asked for an ELF target, which writes a real `//` table.
+        let mut writers: Vec<(std::path::PathBuf, Vec<&str>, bool)> = vec![(system, vec![], false)];
         let gnu = std::path::PathBuf::from("/opt/homebrew/opt/binutils/bin/ar");
         if gnu.is_file() {
-            writers.push(gnu);
+            writers.push((gnu, vec!["--target=elf64-x86-64"], true));
         }
-        for writer in &writers {
+        for (writer, extra, gnu_table) in &writers {
             let archive = tree.0.join("ref.a");
             let _ = std::fs::remove_file(&archive);
             // `S`: no symbol table — see `ar.rs`'s `we_accept_what_system_ar_writes`
             // for what macOS's `ar` does to non-object files without it.
             let status = std::process::Command::new(writer)
+                .args(extra)
                 .arg("rcS")
                 .arg(&archive)
                 .args(contents.iter().map(|(n, _)| *n))
@@ -1038,6 +1294,14 @@ mod tests {
                 .unwrap();
             assert!(status.success(), "{} could not write", writer.display());
             let bytes = std::fs::read(&archive).unwrap();
+            if *gnu_table {
+                assert_eq!(
+                    &bytes[8..10],
+                    b"//",
+                    "{} did not write a GNU long-name table",
+                    writer.display()
+                );
+            }
             let out = scan(&bytes);
             assert!(
                 out.walk_stop.is_none(),

@@ -806,10 +806,15 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   Two members of five means the other three were never reached, not that
   they are gone: a hex editor at that offset is the next step. A file
-  that ends partway through a member header is said to be cut short
-  instead — too few bytes remain for another member, so nothing is
-  missing from the report. The exit code is the ordinary one: 4 when any
-  member was recovered (they are `Unattested`), 5 when none was.
+  that ends partway through a member's header, its long name or a GNU
+  long-name table is said to be cut short instead — the file ended inside
+  that member, so nothing is missing from the report. The exit code is
+  the ordinary one: 4 when any member was recovered (they are
+  `Unattested`), 5 when none was. Two healthy shapes this build cannot
+  read are exit 3, naming them: a GNU thin archive (`!<thin>`, whose
+  members live in other files), and a symbol table whose header the ar
+  reader cannot parse (GNU `ar rcs` on macOS writes `__.SYMDEF` with a
+  blank mode field; `stuffr list` refuses that archive too).
 
   LHA and ARJ are the two where the ordinary reader has no fallback at
   all, and ARJ's is the sharper of them. LHA carries no index, no entry

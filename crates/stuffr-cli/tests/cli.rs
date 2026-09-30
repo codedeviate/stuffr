@@ -12142,3 +12142,43 @@ fn salvage_recovers_what_stuffr_pack_wrote_as_ar() {
         vec![7u8; 3001]
     );
 }
+
+/// Task 4 fix round 1 (I2, I3): two healthy archives this build cannot
+/// read are exit 3 naming the shape — never exit 4 with fabricated content,
+/// never exit 5 "nothing recoverable". A GNU thin archive, found by its `.a`
+/// extension alone with no `--format`; and a `__.SYMDEF` with GNU `ar rcs`'s
+/// blank mode field on Mach-O.
+#[test]
+fn salvage_refuses_a_thin_archive_and_an_unreadable_symbol_table_at_exit_3() {
+    let dir = tmp_dir();
+    let mut thin = b"!<thin>\n".to_vec();
+    thin.extend_from_slice(&ar_member("a.txt/", b"")[..60]);
+    thin[8 + 48..8 + 58].copy_from_slice(format!("{:<10}", 18).as_bytes());
+    thin.extend_from_slice(&ar_member("bb.bin/", b"")[..60]);
+    let archive = dir.join("thin.a");
+    std::fs::write(&archive, &thin).unwrap();
+    let out_dir = dir.join("thin-out");
+    let run = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("thin archive"), "{stderr}");
+    assert!(!out_dir.join("a.txt").exists());
+
+    let mut symdef = b"!<arch>\n".to_vec();
+    let mut table = ar_member("__.SYMDEF", b"\0\0\0\0");
+    table[40..48].copy_from_slice(&[b' '; 8]);
+    symdef.extend(table);
+    symdef.extend(ar_member("f.o", b"fff"));
+    let archive = dir.join("symdef.a");
+    std::fs::write(&archive, &symdef).unwrap();
+    let run = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("symbol table (`__.SYMDEF`)"), "{stderr}");
+    assert!(!stderr.contains("nothing recoverable"), "{stderr}");
+}
