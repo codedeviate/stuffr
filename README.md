@@ -11,7 +11,7 @@ read list.
 
 > **Status: `stuffr salvage` covers all eight containers — `zip`, `arc`,
 > `zoo`, `lha` and `arj` since Salvage Stage 2 (`0.6.0`), and `tar`, `cpio`
-> and `ar` since Salvage Stage 3.** Every one but `ar` finds its own records by scanning for them, so an archive
+> and `ar` since Salvage Stage 3 (`0.7.0`).** Every one but `ar` finds its own records by scanning for them, so an archive
 > whose index, main header or one damaged entry costs the ordinary reader everything
 > behind it still gives up what it holds. LHA and ARJ are the sharpest cases:
 > LHA carries no index, no entry count and no trailer, so one bad header ends
@@ -35,6 +35,11 @@ read list.
 > cannot cross a hole in the middle, and when it stops there it says so on
 > stderr — the offset, and that the members after it are unreachable by
 > construction, not absent.
+>
+> `0.7.0` is tagged for testers while Stage 3 finishes; it is on GitHub and
+> Homebrew, not yet on crates.io. **1515** tests under `--all-features`,
+> **1450** on the default tier — measured from this bump's own `make check`,
+> `GATE_EXIT=0`, never carried forward.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
