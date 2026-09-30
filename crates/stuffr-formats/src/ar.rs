@@ -219,7 +219,7 @@ static AR_MAGIC: &[MagicRule] = &[MagicRule {
 /// zero-entry archive contains. See the module doc for why writing this
 /// unconditionally (rather than leaving it to `ar::Builder`'s own lazy
 /// write on first `append`) matters for an empty archive specifically.
-const GLOBAL_HEADER: &[u8; 8] = b"!<arch>\n";
+pub(crate) const GLOBAL_HEADER: &[u8; 8] = b"!<arch>\n";
 
 /// The mode `add` writes when the caller does not say — `rw-r--r--` with the
 /// regular-file bit set, matching what a real `ar` (`ar rcS`, measured on
@@ -309,7 +309,7 @@ fn classify_ar_error(e: io::Error) -> Error {
 /// Fixed width of one `ar` entry header — six ASCII fields plus the 16-byte
 /// identifier, `` ` `` and `\n`. Mirrors the vendored crate's own private
 /// `ENTRY_HEADER_LEN` (`ar-0.9.0/src/lib.rs:103`).
-const AR_ENTRY_HEADER_LEN: usize = 60;
+pub(crate) const AR_ENTRY_HEADER_LEN: usize = 60;
 
 /// Ceiling on a BSD extended (`#1/N`) identifier's declared length —
 /// `ar-0.9.0/src/lib.rs:307`'s `let mut id_buffer = vec![0; padded_length as
@@ -572,14 +572,43 @@ enum ArGuardPhase {
         pos: usize,
         remaining: u64,
         pad_after: bool,
+        /// False for the truncated remainder: nothing follows it, so it ends
+        /// no record a [`GuardObserver`] should hear about.
+        ends_record: bool,
     },
     /// Passing through `remaining` payload bytes verbatim — covers a BSD
     /// identifier's own bytes plus the entry's real data, or a skipped GNU
     /// name/symbol table's payload, all alike: nothing downstream of a
     /// validated header allocates from a declared length again until the
     /// NEXT header.
-    Payload { remaining: u64, pad_after: bool },
+    Payload {
+        remaining: u64,
+        pad_after: bool,
+        ends_record: bool,
+    },
 }
+
+/// Told where [`ArGuardedReader`] finds each record boundary — the one thing
+/// `ar_salvage.rs`'s sequential walk needs from this module that the crate
+/// does not expose (`ar::Archive` keeps every offset private).
+///
+/// The guard already walks the crate's own state machine to find header
+/// boundaries; this only lets a caller SEE them, so the salvage walk adds no
+/// ninth mirrored fact about `ar = "=0.9.0"` (see `containers.md`'s pin
+/// note). The ordinary read path passes `()`, whose hooks do nothing.
+pub(crate) trait GuardObserver {
+    /// The first byte of a header that begins at source offset `at` has
+    /// been read. Called when the crate actually READS there, not when a pad
+    /// byte ends — so after a bad pad byte this has not fired — and not at
+    /// end of stream, where no header began.
+    fn header_starts(&mut self, _at: u64) {}
+    /// The record (global header, or one member's header and payload) that
+    /// ends at source offset `at` has been read whole — `at` is where the
+    /// next record, or its pad byte, begins.
+    fn record_ends(&mut self, _at: u64) {}
+}
+
+impl GuardObserver for () {}
 
 /// Wraps the real archive source and is what `ar::Archive` reads from for
 /// the archive's WHOLE lifetime, inspecting every entry header before the
@@ -587,8 +616,16 @@ enum ArGuardPhase {
 /// single peek before each entry" section for why this shape, rather than
 /// `cpio.rs`'s peek-then-delegate helper, is what closes this container's
 /// two reachable OOM sites.
-struct ArGuardedReader {
-    inner: Box<dyn Source>,
+///
+/// Generic over its source and a [`GuardObserver`] for Salvage Stage 3
+/// Task 4: `ar_salvage.rs` walks the archive through this SAME guard, so
+/// its ceilings keep one owner, and learns the offsets it needs through the
+/// observer. The defaults are the ordinary read path's.
+pub(crate) struct ArGuardedReader<R = Box<dyn Source>, O = ()> {
+    inner: R,
+    observer: O,
+    /// Bytes read from `inner` so far — the source offset of the next one.
+    pos: u64,
     phase: ArGuardPhase,
     variant: ar::Variant,
     /// Length of the GNU long-name table this archive declared, mirroring
@@ -602,8 +639,18 @@ struct ArGuardedReader {
 
 impl ArGuardedReader {
     fn new(inner: Box<dyn Source>) -> Self {
+        Self::observed(inner, ())
+    }
+}
+
+impl<R: Read, O: GuardObserver> ArGuardedReader<R, O> {
+    /// The guard over any source, reporting its record boundaries to
+    /// `observer` — see [`GuardObserver`].
+    pub(crate) fn observed(inner: R, observer: O) -> Self {
         ArGuardedReader {
             inner,
+            observer,
+            pos: 0,
             phase: ArGuardPhase::GlobalHeader {
                 remaining: GLOBAL_HEADER.len() as u8,
             },
@@ -613,7 +660,7 @@ impl ArGuardedReader {
     }
 }
 
-impl Read for ArGuardedReader {
+impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -622,6 +669,7 @@ impl Read for ArGuardedReader {
             match &mut self.phase {
                 ArGuardPhase::GlobalHeader { remaining } => {
                     if *remaining == 0 {
+                        self.observer.record_ends(self.pos);
                         self.phase = ArGuardPhase::Header {
                             buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
                         };
@@ -632,6 +680,7 @@ impl Read for ArGuardedReader {
                     if n == 0 {
                         return Ok(0);
                     }
+                    self.pos += n as u64;
                     *remaining -= n as u8;
                     return Ok(n);
                 }
@@ -641,6 +690,7 @@ impl Read for ArGuardedReader {
                     if n == 0 {
                         return Ok(0);
                     }
+                    self.pos += 1;
                     out[0] = one[0];
                     self.phase = ArGuardPhase::Header {
                         buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
@@ -655,12 +705,19 @@ impl Read for ArGuardedReader {
                         if n == 0 {
                             break;
                         }
+                        // Reported once a header's first byte exists: at end
+                        // of stream there is no header to have started.
+                        if buf.is_empty() {
+                            self.observer.header_starts(self.pos);
+                        }
+                        self.pos += n as u64;
                         buf.extend_from_slice(&tmp[..n]);
                     }
                     if buf.is_empty() {
                         return Ok(0);
                     }
-                    let (payload_len, pad_after) = if buf.len() == AR_ENTRY_HEADER_LEN {
+                    let whole = buf.len() == AR_ENTRY_HEADER_LEN;
+                    let (payload_len, pad_after) = if whole {
                         let hdr: [u8; AR_ENTRY_HEADER_LEN] = buf
                             .as_slice()
                             .try_into()
@@ -678,6 +735,7 @@ impl Read for ArGuardedReader {
                         pos: 0,
                         remaining: payload_len,
                         pad_after,
+                        ends_record: whole,
                     };
                 }
                 ArGuardPhase::Serving {
@@ -685,6 +743,7 @@ impl Read for ArGuardedReader {
                     pos,
                     remaining,
                     pad_after,
+                    ends_record,
                 } => {
                     if *pos < buf.len() {
                         let n = (buf.len() - *pos).min(out.len());
@@ -695,13 +754,18 @@ impl Read for ArGuardedReader {
                     self.phase = ArGuardPhase::Payload {
                         remaining: *remaining,
                         pad_after: *pad_after,
+                        ends_record: *ends_record,
                     };
                 }
                 ArGuardPhase::Payload {
                     remaining,
                     pad_after,
+                    ends_record,
                 } => {
                     if *remaining == 0 {
+                        if *ends_record {
+                            self.observer.record_ends(self.pos);
+                        }
                         self.phase = if *pad_after {
                             ArGuardPhase::Pad
                         } else {
@@ -718,6 +782,7 @@ impl Read for ArGuardedReader {
                     if n == 0 {
                         return Ok(0);
                     }
+                    self.pos += n as u64;
                     *remaining -= n as u64;
                     return Ok(n);
                 }
@@ -892,7 +957,7 @@ impl Read for ArEntryPayload<'_> {
 
 /// `ar` has no notion of a directory or a symlink — every entry is an opaque
 /// named blob — so every entry reads back as [`EntryKind::File`].
-fn entry_meta(header: &ar::Header) -> EntryMeta {
+pub(crate) fn entry_meta(header: &ar::Header) -> EntryMeta {
     EntryMeta {
         name: String::from_utf8_lossy(header.identifier()).into_owned(),
         size: Some(header.size()),

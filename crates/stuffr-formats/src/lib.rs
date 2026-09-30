@@ -176,6 +176,8 @@ mod zstd_shared;
 
 #[cfg(feature = "ar")]
 pub mod ar;
+#[cfg(feature = "ar")]
+pub mod ar_salvage;
 #[cfg(feature = "brotli")]
 pub mod brotli;
 #[cfg(feature = "bzip2")]
