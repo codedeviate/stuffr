@@ -1584,6 +1584,14 @@ pub struct SalvageOutcome {
     /// never moves [`salvage_exit_code`], so without that line a mixed run
     /// would lose an entry `stuffr list` shows in silence.
     pub sightings: Vec<stuffr_core::salvage::Sighting>,
+    /// Where a sequential-only scanner's walk stopped short of the end of
+    /// the archive (`ar`, Salvage Stage 3 Task 4), carried through from
+    /// [`stuffr_core::salvage::SalvageOutcome::walk_stop`] untouched. The CLI
+    /// prints [`stuffr_core::salvage::describe_walk_stop`] of it on stderr on
+    /// every run that has one: the entries behind a hole are unreachable by
+    /// construction, not absent, and nothing else in the report says so. It
+    /// never moves [`salvage_exit_code`].
+    pub walk_stop: Option<stuffr_core::salvage::WalkStop>,
 }
 
 /// Ruling R-N (fix round 1): the exit-code bucket a COMPLETED salvage run's
@@ -1780,16 +1788,17 @@ fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatI
 /// (Task 4, [`stuffr_formats::legacy::zoo_salvage::salvage_zoo`]), `lha`
 /// (Task 5), `arj`
 /// (Task 6, [`stuffr_formats::legacy::arj_salvage::salvage_arj`]), `tar`
-/// (Salvage Stage 3 Task 2, [`stuffr_formats::tar_salvage::salvage_tar`])
-/// and `cpio` (Stage 3 Task 3, [`stuffr_formats::cpio_salvage::salvage_cpio`])
-/// are wired; every other format — including one this build has fully
-/// registered as an ordinary container, like `ar` — answers
+/// (Salvage Stage 3 Task 2, [`stuffr_formats::tar_salvage::salvage_tar`]),
+/// `cpio` (Stage 3 Task 3, [`stuffr_formats::cpio_salvage::salvage_cpio`])
+/// and `ar` (Stage 3 Task 4, [`stuffr_formats::ar_salvage::salvage_ar`]) are
+/// wired — every container this project registers. Any other format answers
 /// [`Error::Unsupported`] (exit 3) **naming the format**, never a silent
 /// empty [`stuffr_core::salvage::SalvageOutcome`]. An empty outcome would
 /// reach the CLI as "the scan found nothing recoverable" (exit 5), a claim
 /// about the ARCHIVE; the truth here is a claim about this BUILD — it never
-/// tried. `ar` is the whole of that set now, until its own Stage 3 task
-/// wires it.
+/// tried. No registered container reaches that arm any more; a caller
+/// passing a codec's id (or any non-container) still does, and
+/// `salvage_dispatch_tests` pins it there.
 fn salvage_scan(
     format: FormatId,
     src: &mut dyn SeekRead,
@@ -1824,6 +1833,10 @@ fn salvage_scan(
         "cpio" => stuffr_formats::cpio_salvage::salvage_cpio(src, policy),
         #[cfg(not(feature = "cpio"))]
         "cpio" => Err(Error::FormatNotEnabled(FormatId::new("cpio"))),
+        #[cfg(feature = "ar")]
+        "ar" => stuffr_formats::ar_salvage::salvage_ar(src, policy),
+        #[cfg(not(feature = "ar"))]
+        "ar" => Err(Error::FormatNotEnabled(FormatId::new("ar"))),
         other => Err(Error::Unsupported(format!(
             "salvage has no scanner for `{other}` archives in this build"
         ))),
@@ -1946,6 +1959,7 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     Ok(SalvageOutcome {
         entries,
         sightings: scan.sightings,
+        walk_stop: scan.walk_stop,
     })
 }
 
@@ -2525,6 +2539,15 @@ fn write_salvaged_payload(
         ),
         #[cfg(not(feature = "cpio"))]
         "cpio" => Err(Error::FormatNotEnabled(FormatId::new("cpio"))),
+        #[cfg(feature = "ar")]
+        "ar" => stuffr_formats::ar_salvage::ArSalvage::new().write_payload(
+            archive_path,
+            entry,
+            compressed_len,
+            out,
+        ),
+        #[cfg(not(feature = "ar"))]
+        "ar" => Err(Error::FormatNotEnabled(FormatId::new("ar"))),
         // Unreachable in practice: `salvage_scan` already refuses any other
         // format before a single candidate is ever produced, so `salvage()`
         // never reaches a per-entry write for one.
@@ -5030,7 +5053,8 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 entries: vec![],
-                sightings: Vec::new()
+                sightings: Vec::new(),
+                walk_stop: None
             }),
             5,
             "nothing recoverable at all"
@@ -5039,6 +5063,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::Directory(PathBuf::from("b"))),
@@ -5051,6 +5076,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(SalvageDisposition::WrittenPartial {
                     path: PathBuf::from("a.partial"),
                     cause: PartialCause::ChecksumMismatch,
@@ -5063,6 +5089,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(SalvageDisposition::SkippedUnverified)],
             }),
             3,
@@ -5072,6 +5099,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::WrittenDisambiguated {
@@ -5089,6 +5117,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![
                     record(SalvageDisposition::WrittenPartial {
                         path: PathBuf::from("a.partial"),
@@ -5110,6 +5139,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::NotSelected),
@@ -5122,6 +5152,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(SalvageDisposition::NotWritten); 3],
             }),
             0,
@@ -5134,6 +5165,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(SalvageDisposition::SkippedPartial(
                     PartialCause::Truncated
                 ))],
@@ -5150,6 +5182,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(SalvageDisposition::SkippedUnsafePath {
                     reason: "path traversal above the destination"
                 })],
@@ -5160,6 +5193,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![
                     record(SalvageDisposition::Written(PathBuf::from("a"))),
                     record(SalvageDisposition::SkippedUnverified),
@@ -5204,6 +5238,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::Written(PathBuf::from("a")),
@@ -5218,6 +5253,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::NotWritten,
@@ -5233,6 +5269,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(
                     SalvageStatus::Unattested,
                     SalvageDisposition::Directory(PathBuf::from("d")),
@@ -5246,6 +5283,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![
                     record(
                         SalvageStatus::Unattested,
@@ -5267,6 +5305,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![
                     record(
                         SalvageStatus::Unattested,
@@ -5288,6 +5327,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&SalvageOutcome {
                 sightings: Vec::new(),
+                walk_stop: None,
                 entries: vec![record(
                     SalvageStatus::Complete,
                     SalvageDisposition::Written(PathBuf::from("a")),
@@ -5300,71 +5340,63 @@ mod salvage_tests {
     }
 }
 
-/// Task 2's own required test: dispatch on a resolved format this build has
-/// no scanner for yet. Deliberately NOT inside [`salvage_tests`] above, which
-/// is gated on `feature = "zip"` — the whole point of this dispatch is that
-/// it must answer correctly even in a build with no salvage scanner wired
-/// at all, so its own test must not depend on one either. Gated on
-/// `feature = "ar"` purely to build a fixture the registry's magic table
-/// recognises: `ar` is part of the `pure` feature bundle, which both the
-/// default feature set and the pure-tier build (`--no-default-features
-/// --features pure`) include, so this runs on all three tiers `make check`
-/// exercises.
+/// Task 2's own required test: dispatch on a format this build has no
+/// scanner for. Deliberately NOT inside [`salvage_tests`] above, which is
+/// gated on `feature = "zip"` — the whole point of this dispatch is that it
+/// must answer correctly even in a build with no salvage scanner wired at
+/// all, so its own test must not depend on one either.
 ///
-/// **It used `tar` until Salvage Stage 3 Task 2 wired tar's scanner, and
-/// `cpio` until Task 3 wired cpio's**, at which point each format's file
-/// stopped being refused and started being scanned. `ar` is the last
-/// unwired container; its own Stage 3 task will have to retire this test —
-/// or keep it on a format registered only as a container.
-#[cfg(all(test, feature = "ar"))]
+/// **Re-homed three times, and now off containers altogether.** It used
+/// `tar` until Salvage Stage 3 Task 2, `cpio` until Task 3 and `ar` until
+/// Task 4, each moved when that format's scanner was wired. After Task 4
+/// every container this project registers has a scanner, so no archive a
+/// user can name reaches [`salvage_scan`]'s `other =>` arm any more — and
+/// deleting the test would leave that arm, the refusal that keeps a silent
+/// "nothing recoverable" from being a claim about the ARCHIVE, uncovered. So
+/// the first test calls [`salvage_scan`] directly with a CODEC's id, the one
+/// shape that still reaches it, and the second pins what a user meets for a
+/// codec-only file instead: [`resolve_salvage_format`] refuses it as not an
+/// archive (exit 2) before dispatch — never exit 1, never an empty outcome.
+#[cfg(test)]
 mod salvage_dispatch_tests {
     use super::*;
     use stuffr_core::salvage::SalvagePolicy;
 
-    /// The `ar` global header, `!<arch>\n`, at offset 0 — enough for
-    /// [`resolve_chain`]'s magic match to identify the file as `ar`, nothing
-    /// else filled in. [`salvage`]'s own format resolution never opens the
-    /// container to identify it (see [`resolve_salvage_format`]'s doc), so
-    /// this is sufficient: the dispatch this test pins never reaches far
-    /// enough to care whether the rest is well-formed.
-    fn ar_like_bytes() -> Vec<u8> {
-        let mut bytes = b"!<arch>\n".to_vec();
-        bytes.resize(68, b' ');
-        bytes
+    /// A format with no salvage scanner is refused with
+    /// [`Error::Unsupported`] (exit 3) naming the format — never a silent
+    /// empty outcome, which would read to a caller as "the scan found
+    /// nothing recoverable" (exit 5): a claim about the ARCHIVE, where the
+    /// truth here is a claim about this BUILD — it never tried.
+    #[test]
+    fn salvage_scan_refuses_a_format_it_has_no_scanner_for() {
+        let mut src = std::io::Cursor::new(b"\x1f\x8b\x08\0\0\0\0\0".to_vec());
+        let err = salvage_scan(FormatId::new("gzip"), &mut src, &SalvagePolicy::default())
+            .expect_err("a format with no salvage scanner must refuse, not report empty");
+        assert_eq!(err.exit_code(), 3, "{err}");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("`gzip`"),
+            "the message must name the format it refused: {err}"
+        );
     }
 
-    /// An ar is a container this build cannot salvage yet. The refusal is
-    /// [`Error::Unsupported`] (exit 3) naming the format — never a silent
-    /// empty [`SalvageOutcome`], which would read to a caller as "the scan
-    /// found nothing recoverable" (exit 5): a claim about the ARCHIVE, where
-    /// the truth here is a claim about this BUILD — it never tried.
+    /// What a user meets for the same shape: a codec-only file is not an
+    /// archive, refused before any scanner is chosen.
+    #[cfg(feature = "gzip")]
     #[test]
-    fn salvage_refuses_a_format_it_cannot_scan() {
+    fn salvage_refuses_a_codec_only_file_as_not_an_archive() {
         let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("archive.a");
-        std::fs::write(&archive, ar_like_bytes()).unwrap();
-
+        let file = dir.path().join("plain.gz");
+        std::fs::write(&file, b"\x1f\x8b\x08\0\0\0\0\0\0\x03").unwrap();
         let opts = SalvageOpts {
             dest: None,
             policy: SalvagePolicy::default(),
             select: None,
             format: None,
         };
-        let err = salvage(&archive, &opts)
-            .expect_err("a format with no salvage scanner must refuse, not report empty");
-        assert_eq!(
-            err.exit_code(),
-            3,
-            "must be exit 3 (a build-capability limit), never a silent exit 5 empty outcome"
-        );
-        assert!(
-            matches!(err, Error::Unsupported(_)),
-            "expected Error::Unsupported, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("`ar`"),
-            "the message must name the format it refused: {err}"
-        );
+        let err = salvage(&file, &opts).expect_err("a codec-only file is not an archive");
+        assert!(matches!(err, Error::NotAnArchive { .. }), "{err:?}");
+        assert_eq!(err.exit_code(), 2, "{err}");
     }
 }
 
@@ -6009,6 +6041,7 @@ mod salvage_strict_tests {
         // proof the format cannot give, and dropping `--strict` recovers it.
         let outcome = SalvageOutcome {
             sightings: Vec::new(),
+            walk_stop: None,
             entries: vec![SalvagedRecord {
                 scan_position: 0,
                 name: "x".into(),

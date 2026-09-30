@@ -720,7 +720,7 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   has no scanner for is exit 3, a statement about this build rather than
   about the archive.
 
-  Scanners exist for: zip, arc, zoo, lha, arj, tar, cpio.
+  Scanners exist for: zip, arc, zoo, lha, arj, tar, cpio, ar.
 
   HOW MUCH TO TRUST AN `Intact` ROW IS NOT THE SAME ANSWER FOR EACH.
   `Intact` always means the same thing mechanically — this build decoded
@@ -781,9 +781,35 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   such entry. A header of the odc (070707) or newc-crc (070702) variant,
   which this build does not read, is never a row either: a run that
   recovers nothing else says so at exit 3, and a run that recovers
-  something names each one on stderr with its offset. ar records no
-  checksum either, and has no scanner yet; use `stuffr list` and
-  `stuffr unpack` on it.
+  something names each one on stderr with its offset.
+
+  ar records no checksum either, so every member salvage recovers is
+  `Unattested` too — and ar salvage has a LIMIT the others do not. A
+  member header's only fixed marker is the two bytes "`\n", far too weak
+  to search a damaged archive for (it would report noise as members), so
+  ar salvage WALKS the archive from its start, member by member, exactly
+  as `stuffr list` does, and stops at the first header it cannot read.
+  That recovers a truncated tail fully: every member before the cut, and
+  the cut one's surviving bytes as NAME.partial. It cannot cross a hole
+  in the middle. When the walk stops early the run says so on stderr,
+  --list, -C and -o alike, with the offset. Five members, the third's
+  header destroyed:
+
+    $ stuffr salvage --list damaged.a
+    salvage -> this build's ar salvage scanner walks the archive in order from its start, as `stuffr list`
+    does, and stopped at offset 142 with 200 bytes still to go: Invalid
+    timestamp field in entry header ("XXXXXXXXXXXX"). ... any entries in
+    those 200 bytes are unreachable by construction — not absent, and not
+    counted in this report
+    0    Unattested    one.txt [no checksum and no header self-check ...]
+    1    Unattested    two.txt [no checksum and no header self-check ...]
+
+  Two members of five means the other three were never reached, not that
+  they are gone: a hex editor at that offset is the next step. A file
+  that ends partway through a member header is said to be cut short
+  instead — too few bytes remain for another member, so nothing is
+  missing from the report. The exit code is the ordinary one: 4 when any
+  member was recovered (they are `Unattested`), 5 when none was.
 
   LHA and ARJ are the two where the ordinary reader has no fallback at
   all, and ARJ's is the sharper of them. LHA carries no index, no entry
@@ -847,8 +873,8 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
       but the format offers no checksum to check the CONTENT against" —
       tar, and only tar, reaches it here. `Unattested` means "the format
       offers neither a checksum nor a self-verifying header, so nothing
-      attests this is an entry at all" — cpio reaches it, and ar will
-      when it has a scanner. This can show MORE
+      attests this is an entry at all" — cpio and ar reach it. This can
+      show MORE
       rows than `stuffr list` on the same archive: a zip whose central
       directory declares two records under one name (`zip.rs`'s own
       last-record-wins collapse — see "WHAT THIS BUILD CAN DO" below) makes

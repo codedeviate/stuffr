@@ -335,11 +335,12 @@ pub enum Command {
         /// Selects among the formats this build's salvage can attempt to
         /// scan — `zip`, `tar`, `ar`, `cpio`, `arc`, `zoo`, `lha`, `arj` — not
         /// merely accepted or rejected as in an earlier stage. Naming one
-        /// this build has no salvage scanner for yet is refused at exit 3,
-        /// exactly as an undetected archive of that same format would be:
-        /// `ar` is still to come.
+        /// this build has no salvage scanner for is refused at exit 3,
+        /// exactly as an undetected archive of that same format would be.
+        /// `ar`'s scanner walks members in order and cannot cross a damaged
+        /// header; it says on stderr where it stopped.
         ///
-        /// Scanners exist for: zip, arc, zoo, lha, arj, tar, cpio.
+        /// Scanners exist for: zip, arc, zoo, lha, arj, tar, cpio, ar.
         #[arg(long)]
         format: Option<String>,
     },

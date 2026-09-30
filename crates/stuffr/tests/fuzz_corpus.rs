@@ -343,6 +343,9 @@ const SALVAGE_SHAPES: &[&str] = &[
     "cpio-healthy",
     "cpio-destroyed-first-header",
     "cpio-truncated-tail",
+    "ar-healthy",
+    "ar-hole-at-second-header",
+    "ar-truncated-tail",
 ];
 
 /// The `SALVAGE_SLOTS` name a shape's seed carries in its selector byte: the
@@ -402,6 +405,13 @@ fn salvage_tar_seed(work: &Path, sample_dir: &Path) -> stuffr_core::Result<Vec<u
 /// corpus to borrow, and every cpio tool writes the same `newc` layout.
 fn salvage_cpio_seed(work: &Path, sample_dir: &Path) -> stuffr_core::Result<Vec<u8>> {
     salvage_container_seed(work, sample_dir, "cpio")
+}
+
+/// The sample tree packed as an `ar` through the same writer — Salvage
+/// Stage 3 Task 4's seed. `ar` stores no directories, so the two files alone
+/// land, each under a `/`-bearing name and therefore in the BSD `#1/N` form.
+fn salvage_ar_seed(work: &Path, sample_dir: &Path) -> stuffr_core::Result<Vec<u8>> {
+    salvage_container_seed(work, sample_dir, "ar")
 }
 
 fn salvage_container_seed(
@@ -1124,6 +1134,7 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     let healthy = healthy_salvage_seed();
     let healthy_tar = salvage_tar_seed(work.path(), &sample_dir)?;
     let healthy_cpio = salvage_cpio_seed(work.path(), &sample_dir)?;
+    let healthy_ar = salvage_ar_seed(work.path(), &sample_dir)?;
     let mut salvage_count = 0usize;
     let salvage_selector = |slot: &str| {
         SALVAGE_SLOTS
@@ -1302,6 +1313,31 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
                     .expect("the sample tree's nested.txt is the last entry");
                 healthy_cpio[..at + 6].to_vec()
             }
+            // Salvage Stage 3 Task 4. `ar`'s one honest tier for a whole
+            // member is `Unattested`, as cpio's is.
+            "ar-healthy" => healthy_ar.clone(),
+            // The SECOND member's timestamp made unparseable: the walk keeps
+            // the first member and stops there — the hole ar cannot cross.
+            "ar-hole-at-second-header" => {
+                let second = healthy_ar
+                    .windows(3)
+                    .enumerate()
+                    .filter(|(_, w)| *w == b"#1/")
+                    .nth(1)
+                    .map(|(i, _)| i)
+                    .expect("both sample files are stored in the `#1/N` form");
+                let mut bytes = healthy_ar.clone();
+                bytes[second + 16..second + 28].copy_from_slice(b"XXXXXXXXXXXX");
+                bytes
+            }
+            // Cut six bytes into the LAST member's payload, found by content.
+            "ar-truncated-tail" => {
+                let at = healthy_ar
+                    .windows(b"nested seed".len())
+                    .position(|w| w == b"nested seed")
+                    .expect("the sample tree's nested.txt is the last member");
+                healthy_ar[..at + 6].to_vec()
+            }
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
         let slot = salvage_shape_slot(shape);
@@ -1403,6 +1439,7 @@ fn top_tier(slot: &str) -> stuffr_core::salvage::SalvageStatus {
         "zip" | "arc" | "zoo" | "lha" | "arj" => SalvageStatus::Intact,
         "tar" => SalvageStatus::Complete,
         "cpio" => SalvageStatus::Unattested,
+        "ar" => SalvageStatus::Unattested,
         other => panic!("SALVAGE_SLOTS names `{other}` but `top_tier` has no arm for it"),
     }
 }
@@ -1490,6 +1527,8 @@ fn every_salvage_seed_produces_records_and_reaches_its_top_tier() {
         ("tar-truncated-tail", SalvageStatus::Partial),
         // And cpio's, which is the ONLY damage cpio's evidence can see.
         ("cpio-truncated-tail", SalvageStatus::Partial),
+        // And ar's, the damage its walk recovers fully.
+        ("ar-truncated-tail", SalvageStatus::Partial),
     ] {
         let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
         let path = salvage_payload_path(&seed_path, scratch.path());

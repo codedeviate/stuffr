@@ -34,7 +34,8 @@ stuffr-core = { path = "../crates/stuffr-core", features = ["testing"] }
 #
 # `tar` (Salvage Stage 3 Task 2) repeated `arj`'s omission and compiled for
 # the same reason — `stuffr`'s default features carry it — and `cpio` (Task
-# 3) would have too. Both are named now, with the scanner that needs them.
+# 3) would have too. Both are named now, with the scanner that needs them,
+# and `ar` (Task 4) with its own.
 stuffr-formats = { path = "../crates/stuffr-formats", features = [
     "zip",
     "arc",
@@ -43,6 +44,7 @@ stuffr-formats = { path = "../crates/stuffr-formats", features = [
     "arj",
     "tar",
     "cpio",
+    "ar",
 ] }
 tempfile = "3"
 # Only for `container.rs`'s independent EOCD re-parse (Ruling A's second

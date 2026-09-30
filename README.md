@@ -9,9 +9,9 @@ lineage here: **StuffIt** (`.sit`) was the dominant compressor on classic Mac OS
 for the better part of fifteen years, and it is itself one of the formats on the
 read list.
 
-> **Status: `stuffr salvage` covers seven formats — `zip`, `arc`, `zoo`,
-> `lha` and `arj` since Salvage Stage 2 (`0.6.0`), and `tar` and `cpio`
-> since Salvage Stage 3.** Each finds its own records by scanning for them, so an archive
+> **Status: `stuffr salvage` covers all eight containers — `zip`, `arc`,
+> `zoo`, `lha` and `arj` since Salvage Stage 2 (`0.6.0`), and `tar`, `cpio`
+> and `ar` since Salvage Stage 3.** Every one but `ar` finds its own records by scanning for them, so an archive
 > whose index, main header or one damaged entry costs the ordinary reader everything
 > behind it still gives up what it holds. LHA and ARJ are the sharpest cases:
 > LHA carries no index, no entry count and no trailer, so one bad header ends
@@ -26,8 +26,15 @@ read list.
 > records no checksum of any kind, so a plausible-looking header found
 > mid-payload cannot be told from a real one by any evidence the format
 > carries: every cpio entry is `SalvageStatus::Unattested` — written under its
-> real name, tagged on its row, exit 4 — and never `Complete`. **`ar` is not
-> here yet**, for the same reason and a harder one.
+> real name, tagged on its row, exit 4 — and never `Complete`. **`ar`** is
+> `Unattested` for the same reason, and has a harder limit, stated rather
+> than hidden: a member header's only fixed marker is two bytes (`` `\n ``),
+> far too weak to search for without reporting noise as entries, so `ar`
+> salvage WALKS the archive from its start as `stuffr list` does and stops at
+> the first member it cannot read. That recovers a truncated tail fully; it
+> cannot cross a hole in the middle, and when it stops there it says so on
+> stderr — the offset, and that the members after it are unreachable by
+> construction, not absent.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
@@ -720,7 +727,7 @@ stuffr cat      ARCHIVE [PATTERNS... | --index N...]  # entry data; works on a p
 stuffr info     ARCHIVE                    # resolved chain, ladder rung, fidelity
 stuffr formats                             # capability matrix for THIS build
 stuffr test     ARCHIVE                    # integrity check, no extraction
-stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha/arj/tar/cpio; scan position, not list's index
+stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha/arj/tar/cpio/ar; scan position, not list's index
 stuffr convert  IN -o OUT                  # recompress without staging to disk
 stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
 ```

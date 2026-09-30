@@ -11917,3 +11917,228 @@ fn salvage_says_exit_3_for_a_cpio_variant_it_cannot_read() {
     assert!(!stderr.contains("nothing recoverable"), "{stderr}");
     assert!(out.stdout.is_empty());
 }
+
+// ---------------------------------------------------------------------
+// Salvage Stage 3 Task 4: `ar`, and the limitation it states.
+// ---------------------------------------------------------------------
+
+/// One plain `ar` member: a short name, placeholder fields, and the `\n` pad
+/// after an odd-sized payload — the common layout every writer shares.
+fn ar_member(name: &str, data: &[u8]) -> Vec<u8> {
+    let mut out = format!(
+        "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+        0,
+        0,
+        0,
+        "100644",
+        data.len()
+    )
+    .into_bytes();
+    assert_eq!(out.len(), 60);
+    out.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        out.push(b'\n');
+    }
+    out
+}
+
+fn ar_archive(entries: &[(&str, &[u8])]) -> (Vec<u8>, Vec<usize>) {
+    let mut out = b"!<arch>\n".to_vec();
+    let mut offsets = Vec::new();
+    for (name, data) in entries {
+        offsets.push(out.len());
+        out.extend(ar_member(name, data));
+    }
+    (out, offsets)
+}
+
+/// **The limitation, where a user meets it.** An `ar` whose third member's
+/// header is destroyed: `list` refuses the archive at exit 5; `salvage`
+/// recovers the two members before the hole — and NOT the two intact ones
+/// after it — and every mode (`--list`, `-C`, `-o`) says on stderr where the
+/// walk stopped and that what follows is unreachable by construction, not
+/// absent. Exit 4, the ordinary code for `Unattested` members (Ruling S-X).
+#[test]
+fn salvage_of_an_ar_with_a_hole_says_what_lies_past_it_is_unreachable() {
+    let dir = tmp_dir();
+    let (mut bytes, offsets) = ar_archive(&[
+        ("one.txt", b"first"),
+        ("two.txt", b"second"),
+        ("three.txt", b"third"),
+        ("four.txt", b"fourth"),
+        ("five.txt", b"fifth"),
+    ]);
+    let hole = offsets[2];
+    bytes[hole + 16..hole + 28].copy_from_slice(b"XXXXXXXXXXXX");
+    let archive = dir.join("holed.a");
+    std::fs::write(&archive, &bytes).unwrap();
+
+    assert_eq!(
+        run_output(&["list", archive.to_str().unwrap()])
+            .status
+            .code(),
+        Some(5)
+    );
+
+    let says_why = |stderr: &str, mode: &str| {
+        for needle in [
+            format!("stopped at offset {hole}"),
+            format!("{} bytes still to go", bytes.len() - hole),
+            "unreachable by construction — not absent".to_string(),
+            "timestamp".to_string(),
+        ] {
+            assert!(
+                stderr.contains(&needle),
+                "{mode}: missing {needle:?}: {stderr}"
+            );
+        }
+    };
+
+    let out = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stdout}{stderr}");
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows.len(), 2, "{stdout}");
+    for (row, name) in rows.iter().zip(["one.txt", "two.txt"]) {
+        assert!(row.contains(name) && row.contains("Unattested"), "{row}");
+    }
+    for later in ["three.txt", "four.txt", "five.txt"] {
+        assert!(!stdout.contains(later), "{stdout}");
+    }
+    says_why(&stderr, "--list");
+
+    let out_dir = dir.join("recovered");
+    let written = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&written.stderr);
+    assert_eq!(written.status.code(), Some(4), "{stderr}");
+    says_why(&stderr, "-C");
+    assert!(stderr.contains("2 entries are unattested"), "{stderr}");
+    assert_eq!(std::fs::read(out_dir.join("one.txt")).unwrap(), b"first");
+    assert_eq!(std::fs::read(out_dir.join("two.txt")).unwrap(), b"second");
+    assert!(!out_dir.join("four.txt").exists());
+
+    let target = dir.join("picked.txt");
+    let one = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "--index",
+        "1",
+        "-o",
+        target.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&one.stderr);
+    assert_eq!(one.status.code(), Some(4), "{stderr}");
+    says_why(&stderr, "-o");
+    assert_eq!(std::fs::read(&target).unwrap(), b"second");
+}
+
+/// The common damage: an `ar` cut inside its last member's payload. Every
+/// member before it is whole, the cut one lands as `NAME.partial` holding
+/// exactly the surviving bytes, and nothing claims anything is unreachable.
+/// Cut inside the last member's HEADER instead, the note says the archive is
+/// cut short there — never "unreachable".
+#[test]
+fn salvage_of_a_truncated_ar_recovers_the_tail_and_says_no_more_than_that() {
+    let dir = tmp_dir();
+    let (bytes, offsets) = ar_archive(&[("a.txt", b"alpha"), ("b.txt", b"bravo and more")]);
+    let payload_cut = &bytes[..offsets[1] + 60 + 5];
+    let archive = dir.join("cut.a");
+    std::fs::write(&archive, payload_cut).unwrap();
+    let out_dir = dir.join("cut-out");
+    let run = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(4), "{stderr}");
+    assert!(!stderr.contains("unreachable"), "{stderr}");
+    assert!(!stderr.contains("walks the archive"), "{stderr}");
+    assert_eq!(std::fs::read(out_dir.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(
+        std::fs::read(out_dir.join("b.txt.partial")).unwrap(),
+        b"bravo"
+    );
+
+    let header_cut = &bytes[..offsets[1] + 30];
+    std::fs::write(&archive, header_cut).unwrap();
+    let run = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(4), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "the file ends 30 bytes into the record at offset {}",
+            offsets[1]
+        )),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cut short"), "{stderr}");
+    assert!(!stderr.contains("unreachable"), "{stderr}");
+}
+
+/// Nothing recovered at all — the FIRST header destroyed — is exit 5, and
+/// the note still says why, before the "nothing recoverable" line.
+#[test]
+fn salvage_of_an_ar_whose_first_header_is_destroyed_exits_5_and_says_why() {
+    let dir = tmp_dir();
+    let (mut bytes, _) = ar_archive(&[("a.txt", b"alpha"), ("b.txt", b"bravo")]);
+    bytes[8 + 48..8 + 58].copy_from_slice(b"??????????");
+    let archive = dir.join("first.a");
+    std::fs::write(&archive, &bytes).unwrap();
+    let run = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(5), "{stderr}");
+    let note = stderr
+        .find("stopped at offset 8")
+        .unwrap_or_else(|| panic!("{stderr}"));
+    let nothing = stderr.find("found nothing recoverable").unwrap();
+    assert!(note < nothing, "{stderr}");
+}
+
+/// `stuffr pack` over a tree (every name `/`-bearing, so BSD `#1/N` form),
+/// then salvage: every file back, byte for byte, exit 4 for `Unattested`.
+#[test]
+fn salvage_recovers_what_stuffr_pack_wrote_as_ar() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("a.txt"), b"alpha\n").unwrap();
+    std::fs::write(tree.join("sub").join("b.bin"), vec![7u8; 3001]).unwrap();
+    let archive = dir.join("packed.a");
+    let packed = run_output(&[
+        "pack",
+        tree.to_str().unwrap(),
+        "-o",
+        archive.to_str().unwrap(),
+    ]);
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let out_dir = dir.join("packed-out");
+    let run = run_output(&[
+        "salvage",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(4), "{stderr}");
+    assert!(!stderr.contains("walks the archive"), "{stderr}");
+    assert_eq!(
+        std::fs::read(out_dir.join("tree").join("a.txt")).unwrap(),
+        b"alpha\n"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("tree").join("sub").join("b.bin")).unwrap(),
+        vec![7u8; 3001]
+    );
+}

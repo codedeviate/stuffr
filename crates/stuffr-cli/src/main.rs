@@ -1302,6 +1302,15 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     if let Some(note) = stuffr::salvage::describe_sightings(&outcome.sightings) {
         eprintln!("salvage -> {note}");
     }
+    // Salvage Stage 3 Task 4: where a sequential-only scanner (`ar`) had to
+    // stop. The entries behind a hole are unreachable by construction, not
+    // absent, and no row or summary count can say so — so this line does, on
+    // every run that has one, `--list`, `-C` and `-o` alike, and before the
+    // "nothing recoverable" line below when the walk stopped at the first
+    // header. It never moves the exit code (Ruling S-X).
+    if let Some(stop) = &outcome.walk_stop {
+        eprintln!("salvage -> {}", stuffr::salvage::describe_walk_stop(stop));
+    }
 
     // Computed on the FULL scan: "nothing recoverable at all" is a fact
     // about the archive, not about which scan positions the caller happened
@@ -1359,6 +1368,7 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     Ok(entries::salvage_exit_code(&entries::SalvageOutcome {
         entries: subset,
         sightings: outcome.sightings,
+        walk_stop: outcome.walk_stop,
     }))
 }
 
