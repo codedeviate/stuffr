@@ -6431,7 +6431,7 @@ fn test_reports_a_zip_whose_index_declares_more_records_than_are_reachable() {
         "a shadowed record is a fidelity loss, not corruption: {err}"
     );
     assert!(
-        err.contains("declares 2") && err.contains("only 1"),
+        err.contains("declares 2") && err.contains("but 1 were enumerated"),
         "the warning must name both counts: {err}"
     );
     assert!(

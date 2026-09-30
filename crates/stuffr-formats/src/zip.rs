@@ -521,6 +521,15 @@ struct DeclaredIndex {
     /// on another disk — must declare the same number in both, so holding the
     /// reader to the total is a check rather than a restatement.
     entries: u64,
+    /// Records on this disk: the EOCD's field at offset 8 (zip64: 24).
+    ///
+    /// Carried because it is the figure `zip` actually LOOPS over for a plain
+    /// EOCD (`CentralDirectoryInfo::try_from` reads
+    /// `number_of_files_on_this_disk`; only a zip64 record has it read the
+    /// total). When it disagrees with [`Self::entries`] the index contradicts
+    /// itself, and the enumeration can then land on EITHER side of the
+    /// declared total — see [`note_unreachable_records`].
+    entries_on_disk: u64,
     /// Offset of the central directory, relative to the start of the archive.
     ///
     /// Carried only to confirm that the record found here is the same one the
@@ -579,11 +588,13 @@ fn read_declared_index<R: Read + Seek>(r: &mut R) -> Option<DeclaredIndex> {
                 && i + END_OF_CENTRAL_DIR_TOTAL + le16(&tail[i + 20..]) as usize == tail.len()
         })?;
 
+    let entries_on_disk = le16(&tail[at + 8..]);
     let entries = le16(&tail[at + 10..]);
     let cd_offset = le32(&tail[at + 16..]);
     if entries != u16::MAX && cd_offset != u32::MAX {
         return Some(DeclaredIndex {
             entries: u64::from(entries),
+            entries_on_disk: u64::from(entries_on_disk),
             cd_offset: u64::from(cd_offset),
         });
     }
@@ -625,6 +636,7 @@ fn read_zip64_declared_index<R: Read + Seek>(
     }
     Some(DeclaredIndex {
         entries: le64(&fixed[32..]),
+        entries_on_disk: le64(&fixed[24..]),
         cd_offset: le64(&fixed[48..]),
     })
 }
@@ -646,11 +658,24 @@ fn read_zip64_declared_index<R: Read + Seek>(
 ///    the crate's chosen record pointed; requiring that to agree with this
 ///    one's own `cd_offset` makes the comparison apples to apples.
 ///
-/// Only a shortfall is reported. The opposite direction is unreachable —
-/// `read_central_header` pushes exactly `number_of_files` records and
-/// propagates any parse failure, so the collapsed map can never hold more
-/// names than the archive declared records — and a branch that cannot fire is
-/// not worth a message nobody will ever read.
+/// Both directions are reported. This used to report only a shortfall, on
+/// the premise that `read_central_header` pushes exactly the declared number
+/// of records so the collapsed map can never hold MORE names than were
+/// declared. That premise was false: for a plain EOCD the crate loops over
+/// the on-this-disk count (offset 8), not the total (offset 10) this compares
+/// against, so an EOCD declaring 4 on this disk and 1 in total enumerated
+/// four entries in silence — `test --strict-fidelity` said "exact fidelity"
+/// at exit 0 (the v0.7.0 deep-fuzz `container` finding). Info-ZIP's
+/// `zipinfo` reports the total ("number of entries: 1") for that file.
+///
+/// The reason names the cause it can actually see: when the EOCD's two
+/// counts disagree — which a single-disk archive, the only kind `zip` opens,
+/// must never do — that self-contradiction is the cause, whichever side of
+/// the total the enumeration landed on; otherwise a shortfall is names
+/// collapsing in the crate's map. An excess with agreeing counts is not
+/// believed reachable (only a zip64 record whose total disagrees with an
+/// unsaturated plain EOCD could produce one) and is still reported rather
+/// than trusted.
 fn note_unreachable_records(
     report: &mut FidelityReport,
     archive: &zip::ZipArchive<SeekAdapter>,
@@ -661,17 +686,30 @@ fn note_unreachable_records(
         return;
     }
     let enumerated = archive.len() as u64;
-    let Some(shadowed) = declared.entries.checked_sub(enumerated).filter(|n| *n > 0) else {
+    if enumerated == declared.entries {
         return;
+    }
+    let reason = if declared.entries_on_disk != declared.entries {
+        format!(
+            "the end-of-central-directory record contradicts itself, declaring {} record(s) \
+             in the archive but {} on its only disk",
+            declared.entries, declared.entries_on_disk
+        )
+    } else if let Some(shadowed) = declared.entries.checked_sub(enumerated) {
+        format!(
+            "{shadowed} record(s) repeat a name already in the index and are shadowed by \
+             it; only the last record under each name can be read"
+        )
+    } else {
+        "the reader enumerated more records than the end-of-central-directory record \
+         declares"
+            .to_string()
     };
     report.warn(Fidelity::EntryCountMismatch {
         format: ZIP,
         declared: declared.entries,
         enumerated,
-        reason: format!(
-            "{shadowed} record(s) repeat a name already in the index and are shadowed by \
-             it; only the last record under each name can be read"
-        ),
+        reason,
     });
 }
 
@@ -2785,6 +2823,82 @@ mod tests {
         let ar = open_seekable(&bytes);
         assert_eq!(count_mismatch(ar.fidelity()), None);
         assert!(ar.fidelity().is_lossless());
+    }
+
+    // -----------------------------------------------------------------------
+    // An EOCD whose two counts disagree with each other
+    // -----------------------------------------------------------------------
+
+    /// Rewrites one of the EOCD's two record counts — `field` is its offset
+    /// within the record, 8 (on this disk) or 10 (archive total) — leaving
+    /// every central-directory record physically intact.
+    fn with_eocd_count(bytes: &[u8], field: usize, count: u16) -> Vec<u8> {
+        let eocd = bytes.len() - END_OF_CENTRAL_DIR_TOTAL;
+        assert_eq!(bytes[eocd..eocd + 4], SIG_END_OF_CENTRAL_DIR, "no EOCD");
+        let mut out = bytes.to_vec();
+        out[eocd + field..eocd + field + 2].copy_from_slice(&count.to_le_bytes());
+        out
+    }
+
+    fn count_mismatch_reason(report: &FidelityReport) -> Option<&str> {
+        report.warnings.iter().find_map(|w| match w {
+            Fidelity::EntryCountMismatch { reason, .. } => Some(reason.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The v0.7.0 deep-fuzz finding (`container` target, 505-byte input):
+    /// an EOCD declaring 4 records on this disk but 1 in the whole archive.
+    /// `zip` reads the plain EOCD's on-this-disk count and so enumerates
+    /// every record, while the declared TOTAL — the figure Info-ZIP's
+    /// `zipinfo` reports ("number of entries: 1") — says one. Before this,
+    /// `note_unreachable_records` reported only a shortfall, so the
+    /// excess was silent: `list` printed four rows and `test
+    /// --strict-fidelity` said "exact fidelity" at exit 0 for an index that
+    /// contradicts itself.
+    #[test]
+    fn an_eocd_declaring_fewer_records_in_total_than_on_its_only_disk_is_reported() {
+        let clean = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta"), ("c.txt", b"c")]);
+        let bytes = with_eocd_count(&clean, 10, 1);
+        let ar = open_seekable(&bytes);
+        let report = ar.fidelity();
+
+        assert_eq!(
+            count_mismatch(report),
+            Some((1, 3)),
+            "both numbers must be named: {:?}",
+            report.warnings
+        );
+        let reason = count_mismatch_reason(report).unwrap();
+        assert!(
+            reason.contains("1 record(s) in the archive") && reason.contains("3 on its only disk"),
+            "the reason must name the self-contradiction, not a shadowed name: {reason}"
+        );
+        assert!(!report.is_lossless());
+        assert_eq!(report.rung, Rung::Exact);
+    }
+
+    /// The converse: 3 in total, 1 on this disk. `zip` reads one record, so
+    /// this was already warned about — but as "records repeat a name", which
+    /// is false here: nothing is shadowed, the index itself disagrees.
+    #[test]
+    fn an_eocd_declaring_more_records_in_total_than_on_its_only_disk_names_the_real_cause() {
+        let clean = build_zip(&[("a.txt", b"alpha"), ("b.txt", b"beta"), ("c.txt", b"c")]);
+        let bytes = with_eocd_count(&clean, 8, 1);
+        let ar = open_seekable(&bytes);
+        let report = ar.fidelity();
+
+        assert_eq!(
+            count_mismatch(report),
+            Some((3, 1)),
+            "{:?}",
+            report.warnings
+        );
+        let reason = count_mismatch_reason(report).unwrap();
+        assert!(
+            reason.contains("3 record(s) in the archive") && reason.contains("1 on its only disk"),
+            "the reason must name the self-contradiction, not a shadowed name: {reason}"
+        );
     }
 
     // -----------------------------------------------------------------------

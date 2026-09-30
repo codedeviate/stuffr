@@ -103,8 +103,12 @@ pub enum Fidelity {
     #[error("total entry count is unknown without the trailing index")]
     EntryCountUnknown,
 
-    /// The archive's own index declares more records than the reader was able
-    /// to enumerate, so entries exist in the file that no caller can reach.
+    /// The archive's own index declares a different number of records than
+    /// the reader enumerated. Usually FEWER were enumerated, so entries exist
+    /// in the file that no caller can reach; zip can also enumerate MORE, when
+    /// its end-of-central-directory record's two counts contradict each other
+    /// (the v0.7.0 deep-fuzz finding), so the message names both figures
+    /// without saying which way round they are.
     ///
     /// Distinct from [`Self::EntryCountUnknown`], which is the forward reader
     /// admitting it never saw a count at all. Here the count WAS read, from
@@ -125,8 +129,8 @@ pub enum Fidelity {
     /// and the reader, and a shortfall that cannot say WHY is one the user
     /// cannot act on.
     #[error(
-        "`{format}` index declares {declared} entries but only {enumerated} are \
-         reachable: {reason}"
+        "`{format}` index declares {declared} entries but {enumerated} were \
+         enumerated: {reason}"
     )]
     EntryCountMismatch {
         format: FormatId,
