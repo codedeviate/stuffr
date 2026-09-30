@@ -592,6 +592,13 @@ pub struct SalvageOutcome {
     /// `salvage_*` entry point fills it in after the scan. A sighting is
     /// never an entry, and never touches the run's exit code.
     pub sightings: Vec<Sighting>,
+    /// Where a SEQUENTIAL-ONLY scanner's walk stopped short of the end of
+    /// the source, if it did — see [`WalkStop`]. Always `None` from
+    /// [`salvage_all`], for the same reason [`Self::sightings`] is always
+    /// empty there: only the scanner knows its walk ended early, so its own
+    /// `salvage_*` entry point fills this in. Like a sighting it is never an
+    /// entry and never touches the run's exit code.
+    pub walk_stop: Option<WalkStop>,
 }
 
 /// A header a scanner SAW and has no gate for (Rulings S-V and 3-J): its
@@ -693,6 +700,115 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
          and it is the SCAN that stops there",
         parts.join("; and ")
     ))
+}
+
+/// Where a scanner that can ONLY walk its format in order — record after
+/// record from the start, the way the ordinary reader does — had to stop
+/// before the end of the source (Salvage Stage 3 Task 4).
+///
+/// # Why a walk stop is not a [`Sighting`]
+///
+/// A sighting is a header the scan SAW, whose structure is a header's and
+/// which it cannot gate. A walk stop is the opposite: a place where the
+/// walk found nothing it could read as a record at all, and — because the
+/// format carries nothing strong enough to search for (an `ar` member's
+/// only marker is two bytes) — cannot look any further. Folding it into
+/// [`Sighting`] would make "saw a real header" and "could see nothing" one
+/// channel, and [`describe_sightings`]'s own sentence ("`stuffr list` may
+/// read these headers normally") would then be false about it.
+///
+/// # What it must say, and why it has to be said at all
+///
+/// The entries a sequential walk cannot reach are **unreachable by
+/// construction, not absent**: a run that recovers three entries from a
+/// ten-entry archive with a hole after the third reports three rows, and
+/// nothing in those rows says seven more may sit behind the hole. So the
+/// caller prints [`describe_walk_stop`] of this on every run that has one,
+/// and the offset it names is where a user with a hex editor would look.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WalkStop {
+    /// The scanner's format, for the sentence [`describe_walk_stop`] writes.
+    pub format: FormatId,
+    /// Where the record the walk could not read begins — the first byte
+    /// after the last record it did read.
+    pub offset: u64,
+    /// Bytes from [`Self::offset`] to the end of the source.
+    pub remaining: u64,
+    /// Which of the two things this stop is — see [`WalkStopKind`].
+    pub kind: WalkStopKind,
+    /// The ordinary reader's own words for why that record would not read,
+    /// so the note and `stuffr list`'s refusal of the same bytes agree.
+    pub cause: String,
+}
+
+/// The two stops a sequential walk can make, told apart by a measurement
+/// rather than a guess: whether enough bytes remain after the stop point for
+/// ANY further record to exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkStopKind {
+    /// Fewer bytes remain than the format's smallest record header. The file
+    /// is cut short there, and no entry can be hiding after the stop point
+    /// — the common damage, and the one a sequential walk handles fully.
+    CutShort,
+    /// Enough bytes remain to hold further records, and the walk could not
+    /// read the one at the stop point. Whatever those bytes hold is
+    /// unreachable by construction.
+    Unreadable,
+}
+
+impl WalkStop {
+    pub fn new(
+        format: FormatId,
+        offset: u64,
+        remaining: u64,
+        kind: WalkStopKind,
+        cause: impl Into<String>,
+    ) -> Self {
+        Self {
+            format,
+            offset,
+            remaining,
+            kind,
+            cause: cause.into(),
+        }
+    }
+}
+
+/// The one sentence a caller prints for a [`WalkStop`] — written here, once,
+/// so every sequential-only scanner gets the same report without a line of
+/// its own, and so its two kinds can never be described four ways.
+///
+/// An [`WalkStopKind::Unreadable`] stop says the entries after it are
+/// *unreachable by construction, not absent*, with the offset and the byte
+/// count; a [`WalkStopKind::CutShort`] one says that nothing after it is
+/// missing from the report, which is exactly as true — too few bytes remain
+/// for any further record.
+pub fn describe_walk_stop(stop: &WalkStop) -> String {
+    let WalkStop {
+        format,
+        offset,
+        remaining,
+        kind,
+        cause,
+    } = stop;
+    let bytes = if *remaining == 1 { "byte" } else { "bytes" };
+    match kind {
+        WalkStopKind::Unreadable => format!(
+            "this build's {format} salvage scanner walks the archive in order from its start, \
+             as `stuffr list` does, and stopped at offset {offset} with {remaining} {bytes} still \
+             to go: {cause}. The {format} format marks its records with nothing strong enough \
+             to search for, so the scanner cannot find its way past a record it cannot read; \
+             any entries in those {remaining} {bytes} are unreachable by construction — not \
+             absent, and not counted in this report"
+        ),
+        WalkStopKind::CutShort => format!(
+            "this build's {format} salvage scanner walks the archive in order from its start, \
+             and the file ends {remaining} {bytes} into the record at offset {offset} ({cause}): \
+             too few for any further entry, so the archive is cut short there and nothing \
+             after that point is missing from this report"
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1130,6 +1246,7 @@ pub fn annotate_candidates(
     Ok(SalvageOutcome {
         entries,
         sightings: Vec::new(),
+        walk_stop: None,
     })
 }
 
@@ -1986,5 +2103,35 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("`stuffr list`"), "{note}");
+    }
+
+    /// Task 4: the walk-stop note. A hole says what the brief requires —
+    /// the entries after it are unreachable by construction, NOT absent,
+    /// with the offset and the byte count — and a cut-short tail says the
+    /// opposite, because nothing can be hiding in too few bytes for a record.
+    #[test]
+    fn describe_walk_stop_says_unreachable_for_a_hole_and_complete_for_a_cut() {
+        let f = FormatId::new("fmt");
+        let hole = describe_walk_stop(&WalkStop::new(
+            f,
+            1234,
+            5000,
+            WalkStopKind::Unreadable,
+            "bad field",
+        ));
+        for needle in [
+            "offset 1234",
+            "5000 bytes",
+            "bad field",
+            "unreachable by construction",
+            "not absent",
+            "fmt",
+        ] {
+            assert!(hole.contains(needle), "missing {needle:?}: {hole}");
+        }
+        let cut = describe_walk_stop(&WalkStop::new(f, 90, 1, WalkStopKind::CutShort, "eof"));
+        assert!(cut.contains("1 byte into the record at offset 90"), "{cut}");
+        assert!(cut.contains("cut short"), "{cut}");
+        assert!(!cut.contains("unreachable"), "{cut}");
     }
 }
