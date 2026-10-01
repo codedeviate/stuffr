@@ -36,9 +36,11 @@ read list.
 > stderr — the offset, and that the members after it are unreachable by
 > construction, not absent.
 >
-> `0.7.0` is tagged for testers while Stage 3 finishes; it is on GitHub and
-> Homebrew, not yet on crates.io. **1515** tests under `--all-features`,
-> **1450** on the default tier — measured from this bump's own `make check`,
+> `0.7.1` is tagged for testers while Stage 3 finishes; it is on GitHub and
+> Homebrew, not yet on crates.io (`v0.7.0` is tagged but was never built
+> from: its deep fuzz found a missing zip entry-count warning, fixed in
+> `0.7.1`). **1517** tests under `--all-features`, **1452** on the default
+> tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`, never carried forward.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
