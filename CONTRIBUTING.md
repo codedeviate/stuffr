@@ -188,7 +188,7 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.5.0` | Salvage Stage 1 — the `salvage` verb and zip's central-directory recovery scan (`SalvageScan`, `Candidate`, `SalvageStatus`, `salvage_all`), reversing Phase 2's "declared, not recovered" ruling for zip: the shadowed-record parse that ruling declined to build now serves recovery, not only `list`'s warning. |
 | `0.6.0` | Salvage Stage 2 — four more salvage scanners (`arc`, `zoo`, `lha`, `arj`, joining `zip`), dispatch by resolved archive format, the shared `stream_verify` both CRC widths go through, and the per-entry write seam that came with them. A MINOR, not a `0.5.x` patch: `0.5.0` is PUBLISHED (crates.io, 2026-09-17) and Stage 2 breaks its `stuffr-core::salvage` API — `collect_candidates`/`annotate_candidates` both change signature, `UnverifiedCause` and `SalvageDisposition` both gain variants, `PartialCause::Truncated` is NARROWED and `DecodeFailed` added beside it, and `Candidate`/`SalvagedEntry`/`SalvageOutcome` are closed with `#[non_exhaustive]` plus constructors. Cargo reads a `0.x` middle number as the major, so a break to a published `0.5.0` cannot ship as `0.5.x`. The final fix wave adds to that set: `SalvageDisposition` gains a further variant (`SkippedUnsafePath` — a containment refusal is a per-entry outcome now, not a run abort), `SalvageScan` gains a `write_payload` method (defaulted, so additive for an implementor), `stuffr-formats::salvage_verify` becomes a `pub mod` so `stream_verify` is reachable at all, and `safe_join`/`check_symlink_target` refuse a NUL-bearing name at exit 7 where it used to reach the filesystem and exit 1. |
 | `0.7.0`/`0.7.1` | Salvage Stage 3's three scanners (`tar`, `cpio`, `ar`), tagged for testers before the stage finished. `v0.7.0` was never built from (its tag's deep fuzz failed on a pre-existing zip defect); `0.7.1` is on Homebrew. Neither is on crates.io — the publish was held until the stage completes. |
-| `0.8.0` | Salvage Stage 3, complete — `tar`, `cpio`, `ar` (the three where a false positive is undetectable by construction; `tar` is the one format that reaches `Complete`, `cpio` and `ar` are `Unattested`), plus `ContainerCaps::salvage` and `stuffr formats`' SALVAGE column. **Status: implementation complete (Tasks 1–8), final whole-branch review pending; bumped, not tagged.** A breaking bump: `ContainerCaps` gained a public field. |
+| `0.8.0` | Salvage Stage 3, complete — `tar`, `cpio`, `ar` (the three where a false positive is undetectable by construction; `tar` is the one format that reaches `Complete`, `cpio` and `ar` are `Unattested`), plus `ContainerCaps::salvage` and `stuffr formats`' SALVAGE column. **Status: implementation complete (Tasks 1–8), final whole-branch review pending; bumped, not tagged.** A breaking bump: `ContainerCaps` gained a public `salvage` field, a breaking change for an external exhaustive literal. |
 | `0.9.x`/later | Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
@@ -296,10 +296,10 @@ break; when Stage 2 shipped it broke MORE than the row predicted
 reshaping the same `stuffr-core::salvage` surface), so the row was widened
 to say what actually shipped — the same treatment `0.3.0`'s row got, for the
 same reason, and not a renumbering. The number it predicted was already
-right, and was re-argued from the diff rather than inherited: see
-the release notes (`.claude/skills/stuffr-release/history.md`, local-only)
-for that argument and for the dated reverse-dependency measurement behind
-it. The `0.5.x`/later row moved on to `0.7.x`, since `0.6.0` is now spent.
+right, and was re-argued from the diff rather than inherited — Stage 2
+breaks the `stuffr-core::salvage` API with signature and enum changes, so
+the next release is `0.6.0` rather than a patch. The `0.5.x`/later row
+moved on to `0.7.x`, since `0.6.0` is now spent.
 
 It was revised a **sixth** time when Salvage Stage 3 finished. `0.7.0` and
 `0.7.1` had already gone to testers carrying the stage's three scanners
@@ -418,9 +418,9 @@ Task 1 and deliberately deferred to Task 9: designing a constructor for a
 trait's return type from ONE caller guesses at the shape, and four more
 scanners (`arc`, `zoo`, `lha`, `arj`) were due to land. All five read
 through it, and Salvage Stage 3's three (`tar`, `cpio`, `ar`) were built on
-it with `Candidate`'s constructor unchanged, with whichever fields a scanner does not set defaulting to the
-answers that assert the least (no declared length, nothing to verify with,
-nothing missing, nothing deleted).
+it with `Candidate`'s constructor unchanged, with whichever fields a
+scanner does not set defaulting to the answers that assert the least (no
+declared length, nothing to verify with, nothing missing, nothing deleted).
 
 **And the extension point protected here has to actually be reachable, or
 the whole argument is spent on nothing.** The final whole-branch review

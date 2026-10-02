@@ -15,9 +15,10 @@ read list.
 > `0.7.1`; the stage completes in `0.8.0`).** `stuffr formats` says which
 > containers a build can salvage, and how far each can be trusted, in its
 > SALVAGE column: `yes` for the five that checksum an entry's content,
-> `weak` for `tar`, `cpio` and `ar`. Every one but `ar` finds its own records by scanning for them, so an archive
-> whose index, main header or one damaged entry costs the ordinary reader everything
-> behind it still gives up what it holds. LHA and ARJ are the sharpest cases:
+> `weak` for `tar`, `cpio` and `ar`. Every one but `ar` finds its own
+> records by scanning for them, so an archive whose index, main header or
+> one damaged entry costs the ordinary reader everything behind it still
+> gives up what it holds. LHA and ARJ are the sharpest cases:
 > LHA carries no index, no entry count and no trailer, so one bad header ends
 > `list` for every entry behind it, and an ARJ archive opens with a main
 > header the reader must parse before it hands back a single entry — two
@@ -46,8 +47,9 @@ read list.
 > testers, never on crates.io (`v0.7.0` is tagged but was never built from:
 > its deep fuzz found a missing zip entry-count warning, fixed in `0.7.1`).
 > `0.8.0` is a breaking bump over both: `ContainerCaps` gained a public
-> `salvage` field. <<COUNTS>> — measured from this bump's own `make check`,
-> `GATE_EXIT=0`, never carried forward.
+> `salvage` field. **1539** tests under `--all-features`, **1474** on the
+> default tier — measured from this bump's own `make check`, `GATE_EXIT=0`,
+> never carried forward.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
@@ -125,7 +127,7 @@ read list.
 > computes 116 and the 59-byte model 119. See
 > `crates/stuffr-formats/src/legacy/zoo.rs`'s module doc for all five
 > measurements. **1408** tests under `--all-features`, **1343** on the
-> default tier — measured from this bump's own `make check`, `GATE_EXIT=0`,
+> default tier — measured from `0.6.0`'s own `make check`, `GATE_EXIT=0`,
 > never carried forward.
 >
 > **`0.6.1` closes four exit-code defects that `0.6.0` shipped**, all four
