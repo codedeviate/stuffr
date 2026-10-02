@@ -1446,6 +1446,55 @@ fn top_tier(slot: &'static str) -> stuffr_core::salvage::SalvageStatus {
     }
 }
 
+/// **The attestation class of every salvage format, written out as literals
+/// — an independent witness to `entries::salvage_attestation`'s one table.**
+///
+/// Salvage Stage 3 Task 5 moved the class to a single owner (the facade's
+/// scanner dispatch), and both the fuzz target's `attestation` and this
+/// file's [`top_tier`] now READ it from there. That removed a drift risk and
+/// also the only independent statement of the class: a wrong class in the
+/// table would hand the oracle the wrong boundary and hand [`top_tier`] the
+/// matching wrong tier, and the two would agree. This test is the second
+/// source again — it must never derive its expectations from the table it
+/// checks (Stage 3 Task 7, carried from Task 5's review, Minor 1).
+///
+/// Each row is gated on its format's own feature, so it compiles and runs in
+/// every build; a build without a format has no scanner for it and the
+/// table answers `None`, which is asserted too.
+#[test]
+fn every_salvage_format_has_the_attestation_class_its_format_carries() {
+    use stuffr_core::salvage::Attestation::{ContentChecksum, HeaderChecksumOnly, Nothing};
+    let class = |name: &'static str| entries::salvage_attestation(FormatId::new(name));
+    let rows = [
+        ("zip", cfg!(feature = "zip"), ContentChecksum),
+        ("arc", cfg!(feature = "arc"), ContentChecksum),
+        ("zoo", cfg!(feature = "zoo"), ContentChecksum),
+        ("lha", cfg!(feature = "lha"), ContentChecksum),
+        ("arj", cfg!(feature = "arj"), ContentChecksum),
+        ("tar", cfg!(feature = "tar"), HeaderChecksumOnly),
+        ("cpio", cfg!(feature = "cpio"), Nothing),
+        ("ar", cfg!(feature = "ar"), Nothing),
+    ];
+    for (name, enabled, expected) in rows {
+        let want = enabled.then_some(expected);
+        assert_eq!(
+            class(name),
+            want,
+            "`{name}`'s salvage attestation class (feature enabled: {enabled})"
+        );
+    }
+    // Every slot the fuzz target can select is one of the rows above, so a
+    // ninth slot fails here until somebody writes its class down by hand.
+    for &slot in SALVAGE_SLOTS {
+        assert!(
+            rows.iter().any(|(name, ..)| *name == slot),
+            "SALVAGE_SLOTS names `{slot}`, which this pin has no literal class for"
+        );
+    }
+    // And a non-container has no class at all.
+    assert_eq!(class("gzip"), None);
+}
+
 /// **The claim the salvage corpus is actually making.** Its seeds exist so
 /// the fuzz target's oracle call — `check_salvage_claim`, which the target
 /// makes for every record that makes a claim (`Intact`, `Complete`,
