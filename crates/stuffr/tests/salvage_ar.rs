@@ -30,6 +30,7 @@ impl Scratch {
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Scratch(dir)
     }

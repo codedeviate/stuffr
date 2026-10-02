@@ -2269,6 +2269,7 @@ mod tests {
             std::process::id(),
             &bytes
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let archive = dir.join("written.lzh");
         std::fs::write(&archive, &bytes).expect("write archive");

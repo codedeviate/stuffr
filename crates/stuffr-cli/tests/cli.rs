@@ -2113,6 +2113,7 @@ fn tmp_dir() -> PathBuf {
     let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
     p.push(format!("stuffr-cli-archive-{}-{n}", *RUN_TOKEN));
+    let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
 }
