@@ -297,8 +297,10 @@ reshaping the same `stuffr-core::salvage` surface), so the row was widened
 to say what actually shipped — the same treatment `0.3.0`'s row got, for the
 same reason, and not a renumbering. The number it predicted was already
 right, and was re-argued from the diff rather than inherited — Stage 2
-breaks the `stuffr-core::salvage` API with signature and enum changes, so
-the next release is `0.6.0` rather than a patch. The `0.5.x`/later row
+changed published API (`stuffr::entries::PartialCause` gained
+`DecodeFailed` and `Truncated` narrowed, `SalvageDisposition` gained
+`SkippedUnwritable`, and `SalvageScan` gained `max_whole_entry`), so the
+next release is `0.6.0` rather than a patch. The `0.5.x`/later row
 moved on to `0.7.x`, since `0.6.0` is now spent.
 
 It was revised a **sixth** time when Salvage Stage 3 finished. `0.7.0` and

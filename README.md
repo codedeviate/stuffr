@@ -127,7 +127,7 @@ read list.
 > computes 116 and the 59-byte model 119. See
 > `crates/stuffr-formats/src/legacy/zoo.rs`'s module doc for all five
 > measurements. **1408** tests under `--all-features`, **1343** on the
-> default tier — measured from `0.6.0`'s own `make check`, `GATE_EXIT=0`,
+> default tier — measured from `0.6.1`'s own `make check`, `GATE_EXIT=0`,
 > never carried forward.
 >
 > **`0.6.1` closes four exit-code defects that `0.6.0` shipped**, all four
