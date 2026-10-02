@@ -1352,4 +1352,481 @@ mod tests {
             );
         }
     }
+
+    // -------------------------------------------------------------------
+    // Salvage Stage 3 Task 6: the damage catalogue.
+    //
+    // **Every expectation here is the PRE-DAMAGE state, and none of it
+    // comes from this scanner.** [`inputs`] is written to disk, a REAL `ar`
+    // archives it, and what each mutation must produce is derived from
+    // those input files plus the member geometry [`members`] parses longhand
+    // out of the writer's bytes — never from what `salvage_ar` currently
+    // returns. The writers are the platform `ar` (BSD here, GNU binutils on
+    // the CI runner) and, on macOS, GNU binutils' keg-only `ar` for both its
+    // default (Mach-O) target and an ELF one — the two spell a plain member
+    // name differently (`name` vs `name/`). All REQUIRED.
+    //
+    // **ar's header row is NOT "neighbours unaffected"** (controller
+    // ruling, Task 6): this scanner walks and cannot cross a hole, by
+    // construction (Task 4's stated limit). The row asserts that limit
+    // instead — every member BEFORE the corrupted header recovered at its
+    // tier, none AFTER, and the walk-stop note saying, with the offset,
+    // that they are unreachable by construction.
+    // -------------------------------------------------------------------
+    mod damage_catalogue {
+        use std::path::{Path, PathBuf};
+
+        use super::*;
+
+        /// The files every writer is fed: THE pre-damage state. Each payload
+        /// is well over a kilobyte so a flip at its middle is far from any
+        /// header; `beta.txt` is odd-sized, so its `\n` pad byte is in play.
+        fn inputs() -> Vec<(&'static str, Vec<u8>)> {
+            vec![
+                (
+                    "alpha.txt",
+                    (0..200)
+                        .flat_map(|i| format!("alpha line {i}\n").into_bytes())
+                        .collect(),
+                ),
+                (
+                    "beta.txt",
+                    (0..301)
+                        .flat_map(|i| format!("beta {i};").into_bytes())
+                        .collect(),
+                ),
+                (
+                    "gamma.bin",
+                    (0..1500u32).map(|i| ((i * 7 + 3) % 256) as u8).collect(),
+                ),
+                (
+                    "delta.txt",
+                    (0..151)
+                        .flat_map(|i| format!("delta row {i}\n").into_bytes())
+                        .collect(),
+                ),
+            ]
+        }
+
+        /// GNU binutils' keg-only Homebrew `ar` — see `reference-tools.md`.
+        const GNU_AR_ON_MACOS: &str = "/opt/homebrew/opt/binutils/bin/ar";
+
+        /// `(writer, extra args)`: the platform `ar`, plus GNU's on macOS
+        /// (where the platform's is BSD) for its default target and for ELF.
+        fn writers() -> Vec<(PathBuf, Vec<&'static str>)> {
+            let platform = which("ar").unwrap_or_else(|| {
+                panic!("no reference `ar` on PATH — this catalogue proved nothing")
+            });
+            let mut out = vec![(platform, vec![])];
+            if cfg!(target_os = "macos") {
+                let gnu = PathBuf::from(GNU_AR_ON_MACOS);
+                assert!(
+                    gnu.is_file(),
+                    "GNU ar not at {GNU_AR_ON_MACOS} (`brew install binutils`) — without it \
+                     this catalogue covers BSD ar alone, and CI runs GNU's"
+                );
+                out.push((gnu.clone(), vec![]));
+                out.push((gnu, vec!["--target=elf64-x86-64"]));
+            }
+            out
+        }
+
+        /// Every writer's archive of [`inputs`] (`rcS`: no symbol table),
+        /// `(label, bytes, writer)`.
+        fn reference_archives(tag: &str) -> Vec<(String, Vec<u8>, PathBuf)> {
+            let tree = tempfile_dir(&format!("catalogue-{tag}"));
+            for (name, data) in inputs() {
+                std::fs::write(tree.0.join(name), data).unwrap();
+            }
+            let mut out = Vec::new();
+            for (writer, extra) in writers() {
+                let archive = tree.0.join("ref.a");
+                let _ = std::fs::remove_file(&archive);
+                let status = std::process::Command::new(&writer)
+                    .args(&extra)
+                    .arg("rcS")
+                    .arg(&archive)
+                    .args(inputs().iter().map(|(n, _)| *n))
+                    .current_dir(&tree.0)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "{} could not write", writer.display());
+                out.push((
+                    format!("{} {}", writer.display(), extra.join(" ")),
+                    std::fs::read(&archive).unwrap(),
+                    writer,
+                ));
+            }
+            out
+        }
+
+        /// One member's geometry, read by THIS TEST from the raw bytes: its
+        /// header's offset and its CONTENT's range (past a BSD `#1/N` name).
+        struct Member {
+            name: String,
+            header: usize,
+            content: std::ops::Range<usize>,
+        }
+
+        /// Walks an archive by the format's layout — `!<arch>\n`, then
+        /// 60-byte headers (name `0..16`, decimal size `48..58`, `` `\n ``
+        /// at `58..60`), each body padded to even — resolving the two
+        /// plain-name spellings (`name`, GNU's `name/`) and BSD's `#1/N`.
+        /// Hand-rolled rather than read through the `ar` crate, which is the
+        /// walk under test.
+        fn members(bytes: &[u8]) -> Vec<Member> {
+            assert_eq!(&bytes[..8], b"!<arch>\n");
+            let mut out = Vec::new();
+            let mut at = 8usize;
+            while at + 60 <= bytes.len() {
+                assert_eq!(&bytes[at + 58..at + 60], b"`\n", "a header at {at}");
+                let field = |r: std::ops::Range<usize>| {
+                    std::str::from_utf8(&bytes[at + r.start..at + r.end])
+                        .unwrap()
+                        .trim_end()
+                        .to_string()
+                };
+                let size: usize = field(48..58).parse().unwrap();
+                let raw = field(0..16);
+                let body = at + 60;
+                let (name, content) = match raw.strip_prefix("#1/") {
+                    Some(n) => {
+                        let n: usize = n.parse().unwrap();
+                        let name = String::from_utf8(bytes[body..body + n].to_vec()).unwrap();
+                        (
+                            name.trim_end_matches('\0').to_string(),
+                            body + n..body + size,
+                        )
+                    }
+                    None => {
+                        assert!(!raw.starts_with('/'), "no symbol or name table expected");
+                        (raw.trim_end_matches('/').to_string(), body..body + size)
+                    }
+                };
+                out.push(Member {
+                    name,
+                    header: at,
+                    content,
+                });
+                at = body + size + size % 2;
+            }
+            out
+        }
+
+        /// `ar p` — the WRITER's own reading of `name` (BSD `ar` does not
+        /// find GNU's `name/` spelling) — and whether it exited 0.
+        fn platform_extract(writer: &Path, bytes: &[u8], name: &str) -> (bool, Vec<u8>) {
+            let dir = tempfile_dir("catalogue-extract");
+            let archive = dir.0.join("damaged.a");
+            std::fs::write(&archive, bytes).unwrap();
+            let out = std::process::Command::new(writer)
+                .arg("p")
+                .arg(&archive)
+                .arg(name)
+                .output()
+                .unwrap();
+            (out.status.success(), out.stdout)
+        }
+
+        fn rows(out: &SalvageOutcome) -> Vec<(&str, SalvageStatus)> {
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.status))
+                .collect()
+        }
+
+        fn all_unattested(want: &[(&'static str, Vec<u8>)]) -> Vec<(&'static str, SalvageStatus)> {
+            want.iter()
+                .map(|(n, _)| (*n, SalvageStatus::Unattested))
+                .collect()
+        }
+
+        // ---------------------------------------------------------------
+        // Step 1: the agreement property.
+        // ---------------------------------------------------------------
+
+        /// **Salvage of an UNDAMAGED archive agrees exactly with the
+        /// ordinary reader AND with the files that went in** — names and
+        /// sizes as `list` reports them, bytes as the input files hold them,
+        /// every member `Unattested` (never `Complete`, never `Intact`), and
+        /// no walk stop.
+        #[test]
+        fn salvage_of_every_writer_s_healthy_archive_agrees_with_the_reader_and_the_inputs() {
+            let want = inputs();
+            for (writer, bytes, _) in reference_archives("agree") {
+                let reader = read_through_the_reader(&bytes)
+                    .unwrap_or_else(|e| panic!("{writer}: the ordinary reader must walk it: {e}"));
+                let out = scan(&bytes);
+                assert!(out.walk_stop.is_none(), "{writer}: {:?}", out.walk_stop);
+                assert_eq!(
+                    out.entries
+                        .iter()
+                        .map(|e| (e.meta.name.clone(), e.meta.size))
+                        .collect::<Vec<_>>(),
+                    reader
+                        .iter()
+                        .map(|(n, s, _)| (n.clone(), Some(*s)))
+                        .collect::<Vec<_>>(),
+                    "{writer}: salvage and the ordinary reader must describe every member alike"
+                );
+                assert_eq!(
+                    members(&bytes)
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>(),
+                    want.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                    "{writer}: sanity, this test's own geometry finds the inputs in order"
+                );
+                assert_eq!(rows(&out), all_unattested(&want), "{writer}");
+                let written = write_back(&bytes, &out);
+                for (i, (name, data)) in want.iter().enumerate() {
+                    assert_eq!(&reader[i].2, data, "{writer}: the reader's {name}");
+                    assert_eq!(
+                        (written[i].1.as_slice(), written[i].2),
+                        (data.as_slice(), true),
+                        "{writer}: {name}"
+                    );
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Step 2: the mutation catalogue.
+        // ---------------------------------------------------------------
+
+        /// Row 1/3 — **a truncated tail.** Cut inside the LAST member's
+        /// content: every earlier member `Unattested` with exactly its input
+        /// bytes, the cut one `Partial` with exactly the surviving prefix,
+        /// and no walk stop (nothing after it is missing from the report).
+        #[test]
+        fn damage_catalogue_a_truncated_tail() {
+            let want = inputs();
+            let last = want.len() - 1;
+            for (writer, bytes, _) in reference_archives("tail") {
+                let content = members(&bytes)[last].content.clone();
+                for keep in [0, 1, content.len() / 2, content.len() - 1] {
+                    let cut = &bytes[..content.start + keep];
+                    let out = scan(cut);
+                    let mut expected = all_unattested(&want);
+                    expected[last].1 = SalvageStatus::Partial;
+                    assert_eq!(rows(&out), expected, "{writer} keep={keep}");
+                    assert!(out.walk_stop.is_none(), "{writer}: {:?}", out.walk_stop);
+                    let written = write_back(cut, &out);
+                    for (i, (name, data)) in want.iter().enumerate().take(last) {
+                        assert_eq!(
+                            (written[i].1.as_slice(), written[i].2),
+                            (data.as_slice(), true),
+                            "{writer} {name}"
+                        );
+                    }
+                    assert_eq!(
+                        (written[last].1.as_slice(), written[last].2),
+                        (&want[last].1[..keep], false),
+                        "{writer} keep={keep}: exactly the surviving prefix"
+                    );
+                }
+            }
+        }
+
+        /// Row 2/3 — **a byte flipped mid-content. The stage's point.** `ar`
+        /// checksums nothing, so the damaged member is a SILENTLY WRONG
+        /// FILE. Its tier must not claim otherwise — `Unattested`, never
+        /// `Intact` or `Complete` — and its written bytes are asserted to
+        /// DIFFER from the input in exactly the flipped byte. The writer's
+        /// own `ar p` prints the same wrong bytes at exit 0. Every member takes
+        /// its turn.
+        #[test]
+        fn damage_catalogue_a_byte_flipped_mid_payload() {
+            let want = inputs();
+            for (writer, bytes, tool) in reference_archives("flip") {
+                for (damaged, target) in members(&bytes).iter().enumerate() {
+                    let mid = target.content.len() / 2;
+                    let mut flipped = bytes.clone();
+                    flipped[target.content.start + mid] ^= 0xFF;
+
+                    let out = scan(&flipped);
+                    assert_eq!(
+                        rows(&out),
+                        all_unattested(&want),
+                        "{writer} damaged={damaged}"
+                    );
+                    assert!(out.walk_stop.is_none(), "{writer}: {:?}", out.walk_stop);
+                    let written = write_back(&flipped, &out);
+                    let mut wrong = want[damaged].1.clone();
+                    wrong[mid] ^= 0xFF;
+                    assert_ne!(
+                        written[damaged].1, want[damaged].1,
+                        "{writer}: silently wrong"
+                    );
+                    assert_eq!(
+                        (written[damaged].1.as_slice(), written[damaged].2),
+                        (wrong.as_slice(), true),
+                        "{writer}: wrong in exactly the flipped byte and no other"
+                    );
+                    for (i, (name, data)) in want.iter().enumerate() {
+                        if i != damaged {
+                            assert_eq!(&written[i].1, data, "{writer}: {name}");
+                        }
+                    }
+                    let (ok, printed) = platform_extract(&tool, &flipped, want[damaged].0);
+                    assert!(
+                        ok && printed == wrong,
+                        "{writer}: the writer's own `ar p` prints the same wrong bytes at exit 0 \
+                         (exit ok: {ok}, {} bytes)",
+                        printed.len()
+                    );
+                }
+            }
+        }
+
+        /// Row 3/3 — **a header field corrupted, under ar's stated limit.**
+        /// Three fields — the SIZE, the MODE and the MTIME, each made
+        /// unparseable — against every member in turn. Every member BEFORE the damage is `Unattested`
+        /// with exactly its input bytes; NONE after it is reported; the walk
+        /// stops `Unreadable` at exactly that header with every byte from it
+        /// to EOF counted, and its note says, with the offset, that those
+        /// bytes' entries are unreachable by construction, not absent. The
+        /// members after are asserted still on disk, intact, at the offsets
+        /// this test's geometry found — so "not reported" is the limit, not
+        /// a loss.
+        #[test]
+        fn damage_catalogue_a_corrupted_header_field() {
+            let want = inputs();
+            for (writer, bytes, _) in reference_archives("header") {
+                let geometry = members(&bytes);
+                for (damaged, target) in geometry.iter().enumerate() {
+                    let h = target.header;
+                    for (field, range, junk) in [
+                        ("size", 48..58, &b"garbage!!!"[..]),
+                        ("mode", 40..48, &b"rw-r--r-"[..]),
+                        ("mtime", 16..28, &b"not-a-time!!"[..]),
+                    ] {
+                        let mut bad = bytes.clone();
+                        bad[h + range.start..h + range.end].copy_from_slice(junk);
+                        assert!(
+                            read_through_the_reader(&bad).is_err(),
+                            "{writer} {field}: sanity, the ordinary reader must refuse it"
+                        );
+                        let out = scan(&bad);
+                        assert_eq!(
+                            rows(&out),
+                            all_unattested(&want)[..damaged],
+                            "{writer} damaged={damaged} {field}: what precedes the hole, and \
+                             nothing after it"
+                        );
+                        let written = write_back(&bad, &out);
+                        for (i, (name, data)) in want.iter().enumerate().take(damaged) {
+                            assert_eq!(
+                                (written[i].1.as_slice(), written[i].2),
+                                (data.as_slice(), true),
+                                "{writer} {field}: {name}"
+                            );
+                        }
+                        let stop = out
+                            .walk_stop
+                            .as_ref()
+                            .unwrap_or_else(|| panic!("{writer} {field}: a hole must be said"));
+                        assert_eq!(
+                            (stop.offset, stop.remaining, stop.kind),
+                            (h as u64, (bad.len() - h) as u64, WalkStopKind::Unreadable),
+                            "{writer} damaged={damaged} {field}"
+                        );
+                        let note = describe_walk_stop(stop);
+                        for needle in [
+                            format!("offset {h}"),
+                            "unreachable by construction".to_string(),
+                            "not absent".to_string(),
+                        ] {
+                            assert!(
+                                note.contains(&needle),
+                                "{writer}: missing {needle:?}: {note}"
+                            );
+                        }
+                        for later in &geometry[damaged + 1..] {
+                            let data = &want.iter().find(|(n, _)| *n == later.name).unwrap().1;
+                            assert_eq!(
+                                &bad[later.content.clone()],
+                                data.as_slice(),
+                                "{writer}: `{}` is still there — unreachable, not lost",
+                                later.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The header field that is NOT refused: a SIZE that still PARSES
+        /// but lies (grown by two). The walk believes it, as `list` does, so
+        /// the member is reported over what its header claims —
+        /// `Unattested`, never a tier that vouches for it — with WRONG
+        /// bytes (two of the next header's), and the walk then stops inside
+        /// the next header, saying so; nothing after is reported. Middle
+        /// members only: grown past the last member, the claim runs off the
+        /// end of the file, which is the truncated-tail row's shape.
+        #[test]
+        fn damage_catalogue_a_size_that_lies_is_believed_and_not_vouched_for() {
+            let want = inputs();
+            for (writer, bytes, _) in reference_archives("lying-size") {
+                let geometry = members(&bytes);
+                for (damaged, target) in geometry.iter().enumerate().take(geometry.len() - 1) {
+                    let h = target.header;
+                    let declared: usize = std::str::from_utf8(&bytes[h + 48..h + 58])
+                        .unwrap()
+                        .trim_end()
+                        .parse()
+                        .unwrap();
+                    let mut bad = bytes.clone();
+                    bad[h + 48..h + 58].copy_from_slice(format!("{:<10}", declared + 2).as_bytes());
+
+                    let out = scan(&bad);
+                    assert_eq!(
+                        rows(&out),
+                        all_unattested(&want)[..=damaged],
+                        "{writer} damaged={damaged}"
+                    );
+                    let written = write_back(&bad, &out);
+                    assert_ne!(
+                        written[damaged].1, want[damaged].1,
+                        "{writer}: the lying member's bytes are wrong, and its tier never said \
+                         otherwise"
+                    );
+                    let stop = out
+                        .walk_stop
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("{writer}: landing mid-header must be said"));
+                    assert_eq!(stop.kind, WalkStopKind::Unreadable, "{writer}: {stop:?}");
+                    assert!(
+                        (stop.offset as usize) > h
+                            && (stop.offset as usize) < geometry[damaged + 1].content.start,
+                        "{writer}: the stop is where the lie landed: {stop:?}"
+                    );
+                }
+            }
+        }
+
+        /// Recorded, not a defect of this scanner: **`ar 0.9.0` never checks
+        /// the `` `\n `` terminator** (`lib.rs`'s header read parses fields
+        /// `0..58` and ignores `58..60`), so a destroyed terminator is not
+        /// damage EITHER verb sees — `list` reads every member and the walk,
+        /// being that reader, agrees. Pinned so a crate that starts checking
+        /// it moves both at once, visibly. The format's one fixed marker
+        /// carries nothing here; the field parses are the whole gate.
+        #[test]
+        fn a_destroyed_terminator_is_read_by_list_and_salvage_alike() {
+            let want = inputs();
+            for (writer, bytes, _) in reference_archives("terminator") {
+                for target in members(&bytes) {
+                    let mut bad = bytes.clone();
+                    bad[target.header + 58..target.header + 60].copy_from_slice(b"XX");
+                    let reader = read_through_the_reader(&bad)
+                        .unwrap_or_else(|e| panic!("{writer}: the reader refused it: {e}"));
+                    assert_eq!(reader.len(), want.len(), "{writer}");
+                    let out = scan(&bad);
+                    assert!(out.walk_stop.is_none(), "{writer}: {:?}", out.walk_stop);
+                    assert_eq!(rows(&out), all_unattested(&want), "{writer}");
+                }
+            }
+        }
+    }
 }

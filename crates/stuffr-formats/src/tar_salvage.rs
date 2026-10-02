@@ -2734,4 +2734,487 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -------------------------------------------------------------------
+    // Salvage Stage 3 Task 6: the damage catalogue.
+    //
+    // **Every expectation here is the PRE-DAMAGE state, and none of it
+    // comes from this scanner.** [`inputs`] is written to disk, a REAL
+    // `tar` archives it, and what each mutation must produce is derived
+    // from those input files plus the record geometry [`members`] parses
+    // longhand out of the writer's bytes — never from what `salvage_tar`
+    // currently returns. The writers are the platform `tar` (bsdtar here,
+    // GNU on the CI runner) and, on macOS, GNU tar as `gtar`, each in its
+    // own default format (pax with xattr records for bsdtar, GNU for GNU)
+    // and in `--format=ustar`. Both are REQUIRED: a missing writer panics,
+    // because a catalogue that silently ran over one dialect is the exact
+    // gap `reference-tools.md` records CI and a Mac disagreeing across.
+    // -------------------------------------------------------------------
+    mod damage_catalogue {
+        use std::path::{Path, PathBuf};
+
+        use super::*;
+
+        /// The files every writer is fed: THE pre-damage state. Each payload
+        /// is well over a kilobyte, so a flip at its middle is hundreds of
+        /// bytes from any header block, and none of them can read as a
+        /// header (text, and an arithmetic byte run).
+        fn inputs() -> Vec<(&'static str, Vec<u8>)> {
+            vec![
+                (
+                    "alpha.txt",
+                    (0..200)
+                        .flat_map(|i| format!("alpha line {i}\n").into_bytes())
+                        .collect(),
+                ),
+                (
+                    "beta.txt",
+                    (0..301)
+                        .flat_map(|i| format!("beta {i};").into_bytes())
+                        .collect(),
+                ),
+                (
+                    "gamma.bin",
+                    (0..1500u32).map(|i| ((i * 7 + 3) % 256) as u8).collect(),
+                ),
+                (
+                    "delta.txt",
+                    (0..151)
+                        .flat_map(|i| format!("delta row {i}\n").into_bytes())
+                        .collect(),
+                ),
+            ]
+        }
+
+        fn require_bin(bin: &str) -> PathBuf {
+            which(bin).unwrap_or_else(|| {
+                panic!(
+                    "no reference `{bin}` on PATH — this catalogue proved nothing, which is \
+                     worth knowing rather than passing silently (macOS: `brew install gnu-tar` \
+                     for `gtar`)"
+                )
+            })
+        }
+
+        /// The writers: the platform `tar`, plus GNU tar on macOS, where the
+        /// platform's is bsdtar. On Linux the platform `tar` IS GNU's.
+        fn writers() -> Vec<PathBuf> {
+            let mut out = vec![require_bin("tar")];
+            if cfg!(target_os = "macos") {
+                out.push(require_bin("gtar"));
+            }
+            out
+        }
+
+        struct Scratch(PathBuf);
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// A fresh directory holding [`inputs`] under `tree/`.
+        fn scratch(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!(
+                "stuffr-tar-catalogue-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("tree")).unwrap();
+            for (name, data) in inputs() {
+                std::fs::write(dir.join("tree").join(name), data).unwrap();
+            }
+            Scratch(dir)
+        }
+
+        /// Every writer's archive of [`inputs`], in its default format and
+        /// in `ustar`: `(label, bytes)`.
+        fn reference_archives(tag: &str) -> Vec<(String, Vec<u8>)> {
+            let dir = scratch(tag);
+            let names: Vec<&str> = inputs().iter().map(|(n, _)| *n).collect();
+            let mut out = Vec::new();
+            for writer in writers() {
+                for format in [None, Some("ustar")] {
+                    let archive = dir.0.join("ref.tar");
+                    let _ = std::fs::remove_file(&archive);
+                    let mut cmd = std::process::Command::new(&writer);
+                    // No `._` AppleDouble members from bsdtar; xattrs still
+                    // ride in pax records, which is a shape worth keeping.
+                    cmd.env("COPYFILE_DISABLE", "1");
+                    if let Some(format) = format {
+                        cmd.arg(format!("--format={format}"));
+                    }
+                    let status = cmd
+                        .arg("-cf")
+                        .arg(&archive)
+                        .arg("-C")
+                        .arg(dir.0.join("tree"))
+                        .args(&names)
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "{} could not write", writer.display());
+                    out.push((
+                        format!("{} ({})", writer.display(), format.unwrap_or("default")),
+                        std::fs::read(&archive).unwrap(),
+                    ));
+                }
+            }
+            out
+        }
+
+        /// One file entry's geometry, read by THIS TEST from the raw bytes:
+        /// the header block's offset and the payload's range.
+        struct Member {
+            name: String,
+            header: usize,
+            payload: std::ops::Range<usize>,
+        }
+
+        /// Walks the archive the way POSIX lays it out — a 512-byte header,
+        /// its octal `size` at `124..136`, the payload rounded up to 512 —
+        /// skipping extension records (`x`, `g`, `L`, `K`) and stopping at
+        /// the first zero block. Hand-rolled rather than read through
+        /// `tar::Header`, which is the parser under test.
+        fn members(bytes: &[u8]) -> Vec<Member> {
+            let mut out = Vec::new();
+            let mut at = 0usize;
+            while at + BLOCK <= bytes.len() {
+                let block = &bytes[at..at + BLOCK];
+                if block.iter().all(|&b| b == 0) {
+                    break;
+                }
+                let size_field = std::str::from_utf8(&block[124..136]).unwrap();
+                let size = usize::from_str_radix(size_field.trim_matches(['\0', ' ']), 8).unwrap();
+                let payload = at + BLOCK..at + BLOCK + size;
+                if !b"xgLK".contains(&block[156]) {
+                    let end = block[..100].iter().position(|&b| b == 0).unwrap_or(100);
+                    assert!(
+                        block[345..500].iter().all(|&b| b == 0),
+                        "a ustar prefix is a shape this geometry does not join"
+                    );
+                    out.push(Member {
+                        name: String::from_utf8(block[..end].to_vec()).unwrap(),
+                        header: at,
+                        payload: payload.clone(),
+                    });
+                }
+                at = payload.start + size.div_ceil(BLOCK) * BLOCK;
+            }
+            out
+        }
+
+        /// Overwrites the checksum field with the POSIX sum of the block as
+        /// it now stands — so a test can damage a field the checksum would
+        /// otherwise catch, and reach the gate's LATER criteria.
+        fn reseal(block: &mut [u8]) {
+            block[148..156].fill(b' ');
+            let sum: u32 = block.iter().map(|&b| u32::from(b)).sum();
+            block[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        }
+
+        /// The platform tar's own extraction of `name` from `bytes`, and
+        /// whether it exited 0 — the format's own tool, asked what IT makes
+        /// of a damaged archive.
+        fn platform_extract(bytes: &[u8], name: &str) -> (bool, Vec<u8>) {
+            let dir = scratch("extract");
+            let archive = dir.0.join("damaged.tar");
+            std::fs::write(&archive, bytes).unwrap();
+            let out_dir = dir.0.join("out");
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let status = std::process::Command::new(require_bin("tar"))
+                .arg("-xf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&out_dir)
+                .arg(name)
+                .status()
+                .unwrap();
+            (
+                status.success(),
+                std::fs::read(Path::new(&out_dir).join(name)).unwrap_or_default(),
+            )
+        }
+
+        fn rows(out: &SalvageOutcome) -> Vec<(&str, SalvageStatus)> {
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.status))
+                .collect()
+        }
+
+        // ---------------------------------------------------------------
+        // Step 1: the agreement property.
+        // ---------------------------------------------------------------
+
+        /// **Salvage of an UNDAMAGED archive agrees exactly with the
+        /// ordinary reader AND with the files that went in** — same names,
+        /// same order, same sizes and kinds as `list`, the same bytes as the
+        /// input files, every entry `Complete` (never `Intact`), no
+        /// sighting. Three-way, so "salvage agrees with the reader" cannot
+        /// be two wrongs agreeing: the third leg is what the writer was fed.
+        #[test]
+        fn salvage_of_every_writer_s_healthy_archive_agrees_with_the_reader_and_the_inputs() {
+            let want = inputs();
+            for (writer, bytes) in reference_archives("agree") {
+                let reader = read_through_the_reader(&bytes)
+                    .unwrap_or_else(|e| panic!("{writer}: the ordinary reader must walk it: {e}"));
+                let out = scan(&bytes);
+                assert!(out.sightings.is_empty(), "{writer}: {:?}", out.sightings);
+                assert_eq!(
+                    out.entries
+                        .iter()
+                        .map(|e| (e.meta.name.clone(), e.meta.size, e.meta.kind.clone()))
+                        .collect::<Vec<_>>(),
+                    reader
+                        .iter()
+                        .map(|(n, s, k, _)| (n.clone(), Some(*s), k.clone()))
+                        .collect::<Vec<_>>(),
+                    "{writer}: salvage and the ordinary reader must describe every entry alike"
+                );
+                assert_eq!(
+                    members(&bytes)
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>(),
+                    want.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                    "{writer}: sanity, this test's own geometry finds the inputs in order"
+                );
+                let written = write_back(&bytes, &out);
+                for (i, (name, data)) in want.iter().enumerate() {
+                    assert_eq!(out.entries[i].meta.name, *name, "{writer}");
+                    assert_eq!(
+                        out.entries[i].status,
+                        SalvageStatus::Complete,
+                        "{writer}: {name}"
+                    );
+                    assert_eq!(&reader[i].3, data, "{writer}: the reader's {name}");
+                    assert_eq!(&written[i], &(data.clone(), true), "{writer}: {name}");
+                }
+                assert_eq!(out.entries.len(), want.len(), "{writer}");
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Step 2: the mutation catalogue.
+        // ---------------------------------------------------------------
+
+        /// Row 1/3 — **a truncated tail.** Cut inside the LAST entry's
+        /// payload (both ends: no payload byte at all, and one short of
+        /// whole): every earlier entry is `Complete` with exactly its input
+        /// bytes, and the cut one is `Partial` with exactly the input's
+        /// prefix that survived — never padded, never dropped.
+        #[test]
+        fn damage_catalogue_a_truncated_tail() {
+            let want = inputs();
+            let last = want.len() - 1;
+            for (writer, bytes) in reference_archives("tail") {
+                let geometry = members(&bytes);
+                let payload = geometry[last].payload.clone();
+                for keep in [0, 1, payload.len() / 2, payload.len() - 1] {
+                    let cut = &bytes[..payload.start + keep];
+                    let out = scan(cut);
+                    let mut expected: Vec<(&str, SalvageStatus)> = want
+                        .iter()
+                        .map(|(n, _)| (*n, SalvageStatus::Complete))
+                        .collect();
+                    expected[last].1 = SalvageStatus::Partial;
+                    assert_eq!(rows(&out), expected, "{writer} keep={keep}");
+                    let written = write_back(cut, &out);
+                    for (i, (name, data)) in want.iter().enumerate().take(last) {
+                        assert_eq!(&written[i], &(data.clone(), true), "{writer} {name}");
+                    }
+                    assert_eq!(
+                        written[last],
+                        (want[last].1[..keep].to_vec(), false),
+                        "{writer} keep={keep}: exactly the surviving prefix"
+                    );
+                }
+            }
+        }
+
+        /// Row 2/3 — **a byte flipped mid-payload. This is the stage's
+        /// point.** tar has no content checksum, so the damaged entry is a
+        /// SILENTLY WRONG FILE: every declared byte present, the header
+        /// still self-verifying. The tier must not claim otherwise — it is
+        /// `Complete` (header checked), never `Intact` (content checked) —
+        /// and the bytes written are asserted to DIFFER from what went in,
+        /// in exactly the flipped byte, so this row proves both halves: the
+        /// file is wrong, and nothing said it was right.
+        ///
+        /// The platform `tar` is asked too, and extracts the same wrong
+        /// bytes at exit 0: the format cannot see it, not just this scanner.
+        /// Every entry takes its turn as the damaged one.
+        #[test]
+        fn damage_catalogue_a_byte_flipped_mid_payload() {
+            let want = inputs();
+            for (writer, bytes) in reference_archives("flip") {
+                let geometry = members(&bytes);
+                for (damaged, target) in geometry.iter().enumerate() {
+                    let mid = target.payload.len() / 2;
+                    let mut flipped = bytes.clone();
+                    flipped[target.payload.start + mid] ^= 0xFF;
+
+                    let out = scan(&flipped);
+                    assert_eq!(
+                        rows(&out),
+                        want.iter()
+                            .map(|(n, _)| (*n, SalvageStatus::Complete))
+                            .collect::<Vec<_>>(),
+                        "{writer} damaged={damaged}: tar can claim no more than `Complete`, \
+                         and a flipped payload byte moves no header"
+                    );
+                    assert!(
+                        out.entries
+                            .iter()
+                            .all(|e| e.status != SalvageStatus::Intact),
+                        "{writer}: `Intact` would claim a content check tar does not carry"
+                    );
+                    let written = write_back(&flipped, &out);
+                    let mut wrong = want[damaged].1.clone();
+                    wrong[mid] ^= 0xFF;
+                    assert_ne!(
+                        written[damaged].0, want[damaged].1,
+                        "{writer}: silently wrong"
+                    );
+                    assert_eq!(
+                        written[damaged],
+                        (wrong.clone(), true),
+                        "{writer}: wrong in exactly the flipped byte and no other"
+                    );
+                    for (i, (name, data)) in want.iter().enumerate() {
+                        if i != damaged {
+                            assert_eq!(&written[i], &(data.clone(), true), "{writer}: {name}");
+                        }
+                    }
+                    assert_eq!(
+                        platform_extract(&flipped, want[damaged].0),
+                        (true, wrong),
+                        "{writer}: the platform tar extracts the same wrong bytes at exit 0"
+                    );
+                }
+            }
+        }
+
+        /// Row 3/3 — **a header field corrupted.** That entry is absent (or,
+        /// for a header the gate sees and cannot accept, refused as a
+        /// sighting); every other entry is `Complete` with exactly its input
+        /// bytes. Four fields, each against every entry in turn — the first
+        /// included, which is the direction an ordinary reader loses
+        /// everything in:
+        ///
+        /// - (a) a NAME byte flipped — the header checksum disagrees;
+        /// - (b) the CHECKSUM field itself changed;
+        /// - (c) the SIZE field made non-octal — the checksum disagrees, and
+        ///   the payload it no longer locates is scanned through;
+        /// - (d) the MAGIC destroyed with the checksum RESEALED, so the
+        ///   block clears criterion 2 and is refused by criterion 3 alone —
+        ///   a sighting at that header's offset, never an entry.
+        #[test]
+        fn damage_catalogue_a_corrupted_header_field() {
+            let want = inputs();
+            for (writer, bytes) in reference_archives("header") {
+                let geometry = members(&bytes);
+                for (damaged, target) in geometry.iter().enumerate() {
+                    let h = target.header;
+                    let survivors: Vec<(&str, SalvageStatus)> = want
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != damaged)
+                        .map(|(_, (n, _))| (*n, SalvageStatus::Complete))
+                        .collect();
+                    for field in ["name byte", "checksum", "size", "magic, resealed"] {
+                        let mut bad = bytes.clone();
+                        match field {
+                            "name byte" => bad[h + 2] ^= 0x20,
+                            "checksum" => bad[h + 150] = b'9',
+                            "size" => bad[h + 124..h + 128].copy_from_slice(b"zzzz"),
+                            _ => {
+                                bad[h + 257..h + 263].copy_from_slice(b"bogus\0");
+                                reseal(&mut bad[h..h + BLOCK]);
+                            }
+                        }
+                        assert!(
+                            read_through_the_reader(&bad).is_err() || field == "magic, resealed",
+                            "{writer} {field}: sanity, the ordinary reader must refuse it"
+                        );
+                        let out = scan(&bad);
+                        assert_eq!(
+                            rows(&out),
+                            survivors,
+                            "{writer} damaged={damaged} {field}: that entry absent, its \
+                             neighbours unaffected"
+                        );
+                        let written = write_back(&bad, &out);
+                        for (entry, got) in out.entries.iter().zip(&written) {
+                            let name = &entry.meta.name;
+                            let data = &want.iter().find(|(n, _)| n == name).unwrap().1;
+                            assert_eq!(got, &(data.clone(), true), "{writer} {field}: {name}");
+                        }
+                        if field == "magic, resealed" {
+                            let offsets: Vec<u64> =
+                                out.sightings.iter().map(|s| s.offset).collect();
+                            assert_eq!(
+                                offsets.first(),
+                                Some(&(h as u64)),
+                                "{writer} damaged={damaged}: a header the gate refuses on its \
+                                 magic alone is said, not silently dropped"
+                            );
+                            // NOT `== [h]`: GNU tar's archives also report the
+                            // header's one-byte-late copy — Task 6 finding D1,
+                            // pinned by the ignored test below. Bounded here so
+                            // nothing ELSE can ride along unseen.
+                            assert!(
+                                offsets
+                                    .iter()
+                                    .all(|&o| (h as u64..h as u64 + 8).contains(&o)),
+                                "{writer} damaged={damaged}: {offsets:?}"
+                            );
+                        } else {
+                            assert!(
+                                out.sightings.is_empty(),
+                                "{writer} damaged={damaged} {field}: {:?}",
+                                out.sightings
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// **Task 6 finding D1 — ignored until the controller rules.** A
+        /// header whose magic is junk (checksum still valid) is ONE ungateable
+        /// header, and the note must say one. On GNU tar's archives it says
+        /// two: its one-byte-late copy agrees with itself whenever the name's
+        /// first byte equals the payload's (`alpha.txt` / `alpha line 0`),
+        /// and [`looks_like_a_shifted_twin`] does not recognise the copy's
+        /// source because it requires that source's magic to be `ustar` or
+        /// blank — exactly what a junk-magic header is not. Measured through
+        /// the binary: "saw 2 tar header(s) … at offset(s) 0, 1". bsdtar's
+        /// archives give one (its fields shift differently). Run with
+        /// `--ignored`; it fails today.
+        #[test]
+        #[ignore = "Task 6 finding D1: a junk-magic tar header's shifted copy is a second sighting"]
+        fn d1_a_junk_magic_header_is_one_sighting_not_two() {
+            for (writer, bytes) in reference_archives("d1") {
+                for target in members(&bytes) {
+                    let h = target.header;
+                    let mut bad = bytes.clone();
+                    bad[h + 257..h + 263].copy_from_slice(b"bogus\0");
+                    reseal(&mut bad[h..h + BLOCK]);
+                    assert_eq!(
+                        scan(&bad)
+                            .sightings
+                            .iter()
+                            .map(|s| s.offset)
+                            .collect::<Vec<_>>(),
+                        [h as u64],
+                        "{writer}: {}",
+                        target.name
+                    );
+                }
+            }
+        }
+    }
 }

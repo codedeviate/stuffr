@@ -1799,4 +1799,393 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
     }
+
+    // -------------------------------------------------------------------
+    // Salvage Stage 3 Task 6: the damage catalogue.
+    //
+    // **Every expectation here is the PRE-DAMAGE state, and none of it
+    // comes from this scanner.** [`inputs`] is written to disk, a REAL
+    // `cpio -o -H newc` archives it, and what each mutation must produce is
+    // derived from those input files plus the record geometry [`members`]
+    // parses longhand out of the writer's bytes — never from what
+    // `salvage_cpio` currently returns. The writers are the platform `cpio`
+    // (bsdcpio here, GNU on the CI runner) and, on macOS, GNU cpio's
+    // keg-only install. Both are REQUIRED: macOS's and Linux's `cpio` are
+    // different programs, and a catalogue that ran over one alone would
+    // repeat the 0.2.0 gap `reference-tools.md` records.
+    // -------------------------------------------------------------------
+    mod damage_catalogue {
+        use std::path::PathBuf;
+
+        use super::*;
+
+        /// The files every writer is fed: THE pre-damage state. Each payload
+        /// is at least 1,500 bytes — **large on purpose**: a flip at a
+        /// payload's middle is then ~750 bytes from the nearest header, so
+        /// it cannot land inside one (a `newc` header is 110 bytes plus the
+        /// name, and on tiny payloads "mid-payload" and "in the next
+        /// header" are a few bytes apart). None contains `070701`.
+        fn inputs() -> Vec<(&'static str, Vec<u8>)> {
+            vec![
+                (
+                    "alpha.txt",
+                    (0..200)
+                        .flat_map(|i| format!("alpha line {i}\n").into_bytes())
+                        .collect(),
+                ),
+                (
+                    "beta.txt",
+                    (0..301)
+                        .flat_map(|i| format!("beta {i};").into_bytes())
+                        .collect(),
+                ),
+                (
+                    "gamma.bin",
+                    (0..1500u32).map(|i| ((i * 7 + 3) % 256) as u8).collect(),
+                ),
+                (
+                    "delta.txt",
+                    (0..151)
+                        .flat_map(|i| format!("delta row {i}\n").into_bytes())
+                        .collect(),
+                ),
+            ]
+        }
+
+        /// GNU cpio's keg-only Homebrew install — see `reference-tools.md`.
+        const GNU_CPIO_ON_MACOS: &str = "/opt/homebrew/opt/cpio/bin/cpio";
+
+        /// The writers: the platform `cpio`, plus GNU cpio on macOS, where
+        /// the platform's is bsdcpio. On Linux the platform `cpio` IS GNU's.
+        fn writers() -> Vec<PathBuf> {
+            let mut out = vec![which("cpio").unwrap_or_else(|| {
+                panic!("no reference `cpio` on PATH — this catalogue proved nothing")
+            })];
+            if cfg!(target_os = "macos") {
+                let gnu = PathBuf::from(GNU_CPIO_ON_MACOS);
+                assert!(
+                    gnu.is_file(),
+                    "GNU cpio not at {GNU_CPIO_ON_MACOS} (`brew install cpio`) — without it \
+                     this catalogue covers bsdcpio alone, and CI runs GNU's"
+                );
+                out.push(gnu);
+            }
+            out
+        }
+
+        /// Every writer's `newc` archive of [`inputs`]: `(label, bytes)`.
+        fn reference_archives(tag: &str) -> Vec<(String, Vec<u8>)> {
+            let tree = tempfile_dir(&format!("catalogue-{tag}"));
+            for (name, data) in inputs() {
+                std::fs::write(tree.0.join(name), data).unwrap();
+            }
+            let names: Vec<&str> = inputs().iter().map(|(n, _)| *n).collect();
+            writers()
+                .into_iter()
+                .map(|writer| {
+                    let bytes = reference_archive(&writer, &tree.0, &names, "newc")
+                        .unwrap_or_else(|| panic!("{} cannot write newc", writer.display()));
+                    (writer.display().to_string(), bytes)
+                })
+                .collect()
+        }
+
+        /// One entry's geometry, read by THIS TEST from the raw bytes.
+        struct Member {
+            name: String,
+            header: usize,
+            payload: std::ops::Range<usize>,
+        }
+
+        fn round4(n: usize) -> usize {
+            n.div_ceil(4) * 4
+        }
+
+        /// Walks a `newc` archive by its published layout — `070701`,
+        /// thirteen 8-digit hex fields (`c_filesize` the 7th at byte 54,
+        /// `c_namesize` the 12th at byte 94), the NUL-terminated name, both
+        /// name and payload padded to four — up to `TRAILER!!!`.
+        /// Hand-rolled rather than read through [`gate_newc_at`], which is
+        /// the code under test.
+        fn members(bytes: &[u8]) -> Vec<Member> {
+            let hex = |at: usize| {
+                usize::from_str_radix(std::str::from_utf8(&bytes[at..at + 8]).unwrap(), 16).unwrap()
+            };
+            let mut out = Vec::new();
+            let mut at = 0usize;
+            loop {
+                assert_eq!(&bytes[at..at + 6], b"070701", "a newc header at {at}");
+                let namesize = hex(at + 94);
+                let filesize = hex(at + 54);
+                let name =
+                    String::from_utf8(bytes[at + 110..at + 110 + namesize - 1].to_vec()).unwrap();
+                if name == "TRAILER!!!" {
+                    return out;
+                }
+                let start = round4(at + 110 + namesize);
+                out.push(Member {
+                    name,
+                    header: at,
+                    payload: start..start + filesize,
+                });
+                at = round4(start + filesize);
+            }
+        }
+
+        /// The platform cpio's own extraction of `name` from `bytes`, and
+        /// whether it exited 0.
+        fn platform_extract(bytes: &[u8], name: &str) -> (bool, Vec<u8>) {
+            let dir = tempfile_dir("catalogue-extract");
+            let mut child = std::process::Command::new(&writers()[0])
+                .arg("-i")
+                .arg(name)
+                .current_dir(&dir.0)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(bytes).unwrap();
+            let status = child.wait().unwrap();
+            (
+                status.success(),
+                std::fs::read(dir.0.join(name)).unwrap_or_default(),
+            )
+        }
+
+        fn rows(out: &SalvageOutcome) -> Vec<(&str, SalvageStatus)> {
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.status))
+                .collect()
+        }
+
+        fn all_unattested(want: &[(&'static str, Vec<u8>)]) -> Vec<(&'static str, SalvageStatus)> {
+            want.iter()
+                .map(|(n, _)| (*n, SalvageStatus::Unattested))
+                .collect()
+        }
+
+        // ---------------------------------------------------------------
+        // Step 1: the agreement property.
+        // ---------------------------------------------------------------
+
+        /// **Salvage of an UNDAMAGED archive agrees exactly with the
+        /// ordinary reader AND with the files that went in** — names, sizes
+        /// and kinds as `list` reports them, bytes as the input files hold
+        /// them, every entry `Unattested` (never `Complete`, never `Intact`),
+        /// no sighting.
+        #[test]
+        fn salvage_of_every_writer_s_healthy_archive_agrees_with_the_reader_and_the_inputs() {
+            let want = inputs();
+            for (writer, bytes) in reference_archives("agree") {
+                let reader = read_through_the_reader(&bytes)
+                    .unwrap_or_else(|e| panic!("{writer}: the ordinary reader must walk it: {e}"));
+                let out = scan(&bytes);
+                assert!(out.sightings.is_empty(), "{writer}: {:?}", out.sightings);
+                assert_eq!(
+                    out.entries
+                        .iter()
+                        .map(|e| (e.meta.name.clone(), e.meta.size, e.meta.kind.clone()))
+                        .collect::<Vec<_>>(),
+                    reader
+                        .iter()
+                        .map(|(n, s, k, _)| (n.clone(), Some(*s), k.clone()))
+                        .collect::<Vec<_>>(),
+                    "{writer}: salvage and the ordinary reader must describe every entry alike"
+                );
+                assert_eq!(
+                    members(&bytes)
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>(),
+                    want.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                    "{writer}: sanity, this test's own geometry finds the inputs in order"
+                );
+                assert_eq!(rows(&out), all_unattested(&want), "{writer}");
+                let written = write_back(&bytes, &out);
+                for (i, (name, data)) in want.iter().enumerate() {
+                    assert_eq!(&reader[i].3, data, "{writer}: the reader's {name}");
+                    assert_eq!(&written[i], &(data.clone(), true), "{writer}: {name}");
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Step 2: the mutation catalogue.
+        // ---------------------------------------------------------------
+
+        /// Row 1/3 — **a truncated tail.** Cut inside the LAST entry's
+        /// payload (which takes the trailer with it): every earlier entry
+        /// `Unattested` with exactly its input bytes, the cut one `Partial`
+        /// with exactly the input's surviving prefix.
+        #[test]
+        fn damage_catalogue_a_truncated_tail() {
+            let want = inputs();
+            let last = want.len() - 1;
+            for (writer, bytes) in reference_archives("tail") {
+                let payload = members(&bytes)[last].payload.clone();
+                for keep in [0, 1, payload.len() / 2, payload.len() - 1] {
+                    let cut = &bytes[..payload.start + keep];
+                    let out = scan(cut);
+                    let mut expected = all_unattested(&want);
+                    expected[last].1 = SalvageStatus::Partial;
+                    assert_eq!(rows(&out), expected, "{writer} keep={keep}");
+                    let written = write_back(cut, &out);
+                    for (i, (name, data)) in want.iter().enumerate().take(last) {
+                        assert_eq!(&written[i], &(data.clone(), true), "{writer} {name}");
+                    }
+                    assert_eq!(
+                        written[last],
+                        (want[last].1[..keep].to_vec(), false),
+                        "{writer} keep={keep}: exactly the surviving prefix"
+                    );
+                }
+            }
+        }
+
+        /// Row 2/3 — **a byte flipped mid-payload. The stage's point.**
+        /// `newc` checksums nothing, so the damaged entry is a SILENTLY
+        /// WRONG FILE. The tier must not claim otherwise: `Unattested`,
+        /// never `Intact` (and never `Complete`, which would claim a header
+        /// check `newc` lacks) — and the bytes written are asserted to
+        /// DIFFER from the input in exactly the flipped byte. The platform
+        /// `cpio` extracts the same wrong bytes at exit 0. Every entry takes
+        /// its turn; the flip is asserted to sit hundreds of bytes inside
+        /// its payload, nowhere near a header.
+        #[test]
+        fn damage_catalogue_a_byte_flipped_mid_payload() {
+            let want = inputs();
+            for (writer, bytes) in reference_archives("flip") {
+                let geometry = members(&bytes);
+                for (damaged, target) in geometry.iter().enumerate() {
+                    let mid = target.payload.len() / 2;
+                    assert!(
+                        mid >= 500 && target.payload.len() - mid >= 500,
+                        "the flip must be unambiguously mid-payload"
+                    );
+                    let mut flipped = bytes.clone();
+                    flipped[target.payload.start + mid] ^= 0xFF;
+
+                    let out = scan(&flipped);
+                    assert_eq!(
+                        rows(&out),
+                        all_unattested(&want),
+                        "{writer} damaged={damaged}"
+                    );
+                    assert!(out.sightings.is_empty(), "{writer}: {:?}", out.sightings);
+                    let written = write_back(&flipped, &out);
+                    let mut wrong = want[damaged].1.clone();
+                    wrong[mid] ^= 0xFF;
+                    assert_ne!(
+                        written[damaged].0, want[damaged].1,
+                        "{writer}: silently wrong"
+                    );
+                    assert_eq!(
+                        written[damaged],
+                        (wrong.clone(), true),
+                        "{writer}: wrong in exactly the flipped byte and no other"
+                    );
+                    for (i, (name, data)) in want.iter().enumerate() {
+                        if i != damaged {
+                            assert_eq!(&written[i], &(data.clone(), true), "{writer}: {name}");
+                        }
+                    }
+                    assert_eq!(
+                        platform_extract(&flipped, want[damaged].0),
+                        (true, wrong),
+                        "{writer}: the platform cpio extracts the same wrong bytes at exit 0"
+                    );
+                }
+            }
+        }
+
+        /// Row 3/3 — **a header field corrupted.** That entry is absent;
+        /// every other entry is `Unattested` with exactly its input bytes.
+        /// Three fields against every entry in turn (the first included):
+        /// (a) the MAGIC's last digit, (b) a `c_mode` digit made non-hex,
+        /// (c) a `c_filesize` digit made non-hex — the last leaves nothing
+        /// to say where its payload ends, so that payload is scanned
+        /// through. The entry BEFORE the damage is the subtle one: its size
+        /// is no longer corroborated by the header it lands on, so its jump
+        /// is not taken — and it must still come back whole.
+        #[test]
+        fn damage_catalogue_a_corrupted_header_field() {
+            let want = inputs();
+            for (writer, bytes) in reference_archives("header") {
+                for (damaged, target) in members(&bytes).iter().enumerate() {
+                    let h = target.header;
+                    for (field, at) in
+                        [("magic", h + 5), ("c_mode", h + 14), ("c_filesize", h + 61)]
+                    {
+                        let mut bad = bytes.clone();
+                        bad[at] = b'x';
+                        assert!(
+                            read_through_the_reader(&bad).is_err(),
+                            "{writer} {field}: sanity, the ordinary reader must refuse it"
+                        );
+                        let out = scan(&bad);
+                        let survivors: Vec<_> = all_unattested(&want)
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(i, _)| *i != damaged)
+                            .map(|(_, row)| row)
+                            .collect();
+                        assert_eq!(
+                            rows(&out),
+                            survivors,
+                            "{writer} damaged={damaged} {field}: that entry absent, its \
+                             neighbours unaffected"
+                        );
+                        assert!(out.sightings.is_empty(), "{writer}: {:?}", out.sightings);
+                        let written = write_back(&bad, &out);
+                        for (entry, got) in out.entries.iter().zip(&written) {
+                            let name = &entry.meta.name;
+                            let data = &want.iter().find(|(n, _)| n == name).unwrap().1;
+                            assert_eq!(got, &(data.clone(), true), "{writer} {field}: {name}");
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The header field that is NOT absent-or-refused: a `c_filesize`
+        /// that still PARSES but lies (grown by 0x100). Nothing in `newc`
+        /// can tell, so the entry is reported over what its header claims —
+        /// `Unattested`, never a tier that vouches for it — and its written
+        /// bytes are WRONG (they run into the next header). What must hold
+        /// is that the lie costs no neighbour: the jump it asks for lands on
+        /// no header, so it is not taken, and the entry behind it is found.
+        #[test]
+        fn damage_catalogue_a_size_that_lies_costs_no_neighbour() {
+            let want = inputs();
+            for (writer, bytes) in reference_archives("lying-size") {
+                let geometry = members(&bytes);
+                for (damaged, target) in geometry.iter().enumerate().take(geometry.len() - 1) {
+                    let h = target.header;
+                    let mut bad = bytes.clone();
+                    let lie = target.payload.len() + 0x100;
+                    bad[h + 54..h + 62].copy_from_slice(format!("{lie:08X}").as_bytes());
+
+                    let out = scan(&bad);
+                    assert_eq!(
+                        rows(&out),
+                        all_unattested(&want),
+                        "{writer} damaged={damaged}"
+                    );
+                    let written = write_back(&bad, &out);
+                    assert_ne!(
+                        written[damaged].0, want[damaged].1,
+                        "{writer}: the lying entry's bytes are wrong, and its tier never said \
+                         otherwise"
+                    );
+                    for (i, (name, data)) in want.iter().enumerate() {
+                        if i != damaged {
+                            assert_eq!(&written[i], &(data.clone(), true), "{writer}: {name}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
