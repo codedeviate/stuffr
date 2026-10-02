@@ -412,25 +412,33 @@ fn slot_from_payload(payload: &[u8]) -> Option<&'static str> {
 /// Five slots are [`Attestation::ContentChecksum`]: zip carries a CRC-32,
 /// and ARC, ZOO, LHA and ARJ each carry a CRC of their own. `tar` (Stage 3
 /// Task 2) is [`Attestation::HeaderChecksumOnly`], and `cpio` (Task 3) and
-/// `ar` (Task 4) are [`Attestation::Nothing`]. It is a `match` naming each
-/// slot rather than one constant, because the classes differ — a constant
-/// would carry the
-/// wrong class into the exact slots the argument exists for, silently,
-/// which is the shape [`no_cross_check_arm`] one screen up was written to
-/// stop. Each scanner's class is stated here by name, where a reviewer
-/// reading the oracle call can see it.
+/// `ar` (Task 4) are [`Attestation::Nothing`]. Per slot, never one
+/// constant, because the classes differ — a constant would carry the wrong
+/// class into the exact slots the argument exists for, silently.
+///
+/// **Read from `entries::salvage_attestation` since Salvage Stage 3 Task 5**,
+/// not stated here. This was a `match` of its own, and `stuffr formats`'
+/// SALVAGE column needs the same fact, which a fuzz target excluded from
+/// the workspace cannot export — so the class now lives in ONE table, the
+/// facade's scanner dispatch, beside each scanner's entry point. That table
+/// is still apart from the code under test: no scanner consults it when it
+/// decides a status, so the oracle still checks each scanner's statuses
+/// against a class the scanner did not choose for itself. A slot with no
+/// scanner (`None`) aborts the run, as an unmatched name here always did —
+/// the loud-not-silent rule [`no_cross_check_arm`] states.
 ///
 /// It was a `bool` (`format_offers_verifier`) for one commit, and that
 /// could not tell a header-only checksum from a content one: a scanner in
 /// any of these five slots answering `Complete` after its CRC had been
 /// compared and disagreed passed the oracle. Ruling 3-G.
-fn attestation(name: &str) -> Attestation {
-    match name {
-        "zip" | "arc" | "zoo" | "lha" | "arj" => Attestation::ContentChecksum,
-        "tar" => Attestation::HeaderChecksumOnly,
-        "cpio" | "ar" => Attestation::Nothing,
-        other => no_cross_check_arm(other),
-    }
+fn attestation(name: &'static str) -> Attestation {
+    entries::salvage_attestation(stuffr_core::FormatId::new(name)).unwrap_or_else(|| {
+        panic!(
+            "SALVAGE_SLOTS names `{name}`, but `entries::salvage_attestation` reports no \
+             scanner for it in this build — so `check_salvage_claim` has no class to judge it \
+             by. Append a slot only in the commit that wires its scanner."
+        )
+    })
 }
 
 /// Runs [`check_salvage_claim`] and reports that one call was made.

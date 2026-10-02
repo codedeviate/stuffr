@@ -304,6 +304,9 @@ impl Container for Arc {
             // this reader checks it before handing back a single byte — a
             // format-wide guarantee, not a per-writer option, so `Always`.
             detects_corruption: CorruptionDetection::Always,
+            // `crate::legacy::arc_salvage` scans it; `stuffr::entries::salvage_scanner`
+            // dispatches to it, and a test there pins this flag to that arm.
+            salvage: true,
             ..ContainerCaps::read_only()
         }
     }

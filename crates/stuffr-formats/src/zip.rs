@@ -260,6 +260,9 @@ impl Container for Zip {
             // neither costs a fidelity warning.
             stores_dirs: true,
             stores_symlinks: true,
+            // `crate::zip_salvage` scans it; `stuffr::entries::salvage_scanner`
+            // dispatches to it, and a test there pins this flag to that arm.
+            salvage: true,
             ..Default::default()
         }
     }

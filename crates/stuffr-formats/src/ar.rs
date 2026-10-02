@@ -256,6 +256,9 @@ impl Container for Ar {
             read: true,
             write: true,
             forward_parse: true,
+            // `crate::ar_salvage` scans it; `stuffr::entries::salvage_scanner`
+            // dispatches to it, and a test there pins this flag to that arm.
+            salvage: true,
             ..Default::default()
         }
     }

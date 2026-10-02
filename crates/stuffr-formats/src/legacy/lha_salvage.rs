@@ -1657,8 +1657,8 @@ pub fn write_payload(
     out: &mut dyn Write,
 ) -> Result<bool> {
     // Refused BEFORE `archive_path` is opened, which `entries.rs`'s own
-    // `salvage_seam_tests::every_salvage_slot_reaches_a_real_payload_writer`
-    // relies on: it probes every slot with a codec-less entry and a path
+    // `salvage_caps_tests` relies on: it probes every salvage-capable
+    // container with a codec-less entry and a path
     // that does not exist.
     let Some(method) = method_for_codec(entry.meta.codec) else {
         return Err(Error::Unsupported(format!(
@@ -3254,9 +3254,8 @@ mod tests {
     }
 
     /// A codec-less entry is refused BEFORE `archive_path` is opened —
-    /// `entries.rs`'s `every_salvage_slot_reaches_a_real_payload_writer`
-    /// probes every slot with exactly that shape and a path that does not
-    /// exist.
+    /// `entries.rs`'s `salvage_caps_tests` probes every salvage-capable
+    /// container with exactly that shape and a path that does not exist.
     #[test]
     fn write_payload_refuses_a_codec_less_entry_without_opening_the_archive() {
         let entry = SalvagedEntry::new(0, 0, 0, EntryMeta::file("probe"), SalvageStatus::Complete);

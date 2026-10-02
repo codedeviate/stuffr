@@ -236,6 +236,9 @@ impl Container for Lha {
             // corruption property.
             detects_corruption: CorruptionDetection::Always,
             stores_dirs: true,
+            // `crate::legacy::lha_salvage` scans it; `stuffr::entries::salvage_scanner`
+            // dispatches to it, and a test there pins this flag to that arm.
+            salvage: true,
             ..ContainerCaps::read_write()
         }
     }

@@ -85,8 +85,8 @@ pub const CONTAINER_SLOTS: &[&str] = &[
 /// is forced to — the same leading-selector-byte shape [`CONTAINER_SLOTS`]
 /// already uses, rather than a second one invented for this target.
 ///
-/// Lists only formats `stuffr::entries::salvage_scan` actually dispatches to
-/// a real scanner: `zip` (Salvage Stage 1), `arc` (Stage 2 Task 3), `zoo`
+/// Lists only formats `stuffr::entries::salvage_scanner` actually dispatches
+/// to a real scanner: `zip` (Salvage Stage 1), `arc` (Stage 2 Task 3), `zoo`
 /// (Stage 2 Task 4), `lha` (Stage 2 Task 5), `arj` (Stage 2 Task 6), `tar`
 /// (Stage 3 Task 2), `cpio` (Stage 3 Task 3) and `ar` (Stage 3 Task 4) —
 /// every registered container, as of that task. A format with no scanner
@@ -94,7 +94,16 @@ pub const CONTAINER_SLOTS: &[&str] = &[
 /// not the archive; see `salvage_scan`'s own doc), so listing one here
 /// before its own scanner lands would spend a share of every fuzzing run
 /// proving nothing but that already-known refusal. Append a name in the same
-/// commit that wires its scanner into `salvage_scan`, never before.
+/// commit that wires its scanner into `salvage_scanner`, never before.
+///
+/// **This is the fuzz target's wire format, not the answer to "which formats
+/// can be salvaged"** — that is [`crate::ContainerCaps::salvage`], which
+/// `stuffr::entries`' `salvage_caps_tests` pins to the dispatch for every
+/// registered container (Salvage Stage 3 Task 5 deleted the older test that
+/// pinned this list to the dispatch instead). A slot naming a format with no
+/// scanner still fails loudly: the fuzz target's `attestation` and the corpus
+/// generator's `top_tier` both read `stuffr::entries::salvage_attestation`,
+/// and panic on `None`.
 ///
 /// **Append-only, the identical rule [`CODEC_SLOTS`] and [`CONTAINER_SLOTS`]
 /// carry, for the identical reason: the index is the wire format of every

@@ -243,6 +243,9 @@ impl Container for Tar {
             // shape.
             stores_dirs: true,
             stores_symlinks: true,
+            // `crate::tar_salvage` scans it; `stuffr::entries::salvage_scanner`
+            // dispatches to it, and a test there pins this flag to that arm.
+            salvage: true,
             ..Default::default()
         }
     }

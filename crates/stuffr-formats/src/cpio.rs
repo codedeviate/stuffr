@@ -225,6 +225,9 @@ impl Container for CpioNewc {
             // comment. A symlink's target is its payload.
             stores_dirs: true,
             stores_symlinks: true,
+            // `crate::cpio_salvage` scans it; `stuffr::entries::salvage_scanner`
+            // dispatches to it, and a test there pins this flag to that arm.
+            salvage: true,
             ..Default::default()
         }
     }

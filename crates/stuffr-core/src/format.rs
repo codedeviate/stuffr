@@ -263,6 +263,25 @@ pub struct ContainerCaps {
     /// (CRC-16 per entry) and `arj` (CRC-32 per entry) are the first two to
     /// declare it.
     pub detects_corruption: CorruptionDetection,
+    /// `stuffr salvage` has a scanner for this container: it can scan a
+    /// damaged archive for entries, report what it proved about each, and
+    /// write what it recovered.
+    ///
+    /// The one answer to "is salvage supported", read by `stuffr formats`'
+    /// SALVAGE column and by `stuffr::entries::salvage`, which refuses a
+    /// container saying `false` at exit 3 before scanning a byte. It is NOT
+    /// the dispatch: the facade still maps a format to its scanner by name,
+    /// and a test there pins the two to each other for every container a
+    /// build registers, in both directions.
+    ///
+    /// It says nothing about how much a recovered entry can be trusted —
+    /// that is a per-format class of evidence
+    /// ([`crate::salvage::Attestation`]), owned beside the scanner dispatch.
+    ///
+    /// Defaults to `false` via [`Self::read_only`], [`Self::read_write`] and
+    /// `Default`, like every other capability here: a container claims it
+    /// explicitly, in the same commit that wires its scanner.
+    pub salvage: bool,
 }
 
 /// A magic-byte rule. Detection matches these against a bounded prefix.
@@ -340,6 +359,7 @@ impl ContainerCaps {
             stores_dirs: false,
             stores_symlinks: false,
             detects_corruption: CorruptionDetection::Never,
+            salvage: false,
         }
     }
 

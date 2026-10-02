@@ -6,6 +6,7 @@
 //! looks identical either way. Here each one has a broken double proving it
 //! can fail, exactly as `conformance.rs`'s `broken_codecs` does.
 
+pub use crate::salvage::Attestation;
 use crate::salvage::SalvageStatus;
 use crate::{EntryKind, Error, Fidelity, FidelityReport};
 
@@ -156,49 +157,6 @@ pub fn check_fidelity_claim(report: &FidelityReport, approximated: bool) -> Resu
         ));
     }
     Ok(())
-}
-
-/// Which class of evidence a FORMAT offers for one of its entries — the
-/// third argument to [`check_salvage_claim`], and a per-format constant.
-///
-/// **Three classes, which is why this is an enum and not a `bool`.** Salvage
-/// Stage 3 Task 1 first shipped the argument as `format_offers_verifier:
-/// bool`, and its fix round's review showed with a truth table that no
-/// reading of a two-valued flag can hold the boundary: read as "a content
-/// checksum", it let `cpio` claim [`SalvageStatus::Complete`]; read as "a
-/// content checksum OR a self-verifying header" (the shipped reading), it
-/// let `tar` claim [`SalvageStatus::Intact`] and — live against the five
-/// scanners that shipped before this stage — let `zip`, `arc`, `zoo`, `lha`
-/// or `arj` answer `Complete` for an entry whose CRC was compared and
-/// DISAGREED, turning an exit-4 `Partial` into an exit-0 clean recovery.
-/// Both false claims sat in the one cell (`checked`, `offers`) that tar's
-/// honest `Complete` also occupies, so no function of those inputs could
-/// refuse them and permit it. Ruling 3-G.
-///
-/// Two bools (`offers_content_checksum`, `header_self_verifies`) were
-/// considered and refused: four states for three classes, one of them
-/// meaningless, and the split pushed back onto every caller. Here each
-/// scanner NAMES its class.
-///
-/// **Deliberately NOT `#[non_exhaustive]`**, for the reason Ruling 3-D kept
-/// it off [`SalvageStatus`]: a fourth class of evidence must fail to compile
-/// at every `match`, [`check_salvage_claim`]'s own included, rather than be
-/// absorbed by a wildcard arm that decides what it permits by accident.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Attestation {
-    /// A checksum over the entry's CONTENT, computed by the original writer —
-    /// `zip`, `arc`, `zoo`, `lha`, `arj`. The only class that can earn
-    /// [`SalvageStatus::Intact`].
-    ContentChecksum,
-    /// A checksum over the HEADER only; the content has none — `tar`. The
-    /// only class that can earn [`SalvageStatus::Complete`]: "every declared
-    /// byte was present and the header self-verified" is exactly what this
-    /// class can prove and all it can prove.
-    HeaderChecksumOnly,
-    /// Neither — `cpio`, `ar`. A coincidental header match and a real entry
-    /// are indistinguishable in the bytes, so the only honest tier this
-    /// class can reach on a whole entry is [`SalvageStatus::Unattested`].
-    Nothing,
 }
 
 /// Never report a status that claims more evidence than the format offers

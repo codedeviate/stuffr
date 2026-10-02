@@ -375,6 +375,9 @@ impl Container for Zoo {
             // Every ZOO entry carries a CRC-16/ARC the format mandates, and
             // this reader checks it before handing back a single byte.
             detects_corruption: CorruptionDetection::Always,
+            // `crate::legacy::zoo_salvage` scans it; `stuffr::entries::salvage_scanner`
+            // dispatches to it, and a test there pins this flag to that arm.
+            salvage: true,
             ..ContainerCaps::read_only()
         }
     }

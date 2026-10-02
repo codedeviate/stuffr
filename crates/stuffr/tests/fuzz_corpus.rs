@@ -1429,18 +1429,20 @@ fn the_corpus_builders_crc_matches_the_published_check_value() {
 /// slot's class, so a seed that reaches it is a seed the fuzz target's
 /// oracle call is live for.
 ///
-/// A `match` naming every slot with a panic for the rest, the same shape as
-/// the fuzz target's own `attestation`: a slot appended without an arm
-/// here fails this file's tests rather than being judged against the wrong
-/// tier.
-fn top_tier(slot: &str) -> stuffr_core::salvage::SalvageStatus {
-    use stuffr_core::salvage::SalvageStatus;
-    match slot {
-        "zip" | "arc" | "zoo" | "lha" | "arj" => SalvageStatus::Intact,
-        "tar" => SalvageStatus::Complete,
-        "cpio" => SalvageStatus::Unattested,
-        "ar" => SalvageStatus::Unattested,
-        other => panic!("SALVAGE_SLOTS names `{other}` but `top_tier` has no arm for it"),
+/// Derived from the slot's class in `stuffr::entries::salvage_attestation`
+/// — the same table the fuzz target's own `attestation` reads, so the two
+/// cannot disagree — and the class maps to its tier through an exhaustive
+/// `match`, so a fourth class fails to compile here rather than being
+/// judged against the wrong tier. A slot with no scanner panics, failing
+/// this file's tests. (A per-slot table of its own until Salvage Stage 3
+/// Task 5.)
+fn top_tier(slot: &'static str) -> stuffr_core::salvage::SalvageStatus {
+    use stuffr_core::salvage::{Attestation, SalvageStatus};
+    match stuffr::entries::salvage_attestation(stuffr_core::FormatId::new(slot)) {
+        Some(Attestation::ContentChecksum) => SalvageStatus::Intact,
+        Some(Attestation::HeaderChecksumOnly) => SalvageStatus::Complete,
+        Some(Attestation::Nothing) => SalvageStatus::Unattested,
+        None => panic!("SALVAGE_SLOTS names `{slot}` but this build has no scanner for it"),
     }
 }
 

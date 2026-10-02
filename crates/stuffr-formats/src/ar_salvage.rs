@@ -446,8 +446,8 @@ pub fn write_payload(
     out: &mut dyn Write,
 ) -> Result<bool> {
     // Refused BEFORE `archive_path` is opened — `entries.rs`'s
-    // `every_salvage_slot_reaches_a_real_payload_writer` probes every slot
-    // with a codec-less entry and a path that does not exist.
+    // `salvage_caps_tests` probes every salvage-capable container with a
+    // codec-less entry and a path that does not exist.
     if entry.meta.codec != Some(STORED) {
         return Err(Error::Unsupported(format!(
             "entry `{}` carries codec {:?}; this build's ar salvage writer writes stored \

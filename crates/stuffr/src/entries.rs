@@ -1777,69 +1777,173 @@ fn resolve_salvage_format(path: &Path, hint: Option<FormatId>) -> Result<FormatI
     })
 }
 
-/// Dispatches a resolved container format to its salvage scanner, matching
-/// [`stuffr_formats::zip_salvage::salvage_zip`]'s own signature exactly —
-/// `fn(&mut dyn SeekRead, &SalvagePolicy) -> Result<SalvageOutcome>` (the
-/// [`stuffr_core::salvage::SalvageOutcome`] the shared engine produces, not
-/// this module's own [`SalvageOutcome`] report) — so each later task's own
-/// scanner drops in as one more arm here, gated on its own
-/// feature, alongside the task that adds it. `zip` (Task 2), `arc`
-/// (Task 3, [`stuffr_formats::legacy::arc_salvage::salvage_arc`]), `zoo`
-/// (Task 4, [`stuffr_formats::legacy::zoo_salvage::salvage_zoo`]), `lha`
-/// (Task 5), `arj`
-/// (Task 6, [`stuffr_formats::legacy::arj_salvage::salvage_arj`]), `tar`
-/// (Salvage Stage 3 Task 2, [`stuffr_formats::tar_salvage::salvage_tar`]),
+/// One salvage scanner this build has: its entry point, and the class of
+/// evidence its format offers.
+///
+/// The two travel together in ONE table ([`salvage_scanner`]) so they
+/// cannot disagree about which formats exist — a scanner arm without a
+/// class, or a class for a format with no scanner, is unrepresentable.
+#[derive(Clone, Copy)]
+struct SalvageScanner {
+    scan: fn(
+        &mut dyn SeekRead,
+        &stuffr_core::salvage::SalvagePolicy,
+    ) -> Result<stuffr_core::salvage::SalvageOutcome>,
+    attestation: stuffr_core::salvage::Attestation,
+}
+
+/// The refusal for a format this build has no salvage scanner for:
+/// [`Error::Unsupported`], exit 3, naming the format. Shared by
+/// [`salvage_scanner`]'s fallback and [`refuse_unsalvageable`] so the two
+/// routes to "no scanner" cannot word it differently.
+fn no_salvage_scanner(format: FormatId) -> Error {
+    Error::Unsupported(format!(
+        "salvage has no scanner for `{}` archives in this build",
+        format.as_str()
+    ))
+}
+
+/// Maps a resolved container format to its salvage scanner and its
+/// [`Attestation`](stuffr_core::salvage::Attestation) class — the one place
+/// either fact is stated per format.
+///
+/// Every scanner matches [`stuffr_formats::zip_salvage::salvage_zip`]'s own
+/// signature exactly — `fn(&mut dyn SeekRead, &SalvagePolicy) ->
+/// Result<SalvageOutcome>` (the [`stuffr_core::salvage::SalvageOutcome`] the
+/// shared engine produces, not this module's own [`SalvageOutcome`] report)
+/// — so each scanner task's own scanner dropped in as one more arm here,
+/// gated on its own feature. `zip` (Stage 2 Task 2), `arc` (Task 3,
+/// [`stuffr_formats::legacy::arc_salvage::salvage_arc`]), `zoo` (Task 4,
+/// [`stuffr_formats::legacy::zoo_salvage::salvage_zoo`]), `lha` (Task 5),
+/// `arj` (Task 6, [`stuffr_formats::legacy::arj_salvage::salvage_arj`]),
+/// `tar` (Salvage Stage 3 Task 2, [`stuffr_formats::tar_salvage::salvage_tar`]),
 /// `cpio` (Stage 3 Task 3, [`stuffr_formats::cpio_salvage::salvage_cpio`])
 /// and `ar` (Stage 3 Task 4, [`stuffr_formats::ar_salvage::salvage_ar`]) are
-/// wired — every container this project registers. Any other format answers
-/// [`Error::Unsupported`] (exit 3) **naming the format**, never a silent
-/// empty [`stuffr_core::salvage::SalvageOutcome`]. An empty outcome would
-/// reach the CLI as "the scan found nothing recoverable" (exit 5), a claim
-/// about the ARCHIVE; the truth here is a claim about this BUILD — it never
-/// tried. No registered container reaches that arm any more; a caller
-/// passing a codec's id (or any non-container) still does, and
-/// `salvage_dispatch_tests` pins it there.
+/// wired — every container this project registers.
+///
+/// **The classes.** `zip`, `arc`, `zoo`, `lha` and `arj` carry a CRC over
+/// each entry's content (`ContentChecksum`); `tar` checksums each header and
+/// nothing else (`HeaderChecksumOnly`); `cpio` and `ar` carry neither
+/// (`Nothing`). The fuzz target's honesty oracle, the corpus generator's
+/// strongest-tier expectation and `stuffr formats`' SALVAGE column all read
+/// the class from here, through [`salvage_attestation`] — it was a
+/// fuzz-target-local `match` until Stage 3 Task 5, which the CLI could not
+/// reach.
+///
+/// **Whether** a container has a scanner is also
+/// [`ContainerCaps::salvage`](stuffr_core::ContainerCaps::salvage), the
+/// registry's answer; `salvage_caps_tests` pins this table to that field for
+/// every container a build registers, so the two cannot drift. This table
+/// stays the DISPATCH (Ruling 3-B): a caps flag cannot name a function.
+///
+/// Any other format answers [`Error::Unsupported`] (exit 3) **naming the
+/// format**, never a silent empty [`stuffr_core::salvage::SalvageOutcome`].
+/// An empty outcome would reach the CLI as "the scan found nothing
+/// recoverable" (exit 5), a claim about the ARCHIVE; the truth here is a
+/// claim about this BUILD — it never tried. No registered container reaches
+/// that arm any more; a caller passing a codec's id (or any non-container)
+/// still does, and `salvage_dispatch_tests` pins it there.
+fn salvage_scanner(format: FormatId) -> Result<SalvageScanner> {
+    #[allow(unused_imports)] // a build with no scanner names no class
+    use stuffr_core::salvage::Attestation::{ContentChecksum, HeaderChecksumOnly, Nothing};
+    match format.as_str() {
+        #[cfg(feature = "zip")]
+        "zip" => Ok(SalvageScanner {
+            scan: stuffr_formats::zip_salvage::salvage_zip,
+            attestation: ContentChecksum,
+        }),
+        #[cfg(not(feature = "zip"))]
+        "zip" => Err(Error::FormatNotEnabled(FormatId::new("zip"))),
+        #[cfg(feature = "arc")]
+        "arc" => Ok(SalvageScanner {
+            scan: stuffr_formats::legacy::arc_salvage::salvage_arc,
+            attestation: ContentChecksum,
+        }),
+        #[cfg(not(feature = "arc"))]
+        "arc" => Err(Error::FormatNotEnabled(FormatId::new("arc"))),
+        #[cfg(feature = "zoo")]
+        "zoo" => Ok(SalvageScanner {
+            scan: stuffr_formats::legacy::zoo_salvage::salvage_zoo,
+            attestation: ContentChecksum,
+        }),
+        #[cfg(not(feature = "zoo"))]
+        "zoo" => Err(Error::FormatNotEnabled(FormatId::new("zoo"))),
+        #[cfg(feature = "lha")]
+        "lha" => Ok(SalvageScanner {
+            scan: stuffr_formats::legacy::lha_salvage::salvage_lha,
+            attestation: ContentChecksum,
+        }),
+        #[cfg(not(feature = "lha"))]
+        "lha" => Err(Error::FormatNotEnabled(FormatId::new("lha"))),
+        #[cfg(feature = "arj")]
+        "arj" => Ok(SalvageScanner {
+            scan: stuffr_formats::legacy::arj_salvage::salvage_arj,
+            attestation: ContentChecksum,
+        }),
+        #[cfg(not(feature = "arj"))]
+        "arj" => Err(Error::FormatNotEnabled(FormatId::new("arj"))),
+        #[cfg(feature = "tar")]
+        "tar" => Ok(SalvageScanner {
+            scan: stuffr_formats::tar_salvage::salvage_tar,
+            attestation: HeaderChecksumOnly,
+        }),
+        #[cfg(not(feature = "tar"))]
+        "tar" => Err(Error::FormatNotEnabled(FormatId::new("tar"))),
+        #[cfg(feature = "cpio")]
+        "cpio" => Ok(SalvageScanner {
+            scan: stuffr_formats::cpio_salvage::salvage_cpio,
+            attestation: Nothing,
+        }),
+        #[cfg(not(feature = "cpio"))]
+        "cpio" => Err(Error::FormatNotEnabled(FormatId::new("cpio"))),
+        #[cfg(feature = "ar")]
+        "ar" => Ok(SalvageScanner {
+            scan: stuffr_formats::ar_salvage::salvage_ar,
+            attestation: Nothing,
+        }),
+        #[cfg(not(feature = "ar"))]
+        "ar" => Err(Error::FormatNotEnabled(FormatId::new("ar"))),
+        _ => Err(no_salvage_scanner(format)),
+    }
+}
+
+/// The class of evidence `format`'s salvage scanner can offer for an
+/// entry, or `None` when this build has no scanner for it — see
+/// [`salvage_scanner`] for which format has which class, and why this is
+/// the one place that says so.
+///
+/// `stuffr formats` renders it (SALVAGE `yes` only for
+/// [`Attestation::ContentChecksum`](stuffr_core::salvage::Attestation::ContentChecksum),
+/// `weak` for the other two classes), and the `salvage` fuzz target hands
+/// it to the honesty oracle.
+pub fn salvage_attestation(format: FormatId) -> Option<stuffr_core::salvage::Attestation> {
+    salvage_scanner(format).ok().map(|s| s.attestation)
+}
+
+/// Dispatches a resolved container format to its salvage scanner — see
+/// [`salvage_scanner`].
 fn salvage_scan(
     format: FormatId,
     src: &mut dyn SeekRead,
     policy: &stuffr_core::salvage::SalvagePolicy,
 ) -> Result<stuffr_core::salvage::SalvageOutcome> {
-    match format.as_str() {
-        #[cfg(feature = "zip")]
-        "zip" => stuffr_formats::zip_salvage::salvage_zip(src, policy),
-        #[cfg(not(feature = "zip"))]
-        "zip" => Err(Error::FormatNotEnabled(FormatId::new("zip"))),
-        #[cfg(feature = "arc")]
-        "arc" => stuffr_formats::legacy::arc_salvage::salvage_arc(src, policy),
-        #[cfg(not(feature = "arc"))]
-        "arc" => Err(Error::FormatNotEnabled(FormatId::new("arc"))),
-        #[cfg(feature = "zoo")]
-        "zoo" => stuffr_formats::legacy::zoo_salvage::salvage_zoo(src, policy),
-        #[cfg(not(feature = "zoo"))]
-        "zoo" => Err(Error::FormatNotEnabled(FormatId::new("zoo"))),
-        #[cfg(feature = "lha")]
-        "lha" => stuffr_formats::legacy::lha_salvage::salvage_lha(src, policy),
-        #[cfg(not(feature = "lha"))]
-        "lha" => Err(Error::FormatNotEnabled(FormatId::new("lha"))),
-        #[cfg(feature = "arj")]
-        "arj" => stuffr_formats::legacy::arj_salvage::salvage_arj(src, policy),
-        #[cfg(not(feature = "arj"))]
-        "arj" => Err(Error::FormatNotEnabled(FormatId::new("arj"))),
-        #[cfg(feature = "tar")]
-        "tar" => stuffr_formats::tar_salvage::salvage_tar(src, policy),
-        #[cfg(not(feature = "tar"))]
-        "tar" => Err(Error::FormatNotEnabled(FormatId::new("tar"))),
-        #[cfg(feature = "cpio")]
-        "cpio" => stuffr_formats::cpio_salvage::salvage_cpio(src, policy),
-        #[cfg(not(feature = "cpio"))]
-        "cpio" => Err(Error::FormatNotEnabled(FormatId::new("cpio"))),
-        #[cfg(feature = "ar")]
-        "ar" => stuffr_formats::ar_salvage::salvage_ar(src, policy),
-        #[cfg(not(feature = "ar"))]
-        "ar" => Err(Error::FormatNotEnabled(FormatId::new("ar"))),
-        other => Err(Error::Unsupported(format!(
-            "salvage has no scanner for `{other}` archives in this build"
-        ))),
+    (salvage_scanner(format)?.scan)(src, policy)
+}
+
+/// Refuses, before a byte is scanned, a container whose
+/// [`ContainerCaps::salvage`](stuffr_core::ContainerCaps::salvage) says it
+/// has no scanner — with exactly [`salvage_scanner`]'s own refusal, so a
+/// caller cannot tell which of the two caught it.
+///
+/// This is where `--format` (and a detected format alike) is validated
+/// against the registry's answer. A format `registry` does not hold as a
+/// container passes through untouched: a codec's id, or a container this
+/// build did not compile, still reaches [`salvage_scanner`]'s own
+/// `Unsupported`/`FormatNotEnabled` arms, which say more than "no".
+fn refuse_unsalvageable(registry: &Registry, format: FormatId) -> Result<()> {
+    match registry.container(format) {
+        Some(container) if !container.caps().salvage => Err(no_salvage_scanner(format)),
+        Some(_) | None => Ok(()),
     }
 }
 
@@ -1925,6 +2029,7 @@ fn salvage_scan(
 /// build could really decode the entry, and now agree.
 pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     let format = resolve_salvage_format(path, opts.format)?;
+    refuse_unsalvageable(crate::registry(), format)?;
     let scan = {
         let mut file = std::fs::File::open(path)?;
         salvage_scan(format, &mut file, &opts.policy)?
@@ -2425,11 +2530,11 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// scanner now computes once, at discovery, instead of a generic caller
 /// re-deriving (and mis-deriving) it later.
 ///
-/// # Fix round 1, MEDIUM-2: this table and [`salvage_scan`]'s are two
+/// # Fix round 1, MEDIUM-2: this table and [`salvage_scanner`]'s are two
 /// independent `match`es, coupled only by convention
 ///
 /// Nothing — neither the type system nor, before this fix round, a test —
-/// stops a later task from adding a scanner arm to [`salvage_scan`] and
+/// stops a later task from adding a scanner arm to [`salvage_scanner`] and
 /// forgetting the matching arm here. The result is not a compile error or
 /// even a loud runtime one: an unmatched format falls to the `other =>` arm
 /// below, [`place_salvaged_file`] maps that `Error::Unsupported` to
@@ -2438,13 +2543,14 @@ fn disambiguated_path(target: &Path, scan_position: usize) -> PathBuf {
 /// writes anything, which is the EXACT companion gap ARC itself shipped
 /// with in Task 3 (a real scanner, an unpopulated `EntryMeta::codec`,
 /// every entry quietly `SkippedNotBuiltIn`) recurring through the seam
-/// built to close it. `salvage_seam_tests`'s
-/// `every_salvage_slot_reaches_a_real_payload_writer` pins the positive
-/// set — every name in [`stuffr_core::testing::SALVAGE_SLOTS`] (the same
-/// list the fuzz corpus generator and `entries::salvage`'s own dispatch
-/// table are checked against elsewhere) must reach a real per-format arm
-/// here, never this function's own fallback — so the NEXT scanner task
-/// that forgets this half fails a test rather than shipping silently.
+/// built to close it. `salvage_caps_tests` pins it: every container this
+/// build registers with
+/// [`ContainerCaps::salvage`](stuffr_core::ContainerCaps::salvage) set must
+/// reach a real per-format arm here, never this function's own fallback,
+/// and one without it must not — so the NEXT scanner task that forgets
+/// this half fails a test rather than shipping silently. (Until Salvage
+/// Stage 3 Task 5 the guard iterated `stuffr_core::testing::SALVAGE_SLOTS`,
+/// the fuzz corpus's wire format, rather than the registry.)
 ///
 /// `SalvageScan::write_payload` now EXISTS (final whole-branch review, F2)
 /// and every arm below calls it, so a scanner's write half is declared on
@@ -2548,7 +2654,7 @@ fn write_salvaged_payload(
         ),
         #[cfg(not(feature = "ar"))]
         "ar" => Err(Error::FormatNotEnabled(FormatId::new("ar"))),
-        // Unreachable in practice: `salvage_scan` already refuses any other
+        // Unreachable in practice: `salvage_scanner` already refuses any other
         // format before a single candidate is ever produced, so `salvage()`
         // never reaches a per-entry write for one.
         other => Err(Error::Unsupported(format!(
@@ -5350,7 +5456,7 @@ mod salvage_tests {
 /// `tar` until Salvage Stage 3 Task 2, `cpio` until Task 3 and `ar` until
 /// Task 4, each moved when that format's scanner was wired. After Task 4
 /// every container this project registers has a scanner, so no archive a
-/// user can name reaches [`salvage_scan`]'s `other =>` arm any more — and
+/// user can name reaches [`salvage_scanner`]'s fallback arm any more — and
 /// deleting the test would leave that arm, the refusal that keeps a silent
 /// "nothing recoverable" from being a claim about the ARCHIVE, uncovered. So
 /// the first test calls [`salvage_scan`] directly with a CODEC's id, the one
@@ -5397,6 +5503,124 @@ mod salvage_dispatch_tests {
         let err = salvage(&file, &opts).expect_err("a codec-only file is not an archive");
         assert!(matches!(err, Error::NotAnArchive { .. }), "{err:?}");
         assert_eq!(err.exit_code(), 2, "{err}");
+    }
+
+    /// A container whose caps say it has no scanner is refused before any
+    /// byte is scanned, with the SAME error [`salvage_scan`]'s fallback has
+    /// always given — [`Error::Unsupported`], exit 3, naming the format.
+    /// Driven through a registry holding only `stuffr_core::testing`'s mock
+    /// container, because every container this project registers now has a
+    /// scanner, so no real one can stand in for the refused shape.
+    #[test]
+    fn a_container_whose_caps_say_no_salvage_is_refused_at_exit_3() {
+        use stuffr_core::testing::{MOCK_CONTAINER, MockContainer};
+        let mut registry = Registry::new();
+        registry.register_container(
+            std::sync::Arc::new(MockContainer),
+            stuffr_core::FormatMeta::container(MOCK_CONTAINER, &[], &[]),
+        );
+        assert!(
+            !registry.container(MOCK_CONTAINER).unwrap().caps().salvage,
+            "sanity: the mock must not claim salvage, or this test proves nothing"
+        );
+        let err = refuse_unsalvageable(&registry, MOCK_CONTAINER)
+            .expect_err("caps say no salvage, so the run must be refused");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 3, "{err}");
+        assert_eq!(
+            err.to_string(),
+            salvage_scan(
+                MOCK_CONTAINER,
+                &mut std::io::Cursor::new(Vec::new()),
+                &SalvagePolicy::default()
+            )
+            .unwrap_err()
+            .to_string(),
+            "the caps refusal must say exactly what the dispatch fallback says"
+        );
+    }
+}
+
+/// Salvage Stage 3 Task 5: [`ContainerCaps::salvage`](stuffr_core::ContainerCaps::salvage)
+/// and this module's two per-format dispatch tables agree, for every
+/// container THIS build registers — the scanner table
+/// ([`salvage_scanner`]) and the payload-writer table
+/// ([`write_salvaged_payload`]).
+///
+/// **This replaces `salvage_seam_tests::every_salvage_slot_reaches_a_real_payload_writer`**,
+/// which iterated `stuffr_core::testing::SALVAGE_SLOTS` — a fuzz corpus's
+/// append-only wire format, never a statement of what this build can do —
+/// and so could only ever check the names someone had remembered to
+/// append there. This iterates the live registry instead, so it runs on
+/// whatever set each leg (`--all-features`, default) actually compiled,
+/// and fails in both directions: a container that gains a scanner arm
+/// without setting the caps flag, and one that sets the flag with no arm
+/// (or with a scanner arm but no writer arm, the Stage 2 Task 3 ARC gap).
+#[cfg(test)]
+mod salvage_caps_tests {
+    use super::*;
+    use stuffr_core::salvage::{SalvageStatus, SalvagedEntry};
+
+    #[test]
+    fn every_registered_containers_salvage_cap_agrees_with_the_dispatch() {
+        let registry = crate::registry();
+        let containers: Vec<FormatId> = registry
+            .matrix()
+            .into_iter()
+            .filter(|row| row.kind == stuffr_core::FormatKind::Container)
+            .map(|row| row.id)
+            .collect();
+        assert!(
+            !containers.is_empty(),
+            "sanity: this build must register at least one container"
+        );
+        for id in containers {
+            let name = id.as_str();
+            let cap = registry
+                .container(id)
+                .expect("the matrix lists only registered formats")
+                .caps()
+                .salvage;
+            let scanner = salvage_scanner(id);
+            assert_eq!(
+                cap,
+                scanner.is_ok(),
+                "`{name}`: ContainerCaps::salvage is {cap}, but salvage_scanner {} — the caps \
+                 flag and the dispatch arm must land together",
+                match &scanner {
+                    Ok(_) => "has a scanner arm for it".to_string(),
+                    Err(e) => format!("refuses it: {e}"),
+                }
+            );
+
+            // `meta.codec` is `None` on purpose: every real per-format
+            // `write_payload` refuses a `None` codec itself, with its own,
+            // differently-worded error, WITHOUT opening `archive_path`
+            // first — so a path that does not exist is safe to use, and the
+            // two failure messages are trivially distinguishable.
+            let entry =
+                SalvagedEntry::new(0, 0, 0, EntryMeta::file("probe"), SalvageStatus::Complete);
+            let err = write_salvaged_payload(
+                id,
+                Path::new("/nonexistent-salvage-caps-probe"),
+                &entry,
+                0,
+                &mut std::io::sink(),
+            )
+            .expect_err("a codec-less probe entry must always be refused");
+            let reached_a_writer = !err.to_string().contains("has no payload writer for");
+            assert_eq!(
+                cap,
+                reached_a_writer,
+                "`{name}`: ContainerCaps::salvage is {cap}, but write_salvaged_payload \
+                 {} a real per-format arm for it: {err}",
+                if reached_a_writer {
+                    "reached"
+                } else {
+                    "fell through to its fallback instead of"
+                }
+            );
+        }
     }
 }
 
@@ -5875,52 +6099,6 @@ mod arc_salvage_tests {
              report Truncated, regardless of how small the declared original_size is \
              (fix round 2, NEW-1)"
         );
-    }
-}
-
-/// Fix round 1, MEDIUM-2: `salvage_scan`'s dispatch table and
-/// `write_salvaged_payload`'s are two independent `match`es, coupled only
-/// by convention — nothing stops a later scanner task from adding the
-/// first arm and forgetting the second, which reproduces the exact
-/// companion gap ARC itself shipped with in Task 3 (a real scanner, an
-/// unpopulated codec, every entry quietly `SkippedNotBuiltIn`). This pins
-/// the positive set the review asked for: every name
-/// `stuffr_core::testing::SALVAGE_SLOTS` lists must reach a REAL
-/// per-format arm of `write_salvaged_payload`, never its own fallback.
-#[cfg(test)]
-mod salvage_seam_tests {
-    use super::*;
-    use stuffr_core::salvage::{SalvageStatus, SalvagedEntry};
-    use stuffr_core::testing::SALVAGE_SLOTS;
-
-    #[test]
-    fn every_salvage_slot_reaches_a_real_payload_writer() {
-        for &name in SALVAGE_SLOTS {
-            let format = FormatId::new(name);
-            // `meta.codec` is `None` on purpose: every real per-format
-            // `write_payload` refuses a `None` codec itself, with its own,
-            // differently-worded error, WITHOUT ever opening
-            // `archive_path` first — so a path that does not exist is safe
-            // to use, and the two failure messages are trivially
-            // distinguishable from each other.
-            let entry =
-                SalvagedEntry::new(0, 0, 0, EntryMeta::file("probe"), SalvageStatus::Complete);
-            let err = write_salvaged_payload(
-                format,
-                Path::new("/nonexistent-salvage-seam-probe"),
-                &entry,
-                0,
-                &mut std::io::sink(),
-            )
-            .expect_err("a codec-less probe entry must always be refused");
-            let message = err.to_string();
-            assert!(
-                !message.contains("has no payload writer for"),
-                "SALVAGE_SLOTS names `{name}`, which `salvage_scan` dispatches to a real \
-                 scanner, but `write_salvaged_payload` fell through to its own fallback \
-                 for it instead of a real per-format arm: {message}"
-            );
-        }
     }
 }
 

@@ -316,6 +316,9 @@ impl Container for Arj {
             // the same declaration `lha` makes for its CRC-16.
             detects_corruption: CorruptionDetection::Always,
             stores_dirs: true,
+            // `crate::legacy::arj_salvage` scans it; `stuffr::entries::salvage_scanner`
+            // dispatches to it, and a test there pins this flag to that arm.
+            salvage: true,
             ..ContainerCaps::read_write()
         }
     }
