@@ -464,7 +464,12 @@ fn clears_criterion_3(src: &mut dyn SeekRead, offset: u64, file_len: u64, block:
 /// length the engine then advances by (Ruling 3-J item 3's hazard). No
 /// writer on this machine produces it; it is recorded rather than closed.
 /// With a `ustar` or junk magic the copy fails criterion 3 on the magic
-/// alone, reaches [`sighting_at`], and is judged there leniently.
+/// alone and reaches [`sighting_at`]. A `ustar` or blank-magic source is
+/// recognised there leniently; a junk-magic source is NOT (this function
+/// requires `ustar` or blank), so [`TarSalvage::next_candidate`] demotes an
+/// ungateable 1..=7 bytes after the last recorded one to a copy instead.
+/// Residual: a noise-level phantom 1..=7 bytes before a genuine junk-magic
+/// header would demote that genuine header to a copy.
 ///
 /// When the bytes before the genuine header are payload rather than padding,
 /// the window DOES name something and the header is still refused;
@@ -714,8 +719,24 @@ impl SalvageScan for TarSalvage {
                     return Ok(Some(found.candidate));
                 }
                 // Counted, not reported — see `UngateableSightings`.
+                //
+                // An ungateable 1..=7 bytes after the last one recorded is
+                // that one's shifted copy (a junk-magic header's late copy
+                // agrees with itself when name[0] == payload[0], and
+                // `looks_like_a_shifted_twin` only recognises ustar or blank
+                // magic sources), so it joins the copies, which
+                // `into_sightings` still reports only when on the grid.
                 Scanned::Ungateable(kind) => {
-                    self.seen.seen.push((offset, kind));
+                    let late = self
+                        .seen
+                        .seen
+                        .last()
+                        .and_then(|&(at, _)| offset.checked_sub(at));
+                    if late.is_some_and(|k| (1..=7).contains(&k)) {
+                        self.seen.copies.push(offset);
+                    } else {
+                        self.seen.seen.push((offset, kind));
+                    }
                     search_from = offset + 1;
                 }
                 // Kept aside, and decided once the scan is over — see
@@ -3161,14 +3182,11 @@ mod tests {
                                 "{writer} damaged={damaged}: a header the gate refuses on its \
                                  magic alone is said, not silently dropped"
                             );
-                            // NOT `== [h]`: GNU tar's archives also report the
-                            // header's one-byte-late copy — Task 6 finding D1,
-                            // pinned by the ignored test below. Bounded here so
-                            // nothing ELSE can ride along unseen.
-                            assert!(
-                                offsets
-                                    .iter()
-                                    .all(|&o| (h as u64..h as u64 + 8).contains(&o)),
+                            // Exactly one: the header's one-byte-late copy
+                            // (GNU tar, Task 6 finding D1) is not a sighting.
+                            assert_eq!(
+                                offsets,
+                                [h as u64],
                                 "{writer} damaged={damaged}: {offsets:?}"
                             );
                         } else {
@@ -3183,7 +3201,7 @@ mod tests {
             }
         }
 
-        /// **Task 6 finding D1 — ignored until the controller rules.** A
+        /// **Task 6 finding D1 (fixed).** A
         /// header whose magic is junk (checksum still valid) is ONE ungateable
         /// header, and the note must say one. On GNU tar's archives it says
         /// two: its one-byte-late copy agrees with itself whenever the name's
@@ -3192,10 +3210,8 @@ mod tests {
         /// source because it requires that source's magic to be `ustar` or
         /// blank — exactly what a junk-magic header is not. Measured through
         /// the binary: "saw 2 tar header(s) … at offset(s) 0, 1". bsdtar's
-        /// archives give one (its fields shift differently). Run with
-        /// `--ignored`; it fails today.
+        /// archives give one (its fields shift differently).
         #[test]
-        #[ignore = "Task 6 finding D1: a junk-magic tar header's shifted copy is a second sighting"]
         fn d1_a_junk_magic_header_is_one_sighting_not_two() {
             for (writer, bytes) in reference_archives("d1") {
                 for target in members(&bytes) {

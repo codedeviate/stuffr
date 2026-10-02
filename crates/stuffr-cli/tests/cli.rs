@@ -12473,6 +12473,39 @@ fn checksumless_catalogue_end_to_end(format: &str, tier: &str, whole_exit: i32) 
 #[test]
 fn damage_catalogue_tar_end_to_end() {
     checksumless_catalogue_end_to_end("tar", "Complete", 0);
+
+    // Task 6 finding D1, at the binary: a GNU tar header whose magic is junk
+    // (checksum resealed) is ONE header in the note, at its own offset, not
+    // also its one-byte-late copy. `alpha.txt`'s name and payload both start
+    // with `a`, the case where that copy agrees with itself. GNU tar is
+    // `gtar` on macOS and `tar` on Linux.
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let inputs = checksumless_inputs();
+    for (name, data) in &inputs {
+        std::fs::write(tree.join(name), data).unwrap();
+    }
+    let gnu = which("gtar").unwrap_or_else(|| require_bin("tar"));
+    let out = dir.join("gnu.tar");
+    let mut args = vec![os(&"-cf"), os(&out)];
+    args.extend(inputs.iter().map(|(n, _)| os(n)));
+    run_tool(&gnu, &args, &tree, b"");
+    let mut bytes = std::fs::read(&out).unwrap();
+    bytes[257..263].copy_from_slice(b"bogus\0");
+    bytes[148..156].copy_from_slice(b"        ");
+    let sum: u32 = bytes[..512].iter().map(|&x| u32::from(x)).sum();
+    bytes[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let damaged = dir.join("junk-magic.tar");
+    std::fs::write(&damaged, &bytes).unwrap();
+    let out = run_output(&["salvage", damaged.to_str().unwrap(), "--list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("saw 1 tar header(s)") && stderr.contains("offset(s) 0"),
+        "one header at offset 0, not its late copy too: {stderr}"
+    );
+    assert!(!stderr.contains("offset(s) 0, 1"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// cpio (`newc`): `Unattested`, exit 4 even when whole.
