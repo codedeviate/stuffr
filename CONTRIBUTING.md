@@ -187,7 +187,9 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.4.0` | Phase 3a–3b — the fuzzing harness, the honesty oracle and the exit-code corrections it found, plus three read-only legacy formats (`compress`, `lha`, `arj`), each proven against the fixture-driven conformance harness Phase 3b's Task 1 introduced for read-only containers. |
 | `0.5.0` | Salvage Stage 1 — the `salvage` verb and zip's central-directory recovery scan (`SalvageScan`, `Candidate`, `SalvageStatus`, `salvage_all`), reversing Phase 2's "declared, not recovered" ruling for zip: the shadowed-record parse that ruling declined to build now serves recovery, not only `list`'s warning. |
 | `0.6.0` | Salvage Stage 2 — four more salvage scanners (`arc`, `zoo`, `lha`, `arj`, joining `zip`), dispatch by resolved archive format, the shared `stream_verify` both CRC widths go through, and the per-entry write seam that came with them. A MINOR, not a `0.5.x` patch: `0.5.0` is PUBLISHED (crates.io, 2026-09-17) and Stage 2 breaks its `stuffr-core::salvage` API — `collect_candidates`/`annotate_candidates` both change signature, `UnverifiedCause` and `SalvageDisposition` both gain variants, `PartialCause::Truncated` is NARROWED and `DecodeFailed` added beside it, and `Candidate`/`SalvagedEntry`/`SalvageOutcome` are closed with `#[non_exhaustive]` plus constructors. Cargo reads a `0.x` middle number as the major, so a break to a published `0.5.0` cannot ship as `0.5.x`. The final fix wave adds to that set: `SalvageDisposition` gains a further variant (`SkippedUnsafePath` — a containment refusal is a per-entry outcome now, not a run abort), `SalvageScan` gains a `write_payload` method (defaulted, so additive for an implementor), `stuffr-formats::salvage_verify` becomes a `pub mod` so `stream_verify` is reachable at all, and `safe_join`/`check_symlink_target` refuse a NUL-bearing name at exit 7 where it used to reach the filesystem and exit 1. |
-| `0.7.x`/later | Salvage Stage 3 (`tar`, `cpio`, `ar` — the three where a false positive is undetectable by construction, and the only place a `Complete` tier is genuinely reachable) and Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
+| `0.7.0`/`0.7.1` | Salvage Stage 3's three scanners (`tar`, `cpio`, `ar`), tagged for testers before the stage finished. `v0.7.0` was never built from (its tag's deep fuzz failed on a pre-existing zip defect); `0.7.1` is on Homebrew. Neither is on crates.io — the publish was held until the stage completes. |
+| `0.8.0` | Salvage Stage 3, complete — `tar`, `cpio`, `ar` (the three where a false positive is undetectable by construction; `tar` is the one format that reaches `Complete`, `cpio` and `ar` are `Unattested`), plus `ContainerCaps::salvage` and `stuffr formats`' SALVAGE column. **Status: implementation complete (Tasks 1–8), final whole-branch review pending; bumped, not tagged.** A breaking bump: `ContainerCaps` gained a public field. |
+| `0.9.x`/later | Phase 5 — compatibility symlinks, `convert`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -295,9 +297,18 @@ reshaping the same `stuffr-core::salvage` surface), so the row was widened
 to say what actually shipped — the same treatment `0.3.0`'s row got, for the
 same reason, and not a renumbering. The number it predicted was already
 right, and was re-argued from the diff rather than inherited: see
-`CLAUDE.md`'s Versioning section for that argument and for the dated
-reverse-dependency measurement behind it. The `0.5.x`/later row moved on to
-`0.7.x`, since `0.6.0` is now spent.
+the release notes (`.claude/skills/stuffr-release/history.md`, local-only)
+for that argument and for the dated reverse-dependency measurement behind
+it. The `0.5.x`/later row moved on to `0.7.x`, since `0.6.0` is now spent.
+
+It was revised a **sixth** time when Salvage Stage 3 finished. `0.7.0` and
+`0.7.1` had already gone to testers carrying the stage's three scanners
+before it was complete, and the stage's last tasks then added a public
+field to `ContainerCaps` (`salvage`, `073337f`), which an external
+exhaustive literal cannot absorb — so the completed stage could not be a
+`0.7.x` patch and takes `0.8.0`, measured from the diff against `v0.7.1`
+and against `v0.6.1` (still crates.io's newest), not inherited from this
+table. Phase 5 moves to the next open row.
 
 After 1.0, normal semver applies: breaking changes to any public API in
 `stuffr-core` or the `stuffr` facade require a major bump.
@@ -386,7 +397,7 @@ The rule above has two answers — open (downstream constructs) and closed
 (downstream only destructures) — and Salvage needed a third, because
 `stuffr-core::salvage`'s `Candidate` is a struct downstream MUST construct
 and MUST NOT be broken by a new field. `SalvageScan::next_candidate` returns
-`Result<Option<Candidate>>`, so every out-of-crate scanner builds one; five
+`Result<Option<Candidate>>`, so every out-of-crate scanner builds one; eight
 do inside this workspace and, since `0.5.0` is published, an external one is
 no longer hypothetical. Under the open rule, each field Stage 2 added broke
 all of them at once.
@@ -405,8 +416,9 @@ one — `salvage_all` does).
 **That is why the change waited.** It was raised as Ruling S-I in Stage 2
 Task 1 and deliberately deferred to Task 9: designing a constructor for a
 trait's return type from ONE caller guesses at the shape, and four more
-scanners (`arc`, `zoo`, `lha`, `arj`) were due to land. All five now read
-through it, with whichever fields a scanner does not set defaulting to the
+scanners (`arc`, `zoo`, `lha`, `arj`) were due to land. All five read
+through it, and Salvage Stage 3's three (`tar`, `cpio`, `ar`) were built on
+it with `Candidate`'s constructor unchanged, with whichever fields a scanner does not set defaulting to the
 answers that assert the least (no declared length, nothing to verify with,
 nothing missing, nothing deleted).
 
@@ -423,12 +435,18 @@ private dispatch. `crates/stuffr-formats/tests/salvage_seam.rs` implements a
 sixth scanner from the published surface alone — an INTEGRATION test, so
 everything it touches has to be genuinely `pub`.
 
-**One half is still open and is Stage 3's, stated here rather than left
-implied:** `stuffr salvage` resolves a format NAME to a scanner, with no
-registration point a third party can add itself to, so an out-of-tree
-scanner reaches `salvage_all` and none of `.partial` naming, `NAME.salvaged-N`
+**One half is still open, stated here rather than left implied:** `stuffr
+salvage` resolves a format NAME to a scanner, with no registration point a
+third party can add itself to, so an out-of-tree scanner reaches
+`salvage_all` and none of `.partial` naming, `NAME.salvaged-N`
 disambiguation, containment or `salvage_exit_code`. Closing that means a
-salvage registry.
+salvage registry. Salvage Stage 3 closed the QUERY half and deliberately
+left this one: `ContainerCaps::salvage` makes "can this container be
+salvaged" a registry fact (`stuffr formats`' SALVAGE column and
+`entries::salvage`'s exit-3 refusal read it), but the dispatch is still a
+name match in `entries::salvage_scanner` — a caps flag cannot name a
+function — and a test there pins the flag and the dispatch to each other
+for every registered container, in both directions.
 
 **The opposite call, on the same day, for `stuffr::entries::PartialCause`:
 it stays OPEN, deliberately.** It is an enum, so "enums carry it" would seem
@@ -649,9 +667,14 @@ is a seed whose selector byte, modulo the table's length, happens to land on
 starts feeding a different codec — nothing fails to tell you, and a corpus
 built to cover twelve codecs quietly stops covering one of them.
 `SALVAGE_SLOTS` lists only formats `entries::salvage_scan` actually
-dispatches to a real scanner (`zip`, `arc`, `zoo`, `lha`, `arj`), never a
-format merely registered as an ordinary container — see that constant's own
-doc. Two tests in `crates/stuffr/tests/fuzz_corpus.rs` keep the table and the
+dispatches to a real scanner (`zip`, `arc`, `zoo`, `lha`, `arj`, `tar`,
+`cpio`, `ar` — every container, since Salvage Stage 3), never a format
+merely registered as an ordinary container — see that constant's own doc.
+Each slot's class of evidence (`Attestation`) has ONE owner,
+`entries::salvage_attestation`, which the fuzz target and the corpus both
+read; `every_salvage_format_has_the_attestation_class_its_format_carries`
+pins it with literals, so a wrong class in that table cannot be agreed with
+by everything that reads it. Two tests in `crates/stuffr/tests/fuzz_corpus.rs` keep the table and the
 corpus in step: `every_salvage_slot_carries_at_least_one_seed` fails the
 build for a slot nobody wrote a seed shape for, and
 `every_salvage_seed_is_recognised_as_the_slot_its_shape_names` fails for a
@@ -679,9 +702,20 @@ runs that block under `bash -e -o pipefail` where a no-match grep would abort
 the script before the check it feeds. The Makefile runs under a plain `sh`
 and must not. Both files say so; do not tidy either into matching the other.)
 
+**A long-lived local corpus makes `make fuzz` mutate nothing.** libFuzzer
+counts loading the corpus against `-runs`, and `make fuzz` never empties
+`fuzz/corpus/` (`make fuzz-corpus` only adds seeds). Once a target's
+accumulated corpus holds more than 2000 inputs — measured at Salvage Stage
+3 Task 7: `salvage` held 12,019 — the whole budget is spent loading it, and
+`target 'salvage': 2000 executions — OK` reports a corpus load, not a fuzz
+run. CI starts from fresh seeds and is unaffected. To reset a target, either
+minimise it (`cargo +nightly fuzz cmin <target>`, keeps coverage) or delete
+`fuzz/corpus/<target>` and run `make fuzz-corpus`.
+
 **An unseeded target can execute cleanly and prove nothing, and `salvage`
-did.** Its only oracle call, `check_salvage_claim`, is made for
-`SalvageStatus::Intact` records alone, and `Intact` requires a CRC-32 that matches
+did.** Its only oracle call, `check_salvage_claim`, was then made for
+`SalvageStatus::Intact` records alone (since Salvage Stage 3 it is made for
+every `Intact`, `Complete` and `Unattested` record), and `Intact` requires a CRC-32 that matches
 its payload — which random mutation from an EMPTY corpus will not produce.
 So the assertion was unreachable by construction, not merely unlucky.
 Measured before it was seeded: 100,000 runs plateaued at `cov: 217` with a
@@ -695,7 +729,7 @@ corpus inputs produce at least one salvaged record with 117 reaching
 `Intact`. This is the same lesson as "a new target must be shown to complete
 an iteration" one section up, one level deeper: here the iterations DID
 complete, they just never reached the check. The generator's own
-`every_salvage_seed_produces_records_and_at_least_one_intact` test is what
+`every_salvage_seed_produces_records_and_reaches_its_top_tier` test is what
 keeps it that way — it runs the real engine over every seed rather than
 counting files, because counting files is exactly the assertion that would
 have passed on the empty state.

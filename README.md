@@ -11,7 +11,11 @@ read list.
 
 > **Status: `stuffr salvage` covers all eight containers — `zip`, `arc`,
 > `zoo`, `lha` and `arj` since Salvage Stage 2 (`0.6.0`), and `tar`, `cpio`
-> and `ar` since Salvage Stage 3 (`0.7.0`).** Every one but `ar` finds its own records by scanning for them, so an archive
+> and `ar` since Salvage Stage 3 (scanners first shipped to testers in
+> `0.7.1`; the stage completes in `0.8.0`).** `stuffr formats` says which
+> containers a build can salvage, and how far each can be trusted, in its
+> SALVAGE column: `yes` for the five that checksum an entry's content,
+> `weak` for `tar`, `cpio` and `ar`. Every one but `ar` finds its own records by scanning for them, so an archive
 > whose index, main header or one damaged entry costs the ordinary reader everything
 > behind it still gives up what it holds. LHA and ARJ are the sharpest cases:
 > LHA carries no index, no entry count and no trailer, so one bad header ends
@@ -34,13 +38,15 @@ read list.
 > the first member it cannot read. That recovers a truncated tail fully; it
 > cannot cross a hole in the middle, and when it stops there it says so on
 > stderr — the offset, and that the members after it are unreachable by
-> construction, not absent.
+> construction, not absent. A run that recovers three members of ten lists
+> three rows; that stderr note is the only sign of the other seven.
 >
-> `0.7.1` is tagged for testers while Stage 3 finishes; it is on GitHub and
-> Homebrew, not yet on crates.io (`v0.7.0` is tagged but was never built
-> from: its deep fuzz found a missing zip entry-count warning, fixed in
-> `0.7.1`). **1517** tests under `--all-features`, **1452** on the default
-> tier — measured from this bump's own `make check`,
+> `0.8.0` completes Salvage Stage 3 and is bumped but not yet tagged;
+> crates.io still carries `0.6.1`. `0.7.1` is tagged and on Homebrew for
+> testers, never on crates.io (`v0.7.0` is tagged but was never built from:
+> its deep fuzz found a missing zip entry-count warning, fixed in `0.7.1`).
+> `0.8.0` is a breaking bump over both: `ContainerCaps` gained a public
+> `salvage` field. <<COUNTS>> — measured from this bump's own `make check`,
 > `GATE_EXIT=0`, never carried forward.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
@@ -74,12 +80,12 @@ read list.
 > on a name the archive chose. It is not an attack shape: a zeroed run
 > inside an ordinary name produces it, and it was the only exit 1 in a
 > 31,460-invocation corruption sweep over 2,860 mutated archives in all five
-> salvageable formats. `list` and `test` still exit 0 on such an archive —
+> formats salvageable at the time (Stage 2). `list` and `test` still exit 0 on such an archive —
 > neither turns a name into a path — and `salvage` skips that one entry and
 > recovers the rest, at 7 where it used to report 4.
 >
 > **How much to trust a recovered entry is not the same answer for all five
-> formats, and the difference is worth knowing before you rely on one.** An
+> checksummed formats, and the difference is worth knowing before you rely on one.** An
 > `Intact` row means this build decoded the entry's payload and it agreed
 > with the checksum the archive carries. What differs is how much
 > independent evidence stands behind the code that read it:
@@ -722,9 +728,12 @@ are not implemented yet. `pack` walks a directory tree, and
 `pack -o bundle.tar.gz` composes a container on top of a codec in one pass.
 `salvage` is the one recovery-biased verb, and everything else here stays
 as uncompromising as it was before it existed. It recovered zip archives
-only in Stage 1; Stage 2 adds a scanner per legacy container, `arc` and
-`zoo` and `lha` so far. Naming any other format with `--format` is exit 3 —
-a statement about this build, never about the archive.*
+only in Stage 1; Stage 2 added a scanner per legacy container (`arc`,
+`zoo`, `lha`, `arj`) and Stage 3 the checksum-less three (`tar`, `cpio`,
+`ar`), so every container `stuffr formats` lists has one — its SALVAGE
+column says how far each can be trusted. Naming a format this build has no
+scanner for with `--format` is exit 3 — a statement about this build, never
+about the archive.*
 
 ```
 stuffr pack     [-o out.tar.zst] [--format F] [--level N] PATHS...
