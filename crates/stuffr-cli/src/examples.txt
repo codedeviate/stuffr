@@ -718,7 +718,8 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   are — it is salvage's willingness to accept less-than-proven content
   that buys them that freedom. Naming with --format a format this build
   has no scanner for is exit 3, a statement about this build rather than
-  about the archive.
+  about the archive. `stuffr formats` shows which ones, and how far each
+  can be trusted, in its SALVAGE column.
 
   Scanners exist for: zip, arc, zoo, lha, arj, tar, cpio, ar.
 
@@ -1101,6 +1102,21 @@ WHAT THIS BUILD CAN DO
       `zoo` trivially so — neither has an encoder to parallelise
       in the first place; `lha` and `arj` have one each and both are
       single-threaded — and `arj`'s does not compress at all).
+
+      The SALVAGE column says what `stuffr salvage` can do with a damaged
+      archive of that format, so the answer no longer has to be found by
+      running it and reading an exit 3. `yes` means salvage scans it,
+      checks each recovered entry against a checksum the archive itself
+      carries (an entry can reach `Intact`), and writes what it recovers.
+      `weak` means it scans and writes, but the format offers nothing to
+      verify an entry's content against: tar checksums only each header
+      (its best is `Complete`), and cpio and ar checksum nothing at all
+      (`Unattested`, exit 4) — see "RECOVERING A DAMAGED ARCHIVE" above.
+      `-` means no scanner, which is every codec: salvage works on archives,
+      and a bare `.gz` is refused at exit 2 as not one.
+
+      SALVAGE reads yes for: zip, arc, zoo, lha, arj.
+      SALVAGE reads weak for: tar, cpio, ar.
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS

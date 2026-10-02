@@ -10868,6 +10868,77 @@ fn the_documented_salvage_scanner_list_matches_what_the_binary_actually_scans() 
     );
 }
 
+/// Salvage Stage 3 Task 5: `stuffr formats` grew a SALVAGE column, and the
+/// examples page must say what it prints — derived from the BINARY's own
+/// table, the way the scanner-list guard above derives from its exit codes,
+/// so neither a page naming the wrong set nor a column change the page
+/// never caught up with can pass.
+///
+/// The page carries one machine-readable sentence per non-`-` value,
+/// `SALVAGE reads VALUE for: a, b, c.`, and each must name exactly the rows
+/// `stuffr formats` prints with that value. Both legs run it: which rows
+/// exist is the registry's, and which value each shows comes from
+/// `ContainerCaps::salvage` and the format's attestation class, not from
+/// anything this test or the page restates.
+#[test]
+fn the_examples_page_documents_the_salvage_column_stuffr_formats_prints() {
+    let formats = run_output(&["formats"]);
+    assert!(formats.status.success(), "stuffr formats must exit 0");
+    let table = String::from_utf8(formats.stdout).unwrap();
+    let mut lines = table.lines();
+    let header: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+    // Every column before EXTENSIONS is one token wide, so the header's
+    // token index is the row's too; EXTENSIONS (empty, or several) is last.
+    let at = header
+        .iter()
+        .position(|c| *c == "SALVAGE")
+        .unwrap_or_else(|| panic!("stuffr formats must print a SALVAGE column: {header:?}"));
+    let mut shown: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for line in lines.take_while(|l| !l.trim().is_empty()) {
+        let cells: Vec<&str> = line.split_whitespace().collect();
+        shown
+            .entry(cells[at].to_string())
+            .or_default()
+            .push(cells[0].to_string());
+    }
+    for value in shown.keys() {
+        assert!(
+            ["yes", "weak", "-"].contains(&value.as_str()),
+            "SALVAGE printed `{value}`, which the page does not define"
+        );
+    }
+
+    let out = run_output(&["--examples"]);
+    let examples = String::from_utf8(out.stdout).unwrap();
+    for value in ["yes", "weak"] {
+        let marker = format!("SALVAGE reads {value} for:");
+        let at = examples
+            .find(&marker)
+            .unwrap_or_else(|| panic!("the examples page must carry a `{marker}` sentence"));
+        let rest = &examples[at + marker.len()..];
+        let end = rest
+            .find('.')
+            .unwrap_or_else(|| panic!("the `{marker}` sentence must end in a `.`"));
+        let mut documented: Vec<String> = rest[..end]
+            .split(',')
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        documented.sort();
+        let mut printed = shown.get(value).cloned().unwrap_or_default();
+        printed.sort();
+        assert!(
+            !printed.is_empty(),
+            "no row printed SALVAGE `{value}` — the column is broken, not the page"
+        );
+        assert_eq!(
+            documented, printed,
+            "`--examples` says SALVAGE reads `{value}` for a different set of formats than \
+             `stuffr formats` prints"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------
 // Salvage Stage 2 Task 7: the legacy damage catalogue, end to end.
 //

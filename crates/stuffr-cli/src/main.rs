@@ -1764,8 +1764,8 @@ fn print_formats() -> stuffr::Result<()> {
     }
     writeln!(
         out,
-        "{:<16} {:<10} {:<5} {:<5} {:<8} EXTENSIONS",
-        "FORMAT", "KIND", "READ", "WRITE", "PARALLEL"
+        "{:<16} {:<10} {:<5} {:<5} {:<8} {:<7} EXTENSIONS",
+        "FORMAT", "KIND", "READ", "WRITE", "PARALLEL", "SALVAGE"
     )?;
     let registry = stuffr::registry();
     for r in rows {
@@ -1777,7 +1777,7 @@ fn print_formats() -> stuffr::Result<()> {
             && registry.codec(r.id).is_some_and(|c| c.caps().weak_encoder);
         writeln!(
             out,
-            "{:<16} {:<10} {:<5} {:<5} {:<8} {}",
+            "{:<16} {:<10} {:<5} {:<5} {:<8} {:<7} {}",
             r.id.as_str(),
             match r.kind {
                 stuffr::FormatKind::Codec => "codec",
@@ -1792,6 +1792,7 @@ fn print_formats() -> stuffr::Result<()> {
                 "-"
             },
             if r.parallel { "yes" } else { "-" },
+            salvage_column(registry, r.id),
             r.extensions.join(", "),
         )?;
     }
@@ -1804,7 +1805,45 @@ fn print_formats() -> stuffr::Result<()> {
         "(WRITE shows `weak` for a codec whose encoder in this build is a fallback markedly \
          worse than the format's usual one — see --allow-weak-encoder.)"
     )?;
+    writeln!(
+        out,
+        "(SALVAGE shows `yes` where `stuffr salvage` scans, verifies each entry against a \
+         checksum the archive carries, and writes; `weak` where it scans and writes but the \
+         format checksums nothing an entry's content can be verified against.)"
+    )?;
     Ok(())
+}
+
+/// `stuffr formats`' SALVAGE cell for one row: `-` where this build has no
+/// salvage scanner, `yes` where the format carries a checksum over each
+/// entry's content, `weak` where it does not.
+///
+/// Two facts, each read from its one owner, never restated here: WHETHER
+/// salvage is supported is the container's own
+/// [`ContainerCaps::salvage`](stuffr::ContainerCaps::salvage); HOW MUCH a
+/// recovered entry can be trusted is the format's
+/// [`Attestation`](stuffr::salvage::Attestation) class, from
+/// [`stuffr::entries::salvage_attestation`]. `weak` is tar (a checksum over
+/// each header, none over content — at best `Complete`), cpio and ar (no
+/// checksum at all — `Unattested`): salvage still scans and writes them, so
+/// `-` would be false, and `yes` would promise a verification they cannot
+/// have. The spec's other `weak` case — "this build cannot decode some
+/// methods" — has no per-build fact to read and is not guessed at.
+///
+/// A row with the caps flag but no class cannot occur: `stuffr::entries`'
+/// `salvage_caps_tests` pins the flag to the dispatch table the class lives
+/// in. It renders `-`, the answer that claims nothing.
+fn salvage_column(registry: &stuffr::Registry, id: FormatId) -> &'static str {
+    use stuffr::salvage::Attestation;
+    let supported = registry.container(id).is_some_and(|c| c.caps().salvage);
+    if !supported {
+        return "-";
+    }
+    match stuffr::entries::salvage_attestation(id) {
+        Some(Attestation::ContentChecksum) => "yes",
+        Some(Attestation::HeaderChecksumOnly | Attestation::Nothing) => "weak",
+        None => "-",
+    }
 }
 
 #[cfg(test)]
