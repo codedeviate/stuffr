@@ -12253,3 +12253,236 @@ fn salvage_refuses_a_thin_archive_and_an_unreadable_symbol_table_at_exit_3() {
     assert!(stderr.contains("symbol table (`__.SYMDEF`)"), "{stderr}");
     assert!(!stderr.contains("nothing recoverable"), "{stderr}");
 }
+
+// ---------------------------------------------------------------------
+// Salvage Stage 3 Task 6: the checksumless damage catalogue, end to end.
+//
+// The fast half lives beside each scanner — `tar_salvage.rs`,
+// `cpio_salvage.rs` and `ar_salvage.rs` each carry a `damage_catalogue`
+// module that owns the agreement property and the full mutation table over
+// every reference writer (BSD and GNU). What this file adds is what only a
+// process can state: the ROW a user reads, the EXIT CODE a script branches
+// on, and the BYTES left on disk. The middle row is the stage's point: none
+// of these formats checksums its content, so a flipped payload byte is a
+// silently wrong file, and the run must never print a tier that says the
+// content was checked (`Intact`).
+//
+// Every expectation is the PRE-DAMAGE state: the input files, fed to the
+// platform's own `tar`/`cpio`/`ar` (REQUIRED, never skipped), with damage
+// placed by finding the input's own bytes in the writer's output — all three
+// formats store payloads verbatim — never by asking stuffr where they are.
+// ---------------------------------------------------------------------
+
+/// The files every writer is fed. Each payload is over a kilobyte, so a
+/// flip at its middle is far from any header (a cpio `newc` header is 110
+/// bytes plus the name), and each is distinct, so finding it in the archive
+/// is unambiguous.
+fn checksumless_inputs() -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "alpha.txt",
+            (0..200)
+                .flat_map(|i| format!("alpha line {i}\n").into_bytes())
+                .collect(),
+        ),
+        (
+            "beta.txt",
+            (0..301)
+                .flat_map(|i| format!("beta {i};").into_bytes())
+                .collect(),
+        ),
+        (
+            "gamma.bin",
+            (0..1500u32).map(|i| ((i * 7 + 3) % 256) as u8).collect(),
+        ),
+        (
+            "delta.txt",
+            (0..151)
+                .flat_map(|i| format!("delta row {i}\n").into_bytes())
+                .collect(),
+        ),
+    ]
+}
+
+/// The platform tool's archive of [`checksumless_inputs`], in `dir`.
+fn checksumless_archive(format: &str, dir: &Path) -> Vec<u8> {
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let inputs = checksumless_inputs();
+    for (name, data) in &inputs {
+        std::fs::write(tree.join(name), data).unwrap();
+    }
+    let names: Vec<&std::ffi::OsStr> = inputs.iter().map(|(n, _)| os(n)).collect();
+    match format {
+        "tar" => {
+            let out = dir.join("ref.tar");
+            let mut args = vec![os(&"--format=ustar"), os(&"-cf"), os(&out)];
+            args.extend(&names);
+            run_tool(&require_bin("tar"), &args, &tree, b"");
+            std::fs::read(out).unwrap()
+        }
+        "cpio" => {
+            let list: Vec<&str> = inputs.iter().map(|(n, _)| *n).collect();
+            run_tool(
+                &require_bin("cpio"),
+                &[os(&"-o"), os(&"-H"), os(&"newc")],
+                &tree,
+                list.join("\n").as_bytes(),
+            )
+        }
+        "ar" => {
+            let out = dir.join("ref.a");
+            let mut args = vec![os(&"rcS"), os(&out)];
+            args.extend(&names);
+            run_tool(&require_bin("ar"), &args, &tree, b"");
+            std::fs::read(out).unwrap()
+        }
+        other => panic!("no writer for {other}"),
+    }
+}
+
+/// Where `data` starts in `archive` — asserted to occur exactly once.
+fn payload_offset(archive: &[u8], data: &[u8]) -> usize {
+    let hits: Vec<usize> = archive
+        .windows(data.len())
+        .enumerate()
+        .filter(|(_, w)| *w == data)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(hits.len(), 1, "an input's bytes must appear exactly once");
+    hits[0]
+}
+
+/// The three rows over one format, end to end. `tier` is the best the
+/// format can say (`Complete` for tar, `Unattested` for cpio and ar) and
+/// `whole_exit` the code a run with nothing worse exits with (0 and 4).
+fn checksumless_catalogue_end_to_end(format: &str, tier: &str, whole_exit: i32) {
+    let dir = tmp_dir();
+    let healthy = checksumless_archive(format, &dir);
+    let inputs = checksumless_inputs();
+    let row_of = |rows: &[String], name: &str| -> String {
+        rows.iter()
+            .find(|r| r.split_whitespace().any(|w| w == name))
+            .unwrap_or_else(|| panic!("{format}: no row for {name}: {rows:?}"))
+            .clone()
+    };
+
+    // 0. The undamaged archive: every input listed at the format's tier.
+    let path = dir.join(format!("healthy.{format}"));
+    std::fs::write(&path, &healthy).unwrap();
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), inputs.len(), "{format}: {rows:?}");
+    for (name, _) in &inputs {
+        assert!(row_of(&rows, name).contains(tier), "{format}: {rows:?}");
+    }
+
+    // 1. A byte flipped mid-payload of `beta.txt`: still listed at the
+    //    format's tier, never `Intact`; written under its REAL name at the
+    //    ordinary exit code; and wrong on disk in exactly that byte.
+    let (beta, beta_data) = (&inputs[1].0, &inputs[1].1);
+    let mid = beta_data.len() / 2;
+    let mut flipped = healthy.clone();
+    flipped[payload_offset(&healthy, beta_data) + mid] ^= 0xFF;
+    let path = dir.join(format!("flipped.{format}"));
+    std::fs::write(&path, &flipped).unwrap();
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), inputs.len(), "{format}: {rows:?}");
+    assert!(row_of(&rows, beta).contains(tier), "{format}: {rows:?}");
+    assert!(
+        rows.iter().all(|r| !r.contains("Intact")),
+        "{format}: `Intact` claims a content check this format does not carry: {rows:?}"
+    );
+    let out_dir = dir.join(format!("flipped-{format}"));
+    let out = run_output(&[
+        "salvage",
+        path.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(whole_exit),
+        "{format}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut wrong = beta_data.clone();
+    wrong[mid] ^= 0xFF;
+    assert_eq!(
+        std::fs::read(out_dir.join(beta)).unwrap(),
+        wrong,
+        "{format}: the silently wrong file, wrong in exactly the flipped byte"
+    );
+    for (name, data) in inputs.iter().filter(|(n, _)| n != beta) {
+        assert_eq!(
+            &std::fs::read(out_dir.join(name)).unwrap(),
+            data,
+            "{format}"
+        );
+    }
+
+    // 2. A truncated tail, cut halfway through `delta.txt`: the earlier
+    //    three at the format's tier and whole on disk, the cut one
+    //    `Partial (truncated)`, its genuine prefix as `.partial`, exit 4.
+    let (delta, delta_data) = (&inputs[3].0, &inputs[3].1);
+    let keep = delta_data.len() / 2;
+    let path = dir.join(format!("cut.{format}"));
+    std::fs::write(
+        &path,
+        &healthy[..payload_offset(&healthy, delta_data) + keep],
+    )
+    .unwrap();
+    let rows = salvage_list_rows(&path);
+    assert_eq!(rows.len(), inputs.len(), "{format}: {rows:?}");
+    assert!(
+        row_of(&rows, delta).contains("Partial (truncated)"),
+        "{format}: {rows:?}"
+    );
+    let out_dir = dir.join(format!("cut-{format}"));
+    let out = run_output(&[
+        "salvage",
+        path.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "{format}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join(format!("{delta}.partial"))).unwrap(),
+        delta_data[..keep],
+        "{format}: exactly the surviving prefix, nothing invented"
+    );
+    assert!(!out_dir.join(delta).exists(), "{format}");
+    for (name, data) in &inputs[..3] {
+        assert!(row_of(&rows, name).contains(tier), "{format}: {rows:?}");
+        assert_eq!(
+            &std::fs::read(out_dir.join(name)).unwrap(),
+            data,
+            "{format}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// tar: `Complete` (header self-check only), so a flipped payload byte is
+/// written under its real name at EXIT 0 — the sharpest form of the row.
+#[test]
+fn damage_catalogue_tar_end_to_end() {
+    checksumless_catalogue_end_to_end("tar", "Complete", 0);
+}
+
+/// cpio (`newc`): `Unattested`, exit 4 even when whole.
+#[test]
+fn damage_catalogue_cpio_end_to_end() {
+    checksumless_catalogue_end_to_end("cpio", "Unattested", 4);
+}
+
+/// ar: `Unattested`, exit 4 even when whole.
+#[test]
+fn damage_catalogue_ar_end_to_end() {
+    checksumless_catalogue_end_to_end("ar", "Unattested", 4);
+}
