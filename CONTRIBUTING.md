@@ -11,6 +11,28 @@ make check   # the full gate: fmt, lint, test, release build
 in `.git/hooks` by default and are never cloned, so an uninstalled hook is a
 hook that silently does nothing.
 
+### Reference tools the tests need (macOS)
+
+The salvage damage catalogues check stuffr against what real `tar`, `cpio`
+and `ar` write, and CI's Linux runner uses the GNU implementations. On Linux
+the platform tools already are GNU's. macOS ships BSD ones, so **`make check`
+on a Mac also needs the GNU three**, and the tests fail loudly rather than
+quietly cover BSD alone:
+
+```bash
+brew install gnu-tar cpio binutils
+```
+
+- GNU tar is found as `gtar` on `PATH` (the formula puts it there).
+- GNU cpio and GNU ar are keg-only and on `PATH` under no name, so the tests
+  look for them at fixed paths: `/opt/homebrew/opt/cpio/bin/cpio` and
+  `/opt/homebrew/opt/binutils/bin/ar`. The GNU `ar` symbol-table test also
+  needs a C compiler (`cc`, from the Xcode command-line tools).
+- **Known gap: Intel Macs.** Homebrew's prefix there is `/usr/local`, not
+  `/opt/homebrew`, so those two paths do not exist and the cpio and ar
+  catalogues fail even with the tools installed. Resolving the keg through
+  `brew --prefix` is a recorded follow-up, not done yet.
+
 ## The gate
 
 `make check` is this project's Definition of Done, made executable:
