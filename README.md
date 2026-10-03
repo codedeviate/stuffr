@@ -63,8 +63,20 @@ read list.
 > One CLI change over `0.7.1`: a `salvage` run (not `--index`-narrowed)
 > that saw a header it could not gate exits 4 where it exited 0.
 > **1541** tests under `--all-features`, **1476** on the
-> default tier — measured from this bump's own `make check`, `GATE_EXIT=0`,
+> default tier — measured from `0.8.0`'s own `make check`, `GATE_EXIT=0`,
 > never carried forward.
+>
+> `0.8.1` is a patch on `0.8.0`. `stuffr list` now reads the static
+> libraries GNU `ar rc`/`ar rcs` write on macOS, whose `__.SYMDEF` symbol
+> table has a blank mode field — they exited 5; the table lists with its
+> mode unknown rather than an invented one. A GNU sparse tar header that
+> would overflow the `tar` crate's offset arithmetic (a panic in debug and
+> fuzz builds) is refused as corrupt, and a pax extended header over
+> 16 MiB is refused as a resource limit (exit 6) before it is buffered;
+> `tar` is now pinned to the exact version that guard mirrors. `make fuzz`
+> sizes `-runs` to each target's corpus, so it mutates again on a grown
+> local corpus. **1562** tests under `--all-features`, **1497** on the
+> default tier — measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
