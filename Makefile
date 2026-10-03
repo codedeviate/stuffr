@@ -263,7 +263,7 @@ FUZZ_SEED = 1
 # grows, so a fixed budget used to be swallowed whole by a large local corpus
 # (salvage held 12,019 inputs: zero mutations, "OK"). The recipe counts the
 # files (a missing dir counts 0), passes `-runs=<files> + FUZZ_RUNS`, and
-# fails a target whose `Done N runs` is not above the file count.
+# fails a target whose `Done N runs` is below the `-runs` it was given.
 #
 # An execution count still is not evidence, and this recipe's check is only
 # that a target mutated. To measure whether the salvage oracle actually FIRES,
@@ -283,13 +283,13 @@ fuzz: fuzz-corpus
 	  : "No '|| true' on the next line, unlike ci.yml's otherwise-identical" ; \
 	  : "copy. A make recipe runs under a plain /bin/sh with no -e, so a" ; \
 	  : "no-match grep pipeline sets \$$? and carries on, reaching the" ; \
-	  : "explicit empty/not-above-corpus check below. GitHub Actions runs its run: block" ; \
+	  : "explicit empty/short-run check below. GitHub Actions runs its run: block" ; \
 	  : "under bash -e -o pipefail, where the same line would abort the whole" ; \
 	  : "script before that check ever ran — hence the '|| true' there and" ; \
 	  : "not here. Do not tidy either half into matching the other." ; \
 	  n=$$(grep -oE 'Done [0-9]+ runs' "$$tmp" | tail -1 | grep -oE '[0-9]+'); \
-	  if [ -z "$$n" ] || [ "$$n" -le "$$corpus" ]; then \
-	    echo "make fuzz: target '$$target' ran $$n executions over a $$corpus-input corpus — no mutation happened; treating as a failure" >&2; \
+	  if [ -z "$$n" ] || [ "$$n" -lt "$$runs" ]; then \
+	    echo "make fuzz: target '$$target' ran $$n executions, expected $$runs ($$corpus corpus + $(FUZZ_RUNS) mutated) — a short run means no full mutation budget; treating as a failure" >&2; \
 	    cat "$$tmp"; rm -f "$$tmp"; status=1; continue; \
 	  fi; \
 	  echo "target '$$target': $$n executions ($$corpus corpus + $$((n - corpus)) mutated) — OK"; \

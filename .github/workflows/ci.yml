@@ -345,7 +345,7 @@ jobs:
             # line in the Makefile, on purpose. GitHub Actions runs a `run:`
             # block under `bash -e -o pipefail`, so a no-match grep pipeline
             # would abort this whole script via `set -e` before reaching the
-            # explicit not-above-corpus check below — which is the check that turns
+            # explicit short-run check below — which is the check that turns
             # "no summary line" into a reported failure rather than a silent
             # one. A make recipe runs under a plain `/bin/sh` with no `-e`,
             # so `Makefile`'s copy must NOT have it: there, `|| true` would
@@ -353,8 +353,8 @@ jobs:
             # "match" would break the recipe's own `continue`-and-collect
             # loop. Do not tidy either half into agreeing with the other.
             count=$(grep -oE 'Done [0-9]+ runs' "$log" | tail -1 | grep -oE '[0-9]+' || true)
-            if [ -z "$count" ] || [ "$count" -le "$corpus" ]; then
-              echo "::error::fuzz target '$target' ran $count executions over a $corpus-input corpus (or printed no libFuzzer summary) — no mutation happened; treating this as a failure, not a clean run"
+            if [ -z "$count" ] || [ "$count" -lt "$runs" ]; then
+              echo "::error::fuzz target '$target' ran $count executions, expected $runs ($corpus corpus + $FUZZ_RUNS mutated) (or printed no libFuzzer summary) — the mutation budget was not spent; treating this as a failure, not a clean run"
               cat "$log"
               status=1
               continue
