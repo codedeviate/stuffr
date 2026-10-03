@@ -77,13 +77,18 @@ jobs:
       #     --no-default-features --features c-backed -p stuffr-formats --lib
       #     -- --list` lists `legacy::lha::tests::lhasa_reads_what_we_write`,
       #     so that job runs the test and panics without the tool.
-      # `tar.rs`'s own cross-implementation test is the one holdout: it
-      # counts how many of `tar`, `gtar` and `python3` are on PATH and only
-      # asserts that at least one was tried, rather than requiring a named
-      # binary — deliberate, because it is a multi-writer fallback test, not
-      # a single-reference-tool one, and every candidate it lists is already
-      # part of this image or the base image. (`python3` is not named here:
-      # it is part of the base image and cannot be absent.)
+      # `tar.rs`'s multi-writer cross-implementation test is the one
+      # holdout: it counts how many of `tar`, `gtar` and `python3` are on
+      # PATH and only asserts that at least one was tried, rather than
+      # requiring a named binary — deliberate, because it is a multi-writer
+      # fallback test, not a single-reference-tool one, and every candidate
+      # it lists is already part of this image or the base image. (`python3`
+      # is not named here: it is part of the base image and cannot be
+      # absent.) Since 0.8.1 `tar.rs` and `cli.rs` also have tests that
+      # REQUIRE GNU tar (`--sparse --hole-detection=raw`, `--format=pax`):
+      # `gtar`, or a `tar` whose `--version` says GNU. The runner's own
+      # `tar` is GNU's, so nothing is installed for them here; on macOS
+      # they need `brew install gnu-tar` and panic naming it otherwise.
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
       # The same command CONTRIBUTING.md tells a human to run — but NOT the
       # same toolchain, and not the same platform. The `rm` above puts this

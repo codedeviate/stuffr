@@ -23,7 +23,10 @@ quietly cover BSD alone:
 brew install gnu-tar cpio binutils
 ```
 
-- GNU tar is found as `gtar` on `PATH` (the formula puts it there).
+- GNU tar is found as `gtar` on `PATH` (the formula puts it there). Besides
+  the catalogues, the GNU sparse and pax tests in `tar.rs` and `cli.rs`
+  (0.8.1) need it: they write archives with GNU-only flags
+  (`--sparse --hole-detection=raw`, `--format=pax`) that bsdtar rejects.
 - GNU cpio and GNU ar are keg-only and on `PATH` under no name, so the tests
   look for them at fixed paths: `/opt/homebrew/opt/cpio/bin/cpio` and
   `/opt/homebrew/opt/binutils/bin/ar`. The GNU `ar` symbol-table tests (in
