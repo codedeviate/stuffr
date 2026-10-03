@@ -71,13 +71,17 @@
 //! - A GNU **thin** archive (`!<thin>\n`) keeps each member's content in a
 //!   separate file, so the bytes after a header are the next header. Walked
 //!   as an ordinary archive, they would be written as a member's content.
-//! - A **symbol table** (`/`, `/SYM64/`, `__.SYMDEF`, `__.SYMDEF SORTED`)
-//!   whose header `ar 0.9.0` cannot parse — GNU `ar rcs` on Mach-O writes
-//!   `__.SYMDEF` with a blank mode, which the crate refuses — ends the walk
-//!   with a [`WalkStopKind::UnsupportedShape`] stop naming it; with nothing
-//!   recovered before it, the run is exit 3 rather than "nothing
-//!   recoverable". `stuffr list` still refuses that archive (a separate
-//!   follow-up).
+//! - A **symbol table** (`/`, `/SYM64/`, `__.SYMDEF`, `__.SYMDEF SORTED`;
+//!   `ar.rs`'s `symbol_table_name` owns the list) whose header `ar 0.9.0`
+//!   cannot parse ends the walk with a [`WalkStopKind::UnsupportedShape`]
+//!   stop naming it; with nothing recovered before it, the run is exit 3
+//!   rather than "nothing recoverable". The case that motivated it — GNU
+//!   `ar rcs` on Mach-O writing `__.SYMDEF` with a blank mode — no longer
+//!   reaches it: since 0.8.1 `ar.rs`'s guard normalises that mode, so the
+//!   walk reads the table like `stuffr list` does (an inline one is a
+//!   member whose mode is unknown). What still stops here is a symbol table
+//!   damaged in a way the guard does not normalise, and GNU's `/SYM64/`,
+//!   which the crate cannot read at all.
 //!
 //! Any other global header that is not `!<arch>\n` is the ordinary reader's
 //! refusal: a stop at offset 0 and nothing recovered. An earlier version
@@ -119,7 +123,10 @@ use stuffr_core::salvage::{
 };
 use stuffr_core::{Error, FormatId, Result, SeekRead};
 
-use crate::ar::{AR, AR_ENTRY_HEADER_LEN, ArGuardedReader, GuardObserver, entry_meta};
+use crate::ar::{
+    AR, AR_ENTRY_HEADER_LEN, ArGuardedReader, GuardObserver, MAX_SYMBOL_TABLE_EXTENDED_LEN,
+    entry_meta, symbol_table_name,
+};
 
 /// The codec an `ar` member carries in [`stuffr_core::EntryMeta::codec`].
 /// **Setting it at all is load-bearing**: `entries.rs` hands it to
@@ -128,14 +135,18 @@ use crate::ar::{AR, AR_ENTRY_HEADER_LEN, ArGuardedReader, GuardObserver, entry_m
 /// shipped in Salvage Stage 2.
 pub const STORED: FormatId = FormatId::new("ar-stored");
 
-/// The two offsets the walk needs from [`ArGuardedReader`] — see
-/// [`GuardObserver`] for exactly when each is reported.
+/// What the walk needs from [`ArGuardedReader`] — see [`GuardObserver`]
+/// for exactly when each is reported.
 #[derive(Debug, Clone, Copy, Default)]
 struct Marks {
     /// Where the header the crate most recently started to read begins.
     header_at: u64,
     /// Where the last record read whole ends.
     record_end: u64,
+    /// Whether the guard rewrote the blank mode of the header the crate
+    /// read last, so the member's mode is unknown — `ar.rs`'s
+    /// `NORMALISED_MODE`.
+    mode_unknown: bool,
 }
 
 /// A [`GuardObserver`] the walk can still read while `ar::Archive` owns the
@@ -160,6 +171,12 @@ impl GuardObserver for SharedMarks {
     fn record_ends(&mut self, at: u64) {
         let mut marks = self.0.get();
         marks.record_end = at;
+        self.0.set(marks);
+    }
+
+    fn header_scanned(&mut self, mode_unknown: bool) {
+        let mut marks = self.0.get();
+        marks.mode_unknown = mode_unknown;
         self.0.set(marks);
     }
 }
@@ -190,19 +207,11 @@ impl Read for WalkSource<'_> {
 /// header — never a payload.
 const THIN_GLOBAL_HEADER: &[u8; 8] = b"!<thin>\n";
 
-/// Every symbol-table member identifier the `ar` variants write: GNU's `/`
-/// and `/SYM64/`, BSD's `__.SYMDEF` and `__.SYMDEF SORTED` (inline or in the
-/// `#1/N` extended form).
-const SYMBOL_TABLE_NAMES: [&str; 4] = ["/", "/SYM64/", "__.SYMDEF", "__.SYMDEF SORTED"];
-
-/// The longest `#1/N` name worth reading to recognise a symbol table — the
-/// longest of [`SYMBOL_TABLE_NAMES`] rounded up to the four-byte padding BSD
-/// writers use, with room to spare. A longer name is no symbol table.
-const MAX_SYMBOL_TABLE_EXTENDED_LEN: u64 = 64;
-
 /// Which symbol table, if any, the member header at `offset` names. Read
 /// straight from the file, after the walk has stopped there: the crate
-/// refused the header, so there is no parsed identifier to consult.
+/// refused the header, so there is no parsed identifier to consult. The
+/// names themselves are `ar.rs`'s ([`symbol_table_name`]), the list the
+/// guard normalises from.
 fn symbol_table_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<&'static str> {
     let header = read_at(src, offset, AR_ENTRY_HEADER_LEN as u64, file_len)?;
     let mut identifier = header[..16].to_vec();
@@ -219,9 +228,7 @@ fn symbol_table_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option
             identifier.pop();
         }
     }
-    SYMBOL_TABLE_NAMES
-        .into_iter()
-        .find(|name| name.as_bytes() == identifier.as_slice())
+    symbol_table_name(&identifier)
 }
 
 /// `len` bytes at `at`, or `None` if the source does not hold them all (or
@@ -281,10 +288,15 @@ fn walk(src: &mut dyn SeekRead) -> Result<Walk> {
                 // drains whatever of the payload is present — the walk reads
                 // nothing of it itself.
                 Some(Ok(entry)) => {
-                    let header_at = marks.get().header_at;
+                    let Marks {
+                        header_at,
+                        mode_unknown,
+                        ..
+                    } = marks.get();
                     let payload_start = pos.get();
                     candidates.push(candidate(
                         entry.header(),
+                        mode_unknown,
                         header_at,
                         payload_start,
                         file_len,
@@ -345,14 +357,20 @@ fn walk(src: &mut dyn SeekRead) -> Result<Walk> {
 
 /// The candidate for one member the crate read, with the fields `ar.rs`'s own
 /// `entry_meta` reports.
-fn candidate(header: &ar::Header, offset: u64, payload_start: u64, file_len: u64) -> Candidate {
+fn candidate(
+    header: &ar::Header,
+    mode_unknown: bool,
+    offset: u64,
+    payload_start: u64,
+    file_len: u64,
+) -> Candidate {
     let size = header.size();
     // `Some(n)` always means `n < declared_len`, per the field's contract.
     let available_len = match payload_start.checked_add(size) {
         Some(end) if end <= file_len => None,
         _ => Some(file_len.saturating_sub(payload_start)),
     };
-    let mut meta = entry_meta(header);
+    let mut meta = entry_meta(header, mode_unknown);
     meta.compressed_size = Some(size);
     meta.codec = Some(STORED);
     // No verifier: `ar` has none, which is also why no two members are ever
@@ -579,13 +597,30 @@ mod tests {
         out
     }
 
-    /// One member whose MODE field is blank, as GNU `ar rcs` writes its
-    /// `__.SYMDEF` on Mach-O (fix round 1, I3) — `ar 0.9.0` requires a
-    /// non-empty octal mode and refuses it.
-    fn blank_mode_member(identifier: &[u8], data: &[u8]) -> Vec<u8> {
+    /// One member whose MODE field (`[40..48]`, `ar-0.9.0/src/lib.rs:292`)
+    /// is `mode`: all spaces is GNU `ar rcs`'s Mach-O `__.SYMDEF` (fix round
+    /// 1, I3), which the guard normalises on a symbol table since 0.8.1;
+    /// anything else that is not octal, the crate still refuses.
+    fn mode_member(identifier: &[u8], data: &[u8], mode: &[u8; 8]) -> Vec<u8> {
         let mut out = member(identifier, data.len() as u64, data);
-        out[40..48].copy_from_slice(&[b' '; 8]);
+        out[40..48].copy_from_slice(mode);
         out
+    }
+
+    const BLANK_MODE: &[u8; 8] = &[b' '; 8];
+    /// A mode the guard does NOT normalise: not blank, and not octal.
+    const BAD_MODE: &[u8; 8] = b"zzzzzzzz";
+
+    /// The `#1/20` member carrying `__.SYMDEF SORTED` as its name, plus a
+    /// four-byte table, with the given mode.
+    fn extended_symbol_table(mode: &[u8; 8]) -> Vec<u8> {
+        let mut ext = b"__.SYMDEF SORTED".to_vec();
+        ext.resize(20, 0);
+        let mut body = ext;
+        body.extend_from_slice(b"\0\0\0\0");
+        let mut id = b"#1/".to_vec();
+        id.extend_from_slice(format!("{:<13}", 20).as_bytes());
+        mode_member(&id, &body, mode)
     }
 
     /// Header offsets of every member of an archive this module did NOT
@@ -1129,15 +1164,16 @@ mod tests {
         }
     }
 
-    /// Fix round 1, I3: a symbol table whose header `ar 0.9.0` cannot parse
-    /// is a shape this build does not read. With nothing recovered before
-    /// it, exit 3 naming it — never exit 5 "nothing recoverable" over a
-    /// healthy archive.
+    /// Fix round 1, I3, narrowed in 0.8.1: a symbol table whose header
+    /// `ar 0.9.0` cannot parse, in a way the guard does NOT normalise (a mode
+    /// that is neither blank nor octal), is a shape this build does not
+    /// read. With nothing recovered before it, exit 3 naming it — never
+    /// exit 5 "nothing recoverable" over a possibly healthy archive.
     #[test]
     fn an_unparseable_symbol_table_first_is_exit_3_naming_it() {
         for ident in [&b"__.SYMDEF"[..], b"__.SYMDEF SORTED"] {
             let mut bytes = GLOBAL_HEADER.to_vec();
-            bytes.extend(blank_mode_member(ident, b"\0\0\0\0"));
+            bytes.extend(mode_member(ident, b"\0\0\0\0", BAD_MODE));
             bytes.extend(member(b"f.o", 3, b"fff"));
             let err = salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default())
                 .expect_err("an unreadable symbol table with nothing before it is exit 3");
@@ -1148,13 +1184,7 @@ mod tests {
         }
         // The same table in the `#1/N` extended form BSD tools also write.
         let mut bytes = GLOBAL_HEADER.to_vec();
-        let mut ext = b"__.SYMDEF SORTED".to_vec();
-        ext.resize(20, 0);
-        let mut body = ext.clone();
-        body.extend_from_slice(b"\0\0\0\0");
-        let mut id = b"#1/".to_vec();
-        id.extend_from_slice(format!("{:<13}", 20).as_bytes());
-        bytes.extend(blank_mode_member(&id, &body));
+        bytes.extend(extended_symbol_table(BAD_MODE));
         let err =
             salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default()).expect_err("exit 3");
         assert_eq!(err.exit_code(), 3, "{err}");
@@ -1168,7 +1198,7 @@ mod tests {
         let mut bytes = GLOBAL_HEADER.to_vec();
         bytes.extend(member(b"a.o", 2, b"aa"));
         let at = bytes.len() as u64;
-        bytes.extend(blank_mode_member(b"__.SYMDEF", b"\0\0\0\0"));
+        bytes.extend(mode_member(b"__.SYMDEF", b"\0\0\0\0", BAD_MODE));
         bytes.extend(member(b"b.o", 2, b"bb"));
         let out = scan(&bytes);
         assert_eq!(out.entries.len(), 1);
@@ -1180,15 +1210,67 @@ mod tests {
         assert!(!note.contains("unreachable by construction"), "{note}");
     }
 
+    /// 0.8.1: a BLANK mode on a symbol table is normalised by `ar.rs`'s
+    /// guard, so the walk reads past it. Inline, the table is a member the
+    /// crate hands back (mode unknown); in `#1/N` form the crate skips it.
+    /// A blank mode on an ordinary member is not normalised and still stops
+    /// the walk, as `stuffr list` still refuses it.
+    #[test]
+    fn a_blank_mode_symbol_table_walks_whole_and_an_ordinary_member_does_not() {
+        for ident in [&b"__.SYMDEF"[..], b"__.SYMDEF SORTED"] {
+            let mut bytes = GLOBAL_HEADER.to_vec();
+            bytes.extend(mode_member(ident, b"\0\0\0\0", BLANK_MODE));
+            bytes.extend(member(b"f.o", 3, b"fff"));
+            let out = scan(&bytes);
+            assert!(out.walk_stop.is_none(), "{:?}", out.walk_stop);
+            let name = std::str::from_utf8(ident).unwrap();
+            let got: Vec<_> = out
+                .entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.meta.mode))
+                .collect();
+            assert_eq!(got, [(name, None), ("f.o", Some(0o100644))]);
+        }
+
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend(extended_symbol_table(BLANK_MODE));
+        bytes.extend(member(b"f.o", 3, b"fff"));
+        let out = scan(&bytes);
+        assert!(out.walk_stop.is_none(), "{:?}", out.walk_stop);
+        assert_eq!(
+            names_and_statuses(&out),
+            [("f.o".to_string(), SalvageStatus::Unattested)]
+        );
+
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend(member(b"a.o", 2, b"aa"));
+        let at = bytes.len() as u64;
+        bytes.extend(mode_member(b"b.o", b"bb", BLANK_MODE));
+        let out = scan(&bytes);
+        assert_eq!(out.entries.len(), 1);
+        let stop = out
+            .walk_stop
+            .expect("an ordinary member's blank mode stops the walk");
+        assert_eq!((stop.offset, stop.kind), (at, WalkStopKind::Unreadable));
+        assert!(
+            stop.cause.contains("Invalid file mode field"),
+            "{}",
+            stop.cause
+        );
+    }
+
     /// The real writer behind I3: GNU `ar rcs` over Mach-O objects writes a
-    /// `__.SYMDEF` with a blank mode. macOS only — an ELF host's GNU `ar`
+    /// `__.SYMDEF` with a blank mode. Since 0.8.1 the guard normalises it,
+    /// so the walk is whole: the table is recovered as the member it is
+    /// (as `stuffr list` and Apple `ar t` show it), mode unknown, and no
+    /// stop. macOS only — an ELF host's GNU `ar`
     /// writes `/` instead, and the hand-built fixtures above pin the shape
     /// there. On macOS the keg-only GNU `ar` and a C compiler are REQUIRED
     /// and their absence fails loudly, like the catalogue's `writers()`
     /// (Ruling 970): this test used to return early without them and pass
     /// having proved nothing.
     #[test]
-    fn gnu_ar_s_mach_o_symbol_table_is_exit_3_not_5() {
+    fn gnu_ar_s_mach_o_symbol_table_walks_whole() {
         if !cfg!(target_os = "macos") {
             return;
         }
@@ -1222,10 +1304,21 @@ mod tests {
             "GNU ar on macOS no longer writes the Mach-O `__.SYMDEF` first: {:?}",
             String::from_utf8_lossy(&bytes[8..bytes.len().min(68)])
         );
-        let err = salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default())
-            .expect_err("GNU's Mach-O symbol table is a shape this build does not read");
-        assert_eq!(err.exit_code(), 3, "{err}");
-        assert!(err.to_string().contains("__.SYMDEF"), "{err}");
+        let out = salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default())
+            .expect("GNU's Mach-O library walks whole");
+        assert!(out.walk_stop.is_none(), "{:?}", out.walk_stop);
+        let got: Vec<_> = out
+            .entries
+            .iter()
+            .map(|e| (e.meta.name.as_str(), e.meta.mode.is_some(), e.status))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("__.SYMDEF", false, SalvageStatus::Unattested),
+                ("f.o", true, SalvageStatus::Unattested),
+            ]
+        );
     }
 
     // -------------------------------------------------------------------

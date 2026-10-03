@@ -815,8 +815,10 @@ pub enum WalkStopKind {
     Unreadable,
     /// The record at the stop point is one the scanner RECOGNISES — its
     /// [`WalkStop::cause`] names it — in a shape this build cannot read (Task
-    /// 4 fix round 1: GNU `ar`'s Mach-O `__.SYMDEF` with a blank mode). Not
-    /// evidence of damage; what follows is unreachable to this scanner.
+    /// 4 fix round 1: an `ar` symbol table whose header the reader cannot
+    /// parse; GNU `ar`'s Mach-O `__.SYMDEF` with a blank mode was the first,
+    /// and is read since 0.8.1). Not evidence of damage; what follows is
+    /// unreachable to this scanner.
     UnsupportedShape,
 }
 

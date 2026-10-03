@@ -86,6 +86,20 @@
 //! that module works around it). Property 12's hostile names are stored and
 //! read back verbatim by construction, with nothing for this module to do.
 //!
+//! # GNU's blank-mode symbol table: read, with its mode unknown
+//!
+//! GNU binutils' `ar rc`, `ar rcs` and `ranlib` over Mach-O objects write an
+//! inline `__.SYMDEF` whose mode field is all spaces; the crate requires an
+//! octal mode (`lib.rs:292`), so `list` used to exit 5 over a healthy
+//! library. [`ArGuardedReader`] rewrites an all-space mode to
+//! [`NORMALISED_MODE`] on a BSD-named symbol table ONLY, and says so through
+//! [`GuardObserver::header_scanned`], so [`entry_meta`] reports that mode as
+//! unknown. The crate hands an inline `__.SYMDEF` back as an ordinary member
+//! (`is_symbol_lookup_table_id`, `lib.rs:498-507`: `Common => false`), so
+//! `list` shows it, as Apple's `ar t` does; nothing about it is invented. A
+//! blank mode on any other member is still the crate's refusal. GNU's
+//! `/SYM64/` remains unreadable: the crate parses it as a `/N` reference.
+//!
 //! # Four header fields `ar` 0.9.0 trusts before use, and what this module does about each
 //!
 //! Three are allocations made straight from a header-declared length, before
@@ -194,7 +208,9 @@
 //! would need roughly 4 MiB), while remaining ~570x smaller than the ~9.3
 //! GiB a 10-digit declared length can otherwise buy.
 
+use std::cell::Cell;
 use std::io::{self, Read, Write};
+use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use stuffr_core::{
@@ -270,7 +286,8 @@ impl Container for Ar {
         // the module doc's "Four header fields" section for why the guard
         // has to be installed here, below the crate, rather than as a peek
         // this module performs itself before delegating.
-        let guarded = ArGuardedReader::new(source);
+        let mode_unknown = ModeUnknown::default();
+        let guarded = ArGuardedReader::observed(source, mode_unknown.clone());
         // Leaked deliberately and reclaimed in `ArRead::drop` — see that
         // struct's own doc for why, and `tar.rs`'s module doc for the fuller
         // argument this mirrors.
@@ -278,6 +295,7 @@ impl Container for Ar {
         Ok(Box::new(ArRead {
             archive,
             current: None,
+            mode_unknown,
             report,
             seekable,
         }))
@@ -343,6 +361,111 @@ const MAX_BSD_IDENTIFIER_LEN: u64 = 65_536;
 /// ~570x smaller than the ~9.3 GiB a 10-digit declared length can otherwise
 /// buy.
 const MAX_GNU_NAME_TABLE_LEN: u64 = 16 * 1024 * 1024;
+
+// --- Symbol tables: one owner for their names, and GNU's blank mode --------
+
+/// GNU's symbol-table member identifiers: `/` (`ar-0.9.0/src/lib.rs:109`,
+/// skipped by the crate before it parses a mode, `lib.rs:257-259`) and
+/// `/SYM64/` (which the crate does not recognise at all: it parses
+/// `buffer[1..16]` as a long-name index, `lib.rs:267`, and refuses it).
+/// Listed so [`symbol_table_name`] can name either one; the guard never
+/// rewrites a header that carries one of these.
+const GNU_SYMBOL_TABLE_NAMES: [&str; 2] = ["/", "/SYM64/"];
+
+/// BSD's symbol-table member identifiers, inline or in the `#1/N` form —
+/// the crate's own `BSD_SYMBOL_LOOKUP_TABLE_ID` and
+/// `BSD_SORTED_SYMBOL_LOOKUP_TABLE_ID` (`lib.rs:105-106`). These are the
+/// only names [`ArGuardedReader`] normalises a blank mode for.
+const BSD_SYMBOL_TABLE_NAMES: [&str; 2] = ["__.SYMDEF", "__.SYMDEF SORTED"];
+
+/// The longest `#1/N` name worth reading to recognise a symbol table: the
+/// longest of the names above, rounded up to the four-byte padding BSD
+/// writers use, with room to spare. A longer name is no symbol table.
+pub(crate) const MAX_SYMBOL_TABLE_EXTENDED_LEN: u64 = 64;
+
+/// Which symbol table, if any, `identifier` names: every name the `ar`
+/// variants write, GNU's and BSD's. `identifier` is the resolved name:
+/// trailing spaces trimmed from an inline field, or a `#1/N` name's own
+/// bytes with trailing NULs trimmed (`lib.rs:249-252`, `lib.rs:323-325`).
+pub(crate) fn symbol_table_name(identifier: &[u8]) -> Option<&'static str> {
+    GNU_SYMBOL_TABLE_NAMES
+        .into_iter()
+        .chain(BSD_SYMBOL_TABLE_NAMES)
+        .find(|name| name.as_bytes() == identifier)
+}
+
+/// A header's octal mode field — `lib.rs:292`, `parse_number("file mode",
+/// &buffer[40..48], 8)`. Unlike uid and gid (`lib.rs:282-291`), the crate
+/// never lets this field be blank, in any variant.
+const MODE_FIELD: std::ops::Range<usize> = 40..48;
+
+/// What the guard writes into a blank mode field on a BSD-named symbol
+/// table before the crate reads it: the smallest value `parse_number`
+/// accepts. **Never reported**: the guard tells its [`GuardObserver`] the
+/// mode was blank, and [`entry_meta`] reports it as unknown.
+///
+/// GNU binutils' `ar rc`, `ar rcs` and `ranlib` over Mach-O objects write
+/// their inline `__.SYMDEF` with this field all spaces (measured 2026-10-03;
+/// mtime, uid and gid are `0`, so mode is the only blank field). The crate
+/// refuses that, so `stuffr list` used to exit 5 over a healthy library.
+const NORMALISED_MODE: &[u8; 8] = &{
+    let mut mode = [b' '; 8];
+    mode[0] = b'0';
+    mode
+};
+
+/// Whether the whole header in `buf` names a BSD symbol table, inline or as
+/// a `#1/N` name: the one shape whose blank mode the guard normalises.
+///
+/// The crate parses the mode (`lib.rs:292`) BEFORE it reads a `#1/N` name
+/// (`lib.rs:293-332`), so the name has to be read ahead here, into `buf`,
+/// which the guard then serves as part of the header. Only names up to
+/// [`MAX_SYMBOL_TABLE_EXTENDED_LEN`] are read, and only when `variant` says
+/// the crate will resolve this `#1/N` at all: [`scan_ar_header`] has just
+/// mirrored its `variant != GNU && starts_with("#1/")` test (`lib.rs:293`).
+/// `payload_len` bounds the read ahead to bytes the header declares as its
+/// own, so a short read here is the file ending where the crate would hit
+/// the end too.
+fn names_a_bsd_symbol_table<R: Read>(
+    inner: &mut R,
+    pos: &mut u64,
+    buf: &mut Vec<u8>,
+    variant: ar::Variant,
+    payload_len: u64,
+) -> io::Result<bool> {
+    // `lib.rs:249-252`: the inline name, trailing spaces trimmed.
+    let mut identifier = buf[0..16].to_vec();
+    while identifier.last() == Some(&b' ') {
+        identifier.pop();
+    }
+    if variant == ar::Variant::BSD && identifier.starts_with(b"#1/") {
+        // `lib.rs:296`: the name's length, `buffer[3..16]`.
+        let Some(len) = parse_ar_field(&buf[3..16]) else {
+            return Ok(false);
+        };
+        if len > MAX_SYMBOL_TABLE_EXTENDED_LEN || len > payload_len {
+            return Ok(false);
+        }
+        let want = AR_ENTRY_HEADER_LEN + len as usize;
+        while buf.len() < want {
+            let mut tmp = vec![0u8; want - buf.len()];
+            let n = inner.read(&mut tmp)?;
+            if n == 0 {
+                break;
+            }
+            *pos += n as u64;
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        // `lib.rs:323-325`: trailing NULs trimmed.
+        identifier = buf[AR_ENTRY_HEADER_LEN..].to_vec();
+        while identifier.last() == Some(&0) {
+            identifier.pop();
+        }
+    }
+    Ok(BSD_SYMBOL_TABLE_NAMES
+        .into_iter()
+        .any(|name| name.as_bytes() == identifier.as_slice()))
+}
 
 /// What [`scan_ar_header`] learned about one 60-byte header, needed only to
 /// track [`ArGuardedReader`]'s own position through the stream — never to
@@ -609,9 +732,28 @@ pub(crate) trait GuardObserver {
     /// ends at source offset `at` has been read whole — `at` is where the
     /// next record, or its pad byte, begins.
     fn record_ends(&mut self, _at: u64) {}
+    /// A whole header has been scanned and is about to reach the crate.
+    /// `mode_unknown` is true when its mode field was blank and the guard
+    /// rewrote it (a BSD-named symbol table: see [`NORMALISED_MODE`]). The
+    /// crate reads nothing after an entry's header before handing that
+    /// entry back, so the last call before `next_entry` returns describes
+    /// that entry's header.
+    fn header_scanned(&mut self, _mode_unknown: bool) {}
 }
 
 impl GuardObserver for () {}
+
+/// The read path's [`GuardObserver`]: whether the header the crate read
+/// last had its mode rewritten. Shared because `ar::Archive` owns the
+/// guard, and offers no way back to it.
+#[derive(Clone, Default)]
+struct ModeUnknown(Rc<Cell<bool>>);
+
+impl GuardObserver for ModeUnknown {
+    fn header_scanned(&mut self, mode_unknown: bool) {
+        self.0.set(mode_unknown);
+    }
+}
 
 /// Wraps the real archive source and is what `ar::Archive` reads from for
 /// the archive's WHOLE lifetime, inspecting every entry header before the
@@ -623,8 +765,8 @@ impl GuardObserver for () {}
 /// Generic over its source and a [`GuardObserver`] for Salvage Stage 3
 /// Task 4: `ar_salvage.rs` walks the archive through this SAME guard, so
 /// its ceilings keep one owner, and learns the offsets it needs through the
-/// observer. The defaults are the ordinary read path's.
-pub(crate) struct ArGuardedReader<R = Box<dyn Source>, O = ()> {
+/// observer. The ordinary read path's is [`ModeUnknown`] (see [`ArSource`]).
+pub(crate) struct ArGuardedReader<R, O> {
     inner: R,
     observer: O,
     /// Bytes read from `inner` so far — the source offset of the next one.
@@ -638,12 +780,6 @@ pub(crate) struct ArGuardedReader<R = Box<dyn Source>, O = ()> {
     /// is seen, which is exactly the state the crate's own empty `Vec` is in
     /// and the state the 68-byte panic reproducer exploits.
     name_table_len: u64,
-}
-
-impl ArGuardedReader {
-    fn new(inner: Box<dyn Source>) -> Self {
-        Self::observed(inner, ())
-    }
 }
 
 impl<R: Read, O: GuardObserver> ArGuardedReader<R, O> {
@@ -727,16 +863,31 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                             .expect("just checked buf.len() == AR_ENTRY_HEADER_LEN");
                         let scan =
                             scan_ar_header(&hdr, &mut self.variant, &mut self.name_table_len)?;
+                        let mode_unknown = hdr[MODE_FIELD].iter().all(|&b| b == b' ')
+                            && names_a_bsd_symbol_table(
+                                &mut self.inner,
+                                &mut self.pos,
+                                buf,
+                                self.variant,
+                                scan.payload_len,
+                            )?;
+                        if mode_unknown {
+                            buf[MODE_FIELD].copy_from_slice(NORMALISED_MODE);
+                        }
+                        self.observer.header_scanned(mode_unknown);
                         (scan.payload_len, scan.pad_after)
                     } else {
                         // Truncated mid-header — see this phase's own doc.
                         (0, false)
                     };
                     let full = std::mem::take(buf);
+                    // A `#1/N` name read ahead by `names_a_bsd_symbol_table`
+                    // is served from `buf` too, so it leaves the payload.
+                    let read_ahead = full.len().saturating_sub(AR_ENTRY_HEADER_LEN) as u64;
                     self.phase = ArGuardPhase::Serving {
                         buf: full,
                         pos: 0,
-                        remaining: payload_len,
+                        remaining: payload_len - read_ahead,
                         pad_after,
                         ends_record: whole,
                     };
@@ -794,7 +945,7 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
     }
 }
 
-type ArSource = ArGuardedReader;
+type ArSource = ArGuardedReader<Box<dyn Source>, ModeUnknown>;
 type ArArchive = ar::Archive<ArSource>;
 
 /// Owns the archive on the heap and, while one is in progress, the entry
@@ -837,6 +988,9 @@ struct ArRead {
     /// The entry currently in progress. `None` between entries and once the
     /// archive is exhausted.
     current: Option<ar::Entry<'static, ArSource>>,
+    /// Whether the guard rewrote the mode of the header the crate read last
+    /// — the header of the entry `next_entry` just returned.
+    mode_unknown: ModeUnknown,
     report: FidelityReport,
     seekable: bool,
 }
@@ -879,7 +1033,7 @@ impl ArchiveRead for ArRead {
             Some(Ok(raw)) => raw,
         };
 
-        let meta = entry_meta(raw.header());
+        let meta = entry_meta(raw.header(), self.mode_unknown.0.get());
         let remaining = raw.header().size();
         let name = meta.name.clone();
         self.current = Some(raw);
@@ -960,12 +1114,17 @@ impl Read for ArEntryPayload<'_> {
 
 /// `ar` has no notion of a directory or a symlink — every entry is an opaque
 /// named blob — so every entry reads back as [`EntryKind::File`].
-pub(crate) fn entry_meta(header: &ar::Header) -> EntryMeta {
+///
+/// `mode_unknown` is the guard's word that this header's mode field was
+/// blank (see [`GuardObserver::header_scanned`]): the crate then parsed
+/// [`NORMALISED_MODE`], which the archive never said, so the mode is
+/// reported as unknown rather than as that.
+pub(crate) fn entry_meta(header: &ar::Header, mode_unknown: bool) -> EntryMeta {
     EntryMeta {
         name: String::from_utf8_lossy(header.identifier()).into_owned(),
         size: Some(header.size()),
         mtime: Some(UNIX_EPOCH + Duration::from_secs(header.mtime())),
-        mode: Some(header.mode()),
+        mode: (!mode_unknown).then(|| header.mode()),
         uid: Some(header.uid()),
         gid: Some(header.gid()),
         kind: EntryKind::File,
@@ -1962,5 +2121,174 @@ mod tests {
             ],
             "both names must resolve through the table"
         );
+    }
+
+    // --- 0.8.1 Task 1: GNU `ar`'s blank-mode symbol table -----------------
+    //
+    // Field offsets are `ar-0.9.0/src/lib.rs`'s `Header::read`: identifier
+    // `buffer[0..16]` (:249), mtime `[16..28]` (:281), uid `[28..34]`
+    // (:282-286), gid `[34..40]` (:287-291), mode `[40..48]` (:292, octal,
+    // NOT `parse_number_permitting_empty`), size `[48..58]` (:253).
+
+    /// `ar_header_raw` with its mode field blanked: all ASCII spaces, the
+    /// shape GNU binutils writes into its Mach-O `__.SYMDEF`.
+    fn blank_mode_header(identifier: &[u8; 16], size: u64) -> Vec<u8> {
+        let mut h = ar_header_raw(identifier, size);
+        h[MODE_FIELD].copy_from_slice(&[b' '; 8]);
+        h
+    }
+
+    /// One entry as [`read_all`] reads it: name, mode, payload.
+    type ReadBack = (String, Option<u32>, Vec<u8>);
+
+    /// Every entry's name, mode and payload, in archive order.
+    fn read_all(bytes: &[u8]) -> stuffr_core::Result<Vec<ReadBack>> {
+        let mut ar = open_guarded(bytes.to_vec(), 4096);
+        let mut got = Vec::new();
+        while let Some(mut entry) = ar.next_entry()? {
+            let name = entry.meta().name.clone();
+            let mode = entry.meta().mode;
+            let mut data = Vec::new();
+            entry
+                .reader()
+                .read_to_end(&mut data)
+                .map_err(stuffr_core::Error::from_decode_io)?;
+            got.push((name, mode, data));
+        }
+        Ok(got)
+    }
+
+    /// The real writer. GNU binutils' `ar rcs` over Mach-O objects writes an
+    /// INLINE `__.SYMDEF` whose mode field is all spaces (measured
+    /// 2026-10-03: `rc`, `rcs` and `ranlib` alike; mtime, uid and gid are
+    /// `0`). The crate surfaces an inline `__.SYMDEF` as an ordinary member
+    /// (`is_symbol_lookup_table_id`, `lib.rs:498-507`: `Common => false`),
+    /// so `list` shows it — as Apple `ar t` does — with its mode UNKNOWN,
+    /// never an invented one. macOS only: an ELF host's GNU `ar` writes `/`,
+    /// which the crate skips before parsing a mode (`lib.rs:257-259`). On
+    /// macOS the keg-only GNU `ar` and `cc` are required, and their absence
+    /// fails loudly.
+    #[test]
+    fn gnu_ar_on_mach_o_lists_its_blank_mode_symbol_table_with_mode_unknown() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        const GNU_AR_ON_MACOS: &str = "/opt/homebrew/opt/binutils/bin/ar";
+        let gnu = std::path::PathBuf::from(GNU_AR_ON_MACOS);
+        assert!(
+            gnu.is_file(),
+            "GNU ar not at {GNU_AR_ON_MACOS} (`brew install binutils`) — without it this \
+             test proves nothing about the real writer"
+        );
+        let cc = require_bin("cc");
+        let dir = std::env::temp_dir().join(format!("stuffr-ar-gnu-symdef-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, body) in [
+            ("f", "int f(void){return 1;}\n"),
+            ("g", "int g(void){return 2;}\n"),
+        ] {
+            std::fs::write(dir.join(format!("{name}.c")), body).unwrap();
+            let ok = std::process::Command::new(&cc)
+                .args(["-c", "-o", &format!("{name}.o"), &format!("{name}.c")])
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(ok.success(), "cc -c {name}.c");
+        }
+        let made = std::process::Command::new(&gnu)
+            .args(["rcs", "lib.a", "f.o", "g.o"])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(made.success(), "GNU ar rcs");
+        let bytes = std::fs::read(dir.join("lib.a")).unwrap();
+        let first = &bytes[GLOBAL_HEADER.len()..GLOBAL_HEADER.len() + AR_ENTRY_HEADER_LEN];
+        assert_eq!(
+            first[0..16],
+            padded_identifier("__.SYMDEF"),
+            "GNU no longer writes an inline __.SYMDEF"
+        );
+        assert_eq!(
+            first[MODE_FIELD], [b' '; 8],
+            "GNU no longer writes a blank mode"
+        );
+
+        let got = read_all(&bytes).expect("a healthy GNU library must list");
+        let names: Vec<&str> = got.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert_eq!(names, ["__.SYMDEF", "f.o", "g.o"]);
+        assert_eq!(got[0].1, None, "the blank mode is unknown, not invented");
+        for (i, obj) in [(1, "f.o"), (2, "g.o")] {
+            assert_eq!(
+                got[i].2,
+                std::fs::read(dir.join(obj)).unwrap(),
+                "{obj}'s bytes"
+            );
+            assert!(got[i].1.is_some(), "{obj} carries a real mode");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Hand-built twins of the GNU shape: both inline symbol-table names
+    /// with a blank mode list, mode unknown; the member after keeps its mode.
+    #[test]
+    fn an_inline_blank_mode_symbol_table_lists_with_mode_unknown() {
+        for ident in ["__.SYMDEF", "__.SYMDEF SORTED"] {
+            let mut bytes = GLOBAL_HEADER.to_vec();
+            bytes.extend(blank_mode_header(&padded_identifier(ident), 4));
+            bytes.extend_from_slice(b"\0\0\0\0");
+            bytes.extend(ar_header_raw(&padded_identifier("a.o"), 2));
+            bytes.extend_from_slice(b"aa");
+            let got = read_all(&bytes).unwrap_or_else(|e| panic!("{ident}: {e}"));
+            assert_eq!(
+                got,
+                vec![
+                    (ident.to_string(), None, b"\0\0\0\0".to_vec()),
+                    ("a.o".to_string(), Some(0o100644), b"aa".to_vec()),
+                ],
+                "{ident}"
+            );
+        }
+    }
+
+    /// The `#1/N` form of the same table: normalised too, and then skipped
+    /// by the crate as the BSD symbol table it is (`lib.rs:327-331`).
+    #[test]
+    fn a_bsd_extended_blank_mode_symbol_table_is_skipped() {
+        let mut name = b"__.SYMDEF SORTED".to_vec();
+        name.resize(20, 0);
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend(blank_mode_header(&bsd_ext_identifier_field(20), 24));
+        bytes.extend_from_slice(&name);
+        bytes.extend_from_slice(b"\0\0\0\0");
+        bytes.extend(ar_header_raw(&padded_identifier("a.o"), 2));
+        bytes.extend_from_slice(b"aa");
+        let got = read_all(&bytes).expect("the BSD table is skipped");
+        assert_eq!(
+            got,
+            vec![("a.o".to_string(), Some(0o100644), b"aa".to_vec())]
+        );
+    }
+
+    /// The rewrite is for symbol tables ONLY: an ordinary member with a
+    /// blank mode is refused exactly as before — exit 5, the crate's own
+    /// message — and so is a symbol table whose mode is not blank but bad.
+    #[test]
+    fn a_blank_mode_on_an_ordinary_member_is_still_refused() {
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend(blank_mode_header(&padded_identifier("a.o"), 2));
+        bytes.extend_from_slice(b"aa");
+        let err = read_all(&bytes).expect_err("an ordinary member's blank mode");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(err.to_string().contains("Invalid file mode field"), "{err}");
+
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        let mut h = ar_header_raw(&padded_identifier("__.SYMDEF"), 4);
+        h[MODE_FIELD].copy_from_slice(b"zzzzzzzz");
+        bytes.extend(h);
+        bytes.extend_from_slice(b"\0\0\0\0");
+        let err = read_all(&bytes).expect_err("a bad, non-blank mode is not normalised");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(err.to_string().contains("Invalid file mode field"), "{err}");
     }
 }

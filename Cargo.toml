@@ -83,10 +83,10 @@ tar = { version = "0.4.46", default-features = false }
 # PINNED EXACTLY, and the pin is load-bearing. `ar.rs`'s `ArGuardedReader`
 # and `scan_ar_header` mirror `ar::Header::read`'s PRIVATE header state
 # machine, because the allocations and the slice index they bound all happen
-# inside the crate, below anything this module can peek at. EIGHT facts about
-# 0.9.0's internals are hard-coded there — the list said five until the Phase
-# 3a whole-branch review recounted it, and the three it was missing are the
-# ones a reader would never think to check:
+# inside the crate, below anything this module can peek at. ELEVEN facts
+# about 0.9.0's internals are hard-coded there — the list said five until the
+# Phase 3a whole-branch review recounted it, and the three it was missing are
+# the ones a reader would never think to check; 0.8.1 added the last three:
 #
 #   1. the 60-byte header width;
 #   2. the `[48..58]` file-size field;
@@ -106,7 +106,17 @@ tar = { version = "0.4.46", default-features = false }
 #      `io::ErrorKind` the guards raise survives to `classify_ar_error`.
 #      Annotate it upstream and `refuse_if_over`'s `OutOfMemory` stops
 #      landing on `ResourceLimit` — a silently wrong exit code, not a
-#      failure.
+#      failure;
+#   9. the `[40..48]` mode field, parsed as octal with no blank allowed, and
+#      parsed BEFORE a `#1/N` name is read (`lib.rs:292-293`) — why the guard
+#      rewrites a blank one on a symbol table, and reads a `#1/N` name ahead
+#      to recognise one;
+#  10. the BSD symbol-table names (`lib.rs:105-106`) and how a name is
+#      trimmed (trailing spaces inline, `lib.rs:249-252`; trailing NULs in
+#      `#1/N` form, `lib.rs:323-325`);
+#  11. that `next_entry` reads no further header between an entry's header
+#      and handing that entry back — why the guard's LAST
+#      `header_scanned` call describes the entry just returned.
 #
 # — plus the GNU-before-BSD branch order the variant latch depends on. A
 # 0.9.x patch release that changes ANY of them desyncs the mirror silently,
@@ -126,7 +136,7 @@ tar = { version = "0.4.46", default-features = false }
 # under the MSRV section until 1.88 lifted it: an exact pin blocks
 # patch-level fixes, and is worth it only while something concrete depends on
 # the exact version. Before loosening this to a caret range, re-verify each
-# of those eight facts against the new `ar` source line by line — or replace
+# of those eleven facts against the new `ar` source line by line — or replace
 # the mirror with a drift test that compares the guard's boundary walk
 # against the crate's own entry offsets over a fixture set, which is what
 # would make a caret range safe.

@@ -12197,6 +12197,97 @@ fn salvage_of_an_ar_whose_first_header_is_destroyed_exits_5_and_says_why() {
     assert!(note < nothing, "{stderr}");
 }
 
+/// 0.8.1: GNU binutils' `ar rcs` over Mach-O objects writes its inline
+/// `__.SYMDEF` with an all-space mode field, which `list` used to refuse at
+/// exit 5. Now `list` exits 0 and shows the table as Apple `ar t` does,
+/// `unpack` extracts every member with the objects byte-exact, and
+/// `salvage --list` recovers every member with no walk-stop note. macOS
+/// only — an ELF host's GNU `ar` writes `/`, which was always read — and
+/// GNU `ar` (keg-only, `brew install binutils`) plus `cc` are required
+/// there, failing loudly when absent.
+#[test]
+fn gnu_ar_on_mach_o_with_a_blank_mode_symbol_table_lists_unpacks_and_salvages() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let gnu = PathBuf::from("/opt/homebrew/opt/binutils/bin/ar");
+    assert!(
+        gnu.is_file(),
+        "GNU ar not at {} (`brew install binutils`)",
+        gnu.display()
+    );
+    let cc = which("cc").expect("no `cc` on PATH — this test needs Mach-O objects");
+    let dir = tmp_dir();
+    for (name, body) in [
+        ("f", "int f(void){return 1;}\n"),
+        ("g", "int g(void){return 2;}\n"),
+    ] {
+        std::fs::write(dir.join(format!("{name}.c")), body).unwrap();
+        let ok = Command::new(&cc)
+            .args(["-c", "-o", &format!("{name}.o"), &format!("{name}.c")])
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(ok.success(), "cc -c {name}.c");
+    }
+    let made = Command::new(&gnu)
+        .args(["rcs", "lib.a", "f.o", "g.o"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert!(made.success(), "GNU ar rcs");
+    let archive = dir.join("lib.a");
+    let bytes = std::fs::read(&archive).unwrap();
+    // The first member header (after the 8-byte `!<arch>\n`): its mode field
+    // is `[40..48]` (`ar-0.9.0/src/lib.rs:292`).
+    assert_eq!(&bytes[8..8 + 16], format!("{:<16}", "__.SYMDEF").as_bytes());
+    assert_eq!(
+        bytes[8 + 40..8 + 48],
+        [b' '; 8],
+        "GNU no longer writes a blank mode"
+    );
+
+    let out = run_output(&["list", archive.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let names: Vec<&str> = stdout
+        .lines()
+        .map(|l| l.split_whitespace().last().unwrap())
+        .collect();
+    assert_eq!(names, ["__.SYMDEF", "f.o", "g.o"], "{stdout}");
+
+    let out_dir = dir.join("unpacked");
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        out_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    for obj in ["f.o", "g.o"] {
+        assert_eq!(
+            std::fs::read(out_dir.join(obj)).unwrap(),
+            std::fs::read(dir.join(obj)).unwrap(),
+            "{obj}"
+        );
+    }
+    assert!(out_dir.join("__.SYMDEF").is_file());
+
+    let out = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stdout}{stderr}");
+    let rows: Vec<&str> = stdout.lines().collect();
+    assert_eq!(rows.len(), 3, "{stdout}");
+    for (row, name) in rows.iter().zip(["__.SYMDEF", "f.o", "g.o"]) {
+        assert!(row.contains(name) && row.contains("Unattested"), "{row}");
+    }
+    assert!(!stderr.contains("stopped at offset"), "{stderr}");
+    assert!(!stderr.contains("symbol table"), "{stderr}");
+}
+
 /// `stuffr pack` over a tree (every name `/`-bearing, so BSD `#1/N` form),
 /// then salvage: every file back, byte for byte, exit 4 for `Unattested`.
 #[test]
@@ -12241,8 +12332,10 @@ fn salvage_recovers_what_stuffr_pack_wrote_as_ar() {
 /// Task 4 fix round 1 (I2, I3): two healthy archives this build cannot
 /// read are exit 3 naming the shape — never exit 4 with fabricated content,
 /// never exit 5 "nothing recoverable". A GNU thin archive, found by its `.a`
-/// extension alone with no `--format`; and a `__.SYMDEF` with GNU `ar rcs`'s
-/// blank mode field on Mach-O.
+/// extension alone with no `--format`; and a `__.SYMDEF` whose mode field
+/// is neither blank nor octal. (GNU `ar rcs`'s BLANK mode on Mach-O was this
+/// test's original shape; it is read since 0.8.1 — see
+/// `gnu_ar_on_mach_o_with_a_blank_mode_symbol_table_lists_unpacks_and_salvages`.)
 #[test]
 fn salvage_refuses_a_thin_archive_and_an_unreadable_symbol_table_at_exit_3() {
     let dir = tmp_dir();
@@ -12266,7 +12359,7 @@ fn salvage_refuses_a_thin_archive_and_an_unreadable_symbol_table_at_exit_3() {
 
     let mut symdef = b"!<arch>\n".to_vec();
     let mut table = ar_member("__.SYMDEF", b"\0\0\0\0");
-    table[40..48].copy_from_slice(&[b' '; 8]);
+    table[40..48].copy_from_slice(b"zzzzzzzz");
     symdef.extend(table);
     symdef.extend(ar_member("f.o", b"fff"));
     let archive = dir.join("symdef.a");
