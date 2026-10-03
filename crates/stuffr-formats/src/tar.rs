@@ -415,8 +415,8 @@ impl Read for TrailerWatch {
 }
 
 /// The most bytes a pax `x` (local extended) header may declare for its
-/// payload — the one ceiling on it, owned here and shared by
-/// `tar_salvage.rs`.
+/// payload — the one ceiling on it. Salvage does not share it: it has its
+/// own scan budget, `MAX_SALVAGE_PAX_SCAN`, for a different purpose.
 ///
 /// Real pax headers are KB-scale: a long path, a long link target, a few
 /// timestamps, perhaps a handful of extended attributes. 16 MiB is the

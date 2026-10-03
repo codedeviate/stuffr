@@ -242,8 +242,8 @@
 //! header: the chain is walked by its headers' declared spans first, so a
 //! forged extension header costs one block read, never one payload.
 //!
-//! The two ceilings, both on METADATA rather than on an entry, and both
-//! checked before a byte is allocated for them:
+//! A ceiling and a scan budget, both on METADATA rather than on an entry,
+//! and both checked before a byte is allocated for them:
 //!
 //! - [`MAX_LONG_NAME`] — 65,536 bytes for a GNU `L`/`K` payload, the figure
 //!   `cpio.rs` bounds a name and a symlink target with (16x Linux's
@@ -670,8 +670,14 @@ pub const MAX_LONG_NAME: u64 = 65_536;
 /// each (criterion 5 needs the pax `path`), which at 16 MiB made
 /// `salvage --list` on such a file ~16x slower than at 1 MiB. A
 /// per-terminal-header budget (read once per converged header, not once per
-/// chain) is a recorded follow-up; until then the budget stays small.
+/// chain) is a recorded follow-up; until then the budget stays small. The
+/// measured residual: converging forged chains cost about 1 s per MiB of
+/// hostile input (multi16.tar: 15.2 s at 1 MiB, the same as v0.8.0's
+/// 16.2 s), not the 1.66 s of the nameless16 fixture.
 pub const MAX_SALVAGE_PAX_SCAN: u64 = 1 << 20;
+
+// The scan budget must stay below the ordinary reader's ceiling.
+const _: () = assert!(MAX_SALVAGE_PAX_SCAN < crate::tar::MAX_PAX_EXTENSION);
 
 /// The codec a stored tar entry carries in [`EntryMeta::codec`].
 ///
@@ -2106,7 +2112,9 @@ mod tests {
     /// is recovered under its own name.
     #[test]
     fn a_pax_header_one_byte_past_the_scan_budget_is_not_a_chain() {
-        let over = usize::try_from(MAX_SALVAGE_PAX_SCAN).unwrap() + 1;
+        // Deliberately absolute (not relative to the constant): raising the
+        // budget past 1 MiB must make this test fail.
+        let over = (1usize << 20) + 1;
         let prefix = b"13 path=nope\n";
         let mut record = prefix.to_vec();
         record.resize(over, b'x');
