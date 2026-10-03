@@ -110,7 +110,10 @@ tar = { version = "0.4.46", default-features = false }
 #   9. the `[40..48]` mode field, parsed as octal with no blank allowed, and
 #      parsed BEFORE a `#1/N` name is read (`lib.rs:292-293`) — why the guard
 #      rewrites a blank one on a symbol table, and reads a `#1/N` name ahead
-#      to recognise one;
+#      to recognise one. The "parsed before a `#1/N` name" half serves a
+#      shape no measured writer produces (Apple writes a real mode, GNU an
+#      inline name), so a future loosening of the pin may drop that half and
+#      the read-ahead with it;
 #  10. the BSD symbol-table names (`lib.rs:105-106`) and how a name is
 #      trimmed (trailing spaces inline, `lib.rs:249-252`; trailing NULs in
 #      `#1/N` form, `lib.rs:323-325`);
@@ -212,8 +215,8 @@ clap = { version = "4", features = ["derive"] }
 # before.
 #
 # `unarj-rs` — THREE reasons now, and only the first is an MSRV guard.
-# Enumerated rather than summarised, the way `ar = "=0.9.0"` enumerates its
-# eight, because a fact nobody wrote down is a fact that desyncs silently:
+# Enumerated rather than summarised, the way the `ar = "=0.9.0"` list below
+# does, because a fact nobody wrote down is a fact that desyncs silently:
 #
 #   1. It declares no `rust-version` at all, so a patch release can raise the
 #      MSRV with nothing to announce it (the `ruzstd` 0.8.2 failure mode under
