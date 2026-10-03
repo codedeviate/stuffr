@@ -676,6 +676,14 @@ pub const MAX_LONG_NAME: u64 = 65_536;
 /// 16.2 s), not the 1.66 s of the nameless16 fixture.
 pub const MAX_SALVAGE_PAX_SCAN: u64 = 1 << 20;
 
+/// Renamed to [`MAX_SALVAGE_PAX_SCAN`] in 0.8.1. Not the ordinary path's
+/// 16 MiB `tar::MAX_PAX_EXTENSION` — this keeps 0.8.0's 1 MiB value.
+#[deprecated(
+    since = "0.8.1",
+    note = "renamed MAX_SALVAGE_PAX_SCAN; not tar::MAX_PAX_EXTENSION (16 MiB)"
+)]
+pub const MAX_PAX_EXTENSION: u64 = MAX_SALVAGE_PAX_SCAN;
+
 // The scan budget must stay below the ordinary reader's ceiling.
 const _: () = assert!(MAX_SALVAGE_PAX_SCAN < crate::tar::MAX_PAX_EXTENSION);
 
