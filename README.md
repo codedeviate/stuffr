@@ -62,7 +62,7 @@ read list.
 > 0), so an out-of-tree scanner that never overrode it now reports less.
 > One CLI change over `0.7.1`: a `salvage` run (not `--index`-narrowed)
 > that saw a header it could not gate exits 4 where it exited 0.
-> **1539** tests under `--all-features`, **1474** on the
+> **1541** tests under `--all-features`, **1476** on the
 > default tier — measured from this bump's own `make check`, `GATE_EXIT=0`,
 > never carried forward.
 >
