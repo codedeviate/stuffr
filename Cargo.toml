@@ -76,7 +76,53 @@ lzma-rust2 = "0.20"
 # entry by entry through `safe_join`. Reading or writing extended attributes
 # via `tar`'s own unpack path would bypass that gate entirely, so the feature
 # is not merely unused, it is one this project must not use.
-tar = { version = "0.4.46", default-features = false }
+#
+# PINNED EXACTLY, and the pin is load-bearing — the `ar = "=0.9.0"` trade
+# below, for the same reason. `tar.rs`'s `CrateNextGuard` sits between the
+# source and `tar::Archive` and mirrors the crate's PRIVATE next-header
+# bookkeeping, so it can refuse the one GNU sparse header 0.4.46 overflows
+# on (`archive.rs:532`, a panic in debug and under `cargo fuzz`) before the
+# crate reaches it. Seven facts about 0.4.46's internals are hard-coded
+# there (all citations `src/archive.rs` unless marked):
+#
+#   1. how `EntriesFields::next` advances, and which advances are checked:
+#      `+= BLOCK_SIZE` per header (`:305`, unchecked, unreachable short of
+#      2^64 delivered bytes), `checked_add(round_up(size))` (`:374-381`),
+#      and `+= BLOCK_SIZE` per GNU sparse EXTENSION block (`:524-533`,
+#      unchecked — the overflow) — read before the payload, with
+#      `isextended` at header offset 482 / extension-block offset 504;
+#   2. the pax `size` application rule (`:327-356`): a preceding pax `x`
+#      overrides the size of any header that is not itself an extension
+#      header (`is_extension_header`, NEW in 0.4.46 — 0.4.45 applied it
+#      differently, so this area changes in patch releases);
+#   3. the `L`/`K`/`x` lifecycle (`:405-448`): consumed by the crate, not
+#      handed back, only when the header has GNU or ustar magic; the pending
+#      pax payload survives `L`/`K` and is used up by the first header
+#      handed back; a second `x` stops the crate;
+#   4. `pax_extensions_value`'s semantics (`pax.rs:64-85`): the first
+#      malformed record ends the search with no answer — `tar.rs`'s
+#      `pax_size` reproduces it;
+#   5. headers and extension blocks are read whole, 512 bytes, by
+#      `try_read_all` (`:618-633`), and an `x` payload by `read_all`
+#      (`entry.rs:297-302`) — why the guard can hold a block and why its
+#      pax ceiling (`MAX_PAX_EXTENSION`) is enforced at the crate's first
+#      payload read;
+#   6. `entries()` never seeks, and `ignore_zeros` is off by default
+#      (`:64`);
+#   7. any `Entries` error sets `done` (`:579-593`), so a mirror that is
+#      only right while the crate is right is right enough — and the guard's
+#      `io::ErrorKind`s reach `classify_tar_error` un-annotated.
+#
+# A 0.4.x release that changes ANY of them desyncs the mirror silently: the
+# usual symptom is the guard losing track of `next` and the overflow
+# becoming reachable again with nothing failing; a false refusal of a valid
+# archive would need crafted payload bytes. Before bumping, re-verify each
+# of the seven against the new source line by line (`diff` the old and new
+# `src/archive.rs`, `src/pax.rs`, `src/entry.rs`) — or replace the mirror
+# with a drift test comparing the guard's header walk to the crate's own
+# `raw_header_position`s over mutated fixtures, which would make a caret
+# range safe.
+tar = { version = "=0.4.46", default-features = false }
 # The simplest container in the tree: no trailer at all, so a reader knows
 # it has reached the end only because the underlying stream has (`ar 0.9.0`).
 #
