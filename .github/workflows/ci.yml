@@ -248,7 +248,7 @@ jobs:
       # emptied `fuzz/corpus/codec` reported `Done 2000 runs`, exit 0). The
       # execution-count check catches a different scenario: a target that
       # returns early on every input, or a run that never really started —
-      # anything that exits 0 without libFuzzer printing a non-zero summary
+      # anything that exits 0 without libFuzzer printing a summary above the corpus
       # line. Both failures are worth preventing; only one of them is
       # prevented HERE, and an earlier version of this comment claimed
       # otherwise.
@@ -328,7 +328,7 @@ jobs:
           for target in codec container chain roundtrip salvage; do
             # libFuzzer counts the corpus load against `-runs`, so size it
             # to the seeds `make fuzz-corpus` wrote (same as the Makefile).
-            corpus=$(find fuzz/corpus/$target -type f 2>/dev/null | wc -l | tr -d ' ')
+            corpus=$(find fuzz/corpus/$target -type f 2>/dev/null | wc -l | tr -d ' ' || true)
             runs=$((corpus + FUZZ_RUNS))
             cmd="cargo fuzz run $target -- -runs=$runs -seed=$FUZZ_SEED"
             echo "==> $cmd"
@@ -339,11 +339,13 @@ jobs:
               status=1
               continue
             fi
+            # (The corpus count above takes `|| true` for the same reason: a
+            # missing dir makes `find` exit 1; this way `wc` still yields 0.)
             # `|| true` is load-bearing HERE and absent from the identical
             # line in the Makefile, on purpose. GitHub Actions runs a `run:`
             # block under `bash -e -o pipefail`, so a no-match grep pipeline
             # would abort this whole script via `set -e` before reaching the
-            # explicit zero-count check below — which is the check that turns
+            # explicit not-above-corpus check below — which is the check that turns
             # "no summary line" into a reported failure rather than a silent
             # one. A make recipe runs under a plain `/bin/sh` with no `-e`,
             # so `Makefile`'s copy must NOT have it: there, `|| true` would

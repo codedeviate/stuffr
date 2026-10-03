@@ -283,7 +283,7 @@ fuzz: fuzz-corpus
 	  : "No '|| true' on the next line, unlike ci.yml's otherwise-identical" ; \
 	  : "copy. A make recipe runs under a plain /bin/sh with no -e, so a" ; \
 	  : "no-match grep pipeline sets \$$? and carries on, reaching the" ; \
-	  : "explicit empty/zero check below. GitHub Actions runs its run: block" ; \
+	  : "explicit empty/not-above-corpus check below. GitHub Actions runs its run: block" ; \
 	  : "under bash -e -o pipefail, where the same line would abort the whole" ; \
 	  : "script before that check ever ran — hence the '|| true' there and" ; \
 	  : "not here. Do not tidy either half into matching the other." ; \
