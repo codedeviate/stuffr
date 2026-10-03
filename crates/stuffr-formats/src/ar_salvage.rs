@@ -1180,16 +1180,28 @@ mod tests {
         assert!(!note.contains("unreachable by construction"), "{note}");
     }
 
-    /// The real writer behind I3, when this machine has it: GNU `ar rcs`
-    /// over Mach-O objects writes a `__.SYMDEF` with a blank mode. Needs the
-    /// keg-only GNU `ar` and a C compiler; the hand-built fixtures above pin
-    /// the same shape everywhere else.
+    /// The real writer behind I3: GNU `ar rcs` over Mach-O objects writes a
+    /// `__.SYMDEF` with a blank mode. macOS only — an ELF host's GNU `ar`
+    /// writes `/` instead, and the hand-built fixtures above pin the shape
+    /// there. On macOS the keg-only GNU `ar` and a C compiler are REQUIRED
+    /// and their absence fails loudly, like the catalogue's `writers()`
+    /// (Ruling 970): this test used to return early without them and pass
+    /// having proved nothing.
     #[test]
     fn gnu_ar_s_mach_o_symbol_table_is_exit_3_not_5() {
-        let gnu = std::path::PathBuf::from("/opt/homebrew/opt/binutils/bin/ar");
-        let (true, Some(cc)) = (gnu.is_file(), which("cc")) else {
+        if !cfg!(target_os = "macos") {
             return;
-        };
+        }
+        const GNU_AR_ON_MACOS: &str = "/opt/homebrew/opt/binutils/bin/ar";
+        let gnu = std::path::PathBuf::from(GNU_AR_ON_MACOS);
+        assert!(
+            gnu.is_file(),
+            "GNU ar not at {GNU_AR_ON_MACOS} (`brew install binutils`) — without it this \
+             test proves nothing about the real writer"
+        );
+        let cc = which("cc").unwrap_or_else(|| {
+            panic!("no `cc` on PATH — this test needs a Mach-O object to archive")
+        });
         let dir = tempfile_dir("symdef");
         std::fs::write(dir.0.join("f.c"), "int f(void){return 1;}\n").unwrap();
         let compiled = std::process::Command::new(cc)
@@ -1205,10 +1217,11 @@ mod tests {
             .unwrap();
         assert!(made.success());
         let bytes = std::fs::read(dir.0.join("lib.a")).unwrap();
-        if !bytes[8..].starts_with(b"__.SYMDEF") {
-            // Not the Mach-O shape (an ELF host writes `/`); nothing to pin.
-            return;
-        }
+        assert!(
+            bytes[8..].starts_with(b"__.SYMDEF"),
+            "GNU ar on macOS no longer writes the Mach-O `__.SYMDEF` first: {:?}",
+            String::from_utf8_lossy(&bytes[8..bytes.len().min(68)])
+        );
         let err = salvage_ar(&mut Cursor::new(bytes), &SalvagePolicy::default())
             .expect_err("GNU's Mach-O symbol table is a shape this build does not read");
         assert_eq!(err.exit_code(), 3, "{err}");
