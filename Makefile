@@ -258,13 +258,22 @@ FUZZ_SEED = 1
 # seed shapes is for — at least one per `SALVAGE_SLOTS` entry, which
 # `every_salvage_slot_carries_at_least_one_seed` fails the build over.
 #
+# `-runs` is sized per target to the corpus it loads: libFuzzer counts the
+# initial corpus load against `-runs`, and `fuzz/corpus/<target>` only ever
+# grows, so a fixed budget used to be swallowed whole by a large local corpus
+# (salvage held 12,019 inputs: zero mutations, "OK"). The recipe counts the
+# files (a missing dir counts 0), passes `-runs=<files> + FUZZ_RUNS`, and
+# fails a target whose `Done N runs` is not above the file count.
+#
 # An execution count still is not evidence, and this recipe's check is only
-# that a target ran. To measure whether the salvage oracle actually FIRES,
+# that a target mutated. To measure whether the salvage oracle actually FIRES,
 # see CONTRIBUTING.md's `STUFFR_FUZZ_SALVAGE_TRACE` recipe.
 fuzz: fuzz-corpus
 	@status=0; \
 	for target in codec container chain roundtrip salvage; do \
-	  cmd="cargo +nightly fuzz run $$target -- -runs=$(FUZZ_RUNS) -seed=$(FUZZ_SEED)"; \
+	  corpus=$$(find fuzz/corpus/$$target -type f 2>/dev/null | wc -l | tr -d ' '); \
+	  runs=$$((corpus + $(FUZZ_RUNS))); \
+	  cmd="cargo +nightly fuzz run $$target -- -runs=$$runs -seed=$(FUZZ_SEED)"; \
 	  echo "==> $$cmd"; \
 	  tmp=$$(mktemp); \
 	  if ! $$cmd >"$$tmp" 2>&1; then \
@@ -279,11 +288,11 @@ fuzz: fuzz-corpus
 	  : "script before that check ever ran — hence the '|| true' there and" ; \
 	  : "not here. Do not tidy either half into matching the other." ; \
 	  n=$$(grep -oE 'Done [0-9]+ runs' "$$tmp" | tail -1 | grep -oE '[0-9]+'); \
-	  if [ -z "$$n" ] || [ "$$n" -eq 0 ]; then \
-	    echo "make fuzz: target '$$target' reported zero (or no) executions — treating as a failure, not a clean run" >&2; \
+	  if [ -z "$$n" ] || [ "$$n" -le "$$corpus" ]; then \
+	    echo "make fuzz: target '$$target' ran $$n executions over a $$corpus-input corpus — no mutation happened; treating as a failure" >&2; \
 	    cat "$$tmp"; rm -f "$$tmp"; status=1; continue; \
 	  fi; \
-	  echo "target '$$target': $$n executions — OK"; \
+	  echo "target '$$target': $$n executions ($$corpus corpus + $$((n - corpus)) mutated) — OK"; \
 	  rm -f "$$tmp"; \
 	done; \
 	exit $$status

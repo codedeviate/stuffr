@@ -326,7 +326,11 @@ jobs:
           # exactly how the next reader concludes a low coverage figure is
           # expected.
           for target in codec container chain roundtrip salvage; do
-            cmd="cargo fuzz run $target -- -runs=$FUZZ_RUNS -seed=$FUZZ_SEED"
+            # libFuzzer counts the corpus load against `-runs`, so size it
+            # to the seeds `make fuzz-corpus` wrote (same as the Makefile).
+            corpus=$(find fuzz/corpus/$target -type f 2>/dev/null | wc -l | tr -d ' ')
+            runs=$((corpus + FUZZ_RUNS))
+            cmd="cargo fuzz run $target -- -runs=$runs -seed=$FUZZ_SEED"
             echo "==> $cmd"
             log=$(mktemp)
             if ! $cmd >"$log" 2>&1; then
@@ -347,13 +351,13 @@ jobs:
             # "match" would break the recipe's own `continue`-and-collect
             # loop. Do not tidy either half into agreeing with the other.
             count=$(grep -oE 'Done [0-9]+ runs' "$log" | tail -1 | grep -oE '[0-9]+' || true)
-            if [ -z "$count" ] || [ "$count" -eq 0 ]; then
-              echo "::error::fuzz target '$target' reported zero (or no) executions in its libFuzzer summary — treating this as a failure, not a clean run"
+            if [ -z "$count" ] || [ "$count" -le "$corpus" ]; then
+              echo "::error::fuzz target '$target' ran $count executions over a $corpus-input corpus (or printed no libFuzzer summary) — no mutation happened; treating this as a failure, not a clean run"
               cat "$log"
               status=1
               continue
             fi
-            echo "fuzz target '$target': $count executions — OK"
+            echo "fuzz target '$target': $count executions ($corpus corpus + $((count - corpus)) mutated) — OK"
           done
           exit $status
 

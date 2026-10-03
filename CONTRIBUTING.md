@@ -722,22 +722,26 @@ make fuzz-corpus   # (re)generate fuzz/corpus/{codec,container,chain,roundtrip,s
 make fuzz          # short, seeded smoke pass — the local equivalent of CI's fuzz-smoke job
 ```
 
-`make fuzz` mirrors `ci.yml`'s `fuzz-smoke` job — same fixed `-runs=2000
--seed=1` budget per target, same non-zero-execution-count check so a target
+`make fuzz` mirrors `ci.yml`'s `fuzz-smoke` job — same fixed `-seed=1` and 2000-run
+mutation budget per target (on top of the corpus load), same non-zero-execution-count check so a target
 that silently returns early on every input can't pass by doing nothing. (Not
 *exactly*: the CI copy ends its grep pipeline with `|| true`, because GitHub
 runs that block under `bash -e -o pipefail` where a no-match grep would abort
 the script before the check it feeds. The Makefile runs under a plain `sh`
 and must not. Both files say so; do not tidy either into matching the other.)
 
-**A long-lived local corpus makes `make fuzz` mutate nothing.** libFuzzer
-counts loading the corpus against `-runs`, and `make fuzz` never empties
-`fuzz/corpus/` (`make fuzz-corpus` only adds seeds). Once a target's
-accumulated corpus holds more than 2000 inputs — measured at Salvage Stage
-3 Task 7: `salvage` held 12,019 — the whole budget is spent loading it, and
-`target 'salvage': 2000 executions — OK` reports a corpus load, not a fuzz
-run. CI starts from fresh seeds and is unaffected. To reset a target, either
-minimise it (`cargo +nightly fuzz cmin <target>`, keeps coverage) or delete
+**`make fuzz` sizes `-runs` to the corpus it loads.** libFuzzer counts
+loading the corpus against `-runs`, and `make fuzz` never empties
+`fuzz/corpus/` (`make fuzz-corpus` only adds seeds), so a fixed `-runs=2000`
+against an accumulated corpus (Salvage Stage 3 Task 7: `salvage` held
+12,019 inputs) spent the whole budget on the load and mutated nothing. Per
+target the recipe now counts the files in `fuzz/corpus/<target>` and passes
+`-runs=<files> + 2000`, and it treats a `Done N runs` with `N` not above the
+file count as a failure, not a clean run. Each line reads
+`target 'salvage': 14021 executions (12019 corpus + 2002 mutated) — OK`.
+A seeds-only corpus (what CI starts from) gets seeds + 2000. The corpus is
+still grown by every run; to shrink it, minimise a target
+(`cargo +nightly fuzz cmin <target>`, keeps coverage) or delete
 `fuzz/corpus/<target>` and run `make fuzz-corpus`.
 
 **An unseeded target can execute cleanly and prove nothing, and `salvage`
