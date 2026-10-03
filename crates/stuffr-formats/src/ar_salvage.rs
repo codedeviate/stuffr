@@ -91,7 +91,7 @@
 //! block). A header that parses is not thereby shown to be a real member,
 //! so every whole member is [`SalvageStatus::Unattested`]: written under its
 //! real name, tagged on its row, exit 4 — the tier
-//! [`stuffr_core::testing::check_salvage_claim`] permits for
+//! `stuffr_core::testing::check_salvage_claim` permits for
 //! `Attestation::Nothing`, and the only one. A damaged SIZE field that still
 //! parses is the sharpest case of that: the walk believes it, as `list`
 //! does, and either lands inside the next member's bytes (and stops there,

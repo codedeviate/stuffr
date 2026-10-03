@@ -19,7 +19,7 @@
 //! every declared byte present is [`SalvageStatus::Complete`] — "every
 //! declared byte was present and the header self-verified" — and **never
 //! [`SalvageStatus::Intact`]**, which would claim a content checksum tar does
-//! not have. [`stuffr_core::testing::check_salvage_claim`] holds that line:
+//! not have. `stuffr_core::testing::check_salvage_claim` holds that line:
 //! tar's class is `Attestation::HeaderChecksumOnly`, and `Complete` is the
 //! one claim-bearing tier that class may reach, and only with the header
 //! checksum actually checked. [`TarSalvage::verify`] overrides the trait's

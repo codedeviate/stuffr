@@ -23,7 +23,7 @@
 //! all" — and never [`SalvageStatus::Complete`], which asserts a header
 //! self-check `newc` does not have. It is written under its real name
 //! (salvage is the recovery-biased verb), the `--list` row says why, and the
-//! run exits 4. [`stuffr_core::testing::check_salvage_claim`] holds the line:
+//! run exits 4. `stuffr_core::testing::check_salvage_claim` holds the line:
 //! cpio's class is `Attestation::Nothing`, and `Unattested` with nothing
 //! checked is the one claim that class permits.
 //!

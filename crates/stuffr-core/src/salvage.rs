@@ -385,7 +385,7 @@ pub enum SalvageStatus {
     /// for one would be asserting a header self-check that does not exist.
     /// They are [`SalvageStatus::Unattested`].
     ///
-    /// [`crate::testing::check_salvage_claim`] is what holds the line: this
+    /// `stuffr_core::testing::check_salvage_claim` is what holds the line: this
     /// tier requires a format whose only checksum covers the HEADER
     /// (`Attestation::HeaderChecksumOnly`) AND that checksum to have been
     /// checked — so the checksumless pair cannot reach it, and neither can a
