@@ -214,12 +214,18 @@ miri:
 	  echo "==> $$n tests passed under MIRIFLAGS=$$flags"; \
 	done
 
-# Local rehearsal of ci.yml's `fuzz-smoke` job: same fixed -runs/-seed
-# budget per target, same non-zero-execution-count check (Ruling H — see
+# Local counterpart of ci.yml's `fuzz-smoke` job: same fixed -runs/-seed
+# flags per target, same non-zero-execution-count check (Ruling H — see
 # that job's comments for why the check exists and how it was verified to
 # actually fail). NOT part of `check`, for the same reason `miri` isn't:
 # cargo-fuzz needs the nightly toolchain, and `make check` is meant to run
 # after every edit on whatever toolchain is active.
+#
+# NOT the same budget as CI, though: CI starts from the seeds alone, while
+# this run loads the whole local `fuzz/corpus/<target>`, and libFuzzer
+# executes every loaded input once before mutating — so once a local corpus
+# outgrows -runs=$(FUZZ_RUNS), this is a regression replay of that corpus
+# with no mutation at all.
 #
 # Unlike CI, this does NOT `rm rust-toolchain.toml` — that file is a
 # tracked part of a local checkout, not an ephemeral one, and deleting it
@@ -243,12 +249,14 @@ FUZZ_SEED = 1
 # plateaued at `cov: 217` after 100,000 runs, and the binary's own
 # `salvage --list` over all 64 accumulated corpus inputs produced not one
 # salvaged record — so its only oracle call (`check_salvage_claim`, which
-# fires on `SalvageStatus::Intact` alone, and `Intact` needs a CRC-32 that
-# matches its payload) was unreachable by construction. `target 'salvage':
-# 2000 executions — OK` was true and proved nothing. See `SALVAGE_SHAPES` in
-# `crates/stuffr/tests/fuzz_corpus.rs` for what each of the eighteen seeds is
-# for — at least one per `SALVAGE_SLOTS` entry as of Stage 2 Task 8, which
-# `every_salvage_slot_carries_at_least_one_seed` now fails the build over.
+# then fired on `SalvageStatus::Intact` alone, and `Intact` needs a CRC-32
+# that matches its payload) was unreachable by construction. `target
+# 'salvage': 2000 executions — OK` was true and proved nothing. Since
+# Salvage Stage 3 the oracle is asked about all three claim-bearing tiers
+# (`Intact`, `Complete`, `Unattested`). See `SALVAGE_SHAPES` in
+# `crates/stuffr/tests/fuzz_corpus.rs` for what each of its twenty-seven
+# seed shapes is for — at least one per `SALVAGE_SLOTS` entry, which
+# `every_salvage_slot_carries_at_least_one_seed` fails the build over.
 #
 # An execution count still is not evidence, and this recipe's check is only
 # that a target ran. To measure whether the salvage oracle actually FIRES,
