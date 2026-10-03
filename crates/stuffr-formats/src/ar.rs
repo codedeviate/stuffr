@@ -414,6 +414,43 @@ const NORMALISED_MODE: &[u8; 8] = &{
     mode
 };
 
+/// How a header's 16-byte name field resolves: the one place the BSD
+/// name-trimming rule (`Cargo.toml`'s ar pin note, fact 10) is written, for
+/// [`names_a_bsd_symbol_table`] and `ar_salvage.rs`'s `symbol_table_at`.
+pub(crate) enum NameField {
+    /// The identifier is the field itself, trailing spaces trimmed
+    /// (`lib.rs:249-252`).
+    Inline(Vec<u8>),
+    /// A `#1/N` field: the identifier is the first `N` bytes after the
+    /// header, to be passed through [`trim_extended_name`].
+    Extended(u64),
+    /// A `#1/N` field whose length does not parse or is past
+    /// [`MAX_SYMBOL_TABLE_EXTENDED_LEN`]: no symbol table.
+    NotASymbolTable,
+}
+
+/// Resolves the name field of the header in `header` (at least 16 bytes).
+pub(crate) fn name_field(header: &[u8]) -> NameField {
+    let mut identifier = header[0..16].to_vec();
+    while identifier.last() == Some(&b' ') {
+        identifier.pop();
+    }
+    if !identifier.starts_with(b"#1/") {
+        return NameField::Inline(identifier);
+    }
+    // `lib.rs:296`: the name's length, `buffer[3..16]`.
+    match parse_ar_field(&header[3..16]) {
+        Some(len) if len <= MAX_SYMBOL_TABLE_EXTENDED_LEN => NameField::Extended(len),
+        _ => NameField::NotASymbolTable,
+    }
+}
+
+/// A `#1/N` name's bytes with trailing NULs trimmed (`lib.rs:323-325`).
+pub(crate) fn trim_extended_name(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    &bytes[..end]
+}
+
 /// Whether the whole header in `buf` names a BSD symbol table, inline or as
 /// a `#1/N` name: the one shape whose blank mode the guard normalises.
 ///
@@ -433,35 +470,36 @@ fn names_a_bsd_symbol_table<R: Read>(
     variant: ar::Variant,
     payload_len: u64,
 ) -> io::Result<bool> {
-    // `lib.rs:249-252`: the inline name, trailing spaces trimmed.
-    let mut identifier = buf[0..16].to_vec();
-    while identifier.last() == Some(&b' ') {
-        identifier.pop();
-    }
-    if variant == ar::Variant::BSD && identifier.starts_with(b"#1/") {
-        // `lib.rs:296`: the name's length, `buffer[3..16]`.
-        let Some(len) = parse_ar_field(&buf[3..16]) else {
-            return Ok(false);
-        };
-        if len > MAX_SYMBOL_TABLE_EXTENDED_LEN || len > payload_len {
-            return Ok(false);
-        }
-        let want = AR_ENTRY_HEADER_LEN + len as usize;
-        while buf.len() < want {
-            let mut tmp = vec![0u8; want - buf.len()];
-            let n = inner.read(&mut tmp)?;
-            if n == 0 {
-                break;
+    let identifier = match name_field(buf) {
+        NameField::Inline(identifier) => identifier,
+        NameField::NotASymbolTable => return Ok(false),
+        // The crate resolves a `#1/N` name only under BSD (`lib.rs:293`);
+        // under any other variant the field stays what it says, which is
+        // no symbol table.
+        NameField::Extended(_) if variant != ar::Variant::BSD => return Ok(false),
+        NameField::Extended(len) => {
+            if len > payload_len {
+                return Ok(false);
             }
-            *pos += n as u64;
-            buf.extend_from_slice(&tmp[..n]);
+            let want = AR_ENTRY_HEADER_LEN + len as usize;
+            // An error out of this loop leaves `buf` longer than one
+            // header, so a retried `read` would lose sync. Unreachable
+            // today: the crate's bare header `read` (`lib.rs:234`)
+            // propagates the error and latches it, never retrying. A
+            // local buffer would not help: the bytes already taken from
+            // `inner` could not be given back.
+            while buf.len() < want {
+                let mut tmp = vec![0u8; want - buf.len()];
+                let n = inner.read(&mut tmp)?;
+                if n == 0 {
+                    break;
+                }
+                *pos += n as u64;
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            trim_extended_name(&buf[AR_ENTRY_HEADER_LEN..]).to_vec()
         }
-        // `lib.rs:323-325`: trailing NULs trimmed.
-        identifier = buf[AR_ENTRY_HEADER_LEN..].to_vec();
-        while identifier.last() == Some(&0) {
-            identifier.pop();
-        }
-    }
+    };
     Ok(BSD_SYMBOL_TABLE_NAMES
         .into_iter()
         .any(|name| name.as_bytes() == identifier.as_slice()))
@@ -719,9 +757,10 @@ enum ArGuardPhase {
 /// does not expose (`ar::Archive` keeps every offset private).
 ///
 /// The guard already walks the crate's own state machine to find header
-/// boundaries; this only lets a caller SEE them, so the salvage walk adds no
-/// ninth mirrored fact about `ar = "=0.9.0"` (see `containers.md`'s pin
-/// note). The ordinary read path passes `()`, whose hooks do nothing.
+/// boundaries; this only lets a caller SEE them. The facts about
+/// `ar = "=0.9.0"` that the observer rests on are the ones `Cargo.toml`'s ar
+/// pin list names; the observer adds none of its own. Every caller passes an
+/// observer; the read path's reports the blank-mode rewrite (`ModeUnknown`).
 pub(crate) trait GuardObserver {
     /// The first byte of a header that begins at source offset `at` has
     /// been read. Called when the crate actually READS there, not when a pad

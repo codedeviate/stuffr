@@ -56,7 +56,8 @@
 //! allocates, with no second copy of either figure here. The one thing the
 //! crate does not expose is WHERE each member lies, so the guard reports its
 //! record boundaries through a [`GuardObserver`]; it already finds them to
-//! do its own job, so that adds no ninth mirrored fact about `ar = "=0.9.0"`.
+//! do its own job, so that adds no mirrored fact of its own about
+//! `ar = "=0.9.0"` (the list is in `Cargo.toml`'s ar pin note).
 //!
 //! **A refusal is a stop, never an `Err`.** Whatever makes `stuffr list` fail
 //! on a member — a field that does not parse, a pad byte that is not `\n`, a
@@ -124,8 +125,8 @@ use stuffr_core::salvage::{
 use stuffr_core::{Error, FormatId, Result, SeekRead};
 
 use crate::ar::{
-    AR, AR_ENTRY_HEADER_LEN, ArGuardedReader, GuardObserver, MAX_SYMBOL_TABLE_EXTENDED_LEN,
-    entry_meta, symbol_table_name,
+    AR, AR_ENTRY_HEADER_LEN, ArGuardedReader, GuardObserver, NameField, entry_meta, name_field,
+    symbol_table_name, trim_extended_name,
 };
 
 /// The codec an `ar` member carries in [`stuffr_core::EntryMeta::codec`].
@@ -214,21 +215,14 @@ const THIN_GLOBAL_HEADER: &[u8; 8] = b"!<thin>\n";
 /// guard normalises from.
 fn symbol_table_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<&'static str> {
     let header = read_at(src, offset, AR_ENTRY_HEADER_LEN as u64, file_len)?;
-    let mut identifier = header[..16].to_vec();
-    while identifier.last() == Some(&b' ') {
-        identifier.pop();
-    }
-    if let Some(len) = identifier.strip_prefix(b"#1/") {
-        let len: u64 = std::str::from_utf8(len).ok()?.trim_end().parse().ok()?;
-        if len > MAX_SYMBOL_TABLE_EXTENDED_LEN {
-            return None;
-        }
-        identifier = read_at(src, offset + AR_ENTRY_HEADER_LEN as u64, len, file_len)?;
-        while identifier.last() == Some(&0) {
-            identifier.pop();
+    match name_field(&header) {
+        NameField::Inline(identifier) => symbol_table_name(&identifier),
+        NameField::NotASymbolTable => None,
+        NameField::Extended(len) => {
+            let bytes = read_at(src, offset + AR_ENTRY_HEADER_LEN as u64, len, file_len)?;
+            symbol_table_name(trim_extended_name(&bytes))
         }
     }
-    symbol_table_name(&identifier)
 }
 
 /// `len` bytes at `at`, or `None` if the source does not hold them all (or
