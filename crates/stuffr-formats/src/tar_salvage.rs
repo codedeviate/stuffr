@@ -248,13 +248,14 @@
 //! - [`MAX_LONG_NAME`] — 65,536 bytes for a GNU `L`/`K` payload, the figure
 //!   `cpio.rs` bounds a name and a symlink target with (16x Linux's
 //!   `PATH_MAX`);
-//! - [`MAX_PAX_EXTENSION`] — 16 MiB for a pax `x` payload, which is parsed
+//! - [`MAX_SALVAGE_PAX_SCAN`] — 1 MiB for a pax `x` payload, which is parsed
 //!   by `tar::PaxExtensions` (the reader's own parser) and so must be held
 //!   whole. A pax header past it is one carrying extended attributes on that
 //!   scale; the entry behind it is still recovered, under its header fields.
-//!   The figure is `tar.rs`'s, which owns it: the ordinary reader refuses
-//!   the same header (`ResourceLimit`, exit 6), so on pax the two agree on
-//!   where the line is and differ only in what they do past it.
+//!   This is a scan budget, NOT the list ceiling: `tar.rs`'s
+//!   `MAX_PAX_EXTENSION` (16 MiB) is what the ordinary reader buffers
+//!   (`ResourceLimit`, exit 6, past it), while a byte-granular scan can read
+//!   one payload per candidate position, so salvage keeps the smaller figure.
 //!
 //! The ordinary reader does not bound a GNU `L`/`K` payload
 //! (`EntryFields::read_all` grows without limit), so [`MAX_LONG_NAME`] is a
@@ -656,11 +657,21 @@ const SCAN_CHUNK: usize = 64 * 1024;
 /// refuses to read it — see the module doc's extension section.
 pub const MAX_LONG_NAME: u64 = 65_536;
 
-/// The most bytes a pax `x` payload may declare before this scanner refuses
-/// to read it — see the module doc's extension section. Owned by `tar.rs`,
-/// whose reader refuses the same header past the same figure, so `salvage`
-/// and `list` draw the line in one place.
-pub use crate::tar::MAX_PAX_EXTENSION;
+/// The most bytes a pax `x` payload may declare before this scanner declines
+/// to read it as part of a chain: a per-candidate SCAN BUDGET, 1 MiB.
+///
+/// This is deliberately NOT a second copy of the list ceiling.
+/// [`crate::tar::MAX_PAX_EXTENSION`] (16 MiB) bounds what the ordinary path
+/// buffers for one header it has already accepted as a header. This budget
+/// bounds how much a byte-granular salvage scan may read per candidate:
+/// a failed chain resumes the scan one byte on, so forged extension chains
+/// can make the scanner read one payload per byte position. Chains that all
+/// converge on one ustar header with an empty name still cost a payload
+/// each (criterion 5 needs the pax `path`), which at 16 MiB made
+/// `salvage --list` on such a file ~16x slower than at 1 MiB. A
+/// per-terminal-header budget (read once per converged header, not once per
+/// chain) is a recorded follow-up; until then the budget stays small.
+pub const MAX_SALVAGE_PAX_SCAN: u64 = 1 << 20;
 
 /// The codec a stored tar entry carries in [`EntryMeta::codec`].
 ///
@@ -1022,7 +1033,7 @@ fn sighting_at(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8; 
 /// extension's declared span, block-rounded, says where the next header
 /// sits — and records where each payload lies. Only once that walk reaches
 /// a real header are the payloads read. Reading them first cost one payload
-/// per forged extension header, each up to [`MAX_PAX_EXTENSION`], and a
+/// per forged extension header, each up to [`MAX_SALVAGE_PAX_SCAN`], and a
 /// failed chain resumes the scan one byte on: a file of forged `x` headers
 /// made the scan's work (headers × ceiling), measured at 26.7 s for 16 MiB.
 fn gate_chain_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<Found> {
@@ -1056,7 +1067,7 @@ fn gate_chain_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<F
             } else if entry_type.is_gnu_longlink() {
                 (&mut long_link, MAX_LONG_NAME)
             } else {
-                (&mut pax, MAX_PAX_EXTENSION)
+                (&mut pax, MAX_SALVAGE_PAX_SCAN)
             };
             // "two long name entries describing the same member" — the
             // reader refuses the archive; the chain is broken here.
@@ -2055,10 +2066,10 @@ mod tests {
         );
     }
 
-    /// The same for a pax header past [`MAX_PAX_EXTENSION`].
+    /// The same for a pax header past [`MAX_SALVAGE_PAX_SCAN`].
     #[test]
     fn an_oversized_pax_header_is_refused_before_it_is_allocated() {
-        let record_len = usize::try_from(MAX_PAX_EXTENSION).unwrap() + (1 << 20);
+        let record_len = usize::try_from(MAX_SALVAGE_PAX_SCAN).unwrap() + (1 << 20);
         let mut record = format!("{record_len} SCHILY.xattr.big=").into_bytes();
         record.resize(record_len - 1, b'x');
         record.push(b'\n');
@@ -2074,12 +2085,37 @@ mod tests {
         assert!(
             largest < 512 << 10,
             "largest single allocation was {largest} bytes — a {record_len}-byte pax header \
-             was read into memory past MAX_PAX_EXTENSION"
+             was read into memory past MAX_SALVAGE_PAX_SCAN"
         );
         assert!(
             largest >= SCAN_CHUNK,
             "the recording allocator is not attached ({largest})"
         );
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| e.meta.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["own-name.txt"]
+        );
+    }
+
+    /// Pins the budget: a pax `x` header declaring one byte past
+    /// [`MAX_SALVAGE_PAX_SCAN`] is not read as a chain (as at 0.8.0's 1 MiB
+    /// ceiling), so its `path` does not apply and the real header after it
+    /// is recovered under its own name.
+    #[test]
+    fn a_pax_header_one_byte_past_the_scan_budget_is_not_a_chain() {
+        let over = usize::try_from(MAX_SALVAGE_PAX_SCAN).unwrap() + 1;
+        let prefix = b"13 path=nope\n";
+        let mut record = prefix.to_vec();
+        record.resize(over, b'x');
+        let mut bytes =
+            header_block("PaxHeaders/x", record.len() as u64, tar::EntryType::XHeader).to_vec();
+        bytes.extend_from_slice(&padded(&record));
+        bytes.extend_from_slice(&files(&[("own-name.txt", b"kept")]));
+        let mut src = Cursor::new(bytes);
+        let out = salvage_tar(&mut src, &SalvagePolicy::default()).unwrap();
         assert_eq!(
             out.entries
                 .iter()
