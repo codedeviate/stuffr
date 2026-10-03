@@ -244,14 +244,17 @@
 //! - [`MAX_LONG_NAME`] — 65,536 bytes for a GNU `L`/`K` payload, the figure
 //!   `cpio.rs` bounds a name and a symlink target with (16x Linux's
 //!   `PATH_MAX`);
-//! - [`MAX_PAX_EXTENSION`] — 1 MiB for a pax `x` payload, which is parsed
+//! - [`MAX_PAX_EXTENSION`] — 16 MiB for a pax `x` payload, which is parsed
 //!   by `tar::PaxExtensions` (the reader's own parser) and so must be held
 //!   whole. A pax header past it is one carrying extended attributes on that
 //!   scale; the entry behind it is still recovered, under its header fields.
+//!   The figure is `tar.rs`'s, which owns it: the ordinary reader refuses
+//!   the same header (`ResourceLimit`, exit 6), so on pax the two agree on
+//!   where the line is and differ only in what they do past it.
 //!
-//! The ordinary reader bounds neither (`EntryFields::read_all` grows without
-//! limit), so this is a narrowing `list` does not share, and a documented
-//! one.
+//! The ordinary reader does not bound a GNU `L`/`K` payload
+//! (`EntryFields::read_all` grows without limit), so [`MAX_LONG_NAME`] is a
+//! narrowing `list` does not share, and a documented one.
 //!
 //! pax `g` (global) headers are not consumed by `tar::Archive`, which hands
 //! them back as entries of kind `Other`; so does this scanner.
@@ -650,8 +653,10 @@ const SCAN_CHUNK: usize = 64 * 1024;
 pub const MAX_LONG_NAME: u64 = 65_536;
 
 /// The most bytes a pax `x` payload may declare before this scanner refuses
-/// to read it — see the module doc's extension section.
-pub const MAX_PAX_EXTENSION: u64 = 1024 * 1024;
+/// to read it — see the module doc's extension section. Owned by `tar.rs`,
+/// whose reader refuses the same header past the same figure, so `salvage`
+/// and `list` draw the line in one place.
+pub use crate::tar::MAX_PAX_EXTENSION;
 
 /// The codec a stored tar entry carries in [`EntryMeta::codec`].
 ///
@@ -2024,7 +2029,7 @@ mod tests {
     /// The same for a pax header past [`MAX_PAX_EXTENSION`].
     #[test]
     fn an_oversized_pax_header_is_refused_before_it_is_allocated() {
-        let record_len = 2usize << 20;
+        let record_len = usize::try_from(MAX_PAX_EXTENSION).unwrap() + (1 << 20);
         let mut record = format!("{record_len} SCHILY.xattr.big=").into_bytes();
         record.resize(record_len - 1, b'x');
         record.push(b'\n');

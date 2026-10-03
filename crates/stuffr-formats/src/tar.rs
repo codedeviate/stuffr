@@ -414,6 +414,27 @@ impl Read for TrailerWatch {
     }
 }
 
+/// The most bytes a pax `x` (local extended) header may declare for its
+/// payload — the one ceiling on it, owned here and shared by
+/// `tar_salvage.rs`.
+///
+/// Real pax headers are KB-scale: a long path, a long link target, a few
+/// timestamps, perhaps a handful of extended attributes. 16 MiB is the
+/// order of `ar.rs`'s GNU name-table ceiling (`MAX_GNU_NAME_TABLE_LEN`, the
+/// same figure, sized for a TABLE of names) and is thousands of times any
+/// real pax header, while stopping a declared payload from buying unbounded
+/// memory. It has to be held whole twice — once by the crate's own
+/// `read_all` (`entry.rs:297-302`, which bounds nothing) and once by
+/// [`CrateNextGuard`], which needs its `size=` record — so the guard refuses
+/// a header declaring more BEFORE the crate reads a payload byte, which
+/// bounds both copies. [`Error::ResourceLimit`] (exit 6): refused on the
+/// declared size, before an allocator is asked.
+///
+/// Fixed, not tunable: no CLI flag or `OpenOpts` field overrides a
+/// container's metadata ceilings (`ar.rs`'s are fixed the same way), and
+/// `salvage --max-entry` bounds an ENTRY's payload, not metadata.
+pub const MAX_PAX_EXTENSION: u64 = 16 * 1024 * 1024;
+
 /// What `tar::Archive` reads from: [`TrailerWatch`] behind [`CrateNextGuard`].
 type TarSource = CrateNextGuard<TrailerWatch>;
 
@@ -464,10 +485,14 @@ type TarSource = CrateNextGuard<TrailerWatch>;
 /// for the `k`th extension block the crate reads. The guard computes the
 /// left side as the crate does — the same sum, `checked_add` where the
 /// crate adds unchecked — and refuses when it does not fit, at the moment
-/// the crate would ask for that block's bytes. That is precise in both
-/// directions: a block the crate would never read (it stopped earlier, on a
-/// bad checksum or a malformed map) is never refused, and every block it
-/// can advance over is passed through untouched. Mirrored with the crate's
+/// the crate would ask for that block's bytes. A block the crate would
+/// never read (it stopped earlier, on a bad checksum or a malformed map) is
+/// never refused, and every block it can advance over is passed through
+/// untouched. The one place the verdict's WORDING differs from the crate's:
+/// when the block that would overflow is missing or short, the guard
+/// reports the overflow where the crate would have reported "failed to read
+/// extension" — both `Corrupt`, exit 5, and the arithmetic claim above
+/// still holds. Mirrored with the crate's
 /// own parsers (`tar::Header`, `tar::GnuExtSparseHeader`, [`pax_size`]), so
 /// no field offset is restated here beyond the citations above.
 ///
@@ -487,7 +512,14 @@ type TarSource = CrateNextGuard<TrailerWatch>;
 /// [`TrailerWatch`]'s count of what tar consumed is unchanged.
 ///
 /// The cost: a pax `x` payload is held twice, once here and once by the
-/// crate's own `read_all`, which bounds it no more than this does.
+/// crate's own `read_all`, which bounds nothing itself. Both are bounded by
+/// one ceiling, [`MAX_PAX_EXTENSION`], which this guard enforces on the
+/// crate's first read of the payload (`ResourceLimit`, exit 6), so neither
+/// copy grows past it.
+///
+/// Every private fact of the crate this mirrors is listed beside the
+/// `tar = "=0.4.46"` pin in the workspace `Cargo.toml`; a bump re-verifies
+/// them.
 struct CrateNextGuard<R> {
     inner: R,
     /// Bytes read from `inner` so far — the crate's `ArchiveInner::pos`
@@ -673,6 +705,21 @@ fn sparse_overflow(run: &SparseRun) -> io::Error {
     )
 }
 
+/// The refusal: a pax `x` header declaring a payload past
+/// [`MAX_PAX_EXTENSION`]. `OutOfMemory`, which [`Error::from_decode_io`]
+/// classifies as [`Error::ResourceLimit`] (exit 6) — `ar.rs`'s
+/// `refuse_if_over` shape.
+fn pax_over_ceiling(len: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "tar pax extended header declares a payload of {len} bytes, past the \
+             {MAX_PAX_EXTENSION}-byte ceiling this container reads eagerly; no legitimate \
+             archive's pax header is this large"
+        ),
+    )
+}
+
 impl<R: Read> Read for CrateNextGuard<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
@@ -727,6 +774,15 @@ impl<R: Read> Read for CrateNextGuard<R> {
                     // A short block: "failed to read extension" (`:529`).
                 }
                 GuardPhase::Payload { next, mut pax } => {
+                    if let Some(capture) = &pax
+                        && capture.len > MAX_PAX_EXTENSION
+                    {
+                        // Refused on the crate's FIRST payload read, so
+                        // only once it has accepted the `x` header (a bad
+                        // checksum stays the crate's own `Corrupt`) and
+                        // before either copy holds a payload byte.
+                        return Err(pax_over_ceiling(capture.len));
+                    }
                     if self.pos == next {
                         if let Some(capture) = pax {
                             self.pax = Some(capture.bytes);
@@ -2313,6 +2369,87 @@ mod tests {
         let err = walk(open(&bytes)).expect_err("the pax size overflows");
         assert_eq!(err.exit_code(), 5, "{err}");
         assert!(err.to_string().contains(GUARD_PHRASE), "{err}");
+    }
+
+    /// A pax `x` header whose `size=` record is followed by a regular file,
+    /// built with the crate's own `Builder`, and a
+    /// `comment` record making the `x` payload as large as the test needs.
+    fn pax_then_file(path: &str, comment_len: usize) -> Vec<u8> {
+        let buf = SharedBuf::new();
+        let mut builder =
+            tar::Builder::new(Box::new(buf.clone()) as Box<dyn std::io::Write + Send>);
+        let comment = vec![b'c'; comment_len];
+        builder
+            .append_pax_extensions([("path", path.as_bytes()), ("comment", &comment[..])])
+            .unwrap();
+        let mut header = tar::Header::new_ustar();
+        header.set_path("short.txt").unwrap();
+        header.set_mode(0o644);
+        header.set_size(5);
+        header.set_cksum();
+        builder.append(&header, &b"hello"[..]).unwrap();
+        builder.into_inner().unwrap().flush().unwrap();
+        buf.contents()
+    }
+
+    /// I1 of the 0.8.1 Task 2 review: the guard holds every pax `x`
+    /// payload, and so does the crate, so an unbounded one cost both. A
+    /// payload declared past [`MAX_PAX_EXTENSION`] is a `ResourceLimit`
+    /// (exit 6) — with every byte of it present, on both source shapes.
+    #[test]
+    fn a_pax_header_past_the_ceiling_is_a_resource_limit() {
+        let over = usize::try_from(MAX_PAX_EXTENSION).unwrap() + (1 << 20);
+        let bytes = pax_then_file("big.txt", over);
+        assert!(bytes.len() > over, "the payload is really there");
+        for (shape, ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
+            let err = walk(ar).expect_err("a pax header past the ceiling");
+            assert!(
+                matches!(err, stuffr_core::Error::ResourceLimit(_)),
+                "{shape}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), 6, "{shape}: {err}");
+        }
+    }
+
+    /// The same refusal when the declared payload is NOT there: a 4 GiB
+    /// `x` header followed by 1 KiB. Still exit 6, not 5 — the ceiling is
+    /// checked against the DECLARED size before a payload byte is read,
+    /// which is `Error::exit_code`'s "refused before an allocator was asked"
+    /// rule, so how much of the payload exists never comes into it.
+    #[test]
+    fn a_pax_header_declaring_4_gib_with_1_kib_present_is_a_resource_limit() {
+        let mut header = tar::Header::new_ustar();
+        header.set_path("PaxHeaders/big").unwrap();
+        header.set_entry_type(tar::EntryType::XHeader);
+        header.set_size(4 << 30);
+        header.set_cksum();
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(&[b'c'; 1024]);
+        let err = walk(open(&bytes)).expect_err("a pax header past the ceiling");
+        assert!(
+            matches!(err, stuffr_core::Error::ResourceLimit(_)),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 6, "{err}");
+    }
+
+    /// The ceiling's inside edge: a healthy pax header — a 300-byte path —
+    /// and one a few KiB short of the ceiling both list normally, the path
+    /// record applied.
+    #[test]
+    fn a_pax_header_inside_the_ceiling_lists_normally() {
+        let long = format!("{}/name.txt", "d".repeat(290));
+        let near = usize::try_from(MAX_PAX_EXTENSION).unwrap() - 4096;
+        for comment_len in [0, near] {
+            let bytes = pax_then_file(&long, comment_len);
+            for ar in [open(&bytes), open_seekable(&bytes)] {
+                let mut ar = ar;
+                let entry = ar.next_entry().unwrap().expect("one entry");
+                assert_eq!(entry.meta().name, long, "comment {comment_len}");
+                drop(entry);
+                assert!(ar.next_entry().unwrap().is_none());
+            }
+        }
     }
 
     /// GNU tar, wherever this platform keeps it: `gtar` (Homebrew's

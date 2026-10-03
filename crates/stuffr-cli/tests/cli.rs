@@ -3551,6 +3551,128 @@ fn a_system_tar_of_dot_extracts_cleanly() {
     );
 }
 
+/// GNU tar, wherever this platform keeps it: `gtar` (Homebrew's `gnu-tar`
+/// on macOS) or the platform `tar` when `--version` says it is GNU's, as on
+/// Linux. Missing is a failure naming the fix, never a fallback to bsdtar —
+/// which rejects GNU-only flags such as `--hole-detection` and would fail as
+/// an unexplained "reference tool failed". `tar.rs`'s `gnu_tar()`'s check.
+fn require_gnu_tar() -> PathBuf {
+    if let Some(gtar) = which("gtar") {
+        return gtar;
+    }
+    let tar = require_bin("tar");
+    let out = Command::new(&tar).arg("--version").output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("GNU tar"),
+        "no GNU tar: neither `gtar` nor a GNU `tar` on PATH (macOS: `brew install gnu-tar`)"
+    );
+    tar
+}
+
+/// 0.8.1 Task 2 fix round, I1: a pax `x` header past `tar.rs`'s
+/// `MAX_PAX_EXTENSION` (16 MiB) is refused at exit 6 — with every byte of
+/// its 17 MiB payload present, and equally when it declares 4 GiB and
+/// delivers 1 KiB. Exit 6 in both, because the ceiling is checked against
+/// the DECLARED size before a payload byte is read (`Error::exit_code`'s
+/// "refused before an allocator was asked"), so how much is present never
+/// enters into it.
+#[test]
+fn a_tar_pax_header_past_the_ceiling_exits_6() {
+    let dir = tmp_dir();
+    let mut builder = Builder::new(Vec::new());
+    let comment = vec![b'c'; 17 << 20];
+    builder
+        .append_pax_extensions([("comment", &comment[..])])
+        .unwrap();
+    let mut header = Header::new_ustar();
+    header.set_path("after.txt").unwrap();
+    header.set_mode(0o644);
+    header.set_size(5);
+    header.set_cksum();
+    builder.append(&header, &b"hello"[..]).unwrap();
+    let big = builder.into_inner().unwrap();
+    assert!(big.len() > 17 << 20, "the payload is really there");
+    let big_path = dir.join("big-pax.tar");
+    std::fs::write(&big_path, &big).unwrap();
+
+    let mut header = Header::new_ustar();
+    header.set_path("PaxHeaders/big").unwrap();
+    header.set_entry_type(tar::EntryType::XHeader);
+    header.set_size(4 << 30);
+    header.set_cksum();
+    let mut short = header.as_bytes().to_vec();
+    short.extend_from_slice(&[b'c'; 1024]);
+    let short_path = dir.join("short-pax.tar");
+    std::fs::write(&short_path, &short).unwrap();
+
+    for path in [&big_path, &short_path] {
+        let out = run_output(&["list", path.to_str().unwrap()]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(6), "{path:?}: {stderr}");
+        assert!(stderr.contains("pax extended header"), "{path:?}: {stderr}");
+    }
+    // A pipe, written from a thread: stuffr refuses on the header and exits
+    // without draining the 17 MiB behind it, so the writer meets a broken
+    // pipe — which is the point, not a failure.
+    let mut child = Command::new(STUFFR)
+        .args(["list", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&big);
+    });
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "a pipe: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The ceiling's healthy side: GNU tar's own `--format=pax` archive of a
+/// file whose path is 300 bytes — past ustar's 255, so carried in a pax
+/// `path` record — lists normally under its full name.
+#[test]
+fn a_gnu_tar_pax_archive_with_a_300_byte_path_lists_normally() {
+    let dir = tmp_dir();
+    let src = dir.join("src");
+    let rel = format!("{}/{}", "d".repeat(200), "f".repeat(99));
+    assert_eq!(rel.len(), 300);
+    std::fs::create_dir_all(src.join("d".repeat(200))).unwrap();
+    std::fs::write(src.join(&rel), b"long path").unwrap();
+    let archive = dir.join("pax.tar");
+    run_tool(
+        &require_gnu_tar(),
+        &[os(&"--format=pax"), os(&"-cf"), os(&archive), os(&rel)],
+        &src,
+        b"",
+    );
+    let bytes = std::fs::read(&archive).unwrap();
+    assert!(
+        Header::from_byte_slice(&bytes[..512])
+            .entry_type()
+            .is_pax_local_extensions(),
+        "GNU tar carried the path in a pax `x` header"
+    );
+    let out = run_output(&["list", archive.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains(&rel), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `tar.rs`'s own tests gate on the system tool the same way rather than
 /// failing a machine that has none.
 fn which_tar() -> Option<PathBuf> {
@@ -12718,7 +12840,7 @@ fn a_gnu_tar_sparse_archive_lists_tests_and_unpacks_byte_identical() {
         file.set_len(len).unwrap();
         file.sync_all().unwrap();
     }
-    let gnu = which("gtar").unwrap_or_else(|| require_bin("tar"));
+    let gnu = require_gnu_tar();
     let archive = dir.join("sparse.tar");
     run_tool(
         &gnu,
