@@ -238,6 +238,10 @@
 //! differently from `list`: a name longer than 100 bytes then comes back
 //! truncated to what the header block itself holds.
 //!
+//! No extension payload is read until the chain is known to reach a real
+//! header: the chain is walked by its headers' declared spans first, so a
+//! forged extension header costs one block read, never one payload.
+//!
 //! The two ceilings, both on METADATA rather than on an entry, and both
 //! checked before a byte is allocated for them:
 //!
@@ -921,6 +925,12 @@ fn strip_one_nul(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+/// Whether an extension payload of `len` bytes at `at` is within `ceiling`
+/// and wholly inside the source — decided from the header alone.
+fn extension_fits(at: u64, len: u64, ceiling: u64, file_len: u64) -> bool {
+    len <= ceiling && at.checked_add(len).is_some_and(|end| end <= file_len)
+}
+
 /// Reads an extension payload of `len` bytes at `at`, refusing — before
 /// anything is allocated — one over `ceiling` or one the source does not
 /// wholly hold.
@@ -931,7 +941,7 @@ fn read_extension(
     ceiling: u64,
     file_len: u64,
 ) -> Option<Vec<u8>> {
-    if len > ceiling || at.checked_add(len)? > file_len {
+    if !extension_fits(at, len, ceiling, file_len) {
         return None;
     }
     src.seek(SeekFrom::Start(at)).ok()?;
@@ -1006,8 +1016,20 @@ fn sighting_at(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8; 
 /// Gates the header at `offset` and, if it is an extension, the chain it
 /// begins — see the module doc. `None` for anything that does not reach a
 /// real header.
+///
+/// Two passes, so that a chain is proven before any payload is read (Task 2
+/// re-review I-N1). The first walks the chain by its headers alone — each
+/// extension's declared span, block-rounded, says where the next header
+/// sits — and records where each payload lies. Only once that walk reaches
+/// a real header are the payloads read. Reading them first cost one payload
+/// per forged extension header, each up to [`MAX_PAX_EXTENSION`], and a
+/// failed chain resumes the scan one byte on: a file of forged `x` headers
+/// made the scan's work (headers × ceiling), measured at 26.7 s for 16 MiB.
 fn gate_chain_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<Found> {
-    let mut extensions = Extensions::default();
+    // Where each extension's payload lies: `(start, len)`, by slot.
+    let mut long_name = None;
+    let mut long_link = None;
+    let mut pax = None;
     let mut at = offset;
     for _ in 0..=MAX_EXTENSIONS {
         let block = read_block(src, at, file_len)?;
@@ -1030,28 +1052,35 @@ fn gate_chain_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<F
                 || entry_type.is_pax_local_extensions())
         {
             let (slot, ceiling) = if entry_type.is_gnu_longname() {
-                (&mut extensions.long_name, MAX_LONG_NAME)
+                (&mut long_name, MAX_LONG_NAME)
             } else if entry_type.is_gnu_longlink() {
-                (&mut extensions.long_link, MAX_LONG_NAME)
+                (&mut long_link, MAX_LONG_NAME)
             } else {
-                (&mut extensions.pax, MAX_PAX_EXTENSION)
+                (&mut pax, MAX_PAX_EXTENSION)
             };
             // "two long name entries describing the same member" — the
             // reader refuses the archive; the chain is broken here.
-            if slot.is_some() {
+            if slot.is_some() || !extension_fits(payload_start, raw_span, ceiling, file_len) {
                 return None;
             }
-            *slot = Some(read_extension(
-                src,
-                payload_start,
-                raw_span,
-                ceiling,
-                file_len,
-            )?);
+            *slot = Some((payload_start, raw_span, ceiling));
             at = payload_start.checked_add(round_up_to_block(raw_span)?)?;
             continue;
         }
 
+        // The chain reached a real header: now, and only now, its
+        // extensions' payloads are worth reading.
+        let mut read = |planned: Option<(u64, u64, u64)>| match planned {
+            Some((start, len, ceiling)) => {
+                read_extension(src, start, len, ceiling, file_len).map(Some)
+            }
+            None => Some(None),
+        };
+        let extensions = Extensions {
+            long_name: read(long_name)?,
+            long_link: read(long_link)?,
+            pax: read(pax)?,
+        };
         return candidate_from(header, at, payload_start, raw_span, &extensions, file_len);
     }
     None
@@ -2058,6 +2087,112 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["own-name.txt"]
         );
+    }
+
+    /// A [`SeekRead`] that counts every byte its reads return.
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        read: u64,
+    }
+
+    impl io::Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl io::Seek for CountingReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// Task 2 re-review I-N1: a file of forged `x` headers, one on every
+    /// block, each declaring a payload that runs to the end of the file. No
+    /// chain reaches a real header, so no payload may be read: what the scan
+    /// reads stays a constant per checksum-valid block (one search chunk and
+    /// a few blocks), not one extension payload per forged header — which
+    /// made the work (headers × ceiling), 26.7 s for 16 MiB of input.
+    /// Counted in bytes, not timed, so the bound cannot flake.
+    #[test]
+    fn a_forged_extension_chain_is_refused_without_reading_its_payload() {
+        let headers: u64 = 1024;
+        let len = headers * BLOCK_U64;
+        let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap());
+        for i in 0..headers {
+            let mut header = tar::Header::new_ustar();
+            header.set_path("PaxHeaders/x").unwrap();
+            header.set_size(len - (i + 1) * BLOCK_U64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::XHeader);
+            header.set_cksum();
+            bytes.extend_from_slice(header.as_bytes());
+        }
+        let mut src = CountingReader {
+            inner: Cursor::new(bytes),
+            read: 0,
+        };
+
+        let out = salvage_tar(&mut src, &SalvagePolicy::default()).unwrap();
+        assert!(out.entries.is_empty());
+        let per_header = SCAN_CHUNK as u64 + 8 * BLOCK_U64;
+        assert!(
+            src.read <= headers * per_header,
+            "read {} bytes from a {len}-byte file of {headers} forged headers — over \
+             {per_header} per header, so extension payloads were read for chains that \
+             reach no header",
+            src.read
+        );
+    }
+
+    /// The payload-later chain walk keeps every extension of a real chain:
+    /// a GNU long name AND a pax `size` record ahead of one header both
+    /// apply, exactly as the reader applies them.
+    #[test]
+    fn a_chain_of_two_extensions_still_applies_both() {
+        let long = format!("chain/{}.txt", "c".repeat(150));
+        let mut name = long.clone().into_bytes();
+        name.push(0);
+        let mut bytes = header_block(
+            "././@LongLink",
+            name.len() as u64,
+            tar::EntryType::GNULongName,
+        )
+        .to_vec();
+        bytes.extend_from_slice(&padded(&name));
+        let record = b"10 size=5\n";
+        let mut pax = tar::Header::new_ustar();
+        pax.set_path("PaxHeaders/x").unwrap();
+        pax.set_size(record.len() as u64);
+        pax.set_mode(0o644);
+        pax.set_entry_type(tar::EntryType::XHeader);
+        pax.set_cksum();
+        bytes.extend_from_slice(pax.as_bytes());
+        bytes.extend_from_slice(&padded(record));
+        bytes.extend_from_slice(&header_block("short", 0, tar::EntryType::Regular));
+        bytes.extend_from_slice(&padded(b"hello"));
+        bytes.extend_from_slice(&files(&[("next.txt", b"next")]));
+
+        let reader = read_through_the_reader(&bytes).expect("the reader accepts it");
+        let out = scan(&bytes);
+        let rows = out
+            .entries
+            .iter()
+            .map(|e| (e.meta.name.clone(), e.meta.size.unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            reader
+                .iter()
+                .map(|(n, s, _, _)| (n.clone(), *s))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rows[0], (long, 5));
+        let written = write_back(&bytes, &out);
+        assert_eq!(written[0], (b"hello".to_vec(), true));
+        assert_eq!(written[1], (b"next".to_vec(), true));
     }
 
     // -------------------------------------------------------------------
