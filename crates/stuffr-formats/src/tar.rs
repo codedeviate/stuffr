@@ -128,6 +128,15 @@
 //!    by every tool) pass: `a.tar`'s own marker satisfies both rules and
 //!    `b.tar` is part of the ignored tail.
 //!
+//! # One header the crate would overflow on is refused before it reads it
+//!
+//! A GNU sparse header declaring a size within a few blocks of `2^64` makes
+//! `tar` 0.4.46 add past `u64::MAX` (`archive.rs:532`): a panic under debug
+//! assertions, which `cargo fuzz` enables, and a silent wrap in release.
+//! [`CrateNextGuard`] sits between the source and the crate, mirrors the
+//! crate's next-header offset, and refuses exactly that extension block as
+//! `Corrupt`. Its doc derives the bound.
+//!
 //! # `add` measures a payload whose size the caller did not declare
 //!
 //! `tar::Builder::append` writes the header first and pads from the number
@@ -201,9 +210,10 @@ const DEFAULT_MODE: u32 = 0o644;
 /// rationale one level up.
 const DEFAULT_DIR_MODE: u32 = 0o755;
 
-/// The reader handed to `tar::Archive`. Wraps the ladder's source only to
-/// watch for the end-of-archive marker; see the module doc's point 4.
-type TarArchive = tar::Archive<TrailerWatch>;
+/// The archive over [`TarSource`]: the ladder's source, watched for the
+/// end-of-archive marker (the module doc's point 4) and guarded against the
+/// one header the crate overflows on ([`CrateNextGuard`]).
+type TarArchive = tar::Archive<TarSource>;
 
 pub struct Tar;
 
@@ -278,7 +288,8 @@ impl Container for Tar {
         // Leaked deliberately and reclaimed in `TarRead::drop` — see the
         // module doc for why `self_cell` cannot express this and why the
         // pointer is raw rather than a `Box` field.
-        let archive: *mut TarArchive = Box::into_raw(Box::new(tar::Archive::new(watched)));
+        let archive: *mut TarArchive =
+            Box::into_raw(Box::new(tar::Archive::new(CrateNextGuard::new(watched))));
 
         // SAFETY: `archive` was just allocated by `Box::into_raw`, so it is
         // non-null, aligned and initialised, and nothing else has a pointer
@@ -403,12 +414,359 @@ impl Read for TrailerWatch {
     }
 }
 
+/// What `tar::Archive` reads from: [`TrailerWatch`] behind [`CrateNextGuard`].
+type TarSource = CrateNextGuard<TrailerWatch>;
+
+/// Refuses the one header shape whose arithmetic `tar` 0.4.46 cannot carry
+/// out — a GNU sparse header declaring a size within a few blocks of `2^64`
+/// — before the crate overflows on it, and passes every other byte through
+/// verbatim. The `ArGuardedReader` (`ar.rs`) shape: it sits between the
+/// source and the crate for the archive's whole life and holds each
+/// 512-byte header block whole before the crate sees a byte of it. It
+/// rewrites nothing.
+///
+/// # The overflow, and the exact bound
+///
+/// Every crate citation is `tar` 0.4.46 `src/archive.rs`. The crate keeps
+/// `EntriesFields::next`, the archive offset of the next header, and
+/// advances it three ways:
+///
+/// 1. `self.next += BLOCK_SIZE` after reading a non-zero header (`:305`;
+///    `:312` is the `ignore_zeros` twin, and `Archive::new` leaves that off,
+///    `:64`) — unchecked, but only reached once the source has actually
+///    DELIVERED `self.next` bytes (`entries()` reads its way there, `:293`
+///    and `skip`), so overflowing it needs a stream of `2^64` bytes. Not
+///    reachable, and the same holds for every non-sparse header: its
+///    declared size is only ever added CHECKED (point 2).
+/// 2. `self.next = self.next.checked_add(round_up(size))`, `size` being the
+///    header's own field or, when a pax `x` header preceded it and it is not
+///    itself an extension header, the pax `size` record (`:328-354`,
+///    `:374-381`) — checked, an error ("size overflow") rather than a panic.
+///    This can leave `next` as high as `2^64 - 512` without a single
+///    payload byte existing.
+/// 3. `self.next += BLOCK_SIZE` once per GNU sparse EXTENSION block
+///    (`:524-533`), read from the source straight after the sparse header
+///    and so BEFORE any of the size added in point 2 is crossed —
+///    unchecked. This is the panic: `next` near `2^64` from point 2, then
+///    one more block.
+///
+/// So the crate panics exactly when, for a header the crate reaches its
+/// extension loop on (typeflag `S`, a GNU magic so `as_gnu()` answers,
+/// `isextended` set — `:455-461`, `:524`; `isextended` is offset 482 of the
+/// header and offset 504 of each extension block, by the field widths of
+/// `header.rs:97-124` (`GnuHeader`) and `:142-146` (`GnuExtSparseHeader`)),
+/// with `H` the offset just past it and `size` as in point 2:
+///
+/// ```text
+/// H + round_up(size, 512) + 512 * k  >  u64::MAX
+/// ```
+///
+/// for the `k`th extension block the crate reads. The guard computes the
+/// left side as the crate does — the same sum, `checked_add` where the
+/// crate adds unchecked — and refuses when it does not fit, at the moment
+/// the crate would ask for that block's bytes. That is precise in both
+/// directions: a block the crate would never read (it stopped earlier, on a
+/// bad checksum or a malformed map) is never refused, and every block it
+/// can advance over is passed through untouched. Mirrored with the crate's
+/// own parsers (`tar::Header`, `tar::GnuExtSparseHeader`, [`pax_size`]), so
+/// no field offset is restated here beyond the citations above.
+///
+/// # What it mirrors, and why that is enough
+///
+/// To know where headers are, the guard tracks the crate's `next` itself,
+/// which is the whole of the mirror: the header at `next`, then extension
+/// blocks if any, then payload up to the new `next`. The pax `size`
+/// override moves `next`, so a pax `x` payload is held as it passes, and
+/// applied with the crate's own lifecycle (`:405-448`: held across GNU `L`/
+/// `K` headers, consumed by the first header the crate hands back). The
+/// mirror only has to be right while the crate is: any header the crate
+/// rejects ends `Entries` (`done`, `:579-593`), so nothing is read through
+/// this guard again and its state after that point is moot. It reads
+/// nothing ahead of the crate either — a header and an extension block are
+/// read by the crate's `try_read_all` (`:618-633`) whole, 512 bytes — so
+/// [`TrailerWatch`]'s count of what tar consumed is unchanged.
+///
+/// The cost: a pax `x` payload is held twice, once here and once by the
+/// crate's own `read_all`, which bounds it no more than this does.
+struct CrateNextGuard<R> {
+    inner: R,
+    /// Bytes read from `inner` so far — the crate's `ArchiveInner::pos`
+    /// once the held block has been served.
+    pos: u64,
+    /// A header or extension block, read whole before any of it is served.
+    held: [u8; BLOCK],
+    held_len: usize,
+    served: usize,
+    phase: GuardPhase,
+    /// A pax `x` payload the crate is holding for the next header it hands
+    /// back — its `pax_extensions` local in `next_entry` (`:393`).
+    pax: Option<Vec<u8>>,
+}
+
+/// What [`CrateNextGuard`] expects the next byte it reads to be.
+enum GuardPhase {
+    /// The first byte of a header block, at the crate's `next`.
+    Header,
+    /// The first byte of a GNU sparse extension block.
+    Extension(SparseRun),
+    /// Payload, up to the crate's `next`, with the leading bytes of a pax
+    /// `x` payload being collected when `pax` is set.
+    Payload { next: u64, pax: Option<PaxCapture> },
+    /// The crate has stopped reading headers — an end-of-archive block, a
+    /// short read, or a header it rejects. Bytes pass through.
+    Done,
+}
+
+/// One sparse header's extension chain, as far as the crate has read it.
+struct SparseRun {
+    /// Where the sparse header began, for the refusal's message.
+    header_at: u64,
+    /// The size the crate advanced `next` by (point 2).
+    size: u64,
+    /// The crate's `next` before the next extension block.
+    next: u64,
+    /// Extension blocks read so far.
+    blocks: u64,
+}
+
+/// A pax `x` payload being held as it passes.
+struct PaxCapture {
+    bytes: Vec<u8>,
+    /// The payload's length — the `x` header's own size field, which a
+    /// pax record never overrides (`:336`).
+    len: u64,
+}
+
+impl<R: Read> CrateNextGuard<R> {
+    fn new(inner: R) -> Self {
+        CrateNextGuard {
+            inner,
+            pos: 0,
+            held: [0; BLOCK],
+            held_len: 0,
+            served: 0,
+            phase: GuardPhase::Header,
+            pax: None,
+        }
+    }
+
+    /// Reads one block into `held`, as far as the source has it. The
+    /// crate's `try_read_all` (`:618-633`) is what will consume it, and it
+    /// stops at the first error, so only `Interrupted` — which `Read`
+    /// callers retry — is retried here rather than ending the block.
+    fn hold_block(&mut self) -> io::Result<()> {
+        self.held_len = 0;
+        self.served = 0;
+        while self.held_len < BLOCK {
+            let n = match self.inner.read(&mut self.held[self.held_len..]) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            self.held_len += n;
+            self.pos += n as u64;
+        }
+        Ok(())
+    }
+
+    /// The phase after the header now held whole, mirroring
+    /// `next_entry_raw` (`:285-384`) and `next_entry` (`:386-449`).
+    fn after_header(&mut self) -> GuardPhase {
+        if self.held.iter().all(|&b| b == 0) {
+            // An end-of-archive block: the crate stops (`:304-310`).
+            return GuardPhase::Done;
+        }
+        let header = tar::Header::from_byte_slice(&self.held);
+        let entry_type = header.entry_type();
+        // `:330-333`: no pax record overrides one of these four's size.
+        let is_extension_header = entry_type.is_gnu_longname()
+            || entry_type.is_gnu_longlink()
+            || entry_type.is_pax_local_extensions()
+            || entry_type.is_pax_global_extensions();
+        // `:408-445`: the three the crate consumes itself rather than hand
+        // back, holding its pax payload across them.
+        let recognized = header.as_gnu().is_some() || header.as_ustar().is_some();
+        let consumed_by_crate = recognized
+            && (entry_type.is_gnu_longname()
+                || entry_type.is_gnu_longlink()
+                || entry_type.is_pax_local_extensions());
+        if consumed_by_crate && entry_type.is_pax_local_extensions() && self.pax.is_some() {
+            // "two pax extensions entries" (`:434-439`): the crate stops.
+            return GuardPhase::Done;
+        }
+        // Any other header is handed back, and the pax payload with it.
+        let pax = if consumed_by_crate {
+            None
+        } else {
+            self.pax.take()
+        };
+        let Ok(mut size) = header.entry_size() else {
+            // The crate's own error (`:349`).
+            return GuardPhase::Done;
+        };
+        if !is_extension_header && let Some(over) = pax.as_deref().and_then(pax_size) {
+            size = over;
+        }
+        // `:374-381`, checked exactly where the crate checks it.
+        let Some(next) = size
+            .checked_add(BLOCK as u64 - 1)
+            .and_then(|s| self.pos.checked_add(s & !(BLOCK as u64 - 1)))
+        else {
+            return GuardPhase::Done;
+        };
+        if consumed_by_crate && entry_type.is_pax_local_extensions() {
+            return GuardPhase::Payload {
+                next,
+                pax: Some(PaxCapture {
+                    bytes: Vec::new(),
+                    len: size,
+                }),
+            };
+        }
+        // `:455-461` and `:524`.
+        let extended =
+            entry_type.is_gnu_sparse() && header.as_gnu().is_some_and(|gnu| gnu.is_extended());
+        if extended {
+            return GuardPhase::Extension(SparseRun {
+                header_at: self.pos - BLOCK as u64,
+                size,
+                next,
+                blocks: 0,
+            });
+        }
+        GuardPhase::Payload { next, pax: None }
+    }
+}
+
+/// A pax `x` payload's `size` record — the size `tar::Archive` advances by
+/// in place of the header's own field — with `tar` 0.4.46 `pax.rs:64-85`'s
+/// (`pax_extensions_value`, private to the crate) exact semantics: the first
+/// malformed record ends the search with no answer, and so does a `size`
+/// value that is not a decimal `u64`. The one owner: [`CrateNextGuard`]
+/// mirrors the reader with it and `tar_salvage.rs` applies it as the reader
+/// does.
+pub(crate) fn pax_size(pax: &[u8]) -> Option<u64> {
+    for record in tar::PaxExtensions::new(pax) {
+        let record = record.ok()?;
+        if record.key() != Ok("size") {
+            continue;
+        }
+        return record.value().ok()?.parse::<u64>().ok();
+    }
+    None
+}
+
+/// The refusal: reading `run`'s next extension block would carry the
+/// crate's `next` past `u64::MAX`. `InvalidData`, so `classify_tar_error`
+/// routes it through [`Error::from_decode_io`] to `Corrupt`.
+fn sparse_overflow(run: &SparseRun) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "tar GNU sparse header at offset {} declares {} bytes; with its extension \
+             block {} that puts the next header past 2^64 bytes, which no archive can hold",
+            run.header_at,
+            run.size,
+            run.blocks + 1
+        ),
+    )
+}
+
+impl<R: Read> Read for CrateNextGuard<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.served < self.held_len {
+                let n = (self.held_len - self.served).min(out.len());
+                out[..n].copy_from_slice(&self.held[self.served..self.served + n]);
+                self.served += n;
+                return Ok(n);
+            }
+            // Taken by value and put back on every route that continues;
+            // the error routes leave `Done`, because the crate stops at them.
+            match std::mem::replace(&mut self.phase, GuardPhase::Done) {
+                GuardPhase::Header => {
+                    self.hold_block()?;
+                    if self.held_len == 0 {
+                        return Ok(0);
+                    }
+                    if self.held_len == BLOCK {
+                        self.phase = self.after_header();
+                    }
+                    // A short block: `try_read_all` fails on it, and the
+                    // crate stops — `Done` stands.
+                }
+                GuardPhase::Extension(mut run) => {
+                    // Refused before a byte of the block is read: the
+                    // crate's `try_read_all` fails where `:532` would have
+                    // overflowed one line later.
+                    run.next = run
+                        .next
+                        .checked_add(BLOCK as u64)
+                        .ok_or_else(|| sparse_overflow(&run))?;
+                    run.blocks += 1;
+                    self.hold_block()?;
+                    if self.held_len == 0 {
+                        return Ok(0);
+                    }
+                    if self.held_len == BLOCK {
+                        let mut ext = tar::GnuExtSparseHeader::new();
+                        ext.as_mut_bytes().copy_from_slice(&self.held);
+                        self.phase = if ext.is_extended() {
+                            GuardPhase::Extension(run)
+                        } else {
+                            GuardPhase::Payload {
+                                next: run.next,
+                                pax: None,
+                            }
+                        };
+                    }
+                    // A short block: "failed to read extension" (`:529`).
+                }
+                GuardPhase::Payload { next, mut pax } => {
+                    if self.pos == next {
+                        if let Some(capture) = pax {
+                            self.pax = Some(capture.bytes);
+                        }
+                        self.phase = GuardPhase::Header;
+                        continue;
+                    }
+                    let want = out
+                        .len()
+                        .min(usize::try_from(next - self.pos).unwrap_or(usize::MAX));
+                    let n = match self.inner.read(&mut out[..want]) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            // A payload read error is the caller's to retry
+                            // or not; the mirror stays where it was.
+                            self.phase = GuardPhase::Payload { next, pax };
+                            return Err(e);
+                        }
+                    };
+                    if let Some(capture) = &mut pax {
+                        let room = capture.len.saturating_sub(capture.bytes.len() as u64);
+                        let keep = n.min(usize::try_from(room).unwrap_or(usize::MAX));
+                        capture.bytes.extend_from_slice(&out[..keep]);
+                    }
+                    self.pos += n as u64;
+                    self.phase = GuardPhase::Payload { next, pax };
+                    return Ok(n);
+                }
+                GuardPhase::Done => return self.inner.read(out),
+            }
+        }
+    }
+}
+
 struct TarRead {
     /// Borrows the allocation `archive` points at, with its lifetime
     /// extended. `Option` so [`Drop`] can drop it BEFORE freeing what it
     /// borrows, rather than relying on `tar::Entries` having no `Drop` impl
     /// of its own — true today, and not this module's promise to keep.
-    entries: Option<tar::Entries<'static, TrailerWatch>>,
+    entries: Option<tar::Entries<'static, TarSource>>,
     /// Owned by this struct, reclaimed in [`Drop`]. See the module doc.
     archive: *mut TarArchive,
     report: FidelityReport,
@@ -585,7 +943,7 @@ impl ArchiveRead for TarRead {
 /// assert `unsafe impl Send` for a property that is false — see `Entry`'s own
 /// doc in `archive.rs`.
 struct EntryPayload<'a> {
-    entry: tar::Entry<'a, TrailerWatch>,
+    entry: tar::Entry<'a, TarSource>,
     /// Payload bytes the entry's own header promised and has not delivered.
     remaining: u64,
     /// Kept for the error message: a corrupt archive should say WHICH entry.
@@ -648,7 +1006,7 @@ pub(crate) fn is_regular_file(entry_type: tar::EntryType) -> bool {
 /// so a lossy conversion is the most this layer can carry. Names are NOT
 /// sanitised — see harness property 12; refusal is the ops layer's job and it
 /// can only refuse what it can still see.
-fn entry_meta(entry: &tar::Entry<'_, TrailerWatch>) -> EntryMeta {
+fn entry_meta(entry: &tar::Entry<'_, TarSource>) -> EntryMeta {
     let header = entry.header();
     EntryMeta {
         name: String::from_utf8_lossy(&entry.path_bytes()).into_owned(),
@@ -1736,10 +2094,8 @@ mod tests {
     /// through the raw `tar::Builder` because this module's own `add` never
     /// produces that typeflag.
     ///
-    /// Its sibling case, `GNUSparse`, is not tested here for want of a
-    /// fixture: writing one needs GNU tar's `--sparse`, which is absent from
-    /// the CI runner and from macOS, and a hand-built sparse block map would
-    /// be testing this test rather than the code.
+    /// Its sibling case, `GNUSparse`, is pinned on a real GNU tar `--sparse`
+    /// archive by `a_gnu_tar_sparse_archive_reads_back_byte_identical`.
     #[test]
     fn a_continuous_typeflag_entry_reads_back_as_a_file_not_as_other() {
         let buf = SharedBuf::new();
@@ -1841,6 +2197,242 @@ mod tests {
         // A caller asking for random access a format never had should be able
         // to tell that answer from an internal failure.
         assert_eq!(err.exit_code(), 3, "{err}");
+    }
+
+    /// A GNU sparse header (typeflag `S`) declaring `size`, with its
+    /// `isextended` flag set as asked — built with the crate's own
+    /// `Header::new_gnu`, as every hand-built header in this module is.
+    fn gnu_sparse_header(name: &str, size: u64, extended: bool) -> [u8; BLOCK] {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name).unwrap();
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(size);
+        header
+            .as_gnu_mut()
+            .expect("new_gnu is a GNU header")
+            .set_is_extended(extended);
+        header.set_cksum();
+        *header.as_bytes()
+    }
+
+    /// One GNU sparse extension block with no regions, chaining to another
+    /// when `extended`.
+    fn gnu_extension_block(extended: bool) -> [u8; BLOCK] {
+        let mut ext = tar::GnuExtSparseHeader::new();
+        ext.set_is_extended(extended);
+        *ext.as_bytes()
+    }
+
+    /// Lists, then reads every payload — `list` and `test` in one walk —
+    /// returning the first error.
+    fn walk(mut ar: Box<dyn ArchiveRead>) -> stuffr_core::Result<()> {
+        while let Some(mut entry) = ar.next_entry()? {
+            let mut sink = Vec::new();
+            entry
+                .reader()
+                .read_to_end(&mut sink)
+                .map_err(stuffr_core::Error::from_decode_io)?;
+        }
+        Ok(())
+    }
+
+    /// The phrase only [`CrateNextGuard`]'s refusal carries, so a test can
+    /// tell its `Corrupt` from one the crate raised itself.
+    const GUARD_PHRASE: &str = "past 2^64";
+
+    /// Stage 3 Task 2 review F4: a 2048-byte GNU sparse header with
+    /// `isextended = 1` and size `2^64 - 1024` puts the crate's `next` at
+    /// `2^64 - 512`, and its extension loop's unchecked `self.next +=
+    /// BLOCK_SIZE` (`tar` 0.4.46 `archive.rs:532`) then overflows — a panic
+    /// in a debug build and under `cargo fuzz`, a silent wrap in release.
+    /// Corrupt (exit 5), on every source shape, and never a panic.
+    #[test]
+    fn a_sparse_header_the_crate_would_overflow_on_is_corrupt_not_a_panic() {
+        let mut bytes = gnu_sparse_header("sparse.bin", u64::MAX - 1023, true).to_vec();
+        bytes.extend_from_slice(&gnu_extension_block(false));
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+        assert_eq!(
+            bytes.len(),
+            2048,
+            "the reproducer as the review measured it"
+        );
+
+        for (shape, ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
+            let err = walk(ar).expect_err("an archive the crate cannot advance over");
+            assert!(
+                matches!(err, stuffr_core::Error::Corrupt(_)),
+                "{shape}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), 5, "{shape}: {err}");
+            assert!(err.to_string().contains(GUARD_PHRASE), "{shape}: {err}");
+        }
+    }
+
+    /// The overflow can land on ANY extension block, not only the first:
+    /// here the header leaves `next` one block further from the edge, so the
+    /// first extension block fits and the second does not.
+    #[test]
+    fn the_overflow_guard_counts_every_extension_block() {
+        let mut bytes = gnu_sparse_header("sparse.bin", u64::MAX - 1535, true).to_vec();
+        bytes.extend_from_slice(&gnu_extension_block(true));
+        bytes.extend_from_slice(&gnu_extension_block(false));
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+        let err = walk(open(&bytes)).expect_err("the second extension overflows");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(err.to_string().contains(GUARD_PHRASE), "{err}");
+    }
+
+    /// The size the crate advances by is a pax `size` record's when one
+    /// precedes the header (`archive.rs:343-354`), not the header's own
+    /// field — so a sparse header declaring 0 behind a pax record declaring a
+    /// size near `2^64` overflows exactly as the reproducer does.
+    #[test]
+    fn the_overflow_guard_follows_a_pax_size_override() {
+        let buf = SharedBuf::new();
+        let mut builder =
+            tar::Builder::new(Box::new(buf.clone()) as Box<dyn std::io::Write + Send>);
+        // Two blocks further from the edge than the reproducer, because the
+        // `x` header and its payload block come first: the sparse header
+        // ends at 1536, so `next` lands on `2^64 - 512` as before.
+        let size = (u64::MAX - 2047).to_string();
+        builder
+            .append_pax_extensions([("size", size.as_bytes())])
+            .unwrap();
+        builder.into_inner().unwrap().flush().unwrap();
+        let mut bytes = buf.contents();
+        // `into_inner` finishes the archive: drop its two-block marker so the
+        // `x` header describes the sparse header appended next.
+        assert_eq!(bytes.len(), 4 * BLOCK, "x header, its payload, the marker");
+        assert!(bytes[2 * BLOCK..].iter().all(|&b| b == 0));
+        bytes.truncate(2 * BLOCK);
+        bytes.extend_from_slice(&gnu_sparse_header("sparse.bin", 0, true));
+        bytes.extend_from_slice(&gnu_extension_block(false));
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+
+        let err = walk(open(&bytes)).expect_err("the pax size overflows");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(err.to_string().contains(GUARD_PHRASE), "{err}");
+    }
+
+    /// GNU tar, wherever this platform keeps it: `gtar` (Homebrew's
+    /// `gnu-tar`, which macOS already needs for `tar_salvage.rs`'s damage
+    /// catalogue) or the platform `tar` when that is GNU's, as on Linux.
+    /// Missing is a failure, not a skip — the catalogue's own rule.
+    fn gnu_tar() -> std::path::PathBuf {
+        if let Some(gtar) = which("gtar") {
+            return gtar;
+        }
+        let tar = which("tar").expect("no `tar` on PATH");
+        let out = std::process::Command::new(&tar)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("GNU tar"),
+            "no GNU tar: neither `gtar` nor a GNU `tar` on PATH (macOS: `brew install gnu-tar`)"
+        );
+        tar
+    }
+
+    /// A file with holes, as GNU tar's `--sparse` writes it — the healthy
+    /// shape the overflow guard sits in front of, extension blocks and all —
+    /// lists and reads back byte-identical on both source shapes.
+    ///
+    /// The file is twelve 1000-byte data runs with zero runs between them,
+    /// then a real hole to 64 MiB. GNU tar archives a file as sparse only
+    /// when the filesystem reports fewer blocks than its size, which the
+    /// trailing hole provides; `--hole-detection=raw` then maps the zero
+    /// runs as holes too, so the map overflows the header's four slots and
+    /// GNU tar writes extension blocks. Both facts are asserted on the
+    /// fixture with the crate's own parser, so it cannot quietly stop being
+    /// the shape this is about. (Measured on this machine's APFS: holes
+    /// punched into a small file, or extended to 16 MiB, come back fully
+    /// allocated after `fsync`; a 64 MiB extension stays a hole.)
+    #[test]
+    fn a_gnu_tar_sparse_archive_reads_back_byte_identical() {
+        let dir = std::env::temp_dir().join(format!("stuffr-tar-sparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (data, len) = write_holey_file(&dir.join("holey.bin"));
+
+        let archive = dir.join("sparse.tar");
+        let status = std::process::Command::new(gnu_tar())
+            .args(["--format=gnu", "--sparse", "--hole-detection=raw", "-cf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&dir)
+            .arg("holey.bin")
+            .status()
+            .unwrap();
+        assert!(status.success(), "GNU tar could not write the fixture");
+        let bytes = std::fs::read(&archive).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let header = tar::Header::from_byte_slice(&bytes[..BLOCK]);
+        assert!(
+            header.entry_type().is_gnu_sparse(),
+            "typeflag `S` — GNU tar did not see a hole in the file"
+        );
+        assert!(
+            header.as_gnu().is_some_and(|gnu| gnu.is_extended()),
+            "the map spills into extension blocks"
+        );
+
+        for (shape, mut ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
+            let mut entry = ar.next_entry().expect(shape).expect(shape);
+            assert_eq!(entry.meta().name, "holey.bin", "{shape}");
+            assert_eq!(entry.meta().size, Some(len), "{shape}");
+            assert_eq!(entry.meta().kind, EntryKind::File, "{shape}");
+            let mut got = Vec::new();
+            entry.reader().read_to_end(&mut got).expect(shape);
+            assert_eq!(got.len() as u64, len, "{shape}");
+            assert!(
+                got[..data.len()] == data[..],
+                "{shape}: the data runs differ"
+            );
+            assert!(
+                got[data.len()..].iter().all(|&b| b == 0),
+                "{shape}: the hole reads back as zeros"
+            );
+            drop(entry);
+            assert!(ar.next_entry().expect(shape).is_none(), "{shape}");
+        }
+    }
+
+    /// Writes the sparse fixture [`a_gnu_tar_sparse_archive_reads_back_byte_identical`]
+    /// describes at `path`, returning its leading data and its full length.
+    fn write_holey_file(path: &std::path::Path) -> (Vec<u8>, u64) {
+        let mut data = vec![0u8; 12 * 16384 + 3000];
+        for run in 0..12 {
+            let at = run * 16384 + 4096;
+            for (i, b) in data[at..at + 1000].iter_mut().enumerate() {
+                *b = ((i * 7 + run) % 251) as u8 + 1;
+            }
+        }
+        let len = 64 << 20;
+        let mut file = std::fs::File::create(path).unwrap();
+        std::io::Write::write_all(&mut file, &data).unwrap();
+        file.set_len(len).unwrap();
+        file.sync_all().unwrap();
+        (data, len)
+    }
+
+    /// The other side of the bound: one block further from the edge, every
+    /// advance the crate makes fits in a `u64`, so the guard must stand
+    /// aside and let the crate reach its OWN verdict (here, that the sparse
+    /// map accounts for none of the declared size).
+    #[test]
+    fn a_sparse_header_one_block_inside_the_bound_reaches_the_crate() {
+        let mut bytes = gnu_sparse_header("sparse.bin", u64::MAX - 1535, true).to_vec();
+        bytes.extend_from_slice(&gnu_extension_block(false));
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+        let err = walk(open(&bytes)).expect_err("the crate's own refusal");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(
+            !err.to_string().contains(GUARD_PHRASE),
+            "the guard refused a header the crate can advance over: {err}"
+        );
     }
 
     /// Opens `bytes` from a real file, which is the only source shape that

@@ -289,7 +289,7 @@ use stuffr_core::salvage::{
 };
 use stuffr_core::{EntryMeta, Error, FormatId, Result, SeekRead};
 
-use crate::tar::{BLOCK, TAR, entry_kind, header_mtime};
+use crate::tar::{BLOCK, TAR, entry_kind, header_mtime, pax_size};
 
 /// [`BLOCK`] as the `u64` every offset below is.
 const BLOCK_U64: u64 = BLOCK as u64;
@@ -890,20 +890,10 @@ impl Extensions {
             .map(|record| record.value_bytes().to_vec())
     }
 
-    /// The pax `size` override, with `tar` 0.4.46 `pax.rs:64-85`'s
-    /// (`pax_extensions_value`) exact semantics: the first malformed record
-    /// ends the search with no answer, and so does a `size` value that is
-    /// not a decimal `u64`.
+    /// The pax `size` override, as the reader applies it — `tar.rs`'s
+    /// [`pax_size`], the one owner of that rule.
     fn pax_size(&self) -> Option<u64> {
-        let pax = self.pax.as_deref()?;
-        for record in tar::PaxExtensions::new(pax) {
-            let record = record.ok()?;
-            if record.key() != Ok("size") {
-                continue;
-            }
-            return record.value().ok()?.parse::<u64>().ok();
-        }
-        None
+        pax_size(self.pax.as_deref()?)
     }
 
     /// Whether any well-formed pax record is a `GNU.sparse.*` one — pax
