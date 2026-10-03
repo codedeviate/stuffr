@@ -173,11 +173,12 @@
 //! ordinary verbs still read the archive — never "the scan found nothing
 //! recoverable" at exit 5, which is a claim about the archive where the
 //! truth is a claim about this build. A run that recovered something
-//! reports it at its ordinary code (Ruling S-X) — and, since Task 2-N,
-//! carries every sighting with its offset in
-//! [`SalvageOutcome::sightings`], which the CLI prints on stderr: before
-//! that, the mixed run was completely silent about a header `stuffr list`
-//! reads. This is Ruling S-V's shape, and `lha_salvage.rs`'s
+//! reports it (Ruling S-X) — and, since Task 2-N, carries every sighting
+//! with its offset in [`SalvageOutcome::sightings`], which the CLI prints
+//! on stderr: before that, the mixed run was completely silent about a
+//! header `stuffr list` reads. Since the stage's final review (I-1) that
+//! run also exits 4 rather than 0 when it was not `--index`-selective —
+//! decided in the facade's `salvage_exit_code`, not here. This is Ruling S-V's shape, and `lha_salvage.rs`'s
 //! `UngateableSightings` is the template.
 //!
 //! Counted and never listed, because a listed candidate is one the engine
@@ -2361,9 +2362,10 @@ mod tests {
 
     /// Task 2-N, N3: in a MIXED run a sighting used to be completely silent —
     /// the `JUNKJUNK` header `stuffr list` reads was simply absent, at exit
-    /// 0, with nothing said. The run still reports what it got at its
-    /// ordinary code (Ruling S-X), and the outcome now carries the sighting,
-    /// with where it was, for the caller to print. Still never a row.
+    /// 0, with nothing said. The run still reports what it got (Ruling
+    /// S-X), and the outcome now carries the sighting, with where it was,
+    /// for the caller to print — and, since the final review's I-1, for the
+    /// facade's exit code to count. Still never a row.
     #[test]
     fn a_mixed_run_carries_its_sightings_and_still_lists_none_of_them() {
         let mut bytes = v7_block("j.txt", 4, V7_GNU_SPELLING, *b"JUNKJUNK").to_vec();

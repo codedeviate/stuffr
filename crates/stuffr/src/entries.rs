@@ -1580,9 +1580,10 @@ pub struct SalvageOutcome {
     /// What the scanner saw and could not gate, carried through from
     /// [`stuffr_core::salvage::SalvageOutcome::sightings`] untouched. The CLI
     /// prints [`stuffr_core::salvage::describe_sightings`] of it on stderr on
-    /// every run that has any (Task 2-N): a sighting is never an entry and
-    /// never moves [`salvage_exit_code`], so without that line a mixed run
-    /// would lose an entry `stuffr list` shows in silence.
+    /// every run that has any (Task 2-N): a sighting is never an entry, so
+    /// without that line a mixed run would lose an entry `stuffr list` shows
+    /// in silence. It also raises a non-selective run's
+    /// [`salvage_exit_code`] to at least 4 (the final review's I-1).
     pub sightings: Vec<stuffr_core::salvage::Sighting>,
     /// Where a sequential-only scanner's walk stopped short of the end of
     /// the archive (`ar`, Salvage Stage 3 Task 4), carried through from
@@ -1625,10 +1626,29 @@ pub struct SalvageOutcome {
 /// 7  any entry refused by containment
 /// 3  any entry Unverified
 /// 4  any entry Unattested, any entry Partial (written or skipped), any
-///    entry skipped for any other reason, or any entry written under a
-///    disambiguated name
-/// 0  every entry Intact or Complete
+///    entry skipped for any other reason, any entry written under a
+///    disambiguated name, or any header SEEN and not gated (a sighting)
+/// 0  every entry Intact or Complete, and no sighting
 /// ```
+///
+/// **A sighting is bucket 4** — the final whole-branch review's I-1, which
+/// reverses Ruling S-X ("a sighting never moves the exit code") for this
+/// case. S-X parked it for LHA on proportionality: no writer produced the
+/// shape, and closing it needed a channel [`SalvageOutcome`] did not have.
+/// Both reasons were gone by Stage 3's end: `sightings` exists, and tar
+/// reaches it — a header with junk magic over a valid checksum, which
+/// `stuffr list` and `gtar` both read, was printed as a note at exit 0, so
+/// `salvage -C out && rm broken.tar` deleted it. A sighting is not an entry
+/// (no row, no scan position), but it IS something the run skipped.
+///
+/// **Selective runs exempt it, as they exempt `NotSelected`.** A sighting
+/// has no scan position, so an `--index` run cannot have asked for it; the
+/// run is about the positions it named. Since this function cannot see the
+/// selection, the CALLER says so: the CLI passes the selected subset with
+/// an empty `sightings` (and still prints the note). A non-selective run —
+/// `-C` over everything, or a report-only `--list` — passes them through,
+/// and exits at least 4. LHA's level-2/3 sightings are still counted flags
+/// outside this channel, so a mixed LHA run does not reach it yet.
 ///
 /// **`Unattested` is bucket 4, not 3, and that is Salvage Stage 3's own
 /// ruling** (`stuffr_core::salvage::SalvageStatus::Unattested`). It is the
@@ -1725,6 +1745,16 @@ pub fn salvage_exit_code(outcome: &SalvageOutcome) -> i32 {
             // proven (it is not `Unverified`), only its placement failed.
             | SalvageDisposition::SkippedUnwritable { .. } => any_degraded = true,
         }
+    }
+
+    // The final whole-branch review's I-1, reversing Ruling S-X for this
+    // case: a header the scan SAW and could not gate is an entry `stuffr
+    // list` may read that this run did not recover — skipped, in every sense
+    // a `salvage -C out && rm` script cares about. Bucket 4, below 3 and 7
+    // like every other skip. A selective (`--index`) caller passes a subset
+    // with no sightings: see this function's doc.
+    if !outcome.sightings.is_empty() {
+        any_degraded = true;
     }
 
     if any_unsafe_path {
@@ -5317,6 +5347,74 @@ mod salvage_tests {
              pointed is a more severe fact than one that is merely damaged, and folding it \
              into either bucket would silently retire the signal a hostile-archive script \
              already checks for"
+        );
+    }
+
+    /// The final whole-branch review's I-1, reversing Ruling S-X for this
+    /// case: a run that SAW a header it could not gate is bucket 4, not 0.
+    /// The measured shape was a tar whose middle entry carried junk magic
+    /// over a valid checksum — `stuffr list` and `gtar` both read three
+    /// entries, `salvage -C out` wrote two and exited 0, so `salvage -C out
+    /// && rm broken.tar` deleted the third. A sighting is a skipped entry in
+    /// every sense a script cares about. Only bucket 4 moves: 3 and 7 still
+    /// outrank it, and an empty run is still 5 (the scanner itself refuses
+    /// an all-sightings run at exit 3 before an outcome exists).
+    #[test]
+    fn a_sighting_raises_a_clean_run_to_bucket_four_and_no_higher() {
+        let record = |disposition: SalvageDisposition| SalvagedRecord {
+            scan_position: 0,
+            name: "x".into(),
+            status: SalvageStatus::Complete,
+            shadows: None,
+            collides_with: None,
+            marked_deleted: false,
+            disposition,
+        };
+        let seen = || {
+            vec![stuffr_core::salvage::Sighting::new(
+                FormatId::new("tar"),
+                0,
+                "header(s) of a shape this test made up",
+            )]
+        };
+        let outcome = |entries: Vec<SalvagedRecord>| SalvageOutcome {
+            entries,
+            sightings: seen(),
+            walk_stop: None,
+        };
+
+        assert_eq!(
+            salvage_exit_code(&outcome(vec![record(SalvageDisposition::Written(
+                PathBuf::from("a")
+            ))])),
+            4,
+            "a clean run that saw a header it could not gate lost an entry `list` reads"
+        );
+        assert_eq!(
+            salvage_exit_code(&outcome(vec![record(SalvageDisposition::NotWritten)])),
+            4,
+            "a report-only run over the same archive says the same thing"
+        );
+        assert_eq!(
+            salvage_exit_code(&outcome(vec![record(
+                SalvageDisposition::SkippedUnverified
+            )])),
+            3,
+            "3 still outranks the sighting's 4"
+        );
+        assert_eq!(
+            salvage_exit_code(&outcome(vec![record(
+                SalvageDisposition::SkippedUnsafePath {
+                    reason: "empty entry name"
+                }
+            )])),
+            7,
+            "7 still outranks the sighting's 4"
+        );
+        assert_eq!(
+            salvage_exit_code(&outcome(vec![])),
+            5,
+            "an empty run is still 5"
         );
     }
 

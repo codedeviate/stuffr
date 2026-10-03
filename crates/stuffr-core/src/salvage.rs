@@ -642,7 +642,9 @@ pub struct SalvageOutcome {
     /// order — see [`Sighting`]. Always empty from [`salvage_all`]: the
     /// engine cannot know what its scanner refused, so a format's own
     /// `salvage_*` entry point fills it in after the scan. A sighting is
-    /// never an entry, and never touches the run's exit code.
+    /// never an entry; the facade's `salvage_exit_code` counts a
+    /// non-selective run that has one as degraded (exit 4) since the
+    /// Salvage Stage 3 final review's I-1, which reversed Ruling S-X there.
     pub sightings: Vec<Sighting>,
     /// Where a SEQUENTIAL-ONLY scanner's walk stopped short of the end of
     /// the source, if it did — see [`WalkStop`]. Always `None` from
@@ -667,7 +669,10 @@ pub struct SalvageOutcome {
 /// Stage 3's Task 2-N it said nothing else: an entry `stuffr list` shows was
 /// simply absent from `salvage --list`, at exit 0, with an empty stderr. The
 /// sightings recorded here are what the caller prints instead
-/// ([`describe_sightings`]), in a mixed run as in any other.
+/// ([`describe_sightings`]), in a mixed run as in any other — and since the
+/// stage's final review (I-1, reversing S-X for this case) a non-selective
+/// mixed run also exits 4, not 0: a `salvage -C out && rm` script must not
+/// delete an archive holding an entry `stuffr list` reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Sighting {

@@ -764,10 +764,13 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   a real header seen a byte late; it refuses it, and a run that recovers
   nothing else says so at exit 3 rather than "nothing recoverable" —
   `stuffr list` and `stuffr unpack` still read those headers. A run that
-  DOES recover other entries keeps its ordinary exit code and names every
-  such header on stderr, with its offset (`salvage -> this build's
-  salvage scanner saw 1 tar header(s) whose magic field ... at offset(s)
-  0`); it is never a row.
+  DOES recover other entries names every such header on stderr, with its
+  offset (`salvage -> this build's salvage scanner saw 1 tar header(s)
+  whose magic field ... at offset(s) 0`), and exits 4, not 0: the header
+  is an entry `list` may read that this run did not recover, so `salvage
+  -C out && rm damaged.tar` must not go ahead. It is never a row. A run
+  narrowed with --index is about the positions it named and keeps its
+  own code; the note still prints.
 
   cpio (`newc`) records NEITHER checksum — nothing over the content and
   nothing over the header — so every cpio entry salvage recovers is
@@ -1000,7 +1003,8 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   Exit codes for a COMPLETED salvage run (see "EXIT CODES" below for the
   full table), computed over whatever `--index` selected (the whole scan
-  when it was omitted): 0 — every entry Intact or Complete. 3 — any entry
+  when it was omitted): 0 — every entry Intact or Complete, and no header
+  seen that the scan could not gate. 3 — any entry
   Unverified (an undecodable compression method, a data-descriptor entry
   with no length to reconcile against a central directory, or an entry past
   the ceiling --max-entry sets) — outranks 4 deliberately, since it usually
@@ -1013,7 +1017,9 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
   format carries neither a checksum nor a self-verifying header, so the
   entry IS written under its real name and the run says so — there is no
   flag to opt out of, and no rebuild that would change it, which is why it
-  is 4 and not 3). 5 — the scan found
+  is 4 and not 3), or — when no --index narrowed the run — any header the
+  scan saw and could not gate (named on stderr; `stuffr list` may read
+  it, and this run did not recover it). 5 — the scan found
   nothing recoverable in the archive at all, regardless of `--index`. 7 —
   any entry refused by containment (a hostile path escaping -C or -o, an
   empty entry name, a symlinked ancestor), which OUTRANKS every code above

@@ -1294,11 +1294,12 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     };
     let outcome = entries::salvage(&path, &opts)?;
 
-    // Task 2-N: a header the scanner SAW and could not gate is never a row
-    // and never moves the exit code (Ruling S-X), so this line is the only
-    // trace of it — printed on every run that has one, `--list`, `-C` and
-    // `-o` alike. Before it, a mixed run lost an entry `stuffr list` shows
-    // at exit 0 with an empty stderr. Nothing prints for a run with none.
+    // Task 2-N: a header the scanner SAW and could not gate is never a row,
+    // so this line is the only trace of WHICH header it was — printed on
+    // every run that has one, `--list`, `-C` and `-o` alike. Before it, a
+    // mixed run lost an entry `stuffr list` shows at exit 0 with an empty
+    // stderr. Nothing prints for a run with none. A non-selective run also
+    // exits at least 4 for it (the final review's I-1; see the subset below).
     if let Some(note) = stuffr::salvage::describe_sightings(&outcome.sightings) {
         eprintln!("salvage -> {note}");
     }
@@ -1357,17 +1358,26 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     // asked to recover, not the whole archive. `-o` already narrowed
     // `select` to exactly the one requested entry, so this naturally
     // matches what `finish_single_file_recovery` just reported.
-    let subset: Vec<entries::SalvagedRecord> = match &select {
-        None => outcome.entries,
-        Some(set) => outcome
-            .entries
-            .into_iter()
-            .filter(|r| set.contains(&r.scan_position))
-            .collect(),
+    //
+    // Sightings follow the same rule (the final review's I-1): a whole-
+    // archive run carries them and exits at least 4, while a selective run
+    // drops them — a sighting has no scan position, so `--index` cannot
+    // have asked for it, exactly as a `NotSelected` entry does not count.
+    // The note above has already named it either way.
+    let (subset, sightings): (Vec<entries::SalvagedRecord>, _) = match &select {
+        None => (outcome.entries, outcome.sightings),
+        Some(set) => (
+            outcome
+                .entries
+                .into_iter()
+                .filter(|r| set.contains(&r.scan_position))
+                .collect(),
+            Vec::new(),
+        ),
     };
     Ok(entries::salvage_exit_code(&entries::SalvageOutcome {
         entries: subset,
-        sightings: outcome.sightings,
+        sightings,
         walk_stop: outcome.walk_stop,
     }))
 }

@@ -11727,13 +11727,16 @@ fn v7_tar_entry(name: &str, data: &[u8], magic: &[u8; 8]) -> Vec<u8> {
 
 /// Task 2-N, N3: in a MIXED run an ungateable header used to be completely
 /// silent. `JUNKJUNK` then a healthy `ok.txt`: `list` shows two entries,
-/// and `salvage` gave one row at exit 0 with an EMPTY stderr. The exit code
-/// is right (Ruling S-X: report what was got, at its ordinary code) and
-/// stays; what was missing is the sentence saying a header was seen, where,
-/// and that `list` may read it — under `--list` and under `-C` alike. It is
-/// still never a row. A healthy archive keeps an empty stderr under `--list`
-/// (and only `-C`'s own summary line under `-C`): the note must not fire
-/// where nothing was refused.
+/// and `salvage` gave one row at exit 0 with an EMPTY stderr. Task 2-N added
+/// the sentence saying a header was seen, where, and that `list` may read
+/// it — under `--list` and under `-C` alike. It is still never a row.
+///
+/// **The exit code is 4, not 0, since the final whole-branch review's I-1**
+/// (reversing Ruling S-X for this case): the note alone left `salvage -C out
+/// && rm mixed.tar` deleting `j.txt`, which `list` reads. A healthy archive
+/// keeps exit 0 and an empty stderr under `--list` (and only `-C`'s own
+/// summary line under `-C`): neither the note nor the code may fire where
+/// nothing was refused.
 #[test]
 fn salvage_names_an_ungateable_tar_header_in_a_mixed_run() {
     let dir = tmp_dir();
@@ -11757,7 +11760,7 @@ fn salvage_names_an_ungateable_tar_header_in_a_mixed_run() {
     let out = salvage_list(&archive);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    assert_eq!(out.status.code(), Some(4), "{stdout}{stderr}");
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
     assert!(
         stdout.contains("ok.txt") && !stdout.contains("j.txt"),
@@ -11777,13 +11780,33 @@ fn salvage_names_an_ungateable_tar_header_in_a_mixed_run() {
         out_dir.to_str().unwrap(),
     ]);
     let stderr = String::from_utf8_lossy(&written.stderr);
-    assert_eq!(written.status.code(), Some(0), "{stderr}");
+    assert_eq!(written.status.code(), Some(4), "{stderr}");
     assert!(
         stderr.contains("magic field") && stderr.contains("offset(s) 0"),
         "{stderr}"
     );
     assert_eq!(std::fs::read(out_dir.join("ok.txt")).unwrap(), b"fine");
     assert!(!out_dir.join("j.txt").exists());
+
+    // An `--index`-selective run is about the positions it named, and a
+    // sighting has no position to name — the same exemption `NotSelected`
+    // has. Asking for `ok.txt` alone and getting it whole is exit 0; the
+    // note still prints, so the header is not hidden.
+    let picked_dir = dir.join("picked");
+    let picked = run_output(&[
+        "salvage",
+        "--format",
+        "tar",
+        archive.to_str().unwrap(),
+        "--index",
+        "0",
+        "-C",
+        picked_dir.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&picked.stderr);
+    assert_eq!(picked.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("magic field"), "{stderr}");
+    assert_eq!(std::fs::read(picked_dir.join("ok.txt")).unwrap(), b"fine");
 
     let out = salvage_list(&whole);
     assert_eq!(out.status.code(), Some(0));

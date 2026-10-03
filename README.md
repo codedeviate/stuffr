@@ -27,7 +27,11 @@ read list.
 > Stage 3 addition, is the one format that reaches `SalvageStatus::Complete`
 > ("every declared byte was present and the header self-verified, but the
 > format offers nothing to check the content against"): tar checksums each
-> header and never its payload, so a tar entry is never `Intact`. **`cpio`**
+> header and never its payload, so a tar entry is never `Intact`. A
+> checksum-valid tar header the scan cannot gate (a junk magic field, a v7
+> checksum spelled unlike any known writer's) is never a row: the run names
+> it on stderr with its offset and exits 4 rather than 0, because `stuffr
+> list` may read the entry this run did not recover. **`cpio`**
 > records no checksum of any kind, so a plausible-looking header found
 > mid-payload cannot be told from a real one by any evidence the format
 > carries: every cpio entry is `SalvageStatus::Unattested` — written under its
