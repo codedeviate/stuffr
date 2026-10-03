@@ -674,7 +674,9 @@ fn read_zip64_declared_index<R: Read + Seek>(
 /// The reason names the cause it can actually see: when the EOCD's two
 /// counts disagree — which a single-disk archive, the only kind `zip` opens,
 /// must never do — that self-contradiction is the cause, whichever side of
-/// the total the enumeration landed on; otherwise a shortfall is names
+/// the total the enumeration landed on, ON it included (names collapsing
+/// can bring an on-disk walk down to exactly the total, so equality proves
+/// nothing there); otherwise a shortfall is names
 /// collapsing in the crate's map. An excess with agreeing counts is not
 /// believed reachable (only a zip64 record whose total disagrees with an
 /// unsaturated plain EOCD could produce one) and is still reported rather
@@ -689,10 +691,16 @@ fn note_unreachable_records(
         return;
     }
     let enumerated = archive.len() as u64;
-    if enumerated == declared.entries {
+    // The self-contradiction is checked BEFORE the equality return (the
+    // Salvage Stage 3 final review's zip M1): `zip` walks the on-disk count
+    // and collapses repeated names, so an EOCD saying 8 on disk and 6 in
+    // total over eight records under six names enumerates exactly 6 — equal
+    // to the total, and still two records short of what the archive holds.
+    let contradicts_itself = declared.entries_on_disk != declared.entries;
+    if enumerated == declared.entries && !contradicts_itself {
         return;
     }
-    let reason = if declared.entries_on_disk != declared.entries {
+    let reason = if contradicts_itself {
         format!(
             "the end-of-central-directory record contradicts itself, declaring {} record(s) \
              in the archive but {} on its only disk",
@@ -2902,6 +2910,38 @@ mod tests {
             reason.contains("3 record(s) in the archive") && reason.contains("1 on its only disk"),
             "the reason must name the self-contradiction, not a shadowed name: {reason}"
         );
+    }
+
+    /// Salvage Stage 3 final review, zip M1: the two counts disagree AND
+    /// the enumeration happens to land on the total. Eight records under six
+    /// names, EOCD saying 8 on this disk and 6 in total: `zip` walks all
+    /// eight (the on-disk count), collapses them to six names, and six
+    /// equals the declared total — so the early `enumerated == total`
+    /// return used to skip the self-contradiction check, and `list` showed
+    /// six of eight records with "exact fidelity". The contradiction is a
+    /// fact about the index whatever the enumeration landed on.
+    #[test]
+    fn an_eocd_contradicting_itself_is_reported_even_when_the_enumeration_matches_its_total() {
+        let shadowing = build_shadowing_zip();
+        let eocd = shadowing.len() - END_OF_CENTRAL_DIR_TOTAL;
+        assert_eq!(le16(&shadowing[eocd + 8..]), 8, "fixture: 8 on this disk");
+        let bytes = with_eocd_count(&shadowing, 10, 6);
+        let ar = open_seekable(&bytes);
+        let report = ar.fidelity();
+
+        assert_eq!(
+            count_mismatch(report),
+            Some((6, 6)),
+            "a self-contradicting EOCD must be warned about even when the collapsed \
+             enumeration equals its total: {:?}",
+            report.warnings
+        );
+        let reason = count_mismatch_reason(report).unwrap();
+        assert!(
+            reason.contains("6 record(s) in the archive") && reason.contains("8 on its only disk"),
+            "{reason}"
+        );
+        assert!(!report.is_lossless());
     }
 
     // -----------------------------------------------------------------------
