@@ -51,7 +51,18 @@ read list.
 > testers, never on crates.io (`v0.7.0` is tagged but was never built from:
 > its deep fuzz found a missing zip entry-count warning, fixed in `0.7.1`).
 > `0.8.0` is a breaking bump over both: `ContainerCaps` gained a public
-> `salvage` field. **1539** tests under `--all-features`, **1474** on the
+> `salvage` field. A crates.io user coming from `0.6.1` meets the rest of
+> Stage 3's breaks too: `SalvageStatus::Unattested` (a new variant on a
+> closed enum); `testing::check_salvage_claim(&status, checked,
+> Attestation)`, which took `(status, checked)`;
+> `SalvageDisposition::SkippedUnattested`; the facade
+> `entries::SalvageOutcome`'s new public `sightings` and `walk_stop`
+> fields; and one change that **still compiles**: `SalvageScan::verify`'s
+> default answers `Unattested` (exit 4) where it answered `Complete` (exit
+> 0), so an out-of-tree scanner that never overrode it now reports less.
+> One CLI change over `0.7.1`: a `salvage` run (not `--index`-narrowed)
+> that saw a header it could not gate exits 4 where it exited 0.
+> **1539** tests under `--all-features`, **1474** on the
 > default tier — measured from this bump's own `make check`, `GATE_EXIT=0`,
 > never carried forward.
 >
