@@ -12,7 +12,7 @@ read list.
 > **Status: `stuffr salvage` covers all eight containers — `zip`, `arc`,
 > `zoo`, `lha` and `arj` since Salvage Stage 2 (`0.6.0`), and `tar`, `cpio`
 > and `ar` since Salvage Stage 3 (scanners first shipped to testers in
-> `0.7.1`; the stage completes in `0.8.0`).** `stuffr formats` says which
+> `0.7.1`; the stage completed in `0.8.0`).** `stuffr formats` says which
 > containers a build can salvage, and how far each can be trusted, in its
 > SALVAGE column: `yes` for the five that checksum an entry's content,
 > `weak` for `tar`, `cpio` and `ar`. Every one but `ar` finds its own
@@ -46,9 +46,9 @@ read list.
 > construction, not absent. A run that recovers three members of ten lists
 > three rows; that stderr note is the only sign of the other seven.
 >
-> `0.8.0` completes Salvage Stage 3 and is bumped but not yet tagged;
-> crates.io still carries `0.6.1`. `0.7.1` is tagged and on Homebrew for
-> testers, never on crates.io (`v0.7.0` is tagged but was never built from:
+> `0.8.0` completes Salvage Stage 3; it is tagged, on Homebrew, and
+> published to crates.io (all four crates). `0.7.1` is tagged and on
+> Homebrew for testers, never on crates.io (`v0.7.0` is tagged but was never built from:
 > its deep fuzz found a missing zip entry-count warning, fixed in `0.7.1`).
 > `0.8.0` is a breaking bump over both: `ContainerCaps` gained a public
 > `salvage` field. A crates.io user coming from `0.6.1` meets the rest of
