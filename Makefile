@@ -165,11 +165,15 @@ release:
 # pointer-exercising test would hide exactly the failure this target exists
 # to find. `cargo miri test` fails hard on the first unsupported operation,
 # so a newly added subprocess test shows up as a loud Miri failure and is
-# added here deliberately.
+# added here deliberately. Tests that only exercise multi-megabyte limits
+# (the 16 MiB pax ceiling) are skipped under Miri too: they don't touch the
+# unsafe regions and Miri runs them for hours.
 MIRI_SKIP = --skip system_tar_ --skip we_accept_what_system_tar_ \
             --skip every_reference_writer_ --skip system_ar_ \
             --skip we_accept_what_system_ar_ --skip require_bin \
-            --skip a_gnu_tar_sparse_archive_ --skip gnu_ar_on_mach_o_
+            --skip a_gnu_tar_sparse_archive_ --skip gnu_ar_on_mach_o_ \
+            --skip a_pax_header_past_the_ceiling_ \
+            --skip a_pax_header_inside_the_ceiling_
 # `-Zmiri-disable-isolation` because several of these tests write a real temp
 # file (tar's `by_index` test needs a genuinely seekable source, which a
 # Cursor is not, as far as `FileSource` is concerned). Isolation is Miri's
