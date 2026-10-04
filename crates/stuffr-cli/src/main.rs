@@ -211,17 +211,13 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 // name four losses on the next four lines. A count of what
                 // was actually lost is the one number here that is true, and
                 // it agrees with the list `report_fidelity` prints below it.
-                let losses = out.fidelity.warnings.len();
                 eprintln!(
                     "{} path(s) -> {} ({} -> {} bytes, {})",
                     inputs.len(),
                     out.format,
                     out.bytes_in,
                     out.bytes_out,
-                    match losses {
-                        0 => "no fidelity loss".to_string(),
-                        n => format!("{n} fidelity loss(es)"),
-                    }
+                    write_fidelity_summary(&out.fidelity)
                 );
                 // Said every run, and deliberately NOT routed through
                 // `report_fidelity`: a note is something stuffr did correctly
@@ -269,8 +265,12 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             };
             let out = ops::compress(input_of(&input), dst, &opts)?;
             eprintln!(
-                "{} -> {} ({} -> {} bytes, {} fidelity)",
-                input, out.format, out.bytes_in, out.bytes_out, out.fidelity.rung
+                "{} -> {} ({} -> {} bytes, {})",
+                input,
+                out.format,
+                out.bytes_in,
+                out.bytes_out,
+                write_fidelity_summary(&out.fidelity)
             );
             // Honoured on the single-stream path too, rather than accepted
             // and ignored — the tree's rule for a flag that would otherwise
@@ -509,7 +509,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 target.describe(),
                 out.bytes_in,
                 out.bytes_out,
-                read_fidelity_summary(&out.fidelity)
+                write_fidelity_summary(&out.fidelity)
             );
             report_fidelity(&out.fidelity, strict_fidelity)
         }
@@ -1538,6 +1538,17 @@ fn read_fidelity_summary(report: &stuffr::FidelityReport) -> String {
     match report.warnings.len() {
         0 => format!("{} fidelity", report.rung),
         n => format!("{} access, {n} fidelity loss(es)", report.rung),
+    }
+}
+
+/// The parenthesised fidelity phrase of a WRITE-side summary line (`pack`,
+/// `convert`): `no fidelity loss`, or `N fidelity loss(es)`. Never the rung —
+/// `Rung` describes the adaptive READ ladder and is a constant on a write, so
+/// it would claim `exact` / `forward-only` about something that was not read.
+fn write_fidelity_summary(report: &stuffr::FidelityReport) -> String {
+    match report.warnings.len() {
+        0 => "no fidelity loss".to_string(),
+        n => format!("{n} fidelity loss(es)"),
     }
 }
 

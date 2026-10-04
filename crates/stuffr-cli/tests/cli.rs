@@ -786,11 +786,11 @@ fn pack_writes_output_to_stdout() {
     let _ = std::fs::remove_file(&src);
 }
 
-/// Mirrors `info_over_a_pipe_reports_forward_only_not_exact`: `compress` must
-/// compute its own fidelity rung from the source's actual seekability rather
-/// than assuming `Exact`, the same way `decompress` already does.
+/// A write line says what the write LOST, in the words every write line uses.
+/// The read rung (`forward-only` over a pipe) is a claim about reading, and
+/// `info` still reports it; it must not appear on pack's summary.
 #[test]
-fn pack_over_a_pipe_reports_forward_only_not_exact() {
+fn pack_over_a_pipe_says_no_fidelity_loss_not_a_read_rung() {
     let out = tmp("pack-rung-pipe.gz");
     let _ = std::fs::remove_file(&out);
     let plain = b"payload".repeat(50);
@@ -806,18 +806,18 @@ fn pack_over_a_pipe_reports_forward_only_not_exact() {
     let result = child.wait_with_output().unwrap();
     assert!(result.status.success());
     let err_text = String::from_utf8_lossy(&result.stderr);
+    assert!(err_text.contains("no fidelity loss"), "{err_text}");
     assert!(
-        err_text.contains("forward-only"),
-        "a pipe cannot seek, so pack's reported rung must not be exact: {err_text}"
+        !err_text.contains("forward-only") && !err_text.contains("exact"),
+        "a write line makes no read-rung claim: {err_text}"
     );
 
     let _ = std::fs::remove_file(&out);
 }
 
-/// The other half of the pair above: together they prove the rung is
-/// computed rather than a constant either way.
+/// The other half of the pair above: same words from a seekable file.
 #[test]
-fn pack_of_a_seekable_file_reports_exact() {
+fn pack_of_a_seekable_file_says_no_fidelity_loss() {
     let src = tmp("pack-rung-file.txt");
     let gz = tmp("pack-rung-file.txt.gz");
     let _ = std::fs::remove_file(&gz);
@@ -831,7 +831,7 @@ fn pack_of_a_seekable_file_reports_exact() {
         .unwrap();
     assert!(out.status.success());
     let err_text = String::from_utf8_lossy(&out.stderr);
-    assert!(err_text.contains("exact"), "{err_text}");
+    assert!(err_text.contains("no fidelity loss"), "{err_text}");
 
     let _ = std::fs::remove_file(&src);
     let _ = std::fs::remove_file(&gz);
@@ -13411,16 +13411,25 @@ fn convert_refuses_stdin_redirected_from_its_own_output() {
 }
 
 #[test]
-fn convert_progress_line_carries_pack_s_fidelity_suffix() {
+fn convert_progress_line_says_what_the_write_lost_in_packs_words() {
     let (dir, a) = convert_fixture();
     let b = dir.join("b.tar.xz");
     let out = run_output(&["convert", a.to_str().unwrap(), b.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert!(
-        stderr_text(&out).contains(" bytes, exact fidelity)"),
+        stderr_text(&out).contains(" bytes, no fidelity loss)"),
         "{}",
         stderr_text(&out)
     );
+    // From stdin the READ rung is forward-only; that is not a claim about
+    // the write and must not reach its line.
+    let data = std::fs::read(&a).unwrap();
+    let c = dir.join("c.tar.xz");
+    let out = run_with_stdin_output(&["convert", "-", "-o", c.to_str().unwrap()], &data);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let err = stderr_text(&out);
+    assert!(err.contains(" bytes, no fidelity loss)"), "{err}");
+    assert!(!err.contains("forward-only"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
