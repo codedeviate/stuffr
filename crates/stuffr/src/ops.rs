@@ -1008,7 +1008,16 @@ pub struct ConvertSource {
     decoded: Box<dyn Source>,
     consumed: Arc<AtomicU64>,
     rung: Rung,
+    /// The source file's size, when it is a file: the denominator entry
+    /// mode's [`crate::entries::ArchiveBudget`] divides by. `None` on stdin,
+    /// where the running `consumed` tally stands in for it.
+    compressed_total: Option<u64>,
 }
+
+/// What a [`ConvertSource`] carries, taken apart for the write half that
+/// consumes it: the chain, the decoded source, the raw-byte tally, the raw
+/// source's rung and its size when known.
+pub(crate) type ConvertParts = (Chain, Box<dyn Source>, Arc<AtomicU64>, Rung, Option<u64>);
 
 impl ConvertSource {
     /// Opens and resolves `src` against the build's default registry.
@@ -1019,6 +1028,10 @@ impl ConvertSource {
     /// Opens and resolves `src` against `registry`.
     pub fn open_with(registry: &Registry, src: Input, memory_limit: Option<u64>) -> Result<Self> {
         let path = src.path().map(Path::to_path_buf);
+        let compressed_total = path
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len());
         let source = src.open()?;
         // From the RAW source, before anything wraps it — see `decompress_with`.
         let rung = if source.caps().seekable {
@@ -1041,12 +1054,26 @@ impl ConvertSource {
             decoded,
             consumed,
             rung,
+            compressed_total,
         })
     }
 
     /// The source's chain, as [`resolve_source_chain`] resolved it.
     pub fn chain(&self) -> &Chain {
         &self.chain
+    }
+
+    /// Takes the source apart for a write half outside this module
+    /// (`entries`' container conversion), so the chain resolved at open is
+    /// the one used — never a second detection.
+    pub(crate) fn into_parts(self) -> ConvertParts {
+        (
+            self.chain,
+            self.decoded,
+            self.consumed,
+            self.rung,
+            self.compressed_total,
+        )
     }
 }
 
@@ -1163,12 +1190,7 @@ fn write_recompressed(
     dst: Output,
     o: &RecompressOpts,
 ) -> Result<Outcome> {
-    let ConvertSource {
-        chain,
-        mut decoded,
-        consumed,
-        rung,
-    } = src;
+    let (chain, mut decoded, consumed, rung, _compressed_total) = src.into_parts();
 
     let format = match (o.codec, chain.outermost_codec(), chain.container()) {
         (Some(target), _, _) => target,

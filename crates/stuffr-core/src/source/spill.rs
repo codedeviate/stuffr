@@ -72,6 +72,15 @@ impl SpillSource {
     /// the trailing index, so it will need the whole stream regardless, and the
     /// eager path has no partially-materialized states to get wrong.
     pub fn materialize(mut src: Box<dyn Source>, policy: &SpillPolicy) -> Result<Self> {
+        Self::materialize_from(&mut *src, policy)
+    }
+
+    /// [`Self::materialize`] from any reader, borrowed: the one owner of the
+    /// spill loop and its limits, for a caller whose bytes are not a
+    /// [`Source`] — an archive entry's payload borrows its archive, so it can
+    /// be neither boxed as `'static` nor sent. `stuffr convert` buffers an
+    /// entry of unknown size through this, under the same policy.
+    pub fn materialize_from<R: Read + ?Sized>(src: &mut R, policy: &SpillPolicy) -> Result<Self> {
         let limit = policy.hard_limit();
         if !policy.is_enabled() {
             return Err(Error::SpillLimitExceeded { limit: 0 });

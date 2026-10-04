@@ -5,14 +5,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
-    ArchiveRead, Chain, ContainerCaps, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO,
-    DecodeOpts, Entry, EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields,
-    OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead,
-    Sink, Source, SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain,
+    ArchiveRead, ArchiveWrite, Chain, Codec, Container, ContainerCaps, Counting, CountingWriter,
+    CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts, Entry, EntryKind, EntryMeta, Error,
+    Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR,
+    RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source, SourceCaps, SpillPolicy,
+    SpillSource, StreamPolicy, check_symlink_target, ladder, resolve_chain,
     resolve_chain_deep_with, safe_join,
 };
 
-use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
+use crate::ops::{CompressOpts, ConvertSource, Finish, Input, Outcome, Output, discard, publish};
 
 /// Bounds decoded output for one archive, per entry and in total.
 ///
@@ -249,6 +250,26 @@ fn open_archive(
     };
     let (chain, source) =
         resolve_chain_deep_with(registry, path.as_deref(), Box::new(counting), &opts)?;
+    let (archive, container) = open_resolved(registry, &chain, source, &consumed, max_ratio)?;
+    Ok((archive, container, consumed))
+}
+
+/// The container half of [`open_archive`]: `source` is already positioned past
+/// every codec layer `chain` names, and `consumed` is the tally of raw bytes
+/// beneath it. Bounds the decoded stream with `--max-ratio`
+/// ([`RatioGuardedSource`]), then opens the container through the ladder.
+///
+/// Split out so a source resolved elsewhere — `convert`'s
+/// [`crate::ops::ConvertSource`], which resolves content-first and is opened
+/// before the mode is chosen — goes through exactly the guards every read
+/// verb has, rather than a copy of them.
+fn open_resolved(
+    registry: &Registry,
+    chain: &Chain,
+    source: Box<dyn Source>,
+    consumed: &Arc<AtomicU64>,
+    max_ratio: u64,
+) -> Result<(Box<dyn ArchiveRead>, FormatId)> {
     // Kept for the error path: once the loop below has peeled layers, the
     // original chain is the only thing that can say what the input actually
     // was.
@@ -266,10 +287,10 @@ fn open_archive(
     // lockstep — see the module's own test for this.
     let source: Box<dyn Source> = Box::new(RatioGuardedSource::new(
         source,
-        Arc::clone(&consumed),
+        Arc::clone(consumed),
         max_ratio,
     ));
-    let mut chain = &chain;
+    let mut chain = chain;
     loop {
         match chain {
             Chain::Codec { inner, .. } => chain = inner,
@@ -282,11 +303,7 @@ fn open_archive(
                 // disk.
                 let resolved =
                     ladder::resolve(source, *container, k.caps(), &StreamPolicy::default())?;
-                return Ok((
-                    k.open(resolved, &OpenOpts::default())?,
-                    *container,
-                    consumed,
-                ));
+                return Ok((k.open(resolved, &OpenOpts::default())?, *container));
             }
             // Names what the input resolved to, so "unpack this .gz" is
             // actionable rather than a bare refusal.
@@ -3006,30 +3023,11 @@ pub fn create_archive(
         )));
     }
 
-    let opened = dst.create(o.force, o.sync)?;
-    let finish = opened.finish;
-    // `CountingWriter` is innermost, closest to the file, so `bytes_out`
-    // counts the bytes that actually land on disk — compressed, when there is
-    // a codec.
-    let (counted, bytes_out) = CountingWriter::new(opened.writer);
-
-    // The sink chain, innermost first. With a codec the codec's own `Sink` IS
-    // the container's destination — never wrapped in `PlainSink`, which would
-    // compile (a `Box<dyn Sink>` is `Write + Send`) and then flush instead of
-    // finishing, dropping the codec's trailer: the very bug this composes to
-    // fix. `PlainSink` is for the bare-container case only.
-    let sink: Box<dyn Sink> = match encoder {
-        Some((c, encode)) => c.encoder(Box::new(counted), &encode)?,
-        None => PlainSink::new(Box::new(counted)),
-    };
-
-    let archive = kind.create(
-        sink,
-        &CreateOpts {
-            level: o.level,
-            ..Default::default()
-        },
-    )?;
+    let ArchiveTarget {
+        archive,
+        finish,
+        bytes_out,
+    } = create_target(kind.as_ref(), encoder, &dst, o.level, o.force, o.sync)?;
 
     // Read once, outside the closure: what this container can and cannot
     // represent decides whether a directory or symlink is written or warned
@@ -3158,12 +3156,7 @@ pub fn create_archive(
             });
         }
 
-        // Container trailer first, then the layer beneath it. `finish` hands
-        // the sink back precisely so this second call is possible; dropping
-        // it is what truncated every composed archive before Phase 2c, and is
-        // why `Sink` is `#[must_use]`.
-        let sink = archive.finish()?;
-        sink.finish()?;
+        finish_target(archive)?;
         Ok((bytes_in, warnings))
     })();
 
@@ -3193,6 +3186,408 @@ pub fn create_archive(
             Err(e)
         }
     }
+}
+
+/// What [`convert_archive`] may do beyond the defaults: the write side's
+/// encoder options (as `pack` takes them) and the read side's limits (as
+/// `unpack` takes them), in one struct because a conversion is both at once.
+#[derive(Clone, Debug)]
+pub struct ConvertOpts {
+    /// Write side — same meaning as `CompressOpts::level`.
+    pub level: Option<i32>,
+    /// Same meaning as `CompressOpts::force`: replace an existing destination.
+    pub force: bool,
+    /// Same meaning as `CompressOpts::sync`.
+    pub sync: bool,
+    /// Write side — same meaning as `CompressOpts::allow_weak_encoder`.
+    pub allow_weak_encoder: bool,
+    /// Write side — same meaning as `CompressOpts::threads`.
+    pub threads: Option<usize>,
+    /// Write side — same meaning as `CompressOpts::turbo`.
+    pub turbo: bool,
+    /// Read side — same meaning as `ExtractOpts::max_ratio`: per entry and
+    /// for the archive's running total ([`ArchiveBudget`]), and for the codec
+    /// layers beneath the source container.
+    pub max_ratio: u64,
+    /// Read side — the cap every source codec layer's decoder is built under
+    /// (when the source is opened here; a [`ConvertSource`] fixed its own at
+    /// open). Also the memory bound the write side's governor is resolved
+    /// against, as `CompressOpts::memory_limit` is.
+    pub memory_limit: Option<u64>,
+    /// How an entry with no declared size is buffered before it is
+    /// written. The CLI passes `SpillPolicy::default()`.
+    pub spill: SpillPolicy,
+}
+
+impl Default for ConvertOpts {
+    fn default() -> Self {
+        Self {
+            level: None,
+            force: false,
+            sync: true,
+            allow_weak_encoder: false,
+            threads: None,
+            turbo: false,
+            max_ratio: DEFAULT_MAX_RATIO,
+            memory_limit: None,
+            spill: SpillPolicy::default(),
+        }
+    }
+}
+
+impl ConvertOpts {
+    /// The write side, spelled as the `CompressOpts` that
+    /// [`crate::ops::checked_encoder`] reads — so the encoder is built by
+    /// the one owner of those rules rather than a copy of them.
+    fn write_side(&self, codec: Option<FormatId>) -> CompressOpts {
+        CompressOpts {
+            format: codec,
+            level: self.level,
+            force: self.force,
+            sync: self.sync,
+            allow_weak_encoder: self.allow_weak_encoder,
+            threads: self.threads,
+            turbo: self.turbo,
+            memory_limit: self.memory_limit,
+        }
+    }
+}
+
+/// Converts the archive in `src` into a `container` archive at `dst`,
+/// optionally through `codec`, using the build's default registry. See
+/// [`convert_archive_with`].
+pub fn convert_archive(
+    src: Input,
+    dst: Output,
+    container: FormatId,
+    codec: Option<FormatId>,
+    o: &ConvertOpts,
+) -> Result<Outcome> {
+    convert_archive_with(crate::registry(), src, dst, container, codec, o)
+}
+
+/// Converts the archive in `src` into a `container` archive at `dst`,
+/// optionally through `codec` (`.zip` → `.tar.xz`), consulting `registry`.
+///
+/// Opens the source as a [`ConvertSource`] — content-first, the rule `stuffr
+/// convert`'s mode selection shares — and hands it to
+/// [`convert_archive_source_with`]; there is one code path.
+///
+/// Every entry the source yields is planned by the same helper `pack` uses
+/// (`plan_entry_write`): what the target has no shape for — a directory in an
+/// `ar`, a symlink, a device or fifo — is skipped with `pack`'s own warning,
+/// and an entry with no ownership is reported. Names are copied verbatim:
+/// nothing is extracted, so path containment does not apply, and `unpack`
+/// refuses a `../x` later exactly as it would from the source. Duplicate
+/// names are kept in source order wherever the target's writer accepts them;
+/// a writer that refuses a name (zip refuses a duplicate) refuses it exactly
+/// as for `pack`.
+///
+/// # Errors
+///
+/// The read side's vocabulary as `unpack` has it — corrupt source exit 5, a
+/// ratio, memory or spill limit exit 6 — plus: a payload that does not
+/// deliver the size its header declared is [`Error::Corrupt`], never padded
+/// or truncated. On any error the destination is left as it was.
+pub fn convert_archive_with(
+    registry: &Registry,
+    src: Input,
+    dst: Output,
+    container: FormatId,
+    codec: Option<FormatId>,
+    o: &ConvertOpts,
+) -> Result<Outcome> {
+    // Before the source is opened, as in `create_archive`: a target this
+    // build cannot write, a rejected level or an unconsented weak encoder
+    // must cost nothing.
+    check_convert_target_with(registry, container, codec, o)?;
+    let source = ConvertSource::open_with(registry, src, o.memory_limit)?;
+    convert_archive_source_with(registry, source, dst, container, codec, o)
+}
+
+/// [`convert_archive`] from a source already opened with
+/// [`ConvertSource::open`] — what `stuffr convert` does, since it must read
+/// the source's chain to choose a mode and stdin cannot be opened twice.
+pub fn convert_archive_source(
+    src: ConvertSource,
+    dst: Output,
+    container: FormatId,
+    codec: Option<FormatId>,
+    o: &ConvertOpts,
+) -> Result<Outcome> {
+    convert_archive_source_with(crate::registry(), src, dst, container, codec, o)
+}
+
+/// Refuses, before any input is opened, a target [`convert_archive`] could
+/// not write: a container or codec this build cannot write (exit 3), a level
+/// out of range or an unconsented weak encoder (exit 2). Against the build's
+/// default registry; see [`check_convert_target_with`].
+pub fn check_convert_target(
+    container: FormatId,
+    codec: Option<FormatId>,
+    o: &ConvertOpts,
+) -> Result<()> {
+    check_convert_target_with(crate::registry(), container, codec, o)
+}
+
+/// [`check_convert_target`] against `registry`. A caller that opens a
+/// [`ConvertSource`] first calls it BEFORE the open, so a usage error costs
+/// no read of the input; [`convert_archive_source_with`] checks again itself.
+pub fn check_convert_target_with(
+    registry: &Registry,
+    container: FormatId,
+    codec: Option<FormatId>,
+    o: &ConvertOpts,
+) -> Result<()> {
+    convert_target(registry, container, codec, o).map(|_| ())
+}
+
+/// The target container's writer and its codec's checked encoder.
+type ConvertTarget<'r> = (
+    &'r Arc<dyn Container>,
+    Option<(&'r Arc<dyn Codec>, EncodeOpts)>,
+);
+
+/// The ONE place a conversion's target is checked: `require_container_writer`
+/// (a read-only container is refused by the registry), then
+/// [`crate::ops::checked_encoder`] for the codec.
+fn convert_target<'r>(
+    registry: &'r Registry,
+    container: FormatId,
+    codec: Option<FormatId>,
+    o: &ConvertOpts,
+) -> Result<ConvertTarget<'r>> {
+    let kind = registry.require_container_writer(container)?;
+    let encoder = match codec {
+        Some(id) => Some(crate::ops::checked_encoder(
+            registry,
+            id,
+            &o.write_side(codec),
+        )?),
+        None => None,
+    };
+    Ok((kind, encoder))
+}
+
+/// [`convert_archive_source`] against `registry` — the same registry the
+/// source was opened with, which is the caller's to keep consistent.
+///
+/// The source container is opened through the read verbs' own guards
+/// (`open_resolved`: the ratio guard over the decoded stream, then the
+/// ladder) BEFORE the destination is created, so a source that is not an
+/// archive, or whose container header is corrupt, leaves nothing behind.
+///
+/// # What `Outcome` reports
+///
+/// `format` is `container`. `bytes_in` is the payload bytes read from the
+/// source's entries — what `pack` reports for the files it read — not the
+/// raw source size: a seekable zip is read through `as_seek`, which no
+/// counter beneath it sees. `bytes_out` is what reached the destination.
+/// `fidelity` is the source reader's own report (its rung, and any warning it
+/// raised — a shadowed zip record, say) merged with the write side's
+/// warnings, so `--strict-fidelity` judges both.
+pub fn convert_archive_source_with(
+    registry: &Registry,
+    src: ConvertSource,
+    dst: Output,
+    container: FormatId,
+    codec: Option<FormatId>,
+    o: &ConvertOpts,
+) -> Result<Outcome> {
+    let (kind, encoder) = convert_target(registry, container, codec, o)?;
+    // The rung is the RAW source's; the container's own report, from the
+    // ladder that actually opened it, is the one that describes this read.
+    let (chain, decoded, consumed, _raw_rung, compressed_total) = src.into_parts();
+    let (mut ar, _source_container) =
+        open_resolved(registry, &chain, decoded, &consumed, o.max_ratio)?;
+    let mut budget = ArchiveBudget::new(compressed_total, o.max_ratio).tracking(consumed);
+
+    let ArchiveTarget {
+        archive,
+        finish,
+        bytes_out,
+    } = create_target(kind.as_ref(), encoder, &dst, o.level, o.force, o.sync)?;
+    let caps = kind.caps();
+
+    let result = (|| -> Result<(u64, Vec<Fidelity>)> {
+        let mut archive = archive;
+        let moved = convert_entries(
+            ar.as_mut(),
+            archive.as_mut(),
+            &caps,
+            container,
+            &mut budget,
+            &o.spill,
+        )?;
+        finish_target(archive)?;
+        Ok(moved)
+    })();
+
+    match result {
+        Ok((bytes_in, warnings)) => {
+            publish(finish)?;
+            let mut fidelity = ar.fidelity().clone();
+            fidelity.merge(&FidelityReport {
+                rung: Rung::Exact,
+                warnings,
+            });
+            Ok(Outcome {
+                bytes_in,
+                bytes_out: bytes_out.load(Ordering::Relaxed),
+                format: container,
+                fidelity,
+                notes: Vec::new(),
+            })
+        }
+        Err(e) => {
+            discard(finish);
+            Err(e)
+        }
+    }
+}
+
+/// Moves every entry `ar` yields into `archive`, returning the payload bytes
+/// moved and the write side's warnings. Finishes nothing: the caller owns the
+/// trailer and the publish.
+fn convert_entries(
+    ar: &mut dyn ArchiveRead,
+    archive: &mut dyn ArchiveWrite,
+    caps: &ContainerCaps,
+    container: FormatId,
+    budget: &mut ArchiveBudget,
+    spill: &SpillPolicy,
+) -> Result<(u64, Vec<Fidelity>)> {
+    let mut moved = 0u64;
+    let mut warnings = Vec::new();
+    while let Some(mut entry) = ar.next_entry()? {
+        let mut meta = entry.meta().clone();
+        if let WritePlan::Skip = plan_entry_write(caps, container, &meta, &mut warnings) {
+            // Unread: the reader drains (or seeks past) an entry the caller
+            // did not consume, as it does for `list`.
+            continue;
+        }
+        match &meta.kind {
+            EntryKind::File => {
+                moved += write_payload(entry.reader(), &mut meta, archive, budget, spill)?;
+            }
+            // `plan_entry_write` writes only a file, a directory or a
+            // symlink, so this is the latter two. Neither has a payload to
+            // frame: a symlink's target travels in `meta.kind`, and zip and
+            // cpio, which read the target as the entry's payload, already
+            // did so and hand over an empty reader — whose declared size
+            // (the target's length) must never be held to a length guard.
+            _ => archive.add(&meta, &mut std::io::empty())?,
+        }
+    }
+    Ok((moved, warnings))
+}
+
+/// Writes one file entry's payload into `archive`, returning its length.
+///
+/// A declared size streams straight through, held to exactly that length
+/// ([`EntryPayload`]). No declared size: the payload is buffered under
+/// `spill` (in memory, then a temp file, within the policy's limits) so the
+/// writer — every container here puts the size in a header BEFORE the data —
+/// is handed an exact size and a fresh reader. `SpillPolicy::Off`, or a
+/// payload past the policy's limit, is [`Error::SpillLimitExceeded`] (exit 6).
+fn write_payload(
+    reader: &mut dyn Read,
+    meta: &mut EntryMeta,
+    archive: &mut dyn ArchiveWrite,
+    budget: &mut ArchiveBudget,
+    spill: &SpillPolicy,
+) -> Result<u64> {
+    let name = meta.name.clone();
+    let mut payload = EntryPayload::new(reader, &name, budget, meta.size);
+    match meta.size {
+        Some(_) => {
+            let added = archive.add(meta, &mut payload);
+            payload.settle(added)?;
+            payload.verify_end()?;
+        }
+        None => {
+            let buffered = SpillSource::materialize_from(&mut payload, spill);
+            let mut buffered = payload.settle(buffered)?;
+            meta.size = Some(payload.delivered);
+            archive.add(meta, &mut buffered)?;
+        }
+    }
+    Ok(payload.delivered)
+}
+
+/// A container writer over its destination, created and not yet finished.
+struct ArchiveTarget {
+    archive: Box<dyn ArchiveWrite>,
+    /// What `publish` or `discard` needs once the writing is over.
+    finish: Option<Finish>,
+    /// Bytes that reached the destination, counted beneath any codec.
+    bytes_out: Arc<AtomicU64>,
+}
+
+/// The write side of every archive this module creates — `pack`'s and
+/// `convert`'s alike: the destination (a temp file beside it), then the
+/// codec's encoder sink or a [`PlainSink`], then `container.create` on top.
+///
+/// `encoder` is [`crate::ops::checked_encoder`]'s answer, obtained BEFORE
+/// this is called, so a refused level or an unconsented weak encoder costs
+/// nothing. If the encoder or the container cannot be built once the
+/// destination exists, the temp file is discarded here; after a successful
+/// return the caller owns `finish` and must `publish` or `discard` it.
+fn create_target(
+    kind: &dyn Container,
+    encoder: Option<(&Arc<dyn Codec>, EncodeOpts)>,
+    dst: &Output,
+    level: Option<i32>,
+    force: bool,
+    sync: bool,
+) -> Result<ArchiveTarget> {
+    let opened = dst.create(force, sync)?;
+    let finish = opened.finish;
+    // `CountingWriter` is innermost, closest to the file, so `bytes_out`
+    // counts the bytes that actually land on disk — compressed, when there is
+    // a codec.
+    let (counted, bytes_out) = CountingWriter::new(opened.writer);
+
+    let built = (move || {
+        // The sink chain, innermost first. With a codec the codec's own
+        // `Sink` IS the container's destination — never wrapped in
+        // `PlainSink`, which would compile (a `Box<dyn Sink>` is `Write +
+        // Send`) and then flush instead of finishing, dropping the codec's
+        // trailer: the very bug this composes to fix. `PlainSink` is for the
+        // bare-container case only.
+        let sink: Box<dyn Sink> = match encoder {
+            Some((c, encode)) => c.encoder(Box::new(counted), &encode)?,
+            None => PlainSink::new(Box::new(counted)),
+        };
+        kind.create(
+            sink,
+            &CreateOpts {
+                level,
+                ..Default::default()
+            },
+        )
+    })();
+
+    match built {
+        Ok(archive) => Ok(ArchiveTarget {
+            archive,
+            finish,
+            bytes_out,
+        }),
+        Err(e) => {
+            discard(finish);
+            Err(e)
+        }
+    }
+}
+
+/// Container trailer first, then the layer beneath it. `finish` hands the
+/// sink back precisely so this second call is possible; dropping it is what
+/// truncated every composed archive before Phase 2c, and is why `Sink` is
+/// `#[must_use]`.
+fn finish_target(archive: Box<dyn ArchiveWrite>) -> Result<()> {
+    let sink = archive.finish()?;
+    sink.finish()
 }
 
 /// Delivers **exactly** the number of bytes an entry's header already
@@ -3811,22 +4206,185 @@ fn create_symlink(link_target: &str, at: &Path) -> Result<()> {
 /// the ratio guard beneath the container as `ResourceLimit` (exit 6). A
 /// failed WRITE is the destination's fault and stays `Error::Io`, which is
 /// what lets `stuffr cat … | head` map a `BrokenPipe` to a clean exit.
+/// Both read-side rules live in [`EntryPayload`], which `convert` reads
+/// through too.
 fn copy_charging(
     src: &mut dyn Read,
     dst: &mut dyn Write,
     entry: &str,
     budget: &mut ArchiveBudget,
 ) -> Result<u64> {
+    let mut payload = EntryPayload::new(src, entry, budget, None);
     let mut buf = vec![0u8; 64 * 1024];
-    let mut total = 0u64;
     loop {
-        let n = src.read(&mut buf).map_err(Error::from_decode_io)?;
+        let n = match payload.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => return payload.settle(Err(Error::from(e))),
+        };
         if n == 0 {
-            return Ok(total);
+            return Ok(payload.delivered);
         }
-        budget.charge(entry, n as u64)?;
         dst.write_all(&buf[..n])?;
-        total += n as u64;
+    }
+}
+
+/// An entry's payload as a `Read`, under the read side's rules: every byte is
+/// charged to the [`ArchiveBudget`] as it passes, a failed read is the
+/// archive's fault ([`Error::from_decode_io`]), and — when `declared` is
+/// given — exactly that many bytes are delivered or the entry is `Corrupt`.
+///
+/// The one owner of those rules for every verb that reads a payload:
+/// [`copy_charging`] (`cat`, `test`, `unpack`) reads with `declared: None`,
+/// and `convert` hands it to a target container's writer with the source
+/// header's size.
+///
+/// # Why errors are kept as well as raised
+///
+/// A `Read` can only fail with an `io::Error`, and a container writer
+/// reading from this may wrap that error in its own type (`zip`'s
+/// `ZipError::Io`) or remap it. So the typed [`Error`] is stashed when it is
+/// raised, and the caller takes it back with [`Self::settle`] whatever the
+/// writer returned: a budget refusal stays exit 6 and a short payload stays
+/// exit 5 however many layers it crossed. The raised `io::Error` is marked
+/// decode-side as well, so a bare `?` on the way up classifies it the same.
+///
+/// # Size disagreements are never repaired
+///
+/// A payload shorter than its header declared is `Corrupt`, never padded; a
+/// longer one is `Corrupt` too (detected by reading one byte past the
+/// declared end), never silently clipped. That is the opposite of
+/// [`ExactLength`], on purpose: there a live FILE changed under the walk and
+/// the archive being written can still be framed honestly with a warning;
+/// here the SOURCE ARCHIVE contradicts itself, and there is nothing honest to
+/// write.
+struct EntryPayload<'a> {
+    inner: &'a mut dyn Read,
+    entry: &'a str,
+    budget: &'a mut ArchiveBudget,
+    declared: Option<u64>,
+    /// Bytes handed out so far.
+    delivered: u64,
+    /// Whether the byte past `declared` has been looked for.
+    end_checked: bool,
+    /// The typed error behind the first failure raised; see the type's doc.
+    failure: Option<Error>,
+}
+
+impl<'a> EntryPayload<'a> {
+    fn new(
+        inner: &'a mut dyn Read,
+        entry: &'a str,
+        budget: &'a mut ArchiveBudget,
+        declared: Option<u64>,
+    ) -> Self {
+        Self {
+            inner,
+            entry,
+            budget,
+            declared,
+            delivered: 0,
+            end_checked: false,
+            failure: None,
+        }
+    }
+
+    /// Stashes `e` and returns the `io::Error` a reader must raise for it.
+    fn fail(&mut self, kind: std::io::ErrorKind, e: Error) -> std::io::Error {
+        let raised =
+            stuffr_core::source::mark_decode_side(std::io::Error::new(kind, e.to_string()));
+        if self.failure.is_none() {
+            self.failure = Some(e);
+        }
+        raised
+    }
+
+    /// The payload's own failure, when it raised one, over whatever `r` says
+    /// — even an `Ok`: a writer that swallowed the error must not turn a
+    /// corrupt entry into a written one.
+    fn settle<T>(&mut self, r: Result<T>) -> Result<T> {
+        match self.failure.take() {
+            Some(e) => Err(e),
+            None => r,
+        }
+    }
+
+    /// After the writer is done: the declared length must have been met and
+    /// not exceeded, whether or not the writer read to the end itself.
+    fn verify_end(&mut self) -> Result<()> {
+        let mut probe = [0u8; 1];
+        while self.read(&mut probe).map_err(Error::from)? > 0 {}
+        self.settle(Ok(()))
+    }
+
+    fn short(&mut self, declared: u64) -> std::io::Error {
+        let e = Error::Corrupt(format!(
+            "entry `{}` declares {declared} bytes but its payload ends after {}",
+            self.entry, self.delivered
+        ));
+        self.fail(std::io::ErrorKind::InvalidData, e)
+    }
+
+    fn long(&mut self, declared: u64) -> std::io::Error {
+        let e = Error::Corrupt(format!(
+            "entry `{}` declares {declared} bytes but its payload carries more",
+            self.entry
+        ));
+        self.fail(std::io::ErrorKind::InvalidData, e)
+    }
+}
+
+impl Read for EntryPayload<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(std::io::Error::other("entry payload already failed"));
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let want = match self.declared {
+            Some(declared) if self.delivered >= declared => {
+                if !self.end_checked {
+                    self.end_checked = true;
+                    let mut probe = [0u8; 1];
+                    let extra = match self.inner.read(&mut probe) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            let kind = e.kind();
+                            return Err(self.fail(kind, Error::from_decode_io(e)));
+                        }
+                    };
+                    if extra > 0 {
+                        return Err(self.long(declared));
+                    }
+                }
+                return Ok(0);
+            }
+            Some(declared) => usize::try_from(declared - self.delivered)
+                .unwrap_or(usize::MAX)
+                .min(buf.len()),
+            None => buf.len(),
+        };
+        let n = match self.inner.read(&mut buf[..want]) {
+            Ok(n) => n,
+            Err(e) => {
+                let kind = e.kind();
+                return Err(self.fail(kind, Error::from_decode_io(e)));
+            }
+        };
+        if n == 0 {
+            if let Some(declared) = self.declared {
+                return Err(self.short(declared));
+            }
+            return Ok(0);
+        }
+        // Charged from bytes ACTUALLY read, never from the declared size.
+        // `OutOfMemory` is the kind `Error::from_decode_io` maps to
+        // `ResourceLimit`, should the stash ever be bypassed.
+        if let Err(e) = self.budget.charge(self.entry, n as u64) {
+            return Err(self.fail(std::io::ErrorKind::OutOfMemory, e));
+        }
+        self.delivered += n as u64;
+        Ok(n)
     }
 }
 
@@ -6521,5 +7079,253 @@ mod salvage_strict_tests {
         let mut by_disposition_alone = outcome;
         by_disposition_alone.entries[0].status = SalvageStatus::Complete;
         assert_eq!(salvage_exit_code(&by_disposition_alone), 4);
+    }
+}
+
+/// `convert_entries` against a hand-rolled reader, for what no registered
+/// container yields: an entry with no declared size (the spill path), and a
+/// payload that disagrees with its declared size WITHOUT the reader noticing
+/// (every real reader here checks its own framing first, so an end-to-end
+/// test of a cut archive never reaches [`EntryPayload`]'s own check).
+///
+/// The writer is the real `tar` from the build's registry, so what is
+/// asserted is what lands in an archive, read back through `cat`.
+#[cfg(all(test, feature = "tar"))]
+mod convert_tests {
+    use super::*;
+
+    /// Entries as `(meta, payload)`, yielded in order.
+    struct Scripted {
+        entries: std::collections::VecDeque<(EntryMeta, Vec<u8>)>,
+        report: FidelityReport,
+    }
+
+    impl Scripted {
+        fn new(entries: Vec<(EntryMeta, Vec<u8>)>) -> Self {
+            Self {
+                entries: entries.into(),
+                report: FidelityReport::new(Rung::Exact),
+            }
+        }
+    }
+
+    impl ArchiveRead for Scripted {
+        fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+            Ok(self
+                .entries
+                .pop_front()
+                .map(|(meta, payload)| Entry::new(meta, Box::new(std::io::Cursor::new(payload)))))
+        }
+
+        fn by_index(&mut self, _index: usize) -> Result<Entry<'_>> {
+            Err(Error::Unsupported("scripted reader has no index".into()))
+        }
+
+        fn fidelity(&self) -> &FidelityReport {
+            &self.report
+        }
+    }
+
+    fn file(name: &str, size: Option<u64>) -> EntryMeta {
+        EntryMeta {
+            name: name.into(),
+            size,
+            uid: Some(1000),
+            gid: Some(1000),
+            ..Default::default()
+        }
+    }
+
+    fn scratch() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "stuffr-convert-unit-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Converts `entries` into a tar at a fresh path under `budget` and
+    /// `spill`, returning the tar's path on success.
+    fn convert(
+        entries: Vec<(EntryMeta, Vec<u8>)>,
+        budget: &mut ArchiveBudget,
+        spill: &SpillPolicy,
+    ) -> Result<PathBuf> {
+        let tar = FormatId::new("tar");
+        let kind = crate::registry().require_container_writer(tar).unwrap();
+        let out = scratch().join("out.tar");
+        let file = std::fs::File::create(&out).unwrap();
+        let mut archive = kind
+            .create(PlainSink::new(Box::new(file)), &CreateOpts::default())
+            .unwrap();
+        let mut ar = Scripted::new(entries);
+        convert_entries(&mut ar, archive.as_mut(), &kind.caps(), tar, budget, spill)?;
+        finish_target(archive)?;
+        Ok(out)
+    }
+
+    fn budget() -> ArchiveBudget {
+        ArchiveBudget::new(None, DEFAULT_MAX_RATIO).tracking(Arc::new(AtomicU64::new(u64::MAX)))
+    }
+
+    fn payload_of(tar: &Path, index: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        cat(
+            Input::Path(tar.to_path_buf()),
+            &Selection::Indices(vec![index]),
+            DEFAULT_MAX_RATIO,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        out
+    }
+
+    fn bytes(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn an_entry_with_no_declared_size_is_buffered() {
+        let big = bytes(64 * 1024);
+        let tar = convert(
+            vec![
+                (file("unsized.bin", None), big.clone()),
+                (file("after.txt", Some(5)), b"after".to_vec()),
+            ],
+            &mut budget(),
+            &SpillPolicy::Memory { cap: 1024 * 1024 },
+        )
+        .unwrap();
+
+        let (listed, _) = list(Input::Path(tar.clone()), DEFAULT_MAX_RATIO, None).unwrap();
+        assert_eq!(
+            listed[0].size,
+            Some(big.len() as u64),
+            "measured, then declared"
+        );
+        assert_eq!(payload_of(&tar, 0), big);
+        assert_eq!(
+            payload_of(&tar, 1),
+            b"after",
+            "the next entry is framed correctly"
+        );
+    }
+
+    #[test]
+    fn an_entry_past_the_memory_cap_spills_to_a_temp_file() {
+        let big = bytes(64 * 1024);
+        let tar = convert(
+            vec![(file("unsized.bin", None), big.clone())],
+            &mut budget(),
+            &SpillPolicy::Temp {
+                dir: None,
+                mem_cap: 1024,
+                max: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        assert_eq!(payload_of(&tar, 0), big);
+    }
+
+    #[test]
+    fn buffering_is_refused_when_spill_is_off() {
+        let err = convert(
+            vec![(file("unsized.bin", None), bytes(10))],
+            &mut budget(),
+            &SpillPolicy::Off,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::SpillLimitExceeded { limit: 0 }),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 6);
+    }
+
+    #[test]
+    fn buffering_past_the_spill_limit_is_exit_6() {
+        let err = convert(
+            vec![(file("unsized.bin", None), bytes(64 * 1024))],
+            &mut budget(),
+            &SpillPolicy::Memory { cap: 1024 },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::SpillLimitExceeded { limit: 1024 }),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 6);
+    }
+
+    #[test]
+    fn a_payload_shorter_than_declared_is_corrupt_never_padded() {
+        let err = convert(
+            vec![(file("short.txt", Some(10)), b"four".to_vec())],
+            &mut budget(),
+            &SpillPolicy::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+        assert!(err.to_string().contains("short.txt"), "{err}");
+    }
+
+    #[test]
+    fn a_payload_longer_than_declared_is_corrupt_never_clipped() {
+        let err = convert(
+            vec![(file("long.txt", Some(4)), b"four and then some".to_vec())],
+            &mut budget(),
+            &SpillPolicy::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+        assert!(err.to_string().contains("long.txt"), "{err}");
+    }
+
+    /// The budget's refusal crosses the target writer as an `io::Error` and
+    /// must come out the other side as the resource limit it was.
+    #[test]
+    fn the_expansion_budget_is_charged_as_payload_crosses_into_the_writer() {
+        let mut tight = ArchiveBudget::new(Some(1), 1);
+        let err = convert(
+            vec![(
+                file("bomb.bin", Some(2 * 1024 * 1024)),
+                vec![0u8; 2 * 1024 * 1024],
+            )],
+            &mut tight,
+            &SpillPolicy::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+        assert!(err.to_string().contains("bomb.bin"), "{err}");
+    }
+
+    /// `copy_charging` reads through the same adapter now; its two
+    /// classifications must be what they were.
+    #[test]
+    fn copy_charging_still_classifies_a_failed_read_as_the_archives_fault() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "bad block",
+                ))
+            }
+        }
+        let err = copy_charging(&mut Broken, &mut std::io::sink(), "x", &mut budget()).unwrap_err();
+        assert!(
+            matches!(err, Error::Corrupt(ref m) if m == "bad block"),
+            "{err:?}"
+        );
+
+        let mut tight = ArchiveBudget::new(Some(1), 1);
+        let mut big = std::io::Cursor::new(vec![0u8; 2 * 1024 * 1024]);
+        let err = copy_charging(&mut big, &mut std::io::sink(), "y", &mut tight).unwrap_err();
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
     }
 }
