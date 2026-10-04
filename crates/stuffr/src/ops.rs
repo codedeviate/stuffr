@@ -500,6 +500,9 @@ fn resolved_budget_inner(o: &CompressOpts, env: Option<usize>) -> Option<Arc<Gov
 pub struct Outcome {
     pub bytes_in: u64,
     pub bytes_out: u64,
+    /// The outermost format of the output. For `recompress` writing a bare
+    /// stream with no codec and no container, the source codec that was
+    /// removed.
     pub format: FormatId,
     pub fidelity: FidelityReport,
     /// Things the caller should be TOLD but which cost no fidelity — so
@@ -903,6 +906,7 @@ pub struct RecompressOpts {
     pub codec: Option<FormatId>,
     /// Write side — same meaning as `CompressOpts::level`.
     pub level: Option<i32>,
+    /// Same meaning as `CompressOpts::force`: replace an existing destination.
     pub force: bool,
     /// Same meaning as `CompressOpts::sync` / `DecompressOpts::sync`.
     pub sync: bool,
@@ -955,6 +959,34 @@ impl RecompressOpts {
     }
 }
 
+/// Resolves the chain of a conversion's source: **content first**, the path
+/// only as a fallback.
+///
+/// This is the single owner of convert's source-chain rule; the library's
+/// `recompress` and the CLI's mode selection must both go through it so they
+/// cannot disagree. A path that names a compound chain (`x.tar.gz`) is trusted
+/// by `resolve_chain` for the layers beneath the outer codec, and a conversion
+/// never parses the container to catch the lie, so a misnamed file would be
+/// "converted" with a codec layer left in. Resolving with no path makes every
+/// layer a matter of magic. Only when content alone cannot name the outer
+/// format (brotli and raw deflate have no magic; a zip/apk tie) is the path
+/// consulted, as the same extension fallback `unpack` uses.
+///
+/// Returns the chain and the source decoded through every codec layer.
+pub fn resolve_source_chain(
+    registry: &Registry,
+    path: Option<&Path>,
+    src: Box<dyn Source>,
+    opts: &DecodeOpts,
+) -> Result<(Chain, Box<dyn Source>)> {
+    let (prefix, src) = stuffr_core::probe(src)?;
+    let hint = match stuffr_core::resolve_chain(registry, None, &prefix) {
+        Ok(_) => None,
+        Err(_) => path,
+    };
+    stuffr_core::resolve_chain_deep_with(registry, hint, src, opts)
+}
+
 /// Converts `src`'s compression to `o.codec`, using the build's default
 /// registry. See [`recompress_with`].
 pub fn recompress(src: Input, dst: Output, o: &RecompressOpts) -> Result<Outcome> {
@@ -964,8 +996,7 @@ pub fn recompress(src: Input, dst: Output, o: &RecompressOpts) -> Result<Outcome
 /// Converts `src`'s compression to `o.codec`, consulting `registry` rather
 /// than the build's default.
 ///
-/// The source's chain is resolved **by content**, as `unpack` does
-/// (`resolve_chain_deep_with`), and **every** codec layer is peeled: a `.gz`
+/// The source's chain is resolved **by content** ([`resolve_source_chain`]), and **every** codec layer is peeled: a `.gz`
 /// over an `.xz` decodes fully. At most one codec is written — the write side
 /// is one codec deep, as in `pack`. Whatever lies beneath the codec layers (a
 /// container, or a plain stream) is never parsed and is copied byte for byte,
@@ -984,10 +1015,10 @@ pub fn recompress(src: Input, dst: Output, o: &RecompressOpts) -> Result<Outcome
 /// # What `Outcome` reports
 ///
 /// `bytes_in` is the raw source bytes read; `bytes_out` the bytes written.
-/// `format` is the target codec, or with `codec: None` the format beneath the
-/// peeled layers: the container if there is one, else — for a plain stream —
-/// the outermost source codec, which is what [`decompress`] reports for the
-/// same input.
+/// `format` is the outermost format of the output: the target codec, or with
+/// `codec: None` the container beneath the peeled layers. When the output is
+/// a bare stream with no codec and no container, it is the source codec that
+/// was removed (what [`decompress`] reports for the same input).
 ///
 /// # Errors
 ///
@@ -1028,12 +1059,8 @@ pub fn recompress_with(
         memory_limit: o.memory_limit,
         ..Default::default()
     };
-    let (chain, mut decoded) = stuffr_core::resolve_chain_deep_with(
-        registry,
-        path.as_deref(),
-        Box::new(counting),
-        &decode_opts,
-    )?;
+    let (chain, mut decoded) =
+        resolve_source_chain(registry, path.as_deref(), Box::new(counting), &decode_opts)?;
 
     let format = match (o.codec, chain.outermost_codec(), chain.container()) {
         (Some(target), _, _) => target,
