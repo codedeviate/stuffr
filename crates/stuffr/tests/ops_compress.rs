@@ -997,3 +997,73 @@ fn an_explicit_count_is_honoured_and_memory_still_binds() {
         "memory must still clamp"
     );
 }
+
+/// `compress` computes its fidelity rung from the SOURCE's seekability rather
+/// than assuming `Exact`. `Input::Stdin` is the library's only non-seekable
+/// source, and a test process's own stdin is whatever the runner inherited, so
+/// the test re-runs itself as a child with a real pipe on stdin and does the
+/// asserting there.
+#[test]
+fn compress_from_a_pipe_reports_a_forward_only_rung() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    use stuffr::Rung;
+
+    const CHILD: &str = "STUFFR_TEST_RUNG_PIPE_CHILD";
+    const NAME: &str = "compress_from_a_pipe_reports_a_forward_only_rung";
+
+    if let Ok(dst) = std::env::var(CHILD) {
+        let out = compress(
+            Input::Stdin,
+            Output::Path(dst.into()),
+            &CompressOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(out.fidelity.rung, Rung::ForwardOnly);
+        return;
+    }
+
+    let dst = tmp("rung-pipe.gz");
+    let _ = std::fs::remove_file(&dst);
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--test-threads=1"])
+        .env(CHILD, &dst)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&b"the quick brown fox ".repeat(100))
+        .unwrap();
+    let res = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_file(&dst);
+    assert!(
+        res.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&res.stdout),
+        String::from_utf8_lossy(&res.stderr)
+    );
+}
+
+#[test]
+fn compress_from_a_seekable_file_reports_an_exact_rung() {
+    let src = tmp("rung-file.txt");
+    let dst = tmp("rung-file.txt.gz");
+    let _ = std::fs::remove_file(&dst);
+    std::fs::write(&src, b"the quick brown fox ".repeat(100)).unwrap();
+
+    let out = compress(
+        Input::Path(src.clone()),
+        Output::Path(dst.clone()),
+        &CompressOpts::default(),
+    )
+    .unwrap();
+    assert_eq!(out.fidelity.rung, stuffr::Rung::Exact);
+
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&dst);
+}
