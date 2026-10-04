@@ -168,7 +168,8 @@ release:
 # added here deliberately.
 MIRI_SKIP = --skip system_tar_ --skip we_accept_what_system_tar_ \
             --skip every_reference_writer_ --skip system_ar_ \
-            --skip we_accept_what_system_ar_ --skip require_bin
+            --skip we_accept_what_system_ar_ --skip require_bin \
+            --skip a_gnu_tar_sparse_archive_ --skip gnu_ar_on_mach_o_
 # `-Zmiri-disable-isolation` because several of these tests write a real temp
 # file (tar's `by_index` test needs a genuinely seekable source, which a
 # Cursor is not, as far as `FileSource` is concerned). Isolation is Miri's
