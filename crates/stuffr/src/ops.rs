@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::governor::detect_cpu_budget;
 use stuffr_core::{
-    BudgetInputs, Chain, ContainerCaps, Counting, CountingWriter, DEFAULT_MAX_RATIO, DecodeOpts,
-    EncodeOpts, Error, FidelityReport, FileSource, FormatId, FormatKind, Governor, RatioGuard,
-    ReaderSource, Registry, Result, Rung, Source, default_memory_limit,
+    BudgetInputs, Chain, Codec, ContainerCaps, Counting, CountingWriter, DEFAULT_MAX_RATIO,
+    DecodeOpts, EncodeOpts, Error, FidelityReport, FileSource, FormatId, FormatKind, Governor,
+    PlainSink, RatioGuard, ReaderSource, Registry, Result, Rung, Sink, Source,
+    default_memory_limit,
 };
 
 /// Per-process counter mixed into the temp file name alongside the pid, so
@@ -581,6 +582,69 @@ pub fn default_format() -> Result<FormatId> {
     default_format_in(crate::registry())
 }
 
+/// The encoder for `format`, consented to and option-checked, with the
+/// [`EncodeOpts`] it must be built from.
+///
+/// The one owner of the write side's encoder rules — `compress_with`,
+/// `recompress_with` and `entries::create_archive` all build their codec
+/// layer here, so a rule added to one cannot be missing from the others:
+///
+/// * `require_encoder`, which refuses a decode-only codec;
+/// * the weak-encoder consent (`CodecCaps::weak_encoder`): refused unless
+///   the caller opted in with `allow_weak_encoder`;
+/// * `level`, and the governor [`resolved_budget`] resolves (`--threads`,
+///   `--turbo`, `STUFFR_THREADS`);
+/// * `Codec::check_encode_opts`.
+///
+/// Call it BEFORE the destination is opened: every refusal here must cost
+/// nothing, with no temp file created and no existing file disturbed.
+pub(crate) fn checked_encoder<'r>(
+    registry: &'r Registry,
+    format: FormatId,
+    o: &CompressOpts,
+) -> Result<(&'r Arc<dyn Codec>, EncodeOpts)> {
+    let codec = registry.require_encoder(format)?;
+
+    // Consent, not capability: refuse only when this build's encoder is
+    // weak AND the caller has not opted in via `--allow-weak-encoder`.
+    if codec.caps().weak_encoder && !o.allow_weak_encoder {
+        return Err(Error::Usage(format!(
+            "`{format}` in this build has only a weak encoder: it produces valid \
+             output with a markedly worse ratio, and buffers the whole input in \
+             memory. Pass --allow-weak-encoder to use it anyway, or rebuild with \
+             --features c-backed for the real encoder."
+        )));
+    }
+
+    let encode = EncodeOpts {
+        level: o.level,
+        governor: resolved_budget(o),
+        ..Default::default()
+    };
+    codec.check_encode_opts(&encode)?;
+    Ok((codec, encode))
+}
+
+/// Reads `decoded` to its end under `guard`, writing every byte to `out`.
+///
+/// The one copy of the read side's ratio-guard loop, shared by
+/// `decompress_with` and `recompress_with`: a read error is a DECODER's error
+/// and goes through [`Error::from_decode_io`] (corrupt input is exit 5, never
+/// exit 1), and every chunk is recorded against `--max-ratio` before it is
+/// written, so a refused stream never reaches the destination past the
+/// limit. Does not flush or finish `out` — that is the caller's write side.
+fn copy_decoded(decoded: &mut dyn Read, guard: &mut RatioGuard, out: &mut dyn Write) -> Result<()> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = decoded.read(&mut buf).map_err(Error::from_decode_io)?;
+        if n == 0 {
+            return Ok(());
+        }
+        guard.record(n)?;
+        out.write_all(&buf[..n])?;
+    }
+}
+
 /// Compresses `src` into `dst`, using the build's default registry.
 pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     compress_with(crate::registry(), src, dst, o)
@@ -630,26 +694,8 @@ pub fn compress_with(
         )));
     }
     let format = choose_format(registry, &dst, o.format)?;
-    let codec = registry.require_encoder(format)?;
-
-    // Consent, not capability: refuse only when this build's encoder is
-    // weak AND the caller has not opted in via `--allow-weak-encoder`.
-    if codec.caps().weak_encoder && !o.allow_weak_encoder {
-        return Err(Error::Usage(format!(
-            "`{format}` in this build has only a weak encoder: it produces valid \
-             output with a markedly worse ratio, and buffers the whole input in \
-             memory. Pass --allow-weak-encoder to use it anyway, or rebuild with \
-             --features c-backed for the real encoder."
-        )));
-    }
-
-    let encode = EncodeOpts {
-        level: o.level,
-        governor: resolved_budget(o),
-        ..Default::default()
-    };
     // Before any filesystem work: a rejected option must cost nothing.
-    codec.check_encode_opts(&encode)?;
+    let (codec, encode) = checked_encoder(registry, format, o)?;
 
     let mut reader = src.open()?;
     // Computed from the source's actual seekability, the same way
@@ -818,15 +864,7 @@ pub fn decompress_with(
     let mut writer = opened.writer;
 
     let mut run = || -> Result<()> {
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            let n = decoder.read(&mut buf).map_err(Error::from_decode_io)?;
-            if n == 0 {
-                break;
-            }
-            guard.record(n)?;
-            writer.write_all(&buf[..n])?;
-        }
+        copy_decoded(&mut decoder, &mut guard, &mut writer)?;
         // `Sink::finish`'s flush contract is the write side; a decode writes
         // straight to the destination rather than through a `Sink`, so it
         // has to flush itself before publishing.
@@ -843,6 +881,195 @@ pub fn decompress_with(
             Ok(Outcome {
                 bytes_in: consumed.load(Ordering::Relaxed),
                 bytes_out: guard.produced(),
+                format,
+                fidelity: FidelityReport::new(rung),
+                notes: Vec::new(),
+            })
+        }
+        Err(e) => {
+            discard(finish);
+            Err(e)
+        }
+    }
+}
+
+/// Options for [`recompress`]: a read side and a write side in one struct,
+/// because a codec-only conversion is a decode piped into an encode and
+/// needs both sets of limits at once.
+#[derive(Clone, Debug)]
+pub struct RecompressOpts {
+    /// The target codec; `None` writes the decoded stream with no codec
+    /// (e.g. `.tar.gz` → `.tar`).
+    pub codec: Option<FormatId>,
+    /// Write side — same meaning as `CompressOpts::level`.
+    pub level: Option<i32>,
+    pub force: bool,
+    /// Same meaning as `CompressOpts::sync` / `DecompressOpts::sync`.
+    pub sync: bool,
+    /// Write side — same meaning as `CompressOpts::allow_weak_encoder`.
+    pub allow_weak_encoder: bool,
+    /// Write side — same meaning as `CompressOpts::threads`.
+    pub threads: Option<usize>,
+    /// Write side — same meaning as `CompressOpts::turbo`.
+    pub turbo: bool,
+    /// Read side — same meaning as `DecompressOpts::max_ratio`.
+    pub max_ratio: u64,
+    /// Read side — same meaning as `DecompressOpts::memory_limit`: the cap
+    /// every source codec layer's decoder is built under. Also the memory
+    /// bound the write side's governor is resolved against, as
+    /// `CompressOpts::memory_limit` is.
+    pub memory_limit: Option<u64>,
+}
+
+impl Default for RecompressOpts {
+    fn default() -> Self {
+        Self {
+            codec: None,
+            level: None,
+            force: false,
+            sync: true,
+            allow_weak_encoder: false,
+            threads: None,
+            turbo: false,
+            max_ratio: DEFAULT_MAX_RATIO,
+            memory_limit: None,
+        }
+    }
+}
+
+impl RecompressOpts {
+    /// The write side, spelled as the `CompressOpts` that
+    /// [`checked_encoder`] and [`resolved_budget`] read — so the encoder is
+    /// built by the one owner of those rules rather than a copy of them.
+    fn write_side(&self) -> CompressOpts {
+        CompressOpts {
+            format: self.codec,
+            level: self.level,
+            force: self.force,
+            sync: self.sync,
+            allow_weak_encoder: self.allow_weak_encoder,
+            threads: self.threads,
+            turbo: self.turbo,
+            memory_limit: self.memory_limit,
+        }
+    }
+}
+
+/// Converts `src`'s compression to `o.codec`, using the build's default
+/// registry. See [`recompress_with`].
+pub fn recompress(src: Input, dst: Output, o: &RecompressOpts) -> Result<Outcome> {
+    recompress_with(crate::registry(), src, dst, o)
+}
+
+/// Converts `src`'s compression to `o.codec`, consulting `registry` rather
+/// than the build's default.
+///
+/// The source's chain is resolved **by content**, as `unpack` does
+/// (`resolve_chain_deep_with`), and **every** codec layer is peeled: a `.gz`
+/// over an `.xz` decodes fully. At most one codec is written — the write side
+/// is one codec deep, as in `pack`. Whatever lies beneath the codec layers (a
+/// container, or a plain stream) is never parsed and is copied byte for byte,
+/// so the conversion loses nothing and the returned fidelity has no warnings.
+///
+/// The read side is bounded exactly as [`decompress_with`] bounds it —
+/// `Counting` on the raw input, `RatioGuard` on the decoded output
+/// (`max_ratio`), `DecodeOpts::memory_limit` on every decoder — and the
+/// write side's encoder is built exactly as [`compress_with`] builds it.
+///
+/// Every byte is decoded before the destination is published: a source that
+/// fails late (a gzip trailer whose CRC does not match, a stream cut short)
+/// is an error with nothing left under the destination's name, never a
+/// re-encoded file built from a stream that failed its own check.
+///
+/// # What `Outcome` reports
+///
+/// `bytes_in` is the raw source bytes read; `bytes_out` the bytes written.
+/// `format` is the target codec, or with `codec: None` the format beneath the
+/// peeled layers: the container if there is one, else — for a plain stream —
+/// the outermost source codec, which is what [`decompress`] reports for the
+/// same input.
+///
+/// # Errors
+///
+/// [`Error::Usage`] when the source has no codec layer and `o.codec` is
+/// `None` — there is nothing to convert, and writing the input back out
+/// unchanged under a new name is not a conversion. Refused before the
+/// destination is created. Everything else is the read side's and the write
+/// side's own vocabulary: corrupt input exit 5, a ratio or memory refusal
+/// exit 6, an encoder this build lacks exit 3.
+pub fn recompress_with(
+    registry: &Registry,
+    src: Input,
+    dst: Output,
+    o: &RecompressOpts,
+) -> Result<Outcome> {
+    let write = o.write_side();
+    // Before any filesystem work, as in `compress_with`: a rejected level or
+    // an unconsented weak encoder must cost nothing.
+    let encoder = match o.codec {
+        Some(id) => Some(checked_encoder(registry, id, &write)?),
+        None => None,
+    };
+
+    let path = src.path().map(Path::to_path_buf);
+    let source = src.open()?;
+    // From the RAW source, before anything wraps it — see `decompress_with`.
+    let rung = if source.caps().seekable {
+        Rung::Exact
+    } else {
+        Rung::ForwardOnly
+    };
+
+    // `Counting` under the resolver, so the compressed bytes every layer's
+    // decoder pulls are what `--max-ratio` divides by — the arrangement
+    // `entries::open_archive` uses for the same deep chain.
+    let (counting, consumed) = Counting::new(source);
+    let decode_opts = DecodeOpts {
+        memory_limit: o.memory_limit,
+        ..Default::default()
+    };
+    let (chain, mut decoded) = stuffr_core::resolve_chain_deep_with(
+        registry,
+        path.as_deref(),
+        Box::new(counting),
+        &decode_opts,
+    )?;
+
+    let format = match (o.codec, chain.outermost_codec(), chain.container()) {
+        (Some(target), _, _) => target,
+        (None, None, _) => {
+            return Err(Error::Usage(format!(
+                "nothing to convert: the input is {} with no codec layer, and no \
+                 target codec was given",
+                chain.describe()
+            )));
+        }
+        (None, Some(_), Some(container)) => container,
+        (None, Some(outer), None) => outer,
+    };
+
+    let mut guard = RatioGuard::new(Arc::clone(&consumed), o.max_ratio);
+    let opened = dst.create(o.force, o.sync)?;
+    let finish = opened.finish;
+    let (counted, written) = CountingWriter::new(opened.writer);
+
+    let run = || -> Result<()> {
+        let mut sink: Box<dyn Sink> = match &encoder {
+            Some((codec, encode)) => codec.encoder(Box::new(counted), encode)?,
+            None => PlainSink::new(Box::new(counted)),
+        };
+        copy_decoded(&mut decoded, &mut guard, &mut sink)?;
+        // The codec's trailer, then a flush of the destination — the
+        // `Sink::finish` contract. Only after this is every byte on its way.
+        sink.finish()
+    };
+
+    match run() {
+        Ok(()) => {
+            publish(finish)?;
+            Ok(Outcome {
+                bytes_in: consumed.load(Ordering::Relaxed),
+                bytes_out: written.load(Ordering::Relaxed),
                 format,
                 fidelity: FidelityReport::new(rung),
                 notes: Vec::new(),

@@ -5,11 +5,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use stuffr_core::{
-    ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts,
-    EncodeOpts, Entry, EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields,
-    OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead,
-    Sink, Source, SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain,
-    resolve_chain_deep_with, safe_join,
+    ArchiveRead, Chain, Counting, CountingWriter, CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts, Entry,
+    EntryKind, EntryMeta, Error, Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts,
+    PROBE_LEN, PlainSink, RATIO_FLOOR, RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source,
+    SourceCaps, StreamPolicy, check_symlink_target, ladder, resolve_chain, resolve_chain_deep_with,
+    safe_join,
 };
 
 use crate::ops::{CompressOpts, Input, Outcome, Output, discard, publish};
@@ -2781,44 +2781,23 @@ pub fn create_archive(
     // Resolved, checked and consented to BEFORE the destination is opened —
     // the same order `ops::compress_with` uses, so a rejected level or an
     // unconsented weak encoder costs nothing on either path.
+    //
+    // On the composed path `ops::resolved_budget(o)` — inside
+    // `checked_encoder` — is consulted exactly as on the single-stream path.
+    // Phase 2c used to hardcode `None` here: the CLI refused `--threads`,
+    // `--turbo` and `--allow-weak-encoder` whenever the output named a
+    // container, so building a governor from `STUFFR_THREADS` alone (which no
+    // flag check can see) would have let the environment succeed at exactly
+    // what the flag was refused for — and, because xz and lzip split their
+    // input per worker, `STUFFR_THREADS=4 stuffr pack big -o x.tar.xz` would
+    // have emitted different bytes from the same command without it. Now
+    // that `refuse_unhonoured_pack_flags` only refuses these where the
+    // resolved chain has NO codec layer, a composed write with a codec is
+    // exactly the case `resolved_budget` exists for, and the reproducibility
+    // promise (same input + same flags + same environment) holds the same
+    // way it does on the single-stream path.
     let encoder = match codec {
-        Some(id) => {
-            let c = crate::registry().require_encoder(id)?;
-            if c.caps().weak_encoder && !o.allow_weak_encoder {
-                return Err(Error::Usage(format!(
-                    "`{id}` in this build has only a weak encoder: it produces valid \
-                     output with a markedly worse ratio, and buffers the whole input in \
-                     memory. Pass --allow-weak-encoder to use it anyway, or rebuild with \
-                     --features c-backed for the real encoder."
-                )));
-            }
-            let encode = EncodeOpts {
-                level: o.level,
-                // `ops::resolved_budget(o)`, matching the single-stream path.
-                //
-                // Phase 2c used to hardcode `None` here: the CLI refused
-                // `--threads`, `--turbo` and `--allow-weak-encoder` whenever
-                // the output named a container, so building a governor from
-                // `STUFFR_THREADS` alone (which no flag check can see) would
-                // have let the environment succeed at exactly what the flag
-                // was refused for — and, because xz and lzip split their
-                // input per worker, `STUFFR_THREADS=4 stuffr pack big -o
-                // x.tar.xz` would have emitted different bytes from the same
-                // command without it.
-                //
-                // Now that `refuse_unhonoured_pack_flags` only refuses these
-                // where the resolved chain has NO codec layer, a composed
-                // write with a codec is exactly the case `resolved_budget`
-                // exists for, and the reproducibility promise (same input +
-                // same flags + same environment) holds the same way it does
-                // on the single-stream path: `STUFFR_THREADS` is consulted
-                // here precisely because `--threads` is now honoured here.
-                governor: crate::ops::resolved_budget(o),
-                ..Default::default()
-            };
-            c.check_encode_opts(&encode)?;
-            Some((c, encode))
-        }
+        Some(id) => Some(crate::ops::checked_encoder(crate::registry(), id, o)?),
         None => None,
     };
 
@@ -4490,6 +4469,7 @@ mod tests {
 #[cfg(all(test, feature = "zip"))]
 mod salvage_tests {
     use super::*;
+    use stuffr_core::EncodeOpts;
     use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
 
     /// CRC-32/ISO-HDLC — the same algorithm `zip_salvage.rs`'s own
