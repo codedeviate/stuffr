@@ -987,10 +987,80 @@ pub fn resolve_source_chain(
     stuffr_core::resolve_chain_deep_with(registry, hint, src, opts)
 }
 
+/// A conversion's source, opened and resolved **by content**
+/// ([`resolve_source_chain`]) with nothing written anywhere yet.
+///
+/// Exists so a caller can see the source's chain BEFORE choosing what to do
+/// with it, without opening the input twice: `stuffr convert` picks its mode
+/// from [`ConvertSource::chain`] and then hands this same value to
+/// [`recompress_source`]. Opening twice is impossible on stdin (the first
+/// open consumes the bytes the second would need) and wrong on a path (two
+/// resolutions are two chances to disagree), so the source is opened once
+/// and carried.
+///
+/// Opening reads the probe prefix and every codec layer's header, so a
+/// corrupt or hostile header fails here (exit 5/6), before any destination
+/// exists. The read side's bounds are armed from the start: every raw byte
+/// is counted for [`RecompressOpts::max_ratio`], and every decoder is built
+/// under the `memory_limit` given here.
+pub struct ConvertSource {
+    chain: Chain,
+    decoded: Box<dyn Source>,
+    consumed: Arc<AtomicU64>,
+    rung: Rung,
+}
+
+impl ConvertSource {
+    /// Opens and resolves `src` against the build's default registry.
+    pub fn open(src: Input, memory_limit: Option<u64>) -> Result<Self> {
+        Self::open_with(crate::registry(), src, memory_limit)
+    }
+
+    /// Opens and resolves `src` against `registry`.
+    pub fn open_with(registry: &Registry, src: Input, memory_limit: Option<u64>) -> Result<Self> {
+        let path = src.path().map(Path::to_path_buf);
+        let source = src.open()?;
+        // From the RAW source, before anything wraps it — see `decompress_with`.
+        let rung = if source.caps().seekable {
+            Rung::Exact
+        } else {
+            Rung::ForwardOnly
+        };
+        // `Counting` under the resolver, so the compressed bytes every layer's
+        // decoder pulls are what `--max-ratio` divides by — the arrangement
+        // `entries::open_archive` uses for the same deep chain.
+        let (counting, consumed) = Counting::new(source);
+        let decode_opts = DecodeOpts {
+            memory_limit,
+            ..Default::default()
+        };
+        let (chain, decoded) =
+            resolve_source_chain(registry, path.as_deref(), Box::new(counting), &decode_opts)?;
+        Ok(Self {
+            chain,
+            decoded,
+            consumed,
+            rung,
+        })
+    }
+
+    /// The source's chain, as [`resolve_source_chain`] resolved it.
+    pub fn chain(&self) -> &Chain {
+        &self.chain
+    }
+}
+
 /// Converts `src`'s compression to `o.codec`, using the build's default
 /// registry. See [`recompress_with`].
 pub fn recompress(src: Input, dst: Output, o: &RecompressOpts) -> Result<Outcome> {
     recompress_with(crate::registry(), src, dst, o)
+}
+
+/// [`recompress`] from a source already opened with [`ConvertSource::open`].
+/// `o.memory_limit` is the write side's bound here; the read side's was
+/// fixed when the source was opened.
+pub fn recompress_source(src: ConvertSource, dst: Output, o: &RecompressOpts) -> Result<Outcome> {
+    recompress_source_with(crate::registry(), src, dst, o)
 }
 
 /// Converts `src`'s compression to `o.codec`, consulting `registry` rather
@@ -1034,33 +1104,52 @@ pub fn recompress_with(
     dst: Output,
     o: &RecompressOpts,
 ) -> Result<Outcome> {
-    let write = o.write_side();
-    // Before any filesystem work, as in `compress_with`: a rejected level or
+    // Before the source is opened, as in `compress_with`: a rejected level or
     // an unconsented weak encoder must cost nothing.
-    let encoder = match o.codec {
-        Some(id) => Some(checked_encoder(registry, id, &write)?),
-        None => None,
-    };
+    let encoder = target_encoder(registry, o)?;
+    let source = ConvertSource::open_with(registry, src, o.memory_limit)?;
+    write_recompressed(source, encoder, dst, o)
+}
 
-    let path = src.path().map(Path::to_path_buf);
-    let source = src.open()?;
-    // From the RAW source, before anything wraps it — see `decompress_with`.
-    let rung = if source.caps().seekable {
-        Rung::Exact
-    } else {
-        Rung::ForwardOnly
-    };
+/// [`recompress_with`] from a source already opened with
+/// [`ConvertSource::open_with`] — against the same `registry`, which is the
+/// caller's to keep consistent. The encoder is still checked before the
+/// destination is created.
+pub fn recompress_source_with(
+    registry: &Registry,
+    src: ConvertSource,
+    dst: Output,
+    o: &RecompressOpts,
+) -> Result<Outcome> {
+    let encoder = target_encoder(registry, o)?;
+    write_recompressed(src, encoder, dst, o)
+}
 
-    // `Counting` under the resolver, so the compressed bytes every layer's
-    // decoder pulls are what `--max-ratio` divides by — the arrangement
-    // `entries::open_archive` uses for the same deep chain.
-    let (counting, consumed) = Counting::new(source);
-    let decode_opts = DecodeOpts {
-        memory_limit: o.memory_limit,
-        ..Default::default()
-    };
-    let (chain, mut decoded) =
-        resolve_source_chain(registry, path.as_deref(), Box::new(counting), &decode_opts)?;
+/// The target codec's encoder, checked, or `None` for a codec-less target.
+fn target_encoder<'r>(
+    registry: &'r Registry,
+    o: &RecompressOpts,
+) -> Result<Option<(&'r Arc<dyn Codec>, EncodeOpts)>> {
+    match o.codec {
+        Some(id) => Ok(Some(checked_encoder(registry, id, &o.write_side())?)),
+        None => Ok(None),
+    }
+}
+
+/// The write half of every recompress entry point: the "nothing to convert"
+/// refusal, then decode → encode → publish (or discard).
+fn write_recompressed(
+    src: ConvertSource,
+    encoder: Option<(&Arc<dyn Codec>, EncodeOpts)>,
+    dst: Output,
+    o: &RecompressOpts,
+) -> Result<Outcome> {
+    let ConvertSource {
+        chain,
+        mut decoded,
+        consumed,
+        rung,
+    } = src;
 
     let format = match (o.codec, chain.outermost_codec(), chain.container()) {
         (Some(target), _, _) => target,

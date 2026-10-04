@@ -142,6 +142,73 @@ pub enum Command {
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
     },
+    /// Change a file's compression without unpacking it to disk.
+    ///
+    /// `.tar.gz` -> `.tar.zst`, `.gz` -> `.xz`, `.tar.xz` -> `.tar`: the
+    /// container (or the plain stream) is kept byte for byte and only the
+    /// codec around it changes. The input's chain is detected by content,
+    /// never by its name; the target's comes from OUT's name or --format.
+    Convert {
+        /// Input path, or `-` for stdin.
+        input: String,
+        /// Output path; the same as -o. Give one or the other, not both.
+        #[arg(value_name = "OUT")]
+        output_pos: Option<String>,
+        /// Output path, or `-` for stdout (which needs --format).
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Use this target format instead of inferring one from the output
+        /// name. A codec or a container; one the name contradicts is refused.
+        #[arg(long)]
+        format: Option<String>,
+        /// Compression level for the target codec. gzip accepts 0-9.
+        ///
+        /// Also what makes converting a file to the chain it already has
+        /// (`.tar.gz` -> `.tar.gz`) a re-encode rather than "nothing to
+        /// convert".
+        #[arg(long)]
+        level: Option<i32>,
+        /// Encode with N worker threads. 0 means auto-detect.
+        ///
+        /// OMITTING this flag is not the same as passing 0: without it, stuffr
+        /// encodes single-threaded, so the same input always produces the same
+        /// bytes on any machine. Multi-threaded xz and zstd split the input
+        /// per worker, so their output depends on the worker count.
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Use the full detected CPU budget, uncapped.
+        ///
+        /// Lifts the CPU cap only — `--memory-limit` still binds. Turbo means
+        /// "use my cores", not "ignore the OOM killer".
+        #[arg(long)]
+        turbo: bool,
+        /// Use a weak fallback encoder that this build ships in place of the
+        /// format's real one. Worse ratio, and buffers the whole input.
+        #[arg(long)]
+        allow_weak_encoder: bool,
+        /// Overwrite an existing output.
+        #[arg(long)]
+        force: bool,
+        /// Fail (exit 4) if anything was approximated or lost.
+        ///
+        /// A codec conversion copies the container byte for byte and loses
+        /// nothing, so today this can only ever pass; it is here so a script
+        /// can ask the same question of every verb.
+        #[arg(long)]
+        strict_fidelity: bool,
+        /// Refuse a decode expanding by more than this ratio.
+        #[arg(long)]
+        max_ratio: Option<u64>,
+        /// Cap the memory stuffr will ask for, e.g. 512M or 2G.
+        ///
+        /// Bounds every source codec layer's decoder and the encoder's worker
+        /// count. Defaults to 25% of available RAM, honouring cgroup limits.
+        #[arg(long, value_name = "SIZE")]
+        memory_limit: Option<String>,
+        /// Skip the fsync that makes the output durable before it is published.
+        #[arg(long)]
+        no_sync: bool,
+    },
     /// Decompress a file, or stream an archive's entries, to stdout.
     Cat {
         /// Input path, or `-` for stdin.

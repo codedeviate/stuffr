@@ -2791,7 +2791,7 @@ pub fn create_archive(
     // what the flag was refused for — and, because xz and lzip split their
     // input per worker, `STUFFR_THREADS=4 stuffr pack big -o x.tar.xz` would
     // have emitted different bytes from the same command without it. Now
-    // that `refuse_unhonoured_pack_flags` only refuses these where the
+    // that `refuse_unhonoured_encoder_flags` only refuses these where the
     // resolved chain has NO codec layer, a composed write with a codec is
     // exactly the case `resolved_budget` exists for, and the reproducibility
     // promise (same input + same flags + same environment) holds the same

@@ -5639,7 +5639,7 @@ fn a_format_flag_contradicting_the_output_name_is_refused_before_anything_is_wri
 /// specifically so `STUFFR_THREADS` could not succeed at what `--threads`
 /// was refused for (no container compressed anything itself, so there was
 /// genuinely nothing to hand a worker count to). Now that
-/// `refuse_unhonoured_pack_flags` only refuses these where the resolved
+/// `refuse_unhonoured_encoder_flags` only refuses these where the resolved
 /// chain has NO codec layer, `-o out.tar.xz` names a real codec underneath
 /// the container, and `entries::create_archive` builds its governor from
 /// `ops::resolved_budget(o)` exactly as the single-stream path does —
@@ -12902,5 +12902,405 @@ fn a_gnu_tar_sparse_archive_lists_tests_and_unpacks_byte_identical() {
         got[data.len()..].iter().all(|&b| b == 0),
         "the hole unpacks as zeros"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// `stuffr convert` (Phase 5a). Codec mode only so far: a container change is
+// refused at exit 3 until entry mode lands.
+// ---------------------------------------------------------------------------
+
+/// The two payloads `convert_fixture` packs, for byte-for-byte comparison.
+fn convert_payloads() -> (Vec<u8>, Vec<u8>) {
+    (
+        b"first file, compressible enough to matter\n".repeat(50),
+        (0u8..=255).collect(),
+    )
+}
+
+/// A fresh scratch directory holding `d/one.txt` and `d/sub/two.bin`, packed
+/// by stuffr itself into `a.tar.gz`. Returns `(dir, a.tar.gz)`.
+fn convert_fixture() -> (PathBuf, PathBuf) {
+    let dir = tmp_dir();
+    let d = dir.join("d");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    let (one, two) = convert_payloads();
+    std::fs::write(d.join("one.txt"), one).unwrap();
+    std::fs::write(d.join("sub/two.bin"), two).unwrap();
+    let a = dir.join("a.tar.gz");
+    let out = run_output(&["pack", d.to_str().unwrap(), "-o", a.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    (dir, a)
+}
+
+fn stderr_text(out: &std::process::Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// `stuffr unpack ARCHIVE -C dir/LABEL` reproduces `convert_fixture`'s files.
+fn assert_unpacks_to_the_fixture(dir: &Path, archive: &Path, label: &str) {
+    let dest = dir.join(label);
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let (one, two) = convert_payloads();
+    assert_eq!(std::fs::read(dest.join("d/one.txt")).unwrap(), one);
+    assert_eq!(std::fs::read(dest.join("d/sub/two.bin")).unwrap(), two);
+}
+
+#[test]
+fn convert_recompresses_a_tar_gz_to_tar_zst() {
+    let (dir, a) = convert_fixture();
+    let b = dir.join("b.tar.zst");
+    // The default (pure) build's zstd encoder is the weak fallback, which
+    // needs consent; on a c-backed build the flag is accepted and unused.
+    let out = run_output(&[
+        "convert",
+        a.to_str().unwrap(),
+        "-o",
+        b.to_str().unwrap(),
+        "--allow-weak-encoder",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    // The progress line names the TARGET chain, never `Outcome.format`.
+    assert!(
+        stderr_text(&out).contains("-> tar over zstd ("),
+        "{}",
+        stderr_text(&out)
+    );
+    assert_unpacks_to_the_fixture(&dir, &b, "out");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_accepts_the_destination_as_a_second_positional() {
+    let (dir, a) = convert_fixture();
+    let b = dir.join("b.tar.xz");
+    let out = run_output(&["convert", a.to_str().unwrap(), b.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_unpacks_to_the_fixture(&dir, &b, "out");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_refuses_both_destination_forms_at_once() {
+    let (dir, a) = convert_fixture();
+    let b = dir.join("b.tar.xz");
+    let c = dir.join("c.tar.xz");
+    let out = run_output(&[
+        "convert",
+        a.to_str().unwrap(),
+        b.to_str().unwrap(),
+        "-o",
+        c.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    assert!(!b.exists() && !c.exists());
+    // Neither form at all is the same mistake from the other side.
+    let out = run_output(&["convert", a.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_refuses_a_plain_stream_into_a_container() {
+    let dir = tmp_dir();
+    let x = dir.join("x");
+    std::fs::write(&x, b"just bytes\n".repeat(20)).unwrap();
+    let gz = dir.join("x.gz");
+    assert!(run(&["pack", x.to_str().unwrap(), "-o", gz.to_str().unwrap()]).success());
+    let zip = dir.join("x.zip");
+    let out = run_output(&["convert", gz.to_str().unwrap(), "-o", zip.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    let err = stderr_text(&out);
+    assert!(
+        err.contains("is gzip") && err.contains("would be zip"),
+        "both chains must be named: {err}"
+    );
+    assert!(!zip.exists());
+    // And the mirror image: a container into a plain stream.
+    let (fdir, a) = convert_fixture();
+    let plain = fdir.join("a.gz");
+    let out = run_output(&[
+        "convert",
+        a.to_str().unwrap(),
+        "-o",
+        plain.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    let err = stderr_text(&out);
+    assert!(
+        err.contains("is tar over gzip") && err.contains("would be gzip"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&fdir);
+}
+
+#[test]
+fn convert_refuses_nothing_to_convert() {
+    let (dir, a) = convert_fixture();
+    let b = dir.join("b.tar.gz");
+    let out = run_output(&["convert", a.to_str().unwrap(), "-o", b.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    assert!(
+        stderr_text(&out).contains("nothing to convert"),
+        "{}",
+        stderr_text(&out)
+    );
+    assert!(!b.exists());
+    // A re-encode flag makes the identical chain a real conversion.
+    let out = run_output(&[
+        "convert",
+        a.to_str().unwrap(),
+        "-o",
+        b.to_str().unwrap(),
+        "--level",
+        "9",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_unpacks_to_the_fixture(&dir, &b, "out");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn convert_refuses_overwriting_its_own_input() {
+    let (dir, a) = convert_fixture();
+    let before = std::fs::read(&a).unwrap();
+    let a_str = a.to_str().unwrap();
+    // `--level 9` so an identical chain is not refused as "nothing to
+    // convert" first: the refusal under test must be the same-file one.
+    let check = |out: std::process::Output| {
+        assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+        assert!(
+            stderr_text(&out).contains("same file"),
+            "{}",
+            stderr_text(&out)
+        );
+        assert_eq!(std::fs::read(&a).unwrap(), before, "the input was touched");
+    };
+    check(run_output(&[
+        "convert", a_str, a_str, "--force", "--level", "9",
+    ]));
+
+    let link = dir.join("l.tar.gz");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+    check(run_output(&[
+        "convert",
+        a_str,
+        link.to_str().unwrap(),
+        "--force",
+        "--level",
+        "9",
+    ]));
+
+    check(
+        Command::new(STUFFR)
+            .current_dir(&dir)
+            .args([
+                "convert",
+                "a.tar.gz",
+                "./a.tar.gz",
+                "--force",
+                "--level",
+                "9",
+            ])
+            .output()
+            .unwrap(),
+    );
+
+    // A hard link is the same inode under a name nothing canonicalises to.
+    let hard = dir.join("h.tar.gz");
+    std::fs::hard_link(&a, &hard).unwrap();
+    check(run_output(&[
+        "convert",
+        a_str,
+        "-o",
+        hard.to_str().unwrap(),
+        "--force",
+        "--level",
+        "9",
+    ]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_to_stdout_needs_format() {
+    let dir = tmp_dir();
+    let payload = b"payload for the pipe\n".repeat(40);
+    let x = dir.join("x");
+    std::fs::write(&x, &payload).unwrap();
+    let gz = dir.join("x.gz");
+    assert!(run(&["pack", x.to_str().unwrap(), "-o", gz.to_str().unwrap()]).success());
+
+    let out = run_output(&["convert", gz.to_str().unwrap(), "-o", "-"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    assert!(out.stdout.is_empty());
+
+    let out = run_output(&["convert", gz.to_str().unwrap(), "-o", "-", "--format", "xz"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(out.stdout.starts_with(b"\xfd7zXZ\x00"), "not an xz stream");
+    let back = run_with_stdin_output(&["cat", "-"], &out.stdout);
+    assert_eq!(back.status.code(), Some(0), "{}", stderr_text(&back));
+    assert_eq!(back.stdout, payload);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_reads_stdin() {
+    let (dir, a) = convert_fixture();
+    let b = dir.join("b.tar.xz");
+    let out = run_with_stdin_output(
+        &["convert", "-", "-o", b.to_str().unwrap()],
+        &std::fs::read(&a).unwrap(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_unpacks_to_the_fixture(&dir, &b, "out");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_refuses_a_format_that_contradicts_the_name() {
+    let (dir, a) = convert_fixture();
+    let b = dir.join("b.tar.xz");
+    let out = run_output(&[
+        "convert",
+        a.to_str().unwrap(),
+        "-o",
+        b.to_str().unwrap(),
+        "--format",
+        "zstd",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    assert!(!b.exists());
+    // A container --format against a name saying another container is
+    // `pack`'s own refusal, reached through the same resolver.
+    let out = run_output(&[
+        "convert",
+        a.to_str().unwrap(),
+        "-o",
+        b.to_str().unwrap(),
+        "--format",
+        "zip",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    // A --format agreeing with the name is no contradiction.
+    let out = run_output(&[
+        "convert",
+        a.to_str().unwrap(),
+        "-o",
+        b.to_str().unwrap(),
+        "--format",
+        "xz",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_unpacks_to_the_fixture(&dir, &b, "out");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_between_containers_is_refused_until_stage_2() {
+    let (dir, a) = convert_fixture();
+    let zip = dir.join("a.zip");
+    let out = run_output(&["convert", a.to_str().unwrap(), "-o", zip.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr_text(&out));
+    assert!(!zip.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_refuses_encoder_flags_a_codecless_target_cannot_honour() {
+    let (dir, a) = convert_fixture();
+    let b = dir.join("b.tar");
+    for flag in [
+        &["--threads", "2"][..],
+        &["--turbo"][..],
+        &["--allow-weak-encoder"][..],
+    ] {
+        let mut args = vec!["convert", a.to_str().unwrap(), "-o", b.to_str().unwrap()];
+        args.extend_from_slice(flag);
+        let out = run_output(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{flag:?}: {}",
+            stderr_text(&out)
+        );
+        let err = stderr_text(&out);
+        assert!(err.contains(flag[0]), "{err}");
+        // `pack`'s wording is about containers; this target is a bare tar
+        // reached by removing a codec, and the message must say so.
+        assert!(!err.contains("no container in this build"), "{err}");
+        assert!(err.contains("no codec layer"), "{err}");
+        assert!(!b.exists());
+    }
+    // `--level` is accepted and inert there, exactly as `pack -o x.tar
+    // --level 9` accepts it.
+    let out = run_output(&[
+        "convert",
+        a.to_str().unwrap(),
+        "-o",
+        b.to_str().unwrap(),
+        "--level",
+        "9",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(
+        stderr_text(&out).contains("-> tar ("),
+        "{}",
+        stderr_text(&out)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_points_an_unrecognised_input_at_pack() {
+    let dir = tmp_dir();
+    let notes = dir.join("notes.txt");
+    std::fs::write(&notes, b"plain text that no probe recognises\n").unwrap();
+    let out_path = dir.join("notes.txt.gz");
+    let out = run_output(&[
+        "convert",
+        notes.to_str().unwrap(),
+        "-o",
+        out_path.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
+    assert!(
+        stderr_text(&out).contains("stuffr pack"),
+        "{}",
+        stderr_text(&out)
+    );
+    assert!(!out_path.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn convert_to_a_bare_stream_names_raw_in_its_progress_line() {
+    let dir = tmp_dir();
+    let payload = b"decoded by convert\n".repeat(30);
+    let x = dir.join("x");
+    std::fs::write(&x, &payload).unwrap();
+    let gz = dir.join("x.gz");
+    assert!(run(&["pack", x.to_str().unwrap(), "-o", gz.to_str().unwrap()]).success());
+    let back = dir.join("back");
+    let out = run_output(&[
+        "convert",
+        gz.to_str().unwrap(),
+        "-o",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(
+        stderr_text(&out).contains("-> raw ("),
+        "{}",
+        stderr_text(&out)
+    );
+    assert_eq!(std::fs::read(&back).unwrap(), payload);
     let _ = std::fs::remove_dir_all(&dir);
 }

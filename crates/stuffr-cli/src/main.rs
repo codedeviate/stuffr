@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
-use stuffr::FormatId;
 use stuffr::entries::{self, ExtractOpts, SalvageOpts, Selection};
-use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output};
+use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output, RecompressOpts};
+use stuffr::{Chain, FormatId};
 use stuffr_cli::cli::{Cli, Command};
 
 /// The `--examples` page. A static asset rather than an inline literal so it
@@ -67,8 +67,9 @@ fn main() -> ExitCode {
 /// `Cat`, `Info`, `Formats` and `List` never write anywhere else — `List`
 /// prints one line per entry (or a JSON array) straight to stdout, the same
 /// early-closing-reader shape as `Cat` (e.g. `stuffr list big.tar | head`).
-/// `Pack` and `Unpack` write to stdout only when `-o -` was passed
-/// explicitly; every other destination is a real file, where a `BrokenPipe`
+/// `Pack`, `Unpack` and `Convert` write to stdout only when `-o -` was passed
+/// explicitly (`Convert` also takes it as its second positional); every other
+/// destination is a real file, where a `BrokenPipe`
 /// mid-write would mean something is actually wrong and must not be
 /// swallowed (see `run`).
 fn destination_is_stdout(cmd: &Command) -> bool {
@@ -85,6 +86,13 @@ fn destination_is_stdout(cmd: &Command) -> bool {
         }
         | Command::Unpack {
             output: Some(o), ..
+        }
+        | Command::Convert {
+            output: Some(o), ..
+        }
+        | Command::Convert {
+            output_pos: Some(o),
+            ..
         } => o == "-",
         _ => false,
     }
@@ -168,7 +176,11 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // A container output collects every path into one archive; a
             // codec output compresses exactly one stream.
             if let Some((container, codec)) = resolve_pack_chain(fmt, output.as_deref())? {
-                refuse_unhonoured_pack_flags(&opts, codec.is_some())?;
+                refuse_unhonoured_encoder_flags(
+                    EncoderFlags::of(&opts),
+                    codec.is_some(),
+                    NoCodecLayer::PackContainer,
+                )?;
                 let inputs = pack_inputs(&paths)?;
                 let dst = match output {
                     Some(o) => output_of(&o),
@@ -359,6 +371,130 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             };
             let out = ops::decompress(input_of(&input), dst, &opts)?;
             eprintln!("{} -> {} bytes", out.format, out.bytes_out);
+            report_fidelity(&out.fidelity, strict_fidelity)
+        }
+        Command::Convert {
+            input,
+            output_pos,
+            output,
+            format,
+            level,
+            threads,
+            turbo,
+            allow_weak_encoder,
+            force,
+            strict_fidelity,
+            max_ratio,
+            memory_limit,
+            no_sync,
+        } => {
+            // Bounds every source codec layer's decoder, as on `unpack`; the
+            // CLI default is the bound, not unbounded.
+            let memory_limit = Some(
+                parse_memory_limit(memory_limit)?.unwrap_or_else(stuffr::default_memory_limit),
+            );
+            let fmt = match format.as_deref() {
+                Some(name) => Some(format_by_name(name)?),
+                None => None,
+            };
+            let out_arg = match (output_pos, output) {
+                (Some(_), Some(_)) => {
+                    return Err(stuffr::Error::Usage(
+                        "convert takes its destination once: as a second positional OUT or \
+                         as -o OUT, not both"
+                            .into(),
+                    ));
+                }
+                (None, None) => {
+                    return Err(stuffr::Error::Usage(
+                        "convert needs a destination: `stuffr convert IN OUT` or \
+                         `stuffr convert IN -o OUT`"
+                            .into(),
+                    ));
+                }
+                (Some(o), None) | (None, Some(o)) => o,
+            };
+            let dst = output_of(&out_arg);
+            let out_name = match dst {
+                Output::Path(_) => Some(out_arg.as_str()),
+                Output::Stdout => None,
+            };
+            if out_name.is_none() && fmt.is_none() {
+                return Err(stuffr::Error::Usage(
+                    "-o - writes to stdout, which has no name to take the target format \
+                     from; pass --format"
+                        .into(),
+                ));
+            }
+
+            // Everything decided from the command line alone comes first, so
+            // a refusal costs no read of the input — which on stdin would be
+            // bytes nobody can give back.
+            let target = convert_target_chain(fmt, out_name)?;
+            refuse_unhonoured_encoder_flags(
+                EncoderFlags {
+                    threads: threads.is_some(),
+                    turbo,
+                    allow_weak_encoder,
+                },
+                target.outermost_codec().is_some(),
+                NoCodecLayer::ConvertTarget(&target),
+            )?;
+            let src = input_of(&input);
+            if let (Input::Path(i), Output::Path(o)) = (&src, &dst) {
+                refuse_converting_onto_itself(i, o)?;
+            }
+
+            // Opened ONCE: the mode is chosen from this source's own chain
+            // and the same value is then converted, so stdin is read once
+            // and the CLI cannot disagree with the library about what the
+            // input is (`ops::resolve_source_chain` is that rule's owner).
+            let source = match ops::ConvertSource::open(src, memory_limit) {
+                Err(stuffr::Error::UnknownFormat { seen }) => {
+                    return Err(stuffr::Error::Usage(format!(
+                        "`{input}` is not in any format this build recognises (leading \
+                         bytes were {seen}). convert changes a format; to compress a plain \
+                         file use `stuffr pack`"
+                    )));
+                }
+                other => other?,
+            };
+            let reencode = level.is_some() || threads.is_some() || turbo;
+            match convert_mode(source.chain(), &target, reencode)? {
+                ConvertMode::Codec => {}
+                ConvertMode::Entry => {
+                    return Err(stuffr::Error::Unsupported(format!(
+                        "{} -> {} changes the container, and container conversion is not \
+                         in this build yet",
+                        source.chain().describe(),
+                        target.describe()
+                    )));
+                }
+            }
+
+            let mut opts = RecompressOpts {
+                codec: target.outermost_codec(),
+                level,
+                force,
+                sync: !no_sync,
+                allow_weak_encoder,
+                threads,
+                turbo,
+                memory_limit,
+                ..Default::default()
+            };
+            if let Some(r) = max_ratio {
+                opts.max_ratio = r;
+            }
+            let out = ops::recompress_source(source, dst, &opts)?;
+            // The TARGET chain, never `out.format`: for a bare stream with no
+            // codec that names the codec just removed.
+            eprintln!(
+                "{input} -> {} ({} -> {} bytes)",
+                target.describe(),
+                out.bytes_in,
+                out.bytes_out
+            );
             report_fidelity(&out.fidelity, strict_fidelity)
         }
         Command::Cat {
@@ -1554,30 +1690,219 @@ fn refuse_unhonoured_extract_flags(output: bool, format: bool) -> stuffr::Result
 /// tells it how many rows there are, never what any row's WRITE column says.
 /// Every stale "read-only" sentence in this task had to be found by hand for
 /// the same reason.
-fn refuse_unhonoured_pack_flags(opts: &CompressOpts, has_codec: bool) -> stuffr::Result<()> {
+///
+/// `convert` (Phase 5a) applies the same rule to its target chain, so the
+/// logic — which flags, in which order — has one owner and only the reason
+/// clause differs by `NoCodecLayer`. `pack`'s messages are byte-identical to
+/// what they were before the generalisation; its tests pin them.
+fn refuse_unhonoured_encoder_flags(
+    flags: EncoderFlags,
+    has_codec: bool,
+    target: NoCodecLayer<'_>,
+) -> stuffr::Result<()> {
     if has_codec {
         return Ok(());
     }
-    if opts.threads.is_some() {
-        return Err(stuffr::Error::Usage(
-            "--threads governs a codec's parallel encoder; no container in this build has \
-             a parallel encoder of its own, so there is no worker count to hand it"
-                .into(),
-        ));
+    // Only the reason after the semicolon depends on the verb: `pack`'s target
+    // is a container it is building, `convert`'s is whatever chain is left
+    // once the codec is removed (`.tar.gz` -> `.tar`, `.gz` -> a bare stream).
+    let (threads_why, turbo_why, weak_why) = match target {
+        NoCodecLayer::PackContainer => (
+            "no container in this build has a parallel encoder of its own, so there is no \
+             worker count to hand it"
+                .to_string(),
+            "no container in this build has a parallel encoder of its own".to_string(),
+            "no container in this build has an encoder that can fall back".to_string(),
+        ),
+        NoCodecLayer::ConvertTarget(chain) => {
+            let d = chain.describe();
+            (
+                format!(
+                    "the target, {d}, has no codec layer, so there is no encoder to hand a \
+                     worker count to"
+                ),
+                format!("the target, {d}, has no codec layer, so there is no encoder to run"),
+                format!("the target, {d}, has no codec layer, so there is no encoder to fall back"),
+            )
+        }
+    };
+    if flags.threads {
+        return Err(stuffr::Error::Usage(format!(
+            "--threads governs a codec's parallel encoder; {threads_why}"
+        )));
     }
-    if opts.turbo {
-        return Err(stuffr::Error::Usage(
-            "--turbo lifts the CPU cap for a codec's parallel encoder; no container in \
-             this build has a parallel encoder of its own"
-                .into(),
-        ));
+    if flags.turbo {
+        return Err(stuffr::Error::Usage(format!(
+            "--turbo lifts the CPU cap for a codec's parallel encoder; {turbo_why}"
+        )));
     }
-    if opts.allow_weak_encoder {
-        return Err(stuffr::Error::Usage(
-            "--allow-weak-encoder consents to a codec's fallback encoder; no container in \
-             this build has an encoder that can fall back"
-                .into(),
-        ));
+    if flags.allow_weak_encoder {
+        return Err(stuffr::Error::Usage(format!(
+            "--allow-weak-encoder consents to a codec's fallback encoder; {weak_why}"
+        )));
+    }
+    Ok(())
+}
+
+/// The encoder flags [`refuse_unhonoured_encoder_flags`] judges — whether
+/// each was given, which is all the refusal needs.
+///
+/// `--level` is deliberately absent, as it always was from pack's list: `pack
+/// -o x.tar --level 9` accepts it and it is inert, and `convert` to a
+/// codec-less target does exactly the same rather than invent a second rule.
+struct EncoderFlags {
+    threads: bool,
+    turbo: bool,
+    allow_weak_encoder: bool,
+}
+
+impl EncoderFlags {
+    fn of(opts: &CompressOpts) -> Self {
+        Self {
+            threads: opts.threads.is_some(),
+            turbo: opts.turbo,
+            allow_weak_encoder: opts.allow_weak_encoder,
+        }
+    }
+}
+
+/// What has no codec layer, for [`refuse_unhonoured_encoder_flags`]' wording.
+enum NoCodecLayer<'a> {
+    /// `pack` to a bare container. Its messages are pinned by its tests.
+    PackContainer,
+    /// `convert` to a target chain with no codec: a bare container, or a
+    /// plain stream the codec was removed from.
+    ConvertTarget(&'a Chain),
+}
+
+/// How `convert` gets from the source chain to the target chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConvertMode {
+    /// The container (or the plain stream) is kept byte for byte and only
+    /// the codec changes — `ops::recompress_source`.
+    Codec,
+    /// The container changes; entries are read from one and written into the
+    /// other.
+    Entry,
+}
+
+/// The ONE owner of convert's mode table, applied to the source chain
+/// `ops::ConvertSource` resolved by content and the target chain
+/// [`convert_target_chain`] resolved from the command line.
+///
+/// | src -> dst | result |
+/// |---|---|
+/// | same container (two plain streams count as the same), codec differs | `Codec` |
+/// | different containers | `Entry` |
+/// | plain stream <-> container | exit 2, naming both chains |
+/// | identical chain, no re-encode flag | exit 2, nothing to convert |
+/// | identical chain with `--level`/`--threads`/`--turbo` | `Codec` |
+///
+/// "Identical" is whole-chain equality, so a source with several codec
+/// layers (`gzip` over `xz` over `tar`) is never identical to a target,
+/// which has at most one, and converting it peels them all.
+fn convert_mode(src: &Chain, dst: &Chain, reencode: bool) -> stuffr::Result<ConvertMode> {
+    match (src.container(), dst.container()) {
+        (Some(a), Some(b)) if a != b => Ok(ConvertMode::Entry),
+        (None, Some(_)) => Err(stuffr::Error::Usage(format!(
+            "the input is {} and the output would be {}: a plain stream has no entries \
+             to put in an archive. Decode it with `stuffr unpack`, then `stuffr pack` the \
+             file into the archive.",
+            src.describe(),
+            dst.describe()
+        ))),
+        (Some(_), None) => Err(stuffr::Error::Usage(format!(
+            "the input is {} and the output would be {}: an archive's entries do not fit \
+             in a plain stream. Take them out with `stuffr unpack -C DIR` or `stuffr cat`, \
+             or name an output that keeps the container (`.{}` plus a codec).",
+            src.describe(),
+            dst.describe(),
+            src.container().map(|c| c.to_string()).unwrap_or_default()
+        ))),
+        _ if src == dst && !reencode => Err(stuffr::Error::Usage(format!(
+            "nothing to convert: the input is already {}. Pass --level, --threads or \
+             --turbo to re-encode it anyway.",
+            src.describe()
+        ))),
+        _ => Ok(ConvertMode::Codec),
+    }
+}
+
+/// The chain `convert` will write: from OUT's name, or from `--format`, with
+/// the two refused (exit 2) where they contradict each other.
+///
+/// A container `--format` (or none at all) goes through `pack`'s own
+/// [`resolve_pack_chain`], so `--format zip -o x.tar.gz` is refused by the
+/// same code and in the same words for both verbs. A codec `--format` is
+/// convert's own case — `pack` hands a codec `--format` straight to the
+/// single-stream path without consulting the name at all — and is refused
+/// unless the name is silent (`out.bin`, stdout) or names that same codec
+/// outermost (`--format xz -o b.tar.xz`). A name saying another codec, or a
+/// bare container, would otherwise yield a file whose name lies about it.
+fn convert_target_chain(fmt: Option<FormatId>, output: Option<&str>) -> stuffr::Result<Chain> {
+    if let Some((container, codec)) = resolve_pack_chain(fmt, output)? {
+        let inner = Chain::Container { container };
+        return Ok(match codec {
+            Some(codec) => Chain::Codec {
+                codec,
+                inner: Box::new(inner),
+            },
+            None => inner,
+        });
+    }
+    let named = output.map(|o| stuffr::chain_for_new_path(stuffr::registry(), Path::new(o)));
+    let Some(id) = fmt else {
+        // No --format and no container in the name: the name's codec, or
+        // `Raw` for a name that says nothing (`.gz` -> `x` decodes).
+        return Ok(named.unwrap_or(Chain::Raw));
+    };
+    match named {
+        None | Some(Chain::Raw) => Ok(Chain::Codec {
+            codec: id,
+            inner: Box::new(Chain::Raw),
+        }),
+        Some(chain) if chain.outermost_codec() == Some(id) => Ok(chain),
+        Some(chain) => Err(stuffr::Error::Usage(format!(
+            "--format {id} asks for {id}, but the output name `{}` says {}. Rename the \
+             output, or drop --format and let the name decide.",
+            output.unwrap_or_default(),
+            chain.describe()
+        ))),
+    }
+}
+
+/// Refuses (exit 2) a conversion whose output is its own input, before the
+/// output is opened.
+///
+/// With `--force` the temp-file-then-rename write would otherwise replace the
+/// input with its own conversion — harmless when it succeeds, but `convert`
+/// reads the input WHILE writing, and a symlink destination takes the
+/// direct-write branch (`Output::create`), truncating the very file being
+/// read. Two tests, because neither alone is enough: canonical paths catch
+/// `./a`, `a` and a symlink to `a`; only `(dev, ino)` catches a hard link,
+/// whose name canonicalises to itself.
+fn refuse_converting_onto_itself(input: &Path, output: &Path) -> stuffr::Result<()> {
+    let canonical_match = match (std::fs::canonicalize(input), std::fs::canonicalize(output)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    #[cfg(unix)]
+    let inode_match = {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(input), std::fs::metadata(output)) {
+            (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+            _ => false,
+        }
+    };
+    #[cfg(not(unix))]
+    let inode_match = false;
+    if canonical_match || inode_match {
+        return Err(stuffr::Error::Usage(format!(
+            "`{}` and `{}` are the same file; convert reads its input while writing its \
+             output, so it cannot convert a file onto itself. Name a different output.",
+            input.display(),
+            output.display()
+        )));
     }
     Ok(())
 }

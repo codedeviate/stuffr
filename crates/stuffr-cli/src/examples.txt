@@ -351,6 +351,97 @@ STREAMING TO STDOUT
       under "EXTRACTING AN ARCHIVE'S ENTRIES" below.
 
 
+CONVERTING BETWEEN FORMATS
+
+  stuffr convert IN -o OUT [flags]
+  stuffr convert IN OUT    [flags]
+      Two spellings of one command: the destination is either -o OUT or a
+      second positional OUT. Giving both, or neither, is a usage error
+      (exit 2). Nothing is unpacked to disk on the way.
+
+  stuffr convert backup.tar.gz -o backup.tar.zst
+      Codec mode: the container is kept byte for byte and only the
+      compression around it changes. Every codec layer of the input is
+      peeled (a gzip over an xz decodes fully) and at most one is written,
+      as with pack. Nothing is parsed inside the tar, so nothing can be
+      lost and the conversion is exact. IN's chain is detected from its
+      CONTENT, never its name: a `.tar.gz` that is really gzip over xz
+      over tar converts correctly. The target chain comes from OUT's name
+      (compound spellings like `.tgz` and `.tbz` included) or from
+      --format. On a build whose zstd encoder is the weak fallback, a zstd
+      target needs --allow-weak-encoder, exactly as pack does.
+
+  stuffr convert notes.txt.gz notes.txt.xz
+  stuffr convert backup.tar.xz backup.tar
+  stuffr convert notes.txt.gz notes.txt
+      The same mode on a plain stream, and with no codec at all on the
+      target side: the last two only remove one. The summary on stderr
+      names the TARGET chain — `-> tar over zstd`, `-> tar`, `-> raw`.
+
+  How the two chains decide what happens:
+
+    same container (or plain on both sides), codec changes  codec mode
+    identical chain, e.g. .tar.gz -> .tar.gz                  exit 2,
+        "nothing to convert" — unless --level, --threads or --turbo asks
+        for a re-encode, which makes it codec mode again
+    plain stream <-> container (.gz -> .zip, .tar.gz -> .gz)  exit 2,
+        naming both chains: a plain stream has no entries to put in an
+        archive, and an archive's entries do not fit in a plain stream.
+        `stuffr pack` / `stuffr unpack -C` are the verbs for those
+    different containers (.tar.gz -> .zip)                    exit 3,
+        "container conversion is not in this build yet". Unpack with -C
+        and pack the directory in the meantime:
+          stuffr unpack backup.tar.gz -C tree
+          stuffr pack tree -o backup.zip
+
+  stuffr convert backup.tar.gz backup.tar.gz --level 9 --force
+      Refused (exit 2), --force or not: OUT is IN. So is the same file reached
+      as `./backup.tar.gz`, through a symlink, or through a hard link —
+      convert reads its input while it writes, so it never converts a
+      file onto itself. Write to a new name and rename afterwards.
+
+  stuffr convert notes.txt.gz -o - --format xz > notes.txt.xz
+  cat backup.tar.gz | stuffr convert - -o backup.tar.xz
+      `-` works at both ends. Stdout has no name to take a target from, so
+      -o - needs --format; stdin is read exactly once. --format names a
+      codec or a container, and one OUT's name contradicts is refused
+      (exit 2) as pack refuses it: `convert a.tar.gz -o b.tar.xz --format
+      zstd` would write a zstd file under a name promising xz. A codec
+      --format against a stdout target writes a plain stream, so it fits
+      only a plain input.
+
+  stuffr convert big.tar.gz -o big.tar.xz --threads 0 --memory-limit 2G
+      --threads, --turbo, --level and --allow-weak-encoder mean what they
+      mean for pack and act on the target codec. Where the target has no
+      codec (`-o backup.tar`, `-o notes.txt`), --threads, --turbo and
+      --allow-weak-encoder are refused (exit 2) rather than ignored;
+      --level is accepted and inert there, as `pack -o x.tar --level 9`
+      accepts it. --max-ratio and --memory-limit bound the read side as
+      they do for unpack (exit 6), and --memory-limit also bounds the
+      encoder's workers. --force replaces an existing OUT, --no-sync skips
+      the fsync before it is published, and --strict-fidelity exits 4 on
+      any fidelity loss — which codec mode, copying the container
+      untouched, never has.
+
+  Unrecognised input — bytes no probe identifies, such as a plain text
+  file — is a usage error (exit 2): convert changes a format, and to
+  compress a plain file you want `stuffr pack`. A corrupt input is exit 5
+  and leaves no OUT behind: everything is decoded before OUT is
+  published, so a gzip trailer that fails its CRC on the last byte still
+  costs you nothing on disk. That promise is a PATH destination's only:
+  with -o - the bytes already written to stdout cannot be taken back, so
+  a late failure leaves a truncated stream downstream and only the exit
+  status says so. Check it.
+
+  A codec with no magic bytes (brotli, raw deflate) nested INSIDE another
+  codec cannot be detected by content, so it is not peeled and stays in
+  the output: gzip over brotli named `x.gz`, converted to `x.xz`, is xz
+  over brotli. unpack and cat behave the same way. And whatever sits
+  beneath it is invisible too — gzip over brotli over tar reads as a plain
+  gzip stream, so converting it to `.tar.xz` is the plain -> container
+  refusal above. As the OUTERMOST layer such a codec is still found by
+  IN's extension (`.br`).
+
 STDIN AND STDOUT VIA `-`
 
   `-` means the stream, wherever a path is expected: stdin for an input,
