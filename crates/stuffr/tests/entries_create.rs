@@ -632,3 +632,81 @@ fn excluding_the_output_from_a_tree_that_has_other_files_still_packs() {
         "and the archive is not inside itself: {names:?}"
     );
 }
+
+/// The exact words `pack` uses when the target container has no directory
+/// entry. The wording is user-facing and shared by every container that
+/// lacks the kind, so it is pinned verbatim, not by substring of the entry.
+#[test]
+#[cfg(feature = "ar")]
+fn the_no_directory_entries_warning_has_its_exact_wording() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"a").unwrap();
+
+    let report = entries::create_archive(
+        &[root],
+        Output::Path(dir.join("p.a")),
+        FormatId::new("ar"),
+        None,
+        &CompressOpts::default(),
+    )
+    .unwrap();
+
+    let reason = report
+        .fidelity
+        .warnings
+        .iter()
+        .find_map(|w| match w {
+            Fidelity::EntrySkipped { entry, reason } if entry == "proj" => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("the dropped directory must be named");
+    assert_eq!(
+        reason,
+        "`ar` has no directory entries, so the directory itself is not stored; \
+         everything inside it still is, and extraction recreates the parents it needs"
+    );
+}
+
+/// The exact words for a symlink the target container cannot hold, and the
+/// order relative to the entries around it.
+#[cfg(all(unix, feature = "ar"))]
+#[test]
+fn the_no_symlink_entries_warning_has_its_exact_wording() {
+    let dir = tmp_dir();
+    let root = dir.join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"a").unwrap();
+    std::os::unix::fs::symlink("a.txt", root.join("link")).unwrap();
+
+    let report = entries::create_archive(
+        &[root],
+        Output::Path(dir.join("p.a")),
+        FormatId::new("ar"),
+        None,
+        &CompressOpts::default(),
+    )
+    .unwrap();
+
+    let skipped: Vec<(String, String)> = report
+        .fidelity
+        .warnings
+        .iter()
+        .filter_map(|w| match w {
+            Fidelity::EntrySkipped { entry, reason } => Some((entry.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect();
+    let link = skipped
+        .iter()
+        .find(|(e, _)| e == "proj/link")
+        .expect("the dropped symlink must be named");
+    assert_eq!(
+        link.1,
+        "`ar` has no symlink entries; storing it as a regular file would \
+         materialise the link's target text as that file's contents"
+    );
+    let order: Vec<&str> = skipped.iter().map(|(e, _)| e.as_str()).collect();
+    assert_eq!(order, vec!["proj", "proj/link"], "walk order is preserved");
+}
