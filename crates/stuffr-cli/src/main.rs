@@ -444,32 +444,9 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             if let (Input::Path(i), Output::Path(o)) = (&src, &dst) {
                 refuse_converting_onto_itself(i, o)?;
             }
-
-            // Opened ONCE: the mode is chosen from this source's own chain
-            // and the same value is then converted, so stdin is read once
-            // and the CLI cannot disagree with the library about what the
-            // input is (`ops::resolve_source_chain` is that rule's owner).
-            let source = match ops::ConvertSource::open(src, memory_limit) {
-                Err(stuffr::Error::UnknownFormat { seen }) => {
-                    return Err(stuffr::Error::Usage(format!(
-                        "`{input}` is not in any format this build recognises (leading \
-                         bytes were {seen}). convert changes a format; to compress a plain \
-                         file use `stuffr pack`"
-                    )));
-                }
-                other => other?,
-            };
-            let reencode = level.is_some() || threads.is_some() || turbo;
-            match convert_mode(source.chain(), &target, reencode)? {
-                ConvertMode::Codec => {}
-                ConvertMode::Entry => {
-                    return Err(stuffr::Error::Unsupported(format!(
-                        "{} -> {} changes the container, and container conversion is not \
-                         in this build yet",
-                        source.chain().describe(),
-                        target.describe()
-                    )));
-                }
+            #[cfg(unix)]
+            if let (Input::Stdin, Output::Path(o)) = (&src, &dst) {
+                refuse_stdin_redirected_from(o)?;
             }
 
             let mut opts = RecompressOpts {
@@ -486,14 +463,53 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             if let Some(r) = max_ratio {
                 opts.max_ratio = r;
             }
+            // Level range, weak-encoder consent and a missing encoder are
+            // command-line errors too: refused before the input is opened, so
+            // a corrupt input cannot mask them with exit 5 and stdin is not
+            // consumed. `ops` owns the checks; this only asks them early.
+            ops::check_recompress_target(&opts)?;
+
+            // Opened ONCE: the mode is chosen from this source's own chain
+            // and the same value is then converted, so stdin is read once
+            // and the CLI cannot disagree with the library about what the
+            // input is (`ops::resolve_source_chain` is that rule's owner).
+            let source = match ops::ConvertSource::open(src, memory_limit) {
+                Err(stuffr::Error::UnknownFormat { seen }) => {
+                    return Err(stuffr::Error::Usage(format!(
+                        "`{input}` is not in any format this build recognises (leading \
+                         bytes were {seen}). convert changes a format; to compress a plain \
+                         file use `stuffr pack`"
+                    )));
+                }
+                other => other?,
+            };
+            let reencode = level.is_some() || threads.is_some() || turbo;
+            match convert_mode(
+                source.chain(),
+                &target,
+                reencode,
+                matches!(dst, Output::Stdout),
+            )? {
+                ConvertMode::Codec => {}
+                ConvertMode::Entry => {
+                    return Err(stuffr::Error::Unsupported(format!(
+                        "{} -> {} changes the container, and container conversion is not \
+                         in this build yet",
+                        source.chain().describe(),
+                        target.describe()
+                    )));
+                }
+            }
+
             let out = ops::recompress_source(source, dst, &opts)?;
             // The TARGET chain, never `out.format`: for a bare stream with no
             // codec that names the codec just removed.
             eprintln!(
-                "{input} -> {} ({} -> {} bytes)",
+                "{input} -> {} ({} -> {} bytes, {})",
                 target.describe(),
                 out.bytes_in,
-                out.bytes_out
+                out.bytes_out,
+                read_fidelity_summary(&out.fidelity)
             );
             report_fidelity(&out.fidelity, strict_fidelity)
         }
@@ -655,15 +671,11 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // exactly the claim this tool exists not to make. Same ruling
             // `pack`'s summary line already carries, for the same reason: when
             // something was lost, the honest number is how much.
-            let losses = out.fidelity.warnings.len();
             eprintln!(
                 "{} -> {} bytes verified ({})",
                 out.format,
                 out.bytes_out,
-                match losses {
-                    0 => format!("{} fidelity", out.fidelity.rung),
-                    n => format!("{} access, {n} fidelity loss(es)", out.fidelity.rung),
-                }
+                read_fidelity_summary(&out.fidelity)
             );
             report_fidelity(&out.fidelity, strict_fidelity)
         }
@@ -1518,6 +1530,17 @@ fn dispatch_salvage(args: SalvageArgs) -> stuffr::Result<i32> {
     }))
 }
 
+/// The parenthesised fidelity phrase of a read-side summary line: `exact
+/// fidelity` when clean, `exact access, N fidelity loss(es)` otherwise —
+/// never the rung alone over a report that carries warnings. `test` and
+/// `convert` print it; the rationale is `test`'s comment above.
+fn read_fidelity_summary(report: &stuffr::FidelityReport) -> String {
+    match report.warnings.len() {
+        0 => format!("{} fidelity", report.rung),
+        n => format!("{} access, {n} fidelity loss(es)", report.rung),
+    }
+}
+
 /// Prints what an operation approximated, and fails under --strict-fidelity.
 ///
 /// The report is printed either way: a caller who did not ask for the gate
@@ -1796,12 +1819,18 @@ enum ConvertMode {
 /// | different containers | `Entry` |
 /// | plain stream <-> container | exit 2, naming both chains |
 /// | identical chain, no re-encode flag | exit 2, nothing to convert |
-/// | identical chain with `--level`/`--threads`/`--turbo` | `Codec` |
+/// | identical chain with a codec, with `--level`/`--threads`/`--turbo` | `Codec` |
+/// | identical chain with NO codec, whatever the flags | exit 2, nothing to convert |
 ///
 /// "Identical" is whole-chain equality, so a source with several codec
 /// layers (`gzip` over `xz` over `tar`) is never identical to a target,
 /// which has at most one, and converting it peels them all.
-fn convert_mode(src: &Chain, dst: &Chain, reencode: bool) -> stuffr::Result<ConvertMode> {
+fn convert_mode(
+    src: &Chain,
+    dst: &Chain,
+    reencode: bool,
+    dst_is_stdout: bool,
+) -> stuffr::Result<ConvertMode> {
     match (src.container(), dst.container()) {
         (Some(a), Some(b)) if a != b => Ok(ConvertMode::Entry),
         (None, Some(_)) => Err(stuffr::Error::Usage(format!(
@@ -1814,10 +1843,28 @@ fn convert_mode(src: &Chain, dst: &Chain, reencode: bool) -> stuffr::Result<Conv
         (Some(_), None) => Err(stuffr::Error::Usage(format!(
             "the input is {} and the output would be {}: an archive's entries do not fit \
              in a plain stream. Take them out with `stuffr unpack -C DIR` or `stuffr cat`, \
-             or name an output that keeps the container (`.{}` plus a codec).",
+             or name an output that keeps the container. {}",
             src.describe(),
             dst.describe(),
-            src.container().map(|c| c.to_string()).unwrap_or_default()
+            if dst_is_stdout {
+                format!(
+                    "To stream it, pipe through pack: `stuffr convert IN -o - --format {} | \
+                     stuffr pack - -o - --format {}`.",
+                    src.container().map(|c| c.to_string()).unwrap_or_default(),
+                    dst.outermost_codec()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default()
+                )
+            } else {
+                String::new()
+            }
+        ))),
+        // Re-encoding needs a codec, so an identical chain with none has
+        // nothing to re-encode whatever the flags say: no hint.
+        _ if src == dst && src.outermost_codec().is_none() => Err(stuffr::Error::Usage(format!(
+            "nothing to convert: the input is already {}, which has no codec layer to \
+             change.",
+            src.describe()
         ))),
         _ if src == dst && !reencode => Err(stuffr::Error::Usage(format!(
             "nothing to convert: the input is already {}. Pass --level, --threads or \
@@ -1897,14 +1944,46 @@ fn refuse_converting_onto_itself(input: &Path, output: &Path) -> stuffr::Result<
     #[cfg(not(unix))]
     let inode_match = false;
     if canonical_match || inode_match {
-        return Err(stuffr::Error::Usage(format!(
-            "`{}` and `{}` are the same file; convert reads its input while writing its \
-             output, so it cannot convert a file onto itself. Name a different output.",
-            input.display(),
-            output.display()
-        )));
+        return Err(same_file_error(&input.display().to_string(), output));
     }
     Ok(())
+}
+
+fn same_file_error(input: &str, output: &Path) -> stuffr::Error {
+    stuffr::Error::Usage(format!(
+        "`{input}` and `{}` are the same file; convert reads its input while writing its \
+         output, so it cannot convert a file onto itself. Name a different output.",
+        output.display()
+    ))
+}
+
+/// The stdin spelling of [`refuse_converting_onto_itself`]: `convert - -o l.xz
+/// < big.xz` with `l.xz` a symlink to `big.xz` would truncate the input the
+/// same way. When fd 0 is a regular file and OUT exists, compares `(dev, ino)`
+/// (OUT's following symlinks). A pipe, a tty or a missing OUT cannot clash.
+///
+/// fd 0 is only read through a `dup` (`BorrowedFd::try_clone_to_owned`), so
+/// dropping the handle closes the duplicate and never stdin itself; `fstat`
+/// reads no bytes, so the stream is untouched.
+#[cfg(unix)]
+fn refuse_stdin_redirected_from(output: &Path) -> stuffr::Result<()> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    let Ok(fd) = std::io::stdin().as_fd().try_clone_to_owned() else {
+        return Ok(());
+    };
+    let Ok(stdin_meta) = std::fs::File::from(fd).metadata() else {
+        return Ok(());
+    };
+    if !stdin_meta.is_file() {
+        return Ok(());
+    }
+    match std::fs::metadata(output) {
+        Ok(o) if (o.dev(), o.ino()) == (stdin_meta.dev(), stdin_meta.ino()) => {
+            Err(same_file_error("-", output))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The kind column `list` prints — `EntryKind` is `#[non_exhaustive]`, so a

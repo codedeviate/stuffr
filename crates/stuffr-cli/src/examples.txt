@@ -383,7 +383,9 @@ CONVERTING BETWEEN FORMATS
     same container (or plain on both sides), codec changes  codec mode
     identical chain, e.g. .tar.gz -> .tar.gz                  exit 2,
         "nothing to convert" — unless --level, --threads or --turbo asks
-        for a re-encode, which makes it codec mode again
+        for a re-encode, which makes it codec mode again. A chain with no
+        codec (.tar -> .tar) is always refused: there is nothing to
+        re-encode
     plain stream <-> container (.gz -> .zip, .tar.gz -> .gz)  exit 2,
         naming both chains: a plain stream has no entries to put in an
         archive, and an archive's entries do not fit in a plain stream.
@@ -408,7 +410,9 @@ CONVERTING BETWEEN FORMATS
       (exit 2) as pack refuses it: `convert a.tar.gz -o b.tar.xz --format
       zstd` would write a zstd file under a name promising xz. A codec
       --format against a stdout target writes a plain stream, so it fits
-      only a plain input.
+      only a plain input. For a container to stdout, strip the codec with
+      convert and put the new one on with pack:
+        stuffr convert a.tar.gz -o - --format tar | stuffr pack - -o - --format xz
 
   stuffr convert big.tar.gz -o big.tar.xz --threads 0 --memory-limit 2G
       --threads, --turbo, --level and --allow-weak-encoder mean what they

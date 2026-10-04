@@ -1125,6 +1125,25 @@ pub fn recompress_source_with(
     write_recompressed(src, encoder, dst, o)
 }
 
+/// Refuses, before any input is opened, a target [`recompress`] could not
+/// write: a level out of range, or a weak encoder nobody consented to
+/// (exit 2), or an encoder this build lacks (exit 3). Against the build's
+/// default registry; see [`check_recompress_target_with`].
+pub fn check_recompress_target(o: &RecompressOpts) -> Result<()> {
+    check_recompress_target_with(crate::registry(), o)
+}
+
+/// [`check_recompress_target`] against `registry`.
+///
+/// The ONE owner of the encoder checks is `target_encoder`, which this wraps
+/// and [`recompress_with`] / [`recompress_source_with`] call themselves; a caller that opens a
+/// [`ConvertSource`] first (the CLI) calls it BEFORE the open, so a usage
+/// error costs no read of the input — on stdin, bytes nobody can give back —
+/// and cannot be masked by a corrupt input's exit 5.
+pub fn check_recompress_target_with(registry: &Registry, o: &RecompressOpts) -> Result<()> {
+    target_encoder(registry, o).map(|_| ())
+}
+
 /// The target codec's encoder, checked, or `None` for a codec-less target.
 fn target_encoder<'r>(
     registry: &'r Registry,
