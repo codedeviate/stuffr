@@ -3051,15 +3051,7 @@ pub fn create_archive(
             // ownership warning always came. An entry the walk skipped is
             // never written, so it is not planned and owes no ownership.
             let mut entry_warnings = Vec::new();
-            let planned = match &item.source {
-                crate::walk::ItemSource::Skipped { .. } => None,
-                _ => Some(plan_entry_write(
-                    &caps,
-                    container,
-                    &item.meta,
-                    &mut entry_warnings,
-                )),
-            };
+            let planned = plan_item(&caps, container, item, &mut entry_warnings);
             match &item.source {
                 // A file the walk named and this process cannot OPEN is a
                 // warning, never a failure — the same ruling `walk.rs`'s
@@ -3136,7 +3128,7 @@ pub fn create_archive(
                 // fidelity report; refusing would be the tenth instance of
                 // this project's signature defect.
                 crate::walk::ItemSource::Dir | crate::walk::ItemSource::Symlink => {
-                    if matches!(planned, Some(WritePlan::Write)) {
+                    if let Some(WritePlan::Write) = planned {
                         archive.add(&item.meta, &mut std::io::empty())?;
                     }
                 }
@@ -3402,8 +3394,10 @@ fn is_output_file(candidate: &Path, dst_canonical: Option<&Path>) -> bool {
 ///
 /// On unix the walk always learns both, so this fires for nothing; it is the
 /// non-unix build (and any future entry source with no ids) that needs it.
-/// Skipped items are excluded — an entry that was not written cannot have lost
-/// its ownership.
+/// This looks at `meta` alone and excludes nothing: an item the walk skipped is
+/// never planned (see [`plan_item`]), so it never gets here, while a directory
+/// or symlink the container cannot hold is still reported by
+/// [`plan_entry_write`] even though it is not written.
 fn ownership_warning(meta: &EntryMeta) -> Option<Fidelity> {
     if meta.uid.is_some() && meta.gid.is_some() {
         return None;
@@ -3430,13 +3424,23 @@ enum WritePlan {
 /// The single owner of "this container cannot hold X": a directory or symlink
 /// the container has no entry kind for is skipped with its reason (an `ar`
 /// would land a directory as a zero-byte regular file, after which every
-/// entry beneath it is unextractable), and an entry with no ownership gets
+/// entry beneath it is unextractable), a special file (`EntryKind::Other`: a
+/// device, fifo or socket, which only an entry read from another archive can
+/// be) is never stored, and an entry with no ownership gets
 /// [`ownership_warning`]. It reads only `meta` and `caps`, so an entry that
 /// came from another archive is judged by the same rules as a walked one.
 ///
+/// Every kind is named, and `EntryKind` being `#[non_exhaustive]`, a kind this
+/// build has never heard of is skipped too: writing it as a regular file would
+/// be the `ar`-directory defect, silently.
+///
+/// An entry skipped here STILL reports its missing ownership, as it always
+/// has: the ownership warning is appended after the skip reason whatever the
+/// plan is. That is existing behaviour, pinned by a test, not a rationale.
+///
 /// What it deliberately does not own is anything about the walk: an entry the
-/// walk itself skipped is never planned, and the hardlink summary stays in
-/// `create_archive`.
+/// walk itself skipped is never planned ([`plan_item`]), and the hardlink
+/// summary stays in `create_archive`.
 fn plan_entry_write(
     caps: &ContainerCaps,
     container: FormatId,
@@ -3444,7 +3448,9 @@ fn plan_entry_write(
     warnings: &mut Vec<Fidelity>,
 ) -> WritePlan {
     let plan = match &meta.kind {
-        EntryKind::Dir if !caps.stores_dirs => {
+        EntryKind::File => WritePlan::Write,
+        EntryKind::Dir if caps.stores_dirs => WritePlan::Write,
+        EntryKind::Dir => {
             warnings.push(Fidelity::EntrySkipped {
                 entry: meta.name.clone(),
                 reason: format!(
@@ -3455,7 +3461,8 @@ fn plan_entry_write(
             });
             WritePlan::Skip
         }
-        EntryKind::Symlink { .. } if !caps.stores_symlinks => {
+        EntryKind::Symlink { .. } if caps.stores_symlinks => WritePlan::Write,
+        EntryKind::Symlink { .. } => {
             warnings.push(Fidelity::EntrySkipped {
                 entry: meta.name.clone(),
                 reason: format!(
@@ -3466,13 +3473,44 @@ fn plan_entry_write(
             });
             WritePlan::Skip
         }
-        _ => WritePlan::Write,
+        EntryKind::Other => {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: meta.name.clone(),
+                reason: "is a special file (device, fifo or socket); stuffr \
+                         does not store those"
+                    .to_string(),
+            });
+            WritePlan::Skip
+        }
+        _ => {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: meta.name.clone(),
+                reason: "is an entry kind this build does not know how to \
+                         store"
+                    .to_string(),
+            });
+            WritePlan::Skip
+        }
     };
-    // Skipped entries still get this, as they always have.
     if let Some(w) = ownership_warning(meta) {
         warnings.push(w);
     }
     plan
+}
+
+/// [`plan_entry_write`] for one walked item, or `None` for an item the walk
+/// itself skipped: that is never written, so it is not planned and owes no
+/// ownership warning.
+fn plan_item(
+    caps: &ContainerCaps,
+    container: FormatId,
+    item: &crate::walk::WalkItem,
+    warnings: &mut Vec<Fidelity>,
+) -> Option<WritePlan> {
+    match &item.source {
+        crate::walk::ItemSource::Skipped { .. } => None,
+        _ => Some(plan_entry_write(caps, container, &item.meta, warnings)),
+    }
 }
 
 /// The entry name a command-line path is stored under: its final component.
@@ -4312,7 +4350,7 @@ mod tests {
     }
 
     /// The walk-specific half of the old `ownership_warning`: an entry the
-    /// walk skipped is never planned (see `create_archive`), so only the
+    /// walk skipped is never planned (see `plan_item`), so only the
     /// meta-only rule is left here — and it still reports a skipped-by-caps
     /// directory's ownership, as it always did.
     #[test]
@@ -4330,6 +4368,11 @@ mod tests {
         assert!(matches!(w[0], Fidelity::EntrySkipped { .. }));
         assert!(matches!(w[1], Fidelity::MetadataIncomplete { .. }));
         assert_eq!(w.len(), 2);
+        // The ownership text, verbatim: what `pack` prints today.
+        assert_eq!(
+            w[1].to_string(),
+            "entry `proj/notes.txt` is missing metadata: uid_gid"
+        );
 
         let mut w = Vec::new();
         let file = meta_with(Some(1), Some(1));
@@ -4338,6 +4381,115 @@ mod tests {
             WritePlan::Write
         ));
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn plan_entry_write_follows_the_caps_for_dirs_and_symlinks() {
+        let link = EntryMeta {
+            kind: EntryKind::Symlink { target: "t".into() },
+            ..meta_with(Some(1), Some(1))
+        };
+        let dir = EntryMeta {
+            kind: EntryKind::Dir,
+            ..meta_with(Some(1), Some(1))
+        };
+        let none = ContainerCaps::default();
+        let all = ContainerCaps {
+            stores_dirs: true,
+            stores_symlinks: true,
+            ..Default::default()
+        };
+
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&all, FormatId::new("x"), &link, &mut w),
+            WritePlan::Write
+        ));
+        assert!(matches!(
+            plan_entry_write(&all, FormatId::new("x"), &dir, &mut w),
+            WritePlan::Write
+        ));
+        assert!(w.is_empty());
+
+        assert!(matches!(
+            plan_entry_write(&none, FormatId::new("x"), &link, &mut w),
+            WritePlan::Skip
+        ));
+        assert_eq!(
+            w[0].to_string(),
+            "skipped entry `proj/notes.txt`: `x` has no symlink entries; storing \
+             it as a regular file would materialise the link's target text as \
+             that file's contents"
+        );
+        assert_eq!(w.len(), 1);
+
+        // Symlinks stored, dirs not: the two flags are independent.
+        let links_only = ContainerCaps {
+            stores_symlinks: true,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&links_only, FormatId::new("x"), &link, &mut w),
+            WritePlan::Write
+        ));
+        assert!(matches!(
+            plan_entry_write(&links_only, FormatId::new("x"), &dir, &mut w),
+            WritePlan::Skip
+        ));
+        assert_eq!(w.len(), 1);
+    }
+
+    /// An entry read from another archive can be a device, fifo or socket;
+    /// no container here has a shape for it, so it is never handed over.
+    #[test]
+    fn plan_entry_write_never_stores_a_special_file() {
+        let all = ContainerCaps {
+            stores_dirs: true,
+            stores_symlinks: true,
+            ..Default::default()
+        };
+        let other = EntryMeta {
+            kind: EntryKind::Other,
+            ..meta_with(Some(1), Some(1))
+        };
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&all, FormatId::new("x"), &other, &mut w),
+            WritePlan::Skip
+        ));
+        assert_eq!(w.len(), 1);
+        assert_eq!(
+            w[0].to_string(),
+            "skipped entry `proj/notes.txt`: is a special file (device, fifo or \
+             socket); stuffr does not store those"
+        );
+    }
+
+    /// The walk-specific rule `create_archive` relies on: an item the walk
+    /// skipped is never planned, so it owes no ownership warning either.
+    #[test]
+    fn a_walk_skipped_item_is_never_planned() {
+        let caps = ContainerCaps::default();
+        let skipped = crate::walk::WalkItem {
+            meta: meta_with(None, None),
+            source: crate::walk::ItemSource::Skipped { reason: "r".into() },
+            link_id: None,
+        };
+        let mut w = Vec::new();
+        assert!(plan_item(&caps, FormatId::new("x"), &skipped, &mut w).is_none());
+        assert!(w.is_empty(), "no skip text and no ownership warning");
+
+        let file = crate::walk::WalkItem {
+            meta: meta_with(None, None),
+            source: crate::walk::ItemSource::File("p".into()),
+            link_id: None,
+        };
+        assert!(matches!(
+            plan_item(&caps, FormatId::new("x"), &file, &mut w),
+            Some(WritePlan::Write)
+        ));
+        assert_eq!(w.len(), 1, "a planned item with no ids still reports them");
     }
 
     /// The three decisions [`is_output_file`] makes, the third of which is a
