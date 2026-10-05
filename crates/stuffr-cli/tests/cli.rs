@@ -13806,25 +13806,38 @@ fn convert_strict_fidelity_passes_a_lossless_piped_source() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An entry name longer than anything `ar` usually holds: whatever `pack`
-/// does with it into `ar`, `convert` does the same, because both hand the
-/// name to the same writer. If that is a failure, no OUT is left behind.
+/// A name a target's writer genuinely refuses: an `lha` level-1 header's
+/// filename field holds under 255 bytes (`MAX_LEVEL1_NAME`), and the writer
+/// says so at `add` with `Error::Unsupported`. (`ar` would not do: its BSD
+/// `#1/N` form holds any name, so `pack` succeeds and nothing is proven.)
+/// `convert` hands the name to the same writer, so it must exit as `pack`
+/// does — and, failing, publish no OUT.
 #[test]
-fn convert_into_ar_with_a_name_too_long_matches_pack() {
+fn convert_into_lha_with_a_name_too_long_matches_pack() {
     let dir = tmp_dir();
-    let deep = dir.join("d").join("a".repeat(200)).join("b".repeat(200));
-    std::fs::create_dir_all(&deep).unwrap();
-    let file = deep.join(format!("{}.txt", "c".repeat(200)));
-    std::fs::write(&file, b"far down").unwrap();
     let d = dir.join("d");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join(format!("{}.txt", "n".repeat(240))),
+        b"too long for lha",
+    )
+    .unwrap();
 
-    let packed = dir.join("p.a");
+    let packed = dir.join("p.lzh");
     let pack = run_output(&["pack", d.to_str().unwrap(), "-o", packed.to_str().unwrap()]);
+    // The premise, asserted: the lha writer really refuses this name.
+    assert_eq!(pack.status.code(), Some(3), "{}", stderr_text(&pack));
+    assert!(
+        stderr_text(&pack).contains("LHA cannot store"),
+        "{}",
+        stderr_text(&pack)
+    );
+    assert!(!packed.exists());
 
     let tar = dir.join("s.tar");
     let out = run_output(&["pack", d.to_str().unwrap(), "-o", tar.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
-    let converted = dir.join("c.a");
+    let converted = dir.join("c.lzh");
     let convert = run_output(&[
         "convert",
         tar.to_str().unwrap(),
@@ -13838,32 +13851,47 @@ fn convert_into_ar_with_a_name_too_long_matches_pack() {
         stderr_text(&pack),
         stderr_text(&convert)
     );
-    assert_ne!(convert.status.code(), Some(1), "{}", stderr_text(&convert));
-    if convert.status.code() == Some(0) {
-        // Same name stored by both routes.
-        let rel = file.strip_prefix(&dir).unwrap().to_str().unwrap();
-        for archive in [&packed, &converted] {
-            let out = run_output(&["list", archive.to_str().unwrap()]);
-            assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
-            assert!(
-                String::from_utf8_lossy(&out.stdout).contains(rel),
-                "{}: {}",
-                archive.display(),
-                String::from_utf8_lossy(&out.stdout)
-            );
-        }
-        let back = dir.join("back");
-        let out = run_output(&[
-            "unpack",
-            converted.to_str().unwrap(),
-            "-C",
-            back.to_str().unwrap(),
-        ]);
-        assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
-        let rel = file.strip_prefix(&dir).unwrap();
-        assert_eq!(std::fs::read(back.join(rel)).unwrap(), b"far down");
-    } else {
-        assert!(!converted.exists(), "a failed convert leaves no OUT");
+    assert!(
+        stderr_text(&convert).contains("LHA cannot store"),
+        "{}",
+        stderr_text(&convert)
+    );
+    assert!(!converted.exists(), "a failed convert leaves no OUT");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Entry mode into a container this build only READS (`zoo`, `arc`) is a
+/// capability refusal, exit 3, with no OUT — from a file and from stdin.
+/// It is raised once the source is open (a codec-mode `x.zoo.gz -> x.zoo`
+/// is legal, and the mode is not known before), never as a corrupt input.
+#[test]
+fn convert_into_a_read_only_container_exits_3_and_writes_nothing() {
+    let registry = stuffr::registry();
+    let read_only: Vec<(String, String)> = registry
+        .matrix()
+        .into_iter()
+        .filter(|row| registry.container(row.id).is_some() && row.read && !row.write)
+        .map(|row| (row.id.to_string(), row.extensions[0].to_string()))
+        .collect();
+    assert!(
+        !read_only.is_empty(),
+        "the premise: arc and zoo are read-only"
+    );
+    let (dir, a) = convert_fixture();
+    let data = std::fs::read(&a).unwrap();
+    for (id, ext) in read_only {
+        let t = dir.join(format!("t.{ext}"));
+        let out = run_output(&["convert", a.to_str().unwrap(), "-o", t.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(3), "{id}: {}", stderr_text(&out));
+        assert!(!t.exists(), "{id}: no OUT");
+        let out = run_with_stdin_output(&["convert", "-", "-o", t.to_str().unwrap()], &data);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{id} stdin: {}",
+            stderr_text(&out)
+        );
+        assert!(!t.exists(), "{id} stdin: no OUT");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
