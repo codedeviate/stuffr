@@ -224,6 +224,12 @@ const MAX_SPOOL_HOLE: usize = 1024 * 1024;
 /// own `DEFAULT_FILE_PERMISSIONS`, and what every zip tool writes.
 const DEFAULT_FILE_MODE: u32 = 0o644;
 
+/// The mode zip stores for a DIRECTORY entry when the caller declares none:
+/// `0o755`, traversable, as `tar.rs` and `cpio.rs` default theirs.
+/// `DEFAULT_FILE_MODE` has no owner-execute bit, and a directory extracted
+/// with it cannot be entered.
+const DEFAULT_DIR_MODE: u32 = 0o755;
+
 /// `EntryMeta::codec` for a stored (uncompressed) entry. Deliberately a value
 /// rather than `None`: `None` on a `per_entry_codec` container reads as "not
 /// known", and "this entry is not compressed" is a different, knowable fact.
@@ -2166,12 +2172,16 @@ impl ZipWrite {
     /// promise: same input, same flags, same bytes. Every entry's real mtime
     /// is set explicitly below when the caller supplies one.
     fn options(&self, meta: &EntryMeta) -> SimpleFileOptions {
+        let default_mode = match meta.kind {
+            EntryKind::Dir => DEFAULT_DIR_MODE,
+            _ => DEFAULT_FILE_MODE,
+        };
         let mut o = SimpleFileOptions::DEFAULT
             .compression_method(self.method)
             // Masked to `0o777` by zip itself, so an `st_mode`-shaped value
             // from another container round-trips without the type bits
             // fighting the ones zip sets from `EntryKind` below.
-            .unix_permissions(meta.mode.unwrap_or(DEFAULT_FILE_MODE))
+            .unix_permissions(meta.mode.unwrap_or(default_mode))
             // zip64 per entry, decided from the DECLARED size. Without it,
             // `ZipWriter::write` aborts the entry past 4 GiB with "Large file
             // option has not been set"; with it unconditionally, every small
@@ -3808,6 +3818,34 @@ mod tests {
             None,
             "a forward read has no external attributes to read a mode from, and must not \
              invent one"
+        );
+    }
+
+    /// A directory handed over with no mode used to get `DEFAULT_FILE_MODE`
+    /// (`0o644`): no owner-execute bit, so it extracted as a directory
+    /// nothing could traverse into — `tar.rs`'s and `cpio.rs`'s
+    /// `DEFAULT_DIR_MODE` defect, still open here. `pack` never reached it
+    /// (a walked directory always has a mode); `stuffr convert` from an lha
+    /// archive, whose entries carry none, did. A file's default is unchanged.
+    #[test]
+    fn a_directory_entry_with_no_mode_defaults_to_an_executable_one() {
+        let mut dir = EntryMeta::file("d/");
+        dir.kind = EntryKind::Dir;
+        assert_eq!(dir.mode, None, "the point of this test");
+        let file = EntryMeta::file("d/f.txt");
+        assert_eq!(file.mode, None, "the point of this test");
+        let bytes = build_with(&CreateOpts::default(), &[(dir, b""), (file, b"x")]);
+
+        let got = read_all_seekable(&bytes).unwrap();
+        assert_eq!(
+            got[0].0.mode.map(|m| m & 0o7777),
+            Some(DEFAULT_DIR_MODE),
+            "an unset directory mode must default to something traversable"
+        );
+        assert_eq!(
+            got[1].0.mode.map(|m| m & 0o7777),
+            Some(DEFAULT_FILE_MODE),
+            "a file's own default must be unaffected by the directory fix"
         );
     }
 
