@@ -282,6 +282,18 @@ pub struct ContainerCaps {
     /// `Default`, like every other capability here: a container claims it
     /// explicitly, in the same commit that wires its scanner.
     pub salvage: bool,
+    /// The writer refuses a second entry under a name it has already
+    /// written, so an archive of this format holds one entry per name.
+    ///
+    /// `zip` is the case: `zip` 8.6.0's `ZipWriter` answers `Duplicate
+    /// filename`, while tar, cpio and ar append a repeat like any other
+    /// entry. Read by `stuffr convert`, whose source can legitimately repeat
+    /// a name (`pack`'s walk never does), to keep the first entry of each
+    /// name and warn about the rest rather than fail on the writer's refusal.
+    ///
+    /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`;
+    /// every registered container states it explicitly.
+    pub unique_names: bool,
 }
 
 /// A magic-byte rule. Detection matches these against a bounded prefix.
@@ -360,6 +372,7 @@ impl ContainerCaps {
             stores_symlinks: false,
             detects_corruption: CorruptionDetection::Never,
             salvage: false,
+            unique_names: false,
         }
     }
 

@@ -255,6 +255,8 @@ impl Container for Tar {
             stores_symlinks: true,
             // `crate::tar_salvage` scans it; `stuffr::entries::salvage_scanner`
             // dispatches to it, and a test there pins this flag to that arm.
+            // A repeated name is appended like any other entry.
+            unique_names: false,
             salvage: true,
             ..Default::default()
         }

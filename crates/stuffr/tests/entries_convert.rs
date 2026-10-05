@@ -15,10 +15,12 @@
 //! * names are copied verbatim — `convert` extracts nothing — and duplicate
 //!   names are kept, in source order.
 //!
-//! The unknown-size (spill) path is tested in `entries.rs`'s own unit tests:
-//! no reader in this build yields an entry without a declared size (a zip
-//! with data descriptors is refused on a pipe at exit 3 before any entry is
-//! read), so only a hand-rolled reader can reach it.
+//! A zip arriving on a pipe is spooled whole (its index is at the end), so a
+//! zip streamed with data descriptors converts entry by entry; the pipe
+//! tests here re-run this binary with a real pipe on stdin. The per-entry
+//! unknown-size path is tested in `entries.rs`'s own unit tests: no reader in
+//! this build yields an entry without a declared size, so only a hand-rolled
+//! reader can reach it.
 #![cfg(all(feature = "tar", feature = "zip"))]
 
 use std::path::{Path, PathBuf};
@@ -450,32 +452,201 @@ fn duplicate_names_are_kept_in_order() {
     );
 }
 
-/// Duplicates are kept wherever the target can hold them; the `zip` writer
-/// cannot (`zip` 8.6.0 refuses `Duplicate filename`), and `convert` adds no
-/// policy of its own — the writer's verdict stands, nothing is published.
+/// Duplicates are kept wherever the target can hold them. `zip` cannot — its
+/// writer refuses a second entry under a name already written
+/// (`ContainerCaps::unique_names`) — so the FIRST entry of each name is kept
+/// and every later one is skipped with a warning, instead of the whole
+/// conversion failing on the writer's refusal.
 #[test]
-fn a_duplicate_name_into_zip_is_the_zip_writers_refusal() {
+fn a_duplicate_name_into_zip_keeps_the_first_entry_and_warns() {
     let dir = tmp_dir();
     let tar = dir.join("src.tar");
     std::fs::write(
         &tar,
-        hand_built_tar(&[("a.txt", b'0', b"first"), ("a.txt", b'0', b"second")]),
+        hand_built_tar(&[
+            ("a.txt", b'0', b"first"),
+            ("a.txt", b'0', b"second"),
+            ("b.txt", b'0', b"other"),
+        ]),
     )
     .unwrap();
 
     let out = dir.join("out.zip");
-    let err = entries::convert_archive(
+    let outcome = entries::convert_archive(
         Input::Path(tar),
         Output::Path(out.clone()),
         fmt("zip"),
         None,
         &ConvertOpts::default(),
     )
-    .unwrap_err();
+    .unwrap();
 
-    assert_eq!(err.exit_code(), 5, "{err}");
-    assert!(err.to_string().contains("a.txt"), "{err}");
-    assert!(!out.exists());
+    let skipped = Fidelity::EntrySkipped {
+        entry: "a.txt".into(),
+        reason: "an entry with this name was already written; `zip` holds one entry per name"
+            .into(),
+    };
+    assert_eq!(outcome.fidelity.warnings, [skipped]);
+    assert_eq!(
+        files_of(&out),
+        [
+            ("a.txt".to_string(), b"first".to_vec()),
+            ("b.txt".to_string(), b"other".to_vec()),
+        ],
+        "exactly one `a.txt`, carrying the first payload"
+    );
+}
+
+/// A zip written the way a tool streaming to a pipe writes one: every entry's
+/// local header carries zero sizes, the real ones following the data in a
+/// data descriptor. A forward zip read cannot deliver such an entry at all.
+fn data_descriptor_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new_stream(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+    buf
+}
+
+/// The payloads of the descriptor zip the pipe tests send.
+fn piped_zip_entries() -> Vec<(String, Vec<u8>)> {
+    let big: Vec<u8> = (0..300 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+        .collect();
+    vec![
+        ("a.txt".to_string(), b"alpha".to_vec()),
+        ("big.bin".to_string(), big),
+        ("c.txt".to_string(), b"gamma".to_vec()),
+    ]
+}
+
+const PIPE_CHILD: &str = "STUFFR_TEST_CONVERT_PIPE_CHILD";
+
+/// `Input::Stdin` is the library's only non-seekable source, and a test
+/// process's own stdin is whatever the runner inherited, so the test re-runs
+/// itself (`--exact NAME`) with the descriptor zip on a real pipe and the
+/// destination in `PIPE_CHILD`; the child converts and asserts, the parent
+/// asserts on what it left behind.
+fn run_child_on_a_pipe(test: &str, dst: &Path) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let entries = piped_zip_entries();
+    let refs: Vec<(&str, &[u8])> = entries
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
+    let bytes = data_descriptor_zip(&refs);
+
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--test-threads=1"])
+        .env(PIPE_CHILD, dst)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // A refusing child may stop reading early; a broken pipe is its answer,
+    // not a failure of this write.
+    let _ = stdin.write_all(&bytes);
+    drop(stdin);
+    let res = child.wait_with_output().unwrap();
+    assert!(
+        res.status.success(),
+        "child failed:\n{}\n{}",
+        String::from_utf8_lossy(&res.stdout),
+        String::from_utf8_lossy(&res.stderr)
+    );
+}
+
+/// The child half: convert stdin into `dst` under `spill`.
+fn convert_stdin(dst: &str, spill: stuffr::SpillPolicy) -> stuffr::Result<stuffr::ops::Outcome> {
+    entries::convert_archive(
+        Input::Stdin,
+        Output::Path(dst.into()),
+        fmt("tar"),
+        None,
+        &ConvertOpts {
+            spill,
+            ..ConvertOpts::default()
+        },
+    )
+}
+
+/// Review Focus 3, at the library level: a descriptor zip on a pipe is spooled
+/// (the `Spilled` rung, read through the central directory) rather than read
+/// forward, and every entry comes out whole.
+#[test]
+fn a_descriptor_zip_on_a_pipe_converts_whole() {
+    const NAME: &str = "a_descriptor_zip_on_a_pipe_converts_whole";
+    if let Ok(dst) = std::env::var(PIPE_CHILD) {
+        let outcome = convert_stdin(&dst, stuffr::SpillPolicy::default()).unwrap();
+        assert_eq!(outcome.fidelity.rung, stuffr::Rung::Spilled);
+        return;
+    }
+    let dir = tmp_dir();
+    let dst = dir.join("out.tar");
+    run_child_on_a_pipe(NAME, &dst);
+    assert_eq!(
+        files_of(&dst),
+        piped_zip_entries(),
+        "every payload, byte for byte"
+    );
+}
+
+#[test]
+fn a_descriptor_zip_on_a_pipe_with_spill_off_is_exit_6() {
+    const NAME: &str = "a_descriptor_zip_on_a_pipe_with_spill_off_is_exit_6";
+    if let Ok(dst) = std::env::var(PIPE_CHILD) {
+        let err = convert_stdin(&dst, stuffr::SpillPolicy::Off).unwrap_err();
+        assert_eq!(err.exit_code(), 6, "{err}");
+        assert!(
+            matches!(err, stuffr::Error::SpillLimitExceeded { .. }),
+            "{err:?}"
+        );
+        return;
+    }
+    let dir = tmp_dir();
+    let dst = dir.join("out.tar");
+    run_child_on_a_pipe(NAME, &dst);
+    assert!(!dst.exists(), "nothing is published");
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "no temp file either"
+    );
+}
+
+#[test]
+fn a_descriptor_zip_past_the_spill_cap_is_exit_6() {
+    const NAME: &str = "a_descriptor_zip_past_the_spill_cap_is_exit_6";
+    if let Ok(dst) = std::env::var(PIPE_CHILD) {
+        let err = convert_stdin(&dst, stuffr::SpillPolicy::Memory { cap: 64 * 1024 }).unwrap_err();
+        assert!(
+            matches!(err, stuffr::Error::SpillLimitExceeded { limit } if limit == 64 * 1024),
+            "{err:?}"
+        );
+        assert_eq!(err.exit_code(), 6);
+        return;
+    }
+    let dir = tmp_dir();
+    let dst = dir.join("out.tar");
+    run_child_on_a_pipe(NAME, &dst);
+    assert!(!dst.exists(), "nothing is published");
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        0,
+        "no temp file either"
+    );
 }
 
 /// The CLI opens its source once (stdin cannot be read twice) and picks the

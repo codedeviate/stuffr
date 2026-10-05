@@ -306,6 +306,8 @@ impl Container for Arc {
             detects_corruption: CorruptionDetection::Always,
             // `crate::legacy::arc_salvage` scans it; `stuffr::entries::salvage_scanner`
             // dispatches to it, and a test there pins this flag to that arm.
+            // A repeated name is appended like any other entry.
+            unique_names: false,
             salvage: true,
             ..ContainerCaps::read_only()
         }

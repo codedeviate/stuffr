@@ -97,3 +97,7 @@ serde = { workspace = true, optional = true }
 stuffr = { path = ".", features = ["serde", "testing"] }
 serde_json = "1"
 tempfile = { workspace = true }
+# Writes the data-descriptor zip `entries_convert.rs` feeds through a pipe:
+# the streaming writer stuffr's own `zip.rs` deliberately never uses, which is
+# what a zip streamed to a pipe by another tool looks like.
+zip = { workspace = true }

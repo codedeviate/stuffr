@@ -250,7 +250,14 @@ fn open_archive(
     };
     let (chain, source) =
         resolve_chain_deep_with(registry, path.as_deref(), Box::new(counting), &opts)?;
-    let (archive, container) = open_resolved(registry, &chain, source, &consumed, max_ratio)?;
+    let (archive, container) = open_resolved(
+        registry,
+        &chain,
+        source,
+        &consumed,
+        max_ratio,
+        &read_verb_policy,
+    )?;
     Ok((archive, container, consumed))
 }
 
@@ -263,12 +270,16 @@ fn open_archive(
 /// [`crate::ops::ConvertSource`], which resolves content-first and is opened
 /// before the mode is chosen — goes through exactly the guards every read
 /// verb has, rather than a copy of them.
+///
+/// `policy_for` picks the ladder policy from the container's caps: the read
+/// verbs pass [`read_verb_policy`], `convert` passes [`convert_read_policy`].
 fn open_resolved(
     registry: &Registry,
     chain: &Chain,
     source: Box<dyn Source>,
     consumed: &Arc<AtomicU64>,
     max_ratio: u64,
+    policy_for: &dyn Fn(&ContainerCaps) -> StreamPolicy,
 ) -> Result<(Box<dyn ArchiveRead>, FormatId)> {
     // Kept for the error path: once the loop below has peeled layers, the
     // original chain is the only thing that can say what the input actually
@@ -298,11 +309,8 @@ fn open_resolved(
                 let k = registry.require_container(*container)?;
                 // `ladder::resolve` takes FOUR arguments: the source, the
                 // format, the container's own caps, and the policy.
-                // `StreamPolicy::default()` is `Adaptive { allow_forward_only:
-                // true, .. }`, which is what keeps a piped archive off the
-                // disk.
-                let resolved =
-                    ladder::resolve(source, *container, k.caps(), &StreamPolicy::default())?;
+                let caps = k.caps();
+                let resolved = ladder::resolve(source, *container, caps, &policy_for(&caps))?;
                 return Ok((k.open(resolved, &OpenOpts::default())?, *container));
             }
             // Names what the input resolved to, so "unpack this .gz" is
@@ -317,6 +325,43 @@ fn open_resolved(
                 ));
             }
         }
+    }
+}
+
+/// The ladder policy of `list`, `test`, `cat` and `unpack`, whatever the
+/// container: `StreamPolicy::default()` is `Adaptive { allow_forward_only:
+/// true, .. }`, which is what keeps a piped archive off the disk.
+fn read_verb_policy(_caps: &ContainerCaps) -> StreamPolicy {
+    StreamPolicy::default()
+}
+
+/// The ladder policy `convert` reads its source under.
+///
+/// A container whose authoritative index is at the END (`trailing_index`:
+/// zip) is never read forward: a forward zip read cannot deliver an entry
+/// written with a data descriptor at all (exit 3), which is exactly what a
+/// zip streamed to a pipe holds, and a conversion reads every entry anyway.
+/// Such a source is spooled under `spill` instead — the `Spilled` rung, read
+/// through the central directory — so every entry comes out whole. Every
+/// other container keeps the read verbs' policy.
+///
+/// `SpillPolicy::Off` becomes a zero-byte memory cap here, so a pipe that
+/// would need spooling is refused as the spill limit it is
+/// ([`Error::SpillLimitExceeded`], exit 6, the error
+/// [`SpillSource::materialize`] itself gives for `Off`), not as a
+/// capability this build lacks. A seekable source never reaches the spill.
+fn convert_read_policy(caps: &ContainerCaps, spill: &SpillPolicy) -> StreamPolicy {
+    if !caps.trailing_index {
+        return read_verb_policy(caps);
+    }
+    let spill = match spill {
+        SpillPolicy::Off => SpillPolicy::Memory { cap: 0 },
+        SpillPolicy::Memory { .. } | SpillPolicy::Temp { .. } => spill.clone(),
+    };
+    StreamPolicy::Adaptive {
+        allow_forward_only: false,
+        spill,
+        allow_degraded: false,
     }
 }
 
@@ -3279,9 +3324,13 @@ pub fn convert_archive(
 /// and an entry with no ownership is reported. Names are copied verbatim:
 /// nothing is extracted, so path containment does not apply, and `unpack`
 /// refuses a `../x` later exactly as it would from the source. Duplicate
-/// names are kept in source order wherever the target's writer accepts them;
-/// a writer that refuses a name (zip refuses a duplicate) refuses it exactly
-/// as for `pack`.
+/// names are kept in source order wherever the target holds them; a target
+/// whose caps say `unique_names` (zip) keeps the FIRST entry of each name and
+/// skips the rest with a warning.
+///
+/// A source whose index is at its end (zip) is spooled under `o.spill` when
+/// it arrives on a pipe, rather than read forward, so entries written with
+/// data descriptors come out whole (see `convert_read_policy`).
 ///
 /// # Errors
 ///
@@ -3399,7 +3448,9 @@ pub fn convert_archive_source_with(
     // ladder that actually opened it, is the one that describes this read.
     let (chain, decoded, consumed, _raw_rung, compressed_total) = src.into_parts();
     let (mut ar, _source_container) =
-        open_resolved(registry, &chain, decoded, &consumed, o.max_ratio)?;
+        open_resolved(registry, &chain, decoded, &consumed, o.max_ratio, &|caps| {
+            convert_read_policy(caps, &o.spill)
+        })?;
     let mut budget = ArchiveBudget::new(compressed_total, o.max_ratio).tracking(consumed);
 
     let ArchiveTarget {
@@ -3459,11 +3510,21 @@ fn convert_entries(
 ) -> Result<(u64, Vec<Fidelity>)> {
     let mut moved = 0u64;
     let mut warnings = Vec::new();
+    // Names already written, for a target that holds one entry per name.
+    let mut written: HashSet<String> = HashSet::new();
     while let Some(mut entry) = ar.next_entry()? {
         let mut meta = entry.meta().clone();
         if let WritePlan::Skip = plan_entry_write(caps, container, &meta, &mut warnings) {
             // Unread: the reader drains (or seeks past) an entry the caller
             // did not consume, as it does for `list`.
+            continue;
+        }
+        // Here, not in `plan_entry_write`: only an archive can repeat a name
+        // (`pack`'s walk never does), so `pack` never needs the check. After
+        // the plan, so an entry that is not written claims no name. The
+        // FIRST entry of a name wins; the writer would refuse the second.
+        if caps.unique_names && !written.insert(meta.name.clone()) {
+            warnings.push(duplicate_name_skipped(container, &meta.name));
             continue;
         }
         match &meta.kind {
@@ -3480,6 +3541,18 @@ fn convert_entries(
         }
     }
     Ok((moved, warnings))
+}
+
+/// The warning for a later entry whose name a `unique_names` target already
+/// holds.
+fn duplicate_name_skipped(container: FormatId, name: &str) -> Fidelity {
+    Fidelity::EntrySkipped {
+        entry: name.to_string(),
+        reason: format!(
+            "an entry with this name was already written; `{container}` holds one \
+             entry per name"
+        ),
+    }
 }
 
 /// Writes one file entry's payload into `archive`, returning its length.

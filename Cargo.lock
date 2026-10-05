@@ -804,6 +804,7 @@ dependencies = [
  "stuffr-core",
  "stuffr-formats",
  "tempfile",
+ "zip",
 ]
 
 [[package]]

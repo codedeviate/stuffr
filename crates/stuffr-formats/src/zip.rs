@@ -262,6 +262,8 @@ impl Container for Zip {
             stores_symlinks: true,
             // `crate::zip_salvage` scans it; `stuffr::entries::salvage_scanner`
             // dispatches to it, and a test there pins this flag to that arm.
+            // `zip` 8.6.0's writer refuses `Duplicate filename`.
+            unique_names: true,
             salvage: true,
             ..Default::default()
         }
