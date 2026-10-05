@@ -390,11 +390,32 @@ CONVERTING BETWEEN FORMATS
         naming both chains: a plain stream has no entries to put in an
         archive, and an archive's entries do not fit in a plain stream.
         `stuffr pack` / `stuffr unpack -C` are the verbs for those
-    different containers (.tar.gz -> .zip)                    exit 3,
-        "container conversion is not in this build yet". Unpack with -C
-        and pack the directory in the meantime:
-          stuffr unpack backup.tar.gz -C tree
-          stuffr pack tree -o backup.zip
+    different containers (.tar.gz -> .zip)                    entry mode
+
+  stuffr convert backup.tar.gz -o backup.zip
+  stuffr convert release.zip release.tar.xz
+  curl -s https://example.org/src.zip | stuffr convert - -o src.tar.xz
+      Entry mode: the container changes, so every entry is read from IN
+      and written into OUT — nothing is unpacked to disk. A target that
+      cannot hold something behaves exactly as pack does: a directory in
+      an ar, or a symlink in a container without symlink entries, is
+      skipped with a warning, a device or fifo is never stored, and the
+      rest is written (exit 0; exit 4 with --strict-fidelity, OUT still
+      written). A zip records no owner, so converting one into a
+      container that stores uid/gid reports a missing-uid_gid warning for
+      every entry (the entries are written owned by 0:0). Converting into
+      a zip keeps the FIRST entry of a repeated name and skips the rest
+      with a warning; other targets keep repeats in order. Names are
+      copied verbatim — convert extracts nothing, so a `../x` stays
+      `../x` and unpack refuses it later, as it would from IN. A zip on a
+      pipe is spooled (memory, then a temp file) so entries another tool
+      streamed with data descriptors come out whole; an entry of unknown
+      size past the spill limits is exit 6. A source entry that delivers
+      fewer or more bytes than its header declared is exit 5 and leaves no
+      OUT. --strict-fidelity judges the warnings, never how IN was read: a
+      tar piped on stdin reads forward-only at full fidelity, and a
+      conversion that lost nothing is exit 0. For a damaged IN, run
+      `stuffr salvage` first, then convert what it recovered.
 
   stuffr convert backup.tar.gz backup.tar.gz --level 9 --force
       Refused (exit 2), --force or not: OUT is IN. So is the same file reached
@@ -425,7 +446,7 @@ CONVERTING BETWEEN FORMATS
       encoder's workers. --force replaces an existing OUT, --no-sync skips
       the fsync before it is published, and --strict-fidelity exits 4 on
       any fidelity loss — which codec mode, copying the container
-      untouched, never has.
+      untouched, never has (entry mode can; see above).
 
   Unrecognised input — bytes no probe identifies, such as a plain text
   file — is a usage error (exit 2): convert changes a format, and to
@@ -440,7 +461,8 @@ CONVERTING BETWEEN FORMATS
   A codec with no magic bytes (brotli, raw deflate) nested INSIDE another
   codec cannot be detected by content, so it is not peeled and stays in
   the output: gzip over brotli named `x.gz`, converted to `x.xz`, is xz
-  over brotli. unpack and cat behave the same way. And whatever sits
+  over brotli. unpack and cat behave the same way, and so does entry
+  mode: such a layer beneath the container is not peeled either. And whatever sits
   beneath it is invisible too — gzip over brotli over tar reads as a plain
   gzip stream, so converting it to `.tar.xz` is the plain -> container
   refusal above. As the OUTERMOST layer such a codec is still found by

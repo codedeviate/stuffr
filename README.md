@@ -752,8 +752,8 @@ OOM killer.
 six round-trip containers
 (`ar`, `arj`, `cpio`, `lha`, `tar`, `zip`/`zip64`) `stuffr formats` lists — `pack`/`unpack`/
 `cat` are entry-aware for every container, with extraction-time path
-containment and bomb limits on by default. `convert` and `install-links`
-are not implemented yet. `pack` walks a directory tree, and
+containment and bomb limits on by default. `convert` works too;
+`install-links` is not implemented yet. `pack` walks a directory tree, and
 `pack -o bundle.tar.gz` composes a container on top of a codec in one pass.
 `salvage` is the one recovery-biased verb, and everything else here stays
 as uncompromising as it was before it existed. It recovered zip archives
@@ -776,6 +776,17 @@ stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zo
 stuffr convert  IN -o OUT                  # recompress without staging to disk
 stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
 ```
+
+`convert` changes a format without unpacking to disk. When the container is
+kept (`.tar.gz -> .tar.zst`) only the codec is re-encoded and the container's
+bytes are copied untouched. When the container changes (`.tgz -> .zip`,
+`.zip -> .tar.xz`) every entry is read from one and written into the other
+under `pack`'s fidelity rules: what the target cannot hold is skipped with a
+warning, and `--strict-fidelity` turns any loss into exit 4 with the output
+still written. A zip records no owner, so converting one into a container
+that stores uid/gid warns about the missing `uid_gid` for every entry. A
+codec with no magic bytes nested inside another (gzip over brotli) is not
+peeled and stays in the output, as with `unpack`.
 
 `ARCHIVE` accepts `-` for stdin everywhere. Optional compat symlinks
 argv[0]-dispatch into the same code, so `gzip`, `gunzip`, `zcat`, `bzip2`, `xz`,

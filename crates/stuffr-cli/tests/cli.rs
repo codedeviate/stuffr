@@ -12906,8 +12906,8 @@ fn a_gnu_tar_sparse_archive_lists_tests_and_unpacks_byte_identical() {
 }
 
 // ---------------------------------------------------------------------------
-// `stuffr convert` (Phase 5a). Codec mode only so far: a container change is
-// refused at exit 3 until entry mode lands.
+// `stuffr convert` (Phase 5a): codec mode here; entry mode (a container
+// change) further down.
 // ---------------------------------------------------------------------------
 
 /// The two payloads `convert_fixture` packs, for byte-for-byte comparison.
@@ -13204,16 +13204,6 @@ fn convert_refuses_a_format_that_contradicts_the_name() {
 }
 
 #[test]
-fn convert_between_containers_is_refused_until_stage_2() {
-    let (dir, a) = convert_fixture();
-    let zip = dir.join("a.zip");
-    let out = run_output(&["convert", a.to_str().unwrap(), "-o", zip.to_str().unwrap()]);
-    assert_eq!(out.status.code(), Some(3), "{}", stderr_text(&out));
-    assert!(!zip.exists());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn convert_refuses_encoder_flags_a_codecless_target_cannot_honour() {
     let (dir, a) = convert_fixture();
     let b = dir.join("b.tar");
@@ -13456,5 +13446,424 @@ fn convert_container_to_stdout_plain_points_at_the_pipe() {
     let tar = dir.join("piped.tar");
     assert!(run(&["unpack", xz.to_str().unwrap(), "-o", tar.to_str().unwrap()]).success());
     assert_eq!(std::fs::read(&tar).unwrap(), first.stdout);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// `stuffr convert`, entry mode (Phase 5a Task 5): the container changes, and
+// entries are read from one and written into the other.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn convert_tar_gz_to_zip_round_trips() {
+    let (dir, a) = convert_fixture();
+    let zip = dir.join("a.zip");
+    let out = run_output(&["convert", a.to_str().unwrap(), "-o", zip.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let err = stderr_text(&out);
+    // One progress line for both modes: the TARGET chain and pack's words.
+    assert!(err.contains("-> zip ("), "{err}");
+    assert!(err.contains(" bytes, no fidelity loss)"), "{err}");
+    assert_unpacks_to_the_fixture(&dir, &zip, "out");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every container this build can WRITE, with the extension `pack` takes it
+/// from and the caps that predict what a conversion into it must drop.
+fn writable_containers() -> Vec<(String, String, stuffr::ContainerCaps)> {
+    let registry = stuffr::registry();
+    registry
+        .matrix()
+        .into_iter()
+        .filter(|row| row.write)
+        .filter_map(|row| {
+            let caps = registry.container(row.id)?.caps();
+            let ext = row.extensions.first()?;
+            Some((row.id.to_string(), ext.to_string(), caps))
+        })
+        .collect()
+}
+
+/// The fidelity warnings converting `source` into a container with `dst`'s
+/// caps must report: one skip per entry kind the target has no shape for,
+/// and one `uid_gid` per entry the source carries no ownership for (a zip,
+/// say) — `pack`'s rules, applied to the entries the SOURCE actually holds.
+/// Returns `(skips, ownership)`.
+fn predicted_convert_warnings(source: &Path, dst: &stuffr::ContainerCaps) -> (usize, usize) {
+    let (metas, outcome) = stuffr::entries::list(
+        stuffr::ops::Input::Path(source.to_path_buf()),
+        stuffr::DEFAULT_MAX_RATIO,
+        None,
+    )
+    .unwrap();
+    assert!(
+        !outcome.fidelity.has_warnings(),
+        "the source itself reads with warnings, so the prediction would be wrong: {:?}",
+        outcome.fidelity.warnings
+    );
+    let skips = metas
+        .iter()
+        .filter(|m| match m.kind {
+            stuffr::EntryKind::Dir => !dst.stores_dirs,
+            stuffr::EntryKind::Symlink { .. } => !dst.stores_symlinks,
+            _ => false,
+        })
+        .count();
+    let ownership = metas
+        .iter()
+        .filter(|m| m.uid.is_none() || m.gid.is_none())
+        .count();
+    (skips, ownership)
+}
+
+/// The matrix: every writable container packed by stuffr, converted into
+/// every OTHER writable container, read back by `unpack`. Payloads must be
+/// exact, the exit 0, and the warnings exactly what the target's caps (and
+/// the source's own metadata) predict — no more, no fewer.
+#[test]
+fn convert_every_container_into_every_other() {
+    let containers = writable_containers();
+    assert!(
+        containers.len() >= 4,
+        "tar, ar, cpio and zip are in every build: {containers:?}"
+    );
+    let dir = tmp_dir();
+    let d = dir.join("d");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    let (one, two) = convert_payloads();
+    std::fs::write(d.join("one.txt"), &one).unwrap();
+    std::fs::write(d.join("sub/two.bin"), &two).unwrap();
+
+    for (src_id, src_ext, _) in &containers {
+        let s = dir.join(format!("s-{src_id}.{src_ext}"));
+        let out = run_output(&["pack", d.to_str().unwrap(), "-o", s.to_str().unwrap()]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "pack {src_id}: {}",
+            stderr_text(&out)
+        );
+
+        for (dst_id, dst_ext, dst_caps) in &containers {
+            if dst_id == src_id {
+                continue;
+            }
+            let label = format!("{src_id}-to-{dst_id}");
+            let t = dir.join(format!("t-{label}.{dst_ext}"));
+            let out = run_output(&["convert", s.to_str().unwrap(), "-o", t.to_str().unwrap()]);
+            let err = stderr_text(&out);
+            assert_eq!(out.status.code(), Some(0), "{label}: {err}");
+            assert!(err.contains(&format!("-> {dst_id} (")), "{label}: {err}");
+
+            let (skips, ownership) = predicted_convert_warnings(&s, dst_caps);
+            let total = skips + ownership;
+            assert_eq!(
+                err.matches("skipped entry").count(),
+                skips,
+                "{label}: skip warnings: {err}"
+            );
+            assert_eq!(
+                err.matches("missing metadata: uid_gid").count(),
+                ownership,
+                "{label}: ownership warnings: {err}"
+            );
+            if total == 0 {
+                assert!(err.contains("no fidelity loss)"), "{label}: {err}");
+                assert!(!err.contains("fidelity warning"), "{label}: {err}");
+            } else {
+                assert!(
+                    err.contains(&format!("{total} fidelity loss(es))")),
+                    "{label}: {err}"
+                );
+                assert!(
+                    err.contains(&format!("stuffr: {total} fidelity warning(s):")),
+                    "{label}: {err}"
+                );
+            }
+
+            let back = dir.join(format!("back-{label}"));
+            let out = run_output(&["unpack", t.to_str().unwrap(), "-C", back.to_str().unwrap()]);
+            assert_eq!(
+                out.status.code(),
+                Some(0),
+                "unpack {label}: {}",
+                stderr_text(&out)
+            );
+            assert_eq!(
+                std::fs::read(back.join("d/one.txt")).unwrap(),
+                one,
+                "{label}"
+            );
+            assert_eq!(
+                std::fs::read(back.join("d/sub/two.bin")).unwrap(),
+                two,
+                "{label}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Archives written by the real tools — not by stuffr — convert to
+/// `.tar.xz` and unpack to exactly the files fed to the tool.
+#[test]
+fn convert_reads_archives_the_reference_tools_wrote() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let (one, two) = convert_payloads();
+    std::fs::write(tree.join("one.txt"), &one).unwrap();
+    std::fs::write(tree.join("two.bin"), &two).unwrap();
+    let names = [os(&"one.txt"), os(&"two.bin")];
+
+    let mut sources: Vec<(&str, PathBuf)> = Vec::new();
+
+    let zip = dir.join("ref.zip");
+    let mut args = vec![os(&"-q"), os(&zip)];
+    args.extend(names);
+    run_tool(&require_bin("zip"), &args, &tree, b"");
+    sources.push(("zip", zip));
+
+    // Both tar implementations where they differ (bsdtar on macOS, GNU tar
+    // from Homebrew); on Linux the two are the same program.
+    for (label, bin) in [("tar", require_bin("tar")), ("gtar", require_gnu_tar())] {
+        let tar = dir.join(format!("ref-{label}.tar"));
+        let mut args = vec![os(&"-cf"), os(&tar)];
+        args.extend(names);
+        run_tool(&bin, &args, &tree, b"");
+        sources.push((label, tar));
+    }
+
+    let cpio = dir.join("ref.cpio");
+    let bytes = run_tool(
+        &require_bin("cpio"),
+        &[os(&"-o"), os(&"-H"), os(&"newc")],
+        &tree,
+        b"one.txt\ntwo.bin\n",
+    );
+    std::fs::write(&cpio, bytes).unwrap();
+    sources.push(("cpio", cpio));
+
+    // `S`: no symbol table. macOS's `ar rc` over non-object members writes
+    // an archive holding only an empty `__.SYMDEF SORTED` (measured: 96
+    // bytes, neither member), which would test nothing.
+    let ar = dir.join("ref.a");
+    let mut args = vec![os(&"rcS"), os(&ar)];
+    args.extend(names);
+    run_tool(&require_bin("ar"), &args, &tree, b"");
+    sources.push(("ar", ar));
+
+    for (label, src) in sources {
+        let x = dir.join(format!("x-{label}.tar.xz"));
+        let out = run_output(&["convert", src.to_str().unwrap(), "-o", x.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(0), "{label}: {}", stderr_text(&out));
+        let back = dir.join(format!("back-{label}"));
+        let out = run_output(&["unpack", x.to_str().unwrap(), "-C", back.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(0), "{label}: {}", stderr_text(&out));
+        assert_eq!(std::fs::read(back.join("one.txt")).unwrap(), one, "{label}");
+        assert_eq!(std::fs::read(back.join("two.bin")).unwrap(), two, "{label}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A real reader for convert's output: the system `unzip` lists the zip a
+/// tar was converted into.
+#[test]
+fn convert_writes_a_zip_the_system_unzip_reads() {
+    let (dir, a) = convert_fixture();
+    let tar = dir.join("s.tar");
+    let out = run_output(&["convert", a.to_str().unwrap(), "-o", tar.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let zip = dir.join("t.zip");
+    let out = run_output(&[
+        "convert",
+        tar.to_str().unwrap(),
+        "-o",
+        zip.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let listing = run_tool(&require_bin("unzip"), &[os(&"-l"), os(&zip)], &dir, b"");
+    let listing = String::from_utf8_lossy(&listing);
+    assert!(listing.contains("d/one.txt"), "{listing}");
+    assert!(listing.contains("d/sub/two.bin"), "{listing}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A zip another tool streamed to a pipe declares its sizes only in data
+/// descriptors AFTER each payload, which a forward reader cannot frame. On
+/// stdin convert spools it, so every entry comes out whole.
+#[test]
+fn convert_reads_a_descriptor_zip_from_stdin() {
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let (one, two) = convert_payloads();
+    std::fs::write(tree.join("one.txt"), &one).unwrap();
+    std::fs::write(tree.join("two.bin"), &two).unwrap();
+    // `-` writes to stdout, which `run_tool` captures through a pipe: the
+    // system zip cannot seek back, so it writes data descriptors.
+    let zip = run_tool(
+        &require_bin("zip"),
+        &[os(&"-q"), os(&"-"), os(&"one.txt"), os(&"two.bin")],
+        &tree,
+        b"",
+    );
+    // The fixture asserted, not assumed: general-purpose flag bit 3 on the
+    // first local header is what "uses a data descriptor" means.
+    assert_eq!(&zip[..4], b"PK\x03\x04");
+    assert_ne!(
+        u16::from_le_bytes([zip[6], zip[7]]) & 0x08,
+        0,
+        "the system zip did not write data descriptors, so this proves nothing"
+    );
+
+    let out_tar = dir.join("out.tar");
+    let out = run_with_stdin_output(&["convert", "-", "-o", out_tar.to_str().unwrap()], &zip);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let back = dir.join("back");
+    let out = run_output(&[
+        "unpack",
+        out_tar.to_str().unwrap(),
+        "-C",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_eq!(std::fs::read(back.join("one.txt")).unwrap(), one);
+    assert_eq!(std::fs::read(back.join("two.bin")).unwrap(), two);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A symlink into a container with no symlink entries is a fidelity loss:
+/// under `--strict-fidelity` that is exit 4, and — as for `pack` — the
+/// output is still written.
+#[cfg(unix)]
+#[test]
+fn convert_strict_fidelity_exits_4_and_keeps_the_output() {
+    let ar_caps = stuffr::registry()
+        .container(stuffr::FormatId::new("ar"))
+        .expect("ar is in every build")
+        .caps();
+    assert!(!ar_caps.stores_symlinks, "the premise: ar has no symlinks");
+    let dir = tmp_dir();
+    let d = dir.join("d");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("real.txt"), b"real").unwrap();
+    std::os::unix::fs::symlink("real.txt", d.join("link.txt")).unwrap();
+    let tar = dir.join("s.tar");
+    let out = run_output(&["pack", d.to_str().unwrap(), "-o", tar.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+
+    let a = dir.join("t.a");
+    let out = run_output(&[
+        "convert",
+        tar.to_str().unwrap(),
+        "-o",
+        a.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr_text(&out));
+    assert!(
+        stderr_text(&out).contains("d/link.txt"),
+        "the warning names the entry: {}",
+        stderr_text(&out)
+    );
+    assert!(a.exists(), "the output is written, as pack writes it");
+    let back = dir.join("back");
+    let out = run_output(&["unpack", a.to_str().unwrap(), "-C", back.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_eq!(std::fs::read(back.join("d/real.txt")).unwrap(), b"real");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Controller ruling C4b: `--strict-fidelity` on convert judges the merged
+/// report's WARNINGS, not the read rung. A tar on a pipe reads forward-only
+/// — at full data fidelity, as `ContainerCaps::forward_parse` promises — so
+/// a conversion that lost nothing is exit 0 under the gate, not exit 4.
+#[test]
+fn convert_strict_fidelity_passes_a_lossless_piped_source() {
+    let (dir, a) = convert_fixture();
+    let tar = dir.join("s.tar");
+    let out = run_output(&["convert", a.to_str().unwrap(), "-o", tar.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let zip = dir.join("t.zip");
+    let out = run_with_stdin_output(
+        &[
+            "convert",
+            "-",
+            "-o",
+            zip.to_str().unwrap(),
+            "--strict-fidelity",
+        ],
+        &std::fs::read(&tar).unwrap(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(
+        stderr_text(&out).contains(" bytes, no fidelity loss)"),
+        "{}",
+        stderr_text(&out)
+    );
+    assert_unpacks_to_the_fixture(&dir, &zip, "out");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An entry name longer than anything `ar` usually holds: whatever `pack`
+/// does with it into `ar`, `convert` does the same, because both hand the
+/// name to the same writer. If that is a failure, no OUT is left behind.
+#[test]
+fn convert_into_ar_with_a_name_too_long_matches_pack() {
+    let dir = tmp_dir();
+    let deep = dir.join("d").join("a".repeat(200)).join("b".repeat(200));
+    std::fs::create_dir_all(&deep).unwrap();
+    let file = deep.join(format!("{}.txt", "c".repeat(200)));
+    std::fs::write(&file, b"far down").unwrap();
+    let d = dir.join("d");
+
+    let packed = dir.join("p.a");
+    let pack = run_output(&["pack", d.to_str().unwrap(), "-o", packed.to_str().unwrap()]);
+
+    let tar = dir.join("s.tar");
+    let out = run_output(&["pack", d.to_str().unwrap(), "-o", tar.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let converted = dir.join("c.a");
+    let convert = run_output(&[
+        "convert",
+        tar.to_str().unwrap(),
+        "-o",
+        converted.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        convert.status.code(),
+        pack.status.code(),
+        "pack: {}\nconvert: {}",
+        stderr_text(&pack),
+        stderr_text(&convert)
+    );
+    assert_ne!(convert.status.code(), Some(1), "{}", stderr_text(&convert));
+    if convert.status.code() == Some(0) {
+        // Same name stored by both routes.
+        let rel = file.strip_prefix(&dir).unwrap().to_str().unwrap();
+        for archive in [&packed, &converted] {
+            let out = run_output(&["list", archive.to_str().unwrap()]);
+            assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(rel),
+                "{}: {}",
+                archive.display(),
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+        let back = dir.join("back");
+        let out = run_output(&[
+            "unpack",
+            converted.to_str().unwrap(),
+            "-C",
+            back.to_str().unwrap(),
+        ]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+        let rel = file.strip_prefix(&dir).unwrap();
+        assert_eq!(std::fs::read(back.join(rel)).unwrap(), b"far down");
+    } else {
+        assert!(!converted.exists(), "a failed convert leaves no OUT");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

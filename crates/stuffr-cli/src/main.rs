@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser};
-use stuffr::entries::{self, ExtractOpts, SalvageOpts, Selection};
+use stuffr::entries::{self, ConvertOpts, ExtractOpts, SalvageOpts, Selection};
 use stuffr::ops::{self, CompressOpts, DecompressOpts, Input, Output, RecompressOpts};
 use stuffr::{Chain, FormatId};
 use stuffr_cli::cli::{Cli, Command};
@@ -468,6 +468,36 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             // a corrupt input cannot mask them with exit 5 and stdin is not
             // consumed. `ops` owns the checks; this only asks them early.
             ops::check_recompress_target(&opts)?;
+            // Entry mode's write side, built from the same flags. Checked
+            // here too, for the same reason: a target container this build
+            // cannot write must not cost a read of stdin either.
+            let convert_opts = ConvertOpts {
+                level,
+                force,
+                sync: !no_sync,
+                allow_weak_encoder,
+                threads,
+                turbo,
+                max_ratio: opts.max_ratio,
+                memory_limit,
+                spill: stuffr::SpillPolicy::default(),
+            };
+            if let Some(container) = target.container() {
+                match entries::check_convert_target(
+                    container,
+                    target.outermost_codec(),
+                    &convert_opts,
+                ) {
+                    // A read-only container (arc, zoo) is still a legal
+                    // CODEC-mode target — `x.arc.gz -> x.arc` only removes
+                    // the gzip — and which mode applies is known only once
+                    // the source is open. That one refusal waits:
+                    // `convert_archive_source` raises it again in entry mode.
+                    Err(stuffr::Error::CapabilityUnavailable { format, .. })
+                        if format == container => {}
+                    other => other?,
+                }
+            }
 
             // Opened ONCE: the mode is chosen from this source's own chain
             // and the same value is then converted, so stdin is read once
@@ -484,24 +514,26 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 other => other?,
             };
             let reencode = level.is_some() || threads.is_some() || turbo;
-            match convert_mode(
+            let out = match convert_mode(
                 source.chain(),
                 &target,
                 reencode,
                 matches!(dst, Output::Stdout),
             )? {
-                ConvertMode::Codec => {}
+                ConvertMode::Codec => ops::recompress_source(source, dst, &opts)?,
                 ConvertMode::Entry => {
-                    return Err(stuffr::Error::Unsupported(format!(
-                        "{} -> {} changes the container, and container conversion is not \
-                         in this build yet",
-                        source.chain().describe(),
-                        target.describe()
-                    )));
+                    let container = target
+                        .container()
+                        .expect("convert_mode answers Entry only for a container target");
+                    entries::convert_archive_source(
+                        source,
+                        dst,
+                        container,
+                        target.outermost_codec(),
+                        &convert_opts,
+                    )?
                 }
-            }
-
-            let out = ops::recompress_source(source, dst, &opts)?;
+            };
             // The TARGET chain, never `out.format`: for a bare stream with no
             // codec that names the codec just removed.
             eprintln!(
@@ -511,6 +543,13 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 out.bytes_out,
                 write_fidelity_summary(&out.fidelity)
             );
+            // One gate for both modes, and it judges the WARNINGS only
+            // (`report_fidelity` reads `has_warnings`, never `is_lossless`).
+            // Entry mode's report merges the source reader's rung, and a
+            // tar or cpio on a pipe reads forward-only — at full data
+            // fidelity (`ContainerCaps::forward_parse`); every real loss,
+            // the reader's or the writer's, is a warning. So a lossless
+            // conversion from stdin is exit 0 under --strict-fidelity.
             report_fidelity(&out.fidelity, strict_fidelity)
         }
         Command::Cat {
