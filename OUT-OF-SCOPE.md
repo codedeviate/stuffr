@@ -211,8 +211,28 @@ question rather than an omission:
 
 - Progress bars and ETA, suppressed when not a TTY
 - Shell completions (bash, zsh, fish) and generated man pages
-- `stuffr bench` — compare formats and levels on real input, report the ratio and
-  throughput trade-off
+- **`stuffr bench <pattern>`** — compare formats on the user's own data rather
+  than on a published corpus. The pattern names the input (a file, or a glob
+  of files); stuffr compresses it with each candidate format and prints one row
+  per format with the two numbers that matter most: **time taken** and
+  **compressed size** (with the ratio beside it). A flag such as
+  `--formats zstd,xz,brotli` limits the run to the named formats; if it is
+  left out, every format this build can write is tried.
+
+  Questions for the spec, not answered here:
+  - **What a glob means.** Is each file compressed on its own, the set packed
+    into one container per container format (`tar` + each codec), or both?
+    Multi-file input is where containers start to matter.
+  - **Levels.** A `--levels` axis (or a fixed fast/default/best trio) turns one
+    row per format into a small grid; the default has to stay readable.
+  - **Decompression time.** For anything that is compressed once and read many
+    times, that is the number that decides, so it is worth a column.
+  - **Honest timing.** Repeat runs and report the median; keep the output in
+    memory or a temp file so disk speed doesn't dominate; state the thread
+    count, because parallel encode under the governor changes the times
+    entirely. The Phase 1e lesson applies: a figure from a debug build is
+    worthless, so the timing harness must refuse to run in one.
+  - **Peak memory**, since `xz`/`lzma` dictionary sizes make it a real cost.
 - `--verify-sha256` and manifest emission on pack
 - Better `stuffr info` output: entropy estimate, "this is already compressed, don't
   bother" advice
