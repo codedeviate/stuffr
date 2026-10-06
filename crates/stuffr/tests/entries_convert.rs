@@ -6,7 +6,7 @@
 //!
 //! * every payload survives the conversion byte for byte, in both directions;
 //! * what the target cannot hold is a warning with `pack`'s own wording, and a
-//!   special file (fifo, device) is skipped — never written as an empty
+//!   special entry (fifo, device, hardlink) is skipped — never written as an empty
 //!   regular file;
 //! * a warning the SOURCE reader raised reaches the conversion's report;
 //! * a declared size the payload does not deliver is `Corrupt` (exit 5) and a
@@ -303,6 +303,7 @@ fn a_special_file_is_skipped_never_written_as_a_regular_file() {
             ("pipe", b'6', b""),
             ("dev/console", b'3', b""),
             ("keep.txt", b'0', b"kept"),
+            ("hard", b'1', b""),
         ]),
     )
     .unwrap();
@@ -317,11 +318,12 @@ fn a_special_file_is_skipped_never_written_as_a_regular_file() {
     )
     .unwrap();
 
-    for name in ["pipe", "dev/console"] {
+    // `unpack`'s wording, "stored" for "created" — a hardlink included,
+    // which the old "special file (device, fifo or socket)" misdescribed.
+    for name in ["pipe", "dev/console", "hard"] {
         let skipped = Fidelity::EntrySkipped {
             entry: name.into(),
-            reason: "is a special file (device, fifo or socket); stuffr does not store those"
-                .into(),
+            reason: "device nodes, fifos, sockets and hardlinks are not stored".into(),
         };
         assert!(
             outcome.fidelity.warnings.contains(&skipped),
@@ -332,7 +334,7 @@ fn a_special_file_is_skipped_never_written_as_a_regular_file() {
     assert_eq!(
         entries_of(&zip),
         [("keep.txt".to_string(), EntryKind::File, b"kept".to_vec())],
-        "neither special file reaches the zip, not even as an empty regular file"
+        "no special entry reaches the zip, not even as an empty regular file"
     );
 }
 

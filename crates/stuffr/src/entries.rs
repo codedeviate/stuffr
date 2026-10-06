@@ -1015,7 +1015,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
             _ => {
                 warnings.push(Fidelity::EntrySkipped {
                     entry: meta.name.clone(),
-                    reason: "device nodes, fifos, sockets and hardlinks are not created".into(),
+                    reason: special_entry_reason("created"),
                 });
             }
         }
@@ -3999,9 +3999,9 @@ enum WritePlan {
 /// The single owner of "this container cannot hold X": a directory or symlink
 /// the container has no entry kind for is skipped with its reason (an `ar`
 /// would land a directory as a zero-byte regular file, after which every
-/// entry beneath it is unextractable), a special file (`EntryKind::Other`: a
-/// device, fifo or socket, which only an entry read from another archive can
-/// be) is never stored, and an entry with no ownership gets
+/// entry beneath it is unextractable), a special entry (`EntryKind::Other`:
+/// a device, fifo, socket or hardlink, which only an entry read from another
+/// archive can be) is never stored, with [`special_entry_reason`], and an entry with no ownership gets
 /// [`ownership_warning`]. It reads only `meta` and `caps`, so an entry that
 /// came from another archive is judged by the same rules as a walked one.
 ///
@@ -4067,9 +4067,7 @@ fn plan_entry_write(
         EntryKind::Other => {
             warnings.push(Fidelity::EntrySkipped {
                 entry: meta.name.clone(),
-                reason: "is a special file (device, fifo or socket); stuffr \
-                         does not store those"
-                    .to_string(),
+                reason: special_entry_reason("stored"),
             });
             WritePlan::Skip
         }
@@ -4109,6 +4107,15 @@ fn plan_entry_write(
         warnings.push(w);
     }
     plan
+}
+
+/// Why an `EntryKind::Other` entry is skipped — the ONE wording `unpack`
+/// (`"created"`) and `convert` (`"stored"`) share. `tar` reads a device node,
+/// a fifo, a socket AND a hardlink as `Other`, so a reason naming only the
+/// first three told a user converting a tar with a hardlink something false
+/// about it (Phase 5a final review, I2).
+fn special_entry_reason(not_what: &str) -> String {
+    format!("device nodes, fifos, sockets and hardlinks are not {not_what}")
 }
 
 /// Why an entry whose name holds a NUL is not written into `container`, a
@@ -5364,8 +5371,9 @@ mod tests {
         assert_eq!(w.len(), 1);
     }
 
-    /// An entry read from another archive can be a device, fifo or socket;
-    /// no container here has a shape for it, so it is never handed over.
+    /// An entry read from another archive can be a device, fifo, socket or
+    /// hardlink; no container here has a shape for it, so it is never handed
+    /// over, and the reason is `unpack`'s wording.
     #[test]
     fn plan_entry_write_never_stores_a_special_file() {
         let all = ContainerCaps {
@@ -5385,8 +5393,8 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(
             w[0].to_string(),
-            "skipped entry `proj/notes.txt`: is a special file (device, fifo or \
-             socket); stuffr does not store those"
+            "skipped entry `proj/notes.txt`: device nodes, fifos, sockets and \
+             hardlinks are not stored"
         );
     }
 
