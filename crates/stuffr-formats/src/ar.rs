@@ -1325,7 +1325,7 @@ impl ArchiveWrite for ArWrite {
             return Err(Error::Unsupported(format!(
                 "ar cannot store `{}`: its name contains a NUL byte, and ar's extended \
                  name form is NUL-padded",
-                stuffr_core::fmt_name(&meta.name)
+                &meta.name
             )));
         }
         // `ar` needs the size up front and cannot stream an unknown length,
@@ -1471,6 +1471,25 @@ mod tests {
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
+    }
+
+    /// The refusal's name is escaped exactly once, by `Error`'s own Display.
+    #[test]
+    fn a_refused_name_is_escaped_once_not_twice() {
+        let mut meta = EntryMeta::file("a\x1b\0b".to_string());
+        meta.size = Some(1);
+        let mut w = Ar
+            .create(
+                PlainSink::new(Box::new(SharedBuf::new())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let err = w
+            .add(&meta, &mut std::io::Cursor::new(b"x"))
+            .expect_err("refused");
+        let m = err.to_string();
+        assert!(m.contains("`a\\x1b\\0b`"), "{m}");
+        assert!(!m.contains("\\\\"), "double escaped: {m}");
     }
 
     /// A BSD `#1/N` name is NUL-padded and read back with every trailing

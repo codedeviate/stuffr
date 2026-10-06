@@ -14204,3 +14204,21 @@ fn bsd_ar_with_odd_names_lists_and_unpacks() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A hostile entry name inside a library error message must not reach the
+/// terminal raw: a truncated ar member named `a<ESC>[31mbc` is reported
+/// with the escape written out, and the exit code stays the classified 5.
+#[test]
+fn a_hostile_name_in_a_corrupt_archive_error_is_escaped() {
+    let dir = tmp_dir();
+    let src = dir.join("in.a");
+    let mut bytes = bsd_ar_with_names(&[(b"a\x1b[31mbc", b"0123456789")]);
+    bytes.truncate(bytes.len() - 6);
+    std::fs::write(&src, bytes).unwrap();
+    let out = run_output(&["test", src.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr_text(&out));
+    assert!(!out.stderr.contains(&0x1b), "raw ESC on stderr");
+    let err = stderr_text(&out);
+    assert!(err.contains("a\\x1b[31mbc"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

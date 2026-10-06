@@ -16,10 +16,10 @@ pub enum Error {
     /// which made a bare `?` below one wrong by default; four sites had it
     /// wrong at once. [`crate::source::decode_side`] carries the whole
     /// argument.
-    #[error("i/o error: {0}")]
+    #[error("i/o error: {}", fmt_name(&.0.to_string()))]
     Io(#[source] std::io::Error),
 
-    #[error("usage error: {0}")]
+    #[error("usage error: {}", fmt_name(.0))]
     Usage(String),
 
     #[error("format `{0}` is not available in this build")]
@@ -37,10 +37,10 @@ pub enum Error {
     #[error("spill limit of {limit} bytes exceeded; raise --max-spill or use a seekable input")]
     SpillLimitExceeded { limit: u64 },
 
-    #[error("resource limit exceeded: {0}")]
+    #[error("resource limit exceeded: {}", fmt_name(.0))]
     ResourceLimit(String),
 
-    #[error("archive is corrupt: {0}")]
+    #[error("archive is corrupt: {}", fmt_name(.0))]
     Corrupt(String),
 
     #[error("unsafe entry path `{}` refused: {reason}", fmt_name(.path))]
@@ -52,7 +52,7 @@ pub enum Error {
     #[error("entry `{}` not found", fmt_name(.0))]
     EntryNotFound(String),
 
-    #[error("unsupported: {0}")]
+    #[error("unsupported: {}", fmt_name(.0))]
     Unsupported(String),
 
     #[error("`{format}` can be {available} but not {requested} by this build")]
@@ -343,6 +343,26 @@ impl From<std::io::Error> for Error {
 mod tests {
     use super::*;
     use crate::format::FormatId;
+
+    #[test]
+    fn free_text_messages_escape_names_but_keep_their_own_text() {
+        let m = Error::Corrupt(format!("entry `{}` bad", "a\x1bb")).to_string();
+        assert_eq!(m, "archive is corrupt: entry `a\\x1bb` bad");
+        let io = std::io::Error::new(std::io::ErrorKind::InvalidData, "a\x1bb short");
+        assert_eq!(Error::Io(io).to_string(), "i/o error: a\\x1bb short");
+        for e in [
+            Error::Usage("x".into()),
+            Error::ResourceLimit("x".into()),
+            Error::Unsupported("x".into()),
+        ] {
+            assert!(!e.to_string().contains('\x1b'));
+        }
+        let plain = "`naïve` \"q\" 'q' 日本";
+        assert_eq!(
+            Error::Unsupported(plain.into()).to_string(),
+            format!("unsupported: {plain}")
+        );
+    }
 
     #[test]
     fn entry_names_in_error_messages_are_escaped() {

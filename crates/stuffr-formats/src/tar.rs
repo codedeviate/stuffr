@@ -1348,7 +1348,7 @@ fn refuse_nul(what: &str, value: &str) -> Result<()> {
         return Err(Error::Unsupported(format!(
             "tar cannot store `{}`: its {what} contains a NUL byte, and tar stores \
              {what}s NUL-terminated",
-            stuffr_core::fmt_name(value)
+            value
         )));
     }
     Ok(())

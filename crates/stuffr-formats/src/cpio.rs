@@ -821,7 +821,7 @@ impl ArchiveWrite for CpioWrite {
             return Err(Error::Unsupported(format!(
                 "cpio newc cannot store `{}`: its name contains a NUL byte, and newc \
                  stores names NUL-terminated",
-                stuffr_core::fmt_name(&meta.name)
+                &meta.name
             )));
         }
         // A symlink's target IS its payload here — see the module doc's
