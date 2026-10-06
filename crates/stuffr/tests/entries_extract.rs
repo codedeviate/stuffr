@@ -784,3 +784,35 @@ fn test_passes_a_tar_with_hard_links() {
         "only the target's payload is verified"
     );
 }
+
+/// Fix round 1, I3: the spec's exit table has "a hard-link name or target
+/// escapes the destination | 7". A relative escape and an absolute target
+/// are both refused before anything is looked up, naming the link entry.
+#[test]
+fn an_escaping_hard_link_target_is_refused_as_unsafe() {
+    for target in ["../outside", "/etc/passwd", "a/../../x"] {
+        let root = tmp_dir();
+        std::fs::write(root.join("outside"), b"outside").unwrap();
+        let archive = write_tar(
+            &root.join("l.tar"),
+            &[file("a", b"hello"), hardlink("h", target)],
+        );
+        let dest = root.join("out");
+        let err = entries::extract(
+            Input::Path(archive),
+            &dest,
+            &Selection::All,
+            &ExtractOpts::default(),
+        )
+        .expect_err("an escaping hard-link target must be refused");
+        match &err {
+            Error::UnsafePath { path, .. } => assert_eq!(path, "h", "{target}"),
+            other => panic!("{target}: expected UnsafePath, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 7, "{target}");
+        assert!(
+            std::fs::symlink_metadata(dest.join("h")).is_err(),
+            "{target}"
+        );
+    }
+}

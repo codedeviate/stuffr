@@ -1197,9 +1197,12 @@ struct HardLinkSite<'a> {
 /// - Target a symlink this run wrote: a new symlink with the same target
 ///   text, through [`extract_symlink`]'s checks. Never `hard_link` on a
 ///   symlink.
-/// - Target a directory, absent from this run, or the link itself: skipped
-///   with `EntrySkipped`, which `--strict-fidelity` turns into exit 4. A
-///   self-link never reaches `hard_link` or `copy`: `copy(x, x)` truncates.
+/// - Target a directory, absent from this run, the link itself, or a file
+///   the copy cannot read: skipped with `EntrySkipped`, which
+///   `--strict-fidelity` turns into exit 4. A self-link never reaches
+///   `hard_link` or the copy, which would truncate it.
+/// - Target escaping `dest`, or reached through a symlink: `UnsafePath`
+///   (exit 7) naming the link entry.
 ///
 /// `hard_link` is the injection seam the copy fallback is tested through;
 /// [`extract`] passes `std::fs::hard_link`.
@@ -1217,27 +1220,38 @@ fn extract_hard_link(
         link_to,
         force,
     } = site;
-    let mut skip = |reason: String| {
-        warnings.push(Fidelity::EntrySkipped {
-            entry: meta.name.clone(),
-            reason,
+    // The target is an archive-supplied path too: lexically checked before
+    // anything else, exactly as an entry's own name is, so a target that
+    // escapes `dest` (`../outside`, `/etc/passwd`) is refused at exit 7
+    // rather than skipped as merely "not extracted". The ENTRY is named.
+    if let Err(Error::UnsafePath { .. }) = safe_join(dest, link_to) {
+        return Err(Error::UnsafePath {
+            path: meta.name.clone(),
+            reason: "its hard-link target is not a safe path inside the destination",
         });
-        Ok(None)
-    };
+    }
     // Every reader refuses or drops a self-link; this is the backstop.
     if link_to == meta.name {
-        return skip(HARD_LINK_REASON_SELF.to_string());
+        return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
     }
     let Some((target_path, kind)) = extracted.resolve(link_to) else {
-        return skip(hard_link_reason_not_extracted(link_to));
+        return Ok(skip_link(
+            warnings,
+            meta,
+            hard_link_reason_not_extracted(link_to),
+        ));
     };
     // The same file under another spelling (`a` -> `./a`): replacing the
     // link's path would delete the target it is about to link to.
     if target_path == link_path {
-        return skip(HARD_LINK_REASON_SELF.to_string());
+        return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
     }
     match kind {
-        ExtractedKind::Dir => skip(hard_link_reason_directory(link_to)),
+        ExtractedKind::Dir => Ok(skip_link(
+            warnings,
+            meta,
+            hard_link_reason_directory(link_to),
+        )),
         ExtractedKind::Symlink(text) => {
             extract_symlink(dest, link_path, meta, text, force, warnings)?;
             Ok(Some((ExtractedKind::Symlink(text.clone()), 0)))
@@ -1245,44 +1259,106 @@ fn extract_hard_link(
         ExtractedKind::File => {
             // The target was checked when it was written, but a symlink
             // could have appeared in one of its ancestors since. Re-checked
-            // here, so `hard_link` and `copy` never resolve through one.
-            refuse_symlinked_ancestors(dest, target_path, link_to)?;
+            // here, so `hard_link` and `copy` never resolve through one. The
+            // refusal names the link ENTRY, which is what the archive asked
+            // for; the target is only how it got there.
+            if let Err(Error::UnsafePath { .. }) =
+                refuse_symlinked_ancestors(dest, target_path, link_to)
+            {
+                return Err(Error::UnsafePath {
+                    path: meta.name.clone(),
+                    reason: "a directory in its hard-link target's path is a symlink",
+                });
+            }
             // Belt and braces on the map: the target must still be the
             // regular file this run wrote, never a symlink to follow.
             if !std::fs::symlink_metadata(target_path).is_ok_and(|md| md.is_file()) {
-                return skip(hard_link_reason_not_extracted(link_to));
+                return Ok(skip_link(
+                    warnings,
+                    meta,
+                    hard_link_reason_not_extracted(link_to),
+                ));
             }
             replace_conflicting(link_path, force)?;
             create_parent(link_path)?;
             if hard_link(target_path, link_path).is_ok() {
                 return Ok(Some((ExtractedKind::File, 0)));
             }
-            // The copy writes bytes a hard link would not have, so it is
-            // charged like a payload: an archive of one large file and many
-            // links to it must not fill the disk on a filesystem without
-            // link support, past the ratio a single payload would be held to.
-            let len = std::fs::metadata(target_path)?.len();
-            budget.charge(&meta.name, len)?;
-            let copied = std::fs::copy(target_path, link_path)?;
-            // The copy is a file of its own: it gets the link entry's
-            // metadata, as the `File` arm gives a payload's, through a
-            // handle for the same reason. Read-only: `copy` carried the
-            // target's permissions over, which may forbid writing, and
-            // `fchmod`/`futimens` need ownership, not write access. Failing
-            // to reopen it is a metadata loss, as for a deferred directory,
-            // not a reason to fail after the bytes are on disk.
-            let missing = match std::fs::File::open(link_path) {
-                Ok(handle) => apply_metadata(&handle, meta),
-                Err(_) => MetaFields {
-                    mtime: meta.mtime.is_some(),
-                    mode: meta.mode.is_some(),
-                    ..Default::default()
-                },
-            };
-            warn_metadata(warnings, &meta.name, missing);
-            Ok(Some((ExtractedKind::File, copied)))
+            copy_link_target(target_path, link_path, meta, link_to, budget, warnings)
         }
     }
+}
+
+/// Records a skipped hard link and answers "nothing was written".
+fn skip_link(
+    warnings: &mut Vec<Fidelity>,
+    meta: &EntryMeta,
+    reason: String,
+) -> Option<(ExtractedKind, u64)> {
+    warnings.push(Fidelity::EntrySkipped {
+        entry: meta.name.clone(),
+        reason,
+    });
+    None
+}
+
+/// The copy fallback of [`extract_hard_link`], done by hand rather than with
+/// `std::fs::copy`, because its two sides fail for different reasons and
+/// `fs::copy` reports both as one `io::Error`:
+///
+/// - **Reading the target** fails on something the ARCHIVE chose: the mode
+///   it declared for the target, restored faithfully (`0o000`), and reached
+///   when `hard_link` fails — on a filesystem without links, or from the
+///   archive alone through `EMLINK` (ext4 caps an inode at 65,000 links).
+///   That is an `EntrySkipped`, never `Error::Io`'s exit 1.
+/// - **Writing the link's file** is the destination's fault, and stays
+///   `Error::Io`, as for a `File` entry's payload.
+///
+/// The bytes are charged to the budget like a payload: an archive of one
+/// large file and many links must not fill the disk past the ratio a single
+/// payload is held to.
+fn copy_link_target(
+    target_path: &Path,
+    link_path: &Path,
+    meta: &EntryMeta,
+    link_to: &str,
+    budget: &mut ArchiveBudget,
+    warnings: &mut Vec<Fidelity>,
+) -> Result<Option<(ExtractedKind, u64)>> {
+    let unreadable = |warnings: &mut Vec<Fidelity>| {
+        skip_link(warnings, meta, hard_link_reason_unreadable(link_to))
+    };
+    let Ok(mut src) = std::fs::File::open(target_path) else {
+        return Ok(unreadable(warnings));
+    };
+    let Ok(len) = src.metadata().map(|md| md.len()) else {
+        return Ok(unreadable(warnings));
+    };
+    budget.charge(&meta.name, len)?;
+    let mut out = std::fs::File::create(link_path)?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                // Nothing half-copied is left under the link's name.
+                drop(out);
+                std::fs::remove_file(link_path)?;
+                return Ok(unreadable(warnings));
+            }
+        };
+        out.write_all(&buf[..n])?;
+        copied += n as u64;
+    }
+    out.flush()?;
+    // The copy is a file of its own: it gets the link entry's metadata, as
+    // the `File` arm gives a payload's, through the same open handle.
+    let missing = apply_metadata(&out, meta);
+    warn_metadata(warnings, &meta.name, missing);
+    Ok(Some((ExtractedKind::File, copied)))
 }
 
 /// The permission bits extraction restores.
@@ -4360,6 +4436,12 @@ fn hard_link_reason_not_kept(target: &str) -> String {
     format!("its hard-link target `{target}` was not kept for copying")
 }
 
+/// Why `unpack` skips a hard link whose target it could not read to copy,
+/// once `hard_link` had failed. Raw, as above.
+fn hard_link_reason_unreadable(target: &str) -> String {
+    format!("its hard-link target `{target}` could not be read to copy it")
+}
+
 /// Why `unpack` skips a hard link to a directory. Raw, as above.
 fn hard_link_reason_directory(target: &str) -> String {
     format!("its hard-link target `{target}` is a directory, which cannot be hard-linked")
@@ -5859,6 +5941,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dest);
     }
 
+    /// Fix round 1, I1: once `hard_link` has failed, a target the copy cannot
+    /// READ — its archive-declared mode restored as `0o000`, reachable from
+    /// the archive alone through `EMLINK` — is a named skip, not `Error::Io`
+    /// (exit 1). Nothing is left under the link's name.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_link_target_is_skipped_when_the_copy_cannot_read_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dest = link_scratch("unreadable");
+        let target = dest.join("b");
+        std::fs::write(&target, b"hello").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&target).is_ok() {
+            // Root reads through any mode; there is nothing to test.
+            return;
+        }
+        let mut extracted = Extracted::default();
+        extracted.record("b", &target, ExtractedKind::File);
+
+        let (r, w) = run_link(&dest, &link_meta("a", "b"), &extracted, |_, _| {
+            Err(std::io::Error::from_raw_os_error(31)) // EMLINK
+        });
+        assert_eq!(r.unwrap(), None);
+        assert_eq!(
+            w,
+            [Fidelity::EntrySkipped {
+                entry: "a".into(),
+                reason: "its hard-link target `b` could not be read to copy it".into(),
+            }]
+        );
+        assert!(std::fs::symlink_metadata(dest.join("a")).is_err());
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
     /// The copy is charged to the budget like a payload: a filesystem
     /// without link support must not let one file and many links expand
     /// past the ratio.
@@ -5910,7 +6027,16 @@ mod tests {
 
         let (r, _) = run_link(&dest, &link_meta("g", "d/f"), &extracted, never_link);
         let err = r.unwrap_err();
-        assert!(matches!(err, Error::UnsafePath { .. }), "{err:?}");
+        match &err {
+            Error::UnsafePath { path, reason } => {
+                assert_eq!(path, "g", "the link ENTRY is named, not its target");
+                assert_eq!(
+                    *reason,
+                    "a directory in its hard-link target's path is a symlink"
+                );
+            }
+            other => panic!("expected UnsafePath, got {other:?}"),
+        }
         assert_eq!(err.exit_code(), 7);
         assert!(!dest.join("g").exists());
         let _ = std::fs::remove_dir_all(&dest);
