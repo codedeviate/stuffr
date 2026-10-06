@@ -185,6 +185,23 @@
 //! run before the crate's own `vec![0; ...]` rather than merely before this
 //! container returns an `Entry` for it.
 //!
+//! ## The one place the guard does not copy the crate: BSD `#1/N` padding
+//!
+//! A `#1/N` header's size field counts the name AND the payload, and the
+//! member is padded to even by that whole size (macOS's `/usr/bin/ar` reads
+//! such a fixture; see `cli.rs`'s `bsd_ar_with_odd_names_lists_and_unpacks`).
+//! `ar` 0.9.0 pads by the payload alone (`next_entry`, `lib.rs:578-580`), so
+//! whenever `N` is odd its decision is inverted and, copied faithfully, the
+//! guard and the crate both read every later member one byte off. So
+//! [`scan_ar_header`] reports both decisions and [`PadAfter::reconcile`]
+//! settles them: a true pad byte the crate will not read is consumed by the
+//! guard (and must be a real `\n`), and a pad byte the crate will read that
+//! is not there is handed to it synthetically — read only by its padding
+//! skip, never by a payload (see [`PadAfter::Synthesize`]). GNU members and
+//! this module's own writer (which pads a `#1/N` name to a multiple of four)
+//! never reach either branch. `ar_salvage.rs` walks through this same guard
+//! and inherits the rule; it keeps no pad rule of its own.
+//!
 //! ## Sizing the two ceilings
 //!
 //! Measured across every `.a`/`.rlib` this machine has (478 archives:
@@ -527,11 +544,60 @@ struct ArHeaderScan {
     /// also the length a BSD extended identifier's own bytes are carved out
     /// of, so it already covers that case with no separate tracking.
     payload_len: u64,
-    /// Whether a single `\n` pad byte follows the payload — decided by the
-    /// ADJUSTED size (`payload_len` minus a BSD identifier's length, if
-    /// any), matching `ar::Header::size()`/`Archive::next_entry`'s own
-    /// `size % 2 != 0` check.
-    pad_after: bool,
+    /// Whether the FORMAT puts a `\n` pad byte after this record: the raw
+    /// `file size` field is odd. For a BSD `#1/N` member that field counts
+    /// the name and the payload, and the member is padded by that whole
+    /// size — confirmed against macOS's `/usr/bin/ar`.
+    true_pad: bool,
+    /// Whether `ar` 0.9.0 will read a pad byte before the next header: the
+    /// ADJUSTED size (`payload_len` minus a BSD identifier's length, if any)
+    /// is odd, `ar::Header::size()`/`Archive::next_entry`'s own `size % 2 !=
+    /// 0` (`lib.rs:578-580`). Differs from `true_pad` exactly when a `#1/N`
+    /// name's length is odd; [`PadAfter::reconcile`] settles the two.
+    crate_pad: bool,
+}
+
+/// What [`ArGuardedReader`] does between one record's last byte and the
+/// next header, given what the format puts there and what the crate will
+/// read there. The crate reads its pad byte, when it reads one, with a
+/// one-byte `read_exact` at the start of the NEXT `next_entry`
+/// (`lib.rs:546-569`), before the header; an entry's payload reads and its
+/// drain on drop are bounded by the entry's length (`lib.rs:805-817`), so no
+/// payload read ever reaches this point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PadAfter {
+    /// No pad byte in the stream, and the crate reads none.
+    None,
+    /// A pad byte in the stream, read and checked by the crate itself.
+    PassThrough,
+    /// A pad byte in the stream that the crate will not read (a `#1/N`
+    /// member with an odd name and an even payload): the guard consumes it
+    /// from the source itself, so the crate's next header read starts at
+    /// the header. It must be a real `\n`, as the crate requires of its own.
+    Discard,
+    /// No pad byte in the stream, but the crate will read one (a `#1/N`
+    /// member with an odd name and an odd payload): the guard hands the
+    /// crate one synthetic `\n`, consuming nothing from the source.
+    ///
+    /// This is not a breach of "never write invented bytes". That rule is
+    /// about what reaches an entry's payload or any output, and this byte
+    /// reaches neither: the crate requests it through its padding skip
+    /// alone, discards it there, and nothing reads past an entry's length.
+    /// `a_bsd_member_padded_by_its_whole_size_reads_every_member` pins the
+    /// payloads on both sides byte-exact.
+    Synthesize,
+}
+
+impl PadAfter {
+    /// The one rule, with one arm per case.
+    fn reconcile(true_pad: bool, crate_pad: bool) -> Self {
+        match (true_pad, crate_pad) {
+            (false, false) => PadAfter::None,
+            (true, true) => PadAfter::PassThrough,
+            (true, false) => PadAfter::Discard,
+            (false, true) => PadAfter::Synthesize,
+        }
+    }
 }
 
 /// Parses one `ar` header's decimal ASCII field the same way the vendored
@@ -719,7 +785,8 @@ fn scan_ar_header(
 
     Ok(ArHeaderScan {
         payload_len: size,
-        pad_after: !adjusted_size.is_multiple_of(2),
+        true_pad: !size.is_multiple_of(2),
+        crate_pad: !adjusted_size.is_multiple_of(2),
     })
 }
 
@@ -730,9 +797,11 @@ fn scan_ar_header(
 enum ArGuardPhase {
     /// Still inside the 8-byte magic `!<arch>\n`; passed through untouched.
     GlobalHeader { remaining: u8 },
-    /// A single `\n` pad byte must be read (and passed through) before the
-    /// next header — `ar` pads every odd-sized record.
-    Pad,
+    /// The gap between a record and the next header, handled as `PadAfter`
+    /// says: a real pad byte passed through to the crate or consumed here,
+    /// or a synthetic one handed to the crate's padding skip.
+    /// [`PadAfter::None`] passes straight on to [`ArGuardPhase::Header`].
+    Pad(PadAfter),
     /// At a header boundary: accumulating up to `AR_ENTRY_HEADER_LEN` bytes
     /// into `buf` before releasing ANY of them, so [`scan_ar_header`] always
     /// sees the header whole. A short read here (fewer than the full width,
@@ -747,7 +816,7 @@ enum ArGuardPhase {
         buf: Vec<u8>,
         pos: usize,
         remaining: u64,
-        pad_after: bool,
+        pad_after: PadAfter,
         /// False for the truncated remainder: nothing follows it, so it ends
         /// no record a [`GuardObserver`] should hear about.
         ends_record: bool,
@@ -759,7 +828,7 @@ enum ArGuardPhase {
     /// NEXT header.
     Payload {
         remaining: u64,
-        pad_after: bool,
+        pad_after: PadAfter,
         ends_record: bool,
     },
 }
@@ -874,19 +943,60 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                     *remaining -= n as u8;
                     return Ok(n);
                 }
-                ArGuardPhase::Pad => {
-                    let mut one = [0u8; 1];
-                    let n = self.inner.read(&mut one)?;
-                    if n == 0 {
-                        return Ok(0);
+                ArGuardPhase::Pad(pad) => match *pad {
+                    PadAfter::None => {
+                        self.phase = ArGuardPhase::Header {
+                            buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
+                        };
                     }
-                    self.pos += 1;
-                    out[0] = one[0];
-                    self.phase = ArGuardPhase::Header {
-                        buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
-                    };
-                    return Ok(1);
-                }
+                    PadAfter::PassThrough => {
+                        let mut one = [0u8; 1];
+                        let n = self.inner.read(&mut one)?;
+                        if n == 0 {
+                            return Ok(0);
+                        }
+                        self.pos += 1;
+                        out[0] = one[0];
+                        self.phase = ArGuardPhase::Header {
+                            buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
+                        };
+                        return Ok(1);
+                    }
+                    PadAfter::Discard => {
+                        let mut one = [0u8; 1];
+                        let n = self.inner.read(&mut one)?;
+                        if n == 0 {
+                            // The crate's header read propagates this bare
+                            // (`lib.rs:234`), and `classify_ar_error` makes
+                            // it `Corrupt`: the file ended inside a record.
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF where a BSD `#1/N` member's padding byte belongs",
+                            ));
+                        }
+                        self.pos += 1;
+                        if one[0] != b'\n' {
+                            // The crate's own refusal of its own pad byte
+                            // (`lib.rs:549-561`), for the byte it will not see.
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid padding byte ({})", one[0]),
+                            ));
+                        }
+                        self.phase = ArGuardPhase::Header {
+                            buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
+                        };
+                    }
+                    PadAfter::Synthesize => {
+                        // Read only by the crate's padding skip — see
+                        // `PadAfter::Synthesize`. Nothing taken from `inner`.
+                        out[0] = b'\n';
+                        self.phase = ArGuardPhase::Header {
+                            buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
+                        };
+                        return Ok(1);
+                    }
+                },
                 ArGuardPhase::Header { buf } => {
                     while buf.len() < AR_ENTRY_HEADER_LEN {
                         let want = AR_ENTRY_HEADER_LEN - buf.len();
@@ -926,10 +1036,13 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                             buf[MODE_FIELD].copy_from_slice(NORMALISED_MODE);
                         }
                         self.observer.header_scanned(mode_unknown);
-                        (scan.payload_len, scan.pad_after)
+                        (
+                            scan.payload_len,
+                            PadAfter::reconcile(scan.true_pad, scan.crate_pad),
+                        )
                     } else {
                         // Truncated mid-header — see this phase's own doc.
-                        (0, false)
+                        (0, PadAfter::None)
                     };
                     let full = std::mem::take(buf);
                     // A `#1/N` name read ahead by `names_a_bsd_symbol_table`
@@ -971,13 +1084,7 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                         if *ends_record {
                             self.observer.record_ends(self.pos);
                         }
-                        self.phase = if *pad_after {
-                            ArGuardPhase::Pad
-                        } else {
-                            ArGuardPhase::Header {
-                                buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
-                            }
-                        };
+                        self.phase = ArGuardPhase::Pad(*pad_after);
                         continue;
                     }
                     let want = out
@@ -2391,5 +2498,212 @@ mod tests {
         let err = read_all(&bytes).expect_err("a bad, non-blank mode is not normalised");
         assert_eq!(err.exit_code(), 5, "{err}");
         assert!(err.to_string().contains("Invalid file mode field"), "{err}");
+    }
+
+    // --- BSD `#1/N` members, padded by their WHOLE size ---------------------
+    //
+    // A `#1/N` header's size counts the name AND the payload, and the member
+    // is padded to even by that size. `ar` 0.9.0 pads by the payload alone
+    // (`lib.rs:578-580`), so for an odd `N` its decision is inverted; the
+    // guard reconciles the two (see `PadAfter`).
+
+    /// One BSD extended member as the format lays it out: one `\n` after it
+    /// when `name.len() + data.len()` is odd.
+    fn bsd_member(name: &[u8], data: &[u8]) -> Vec<u8> {
+        let whole = (name.len() + data.len()) as u64;
+        let mut out = ar_header_raw(&bsd_ext_identifier_field(name.len() as u64), whole);
+        out.extend_from_slice(name);
+        out.extend_from_slice(data);
+        if whole % 2 == 1 {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    /// One inline-named member, padded by its payload.
+    fn plain_member(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = ar_header_raw(&padded_identifier(name), data.len() as u64);
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    /// The four parity combinations, `(name, payload)`: N odd × payload
+    /// even (true pad, the crate expects none), N odd × payload odd (no true
+    /// pad, the crate expects one), and both N-even shapes, where the two
+    /// rules agree.
+    const PARITY_MEMBERS: [(&str, &[u8]); 4] = [
+        ("abc", b"ABCD"),
+        ("hello", b"HELLO"),
+        ("abcd", b"EVE"),
+        ("abcdef", b"EV"),
+    ];
+
+    /// An archive of `members`, each `#1/N` unless its name is `plain.txt`.
+    fn odd_name_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        for (name, data) in members {
+            bytes.extend(if *name == "plain.txt" {
+                plain_member(name, data)
+            } else {
+                bsd_member(name.as_bytes(), data)
+            });
+        }
+        bytes
+    }
+
+    /// Every fixture the BSD-padding tests read: the three-member archive
+    /// the CLI test also uses; all four parities then an ordinary member;
+    /// and each parity as the LAST member, so the archive ends on a true
+    /// pad byte or on a pad only the crate expects.
+    fn odd_name_fixtures() -> Vec<Vec<(&'static str, &'static [u8])>> {
+        let plain: (&str, &[u8]) = ("plain.txt", b"xyz");
+        let mut fixtures = vec![
+            vec![PARITY_MEMBERS[0], PARITY_MEMBERS[1], plain],
+            PARITY_MEMBERS.iter().copied().chain([plain]).collect(),
+        ];
+        for member in PARITY_MEMBERS {
+            fixtures.push(vec![plain, member]);
+        }
+        fixtures
+    }
+
+    /// `scan_ar_header`'s two pad decisions for each parity combination,
+    /// and the reconciliation each pair gets. An inline name has no `#1/N`
+    /// length to subtract, so its two decisions always agree.
+    #[test]
+    fn the_guard_reconciles_both_pad_mismatches() {
+        // `(true_pad, crate_pad, reconciled)`, one per `PARITY_MEMBERS` row.
+        let expected = [
+            (true, false, PadAfter::Discard),
+            (false, true, PadAfter::Synthesize),
+            (true, true, PadAfter::PassThrough),
+            (false, false, PadAfter::None),
+        ];
+        for ((name, data), (true_pad, crate_pad, reconciled)) in
+            PARITY_MEMBERS.into_iter().zip(expected)
+        {
+            let name = name.as_bytes();
+            let member = bsd_member(name, data);
+            let hdr: [u8; AR_ENTRY_HEADER_LEN] = member[..AR_ENTRY_HEADER_LEN].try_into().unwrap();
+            let mut variant = ar::Variant::Common;
+            let scan = scan_ar_header(&hdr, &mut variant, &mut 0).expect("scan");
+            let label = String::from_utf8_lossy(name);
+            assert_eq!(
+                scan.payload_len,
+                (name.len() + data.len()) as u64,
+                "{label}"
+            );
+            assert_eq!(scan.true_pad, true_pad, "{label}: true_pad");
+            assert_eq!(scan.crate_pad, crate_pad, "{label}: crate_pad");
+            assert_eq!(
+                PadAfter::reconcile(scan.true_pad, scan.crate_pad),
+                reconciled,
+                "{label}"
+            );
+            assert_eq!(variant, ar::Variant::BSD, "{label}");
+        }
+        for (data, pad) in [(&b"odd"[..], true), (&b"even"[..], false)] {
+            let hdr: [u8; AR_ENTRY_HEADER_LEN] =
+                ar_header_raw(&padded_identifier("plain.txt"), data.len() as u64)
+                    .try_into()
+                    .unwrap();
+            let scan = scan_ar_header(&hdr, &mut ar::Variant::Common, &mut 0).expect("scan");
+            assert_eq!((scan.true_pad, scan.crate_pad), (pad, pad), "{data:?}");
+        }
+    }
+
+    /// Records every record boundary the guard reports.
+    #[derive(Clone, Default)]
+    struct RecordEnds(Rc<std::cell::RefCell<Vec<u64>>>);
+
+    impl GuardObserver for RecordEnds {
+        fn record_ends(&mut self, at: u64) {
+            self.0.borrow_mut().push(at);
+        }
+    }
+
+    /// The defect: an odd `#1/N` name made the crate mis-pad, so the member
+    /// after it was read one byte off — a misread header, or `Corrupt`.
+    /// Every name and every payload byte comes back exact, including the
+    /// members on either side of a pad only the crate expects: the synthetic
+    /// byte the guard hands the crate reaches no payload.
+    #[test]
+    fn a_bsd_member_padded_by_its_whole_size_reads_every_member() {
+        for members in odd_name_fixtures() {
+            let bytes = odd_name_archive(&members);
+            let got = read_all(&bytes).unwrap_or_else(|e| panic!("{members:?}: {e}"));
+            let want: Vec<ReadBack> = members
+                .iter()
+                .map(|(name, data)| (name.to_string(), Some(0o100644), data.to_vec()))
+                .collect();
+            assert_eq!(got, want, "{members:?}");
+
+            // The guard's own framing: every record ends where the format
+            // says, and the whole source is consumed — nothing skipped and
+            // nothing left over.
+            let ends = RecordEnds::default();
+            let guard =
+                ArGuardedReader::observed(std::io::Cursor::new(bytes.clone()), ends.clone());
+            let mut archive = ar::Archive::new(guard);
+            while let Some(entry) = archive.next_entry() {
+                entry.unwrap_or_else(|e| panic!("{members:?}: {e}"));
+            }
+            let guard = archive.into_inner().expect("into_inner");
+            assert_eq!(guard.pos, bytes.len() as u64, "{members:?}");
+            let mut want_ends = vec![GLOBAL_HEADER.len() as u64];
+            let mut at = GLOBAL_HEADER.len();
+            for (name, data) in &members {
+                let named = if *name == "plain.txt" { 0 } else { name.len() };
+                let whole = named + data.len();
+                want_ends.push((at + AR_ENTRY_HEADER_LEN + whole) as u64);
+                at += AR_ENTRY_HEADER_LEN + whole + whole % 2;
+            }
+            assert_eq!(*ends.0.borrow(), want_ends, "{members:?}");
+        }
+    }
+
+    /// The true pad byte the guard consumes itself is still a real byte: the
+    /// file ending where it belongs is truncation, and a byte other than
+    /// `\n` there is the same refusal the crate makes of its own pad byte.
+    /// Both exit 5.
+    #[test]
+    fn a_missing_or_bad_true_pad_byte_after_an_odd_bsd_name_is_corrupt() {
+        let whole = odd_name_archive(&[PARITY_MEMBERS[0], ("plain.txt", b"xyz")]);
+        let pad = GLOBAL_HEADER.len() + AR_ENTRY_HEADER_LEN + 3 + 4;
+        assert_eq!(whole[pad], b'\n');
+
+        let cut = &whole[..pad];
+        let err = read_all(cut).expect_err("the file ends where the pad byte belongs");
+        assert_eq!(err.exit_code(), 5, "{err}");
+
+        let mut bad = whole.clone();
+        bad[pad] = b'X';
+        let err = read_all(&bad).expect_err("a pad byte that is not `\\n`");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(err.to_string().contains("padding"), "{err}");
+    }
+
+    /// The writer's own output is unaffected: GNU-style inline names and the
+    /// crate's BSD extended names, which it pads to a multiple of four (so
+    /// always even), round-trip byte-exact, odd and even payloads alike.
+    #[test]
+    fn gnu_members_and_even_bsd_names_are_unaffected() {
+        let entries: [(&str, &[u8]); 5] = [
+            ("short.txt", b"odd"),
+            ("even.txt", b"even"),
+            ("this-name-is-longer-than-sixteen-bytes.txt", b"odd"),
+            ("a name with spaces.txt", b"even"),
+            ("dir/inner.txt", b"x"),
+        ];
+        let bytes = build_ar(&entries);
+        let got = read_all(&bytes).expect("read back");
+        let want: Vec<ReadBack> = entries
+            .iter()
+            .map(|(name, data)| (name.to_string(), Some(DEFAULT_MODE), data.to_vec()))
+            .collect();
+        assert_eq!(got, want);
     }
 }

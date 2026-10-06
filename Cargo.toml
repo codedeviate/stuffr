@@ -138,7 +138,11 @@ tar = { version = "=0.4.46", default-features = false }
 #   2. the `[48..58]` file-size field;
 #   3. the `[3..16]` BSD extended length field;
 #   4. the `[1..16]` GNU short-name index;
-#   5. the `size % 2` pad rule;
+#   5. the `size % 2` pad rule, by the payload-only `Header::size()` — which
+#      for an odd `#1/N` name disagrees with the format's whole-size rule, so
+#      the guard tracks both and reconciles them (`ar.rs`'s `PadAfter`); that
+#      reconciliation also rests on the pad being read by a one-byte
+#      `read_exact` and on `Entry` reads never passing the entry's length;
 #   6. that the pad byte is consumed BEFORE the next header rather than after
 #      the payload — the ORDERING fact 5's existence implies but does not
 #      state, and what `ArGuardPhase::Pad -> Header` encodes;

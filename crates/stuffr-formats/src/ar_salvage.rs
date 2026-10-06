@@ -982,6 +982,49 @@ mod tests {
         assert_eq!(&bytes[at..at + 8], b"payload!");
     }
 
+    /// A `#1/N` member is padded by its WHOLE size, name included. The walk
+    /// reads through `ar.rs`'s guard, which owns that rule; before the guard
+    /// reconciled it with the crate's payload-only rule, an odd `N` threw
+    /// the walk one byte off and it stopped at the member after. Every
+    /// member is found, at its real offsets, byte-exact and `Unattested`.
+    #[test]
+    fn bsd_members_with_odd_names_are_walked_whole() {
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        let mut headers = Vec::new();
+        for (identifier, body) in [
+            (&b"#1/3"[..], &b"abcABCD"[..]),
+            (b"#1/5", b"helloHELLO"),
+            (b"plain.txt", b"xyz"),
+        ] {
+            headers.push(bytes.len() as u64);
+            bytes.extend(member(identifier, body.len() as u64, body));
+        }
+        let out = scan(&bytes);
+        assert!(out.walk_stop.is_none(), "{:?}", out.walk_stop);
+        assert_eq!(
+            names_and_statuses(&out),
+            [
+                ("abc", SalvageStatus::Unattested),
+                ("hello", SalvageStatus::Unattested),
+                ("plain.txt", SalvageStatus::Unattested)
+            ]
+            .map(|(n, s)| (n.to_string(), s))
+        );
+        assert_eq!(
+            out.entries.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            headers
+        );
+        assert_eq!(
+            write_back(&bytes, &out),
+            [
+                ("abc", &b"ABCD"[..]),
+                ("hello", b"HELLO"),
+                ("plain.txt", b"xyz")
+            ]
+            .map(|(n, d)| (n.to_string(), d.to_vec(), true))
+        );
+    }
+
     // -------------------------------------------------------------------
     // The guard's ceilings: one owner, answered as a stop, never an `Err`
     // and never an allocation.

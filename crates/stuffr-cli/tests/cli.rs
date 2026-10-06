@@ -14121,3 +14121,86 @@ fn convert_skips_a_name_with_a_nul_its_target_cannot_store() {
     assert_eq!(out.status.code(), Some(4), "{}", stderr_text(&out));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A BSD `#1/N` member is padded by its WHOLE size, name included, and
+/// `ar` 0.9.0 pads by the payload alone, so an odd `N` used to throw every
+/// later member one byte off (`ar.rs`'s `PadAfter`). The fixture is
+/// hand-built — `#1/3` with an even payload (a true pad byte the crate does
+/// not expect), `#1/5` with an odd one (no pad byte, though the crate
+/// expects one), then an inline name — and macOS's own `ar t` is the witness
+/// that it is a valid archive.
+#[cfg(target_os = "macos")]
+#[test]
+fn bsd_ar_with_odd_names_lists_and_unpacks() {
+    fn header(identifier: &str, size: usize) -> Vec<u8> {
+        let h = format!(
+            "{identifier:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n",
+            0, 0, 0, "100644"
+        );
+        assert_eq!(h.len(), 60);
+        h.into_bytes()
+    }
+    let members: [(&str, bool, &[u8]); 3] = [
+        ("abc", true, b"ABCD"),
+        ("hello", true, b"HELLO"),
+        ("plain.txt", false, b"xyz"),
+    ];
+    let mut bytes = b"!<arch>\n".to_vec();
+    for (name, extended, data) in members {
+        let body = if extended {
+            [name.as_bytes(), data].concat()
+        } else {
+            data.to_vec()
+        };
+        let identifier = if extended {
+            format!("#1/{}", name.len())
+        } else {
+            name.to_string()
+        };
+        bytes.extend(header(&identifier, body.len()));
+        bytes.extend_from_slice(&body);
+        if body.len() % 2 == 1 {
+            bytes.push(b'\n');
+        }
+    }
+    let dir = tmp_dir();
+    let archive = dir.join("odd.a");
+    std::fs::write(&archive, &bytes).unwrap();
+    let names: Vec<&str> = members.iter().map(|(name, _, _)| *name).collect();
+
+    let ar = require_bin("/usr/bin/ar");
+    let out = Command::new(&ar).arg("t").arg(&archive).output().unwrap();
+    assert!(out.status.success(), "{}", stderr_text(&out));
+    assert_eq!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        names,
+        "the system `ar` reads the fixture"
+    );
+
+    let out = run_output(&["list", "--json", archive.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let listed: Vec<&str> = v
+        .as_array()
+        .expect("a JSON array of entries")
+        .iter()
+        .map(|row| row["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, names);
+
+    let back = dir.join("back");
+    let out = run_output(&[
+        "unpack",
+        archive.to_str().unwrap(),
+        "-C",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    for (name, _, data) in members {
+        assert_eq!(std::fs::read(back.join(name)).unwrap(), data, "{name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
