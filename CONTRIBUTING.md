@@ -56,40 +56,43 @@ toolchain".
 
 ### What the gate costs, and the trap in the answer
 
-**Two regimes, and the slow one is not this project's code.**
+**~3 minutes, including a build from clean.** Measured 2026-10-06 on an
+Apple Silicon Mac right after `cargo clean`: **166 s** for the whole gate,
+3196 tests across both legs. Real test EXECUTION inside that is **96 s**
+(summed from libtest's own `finished in` figures).
 
-- **~5 minutes when nothing was relinked.** Measured on an Apple Silicon Mac
-  at Salvage Stage 2 Task 8: **289 s** total — `fmt-check` 1 s, `lint` 1 s,
-  `test` (`--all-features`) 112 s, `test-pure` 175 s, `release` 0 s.
-  Real test EXECUTION inside that is only **29.8 s** and **42.2 s** per leg
-  (summed from libtest's own `finished in` figures); the rest is cargo's own
-  work, doc-test compilation most visibly.
-- **20-40 minutes on the first gate after anything relinked**, including the
-  first gate of a session, after a dependency or feature change, and always
-  after `cargo clean`.
+**If the gate takes far longer, look at `target/debug/deps` first.** On
+macOS the dev profile's default `split-debuginfo=unpacked` leaves every
+build's `*.rcgu.o` object files beside the binaries, and cargo never prunes
+stale ones. Two months of builds put **1,123,729 entries** (34 GB of
+`target/`) in that one directory, and a freshly linked test binary then
+took **20-22 s just to start** from there. The gate links ~60 of them, and
+under load each took minutes: the Phase 5a Task 5 gate ran **6660 s** for
+the same 97 s of tests. Every measurement used `--list`, so libtest ran no
+tests at all:
 
-**The difference is macOS evaluating every newly-linked unsigned binary the
-first time it is executed** — `/usr/libexec/syspolicyd`, Gatekeeper's policy
-daemon, observed at 27-70% CPU throughout. `cargo test` links ~24 test
-binaries per leg and each pays it once. Three measurements, all with `--list`
-so that libtest runs no tests at all:
-
-| what | wall clock |
+| fresh copy of the same test binary | first start |
 |---|---|
-| first execution of a newly-linked test binary | **164.86 s** |
-| second execution of that same binary | **0.05 s** |
-| a byte-identical COPY of it, at a new path | **81.59 s** |
+| scratch dir, repo root, `target/`, `target/debug/` | **0 s** |
+| `target/debug/deps/` (1.1M entries) | **20-22 s** (324 s during a gate) |
+| `target/debug/deps/` after `cargo clean` (~6,000 entries) | **0 s** |
 
-The cost follows the FILE, not the code: the same file never pays twice, a
-fresh copy pays again. That is the signature of first-execution
-notarisation/Gatekeeper evaluation, and it is why a 41-minute gate and a
-5-minute gate can both be healthy.
+What it is not: `syspolicyd` (Gatekeeper) sat idle while `amfid` was busy;
+an ESET exclusion for `target/` changed nothing; and 300,000 empty files in
+a scratch dir did not reproduce it. The mechanism is unexplained; the cure
+is not.
 
-**The actionable part: do NOT `cargo clean` to "fix" a slow gate.** That is
-the one action guaranteed to buy the expensive regime, and an implementer who
-reads a stale "the gate takes under a minute" somewhere will reach for it.
-Re-run the gate instead; with nothing changed it drops straight back to ~5
-minutes.
+**The fix is a one-time `cargo clean`.** `make check` runs `deps-guard`
+first, which warns (never fails) once `deps` passes `DEPS_GUARD_MAX`
+(100,000 entries, a round number well clear of both measurements, not a
+measured knee).
+
+This replaces earlier advice in this section, which blamed first-execution
+Gatekeeper evaluation (`syspolicyd`, 164.86 s for a first `--list`, 81.59 s
+for a byte-identical copy at a new path) and said never to `cargo clean`.
+Adding the terminal app under *System Settings → Privacy & Security →
+Developer Tools* removed that cost (a fresh copy outside `deps` starts in
+0.54 s), and `cargo clean` is now the cure, not the trap.
 
 For the record, the slowest actual TEST is
 `lzma_pure::tests::corruption_sweep_is_detected_almost_everywhere` at

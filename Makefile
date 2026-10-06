@@ -6,7 +6,7 @@
 
 CARGO ?= cargo
 
-.PHONY: help check fmt fmt-check lint test test-pure release miri hooks clean fuzz-corpus fuzz
+.PHONY: help check deps-guard fmt fmt-check lint test test-pure release miri hooks clean fuzz-corpus fuzz
 
 help:
 	@echo 'stuffr development targets:'
@@ -24,8 +24,25 @@ help:
 	@echo '  make fuzz     short, seeded smoke pass over the five targets (mirrors CI)'
 
 # Ordered so the cheapest gate fails first.
-check: fmt-check lint test test-pure release
+check: deps-guard fmt-check lint test test-pure release
 	@echo '✓ all gates passed'
+
+# Warns, never fails, when `target/debug/deps` has grown large enough to slow
+# the gate. On macOS the dev profile's default `split-debuginfo=unpacked`
+# keeps every build's `*.rcgu.o` beside the binaries, and cargo never prunes
+# stale ones. At 1,123,729 entries (34 GB of target/) a freshly linked test
+# binary took 20-22 s to START from that directory and 0 s from any other
+# (amfid busy; not Gatekeeper, not ESET), which turned a 166 s gate into
+# 6660 s. A fresh build holds ~6,000 entries. The threshold is a round number
+# well clear of both, not a measured knee. CI starts clean and never trips it.
+DEPS_GUARD_MAX ?= 100000
+
+deps-guard:
+	@n=$$(ls -f target/debug/deps 2>/dev/null | wc -l | tr -d ' '); \
+	if [ "$${n:-0}" -gt $(DEPS_GUARD_MAX) ]; then \
+	  echo "⚠ target/debug/deps holds $$n entries (> $(DEPS_GUARD_MAX)): new test binaries"; \
+	  echo "  start slowly from a crowded deps dir. Run 'cargo clean' once (see CONTRIBUTING.md)."; \
+	fi
 
 # `fuzz/` is `exclude`d from the workspace (see the root `Cargo.toml`), so a
 # `--workspace` command does not reach it — which left FOUR fuzz targets
