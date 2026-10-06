@@ -891,7 +891,12 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
         | entries::SalvageDisposition::NotSelected
         | entries::SalvageDisposition::NotWritten => describe_salvage_status(record.status),
     };
-    let mut line = format!("{:<4} {:<32} {}", record.scan_position, status, record.name);
+    let mut line = format!(
+        "{:<4} {:<32} {}",
+        record.scan_position,
+        status,
+        stuffr::fmt_name(&record.name)
+    );
     if let Some(earlier) = record.shadows {
         line.push_str(&format!(" [shadowed: dup of #{earlier}]"));
     }
@@ -924,7 +929,12 @@ fn describe_salvage_row(record: &entries::SalvagedRecord) -> String {
     if let entries::SalvageDisposition::WrittenDisambiguated { path, .. } = &record.disposition {
         line.push_str(&format!(
             " [written as {}]",
-            path.file_name().unwrap_or(path.as_os_str()).display()
+            stuffr::fmt_name(
+                &path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+            )
         ));
     }
     if matches!(record.disposition, entries::SalvageDisposition::NotSelected) {
@@ -1051,7 +1061,14 @@ fn print_salvage_write_failures(entries: &[entries::SalvagedRecord]) {
             }
             other => unreachable!("filtered above, got {other:?}"),
         };
-        eprintln!("  - #{} {}: {reason}", record.scan_position, record.name);
+        // `reason` may be an `io::Error`'s text; `fmt_name` is idempotent on
+        // an already-escaped string (a backslash is written unchanged).
+        eprintln!(
+            "  - #{} {}: {}",
+            record.scan_position,
+            stuffr::fmt_name(&record.name),
+            stuffr::fmt_name(&reason)
+        );
     }
     if let Some(rest) = failed.len().checked_sub(SHOWN).filter(|n| *n > 0) {
         eprintln!("  … and {rest} more");
@@ -2103,8 +2120,8 @@ fn print_list(
     } else {
         for (i, e) in entries.iter().enumerate() {
             match e.size {
-                Some(n) => writeln!(out, "{i:>5}  {n:>12}  {}", e.name)?,
-                None => writeln!(out, "{i:>5}  {:>12}  {}", "-", e.name)?,
+                Some(n) => writeln!(out, "{i:>5}  {n:>12}  {}", stuffr::fmt_name(&e.name))?,
+                None => writeln!(out, "{i:>5}  {:>12}  {}", "-", stuffr::fmt_name(&e.name))?,
             }
         }
     }

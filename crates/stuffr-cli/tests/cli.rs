@@ -14222,3 +14222,40 @@ fn a_hostile_name_in_a_corrupt_archive_error_is_escaped() {
     assert!(err.contains("a\\x1b[31mbc"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn control_bytes_in_entry_names_never_reach_the_terminal_raw() {
+    let dir = tmp_dir();
+    let tar = dir.join("x.tar");
+    let evil = "a\x1b[31mb\nc";
+    write_raw_tar(&tar, &[Raw::File(evil, b"hi"), Raw::Fifo("p\x1b[2Jipe")]);
+    let t = tar.to_str().unwrap();
+
+    // Text listing: escaped, one line per entry, no raw ESC.
+    let out = run_output(&["list", t]);
+    assert!(out.status.success());
+    assert!(!out.stdout.contains(&0x1b), "raw ESC in list stdout");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("a\\x1b[31mb\\nc"), "{text}");
+    assert_eq!(text.lines().count(), 2, "{text}");
+
+    // The skip warning for the fifo carries no raw control byte.
+    let dest = dir.join("out");
+    let out = run_output(&["unpack", t, "-C", dest.to_str().unwrap()]);
+    assert!(!out.stderr.contains(&0x1b), "raw ESC on unpack stderr");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(err.contains("p\\x1b[2Jipe"), "{err}");
+
+    // Salvage rows too.
+    let out = run_output(&["salvage", t, "--list"]);
+    assert!(!out.stdout.contains(&0x1b), "raw ESC in salvage stdout");
+    assert!(!out.stderr.contains(&0x1b), "raw ESC in salvage stderr");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("a\\x1b[31mb\\nc"), "{text}");
+
+    // JSON stays raw-in-value: serde decodes back to the exact name.
+    let out = run_output(&["list", "--json", t]);
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows[0]["name"].as_str().unwrap(), evil);
+    let _ = std::fs::remove_dir_all(&dir);
+}
