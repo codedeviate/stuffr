@@ -78,6 +78,30 @@ read list.
 > local corpus. **1562** tests under `--all-features`, **1497** on the
 > default tier — measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.9.0` is Phase 5a: **`stuffr convert`**. Codec mode re-encodes the
+> compression around a container and leaves the container alone
+> (`.tar.gz` → `.tar.zst`); entry mode moves entries from one container into
+> another under `pack`'s fidelity rules (`.zip` → `.tar.xz`), with anything
+> the target cannot hold skipped and named on stderr (`--strict-fidelity` →
+> exit 4). Library surface: `ops::recompress*`, `entries::convert_archive*`,
+> `ConvertSource`, `RecompressOpts`, `ConvertOpts`.
+> **Breaking:** four new public fields on `ContainerCaps`, which is not
+> `#[non_exhaustive]` — `unique_names`, `nul_in_names`,
+> `nul_in_link_targets` and `stores_ownership` — so a struct literal that
+> lists every field no longer compiles. Nothing was removed.
+> **Behaviour changes on existing verbs:** `test`, `list`, `cat` and
+> `unpack` now read a compressed container's codec to its end and check its
+> trailer, so a `.tar.gz` whose gzip CRC is wrong exits 5 where 0.8.1 said
+> "verified" (GNU tar's record padding hid the corruption from the tar
+> walk). `unpack` and `cat` may already have written bytes when that exit 5
+> arrives, as with any mid-stream corruption. **Known limitation:**
+> `--index` reads stop at the last selected entry and so do not reach the
+> trailer. The tar, cpio and ar writers refuse an entry name with a NUL byte
+> (exit 3) instead of truncating it; `pack`'s fidelity summary wording
+> changed. **1656** tests under `--all-features`, **1592** on
+> the default tier — measured from this bump's own `make check`,
+> `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
