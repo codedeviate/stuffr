@@ -648,6 +648,30 @@ fn copy_decoded(decoded: &mut dyn Read, guard: &mut RatioGuard, out: &mut dyn Wr
     }
 }
 
+/// The ONE owner of "a directory handed to a verb that reads one stream is a
+/// usage error (exit 2)", the Phase 2c ruling. `File::open` on a directory
+/// SUCCEEDS on unix and fails only at the first `read`, with `EISDIR`, which
+/// reaches the user as `i/o error: Is a directory` at exit 1 — "stuffr
+/// failed" for a caller's mistake. So the check has to be made before the
+/// open, by every verb that would otherwise read the directory as a file.
+///
+/// `explain` words the refusal for its verb, given the path as typed and the
+/// directory's own final component (`"bundle"` when it has none): a
+/// suggestion such as `-o proj.tar.gz` is something a reader can act on,
+/// where the same absolute path repeated three times in one sentence is not.
+pub(crate) fn refuse_directory_input(
+    src: &Input,
+    explain: impl FnOnce(&Path, &str) -> String,
+) -> Result<()> {
+    if let Input::Path(p) = src
+        && p.is_dir()
+    {
+        let stem = p.file_name().and_then(|n| n.to_str()).unwrap_or("bundle");
+        return Err(Error::Usage(explain(p, stem)));
+    }
+    Ok(())
+}
+
 /// Compresses `src` into `dst`, using the build's default registry.
 pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     compress_with(crate::registry(), src, dst, o)
@@ -676,26 +700,15 @@ pub fn compress_with(
     // `Error::exit_code`'s own doc records two earlier corrections of exactly
     // this `_ => 1` leak; this is the third, and the first one Phase 2c
     // introduced by making a directory legal somewhere else.
-    if let Input::Path(p) = &src
-        && p.is_dir()
-    {
-        // The suggestion uses the directory's own final component, not the
-        // path as typed: `-o proj.tar.gz` is something a reader can act on,
-        // where the same absolute path repeated three times in one sentence
-        // is not.
-        let stem = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("bundle")
-            .to_string();
-        return Err(Error::Usage(format!(
+    refuse_directory_input(&src, |p, stem| {
+        format!(
             "`{}` is a directory, and a codec compresses one stream: it has no entries \
              to put a tree in. An output whose extension names a container writes both \
              layers in one step — `-o {stem}.tar.gz`, or `-o {stem}.tar` for no \
              compression.",
             p.display()
-        )));
-    }
+        )
+    })?;
     let format = choose_format(registry, &dst, o.format)?;
     // Before any filesystem work: a rejected option must cost nothing.
     let (codec, encode) = checked_encoder(registry, format, o)?;
@@ -1027,6 +1040,16 @@ impl ConvertSource {
 
     /// Opens and resolves `src` against `registry`.
     pub fn open_with(registry: &Registry, src: Input, memory_limit: Option<u64>) -> Result<Self> {
+        // Before the open, which would succeed on a directory and fail at
+        // the first read as exit 1.
+        refuse_directory_input(&src, |p, stem| {
+            format!(
+                "`{}` is a directory, and convert reads one archive or compressed \
+                 file. To archive a directory, pack it: `stuffr pack {} -o {stem}.zip`.",
+                p.display(),
+                p.display()
+            )
+        })?;
         let path = src.path().map(Path::to_path_buf);
         let compressed_total = path
             .as_deref()

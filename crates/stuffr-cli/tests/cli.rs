@@ -13699,6 +13699,28 @@ fn convert_every_container_into_every_other() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M2 (Phase 5a final review): `convert DIR x.zip` is exit 2 naming `pack`,
+/// as `pack DIR -o x.gz` already is — not `i/o error: Is a directory` at
+/// exit 1.
+#[test]
+fn convert_refuses_a_directory_input_as_a_usage_error() {
+    let (dir, _) = convert_fixture();
+    let zip = dir.join("x.zip");
+    let out = run_output(&[
+        "convert",
+        dir.join("d").to_str().unwrap(),
+        zip.to_str().unwrap(),
+    ]);
+    let err = stderr_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("is a directory") && err.contains("stuffr pack"),
+        "{err}"
+    );
+    assert!(!zip.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// I1 (Phase 5a final review): a target that stores no owner loses nothing
 /// when the source has none, so lha to zip (neither stores one) is lossless
 /// and passes `--strict-fidelity`; zip to tar still reports the ids it is

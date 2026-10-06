@@ -1031,3 +1031,26 @@ fn a_clean_padded_tar_gz_converts_and_tests_clean() {
     assert_eq!(files_of(&out), vec![("t/f.txt".to_string(), payload)]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// M2 (Phase 5a final review): a directory is a usage error (exit 2), the
+/// Phase 2c ruling `pack`'s codec path already applies — not the `Is a
+/// directory` i/o error (exit 1) a read of it would raise.
+#[test]
+fn a_directory_input_is_a_usage_error() {
+    let dir = tmp_dir();
+    let tree = dir.join("proj");
+    std::fs::create_dir_all(&tree).unwrap();
+    let out = dir.join("out.zip");
+    let err = entries::convert_archive(
+        Input::Path(tree),
+        Output::Path(out.clone()),
+        fmt("zip"),
+        None,
+        &ConvertOpts::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert!(err.to_string().contains("stuffr pack"), "{err}");
+    assert!(!out.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
