@@ -381,6 +381,8 @@ impl Container for Zoo {
             unique_names: false,
             // Read-only. ZOO's names are NUL-terminated fields.
             nul_in_names: false,
+            // Read-only; no link representation in the format.
+            nul_in_link_targets: false,
             salvage: true,
             ..ContainerCaps::read_only()
         }

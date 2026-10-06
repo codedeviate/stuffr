@@ -215,3 +215,39 @@ fn every_container_states_whether_its_names_can_hold_a_nul() {
         assert_eq!(got, want, "{name}: nul_in_names");
     }
 }
+
+/// `ContainerCaps::nul_in_link_targets`, pinned the same way as
+/// `nul_in_names` above: whether `stuffr convert` writes a symlink whose
+/// target holds a NUL, or skips it with a warning. tar and cpio differ here
+/// and agree on names, which is why the two flags are separate.
+#[test]
+fn every_container_states_whether_its_link_targets_can_hold_a_nul() {
+    let expected: &[(&str, bool)] = &[
+        ("tar", false),
+        ("cpio", true),
+        ("zip", true),
+        ("ar", false),
+        ("arj", false),
+        ("arc", false),
+        ("zoo", false),
+        ("lha", true),
+    ];
+    let registry = stuffr::registry();
+    for row in registry.matrix() {
+        if row.kind != FormatKind::Container {
+            continue;
+        }
+        let name = row.id.as_str();
+        let want = expected
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("container {name:?} is missing from this table"))
+            .1;
+        let got = registry
+            .container(row.id)
+            .expect("registered")
+            .caps()
+            .nul_in_link_targets;
+        assert_eq!(got, want, "{name}: nul_in_link_targets");
+    }
+}

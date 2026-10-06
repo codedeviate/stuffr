@@ -323,6 +323,8 @@ impl Container for Arj {
             // ARJ's header stores the name as a NUL-terminated string; `add`
             // refuses one.
             nul_in_names: false,
+            // No symlink entries, and no link representation in the format.
+            nul_in_link_targets: false,
             salvage: true,
             ..ContainerCaps::read_write()
         }

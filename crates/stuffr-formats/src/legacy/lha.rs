@@ -244,6 +244,9 @@ impl Container for Lha {
             // given; the reader renders it `%00`, as it does every byte outside
             // printable ASCII (`lha_name_from_parts`).
             nul_in_names: true,
+            // No symlink entries written, but LHA's `name|target` convention
+            // would carry the target in the length-prefixed name field.
+            nul_in_link_targets: true,
             salvage: true,
             ..ContainerCaps::read_write()
         }

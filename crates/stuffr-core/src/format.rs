@@ -311,6 +311,24 @@ pub struct ContainerCaps {
     /// the safe answer for a container that has not been audited; every
     /// registered container states it explicitly.
     pub nul_in_names: bool,
+    /// A symlink TARGET containing a NUL byte is stored, and read back,
+    /// whole. The sibling of [`Self::nul_in_names`], and deliberately a
+    /// separate flag: tar and cpio differ on exactly this.
+    ///
+    /// `false` for tar, whose link target lives in the NUL-terminated
+    /// linkname field (or a GNU `K` payload, also NUL-terminated) — its
+    /// writer refuses one as a backstop, and `stuffr convert` skips such a
+    /// symlink with a warning instead (`plan_entry_write`). `true` for cpio
+    /// newc and zip, which store the target as the entry's BODY, by length
+    /// (measured round trip). A container with no symlink entries
+    /// (`!stores_symlinks`) states what its format would imply: `false` for
+    /// ar, arj, arc and zoo, which have no link representation at all;
+    /// `true` for LHA, whose `name|target` convention lives in its
+    /// length-prefixed name field.
+    ///
+    /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`;
+    /// every registered container states it explicitly.
+    pub nul_in_link_targets: bool,
 }
 
 /// A magic-byte rule. Detection matches these against a bounded prefix.
@@ -391,6 +409,7 @@ impl ContainerCaps {
             salvage: false,
             unique_names: false,
             nul_in_names: false,
+            nul_in_link_targets: false,
         }
     }
 

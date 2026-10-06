@@ -260,6 +260,9 @@ impl Container for Tar {
             // ustar's name field and the GNU `L` payload are both NUL-terminated:
             // a NUL in a name would end it there. `add` refuses one.
             nul_in_names: false,
+            // The linkname field and the GNU `K` payload are NUL-terminated;
+            // `add` refuses a NUL in a link target.
+            nul_in_link_targets: false,
             salvage: true,
             ..Default::default()
         }
@@ -1341,7 +1344,7 @@ fn refuse_nul(what: &str, value: &str) -> Result<()> {
     if value.as_bytes().contains(&0) {
         return Err(Error::Unsupported(format!(
             "tar cannot store `{}`: its {what} contains a NUL byte, and tar stores \
-             names NUL-terminated",
+             {what}s NUL-terminated",
             value.escape_debug()
         )));
     }
@@ -1449,6 +1452,36 @@ mod tests {
             );
         }
         assert!(!Tar.caps().nul_in_names);
+        assert!(!Tar.caps().nul_in_link_targets);
+    }
+
+    /// The link-target refusal says what tar stores NUL-terminated — link
+    /// targets — not "names".
+    #[test]
+    fn a_link_target_refusal_names_link_targets() {
+        let buf = SharedBuf::new();
+        let mut w = Tar
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let link = EntryMeta {
+            kind: EntryKind::Symlink {
+                target: "t\0x".into(),
+            },
+            ..EntryMeta::file("link")
+        };
+        let err = w
+            .add(&link, &mut std::io::empty())
+            .expect_err("a NUL in a link target must be refused");
+        assert_eq!(err.exit_code(), 3);
+        assert!(
+            err.to_string().contains(
+                "its link target contains a NUL byte, and tar stores link targets NUL-terminated"
+            ),
+            "{err}"
+        );
     }
 
     /// Reads every entry back through the ladder over a NON-seekable source,

@@ -272,6 +272,9 @@ impl Container for Zip {
             unique_names: true,
             // The name is a length-prefixed field: a NUL round-trips — measured.
             nul_in_names: true,
+            // The target is the entry's body, stored by length: a NUL
+            // round-trips (measured).
+            nul_in_link_targets: true,
             salvage: true,
             ..Default::default()
         }

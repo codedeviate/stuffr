@@ -232,6 +232,9 @@ impl Container for CpioNewc {
             // newc stores the name NUL-terminated (`c_namesize` counts the NUL):
             // a trailing NUL is lost on read. `add` refuses one.
             nul_in_names: false,
+            // The target is the entry's body, stored by length: a NUL
+            // round-trips (measured), so `add` does not refuse one.
+            nul_in_link_targets: true,
             salvage: true,
             ..Default::default()
         }

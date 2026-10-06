@@ -767,3 +767,122 @@ fn a_name_with_a_nul_is_skipped_into_tar_and_named() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A cpio archive, written by stuffr's own cpio writer, holding a regular
+/// file and a symlink whose TARGET contains a NUL — which newc stores as the
+/// entry's body, by length, so it round-trips. Every entry carries ownership,
+/// mode and mtime, so a conversion owes no metadata warning for it.
+#[cfg(feature = "cpio")]
+fn cpio_with_a_nul_link_target(path: &Path) {
+    use stuffr::{CreateOpts, EntryMeta, PlainSink};
+    let full = |name: &str, kind: EntryKind, size: u64| EntryMeta {
+        size: Some(size),
+        mode: Some(0o644),
+        uid: Some(1),
+        gid: Some(1),
+        mtime: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000)),
+        kind,
+        ..EntryMeta::file(name)
+    };
+    let writer = stuffr::registry()
+        .require_container_writer(fmt("cpio"))
+        .unwrap();
+    let file = std::fs::File::create(path).unwrap();
+    let mut w = writer
+        .create(PlainSink::new(Box::new(file)), &CreateOpts::default())
+        .unwrap();
+    w.add(&full("keep.txt", EntryKind::File, 5), &mut &b"kept\n"[..])
+        .unwrap();
+    let target = "t\0x";
+    w.add(
+        &full(
+            "link",
+            EntryKind::Symlink {
+                target: target.into(),
+            },
+            target.len() as u64,
+        ),
+        &mut std::io::empty(),
+    )
+    .unwrap();
+    w.finish().unwrap().finish().unwrap();
+}
+
+/// Fix round 2 (F2): tar stores a link target NUL-terminated, so a symlink
+/// whose target holds a NUL is skipped with ONE warning naming it — not a
+/// whole-conversion failure at the tar writer's backstop (exit 3) — and
+/// every other entry arrives intact.
+#[cfg(feature = "cpio")]
+#[test]
+fn a_link_target_with_a_nul_is_skipped_into_tar_and_named() {
+    let dir = tmp_dir();
+    let src = dir.join("in.cpio");
+    cpio_with_a_nul_link_target(&src);
+    let dst = dir.join("out.tar");
+    let outcome = entries::convert_archive(
+        Input::Path(src),
+        Output::Path(dst.clone()),
+        fmt("tar"),
+        None,
+        &ConvertOpts::default(),
+    )
+    .expect("one symlink the target cannot hold is a warning, not a failure");
+    let skipped: Vec<_> = outcome
+        .fidelity
+        .warnings
+        .iter()
+        .filter_map(|w| match w {
+            Fidelity::EntrySkipped { entry, reason } => Some((entry.as_str(), reason.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(skipped.len(), 1, "{:?}", outcome.fidelity.warnings);
+    assert_eq!(skipped[0].0, "link");
+    assert!(skipped[0].1.contains("symlink target"), "{}", skipped[0].1);
+    let entries = entries_of(&dst);
+    assert_eq!(
+        entries,
+        vec![("keep.txt".to_string(), EntryKind::File, b"kept\n".to_vec())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The other half of F2: cpio stores the target by length, so the same
+/// symlink converted into cpio keeps its exact target, with no warning.
+#[cfg(feature = "cpio")]
+#[test]
+fn a_link_target_with_a_nul_survives_into_cpio() {
+    let dir = tmp_dir();
+    let src = dir.join("in.cpio");
+    cpio_with_a_nul_link_target(&src);
+    let dst = dir.join("out.cpio");
+    let outcome = entries::convert_archive(
+        Input::Path(src),
+        Output::Path(dst.clone()),
+        fmt("cpio"),
+        None,
+        &ConvertOpts::default(),
+    )
+    .unwrap();
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    let (metas, _) = entries::list(Input::Path(dst.clone()), DEFAULT_MAX_RATIO, None).unwrap();
+    let link = metas
+        .iter()
+        .find(|m| m.name == "link")
+        .expect("the link is kept");
+    assert_eq!(
+        link.kind,
+        EntryKind::Symlink {
+            target: "t\0x".into()
+        }
+    );
+    assert_eq!(
+        files_of(&dst),
+        vec![("keep.txt".to_string(), b"kept\n".to_vec())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

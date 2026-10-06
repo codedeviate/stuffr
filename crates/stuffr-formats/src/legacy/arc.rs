@@ -310,6 +310,8 @@ impl Container for Arc {
             unique_names: false,
             // Read-only. ARC's 13-byte name field is NUL-terminated.
             nul_in_names: false,
+            // Read-only; no link representation in the format.
+            nul_in_link_targets: false,
             salvage: true,
             ..ContainerCaps::read_only()
         }

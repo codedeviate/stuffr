@@ -3909,6 +3909,10 @@ enum WritePlan {
 /// would refuse it anyway, and failing the whole conversion over one entry is
 /// the outcome this function exists to avoid. Only `convert` can meet one: an
 /// OS path cannot carry a NUL, so `pack`'s walk never yields such a name.
+/// A symlink whose TARGET holds one is skipped the same way, with
+/// [`nul_link_target_reason`], for a target whose caps say
+/// `!nul_in_link_targets` (tar); zip and cpio read such a target with
+/// `from_utf8_lossy`, which keeps the NUL.
 ///
 /// An entry skipped here STILL reports its missing ownership, as it always
 /// has: the ownership warning is appended after the skip reason whatever the
@@ -3976,6 +3980,16 @@ fn plan_entry_write(
             });
             WritePlan::Skip
         }
+        WritePlan::Write
+            if !caps.nul_in_link_targets
+                && matches!(&meta.kind, EntryKind::Symlink { target } if target.contains('\0')) =>
+        {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: meta.name.clone(),
+                reason: nul_link_target_reason(container),
+            });
+            WritePlan::Skip
+        }
         plan => plan,
     };
     if let Some(w) = ownership_warning(meta) {
@@ -3990,6 +4004,15 @@ fn nul_name_reason(container: FormatId) -> String {
     format!(
         "its name contains a NUL byte, and `{container}` stores names \
          NUL-terminated, so the name would be cut short there"
+    )
+}
+
+/// Why a symlink whose TARGET holds a NUL is not written into `container`,
+/// a target whose caps say `!nul_in_link_targets`.
+fn nul_link_target_reason(container: FormatId) -> String {
+    format!(
+        "its symlink target contains a NUL byte, and `{container}` stores link \
+         targets NUL-terminated, so the target would be cut short there"
     )
 }
 
@@ -5082,6 +5105,58 @@ mod tests {
         plan_entry_write(&terminated, FormatId::new("ar"), &nul_dir, &mut w);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].to_string().contains("no directory entries"), "{w:?}");
+    }
+
+    #[test]
+    fn a_symlink_target_with_a_nul_is_skipped_where_the_target_cannot_store_one() {
+        let link = EntryMeta {
+            name: "link".into(),
+            kind: EntryKind::Symlink {
+                target: "t\0x".into(),
+            },
+            ..meta_with(Some(1), Some(1))
+        };
+        // tar's shape: symlinks yes, a NUL in a name or link target no.
+        let tar = ContainerCaps {
+            stores_symlinks: true,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&tar, FormatId::new("tar"), &link, &mut w),
+            WritePlan::Skip
+        ));
+        // The reason, verbatim, and distinct from the name reason.
+        assert_eq!(
+            w[0].to_string(),
+            "skipped entry `link`: its symlink target contains a NUL byte, and `tar` \
+             stores link targets NUL-terminated, so the target would be cut short there"
+        );
+        assert_eq!(w.len(), 1);
+
+        // cpio's shape: the target is a length-prefixed body, so it is written.
+        let cpio = ContainerCaps {
+            stores_symlinks: true,
+            nul_in_link_targets: true,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&cpio, FormatId::new("cpio"), &link, &mut w),
+            WritePlan::Write
+        ));
+        assert!(w.is_empty());
+
+        // No symlinks at all: the kind skip's own reason, reported once.
+        let mut w = Vec::new();
+        plan_entry_write(
+            &ContainerCaps::default(),
+            FormatId::new("ar"),
+            &link,
+            &mut w,
+        );
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].to_string().contains("no symlink entries"), "{w:?}");
     }
 
     #[test]

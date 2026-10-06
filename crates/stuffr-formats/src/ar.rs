@@ -281,6 +281,8 @@ impl Container for Ar {
             // interior NUL survives, but a cap that holds some NULs is not
             // one a caller can plan on. `add` refuses one.
             nul_in_names: false,
+            // No symlink entries, and no link representation in the format.
+            nul_in_link_targets: false,
             salvage: true,
             ..Default::default()
         }
