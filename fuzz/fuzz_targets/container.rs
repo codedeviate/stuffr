@@ -2,12 +2,15 @@
 use libfuzzer_sys::fuzz_target;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use stuffr::entries::{ConvertOpts, convert_archive_source};
+use stuffr::ops::{ConvertSource, Input, Output};
 use stuffr_core::testing::{
-    CONTAINER_SLOTS, check_entry_count, check_entry_size, check_error_is_classified,
-    check_fidelity_claim,
+    CONTAINER_SLOTS, check_entries_carried, check_entry_count, check_entry_size,
+    check_error_is_classified, check_fidelity_claim,
 };
 use stuffr_core::{
-    Container, Error, FileSource, FormatId, OpenOpts, ReaderSource, Source, StreamPolicy,
+    Chain, Container, Error, FileSource, FormatId, OpenOpts, ReaderSource, Source, SpillPolicy,
+    StreamPolicy,
 };
 
 /// Independently parses a seekable zip's declared entry count from its EOCD
@@ -194,6 +197,99 @@ fn forward_entry_count(container: &dyn Container, payload: &[u8]) -> Option<usiz
     Some(count)
 }
 
+/// Converts the archive at `input` — the bytes the seekable walk just read
+/// as `slot` — into a bare `tar` at `out`, and checks the conversion against
+/// that walk: an `Err` must be classified (never exit 1), and on `Ok` every
+/// name in `source_names` must be in the produced tar or named by a skip
+/// warning in the conversion's report ([`check_entries_carried`]).
+///
+/// The source goes through [`ConvertSource::open`] — content-first, as
+/// `stuffr convert` opens it — so it may resolve to something other than
+/// `slot` (a tar slot fed zip bytes, a codec layer above a container). The
+/// name comparison runs only when the chain is exactly `slot` with no codec
+/// layer: otherwise the walk being compared against read a different archive
+/// than the one converted, and its names say nothing. The classification
+/// check runs either way. The input carries the slot's extension, so a probe
+/// that names nothing falls back to `slot`, as it would for a user's file.
+///
+/// The destination is a path in the input's own per-iteration tempdir
+/// (`force`, so the published file is replaced, never refused); `Output` has
+/// no in-memory variant, and `Output::Stdout` would write into libFuzzer's
+/// own output. `sync: false`, and spill in memory only: a fuzz input is
+/// small, and an entry that would spill past the cap is a classified exit 6.
+fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[String]) {
+    let opts = ConvertOpts {
+        force: true,
+        sync: false,
+        spill: SpillPolicy::Memory { cap: 16 << 20 },
+        ..ConvertOpts::default()
+    };
+    let src = match ConvertSource::open(Input::Path(input.to_path_buf()), opts.memory_limit) {
+        Ok(s) => s,
+        Err(e) => {
+            check_error_is_classified(&e).expect("convert: source open classification");
+            trace(slot, "open-err", source_names.len(), false);
+            return;
+        }
+    };
+    let same_archive = *src.chain()
+        == Chain::Container {
+            container: FormatId::new(slot),
+        };
+    let tar = FormatId::new("tar");
+    let outcome =
+        match convert_archive_source(src, Output::Path(out.to_path_buf()), tar, None, &opts) {
+            Ok(o) => o,
+            Err(e) => {
+                check_error_is_classified(&e).expect("convert: error classification");
+                trace(slot, "convert-err", source_names.len(), false);
+                return;
+            }
+        };
+    if !same_archive {
+        trace(slot, "other-chain", source_names.len(), false);
+        return;
+    }
+
+    // stuffr wrote this tar a moment ago: failing to read it back is a
+    // finding in its own right, so these are asserts, not early returns.
+    let registry = stuffr::registry();
+    let reader = registry.container(tar).expect("tar is registered");
+    let src: Box<dyn Source> =
+        Box::new(FileSource::open(out).expect("convert: open the produced tar"));
+    let resolved = stuffr_core::resolve(src, tar, reader.caps(), &StreamPolicy::default())
+        .expect("convert: resolve the produced tar");
+    let mut ar = reader
+        .open(resolved, &OpenOpts::default())
+        .expect("convert: open the produced tar as tar");
+    let mut written = Vec::new();
+    while let Some(entry) = ar.next_entry().expect("convert: walk the produced tar") {
+        written.push(entry.meta().name.clone());
+    }
+
+    check_entries_carried(source_names, &written, &outcome.fidelity)
+        .expect("convert: every entry carried or named");
+    trace(slot, "checked", source_names.len(), true);
+}
+
+/// One line per input that reached [`convert_oracle`], on stderr, when
+/// `STUFFR_FUZZ_CONVERT_TRACE` is set — nothing otherwise. The same
+/// measurement `salvage.rs`'s `STUFFR_FUZZ_SALVAGE_TRACE` makes: how many
+/// inputs reached the oracle, and how many of those got as far as the name
+/// comparison (`checked=true`) rather than stopping at a classified refusal
+/// or a chain the walk did not read.
+///
+/// ```text
+/// STUFFR_FUZZ_CONVERT_TRACE=1 cargo +nightly fuzz run container -- -runs=0 2>&1 \
+///   | grep '^convert-trace '
+/// ```
+fn trace(slot: &str, outcome: &str, names: usize, checked: bool) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("STUFFR_FUZZ_CONVERT_TRACE").is_some()) {
+        eprintln!("convert-trace slot={slot} outcome={outcome} names={names} checked={checked}");
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let Some((&selector, payload)) = data.split_first() else {
         return;
@@ -221,7 +317,13 @@ fuzz_target!(|data: &[u8]| {
     let mut _tmp_guard: Option<tempfile::TempDir> = None;
     let path: Option<PathBuf> = if seekable {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let p = tmp.path().join("input");
+        // Named with the slot's extension (every slot name is one of its own
+        // format's extensions): `ConvertSource::open` falls back to the
+        // path's extension when the content probe names nothing, as `stuffr
+        // convert` does for a file — measured, without it 170 of the 217
+        // inputs reaching `convert_oracle` stopped at "could not detect
+        // format" (zips with bytes ahead of their first local header).
+        let p = tmp.path().join(format!("input.{name}"));
         std::fs::write(&p, payload).expect("write temp input");
         _tmp_guard = Some(tmp);
         Some(p)
@@ -264,6 +366,9 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let mut enumerated: usize = 0;
+    // Every name the walk reached, for `convert_oracle`; seekable path only,
+    // the only one the oracle runs on.
+    let mut names: Vec<String> = Vec::new();
 
     loop {
         let mut entry = match ar.next_entry() {
@@ -314,6 +419,9 @@ fuzz_target!(|data: &[u8]| {
         // borrow on `ar` before the next `ar.next_entry()` call.
 
         check_entry_size(declared_size, produced, &entry_name, &entry_kind).expect("entry size");
+        if seekable {
+            names.push(entry_name);
+        }
     }
 
     // Read the report only now that the walk is complete, not mid-walk.
@@ -397,4 +505,11 @@ fuzz_target!(|data: &[u8]| {
         });
 
     check_fidelity_claim(report, approximated).expect("fidelity claim");
+
+    // Phase 5a: convert what this walk read into a tar, seekable path only
+    // (the cheap one: the input is already a file). Last, so every check
+    // above has already passed on these bytes.
+    if let (Some(p), Some(tmp)) = (&path, &_tmp_guard) {
+        convert_oracle(p, &tmp.path().join("converted.tar"), name, &names);
+    }
 });

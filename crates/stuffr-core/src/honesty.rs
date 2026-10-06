@@ -159,13 +159,58 @@ pub fn check_fidelity_claim(report: &FidelityReport, approximated: bool) -> Resu
     Ok(())
 }
 
+/// A conversion carries every entry its source reader enumerated — **or
+/// names the one it left behind**.
+///
+/// `source` is what an independent walk of the source enumerated; `written`
+/// is what a reader of the conversion's OUTPUT enumerated; `report` is the
+/// conversion's own fidelity report. A name absent from `written` is a
+/// supported outcome only when the report says why: a target with no shape
+/// for the entry's kind (a directory in `ar`, a symlink, a device or fifo)
+/// skips it with [`Fidelity::EntrySkipped`], as does a `unique_names` target
+/// for every later entry of a repeated name. What is never acceptable is an
+/// entry that silently fails to arrive.
+///
+/// **Matched by name, never by count.** `FidelityReport::merge` de-duplicates
+/// identical warnings, so two skipped entries of one name leave ONE warning;
+/// and a `unique_names` target legitimately holds a repeated name once. A
+/// count comparison would cry wolf on both, so this asks only "did every name
+/// either arrive or get named".
+pub fn check_entries_carried(
+    source: &[String],
+    written: &[String],
+    report: &FidelityReport,
+) -> Result<(), String> {
+    let arrived: std::collections::HashSet<&str> = written.iter().map(String::as_str).collect();
+    let skipped: std::collections::HashSet<&str> = report
+        .warnings
+        .iter()
+        .filter_map(|w| match w {
+            Fidelity::EntrySkipped { entry, .. } | Fidelity::EncryptedEntrySkipped { entry } => {
+                Some(entry.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    match source
+        .iter()
+        .find(|n| !arrived.contains(n.as_str()) && !skipped.contains(n.as_str()))
+    {
+        Some(missing) => Err(format!(
+            "the source held entry {missing:?}, the converted archive does not, and \
+             the fidelity report names no skip for it"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Never report a status that claims more evidence than the format offers
 /// or the scan actually gathered.
 ///
 /// This lives in the library rather than inside the fuzz target because a
 /// fuzz target's own checks cannot be unit-tested, so a harness that runs
 /// clean is indistinguishable from one whose invariants are vacuous — the
-/// same reason the four checks above it live here.
+/// same reason the five checks above it live here.
 ///
 /// # The two inputs
 ///
@@ -433,6 +478,46 @@ mod broken_honesty {
             "must say what was claimed: {msg}"
         );
         assert!(check_fidelity_claim(&clean, false).is_ok());
+    }
+
+    #[test]
+    fn an_entry_a_conversion_drops_silently_is_refused() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let clean = FidelityReport::new(Rung::Exact);
+        let msg = check_entries_carried(&names(&["a", "b"]), &names(&["a"]), &clean)
+            .expect_err("a dropped entry must fail");
+        assert!(msg.contains("\"b\""), "must name the entry: {msg}");
+        // A warning about a DIFFERENT entry does not launder the drop.
+        let mut other = FidelityReport::new(Rung::Exact);
+        other.warn(Fidelity::EntrySkipped {
+            entry: "c".into(),
+            reason: "special".into(),
+        });
+        assert!(check_entries_carried(&names(&["a", "b"]), &names(&["a"]), &other).is_err());
+        assert!(check_entries_carried(&names(&["a", "b"]), &names(&["b", "a"]), &clean).is_ok());
+    }
+
+    #[test]
+    fn an_entry_a_conversion_skips_and_names_is_permitted() {
+        // Over-strictness guard: neutering `check_entries_carried` to
+        // `Ok(())` makes this pass harder; it is falsified by refusing a
+        // named skip, or by matching on counts — two entries of one name,
+        // one arriving and ONE (merged) warning, is a `unique_names`
+        // target's ordinary output.
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut skipped = FidelityReport::new(Rung::Exact);
+        skipped.warn(Fidelity::EntrySkipped {
+            entry: "dir/".into(),
+            reason: "no directory entries".into(),
+        });
+        assert!(
+            check_entries_carried(&names(&["dir/", "x", "x"]), &names(&["x"]), &skipped).is_ok()
+        );
+        let mut encrypted = FidelityReport::new(Rung::Exact);
+        encrypted.warn(Fidelity::EncryptedEntrySkipped {
+            entry: "secret".into(),
+        });
+        assert!(check_entries_carried(&names(&["secret"]), &[], &encrypted).is_ok());
     }
 
     #[test]
