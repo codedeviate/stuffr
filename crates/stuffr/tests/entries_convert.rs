@@ -1180,6 +1180,81 @@ fn convert(
     .unwrap()
 }
 
+/// A tar of file `a`, symlink `s -> a`, and hard link `l` to `s`: GNU tar
+/// writes exactly this for a hard-linked symlink, and `unpack` recreates `l`
+/// as a symlink.
+fn tar_with_a_link_to_a_symlink() -> Vec<u8> {
+    let mut out = hand_built_tar(&[("a", b'0', b"hello")]);
+    out.truncate(out.len() - 1024);
+    for (name, flag, target) in [("s", b'2', "a"), ("l", b'1', "s")] {
+        let mut h = tar_header(name, 0, flag);
+        h[157..157 + target.len()].copy_from_slice(target.as_bytes());
+        h[148..156].copy_from_slice(b"        ");
+        let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        out.extend_from_slice(&h);
+    }
+    out.extend(std::iter::repeat_n(0u8, 1024));
+    out
+}
+
+/// tar into zip: a hard link to a symlink is that symlink, so it is written
+/// as one with the same target text — not skipped as "not kept for
+/// copying", which is what 0.10.0's first cut said.
+#[test]
+fn a_tar_hard_link_to_a_symlink_converts_to_zip_as_the_symlink() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    std::fs::write(&src, tar_with_a_link_to_a_symlink()).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(&src, &zip, "zip", &ConvertOpts::default());
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    let symlink = |t: &str| EntryKind::Symlink { target: t.into() };
+    let got: Vec<_> = entries_of(&zip)
+        .into_iter()
+        .map(|(name, kind, _)| (name, kind))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("a".to_string(), EntryKind::File),
+            ("s".to_string(), symlink("a")),
+            ("l".to_string(), symlink("a")),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Into a container with no symlink entries, the link is skipped saying its
+/// target is a symlink — not that the target "was not kept".
+#[cfg(feature = "ar")]
+#[test]
+fn a_tar_hard_link_to_a_symlink_into_ar_names_the_symlink() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    std::fs::write(&src, tar_with_a_link_to_a_symlink()).unwrap();
+    let out = dir.join("out.a");
+    let outcome = convert(&src, &out, "ar", &ConvertOpts::default());
+    let warnings: Vec<String> = outcome
+        .fidelity
+        .warnings
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        warnings.contains(
+            &"skipped entry `l`: its hard-link target `s` is a symlink, which `ar` cannot store"
+                .to_string()
+        ),
+        "{warnings:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A tar link into a container without links becomes a regular file holding
 /// exactly its target's bytes, and that is no loss.
 #[test]

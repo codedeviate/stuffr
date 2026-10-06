@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4002,6 +4002,10 @@ pub fn convert_archive_source_with(
 ///   `budget` like any payload, so many links to one large file cannot
 ///   multiply the output past it. A target `links` did not keep is skipped
 ///   ([`hard_link_reason_not_kept`]).
+/// - **A link to a symlink**, into a target without links, IS that symlink
+///   (unpack recreates it as one): written as a symlink with the same target
+///   text when this run wrote the symlink, and skipped with
+///   [`hard_link_reason_symlink`] when the container has no symlink entries.
 fn convert_entries(
     ar: &mut dyn ArchiveRead,
     archive: &mut dyn ArchiveWrite,
@@ -4016,6 +4020,10 @@ fn convert_entries(
     // Names this run wrote: a `unique_names` target holds one entry per name,
     // and a stored link must name a target that is really there.
     let mut written: HashSet<String> = HashSet::new();
+    // Every symlink seen, by name, with its target text when this run wrote
+    // it: a hard link to one IS that symlink. Superseded like a kept
+    // payload: any later entry of the name, written or not, replaces it.
+    let mut symlinks: HashMap<String, Option<String>> = HashMap::new();
     while let Some(mut entry) = ar.next_entry()? {
         let mut meta = entry.meta().clone();
         // Every link naming a kept payload counts it down, copied or
@@ -4024,12 +4032,23 @@ fn convert_entries(
             EntryKind::Hardlink { target } => Some(target.clone()),
             _ => None,
         };
+        // Looked up before this entry's own name supersedes anything.
+        let link_symlink = link_target
+            .as_deref()
+            .and_then(|target| symlinks.get(target).cloned());
+        symlinks.remove(&meta.name);
+        if matches!(meta.kind, EntryKind::Symlink { .. }) {
+            symlinks.insert(meta.name.clone(), None);
+        }
         'entry: {
-            let link_copy_available = link_target
-                .as_deref()
-                .is_some_and(|target| links.contains(target));
+            let link_copy = match (link_target.as_deref(), &link_symlink) {
+                (Some(target), _) if links.contains(target) => LinkCopy::Bytes,
+                (Some(_), Some(Some(_))) => LinkCopy::Symlink,
+                (Some(_), Some(None)) if !caps.stores_symlinks => LinkCopy::UnstorableSymlink,
+                _ => LinkCopy::Unavailable,
+            };
             if let WritePlan::Skip =
-                plan_entry_write(caps, container, &meta, link_copy_available, &mut warnings)
+                plan_entry_write(caps, container, &meta, link_copy, &mut warnings)
             {
                 // Unread: the reader drains (or seeks past) an entry the
                 // caller did not consume, as it does for `list`. A payload
@@ -4047,6 +4066,17 @@ fn convert_entries(
                 warnings.push(duplicate_name_skipped(container, &meta.name));
                 links.forget(&meta.name);
                 break 'entry;
+            }
+            // A link to a symlink, into a target without links, is that
+            // symlink: the plan wrote it only where symlinks are stored.
+            if link_copy == LinkCopy::Symlink
+                && !caps.stores_hardlinks
+                && let Some(Some(text)) = link_symlink
+            {
+                meta.kind = EntryKind::Symlink { target: text };
+            }
+            if let EntryKind::Symlink { target } = &meta.kind {
+                symlinks.insert(meta.name.clone(), Some(target.clone()));
             }
             match meta.kind.clone() {
                 EntryKind::File => {
@@ -4481,6 +4511,24 @@ fn ownership_warning(meta: &EntryMeta) -> Option<Fidelity> {
     })
 }
 
+/// What a hard link's target was, as far as writing the link as something
+/// other than a link goes — [`plan_entry_write`]'s question for a target
+/// container that cannot store links.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkCopy {
+    /// No copy: the target was not kept, or the entry is not a link.
+    Unavailable,
+    /// The target's bytes are kept ([`LinkCache`]): written as a regular file
+    /// holding them.
+    Bytes,
+    /// The target was written as a SYMLINK by this run: the link is that
+    /// same symlink, so it is written as one with the same target text.
+    Symlink,
+    /// The target was a symlink this run could not write, because the
+    /// container has no symlink entries: skipped, saying so.
+    UnstorableSymlink,
+}
+
 /// What a target container does with one entry.
 enum WritePlan {
     /// Hand the entry to the container.
@@ -4533,7 +4581,7 @@ fn plan_entry_write(
     caps: &ContainerCaps,
     container: FormatId,
     meta: &EntryMeta,
-    link_copy_available: bool,
+    link_copy: LinkCopy,
     warnings: &mut Vec<Fidelity>,
 ) -> WritePlan {
     let plan = match &meta.kind {
@@ -4575,7 +4623,20 @@ fn plan_entry_write(
         // this run did not write.
         EntryKind::Hardlink { .. } if caps.stores_hardlinks => WritePlan::Write,
         // Written as a copy of the target's kept bytes.
-        EntryKind::Hardlink { .. } if link_copy_available => WritePlan::Write,
+        EntryKind::Hardlink { .. } if link_copy == LinkCopy::Bytes => WritePlan::Write,
+        // Written as the symlink its target is.
+        EntryKind::Hardlink { .. } if link_copy == LinkCopy::Symlink && caps.stores_symlinks => {
+            WritePlan::Write
+        }
+        EntryKind::Hardlink { target }
+            if matches!(link_copy, LinkCopy::Symlink | LinkCopy::UnstorableSymlink) =>
+        {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: meta.name.clone(),
+                reason: hard_link_reason_symlink(container, target),
+            });
+            WritePlan::Skip
+        }
         EntryKind::Hardlink { target } => {
             warnings.push(Fidelity::EntrySkipped {
                 entry: meta.name.clone(),
@@ -4659,6 +4720,12 @@ fn hard_link_reason_not_kept(target: &str) -> String {
     format!("its hard-link target `{target}` was not kept for copying")
 }
 
+/// Why `convert` skips a hard link whose target this run wrote as a symlink,
+/// into a container with neither link nor symlink entries. Raw, as above.
+fn hard_link_reason_symlink(container: FormatId, target: &str) -> String {
+    format!("its hard-link target `{target}` is a symlink, which `{container}` cannot store")
+}
+
 /// Why `convert` skips a hard link into a container that stores links: its
 /// target was not written by this run, so a stored link would dangle. Raw,
 /// as above.
@@ -4711,7 +4778,11 @@ fn plan_item(
     match &item.source {
         crate::walk::ItemSource::Skipped { .. } => None,
         _ => Some(plan_entry_write(
-            caps, container, &item.meta, false, warnings,
+            caps,
+            container,
+            &item.meta,
+            LinkCopy::Unavailable,
+            warnings,
         )),
     }
 }
@@ -5731,7 +5802,13 @@ mod tests {
             ..meta_with(None, None)
         };
         assert!(matches!(
-            plan_entry_write(&caps, FormatId::new("x"), &dir, false, &mut w),
+            plan_entry_write(
+                &caps,
+                FormatId::new("x"),
+                &dir,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Skip
         ));
         assert!(matches!(w[0], Fidelity::EntrySkipped { .. }));
@@ -5746,7 +5823,13 @@ mod tests {
         let mut w = Vec::new();
         let file = meta_with(Some(1), Some(1));
         assert!(matches!(
-            plan_entry_write(&caps, FormatId::new("x"), &file, false, &mut w),
+            plan_entry_write(
+                &caps,
+                FormatId::new("x"),
+                &file,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Write
         ));
         assert!(w.is_empty());
@@ -5765,7 +5848,7 @@ mod tests {
                 &ContainerCaps::default(),
                 FormatId::new("zip"),
                 &anonymous,
-                false,
+                LinkCopy::Unavailable,
                 &mut w
             ),
             WritePlan::Write
@@ -5777,7 +5860,13 @@ mod tests {
             ..Default::default()
         };
         let mut w = Vec::new();
-        plan_entry_write(&owns, FormatId::new("tar"), &anonymous, false, &mut w);
+        plan_entry_write(
+            &owns,
+            FormatId::new("tar"),
+            &anonymous,
+            LinkCopy::Unavailable,
+            &mut w,
+        );
         assert_eq!(w.len(), 1, "{w:?}");
         assert_eq!(
             w[0].to_string(),
@@ -5794,7 +5883,13 @@ mod tests {
         let terminated = ContainerCaps::default();
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&terminated, FormatId::new("tar"), &nul, false, &mut w),
+            plan_entry_write(
+                &terminated,
+                FormatId::new("tar"),
+                &nul,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Skip
         ));
         // The reason, verbatim: what `stuffr convert` prints for it.
@@ -5812,7 +5907,13 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&holds, FormatId::new("zip"), &nul, false, &mut w),
+            plan_entry_write(
+                &holds,
+                FormatId::new("zip"),
+                &nul,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Write
         ));
         assert!(w.is_empty());
@@ -5823,7 +5924,13 @@ mod tests {
             ..nul
         };
         let mut w = Vec::new();
-        plan_entry_write(&terminated, FormatId::new("ar"), &nul_dir, false, &mut w);
+        plan_entry_write(
+            &terminated,
+            FormatId::new("ar"),
+            &nul_dir,
+            LinkCopy::Unavailable,
+            &mut w,
+        );
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].to_string().contains("no directory entries"), "{w:?}");
     }
@@ -5844,7 +5951,13 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&tar, FormatId::new("tar"), &link, false, &mut w),
+            plan_entry_write(
+                &tar,
+                FormatId::new("tar"),
+                &link,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Skip
         ));
         // The reason, verbatim, and distinct from the name reason.
@@ -5863,7 +5976,13 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&cpio, FormatId::new("cpio"), &link, false, &mut w),
+            plan_entry_write(
+                &cpio,
+                FormatId::new("cpio"),
+                &link,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Write
         ));
         assert!(w.is_empty());
@@ -5874,7 +5993,7 @@ mod tests {
             &ContainerCaps::default(),
             FormatId::new("ar"),
             &link,
-            false,
+            LinkCopy::Unavailable,
             &mut w,
         );
         assert_eq!(w.len(), 1, "{w:?}");
@@ -5900,17 +6019,35 @@ mod tests {
 
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&all, FormatId::new("x"), &link, false, &mut w),
+            plan_entry_write(
+                &all,
+                FormatId::new("x"),
+                &link,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Write
         ));
         assert!(matches!(
-            plan_entry_write(&all, FormatId::new("x"), &dir, false, &mut w),
+            plan_entry_write(
+                &all,
+                FormatId::new("x"),
+                &dir,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Write
         ));
         assert!(w.is_empty());
 
         assert!(matches!(
-            plan_entry_write(&none, FormatId::new("x"), &link, false, &mut w),
+            plan_entry_write(
+                &none,
+                FormatId::new("x"),
+                &link,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Skip
         ));
         assert_eq!(
@@ -5928,11 +6065,23 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&links_only, FormatId::new("x"), &link, false, &mut w),
+            plan_entry_write(
+                &links_only,
+                FormatId::new("x"),
+                &link,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Write
         ));
         assert!(matches!(
-            plan_entry_write(&links_only, FormatId::new("x"), &dir, false, &mut w),
+            plan_entry_write(
+                &links_only,
+                FormatId::new("x"),
+                &dir,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Skip
         ));
         assert_eq!(w.len(), 1);
@@ -5954,7 +6103,13 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&all, FormatId::new("x"), &other, false, &mut w),
+            plan_entry_write(
+                &all,
+                FormatId::new("x"),
+                &other,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Skip
         ));
         assert_eq!(w.len(), 1);
@@ -5983,7 +6138,13 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&can, FormatId::new("x"), &link, false, &mut w),
+            plan_entry_write(
+                &can,
+                FormatId::new("x"),
+                &link,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Write
         ));
         assert!(w.is_empty());
@@ -5992,7 +6153,7 @@ mod tests {
                 &ContainerCaps::default(),
                 FormatId::new("x"),
                 &link,
-                false,
+                LinkCopy::Unavailable,
                 &mut w
             ),
             WritePlan::Skip
@@ -6009,7 +6170,7 @@ mod tests {
                 &ContainerCaps::default(),
                 FormatId::new("x"),
                 &link,
-                true,
+                LinkCopy::Bytes,
                 &mut w
             ),
             WritePlan::Write
@@ -6021,7 +6182,10 @@ mod tests {
             },
             ..meta_with(Some(1), Some(1))
         };
-        for (caps, copy) in [(&can, false), (&ContainerCaps::default(), true)] {
+        for (caps, copy) in [
+            (&can, LinkCopy::Unavailable),
+            (&ContainerCaps::default(), LinkCopy::Bytes),
+        ] {
             let mut w = Vec::new();
             assert!(matches!(
                 plan_entry_write(caps, FormatId::new("x"), &selfish, copy, &mut w),
@@ -6032,6 +6196,43 @@ mod tests {
                 "skipped entry `proj/notes.txt`: it names itself as its hard-link target"
             );
         }
+    }
+
+    /// A link to a symlink this run wrote is written (as that symlink) where
+    /// symlinks are stored; one to a symlink the container could not store
+    /// is skipped saying exactly that.
+    #[test]
+    fn plan_entry_write_follows_a_link_to_a_symlink() {
+        let link = EntryMeta {
+            kind: EntryKind::Hardlink { target: "s".into() },
+            ..meta_with(Some(1), Some(1))
+        };
+        let zip = ContainerCaps {
+            stores_symlinks: true,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&zip, FormatId::new("zip"), &link, LinkCopy::Symlink, &mut w),
+            WritePlan::Write
+        ));
+        assert!(w.is_empty());
+        let ar = ContainerCaps::default();
+        assert!(matches!(
+            plan_entry_write(
+                &ar,
+                FormatId::new("ar"),
+                &link,
+                LinkCopy::UnstorableSymlink,
+                &mut w
+            ),
+            WritePlan::Skip
+        ));
+        assert_eq!(
+            w[0].to_string(),
+            "skipped entry `proj/notes.txt`: its hard-link target `s` is a symlink, \
+             which `ar` cannot store"
+        );
     }
 
     /// The pinned hard-link reasons. The target is interpolated raw;
@@ -6081,7 +6282,13 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&tar, FormatId::new("tar"), &link, false, &mut w),
+            plan_entry_write(
+                &tar,
+                FormatId::new("tar"),
+                &link,
+                LinkCopy::Unavailable,
+                &mut w
+            ),
             WritePlan::Skip
         ));
         assert_eq!(w.len(), 1);
