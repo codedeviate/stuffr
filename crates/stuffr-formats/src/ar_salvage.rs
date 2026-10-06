@@ -1025,6 +1025,37 @@ mod tests {
         );
     }
 
+    /// An archive whose last member is `#1/3` with an even payload, and
+    /// whose only defect is that member's missing final pad byte: every
+    /// member whole, `Unattested`, and no stop — the guard accepts a missing
+    /// final pad as the crate accepts its own, so there is no 0-byte
+    /// `CutShort` to report.
+    #[test]
+    fn a_missing_final_pad_after_an_odd_bsd_name_is_no_stop() {
+        let mut bytes = GLOBAL_HEADER.to_vec();
+        bytes.extend(member(b"plain.txt", 3, b"xyz"));
+        bytes.extend(member(b"#1/3", 7, b"abcABCD"));
+        assert_eq!(bytes.pop(), Some(b'\n'), "the final pad byte");
+        let out = scan(&bytes);
+        assert!(out.walk_stop.is_none(), "{:?}", out.walk_stop);
+        assert_eq!(
+            names_and_statuses(&out),
+            [
+                ("plain.txt", SalvageStatus::Unattested),
+                ("abc", SalvageStatus::Unattested)
+            ]
+            .map(|(n, s)| (n.to_string(), s))
+        );
+        assert_eq!(
+            write_back(&bytes, &out),
+            [("plain.txt", &b"xyz"[..]), ("abc", b"ABCD")].map(|(n, d)| (
+                n.to_string(),
+                d.to_vec(),
+                true
+            ))
+        );
+    }
+
     // -------------------------------------------------------------------
     // The guard's ceilings: one owner, answered as a stop, never an `Err`
     // and never an allocation.

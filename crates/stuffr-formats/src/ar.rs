@@ -573,7 +573,10 @@ enum PadAfter {
     /// A pad byte in the stream that the crate will not read (a `#1/N`
     /// member with an odd name and an even payload): the guard consumes it
     /// from the source itself, so the crate's next header read starts at
-    /// the header. It must be a real `\n`, as the crate requires of its own.
+    /// the header. A byte there must be a real `\n`, as the crate requires
+    /// of its own; no byte at all is the end of the file, which the guard
+    /// accepts as the crate accepts a missing final pad of its own
+    /// (`lib.rs:562-567`): every member was read whole, nothing is lost.
     Discard,
     /// No pad byte in the stream, but the crate will read one (a `#1/N`
     /// member with an odd name and an odd payload): the guard hands the
@@ -585,6 +588,9 @@ enum PadAfter {
     /// alone, discards it there, and nothing reads past an entry's length.
     /// `a_bsd_member_padded_by_its_whole_size_reads_every_member` pins the
     /// payloads on both sides byte-exact.
+    ///
+    /// At the end of the file the crate reads this synthetic `\n` and then
+    /// finds a clean end: its next header read gets zero bytes, `Ok(None)`.
     Synthesize,
 }
 
@@ -966,13 +972,14 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                         let mut one = [0u8; 1];
                         let n = self.inner.read(&mut one)?;
                         if n == 0 {
-                            // The crate's header read propagates this bare
-                            // (`lib.rs:234`), and `classify_ar_error` makes
-                            // it `Corrupt`: the file ended inside a record.
-                            return Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF where a BSD `#1/N` member's padding byte belongs",
-                            ));
+                            // The file ends where only its final pad byte is
+                            // missing: accepted, as the crate accepts its own
+                            // (see `PadAfter::Discard`). The header phase
+                            // reads nothing, and the crate sees a clean end.
+                            self.phase = ArGuardPhase::Header {
+                                buf: Vec::with_capacity(AR_ENTRY_HEADER_LEN),
+                            };
+                            continue;
                         }
                         self.pos += 1;
                         if one[0] != b'\n' {
@@ -2643,16 +2650,9 @@ mod tests {
 
             // The guard's own framing: every record ends where the format
             // says, and the whole source is consumed — nothing skipped and
-            // nothing left over.
-            let ends = RecordEnds::default();
-            let guard =
-                ArGuardedReader::observed(std::io::Cursor::new(bytes.clone()), ends.clone());
-            let mut archive = ar::Archive::new(guard);
-            while let Some(entry) = archive.next_entry() {
-                entry.unwrap_or_else(|e| panic!("{members:?}: {e}"));
-            }
-            let guard = archive.into_inner().expect("into_inner");
-            assert_eq!(guard.pos, bytes.len() as u64, "{members:?}");
+            // nothing left over. Twice: with whole reads, and with a source
+            // that returns one byte per `read`, so every phase (a header,
+            // a `#1/N` name, a pad byte) is crossed in pieces.
             let mut want_ends = vec![GLOBAL_HEADER.len() as u64];
             let mut at = GLOBAL_HEADER.len();
             for (name, data) in &members {
@@ -2661,22 +2661,66 @@ mod tests {
                 want_ends.push((at + AR_ENTRY_HEADER_LEN + whole) as u64);
                 at += AR_ENTRY_HEADER_LEN + whole + whole % 2;
             }
-            assert_eq!(*ends.0.borrow(), want_ends, "{members:?}");
+            for max in [usize::MAX, 1] {
+                let ends = RecordEnds::default();
+                let source = ShortReads {
+                    inner: std::io::Cursor::new(bytes.clone()),
+                    max,
+                };
+                let mut archive = ar::Archive::new(ArGuardedReader::observed(source, ends.clone()));
+                let mut got = Vec::new();
+                while let Some(entry) = archive.next_entry() {
+                    let mut entry = entry.unwrap_or_else(|e| panic!("{members:?} max={max}: {e}"));
+                    let name = String::from_utf8(entry.header().identifier().to_vec()).unwrap();
+                    let mut data = Vec::new();
+                    entry.read_to_end(&mut data).expect("payload");
+                    got.push((name, data));
+                }
+                let want: Vec<(String, Vec<u8>)> = members
+                    .iter()
+                    .map(|(name, data)| (name.to_string(), data.to_vec()))
+                    .collect();
+                assert_eq!(got, want, "{members:?} max={max}");
+                let guard = archive.into_inner().expect("into_inner");
+                assert_eq!(guard.pos, bytes.len() as u64, "{members:?} max={max}");
+                assert_eq!(*ends.0.borrow(), want_ends, "{members:?} max={max}");
+            }
         }
     }
 
-    /// The true pad byte the guard consumes itself is still a real byte: the
-    /// file ending where it belongs is truncation, and a byte other than
-    /// `\n` there is the same refusal the crate makes of its own pad byte.
-    /// Both exit 5.
+    /// A source that returns at most `max` bytes per `read`.
+    struct ShortReads {
+        inner: std::io::Cursor<Vec<u8>>,
+        max: usize,
+    }
+
+    impl Read for ShortReads {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.max);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+
+    /// The true pad byte the guard consumes itself: a missing FINAL one is
+    /// accepted, as the crate accepts its own (every member was read whole);
+    /// the file ending one byte further, inside the next header, is
+    /// truncation, exit 5; and a byte other than `\n` there is the refusal
+    /// the crate makes of its own pad byte, exit 5.
     #[test]
-    fn a_missing_or_bad_true_pad_byte_after_an_odd_bsd_name_is_corrupt() {
+    fn a_missing_final_true_pad_is_accepted_and_a_cut_or_bad_one_is_corrupt() {
         let whole = odd_name_archive(&[PARITY_MEMBERS[0], ("plain.txt", b"xyz")]);
         let pad = GLOBAL_HEADER.len() + AR_ENTRY_HEADER_LEN + 3 + 4;
         assert_eq!(whole[pad], b'\n');
 
         let cut = &whole[..pad];
-        let err = read_all(cut).expect_err("the file ends where the pad byte belongs");
+        let got = read_all(cut).expect("a missing final pad is not corruption");
+        assert_eq!(
+            got,
+            vec![("abc".to_string(), Some(0o100644), b"ABCD".to_vec())]
+        );
+
+        let cut = &whole[..pad + 2];
+        let err = read_all(cut).expect_err("the file ends inside the next header");
         assert_eq!(err.exit_code(), 5, "{err}");
 
         let mut bad = whole.clone();
