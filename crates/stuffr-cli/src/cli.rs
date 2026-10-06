@@ -142,12 +142,21 @@ pub enum Command {
         #[arg(long, value_name = "SIZE")]
         memory_limit: Option<String>,
     },
-    /// Change a file's compression without unpacking it to disk.
+    /// Change a file's compression or its archive format, without unpacking
+    /// it to disk.
     ///
-    /// `.tar.gz` -> `.tar.zst`, `.gz` -> `.xz`, `.tar.xz` -> `.tar`: the
-    /// container (or the plain stream) is kept byte for byte and only the
-    /// codec around it changes. The input's chain is detected by content,
-    /// never by its name; the target's comes from OUT's name or --format.
+    /// Codec mode — the container is kept (`.tar.gz` -> `.tar.zst`, `.gz` ->
+    /// `.xz`, `.tar.xz` -> `.tar`): the container, or the plain stream, is
+    /// copied byte for byte and only the codec around it changes.
+    ///
+    /// Entry mode — the container changes (`.tgz` -> `.zip`, `.zip` ->
+    /// `.tar.xz`): every entry is read from the source and written into the
+    /// target under pack's rules, and what the target cannot hold (a
+    /// directory or symlink in an ar, a device or hardlink anywhere) is
+    /// skipped with a fidelity warning.
+    ///
+    /// The input's chain is detected by content, never by its name; the
+    /// target's comes from OUT's name or --format.
     Convert {
         /// Input path, or `-` for stdin.
         input: String,
@@ -191,9 +200,10 @@ pub enum Command {
         force: bool,
         /// Fail (exit 4) if anything was approximated or lost.
         ///
-        /// A codec conversion copies the container byte for byte and loses
-        /// nothing, so today this can only ever pass; it is here so a script
-        /// can ask the same question of every verb.
+        /// In codec mode the container is copied byte for byte and nothing
+        /// is lost. In entry mode every skipped entry or missing field is a
+        /// warning, and this turns any of them into exit 4 — with the output
+        /// still written, as with pack.
         #[arg(long)]
         strict_fidelity: bool,
         /// Refuse a decode expanding by more than this ratio.

@@ -773,7 +773,7 @@ stuffr info     ARCHIVE                    # resolved chain, ladder rung, fideli
 stuffr formats                             # capability matrix for THIS build
 stuffr test     ARCHIVE                    # integrity check, no extraction
 stuffr salvage  ARCHIVE [-C dir | -o FILE | --list] [--index N...]  # zip/arc/zoo/lha/arj/tar/cpio/ar; scan position, not list's index
-stuffr convert  IN -o OUT                  # recompress without staging to disk
+stuffr convert  IN -o OUT                  # change codec or container (.tgz -> .zip)
 stuffr install-links --dir ~/.local/bin    # opt-in compat symlinks, never automatic
 ```
 
