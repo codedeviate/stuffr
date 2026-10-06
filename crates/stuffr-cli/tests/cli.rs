@@ -14259,3 +14259,190 @@ fn control_bytes_in_entry_names_never_reach_the_terminal_raw() {
     assert_eq!(rows[0]["name"].as_str().unwrap(), evil);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- Hard links on unpack (0.10.0 Task 8) --------------------------------
+
+/// GNU cpio, wherever this platform keeps it: the keg-only Homebrew one on
+/// macOS (`reference-tools.md`), else a `cpio` on PATH whose `--version`
+/// says GNU. Missing is a failure naming the fix, never a silent pass.
+fn require_gnu_cpio() -> PathBuf {
+    if cfg!(target_os = "macos") {
+        let gnu = PathBuf::from("/opt/homebrew/opt/cpio/bin/cpio");
+        assert!(
+            gnu.is_file(),
+            "GNU cpio not at {} (`brew install cpio`)",
+            gnu.display()
+        );
+        return gnu;
+    }
+    let cpio = require_bin("cpio");
+    let out = Command::new(&cpio).arg("--version").output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("GNU cpio"),
+        "the `cpio` on PATH is not GNU cpio"
+    );
+    cpio
+}
+
+/// `a` with two more names (`a1`, `a2`), an empty file `e` with a second
+/// name `e2`, and a plain file `p`.
+#[cfg(unix)]
+fn hard_link_tree(dir: &Path) -> PathBuf {
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a"), b"alpha payload").unwrap();
+    std::fs::hard_link(tree.join("a"), tree.join("a1")).unwrap();
+    std::fs::hard_link(tree.join("a"), tree.join("a2")).unwrap();
+    std::fs::write(tree.join("e"), b"").unwrap();
+    std::fs::hard_link(tree.join("e"), tree.join("e2")).unwrap();
+    std::fs::write(tree.join("p"), b"plain").unwrap();
+    tree
+}
+
+/// The groups share an inode with the expected link count, every name holds
+/// the original bytes, the run exits 0 and warns about nothing.
+#[cfg(unix)]
+fn assert_links_recreated(out: &std::process::Output, dest: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("skipped") && !stderr.contains("warning"),
+        "a recreated link is no loss: {stderr}"
+    );
+    let md = |n: &str| std::fs::symlink_metadata(dest.join(n)).unwrap();
+    let a = md("a");
+    assert_eq!(a.nlink(), 3, "`a` and its two links");
+    for n in ["a1", "a2"] {
+        assert_eq!(md(n).ino(), a.ino(), "{n} shares `a`'s inode");
+        assert_eq!(std::fs::read(dest.join(n)).unwrap(), b"alpha payload");
+    }
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha payload");
+    let e = md("e");
+    assert_eq!(e.nlink(), 2);
+    assert_eq!(md("e2").ino(), e.ino());
+    assert_eq!(e.len(), 0);
+    assert_eq!(md("p").nlink(), 1);
+    assert_eq!(std::fs::read(dest.join("p")).unwrap(), b"plain");
+}
+
+#[cfg(unix)]
+#[test]
+fn unpack_recreates_gnu_tar_hard_links() {
+    let dir = tmp_dir();
+    let tree = hard_link_tree(&dir);
+    let tar = dir.join("x.tar");
+    run_tool(
+        &require_gnu_tar(),
+        &[os(&"-cf"), os(&tar), os(&"-C"), os(&tree), os(&".")],
+        &dir,
+        b"",
+    );
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        tar.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_links_recreated(&out, &dest);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn unpack_recreates_gnu_cpio_hard_links() {
+    let dir = tmp_dir();
+    let tree = hard_link_tree(&dir);
+    // `find .`'s shape, handed over on stdin; `current_dir(tree)` is a
+    // `Command` setting inside `run_tool`, not a shell `cd`.
+    let bytes = run_tool(
+        &require_gnu_cpio(),
+        &[os(&"-o"), os(&"-H"), os(&"newc")],
+        &tree,
+        b".\n./a\n./a1\n./a2\n./e\n./e2\n./p\n",
+    );
+    let cpio = dir.join("x.cpio");
+    std::fs::write(&cpio, bytes).unwrap();
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        cpio.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_links_recreated(&out, &dest);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review Focus 4: forward-only, from a pipe, links are created exactly as
+/// from a file.
+#[cfg(unix)]
+#[test]
+fn unpack_recreates_hard_links_from_a_piped_tar() {
+    let dir = tmp_dir();
+    let tree = hard_link_tree(&dir);
+    let tar = dir.join("x.tar");
+    run_tool(
+        &require_gnu_tar(),
+        &[os(&"-cf"), os(&tar), os(&"-C"), os(&tree), os(&".")],
+        &dir,
+        b"",
+    );
+    let dest = dir.join("out");
+    let out = run_with_stdin_output(
+        &[
+            "unpack",
+            "-",
+            "-C",
+            dest.to_str().unwrap(),
+            "--strict-fidelity",
+        ],
+        &std::fs::read(&tar).unwrap(),
+    );
+    assert_links_recreated(&out, &dest);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A link whose target was not selected is skipped, named on stderr, and
+/// `--strict-fidelity` makes it exit 4.
+#[cfg(unix)]
+#[test]
+fn unpack_skips_a_link_whose_target_was_not_selected() {
+    let dir = tmp_dir();
+    let tree = hard_link_tree(&dir);
+    let tar = dir.join("x.tar");
+    run_tool(
+        &require_gnu_tar(),
+        &[
+            os(&"-cf"),
+            os(&tar),
+            os(&"-C"),
+            os(&tree),
+            os(&"a"),
+            os(&"a1"),
+        ],
+        &dir,
+        b"",
+    );
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        tar.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+        "--index",
+        "1",
+        "--strict-fidelity",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "stderr: {stderr}");
+    assert!(
+        stderr.contains("skipped entry `a1`: its hard-link target `a` was not extracted"),
+        "{stderr}"
+    );
+    assert!(std::fs::symlink_metadata(dest.join("a1")).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

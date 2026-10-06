@@ -375,12 +375,22 @@ fn a_special_file_is_skipped_never_written_as_a_regular_file() {
     )
     .unwrap();
 
-    // `unpack`'s wording, "stored" for "created" — a hardlink included,
-    // which the old "special file (device, fifo or socket)" misdescribed.
-    for name in ["pipe", "dev/console", "hard"] {
+    // `unpack`'s wording, "stored" for "created". A hard link has its own
+    // reason: zip cannot store one, and nothing is kept to copy from yet.
+    for (name, reason) in [
+        ("pipe", "device nodes, fifos and sockets are not stored"),
+        (
+            "dev/console",
+            "device nodes, fifos and sockets are not stored",
+        ),
+        (
+            "hard",
+            "its hard-link target `keep.txt` was not kept for copying",
+        ),
+    ] {
         let skipped = Fidelity::EntrySkipped {
             entry: name.into(),
-            reason: "device nodes, fifos, sockets and hardlinks are not stored".into(),
+            reason: reason.into(),
         };
         assert!(
             outcome.fidelity.warnings.contains(&skipped),

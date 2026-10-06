@@ -158,11 +158,12 @@ pub enum Fidelity {
     /// Distinct from [`Self::MetadataIncomplete`], which is about an entry
     /// that WAS written and lost some of its metadata: here the entry itself
     /// is absent from the result. Extraction raises it for a device node,
-    /// fifo, socket or hardlink — [`crate::EntryKind::Other`] (the honest
-    /// answer a container gives for an entry shape `EntryKind` has no variant
-    /// for yet) or [`crate::EntryKind::Hardlink`], which extraction does not
-    /// create yet. Writing one out as a regular file carrying its "contents"
-    /// would be a silent lie about what the archive held. The write side
+    /// fifo or socket — [`crate::EntryKind::Other`], the honest answer a
+    /// container gives for an entry shape `EntryKind` has no variant for yet
+    /// — and for a [`crate::EntryKind::Hardlink`] whose target it did not
+    /// write, or whose target is a directory. Writing one out as a regular
+    /// file carrying its "contents" would be a silent lie about what the
+    /// archive held. The write side
     /// raises it too, for something met on disk that no container here can
     /// store — a socket, an undecodable name, a directory being packed into
     /// `ar`.
@@ -478,11 +479,11 @@ mod tests {
 
         let f = Fidelity::EntrySkipped {
             entry: "dev/null".into(),
-            reason: "device nodes, fifos and hardlinks are not created".into(),
+            reason: "device nodes, fifos and sockets are not created".into(),
         };
         let s = format!("{f}");
         assert!(
-            s.contains("dev/null") && s.contains("hardlinks"),
+            s.contains("dev/null") && s.contains("sockets"),
             "a skip must say both which entry and why: {s}"
         );
 

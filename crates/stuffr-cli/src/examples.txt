@@ -784,9 +784,15 @@ EXTRACTING AN ARCHIVE'S ENTRIES
         the link's mtime genuinely was not reproduced — but it is why the
         flag is opt-in, and why a caller who only wants "the data arrived"
         should not reach for it.
-      * a device node, fifo, socket or hardlink. There is no shape on disk
-        for one here, so the entry is SKIPPED and named, never materialised
-        as a regular file holding its supposed contents.
+      * a device node, fifo or socket. There is no shape on disk for one
+        here, so the entry is SKIPPED and named, never materialised as a
+        regular file holding its supposed contents.
+      * a hard link whose target this run did not extract (left out by
+        --index or a pattern, or skipped) or whose target is a directory.
+        It is SKIPPED and named. A hard link to a file this run extracted
+        is recreated as a real link (or, where the filesystem refuses one,
+        a copy), and a hard link to a symlink becomes a symlink; neither is
+        a loss.
 
       Ownership (uid/gid) is not restored and not reported: reproducing it
       needs privileges an extraction does not have, and warning per entry

@@ -451,3 +451,336 @@ fn an_archive_whose_metadata_is_fully_restored_reports_no_warnings() {
         outcome.fidelity.warnings
     );
 }
+
+// ---- Hard links (0.10.0 Task 8) ------------------------------------------
+
+fn hardlink<'a>(name: &'a str, target: &str) -> Fixture<'a> {
+    Fixture {
+        name,
+        kind: EntryKind::Hardlink {
+            target: target.to_string(),
+        },
+        data: b"",
+        mode: 0o644,
+    }
+}
+
+fn extract_all(archive: PathBuf, dest: &Path) -> stuffr::ops::Outcome {
+    entries::extract(
+        Input::Path(archive),
+        dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .unwrap()
+}
+
+fn skipped(entry: &str, reason: &str) -> Fidelity {
+    Fidelity::EntrySkipped {
+        entry: entry.into(),
+        reason: reason.into(),
+    }
+}
+
+#[cfg(unix)]
+fn ino_nlink(p: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(p).unwrap();
+    (md.ino(), md.nlink())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_tar_hard_link_extracts_as_a_real_link() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("l.tar"),
+        &[file("b", b"hello"), hardlink("a", "b")],
+    );
+    let dest = root.join("out");
+    let outcome = extract_all(archive, &dest);
+
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "a recreated link loses nothing: {:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"hello");
+    let (ino_a, nlink_a) = ino_nlink(&dest.join("a"));
+    let (ino_b, _) = ino_nlink(&dest.join("b"));
+    assert_eq!(ino_a, ino_b, "the link and its target must share an inode");
+    assert_eq!(nlink_a, 2);
+}
+
+/// A GNU-shaped `newc` group: the two empty names first, the data on the last
+/// (`c`). The reader holds `a` and `b` back and yields them as links to `c`.
+#[cfg(all(unix, feature = "cpio"))]
+#[test]
+fn a_cpio_group_extracts_as_real_links() {
+    fn member(out: &mut Vec<u8>, name: &str, ino: u32, mode: u32, nlink: u32, data: &[u8]) {
+        let namesize = name.len() + 1;
+        let fields = [
+            ino,
+            mode,
+            0,
+            0,
+            nlink,
+            1_600_000_000,
+            data.len() as u32,
+            0,
+            0,
+            0,
+            0,
+            namesize as u32,
+            0,
+        ];
+        out.extend_from_slice(b"070701");
+        for f in fields {
+            out.extend_from_slice(format!("{f:08X}").as_bytes());
+        }
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+        while !out.len().is_multiple_of(4) {
+            out.push(0);
+        }
+    }
+    let mut bytes = Vec::new();
+    member(&mut bytes, "a", 7, 0o100644, 3, b"");
+    member(&mut bytes, "b", 7, 0o100644, 3, b"");
+    member(&mut bytes, "c", 7, 0o100644, 3, b"hello");
+    member(&mut bytes, "TRAILER!!!", 0, 0, 1, b"");
+
+    let root = tmp_dir();
+    let archive = root.join("g.cpio");
+    std::fs::write(&archive, bytes).unwrap();
+    let dest = root.join("out");
+    let outcome = extract_all(archive, &dest);
+
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    let (ino, nlink) = ino_nlink(&dest.join("c"));
+    assert_eq!(nlink, 3, "three names, one inode");
+    for name in ["a", "b", "c"] {
+        assert_eq!(ino_nlink(&dest.join(name)).0, ino, "{name}");
+        assert_eq!(std::fs::read(dest.join(name)).unwrap(), b"hello", "{name}");
+    }
+}
+
+/// Review Focus 1: `gtar -C d -cf x.tar .` names entries `./b` and writes
+/// link targets `./b`. The link resolves by the exact name extraction used.
+#[cfg(unix)]
+#[test]
+fn a_dot_slash_link_resolves_to_its_dot_slash_target() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("l.tar"),
+        &[dir("./"), file("./b", b"hello"), hardlink("./a", "./b")],
+    );
+    let dest = root.join("out");
+    let outcome = extract_all(archive, &dest);
+
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("b")));
+    assert_eq!(ino_nlink(&dest.join("a")).1, 2);
+}
+
+/// Review Focus 2: a link to an extracted symlink is recreated as a symlink
+/// with the same target, never by following it into a link to the file.
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_symlink_becomes_a_symlink() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("l.tar"),
+        &[file("t", b"hello"), symlink("s", "t"), hardlink("h", "s")],
+    );
+    let dest = root.join("out");
+    extract_all(archive, &dest);
+
+    let md = std::fs::symlink_metadata(dest.join("h")).unwrap();
+    assert!(md.file_type().is_symlink(), "h must be a symlink");
+    assert_eq!(
+        std::fs::read_link(dest.join("h")).unwrap(),
+        PathBuf::from("t")
+    );
+    assert_eq!(
+        ino_nlink(&dest.join("t")).1,
+        1,
+        "the symlink's target was never hard-linked"
+    );
+}
+
+#[test]
+fn a_link_to_a_directory_is_skipped_and_named() {
+    let root = tmp_dir();
+    let archive = write_tar(&root.join("l.tar"), &[dir("d"), hardlink("h", "d")]);
+    let dest = root.join("out");
+    let outcome = extract_all(archive, &dest);
+
+    assert!(
+        outcome.fidelity.warnings.contains(&skipped(
+            "h",
+            "its hard-link target `d` is a directory, which cannot be hard-linked"
+        )),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert!(outcome.fidelity.has_warnings(), "--strict-fidelity exits 4");
+    assert!(std::fs::symlink_metadata(dest.join("h")).is_err());
+}
+
+/// `--index` selects only the link: its target was never extracted.
+#[test]
+fn a_link_whose_target_was_not_selected_is_skipped_and_named() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("l.tar"),
+        &[file("b", b"hello"), hardlink("a", "b")],
+    );
+    let dest = root.join("out");
+    let outcome = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::Indices(vec![1]),
+        &ExtractOpts::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("a", "its hard-link target `b` was not extracted")]
+    );
+    assert!(outcome.fidelity.has_warnings(), "--strict-fidelity exits 4");
+    assert!(std::fs::symlink_metadata(dest.join("a")).is_err());
+}
+
+/// Review Focus 3: the link's own path runs through a symlink the archive
+/// planted (`e -> d`), so `e/g` is refused exactly as a file entry would be,
+/// and nothing is created through `e`.
+#[test]
+fn a_link_under_a_symlinked_ancestor_is_refused() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("l.tar"),
+        &[
+            dir("d"),
+            file("d/f", b"hello"),
+            symlink("e", "d"),
+            hardlink("e/g", "d/f"),
+        ],
+    );
+    let dest = root.join("out");
+    let err = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .expect_err("a link written through a symlink must be refused");
+    match &err {
+        Error::UnsafePath { path, .. } => assert_eq!(path, "e/g"),
+        other => panic!("expected UnsafePath, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 7);
+    assert!(std::fs::symlink_metadata(dest.join("d/g")).is_err());
+}
+
+/// The map follows the PATH, not just the name: `a` is extracted as a file,
+/// then replaced (under `--force`) by a directory entry spelt `./a`. A link
+/// to `a` sees the directory, rather than a stale "file" record that would
+/// hand `hard_link` and `copy` a directory and fail at exit 1.
+#[test]
+fn a_link_sees_what_its_target_path_holds_now() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("l.tar"),
+        &[file("a", b"hello"), dir("./a"), hardlink("h", "a")],
+    );
+    let dest = root.join("out");
+    let outcome = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        outcome.fidelity.warnings.contains(&skipped(
+            "h",
+            "its hard-link target `a` is a directory, which cannot be hard-linked"
+        )),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+}
+
+/// An existing file at the link's path is refused without `--force`, as for
+/// a file entry, and replaced with it.
+#[cfg(unix)]
+#[test]
+fn a_link_over_an_existing_file_follows_the_force_rules() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("l.tar"),
+        &[file("b", b"hello"), hardlink("a", "b")],
+    );
+    let dest = root.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("a"), b"old").unwrap();
+    let err = entries::extract(
+        Input::Path(archive.clone()),
+        &dest,
+        &Selection::Names(vec!["a".into(), "b".into()]),
+        &ExtractOpts::default(),
+    )
+    .expect_err("an existing file is refused without --force");
+    assert_eq!(err.exit_code(), 2);
+
+    std::fs::remove_file(dest.join("b")).unwrap();
+    entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts {
+            force: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"hello");
+    assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("b")));
+}
+
+/// `test` verifies payloads; a link has none of its own and is not an error,
+/// and a link whose target never appeared is not one either.
+#[test]
+fn test_passes_a_tar_with_hard_links() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("l.tar"),
+        &[
+            file("b", b"hello"),
+            hardlink("a", "b"),
+            hardlink("z", "gone"),
+        ],
+    );
+    let outcome = entries::test(Input::Path(archive), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+    assert_eq!(
+        outcome.bytes_out, 5,
+        "only the target's payload is verified"
+    );
+}

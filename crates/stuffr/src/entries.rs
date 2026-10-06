@@ -755,6 +755,13 @@ pub fn test(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Out
     let mut bytes = 0u64;
     while let Some(mut entry) = ar.next_entry()? {
         let name = entry.meta().name.clone();
+        // A hard link has no payload of its own to verify: its content is
+        // its target's, which is verified as a `File` where it appears. A
+        // link whose target never appeared is not `test`'s error; `unpack`
+        // and `convert` warn about it when they meet it.
+        if matches!(entry.meta().kind, EntryKind::Hardlink { .. }) {
+            continue;
+        }
         // Charged from bytes ACTUALLY read, never from the size the header
         // declares — the same rule `extract` documents, and for the same
         // reason: a header that under-declares its length would otherwise
@@ -880,6 +887,9 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     // its parent's mtime, and a directory whose archived mode is read-only
     // (0o555, say) could not be written into afterwards.
     let mut deferred_dirs: Vec<(PathBuf, EntryMeta)> = Vec::new();
+    // What this run wrote, for a later hard link to resolve against. Only
+    // what THIS run wrote: a file already in `dest` is never a link target.
+    let mut extracted = Extracted::default();
 
     matched += visit_selected(ar.as_mut(), selection, |entry| {
         let meta = entry.meta().clone();
@@ -959,6 +969,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                 // this is a no-op rather than an error, and nothing at that
                 // path may be replaced: `dest` may legitimately BE a symlink
                 // to a directory the caller named.
+                extracted.record(&meta.name, &target, ExtractedKind::Dir);
                 if target != dest {
                     replace_conflicting(&target, o.force)?;
                     std::fs::create_dir_all(&target)?;
@@ -976,26 +987,12 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
             EntryKind::Symlink {
                 target: link_target,
             } => {
-                // The subtler escape: the link's own PATH is contained while
-                // its TARGET is not, and a later entry written "through" the
-                // link lands wherever it points. Refusing here aborts the
-                // whole extraction, so that later entry is never reached.
-                check_symlink_target(dest, &target, link_target)?;
-                replace_conflicting(&target, o.force)?;
-                create_parent(&target)?;
-                create_symlink(link_target, &target)?;
-                // A symlink's own mode and mtime cannot be set through `std`:
-                // `set_permissions` and `File::set_times` both follow the
-                // link, and there is no `lchmod`/`lutimes` here (nor a `libc`
-                // dependency to reach one with). Whatever the entry declared
-                // is therefore lost, and saying so is the whole job of the
-                // fidelity report.
-                let missing = MetaFields {
-                    mtime: meta.mtime.is_some(),
-                    mode: meta.mode.is_some(),
-                    ..Default::default()
-                };
-                warn_metadata(&mut warnings, &meta.name, missing);
+                extract_symlink(dest, &target, &meta, link_target, o.force, &mut warnings)?;
+                extracted.record(
+                    &meta.name,
+                    &target,
+                    ExtractedKind::Symlink(link_target.clone()),
+                );
             }
             EntryKind::File => {
                 replace_conflicting(&target, o.force)?;
@@ -1008,14 +1005,36 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                 // be redirected by a symlink appearing underneath it.
                 let missing = apply_metadata(&out, &meta);
                 warn_metadata(&mut warnings, &meta.name, missing);
+                extracted.record(&meta.name, &target, ExtractedKind::File);
+            }
+            // The link's own path has been through every check above. Its
+            // reader yields nothing (`EntryKind::Hardlink`'s contract) and
+            // is never read: the content is the target's, on disk already.
+            EntryKind::Hardlink { target: link_to } => {
+                let made = extract_hard_link(
+                    HardLinkSite {
+                        dest,
+                        link_path: &target,
+                        meta: &meta,
+                        link_to,
+                        force: o.force,
+                    },
+                    &extracted,
+                    &mut budget,
+                    &mut warnings,
+                    |from, to| std::fs::hard_link(from, to),
+                )?;
+                if let Some((kind, copied)) = made {
+                    written += copied;
+                    extracted.record(&meta.name, &target, kind);
+                }
             }
             // `EntryKind::Other` — a device node, fifo or socket, the honest
             // answer `tar` gives for a shape `EntryKind` has no variant for
-            // yet — and, until Task 8 creates them, `EntryKind::Hardlink`.
-            // SKIPPED, and said out loud. Writing one out as a regular file
-            // carrying its "contents" would materialise something the archive
-            // never held: a 0-byte plain file where a character device was,
-            // or a broken copy of a hardlink's target.
+            // yet. SKIPPED, and said out loud. Writing one out as a regular
+            // file carrying its "contents" would materialise something the
+            // archive never held: a 0-byte plain file where a character
+            // device was.
             // `_` rather than naming the variant because `EntryKind` is
             // `#[non_exhaustive]`; anything added upstream is unknown to this
             // loop and skipping it is the same honest answer.
@@ -1085,6 +1104,185 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
         fidelity,
         notes: Vec::new(),
     })
+}
+
+/// Creates a symlink entry at `at` — the `Symlink` arm of [`extract`], and
+/// the shape a hard link to an extracted symlink takes.
+fn extract_symlink(
+    dest: &Path,
+    at: &Path,
+    meta: &EntryMeta,
+    link_target: &str,
+    force: bool,
+    warnings: &mut Vec<Fidelity>,
+) -> Result<()> {
+    // The subtler escape: the link's own PATH is contained while its TARGET
+    // is not, and a later entry written "through" the link lands wherever it
+    // points. Refusing here aborts the whole extraction, so that later entry
+    // is never reached.
+    check_symlink_target(dest, at, link_target)?;
+    replace_conflicting(at, force)?;
+    create_parent(at)?;
+    create_symlink(link_target, at)?;
+    // A symlink's own mode and mtime cannot be set through `std`:
+    // `set_permissions` and `File::set_times` both follow the link, and there
+    // is no `lchmod`/`lutimes` here (nor a `libc` dependency to reach one
+    // with). Whatever the entry declared is therefore lost, and saying so is
+    // the whole job of the fidelity report.
+    let missing = MetaFields {
+        mtime: meta.mtime.is_some(),
+        mode: meta.mode.is_some(),
+        ..Default::default()
+    };
+    warn_metadata(warnings, &meta.name, missing);
+    Ok(())
+}
+
+/// What [`extract`] left at a path it wrote, as far as a hard link to it
+/// cares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExtractedKind {
+    File,
+    /// A symlink, with its target text.
+    Symlink(String),
+    Dir,
+}
+
+/// What this run of [`extract`] wrote: each entry's exact name to the path it
+/// was written at, and each path to what is there NOW.
+///
+/// Two maps rather than one `name -> (path, kind)`, because two names can
+/// reach one path (`a` and `./a`, `d` and `d/`), and a later entry replacing
+/// what an earlier one wrote there (`--force`) must be what a link sees. A
+/// stale "file" record for a path that is now a directory would hand
+/// `hard_link` and then `copy` a directory, and fail at exit 1.
+#[derive(Default)]
+struct Extracted {
+    names: std::collections::HashMap<String, PathBuf>,
+    at: std::collections::HashMap<PathBuf, ExtractedKind>,
+}
+
+impl Extracted {
+    fn record(&mut self, name: &str, path: &Path, kind: ExtractedKind) {
+        self.names.insert(name.to_string(), path.to_path_buf());
+        self.at.insert(path.to_path_buf(), kind);
+    }
+
+    /// The path and current kind for an entry name, looked up by the EXACT
+    /// string, never a re-normalised one: GNU tar's `./b` link finds the
+    /// `./b` entry it wrote.
+    fn resolve(&self, name: &str) -> Option<(&Path, &ExtractedKind)> {
+        let path = self.names.get(name)?;
+        Some((path.as_path(), self.at.get(path)?))
+    }
+}
+
+/// Where one hard-link entry lands: `link_path` is what [`safe_join`]
+/// produced for `meta.name`, already through every check an entry path gets.
+struct HardLinkSite<'a> {
+    dest: &'a Path,
+    link_path: &'a Path,
+    meta: &'a EntryMeta,
+    link_to: &'a str,
+    force: bool,
+}
+
+/// Recreates one hard-link entry, returning what it left at the link's path
+/// and the bytes a copy wrote — or `None` for a skip, which is warned about.
+///
+/// - Target a file this run wrote: a real hard link. When `hard_link` fails
+///   for any reason (filesystems differ: `EXDEV`, `EPERM`, no link support),
+///   a copy of the bytes on disk, charged to the budget like a payload and
+///   given the link entry's own metadata. Neither is a fidelity loss.
+/// - Target a symlink this run wrote: a new symlink with the same target
+///   text, through [`extract_symlink`]'s checks. Never `hard_link` on a
+///   symlink.
+/// - Target a directory, absent from this run, or the link itself: skipped
+///   with `EntrySkipped`, which `--strict-fidelity` turns into exit 4. A
+///   self-link never reaches `hard_link` or `copy`: `copy(x, x)` truncates.
+///
+/// `hard_link` is the injection seam the copy fallback is tested through;
+/// [`extract`] passes `std::fs::hard_link`.
+fn extract_hard_link(
+    site: HardLinkSite<'_>,
+    extracted: &Extracted,
+    budget: &mut ArchiveBudget,
+    warnings: &mut Vec<Fidelity>,
+    hard_link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<Option<(ExtractedKind, u64)>> {
+    let HardLinkSite {
+        dest,
+        link_path,
+        meta,
+        link_to,
+        force,
+    } = site;
+    let mut skip = |reason: String| {
+        warnings.push(Fidelity::EntrySkipped {
+            entry: meta.name.clone(),
+            reason,
+        });
+        Ok(None)
+    };
+    // Every reader refuses or drops a self-link; this is the backstop.
+    if link_to == meta.name {
+        return skip(HARD_LINK_REASON_SELF.to_string());
+    }
+    let Some((target_path, kind)) = extracted.resolve(link_to) else {
+        return skip(hard_link_reason_not_extracted(link_to));
+    };
+    // The same file under another spelling (`a` -> `./a`): replacing the
+    // link's path would delete the target it is about to link to.
+    if target_path == link_path {
+        return skip(HARD_LINK_REASON_SELF.to_string());
+    }
+    match kind {
+        ExtractedKind::Dir => skip(hard_link_reason_directory(link_to)),
+        ExtractedKind::Symlink(text) => {
+            extract_symlink(dest, link_path, meta, text, force, warnings)?;
+            Ok(Some((ExtractedKind::Symlink(text.clone()), 0)))
+        }
+        ExtractedKind::File => {
+            // The target was checked when it was written, but a symlink
+            // could have appeared in one of its ancestors since. Re-checked
+            // here, so `hard_link` and `copy` never resolve through one.
+            refuse_symlinked_ancestors(dest, target_path, link_to)?;
+            // Belt and braces on the map: the target must still be the
+            // regular file this run wrote, never a symlink to follow.
+            if !std::fs::symlink_metadata(target_path).is_ok_and(|md| md.is_file()) {
+                return skip(hard_link_reason_not_extracted(link_to));
+            }
+            replace_conflicting(link_path, force)?;
+            create_parent(link_path)?;
+            if hard_link(target_path, link_path).is_ok() {
+                return Ok(Some((ExtractedKind::File, 0)));
+            }
+            // The copy writes bytes a hard link would not have, so it is
+            // charged like a payload: an archive of one large file and many
+            // links to it must not fill the disk on a filesystem without
+            // link support, past the ratio a single payload would be held to.
+            let len = std::fs::metadata(target_path)?.len();
+            budget.charge(&meta.name, len)?;
+            let copied = std::fs::copy(target_path, link_path)?;
+            // The copy is a file of its own: it gets the link entry's
+            // metadata, as the `File` arm gives a payload's, through a
+            // handle for the same reason. Read-only: `copy` carried the
+            // target's permissions over, which may forbid writing, and
+            // `fchmod`/`futimens` need ownership, not write access. Failing
+            // to reopen it is a metadata loss, as for a deferred directory,
+            // not a reason to fail after the bytes are on disk.
+            let missing = match std::fs::File::open(link_path) {
+                Ok(handle) => apply_metadata(&handle, meta),
+                Err(_) => MetaFields {
+                    mtime: meta.mtime.is_some(),
+                    mode: meta.mode.is_some(),
+                    ..Default::default()
+                },
+            };
+            warn_metadata(warnings, &meta.name, missing);
+            Ok(Some((ExtractedKind::File, copied)))
+        }
+    }
 }
 
 /// The permission bits extraction restores.
@@ -4078,11 +4276,11 @@ fn plan_entry_write(
         }
         EntryKind::Hardlink { .. } if caps.stores_hardlinks => WritePlan::Write,
         // Until convert can copy a link's target (Task 9), a target that
-        // cannot store a link skips it, as 0.9.0 did for every tar link.
-        EntryKind::Hardlink { .. } => {
+        // cannot store a link skips it: nothing is kept for copying yet.
+        EntryKind::Hardlink { target } => {
             warnings.push(Fidelity::EntrySkipped {
                 entry: meta.name.clone(),
-                reason: special_entry_reason("stored"),
+                reason: hard_link_reason_not_kept(target),
             });
             WritePlan::Skip
         }
@@ -4141,12 +4339,35 @@ fn plan_entry_write(
 }
 
 /// Why an `EntryKind::Other` entry is skipped — the ONE wording `unpack`
-/// (`"created"`) and `convert` (`"stored"`) share. It names hardlinks too,
-/// because a hard link reaches the same skip where a target cannot store
-/// one; Task 8 rewords it.
+/// (`"created"`) and `convert` (`"stored"`) share. Hard links have their
+/// own reasons ([`hard_link_reason_not_extracted`],
+/// [`hard_link_reason_not_kept`]): `unpack` creates them, and a tar link no
+/// longer reaches `EntryKind::Other`.
 fn special_entry_reason(not_what: &str) -> String {
-    format!("device nodes, fifos, sockets and hardlinks are not {not_what}")
+    format!("device nodes, fifos and sockets are not {not_what}")
 }
+
+/// Why `unpack` skips a hard link: its target was not written by this run —
+/// filtered out by the selection, skipped, or never seen. The target is
+/// interpolated raw; `Fidelity`'s `Display` escapes the whole reason.
+fn hard_link_reason_not_extracted(target: &str) -> String {
+    format!("its hard-link target `{target}` was not extracted")
+}
+
+/// Why `convert` skips a hard link into a container that cannot store one:
+/// the target's bytes were not kept for writing a copy. Raw, as above.
+fn hard_link_reason_not_kept(target: &str) -> String {
+    format!("its hard-link target `{target}` was not kept for copying")
+}
+
+/// Why `unpack` skips a hard link to a directory. Raw, as above.
+fn hard_link_reason_directory(target: &str) -> String {
+    format!("its hard-link target `{target}` is a directory, which cannot be hard-linked")
+}
+
+/// Why `unpack` skips a hard link that names itself, by spelling or by
+/// resolved path.
+const HARD_LINK_REASON_SELF: &str = "it names itself as its hard-link target";
 
 /// Why an entry whose name holds a NUL is not written into `container`, a
 /// target whose caps say `!nul_in_names`.
@@ -5423,14 +5644,14 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(
             w[0].to_string(),
-            "skipped entry `proj/notes.txt`: device nodes, fifos, sockets and \
-             hardlinks are not stored"
+            "skipped entry `proj/notes.txt`: device nodes, fifos and sockets \
+             are not stored"
         );
     }
 
     /// A hard link is written as a link only by a container whose caps say
-    /// `stores_hardlinks`; any other target skips it, with `unpack`'s
-    /// special-file wording until convert can copy the target's bytes.
+    /// `stores_hardlinks`; any other target skips it, saying its target was
+    /// not kept for copying (nothing is, until convert keeps payloads).
     #[test]
     fn plan_entry_write_stores_a_hardlink_only_where_caps_allow() {
         let link = EntryMeta {
@@ -5456,8 +5677,34 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(
             w[0].to_string(),
-            "skipped entry `proj/notes.txt`: device nodes, fifos, sockets and \
-             hardlinks are not stored"
+            "skipped entry `proj/notes.txt`: its hard-link target `proj/a.txt` \
+             was not kept for copying"
+        );
+    }
+
+    /// The pinned hard-link reasons. The target is interpolated raw;
+    /// `Fidelity`'s `Display` escapes the whole reason, once.
+    #[test]
+    fn hard_link_reasons_are_pinned_and_escaped_once_by_display() {
+        assert_eq!(
+            hard_link_reason_not_extracted("t"),
+            "its hard-link target `t` was not extracted"
+        );
+        assert_eq!(
+            hard_link_reason_not_kept("t"),
+            "its hard-link target `t` was not kept for copying"
+        );
+        assert_eq!(
+            hard_link_reason_directory("d"),
+            "its hard-link target `d` is a directory, which cannot be hard-linked"
+        );
+        let w = Fidelity::EntrySkipped {
+            entry: "l".into(),
+            reason: hard_link_reason_not_extracted("a\x1bb"),
+        };
+        assert_eq!(
+            w.to_string(),
+            "skipped entry `l`: its hard-link target `a\\x1bb` was not extracted"
         );
     }
 
@@ -5488,6 +5735,186 @@ mod tests {
             "{}",
             w[0]
         );
+    }
+
+    /// A fresh scratch directory for the hard-link unit tests below.
+    fn link_scratch(tag: &str) -> PathBuf {
+        let p =
+            std::env::temp_dir().join(format!("stuffr-entries-link-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn link_meta(name: &str, target: &str) -> EntryMeta {
+        EntryMeta {
+            name: name.into(),
+            kind: EntryKind::Hardlink {
+                target: target.into(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Runs [`extract_hard_link`] for `meta` against `extracted`, with
+    /// `hard_link` as the link primitive.
+    fn run_link(
+        dest: &Path,
+        meta: &EntryMeta,
+        extracted: &Extracted,
+        hard_link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    ) -> (Result<Option<(ExtractedKind, u64)>>, Vec<Fidelity>) {
+        let EntryKind::Hardlink { target } = &meta.kind else {
+            unreachable!()
+        };
+        let link_path = safe_join(dest, &meta.name).unwrap();
+        let mut budget = ArchiveBudget::new(None, DEFAULT_MAX_RATIO);
+        let mut warnings = Vec::new();
+        let r = extract_hard_link(
+            HardLinkSite {
+                dest,
+                link_path: &link_path,
+                meta,
+                link_to: target,
+                force: true,
+            },
+            extracted,
+            &mut budget,
+            &mut warnings,
+            hard_link,
+        );
+        (r, warnings)
+    }
+
+    fn never_link(_: &Path, _: &Path) -> std::io::Result<()> {
+        panic!("hard_link must not be reached")
+    }
+
+    /// Carried ruling 3: a link naming itself is skipped and never reaches
+    /// `hard_link` or `copy` — `copy(x, x)` truncates `x`. The tar reader
+    /// refuses one and the cpio reader drops one; this is the backstop for
+    /// any reader, so the entry is built directly.
+    #[test]
+    fn a_hard_link_naming_itself_is_skipped_and_its_file_survives() {
+        let dest = link_scratch("self");
+        std::fs::write(dest.join("a"), b"hello").unwrap();
+        let mut extracted = Extracted::default();
+        extracted.record("a", &dest.join("a"), ExtractedKind::File);
+
+        let (r, w) = run_link(&dest, &link_meta("a", "a"), &extracted, never_link);
+        assert!(r.unwrap().is_none());
+        assert_eq!(
+            w,
+            [Fidelity::EntrySkipped {
+                entry: "a".into(),
+                reason: "it names itself as its hard-link target".into(),
+            }]
+        );
+        assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"hello");
+
+        // The same path under another spelling is the same self-link: the
+        // `--force` replace would otherwise delete the target first.
+        let (r, w) = run_link(&dest, &link_meta("./a", "a"), &extracted, never_link);
+        assert!(r.unwrap().is_none());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// Carried ruling 5: when `hard_link` fails (any error — filesystems
+    /// differ), the link becomes a copy of the target's bytes on disk, with
+    /// the link entry's own metadata, and no fidelity warning.
+    #[test]
+    fn hard_link_failure_falls_back_to_a_copy() {
+        let dest = link_scratch("copy");
+        std::fs::write(dest.join("b"), b"hello").unwrap();
+        let mut extracted = Extracted::default();
+        extracted.record("b", &dest.join("b"), ExtractedKind::File);
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let meta = EntryMeta {
+            mode: Some(0o640),
+            mtime: Some(when),
+            ..link_meta("sub/a", "b")
+        };
+
+        let (r, w) = run_link(&dest, &meta, &extracted, |_, _| {
+            Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
+        });
+        assert_eq!(r.unwrap(), Some((ExtractedKind::File, 5)));
+        assert!(w.is_empty(), "a copy is no fidelity loss: {w:?}");
+        let copy = dest.join("sub/a");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"hello");
+        let md = std::fs::metadata(&copy).unwrap();
+        assert_eq!(md.modified().unwrap(), when, "the link entry's mtime");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            assert_eq!(md.permissions().mode() & 0o777, 0o640);
+            assert_ne!(
+                md.ino(),
+                std::fs::metadata(dest.join("b")).unwrap().ino(),
+                "a copy, not a link"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// The copy is charged to the budget like a payload: a filesystem
+    /// without link support must not let one file and many links expand
+    /// past the ratio.
+    #[test]
+    fn the_copy_fallback_is_charged_to_the_budget() {
+        let dest = link_scratch("budget");
+        std::fs::write(dest.join("b"), vec![0u8; 64]).unwrap();
+        let mut extracted = Extracted::default();
+        extracted.record("b", &dest.join("b"), ExtractedKind::File);
+        let link_path = dest.join("a");
+        let meta = link_meta("a", "b");
+        // The ceiling is floored at `RATIO_FLOOR`; spend all but 10 bytes of
+        // it first, as earlier payloads would have, so the 64-byte copy is
+        // the one that crosses the archive's running total.
+        let mut budget = ArchiveBudget::new(Some(32), 1);
+        budget.charge("earlier", RATIO_FLOOR - 10).unwrap();
+        let err = extract_hard_link(
+            HardLinkSite {
+                dest: &dest,
+                link_path: &link_path,
+                meta: &meta,
+                link_to: "b",
+                force: false,
+            },
+            &extracted,
+            &mut budget,
+            &mut Vec::new(),
+            |_, _| Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 6, "{err}");
+        assert!(!link_path.exists(), "refused before the copy");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// Review Focus 3, the target's half: a symlink planted in the target's
+    /// ancestry AFTER it was written (by something other than the archive,
+    /// which cannot replace a directory) is refused at exit 7, and nothing
+    /// is linked or copied through it.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_whose_target_now_sits_under_a_symlink_is_refused() {
+        let dest = link_scratch("ancestor");
+        let elsewhere = link_scratch("ancestor-elsewhere");
+        std::fs::write(elsewhere.join("f"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dest.join("d")).unwrap();
+        let mut extracted = Extracted::default();
+        extracted.record("d/f", &dest.join("d/f"), ExtractedKind::File);
+
+        let (r, _) = run_link(&dest, &link_meta("g", "d/f"), &extracted, never_link);
+        let err = r.unwrap_err();
+        assert!(matches!(err, Error::UnsafePath { .. }), "{err:?}");
+        assert_eq!(err.exit_code(), 7);
+        assert!(!dest.join("g").exists());
+        let _ = std::fs::remove_dir_all(&dest);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     /// The walk-specific rule `create_archive` relies on: an item the walk
