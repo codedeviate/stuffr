@@ -240,9 +240,9 @@ question rather than an omission:
 - **A structured `Chain` type for `info --json`.** Today `info` reports the
   resolved chain as prose; a typed, serialisable `Chain` (container, codec,
   and how they stack) would let `--fidelity=json` consumers walk it
-  programmatically instead of parsing text, and the cross-container
-  `convert` below would consume the same type to plan its own reads and
-  writes. (Deleted by accident in `5715b8b`, which added the `stere` entry
+  programmatically instead of parsing text. The cross-container `convert`
+  (done in Phase 5a, see below) plans its reads and writes from the
+  internal `Chain` today and could share the same serialisable type. (Deleted by accident in `5715b8b`, which added the `stere` entry
   immediately below it; restored by the Phase 2c final review.)
 - **`stere`** (<https://crates.io/crates/stere>, source at `../stere`), a
   structure-aware searchable archive format for log files, developed in-house.
@@ -293,24 +293,16 @@ question rather than an omission:
   remaining work is an ordinary container registration plus one CI edit.
   Not scheduled only because the phases ahead of it are.
 
-- `stuffr convert IN OUT`, taking the destination as a second positional and
-  inferring both formats from the filenames, alongside the `convert IN -o OUT`
-  already planned for Phase 5. Wanted for the case that prompted it: an archive
-  arrives in one format and has to go out in another —
-  `stuffr convert logfile.tgz logfile.zip`.
-
-  This is a larger job than the planned `convert`, and the two should not be
-  conflated. That one is codec-level recompression with the container held
-  fixed (`.tar.gz` → `.tar.zst`), which the streaming design already supports.
-  Crossing *container* formats means reading entries out of one container and
-  writing them into another, so it could not land before containers were in
-  the tree at all — Phase 2 has now put them there, but this is still
-  unscheduled work of its own. A `.zip` destination also carries its own
-  constraint:
-  the central directory needs per-entry sizes the stream has not produced yet,
-  which is the same tension the ZIP-on-a-pipe contract test exists to pin
-  down — so "without staging to disk" may not survive for every format pair,
-  and which pairs it survives for is part of what the spec has to settle.
+- ~~`stuffr convert IN OUT`, taking the destination as a second positional and
+  inferring both formats from the filenames, across container formats~~ —
+  **done in Phase 5a (`0.9.0`).** `stuffr convert logfile.tgz logfile.zip`
+  works, as does `convert IN -o OUT`: codec mode recompresses with the
+  container held fixed (`.tar.gz` → `.tar.zst`), and entry mode reads every
+  entry out of one container and writes it into another under `pack`'s
+  fidelity rules. The staging question this entry left to the spec was
+  settled there: a zip SOURCE arriving on a pipe is spooled (its index is at
+  the end), and an entry with no declared size is buffered under the spill
+  policy before it is written; everything else streams.
 
 ## Metadata fidelity
 
