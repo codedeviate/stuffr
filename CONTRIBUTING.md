@@ -356,8 +356,8 @@ each kind of addition breaks downstream:
   every dependent crate. `#[non_exhaustive]` forces a wildcard arm up front,
   so the addition is not a breaking change. `Error`, `Fidelity`, `EntryKind`
   and `Chain` all carry it, and all four are expected to grow — `EntryKind`
-  gains `Hardlink`, `CharDevice`, `BlockDevice`, `Fifo` and `Socket` when tar
-  and cpio arrive.
+  gained `Hardlink` in 0.10.0, and `CharDevice`, `BlockDevice`, `Fifo` and
+  `Socket` are still to come.
 - **Adding a field to a public struct** does not break `..Default::default()`,
   so the attribute buys nothing there — and it costs something real. A
   `#[non_exhaustive]` struct cannot be built with literal syntax from another
@@ -518,9 +518,9 @@ is whether the enum names an open-ended set that formats will keep adding
 to, or a closed domain fixed by the crate's own design:
 
 - **Open — carry the attribute.** `Error`, `Fidelity`, `EntryKind`, `Chain`.
-  Each is expected to grow as formats are added: `EntryKind` gains
-  `Hardlink`, `CharDevice`, `BlockDevice`, `Fifo` and `Socket` when tar and
-  cpio arrive, and `Fidelity` grows a variant for every new kind of loss a
+  Each is expected to grow as formats are added: `EntryKind` gained
+  `Hardlink` in 0.10.0 and will gain `CharDevice`, `BlockDevice`, `Fifo` and
+  `Socket`, and `Fidelity` grows a variant for every new kind of loss a
   future format can produce.
 - **Closed — no attribute, by design.**
   - `Rung` — the adaptive stream ladder has exactly four rungs

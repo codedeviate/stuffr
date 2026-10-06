@@ -170,13 +170,14 @@ Phase 2c gave `pack` a directory walk and one-step container-over-codec
 composition. Three gaps it left open, each because closing it is a design
 question rather than an omission:
 
-- **Hardlink deduplication.** Two names for one inode currently pack as two
-  independent files, with a fidelity warning saying so. Storing the second as
-  a link needs three things, not one: an inode→first-name map held across the
-  whole walk, an `EntryKind::Hardlink` that does not exist yet (`EntryKind` is
-  `File`/`Dir`/`Symlink`/`Other` today), and a per-container capability bit
-  beside `stores_dirs`/`stores_symlinks`, since `zip` and `ar` have no
-  hardlink concept to write it into.
+- **Hardlink deduplication in `pack`.** Two names for one inode still pack as
+  two independent files, with a fidelity warning saying so. The read side
+  exists since 0.10.0 — `EntryKind::Hardlink`, and the
+  `ContainerCaps::stores_hardlinks` bit beside `stores_dirs`/`stores_symlinks`
+  (tar reads and writes links; cpio reads them; `convert` keeps them into tar
+  and copies them elsewhere) — so what `pack` still lacks is the
+  inode→first-name map held across the whole walk, and the decision to emit
+  a link entry from it.
 - **mtime normalisation for cross-machine reproducibility.** The same tree
   packs to the same bytes on one machine; it does not across two, because the
   entries carry real mtimes. A `--mtime`/`SOURCE_DATE_EPOCH` clamp would fix

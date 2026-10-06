@@ -159,8 +159,10 @@ COLLECTING FILES INTO AN ARCHIVE
       fidelity warning with both lengths, and --strict-fidelity still
       refuses. GNU tar's `file changed as we read it` is the same bargain;
       before this, one touched file aborted the pack and left no archive at
-      all. Hardlinks are reported too: no container here writes a hardlink
-      entry, so two names for one inode extract as two independent files.
+      all. Hardlinks are reported too: pack never writes a hardlink entry,
+      so two names for one inode extract as two independent files. (convert
+      into a tar does keep the links an archive already holds; see
+      CONVERTING.)
 
   stuffr pack . -o backup.tar
       `.` and `..` work, and are named the way every other path is: by the
@@ -416,6 +418,16 @@ CONVERTING BETWEEN FORMATS
       tar piped on stdin reads forward-only at full fidelity, and a
       conversion that lost nothing is exit 0. For a damaged IN, run
       `stuffr salvage` first, then convert what it recovered.
+
+      Hard links in IN (tar and cpio carry them) are kept as links when
+      OUT is a tar. Into a container without link entries each link is
+      written as a full copy of its target's bytes, which loses nothing:
+      for a tar source, from a memory window of the most recent payloads
+      (64 MiB); for a cpio source, which announces its linked files, from
+      exactly those. A link to a symlink is written as that symlink. A
+      link whose copy is not available (its target past the window, or
+      never written) is skipped with a warning naming it and why — exit 4
+      under --strict-fidelity.
 
   stuffr convert backup.tar.gz backup.tar.gz --level 9 --force
       Refused (exit 2), --force or not: OUT is IN. So is the same file reached

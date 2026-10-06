@@ -152,8 +152,10 @@ pub enum Command {
     /// Entry mode — the container changes (`.tgz` -> `.zip`, `.zip` ->
     /// `.tar.xz`): every entry is read from the source and written into the
     /// target under pack's rules, and what the target cannot hold (a
-    /// directory or symlink in an ar, a device or hardlink anywhere) is
-    /// skipped with a fidelity warning.
+    /// directory or symlink in an ar, a device anywhere) is skipped with a
+    /// fidelity warning. A hard link stays a link into tar and is written
+    /// as a copy of its target elsewhere, or skipped, named, when no copy
+    /// is available.
     ///
     /// The input's chain is detected by content, never by its name; the
     /// target's comes from OUT's name or --format.
