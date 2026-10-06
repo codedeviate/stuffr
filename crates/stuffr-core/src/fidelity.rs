@@ -158,9 +158,10 @@ pub enum Fidelity {
     /// Distinct from [`Self::MetadataIncomplete`], which is about an entry
     /// that WAS written and lost some of its metadata: here the entry itself
     /// is absent from the result. Extraction raises it for a device node,
-    /// fifo, socket or hardlink — [`crate::EntryKind::Other`], the honest
+    /// fifo, socket or hardlink — [`crate::EntryKind::Other`] (the honest
     /// answer a container gives for an entry shape `EntryKind` has no variant
-    /// for yet. Writing one out as a regular file carrying its "contents"
+    /// for yet) or [`crate::EntryKind::Hardlink`], which extraction does not
+    /// create yet. Writing one out as a regular file carrying its "contents"
     /// would be a silent lie about what the archive held. The write side
     /// raises it too, for something met on disk that no container here can
     /// store — a socket, an undecodable name, a directory being packed into

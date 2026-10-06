@@ -1319,6 +1319,9 @@ impl ArWrite {
 
 impl ArchiveWrite for ArWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        if matches!(meta.kind, EntryKind::Hardlink { .. }) {
+            return Err(Error::hardlink_not_storable("ar", &meta.name));
+        }
         // A BSD `#1/N` name is NUL-padded and read back with EVERY trailing
         // NUL stripped (see `write_safe_identifier`), so `a/b\0` would come
         // back `a/b` (`ContainerCaps::nul_in_names`). Refused, as ARJ
@@ -1473,6 +1476,29 @@ mod tests {
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
+    }
+
+    /// The writer's backstop (`plan_entry_write` keeps links away from it): a
+    /// hard link is refused, never stored as a regular file.
+    #[test]
+    fn a_hard_link_is_refused_never_written_as_a_regular_file() {
+        let buf = SharedBuf::new();
+        let mut w = Ar
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut meta = EntryMeta::file("a");
+        meta.kind = EntryKind::Hardlink { target: "b".into() };
+        let err = w
+            .add(&meta, &mut std::io::Cursor::new(b"x"))
+            .expect_err("a hard link must be refused");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("hard link"), "{err}");
+        assert!(buf.contents().is_empty(), "nothing was written");
+        assert!(!Ar.caps().stores_hardlinks);
     }
 
     /// The refusal's name is escaped exactly once, by `Error`'s own Display.

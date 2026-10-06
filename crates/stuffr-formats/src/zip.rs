@@ -2214,6 +2214,9 @@ const ZIP64_SIZE_THRESHOLD: u64 = u32::MAX as u64 - 1;
 
 impl ArchiveWrite for ZipWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        if matches!(meta.kind, EntryKind::Hardlink { .. }) {
+            return Err(Error::hardlink_not_storable("zip", &meta.name));
+        }
         let options = self.options(meta);
         // The offset this entry's local header will start at. Read BEFORE the
         // entry is started, because starting it is what finalizes the previous
@@ -2380,6 +2383,29 @@ mod tests {
 
     fn open_seekable(bytes: &[u8]) -> Box<dyn ArchiveRead> {
         try_open_seekable(bytes).expect("open")
+    }
+
+    /// The writer's backstop (`plan_entry_write` keeps links away from it): a
+    /// hard link is refused, never stored as a regular file.
+    #[test]
+    fn a_hard_link_is_refused_never_written_as_a_regular_file() {
+        let buf = SharedBuf::new();
+        let mut w = Zip
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut meta = EntryMeta::file("a");
+        meta.kind = EntryKind::Hardlink { target: "b".into() };
+        let err = w
+            .add(&meta, &mut std::io::Cursor::new(b"x"))
+            .expect_err("a hard link must be refused");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("hard link"), "{err}");
+        assert!(buf.contents().is_empty(), "nothing was written");
+        assert!(!Zip.caps().stores_hardlinks);
     }
 
     /// `read_fixed` and `skip` — the forward reader's two primitives — spell

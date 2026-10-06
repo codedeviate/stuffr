@@ -930,6 +930,9 @@ struct LhaWrite {
 
 impl ArchiveWrite for LhaWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        if matches!(meta.kind, EntryKind::Hardlink { .. }) {
+            return Err(Error::hardlink_not_storable("LHA", &meta.name));
+        }
         // A DIRECTORY's stored name must end with a path separator, and this
         // is not cosmetic — it is the same class of interop defect as
         // `cpio.rs`'s missing `S_IFREG`, invisible to every test that reads
@@ -1159,6 +1162,29 @@ mod tests {
     use stuffr_core::{CreateOpts, OpenOpts, PlainSink, ReaderSource, StreamPolicy};
 
     const SAMPLE_LZH: &[u8] = include_bytes!("../../fixtures/legacy/sample.lzh");
+
+    /// The writer's backstop (`plan_entry_write` keeps links away from it): a
+    /// hard link is refused, never stored as a regular file.
+    #[test]
+    fn a_hard_link_is_refused_never_written_as_a_regular_file() {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Lha
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut meta = EntryMeta::file("a");
+        meta.kind = EntryKind::Hardlink { target: "b".into() };
+        let err = w
+            .add(&meta, &mut std::io::Cursor::new(b"x"))
+            .expect_err("a hard link must be refused");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("hard link"), "{err}");
+        assert!(buf.contents().is_empty(), "nothing was written");
+        assert!(!Lha.caps().stores_hardlinks);
+    }
 
     /// `Lha::open` peeks ONE byte before handing the source to `delharc`, to
     /// tell an archive that declared itself empty with a leading `0` from a

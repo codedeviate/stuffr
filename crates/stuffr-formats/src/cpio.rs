@@ -815,6 +815,9 @@ struct CpioWrite {
 
 impl ArchiveWrite for CpioWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        if matches!(meta.kind, EntryKind::Hardlink { .. }) {
+            return Err(Error::hardlink_not_storable("cpio", &meta.name));
+        }
         // newc stores the name NUL-terminated (`c_namesize` counts the NUL),
         // and the reader trims trailing NULs: `c\0` would come back `c`
         // (`ContainerCaps::nul_in_names`). Refused, as ARJ refuses it,
@@ -983,6 +986,29 @@ mod tests {
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
+    }
+
+    /// The writer's backstop (`plan_entry_write` keeps links away from it): a
+    /// hard link is refused, never stored as a regular file.
+    #[test]
+    fn a_hard_link_is_refused_never_written_as_a_regular_file() {
+        let buf = SharedBuf::new();
+        let mut w = CpioNewc
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut meta = EntryMeta::file("a");
+        meta.kind = EntryKind::Hardlink { target: "b".into() };
+        let err = w
+            .add(&meta, &mut std::io::Cursor::new(b"x"))
+            .expect_err("a hard link must be refused");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("hard link"), "{err}");
+        assert!(buf.contents().is_empty(), "nothing was written");
+        assert!(!CpioNewc.caps().stores_hardlinks);
     }
 
     /// newc stores the name NUL-terminated and its reader trims trailing

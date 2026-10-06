@@ -1009,12 +1009,13 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                 let missing = apply_metadata(&out, &meta);
                 warn_metadata(&mut warnings, &meta.name, missing);
             }
-            // `EntryKind::Other` — a device node, fifo, socket or hardlink,
-            // the honest answer `tar` gives for a shape `EntryKind` has no
-            // variant for yet. SKIPPED, and said out loud. Writing one out as
-            // a regular file carrying its "contents" would materialise
-            // something the archive never held: a 0-byte plain file where a
-            // character device was, or a broken copy of a hardlink's target.
+            // `EntryKind::Other` — a device node, fifo or socket, the honest
+            // answer `tar` gives for a shape `EntryKind` has no variant for
+            // yet — and, until Task 8 creates them, `EntryKind::Hardlink`.
+            // SKIPPED, and said out loud. Writing one out as a regular file
+            // carrying its "contents" would materialise something the archive
+            // never held: a 0-byte plain file where a character device was,
+            // or a broken copy of a hardlink's target.
             // `_` rather than naming the variant because `EntryKind` is
             // `#[non_exhaustive]`; anything added upstream is unknown to this
             // loop and skipping it is the same honest answer.
@@ -3646,9 +3647,10 @@ fn convert_entries(
             EntryKind::File => {
                 moved += write_payload(entry.reader(), &mut meta, archive, budget, spill)?;
             }
-            // `plan_entry_write` writes only a file, a directory or a
-            // symlink, so this is the latter two. Neither has a payload to
-            // frame: a symlink's target travels in `meta.kind`, and zip and
+            // `plan_entry_write` writes only a file, a directory, a symlink
+            // or (where caps allow) a hard link, so this is the last three.
+            // None has a payload to frame: a link's target travels in
+            // `meta.kind`, and zip and
             // cpio, which read the target as the entry's payload, already
             // did so and hand over an empty reader — whose declared size
             // (the target's length) must never be held to a length guard.
@@ -4008,8 +4010,10 @@ enum WritePlan {
 /// the container has no entry kind for is skipped with its reason (an `ar`
 /// would land a directory as a zero-byte regular file, after which every
 /// entry beneath it is unextractable), a special entry (`EntryKind::Other`:
-/// a device, fifo, socket or hardlink, which only an entry read from another
-/// archive can be) is never stored, with [`special_entry_reason`], and an entry with no ownership gets
+/// a device, fifo or socket, which only an entry read from another archive
+/// can be) is never stored, with [`special_entry_reason`], a hard link is
+/// stored only where `stores_hardlinks` says the container has the entry
+/// kind, and an entry with no ownership gets
 /// [`ownership_warning`]. It reads only `meta` and `caps`, so an entry that
 /// came from another archive is judged by the same rules as a walked one.
 ///
@@ -4024,7 +4028,7 @@ enum WritePlan {
 /// would refuse it anyway, and failing the whole conversion over one entry is
 /// the outcome this function exists to avoid. Only `convert` can meet one: an
 /// OS path cannot carry a NUL, so `pack`'s walk never yields such a name.
-/// A symlink whose TARGET holds one is skipped the same way, with
+/// A symlink or hard link whose TARGET holds one is skipped the same way, with
 /// [`nul_link_target_reason`], for a target whose caps say
 /// `!nul_in_link_targets` (tar); zip and cpio read such a target with
 /// `from_utf8_lossy`, which keeps the NUL.
@@ -4109,11 +4113,20 @@ fn plan_entry_write(
         }
         WritePlan::Write
             if !caps.nul_in_link_targets
-                && matches!(&meta.kind, EntryKind::Symlink { target } if target.contains('\0')) =>
+                && matches!(
+                    &meta.kind,
+                    EntryKind::Symlink { target } | EntryKind::Hardlink { target }
+                        if target.contains('\0')
+                ) =>
         {
+            let what = if matches!(meta.kind, EntryKind::Hardlink { .. }) {
+                "hard link"
+            } else {
+                "symlink"
+            };
             warnings.push(Fidelity::EntrySkipped {
                 entry: meta.name.clone(),
-                reason: nul_link_target_reason(container),
+                reason: nul_link_target_reason(container, what),
             });
             WritePlan::Skip
         }
@@ -4128,10 +4141,9 @@ fn plan_entry_write(
 }
 
 /// Why an `EntryKind::Other` entry is skipped — the ONE wording `unpack`
-/// (`"created"`) and `convert` (`"stored"`) share. `tar` reads a device node,
-/// a fifo, a socket AND a hardlink as `Other`, so a reason naming only the
-/// first three told a user converting a tar with a hardlink something false
-/// about it (Phase 5a final review, I2).
+/// (`"created"`) and `convert` (`"stored"`) share. It names hardlinks too,
+/// because a hard link reaches the same skip where a target cannot store
+/// one; Task 8 rewords it.
 fn special_entry_reason(not_what: &str) -> String {
     format!("device nodes, fifos, sockets and hardlinks are not {not_what}")
 }
@@ -4145,11 +4157,11 @@ fn nul_name_reason(container: FormatId) -> String {
     )
 }
 
-/// Why a symlink whose TARGET holds a NUL is not written into `container`,
-/// a target whose caps say `!nul_in_link_targets`.
-fn nul_link_target_reason(container: FormatId) -> String {
+/// Why a symlink or hard link (`what`) whose TARGET holds a NUL is not
+/// written into `container`, a target whose caps say `!nul_in_link_targets`.
+fn nul_link_target_reason(container: FormatId, what: &str) -> String {
     format!(
-        "its symlink target contains a NUL byte, and `{container}` stores link \
+        "its {what} target contains a NUL byte, and `{container}` stores link \
          targets NUL-terminated, so the target would be cut short there"
     )
 }
@@ -5446,6 +5458,35 @@ mod tests {
             w[0].to_string(),
             "skipped entry `proj/notes.txt`: device nodes, fifos, sockets and \
              hardlinks are not stored"
+        );
+    }
+
+    /// A hard link whose target holds a NUL is skipped with the link-target
+    /// reason, not failed by the tar writer's backstop.
+    #[test]
+    fn plan_entry_write_skips_a_hardlink_with_a_nul_in_its_target() {
+        let link = EntryMeta {
+            kind: EntryKind::Hardlink {
+                target: "t\0x".into(),
+            },
+            ..meta_with(Some(1), Some(1))
+        };
+        let tar = ContainerCaps {
+            stores_hardlinks: true,
+            nul_in_link_targets: false,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&tar, FormatId::new("tar"), &link, &mut w),
+            WritePlan::Skip
+        ));
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].to_string()
+                .contains("its hard link target contains a NUL byte, and `tar` stores link"),
+            "{}",
+            w[0]
         );
     }
 

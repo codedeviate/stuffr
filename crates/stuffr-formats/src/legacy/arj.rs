@@ -1454,6 +1454,9 @@ impl ArjWrite {
 
 impl ArchiveWrite for ArjWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        if matches!(meta.kind, EntryKind::Hardlink { .. }) {
+            return Err(Error::hardlink_not_storable("ARJ", &meta.name));
+        }
         // ARJ stores a name as a null-terminated string (both header tables:
         // "filename (null-terminated string)"), so an interior NUL would
         // silently END the name there and leave the rest to be parsed as the
@@ -1649,6 +1652,29 @@ mod tests {
             }
         }
         !crc
+    }
+
+    /// The writer's backstop (`plan_entry_write` keeps links away from it): a
+    /// hard link is refused, never stored as a regular file.
+    #[test]
+    fn a_hard_link_is_refused_never_written_as_a_regular_file() {
+        let buf = stuffr_core::testing::SharedBuf::new();
+        let mut w = Arj
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .expect("create");
+        let mut meta = EntryMeta::file("a");
+        meta.kind = EntryKind::Hardlink { target: "b".into() };
+        let err = w
+            .add(&meta, &mut std::io::Cursor::new(b"x"))
+            .expect_err("a hard link must be refused");
+        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("hard link"), "{err}");
+        assert!(buf.contents().is_empty(), "nothing was written");
+        assert!(!Arj.caps().stores_hardlinks);
     }
 
     /// The PRODUCTION CRC-32 — the one the encoder writes into every basic

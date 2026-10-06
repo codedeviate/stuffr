@@ -108,6 +108,17 @@ impl Error {
         })
     }
 
+    /// A container whose caps say `!stores_hardlinks` was handed an
+    /// `EntryKind::Hardlink`: refused (exit 3) before anything is written,
+    /// never stored as a regular file. `plan_entry_write` keeps links away
+    /// from such writers; this is each writer's backstop, and the ONE wording.
+    pub fn hardlink_not_storable(container: &str, name: &str) -> Self {
+        Error::Unsupported(format!(
+            "{container} cannot store the hard link `{name}`: it has no hard link entry, \
+             and a link written as a regular file would be an empty copy"
+        ))
+    }
+
     /// Maps to the process exit code, per the spec's table. Lives here rather
     /// than in the CLI so it is unit-testable without a process spawn.
     ///

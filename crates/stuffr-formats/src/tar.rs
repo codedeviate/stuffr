@@ -963,8 +963,18 @@ impl ArchiveRead for TarRead {
             return Ok(None);
         };
         let raw = next.map_err(classify_tar_error)?;
-        let meta = entry_meta(&raw);
+        let mut meta = entry_meta(&raw);
         refuse_corrupt_hard_link(&meta)?;
+        // A hard link carries no payload of its own: its content is the
+        // target's. Whatever size its header declares, the reader yields no
+        // bytes and `size` is unknown (`EntryKind::Hardlink`'s contract).
+        if matches!(meta.kind, EntryKind::Hardlink { .. }) {
+            meta.size = None;
+            // Dropped unread: the iterator advances by the header's own size,
+            // so the declared bytes are skipped, never delivered.
+            drop(raw);
+            return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
+        }
         let payload = EntryPayload {
             remaining: raw.size(),
             entry: raw,
@@ -1138,12 +1148,12 @@ fn refuse_corrupt_hard_link(meta: &EntryMeta) -> Result<()> {
         let name = &meta.name;
         if target.is_empty() {
             return Err(Error::Corrupt(format!(
-                "hard link `{name}` names no target; the archive is corrupt"
+                "hard link `{name}` names no target"
             )));
         }
         if target == name {
             return Err(Error::Corrupt(format!(
-                "hard link `{name}` names itself as its target; the archive is corrupt"
+                "hard link `{name}` names itself as its target"
             )));
         }
     }
@@ -1640,6 +1650,52 @@ mod tests {
         }
     }
 
+    /// A header declaring a size on a typeflag-`1` entry (some writers put
+    /// the shared file's size there): the model says a link has no payload
+    /// and an unknown size, and the bytes that follow are skipped.
+    #[test]
+    fn a_hard_link_with_a_header_size_has_no_size_and_no_payload() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut file = tar::Header::new_gnu();
+        file.set_path("b").unwrap();
+        file.set_size(5);
+        file.set_mode(0o644);
+        file.set_cksum();
+        builder.append(&file, &b"hello"[..]).unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_path("a").unwrap();
+        link.set_link_name("b").unwrap();
+        link.set_entry_type(tar::EntryType::Link);
+        link.set_size(5);
+        link.set_mode(0o644);
+        link.set_cksum();
+        builder.append(&link, &b"WORLD"[..]).unwrap();
+        let mut after = tar::Header::new_gnu();
+        after.set_path("c").unwrap();
+        after.set_size(3);
+        after.set_mode(0o644);
+        after.set_cksum();
+        builder.append(&after, &b"end"[..]).unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let mut ar = open(&bytes);
+        let mut seen = Vec::new();
+        while let Some(mut entry) = ar.next_entry().expect("next_entry") {
+            let m = entry.meta().clone();
+            let mut data = Vec::new();
+            entry.reader().read_to_end(&mut data).unwrap();
+            seen.push((m.name, m.kind, m.size, data));
+        }
+        assert_eq!(seen[1].1, EntryKind::Hardlink { target: "b".into() });
+        assert_eq!(seen[1].2, None);
+        assert!(seen[1].3.is_empty(), "the link yields no bytes");
+        assert_eq!(seen[2].0, "c");
+        assert_eq!(
+            seen[2].3, b"end",
+            "the skipped bytes did not desync the next entry"
+        );
+    }
+
     #[test]
     fn devices_and_fifos_still_read_as_other() {
         for flag in [tar::EntryType::Fifo, tar::EntryType::Char] {
@@ -1727,7 +1783,11 @@ mod tests {
         a.kind = EntryKind::Hardlink {
             target: "t\0x".into(),
         };
-        assert!(w.add(&a, &mut std::io::empty()).is_err());
+        let err = w
+            .add(&a, &mut std::io::empty())
+            .expect_err("a NUL target must be refused");
+        assert!(matches!(err, stuffr_core::Error::Unsupported(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 3);
     }
 
     fn which(bin: &str) -> Option<std::path::PathBuf> {
