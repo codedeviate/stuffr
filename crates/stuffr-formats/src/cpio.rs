@@ -235,6 +235,8 @@ impl Container for CpioNewc {
             // The target is the entry's body, stored by length: a NUL
             // round-trips (measured), so `add` does not refuse one.
             nul_in_link_targets: true,
+            // newc's `c_uid`/`c_gid`, which `add` fills from the entry's meta.
+            stores_ownership: true,
             salvage: true,
             ..Default::default()
         }

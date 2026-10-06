@@ -247,6 +247,9 @@ impl Container for Lha {
             // No symlink entries written, but LHA's `name|target` convention
             // would carry the target in the length-prefixed name field.
             nul_in_link_targets: true,
+            // The writer emits no UNIX-owner extension header, and the
+            // reader reports `uid: None`.
+            stores_ownership: false,
             salvage: true,
             ..ContainerCaps::read_write()
         }

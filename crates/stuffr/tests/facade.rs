@@ -251,3 +251,86 @@ fn every_container_states_whether_its_link_targets_can_hold_a_nul() {
         assert_eq!(got, want, "{name}: nul_in_link_targets");
     }
 }
+
+/// `ContainerCaps::stores_ownership`, pinned the same way: whether a missing
+/// uid/gid is a fidelity loss when `pack` or `convert` writes into the
+/// container. A writer that stores no owner must not claim one, or a
+/// lossless lha-to-zip conversion warns once per entry.
+#[test]
+fn every_container_states_whether_it_stores_an_owner() {
+    let expected: &[(&str, bool)] = &[
+        ("tar", true),
+        ("cpio", true),
+        ("ar", true),
+        ("zip", false),
+        ("lha", false),
+        ("arj", false),
+        ("arc", false),
+        ("zoo", false),
+    ];
+    let registry = stuffr::registry();
+    for row in registry.matrix() {
+        if row.kind != FormatKind::Container {
+            continue;
+        }
+        let name = row.id.as_str();
+        let want = expected
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("container {name:?} is missing from this table"))
+            .1;
+        let got = registry
+            .container(row.id)
+            .expect("registered")
+            .caps()
+            .stores_ownership;
+        assert_eq!(got, want, "{name}: stores_ownership");
+    }
+}
+
+/// The audit behind the table above, as behaviour: every writable container
+/// is handed an entry owned by 4242:4343, and reads it back with that owner
+/// exactly when its caps say `stores_ownership`. A writer that drops the ids
+/// while claiming the cap, or keeps them while denying it, fails here.
+#[test]
+fn stores_ownership_agrees_with_what_each_writer_reads_back() {
+    use stuffr::ops::Input;
+    use stuffr_core::{CreateOpts, EntryMeta, PlainSink};
+
+    let dir = std::env::temp_dir().join(format!("stuffr-facade-owner-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let registry = stuffr::registry();
+    for row in registry.matrix() {
+        if row.kind != FormatKind::Container || !row.write {
+            continue;
+        }
+        let kind = registry.container(row.id).expect("registered");
+        let path = dir.join(format!("owned.{}", row.extensions[0]));
+        let sink = PlainSink::new(Box::new(std::fs::File::create(&path).unwrap()));
+        let mut archive = kind.create(sink, &CreateOpts::default()).unwrap();
+        let meta = EntryMeta {
+            size: Some(3),
+            mode: Some(0o644),
+            mtime: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000)),
+            uid: Some(4242),
+            gid: Some(4343),
+            ..EntryMeta::file("owned.txt")
+        };
+        archive.add(&meta, &mut &b"abc"[..]).unwrap();
+        archive.finish().unwrap().finish().unwrap();
+
+        let (metas, _) =
+            stuffr::entries::list(Input::Path(path), stuffr::DEFAULT_MAX_RATIO, None).unwrap();
+        let back = (metas[0].uid, metas[0].gid) == (Some(4242), Some(4343));
+        assert_eq!(
+            back,
+            kind.caps().stores_ownership,
+            "{}: read back uid {:?} gid {:?}",
+            row.id,
+            metas[0].uid,
+            metas[0].gid
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

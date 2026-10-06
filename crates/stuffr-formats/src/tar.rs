@@ -263,6 +263,9 @@ impl Container for Tar {
             // The linkname field and the GNU `K` payload are NUL-terminated;
             // `add` refuses a NUL in a link target.
             nul_in_link_targets: false,
+            // The header's uid and gid fields, which `add` fills from the
+            // entry's meta.
+            stores_ownership: true,
             salvage: true,
             ..Default::default()
         }

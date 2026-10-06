@@ -4024,6 +4024,10 @@ enum WritePlan {
 /// An entry skipped here STILL reports its missing ownership, as it always
 /// has: the ownership warning is appended after the skip reason whatever the
 /// plan is. That is existing behaviour, pinned by a test, not a rationale.
+/// It is reported only into a target whose caps say `stores_ownership`
+/// (tar, cpio, ar): a zip or LHA would not have stored the ids anyway, so
+/// lacking them loses nothing there, and `convert` from lha to zip is
+/// lossless.
 ///
 /// What it deliberately does not own is anything about the walk: an entry the
 /// walk itself skipped is never planned ([`plan_item`]), and the hardlink
@@ -4099,7 +4103,9 @@ fn plan_entry_write(
         }
         plan => plan,
     };
-    if let Some(w) = ownership_warning(meta) {
+    if caps.stores_ownership
+        && let Some(w) = ownership_warning(meta)
+    {
         warnings.push(w);
     }
     plan
@@ -5143,7 +5149,10 @@ mod tests {
     /// directory's ownership, as it always did.
     #[test]
     fn plan_entry_write_skips_what_the_container_cannot_hold_and_still_reports_ownership() {
-        let caps = ContainerCaps::default();
+        let caps = ContainerCaps {
+            stores_ownership: true,
+            ..Default::default()
+        };
         let mut w = Vec::new();
         let dir = EntryMeta {
             kind: EntryKind::Dir,
@@ -5169,6 +5178,38 @@ mod tests {
             WritePlan::Write
         ));
         assert!(w.is_empty());
+    }
+
+    /// I1 (Phase 5a final review): an entry with no ids costs nothing in a
+    /// target that stores no owner, so it earns no `uid_gid` warning there —
+    /// lha to zip reported one per entry for a lossless conversion. The cap
+    /// is the only switch.
+    #[test]
+    fn missing_ownership_is_reported_only_where_the_target_stores_an_owner() {
+        let anonymous = meta_with(None, None);
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(
+                &ContainerCaps::default(),
+                FormatId::new("zip"),
+                &anonymous,
+                &mut w
+            ),
+            WritePlan::Write
+        ));
+        assert!(w.is_empty(), "{w:?}");
+
+        let owns = ContainerCaps {
+            stores_ownership: true,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        plan_entry_write(&owns, FormatId::new("tar"), &anonymous, &mut w);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert_eq!(
+            w[0].to_string(),
+            "entry `proj/notes.txt` is missing metadata: uid_gid"
+        );
     }
 
     #[test]
@@ -5353,7 +5394,12 @@ mod tests {
     /// skipped is never planned, so it owes no ownership warning either.
     #[test]
     fn a_walk_skipped_item_is_never_planned() {
-        let caps = ContainerCaps::default();
+        // A target that stores an owner, so the planned item below has a
+        // warning to owe.
+        let caps = ContainerCaps {
+            stores_ownership: true,
+            ..Default::default()
+        };
         let skipped = crate::walk::WalkItem {
             meta: meta_with(None, None),
             source: crate::walk::ItemSource::Skipped { reason: "r".into() },

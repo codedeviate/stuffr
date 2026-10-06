@@ -13580,8 +13580,9 @@ fn writable_containers() -> Vec<(String, String, stuffr::ContainerCaps)> {
 
 /// The fidelity warnings converting `source` into a container with `dst`'s
 /// caps must report: one skip per entry kind the target has no shape for,
-/// and one `uid_gid` per entry the source carries no ownership for (a zip,
-/// say) — `pack`'s rules, applied to the entries the SOURCE actually holds.
+/// and — into a target that stores an owner (`stores_ownership`) — one
+/// `uid_gid` per entry the source carries no ownership for (a zip, say):
+/// `pack`'s rules, applied to the entries the SOURCE actually holds.
 /// Returns `(skips, ownership)`.
 fn predicted_convert_warnings(source: &Path, dst: &stuffr::ContainerCaps) -> (usize, usize) {
     let (metas, outcome) = stuffr::entries::list(
@@ -13605,7 +13606,7 @@ fn predicted_convert_warnings(source: &Path, dst: &stuffr::ContainerCaps) -> (us
         .count();
     let ownership = metas
         .iter()
-        .filter(|m| m.uid.is_none() || m.gid.is_none())
+        .filter(|m| dst.stores_ownership && (m.uid.is_none() || m.gid.is_none()))
         .count();
     (skips, ownership)
 }
@@ -13695,6 +13696,38 @@ fn convert_every_container_into_every_other() {
             );
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// I1 (Phase 5a final review): a target that stores no owner loses nothing
+/// when the source has none, so lha to zip (neither stores one) is lossless
+/// and passes `--strict-fidelity`; zip to tar still reports the ids it is
+/// about to write as `root:root`.
+#[test]
+fn convert_reports_missing_ownership_only_into_a_target_that_stores_one() {
+    let (dir, _) = convert_fixture();
+    let d = dir.join("d");
+    let lha = dir.join("s.lzh");
+    let out = run_output(&["pack", d.to_str().unwrap(), "-o", lha.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+
+    let zip = dir.join("t.zip");
+    let out = run_output(&[
+        "convert",
+        lha.to_str().unwrap(),
+        zip.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    let err = stderr_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(!err.contains("uid_gid"), "{err}");
+    assert!(err.contains("no fidelity loss)"), "{err}");
+
+    let tar = dir.join("t.tar");
+    let out = run_output(&["convert", zip.to_str().unwrap(), tar.to_str().unwrap()]);
+    let err = stderr_text(&out);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains("missing metadata: uid_gid"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

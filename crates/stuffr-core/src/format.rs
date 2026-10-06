@@ -329,6 +329,20 @@ pub struct ContainerCaps {
     /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`;
     /// every registered container states it explicitly.
     pub nul_in_link_targets: bool,
+    /// The writer records an entry's owner — its uid and gid — so a missing
+    /// one is a real loss: tar, cpio and ar write `meta.uid.unwrap_or(0)`,
+    /// so an entry with no ids would assert `root:root`.
+    ///
+    /// `false` for a format with no owner field the writer fills: zip (the
+    /// Info-ZIP `ux` extra field is not written), LHA (no UNIX extension
+    /// header is written), ARJ, ARC and ZOO. Read by `plan_entry_write`, the
+    /// one owner of the ownership warning: an entry with no ids costs nothing
+    /// in a target that would not have stored them anyway, so `stuffr convert`
+    /// from lha to zip reports no `uid_gid` loss.
+    ///
+    /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`;
+    /// every registered container states it explicitly.
+    pub stores_ownership: bool,
 }
 
 /// A magic-byte rule. Detection matches these against a bounded prefix.
@@ -410,6 +424,7 @@ impl ContainerCaps {
             unique_names: false,
             nul_in_names: false,
             nul_in_link_targets: false,
+            stores_ownership: false,
         }
     }
 

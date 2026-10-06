@@ -275,6 +275,9 @@ impl Container for Zip {
             // The target is the entry's body, stored by length: a NUL
             // round-trips (measured).
             nul_in_link_targets: true,
+            // No owner field outside the Info-ZIP extra fields, which the
+            // writer does not emit (and the reader reports `uid: None`).
+            stores_ownership: false,
             salvage: true,
             ..Default::default()
         }

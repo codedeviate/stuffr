@@ -283,6 +283,9 @@ impl Container for Ar {
             nul_in_names: false,
             // No symlink entries, and no link representation in the format.
             nul_in_link_targets: false,
+            // The member header's uid and gid fields, which `add` fills from
+            // the entry's meta.
+            stores_ownership: true,
             salvage: true,
             ..Default::default()
         }

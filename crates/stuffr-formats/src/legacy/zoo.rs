@@ -383,6 +383,8 @@ impl Container for Zoo {
             nul_in_names: false,
             // Read-only; no link representation in the format.
             nul_in_link_targets: false,
+            // Read-only, and the format has no owner field.
+            stores_ownership: false,
             salvage: true,
             ..ContainerCaps::read_only()
         }

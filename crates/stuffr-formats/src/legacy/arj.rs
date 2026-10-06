@@ -325,6 +325,8 @@ impl Container for Arj {
             nul_in_names: false,
             // No symlink entries, and no link representation in the format.
             nul_in_link_targets: false,
+            // ARJ's header has no owner field.
+            stores_ownership: false,
             salvage: true,
             ..ContainerCaps::read_write()
         }
