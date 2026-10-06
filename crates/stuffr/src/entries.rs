@@ -1534,7 +1534,9 @@ pub fn cat(
             let n = copy_charging(&mut tee, dst, &name, &mut budget)?;
             let seen = tee.seen;
             written += n;
-            if seen == n
+            if n == 0 && meta.kind == EntryKind::File {
+                links.keep_empty(&name);
+            } else if seen == n
                 && let Some(spool) = spool
                 && let Ok(bytes) = spool.finish()
             {
@@ -4050,7 +4052,7 @@ fn convert_entries(
                         links.forget(&meta.name);
                         None
                     };
-                    moved += write_payload(
+                    let n = write_payload(
                         entry.reader(),
                         &mut meta,
                         archive,
@@ -4058,7 +4060,11 @@ fn convert_entries(
                         spill,
                         &mut spool,
                     )?;
-                    if let Some(spool) = spool
+                    moved += n;
+                    if n == 0 {
+                        // Exact without keeping a byte: always available.
+                        links.keep_empty(&meta.name);
+                    } else if let Some(spool) = spool
                         && let Ok(bytes) = spool.finish()
                     {
                         // A spool that cannot be finished (its temp file

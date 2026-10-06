@@ -33,11 +33,19 @@
 //! at the end of the archive. tar announces nothing, so its payloads stay
 //! until evicted.
 //!
+//! **An empty target is always available.** A 0-byte regular file is
+//! recorded by name ([`LinkCache::keep_empty`]) rather than kept: its copy is
+//! exact, costs nothing against the byte budget, is never evicted, and stays
+//! until a later entry of the same name supersedes it. This is what GNU cpio
+//! writes for an empty file with several names (an all-empty group, which
+//! announces nothing), and what a tar link to an empty file needs however
+//! long ago it was written.
+//!
 //! **A link to a link is skipped.** A link written as a copy is not kept in
 //! turn, so a later link naming THAT name (rather than the original target)
 //! finds nothing kept and is skipped with the pinned reason.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{Read, SeekFrom};
 use std::path::PathBuf;
 
@@ -118,6 +126,11 @@ pub(crate) struct LinkCache {
     on_disk: u64,
     /// How many entries of `kept` are on disk.
     files: usize,
+    /// Names of 0-byte files written: always copy-available, at no cost to
+    /// the budget, never evicted, and not counted down. One name per empty
+    /// file the archive holds — linear in the input, like the names it costs
+    /// to read.
+    empties: HashSet<String>,
     /// The most `files` has ever been, for the bound's tests.
     #[cfg(test)]
     files_high_water: usize,
@@ -131,6 +144,7 @@ impl LinkCache {
             in_memory: 0,
             on_disk: 0,
             files: 0,
+            empties: HashSet::new(),
             #[cfg(test)]
             files_high_water: 0,
         }
@@ -242,9 +256,20 @@ impl LinkCache {
         });
     }
 
+    /// Records that a 0-byte regular file was written under `name`. Its copy
+    /// is exact without keeping a byte, so it is copy-available whatever the
+    /// byte budget, until a later entry of the same name supersedes it.
+    /// Nothing under [`CachePolicy::Off`], where no link is ever copied.
+    pub(crate) fn keep_empty(&mut self, name: &str) {
+        self.forget(name);
+        if self.policy != CachePolicy::Off {
+            self.empties.insert(name.to_string());
+        }
+    }
+
     /// Whether `target`'s bytes are kept.
     pub(crate) fn contains(&self, target: &str) -> bool {
-        self.kept.iter().any(|k| k.name == target)
+        self.empties.contains(target) || self.kept.iter().any(|k| k.name == target)
     }
 
     /// A fresh reader over `target`'s bytes, with their length, or `None`
@@ -253,6 +278,9 @@ impl LinkCache {
         &mut self,
         target: &str,
     ) -> stuffr_core::Result<Option<(u64, Box<dyn Read + '_>)>> {
+        if self.empties.contains(target) {
+            return Ok(Some((0, Box::new(std::io::empty()))));
+        }
         let Some(kept) = self.kept.iter_mut().find(|k| k.name == target) else {
             return Ok(None);
         };
@@ -283,6 +311,7 @@ impl LinkCache {
 
     /// Drops whatever is kept under `name`.
     pub(crate) fn forget(&mut self, name: &str) {
+        self.empties.remove(name);
         while let Some(i) = self.kept.iter().position(|k| k.name == name) {
             if let Some(kept) = self.kept.remove(i) {
                 self.release(&kept.bytes);
@@ -512,6 +541,29 @@ mod tests {
         assert!(cache.contains("m"), "the memory tier keeps its own bound");
         assert!(!cache.contains("d0"), "the oldest file went first");
         assert!(cache.contains(&format!("d{}", MAX_SPOOLED_LINK_PAYLOADS + 19)));
+    }
+
+    /// An empty file is copy-available without a byte of budget, however
+    /// much was evicted since, until a same-name entry supersedes it; under
+    /// `Off`, nothing is recorded.
+    #[test]
+    fn an_empty_file_is_always_copy_available() {
+        let mut cache = LinkCache::new(CachePolicy::Recent { cap: 4 });
+        cache.keep_empty("e");
+        for i in 0..10 {
+            put(&mut cache, &format!("f{i}"), b"abcd");
+        }
+        assert!(cache.contains("e"));
+        assert_eq!(read_back(&mut cache, "e").unwrap(), b"");
+        cache.link_seen("e");
+        assert!(cache.contains("e"), "not counted down");
+        put(&mut cache, "e", b"new!");
+        assert_eq!(read_back(&mut cache, "e").unwrap(), b"new!");
+        cache.forget("e");
+        assert!(!cache.contains("e"));
+        let mut off = LinkCache::new(CachePolicy::Off);
+        off.keep_empty("e");
+        assert!(!off.contains("e"));
     }
 
     #[test]

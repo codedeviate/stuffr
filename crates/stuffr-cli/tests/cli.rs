@@ -14604,3 +14604,42 @@ fn cat_of_a_link_without_its_target_is_classified_not_1() {
     assert!(out.stdout.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// GNU cpio into zip, `--strict-fidelity`: every link is a full copy, the
+/// empty file's two names included (an all-empty group, which announces
+/// nothing), so the run is lossless and exits 0.
+#[cfg(unix)]
+#[test]
+fn convert_gnu_cpio_with_hard_links_to_zip_copies_them_strictly() {
+    let dir = tmp_dir();
+    let tree = hard_link_tree(&dir);
+    let bytes = run_tool(
+        &require_gnu_cpio(),
+        &[os(&"-o"), os(&"-H"), os(&"newc")],
+        &tree,
+        b"./a\n./a1\n./a2\n./e\n./e2\n./p\n",
+    );
+    let cpio = dir.join("x.cpio");
+    std::fs::write(&cpio, bytes).unwrap();
+    let zip = dir.join("out.zip");
+    let out = run_output(&[
+        "convert",
+        cpio.to_str().unwrap(),
+        zip.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let unzip = require_bin("unzip");
+    for (name, want) in [
+        ("a", &b"alpha payload"[..]),
+        ("a1", b"alpha payload"),
+        ("a2", b"alpha payload"),
+        ("e", b""),
+        ("e2", b""),
+        ("p", b"plain"),
+    ] {
+        let got = run_tool(&unzip, &[os(&"-p"), os(&zip), os(&name)], &dir, b"");
+        assert_eq!(got, want, "{name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

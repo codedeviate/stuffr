@@ -1646,3 +1646,147 @@ fn cat_tells_a_target_not_kept_from_one_not_selected() {
     assert_eq!(err.to_string(), "entry `x` not found");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// What GNU cpio writes for an empty file with three names: every member
+/// 0 bytes, so the group resolves at the trailer, announcing nothing.
+#[cfg(feature = "cpio")]
+fn all_empty_cpio_group() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    newc_member(&mut bytes, "a", 7, 3, b"");
+    newc_member(&mut bytes, "b", 7, 3, b"");
+    newc_member(&mut bytes, "c", 7, 3, b"");
+    newc_member(&mut bytes, "p", 8, 1, b"plain");
+    newc_member(&mut bytes, "TRAILER!!!", 0, 1, b"");
+    bytes
+}
+
+/// Fix round 2: an empty copy is exact, so every name of an all-empty group
+/// reaches the zip, empty, with no warning.
+#[cfg(feature = "cpio")]
+#[test]
+fn an_all_empty_cpio_group_converts_to_zip_as_empty_copies() {
+    let dir = tmp_dir();
+    let src = dir.join("src.cpio");
+    std::fs::write(&src, all_empty_cpio_group()).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(&src, &zip, "zip", &ConvertOpts::default());
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(
+        files_of(&zip),
+        [
+            ("p".to_string(), b"plain".to_vec()),
+            ("a".to_string(), Vec::new()),
+            ("b".to_string(), Vec::new()),
+            ("c".to_string(), Vec::new()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same group into tar stays a group of links.
+#[cfg(feature = "cpio")]
+#[test]
+fn an_all_empty_cpio_group_converts_to_tar_as_links() {
+    let dir = tmp_dir();
+    let src = dir.join("src.cpio");
+    std::fs::write(&src, all_empty_cpio_group()).unwrap();
+    let out = dir.join("out.tar");
+    let outcome = convert(&src, &out, "tar", &ConvertOpts::default());
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    let link = |name: &str| {
+        (
+            name.to_string(),
+            EntryKind::Hardlink { target: "a".into() },
+            Vec::new(),
+        )
+    };
+    assert_eq!(
+        entries_of(&out),
+        [
+            ("p".to_string(), EntryKind::File, b"plain".to_vec()),
+            ("a".to_string(), EntryKind::File, Vec::new()),
+            link("b"),
+            link("c"),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tar link to a 0-byte file written long ago — more than the memory
+/// cap's worth of payloads since — is still an exact, empty copy.
+#[test]
+fn a_tar_link_to_an_empty_file_survives_any_eviction() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    let filler = [7u8; 800];
+    let mut bytes = hand_built_tar(&[
+        ("e", b'0', b""),
+        ("f1", b'0', &filler),
+        ("f2", b'0', &filler),
+        ("f3", b'0', &filler),
+    ]);
+    bytes.truncate(bytes.len() - 1024);
+    bytes.extend_from_slice(&link_header("l", "e"));
+    bytes.extend(std::iter::repeat_n(0u8, 1024));
+    std::fs::write(&src, bytes).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(
+        &src,
+        &zip,
+        "zip",
+        &ConvertOpts {
+            spill: stuffr::SpillPolicy::Memory { cap: 1024 },
+            ..ConvertOpts::default()
+        },
+    );
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    let files = files_of(&zip);
+    assert_eq!(files.len(), 5);
+    assert_eq!(files[4], ("l".to_string(), Vec::new()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cat` of a link to a printed empty file writes nothing and succeeds.
+#[test]
+fn cat_of_a_link_to_an_empty_file_succeeds() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    let mut bytes = hand_built_tar(&[("e", b'0', b""), ("p", b'0', b"plain")]);
+    bytes.truncate(bytes.len() - 1024);
+    bytes.extend_from_slice(&link_header("l", "e"));
+    bytes.extend(std::iter::repeat_n(0u8, 1024));
+    std::fs::write(&src, bytes).unwrap();
+    for selection in [
+        Selection::All,
+        Selection::Names(vec!["e".into(), "l".into()]),
+    ] {
+        let mut out = Vec::new();
+        entries::cat(
+            Input::Path(src.clone()),
+            &selection,
+            DEFAULT_MAX_RATIO,
+            None,
+            &mut out,
+        )
+        .unwrap_or_else(|e| panic!("{selection:?}: {e}"));
+        let want: &[u8] = if selection == Selection::All {
+            b"plain"
+        } else {
+            b""
+        };
+        assert_eq!(out, want);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
