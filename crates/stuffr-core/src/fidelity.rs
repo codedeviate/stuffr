@@ -131,7 +131,8 @@ pub enum Fidelity {
     /// cannot act on.
     #[error(
         "`{format}` index declares {declared} entries but {enumerated} were \
-         enumerated: {reason}"
+         enumerated: {}",
+        fmt_name(.reason)
     )]
     EntryCountMismatch {
         format: FormatId,
@@ -170,7 +171,7 @@ pub enum Fidelity {
     /// container's own name, the undecodable bytes — and a reason that cannot
     /// name the particular thing that went wrong is a reason the user cannot
     /// act on.
-    #[error("skipped entry `{}`: {reason}", fmt_name(.entry))]
+    #[error("skipped entry `{}`: {}", fmt_name(.entry), fmt_name(.reason))]
     EntrySkipped { entry: String, reason: String },
 
     /// A file that changed length between the moment its size was recorded
@@ -192,8 +193,9 @@ pub enum Fidelity {
     /// bargain that keeps it honest.
     #[error(
         "entry `{}` changed size while it was being read: its header declares \
-         {declared} bytes, {fixup}",
-        fmt_name(.entry)
+         {declared} bytes, {}",
+        fmt_name(.entry),
+        fmt_name(.fixup)
     )]
     EntrySizeChanged {
         entry: String,
@@ -327,6 +329,40 @@ impl Default for FidelityReport {
 mod tests {
     use super::*;
     use crate::format::FormatId;
+
+    #[test]
+    fn free_text_in_fidelity_messages_is_escaped() {
+        let r = || String::from("a\x1bb");
+        let all = [
+            Fidelity::EntrySkipped {
+                entry: "e".into(),
+                reason: r(),
+            },
+            Fidelity::EntryCountMismatch {
+                format: FormatId::new("tar"),
+                declared: 1,
+                enumerated: 0,
+                reason: r(),
+            },
+            Fidelity::EntrySizeChanged {
+                entry: "e".into(),
+                declared: 1,
+                fixup: r(),
+            },
+        ];
+        for f in all {
+            let m = f.to_string();
+            assert!(!m.contains('\x1b'), "raw ESC in {m:?}");
+            assert!(m.contains("a\\x1bb"), "{m:?}");
+        }
+        let plain = "a `b` \"c\" naïve 日本";
+        let m = Fidelity::EntrySkipped {
+            entry: "e".into(),
+            reason: plain.into(),
+        }
+        .to_string();
+        assert_eq!(m, format!("skipped entry `e`: {plain}"));
+    }
 
     #[test]
     fn entry_names_in_fidelity_messages_are_escaped() {
