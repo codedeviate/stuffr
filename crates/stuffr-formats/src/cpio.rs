@@ -126,7 +126,55 @@
 //! make to a mode — folding in the type bits the format demands — and still
 //! fails any container that touches a permission bit or overwrites type bits
 //! a caller supplied.
+//!
+//! # Hard links: grouped by inode, forward-only
+//!
+//! `newc` has no "this is a link" flag. A hard-linked file appears once per
+//! name, each header carrying the same `(c_devmajor, c_devminor, c_ino)` and
+//! `c_nlink > 1`, and GNU cpio stores the shared content on the LAST link
+//! only, giving every earlier one `c_filesize == 0`. Read naively, that
+//! extracts as several empty files and one full one. [`CpioRead`] therefore
+//! groups regular files with `nlink > 1` by that key ([`LinkGroups`]):
+//!
+//! - A zero-size member of a group that has not yet produced data is **held
+//!   back**: nothing is returned for it yet, and the loop reads the next
+//!   header.
+//! - The member that carries data is returned as a `File` and, immediately
+//!   after it, each held-back name in archive order as `EntryKind::Hardlink {
+//!   target: <data name> }`. Each link keeps its own header's mode, mtime and
+//!   ownership; its `size` is the data member's, and its reader is empty.
+//! - A zero-size member of a group that already has its data member (the
+//!   data-first layout) is returned at once as a `Hardlink` to it.
+//! - A second member WITH data (writers that store the content on every
+//!   link) is returned as a plain `File`. That loses nothing.
+//! - At the trailer, a group that never produced data is a genuinely empty
+//!   multi-name file: its first name comes out as a 0-byte `File`, the rest
+//!   as links to it, groups in first-seen order.
+//!
+//! Every `File` returned for a group member with data is built with
+//! [`Entry::announce_links`]: the reader KNOWS other names share it, which
+//! is what lets `convert` keep that payload for a target that cannot store
+//! links. The order matters to that cache: a data-last group's links follow
+//! their data member directly.
+//!
+//! **`ino == 0` never groups.** stuffr's own writer writes `ino=0, nlink=1`
+//! on every entry (and some other writers write `ino=0` too), so `nlink > 1`
+//! with `ino == 0` is treated as `nlink == 1`, exactly as before.
+//!
+//! **Bounded.** Held-back names are capped at [`MAX_HELD_LINK_NAMES`],
+//! checked before each one is stored; past it is `Error::ResourceLimit`
+//! (exit 6). Each name is already bounded by [`MAX_CPIO_NAME_LEN`]. An
+//! archive that ends without a trailer while names are held is the ordinary
+//! truncation error (exit 5): the held names are simply never returned.
+//! Resolved groups keep their data member's name for the rest of the
+//! archive, which costs memory proportional to the archive's own headers,
+//! not more.
+//!
+//! **Only this reader groups.** `cpio_salvage` reports headers as it finds
+//! them, so a salvaged GNU link group still shows its earlier names as
+//! 0-byte files; `by_index` is refused on cpio regardless.
 
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -262,6 +310,7 @@ impl Container for CpioNewc {
             report,
             seekable,
             magic_checked: false,
+            links: LinkGroups::default(),
         }))
     }
 
@@ -480,75 +529,271 @@ struct CpioRead {
     /// whose payload is consumed eagerly), so "am I in `Idle`" cannot stand
     /// in for "is this the first entry".
     magic_checked: bool,
+    /// Hard-link grouping by inode — see the module doc's "Hard links".
+    links: LinkGroups,
+}
+
+/// `(c_devmajor, c_devminor, c_ino)` of a regular file with `nlink > 1`.
+type InodeKey = (u32, u32, u32);
+
+/// One inode's link group, as far as the archive has shown it.
+enum Group {
+    /// Zero-size members seen before any member carried data, in archive
+    /// order.
+    Held(Vec<EntryMeta>),
+    /// The member that carried the data: its name, and the size it
+    /// declared, which every later link reports as its own.
+    Resolved { target: String, size: u64 },
+}
+
+/// What [`LinkGroups::on_member`] decided for one group member.
+enum Placement {
+    /// Held back: return nothing for it yet and read the next header.
+    Hold,
+    /// Return it as a `File` with its payload, announcing links.
+    File,
+    /// Return it as a link to `target`, with no payload, reporting the
+    /// shared content's `size`.
+    Link { target: String, size: u64 },
+}
+
+/// The cpio reader's hard-link state. See the module doc's "Hard links".
+#[derive(Default)]
+struct LinkGroups {
+    groups: HashMap<InodeKey, Group>,
+    /// Keys in the order their group was first held, so the trailer emits
+    /// the groups that never produced data in archive order. A key whose
+    /// group has since resolved is skipped there.
+    held_order: Vec<InodeKey>,
+    /// Names across all `Held` groups; bounded by [`held_link_cap`].
+    held_count: usize,
+    /// Links to return, in order, before another header is read.
+    pending: VecDeque<EntryMeta>,
+}
+
+impl LinkGroups {
+    /// Places one member of the group `key`. `meta` is its own header's
+    /// metadata; `file_size` its declared payload length.
+    fn on_member(&mut self, key: InodeKey, meta: EntryMeta, file_size: u64) -> Result<Placement> {
+        match self.groups.get_mut(&key) {
+            None if file_size == 0 => {
+                self.reserve_held_name(&meta.name)?;
+                self.groups.insert(key, Group::Held(vec![meta]));
+                self.held_order.push(key);
+                Ok(Placement::Hold)
+            }
+            None => {
+                self.groups.insert(
+                    key,
+                    Group::Resolved {
+                        target: meta.name,
+                        size: file_size,
+                    },
+                );
+                Ok(Placement::File)
+            }
+            Some(Group::Held(_)) if file_size == 0 => {
+                self.reserve_held_name(&meta.name)?;
+                if let Some(Group::Held(held)) = self.groups.get_mut(&key) {
+                    held.push(meta);
+                }
+                Ok(Placement::Hold)
+            }
+            Some(group @ Group::Held(_)) => {
+                let resolved = Group::Resolved {
+                    target: meta.name.clone(),
+                    size: file_size,
+                };
+                let Group::Held(held) = std::mem::replace(group, resolved) else {
+                    unreachable!("matched as Held one line above");
+                };
+                self.held_count -= held.len();
+                for mut link in held {
+                    link.kind = EntryKind::Hardlink {
+                        target: meta.name.clone(),
+                    };
+                    link.size = Some(file_size);
+                    self.pending.push_back(link);
+                }
+                Ok(Placement::File)
+            }
+            Some(Group::Resolved { target, size }) if file_size == 0 => Ok(Placement::Link {
+                target: target.clone(),
+                size: *size,
+            }),
+            // The "data on every link" layout: a plain file loses nothing,
+            // and the group stays resolved to its first data member.
+            Some(Group::Resolved { .. }) => Ok(Placement::File),
+        }
+    }
+
+    /// Refuses the next held-back name once the cap is reached, BEFORE it is
+    /// stored; otherwise counts it.
+    fn reserve_held_name(&mut self, name: &str) -> Result<()> {
+        let cap = held_link_cap();
+        if self.held_count >= cap {
+            return Err(Error::ResourceLimit(format!(
+                "entry `{name}` would be hard-link name {} held back awaiting its data member, \
+                 past the {cap}-name ceiling; the ceiling exists because a crafted archive could \
+                 otherwise make this reader hold back unbounded names",
+                self.held_count + 1
+            )));
+        }
+        self.held_count += 1;
+        Ok(())
+    }
+
+    /// At the trailer: every group that never produced data is a genuinely
+    /// empty multi-name file. Its first name becomes a 0-byte `File`, the
+    /// rest links to it, in first-seen order.
+    fn flush_at_trailer(&mut self) {
+        for key in std::mem::take(&mut self.held_order) {
+            let Some(Group::Held(held)) = self.groups.remove(&key) else {
+                continue;
+            };
+            let mut held = held.into_iter();
+            let Some(first) = held.next() else { continue };
+            let target = first.name.clone();
+            self.pending.push_back(first);
+            for mut link in held {
+                link.kind = EntryKind::Hardlink {
+                    target: target.clone(),
+                };
+                link.size = Some(0);
+                self.pending.push_back(link);
+            }
+        }
+        self.held_count = 0;
+    }
 }
 
 impl ArchiveRead for CpioRead {
     fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
-        // Recover the raw reader, finishing off whatever entry the PREVIOUS
-        // call returned — `Reader::finish` drains any bytes the caller did
-        // not read itself, exactly as if the caller had read them.
-        let mut src = match std::mem::replace(&mut self.state, CpioState::Ended) {
-            CpioState::Idle(src) => src,
-            CpioState::Reading(reader) => reader.finish().map_err(classify_cpio_error)?,
-            CpioState::Ended => return Ok(None),
-        };
+        // A loop, not recursion: a held-back member `continue`s to the next
+        // header, and a crafted archive can hold back up to
+        // `MAX_HELD_LINK_NAMES` of them in a row.
+        loop {
+            // Recover the raw reader, finishing off whatever entry the
+            // PREVIOUS call returned — `Reader::finish` drains any bytes the
+            // caller did not read itself, exactly as if the caller had read
+            // them. `None` once the trailer was reached (or a read failed).
+            let src = match std::mem::replace(&mut self.state, CpioState::Ended) {
+                CpioState::Idle(src) => Some(src),
+                CpioState::Reading(reader) => match reader.finish() {
+                    Ok(src) => Some(src),
+                    Err(e) => {
+                        self.links.pending.clear();
+                        return Err(classify_cpio_error(e));
+                    }
+                },
+                CpioState::Ended => None,
+            };
 
-        // Read ahead before EVERY header, not just the first: `refuse_an_
-        // oversized_namesize` (Task 5c) must see `c_namesize` before
-        // `cpio::newc::Reader::new` gets a chance to allocate on its say-so,
-        // and that allocation is one `Reader::new` call per entry, not one
-        // per archive. The read-ahead is non-consuming — `src` replays what
-        // it buffered — and it reuses ONE buffer for the archive's whole
-        // lifetime rather than stacking a wrapper per entry; see
-        // `CpioSource`'s doc for the measurements that shape cost. A read
-        // failure here propagates as `Error::Io` — property 10's
-        // source-error passthrough — rather than being mistaken for a
-        // variant refusal.
-        src.fill_header_prefix()?;
-        if !self.magic_checked {
-            refuse_a_recognised_variant_this_crate_cannot_read(src.header_prefix())?;
-            self.magic_checked = true;
+            // Links queued behind a data member (or at the trailer) come out
+            // before another header is read. Their payload is empty: the
+            // content is the target's.
+            if let Some(meta) = self.links.pending.pop_front() {
+                if let Some(src) = src {
+                    self.state = CpioState::Idle(src);
+                }
+                return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
+            }
+            let Some(mut src) = src else {
+                return Ok(None);
+            };
+
+            // Read ahead before EVERY header, not just the first: `refuse_an_
+            // oversized_namesize` (Task 5c) must see `c_namesize` before
+            // `cpio::newc::Reader::new` gets a chance to allocate on its say-so,
+            // and that allocation is one `Reader::new` call per entry, not one
+            // per archive. The read-ahead is non-consuming — `src` replays what
+            // it buffered — and it reuses ONE buffer for the archive's whole
+            // lifetime rather than stacking a wrapper per entry; see
+            // `CpioSource`'s doc for the measurements that shape cost. A read
+            // failure here propagates as `Error::Io` — property 10's
+            // source-error passthrough — rather than being mistaken for a
+            // variant refusal.
+            src.fill_header_prefix()?;
+            if !self.magic_checked {
+                refuse_a_recognised_variant_this_crate_cannot_read(src.header_prefix())?;
+                self.magic_checked = true;
+            }
+            refuse_an_oversized_namesize(src.header_prefix())?;
+
+            let mut reader = cpio::newc::Reader::new(src).map_err(classify_cpio_error)?;
+            if reader.entry().is_trailer() {
+                // The trailer's own file_size is always 0, so there is nothing
+                // left to drain; `finish` only hands back a reader nothing more
+                // will be done with. Groups still held back become entries now.
+                let _ = reader.finish();
+                self.links.flush_at_trailer();
+                continue;
+            }
+
+            let mut meta = entry_meta(reader.entry());
+            let name = meta.name.clone();
+
+            // A symlink's target lives in the PAYLOAD, not a header field — see
+            // the module doc's "Symlinks" section. Read it now, while `reader`
+            // is still in hand, rather than deferring to the caller the way
+            // every other entry's data is.
+            if is_symlink_mode(reader.entry().mode()) {
+                let target = read_symlink_target(&mut reader, &name)?;
+                let src = reader.finish().map_err(classify_cpio_error)?;
+                self.state = CpioState::Idle(src);
+                meta.kind = EntryKind::Symlink { target };
+                // The payload was already consumed above; nothing is left for a
+                // caller to read. `entries::extract` never calls `.reader()` for
+                // a Symlink entry (it uses `meta.kind`'s own target), the same
+                // convention tar's own Dir/Symlink entries already rely on.
+                return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
+            }
+
+            let remaining = u64::from(reader.entry().file_size());
+
+            // Hard-link grouping — see the module doc's "Hard links". Only a
+            // regular file with `nlink > 1` and a real inode number groups;
+            // `ino == 0` (stuffr's own writer) is treated as `nlink == 1`.
+            let e = reader.entry();
+            let announce = if meta.kind == EntryKind::File && e.nlink() > 1 && e.ino() != 0 {
+                let key = (e.dev_major(), e.dev_minor(), e.ino());
+                match self.links.on_member(key, meta.clone(), remaining)? {
+                    Placement::Hold => {
+                        // A held-back member's payload is 0 bytes, so
+                        // `finish` hands the source straight back.
+                        let src = reader.finish().map_err(classify_cpio_error)?;
+                        self.state = CpioState::Idle(src);
+                        continue;
+                    }
+                    Placement::Link { target, size } => {
+                        let src = reader.finish().map_err(classify_cpio_error)?;
+                        self.state = CpioState::Idle(src);
+                        meta.kind = EntryKind::Hardlink { target };
+                        // The model contract: a link's size is the shared
+                        // content's, which this group's data member declared.
+                        meta.size = Some(size);
+                        return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
+                    }
+                    Placement::File => remaining > 0,
+                }
+            } else {
+                false
+            };
+
+            self.state = CpioState::Reading(reader);
+
+            let payload = CpioEntryPayload {
+                state: &mut self.state,
+                remaining,
+                name,
+            };
+            let entry = Entry::new(meta, Box::new(payload));
+            return Ok(Some(if announce {
+                entry.announce_links()
+            } else {
+                entry
+            }));
         }
-        refuse_an_oversized_namesize(src.header_prefix())?;
-
-        let mut reader = cpio::newc::Reader::new(src).map_err(classify_cpio_error)?;
-        if reader.entry().is_trailer() {
-            // The trailer's own file_size is always 0, so there is nothing
-            // left to drain; `finish` only hands back a reader nothing more
-            // will be done with.
-            let _ = reader.finish();
-            self.state = CpioState::Ended;
-            return Ok(None);
-        }
-
-        let mut meta = entry_meta(reader.entry());
-        let name = meta.name.clone();
-
-        // A symlink's target lives in the PAYLOAD, not a header field — see
-        // the module doc's "Symlinks" section. Read it now, while `reader`
-        // is still in hand, rather than deferring to the caller the way
-        // every other entry's data is.
-        if is_symlink_mode(reader.entry().mode()) {
-            let target = read_symlink_target(&mut reader, &name)?;
-            let src = reader.finish().map_err(classify_cpio_error)?;
-            self.state = CpioState::Idle(src);
-            meta.kind = EntryKind::Symlink { target };
-            // The payload was already consumed above; nothing is left for a
-            // caller to read. `entries::extract` never calls `.reader()` for
-            // a Symlink entry (it uses `meta.kind`'s own target), the same
-            // convention tar's own Dir/Symlink entries already rely on.
-            return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
-        }
-
-        let remaining = u64::from(reader.entry().file_size());
-        self.state = CpioState::Reading(reader);
-
-        let payload = CpioEntryPayload {
-            state: &mut self.state,
-            remaining,
-            name,
-        };
-        Ok(Some(Entry::new(meta, Box::new(payload))))
     }
 
     /// cpio carries no entry index, on any source — the same shape as tar's
@@ -663,6 +908,34 @@ pub(crate) fn is_symlink_mode(mode: u32) -> bool {
 /// `S_IFLNK` mode could otherwise force an allocation of that size before
 /// any caller had asked to read anything.
 pub(crate) const MAX_SYMLINK_TARGET_LEN: u64 = 65_536;
+
+/// Ceiling on hard-link names held back awaiting their group's data member
+/// — see the module doc's "Hard links". A crafted archive could otherwise
+/// make the reader hold back an unbounded number of names, each a 110-byte
+/// header plus a name, before a single entry is returned. 65,536 is far
+/// beyond any real link group (GNU cpio holds them per inode, and a file
+/// with that many names is not a realistic input) and bounds the held
+/// state at a few MiB even with long names.
+pub(crate) const MAX_HELD_LINK_NAMES: usize = 65_536;
+
+// A per-thread override so one test can exercise the ceiling with a handful
+// of headers instead of 65,536. `cfg(test)` only: a non-test build has no
+// override and `held_link_cap` is the constant.
+#[cfg(test)]
+thread_local! {
+    static HELD_LINK_CAP_OVERRIDE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The held-back-name ceiling in force: [`MAX_HELD_LINK_NAMES`], except
+/// under a test that lowered it for its own thread.
+fn held_link_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = HELD_LINK_CAP_OVERRIDE.with(std::cell::Cell::get) {
+        return cap;
+    }
+    MAX_HELD_LINK_NAMES
+}
 
 /// Offset, from the start of a `newc` header, of the byte immediately past
 /// `c_namesize` — the field this container must inspect before delegating
@@ -2163,6 +2436,307 @@ mod tests {
             let elapsed = started.elapsed();
             assert_eq!(seen, n, "every entry must come back");
             println!("forward read: {n} entries in {elapsed:?}");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Hard links: grouping by inode (0.10.0 Task 7).
+    // -------------------------------------------------------------------
+
+    /// One whole `newc` member, built by hand so a test controls `c_ino`,
+    /// `c_nlink` and `c_filesize` — stuffr's own writer always writes
+    /// `ino=0, nlink=1`. Header, NUL-terminated name, payload, each padded to
+    /// a 4-byte boundary, exactly as `cpio::newc` frames them.
+    fn newc_member(name: &str, mode: u32, ino: u32, nlink: u32, data: &[u8]) -> Vec<u8> {
+        let namesize = u32::try_from(name.len() + 1).unwrap();
+        let file_size = u32::try_from(data.len()).unwrap();
+        let mut m = Vec::new();
+        m.extend_from_slice(b"070701");
+        // c_ino, c_mode, c_uid, c_gid, c_nlink, c_mtime, c_filesize,
+        // c_devmajor, c_devminor, c_rdevmajor, c_rdevminor, c_namesize,
+        // c_checksum.
+        for field in [
+            ino, mode, 0, 0, nlink, 0, file_size, 0, 0, 0, 0, namesize, 0,
+        ] {
+            m.extend_from_slice(&hex8(field));
+        }
+        m.extend_from_slice(name.as_bytes());
+        m.push(0);
+        while m.len() % 4 != 0 {
+            m.push(0);
+        }
+        m.extend_from_slice(data);
+        while m.len() % 4 != 0 {
+            m.push(0);
+        }
+        m
+    }
+
+    /// `(name, ino, nlink, payload)` per member, all regular files with mode
+    /// `0o100644`, then the trailer when `trailer` is set.
+    fn newc_archive(members: &[(&str, u32, u32, &[u8])], trailer: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, ino, nlink, data) in members {
+            out.extend(newc_member(name, 0o100_644, *ino, *nlink, data));
+        }
+        if trailer {
+            out.extend(newc_member("TRAILER!!!", 0, 0, 1, b""));
+        }
+        out
+    }
+
+    /// What the reader reports for one entry: name, kind, `meta.size`,
+    /// `announces_links()`, and the bytes its own reader yields.
+    type LinkRow = (String, EntryKind, Option<u64>, bool, Vec<u8>);
+
+    fn read_rows(bytes: &[u8]) -> Result<Vec<LinkRow>> {
+        let mut ar = open_forward_only(&CpioNewc, bytes);
+        let mut rows = Vec::new();
+        while let Some(mut entry) = ar.next_entry()? {
+            let meta = entry.meta().clone();
+            let announces = entry.announces_links();
+            let mut data = Vec::new();
+            entry
+                .reader()
+                .read_to_end(&mut data)
+                .map_err(Error::from_decode_io)?;
+            rows.push((meta.name, meta.kind, meta.size, announces, data));
+        }
+        Ok(rows)
+    }
+
+    fn file_row(name: &str, data: &[u8], announces: bool) -> LinkRow {
+        (
+            name.into(),
+            EntryKind::File,
+            Some(data.len() as u64),
+            announces,
+            data.to_vec(),
+        )
+    }
+
+    fn link_row(name: &str, target: &str, size: u64) -> LinkRow {
+        (
+            name.into(),
+            EntryKind::Hardlink {
+                target: target.into(),
+            },
+            Some(size),
+            false,
+            Vec::new(),
+        )
+    }
+
+    /// GNU cpio's layout: the earlier links of a group are size 0, and the
+    /// LAST one carries the data. The zero-size names are held back and come
+    /// out as links to the data member, right after it; a plain file that
+    /// follows is untouched and announces nothing.
+    #[test]
+    fn gnu_data_last_links_become_hardlinks_to_the_data_member() {
+        let bytes = newc_archive(
+            &[
+                ("a", 7, 3, b""),
+                ("b", 7, 3, b""),
+                ("c", 7, 3, b"hello"),
+                ("d", 0, 1, b"plain"),
+            ],
+            true,
+        );
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![
+                file_row("c", b"hello", true),
+                link_row("a", "c", 5),
+                link_row("b", "c", 5),
+                file_row("d", b"plain", false),
+            ]
+        );
+    }
+
+    /// A held-back link keeps its OWN header metadata (mode here), not the
+    /// data member's: only `kind` and `size` come from the group.
+    #[test]
+    fn a_held_back_link_keeps_its_own_mode() {
+        let mut bytes = newc_member("a", 0o100_600, 7, 2, b"");
+        bytes.extend(newc_member("c", 0o100_644, 7, 2, b"hello"));
+        bytes.extend(newc_member("TRAILER!!!", 0, 0, 1, b""));
+        let mut ar = open_forward_only(&CpioNewc, &bytes);
+        let c = ar.next_entry().expect("reads").expect("c").meta().clone();
+        assert_eq!(c.mode, Some(0o100_644));
+        let a = ar.next_entry().expect("reads").expect("a").meta().clone();
+        assert_eq!(a.kind, EntryKind::Hardlink { target: "c".into() });
+        assert_eq!(a.mode, Some(0o100_600));
+        assert!(ar.next_entry().expect("reads").is_none());
+    }
+
+    /// Data on the FIRST link (other writers, and the order GNU cpio's
+    /// `-o` never uses but `-p`-style tools may): later zero-size names are
+    /// links the moment they arrive.
+    #[test]
+    fn data_first_links_follow_as_hardlinks() {
+        let bytes = newc_archive(
+            &[("c", 7, 3, b"hello"), ("a", 7, 3, b""), ("b", 7, 3, b"")],
+            true,
+        );
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![
+                file_row("c", b"hello", true),
+                link_row("a", "c", 5),
+                link_row("b", "c", 5),
+            ]
+        );
+    }
+
+    /// Some writers store the data on every link. Each is returned as a
+    /// plain `File` with its bytes, so nothing is lost.
+    #[test]
+    fn data_on_every_link_stays_plain_files() {
+        let bytes = newc_archive(&[("a", 7, 2, b"hello"), ("b", 7, 2, b"hello")], true);
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![file_row("a", b"hello", true), file_row("b", b"hello", true)]
+        );
+    }
+
+    /// A group that never produces data is a genuinely empty multi-name
+    /// file: at the trailer its first name becomes a 0-byte `File`, the rest
+    /// links to it.
+    #[test]
+    fn an_all_empty_group_is_one_empty_file_and_links() {
+        let bytes = newc_archive(&[("a", 7, 2, b""), ("b", 7, 2, b"")], true);
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![file_row("a", b"", false), link_row("b", "a", 0)]
+        );
+    }
+
+    /// Two groups interleaved, plus an empty group, resolve independently:
+    /// each data member is followed by its own links only, and the empty
+    /// groups come out at the trailer in first-seen order.
+    #[test]
+    fn interleaved_groups_resolve_independently() {
+        let bytes = newc_archive(
+            &[
+                ("e1", 9, 2, b""),
+                ("x1", 7, 2, b""),
+                ("y1", 8, 3, b""),
+                ("x2", 7, 2, b"xx"),
+                ("y2", 8, 3, b""),
+                ("f1", 10, 2, b""),
+                ("y3", 8, 3, b"yyy"),
+                ("e2", 9, 2, b""),
+                ("f2", 10, 2, b""),
+            ],
+            true,
+        );
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![
+                file_row("x2", b"xx", true),
+                link_row("x1", "x2", 2),
+                file_row("y3", b"yyy", true),
+                link_row("y1", "y3", 3),
+                link_row("y2", "y3", 3),
+                file_row("e1", b"", false),
+                link_row("e2", "e1", 0),
+                file_row("f1", b"", false),
+                link_row("f2", "f1", 0),
+            ]
+        );
+    }
+
+    /// The same inode number on a different device is a different file:
+    /// the key is `(dev_major, dev_minor, ino)`.
+    #[test]
+    fn the_same_ino_on_another_device_is_another_group() {
+        let mut a = newc_member("a", 0o100_644, 7, 2, b"");
+        // c_devmajor is the eighth field: 6 + 7 * 8 == 62.
+        a[62..70].copy_from_slice(&hex8(1));
+        let mut bytes = a;
+        bytes.extend(newc_member("c", 0o100_644, 7, 2, b"hello"));
+        bytes.extend(newc_member("TRAILER!!!", 0, 0, 1, b""));
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![file_row("c", b"hello", true), file_row("a", b"", false)]
+        );
+    }
+
+    /// stuffr's own writer writes `ino=0`. Even with `nlink` forced to 2 on
+    /// every header, nothing groups: `ino == 0` is treated as `nlink == 1`.
+    #[test]
+    fn ino_zero_never_groups() {
+        let mut bytes = build_cpio(&[("a", b""), ("b", b""), ("c", b"hello")]);
+        let mut patched = 0;
+        let mut at = 0;
+        while at + 110 <= bytes.len() {
+            if &bytes[at..at + 6] == b"070701" {
+                assert_eq!(
+                    &bytes[at + 6..at + 14],
+                    b"00000000",
+                    "the writer writes ino=0"
+                );
+                // c_nlink is the fifth field: 6 + 4 * 8 == 38.
+                bytes[at + 38..at + 46].copy_from_slice(&hex8(2));
+                patched += 1;
+            }
+            at += 4;
+        }
+        assert_eq!(patched, 4, "three members and the trailer");
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![
+                file_row("a", b"", false),
+                file_row("b", b"", false),
+                file_row("c", b"hello", false),
+            ]
+        );
+    }
+
+    /// A crafted archive could hold back unbounded names; past the cap the
+    /// reader refuses with `ResourceLimit` (exit 6) before storing the name.
+    /// Exactly at the cap is still fine.
+    #[test]
+    fn holding_back_past_the_cap_is_a_resource_limit() {
+        HELD_LINK_CAP_OVERRIDE.with(|c| c.set(Some(4)));
+        let names: Vec<String> = (0..5).map(|i| format!("n{i}")).collect();
+
+        let mut at_cap: Vec<(&str, u32, u32, &[u8])> = names[..4]
+            .iter()
+            .map(|n| (n.as_str(), 7, 6, &b""[..]))
+            .collect();
+        at_cap.push(("data", 7, 6, b"hello"));
+        let rows = read_rows(&newc_archive(&at_cap, true)).expect("four held names fit");
+        assert_eq!(rows.len(), 5);
+
+        let past: Vec<(&str, u32, u32, &[u8])> =
+            names.iter().map(|n| (n.as_str(), 7, 6, &b""[..])).collect();
+        let err = read_rows(&newc_archive(&past, true)).expect_err("five held names do not");
+        assert!(matches!(err, Error::ResourceLimit(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 6);
+        let msg = err.to_string();
+        assert!(msg.contains('4'), "the message names the limit: {msg}");
+        assert!(msg.contains("hard-link"), "{msg}");
+        HELD_LINK_CAP_OVERRIDE.with(|c| c.set(None));
+    }
+
+    /// The real ceiling is the spec's figure, and outside tests nothing can
+    /// lower it.
+    #[test]
+    fn the_held_link_ceiling_is_65536() {
+        assert_eq!(MAX_HELD_LINK_NAMES, 65_536);
+        assert_eq!(held_link_cap(), MAX_HELD_LINK_NAMES);
+    }
+
+    /// An archive that ends while names are held back is the ordinary
+    /// truncation error (exit 5), never a panic and never a silent end.
+    #[test]
+    fn truncation_while_names_are_held_is_corrupt() {
+        let whole = newc_archive(&[("a", 7, 2, b""), ("b", 7, 2, b"hello")], true);
+        let first = newc_member("a", 0o100_644, 7, 2, b"").len();
+        for cut in [first, first + 50, first + 112] {
+            let err = read_rows(&whole[..cut]).expect_err("truncated");
+            assert_eq!(err.exit_code(), 5, "cut at {cut}: {err:?}");
         }
     }
 }

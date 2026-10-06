@@ -1252,6 +1252,48 @@ mod tests {
     /// `Complete` — named, sized and kinded as the ordinary reader reports
     /// it, with no trailer row and no sighting, and its bytes written back
     /// verbatim. Stands on this project's own writer; see the builders' note.
+    /// The ordinary reader groups a GNU hard-link group by inode (data on
+    /// the last link; earlier names held back and returned as links after
+    /// it). Salvage does NOT: it reports headers as it finds them, in archive
+    /// order, the earlier name as the 0-byte file its header declares.
+    #[test]
+    fn salvage_reports_a_gnu_link_group_header_by_header() {
+        // `newc_entry` writes `c_ino = 1`; force `c_nlink` (offset 38) to 2.
+        let mut a = newc_entry("a", b"");
+        let mut c = newc_entry("c", b"hello");
+        for member in [&mut a, &mut c] {
+            member[38..46].copy_from_slice(b"00000002");
+        }
+        let mut entries = a;
+        entries.extend(c);
+        let bytes = with_trailer(entries, NEWC_MAGIC);
+
+        let out = scan(&bytes);
+        assert!(out.sightings.is_empty());
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| (e.meta.name.as_str(), e.meta.size, e.meta.kind.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a", Some(0), EntryKind::File),
+                ("c", Some(5), EntryKind::File),
+            ]
+        );
+
+        let reader = read_through_the_reader(&bytes).expect("the reader reads it");
+        assert_eq!(
+            reader
+                .iter()
+                .map(|(n, s, k, _)| (n.as_str(), *s, k.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("c", 5, EntryKind::File),
+                ("a", 5, EntryKind::Hardlink { target: "c".into() }),
+            ]
+        );
+    }
+
     #[test]
     fn every_entry_of_a_healthy_cpio_is_unattested_and_agrees_with_the_reader() {
         let long_name = format!("deep/{}/file.txt", "n".repeat(300));
