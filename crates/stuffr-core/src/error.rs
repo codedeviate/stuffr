@@ -43,7 +43,7 @@ pub enum Error {
     #[error("archive is corrupt: {}", fmt_name(.0))]
     Corrupt(String),
 
-    #[error("unsafe entry path `{}` refused: {reason}", fmt_name(.path))]
+    #[error("unsafe entry path `{}` refused: {}", fmt_name(.path), fmt_name(.reason))]
     UnsafePath { path: String, reason: &'static str },
 
     #[error("fidelity degraded under strict mode: {0} warning(s)")]

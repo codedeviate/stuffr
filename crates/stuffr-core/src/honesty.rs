@@ -84,14 +84,15 @@ pub fn check_display_has_no_raw_controls(rendered: &str) -> Result<(), String> {
 /// short of the declared length, before an `Entry` is ever handed back. The
 /// check is not skipped; it has already happened.
 ///
-/// A **`Hardlink`** is exempt for a different reason, stated by
+/// A **`Hardlink`** is not compared against its declared size, for a different reason, stated by
 /// [`EntryKind::Hardlink`] itself: its reader yields no bytes while
 /// `EntryMeta::size` carries the SHARED content's size (cpio's data-last
 /// group reports every name at the group's size; the name that holds the
 /// bytes is the target). Declared 14, produced 0, by design. The fuzz
 /// `container` target aborted on the first newc link-group seed for exactly
 /// this until the exemption existed (0.10.0 Task 10). The link's bytes are
-/// checked where they are read: on the target entry.
+/// checked where they are read: on the target entry. What IS asserted is the
+/// contract itself: a link that yields any bytes of its own is refused.
 ///
 /// Every other kind stays in scope, `Dir` and `Other` included: a directory
 /// entry declares zero and delivers zero, and an entry that cannot say what
@@ -125,7 +126,19 @@ pub fn check_entry_size(
     name: &str,
     kind: &EntryKind,
 ) -> Result<(), String> {
-    if matches!(kind, EntryKind::Symlink { .. } | EntryKind::Hardlink { .. }) {
+    if matches!(kind, EntryKind::Hardlink { .. }) {
+        // Not compared against the declared size (that is the shared
+        // content's), but the model contract is asserted: a link's own
+        // reader yields no bytes.
+        return if produced == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "hard link {name:?} yielded {produced} bytes of its own; a link's reader must be empty"
+            ))
+        };
+    }
+    if matches!(kind, EntryKind::Symlink { .. }) {
         return Ok(());
     }
     match declared {
@@ -571,6 +584,10 @@ mod broken_honesty {
             target: "grp/c".into(),
         };
         assert!(check_entry_size(Some(14), 0, "grp/a", &link).is_ok());
+        assert!(
+            check_entry_size(Some(14), 3, "l", &link).is_err(),
+            "a link whose reader yields bytes breaks the model contract"
+        );
         // ... while a plain file declaring 14 and producing 0 is still refused.
         assert!(check_entry_size(Some(14), 0, "grp/a", &EntryKind::File).is_err());
     }

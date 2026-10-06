@@ -1564,10 +1564,9 @@ fn the_link_and_escape_seeds_read_as_what_they_claim() {
         names.contains(&"grp/c") && names.contains(&"empty/b"),
         "{names:?}"
     );
-    assert!(
-        cpio.len() >= 3,
-        "the groups must enumerate as several entries: {names:?}"
-    );
+    // The data-last group's earlier names and the all-empty group's second
+    // name are links (the data holder / first empty name stays a file).
+    assert_eq!(links(&cpio), ["grp/a", "grp/b", "empty/b"], "{cpio:?}");
 
     let esc = list("e", "tar", escaped_name_tar_seed());
     assert!(
