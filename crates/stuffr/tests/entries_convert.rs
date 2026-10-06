@@ -886,3 +886,146 @@ fn a_link_target_with_a_nul_survives_into_cpio() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A `.tar.gz` shaped the way GNU tar writes one — the tar padded with zeros
+/// to a whole 10240-byte record — beside a copy with one bit flipped inside
+/// a stored member's payload. Returns `(clean, corrupt, payload)`.
+///
+/// The record padding is the point: the container stops reading at its
+/// end-of-archive blocks, so without a drain the gzip trailer behind the
+/// padding (CRC-32 and ISIZE) is never reached and the flip goes unseen.
+/// stuffr's own writer emits no padding, so its `.tar.gz` ends right after
+/// the end-of-archive blocks and hides the defect — hence the hand build.
+///
+/// Level 0 stores every deflate block verbatim, so the flip lands on a
+/// payload byte without disturbing the deflate framing: the
+/// stream still decodes in full, to the wrong bytes, and only the CRC can
+/// tell. The premise is asserted, not assumed.
+#[cfg(feature = "gzip")]
+fn gnu_padded_tar_gz(dir: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+    let mut x: u32 = 0x2545_f491;
+    let payload: Vec<u8> = (0..4000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        })
+        .collect();
+    let mut tar = hand_built_tar(&[("t/f.txt", b'0', &payload)]);
+    tar.resize(tar.len().div_ceil(10240) * 10240, 0);
+    let plain = dir.join("gnu.tar");
+    std::fs::write(&plain, &tar).unwrap();
+    let clean = dir.join("clean.tar.gz");
+    stuffr::ops::compress(
+        Input::Path(plain),
+        Output::Path(clean.clone()),
+        &CompressOpts {
+            format: Some(fmt("gzip")),
+            level: Some(0),
+            ..CompressOpts::default()
+        },
+    )
+    .unwrap();
+
+    let mut gz = std::fs::read(&clean).unwrap();
+    let probe = &payload[1000..1032];
+    let at = gz
+        .windows(probe.len())
+        .position(|w| w == probe)
+        .expect("premise: level 0 stores the payload verbatim");
+    gz[at + 16] ^= 0x01;
+    let corrupt = dir.join("corrupt.tar.gz");
+    std::fs::write(&corrupt, &gz).unwrap();
+
+    let err = stuffr::ops::decompress(
+        Input::Path(corrupt.clone()),
+        Output::Path(dir.join("premise.tar")),
+        &stuffr::ops::DecompressOpts::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.exit_code(),
+        5,
+        "premise: the codec itself rejects the flip: {err}"
+    );
+    (clean, corrupt, payload)
+}
+
+/// C1 (Phase 5a final review): the codec beneath the container is read to
+/// its end, so its own integrity check runs, and a conversion that fails it
+/// publishes nothing.
+#[cfg(feature = "gzip")]
+#[test]
+fn a_corrupt_codec_trailer_under_a_padded_tar_is_exit_5_and_publishes_nothing() {
+    let dir = tmp_dir();
+    let (_, corrupt, _) = gnu_padded_tar_gz(&dir);
+    let out = dir.join("out.zip");
+    let err = entries::convert_archive(
+        Input::Path(corrupt),
+        Output::Path(out.clone()),
+        fmt("zip"),
+        None,
+        &ConvertOpts::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 5, "{err}");
+    assert!(!out.exists(), "nothing is published on a corrupt source");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same check on the read verbs, which share `open_resolved`.
+#[cfg(feature = "gzip")]
+#[test]
+fn the_read_verbs_check_the_codec_trailer_under_a_padded_tar() {
+    let dir = tmp_dir();
+    let (_, corrupt, _) = gnu_padded_tar_gz(&dir);
+    let err = entries::test(Input::Path(corrupt.clone()), DEFAULT_MAX_RATIO, None).unwrap_err();
+    assert_eq!(err.exit_code(), 5, "test: {err}");
+    let err = entries::list(Input::Path(corrupt.clone()), DEFAULT_MAX_RATIO, None).unwrap_err();
+    assert_eq!(err.exit_code(), 5, "list: {err}");
+    let err = entries::cat(
+        Input::Path(corrupt.clone()),
+        &Selection::All,
+        DEFAULT_MAX_RATIO,
+        None,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 5, "cat: {err}");
+    let err = entries::extract(
+        Input::Path(corrupt),
+        &dir.join("x"),
+        &Selection::All,
+        &entries::ExtractOpts::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.exit_code(), 5, "unpack: {err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The clean twin still converts and tests clean: the drain costs a healthy
+/// padded archive nothing.
+#[cfg(feature = "gzip")]
+#[test]
+fn a_clean_padded_tar_gz_converts_and_tests_clean() {
+    let dir = tmp_dir();
+    let (clean, _, payload) = gnu_padded_tar_gz(&dir);
+    entries::test(Input::Path(clean.clone()), DEFAULT_MAX_RATIO, None).unwrap();
+    let out = dir.join("out.zip");
+    let outcome = entries::convert_archive(
+        Input::Path(clean),
+        Output::Path(out.clone()),
+        fmt("zip"),
+        None,
+        &ConvertOpts::default(),
+    )
+    .unwrap();
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(files_of(&out), vec![("t/f.txt".to_string(), payload)]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

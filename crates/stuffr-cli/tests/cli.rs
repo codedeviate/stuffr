@@ -13468,6 +13468,100 @@ fn convert_tar_gz_to_zip_round_trips() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `.tar.gz` the way `gtar czf` writes one — the tar padded with zeros to
+/// a whole 10240-byte record — and a copy with one bit flipped inside the
+/// stored payload. Returns `(dir, clean, corrupt)`.
+///
+/// The padding is what made the codec's trailer unreachable: the tar reader
+/// stops at its end-of-archive blocks, the padding and the gzip CRC/ISIZE
+/// behind it are never read, and the flip went unseen by every read verb
+/// (Phase 5a final review, C1). stuffr's own writer pads nothing, so its
+/// `.tar.gz` hides the defect. `Compression::none()` stores every deflate
+/// block, so the flip changes a payload byte and nothing else: the stream
+/// decodes in full, and only the CRC can tell.
+fn gnu_padded_tar_gz() -> (PathBuf, PathBuf, PathBuf) {
+    let dir = tmp_dir();
+    let payload: Vec<u8> = (0..4000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = Builder::new(&mut tar_bytes);
+        append_tar_entry(&mut builder, "t/f.txt", &payload);
+        builder.finish().unwrap();
+    }
+    tar_bytes.resize(tar_bytes.len().div_ceil(10240) * 10240, 0);
+    let mut enc = GzEncoder::new(Vec::new(), Compression::none());
+    enc.write_all(&tar_bytes).unwrap();
+    let mut gz = enc.finish().unwrap();
+    let clean = dir.join("clean.tar.gz");
+    std::fs::write(&clean, &gz).unwrap();
+
+    let probe = &payload[1000..1032];
+    let at = gz
+        .windows(probe.len())
+        .position(|w| w == probe)
+        .expect("premise: an uncompressed deflate stream stores the payload verbatim");
+    gz[at + 16] ^= 0x01;
+    let corrupt = dir.join("corrupt.tar.gz");
+    std::fs::write(&corrupt, &gz).unwrap();
+    // The premise, through the codec path that always read to the end.
+    let out = run_output(&[
+        "unpack",
+        corrupt.to_str().unwrap(),
+        "-o",
+        dir.join("premise.tar").to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr_text(&out));
+    (dir, clean, corrupt)
+}
+
+#[test]
+fn convert_refuses_a_tar_gz_whose_gzip_trailer_disagrees() {
+    let (dir, _, corrupt) = gnu_padded_tar_gz();
+    let zip = dir.join("out.zip");
+    let out = run_output(&["convert", corrupt.to_str().unwrap(), zip.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr_text(&out));
+    assert!(!zip.exists(), "a corrupt source publishes nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn every_read_verb_checks_the_gzip_trailer_under_a_padded_tar() {
+    let (dir, _, corrupt) = gnu_padded_tar_gz();
+    let c = corrupt.to_str().unwrap();
+    let x = dir.join("x");
+    for args in [
+        vec!["test", c],
+        vec!["list", c],
+        vec!["cat", c],
+        vec!["unpack", c, "-C", x.to_str().unwrap()],
+    ] {
+        let out = run_output(&args);
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "{args:?}: {}",
+            stderr_text(&out)
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_clean_gnu_padded_tar_gz_converts_and_tests_clean() {
+    let (dir, clean, _) = gnu_padded_tar_gz();
+    let c = clean.to_str().unwrap();
+    let out = run_output(&["test", c]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let zip = dir.join("out.zip");
+    let out = run_output(&["convert", c, zip.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let out = run_output(&["test", zip.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Every container this build can WRITE, with the extension `pack` takes it
 /// from and the caps that predict what a conversion into it must drop.
 fn writable_containers() -> Vec<(String, String, stuffr::ContainerCaps)> {

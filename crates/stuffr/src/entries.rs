@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use stuffr_core::{
     ArchiveRead, ArchiveWrite, Chain, Codec, Container, ContainerCaps, Counting, CountingWriter,
@@ -213,6 +213,91 @@ impl Source for RatioGuardedSource {
     }
 }
 
+/// The decoded stream beneath a container, shared between the container
+/// (which reads through this) and [`DrainAtEnd`] (which reads whatever the
+/// container left once its walk is over).
+///
+/// Never seekable, and that is not a loss: it is installed only over a codec
+/// layer, and a decoded stream is forward-only (`StreamOnly`) — the ladder
+/// spools it when a container needs a seek. `as_seek` could not hand out a
+/// reference through the lock anyway, so `caps` says the same thing.
+struct SharedSource(Arc<Mutex<Box<dyn Source>>>);
+
+impl SharedSource {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Box<dyn Source>> {
+        // A panic mid-read leaves nothing half-updated that a later read
+        // could misinterpret: the stream is simply wherever it stopped.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::io::Read for SharedSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.lock().read(buf)
+    }
+}
+
+impl Source for SharedSource {
+    fn caps(&self) -> SourceCaps {
+        SourceCaps {
+            seekable: false,
+            ..self.lock().caps()
+        }
+    }
+
+    fn as_seek(&mut self) -> Option<&mut dyn SeekRead> {
+        None
+    }
+}
+
+/// Reads the decoded stream to its end once the container's walk returns
+/// `None`, so every codec beneath the container runs its own integrity check
+/// — gzip's CRC-32 and ISIZE trailer, xz's and zstd's checksums, bzip2's
+/// block CRCs.
+///
+/// A container stops at its own end marker, and nothing obliged it to read
+/// past it. GNU tar pads every archive to a 10240-byte record, so on every
+/// `gtar czf` archive the padding and the gzip trailer behind it went unread:
+/// a bit flipped in a stored payload decoded to the wrong bytes, and `test`,
+/// `unpack` and `convert` all reported it clean at exit 0 while `gzip -t`
+/// rejected the file (Phase 5a final review, C1). The drain reads through
+/// [`RatioGuardedSource`], so trailing padding is bounded by `--max-ratio`
+/// like every other decoded byte, and its errors go through
+/// [`Error::from_decode_io`]: a failed check is `Corrupt` (exit 5).
+///
+/// It fires in `next_entry`, at the end of the walk, so `convert` sees it
+/// BEFORE it finishes and publishes its destination. A verb that stops
+/// walking early — `cat`/`unpack --index` once the last selected entry is
+/// delivered — reads no further and so checks no trailer; that early stop is
+/// the point of the counted route.
+struct DrainAtEnd {
+    inner: Box<dyn ArchiveRead>,
+    /// `None` once drained, so the check runs once however often the walk is
+    /// asked for its end.
+    rest: Option<Arc<Mutex<Box<dyn Source>>>>,
+}
+
+impl ArchiveRead for DrainAtEnd {
+    fn next_entry(&mut self) -> Result<Option<Entry<'_>>> {
+        let entry = self.inner.next_entry()?;
+        if entry.is_none()
+            && let Some(rest) = self.rest.take()
+        {
+            let mut rest = SharedSource(rest);
+            std::io::copy(&mut rest, &mut std::io::sink()).map_err(Error::from_decode_io)?;
+        }
+        Ok(entry)
+    }
+
+    fn by_index(&mut self, index: usize) -> Result<Entry<'_>> {
+        self.inner.by_index(index)
+    }
+
+    fn fidelity(&self) -> &FidelityReport {
+        self.inner.fidelity()
+    }
+}
+
 /// Opens `src`, resolving any codec layers above the container and bounding
 /// them with `--max-ratio` — see [`RatioGuardedSource`].
 ///
@@ -265,6 +350,9 @@ fn open_archive(
 /// every codec layer `chain` names, and `consumed` is the tally of raw bytes
 /// beneath it. Bounds the decoded stream with `--max-ratio`
 /// ([`RatioGuardedSource`]), then opens the container through the ladder.
+/// Over a codec layer the archive comes back as a [`DrainAtEnd`], so the end
+/// of every walk reads the decoded stream out and the codec's own integrity
+/// check runs — for every read verb and `convert` alike.
 ///
 /// Split out so a source resolved elsewhere — `convert`'s
 /// [`crate::ops::ConvertSource`], which resolves content-first and is opened
@@ -301,6 +389,17 @@ fn open_resolved(
         Arc::clone(consumed),
         max_ratio,
     ));
+    // With a codec layer, keep a handle on the decoded stream so it can be
+    // drained once the container is done — see [`DrainAtEnd`]. A bare
+    // container needs none: no codec check is waiting at its end, and a
+    // seekable one (zip) must keep its `as_seek`.
+    let (source, rest) = if matches!(chain, Chain::Codec { .. }) {
+        let shared = Arc::new(Mutex::new(source));
+        let source: Box<dyn Source> = Box::new(SharedSource(Arc::clone(&shared)));
+        (source, Some(shared))
+    } else {
+        (source, None)
+    };
     let mut chain = chain;
     loop {
         match chain {
@@ -311,7 +410,15 @@ fn open_resolved(
                 // format, the container's own caps, and the policy.
                 let caps = k.caps();
                 let resolved = ladder::resolve(source, *container, caps, &policy_for(&caps))?;
-                return Ok((k.open(resolved, &OpenOpts::default())?, *container));
+                let archive = k.open(resolved, &OpenOpts::default())?;
+                let archive = match rest {
+                    Some(rest) => Box::new(DrainAtEnd {
+                        inner: archive,
+                        rest: Some(rest),
+                    }),
+                    None => archive,
+                };
+                return Ok((archive, *container));
             }
             // Names what the input resolved to, so "unpack this .gz" is
             // actionable rather than a bare refusal.
