@@ -563,7 +563,9 @@ enum Placement {
     /// name would have extraction copy a file onto itself, which truncates.
     Drop,
     /// Return it as a `File` with its payload, announcing links.
-    File,
+    /// `dropped_self` is how many held names this member released were its
+    /// own name declared again, dropped rather than returned as links.
+    File { dropped_self: u32 },
     /// Return it as a link to `target`, with no payload, reporting the
     /// shared content's `size`.
     Link { target: String, size: u64 },
@@ -602,7 +604,7 @@ impl LinkGroups {
                         size: file_size,
                     },
                 );
-                Ok(Placement::File)
+                Ok(Placement::File { dropped_self: 0 })
             }
             Some(Group::Held(_)) if file_size == 0 => {
                 self.reserve_held_name(&meta.name)?;
@@ -622,14 +624,19 @@ impl LinkGroups {
                 self.held_count -= held.len();
                 // A held name equal to the data member's is the same file
                 // declared twice; it is dropped, never a self-link.
-                for mut link in held.into_iter().filter(|m| m.name != meta.name) {
+                let mut dropped_self = 0u32;
+                for mut link in held {
+                    if link.name == meta.name {
+                        dropped_self = dropped_self.saturating_add(1);
+                        continue;
+                    }
                     link.kind = EntryKind::Hardlink {
                         target: meta.name.clone(),
                     };
                     link.size = Some(file_size);
                     self.pending.push_back(link);
                 }
-                Ok(Placement::File)
+                Ok(Placement::File { dropped_self })
             }
             Some(Group::Resolved { target, .. }) if file_size == 0 && meta.name == *target => {
                 Ok(Placement::Drop)
@@ -640,7 +647,7 @@ impl LinkGroups {
             }),
             // The "data on every link" layout: a plain file loses nothing,
             // and the group stays resolved to its first data member.
-            Some(Group::Resolved { .. }) => Ok(Placement::File),
+            Some(Group::Resolved { .. }) => Ok(Placement::File { dropped_self: 0 }),
         }
     }
 
@@ -777,7 +784,9 @@ impl ArchiveRead for CpioRead {
             // regular file with `nlink > 1` and a real inode number groups;
             // `ino == 0` (stuffr's own writer) is treated as `nlink == 1`.
             let e = reader.entry();
+            // `Some(n)`: the payload is announced with `n` links to come.
             let announce = if meta.kind == EntryKind::File && e.nlink() > 1 && e.ino() != 0 {
+                let nlink = e.nlink();
                 let key = (e.dev_major(), e.dev_minor(), e.ino());
                 match self.links.on_member(key, meta.clone(), remaining)? {
                     Placement::Hold | Placement::Drop => {
@@ -796,10 +805,19 @@ impl ArchiveRead for CpioRead {
                         meta.size = Some(size);
                         return Ok(Some(Entry::new(meta, Box::new(io::empty()))));
                     }
-                    Placement::File => remaining > 0,
+                    // `nlink - 1` other names, less the self-names already
+                    // dropped. A self-name dropped LATER still counts: its
+                    // consumer holds the payload until its own end-of-archive
+                    // release, or bound, as for any count that never reaches
+                    // zero.
+                    Placement::File { dropped_self } if remaining > 0 => {
+                        Some(nlink.saturating_sub(1).saturating_sub(dropped_self))
+                            .filter(|n| *n > 0)
+                    }
+                    Placement::File { .. } => None,
                 }
             } else {
-                false
+                None
             };
 
             self.state = CpioState::Reading(reader);
@@ -810,10 +828,9 @@ impl ArchiveRead for CpioRead {
                 name,
             };
             let entry = Entry::new(meta, Box::new(payload));
-            return Ok(Some(if announce {
-                entry.announce_links()
-            } else {
-                entry
+            return Ok(Some(match announce {
+                Some(n) => entry.announce_links(n),
+                None => entry,
             }));
         }
     }
@@ -2509,7 +2526,7 @@ mod tests {
 
     /// What the reader reports for one entry: name, kind, `meta.size`,
     /// `announces_links()`, and the bytes its own reader yields.
-    type LinkRow = (String, EntryKind, Option<u64>, bool, Vec<u8>);
+    type LinkRow = (String, EntryKind, Option<u64>, Option<u32>, Vec<u8>);
 
     fn read_rows(bytes: &[u8]) -> Result<Vec<LinkRow>> {
         let mut ar = open_forward_only(&CpioNewc, bytes);
@@ -2527,7 +2544,7 @@ mod tests {
         Ok(rows)
     }
 
-    fn file_row(name: &str, data: &[u8], announces: bool) -> LinkRow {
+    fn file_row(name: &str, data: &[u8], announces: Option<u32>) -> LinkRow {
         (
             name.into(),
             EntryKind::File,
@@ -2544,7 +2561,7 @@ mod tests {
                 target: target.into(),
             },
             Some(size),
-            false,
+            None,
             Vec::new(),
         )
     }
@@ -2567,10 +2584,10 @@ mod tests {
         assert_eq!(
             read_rows(&bytes).expect("reads"),
             vec![
-                file_row("c", b"hello", true),
+                file_row("c", b"hello", Some(2)),
                 link_row("a", "c", 5),
                 link_row("b", "c", 5),
-                file_row("d", b"plain", false),
+                file_row("d", b"plain", None),
             ]
         );
     }
@@ -2603,7 +2620,7 @@ mod tests {
         assert_eq!(
             read_rows(&bytes).expect("reads"),
             vec![
-                file_row("c", b"hello", true),
+                file_row("c", b"hello", Some(2)),
                 link_row("a", "c", 5),
                 link_row("b", "c", 5),
             ]
@@ -2617,7 +2634,10 @@ mod tests {
         let bytes = newc_archive(&[("a", 7, 2, b"hello"), ("b", 7, 2, b"hello")], true);
         assert_eq!(
             read_rows(&bytes).expect("reads"),
-            vec![file_row("a", b"hello", true), file_row("b", b"hello", true)]
+            vec![
+                file_row("a", b"hello", Some(1)),
+                file_row("b", b"hello", Some(1)),
+            ]
         );
     }
 
@@ -2629,7 +2649,7 @@ mod tests {
         let bytes = newc_archive(&[("a", 7, 2, b""), ("b", 7, 2, b"")], true);
         assert_eq!(
             read_rows(&bytes).expect("reads"),
-            vec![file_row("a", b"", false), link_row("b", "a", 0)]
+            vec![file_row("a", b"", None), link_row("b", "a", 0)]
         );
     }
 
@@ -2655,14 +2675,14 @@ mod tests {
         assert_eq!(
             read_rows(&bytes).expect("reads"),
             vec![
-                file_row("x2", b"xx", true),
+                file_row("x2", b"xx", Some(1)),
                 link_row("x1", "x2", 2),
-                file_row("y3", b"yyy", true),
+                file_row("y3", b"yyy", Some(2)),
                 link_row("y1", "y3", 3),
                 link_row("y2", "y3", 3),
-                file_row("e1", b"", false),
+                file_row("e1", b"", None),
                 link_row("e2", "e1", 0),
-                file_row("f1", b"", false),
+                file_row("f1", b"", None),
                 link_row("f2", "f1", 0),
             ]
         );
@@ -2680,7 +2700,7 @@ mod tests {
         bytes.extend(newc_member("TRAILER!!!", 0, 0, 1, b""));
         assert_eq!(
             read_rows(&bytes).expect("reads"),
-            vec![file_row("c", b"hello", true), file_row("a", b"", false)]
+            vec![file_row("c", b"hello", Some(1)), file_row("a", b"", None)]
         );
     }
 
@@ -2708,9 +2728,9 @@ mod tests {
         assert_eq!(
             read_rows(&bytes).expect("reads"),
             vec![
-                file_row("a", b"", false),
-                file_row("b", b"", false),
-                file_row("c", b"hello", false),
+                file_row("a", b"", None),
+                file_row("b", b"", None),
+                file_row("c", b"hello", None),
             ]
         );
     }
@@ -2779,7 +2799,7 @@ mod tests {
         );
         assert_eq!(
             read_rows(&bytes).expect("reads"),
-            vec![file_row("c", b"hello", true), link_row("a", "c", 5)]
+            vec![file_row("c", b"hello", Some(2)), link_row("a", "c", 5)]
         );
     }
 
@@ -2793,7 +2813,7 @@ mod tests {
         );
         assert_eq!(
             read_rows(&bytes).expect("reads"),
-            vec![file_row("c", b"hello", true), link_row("a", "c", 5)]
+            vec![file_row("c", b"hello", Some(1)), link_row("a", "c", 5)]
         );
     }
 
@@ -2807,7 +2827,7 @@ mod tests {
         );
         assert_eq!(
             read_rows(&bytes).expect("reads"),
-            vec![file_row("a", b"", false), link_row("b", "a", 0)]
+            vec![file_row("a", b"", None), link_row("b", "a", 0)]
         );
     }
 }

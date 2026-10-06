@@ -1139,7 +1139,13 @@ fn link_tar(target: &str, payload: &[u8], name: &str) -> Vec<u8> {
 
 /// A typeflag-`1` header for `name` linking to `target`.
 fn link_header(name: &str, target: &str) -> [u8; 512] {
-    let mut h = tar_header(name, 0, b'1');
+    typed_link_header(name, target, b'1')
+}
+
+/// A header of `typeflag` (`1` hard link, `2` symlink) for `name`, whose
+/// link name is `target`.
+fn typed_link_header(name: &str, target: &str, typeflag: u8) -> [u8; 512] {
+    let mut h = tar_header(name, 0, typeflag);
     h[157..157 + target.len()].copy_from_slice(target.as_bytes());
     h[148..156].copy_from_slice(b"        ");
     let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
@@ -1434,5 +1440,209 @@ fn cat_of_a_link_copies_its_selected_target_or_names_it() {
     );
     assert_eq!(err.exit_code(), 2);
     assert!(out.is_empty(), "nothing invented for the link");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fix round 1, the reviewer's case: one big linked file filling the memory
+/// tier, then many small linked pairs. Each payload is released once its
+/// last link has passed, so the small ones never pile up as temp files (one
+/// open file each, which ran a 256-descriptor process out at about 150).
+/// Every link is copied and nothing is lost.
+#[cfg(feature = "cpio")]
+#[test]
+fn a_big_linked_file_then_many_small_pairs_all_copy() {
+    let dir = tmp_dir();
+    let src = dir.join("src.cpio");
+    let big: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
+    let mut bytes = Vec::new();
+    newc_member(&mut bytes, "big1", 1, 2, b"");
+    newc_member(&mut bytes, "big", 1, 2, &big);
+    let pairs = 400u32;
+    for i in 0..pairs {
+        newc_member(&mut bytes, &format!("s{i}l"), 100 + i, 2, b"");
+        newc_member(
+            &mut bytes,
+            &format!("s{i}"),
+            100 + i,
+            2,
+            format!("small {i}").as_bytes(),
+        );
+    }
+    newc_member(&mut bytes, "TRAILER!!!", 0, 1, b"");
+    std::fs::write(&src, bytes).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(
+        &src,
+        &zip,
+        "zip",
+        &ConvertOpts {
+            spill: stuffr::SpillPolicy::Temp {
+                dir: None,
+                mem_cap: 8192,
+                max: 1 << 30,
+            },
+            ..ConvertOpts::default()
+        },
+    );
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{} warnings, first {:?}",
+        outcome.fidelity.warnings.len(),
+        outcome.fidelity.warnings.first()
+    );
+    let files = files_of(&zip);
+    assert_eq!(files.len(), 2 + 2 * pairs as usize);
+    let get = |n: &str| &files.iter().find(|(name, _)| name == n).unwrap().1;
+    assert_eq!(get("big1"), &big);
+    for i in [0, 199, pairs - 1] {
+        let want = format!("small {i}").into_bytes();
+        assert_eq!(get(&format!("s{i}")), &want);
+        assert_eq!(get(&format!("s{i}l")), &want);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A crafted cpio announcing `nlink = 5` on every file, with no links at
+/// all: counts that never reach zero cost nothing visible. No warning, every
+/// payload intact.
+#[cfg(feature = "cpio")]
+#[test]
+fn announced_links_that_never_come_are_harmless() {
+    let dir = tmp_dir();
+    let src = dir.join("src.cpio");
+    let mut bytes = Vec::new();
+    for i in 0..100u32 {
+        newc_member(
+            &mut bytes,
+            &format!("f{i}"),
+            1 + i,
+            5,
+            format!("file {i}").as_bytes(),
+        );
+    }
+    newc_member(&mut bytes, "TRAILER!!!", 0, 1, b"");
+    std::fs::write(&src, bytes).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(
+        &src,
+        &zip,
+        "zip",
+        &ConvertOpts {
+            spill: stuffr::SpillPolicy::Temp {
+                dir: None,
+                mem_cap: 0,
+                max: 1 << 30,
+            },
+            ..ConvertOpts::default()
+        },
+    );
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    let files = files_of(&zip);
+    assert_eq!(files.len(), 100);
+    assert_eq!(files[42], ("f42".to_string(), b"file 42".to_vec()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Data FIRST, its links after: the payload is held until its last link has
+/// passed, so every name is a full copy.
+#[cfg(feature = "cpio")]
+#[test]
+fn a_data_first_cpio_group_is_fully_copied() {
+    let dir = tmp_dir();
+    let src = dir.join("src.cpio");
+    let mut bytes = Vec::new();
+    newc_member(&mut bytes, "c", 7, 3, b"hello");
+    newc_member(&mut bytes, "p", 8, 1, b"between");
+    newc_member(&mut bytes, "a", 7, 3, b"");
+    newc_member(&mut bytes, "b", 7, 3, b"");
+    newc_member(&mut bytes, "TRAILER!!!", 0, 1, b"");
+    std::fs::write(&src, bytes).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(&src, &zip, "zip", &ConvertOpts::default());
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(
+        files_of(&zip),
+        [
+            ("c".to_string(), b"hello".to_vec()),
+            ("p".to_string(), b"between".to_vec()),
+            ("a".to_string(), b"hello".to_vec()),
+            ("b".to_string(), b"hello".to_vec()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fix round 1, Minor 1: a later entry of a kept name that is SKIPPED (a
+/// fifo `x` after a file `x`) still replaces it, so a link to `x` is skipped
+/// as not kept — never handed the stale "OLD" bytes.
+#[test]
+fn a_skipped_entry_of_a_kept_name_leaves_no_stale_copy() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    let mut bytes = hand_built_tar(&[("x", b'0', b"OLD"), ("x", b'6', b"")]);
+    bytes.truncate(bytes.len() - 1024);
+    bytes.extend_from_slice(&link_header("y", "x"));
+    bytes.extend(std::iter::repeat_n(0u8, 1024));
+    std::fs::write(&src, bytes).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(&src, &zip, "zip", &ConvertOpts::default());
+    let skipped = skips(&outcome.fidelity.warnings);
+    assert_eq!(skipped.len(), 2, "{skipped:?}");
+    assert_eq!(
+        skipped[1],
+        (
+            "y".to_string(),
+            "its hard-link target `x` was not kept for copying".to_string()
+        )
+    );
+    assert_eq!(
+        entries_of(&zip),
+        [("x".to_string(), EntryKind::File, b"OLD".to_vec())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Fix round 1, Minor 4: `cat` of a link whose target was selected and
+/// written but not kept (here a symlink, which has no payload to keep) is a
+/// classified refusal saying so, exit 3 — not "not found" for an entry it
+/// just printed. A target never selected stays `EntryNotFound`, exit 2.
+#[test]
+fn cat_tells_a_target_not_kept_from_one_not_selected() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&typed_link_header("x", "elsewhere", b'2'));
+    bytes.extend_from_slice(&link_header("y", "x"));
+    bytes.extend(std::iter::repeat_n(0u8, 1024));
+    std::fs::write(&src, bytes).unwrap();
+    let cat = |names: &[&str]| {
+        entries::cat(
+            Input::Path(src.clone()),
+            &Selection::Names(names.iter().map(|n| n.to_string()).collect()),
+            DEFAULT_MAX_RATIO,
+            None,
+            &mut Vec::new(),
+        )
+        .unwrap_err()
+    };
+    let err = cat(&["x", "y"]);
+    assert!(matches!(err, stuffr::Error::Unsupported(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 3);
+    assert_eq!(
+        err.to_string(),
+        "unsupported: hard link `y`: its target `x` was not kept for copying"
+    );
+    let err = cat(&["y"]);
+    assert!(matches!(err, stuffr::Error::EntryNotFound(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(err.to_string(), "entry `x` not found");
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -171,7 +171,7 @@ impl EntryMeta {
 pub struct Entry<'a> {
     meta: EntryMeta,
     reader: Box<dyn Read + 'a>,
-    announces_links: bool,
+    announces_links: Option<u32>,
 }
 
 impl<'a> Entry<'a> {
@@ -179,23 +179,26 @@ impl<'a> Entry<'a> {
         Self {
             meta,
             reader,
-            announces_links: false,
+            announces_links: None,
         }
     }
 
     /// Marks this entry as one the reader KNOWS later entries in the same
-    /// archive are hard links to (cpio reads `nlink`; tar cannot know, so it
-    /// never sets this). A hint for consumers that keep payloads for later
-    /// links; never a promise that a link follows.
+    /// archive are hard links to, and how many: `links_to_come` names besides
+    /// this one share it (cpio reads `nlink`; tar cannot know, so it never
+    /// sets this). A hint for consumers that keep payloads for later links,
+    /// so they can drop a payload once its last link has passed; never a
+    /// promise that a link follows, nor that no more will (an archive can
+    /// hold fewer names than `nlink` says, or a crafted larger count).
     #[must_use]
-    pub fn announce_links(mut self) -> Self {
-        self.announces_links = true;
+    pub fn announce_links(mut self, links_to_come: u32) -> Self {
+        self.announces_links = Some(links_to_come);
         self
     }
 
-    /// Whether the reader announced later hard links to this entry; see
-    /// [`Self::announce_links`]. `false` unless a reader set it.
-    pub fn announces_links(&self) -> bool {
+    /// How many later hard links the reader announced to this entry; see
+    /// [`Self::announce_links`]. `None` unless a reader set it.
+    pub fn announces_links(&self) -> Option<u32> {
         self.announces_links
     }
 
@@ -372,9 +375,9 @@ mod tests {
     #[test]
     fn an_entry_announces_links_only_when_its_reader_says_so() {
         let plain = Entry::new(EntryMeta::default(), Box::new(std::io::empty()));
-        assert!(!plain.announces_links());
-        let marked = Entry::new(EntryMeta::default(), Box::new(std::io::empty())).announce_links();
-        assert!(marked.announces_links());
+        assert_eq!(plain.announces_links(), None);
+        let marked = Entry::new(EntryMeta::default(), Box::new(std::io::empty())).announce_links(2);
+        assert_eq!(marked.announces_links(), Some(2));
     }
 
     #[test]

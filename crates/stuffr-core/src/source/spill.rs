@@ -157,6 +157,19 @@ impl SpillWriter {
         self.total == 0
     }
 
+    /// Reserves memory for `additional` more bytes, up to what the memory
+    /// tier can still hold, so a payload of known size grows its buffer once
+    /// rather than by doubling (which could leave it holding about twice
+    /// what it keeps). A hint only: nothing is refused here.
+    pub fn reserve(&mut self, additional: u64) {
+        if self.file.is_some() {
+            return;
+        }
+        let room = self.mem_cap.saturating_sub(self.total);
+        let n = usize::try_from(additional.min(room)).unwrap_or(0);
+        self.mem.reserve_exact(n);
+    }
+
     /// Appends `bytes`, escalating to a temp file once the memory cap is
     /// passed, and refusing past the hard limit.
     pub fn push(&mut self, bytes: &[u8]) -> Result<()> {
@@ -190,13 +203,17 @@ impl SpillWriter {
     }
 
     /// The bytes pushed, as a seekable source positioned at the start.
-    pub fn finish(self) -> Result<SpillSource> {
-        match self.file {
-            None => Ok(SpillSource {
-                backing: Backing::Mem(GuardedSeek::new(Cursor::new(self.mem))),
-                len: self.total,
-                on_disk: false,
-            }),
+    pub fn finish(mut self) -> Result<SpillSource> {
+        match self.file.take() {
+            None => {
+                // A kept buffer holds what it holds, not what doubling left.
+                self.mem.shrink_to_fit();
+                Ok(SpillSource {
+                    backing: Backing::Mem(GuardedSeek::new(Cursor::new(self.mem))),
+                    len: self.total,
+                    on_disk: false,
+                })
+            }
             Some(mut file) => {
                 file.flush()?;
                 file.seek(std::io::SeekFrom::Start(0))?;

@@ -544,10 +544,23 @@ impl Selection {
 fn visit_selected(
     ar: &mut dyn ArchiveRead,
     selection: &Selection,
+    visit: impl FnMut(&mut Entry<'_>) -> Result<()>,
+) -> Result<u64> {
+    visit_selected_noting(ar, selection, visit, |_| {})
+}
+
+/// [`visit_selected`], also telling `passed` about every entry the forward
+/// walk reads and does NOT select — what [`cat`]'s link cache needs to know
+/// that a kept name was replaced. The random-access route reads no other
+/// entry, so it notes none.
+fn visit_selected_noting(
+    ar: &mut dyn ArchiveRead,
+    selection: &Selection,
     mut visit: impl FnMut(&mut Entry<'_>) -> Result<()>,
+    mut passed: impl FnMut(&EntryMeta),
 ) -> Result<u64> {
     if let Selection::Indices(wanted) = selection {
-        return visit_by_index(ar, wanted, visit);
+        return visit_by_index(ar, wanted, visit, passed);
     }
     let mut visited = 0u64;
     while let Some(mut entry) = ar.next_entry()? {
@@ -555,6 +568,7 @@ fn visit_selected(
             && !patterns.is_empty()
             && !matches_any(&entry.meta().name, patterns)
         {
+            passed(entry.meta());
             continue;
         }
         visited += 1;
@@ -617,6 +631,7 @@ fn visit_by_index(
     ar: &mut dyn ArchiveRead,
     wanted: &[usize],
     mut visit: impl FnMut(&mut Entry<'_>) -> Result<()>,
+    mut passed: impl FnMut(&EntryMeta),
 ) -> Result<u64> {
     let mut wanted: Vec<usize> = wanted.to_vec();
     wanted.sort_unstable();
@@ -668,6 +683,8 @@ fn visit_by_index(
             if cursor == wanted.len() {
                 return Ok(visited);
             }
+        } else {
+            passed(entry.meta());
         }
         position += 1;
     }
@@ -1468,41 +1485,75 @@ pub fn cat(
         .map(|m| m.len());
     let (mut ar, format, consumed) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     let mut budget = ArchiveBudget::new(compressed_total, max_ratio).tracking(consumed);
-    let mut links = LinkCache::new(CachePolicy::for_source(format, &SpillPolicy::default()));
+    // Shared by the two visitors below: one for the selected entries, one
+    // told about every entry walked past unselected.
+    let links = std::cell::RefCell::new(LinkCache::new(CachePolicy::for_source(
+        format,
+        &SpillPolicy::default(),
+    )));
+    // Names selected and written, so a link to one that was not kept is told
+    // apart from a link to one never selected.
+    let mut printed: HashSet<String> = HashSet::new();
     let mut written = 0u64;
     let mut matched = 0u64;
 
-    matched += visit_selected(ar.as_mut(), selection, |entry| {
-        let meta = entry.meta().clone();
-        let name = meta.name.clone();
-        if let EntryKind::Hardlink { target } = &meta.kind {
-            links.forget(&name);
-            let Some((_, mut copy)) = links.copy_of(target)? else {
-                return Err(Error::EntryNotFound(target.clone()));
+    matched += visit_selected_noting(
+        ar.as_mut(),
+        selection,
+        |entry| {
+            let meta = entry.meta().clone();
+            let name = meta.name.clone();
+            let mut links = links.borrow_mut();
+            if let EntryKind::Hardlink { target } = &meta.kind {
+                links.forget(&name);
+                let Some((_, mut copy)) = links.copy_of(target)? else {
+                    if printed.contains(target) {
+                        return Err(Error::Unsupported(format!(
+                            "hard link `{name}`: its target `{target}` was not kept for \
+                             copying"
+                        )));
+                    }
+                    return Err(Error::EntryNotFound(target.clone()));
+                };
+                written += copy_charging(&mut copy, dst, &name, &mut budget)?;
+                drop(copy);
+                links.link_seen(target);
+                printed.insert(name);
+                return Ok(());
+            }
+            let announced = entry.announces_links();
+            let mut spool = if links.wants(&meta, announced) {
+                links.spool(&name, meta.size)
+            } else {
+                links.forget(&name);
+                None
             };
-            written += copy_charging(&mut copy, dst, &name, &mut budget)?;
-            return Ok(());
-        }
-        let mut spool = if links.wants(&meta, entry.announces_links()) {
-            links.spool(&name, meta.size)
-        } else {
-            links.forget(&name);
-            None
-        };
-        // A directory or symlink entry frames no payload, so this copies
-        // zero bytes for one rather than needing a case of its own.
-        let mut tee = Tee::new(entry.reader(), &mut spool);
-        let n = copy_charging(&mut tee, dst, &name, &mut budget)?;
-        let seen = tee.seen;
-        written += n;
-        if seen == n
-            && let Some(spool) = spool
-            && let Ok(bytes) = spool.finish()
-        {
-            links.keep(&name, bytes);
-        }
-        Ok(())
-    })?;
+            // A directory or symlink entry frames no payload, so this copies
+            // zero bytes for one rather than needing a case of its own.
+            let mut tee = Tee::new(entry.reader(), &mut spool);
+            let n = copy_charging(&mut tee, dst, &name, &mut budget)?;
+            let seen = tee.seen;
+            written += n;
+            if seen == n
+                && let Some(spool) = spool
+                && let Ok(bytes) = spool.finish()
+            {
+                links.keep(&name, bytes, announced);
+            }
+            printed.insert(name);
+            Ok(())
+        },
+        // An unselected entry of a kept name replaces it, as far as a later
+        // link to the name is concerned; an unselected link still counts its
+        // target's payload down.
+        |meta| {
+            let mut links = links.borrow_mut();
+            links.forget(&meta.name);
+            if let EntryKind::Hardlink { target } = &meta.kind {
+                links.link_seen(target);
+            }
+        },
+    )?;
 
     if matched == 0
         && let Some(missed) = selection.missed()
@@ -3960,92 +4011,110 @@ fn convert_entries(
     let mut written: HashSet<String> = HashSet::new();
     while let Some(mut entry) = ar.next_entry()? {
         let mut meta = entry.meta().clone();
-        let link_copy_available = matches!(
-            &meta.kind,
-            EntryKind::Hardlink { target } if links.contains(target)
-        );
-        if let WritePlan::Skip =
-            plan_entry_write(caps, container, &meta, link_copy_available, &mut warnings)
-        {
-            // Unread: the reader drains (or seeks past) an entry the caller
-            // did not consume, as it does for `list`.
-            continue;
-        }
-        // Here, not in `plan_entry_write`: only an archive can repeat a name
-        // (`pack`'s walk never does), so `pack` never needs the check. After
-        // the plan, so an entry that is not written claims no name. The
-        // FIRST entry of a name wins; the writer would refuse the second.
-        if caps.unique_names && written.contains(&meta.name) {
-            warnings.push(duplicate_name_skipped(container, &meta.name));
-            continue;
-        }
-        match meta.kind.clone() {
-            EntryKind::File => {
-                let mut spool = if links.wants(&meta, entry.announces_links()) {
-                    links.spool(&meta.name, meta.size)
-                } else {
+        // Every link naming a kept payload counts it down, copied or
+        // skipped, so a cpio payload is dropped once its last link passed.
+        let link_target = match &meta.kind {
+            EntryKind::Hardlink { target } => Some(target.clone()),
+            _ => None,
+        };
+        'entry: {
+            let link_copy_available = link_target
+                .as_deref()
+                .is_some_and(|target| links.contains(target));
+            if let WritePlan::Skip =
+                plan_entry_write(caps, container, &meta, link_copy_available, &mut warnings)
+            {
+                // Unread: the reader drains (or seeks past) an entry the
+                // caller did not consume, as it does for `list`. A payload
+                // kept under its name is no longer what a link to the name
+                // means.
+                links.forget(&meta.name);
+                break 'entry;
+            }
+            // Here, not in `plan_entry_write`: only an archive can repeat a
+            // name (`pack`'s walk never does), so `pack` never needs the
+            // check. After the plan, so an entry that is not written claims
+            // no name. The FIRST entry of a name wins; the writer would
+            // refuse the second.
+            if caps.unique_names && written.contains(&meta.name) {
+                warnings.push(duplicate_name_skipped(container, &meta.name));
+                links.forget(&meta.name);
+                break 'entry;
+            }
+            match meta.kind.clone() {
+                EntryKind::File => {
+                    let announced = entry.announces_links();
+                    let mut spool = if links.wants(&meta, announced) {
+                        links.spool(&meta.name, meta.size)
+                    } else {
+                        links.forget(&meta.name);
+                        None
+                    };
+                    moved += write_payload(
+                        entry.reader(),
+                        &mut meta,
+                        archive,
+                        budget,
+                        spill,
+                        &mut spool,
+                    )?;
+                    if let Some(spool) = spool
+                        && let Ok(bytes) = spool.finish()
+                    {
+                        // A spool that cannot be finished (its temp file
+                        // failed) is simply not kept: the link is skipped,
+                        // by name.
+                        links.keep(&meta.name, bytes, announced);
+                    }
+                }
+                EntryKind::Hardlink { target } if caps.stores_hardlinks => {
+                    if !written.contains(&target) {
+                        warnings.push(Fidelity::EntrySkipped {
+                            entry: meta.name.clone(),
+                            reason: hard_link_reason_not_written(&target),
+                        });
+                        break 'entry;
+                    }
+                    archive.add(&meta, &mut std::io::empty())?;
+                }
+                EntryKind::Hardlink { target } => {
                     links.forget(&meta.name);
-                    None
-                };
-                moved += write_payload(
-                    entry.reader(),
-                    &mut meta,
-                    archive,
-                    budget,
-                    spill,
-                    &mut spool,
-                )?;
-                if let Some(spool) = spool
-                    && let Ok(bytes) = spool.finish()
-                {
-                    // A spool that cannot be finished (its temp file failed)
-                    // is simply not kept: the link is skipped, by name.
-                    links.keep(&meta.name, bytes);
+                    // `plan_entry_write` wrote it only because a copy was
+                    // there; the `None` arm is a backstop, never an empty
+                    // file.
+                    let Some((len, mut copy)) = links.copy_of(&target)? else {
+                        warnings.push(Fidelity::EntrySkipped {
+                            entry: meta.name.clone(),
+                            reason: hard_link_reason_not_kept(&target),
+                        });
+                        break 'entry;
+                    };
+                    // A regular file of its own, with the link entry's
+                    // metadata and exactly the target's length: a writer
+                    // that cannot store links refuses a `Hardlink`.
+                    meta.kind = EntryKind::File;
+                    meta.size = Some(len);
+                    // Not counted in `moved`: these bytes were read from the
+                    // source once already, for the target.
+                    write_payload(&mut copy, &mut meta, archive, budget, spill, &mut None)?;
+                }
+                // `plan_entry_write` writes only a file, a directory, a
+                // symlink or a hard link, so this is the middle two. Neither
+                // has a payload to frame: a symlink's target travels in
+                // `meta.kind`, and zip and cpio, which read the target as
+                // the entry's payload, already did so and hand over an empty
+                // reader — whose declared size (the target's length) must
+                // never be held to a length guard.
+                _ => {
+                    links.forget(&meta.name);
+                    archive.add(&meta, &mut std::io::empty())?;
                 }
             }
-            EntryKind::Hardlink { target } if caps.stores_hardlinks => {
-                if !written.contains(&target) {
-                    warnings.push(Fidelity::EntrySkipped {
-                        entry: meta.name.clone(),
-                        reason: hard_link_reason_not_written(&target),
-                    });
-                    continue;
-                }
-                archive.add(&meta, &mut std::io::empty())?;
-            }
-            EntryKind::Hardlink { target } => {
-                links.forget(&meta.name);
-                // `plan_entry_write` wrote it only because a copy was there;
-                // the `None` arm is a backstop, never an empty file.
-                let Some((len, mut copy)) = links.copy_of(&target)? else {
-                    warnings.push(Fidelity::EntrySkipped {
-                        entry: meta.name.clone(),
-                        reason: hard_link_reason_not_kept(&target),
-                    });
-                    continue;
-                };
-                // A regular file of its own, with the link entry's metadata
-                // and exactly the target's length: a writer that cannot store
-                // links refuses a `Hardlink`.
-                meta.kind = EntryKind::File;
-                meta.size = Some(len);
-                // Not counted in `moved`: these bytes were read from the
-                // source once already, for the target.
-                write_payload(&mut copy, &mut meta, archive, budget, spill, &mut None)?;
-            }
-            // `plan_entry_write` writes only a file, a directory, a symlink
-            // or a hard link, so this is the middle two. Neither has a
-            // payload to frame: a symlink's target travels in `meta.kind`,
-            // and zip and cpio, which read the target as the entry's
-            // payload, already did so and hand over an empty reader — whose
-            // declared size (the target's length) must never be held to a
-            // length guard.
-            _ => {
-                links.forget(&meta.name);
-                archive.add(&meta, &mut std::io::empty())?;
-            }
+            written.insert(meta.name);
         }
-        written.insert(meta.name);
+        if let Some(target) = link_target {
+            links.link_seen(&target);
+        }
     }
     Ok((moved, warnings))
 }
