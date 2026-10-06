@@ -1407,8 +1407,8 @@ fn cpio_to_tar_writes_links_as_links() {
 }
 
 /// `cat` of a link writes its target's bytes when the target was selected
-/// earlier in the same run, and is `EntryNotFound` naming the target when it
-/// was not.
+/// earlier in the same run, and when it was not, says the link is one and
+/// that its target must be selected too (usage, exit 2).
 #[test]
 fn cat_of_a_link_copies_its_selected_target_or_names_it() {
     let dir = tmp_dir();
@@ -1434,9 +1434,12 @@ fn cat_of_a_link_copies_its_selected_target_or_names_it() {
         &mut out,
     )
     .unwrap_err();
-    assert!(
-        matches!(&err, stuffr::Error::EntryNotFound(t) if t == "b"),
-        "{err:?}"
+    // The target IS in the archive, so "entry `b` not found" would be
+    // false: the link is what was asked for, and its bytes are `b`'s.
+    assert!(matches!(&err, stuffr::Error::Usage(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "usage error: `a` is a hard link to `b`, so its bytes are `b`'s; select `b` too"
     );
     assert_eq!(err.exit_code(), 2);
     assert!(out.is_empty(), "nothing invented for the link");
@@ -1613,7 +1616,7 @@ fn a_skipped_entry_of_a_kept_name_leaves_no_stale_copy() {
 /// Fix round 1, Minor 4: `cat` of a link whose target was selected and
 /// written but not kept (here a symlink, which has no payload to keep) is a
 /// classified refusal saying so, exit 3 — not "not found" for an entry it
-/// just printed. A target never selected stays `EntryNotFound`, exit 2.
+/// just printed. A target never selected is a usage error naming it, exit 2.
 #[test]
 fn cat_tells_a_target_not_kept_from_one_not_selected() {
     let dir = tmp_dir();
@@ -1641,9 +1644,12 @@ fn cat_tells_a_target_not_kept_from_one_not_selected() {
         "unsupported: hard link `y`: its target `x` was not kept for copying"
     );
     let err = cat(&["y"]);
-    assert!(matches!(err, stuffr::Error::EntryNotFound(_)), "{err:?}");
+    assert!(matches!(err, stuffr::Error::Usage(_)), "{err:?}");
     assert_eq!(err.exit_code(), 2);
-    assert_eq!(err.to_string(), "entry `x` not found");
+    assert_eq!(
+        err.to_string(),
+        "usage error: `y` is a hard link to `x`, so its bytes are `x`'s; select `x` too"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

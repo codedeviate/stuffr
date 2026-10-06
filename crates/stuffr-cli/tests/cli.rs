@@ -14620,8 +14620,9 @@ fn cat_of_a_link_writes_its_targets_bytes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `cat` of a link alone, its target not selected: a classified refusal
-/// naming the TARGET, never exit 1 and never invented bytes.
+/// `cat` of a link alone, its target not selected: a usage refusal (exit 2)
+/// saying it is a link and naming the TARGET to select too, never "not
+/// found" for an entry `list` shows, never exit 1, never invented bytes.
 #[cfg(unix)]
 #[test]
 fn cat_of_a_link_without_its_target_is_classified_not_1() {
@@ -14644,7 +14645,14 @@ fn cat_of_a_link_without_its_target_is_classified_not_1() {
     let out = run_output(&["cat", tar.to_str().unwrap(), "a1"]);
     let stderr = stderr_text(&out);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("entry `a` not found"), "{stderr}");
+    assert!(
+        stderr.contains("`a1` is a hard link to `a`, so its bytes are `a`'s; select `a` too"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("not found"),
+        "`a` IS in the archive: {stderr}"
+    );
     assert!(out.stdout.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }

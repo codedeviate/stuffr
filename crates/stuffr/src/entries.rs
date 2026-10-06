@@ -1468,9 +1468,11 @@ fn warn_metadata(warnings: &mut Vec<Fidelity>, entry: &str, missing: MetaFields)
 /// bytes, when the target was selected earlier in the same run and kept
 /// (by the `link_cache` module, under the default spill policy: tar keeps
 /// recent payloads in memory, cpio the ones it announces as linked). The
-/// copy is charged to the budget like any payload. A target not selected,
-/// or not kept, is [`Error::EntryNotFound`] naming the target (exit 2):
-/// never invented bytes.
+/// copy is charged to the budget like any payload. A target not selected is
+/// [`Error::Usage`] (exit 2) saying the link is one and that its target must
+/// be selected too — not `EntryNotFound`, since the target may well be in the
+/// archive; one selected but not kept is [`Error::Unsupported`]. Never
+/// invented bytes.
 pub fn cat(
     src: Input,
     selection: &Selection,
@@ -1513,7 +1515,10 @@ pub fn cat(
                              copying"
                         )));
                     }
-                    return Err(Error::EntryNotFound(target.clone()));
+                    return Err(Error::Usage(format!(
+                        "`{name}` is a hard link to `{target}`, so its bytes are \
+                         `{target}`'s; select `{target}` too"
+                    )));
                 };
                 written += copy_charging(&mut copy, dst, &name, &mut budget)?;
                 drop(copy);
