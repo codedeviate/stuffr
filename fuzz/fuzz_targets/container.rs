@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use stuffr::entries::{ConvertOpts, convert_archive_source};
 use stuffr::ops::{ConvertSource, Input, Output};
 use stuffr_core::testing::{
-    CONTAINER_SLOTS, check_entries_carried, check_entry_count, check_entry_size,
-    check_error_is_classified, check_fidelity_claim,
+    CONTAINER_SLOTS, check_display_has_no_raw_controls, check_entries_carried, check_entry_count,
+    check_entry_size, check_error_is_classified, check_fidelity_claim,
 };
 use stuffr_core::{
     Chain, Container, Error, FileSource, FormatId, OpenOpts, ReaderSource, Source, SpillPolicy,
@@ -197,6 +197,16 @@ fn forward_entry_count(container: &dyn Container, payload: &[u8]) -> Option<usiz
     Some(count)
 }
 
+/// Every fidelity warning must render without a raw control or bidi
+/// character (the rendering `fmt_name` owns); errors get the same check inside
+/// `check_error_is_classified`.
+fn check_warnings_render_safely(report: &stuffr_core::FidelityReport, what: &str) {
+    for w in &report.warnings {
+        check_display_has_no_raw_controls(&w.to_string())
+            .unwrap_or_else(|m| panic!("{what}: fidelity warning: {m}"));
+    }
+}
+
 /// Converts the archive at `input` — the bytes the seekable walk just read
 /// as `slot` — into a bare `tar` at `out`, and checks the conversion against
 /// that walk: an `Err` must be classified (never exit 1), and on `Ok` every
@@ -228,7 +238,7 @@ fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[
         Ok(s) => s,
         Err(e) => {
             check_error_is_classified(&e).expect("convert: source open classification");
-            trace(slot, "open-err", source_names.len(), false);
+            trace(slot, "open-err", source_names.len(), false, 0);
             return;
         }
     };
@@ -242,12 +252,12 @@ fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[
             Ok(o) => o,
             Err(e) => {
                 check_error_is_classified(&e).expect("convert: error classification");
-                trace(slot, "convert-err", source_names.len(), false);
+                trace(slot, "convert-err", source_names.len(), false, 0);
                 return;
             }
         };
     if !same_archive {
-        trace(slot, "other-chain", source_names.len(), false);
+        trace(slot, "other-chain", source_names.len(), false, 0);
         return;
     }
 
@@ -263,13 +273,21 @@ fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[
         .open(resolved, &OpenOpts::default())
         .expect("convert: open the produced tar as tar");
     let mut written = Vec::new();
+    // Hard links the produced tar holds AS links: the trace's measure of how
+    // many inputs exercised the link path, not an assertion.
+    let mut links = 0usize;
     while let Some(entry) = ar.next_entry().expect("convert: walk the produced tar") {
+        links += usize::from(matches!(
+            entry.meta().kind,
+            stuffr_core::EntryKind::Hardlink { .. }
+        ));
         written.push(entry.meta().name.clone());
     }
 
+    check_warnings_render_safely(&outcome.fidelity, "convert");
     check_entries_carried(source_names, &written, &outcome.fidelity)
         .expect("convert: every entry carried or named");
-    trace(slot, "checked", source_names.len(), true);
+    trace(slot, "checked", source_names.len(), true, links);
 }
 
 /// One line per input that reached [`convert_oracle`], on stderr, when
@@ -283,10 +301,12 @@ fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[
 /// STUFFR_FUZZ_CONVERT_TRACE=1 cargo +nightly fuzz run container -- -runs=0 2>&1 \
 ///   | grep '^convert-trace '
 /// ```
-fn trace(slot: &str, outcome: &str, names: usize, checked: bool) {
+fn trace(slot: &str, outcome: &str, names: usize, checked: bool, links: usize) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("STUFFR_FUZZ_CONVERT_TRACE").is_some()) {
-        eprintln!("convert-trace slot={slot} outcome={outcome} names={names} checked={checked}");
+        eprintln!(
+            "convert-trace slot={slot} outcome={outcome} names={names} checked={checked} links={links}"
+        );
     }
 }
 
@@ -426,6 +446,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Read the report only now that the walk is complete, not mid-walk.
     let report = ar.fidelity();
+    check_warnings_render_safely(report, "walk");
 
     // Ruling A: `declared` is obtained by an independent parse, zip slot on
     // the seekable path only. Every other slot, and zip on the forward-only

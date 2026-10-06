@@ -19,13 +19,44 @@ use crate::{EntryKind, Error, Fidelity, FidelityReport};
 /// `Unsupported`, the `UnknownFormat`/`AmbiguousFormat` pair, and
 /// `NotSeekable` — the fifth, found by this very oracle before the fuzzer had
 /// run once — each fixed after the fact).
+///
+/// It also applies [`check_display_has_no_raw_controls`] to the error's
+/// rendering, so every call site in every fuzz target checks that an error
+/// naming hostile bytes does not carry them raw to a terminal.
 pub fn check_error_is_classified(e: &Error) -> Result<(), String> {
     match e.exit_code() {
         1 => Err(format!(
             "a decoder raised {e:?}, which maps to exit code 1 — that means \
              stuffr failed, not that the input was bad"
         )),
-        _ => Ok(()),
+        _ => check_display_has_no_raw_controls(&e.to_string()),
+    }
+}
+
+/// A rendered `Error` or `Fidelity` message never carries a raw control or
+/// bidi character — the classes `display::fmt_name` escapes: C0
+/// (U+0000–U+001F), DEL, C1 (U+0080–U+009F), and the bidi overrides
+/// U+202A–U+202E and U+2066–U+2069.
+///
+/// An archive member's name is attacker-controlled and ends up inside
+/// messages; a raw ESC or U+202E in one is terminal injection or a spoofed
+/// line. Apply it to ONE rendered message, never to multi-line CLI output
+/// (whose newlines are legitimate). `Err` names the first offender's
+/// codepoint.
+pub fn check_display_has_no_raw_controls(rendered: &str) -> Result<(), String> {
+    match rendered.chars().find(|c| {
+        matches!(*c,
+            '\u{0000}'..='\u{001F}'
+            | '\u{007F}'
+            | '\u{0080}'..='\u{009F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}')
+    }) {
+        Some(c) => Err(format!(
+            "a rendered message carries the raw control character U+{:04X}: {rendered:?}",
+            c as u32
+        )),
+        None => Ok(()),
     }
 }
 
@@ -52,6 +83,15 @@ pub fn check_error_is_classified(e: &Error) -> Result<(), String> {
 /// `read_symlink_target` each raise [`Error::Corrupt`] when the payload runs
 /// short of the declared length, before an `Entry` is ever handed back. The
 /// check is not skipped; it has already happened.
+///
+/// A **`Hardlink`** is exempt for a different reason, stated by
+/// [`EntryKind::Hardlink`] itself: its reader yields no bytes while
+/// `EntryMeta::size` carries the SHARED content's size (cpio's data-last
+/// group reports every name at the group's size; the name that holds the
+/// bytes is the target). Declared 14, produced 0, by design. The fuzz
+/// `container` target aborted on the first newc link-group seed for exactly
+/// this until the exemption existed (0.10.0 Task 10). The link's bytes are
+/// checked where they are read: on the target entry.
 ///
 /// Every other kind stays in scope, `Dir` and `Other` included: a directory
 /// entry declares zero and delivers zero, and an entry that cannot say what
@@ -85,7 +125,7 @@ pub fn check_entry_size(
     name: &str,
     kind: &EntryKind,
 ) -> Result<(), String> {
-    if matches!(kind, EntryKind::Symlink { .. }) {
+    if matches!(kind, EntryKind::Symlink { .. } | EntryKind::Hardlink { .. }) {
         return Ok(());
     }
     match declared {
@@ -521,6 +561,70 @@ mod broken_honesty {
             entry: "secret".into(),
         });
         assert!(check_entries_carried(&names(&["secret"]), &[], &encrypted).is_ok());
+    }
+
+    #[test]
+    fn a_hardlink_declaring_the_shared_size_but_reading_empty_is_permitted() {
+        // Over-strictness guard: the oracle must not fire on a cpio group's
+        // links, whose size is the shared content's and whose reader is empty.
+        let link = EntryKind::Hardlink {
+            target: "grp/c".into(),
+        };
+        assert!(check_entry_size(Some(14), 0, "grp/a", &link).is_ok());
+        // ... while a plain file declaring 14 and producing 0 is still refused.
+        assert!(check_entry_size(Some(14), 0, "grp/a", &EntryKind::File).is_err());
+    }
+
+    #[test]
+    fn a_rendered_message_with_a_raw_escape_fails() {
+        for raw in [
+            "bad \u{1b}[31m name",
+            "nul\0",
+            "del\u{7f}",
+            "c1\u{85}",
+            "rtl \u{202e}gpj",
+            "iso \u{2066}",
+        ] {
+            let msg =
+                check_display_has_no_raw_controls(raw).expect_err("a raw control must be refused");
+            assert!(msg.contains("U+"), "must name the codepoint: {msg}");
+        }
+        let msg = check_display_has_no_raw_controls("a\u{202e}b").unwrap_err();
+        assert!(msg.contains("U+202E"), "{msg}");
+    }
+
+    #[test]
+    fn an_escaped_rendering_passes() {
+        assert!(check_display_has_no_raw_controls("plain name.txt").is_ok());
+        assert!(check_display_has_no_raw_controls("caf\u{e9} \u{4e2d}\u{6587}").is_ok());
+        assert!(check_display_has_no_raw_controls("esc \\x1b and \\u{202e}").is_ok());
+        let e = Error::Corrupt("bad \u{1b}[31m \0 \u{202e}name".into());
+        assert!(check_display_has_no_raw_controls(&e.to_string()).is_ok());
+        assert!(
+            check_display_has_no_raw_controls("U+0041 and \u{a0}\u{2028}").is_ok(),
+            "only the classes fmt_name escapes are refused"
+        );
+    }
+
+    #[test]
+    fn a_hardlink_is_carried_as_a_link_a_copy_or_a_named_skip() {
+        // Over a name-keyed oracle the link's NAME is what is carried, whether
+        // the output holds it as a link entry or as a file copy; the output
+        // list cannot tell them apart and must not need to.
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let clean = FidelityReport::new(Rung::Exact);
+        assert!(
+            check_entries_carried(&names(&["a", "link"]), &names(&["a", "link"]), &clean).is_ok()
+        );
+        let mut skipped = FidelityReport::new(Rung::Exact);
+        skipped.warn(Fidelity::EntrySkipped {
+            entry: "link".into(),
+            reason: "hard link target `a` was not written".into(),
+        });
+        assert!(check_entries_carried(&names(&["a", "link"]), &names(&["a"]), &skipped).is_ok());
+        let msg = check_entries_carried(&names(&["a", "link"]), &names(&["a"]), &clean)
+            .expect_err("a silently missing link must fail");
+        assert!(msg.contains("\"link\""), "{msg}");
     }
 
     #[test]

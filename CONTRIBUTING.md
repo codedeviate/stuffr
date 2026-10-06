@@ -669,7 +669,17 @@ same way a vacuous conformance property would be.
   or is named by a skip warning in the conversion's report — by name, never
   by count. `STUFFR_FUZZ_CONVERT_TRACE=1` prints one `convert-trace` line
   per input that reached it. Its first run found tar's writer truncating a
-  name at a NUL, which is why `ContainerCaps::nul_in_names` exists.
+  name at a NUL, which is why `ContainerCaps::nul_in_names` exists. A
+  `Hardlink` is carried by its name too, whether the output holds it as a
+  link, as a copy of the target, or names it in a skip warning.
+- **`check_display_has_no_raw_controls`** (0.10.0) is the seventh: no
+  rendered `Error` or `Fidelity` message contains a raw C0, DEL, C1 or bidi
+  override character (the classes `display::fmt_name` escapes). It is applied
+  to one message at a time, never to multi-line CLI output.
+  `check_error_is_classified` calls it on every error it is handed, so every
+  call site in every target carries it; the `container` target also applies it
+  to each fidelity warning. A failure is an escaping gap, not a reason to
+  loosen the check.
 
 `check_salvage_claim` refuses a status that claims more than the format or
 the scan supports. Since Salvage Stage 3 it takes the format's class of

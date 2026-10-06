@@ -911,6 +911,116 @@ fn writable_container_slots() -> Vec<(u8, &'static str)> {
         .collect()
 }
 
+/// One ustar header block (512 bytes) for a seed, with a correct checksum.
+fn seed_tar_header(name: &[u8], typeflag: u8, size: usize, linkname: &[u8]) -> [u8; 512] {
+    let mut h = [0u8; 512];
+    h[..name.len()].copy_from_slice(name);
+    h[100..108].copy_from_slice(b"0000644\0");
+    h[108..116].copy_from_slice(b"0001750\0");
+    h[116..124].copy_from_slice(b"0001750\0");
+    h[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    h[136..148].copy_from_slice(b"00000000000\0");
+    h[156] = typeflag;
+    h[157..157 + linkname.len()].copy_from_slice(linkname);
+    h[257..263].copy_from_slice(b"ustar\0");
+    h[263..265].copy_from_slice(b"00");
+    h[148..156].copy_from_slice(b"        ");
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    h
+}
+
+/// A tar member: header, then the payload zero-padded to 512.
+fn seed_tar_member(name: &[u8], typeflag: u8, linkname: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = seed_tar_header(name, typeflag, payload.len(), linkname).to_vec();
+    out.extend_from_slice(payload);
+    out.resize(out.len().next_multiple_of(512), 0);
+    out
+}
+
+/// A pax record `"<len> key=value\n"`, `len` counting itself.
+fn seed_pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+    let body = key.len() + 1 + value.len() + 1 + 1; // "key=" + value + "\n" + the space
+    let mut len = body + 1;
+    while len.to_string().len() + body != len {
+        len = body + len.to_string().len();
+    }
+    let mut r = format!("{len} {key}=").into_bytes();
+    r.extend_from_slice(value);
+    r.push(b'\n');
+    r
+}
+
+fn seed_tar_end(mut tar: Vec<u8>) -> Vec<u8> {
+    tar.extend_from_slice(&[0u8; 1024]);
+    tar
+}
+
+/// A tar with a file and two typeflag-`1` hard links, one whose target is
+/// longer than the 100-byte field and so rides in a pax `linkpath`.
+fn hardlink_tar_seed() -> Vec<u8> {
+    let long_target = format!("{}/file.txt", "d".repeat(120));
+    let mut tar = seed_tar_member(b"file.txt", b'0', b"", b"linked payload\n");
+    tar.extend(seed_tar_member(b"link-short", b'1', b"file.txt", b""));
+    let pax = seed_pax_record("linkpath", long_target.as_bytes());
+    tar.extend(seed_tar_member(b"PaxHeader", b'x', b"", &pax));
+    tar.extend(seed_tar_member(b"link-long", b'1', b"", b""));
+    seed_tar_end(tar)
+}
+
+/// A tar whose entry names carry ESC, U+202E and (through a pax `path`) NUL:
+/// the escape class `fmt_name` exists for.
+fn escaped_name_tar_seed() -> Vec<u8> {
+    let mut tar = seed_tar_member(
+        "esc\u{1b}[31m-\u{202e}gpj.txt".as_bytes(),
+        b'0',
+        b"",
+        b"x\n",
+    );
+    let pax = seed_pax_record("path", b"nul\0inside\x7f.txt");
+    tar.extend(seed_tar_member(b"PaxHeader", b'x', b"", &pax));
+    tar.extend(seed_tar_member(b"placeholder", b'0', b"", b"y\n"));
+    seed_tar_end(tar)
+}
+
+/// One newc cpio member (`070701`), name and data each padded to 4.
+fn seed_newc_member(name: &str, ino: u32, nlink: u32, data: &[u8]) -> Vec<u8> {
+    let namesize = name.len() + 1;
+    let mut out = format!(
+        "070701{ino:08X}{:08X}{:08X}{:08X}{nlink:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{namesize:08X}{:08X}",
+        0o100644, 1000, 1000, 0, data.len(), 0, 0, 0, 0, 0
+    )
+    .into_bytes();
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    out.resize(out.len().next_multiple_of(4), 0);
+    out.extend_from_slice(data);
+    out.resize(out.len().next_multiple_of(4), 0);
+    out
+}
+
+/// A newc cpio with a data-LAST three-name hard-link group (the first two
+/// names carry no bytes) and an all-empty two-name group.
+fn hardlink_cpio_seed() -> Vec<u8> {
+    let mut c = Vec::new();
+    c.extend(seed_newc_member("grp/a", 7, 3, b""));
+    c.extend(seed_newc_member("grp/b", 7, 3, b""));
+    c.extend(seed_newc_member("grp/c", 7, 3, b"group payload\n"));
+    c.extend(seed_newc_member("empty/a", 9, 2, b""));
+    c.extend(seed_newc_member("empty/b", 9, 2, b""));
+    c.extend(seed_newc_member("TRAILER!!!", 0, 1, b""));
+    c
+}
+
+/// Extra `container/` seeds beyond the per-slot pair: `(file stem, slot, bytes)`.
+fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
+    vec![
+        ("tar-hardlinks", "tar", hardlink_tar_seed()),
+        ("cpio-hardlinks", "cpio", hardlink_cpio_seed()),
+        ("tar-escaped-names", "tar", escaped_name_tar_seed()),
+    ]
+}
+
 /// Writes one seed corpus per fuzz target under `root/{codec,container,chain}`.
 pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     let codec_dir = root.join("codec");
@@ -1022,6 +1132,21 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
             let mut seed = vec![sel];
             seed.extend_from_slice(&bytes);
             std::fs::write(container_dir.join(format!("{name}-{tag}.seed")), &seed)?;
+            container_count += 1;
+        }
+    }
+
+    // Hard-link groups and escaped names (0.10.0): the shapes the convert
+    // oracle's link handling and the display check need to reach. Each is
+    // emitted seekable only, the one path `convert_oracle` runs on.
+    for (stem, slot, bytes) in extra_container_seeds() {
+        if let Some((selector, _)) = registered_container_slots()
+            .into_iter()
+            .find(|(_, n)| *n == slot)
+        {
+            let mut seed = vec![selector | 0x80];
+            seed.extend_from_slice(&bytes);
+            std::fs::write(container_dir.join(format!("{stem}.seed")), &seed)?;
             container_count += 1;
         }
     }
@@ -1369,7 +1494,11 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
     let counts = generate_corpus(dir.path()).unwrap();
 
     let expected_codec = registered_codec_slots().len();
-    let expected_container = registered_container_slots().len() * 2;
+    let expected_container = registered_container_slots().len() * 2
+        + extra_container_seeds()
+            .iter()
+            .filter(|(_, slot, _)| registered_container_slots().iter().any(|(_, n)| n == slot))
+            .count();
     let expected_chain = CHAIN_SHAPES.len();
     let expected_roundtrip = writable_codec_slots().len() + writable_container_slots().len();
     let expected_salvage = SALVAGE_SHAPES.len();
@@ -1400,6 +1529,53 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
              reported count of {got} — a seed was overwritten or misnamed"
         );
     }
+}
+
+/// The link and escape seeds are worth nothing unless they read as what they
+/// claim: a hard-link seed whose links parse as plain files exercises none of
+/// the link handling.
+#[test]
+fn the_link_and_escape_seeds_read_as_what_they_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let list = |stem: &str, ext: &str, bytes: Vec<u8>| {
+        let p = dir.path().join(format!("{stem}.{ext}"));
+        std::fs::write(&p, bytes).unwrap();
+        entries::list(Input::Path(p), 0, None).unwrap().0
+    };
+    let links = |metas: &[stuffr_core::EntryMeta]| {
+        metas
+            .iter()
+            .filter(|m| matches!(m.kind, stuffr_core::EntryKind::Hardlink { .. }))
+            .map(|m| m.name.clone())
+            .collect::<Vec<_>>()
+    };
+
+    let tar = list("t", "tar", hardlink_tar_seed());
+    assert_eq!(links(&tar), ["link-short", "link-long"], "{tar:?}");
+    let long = tar.iter().find(|m| m.name == "link-long").unwrap();
+    let stuffr_core::EntryKind::Hardlink { target } = &long.kind else {
+        unreachable!()
+    };
+    assert!(target.len() > 100, "the long target must outgrow the field");
+
+    let cpio = list("c", "cpio", hardlink_cpio_seed());
+    let names: Vec<_> = cpio.iter().map(|m| m.name.as_str()).collect();
+    assert!(
+        names.contains(&"grp/c") && names.contains(&"empty/b"),
+        "{names:?}"
+    );
+    assert!(
+        cpio.len() >= 3,
+        "the groups must enumerate as several entries: {names:?}"
+    );
+
+    let esc = list("e", "tar", escaped_name_tar_seed());
+    assert!(
+        esc.iter()
+            .any(|m| m.name.contains('\u{1b}') && m.name.contains('\u{202e}')),
+        "{esc:?}"
+    );
+    assert!(esc.iter().any(|m| m.name.contains('\0')), "{esc:?}");
 }
 
 /// Writes the REAL seed corpus the fuzz targets read from, under
