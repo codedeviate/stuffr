@@ -294,7 +294,7 @@ pub struct ContainerCaps {
     /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`;
     /// every registered container states it explicitly.
     pub unique_names: bool,
-    /// An entry name containing a NUL byte is stored, and read back, whole.
+    /// An entry name containing a NUL byte is stored whole by the writer.
     ///
     /// `false` for a format whose name field is NUL-terminated or
     /// NUL-padded — tar's ustar field and GNU `L` payload, cpio newc's
@@ -305,7 +305,11 @@ pub struct ContainerCaps {
     /// convert`, whose source can legitimately carry one (an ar or zip
     /// member name), reads this to skip the entry with a warning instead
     /// (`plan_entry_write`). `pack` never meets one: an OS path cannot hold
-    /// a NUL. `true` for zip and LHA, whose names are length-prefixed.
+    /// a NUL. `true` for zip and LHA, whose names are length-prefixed, so
+    /// the writer stores a NUL exactly as given. zip reads it back whole;
+    /// stuffr's LHA reader renders it `%00`, as it does every byte outside
+    /// printable ASCII (`lha_name_from_parts`): the byte is in the archive,
+    /// and only stuffr's rendering of it differs.
     ///
     /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`,
     /// the safe answer for a container that has not been audited; every
