@@ -257,6 +257,9 @@ impl Container for Tar {
             // dispatches to it, and a test there pins this flag to that arm.
             // A repeated name is appended like any other entry.
             unique_names: false,
+            // ustar's name field and the GNU `L` payload are both NUL-terminated:
+            // a NUL in a name would end it there. `add` refuses one.
+            nul_in_names: false,
             salvage: true,
             ..Default::default()
         }
@@ -1147,6 +1150,14 @@ impl TarWrite {
 
 impl ArchiveWrite for TarWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        // Before anything is written, as ARJ does: both the ustar field and
+        // the GNU `L` payload are NUL-terminated, so a NUL would END the name
+        // (or link target) there and store the entry under a shorter one
+        // (`ContainerCaps::nul_in_names`). Refused rather than truncated.
+        refuse_nul("name", &meta.name)?;
+        if let EntryKind::Symlink { target } = &meta.kind {
+            refuse_nul("link target", target)?;
+        }
         let builder = self.builder()?;
 
         // GNU headers so long names and large sizes work without the caller
@@ -1323,6 +1334,20 @@ fn header_field(header: &mut tar::Header, field: Field) -> &mut [u8] {
     }
 }
 
+/// Refuses a `what` (name or link target) containing a NUL byte, which every
+/// field tar stores it in would end at. [`Error::Unsupported`] (exit 3), the
+/// variant ARJ's and LHA's writers use for a name their format cannot store.
+fn refuse_nul(what: &str, value: &str) -> Result<()> {
+    if value.as_bytes().contains(&0) {
+        return Err(Error::Unsupported(format!(
+            "tar cannot store `{}`: its {what} contains a NUL byte, and tar stores \
+             names NUL-terminated",
+            value.escape_debug()
+        )));
+    }
+    Ok(())
+}
+
 /// Copies as much of `value` as fits into `slot`, NUL-padding the rest.
 fn fill(slot: &mut [u8], value: &[u8]) {
     let n = value.len().min(slot.len());
@@ -1380,6 +1405,50 @@ mod tests {
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
+    }
+
+    /// ustar's name field and the GNU `L` payload are both NUL-terminated,
+    /// so a NUL would END the name (or link target) there and store the
+    /// entry under a shorter one — what `stuffr convert` did, silently, to
+    /// an ar member before Phase 5a Task 6's oracle caught it. The long name
+    /// takes the GNU `L` route; the symlink's TARGET is the linkname field.
+    #[test]
+    fn a_name_containing_a_nul_is_refused_rather_than_truncated() {
+        let mut metas: Vec<EntryMeta> =
+            vec!["a\0b".to_string(), format!("{}\0tail", "d/".repeat(60))]
+                .into_iter()
+                .map(EntryMeta::file)
+                .collect();
+        metas.push(EntryMeta {
+            kind: EntryKind::Symlink {
+                target: "t\0x".into(),
+            },
+            ..EntryMeta::file("link")
+        });
+        for mut meta in metas {
+            meta.size = Some(1);
+            let buf = SharedBuf::new();
+            let mut w = Tar
+                .create(
+                    PlainSink::new(Box::new(buf.clone())),
+                    &CreateOpts::default(),
+                )
+                .expect("create");
+            let err = w
+                .add(&meta, &mut std::io::Cursor::new(b"x"))
+                .expect_err("a NUL must be refused, never truncated");
+            assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+            assert_eq!(err.exit_code(), 3);
+            assert!(
+                err.to_string().contains("NUL"),
+                "the refusal must say what about the name it cannot store: {err}"
+            );
+            assert!(
+                buf.contents().is_empty(),
+                "refused before a byte was written"
+            );
+        }
+        assert!(!Tar.caps().nul_in_names);
     }
 
     /// Reads every entry back through the ladder over a NON-seekable source,

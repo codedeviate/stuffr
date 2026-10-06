@@ -276,6 +276,11 @@ impl Container for Ar {
             // dispatches to it, and a test there pins this flag to that arm.
             // A repeated name is appended like any other entry.
             unique_names: false,
+            // A BSD `#1/N` name is NUL-padded and the reader strips EVERY
+            // trailing NUL, so `a/b\0` comes back `a/b` — measured. An
+            // interior NUL survives, but a cap that holds some NULs is not
+            // one a caller can plan on. `add` refuses one.
+            nul_in_names: false,
             salvage: true,
             ..Default::default()
         }
@@ -1193,6 +1198,17 @@ impl ArWrite {
 
 impl ArchiveWrite for ArWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        // A BSD `#1/N` name is NUL-padded and read back with EVERY trailing
+        // NUL stripped (see `write_safe_identifier`), so `a/b\0` would come
+        // back `a/b` (`ContainerCaps::nul_in_names`). Refused, as ARJ
+        // refuses it, before anything is written.
+        if meta.name.as_bytes().contains(&0) {
+            return Err(Error::Unsupported(format!(
+                "ar cannot store `{}`: its name contains a NUL byte, and ar's extended \
+                 name form is NUL-padded",
+                meta.name.escape_debug()
+            )));
+        }
         // `ar` needs the size up front and cannot stream an unknown length,
         // so an entry of unknown size is buffered. Stated rather than
         // hidden: this is the one container here that cannot stream its
@@ -1336,6 +1352,45 @@ mod tests {
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
+    }
+
+    /// A BSD `#1/N` name is NUL-padded and read back with every trailing
+    /// NUL stripped, so `a/b\0` and a long name ending in NUL came back
+    /// shorter — measured before this refusal.
+    #[test]
+    fn a_name_containing_a_nul_is_refused_rather_than_truncated() {
+        let metas: Vec<EntryMeta> = vec![
+            "a\0b".to_string(),
+            "a/b\0".to_string(),
+            format!("{}\0", "x".repeat(20)),
+        ]
+        .into_iter()
+        .map(EntryMeta::file)
+        .collect();
+        for mut meta in metas {
+            meta.size = Some(1);
+            let buf = SharedBuf::new();
+            let mut w = Ar
+                .create(
+                    PlainSink::new(Box::new(buf.clone())),
+                    &CreateOpts::default(),
+                )
+                .expect("create");
+            let err = w
+                .add(&meta, &mut std::io::Cursor::new(b"x"))
+                .expect_err("a NUL must be refused, never truncated");
+            assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+            assert_eq!(err.exit_code(), 3);
+            assert!(
+                err.to_string().contains("NUL"),
+                "the refusal must say what about the name it cannot store: {err}"
+            );
+            assert!(
+                buf.contents().is_empty(),
+                "refused before a byte was written"
+            );
+        }
+        assert!(!Ar.caps().nul_in_names);
     }
 
     fn open(bytes: &[u8]) -> Box<dyn ArchiveRead> {

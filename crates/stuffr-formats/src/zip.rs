@@ -270,6 +270,8 @@ impl Container for Zip {
             // dispatches to it, and a test there pins this flag to that arm.
             // `zip` 8.6.0's writer refuses `Duplicate filename`.
             unique_names: true,
+            // The name is a length-prefixed field: a NUL round-trips — measured.
+            nul_in_names: true,
             salvage: true,
             ..Default::default()
         }

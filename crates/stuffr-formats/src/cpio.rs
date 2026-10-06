@@ -229,6 +229,9 @@ impl Container for CpioNewc {
             // dispatches to it, and a test there pins this flag to that arm.
             // A repeated name is appended like any other entry.
             unique_names: false,
+            // newc stores the name NUL-terminated (`c_namesize` counts the NUL):
+            // a trailing NUL is lost on read. `add` refuses one.
+            nul_in_names: false,
             salvage: true,
             ..Default::default()
         }
@@ -805,6 +808,17 @@ struct CpioWrite {
 
 impl ArchiveWrite for CpioWrite {
     fn add(&mut self, meta: &EntryMeta, data: &mut dyn Read) -> Result<()> {
+        // newc stores the name NUL-terminated (`c_namesize` counts the NUL),
+        // and the reader trims trailing NULs: `c\0` would come back `c`
+        // (`ContainerCaps::nul_in_names`). Refused, as ARJ refuses it,
+        // before anything is written.
+        if meta.name.as_bytes().contains(&0) {
+            return Err(Error::Unsupported(format!(
+                "cpio newc cannot store `{}`: its name contains a NUL byte, and newc \
+                 stores names NUL-terminated",
+                meta.name.escape_debug()
+            )));
+        }
         // A symlink's target IS its payload here — see the module doc's
         // "Symlinks" section — so `data` is not consumed for one, the same
         // "the caller's data reader is irrelevant for this kind" contract
@@ -962,6 +976,40 @@ mod tests {
         }
         w.finish().expect("finish").finish().expect("finish sink");
         buf.contents()
+    }
+
+    /// newc stores the name NUL-terminated and its reader trims trailing
+    /// NULs, so `c\0` came back `c` — measured before this refusal.
+    #[test]
+    fn a_name_containing_a_nul_is_refused_rather_than_truncated() {
+        let metas: Vec<EntryMeta> = vec!["a\0b".to_string(), "c\0".to_string()]
+            .into_iter()
+            .map(EntryMeta::file)
+            .collect();
+        for mut meta in metas {
+            meta.size = Some(1);
+            let buf = SharedBuf::new();
+            let mut w = CpioNewc
+                .create(
+                    PlainSink::new(Box::new(buf.clone())),
+                    &CreateOpts::default(),
+                )
+                .expect("create");
+            let err = w
+                .add(&meta, &mut std::io::Cursor::new(b"x"))
+                .expect_err("a NUL must be refused, never truncated");
+            assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+            assert_eq!(err.exit_code(), 3);
+            assert!(
+                err.to_string().contains("NUL"),
+                "the refusal must say what about the name it cannot store: {err}"
+            );
+            assert!(
+                buf.contents().is_empty(),
+                "refused before a byte was written"
+            );
+        }
+        assert!(!CpioNewc.caps().nul_in_names);
     }
 
     fn open(bytes: &[u8]) -> Box<dyn ArchiveRead> {

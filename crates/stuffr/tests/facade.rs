@@ -177,3 +177,41 @@ fn no_selector_slot_is_listed_twice() {
         }
     }
 }
+
+/// `ContainerCaps::nul_in_names`, written out per container as literals: the
+/// flag decides whether `stuffr convert` writes an entry or skips it with a
+/// warning, so a container that inherits `false` from a constructor by
+/// accident, or claims `true` for a NUL-terminated field, changes what a
+/// conversion keeps. Every registered container must appear here; the
+/// per-writer audit behind each answer is in the container's own `caps()`.
+#[test]
+fn every_container_states_whether_its_names_can_hold_a_nul() {
+    let expected: &[(&str, bool)] = &[
+        ("tar", false),
+        ("cpio", false),
+        ("ar", false),
+        ("arj", false),
+        ("arc", false),
+        ("zoo", false),
+        ("zip", true),
+        ("lha", true),
+    ];
+    let registry = stuffr::registry();
+    for row in registry.matrix() {
+        if row.kind != FormatKind::Container {
+            continue;
+        }
+        let name = row.id.as_str();
+        let want = expected
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("container {name:?} is missing from this table"))
+            .1;
+        let got = registry
+            .container(row.id)
+            .expect("registered")
+            .caps()
+            .nul_in_names;
+        assert_eq!(got, want, "{name}: nul_in_names");
+    }
+}

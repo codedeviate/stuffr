@@ -240,6 +240,10 @@ impl Container for Lha {
             // dispatches to it, and a test there pins this flag to that arm.
             // A repeated name is appended like any other entry.
             unique_names: false,
+            // A level-1 header's name has a length byte, so a NUL is stored as
+            // given; the reader renders it `%00`, as it does every byte outside
+            // printable ASCII (`lha_name_from_parts`).
+            nul_in_names: true,
             salvage: true,
             ..ContainerCaps::read_write()
         }

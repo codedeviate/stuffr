@@ -294,6 +294,23 @@ pub struct ContainerCaps {
     /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`;
     /// every registered container states it explicitly.
     pub unique_names: bool,
+    /// An entry name containing a NUL byte is stored, and read back, whole.
+    ///
+    /// `false` for a format whose name field is NUL-terminated or
+    /// NUL-padded — tar's ustar field and GNU `L` payload, cpio newc's
+    /// `c_namesize` name, ar's BSD `#1/N` name (its trailing NULs are
+    /// stripped on read), ARJ's header string, ARC's and ZOO's fixed fields
+    /// — where the name would otherwise come back shorter than it went in.
+    /// Every such writer refuses the name itself (a backstop); `stuffr
+    /// convert`, whose source can legitimately carry one (an ar or zip
+    /// member name), reads this to skip the entry with a warning instead
+    /// (`plan_entry_write`). `pack` never meets one: an OS path cannot hold
+    /// a NUL. `true` for zip and LHA, whose names are length-prefixed.
+    ///
+    /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`,
+    /// the safe answer for a container that has not been audited; every
+    /// registered container states it explicitly.
+    pub nul_in_names: bool,
 }
 
 /// A magic-byte rule. Detection matches these against a bounded prefix.
@@ -373,6 +390,7 @@ impl ContainerCaps {
             detects_corruption: CorruptionDetection::Never,
             salvage: false,
             unique_names: false,
+            nul_in_names: false,
         }
     }
 
