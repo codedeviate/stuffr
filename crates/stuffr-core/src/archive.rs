@@ -103,8 +103,9 @@ impl std::fmt::Debug for CreateOpts {
     }
 }
 
-/// Phase 2 adds `Hardlink`, `CharDevice`, `BlockDevice`, `Fifo` and `Socket`
-/// for tar and cpio; `#[non_exhaustive]` keeps that from breaking downstream
+/// What an entry is. `Hardlink` is the same content as an EARLIER entry; a
+/// later phase adds `CharDevice`, `BlockDevice`, `Fifo` and `Socket` for tar
+/// and cpio, and `#[non_exhaustive]` keeps that from breaking downstream
 /// matches. Struct types deliberately do NOT carry this attribute — see the
 /// `#[non_exhaustive]` section of CONTRIBUTING.md.
 #[non_exhaustive]
@@ -114,6 +115,16 @@ pub enum EntryKind {
     File,
     Dir,
     Symlink {
+        target: String,
+    },
+    /// The same content as the EARLIER entry named `target`, in the
+    /// archive's own name space (exactly the `EntryMeta::name` that entry
+    /// carried, before any destination join).
+    ///
+    /// A `Hardlink` entry's own reader yields no bytes, and `meta.size` is
+    /// the shared content's size when the reader knows it, else `None`.
+    /// Consumers never read a link's payload; they take it from the target.
+    Hardlink {
         target: String,
     },
     Other,
@@ -160,11 +171,32 @@ impl EntryMeta {
 pub struct Entry<'a> {
     meta: EntryMeta,
     reader: Box<dyn Read + 'a>,
+    announces_links: bool,
 }
 
 impl<'a> Entry<'a> {
     pub fn new(meta: EntryMeta, reader: Box<dyn Read + 'a>) -> Self {
-        Self { meta, reader }
+        Self {
+            meta,
+            reader,
+            announces_links: false,
+        }
+    }
+
+    /// Marks this entry as one the reader KNOWS later entries in the same
+    /// archive are hard links to (cpio reads `nlink`; tar cannot know, so it
+    /// never sets this). A hint for consumers that keep payloads for later
+    /// links; never a promise that a link follows.
+    #[must_use]
+    pub fn announce_links(mut self) -> Self {
+        self.announces_links = true;
+        self
+    }
+
+    /// Whether the reader announced later hard links to this entry; see
+    /// [`Self::announce_links`]. `false` unless a reader set it.
+    pub fn announces_links(&self) -> bool {
+        self.announces_links
     }
 
     pub fn meta(&self) -> &EntryMeta {
@@ -336,6 +368,14 @@ pub trait ArchiveWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_entry_announces_links_only_when_its_reader_says_so() {
+        let plain = Entry::new(EntryMeta::default(), Box::new(std::io::empty()));
+        assert!(!plain.announces_links());
+        let marked = Entry::new(EntryMeta::default(), Box::new(std::io::empty())).announce_links();
+        assert!(marked.announces_links());
+    }
 
     #[test]
     fn a_plain_sink_flushes_its_destination_on_finish() {

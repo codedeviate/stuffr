@@ -266,6 +266,8 @@ impl Container for Tar {
             // The header's uid and gid fields, which `add` fills from the
             // entry's meta.
             stores_ownership: true,
+            // typeflag `1` is a link entry the writer can emit.
+            stores_hardlinks: true,
             salvage: true,
             ..Default::default()
         }

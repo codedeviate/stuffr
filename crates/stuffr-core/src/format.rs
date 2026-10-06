@@ -347,6 +347,18 @@ pub struct ContainerCaps {
     /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`;
     /// every registered container states it explicitly.
     pub stores_ownership: bool,
+    /// The container's WRITER can store an [`crate::EntryKind::Hardlink`] as
+    /// a link, rather than only as a second copy of the bytes.
+    ///
+    /// `true` for tar alone (typeflag `1`). `false` for cpio, whose writer
+    /// writes `ino=0, nlink=1` for every entry, so a real cpio link would
+    /// first need a unique inode per file; and for zip, ar, LHA, ARJ, ARC and
+    /// ZOO, which have no link concept at all. Read by `plan_entry_write`,
+    /// the one owner of what a target cannot hold.
+    ///
+    /// `false` via [`Self::read_only`], [`Self::read_write`] and `Default`;
+    /// every registered container states it explicitly.
+    pub stores_hardlinks: bool,
 }
 
 /// A magic-byte rule. Detection matches these against a bounded prefix.
@@ -429,6 +441,7 @@ impl ContainerCaps {
             nul_in_names: false,
             nul_in_link_targets: false,
             stores_ownership: false,
+            stores_hardlinks: false,
         }
     }
 

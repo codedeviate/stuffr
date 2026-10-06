@@ -2063,6 +2063,7 @@ fn entry_kind_str(kind: &stuffr::EntryKind) -> &'static str {
         stuffr::EntryKind::File => "file",
         stuffr::EntryKind::Dir => "dir",
         stuffr::EntryKind::Symlink { .. } => "symlink",
+        stuffr::EntryKind::Hardlink { .. } => "hardlink",
         stuffr::EntryKind::Other => "other",
         _ => "other",
     }

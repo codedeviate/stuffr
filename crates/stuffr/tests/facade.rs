@@ -334,3 +334,41 @@ fn stores_ownership_agrees_with_what_each_writer_reads_back() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `ContainerCaps::stores_hardlinks`, pinned the same way: whether the
+/// container's WRITER can store an `EntryKind::Hardlink` as a link.
+/// `plan_entry_write` reads it to decide link vs skip, so a container that
+/// inherits `false` by accident silently loses links, and one that claims
+/// `true` without a writer path would drop or corrupt them. Only tar's writer
+/// has a link entry; stuffr's cpio writer writes `ino=0, nlink=1`.
+#[test]
+fn every_container_states_whether_it_stores_hard_links() {
+    let expected: &[(&str, bool)] = &[
+        ("tar", true),
+        ("cpio", false),
+        ("ar", false),
+        ("zip", false),
+        ("lha", false),
+        ("arj", false),
+        ("arc", false),
+        ("zoo", false),
+    ];
+    let registry = stuffr::registry();
+    for row in registry.matrix() {
+        if row.kind != FormatKind::Container {
+            continue;
+        }
+        let name = row.id.as_str();
+        let want = expected
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("container {name:?} is missing from this table"))
+            .1;
+        let got = registry
+            .container(row.id)
+            .expect("registered")
+            .caps()
+            .stores_hardlinks;
+        assert_eq!(got, want, "{name}: stores_hardlinks");
+    }
+}

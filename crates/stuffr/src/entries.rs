@@ -4072,6 +4072,16 @@ fn plan_entry_write(
             });
             WritePlan::Skip
         }
+        EntryKind::Hardlink { .. } if caps.stores_hardlinks => WritePlan::Write,
+        // Until convert can copy a link's target (Task 9), a target that
+        // cannot store a link skips it, as 0.9.0 did for every tar link.
+        EntryKind::Hardlink { .. } => {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: meta.name.clone(),
+                reason: special_entry_reason("stored"),
+            });
+            WritePlan::Skip
+        }
         EntryKind::Other => {
             warnings.push(Fidelity::EntrySkipped {
                 entry: meta.name.clone(),
@@ -5396,6 +5406,39 @@ mod tests {
         let mut w = Vec::new();
         assert!(matches!(
             plan_entry_write(&all, FormatId::new("x"), &other, &mut w),
+            WritePlan::Skip
+        ));
+        assert_eq!(w.len(), 1);
+        assert_eq!(
+            w[0].to_string(),
+            "skipped entry `proj/notes.txt`: device nodes, fifos, sockets and \
+             hardlinks are not stored"
+        );
+    }
+
+    /// A hard link is written as a link only by a container whose caps say
+    /// `stores_hardlinks`; any other target skips it, with `unpack`'s
+    /// special-file wording until convert can copy the target's bytes.
+    #[test]
+    fn plan_entry_write_stores_a_hardlink_only_where_caps_allow() {
+        let link = EntryMeta {
+            kind: EntryKind::Hardlink {
+                target: "proj/a.txt".into(),
+            },
+            ..meta_with(Some(1), Some(1))
+        };
+        let can = ContainerCaps {
+            stores_hardlinks: true,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&can, FormatId::new("x"), &link, &mut w),
+            WritePlan::Write
+        ));
+        assert!(w.is_empty());
+        assert!(matches!(
+            plan_entry_write(&ContainerCaps::default(), FormatId::new("x"), &link, &mut w),
             WritePlan::Skip
         ));
         assert_eq!(w.len(), 1);

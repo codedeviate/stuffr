@@ -278,6 +278,8 @@ impl Container for Zip {
             // No owner field outside the Info-ZIP extra fields, which the
             // writer does not emit (and the reader reports `uid: None`).
             stores_ownership: false,
+            // No link concept in the format.
+            stores_hardlinks: false,
             salvage: true,
             ..Default::default()
         }

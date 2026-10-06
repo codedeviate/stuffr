@@ -314,6 +314,8 @@ impl Container for Arc {
             nul_in_link_targets: false,
             // Read-only, and the format has no owner field.
             stores_ownership: false,
+            // Read-only, and the format has no hard-link concept.
+            stores_hardlinks: false,
             salvage: true,
             ..ContainerCaps::read_only()
         }

@@ -250,6 +250,8 @@ impl Container for Lha {
             // The writer emits no UNIX-owner extension header, and the
             // reader reports `uid: None`.
             stores_ownership: false,
+            // No hard-link concept in the format.
+            stores_hardlinks: false,
             salvage: true,
             ..ContainerCaps::read_write()
         }

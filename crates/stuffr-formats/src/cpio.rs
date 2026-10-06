@@ -237,6 +237,8 @@ impl Container for CpioNewc {
             nul_in_link_targets: true,
             // newc's `c_uid`/`c_gid`, which `add` fills from the entry's meta.
             stores_ownership: true,
+            // The writer writes `ino=0, nlink=1`, so it has no link to store.
+            stores_hardlinks: false,
             salvage: true,
             ..Default::default()
         }

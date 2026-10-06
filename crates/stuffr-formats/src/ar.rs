@@ -303,6 +303,8 @@ impl Container for Ar {
             // The member header's uid and gid fields, which `add` fills from
             // the entry's meta.
             stores_ownership: true,
+            // No link concept: every member is a named blob.
+            stores_hardlinks: false,
             salvage: true,
             ..Default::default()
         }
