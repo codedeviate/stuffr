@@ -1463,7 +1463,7 @@ impl ArchiveWrite for ArjWrite {
             return Err(Error::Unsupported(format!(
                 "ARJ cannot store `{}`: its name contains a NUL byte, and ARJ stores names \
                  null-terminated",
-                meta.name.escape_debug()
+                stuffr_core::fmt_name(&meta.name)
             )));
         }
         let name = meta.name.as_bytes();

@@ -10,6 +10,7 @@ pub mod conformance;
 #[cfg(feature = "testing")]
 mod container_conformance;
 pub mod containment;
+mod display;
 pub mod error;
 pub mod fidelity;
 pub mod format;
@@ -30,6 +31,7 @@ pub use archive::{
     EntryKind, EntryMeta, OpenOpts, PlainSink, Sink,
 };
 pub use containment::{check_symlink_target, safe_join};
+pub use display::fmt_name;
 pub use error::{Error, Result};
 pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};
 pub use format::{

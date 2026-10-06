@@ -1,3 +1,4 @@
+use crate::display::fmt_name;
 use crate::format::FormatId;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -42,13 +43,13 @@ pub enum Error {
     #[error("archive is corrupt: {0}")]
     Corrupt(String),
 
-    #[error("unsafe entry path `{path}` refused: {reason}")]
+    #[error("unsafe entry path `{}` refused: {reason}", fmt_name(.path))]
     UnsafePath { path: String, reason: &'static str },
 
     #[error("fidelity degraded under strict mode: {0} warning(s)")]
     FidelityDegraded(usize),
 
-    #[error("entry `{0}` not found")]
+    #[error("entry `{}` not found", fmt_name(.0))]
     EntryNotFound(String),
 
     #[error("unsupported: {0}")]
@@ -342,6 +343,22 @@ impl From<std::io::Error> for Error {
 mod tests {
     use super::*;
     use crate::format::FormatId;
+
+    #[test]
+    fn entry_names_in_error_messages_are_escaped() {
+        let all = [
+            Error::EntryNotFound("a\x1bb".into()),
+            Error::UnsafePath {
+                path: "a\x1bb".into(),
+                reason: "r",
+            },
+        ];
+        for e in all {
+            let m = e.to_string();
+            assert!(m.contains("a\\x1bb"), "{m}");
+            assert!(!m.contains('\x1b'), "{m:?}");
+        }
+    }
 
     #[test]
     fn exit_codes_match_the_spec_table() {

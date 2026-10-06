@@ -1,5 +1,6 @@
 use std::fmt;
 
+use crate::display::fmt_name;
 use crate::format::FormatId;
 
 /// Which rung of the adaptive stream ladder a read landed on.
@@ -97,7 +98,7 @@ pub enum Fidelity {
     )]
     TrailingIndexUnread { format: FormatId },
 
-    #[error("size of entry `{entry}` was only known after its data (data descriptor)")]
+    #[error("size of entry `{}` was only known after its data (data descriptor)", fmt_name(.entry))]
     SizeFromDataDescriptor { entry: String },
 
     #[error("total entry count is unknown without the trailing index")]
@@ -142,13 +143,13 @@ pub enum Fidelity {
         reason: String,
     },
 
-    #[error("entry `{entry}` is missing metadata: {}", fields.missing().join(", "))]
+    #[error("entry `{}` is missing metadata: {}", fmt_name(.entry), fields.missing().join(", "))]
     MetadataIncomplete { entry: String, fields: MetaFields },
 
     #[error("decoded a solid block, wasting {wasted_bytes} bytes, to reach the requested entry")]
     SolidBlockFullyDecoded { wasted_bytes: u64 },
 
-    #[error("skipped encrypted entry `{entry}`")]
+    #[error("skipped encrypted entry `{}`", fmt_name(.entry))]
     EncryptedEntrySkipped { entry: String },
 
     /// An entry this build cannot materialise, named along with why.
@@ -169,7 +170,7 @@ pub enum Fidelity {
     /// container's own name, the undecodable bytes — and a reason that cannot
     /// name the particular thing that went wrong is a reason the user cannot
     /// act on.
-    #[error("skipped entry `{entry}`: {reason}")]
+    #[error("skipped entry `{}`: {reason}", fmt_name(.entry))]
     EntrySkipped { entry: String, reason: String },
 
     /// A file that changed length between the moment its size was recorded
@@ -190,8 +191,9 @@ pub enum Fidelity {
     /// `--strict-fidelity` still refuses on it, which is the half of the
     /// bargain that keeps it honest.
     #[error(
-        "entry `{entry}` changed size while it was being read: its header declares \
-         {declared} bytes, {fixup}"
+        "entry `{}` changed size while it was being read: its header declares \
+         {declared} bytes, {fixup}",
+        fmt_name(.entry)
     )]
     EntrySizeChanged {
         entry: String,
@@ -325,6 +327,33 @@ impl Default for FidelityReport {
 mod tests {
     use super::*;
     use crate::format::FormatId;
+
+    #[test]
+    fn entry_names_in_fidelity_messages_are_escaped() {
+        let n = || String::from("a\x1bb");
+        let all = [
+            Fidelity::SizeFromDataDescriptor { entry: n() },
+            Fidelity::MetadataIncomplete {
+                entry: n(),
+                fields: MetaFields::default(),
+            },
+            Fidelity::EncryptedEntrySkipped { entry: n() },
+            Fidelity::EntrySkipped {
+                entry: n(),
+                reason: "r".into(),
+            },
+            Fidelity::EntrySizeChanged {
+                entry: n(),
+                declared: 1,
+                fixup: "f".into(),
+            },
+        ];
+        for f in all {
+            let m = f.to_string();
+            assert!(m.contains("a\\x1bb"), "{m}");
+            assert!(!m.contains('\x1b'), "{m:?}");
+        }
+    }
 
     #[test]
     fn spilled_is_authoritative_even_though_it_is_a_lower_rung() {

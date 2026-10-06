@@ -14092,7 +14092,7 @@ fn convert_skips_a_name_with_a_nul_its_target_cannot_store() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     let err = stderr_text(&out);
     assert!(
-        err.contains("skipped entry `a\0bc.txt`") && err.contains("NUL"),
+        err.contains("skipped entry `a\\0bc.txt`") && err.contains("NUL"),
         "the warning names the entry and why: {err}"
     );
     let back = dir.join("back");

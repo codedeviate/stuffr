@@ -1325,7 +1325,7 @@ impl ArchiveWrite for ArWrite {
             return Err(Error::Unsupported(format!(
                 "ar cannot store `{}`: its name contains a NUL byte, and ar's extended \
                  name form is NUL-padded",
-                meta.name.escape_debug()
+                stuffr_core::fmt_name(&meta.name)
             )));
         }
         // `ar` needs the size up front and cannot stream an unknown length,

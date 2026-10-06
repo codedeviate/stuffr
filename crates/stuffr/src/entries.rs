@@ -5242,7 +5242,7 @@ mod tests {
         // The reason, verbatim: what `stuffr convert` prints for it.
         assert_eq!(
             w[0].to_string(),
-            "skipped entry `a\0b`: its name contains a NUL byte, and `tar` stores \
+            "skipped entry `a\\0b`: its name contains a NUL byte, and `tar` stores \
              names NUL-terminated, so the name would be cut short there"
         );
         assert_eq!(w.len(), 1);
