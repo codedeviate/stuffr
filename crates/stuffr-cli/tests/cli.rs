@@ -14446,3 +14446,161 @@ fn unpack_skips_a_link_whose_target_was_not_selected() {
     assert!(std::fs::symlink_metadata(dest.join("a1")).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A GNU tar of `hard_link_tree`, its entries named `./a` and so on.
+#[cfg(unix)]
+fn gnu_tar_of_hard_link_tree(dir: &Path) -> PathBuf {
+    let tree = hard_link_tree(dir);
+    let tar = dir.join("x.tar");
+    run_tool(
+        &require_gnu_tar(),
+        &[os(&"-cf"), os(&tar), os(&"-C"), os(&tree), os(&".")],
+        dir,
+        b"",
+    );
+    tar
+}
+
+/// tar into zip: every link name holds its target's bytes, as a copy, and
+/// that is no loss, so `--strict-fidelity` passes.
+#[cfg(unix)]
+#[test]
+fn convert_gnu_tar_with_hard_links_to_zip_copies_them() {
+    let dir = tmp_dir();
+    let tar = gnu_tar_of_hard_link_tree(&dir);
+    let zip = dir.join("out.zip");
+    let out = run_output(&[
+        "convert",
+        tar.to_str().unwrap(),
+        zip.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let unzip = require_bin("unzip");
+    for (name, want) in [
+        ("./a", &b"alpha payload"[..]),
+        ("./a1", b"alpha payload"),
+        ("./a2", b"alpha payload"),
+        ("./e", b""),
+        ("./e2", b""),
+        ("./p", b"plain"),
+    ] {
+        let got = run_tool(&unzip, &[os(&"-p"), os(&zip), os(&name)], &dir, b"");
+        assert_eq!(got, want, "{name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// cpio into tar: the target stores links, so GNU tar sees links.
+#[cfg(unix)]
+#[test]
+fn convert_gnu_cpio_with_hard_links_to_tar_keeps_links() {
+    let dir = tmp_dir();
+    let tree = hard_link_tree(&dir);
+    let bytes = run_tool(
+        &require_gnu_cpio(),
+        &[os(&"-o"), os(&"-H"), os(&"newc")],
+        &tree,
+        b"./a\n./a1\n./a2\n./e\n./e2\n./p\n",
+    );
+    let cpio = dir.join("x.cpio");
+    std::fs::write(&cpio, bytes).unwrap();
+    let tar = dir.join("t.tar");
+    let out = run_output(&[
+        "convert",
+        cpio.to_str().unwrap(),
+        tar.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let listing = run_tool(&require_gnu_tar(), &[os(&"-tvf"), os(&tar)], &dir, b"");
+    let listing = String::from_utf8_lossy(&listing);
+    assert_eq!(listing.matches(" link to ").count(), 3, "{listing}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tar link whose target is larger than the copy cache's memory tier (the
+/// default 64 MiB) cannot be copied into a container without links: it is
+/// skipped and named, and `--strict-fidelity` makes that exit 4. Piped, so
+/// the source is read forward only. cpio is the target because it stores
+/// the 64 MiB without compressing it, which keeps the test fast.
+#[cfg(unix)]
+#[test]
+fn convert_strict_fidelity_exits_4_when_a_link_cannot_be_copied() {
+    let dir = tmp_dir();
+    let mut tar = tar::Builder::new(Vec::new());
+    let big = vec![0x5au8; 64 * 1024 * 1024 + 512];
+    let mut h = tar::Header::new_gnu();
+    h.set_size(big.len() as u64);
+    h.set_mode(0o644);
+    h.set_mtime(1_000_000_000);
+    h.set_entry_type(tar::EntryType::Regular);
+    tar.append_data(&mut h, "big", &big[..]).unwrap();
+    let mut l = tar::Header::new_gnu();
+    l.set_size(0);
+    l.set_mode(0o644);
+    l.set_mtime(1_000_000_000);
+    l.set_entry_type(tar::EntryType::Link);
+    tar.append_link(&mut l, "link", "big").unwrap();
+    let bytes = tar.into_inner().unwrap();
+    drop(big);
+    let out_path = dir.join("out.cpio");
+    let out = run_with_stdin_output(
+        &[
+            "convert",
+            "-",
+            out_path.to_str().unwrap(),
+            "--strict-fidelity",
+        ],
+        &bytes,
+    );
+    let stderr = stderr_text(&out);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(
+        stderr
+            .contains("skipped entry `link`: its hard-link target `big` was not kept for copying"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cat` of a link and its target writes the target's bytes for both.
+#[cfg(unix)]
+#[test]
+fn cat_of_a_link_writes_its_targets_bytes() {
+    let dir = tmp_dir();
+    let tar = gnu_tar_of_hard_link_tree(&dir);
+    let out = run_output(&["cat", tar.to_str().unwrap(), "./a", "./a1", "./a2"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_eq!(out.stdout, b"alpha payload".repeat(3));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cat` of a link alone, its target not selected: a classified refusal
+/// naming the TARGET, never exit 1 and never invented bytes.
+#[cfg(unix)]
+#[test]
+fn cat_of_a_link_without_its_target_is_classified_not_1() {
+    let dir = tmp_dir();
+    let tree = hard_link_tree(&dir);
+    let tar = dir.join("x.tar");
+    run_tool(
+        &require_gnu_tar(),
+        &[
+            os(&"-cf"),
+            os(&tar),
+            os(&"-C"),
+            os(&tree),
+            os(&"a"),
+            os(&"a1"),
+        ],
+        &dir,
+        b"",
+    );
+    let out = run_output(&["cat", tar.to_str().unwrap(), "a1"]);
+    let stderr = stderr_text(&out);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("entry `a` not found"), "{stderr}");
+    assert!(out.stdout.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

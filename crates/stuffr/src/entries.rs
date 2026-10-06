@@ -9,10 +9,11 @@ use stuffr_core::{
     CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts, Entry, EntryKind, EntryMeta, Error,
     Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR,
     RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source, SourceCaps, SpillPolicy,
-    SpillSource, StreamPolicy, check_symlink_target, ladder, resolve_chain,
+    SpillSource, SpillWriter, StreamPolicy, check_symlink_target, ladder, resolve_chain,
     resolve_chain_deep_with, safe_join,
 };
 
+use crate::link_cache::{CachePolicy, LinkCache, Tee};
 use crate::ops::{
     CompressOpts, ConvertSource, Finish, Input, Outcome, Output, discard, publish,
     refuse_directory_for,
@@ -1445,6 +1446,14 @@ fn warn_metadata(warnings: &mut Vec<Fidelity>, entry: &str, missing: MetaFields)
 /// — a hostile name has nowhere to point. The bomb budget still applies,
 /// since the motivating case (`curl … | stuffr cat - a.txt`) streams
 /// untrusted input of unknown size.
+///
+/// A hard link has no payload of its own: `cat` of one writes its TARGET's
+/// bytes, when the target was selected earlier in the same run and kept
+/// (by the `link_cache` module, under the default spill policy: tar keeps
+/// recent payloads in memory, cpio the ones it announces as linked). The
+/// copy is charged to the budget like any payload. A target not selected,
+/// or not kept, is [`Error::EntryNotFound`] naming the target (exit 2):
+/// never invented bytes.
 pub fn cat(
     src: Input,
     selection: &Selection,
@@ -1459,14 +1468,39 @@ pub fn cat(
         .map(|m| m.len());
     let (mut ar, format, consumed) = open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     let mut budget = ArchiveBudget::new(compressed_total, max_ratio).tracking(consumed);
+    let mut links = LinkCache::new(CachePolicy::for_source(format, &SpillPolicy::default()));
     let mut written = 0u64;
     let mut matched = 0u64;
 
     matched += visit_selected(ar.as_mut(), selection, |entry| {
-        let name = entry.meta().name.clone();
+        let meta = entry.meta().clone();
+        let name = meta.name.clone();
+        if let EntryKind::Hardlink { target } = &meta.kind {
+            links.forget(&name);
+            let Some((_, mut copy)) = links.copy_of(target)? else {
+                return Err(Error::EntryNotFound(target.clone()));
+            };
+            written += copy_charging(&mut copy, dst, &name, &mut budget)?;
+            return Ok(());
+        }
+        let mut spool = if links.wants(&meta, entry.announces_links()) {
+            links.spool(&name, meta.size)
+        } else {
+            links.forget(&name);
+            None
+        };
         // A directory or symlink entry frames no payload, so this copies
         // zero bytes for one rather than needing a case of its own.
-        written += copy_charging(entry.reader(), dst, &name, &mut budget)?;
+        let mut tee = Tee::new(entry.reader(), &mut spool);
+        let n = copy_charging(&mut tee, dst, &name, &mut budget)?;
+        let seen = tee.seen;
+        written += n;
+        if seen == n
+            && let Some(spool) = spool
+            && let Ok(bytes) = spool.finish()
+        {
+            links.keep(&name, bytes);
+        }
         Ok(())
     })?;
 
@@ -3837,7 +3871,7 @@ pub fn convert_archive_source_with(
     // The rung is the RAW source's; the container's own report, from the
     // ladder that actually opened it, is the one that describes this read.
     let (chain, decoded, consumed, _raw_rung, compressed_total) = src.into_parts();
-    let (mut ar, _source_container) =
+    let (mut ar, source_container) =
         open_resolved(registry, &chain, decoded, &consumed, o.max_ratio, &|caps| {
             convert_read_policy(caps, &o.spill)
         })?;
@@ -3849,6 +3883,13 @@ pub fn convert_archive_source_with(
         bytes_out,
     } = create_target(kind.as_ref(), encoder, &dst, o.level, o.force, o.sync)?;
     let caps = kind.caps();
+    // A link into a target that cannot store one is written as a copy of
+    // its target's bytes, kept here as they stream past (see `link_cache`).
+    let mut links = LinkCache::new(CachePolicy::for_convert(
+        source_container,
+        caps.stores_hardlinks,
+        &o.spill,
+    ));
 
     let result = (|| -> Result<(u64, Vec<Fidelity>)> {
         let mut archive = archive;
@@ -3859,6 +3900,7 @@ pub fn convert_archive_source_with(
             container,
             &mut budget,
             &o.spill,
+            &mut links,
         )?;
         finish_target(archive)?;
         Ok(moved)
@@ -3890,6 +3932,18 @@ pub fn convert_archive_source_with(
 /// Moves every entry `ar` yields into `archive`, returning the payload bytes
 /// moved and the write side's warnings. Finishes nothing: the caller owns the
 /// trailer and the publish.
+///
+/// Hard links, as [`plan_entry_write`] plans them:
+///
+/// - **Into a target that stores links** (tar), a link is written as a link
+///   only when its target was written by this run; otherwise it is skipped
+///   ([`hard_link_reason_not_written`]), never stored dangling.
+/// - **Into any other target**, a link is written as a regular file holding
+///   exactly its target's bytes, from `links`, which keeps the payloads it
+///   wants while they stream into the archive. The copy is charged to
+///   `budget` like any payload, so many links to one large file cannot
+///   multiply the output past it. A target `links` did not keep is skipped
+///   ([`hard_link_reason_not_kept`]).
 fn convert_entries(
     ar: &mut dyn ArchiveRead,
     archive: &mut dyn ArchiveWrite,
@@ -3897,14 +3951,22 @@ fn convert_entries(
     container: FormatId,
     budget: &mut ArchiveBudget,
     spill: &SpillPolicy,
+    links: &mut LinkCache,
 ) -> Result<(u64, Vec<Fidelity>)> {
     let mut moved = 0u64;
     let mut warnings = Vec::new();
-    // Names already written, for a target that holds one entry per name.
+    // Names this run wrote: a `unique_names` target holds one entry per name,
+    // and a stored link must name a target that is really there.
     let mut written: HashSet<String> = HashSet::new();
     while let Some(mut entry) = ar.next_entry()? {
         let mut meta = entry.meta().clone();
-        if let WritePlan::Skip = plan_entry_write(caps, container, &meta, &mut warnings) {
+        let link_copy_available = matches!(
+            &meta.kind,
+            EntryKind::Hardlink { target } if links.contains(target)
+        );
+        if let WritePlan::Skip =
+            plan_entry_write(caps, container, &meta, link_copy_available, &mut warnings)
+        {
             // Unread: the reader drains (or seeks past) an entry the caller
             // did not consume, as it does for `list`.
             continue;
@@ -3913,23 +3975,77 @@ fn convert_entries(
         // (`pack`'s walk never does), so `pack` never needs the check. After
         // the plan, so an entry that is not written claims no name. The
         // FIRST entry of a name wins; the writer would refuse the second.
-        if caps.unique_names && !written.insert(meta.name.clone()) {
+        if caps.unique_names && written.contains(&meta.name) {
             warnings.push(duplicate_name_skipped(container, &meta.name));
             continue;
         }
-        match &meta.kind {
+        match meta.kind.clone() {
             EntryKind::File => {
-                moved += write_payload(entry.reader(), &mut meta, archive, budget, spill)?;
+                let mut spool = if links.wants(&meta, entry.announces_links()) {
+                    links.spool(&meta.name, meta.size)
+                } else {
+                    links.forget(&meta.name);
+                    None
+                };
+                moved += write_payload(
+                    entry.reader(),
+                    &mut meta,
+                    archive,
+                    budget,
+                    spill,
+                    &mut spool,
+                )?;
+                if let Some(spool) = spool
+                    && let Ok(bytes) = spool.finish()
+                {
+                    // A spool that cannot be finished (its temp file failed)
+                    // is simply not kept: the link is skipped, by name.
+                    links.keep(&meta.name, bytes);
+                }
+            }
+            EntryKind::Hardlink { target } if caps.stores_hardlinks => {
+                if !written.contains(&target) {
+                    warnings.push(Fidelity::EntrySkipped {
+                        entry: meta.name.clone(),
+                        reason: hard_link_reason_not_written(&target),
+                    });
+                    continue;
+                }
+                archive.add(&meta, &mut std::io::empty())?;
+            }
+            EntryKind::Hardlink { target } => {
+                links.forget(&meta.name);
+                // `plan_entry_write` wrote it only because a copy was there;
+                // the `None` arm is a backstop, never an empty file.
+                let Some((len, mut copy)) = links.copy_of(&target)? else {
+                    warnings.push(Fidelity::EntrySkipped {
+                        entry: meta.name.clone(),
+                        reason: hard_link_reason_not_kept(&target),
+                    });
+                    continue;
+                };
+                // A regular file of its own, with the link entry's metadata
+                // and exactly the target's length: a writer that cannot store
+                // links refuses a `Hardlink`.
+                meta.kind = EntryKind::File;
+                meta.size = Some(len);
+                // Not counted in `moved`: these bytes were read from the
+                // source once already, for the target.
+                write_payload(&mut copy, &mut meta, archive, budget, spill, &mut None)?;
             }
             // `plan_entry_write` writes only a file, a directory, a symlink
-            // or (where caps allow) a hard link, so this is the last three.
-            // None has a payload to frame: a link's target travels in
-            // `meta.kind`, and zip and
-            // cpio, which read the target as the entry's payload, already
-            // did so and hand over an empty reader — whose declared size
-            // (the target's length) must never be held to a length guard.
-            _ => archive.add(&meta, &mut std::io::empty())?,
+            // or a hard link, so this is the middle two. Neither has a
+            // payload to frame: a symlink's target travels in `meta.kind`,
+            // and zip and cpio, which read the target as the entry's
+            // payload, already did so and hand over an empty reader — whose
+            // declared size (the target's length) must never be held to a
+            // length guard.
+            _ => {
+                links.forget(&meta.name);
+                archive.add(&meta, &mut std::io::empty())?;
+            }
         }
+        written.insert(meta.name);
     }
     Ok((moved, warnings))
 }
@@ -3954,27 +4070,42 @@ fn duplicate_name_skipped(container: FormatId, name: &str) -> Fidelity {
 /// writer — every container here puts the size in a header BEFORE the data —
 /// is handed an exact size and a fresh reader. `SpillPolicy::Off`, or a
 /// payload past the policy's limit, is [`Error::SpillLimitExceeded`] (exit 6).
+///
+/// `keep`, when `Some`, is a [`LinkCache`] spool fed through a [`Tee`] with
+/// exactly the bytes the writer reads, so a payload is kept for a later hard
+/// link without being read twice. The tee never changes what the writer
+/// sees; a spool that refuses a byte is dropped, and so is one that did not
+/// see every byte the payload delivered — only a whole payload is ever kept.
 fn write_payload(
     reader: &mut dyn Read,
     meta: &mut EntryMeta,
     archive: &mut dyn ArchiveWrite,
     budget: &mut ArchiveBudget,
     spill: &SpillPolicy,
+    keep: &mut Option<SpillWriter>,
 ) -> Result<u64> {
     let name = meta.name.clone();
     let mut payload = EntryPayload::new(reader, &name, budget, meta.size);
-    match meta.size {
+    let seen = match meta.size {
         Some(_) => {
-            let added = archive.add(meta, &mut payload);
+            let mut tee = Tee::new(&mut payload, keep);
+            let added = archive.add(meta, &mut tee);
+            let seen = tee.seen;
             payload.settle(added)?;
             payload.verify_end()?;
+            seen
         }
         None => {
             let buffered = SpillSource::materialize_from(&mut payload, spill);
             let mut buffered = payload.settle(buffered)?;
             meta.size = Some(payload.delivered);
-            archive.add(meta, &mut buffered)?;
+            let mut tee = Tee::new(&mut buffered, keep);
+            archive.add(meta, &mut tee)?;
+            tee.seen
         }
+    };
+    if seen != payload.delivered {
+        *keep = None;
     }
     Ok(payload.delivered)
 }
@@ -4322,6 +4453,7 @@ fn plan_entry_write(
     caps: &ContainerCaps,
     container: FormatId,
     meta: &EntryMeta,
+    link_copy_available: bool,
     warnings: &mut Vec<Fidelity>,
 ) -> WritePlan {
     let plan = match &meta.kind {
@@ -4350,9 +4482,20 @@ fn plan_entry_write(
             });
             WritePlan::Skip
         }
+        // Every reader drops or refuses a self-link; this is the backstop,
+        // before a copy could be taken from the name being written.
+        EntryKind::Hardlink { target } if *target == meta.name => {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: meta.name.clone(),
+                reason: HARD_LINK_REASON_SELF.to_string(),
+            });
+            WritePlan::Skip
+        }
+        // Stored as a link; `convert_entries` still skips one whose target
+        // this run did not write.
         EntryKind::Hardlink { .. } if caps.stores_hardlinks => WritePlan::Write,
-        // Until convert can copy a link's target (Task 9), a target that
-        // cannot store a link skips it: nothing is kept for copying yet.
+        // Written as a copy of the target's kept bytes.
+        EntryKind::Hardlink { .. } if link_copy_available => WritePlan::Write,
         EntryKind::Hardlink { target } => {
             warnings.push(Fidelity::EntrySkipped {
                 entry: meta.name.clone(),
@@ -4436,6 +4579,13 @@ fn hard_link_reason_not_kept(target: &str) -> String {
     format!("its hard-link target `{target}` was not kept for copying")
 }
 
+/// Why `convert` skips a hard link into a container that stores links: its
+/// target was not written by this run, so a stored link would dangle. Raw,
+/// as above.
+fn hard_link_reason_not_written(target: &str) -> String {
+    format!("its hard-link target `{target}` was not written")
+}
+
 /// Why `unpack` skips a hard link whose target it could not read to copy,
 /// once `hard_link` had failed. Raw, as above.
 fn hard_link_reason_unreadable(target: &str) -> String {
@@ -4480,7 +4630,9 @@ fn plan_item(
 ) -> Option<WritePlan> {
     match &item.source {
         crate::walk::ItemSource::Skipped { .. } => None,
-        _ => Some(plan_entry_write(caps, container, &item.meta, warnings)),
+        _ => Some(plan_entry_write(
+            caps, container, &item.meta, false, warnings,
+        )),
     }
 }
 
@@ -5499,7 +5651,7 @@ mod tests {
             ..meta_with(None, None)
         };
         assert!(matches!(
-            plan_entry_write(&caps, FormatId::new("x"), &dir, &mut w),
+            plan_entry_write(&caps, FormatId::new("x"), &dir, false, &mut w),
             WritePlan::Skip
         ));
         assert!(matches!(w[0], Fidelity::EntrySkipped { .. }));
@@ -5514,7 +5666,7 @@ mod tests {
         let mut w = Vec::new();
         let file = meta_with(Some(1), Some(1));
         assert!(matches!(
-            plan_entry_write(&caps, FormatId::new("x"), &file, &mut w),
+            plan_entry_write(&caps, FormatId::new("x"), &file, false, &mut w),
             WritePlan::Write
         ));
         assert!(w.is_empty());
@@ -5533,6 +5685,7 @@ mod tests {
                 &ContainerCaps::default(),
                 FormatId::new("zip"),
                 &anonymous,
+                false,
                 &mut w
             ),
             WritePlan::Write
@@ -5544,7 +5697,7 @@ mod tests {
             ..Default::default()
         };
         let mut w = Vec::new();
-        plan_entry_write(&owns, FormatId::new("tar"), &anonymous, &mut w);
+        plan_entry_write(&owns, FormatId::new("tar"), &anonymous, false, &mut w);
         assert_eq!(w.len(), 1, "{w:?}");
         assert_eq!(
             w[0].to_string(),
@@ -5561,7 +5714,7 @@ mod tests {
         let terminated = ContainerCaps::default();
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&terminated, FormatId::new("tar"), &nul, &mut w),
+            plan_entry_write(&terminated, FormatId::new("tar"), &nul, false, &mut w),
             WritePlan::Skip
         ));
         // The reason, verbatim: what `stuffr convert` prints for it.
@@ -5579,7 +5732,7 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&holds, FormatId::new("zip"), &nul, &mut w),
+            plan_entry_write(&holds, FormatId::new("zip"), &nul, false, &mut w),
             WritePlan::Write
         ));
         assert!(w.is_empty());
@@ -5590,7 +5743,7 @@ mod tests {
             ..nul
         };
         let mut w = Vec::new();
-        plan_entry_write(&terminated, FormatId::new("ar"), &nul_dir, &mut w);
+        plan_entry_write(&terminated, FormatId::new("ar"), &nul_dir, false, &mut w);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].to_string().contains("no directory entries"), "{w:?}");
     }
@@ -5611,7 +5764,7 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&tar, FormatId::new("tar"), &link, &mut w),
+            plan_entry_write(&tar, FormatId::new("tar"), &link, false, &mut w),
             WritePlan::Skip
         ));
         // The reason, verbatim, and distinct from the name reason.
@@ -5630,7 +5783,7 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&cpio, FormatId::new("cpio"), &link, &mut w),
+            plan_entry_write(&cpio, FormatId::new("cpio"), &link, false, &mut w),
             WritePlan::Write
         ));
         assert!(w.is_empty());
@@ -5641,6 +5794,7 @@ mod tests {
             &ContainerCaps::default(),
             FormatId::new("ar"),
             &link,
+            false,
             &mut w,
         );
         assert_eq!(w.len(), 1, "{w:?}");
@@ -5666,17 +5820,17 @@ mod tests {
 
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&all, FormatId::new("x"), &link, &mut w),
+            plan_entry_write(&all, FormatId::new("x"), &link, false, &mut w),
             WritePlan::Write
         ));
         assert!(matches!(
-            plan_entry_write(&all, FormatId::new("x"), &dir, &mut w),
+            plan_entry_write(&all, FormatId::new("x"), &dir, false, &mut w),
             WritePlan::Write
         ));
         assert!(w.is_empty());
 
         assert!(matches!(
-            plan_entry_write(&none, FormatId::new("x"), &link, &mut w),
+            plan_entry_write(&none, FormatId::new("x"), &link, false, &mut w),
             WritePlan::Skip
         ));
         assert_eq!(
@@ -5694,11 +5848,11 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&links_only, FormatId::new("x"), &link, &mut w),
+            plan_entry_write(&links_only, FormatId::new("x"), &link, false, &mut w),
             WritePlan::Write
         ));
         assert!(matches!(
-            plan_entry_write(&links_only, FormatId::new("x"), &dir, &mut w),
+            plan_entry_write(&links_only, FormatId::new("x"), &dir, false, &mut w),
             WritePlan::Skip
         ));
         assert_eq!(w.len(), 1);
@@ -5720,7 +5874,7 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&all, FormatId::new("x"), &other, &mut w),
+            plan_entry_write(&all, FormatId::new("x"), &other, false, &mut w),
             WritePlan::Skip
         ));
         assert_eq!(w.len(), 1);
@@ -5731,9 +5885,10 @@ mod tests {
         );
     }
 
-    /// A hard link is written as a link only by a container whose caps say
-    /// `stores_hardlinks`; any other target skips it, saying its target was
-    /// not kept for copying (nothing is, until convert keeps payloads).
+    /// A hard link is written as a link by a container whose caps say
+    /// `stores_hardlinks`, as a copy where one is available, and otherwise
+    /// skipped, saying its target was not kept for copying. A self-link is
+    /// skipped whatever the target can do.
     #[test]
     fn plan_entry_write_stores_a_hardlink_only_where_caps_allow() {
         let link = EntryMeta {
@@ -5748,12 +5903,18 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&can, FormatId::new("x"), &link, &mut w),
+            plan_entry_write(&can, FormatId::new("x"), &link, false, &mut w),
             WritePlan::Write
         ));
         assert!(w.is_empty());
         assert!(matches!(
-            plan_entry_write(&ContainerCaps::default(), FormatId::new("x"), &link, &mut w),
+            plan_entry_write(
+                &ContainerCaps::default(),
+                FormatId::new("x"),
+                &link,
+                false,
+                &mut w
+            ),
             WritePlan::Skip
         ));
         assert_eq!(w.len(), 1);
@@ -5762,6 +5923,35 @@ mod tests {
             "skipped entry `proj/notes.txt`: its hard-link target `proj/a.txt` \
              was not kept for copying"
         );
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(
+                &ContainerCaps::default(),
+                FormatId::new("x"),
+                &link,
+                true,
+                &mut w
+            ),
+            WritePlan::Write
+        ));
+        assert!(w.is_empty());
+        let selfish = EntryMeta {
+            kind: EntryKind::Hardlink {
+                target: "proj/notes.txt".into(),
+            },
+            ..meta_with(Some(1), Some(1))
+        };
+        for (caps, copy) in [(&can, false), (&ContainerCaps::default(), true)] {
+            let mut w = Vec::new();
+            assert!(matches!(
+                plan_entry_write(caps, FormatId::new("x"), &selfish, copy, &mut w),
+                WritePlan::Skip
+            ));
+            assert_eq!(
+                w[0].to_string(),
+                "skipped entry `proj/notes.txt`: it names itself as its hard-link target"
+            );
+        }
     }
 
     /// The pinned hard-link reasons. The target is interpolated raw;
@@ -5775,6 +5965,10 @@ mod tests {
         assert_eq!(
             hard_link_reason_not_kept("t"),
             "its hard-link target `t` was not kept for copying"
+        );
+        assert_eq!(
+            hard_link_reason_not_written("t"),
+            "its hard-link target `t` was not written"
         );
         assert_eq!(
             hard_link_reason_directory("d"),
@@ -5807,7 +6001,7 @@ mod tests {
         };
         let mut w = Vec::new();
         assert!(matches!(
-            plan_entry_write(&tar, FormatId::new("tar"), &link, &mut w),
+            plan_entry_write(&tar, FormatId::new("tar"), &link, false, &mut w),
             WritePlan::Skip
         ));
         assert_eq!(w.len(), 1);
@@ -8187,7 +8381,15 @@ mod convert_tests {
             .create(PlainSink::new(Box::new(file)), &CreateOpts::default())
             .unwrap();
         let mut ar = Scripted::new(entries);
-        convert_entries(&mut ar, archive.as_mut(), &kind.caps(), tar, budget, spill)?;
+        convert_entries(
+            &mut ar,
+            archive.as_mut(),
+            &kind.caps(),
+            tar,
+            budget,
+            spill,
+            &mut LinkCache::new(CachePolicy::Off),
+        )?;
         finish_target(archive)?;
         Ok(out)
     }

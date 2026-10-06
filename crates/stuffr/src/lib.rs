@@ -12,6 +12,7 @@ pub use stuffr_core as core;
 pub use stuffr_core::*;
 
 pub mod entries;
+mod link_cache;
 pub mod ops;
 mod walk;
 

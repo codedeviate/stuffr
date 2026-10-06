@@ -47,7 +47,7 @@ pub use registry::{FormatRow, Registry};
 pub use size::format_size;
 pub use source::{
     Counting, CountingWriter, DEFAULT_MAX_RATIO, FileSource, PeekSource, RATIO_FLOOR, RatioGuard,
-    ReaderSource, SeekRead, Source, SourceCaps, SpillPolicy, SpillSource, StreamOnly,
+    ReaderSource, SeekRead, Source, SourceCaps, SpillPolicy, SpillSource, SpillWriter, StreamOnly,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

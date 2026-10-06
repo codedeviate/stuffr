@@ -14,7 +14,7 @@ pub use file::FileSource;
 pub use limit::{Counting, CountingWriter, DEFAULT_MAX_RATIO, RATIO_FLOOR, RatioGuard};
 pub use reader::{PeekSource, ReaderSource};
 pub use seek_guard::{GuardedSeek, MAX_SEEK_POSITION};
-pub use spill::{SpillPolicy, SpillSource};
+pub use spill::{SpillPolicy, SpillSource, SpillWriter};
 pub use stream_only::StreamOnly;
 
 use std::io::{Read, Seek};

@@ -42,6 +42,16 @@ impl SpillPolicy {
         !matches!(self, SpillPolicy::Off)
     }
 
+    /// How many bytes this policy holds in memory before it escalates (or,
+    /// for `Memory`, fails): `0` for `Off`.
+    pub fn memory_cap(&self) -> u64 {
+        match self {
+            SpillPolicy::Off => 0,
+            SpillPolicy::Memory { cap } => *cap,
+            SpillPolicy::Temp { mem_cap, .. } => *mem_cap,
+        }
+    }
+
     fn hard_limit(&self) -> u64 {
         match self {
             SpillPolicy::Off => 0,
@@ -75,87 +85,128 @@ impl SpillSource {
         Self::materialize_from(&mut *src, policy)
     }
 
-    /// [`Self::materialize`] from any reader, borrowed: the one owner of the
-    /// spill loop and its limits, for a caller whose bytes are not a
-    /// [`Source`] — an archive entry's payload borrows its archive, so it can
-    /// be neither boxed as `'static` nor sent. `stuffr convert` buffers an
-    /// entry of unknown size through this, under the same policy.
+    /// [`Self::materialize`] from any reader, borrowed: for a caller whose
+    /// bytes are not a [`Source`] — an archive entry's payload borrows its
+    /// archive, so it can be neither boxed as `'static` nor sent. `stuffr
+    /// convert` buffers an entry of unknown size through this, under the same
+    /// policy. The limits are [`SpillWriter`]'s, which this drives.
     pub fn materialize_from<R: Read + ?Sized>(src: &mut R, policy: &SpillPolicy) -> Result<Self> {
-        let limit = policy.hard_limit();
-        if !policy.is_enabled() {
-            return Err(Error::SpillLimitExceeded { limit: 0 });
-        }
-
-        let mem_cap = match policy {
-            SpillPolicy::Off => 0,
-            SpillPolicy::Memory { cap } => *cap,
-            SpillPolicy::Temp { mem_cap, .. } => *mem_cap,
-        };
-
-        let mut mem: Vec<u8> = Vec::new();
+        let mut spool = SpillWriter::new(policy)?;
         let mut buf = vec![0u8; 64 * 1024];
-        let mut total: u64 = 0;
-
-        // Phase 1: fill memory up to mem_cap.
         loop {
             let n = src.read(&mut buf)?;
             if n == 0 {
-                return Ok(Self {
-                    len: total,
-                    backing: Backing::Mem(GuardedSeek::new(Cursor::new(mem))),
-                    on_disk: false,
-                });
+                return spool.finish();
             }
-            total += n as u64;
-            if total > limit {
-                return Err(Error::SpillLimitExceeded { limit });
-            }
-            if total > mem_cap {
-                mem.extend_from_slice(&buf[..n]);
-                break;
-            }
-            mem.extend_from_slice(&buf[..n]);
+            spool.push(&buf[..n])?;
         }
-
-        // Phase 2: escalate to a temp file, carrying the memory buffer over.
-        let SpillPolicy::Temp { dir, .. } = policy else {
-            // Defensive, unreachable while `mem_cap == hard_limit()` holds for
-            // `Memory`: the `total > limit` check above always fires first, so
-            // the Phase-1 loop never breaks into this arm for that policy.
-            return Err(Error::SpillLimitExceeded { limit });
-        };
-
-        let mut file = match dir {
-            Some(d) => tempfile::tempfile_in(d)?,
-            None => tempfile::tempfile()?,
-        };
-        file.write_all(&mem)?;
-        drop(mem);
-
-        loop {
-            let n = src.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            total += n as u64;
-            if total > limit {
-                return Err(Error::SpillLimitExceeded { limit });
-            }
-            file.write_all(&buf[..n])?;
-        }
-
-        file.flush()?;
-        file.seek(std::io::SeekFrom::Start(0))?;
-        Ok(Self {
-            backing: Backing::File(GuardedSeek::new(file)),
-            len: total,
-            on_disk: true,
-        })
     }
 
     /// Whether the spool escalated past the memory cap. Surfaced by `stuffr info`.
     pub fn spilled_to_disk(&self) -> bool {
         self.on_disk
+    }
+}
+
+/// The push side of the spill loop: bytes handed over one slice at a time,
+/// held in memory up to the policy's memory cap, then in a temp file, and
+/// refused past its hard limit. The one owner of those limits —
+/// [`SpillSource::materialize_from`] drives it from a reader, and a caller
+/// that sees the bytes go past on their way somewhere else (a tee) pushes
+/// them itself.
+///
+/// A refusal ([`Error::SpillLimitExceeded`]) or a temp-file failure leaves
+/// the writer unusable; nothing it held is ever handed out partially.
+#[derive(Debug)]
+pub struct SpillWriter {
+    limit: u64,
+    mem_cap: u64,
+    dir: Option<Option<PathBuf>>,
+    mem: Vec<u8>,
+    file: Option<std::fs::File>,
+    total: u64,
+}
+
+impl SpillWriter {
+    /// An empty spool under `policy`. `SpillPolicy::Off` is refused at once,
+    /// as [`SpillSource::materialize`] refuses it.
+    pub fn new(policy: &SpillPolicy) -> Result<Self> {
+        if !policy.is_enabled() {
+            return Err(Error::SpillLimitExceeded { limit: 0 });
+        }
+        Ok(Self {
+            limit: policy.hard_limit(),
+            mem_cap: policy.memory_cap(),
+            dir: match policy {
+                SpillPolicy::Temp { dir, .. } => Some(dir.clone()),
+                SpillPolicy::Off | SpillPolicy::Memory { .. } => None,
+            },
+            mem: Vec::new(),
+            file: None,
+            total: 0,
+        })
+    }
+
+    /// Bytes accepted so far.
+    pub fn len(&self) -> u64 {
+        self.total
+    }
+
+    /// Whether nothing has been accepted yet.
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    /// Appends `bytes`, escalating to a temp file once the memory cap is
+    /// passed, and refusing past the hard limit.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<()> {
+        self.total += bytes.len() as u64;
+        if self.total > self.limit {
+            return Err(Error::SpillLimitExceeded { limit: self.limit });
+        }
+        if let Some(file) = &mut self.file {
+            file.write_all(bytes)?;
+            return Ok(());
+        }
+        if self.total <= self.mem_cap {
+            self.mem.extend_from_slice(bytes);
+            return Ok(());
+        }
+        // Past the memory cap. Defensive for `Memory`, unreachable while
+        // `mem_cap == hard_limit()` holds for it: the limit check above
+        // always fires first.
+        let Some(dir) = &self.dir else {
+            return Err(Error::SpillLimitExceeded { limit: self.limit });
+        };
+        let mut file = match dir {
+            Some(d) => tempfile::tempfile_in(d)?,
+            None => tempfile::tempfile()?,
+        };
+        file.write_all(&self.mem)?;
+        file.write_all(bytes)?;
+        self.mem = Vec::new();
+        self.file = Some(file);
+        Ok(())
+    }
+
+    /// The bytes pushed, as a seekable source positioned at the start.
+    pub fn finish(self) -> Result<SpillSource> {
+        match self.file {
+            None => Ok(SpillSource {
+                backing: Backing::Mem(GuardedSeek::new(Cursor::new(self.mem))),
+                len: self.total,
+                on_disk: false,
+            }),
+            Some(mut file) => {
+                file.flush()?;
+                file.seek(std::io::SeekFrom::Start(0))?;
+                Ok(SpillSource {
+                    backing: Backing::File(GuardedSeek::new(file)),
+                    len: self.total,
+                    on_disk: true,
+                })
+            }
+        }
     }
 }
 
@@ -276,6 +327,38 @@ mod tests {
         assert!(SpillPolicy::default().is_enabled());
         let err = SpillSource::materialize(pipe(b"x".to_vec()), &SpillPolicy::Off).unwrap_err();
         assert!(matches!(err, crate::Error::SpillLimitExceeded { limit: 0 }));
+    }
+
+    /// The push side keeps the pull side's limits: memory up to the cap,
+    /// then a temp file holding every byte in order, refused past the max.
+    #[test]
+    fn a_spill_writer_escalates_and_refuses_like_materialize() {
+        let policy = SpillPolicy::Temp {
+            dir: None,
+            mem_cap: 10,
+            max: 30,
+        };
+        let mut w = SpillWriter::new(&policy).unwrap();
+        w.push(b"0123456789").unwrap();
+        w.push(b"abcdef").unwrap();
+        assert_eq!(w.len(), 16);
+        let mut s = w.finish().unwrap();
+        assert!(s.spilled_to_disk());
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"0123456789abcdef");
+
+        let mut w = SpillWriter::new(&policy).unwrap();
+        let err = w.push(&[0u8; 31]).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::SpillLimitExceeded { limit: 30 }
+        ));
+        assert!(matches!(
+            SpillWriter::new(&SpillPolicy::Off).unwrap_err(),
+            crate::Error::SpillLimitExceeded { limit: 0 }
+        ));
+        assert_eq!(policy.memory_cap(), 10);
     }
 
     #[test]

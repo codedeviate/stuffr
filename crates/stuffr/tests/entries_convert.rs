@@ -6,8 +6,8 @@
 //!
 //! * every payload survives the conversion byte for byte, in both directions;
 //! * what the target cannot hold is a warning with `pack`'s own wording, and a
-//!   special entry (fifo, device, hardlink) is skipped — never written as an empty
-//!   regular file;
+//!   special entry (fifo, device) is skipped — never written as an empty
+//!   regular file; a hard link is a full copy of its target, or skipped;
 //! * a warning the SOURCE reader raised reaches the conversion's report;
 //! * a declared size the payload does not deliver is `Corrupt` (exit 5) and a
 //!   ratio bomb is a resource limit (exit 6), with nothing left at the
@@ -56,6 +56,11 @@ fn entries_of(archive: &Path) -> Vec<(String, EntryKind, Vec<u8>)> {
         .enumerate()
         .map(|(i, m)| {
             let mut payload = Vec::new();
+            // A link has no payload of its own, and `cat` of a link alone
+            // needs its target selected too: its kind is what is compared.
+            if matches!(m.kind, EntryKind::Hardlink { .. }) {
+                return (m.name.clone(), m.kind.clone(), payload);
+            }
             entries::cat(
                 Input::Path(archive.to_path_buf()),
                 &Selection::Indices(vec![i]),
@@ -375,17 +380,13 @@ fn a_special_file_is_skipped_never_written_as_a_regular_file() {
     )
     .unwrap();
 
-    // `unpack`'s wording, "stored" for "created". A hard link has its own
-    // reason: zip cannot store one, and nothing is kept to copy from yet.
+    // `unpack`'s wording, "stored" for "created". The hard link is no
+    // special: zip cannot store one, so it is written as a full copy.
     for (name, reason) in [
         ("pipe", "device nodes, fifos and sockets are not stored"),
         (
             "dev/console",
             "device nodes, fifos and sockets are not stored",
-        ),
-        (
-            "hard",
-            "its hard-link target `keep.txt` was not kept for copying",
         ),
     ] {
         let skipped = Fidelity::EntrySkipped {
@@ -398,9 +399,13 @@ fn a_special_file_is_skipped_never_written_as_a_regular_file() {
             outcome.fidelity.warnings
         );
     }
+    assert_eq!(outcome.fidelity.warnings.len(), 2);
     assert_eq!(
         entries_of(&zip),
-        [("keep.txt".to_string(), EntryKind::File, b"kept".to_vec())],
+        [
+            ("keep.txt".to_string(), EntryKind::File, b"kept".to_vec()),
+            ("hard".to_string(), EntryKind::File, b"kept".to_vec()),
+        ],
         "no special entry reaches the zip, not even as an empty regular file"
     );
 }
@@ -1119,5 +1124,315 @@ fn a_directory_input_is_a_usage_error() {
     assert_eq!(err.exit_code(), 2, "{err}");
     assert!(err.to_string().contains("stuffr pack"), "{err}");
     assert!(!out.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tar of a regular file `target` holding `payload`, then a typeflag-`1`
+/// entry `name` linking to it.
+fn link_tar(target: &str, payload: &[u8], name: &str) -> Vec<u8> {
+    let mut out = hand_built_tar(&[(target, b'0', payload)]);
+    out.truncate(out.len() - 1024);
+    out.extend_from_slice(&link_header(name, target));
+    out.extend(std::iter::repeat_n(0u8, 1024));
+    out
+}
+
+/// A typeflag-`1` header for `name` linking to `target`.
+fn link_header(name: &str, target: &str) -> [u8; 512] {
+    let mut h = tar_header(name, 0, b'1');
+    h[157..157 + target.len()].copy_from_slice(target.as_bytes());
+    h[148..156].copy_from_slice(b"        ");
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    h
+}
+
+/// The `EntrySkipped` warnings of a report, as `(entry, reason)`.
+fn skips(warnings: &[Fidelity]) -> Vec<(String, String)> {
+    warnings
+        .iter()
+        .filter_map(|w| match w {
+            Fidelity::EntrySkipped { entry, reason } => Some((entry.clone(), reason.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn convert(
+    src: &Path,
+    dst: &Path,
+    container: &'static str,
+    o: &ConvertOpts,
+) -> stuffr::ops::Outcome {
+    entries::convert_archive(
+        Input::Path(src.to_path_buf()),
+        Output::Path(dst.to_path_buf()),
+        fmt(container),
+        None,
+        o,
+    )
+    .unwrap()
+}
+
+/// A tar link into a container without links becomes a regular file holding
+/// exactly its target's bytes, and that is no loss.
+#[test]
+fn a_tar_hard_link_converts_to_zip_as_a_full_copy() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    std::fs::write(&src, hand_built_link_tar("a", "b")).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(&src, &zip, "zip", &ConvertOpts::default());
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "a full copy loses nothing: {:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(
+        entries_of(&zip),
+        [
+            ("b".to_string(), EntryKind::File, b"hello".to_vec()),
+            ("a".to_string(), EntryKind::File, b"hello".to_vec()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One `newc` member: `ino` and `nlink` say which names share a file.
+#[cfg(feature = "cpio")]
+fn newc_member(out: &mut Vec<u8>, name: &str, ino: u32, nlink: u32, data: &[u8]) {
+    let mode = if name == "TRAILER!!!" { 0 } else { 0o100_644 };
+    out.extend_from_slice(
+        format!(
+            "070701{ino:08X}{mode:08X}{:08X}{:08X}{nlink:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
+            1,
+            1,
+            1_000_000_000u32,
+            data.len(),
+            0,
+            0,
+            0,
+            0,
+            name.len() + 1,
+            0
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    while !out.len().is_multiple_of(4) {
+        out.push(0);
+    }
+    out.extend_from_slice(data);
+    while !out.len().is_multiple_of(4) {
+        out.push(0);
+    }
+}
+
+/// A GNU-layout `newc` link group: `a1` and `a2` empty, `a` last with the
+/// shared bytes, then a plain file `p`.
+#[cfg(feature = "cpio")]
+fn gnu_cpio_group(shared: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    newc_member(&mut out, "a1", 7, 3, b"");
+    newc_member(&mut out, "a2", 7, 3, b"");
+    newc_member(&mut out, "a", 7, 3, shared);
+    newc_member(&mut out, "p", 8, 1, b"plain");
+    newc_member(&mut out, "TRAILER!!!", 0, 1, b"");
+    out
+}
+
+/// A cpio link group into zip: every name a full copy, in the order the
+/// reader yields them (the data member, then its links), and no warning.
+#[cfg(feature = "cpio")]
+#[test]
+fn a_cpio_group_converts_to_zip_as_full_copies() {
+    let dir = tmp_dir();
+    let src = dir.join("src.cpio");
+    std::fs::write(&src, gnu_cpio_group(b"shared bytes")).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(&src, &zip, "zip", &ConvertOpts::default());
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    let shared = b"shared bytes".to_vec();
+    assert_eq!(
+        entries_of(&zip),
+        [
+            ("a".to_string(), EntryKind::File, shared.clone()),
+            ("a1".to_string(), EntryKind::File, shared.clone()),
+            ("a2".to_string(), EntryKind::File, shared),
+            ("p".to_string(), EntryKind::File, b"plain".to_vec()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A target larger than the cache's memory tier is not kept, so its link is
+/// skipped, named with the pinned reason, and never written as an empty or
+/// partial file. The target itself is unaffected.
+#[test]
+fn a_tar_link_whose_target_was_evicted_is_skipped_and_named() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    let big: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&src, link_tar("b", &big, "a")).unwrap();
+    let zip = dir.join("out.zip");
+    let outcome = convert(
+        &src,
+        &zip,
+        "zip",
+        &ConvertOpts {
+            spill: stuffr::SpillPolicy::Memory { cap: 1024 },
+            ..ConvertOpts::default()
+        },
+    );
+    assert_eq!(
+        skips(&outcome.fidelity.warnings),
+        [(
+            "a".to_string(),
+            "its hard-link target `b` was not kept for copying".to_string()
+        )],
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(outcome.fidelity.warnings.len(), 1);
+    assert_eq!(
+        entries_of(&zip),
+        [("b".to_string(), EntryKind::File, big)],
+        "no empty `a` beside the target"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Into tar, a link is stored as a link only to a target this run wrote. A
+/// target the tar cannot hold (a fifo, which convert never stores) is
+/// skipped, and so is its link, with the pinned reason: never a dangling
+/// link. (A tar source cannot carry a NUL in a name, which is why the
+/// skipped target here is a fifo; the NUL case, from cpio, is below.)
+#[test]
+fn a_tar_to_tar_link_whose_target_was_skipped_is_skipped() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    let mut bytes = hand_built_tar(&[("k", b'0', b"kept"), ("f", b'6', b"")]);
+    bytes.truncate(bytes.len() - 1024);
+    bytes.extend_from_slice(&link_header("l", "f"));
+    bytes.extend(std::iter::repeat_n(0u8, 1024));
+    std::fs::write(&src, bytes).unwrap();
+    let out = dir.join("out.tar");
+    let outcome = convert(&src, &out, "tar", &ConvertOpts::default());
+    let skipped = skips(&outcome.fidelity.warnings);
+    assert_eq!(skipped.len(), 2, "{skipped:?}");
+    assert_eq!(skipped[0].0, "f");
+    assert_eq!(
+        skipped[1],
+        (
+            "l".to_string(),
+            "its hard-link target `f` was not written".to_string()
+        )
+    );
+    assert_eq!(
+        entries_of(&out),
+        [("k".to_string(), EntryKind::File, b"kept".to_vec())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The NUL case: a cpio group whose data member's name holds a NUL. tar
+/// cannot hold that name, so the member is skipped, and its link — whose
+/// TARGET is that name — is skipped too, never stored dangling.
+#[cfg(feature = "cpio")]
+#[test]
+fn a_cpio_link_to_a_nul_named_target_is_skipped_into_tar() {
+    let dir = tmp_dir();
+    let src = dir.join("src.cpio");
+    let mut bytes = Vec::new();
+    newc_member(&mut bytes, "k", 9, 1, b"kept");
+    newc_member(&mut bytes, "t\0x", 7, 2, b"payload");
+    newc_member(&mut bytes, "l", 7, 2, b"");
+    newc_member(&mut bytes, "TRAILER!!!", 0, 1, b"");
+    std::fs::write(&src, bytes).unwrap();
+    let out = dir.join("out.tar");
+    let outcome = convert(&src, &out, "tar", &ConvertOpts::default());
+    let skipped = skips(&outcome.fidelity.warnings);
+    assert_eq!(skipped.len(), 2, "{skipped:?}");
+    assert_eq!(skipped[0].0, "t\0x");
+    assert_eq!(skipped[1].0, "l");
+    assert_eq!(
+        entries_of(&out),
+        [("k".to_string(), EntryKind::File, b"kept".to_vec())]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// cpio into tar: the target stores links, so the group stays a group.
+#[cfg(feature = "cpio")]
+#[test]
+fn cpio_to_tar_writes_links_as_links() {
+    let dir = tmp_dir();
+    let src = dir.join("src.cpio");
+    std::fs::write(&src, gnu_cpio_group(b"shared bytes")).unwrap();
+    let out = dir.join("out.tar");
+    let outcome = convert(&src, &out, "tar", &ConvertOpts::default());
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    let link = |name: &str| {
+        (
+            name.to_string(),
+            EntryKind::Hardlink { target: "a".into() },
+            Vec::new(),
+        )
+    };
+    assert_eq!(
+        entries_of(&out),
+        [
+            ("a".to_string(), EntryKind::File, b"shared bytes".to_vec()),
+            link("a1"),
+            link("a2"),
+            ("p".to_string(), EntryKind::File, b"plain".to_vec()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `cat` of a link writes its target's bytes when the target was selected
+/// earlier in the same run, and is `EntryNotFound` naming the target when it
+/// was not.
+#[test]
+fn cat_of_a_link_copies_its_selected_target_or_names_it() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    std::fs::write(&src, hand_built_link_tar("a", "b")).unwrap();
+    let mut out = Vec::new();
+    entries::cat(
+        Input::Path(src.clone()),
+        &Selection::All,
+        DEFAULT_MAX_RATIO,
+        None,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(out, b"hellohello");
+
+    let mut out = Vec::new();
+    let err = entries::cat(
+        Input::Path(src),
+        &Selection::Names(vec!["a".into()]),
+        DEFAULT_MAX_RATIO,
+        None,
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, stuffr::Error::EntryNotFound(t) if t == "b"),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert!(out.is_empty(), "nothing invented for the link");
     let _ = std::fs::remove_dir_all(&dir);
 }
