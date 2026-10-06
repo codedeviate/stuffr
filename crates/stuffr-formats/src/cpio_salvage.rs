@@ -1248,10 +1248,6 @@ mod tests {
     // Healthy and damaged archives
     // -------------------------------------------------------------------
 
-    /// Every entry a healthy archive holds comes back `Unattested` — never
-    /// `Complete` — named, sized and kinded as the ordinary reader reports
-    /// it, with no trailer row and no sighting, and its bytes written back
-    /// verbatim. Stands on this project's own writer; see the builders' note.
     /// The ordinary reader groups a GNU hard-link group by inode (data on
     /// the last link; earlier names held back and returned as links after
     /// it). Salvage does NOT: it reports headers as it finds them, in archive
@@ -1294,6 +1290,10 @@ mod tests {
         );
     }
 
+    /// Every entry a healthy archive holds comes back `Unattested` — never
+    /// `Complete` — named, sized and kinded as the ordinary reader reports
+    /// it, with no trailer row and no sighting, and its bytes written back
+    /// verbatim. Stands on this project's own writer; see the builders' note.
     #[test]
     fn every_entry_of_a_healthy_cpio_is_unattested_and_agrees_with_the_reader() {
         let long_name = format!("deep/{}/file.txt", "n".repeat(300));

@@ -167,8 +167,16 @@
 //! archive that ends without a trailer while names are held is the ordinary
 //! truncation error (exit 5): the held names are simply never returned.
 //! Resolved groups keep their data member's name for the rest of the
-//! archive, which costs memory proportional to the archive's own headers,
-//! not more.
+//! archive, and `held_order` keeps every key ever held: both grow in
+//! proportion to the input, each entry paid for by a header of at least 110
+//! bytes, so they are not capped. Only held names are, because a single
+//! header can multiply them (one data member releases many).
+//!
+//! **A member naming its own group is dropped.** A zero-size member whose
+//! name equals its group's data member (or, for an all-empty group, its
+//! first name) is the same file declared twice. It yields no entry at all —
+//! never `Hardlink { target: <its own name> }`, which extraction would turn
+//! into copying a file onto itself.
 //!
 //! **Only this reader groups.** `cpio_salvage` reports headers as it finds
 //! them, so a salvaged GNU link group still shows its earlier names as
@@ -550,6 +558,10 @@ enum Group {
 enum Placement {
     /// Held back: return nothing for it yet and read the next header.
     Hold,
+    /// A zero-size member naming its own group's data member: the same file
+    /// declared twice. Return nothing for it, ever — a `Hardlink` to its own
+    /// name would have extraction copy a file onto itself, which truncates.
+    Drop,
     /// Return it as a `File` with its payload, announcing links.
     File,
     /// Return it as a link to `target`, with no payload, reporting the
@@ -608,7 +620,9 @@ impl LinkGroups {
                     unreachable!("matched as Held one line above");
                 };
                 self.held_count -= held.len();
-                for mut link in held {
+                // A held name equal to the data member's is the same file
+                // declared twice; it is dropped, never a self-link.
+                for mut link in held.into_iter().filter(|m| m.name != meta.name) {
                     link.kind = EntryKind::Hardlink {
                         target: meta.name.clone(),
                     };
@@ -616,6 +630,9 @@ impl LinkGroups {
                     self.pending.push_back(link);
                 }
                 Ok(Placement::File)
+            }
+            Some(Group::Resolved { target, .. }) if file_size == 0 && meta.name == *target => {
+                Ok(Placement::Drop)
             }
             Some(Group::Resolved { target, size }) if file_size == 0 => Ok(Placement::Link {
                 target: target.clone(),
@@ -655,7 +672,9 @@ impl LinkGroups {
             let Some(first) = held.next() else { continue };
             let target = first.name.clone();
             self.pending.push_back(first);
-            for mut link in held {
+            // A later name equal to the first is the same file declared
+            // twice: dropped, never a self-link.
+            for mut link in held.filter(|m| m.name != target) {
                 link.kind = EntryKind::Hardlink {
                     target: target.clone(),
                 };
@@ -677,6 +696,9 @@ impl ArchiveRead for CpioRead {
             // PREVIOUS call returned — `Reader::finish` drains any bytes the
             // caller did not read itself, exactly as if the caller had read
             // them. `None` once the trailer was reached (or a read failed).
+            // After an error the state stays `Ended`, so a later call returns
+            // `Ok(None)`: the pre-existing convention, and the failing call
+            // already returned the classified error.
             let src = match std::mem::replace(&mut self.state, CpioState::Ended) {
                 CpioState::Idle(src) => Some(src),
                 CpioState::Reading(reader) => match reader.finish() {
@@ -758,9 +780,9 @@ impl ArchiveRead for CpioRead {
             let announce = if meta.kind == EntryKind::File && e.nlink() > 1 && e.ino() != 0 {
                 let key = (e.dev_major(), e.dev_minor(), e.ino());
                 match self.links.on_member(key, meta.clone(), remaining)? {
-                    Placement::Hold => {
-                        // A held-back member's payload is 0 bytes, so
-                        // `finish` hands the source straight back.
+                    Placement::Hold | Placement::Drop => {
+                        // A held-back or dropped member's payload is 0
+                        // bytes, so `finish` hands the source straight back.
                         let src = reader.finish().map_err(classify_cpio_error)?;
                         self.state = CpioState::Idle(src);
                         continue;
@@ -2698,7 +2720,15 @@ mod tests {
     /// Exactly at the cap is still fine.
     #[test]
     fn holding_back_past_the_cap_is_a_resource_limit() {
+        /// Clears the override even when an assertion below panics.
+        struct ResetCap;
+        impl Drop for ResetCap {
+            fn drop(&mut self) {
+                HELD_LINK_CAP_OVERRIDE.with(|c| c.set(None));
+            }
+        }
         HELD_LINK_CAP_OVERRIDE.with(|c| c.set(Some(4)));
+        let _reset = ResetCap;
         let names: Vec<String> = (0..5).map(|i| format!("n{i}")).collect();
 
         let mut at_cap: Vec<(&str, u32, u32, &[u8])> = names[..4]
@@ -2717,7 +2747,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains('4'), "the message names the limit: {msg}");
         assert!(msg.contains("hard-link"), "{msg}");
-        HELD_LINK_CAP_OVERRIDE.with(|c| c.set(None));
     }
 
     /// The real ceiling is the spec's figure, and outside tests nothing can
@@ -2738,5 +2767,47 @@ mod tests {
             let err = read_rows(&whole[..cut]).expect_err("truncated");
             assert_eq!(err.exit_code(), 5, "cut at {cut}: {err:?}");
         }
+    }
+
+    /// Data first, then a zero-size member with the SAME name: the same
+    /// file declared twice. No self-link; the other members are unchanged.
+    #[test]
+    fn a_data_first_member_naming_its_own_group_is_dropped() {
+        let bytes = newc_archive(
+            &[("c", 7, 3, b"hello"), ("c", 7, 3, b""), ("a", 7, 3, b"")],
+            true,
+        );
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![file_row("c", b"hello", true), link_row("a", "c", 5)]
+        );
+    }
+
+    /// Data last, with a held name equal to the data member's: dropped at
+    /// resolution, while the other held name still becomes a link.
+    #[test]
+    fn a_data_last_member_naming_its_own_group_is_dropped() {
+        let bytes = newc_archive(
+            &[("c", 7, 3, b""), ("a", 7, 3, b""), ("c", 7, 3, b"hello")],
+            true,
+        );
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![file_row("c", b"hello", true), link_row("a", "c", 5)]
+        );
+    }
+
+    /// An all-empty group naming its first member twice: one 0-byte file,
+    /// links for the other names only.
+    #[test]
+    fn an_all_empty_group_repeating_its_first_name_drops_the_repeat() {
+        let bytes = newc_archive(
+            &[("a", 7, 3, b""), ("a", 7, 3, b""), ("b", 7, 3, b"")],
+            true,
+        );
+        assert_eq!(
+            read_rows(&bytes).expect("reads"),
+            vec![file_row("a", b"", false), link_row("b", "a", 0)]
+        );
     }
 }
