@@ -102,6 +102,43 @@ read list.
 > the default tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`.
 >
+> `0.10.0` reads **hard links**. A tar typeflag-`1` entry and a cpio
+> inode group (GNU cpio's data-on-the-last-link layout included) arrive as
+> `EntryKind::Hardlink { target }`: `unpack` recreates them as real links
+> (a copy where the filesystem refuses one; a link to a symlink as a
+> symlink), `convert` keeps them as links into tar and writes full copies
+> into containers without links, and `cat` of a link writes its target's
+> bytes (the target must be selected too). A link whose target is not
+> available is skipped and named (`--strict-fidelity` → exit 4); a link
+> target that escapes the destination is exit 7; a tar link naming itself
+> (`gtar -cf x a a`) is dropped as the same file declared twice.
+> **Breaking:** `ContainerCaps::stores_hardlinks`, a new public field on an
+> exhaustive struct. Additive: `EntryKind::Hardlink`,
+> `Entry::announce_links`/`announces_links`, `fmt_name`, `SpillWriter`,
+> `SpillPolicy::memory_cap`, `ops::refuse_directory_for`,
+> `testing::check_display_has_no_raw_controls`. Nothing removed.
+> **Behaviour changes:** `list`, `test`, `cat`, `unpack`, `info` and
+> `salvage` exit 2 on a directory input (was 1). Every error and fidelity
+> message, and `list`/`salvage` text, escapes control and bidi characters
+> in names (`a\x1b[31mb`); JSON stays raw. The special-entry skip reason
+> no longer mentions hard links. A tar link's `size` is `None`; held-back
+> cpio link names come after their data member in entry order; `test`
+> does not verify links separately. `cat` of a link without its target is
+> a usage error (exit 2) naming both. Writers without link support refuse
+> a `Hardlink` handed to them directly (exit 3). BSD `ar` members with an
+> odd `#1/N` name length now read correctly (they were misframed), and a
+> missing final pad is accepted. Converting a tar into a container without
+> links keeps up to 64 MiB of recent payloads in memory, on top of the
+> usual buffers.
+> **Known issue:** an archive that places an entry where it earlier created
+> a directory, or beneath a file it created, makes `unpack` fail with exit
+> 1 rather than a classified code. Every entry kind is affected, now
+> including hard links; tracked for 0.10.x. `--index` reads still stop at
+> the last selected entry and skip the codec-trailer check (as in 0.9.0).
+> **1769** tests under `--all-features`, **1705** on the
+> default tier — measured from this bump's own `make check`,
+> `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own

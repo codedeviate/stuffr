@@ -424,10 +424,11 @@ CONVERTING BETWEEN FORMATS
       written as a full copy of its target's bytes, which loses nothing:
       for a tar source, from a memory window of the most recent payloads
       (64 MiB); for a cpio source, which announces its linked files, from
-      exactly those. A link to a symlink is written as that symlink. A
-      link whose copy is not available (its target past the window, or
-      never written) is skipped with a warning naming it and why — exit 4
-      under --strict-fidelity.
+      exactly those. A link to a symlink is written as that symlink when
+      OUT stores symlinks. A link whose copy is not available (its target
+      past the window, never written, or a symlink OUT cannot store) is
+      skipped with a warning naming it and why — exit 4 under
+      --strict-fidelity.
 
   stuffr convert backup.tar.gz backup.tar.gz --level 9 --force
       Refused (exit 2), --force or not: OUT is IN. So is the same file reached
