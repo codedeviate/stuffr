@@ -955,16 +955,26 @@ impl ArchiveRead for TarRead {
             .entries
             .as_mut()
             .expect("TarRead::entries is only taken in Drop");
-        let Some(next) = iter.next() else {
-            self.ended = true;
-            // tar cannot tell "the archive ended" from "the stream ran out",
-            // so this does — see the module doc's point 4.2.
-            self.verify_end_of_archive()?;
-            return Ok(None);
+        let (raw, mut meta) = loop {
+            let Some(next) = iter.next() else {
+                self.ended = true;
+                // tar cannot tell "the archive ended" from "the stream ran
+                // out", so this does — see the module doc's point 4.2.
+                self.verify_end_of_archive()?;
+                return Ok(None);
+            };
+            let raw = next.map_err(classify_tar_error)?;
+            let meta = entry_meta(&raw);
+            refuse_corrupt_hard_link(&meta)?;
+            // A link naming itself is the same file declared twice (GNU tar
+            // writes one for `tar -cf x.tar a a`): it yields no entry, as
+            // cpio's self-named member does. Dropped unread, so the iterator
+            // skips whatever its header declares.
+            if matches!(&meta.kind, EntryKind::Hardlink { target } if *target == meta.name) {
+                continue;
+            }
+            break (raw, meta);
         };
-        let raw = next.map_err(classify_tar_error)?;
-        let mut meta = entry_meta(&raw);
-        refuse_corrupt_hard_link(&meta)?;
         // A hard link carries no payload of its own: its content is the
         // target's. Whatever size its header declares, the reader yields no
         // bytes and `size` is unknown (`EntryKind::Hardlink`'s contract).
@@ -1138,24 +1148,20 @@ pub(crate) fn entry_kind(
     }
 }
 
-/// Refuses the two hard-link shapes that name nothing extractable: a link
-/// with no target, and a link whose target is its own name. Raised here,
-/// where the entry's name is known, as the archive contradicting itself
-/// (exit 5) rather than left for `extract` to meet. `entry_kind` stays
-/// infallible because `tar_salvage.rs` shares it and must never refuse.
+/// Refuses a hard link with no target: it names nothing extractable. Raised
+/// here, where the entry's name is known, as the archive contradicting
+/// itself (exit 5) rather than left for `extract` to meet. `entry_kind`
+/// stays infallible because `tar_salvage.rs` shares it and must never
+/// refuse. A link whose target is its own name is not refused: it is the
+/// same file declared twice, and `next_entry` drops it.
 fn refuse_corrupt_hard_link(meta: &EntryMeta) -> Result<()> {
-    if let EntryKind::Hardlink { target } = &meta.kind {
+    if let EntryKind::Hardlink { target } = &meta.kind
+        && target.is_empty()
+    {
         let name = &meta.name;
-        if target.is_empty() {
-            return Err(Error::Corrupt(format!(
-                "hard link `{name}` names no target"
-            )));
-        }
-        if target == name {
-            return Err(Error::Corrupt(format!(
-                "hard link `{name}` names itself as its target"
-            )));
-        }
+        return Err(Error::Corrupt(format!(
+            "hard link `{name}` names no target"
+        )));
     }
     Ok(())
 }
@@ -1637,17 +1643,55 @@ mod tests {
     }
 
     #[test]
-    fn a_hard_link_naming_itself_or_nothing_is_corrupt() {
-        for (name, target) in [("a", ""), ("a", "a")] {
-            let bytes = tar_with_link(name, target, false);
-            let err = walk(open(&bytes)).expect_err("a link naming nothing usable");
-            assert!(
-                matches!(err, stuffr_core::Error::Corrupt(_)),
-                "{target:?}: {err:?}"
-            );
-            assert_eq!(err.exit_code(), 5, "{target:?}: {err}");
-            assert!(err.to_string().contains("`a`"), "{err}");
-        }
+    fn a_hard_link_naming_nothing_is_corrupt() {
+        let bytes = tar_with_link("a", "", false);
+        let err = walk(open(&bytes)).expect_err("a link naming nothing usable");
+        assert!(matches!(err, stuffr_core::Error::Corrupt(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(err.to_string().contains("`a`"), "{err}");
+    }
+
+    /// `gtar -cf x.tar a a b`, with `a` hard-linked to `b`, writes `a` as a
+    /// file and then `a` again as a link to `a`: the same file declared
+    /// twice. The second yields no entry, as cpio's self-named member does,
+    /// and the entries around it are unaffected.
+    #[test]
+    fn a_hard_link_naming_itself_is_dropped() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut file = tar::Header::new_gnu();
+        file.set_path("a").unwrap();
+        file.set_size(5);
+        file.set_mode(0o644);
+        file.set_cksum();
+        builder.append(&file, &b"hello"[..]).unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Link);
+        link.set_size(0);
+        link.set_mode(0o644);
+        builder.append_link(&mut link, "a", "a").unwrap();
+        let mut b = tar::Header::new_gnu();
+        b.set_entry_type(tar::EntryType::Link);
+        b.set_size(0);
+        b.set_mode(0o644);
+        builder.append_link(&mut b, "b", "a").unwrap();
+        let bytes = builder.into_inner().unwrap();
+        assert_eq!(
+            read_kinds(&bytes),
+            [
+                ("a".to_string(), EntryKind::File, b"hello".to_vec()),
+                (
+                    "b".to_string(),
+                    EntryKind::Hardlink { target: "a".into() },
+                    Vec::new()
+                ),
+            ]
+        );
+        // A self-link that is the LAST entry still ends the archive cleanly.
+        let bytes = tar_with_link("a", "a", false);
+        assert_eq!(
+            read_kinds(&bytes),
+            [("b".to_string(), EntryKind::File, b"hello".to_vec())]
+        );
     }
 
     /// A header declaring a size on a typeflag-`1` entry (some writers put

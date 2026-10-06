@@ -14461,6 +14461,50 @@ fn gnu_tar_of_hard_link_tree(dir: &Path) -> PathBuf {
     tar
 }
 
+/// `gtar -cf x.tar a a b`, with `a` and `b` hard-linked, writes `a`, then
+/// `a` as a link to ITSELF, then `b` as a link to `a`. GNU tar and bsdtar
+/// read it; stuffr drops the self-link (the same file declared twice) and
+/// lists, tests and unpacks the rest. 0.10.0's reader refused it (exit 5).
+#[cfg(unix)]
+#[test]
+fn a_gnu_tar_naming_a_file_twice_lists_and_unpacks() {
+    let dir = tmp_dir();
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a"), b"shared payload").unwrap();
+    std::fs::hard_link(src.join("a"), src.join("b")).unwrap();
+    let tar = dir.join("x.tar");
+    run_tool(
+        &require_gnu_tar(),
+        &[os(&"-cf"), os(&tar), os(&"a"), os(&"a"), os(&"b")],
+        &src,
+        b"",
+    );
+    let listing = run_tool(&require_gnu_tar(), &[os(&"-tvf"), os(&tar)], &dir, b"");
+    let listing = String::from_utf8_lossy(&listing);
+    assert!(listing.contains("a link to a"), "the shape: {listing}");
+
+    let p = tar.to_str().unwrap();
+    let out = run_output(&["list", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout.lines().count(), 2, "a and b, once each: {stdout}");
+    let out = run_output(&["test", p]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        p,
+        "-C",
+        dest.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"shared payload");
+    assert_eq!(std::fs::read(dest.join("b")).unwrap(), b"shared payload");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// tar into zip: every link name holds its target's bytes, as a copy, and
 /// that is no loss, so `--strict-fidelity` passes.
 #[cfg(unix)]
