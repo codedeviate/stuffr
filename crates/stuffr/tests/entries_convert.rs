@@ -692,3 +692,78 @@ fn a_plain_stream_is_not_an_archive() {
     assert_ne!(err.exit_code(), 1, "{err}");
     assert!(!out.exists());
 }
+
+/// An ar archive in the BSD extended form (`#1/N`, the name right after the
+/// header), which carries any byte in a member name — a NUL included.
+#[cfg(feature = "ar")]
+fn bsd_ar(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+    // Every name here is of EVEN length: the `ar` crate pads a `#1/N`
+    // member by its PAYLOAD's parity, so an odd-length name with an odd total
+    // would be framed differently than written.
+    let mut out = b"!<arch>\n".to_vec();
+    for (name, data) in members {
+        let field = |s: String, w: usize| format!("{s:<w$}").into_bytes();
+        out.extend(field(format!("#1/{}", name.len()), 16));
+        out.extend(field("0".into(), 12));
+        out.extend(field("0".into(), 6));
+        out.extend(field("0".into(), 6));
+        out.extend(field("100644".into(), 8));
+        out.extend(field((name.len() + data.len()).to_string(), 10));
+        out.extend(b"`\n");
+        out.extend(*name);
+        out.extend(*data);
+        if out.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// Task 6's fuzz finding: tar ends a name at its first NUL, so an ar member
+/// named `a\0bc.txt` used to land in the tar as `a`, reported as no loss at all.
+/// The target cannot hold the name, so the entry is skipped with ONE warning
+/// naming it, and every other entry arrives intact.
+#[cfg(feature = "ar")]
+#[test]
+fn a_name_with_a_nul_is_skipped_into_tar_and_named() {
+    let dir = tmp_dir();
+    let src = dir.join("in.a");
+    std::fs::write(
+        &src,
+        bsd_ar(&[
+            (b"one1.txt", b"first\n"),
+            (b"a\0bc.txt", b"nul\n"),
+            (b"two2.txt", b"second\n"),
+        ]),
+    )
+    .unwrap();
+    let dst = dir.join("out.tar");
+    let outcome = entries::convert_archive(
+        Input::Path(src),
+        Output::Path(dst.clone()),
+        fmt("tar"),
+        None,
+        &ConvertOpts::default(),
+    )
+    .expect("one entry the target cannot hold is a warning, not a failure");
+    let skipped: Vec<_> = outcome
+        .fidelity
+        .warnings
+        .iter()
+        .filter_map(|w| match w {
+            Fidelity::EntrySkipped { entry, reason } => Some((entry.as_str(), reason.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(skipped.len(), 1, "{:?}", outcome.fidelity.warnings);
+    assert_eq!(skipped[0].0, "a\0bc.txt");
+    assert!(skipped[0].1.contains("NUL"), "{}", skipped[0].1);
+    assert_eq!(
+        files_of(&dst),
+        vec![
+            ("one1.txt".to_string(), b"first\n".to_vec()),
+            ("two2.txt".to_string(), b"second\n".to_vec()),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

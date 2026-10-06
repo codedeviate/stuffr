@@ -13895,3 +13895,81 @@ fn convert_into_a_read_only_container_exits_3_and_writes_nothing() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An ar archive in the BSD extended form (`#1/N`), whose member names may
+/// hold any byte — a NUL included.
+fn bsd_ar_with_names(members: &[(&[u8], &[u8])]) -> Vec<u8> {
+    // Every name here is of EVEN length: the `ar` crate pads a `#1/N`
+    // member by its PAYLOAD's parity, so an odd-length name with an odd total
+    // would be framed differently than written.
+    let mut out = b"!<arch>\n".to_vec();
+    for (name, data) in members {
+        let field = |s: String, w: usize| format!("{s:<w$}").into_bytes();
+        out.extend(field(format!("#1/{}", name.len()), 16));
+        out.extend(field("0".into(), 12));
+        out.extend(field("0".into(), 6));
+        out.extend(field("0".into(), 6));
+        out.extend(field("100644".into(), 8));
+        out.extend(field((name.len() + data.len()).to_string(), 10));
+        out.extend(b"`\n");
+        out.extend(*name);
+        out.extend(*data);
+        if out.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// Task 6's fuzz finding at the CLI: an ar member named `a\0bc.txt` converted
+/// into tar is skipped with a warning (exit 0, the rest written), and
+/// `--strict-fidelity` turns that warning into exit 4 — where it used to
+/// land in the tar as `a` and report "no fidelity loss".
+#[test]
+fn convert_skips_a_name_with_a_nul_its_target_cannot_store() {
+    let dir = tmp_dir();
+    let src = dir.join("in.a");
+    std::fs::write(
+        &src,
+        bsd_ar_with_names(&[(b"keep.txt", b"kept\n"), (b"a\0bc.txt", b"nul\n")]),
+    )
+    .unwrap();
+    let tar = dir.join("out.tar");
+    let out = run_output(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        tar.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    let err = stderr_text(&out);
+    assert!(
+        err.contains("skipped entry `a\0bc.txt`") && err.contains("NUL"),
+        "the warning names the entry and why: {err}"
+    );
+    let back = dir.join("back");
+    let out = run_output(&[
+        "unpack",
+        tar.to_str().unwrap(),
+        "-C",
+        back.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert_eq!(std::fs::read(back.join("keep.txt")).unwrap(), b"kept\n");
+    assert_eq!(
+        std::fs::read_dir(&back).unwrap().count(),
+        1,
+        "only the entry tar can hold"
+    );
+
+    let strict = dir.join("strict.tar");
+    let out = run_output(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        strict.to_str().unwrap(),
+        "--strict-fidelity",
+    ]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr_text(&out));
+    let _ = std::fs::remove_dir_all(&dir);
+}

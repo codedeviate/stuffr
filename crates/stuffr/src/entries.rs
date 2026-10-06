@@ -3902,6 +3902,14 @@ enum WritePlan {
 /// build has never heard of is skipped too: writing it as a regular file would
 /// be the `ar`-directory defect, silently.
 ///
+/// A NAME the target cannot store is the same question: a container whose
+/// caps say `!nul_in_names` (tar, cpio, ar, arj) would end a name at its
+/// first NUL, so an entry whose name holds one is skipped with
+/// [`nul_name_reason`] rather than stored under a shorter name — the writer
+/// would refuse it anyway, and failing the whole conversion over one entry is
+/// the outcome this function exists to avoid. Only `convert` can meet one: an
+/// OS path cannot carry a NUL, so `pack`'s walk never yields such a name.
+///
 /// An entry skipped here STILL reports its missing ownership, as it always
 /// has: the ownership warning is appended after the skip reason whatever the
 /// plan is. That is existing behaviour, pinned by a test, not a rationale.
@@ -3960,10 +3968,29 @@ fn plan_entry_write(
             WritePlan::Skip
         }
     };
+    let plan = match plan {
+        WritePlan::Write if !caps.nul_in_names && meta.name.contains('\0') => {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: meta.name.clone(),
+                reason: nul_name_reason(container),
+            });
+            WritePlan::Skip
+        }
+        plan => plan,
+    };
     if let Some(w) = ownership_warning(meta) {
         warnings.push(w);
     }
     plan
+}
+
+/// Why an entry whose name holds a NUL is not written into `container`, a
+/// target whose caps say `!nul_in_names`.
+fn nul_name_reason(container: FormatId) -> String {
+    format!(
+        "its name contains a NUL byte, and `{container}` stores names \
+         NUL-terminated, so the name would be cut short there"
+    )
 }
 
 /// [`plan_entry_write`] for one walked item, or `None` for an item the walk
@@ -5012,6 +5039,49 @@ mod tests {
             WritePlan::Write
         ));
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn a_name_with_a_nul_is_skipped_where_the_target_cannot_store_one() {
+        let nul = EntryMeta {
+            name: "a\0b".into(),
+            ..meta_with(Some(1), Some(1))
+        };
+        let terminated = ContainerCaps::default();
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&terminated, FormatId::new("tar"), &nul, &mut w),
+            WritePlan::Skip
+        ));
+        // The reason, verbatim: what `stuffr convert` prints for it.
+        assert_eq!(
+            w[0].to_string(),
+            "skipped entry `a\0b`: its name contains a NUL byte, and `tar` stores \
+             names NUL-terminated, so the name would be cut short there"
+        );
+        assert_eq!(w.len(), 1);
+
+        // A target that holds one writes it, and the cap is the only switch.
+        let holds = ContainerCaps {
+            nul_in_names: true,
+            ..Default::default()
+        };
+        let mut w = Vec::new();
+        assert!(matches!(
+            plan_entry_write(&holds, FormatId::new("zip"), &nul, &mut w),
+            WritePlan::Write
+        ));
+        assert!(w.is_empty());
+
+        // A kind skip keeps its own reason; the name is not reported twice.
+        let nul_dir = EntryMeta {
+            kind: EntryKind::Dir,
+            ..nul
+        };
+        let mut w = Vec::new();
+        plan_entry_write(&terminated, FormatId::new("ar"), &nul_dir, &mut w);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].to_string().contains("no directory entries"), "{w:?}");
     }
 
     #[test]
