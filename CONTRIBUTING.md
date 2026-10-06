@@ -650,10 +650,8 @@ cases.
 `stuffr-core/src/honesty.rs` holds the six invariants the targets assert —
 `check_error_is_classified`, `check_entry_size`, `check_entry_count`,
 `check_fidelity_claim` (Phase 3a), `check_salvage_claim` (Salvage Stage 1
-Task 8), and `check_entries_carried` (Phase 5a Task 6: the `container`
-target converts what its seekable walk read into a `tar` and checks every
-name arrived or was named in a skip warning; `STUFFR_FUZZ_CONVERT_TRACE=1`
-prints one `convert-trace` line per input that reached it) — re-exported through `stuffr_core::testing` (gated
+Task 8) and `check_entries_carried` (Phase 5a Task 6) — re-exported through
+`stuffr_core::testing` (gated
 `#[cfg(any(test, feature = "testing"))]`) rather than written inline in a
 fuzz target. The reason is structural, not a style preference: **a fuzz
 target's checks cannot be unit-tested, so a harness that runs clean is
@@ -664,6 +662,14 @@ live in an ordinary library module, each has a `mod broken_honesty` double
 proving it *can* fail — the same `broken_codecs`/`broken_containers` pattern
 the conformance harnesses already use — so a vacuous check is caught the
 same way a vacuous conformance property would be.
+
+- **`check_entries_carried`** is the `container` target's convert oracle:
+  for every input its seekable walk read, the target converts the same file
+  into a bare `tar` and checks that every name the walk saw either arrived
+  or is named by a skip warning in the conversion's report — by name, never
+  by count. `STUFFR_FUZZ_CONVERT_TRACE=1` prints one `convert-trace` line
+  per input that reached it. Its first run found tar's writer truncating a
+  name at a NUL, which is why `ContainerCaps::nul_in_names` exists.
 
 `check_salvage_claim` refuses a status that claims more than the format or
 the scan supports. Since Salvage Stage 3 it takes the format's class of

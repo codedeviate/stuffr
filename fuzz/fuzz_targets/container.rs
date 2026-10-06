@@ -311,10 +311,10 @@ fuzz_target!(|data: &[u8]| {
 
     // The tempdir/file is needed ONLY on the seekable path: the forward-only
     // branch below builds its `Source` straight from an in-memory `Cursor`
-    // and never touches a path. `_tmp_guard` keeps the `TempDir` alive (and
+    // and never touches a path. `tmp_guard` keeps the `TempDir` alive (and
     // therefore its cleanup deferred to the end of this closure) without
     // paying for one on iterations that never use it.
-    let mut _tmp_guard: Option<tempfile::TempDir> = None;
+    let mut tmp_guard: Option<tempfile::TempDir> = None;
     let path: Option<PathBuf> = if seekable {
         let tmp = tempfile::tempdir().expect("tempdir");
         // Named with the slot's extension (every slot name is one of its own
@@ -325,7 +325,7 @@ fuzz_target!(|data: &[u8]| {
         // format" (zips with bytes ahead of their first local header).
         let p = tmp.path().join(format!("input.{name}"));
         std::fs::write(&p, payload).expect("write temp input");
-        _tmp_guard = Some(tmp);
+        tmp_guard = Some(tmp);
         Some(p)
     } else {
         None
@@ -509,7 +509,7 @@ fuzz_target!(|data: &[u8]| {
     // Phase 5a: convert what this walk read into a tar, seekable path only
     // (the cheap one: the input is already a file). Last, so every check
     // above has already passed on these bytes.
-    if let (Some(p), Some(tmp)) = (&path, &_tmp_guard) {
+    if let (Some(p), Some(tmp)) = (&path, &tmp_guard) {
         convert_oracle(p, &tmp.path().join("converted.tar"), name, &names);
     }
 });

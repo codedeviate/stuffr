@@ -167,9 +167,10 @@ pub fn check_fidelity_claim(report: &FidelityReport, approximated: bool) -> Resu
 /// conversion's own fidelity report. A name absent from `written` is a
 /// supported outcome only when the report says why: a target with no shape
 /// for the entry's kind (a directory in `ar`, a symlink, a device or fifo)
-/// skips it with [`Fidelity::EntrySkipped`], as does a `unique_names` target
-/// for every later entry of a repeated name. What is never acceptable is an
-/// entry that silently fails to arrive.
+/// skips it with [`Fidelity::EntrySkipped`], as does a target whose names
+/// cannot hold a NUL (`ContainerCaps::nul_in_names`), and a `unique_names`
+/// target for every later entry of a repeated name. What is never acceptable
+/// is an entry that silently fails to arrive.
 ///
 /// **Matched by name, never by count.** `FidelityReport::merge` de-duplicates
 /// identical warnings, so two skipped entries of one name leave ONE warning;
@@ -499,11 +500,13 @@ mod broken_honesty {
 
     #[test]
     fn an_entry_a_conversion_skips_and_names_is_permitted() {
-        // Over-strictness guard: neutering `check_entries_carried` to
-        // `Ok(())` makes this pass harder; it is falsified by refusing a
-        // named skip, or by matching on counts — two entries of one name,
-        // one arriving and ONE (merged) warning, is a `unique_names`
-        // target's ordinary output.
+        // Over-strictness guard. Neutering `check_entries_carried` to
+        // `Ok(())` leaves this test GREEN — it cannot catch a vacuous
+        // oracle; its sibling above does. It is falsified only by
+        // over-strict behaviour: refusing a name a skip warning covers, or
+        // matching on counts (two entries of one name, one arriving and ONE
+        // merged warning, is a `unique_names` target's ordinary output).
+        // Observed red under the first of those edits.
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let mut skipped = FidelityReport::new(Rung::Exact);
         skipped.warn(Fidelity::EntrySkipped {
