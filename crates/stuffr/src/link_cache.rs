@@ -19,7 +19,9 @@
 //! declined (its write is unaffected), and older payloads are evicted, oldest
 //! first, to make room for a newer one. At most [`MAX_SPOOLED_LINK_PAYLOADS`]
 //! are held on disk at once, so a crafted archive cannot buy one open temp
-//! file per entry. The cache never holds more than its policy allows. A link
+//! file per entry. Each kept payload is charged its name and a fixed
+//! [`KEPT_ENTRY_OVERHEAD`] on top of its bytes, so the COUNT of tiny payloads
+//! is bounded too. The cache never holds more than its policy allows. A link
 //! whose target is not kept is the caller's to skip with a warning; nothing
 //! here ever hands out a partial or empty stand-in.
 //!
@@ -45,9 +47,10 @@
 //! turn, so a later link naming THAT name (rather than the original target)
 //! finds nothing kept and is skipped with the pinned reason.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, SeekFrom};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use stuffr_core::{EntryKind, EntryMeta, FormatId, Source, SpillPolicy, SpillSource, SpillWriter};
 
@@ -106,32 +109,68 @@ struct Limits {
 /// Memory-tier payloads are bounded by bytes instead.
 pub(crate) const MAX_SPOOLED_LINK_PAYLOADS: usize = 64;
 
+/// The memory one kept payload costs beyond its bytes and its name: the
+/// [`SpillSource`], the index's map entry and order-queue node, the shared
+/// name's header. Charged, with the name's length, for every payload kept:
+/// against the policy's total, and against its memory tier too when the
+/// bytes are in memory. So a tar of tiny files cannot keep an effectively
+/// unbounded COUNT of them under a byte cap their payloads alone never
+/// reach. An on-disk payload's overhead is left out of the memory tier: at
+/// most [`MAX_SPOOLED_LINK_PAYLOADS`] of them exist, and a small memory tier
+/// must not refuse a payload that was spooled to disk precisely because the
+/// tier is small. Measured, not guessed: converting a 160,000-entry tar of
+/// ~26-byte files to zip grew peak RSS by ~290 bytes per kept payload beyond
+/// its bytes and name (macOS arm64; the map's growth slack is most of it),
+/// rounded up here.
+pub(crate) const KEPT_ENTRY_OVERHEAD: u64 = 384;
+
 /// One kept payload.
 struct Kept {
-    name: String,
+    /// Its place in [`LinkCache::order`] (and [`LinkCache::disk_order`], when
+    /// on disk): the order it was kept in, unique for the cache's life.
+    seq: u64,
     bytes: SpillSource,
     /// Links still to come, when the reader announced a count (cpio): the
     /// payload is dropped when it reaches zero. `None` (tar): unknown, kept
     /// until evicted.
     links_left: Option<u32>,
+    /// What this payload was charged beyond its bytes:
+    /// [`KEPT_ENTRY_OVERHEAD`] plus its name's length.
+    overhead: u64,
 }
 
 /// Payloads kept so a later hard link can be written as a copy.
+///
+/// Every operation is a map lookup: `kept` answers by name, `order` (and
+/// `disk_order`) answer "oldest" by sequence number. The convert loop calls
+/// `forget`/`spool`/`keep`/`contains` once per entry, so a scan over the kept
+/// payloads here made a tar of small files quadratic in its entry count.
 pub(crate) struct LinkCache {
     policy: CachePolicy,
-    /// Oldest first. At most one payload per name: keeping a name replaces
-    /// what was kept under it.
-    kept: VecDeque<Kept>,
+    /// At most one payload per name: keeping a name replaces what was kept
+    /// under it.
+    kept: HashMap<Rc<str>, Kept>,
+    /// Every kept name by `seq`, oldest first.
+    order: BTreeMap<u64, Rc<str>>,
+    /// The on-disk subset of `order`, oldest first.
+    disk_order: BTreeMap<u64, Rc<str>>,
+    next_seq: u64,
+    /// Payload bytes held in memory and on disk.
     in_memory: u64,
     on_disk: u64,
-    /// How many entries of `kept` are on disk.
-    files: usize,
+    /// The per-payload overhead charged ([`KEPT_ENTRY_OVERHEAD`] plus each
+    /// name's length), summed over in-memory and on-disk payloads.
+    mem_overhead: u64,
+    disk_overhead: u64,
+    /// Whether the per-entry overhead is charged at all: always, except in
+    /// the tests that predate it, which reason in payload bytes alone.
+    charge_overhead: bool,
     /// Names of 0-byte files written: always copy-available, at no cost to
     /// the budget, never evicted, and not counted down. One name per empty
     /// file the archive holds — linear in the input, like the names it costs
     /// to read.
     empties: HashSet<String>,
-    /// The most `files` has ever been, for the bound's tests.
+    /// The most on-disk payloads ever held at once, for the bound's tests.
     #[cfg(test)]
     files_high_water: usize,
 }
@@ -140,10 +179,15 @@ impl LinkCache {
     pub(crate) fn new(policy: CachePolicy) -> Self {
         Self {
             policy,
-            kept: VecDeque::new(),
+            kept: HashMap::new(),
+            order: BTreeMap::new(),
+            disk_order: BTreeMap::new(),
+            next_seq: 0,
             in_memory: 0,
             on_disk: 0,
-            files: 0,
+            mem_overhead: 0,
+            disk_overhead: 0,
+            charge_overhead: true,
             empties: HashSet::new(),
             #[cfg(test)]
             files_high_water: 0,
@@ -168,8 +212,30 @@ impl LinkCache {
         }
     }
 
+    /// Everything charged: payload bytes in both tiers, plus the per-entry
+    /// overhead.
     fn held(&self) -> u64 {
-        self.in_memory + self.on_disk
+        self.in_memory + self.on_disk + self.mem_overhead + self.disk_overhead
+    }
+
+    /// What the memory tier is charged: in-memory payloads and their
+    /// overhead.
+    fn held_in_memory(&self) -> u64 {
+        self.in_memory + self.mem_overhead
+    }
+
+    /// How many payloads are on disk.
+    fn files(&self) -> usize {
+        self.disk_order.len()
+    }
+
+    /// The overhead keeping a payload under `name` is charged.
+    fn overhead_for(&self, name: &str) -> u64 {
+        if self.charge_overhead {
+            KEPT_ENTRY_OVERHEAD + name.len() as u64
+        } else {
+            0
+        }
     }
 
     /// Whether this entry's payload should be kept: under `Announced`, when
@@ -188,22 +254,31 @@ impl LinkCache {
 
     /// A spool for the payload about to be written under `name`, sized from
     /// what the policy has left once older payloads are evicted to fit
-    /// `size` (when it is known). `None` when the payload cannot be kept at
-    /// all: the policy is off, or `size` alone is past it.
+    /// `size` (when it is known) and the entry's overhead. `None` when the
+    /// payload cannot be kept at all: the policy is off, or `size` alone is
+    /// past it.
     ///
     /// Whatever was kept under `name` before is dropped first, kept or not
     /// now: a later link to `name` means the LATEST entry of that name.
     pub(crate) fn spool(&mut self, name: &str, size: Option<u64>) -> Option<SpillWriter> {
         self.forget(name);
         let limits = self.limits()?;
+        let overhead = self.overhead_for(name);
         if let Some(size) = size {
-            if size > limits.total {
+            if size.saturating_add(overhead) > limits.total {
                 return None;
             }
-            while self.held() + size > limits.total && self.evict_oldest() {}
+            while self.held() + size + overhead > limits.total && self.evict_oldest() {}
         }
-        let total = limits.total.saturating_sub(self.held());
-        let mem = limits.mem.saturating_sub(self.in_memory).min(total);
+        let total = limits
+            .total
+            .saturating_sub(self.held())
+            .saturating_sub(overhead);
+        let mem = limits
+            .mem
+            .saturating_sub(self.held_in_memory())
+            .saturating_sub(overhead)
+            .min(total);
         let policy = match limits.disk {
             None => SpillPolicy::Memory { cap: mem },
             Some(dir) => SpillPolicy::Temp {
@@ -232,28 +307,43 @@ impl LinkCache {
             return;
         }
         let len = bytes.caps().len.unwrap_or(u64::MAX);
+        let overhead = self.overhead_for(name);
         let disk = bytes.spilled_to_disk();
-        if len > limits.total || (disk && limits.disk.is_none()) || (!disk && len > limits.mem) {
+        let charged = len.saturating_add(overhead);
+        if charged > limits.total
+            || (disk && limits.disk.is_none())
+            || (!disk && charged > limits.mem)
+        {
             return;
         }
-        while self.held() + len > limits.total && self.evict_oldest() {}
-        while !disk && self.in_memory + len > limits.mem && self.evict_oldest() {}
-        while disk && self.files >= MAX_SPOOLED_LINK_PAYLOADS && self.evict_oldest_on_disk() {}
+        while self.held() + charged > limits.total && self.evict_oldest() {}
+        while !disk && self.held_in_memory() + charged > limits.mem && self.evict_oldest() {}
+        while disk && self.files() >= MAX_SPOOLED_LINK_PAYLOADS && self.evict_oldest_on_disk() {}
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let name: Rc<str> = Rc::from(name);
         if disk {
             self.on_disk += len;
-            self.files += 1;
+            self.disk_overhead += overhead;
+            self.disk_order.insert(seq, Rc::clone(&name));
             #[cfg(test)]
             {
-                self.files_high_water = self.files_high_water.max(self.files);
+                self.files_high_water = self.files_high_water.max(self.files());
             }
         } else {
             self.in_memory += len;
+            self.mem_overhead += overhead;
         }
-        self.kept.push_back(Kept {
-            name: name.to_string(),
-            bytes,
-            links_left: links_to_come,
-        });
+        self.order.insert(seq, Rc::clone(&name));
+        self.kept.insert(
+            name,
+            Kept {
+                seq,
+                bytes,
+                links_left: links_to_come,
+                overhead,
+            },
+        );
     }
 
     /// Records that a 0-byte regular file was written under `name`. Its copy
@@ -269,7 +359,7 @@ impl LinkCache {
 
     /// Whether `target`'s bytes are kept.
     pub(crate) fn contains(&self, target: &str) -> bool {
-        self.empties.contains(target) || self.kept.iter().any(|k| k.name == target)
+        self.empties.contains(target) || self.kept.contains_key(target)
     }
 
     /// A fresh reader over `target`'s bytes, with their length, or `None`
@@ -281,7 +371,7 @@ impl LinkCache {
         if self.empties.contains(target) {
             return Ok(Some((0, Box::new(std::io::empty()))));
         }
-        let Some(kept) = self.kept.iter_mut().find(|k| k.name == target) else {
+        let Some(kept) = self.kept.get_mut(target) else {
             return Ok(None);
         };
         let len = kept.bytes.caps().len.unwrap_or(0);
@@ -295,35 +385,49 @@ impl LinkCache {
     /// with an announced count drops when its last link has; one without a
     /// count (tar) is unaffected.
     pub(crate) fn link_seen(&mut self, target: &str) {
-        let Some(i) = self.kept.iter().position(|k| k.name == target) else {
-            return;
-        };
-        let Some(left) = self.kept[i].links_left.as_mut() else {
+        let Some(left) = self
+            .kept
+            .get_mut(target)
+            .and_then(|k| k.links_left.as_mut())
+        else {
             return;
         };
         *left = left.saturating_sub(1);
-        if *left == 0
-            && let Some(kept) = self.kept.remove(i)
-        {
-            self.release(&kept.bytes);
+        if *left == 0 {
+            self.remove(target);
         }
     }
 
     /// Drops whatever is kept under `name`.
     pub(crate) fn forget(&mut self, name: &str) {
         self.empties.remove(name);
-        while let Some(i) = self.kept.iter().position(|k| k.name == name) {
-            if let Some(kept) = self.kept.remove(i) {
-                self.release(&kept.bytes);
-            }
+        self.remove(name);
+    }
+
+    /// Drops the payload kept under `name`, if any, un-counting it. Dropping
+    /// its `SpillSource` closes (and so deletes) its temp file.
+    fn remove(&mut self, name: &str) {
+        let Some(kept) = self.kept.remove(name) else {
+            return;
+        };
+        self.order.remove(&kept.seq);
+        let len = kept.bytes.caps().len.unwrap_or(0);
+        if kept.bytes.spilled_to_disk() {
+            self.disk_order.remove(&kept.seq);
+            self.on_disk -= len;
+            self.disk_overhead -= kept.overhead;
+        } else {
+            self.in_memory -= len;
+            self.mem_overhead -= kept.overhead;
         }
     }
 
     /// Drops the oldest payload, answering whether there was one.
     fn evict_oldest(&mut self) -> bool {
-        match self.kept.pop_front() {
-            Some(kept) => {
-                self.release(&kept.bytes);
+        match self.order.first_key_value() {
+            Some((_, name)) => {
+                let name = Rc::clone(name);
+                self.remove(&name);
                 true
             }
             None => false,
@@ -333,24 +437,13 @@ impl LinkCache {
     /// Drops the oldest payload held on disk, answering whether there was
     /// one.
     fn evict_oldest_on_disk(&mut self) -> bool {
-        let Some(i) = self.kept.iter().position(|k| k.bytes.spilled_to_disk()) else {
-            return false;
-        };
-        if let Some(kept) = self.kept.remove(i) {
-            self.release(&kept.bytes);
-        }
-        true
-    }
-
-    /// Un-counts a payload leaving the cache. Dropping its `SpillSource`
-    /// closes (and so deletes) its temp file.
-    fn release(&mut self, bytes: &SpillSource) {
-        let len = bytes.caps().len.unwrap_or(0);
-        if bytes.spilled_to_disk() {
-            self.on_disk -= len;
-            self.files -= 1;
-        } else {
-            self.in_memory -= len;
+        match self.disk_order.first_key_value() {
+            Some((_, name)) => {
+                let name = Rc::clone(name);
+                self.remove(&name);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -397,6 +490,15 @@ mod tests {
         EntryMeta::file(name)
     }
 
+    /// A cache charging payload bytes alone, as every test written before
+    /// [`KEPT_ENTRY_OVERHEAD`] existed reasons; its own test is
+    /// `the_per_entry_overhead_bounds_how_many_tiny_payloads_are_kept`.
+    fn lean(policy: CachePolicy) -> LinkCache {
+        let mut cache = LinkCache::new(policy);
+        cache.charge_overhead = false;
+        cache
+    }
+
     /// Spools `bytes` under `name` through a [`Tee`], as the convert loop
     /// does, and keeps the result if the spool survived.
     fn put(cache: &mut LinkCache, name: &str, bytes: &[u8]) {
@@ -426,7 +528,7 @@ mod tests {
 
     #[test]
     fn recent_keeps_within_cap_and_evicts_oldest_first() {
-        let mut cache = LinkCache::new(CachePolicy::Recent { cap: 10 });
+        let mut cache = lean(CachePolicy::Recent { cap: 10 });
         assert!(cache.wants(&file("a"), None));
         put(&mut cache, "a", b"aaaa");
         put(&mut cache, "b", b"bbbb");
@@ -443,7 +545,7 @@ mod tests {
 
     #[test]
     fn a_payload_larger_than_the_cap_is_declined_not_truncated() {
-        let mut cache = LinkCache::new(CachePolicy::Recent { cap: 10 });
+        let mut cache = lean(CachePolicy::Recent { cap: 10 });
         put(&mut cache, "small", b"ok");
         // Declared past the cap: no spool at all, and nothing evicted for it.
         assert!(cache.spool("big", Some(11)).is_none());
@@ -471,7 +573,7 @@ mod tests {
         cache.keep("a", src, None);
         assert!(read_back(&mut cache, "a").is_none());
         // Off by spill policy too, and for every source but cpio and tar.
-        let off = LinkCache::new(CachePolicy::Announced(SpillPolicy::Off));
+        let off = lean(CachePolicy::Announced(SpillPolicy::Off));
         assert!(!off.wants(&file("a"), Some(1)));
         assert_eq!(
             CachePolicy::for_source(FormatId::new("zip"), &SpillPolicy::default()),
@@ -485,7 +587,7 @@ mod tests {
 
     #[test]
     fn announced_spills_past_memory_into_a_temp_file() {
-        let mut cache = LinkCache::new(CachePolicy::Announced(SpillPolicy::Temp {
+        let mut cache = lean(CachePolicy::Announced(SpillPolicy::Temp {
             dir: None,
             mem_cap: 1024,
             max: 1 << 20,
@@ -506,7 +608,7 @@ mod tests {
     /// with no count (tar) is not.
     #[test]
     fn an_announced_payload_is_released_by_its_link_count() {
-        let mut cache = LinkCache::new(CachePolicy::Announced(SpillPolicy::Memory { cap: 100 }));
+        let mut cache = lean(CachePolicy::Announced(SpillPolicy::Memory { cap: 100 }));
         put_counted(&mut cache, "a", b"shared", Some(2));
         cache.link_seen("a");
         assert_eq!(read_back(&mut cache, "a").unwrap(), b"shared");
@@ -515,7 +617,7 @@ mod tests {
         assert_eq!(cache.held(), 0);
         // A link naming nothing kept is a no-op.
         cache.link_seen("a");
-        let mut tar = LinkCache::new(CachePolicy::Recent { cap: 100 });
+        let mut tar = lean(CachePolicy::Recent { cap: 100 });
         put(&mut tar, "t", b"x");
         tar.link_seen("t");
         tar.link_seen("t");
@@ -527,7 +629,7 @@ mod tests {
     /// on-disk payload goes first. Memory-tier payloads are not displaced.
     #[test]
     fn spooled_payloads_are_bounded_whatever_the_counts_say() {
-        let mut cache = LinkCache::new(CachePolicy::Announced(SpillPolicy::Temp {
+        let mut cache = lean(CachePolicy::Announced(SpillPolicy::Temp {
             dir: None,
             mem_cap: 4,
             max: 1 << 20,
@@ -536,7 +638,7 @@ mod tests {
         for i in 0..(MAX_SPOOLED_LINK_PAYLOADS + 20) {
             put_counted(&mut cache, &format!("d{i}"), b"on disk!", Some(9));
         }
-        assert_eq!(cache.files, MAX_SPOOLED_LINK_PAYLOADS);
+        assert_eq!(cache.files(), MAX_SPOOLED_LINK_PAYLOADS);
         assert_eq!(cache.files_high_water, MAX_SPOOLED_LINK_PAYLOADS);
         assert!(cache.contains("m"), "the memory tier keeps its own bound");
         assert!(!cache.contains("d0"), "the oldest file went first");
@@ -548,7 +650,7 @@ mod tests {
     /// `Off`, nothing is recorded.
     #[test]
     fn an_empty_file_is_always_copy_available() {
-        let mut cache = LinkCache::new(CachePolicy::Recent { cap: 4 });
+        let mut cache = lean(CachePolicy::Recent { cap: 4 });
         cache.keep_empty("e");
         for i in 0..10 {
             put(&mut cache, &format!("f{i}"), b"abcd");
@@ -580,6 +682,88 @@ mod tests {
         assert_eq!(
             CachePolicy::for_convert(FormatId::new("cpio"), false, &spill),
             CachePolicy::Announced(spill.clone())
+        );
+    }
+
+    /// Each kept payload is charged its name and [`KEPT_ENTRY_OVERHEAD`] as
+    /// well as its bytes, so 1-byte payloads cannot be kept by the hundred
+    /// thousand under a cap they barely touch.
+    #[test]
+    fn the_per_entry_overhead_bounds_how_many_tiny_payloads_are_kept() {
+        let per = 1 + 2 + KEPT_ENTRY_OVERHEAD; // byte + `fN` name + overhead
+        let mut cache = LinkCache::new(CachePolicy::Recent { cap: 3 * per });
+        for i in 0..9 {
+            put(&mut cache, &format!("f{i}"), b"x");
+        }
+        assert_eq!(cache.kept.len(), 3, "three entries' worth, not nine bytes'");
+        assert_eq!(cache.held(), 3 * per);
+        assert!(cache.contains("f8") && cache.contains("f6") && !cache.contains("f5"));
+        cache.forget("f7");
+        assert_eq!(cache.held(), 2 * per, "forgetting refunds the overhead too");
+        // A payload that fits by its bytes but not with its overhead is
+        // declined, never kept past the cap.
+        let mut tight = LinkCache::new(CachePolicy::Recent { cap: 8 });
+        assert!(tight.spool("a", Some(4)).is_none());
+        put(&mut tight, "a", b"abcd");
+        assert!(!tight.contains("a"));
+        assert_eq!(tight.held(), 0);
+        // An on-disk payload's overhead does not crowd the memory tier.
+        let mut announced = LinkCache::new(CachePolicy::Announced(SpillPolicy::Temp {
+            dir: None,
+            mem_cap: 16,
+            max: 1 << 20,
+        }));
+        put_counted(&mut announced, "d", &[5u8; 64], Some(1));
+        assert!(announced.contains("d"), "spooled to disk and kept");
+        assert_eq!(announced.held_in_memory(), 0);
+        assert_eq!(announced.held(), 64 + 1 + KEPT_ENTRY_OVERHEAD);
+    }
+
+    /// The convert loop's per-entry calls, `n` regular files under the tar
+    /// policy's default 64 MiB cap (so nothing is evicted, the kept set grows
+    /// with every entry), then a link to the first and the last.
+    fn convert_shaped(n: usize) -> std::time::Duration {
+        let names: Vec<String> = (0..n)
+            .map(|i| format!("d{:03}/f{i:07}.txt", i / 1000))
+            .collect();
+        let mut cache = LinkCache::new(CachePolicy::for_source(
+            FormatId::new("tar"),
+            &SpillPolicy::default(),
+        ));
+        let started = std::time::Instant::now();
+        for name in &names {
+            assert!(!cache.contains(name));
+            assert!(cache.wants(&file(name), None));
+            put(&mut cache, name, b"file payload\n");
+        }
+        for name in [&names[0], &names[n - 1]] {
+            assert_eq!(read_back(&mut cache, name).unwrap(), b"file payload\n");
+            cache.link_seen(name);
+        }
+        started.elapsed()
+    }
+
+    /// A timing harness, like cpio's
+    /// `a_forward_read_scales_linearly_with_entry_count`, and `#[ignore]`d
+    /// for the same reason: a wall-time ratio tight enough to tell linear
+    /// from quadratic is loose enough to flake on a loaded runner. Before the
+    /// cache was indexed by name, every call scanned the kept payloads, and
+    /// 4x the entries cost ~16x the time (tar->zip of 160k small files:
+    /// 45.6 s against 0.56 s for 40k). Run with:
+    ///
+    /// ```text
+    /// cargo test -p stuffr --release --lib -- --ignored --nocapture scales
+    /// ```
+    #[test]
+    #[ignore = "timing harness, run explicitly with --ignored --nocapture"]
+    fn the_cache_scales_linearly_with_entry_count() {
+        let small = convert_shaped(25_000);
+        let large = convert_shaped(100_000);
+        println!("link cache: 25k entries in {small:?}, 100k in {large:?}");
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(
+            ratio < 8.0,
+            "4x the entries took {ratio:.1}x the time: the cache is no longer linear"
         );
     }
 }
