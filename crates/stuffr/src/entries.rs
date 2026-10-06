@@ -13,7 +13,10 @@ use stuffr_core::{
     resolve_chain_deep_with, safe_join,
 };
 
-use crate::ops::{CompressOpts, ConvertSource, Finish, Input, Outcome, Output, discard, publish};
+use crate::ops::{
+    CompressOpts, ConvertSource, Finish, Input, Outcome, Output, discard, publish,
+    refuse_directory_for,
+};
 
 /// Bounds decoded output for one archive, per entry and in total.
 ///
@@ -707,6 +710,7 @@ pub fn list(
     max_ratio: u64,
     memory_limit: Option<u64>,
 ) -> Result<(Vec<EntryMeta>, Outcome)> {
+    refuse_directory_for(&src, "list")?;
     let (mut ar, format, _consumed) =
         open_archive(crate::registry(), src, max_ratio, memory_limit)?;
     let mut out = Vec::new();
@@ -729,6 +733,7 @@ pub fn list(
 /// pass on an archive whose payloads are corrupt, which is precisely the
 /// failure it exists to find.
 pub fn test(src: Input, max_ratio: u64, memory_limit: Option<u64>) -> Result<Outcome> {
+    refuse_directory_for(&src, "test")?;
     // Before `src` is consumed by `open_archive`, which takes it by value —
     // the same ordering `extract` and `cat` already use.
     let compressed_total = src
@@ -846,6 +851,7 @@ impl Default for ExtractOpts {
 ///    the header declares. A header that under-declares its length would
 ///    otherwise walk straight through the check it exists to satisfy.
 pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) -> Result<Outcome> {
+    refuse_directory_for(&src, "unpack")?;
     // Before `src` is consumed by `open_archive`, which takes it by value.
     let compressed_total = o.compressed_total.or_else(|| {
         src.path()
@@ -1171,6 +1177,7 @@ pub fn cat(
     memory_limit: Option<u64>,
     dst: &mut dyn Write,
 ) -> Result<Outcome> {
+    refuse_directory_for(&src, "cat")?;
     let compressed_total = src
         .path()
         .and_then(|p| std::fs::metadata(p).ok())
@@ -2227,6 +2234,7 @@ fn refuse_unsalvageable(registry: &Registry, format: FormatId) -> Result<()> {
 /// status and then acting on it — used to disagree about whether this
 /// build could really decode the entry, and now agree.
 pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
+    refuse_directory_for(&Input::Path(path.to_path_buf()), "salvage")?;
     let format = resolve_salvage_format(path, opts.format)?;
     refuse_unsalvageable(crate::registry(), format)?;
     let scan = {

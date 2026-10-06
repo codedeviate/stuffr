@@ -2677,51 +2677,45 @@ fn list_reports_an_empty_lzip_stream_as_corrupt_not_as_an_io_failure() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The hazard side of Task 4b's fix: a genuine i/o failure reading the RAW
-/// source (never reaching a decoder at all) must stay `Error::Io` — exit 1
-/// — and must NOT be swept into `Error::Corrupt` by a fix that reclassifies
-/// too broadly. Opening a directory as if it were a file is a real,
-/// deterministic i/o failure that arises before any codec sees a single
-/// byte: `resolve_chain_deep_with`'s OWN top-level `probe(src)` call reads
-/// the raw source.
+/// A directory handed to a read verb is a usage error (exit 2), never
+/// `i/o error: Is a directory` at exit 1: `File::open` succeeds on a directory
+/// and only the first `read` fails, so the refusal has to come first. Every
+/// verb that reads one stream owes it, and none may touch its destination.
 ///
-/// This does NOT prove that widening `Error::from_decode_io` to that
-/// top-level `probe(src)` call (or into `probe`/`PeekSource::fill`
-/// themselves, rather than scoping it to the decoded-stream `probe` call
-/// inside the re-probe loop) would be safe — checked, and it is a narrower
-/// guard than that. `from_decode_io` only reclassifies `InvalidData` and
-/// `OutOfMemory`; a directory read raises `std::io::ErrorKind::IsADirectory`,
-/// neither of those, so it comes back `Error::Io` — exit 1 — whether or not
-/// that call is widened, and this test cannot tell the two cases apart. What
-/// it DOES catch is a cruder fix: one that swept every raw-source
-/// `io::Error` into `Error::Corrupt` regardless of kind. The widening claim
-/// itself is proven in `probe.rs`'s own
-/// `a_raw_source_io_error_of_the_identical_kind_stays_io_not_corrupt`, which
-/// deliberately uses an `InvalidData`-kind raw-source error — the one kind
-/// `from_decode_io` actually reclassifies — and would flip to `Corrupt` if
-/// that call site were widened.
+/// This replaces `list_reports_a_directory_as_an_io_failure_not_as_corrupt`,
+/// whose directory-as-i/o-failure premise no longer holds. Its real guard —
+/// that a raw-source `InvalidData` read error stays `Error::Io` rather than
+/// becoming `Corrupt` — was never provable from a directory (`IsADirectory`
+/// is not a kind `from_decode_io` reclassifies) and lives, with the kind that
+/// matters, in `probe.rs`'s
+/// `a_raw_source_io_error_of_the_identical_kind_stays_io_not_corrupt`.
 #[test]
-fn list_reports_a_directory_as_an_io_failure_not_as_corrupt() {
+fn a_directory_input_is_a_usage_error_for_every_read_verb() {
     let dir = tmp_dir();
-    let sub = dir.join("not_a_file");
-    std::fs::create_dir_all(&sub).unwrap();
+    let d = dir.join("d");
+    std::fs::create_dir_all(&d).unwrap();
+    let out_dir = dir.join("out");
+    let d = d.to_str().unwrap();
+    let o = out_dir.to_str().unwrap();
 
-    let out = run_output(&["list", sub.to_str().unwrap()]);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "a genuine i/o failure on the raw source must stay exit 1, not become exit 5: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        err.starts_with("stuffr: i/o error:"),
-        "must be Error::Io's own wording, not Error::Corrupt's \"archive is corrupt\": {err}"
-    );
-    assert!(
-        !err.contains("archive is corrupt"),
-        "must not have been reclassified as corrupt: {err}"
-    );
+    let cases: [&[&str]; 6] = [
+        &["list", d],
+        &["test", d],
+        &["cat", d, "x"],
+        &["unpack", d, "-C", o],
+        &["info", d],
+        &["salvage", d, "-C", o],
+    ];
+    for args in cases {
+        let out = run_output(args);
+        let err = stderr_text(&out);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(
+            err.contains("is a directory") && err.contains("stuffr pack"),
+            "{args:?}: {err}"
+        );
+        assert!(!out_dir.exists(), "{args:?} created its destination");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

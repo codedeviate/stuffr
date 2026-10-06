@@ -672,6 +672,21 @@ pub(crate) fn refuse_directory_input(
     Ok(())
 }
 
+/// [`refuse_directory_input`] worded for a read verb (`list`, `test`, `cat`,
+/// `unpack`, `info`, `salvage`): the one message they share, naming the verb
+/// and the way to archive a directory. Must run before anything is opened or
+/// created, so a refused call leaves nothing behind.
+pub(crate) fn refuse_directory_for(src: &Input, verb: &str) -> Result<()> {
+    refuse_directory_input(src, |p, stem| {
+        format!(
+            "`{}` is a directory, and {verb} reads one archive or compressed file. \
+             To archive a directory, pack it: `stuffr pack {} -o {stem}.zip`.",
+            p.display(),
+            p.display()
+        )
+    })
+}
+
 /// Compresses `src` into `dst`, using the build's default registry.
 pub fn compress(src: Input, dst: Output, o: &CompressOpts) -> Result<Outcome> {
     compress_with(crate::registry(), src, dst, o)
@@ -1354,6 +1369,7 @@ pub fn inspect(src: Input) -> Result<Inspection> {
 /// Identifies a stream without decoding it, consulting `registry` rather
 /// than the build's default.
 pub fn inspect_with(registry: &Registry, src: Input) -> Result<Inspection> {
+    refuse_directory_for(&src, "info")?;
     let path = src.path().map(Path::to_path_buf);
 
     let source = src.open()?;
