@@ -675,8 +675,11 @@ pub(crate) fn refuse_directory_input(
 /// [`refuse_directory_input`] worded for a read verb (`list`, `test`, `cat`,
 /// `unpack`, `info`, `salvage`): the one message they share, naming the verb
 /// and the way to archive a directory. Must run before anything is opened or
-/// created, so a refused call leaves nothing behind.
-pub(crate) fn refuse_directory_for(src: &Input, verb: &str) -> Result<()> {
+/// created, so a refused call leaves nothing behind. Public so the CLI can
+/// refuse the stream forms of `cat` and `unpack` (which share
+/// [`decompress`], and so cannot say which verb they serve) with the same
+/// single owner.
+pub fn refuse_directory_for(src: &Input, verb: &str) -> Result<()> {
     refuse_directory_input(src, |p, stem| {
         format!(
             "`{}` is a directory, and {verb} reads one archive or compressed file. \

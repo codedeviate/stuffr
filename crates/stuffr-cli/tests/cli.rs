@@ -2698,10 +2698,14 @@ fn a_directory_input_is_a_usage_error_for_every_read_verb() {
     let d = d.to_str().unwrap();
     let o = out_dir.to_str().unwrap();
 
-    let cases: [&[&str]; 6] = [
+    let out_file = dir.join("out.bin");
+    let f = out_file.to_str().unwrap();
+    let cases: [&[&str]; 8] = [
         &["list", d],
         &["test", d],
+        &["cat", d],
         &["cat", d, "x"],
+        &["unpack", d, "-o", f],
         &["unpack", d, "-C", o],
         &["info", d],
         &["salvage", d, "-C", o],
@@ -2715,6 +2719,7 @@ fn a_directory_input_is_a_usage_error_for_every_read_verb() {
             "{args:?}: {err}"
         );
         assert!(!out_dir.exists(), "{args:?} created its destination");
+        assert!(!out_file.exists(), "{args:?} created its output file");
     }
 
     let _ = std::fs::remove_dir_all(&dir);

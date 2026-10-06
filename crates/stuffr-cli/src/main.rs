@@ -358,6 +358,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             if let Some(r) = max_ratio {
                 opts.max_ratio = r;
             }
+            ops::refuse_directory_for(&input_of(&input), "unpack")?;
             let dst = match output {
                 Some(o) => output_of(&o),
                 None => match input_of(&input) {
@@ -599,6 +600,7 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
                 opts.max_ratio = r;
             }
             // The motivating case: `curl … | stuffr cat - | grep pattern`.
+            ops::refuse_directory_for(&input_of(&input), "cat")?;
             ops::decompress(input_of(&input), Output::Stdout, &opts)?;
             Ok(())
         }
