@@ -964,6 +964,7 @@ impl ArchiveRead for TarRead {
         };
         let raw = next.map_err(classify_tar_error)?;
         let meta = entry_meta(&raw);
+        refuse_corrupt_hard_link(&meta)?;
         let payload = EntryPayload {
             remaining: raw.size(),
             entry: raw,
@@ -1096,8 +1097,8 @@ fn entry_meta(entry: &tar::Entry<'_, TarSource>) -> EntryMeta {
 /// list` and `stuffr salvage --list` cannot come to describe the same header
 /// differently.
 ///
-/// `link_name` is asked for only when the typeflag is a symlink, and
-/// answers the link target AFTER any GNU `K` or pax `linkpath` extension —
+/// `link_name` is asked for only when the typeflag is a symlink or a hard
+/// link, and answers the link target AFTER any GNU `K` or pax `linkpath` extension —
 /// each caller knows its own extensions, this table does not.
 pub(crate) fn entry_kind(
     entry_type: tar::EntryType,
@@ -1111,14 +1112,42 @@ pub(crate) fn entry_kind(
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
                 .unwrap_or_default(),
         }
+    } else if entry_type == tar::EntryType::Link {
+        EntryKind::Hardlink {
+            target: link_name()
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default(),
+        }
     } else if is_regular_file(entry_type) {
         EntryKind::File
     } else {
-        // Hardlinks, devices, FIFOs. `EntryKind` gains variants for these in
-        // a later phase; until then `Other` is the honest answer and is not
-        // silently turned into a regular file.
+        // Devices and FIFOs. `EntryKind` gains variants for these in a later
+        // phase; until then `Other` is the honest answer and is not silently
+        // turned into a regular file.
         EntryKind::Other
     }
+}
+
+/// Refuses the two hard-link shapes that name nothing extractable: a link
+/// with no target, and a link whose target is its own name. Raised here,
+/// where the entry's name is known, as the archive contradicting itself
+/// (exit 5) rather than left for `extract` to meet. `entry_kind` stays
+/// infallible because `tar_salvage.rs` shares it and must never refuse.
+fn refuse_corrupt_hard_link(meta: &EntryMeta) -> Result<()> {
+    if let EntryKind::Hardlink { target } = &meta.kind {
+        let name = &meta.name;
+        if target.is_empty() {
+            return Err(Error::Corrupt(format!(
+                "hard link `{name}` names no target; the archive is corrupt"
+            )));
+        }
+        if target == name {
+            return Err(Error::Corrupt(format!(
+                "hard link `{name}` names itself as its target; the archive is corrupt"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A header's modification time, or `None` when the field does not parse
@@ -1163,7 +1192,7 @@ impl ArchiveWrite for TarWrite {
         // (or link target) there and store the entry under a shorter one
         // (`ContainerCaps::nul_in_names`). Refused rather than truncated.
         refuse_nul("name", &meta.name)?;
-        if let EntryKind::Symlink { target } = &meta.kind {
+        if let EntryKind::Symlink { target } | EntryKind::Hardlink { target } = &meta.kind {
             refuse_nul("link target", target)?;
         }
         let builder = self.builder()?;
@@ -1183,11 +1212,13 @@ impl ArchiveWrite for TarWrite {
         header.set_entry_type(match meta.kind {
             EntryKind::Dir => tar::EntryType::Directory,
             EntryKind::Symlink { .. } => tar::EntryType::Symlink,
-            // `EntryKind::Other` — a hardlink, device or FIFO read out of
-            // some other archive — is written as a regular file, because
-            // that is all `EntryKind` can currently express about it. The
-            // fidelity to recover here is in `EntryKind`'s own missing
-            // variants (see `archive.rs`), not in this match.
+            EntryKind::Hardlink { .. } => tar::EntryType::Link,
+            // `EntryKind::Other` — a device or FIFO read out of some other
+            // archive — is written as a regular file, because that is all
+            // `EntryKind` can currently express about it. The fidelity to
+            // recover here is in `EntryKind`'s own missing variants (see
+            // `archive.rs`), not in this match. A hard link is NEVER
+            // written as a regular file: that would store a 0-byte copy.
             _ => tar::EntryType::Regular,
         });
 
@@ -1204,15 +1235,18 @@ impl ArchiveWrite for TarWrite {
         // `append_fs` emits the two extension entries in when both are
         // needed (`prepare_header_path`, then `prepare_header_link`).
         set_header_field(builder, &mut header, Field::Name, meta.name.as_bytes())?;
-        if let EntryKind::Symlink { target } = &meta.kind {
+        if let EntryKind::Symlink { target } | EntryKind::Hardlink { target } = &meta.kind {
             set_header_field(builder, &mut header, Field::LinkName, target.as_bytes())?;
         }
 
-        // A directory or symlink entry has no payload to frame: its target,
-        // where it has one, lives in the header. Any reader handed for such
-        // an entry is not consumed, and the size is written as zero whatever
-        // the caller declared.
-        if matches!(meta.kind, EntryKind::Dir | EntryKind::Symlink { .. }) {
+        // A directory, symlink or hard link entry has no payload to frame:
+        // its target, where it has one, lives in the header. Any reader
+        // handed for such an entry is not consumed, and the size is written
+        // as zero whatever the caller declared.
+        if matches!(
+            meta.kind,
+            EntryKind::Dir | EntryKind::Symlink { .. } | EntryKind::Hardlink { .. }
+        ) {
             header.set_size(0);
             header.set_cksum();
             return builder.append(&header, io::empty()).map_err(Error::from);
@@ -1509,6 +1543,191 @@ mod tests {
         let resolved =
             stuffr_core::resolve(src, TAR, Tar.caps(), &StreamPolicy::default()).expect("resolve");
         Tar.open(resolved, &OpenOpts::default()).expect("open")
+    }
+
+    /// `(name, kind, payload)` of every entry, through the real reader.
+    fn read_kinds(bytes: &[u8]) -> Vec<(String, EntryKind, Vec<u8>)> {
+        let mut ar = open(bytes);
+        let mut out = Vec::new();
+        while let Some(mut entry) = ar.next_entry().expect("next_entry") {
+            let (name, kind) = (entry.meta().name.clone(), entry.meta().kind.clone());
+            let mut data = Vec::new();
+            entry.reader().read_to_end(&mut data).expect("entry read");
+            out.push((name, kind, data));
+        }
+        out
+    }
+
+    /// A tar holding file `b` then a typeflag-`1` entry `a`, built with the
+    /// `tar` crate itself. `how` picks the long-target route when the target
+    /// is over 100 bytes: GNU `K` (`append_link`) or a pax `linkpath`.
+    fn tar_with_link(name: &str, target: &str, pax: bool) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut file = tar::Header::new_gnu();
+        file.set_path("b").unwrap();
+        file.set_size(5);
+        file.set_mode(0o644);
+        file.set_cksum();
+        builder.append(&file, &b"hello"[..]).unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Link);
+        link.set_size(0);
+        link.set_mode(0o644);
+        if target.is_empty() {
+            // `append_link` refuses an empty target; the zeroed field is
+            // exactly what a hostile archive carries.
+            link.set_path(name).unwrap();
+            link.set_cksum();
+            builder.append(&link, std::io::empty()).unwrap();
+        } else if pax {
+            builder
+                .append_pax_extensions([("linkpath", target.as_bytes())])
+                .unwrap();
+            link.set_path(name).unwrap();
+            link.set_cksum();
+            builder.append(&link, std::io::empty()).unwrap();
+        } else {
+            builder.append_link(&mut link, name, target).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn a_hard_link_reads_as_hardlink_with_its_target() {
+        let got = read_kinds(&tar_with_link("a", "b", false));
+        assert_eq!(
+            got,
+            [
+                ("b".to_string(), EntryKind::File, b"hello".to_vec()),
+                (
+                    "a".to_string(),
+                    EntryKind::Hardlink { target: "b".into() },
+                    Vec::new()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_hard_link_target_reads_whole() {
+        let target = format!("{}b", "d/".repeat(99));
+        assert_eq!(target.len(), 199);
+        let target = format!("{target}x");
+        assert_eq!(target.len(), 200);
+        for pax in [false, true] {
+            let got = read_kinds(&tar_with_link("a", &target, pax));
+            assert_eq!(
+                got[1].1,
+                EntryKind::Hardlink {
+                    target: target.clone()
+                },
+                "pax = {pax}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hard_link_naming_itself_or_nothing_is_corrupt() {
+        for (name, target) in [("a", ""), ("a", "a")] {
+            let bytes = tar_with_link(name, target, false);
+            let err = walk(open(&bytes)).expect_err("a link naming nothing usable");
+            assert!(
+                matches!(err, stuffr_core::Error::Corrupt(_)),
+                "{target:?}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), 5, "{target:?}: {err}");
+            assert!(err.to_string().contains("`a`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn devices_and_fifos_still_read_as_other() {
+        for flag in [tar::EntryType::Fifo, tar::EntryType::Char] {
+            let mut h = tar::Header::new_gnu();
+            h.set_path("x").unwrap();
+            h.set_entry_type(flag);
+            h.set_size(0);
+            h.set_cksum();
+            let mut b = tar::Builder::new(Vec::new());
+            b.append(&h, std::io::empty()).unwrap();
+            let got = read_kinds(&b.into_inner().unwrap());
+            assert_eq!(got[0].1, EntryKind::Other);
+        }
+    }
+
+    /// Writes `File b` and `Hardlink a -> target` through `Tar` and returns
+    /// the raw `(path, type, link name, size)` the `tar` crate sees.
+    fn written_link(target: &str) -> Vec<(String, tar::EntryType, Option<String>, u64)> {
+        let buf = SharedBuf::new();
+        let mut w = Tar
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .unwrap();
+        let mut b = EntryMeta::file("b");
+        b.size = Some(5);
+        w.add(&b, &mut std::io::Cursor::new(&b"hello"[..])).unwrap();
+        let mut a = EntryMeta::file("a");
+        a.size = Some(5); // a stale size must not make a payload
+        a.kind = EntryKind::Hardlink {
+            target: target.into(),
+        };
+        w.add(&a, &mut std::io::Cursor::new(&b"hello"[..])).unwrap();
+        w.finish().unwrap().finish().unwrap();
+        let bytes = buf.contents();
+        let mut archive = tar::Archive::new(&bytes[..]);
+        archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.path().unwrap().to_string_lossy().into_owned(),
+                    e.header().entry_type(),
+                    e.link_name()
+                        .unwrap()
+                        .map(|l| l.to_string_lossy().into_owned()),
+                    e.header().size().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_writer_stores_a_hard_link_as_typeflag_1() {
+        let got = written_link("b");
+        assert_eq!(got[0].1, tar::EntryType::Regular);
+        assert_eq!(
+            got[1],
+            (
+                "a".to_string(),
+                tar::EntryType::Link,
+                Some("b".to_string()),
+                0
+            ),
+            "never a regular file, and no payload"
+        );
+        let long = format!("{}z", "d/".repeat(99));
+        let got = written_link(&long);
+        assert_eq!(got[1].1, tar::EntryType::Link);
+        assert_eq!(got[1].2.as_deref(), Some(long.as_str()));
+    }
+
+    #[test]
+    fn a_hard_link_target_with_a_nul_is_refused() {
+        let buf = SharedBuf::new();
+        let mut w = Tar
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .unwrap();
+        let mut a = EntryMeta::file("a");
+        a.kind = EntryKind::Hardlink {
+            target: "t\0x".into(),
+        };
+        assert!(w.add(&a, &mut std::io::empty()).is_err());
     }
 
     fn which(bin: &str) -> Option<std::path::PathBuf> {

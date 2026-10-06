@@ -146,6 +146,56 @@ fn hand_built_tar(members: &[(&str, u8, &[u8])]) -> Vec<u8> {
     out
 }
 
+/// A tar of one regular file `target` and one typeflag-`1` entry `name`
+/// linking to it, hand-built (the link name is the field at 157..257).
+fn hand_built_link_tar(name: &str, target: &str) -> Vec<u8> {
+    let mut out = hand_built_tar(&[(target, b'0', b"hello")]);
+    out.truncate(out.len() - 1024);
+    let mut h = tar_header(name, 0, b'1');
+    h[157..157 + target.len()].copy_from_slice(target.as_bytes());
+    h[148..156].copy_from_slice(b"        ");
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    out.extend_from_slice(&h);
+    out.extend(std::iter::repeat_n(0u8, 1024));
+    out
+}
+
+#[test]
+fn tar_to_tar_keeps_hard_links_as_links() {
+    let dir = tmp_dir();
+    let src = dir.join("src.tar");
+    std::fs::write(&src, hand_built_link_tar("a", "b")).unwrap();
+
+    let out = dir.join("out.tar");
+    let outcome = entries::convert_archive(
+        Input::Path(src),
+        Output::Path(out.clone()),
+        fmt("tar"),
+        None,
+        &ConvertOpts::default(),
+    )
+    .unwrap();
+
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "a link into tar loses nothing: {:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(
+        entries_of(&out),
+        [
+            ("b".to_string(), EntryKind::File, b"hello".to_vec()),
+            (
+                "a".to_string(),
+                EntryKind::Hardlink { target: "b".into() },
+                Vec::new()
+            ),
+        ],
+        "the link survives as a link, never a 0-byte regular file"
+    );
+}
+
 #[test]
 fn tar_to_zip_keeps_every_payload() {
     let dir = tmp_dir();
@@ -303,10 +353,17 @@ fn a_special_file_is_skipped_never_written_as_a_regular_file() {
             ("pipe", b'6', b""),
             ("dev/console", b'3', b""),
             ("keep.txt", b'0', b"kept"),
-            ("hard", b'1', b""),
         ]),
     )
     .unwrap();
+    // A hard link needs a target, or the reader refuses the archive as
+    // corrupt: append a real one after the three specials.
+    let mut bytes = std::fs::read(&tar).unwrap();
+    bytes.truncate(bytes.len() - 1024);
+    let mut link = hand_built_link_tar("hard", "keep.txt");
+    bytes.extend_from_slice(&link.split_off(512 * 2)[..512]);
+    bytes.extend(std::iter::repeat_n(0u8, 1024));
+    std::fs::write(&tar, bytes).unwrap();
 
     let zip = dir.join("out.zip");
     let outcome = entries::convert_archive(
