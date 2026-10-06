@@ -712,11 +712,15 @@ impl<R: Read> Read for NormalizeDecodeErrors<R> {
 /// codec's `Sink::finish` recover it after the backend has finished
 /// discarding it. The failure genuinely happened; this is recovering
 /// information the backend dropped, not inventing one.
+///
+/// Gated `#[cfg(feature = "brotli")]`: `brotli.rs` is the only consumer.
+#[cfg(feature = "brotli")]
 pub(crate) struct CaptureWriteError<W> {
     inner: W,
     first: Option<std::io::Error>,
 }
 
+#[cfg(feature = "brotli")]
 impl<W> CaptureWriteError<W> {
     pub(crate) fn new(inner: W) -> Self {
         Self { inner, first: None }
@@ -746,6 +750,7 @@ impl<W> CaptureWriteError<W> {
     }
 }
 
+#[cfg(feature = "brotli")]
 impl<W: Write> Write for CaptureWriteError<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.inner.write(buf).map_err(|e| self.record(e))
