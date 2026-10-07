@@ -659,17 +659,19 @@ cases.
 
 ### The oracle lives in the library, not in the targets
 
-`stuffr-core/src/honesty.rs` holds the six invariants the targets assert —
+`stuffr-core/src/honesty.rs` holds the eight invariants the targets assert —
 `check_error_is_classified`, `check_entry_size`, `check_entry_count`,
 `check_fidelity_claim` (Phase 3a), `check_salvage_claim` (Salvage Stage 1
-Task 8) and `check_entries_carried` (Phase 5a Task 6) — re-exported through
+Task 8), `check_entries_carried` (Phase 5a Task 6),
+`check_display_has_no_raw_controls` (0.10.0) and
+`check_extraction_contained` (0.10.1) — re-exported through
 `stuffr_core::testing` (gated
 `#[cfg(any(test, feature = "testing"))]`) rather than written inline in a
 fuzz target. The reason is structural, not a style preference: **a fuzz
 target's checks cannot be unit-tested, so a harness that runs clean is
 indistinguishable from one whose invariants are vacuous** — "ran 30 seconds,
 found nothing" looks identical either way, whether the target is genuinely
-clean or the assertion inside it never fires. Because the six functions
+clean or the assertion inside it never fires. Because the eight functions
 live in an ordinary library module, each has a `mod broken_honesty` double
 proving it *can* fail — the same `broken_codecs`/`broken_containers` pattern
 the conformance harnesses already use — so a vacuous check is caught the
@@ -697,7 +699,11 @@ same way a vacuous conformance property would be.
   symlink finds nothing outside `dest` except the caller's `allowed` files,
   `dest` is still a real directory, and no symlink under `dest` resolves
   outside it — lexically, from the link's own directory, by the same
-  `check_symlink_target` rule extraction enforces. It is the `container`
+  `check_symlink_target` rule extraction enforces, and PHYSICALLY: each link
+  is `canonicalize`d and must land under `canonicalize(dest)` (a dangling or
+  looping link is skipped). The physical half is what sees a chain the
+  lexical rule could not until 0.10.1 — `x/s2 -> ..` plus `s1 -> x/s2/..`,
+  which nets to `x` on paper and to `dest/..` on disk. It is the `container`
   target's extract leg: on the seekable path, after the convert oracle, the
   target runs `entries::extract` (`force: false`, the convert oracle's
   limits) into the per-input temp directory; an `Err` must be classified,

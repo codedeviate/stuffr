@@ -1042,6 +1042,23 @@ fn conflict_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
+/// Symlink-chain tars (0.10.1): `x/`, `x/s2 -> ..` and `s1 -> x/s2/..`, in
+/// both orders. `s1` nets to `x` lexically, but the OS resolves `x/s2` first
+/// and lands on `dest/..` — the shape `check_symlink_target` refuses for its
+/// `..` after a name, and the extract leg's physical containment check
+/// catches if it ever lands. `(file stem, bytes)`.
+fn symlink_chain_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    let dir = seed_tar_member(b"x/", b'5', b"", b"");
+    let s2 = seed_tar_member(b"x/s2", b'2', b"..", b"");
+    let s1 = seed_tar_member(b"s1", b'2', b"x/s2/..", b"");
+    let s2_first = [dir.clone(), s2.clone(), s1.clone()].concat();
+    let s1_first = [dir, s1, s2].concat();
+    vec![
+        ("tar-symlink-chain-s2-first", seed_tar_end(s2_first)),
+        ("tar-symlink-chain-s1-first", seed_tar_end(s1_first)),
+    ]
+}
+
 /// Extra `container/` seeds beyond the per-slot pair: `(file stem, slot, bytes)`.
 fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     vec![
@@ -1053,6 +1070,7 @@ fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     .chain(
         conflict_tar_seeds()
             .into_iter()
+            .chain(symlink_chain_tar_seeds())
             .map(|(stem, bytes)| (stem, "tar", bytes)),
     )
     .collect()

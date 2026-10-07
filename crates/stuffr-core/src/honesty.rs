@@ -264,7 +264,7 @@ pub fn check_entries_carried(
 /// `root` is a scratch directory holding `dest` (at any depth) and nothing
 /// else the extraction had any business touching; `allowed` names what was
 /// already there by the caller's doing — the `container` fuzz target's own
-/// input file — and is exempt together with anything beneath it. Two rules:
+/// input file — and is exempt together with anything beneath it. Three rules:
 ///
 /// 1. **Nothing outside `dest`.** A walk of `root` that never follows a
 ///    symlink finds no path outside `dest` other than `dest`'s own ancestors
@@ -275,6 +275,15 @@ pub fn check_entries_carried(
 ///    [`crate::check_symlink_target`], the rule extraction enforces before
 ///    creating one — so the oracle and the code it polices agree on what
 ///    "escapes" means, and a disagreement between them is a finding.
+/// 3. **No symlink under `dest` resolves outside it PHYSICALLY** (0.10.1).
+///    Each link is `canonicalize`d — the OS's own resolution, following
+///    every link along the way — and the result must sit under
+///    `canonicalize(dest)`. Rule 2 alone was blind to a chain: `x/s2 -> ..`
+///    names `dest`, and `s1 -> x/s2/..` nets to `x` lexically, yet the OS
+///    resolves `x/s2` first and lands on `dest/..`. A link `canonicalize`
+///    cannot resolve (dangling, or a loop) is skipped: it points at nothing.
+///    Checked before rule 2, so a refusal that names "resolves physically"
+///    is this rule's.
 ///
 /// Read-only: it never changes a permission, so a directory it cannot read
 /// is a failure (it cannot vouch for what is inside), not a skip. A caller
@@ -302,6 +311,11 @@ pub fn check_extraction_contained(
         }
         Err(e) => return Err(format!("cannot inspect the destination {dest:?}: {e}")),
     }
+    // Rule 3's yardstick. Canonical, because on macOS a temp `dest` under
+    // `/var` resolves through `/private/var` and every link would otherwise
+    // look like it escaped.
+    let real_dest = std::fs::canonicalize(dest)
+        .map_err(|e| format!("cannot resolve the destination {dest:?}: {e}"))?;
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let listing =
@@ -320,6 +334,16 @@ pub fn check_extraction_contained(
                 if kind.is_symlink() {
                     let target = std::fs::read_link(&path)
                         .map_err(|e| format!("cannot read symlink {path:?}: {e}"))?;
+                    // Physical first, so a link only the OS's own
+                    // resolution can see through is named as such.
+                    if let Ok(real) = std::fs::canonicalize(&path)
+                        && !real.starts_with(&real_dest)
+                    {
+                        return Err(format!(
+                            "symlink {path:?} -> {target:?} resolves physically to {real:?}, \
+                             outside the destination {real_dest:?}"
+                        ));
+                    }
                     crate::check_symlink_target(dest, &path, &target.to_string_lossy()).map_err(
                         |e| {
                             format!(
@@ -1034,6 +1058,36 @@ mod broken_honesty {
         std::os::unix::fs::symlink("dangling", dest.join("d")).unwrap();
         check_extraction_contained(root.path(), &dest, &[&input])
             .expect("links resolving inside the destination are contained");
+    }
+
+    /// 0.10.1: the physical rule. `x/s2 -> ..` names `dest`; `s1 ->
+    /// x/s2/..` nets to `x` lexically, but the OS resolves `x/s2` first and
+    /// lands on `dest/..`. The refusal must come from the PHYSICAL check
+    /// (its message says "resolves physically"), so this double keeps
+    /// failing if that check is removed even though the lexical rule now
+    /// refuses the same shape too.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_chain_resolving_outside_the_destination_physically_is_refused() {
+        let (root, dest, input) = extraction_tree();
+        std::fs::create_dir(dest.join("x")).unwrap();
+        std::os::unix::fs::symlink("..", dest.join("x/s2")).unwrap();
+        std::os::unix::fs::symlink("x/s2/..", dest.join("s1")).unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("dest/s1 -> x/s2/.. resolves to dest/.. and must fail");
+        assert!(msg.contains("resolves physically"), "{msg}");
+        assert!(msg.contains("s1"), "must name the link: {msg}");
+
+        // A benign chain: `x/s2 -> ..` (dest), `s1 -> x/s2/sub/f` (dest/sub/f),
+        // and a loop, which `canonicalize` cannot resolve and so skips.
+        let (root, dest, input) = extraction_tree();
+        std::fs::create_dir(dest.join("x")).unwrap();
+        std::os::unix::fs::symlink("..", dest.join("x/s2")).unwrap();
+        std::os::unix::fs::symlink("x/s2/sub/f", dest.join("s1")).unwrap();
+        std::os::unix::fs::symlink("x/s2", dest.join("s3")).unwrap();
+        std::os::unix::fs::symlink("loop", dest.join("loop")).unwrap();
+        check_extraction_contained(root.path(), &dest, &[&input])
+            .expect("a chain that stays inside the destination is contained");
     }
 
     #[test]
