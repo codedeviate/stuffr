@@ -1369,3 +1369,35 @@ fn a_symlink_target_climbing_through_another_link_is_refused() {
             .unwrap_or_else(|e| panic!("{tag}: {e}"));
     }
 }
+
+/// 0.10.1 fix round 1: an empty symlink target is refused at exit 7 on
+/// every platform — before it, macOS created `l -> ""` at exit 0 and Linux's
+/// `symlink(2)` answered ENOENT, which surfaced as `Error::Io`, exit 1.
+#[test]
+fn an_empty_symlink_target_is_refused_as_unsafe() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("empty.tar"),
+        &[file("a.txt", b"alpha"), symlink("l", "")],
+    );
+    let dest = root.join("out");
+    let err = entries::extract(
+        Input::Path(archive),
+        &dest,
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .expect_err("an empty symlink target must be refused");
+    match &err {
+        Error::UnsafePath { path, reason } => {
+            assert_eq!(path, "");
+            assert!(reason.contains("empty"), "{reason}");
+        }
+        other => panic!("expected UnsafePath, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 7);
+    assert!(
+        std::fs::symlink_metadata(dest.join("l")).is_err(),
+        "the link must not have been created"
+    );
+}

@@ -166,6 +166,9 @@ fn walk_within(
     Ok(())
 }
 
+/// [`check_symlink_target`]'s reason for an empty target.
+pub(crate) const EMPTY_SYMLINK_TARGET: &str = "symlink target is empty";
+
 /// [`check_symlink_target`]'s reason for a target holding `..` after a name.
 pub(crate) const CLIMBS_AFTER_A_NAME: &str =
     "symlink target uses `..` after a name, which can climb out through another link";
@@ -201,7 +204,9 @@ pub(crate) const CLIMBS_AFTER_A_NAME: &str =
 /// `../../a/b` — never after a name: `x/s2/..`, `a/../b` and `./a/..` are
 /// refused (`CLIMBS_AFTER_A_NAME`) whatever they net to. `.` components
 /// are noise, exactly as [`walk_within`] treats them, so a leading `./` is
-/// harmless and `./..` is still a leading run.
+/// harmless and `./..` is still a leading run. An EMPTY target is refused
+/// too (`EMPTY_SYMLINK_TARGET`): it names nothing, and Linux's `symlink(2)`
+/// rejects it with ENOENT, which would otherwise surface as exit 1.
 ///
 /// Why: lexical normalisation reads `x/s2/..` as `x`, but the OS resolves
 /// `x/s2` FIRST, and if `x/s2` is itself a symlink the `..` climbs from
@@ -249,6 +254,17 @@ pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Resu
         return Err(Error::UnsafePath {
             path: target.to_string(),
             reason: "symlink target contains a NUL byte",
+        });
+    }
+    // An empty target names nothing and has no components, so every rule
+    // below would accept it — and `symlink(2)` on Linux answers ENOENT,
+    // which reached the CLI as `Error::Io`, exit 1, on a target the archive
+    // chose (macOS creates `l -> ""` instead). The same refusal `safe_join`
+    // makes for an empty entry NAME.
+    if target.is_empty() {
+        return Err(Error::UnsafePath {
+            path: String::new(),
+            reason: EMPTY_SYMLINK_TARGET,
         });
     }
     // Checked before the walk purely so the reason names symlinks — the
@@ -514,6 +530,22 @@ mod tests {
                 }
                 other => panic!("{target} from {link:?} must be refused, got {other:?}"),
             }
+        }
+    }
+
+    /// 0.10.1 fix round 1: an EMPTY target names nothing and has no
+    /// components, so the walk accepted it — and `symlink(2)` on Linux
+    /// answers ENOENT, which reached the CLI as `Error::Io`, exit 1, on a
+    /// target the archive chose. (macOS creates `l -> ""` at exit 0.)
+    #[test]
+    fn an_empty_symlink_target_is_refused() {
+        let dest = Path::new("/tmp/out");
+        match super::check_symlink_target(dest, &dest.join("sub/l"), "") {
+            Err(Error::UnsafePath { path, reason }) => {
+                assert_eq!(path, "");
+                assert_eq!(reason, super::EMPTY_SYMLINK_TARGET);
+            }
+            other => panic!("an empty target must be refused, got {other:?}"),
         }
     }
 
