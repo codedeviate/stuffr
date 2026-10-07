@@ -999,7 +999,12 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                     {
                         return Ok(());
                     }
-                    std::fs::create_dir_all(&target)?;
+                    if let Err(w) =
+                        skip_if_name_too_long(std::fs::create_dir_all(&target), &meta.name)?
+                    {
+                        warnings.push(w);
+                        return Ok(());
+                    }
                     made.record(&meta.name, &target, MadeKind::Dir);
                     deferred_dirs.push((target.clone(), meta.clone()));
                 } else {
@@ -1037,7 +1042,14 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                 {
                     return Ok(());
                 }
-                let mut out = std::fs::File::create(&target)?;
+                let mut out =
+                    match skip_if_name_too_long(std::fs::File::create(&target), &meta.name)? {
+                        Ok(out) => out,
+                        Err(w) => {
+                            warnings.push(w);
+                            return Ok(());
+                        }
+                    };
                 // Charged as data streams, not from the declared size.
                 written += copy_charging(entry.reader(), &mut out, &meta.name, &mut budget)?;
                 out.flush()?;
@@ -1167,7 +1179,10 @@ fn extract_symlink(
     if !place_entry(dest, at, &meta.name, false, made, force)?.proceed(warnings) {
         return Ok(false);
     }
-    create_symlink(link_target, at)?;
+    if let Err(w) = skip_if_name_too_long(create_symlink(link_target, at), &meta.name)? {
+        warnings.push(w);
+        return Ok(false);
+    }
     // A symlink's own mode and mtime cannot be set through `std`:
     // `set_permissions` and `File::set_times` both follow the link, and there
     // is no `lchmod`/`lutimes` here (nor a `libc` dependency to reach one
@@ -1260,6 +1275,14 @@ fn extract_hard_link(
     if target_path == link_path {
         return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
     }
+    // The same file under a spelling only the FILESYSTEM folds (`A` and `a`
+    // on a case-insensitive volume): the paths differ, so the check above
+    // misses, and `--force` would remove the target itself before linking
+    // to it. Asked of the filesystem, never followed through a symlink, and
+    // decided before anything is removed.
+    if is_same_entry(target_path, link_path) {
+        return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
+    }
     match kind {
         MadeKind::Dir => Ok(skip_link(
             warnings,
@@ -1307,6 +1330,47 @@ fn extract_hard_link(
             }
             copy_link_target(target_path, link_path, meta, link_to, budget, warnings)
         }
+    }
+}
+
+/// Whether `link` is just another spelling of `target`'s own directory
+/// entry — so removing what is at `link` would remove `target` — as only the
+/// filesystem can tell (case folding, Unicode normalisation).
+///
+/// Same `(dev, ino)` from `symlink_metadata` on both is necessary but not
+/// enough: a genuine second hard link (a duplicate link entry, replaced
+/// under `--force`) shares the inode too. It is the same ENTRY when the inode
+/// has one name only, or when `link`'s exact name is not among its parent's
+/// entries. `false` when either is absent, and off unix, where there is no
+/// inode to ask and the exact-path check is all there is.
+fn is_same_entry(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (Ok(t), Ok(l)) = (
+            std::fs::symlink_metadata(target),
+            std::fs::symlink_metadata(link),
+        ) else {
+            return false;
+        };
+        if (t.dev(), t.ino()) != (l.dev(), l.ino()) {
+            return false;
+        }
+        if t.nlink() <= 1 {
+            return true;
+        }
+        let (Some(parent), Some(own)) = (link.parent(), link.file_name()) else {
+            return false;
+        };
+        match std::fs::read_dir(parent) {
+            Ok(entries) => !entries.flatten().any(|e| e.file_name() == own),
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, link);
+        false
     }
 }
 
@@ -1360,7 +1424,15 @@ fn copy_link_target(
         return Ok(unreadable(warnings));
     };
     budget.charge(&meta.name, len)?;
-    let mut out = std::fs::File::create(link_path)?;
+    // `hard_link` failing on a name too long falls through to here, and
+    // the create meets the same refusal: one skip, never exit 1.
+    let mut out = match skip_if_name_too_long(std::fs::File::create(link_path), &meta.name)? {
+        Ok(out) => out,
+        Err(w) => {
+            warnings.push(w);
+            return Ok(None);
+        }
+    };
     let mut buf = vec![0u8; 64 * 1024];
     let mut copied = 0u64;
     loop {
@@ -3032,9 +3104,22 @@ fn open_salvage_target(
     // them is exactly how eight recovered records became six files at exit
     // 0. `claimed`, in the caller, is what separates them.
     place_salvaged(dest, write_target, name, false, made, true)?;
-    let out = std::fs::File::create(write_target).map_err(|e| unwritable(Error::Io(e)))?;
+    let out = match skip_if_name_too_long(std::fs::File::create(write_target), name) {
+        Ok(Ok(out)) => out,
+        Ok(Err(w)) => return Err(unwritable_skip(w)),
+        Err(e) => return Err(unwritable(e)),
+    };
     made.record_path(write_target, MadeKind::File);
     Ok(out)
+}
+
+/// A skip [`place_entry`]'s rules decided, as salvage's own disposition:
+/// its reason, without the entry name salvage prints beside it anyway.
+fn unwritable_skip(w: Fidelity) -> SalvageDisposition {
+    match w {
+        Fidelity::EntrySkipped { reason, .. } => SalvageDisposition::SkippedUnwritable { reason },
+        other => unwritable(other),
+    }
 }
 
 /// [`place_entry`] for salvage: every answer but "proceed" is this entry's
@@ -3042,9 +3127,9 @@ fn open_salvage_target(
 ///
 /// - A `Skip` (the archive contradicts itself on disk) carries
 ///   `place_entry`'s reason, which names the conflict.
-/// - A `Usage` (the destination already held it) carries its message
-///   without the `usage error:` prefix: salvage folds it, so it is not a
-///   usage error here.
+/// - What the destination already held (`extract`'s `Usage`) carries
+///   [`Held::salvage_reason`]: salvage folds it, so it is not a usage
+///   error here, and it names no `--force`, which salvage does not have.
 /// - Anything else (`Error::Io`) is folded kind-blind, as every other
 ///   filesystem failure on this path is.
 fn place_salvaged(
@@ -3055,13 +3140,12 @@ fn place_salvaged(
     made: &mut MadeByRun,
     force: bool,
 ) -> std::result::Result<(), SalvageDisposition> {
-    match place_entry(dest, target, name, placing_dir, made, force) {
-        Ok(Placement::Proceed) => Ok(()),
-        Ok(Placement::Skip(Fidelity::EntrySkipped { reason, .. })) => {
-            Err(SalvageDisposition::SkippedUnwritable { reason })
-        }
-        Ok(Placement::Skip(other)) => Err(unwritable(other)),
-        Err(Error::Usage(reason)) => Err(SalvageDisposition::SkippedUnwritable { reason }),
+    match place(dest, target, name, placing_dir, made, force) {
+        Ok(Placed::Proceed) => Ok(()),
+        Ok(Placed::Skip(w)) => Err(unwritable_skip(w)),
+        Ok(Placed::Held(held)) => Err(SalvageDisposition::SkippedUnwritable {
+            reason: held.salvage_reason(name),
+        }),
         Err(e) => Err(unwritable(e)),
     }
 }
@@ -4784,6 +4868,21 @@ fn conflict_reason_directory_in_the_way(name: &str) -> String {
     format!("a directory `{name}` from earlier in this archive is in the way")
 }
 
+/// Why an entry whose path the destination filesystem cannot hold
+/// (`ENAMETOOLONG`) is skipped, by `unpack` and by salvage alike.
+const PATH_TOO_LONG_REASON: &str = "its path is too long for this filesystem";
+
+/// Salvage's reason for a file record whose path is a directory the
+/// destination already held. No `--force` clause: salvage has no such flag.
+const SALVAGE_REASON_DIRECTORY_IN_THE_WAY: &str =
+    "an existing directory is at this path, and salvage never removes a directory";
+
+/// Salvage's reason for a directory record whose path already holds
+/// something that is not a directory. It is never removed: it may be a file
+/// this same run recovered.
+const SALVAGE_REASON_NOT_A_DIRECTORY_HERE: &str =
+    "something that is not a directory is already at this path";
+
 /// Why `unpack` skips a hard link: its target was not written by this run —
 /// filtered out by the selection, skipped, or never seen. The target is
 /// interpolated raw; `Fidelity`'s `Display` escapes the whole reason.
@@ -5199,6 +5298,11 @@ impl Placement {
 /// 3. **On proceed**, missing parents are created and each is recorded in
 ///    `made`. The caller records the entry itself once it is written.
 ///
+/// A name the destination filesystem cannot hold (`ENAMETOOLONG`, on one
+/// component or on the whole path) is a skip naming the entry
+/// ([`PATH_TOO_LONG_REASON`]): limits are per filesystem, so its own answer
+/// is the honest one, and no length is pre-checked anywhere.
+///
 /// Genuine environment failures (`EACCES`, `ENOSPC`, a read-only
 /// filesystem) stay `Error::Io`, exit 1: they are the destination's, not
 /// the input's.
@@ -5210,6 +5314,76 @@ fn place_entry(
     made: &mut MadeByRun,
     force: bool,
 ) -> Result<Placement> {
+    match place(dest, target, name, placing_dir, made, force)? {
+        Placed::Proceed => Ok(Placement::Proceed),
+        Placed::Skip(w) => Ok(Placement::Skip(w)),
+        Placed::Held(held) => Err(Error::Usage(held.usage_message(name))),
+    }
+}
+
+/// What the destination already held that blocks an entry: the one answer
+/// `extract` (a `Usage`, exit 2) and salvage (a skip, worded without the
+/// `--force` salvage does not have) give differently.
+#[derive(Debug)]
+enum Held {
+    /// A non-directory above the entry, at this path.
+    NotADirectoryAbove(PathBuf),
+    /// A directory at the entry's own path, which is not one.
+    DirectoryInTheWay(PathBuf),
+    /// A non-directory at the entry's own path, and no licence to remove it.
+    Exists(PathBuf),
+}
+
+impl Held {
+    /// `extract`'s wording: a usage error, exit 2.
+    fn usage_message(&self, name: &str) -> String {
+        match self {
+            Held::NotADirectoryAbove(path) => format!(
+                "`{}` exists and is not a directory, so `{name}` cannot be placed beneath it",
+                path.display()
+            ),
+            Held::DirectoryInTheWay(path) => format!(
+                "`{}` is an existing directory; stuffr never removes a directory, even with \
+                 --force",
+                path.display()
+            ),
+            Held::Exists(path) => {
+                format!(
+                    "{} already exists; pass --force to overwrite",
+                    path.display()
+                )
+            }
+        }
+    }
+
+    /// Salvage's wording: the reason of a `SkippedUnwritable`, printed
+    /// beside the record's own name, and naming no flag salvage lacks.
+    fn salvage_reason(&self, name: &str) -> String {
+        match self {
+            Held::NotADirectoryAbove(_) => self.usage_message(name),
+            Held::DirectoryInTheWay(_) => SALVAGE_REASON_DIRECTORY_IN_THE_WAY.to_string(),
+            Held::Exists(_) => SALVAGE_REASON_NOT_A_DIRECTORY_HERE.to_string(),
+        }
+    }
+}
+
+/// [`place_entry`]'s answer before the caller decides what the
+/// destination's prior state means for it.
+enum Placed {
+    Proceed,
+    Skip(Fidelity),
+    Held(Held),
+}
+
+/// [`place_entry`]'s rules, shared with [`place_salvaged`].
+fn place(
+    dest: &Path,
+    target: &Path,
+    name: &str,
+    placing_dir: bool,
+    made: &mut MadeByRun,
+    force: bool,
+) -> Result<Placed> {
     let Ok(relative) = target.strip_prefix(dest) else {
         // Unreachable: every caller has asserted `target.starts_with(dest)`.
         return Err(Error::UnsafePath {
@@ -5219,6 +5393,7 @@ fn place_entry(
     };
     let components: Vec<_> = relative.components().collect();
     let parents = components.len().saturating_sub(1);
+    let too_long = || Placed::Skip(path_too_long(name));
 
     // Rule 1. Once one component is missing, nothing beneath it can exist,
     // so the walk stops there and rule 2 has nothing to look at.
@@ -5230,18 +5405,13 @@ fn place_entry(
             Ok(md) if md.is_dir() => {}
             Ok(_) if made.made(&walked) => {
                 let ancestor: PathBuf = components[..=i].iter().collect();
-                return Ok(Placement::Skip(Fidelity::EntrySkipped {
+                return Ok(Placed::Skip(Fidelity::EntrySkipped {
                     entry: name.to_string(),
                     reason: conflict_reason_not_a_directory(&ancestor.to_string_lossy(), name),
                 }));
             }
-            Ok(_) => {
-                return Err(Error::Usage(format!(
-                    "`{}` exists and is not a directory, so `{name}` cannot be placed \
-                     beneath it",
-                    walked.display()
-                )));
-            }
+            Ok(_) => return Ok(Placed::Held(Held::NotADirectoryAbove(walked))),
+            Err(e) if is_name_too_long(&e) => return Ok(too_long()),
             Err(_) => {
                 first_missing = Some(i);
                 break;
@@ -5250,34 +5420,30 @@ fn place_entry(
     }
 
     // Rule 2.
-    if first_missing.is_none()
-        && let Ok(md) = std::fs::symlink_metadata(target)
-    {
-        if md.is_dir() {
-            if !placing_dir {
-                if made.made(target) {
-                    return Ok(Placement::Skip(Fidelity::EntrySkipped {
-                        entry: name.to_string(),
-                        reason: conflict_reason_directory_in_the_way(name),
-                    }));
+    if first_missing.is_none() {
+        match std::fs::symlink_metadata(target) {
+            Ok(md) if md.is_dir() => {
+                if !placing_dir {
+                    if made.made(target) {
+                        return Ok(Placed::Skip(Fidelity::EntrySkipped {
+                            entry: name.to_string(),
+                            reason: conflict_reason_directory_in_the_way(name),
+                        }));
+                    }
+                    return Ok(Placed::Held(Held::DirectoryInTheWay(target.to_path_buf())));
                 }
-                return Err(Error::Usage(format!(
-                    "`{}` is an existing directory; stuffr never removes a directory, even \
-                     with --force",
-                    target.display()
-                )));
             }
-        } else {
-            if !force {
-                return Err(Error::Usage(format!(
-                    "{} already exists; pass --force to overwrite",
-                    target.display()
-                )));
+            Ok(_) => {
+                if !force {
+                    return Ok(Placed::Held(Held::Exists(target.to_path_buf())));
+                }
+                std::fs::remove_file(target)?;
+                // Gone: whatever replaces it is recorded by the caller once
+                // written, and a failed write must not leave a stale record.
+                made.at.remove(target);
             }
-            std::fs::remove_file(target)?;
-            // Gone: whatever replaces it is recorded by the caller once
-            // written, and a failed write must not leave a stale record.
-            made.at.remove(target);
+            Err(e) if is_name_too_long(&e) => return Ok(too_long()),
+            Err(_) => {}
         }
     }
 
@@ -5293,11 +5459,49 @@ fn place_entry(
                 // absent; a racing local writer is the TOCTOU window
                 // `refuse_symlinked_ancestors` documents.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) if is_name_too_long(&e) => return Ok(too_long()),
                 Err(e) => return Err(e.into()),
             }
         }
     }
-    Ok(Placement::Proceed)
+    Ok(Placed::Proceed)
+}
+
+/// Whether `e` is the filesystem refusing a NAME as too long, for one
+/// component or for the whole path. `InvalidFilename` is what `std` maps
+/// `ENAMETOOLONG` to (stable since 1.87); the raw errno is the fallback for
+/// a platform that reports it otherwise (63 on macOS and the BSDs, 36 on
+/// Linux).
+fn is_name_too_long(e: &std::io::Error) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    const ENAMETOOLONG: i32 = 63;
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    const ENAMETOOLONG: i32 = 36;
+    e.kind() == std::io::ErrorKind::InvalidFilename || e.raw_os_error() == Some(ENAMETOOLONG)
+}
+
+/// The skip for an entry whose path the destination filesystem cannot hold.
+fn path_too_long(name: &str) -> Fidelity {
+    Fidelity::EntrySkipped {
+        entry: name.to_string(),
+        reason: PATH_TOO_LONG_REASON.to_string(),
+    }
+}
+
+/// The ONE fold for every create call an extraction arm makes AFTER
+/// [`place_entry`] (`File::create`, `create_dir_all`, `create_symlink`, the
+/// hard-link copy's create): `Ok(Err(w))` when the filesystem refused the
+/// entry's name as too long, which the caller pushes and skips on; any other
+/// failure stays an error.
+fn skip_if_name_too_long<T, E: Into<Error>>(
+    r: std::result::Result<T, E>,
+    name: &str,
+) -> Result<std::result::Result<T, Fidelity>> {
+    match r.map_err(Into::into) {
+        Ok(v) => Ok(Ok(v)),
+        Err(Error::Io(e)) if is_name_too_long(&e) => Ok(Err(path_too_long(name))),
+        Err(e) => Err(e),
+    }
 }
 
 /// Creates a symlink at `at` pointing to `link_target`.

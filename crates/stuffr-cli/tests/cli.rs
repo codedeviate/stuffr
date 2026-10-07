@@ -14746,3 +14746,41 @@ fn unpack_skips_entries_an_archive_contradicts() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 0.10.1 fix round 1: a 300-byte entry name is past the filesystem's
+/// limit. `unpack` used to end at exit 1 ("File name too long") and never
+/// write `z.txt`; the entry is now skipped and named, the rest extracted,
+/// and `--strict-fidelity` makes it exit 4.
+#[test]
+fn unpack_skips_a_name_too_long_for_the_filesystem() {
+    let dir = tmp_dir();
+    let tar = dir.join("long.tar");
+    let long = format!("{}.txt", "L".repeat(300));
+    {
+        let mut builder = Builder::new(std::fs::File::create(&tar).unwrap());
+        append_tar_entry(&mut builder, "a.txt", b"alpha");
+        append_tar_entry(&mut builder, &long, b"long");
+        append_tar_entry(&mut builder, "z.txt", b"zulu");
+        builder.finish().unwrap();
+    }
+    let expect = format!("skipped entry `{long}`: its path is too long for this filesystem");
+    for (strict, code) in [(false, 0), (true, 4)] {
+        let dest = dir.join(format!("out-{strict}"));
+        let mut args = vec![
+            "unpack",
+            tar.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ];
+        if strict {
+            args.push("--strict-fidelity");
+        }
+        let out = run_output(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "strict={strict}: {stderr}");
+        assert!(stderr.contains(&expect), "strict={strict}: {stderr}");
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

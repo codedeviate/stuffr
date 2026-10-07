@@ -1107,3 +1107,109 @@ fn case_insensitive_collision_is_classified() {
     assert_eq!(err.exit_code(), 2, "{err}");
     assert!(std::fs::symlink_metadata(dest.join("A")).unwrap().is_dir());
 }
+
+// ---- Names the filesystem cannot hold (0.10.1 Task 2, fix round 1) -------
+
+const PATH_TOO_LONG: &str = "its path is too long for this filesystem";
+
+/// A 300-byte component is past every common filesystem's 255-byte limit.
+/// It used to end the run at exit 1 ("File name too long"), losing `z.txt`.
+#[test]
+fn a_name_too_long_for_the_filesystem_is_skipped_and_the_rest_extracted() {
+    let root = tmp_dir();
+    let long = format!("{}.txt", "L".repeat(300));
+    let archive = write_tar(
+        &root.join("long.tar"),
+        &[
+            file("a.txt", b"alpha"),
+            file(&long, b"long"),
+            file("z.txt", b"zulu"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("a skip, never exit 1");
+
+    assert_eq!(outcome.fidelity.warnings, [skipped(&long, PATH_TOO_LONG)]);
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
+}
+
+/// Every component fits, the whole path does not: 25 components of 200
+/// bytes is past PATH_MAX on macOS (1,024) and Linux (4,096) alike. A long
+/// directory component and a symlink are skipped the same way.
+#[test]
+fn a_path_too_deep_for_the_filesystem_is_skipped_and_the_rest_extracted() {
+    let root = tmp_dir();
+    let deep = vec!["d".repeat(200); 25].join("/");
+    let deep_file = format!("{deep}/f.txt");
+    let long_dir = "D".repeat(300);
+    let long_link = "S".repeat(300);
+    let archive = write_tar(
+        &root.join("deep.tar"),
+        &[
+            file("a.txt", b"alpha"),
+            file(&deep_file, b"deep"),
+            dir(&long_dir),
+            symlink(&long_link, "a.txt"),
+            file("z.txt", b"zulu"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("skips, never exit 1");
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [
+            skipped(&deep_file, PATH_TOO_LONG),
+            skipped(&long_dir, PATH_TOO_LONG),
+            skipped(&long_link, PATH_TOO_LONG),
+        ]
+    );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
+}
+
+/// Fix round 1, Minor 2: on a case-insensitive volume, file `A` then hard
+/// link `a -> A` under `--force`. `dest/a` IS `dest/A`; removing it to make
+/// room for the link used to delete the archive's own file, leaving an empty
+/// directory at exit 0. Now the link is a self-link skip and `A` survives.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_case_folded_hard_link_onto_its_own_target_is_a_self_link_skip() {
+    let root = tmp_dir();
+    std::fs::write(root.join("probe"), b"").unwrap();
+    if !root.join("PROBE").exists() {
+        return; // a case-sensitive volume: `a` and `A` are two files
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[file("A", b"orig"), hardlink("a", "A")],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).expect("a skip");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("a", "it names itself as its hard-link target")]
+    );
+    assert_eq!(std::fs::read(dest.join("A")).unwrap(), b"orig");
+}
+
+/// The inode check must not mistake a genuine second link for a self-link:
+/// a duplicate link entry under `--force` still replaces cleanly, silently.
+#[cfg(unix)]
+#[test]
+fn a_repeated_link_entry_under_force_is_not_a_self_link() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[file("b", b"hello"), hardlink("a", "b"), hardlink("a", "b")],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).unwrap();
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("b")));
+}

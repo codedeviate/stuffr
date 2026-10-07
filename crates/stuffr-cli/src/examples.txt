@@ -750,7 +750,9 @@ EXTRACTING AN ARCHIVE'S ENTRIES
       every entry beneath a skipped path is skipped the same way, and the
       rest is extracted: exit 0, or 4 under --strict-fidelity. --force
       changes nothing here. A file named twice is not a contradiction; the
-      rule above applies, and with --force the later one wins.
+      rule above applies, and with --force the later one wins. An entry
+      whose path is too long for the destination's filesystem is skipped
+      and named the same way.
 
   Path containment is not optional and cannot be switched off. An entry
   naming an absolute path, traversing above the destination with `..`, or a
