@@ -700,8 +700,9 @@ same way a vacuous conformance property would be.
   `dest` is still a real directory, and no symlink under `dest` resolves
   outside it — lexically, from the link's own directory, by the same
   `check_symlink_target` rule extraction enforces, and PHYSICALLY: each link
-  is `canonicalize`d and must land under `canonicalize(dest)` (a dangling or
-  looping link is skipped). The physical half is what sees a chain the
+  is `canonicalize`d and must land under `canonicalize(dest)` (a dangling link
+  is resolved through its deepest existing prefix plus the missing tail; only
+  a loop is skipped). The physical half is what sees a chain the
   lexical rule could not until 0.10.1 — `x/s2 -> ..` plus `s1 -> x/s2/..`,
   which nets to `x` on paper and to `dest/..` on disk. It is the `container`
   target's extract leg: on the seekable path, after the convert oracle, the

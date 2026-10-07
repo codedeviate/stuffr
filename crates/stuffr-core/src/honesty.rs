@@ -280,8 +280,11 @@ pub fn check_entries_carried(
 ///    every link along the way — and the result must sit under
 ///    `canonicalize(dest)`. Rule 2 alone was blind to a chain: `x/s2 -> ..`
 ///    names `dest`, and `s1 -> x/s2/..` nets to `x` lexically, yet the OS
-///    resolves `x/s2` first and lands on `dest/..`. A link `canonicalize`
-///    cannot resolve (dangling, or a loop) is skipped: it points at nothing.
+///    resolves `x/s2` first and lands on `dest/..`. A DANGLING link is
+///    resolved through its deepest existing prefix plus the missing tail
+///    (`resolve_link_physically`), so `dest/sub/s -> ../../.bashrc` still
+///    fails; only a loop is skipped, since it points at nothing, and any
+///    other resolution error fails the check.
 ///    Checked before rule 2, so a refusal that names "resolves physically"
 ///    is this rule's.
 ///
@@ -336,7 +339,7 @@ pub fn check_extraction_contained(
                         .map_err(|e| format!("cannot read symlink {path:?}: {e}"))?;
                     // Physical first, so a link only the OS's own
                     // resolution can see through is named as such.
-                    if let Ok(real) = std::fs::canonicalize(&path)
+                    if let Some(real) = resolve_link_physically(&path, &target)?
                         && !real.starts_with(&real_dest)
                     {
                         return Err(format!(
@@ -367,6 +370,72 @@ pub fn check_extraction_contained(
         }
     }
     Ok(())
+}
+
+/// Where the symlink at `link` (whose target is `target`) lands, as the OS
+/// resolves it: `Some(path)` to compare against the canonical destination,
+/// `None` for a loop, which points at nothing.
+///
+/// A dangling link — `canonicalize` says `NotFound` — is NOT skipped: an
+/// escaping link whose last component happens not to exist (`dest/../.bashrc`)
+/// is still an escape. Its target is joined onto the link's own directory,
+/// the deepest prefix of that path which DOES resolve is canonicalized, and
+/// the missing tail is re-applied lexically on top (`..` pops, `.` is
+/// skipped) — nothing in the tail exists, so nothing in it can be a link to
+/// follow. A prefix that is itself dangling or looping is walked past the
+/// same way. Any other error fails the check: the oracle cannot vouch for a
+/// link it could not resolve.
+fn resolve_link_physically(
+    link: &std::path::Path,
+    target: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    use std::path::Component;
+    match std::fs::canonicalize(link) {
+        Ok(real) => return Ok(Some(real)),
+        Err(e) if is_symlink_loop(&e) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot resolve symlink {link:?}: {e}")),
+    }
+    let full = match link.parent() {
+        Some(dir) => dir.join(target),
+        None => target.to_path_buf(),
+    };
+    for prefix in full.ancestors() {
+        match std::fs::canonicalize(prefix) {
+            Ok(mut real) => {
+                let tail = full
+                    .strip_prefix(prefix)
+                    .map_err(|e| format!("cannot split {full:?} at {prefix:?}: {e}"))?;
+                for comp in tail.components() {
+                    match comp {
+                        Component::ParentDir => {
+                            real.pop();
+                        }
+                        Component::Normal(part) => real.push(part),
+                        Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+                    }
+                }
+                return Ok(Some(real));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound || is_symlink_loop(&e) => {}
+            Err(e) => {
+                return Err(format!(
+                    "cannot resolve {prefix:?} for symlink {link:?}: {e}"
+                ));
+            }
+        }
+    }
+    Err(format!("no prefix of {full:?} (symlink {link:?}) resolves"))
+}
+
+/// `ELOOP`, by its raw number: `io::ErrorKind::FilesystemLoop` is not stable
+/// at this crate's MSRV (1.88), and `stuffr-core` has no `libc` dependency.
+fn is_symlink_loop(e: &std::io::Error) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    const ELOOP: i32 = 62;
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    const ELOOP: i32 = 40;
+    e.raw_os_error() == Some(ELOOP)
 }
 
 /// Never report a status that claims more evidence than the format offers
@@ -1088,6 +1157,42 @@ mod broken_honesty {
         std::os::unix::fs::symlink("loop", dest.join("loop")).unwrap();
         check_extraction_contained(root.path(), &dest, &[&input])
             .expect("a chain that stays inside the destination is contained");
+    }
+
+    /// Fix round 1: a DANGLING link is resolved too, through its deepest
+    /// existing prefix plus the missing tail. `sub/s -> ../../nonexistent`
+    /// points at `root/nonexistent`, outside `dest`, and `canonicalize`
+    /// fails on it with `NotFound` — which rule 3 used to skip, leaving only
+    /// the lexical rule between it and a pass. The refusal must be rule 3's.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_link_resolving_outside_the_destination_is_refused() {
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("../../nonexistent", dest.join("sub/s")).unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("dest/sub/s -> ../../nonexistent escapes and must fail");
+        assert!(msg.contains("resolves physically"), "{msg}");
+        // Deeper: the missing tail itself holds more than one name.
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("../../no/such/file", dest.join("sub/s")).unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("a multi-component missing tail outside dest must fail");
+        assert!(msg.contains("resolves physically"), "{msg}");
+    }
+
+    /// The over-strictness guard for the double above: a dangling link that
+    /// would land inside `dest`, and a loop (which points at nothing), pass.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_contained_link_and_a_loop_are_permitted() {
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("../missing/deeper", dest.join("sub/d")).unwrap();
+        std::os::unix::fs::symlink("nothing-here", dest.join("d2")).unwrap();
+        std::os::unix::fs::symlink("l2", dest.join("l1")).unwrap();
+        std::os::unix::fs::symlink("l1", dest.join("l2")).unwrap();
+        std::os::unix::fs::symlink("self", dest.join("self")).unwrap();
+        check_extraction_contained(root.path(), &dest, &[&input])
+            .expect("dangling contained links and loops are contained");
     }
 
     #[test]
