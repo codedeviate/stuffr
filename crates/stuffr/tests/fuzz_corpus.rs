@@ -1012,6 +1012,36 @@ fn hardlink_cpio_seed() -> Vec<u8> {
     c
 }
 
+/// Path-conflict tars (0.10.1): each archive contradicts itself on disk, the
+/// shapes `place_entry` turns into named skips and the `container` target's
+/// extract leg checks. `(file stem, bytes)`.
+fn conflict_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
+    // Directory `x`, then a file `x` where it stands.
+    let mut dir_then_file = seed_tar_member(b"x/", b'5', b"", b"");
+    dir_then_file.extend(seed_tar_member(b"x", b'0', b"", b"file\n"));
+    // A file `a`, then `a/b` beneath it.
+    let mut file_then_child = seed_tar_member(b"a", b'0', b"", b"file\n");
+    file_then_child.extend(seed_tar_member(b"a/b", b'0', b"", b"child\n"));
+    // A file `a`, then a hard link `a/l` -> `a` beneath it.
+    let mut file_then_link = seed_tar_member(b"a", b'0', b"", b"file\n");
+    file_then_link.extend(seed_tar_member(b"a/l", b'1', b"a", b""));
+    // A file `a`, then twenty entries beneath it: the cascade.
+    let mut cascade = seed_tar_member(b"a", b'0', b"", b"file\n");
+    for i in 0..20 {
+        let name = format!("a/{i:02}");
+        cascade.extend(seed_tar_member(name.as_bytes(), b'0', b"", b"n\n"));
+    }
+    vec![
+        ("tar-conflict-dir-then-file", seed_tar_end(dir_then_file)),
+        (
+            "tar-conflict-file-then-child",
+            seed_tar_end(file_then_child),
+        ),
+        ("tar-conflict-file-then-link", seed_tar_end(file_then_link)),
+        ("tar-conflict-cascade", seed_tar_end(cascade)),
+    ]
+}
+
 /// Extra `container/` seeds beyond the per-slot pair: `(file stem, slot, bytes)`.
 fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     vec![
@@ -1019,6 +1049,13 @@ fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
         ("cpio-hardlinks", "cpio", hardlink_cpio_seed()),
         ("tar-escaped-names", "tar", escaped_name_tar_seed()),
     ]
+    .into_iter()
+    .chain(
+        conflict_tar_seeds()
+            .into_iter()
+            .map(|(stem, bytes)| (stem, "tar", bytes)),
+    )
+    .collect()
 }
 
 /// Writes one seed corpus per fuzz target under `root/{codec,container,chain}`.
@@ -1136,9 +1173,10 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
         }
     }
 
-    // Hard-link groups and escaped names (0.10.0): the shapes the convert
-    // oracle's link handling and the display check need to reach. Each is
-    // emitted seekable only, the one path `convert_oracle` runs on.
+    // Hard-link groups and escaped names (0.10.0), and path conflicts
+    // (0.10.1): the shapes the convert oracle's link handling, the display
+    // check and the extract leg need to reach. Each is emitted seekable only,
+    // the one path `convert_oracle` and the extract leg run on.
     for (stem, slot, bytes) in extra_container_seeds() {
         if let Some((selector, _)) = registered_container_slots()
             .into_iter()

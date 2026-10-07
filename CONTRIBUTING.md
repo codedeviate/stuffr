@@ -692,6 +692,21 @@ same way a vacuous conformance property would be.
   call site in every target carries it; the `container` target also applies it
   to each fidelity warning. A failure is an escaping gap, not a reason to
   loosen the check.
+- **`check_extraction_contained`** (0.10.1) is the eighth: after an
+  extraction into `dest`, a walk of the scratch root that never follows a
+  symlink finds nothing outside `dest` except the caller's `allowed` files,
+  `dest` is still a real directory, and no symlink under `dest` resolves
+  outside it — lexically, from the link's own directory, by the same
+  `check_symlink_target` rule extraction enforces. It is the `container`
+  target's extract leg: on the seekable path, after the convert oracle, the
+  target runs `entries::extract` (`force: false`, the convert oracle's
+  limits) into the per-input temp directory; an `Err` must be classified,
+  containment is checked either way, and on `Ok` every name the walk saw is
+  on disk at its `safe_join` path or named by a skip warning
+  (`check_entries_carried`'s rule). It is what catches a path conflict the
+  archive makes with itself reaching exit 1 again.
+  `STUFFR_FUZZ_EXTRACT_TRACE=1` prints one `extract-trace` line per input
+  that reached it.
 
 `check_salvage_claim` refuses a status that claims more than the format or
 the scan supports. Since Salvage Stage 3 it takes the format's class of

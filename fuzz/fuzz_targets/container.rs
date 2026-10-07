@@ -2,11 +2,11 @@
 use libfuzzer_sys::fuzz_target;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use stuffr::entries::{ConvertOpts, convert_archive_source};
+use stuffr::entries::{ConvertOpts, ExtractOpts, Selection, convert_archive_source};
 use stuffr::ops::{ConvertSource, Input, Output};
 use stuffr_core::testing::{
     CONTAINER_SLOTS, check_display_has_no_raw_controls, check_entries_carried, check_entry_count,
-    check_entry_size, check_error_is_classified, check_fidelity_claim,
+    check_entry_size, check_error_is_classified, check_extraction_contained, check_fidelity_claim,
 };
 use stuffr_core::{
     Chain, Container, Error, FileSource, FormatId, OpenOpts, ReaderSource, Source, SpillPolicy,
@@ -227,19 +227,19 @@ fn check_warnings_render_safely(report: &stuffr_core::FidelityReport, what: &str
 /// no in-memory variant, and `Output::Stdout` would write into libFuzzer's
 /// own output. `sync: false`, and spill in memory only: a fuzz input is
 /// small, and an entry that would spill past the cap is a classified exit 6.
-fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[String]) {
-    let opts = ConvertOpts {
-        force: true,
-        sync: false,
-        spill: SpillPolicy::Memory { cap: 16 << 20 },
-        ..ConvertOpts::default()
-    };
+///
+/// Returns whether `input`'s content-first chain is exactly `slot` — the
+/// condition under which the walk's names describe what `entries::extract`
+/// (which resolves the same way) reads — and `false` when the source would not
+/// even open.
+fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[String]) -> bool {
+    let opts = convert_opts();
     let src = match ConvertSource::open(Input::Path(input.to_path_buf()), opts.memory_limit) {
         Ok(s) => s,
         Err(e) => {
             check_error_is_classified(&e).expect("convert: source open classification");
             trace(slot, "open-err", source_names.len(), false, 0);
-            return;
+            return false;
         }
     };
     let same_archive = *src.chain()
@@ -253,12 +253,12 @@ fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[
             Err(e) => {
                 check_error_is_classified(&e).expect("convert: error classification");
                 trace(slot, "convert-err", source_names.len(), false, 0);
-                return;
+                return same_archive;
             }
         };
     if !same_archive {
         trace(slot, "other-chain", source_names.len(), false, 0);
-        return;
+        return false;
     }
 
     // stuffr wrote this tar a moment ago: failing to read it back is a
@@ -288,6 +288,179 @@ fn convert_oracle(input: &Path, out: &Path, slot: &'static str, source_names: &[
     check_entries_carried(source_names, &written, &outcome.fidelity)
         .expect("convert: every entry carried or named");
     trace(slot, "checked", source_names.len(), true, links);
+    true
+}
+
+/// The convert oracle's limits, which the extract leg reuses so both legs read
+/// the input under the same bounds.
+fn convert_opts() -> ConvertOpts {
+    ConvertOpts {
+        force: true,
+        sync: false,
+        spill: SpillPolicy::Memory { cap: 16 << 20 },
+        ..ConvertOpts::default()
+    }
+}
+
+/// Extracts the archive at `input` into `root/out` (0.10.1), and checks what
+/// landed on disk:
+///
+/// 1. an `Err` is classified — never exit 1, which is how a path conflict the
+///    archive makes with itself surfaced before `place_entry` owned them;
+/// 2. nothing exists under `root` outside `root/out` except `allowed` (the
+///    target's own files), and no symlink under `root/out` resolves outside
+///    it ([`check_extraction_contained`]) — run whether `extract` succeeded or
+///    not, since a refusal partway through leaves what it already wrote;
+/// 3. on `Ok`, when `same_archive` says the walk read what `extract` read,
+///    every name the walk enumerated is on disk (at its `safe_join` path) or
+///    named by a skip warning ([`check_entries_carried`]).
+///
+/// `force: false` into a fresh directory, so a repeated name is the
+/// classified exit 2 it is for a user, and a destination-held conflict never
+/// arises.
+fn extract_leg(
+    input: &Path,
+    root: &Path,
+    allowed: &[&Path],
+    slot: &'static str,
+    source_names: &[String],
+    same_archive: bool,
+) {
+    let dest = root.join("out");
+    let copts = convert_opts();
+    let opts = ExtractOpts {
+        max_ratio: copts.max_ratio,
+        memory_limit: copts.memory_limit,
+        force: false,
+        ..ExtractOpts::default()
+    };
+    let result = stuffr::entries::extract(
+        Input::Path(input.to_path_buf()),
+        &dest,
+        &Selection::All,
+        &opts,
+    );
+    // An archive may set a directory's mode to 0o000; the containment walk
+    // reads every directory, and the per-input `TempDir` must be removable.
+    make_traversable(&dest);
+    check_extraction_contained(root, &dest, allowed).expect("extract: contained");
+
+    let outcome = match result {
+        Ok(o) => o,
+        Err(e) => {
+            check_error_is_classified(&e).expect("extract: error classification");
+            extract_trace(
+                slot,
+                source_names.len(),
+                0,
+                0,
+                0,
+                &e.exit_code().to_string(),
+            );
+            return;
+        }
+    };
+    check_warnings_render_safely(&outcome.fidelity, "extract");
+    let skips: Vec<&str> = outcome
+        .fidelity
+        .warnings
+        .iter()
+        .filter_map(|w| match w {
+            stuffr_core::Fidelity::EntrySkipped { reason, .. } => Some(reason.as_str()),
+            _ => None,
+        })
+        .collect();
+    let conflicts = skips
+        .iter()
+        .filter(|r| r.contains("earlier in this archive"))
+        .count();
+    if !same_archive {
+        extract_trace(
+            slot,
+            source_names.len(),
+            0,
+            skips.len(),
+            conflicts,
+            "other-chain",
+        );
+        return;
+    }
+    // `safe_join` cannot refuse here: `extract` refused any name it would,
+    // and it returned `Ok`. `symlink_metadata`, so a dangling symlink counts
+    // as present.
+    let on_disk: Vec<String> = source_names
+        .iter()
+        .filter(|n| {
+            stuffr_core::safe_join(&dest, n).is_ok_and(|p| std::fs::symlink_metadata(p).is_ok())
+        })
+        .cloned()
+        .collect();
+    check_entries_carried(source_names, &on_disk, &outcome.fidelity)
+        .expect("extract: every entry on disk or named");
+    extract_trace(
+        slot,
+        source_names.len(),
+        on_disk.len(),
+        skips.len(),
+        conflicts,
+        "-",
+    );
+}
+
+/// Adds owner `rwx` to every directory under `dir`, so an archive's
+/// restrictive directory mode neither blinds the containment walk nor leaks
+/// the per-input `TempDir`. Permissions only: nothing is moved or removed.
+fn make_traversable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&d) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(mode | 0o700));
+        }
+        if let Ok(listing) = std::fs::read_dir(&d) {
+            for item in listing.flatten() {
+                if item.file_type().is_ok_and(|t| t.is_dir()) {
+                    pending.push(item.path());
+                }
+            }
+        }
+    }
+}
+
+/// One line per input that reached [`extract_leg`], on stderr, when
+/// `STUFFR_FUZZ_EXTRACT_TRACE` is set — nothing otherwise. `extracted` is how
+/// many of the walk's names were found on disk (0 when not compared),
+/// `skips` the `EntrySkipped` warnings, `conflicts` those a self-contradicting
+/// archive caused, and `err` the exit code of a classified refusal (`-` when
+/// `extract` succeeded and was compared, `other-chain` when it succeeded over
+/// a chain the walk did not read).
+///
+/// ```text
+/// STUFFR_FUZZ_EXTRACT_TRACE=1 cargo +nightly fuzz run container -- -runs=0 2>&1 \
+///   | grep '^extract-trace '
+/// ```
+fn extract_trace(
+    slot: &str,
+    names: usize,
+    extracted: usize,
+    skips: usize,
+    conflicts: usize,
+    err: &str,
+) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("STUFFR_FUZZ_EXTRACT_TRACE").is_some()) {
+        eprintln!(
+            "extract-trace slot={slot} names={names} extracted={extracted} skips={skips} \
+             conflicts={conflicts} err={err}"
+        );
+    }
 }
 
 /// One line per input that reached [`convert_oracle`], on stderr, when
@@ -530,7 +703,18 @@ fuzz_target!(|data: &[u8]| {
     // Phase 5a: convert what this walk read into a tar, seekable path only
     // (the cheap one: the input is already a file). Last, so every check
     // above has already passed on these bytes.
+    //
+    // 0.10.1: then extract the same file to disk, beside it.
     if let (Some(p), Some(tmp)) = (&path, &tmp_guard) {
-        convert_oracle(p, &tmp.path().join("converted.tar"), name, &names);
+        let converted = tmp.path().join("converted.tar");
+        let same_archive = convert_oracle(p, &converted, name, &names);
+        extract_leg(
+            p,
+            tmp.path(),
+            &[p.as_path(), converted.as_path()],
+            name,
+            &names,
+            same_archive,
+        );
     }
 });

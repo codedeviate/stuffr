@@ -258,6 +258,93 @@ pub fn check_entries_carried(
     }
 }
 
+/// An extraction into `dest` wrote nothing outside it, and left no symlink
+/// under it that points outside it.
+///
+/// `root` is a scratch directory holding `dest` (at any depth) and nothing
+/// else the extraction had any business touching; `allowed` names what was
+/// already there by the caller's doing — the `container` fuzz target's own
+/// input file — and is exempt together with anything beneath it. Two rules:
+///
+/// 1. **Nothing outside `dest`.** A walk of `root` that never follows a
+///    symlink finds no path outside `dest` other than `dest`'s own ancestors
+///    and `allowed`. `dest` itself must still be a real directory: a
+///    destination swapped for a symlink has moved everything beneath it.
+/// 2. **No escaping symlink inside `dest`.** Every symlink under `dest` is
+///    resolved LEXICALLY from its own directory by
+///    [`crate::check_symlink_target`], the rule extraction enforces before
+///    creating one — so the oracle and the code it polices agree on what
+///    "escapes" means, and a disagreement between them is a finding.
+///
+/// Read-only: it never changes a permission, so a directory it cannot read
+/// is a failure (it cannot vouch for what is inside), not a skip. A caller
+/// extracting archives that set restrictive directory modes makes them
+/// traversable first.
+///
+/// Returns `Err` naming the first offending path.
+pub fn check_extraction_contained(
+    root: &std::path::Path,
+    dest: &std::path::Path,
+    allowed: &[&std::path::Path],
+) -> Result<(), String> {
+    if !dest.starts_with(root) {
+        return Err(format!(
+            "the destination {dest:?} is not inside the scratch root {root:?}"
+        ));
+    }
+    match std::fs::symlink_metadata(dest) {
+        Ok(m) if m.file_type().is_dir() => {}
+        Ok(m) => {
+            return Err(format!(
+                "the destination {dest:?} is no longer a directory ({:?})",
+                m.file_type()
+            ));
+        }
+        Err(e) => return Err(format!("cannot inspect the destination {dest:?}: {e}")),
+    }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let listing =
+            std::fs::read_dir(&dir).map_err(|e| format!("cannot read directory {dir:?}: {e}"))?;
+        for item in listing {
+            let item = item.map_err(|e| format!("cannot read an entry of {dir:?}: {e}"))?;
+            let path = item.path();
+            // `DirEntry::file_type` does not follow a symlink.
+            let kind = item
+                .file_type()
+                .map_err(|e| format!("cannot inspect {path:?}: {e}"))?;
+            if allowed.iter().any(|a| path.starts_with(a)) {
+                continue;
+            }
+            if path.starts_with(dest) {
+                if kind.is_symlink() {
+                    let target = std::fs::read_link(&path)
+                        .map_err(|e| format!("cannot read symlink {path:?}: {e}"))?;
+                    crate::check_symlink_target(dest, &path, &target.to_string_lossy()).map_err(
+                        |e| {
+                            format!(
+                                "symlink {path:?} -> {target:?} resolves outside the \
+                                 destination {dest:?}: {e}"
+                            )
+                        },
+                    )?;
+                } else if kind.is_dir() {
+                    pending.push(path);
+                }
+            } else if kind.is_dir() && dest.starts_with(&path) {
+                // An ancestor of `dest`, on the way down to it.
+                pending.push(path);
+            } else {
+                return Err(format!(
+                    "{path:?} exists outside the destination {dest:?}, and nothing put it \
+                     there but the extraction"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Never report a status that claims more evidence than the format offers
 /// or the scan actually gathered.
 ///
@@ -882,5 +969,88 @@ mod broken_honesty {
             permitted, 3,
             "exactly one cell per claim-bearing tier is honest — 18 cells, 3 permitted"
         );
+    }
+
+    /// A scratch tree shaped like the `container` target's: `root/input.tar`
+    /// (the target's own input), `root/out/` (the destination) holding
+    /// `sub/f`.
+    fn extraction_tree() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.tar");
+        std::fs::write(&input, b"bytes").unwrap();
+        let dest = root.path().join("out");
+        std::fs::create_dir_all(dest.join("sub")).unwrap();
+        std::fs::write(dest.join("sub/f"), b"payload").unwrap();
+        (root, dest, input)
+    }
+
+    #[test]
+    fn a_file_written_outside_the_destination_is_refused() {
+        let (root, dest, input) = extraction_tree();
+        std::fs::write(root.path().join("escape"), b"x").unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("a file beside the destination must fail");
+        assert!(msg.contains("escape"), "must name the path: {msg}");
+        // Deeper outside: a directory the extraction made beside `dest`.
+        let (root, dest, input) = extraction_tree();
+        std::fs::create_dir(root.path().join("elsewhere")).unwrap();
+        assert!(check_extraction_contained(root.path(), &dest, &[&input]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_under_the_destination_resolving_outside_it_is_refused() {
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("../../etc", dest.join("s")).unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("dest/s -> ../../etc must fail");
+        assert!(msg.contains("etc"), "must name the target: {msg}");
+        // From a nested link's own directory: `sub/up -> ../..` escapes,
+        // where the same target one level deeper would not.
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("../..", dest.join("sub/up")).unwrap();
+        assert!(check_extraction_contained(root.path(), &dest, &[&input]).is_err());
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("/etc", dest.join("abs")).unwrap();
+        assert!(check_extraction_contained(root.path(), &dest, &[&input]).is_err());
+        // The destination itself replaced by a symlink is refused too.
+        let root2 = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let dest2 = root2.path().join("out");
+        std::os::unix::fs::symlink(elsewhere.path(), &dest2).unwrap();
+        assert!(check_extraction_contained(root2.path(), &dest2, &[]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_resolving_inside_the_destination_is_permitted() {
+        // Over-strictness guard: neutering the check leaves it green; making
+        // it refuse every symlink (or resolve from `dest` rather than the
+        // link's own directory) turns it red.
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("sub/f", dest.join("s")).unwrap();
+        std::os::unix::fs::symlink("../sub/f", dest.join("sub/up")).unwrap();
+        std::os::unix::fs::symlink("..", dest.join("sub/top")).unwrap();
+        std::os::unix::fs::symlink("dangling", dest.join("d")).unwrap();
+        check_extraction_contained(root.path(), &dest, &[&input])
+            .expect("links resolving inside the destination are contained");
+    }
+
+    #[test]
+    fn the_targets_own_input_and_a_clean_tree_are_permitted() {
+        // Over-strictness guard: the input file sits beside `dest` by
+        // construction, and naming it in `allowed` is what exempts it.
+        let (root, dest, input) = extraction_tree();
+        check_extraction_contained(root.path(), &dest, &[&input])
+            .expect("a clean extraction plus its allowed input is contained");
+        let msg = check_extraction_contained(root.path(), &dest, &[])
+            .expect_err("the input is outside `dest` once it is not allowed");
+        assert!(msg.contains("input.tar"), "{msg}");
+        // An empty destination, and no destination at all yet created
+        // beneath a nested root, are both clean.
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("a/b/out");
+        std::fs::create_dir_all(&dest).unwrap();
+        check_extraction_contained(root.path(), &dest, &[]).expect("empty dest is contained");
     }
 }
