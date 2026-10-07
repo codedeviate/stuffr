@@ -427,7 +427,7 @@ fn resolve_link_physically(
     use std::path::Component;
     match std::fs::canonicalize(link) {
         Ok(real) => return Ok(Some(real)),
-        Err(e) if is_symlink_loop(&e) => return Ok(None),
+        Err(e) if is_symlink_loop(&e) || is_name_too_long(&e) => return Ok(None),
         Err(e) if is_missing_or_through_a_file(&e) => {}
         Err(e) => return Err(format!("cannot resolve symlink {link:?}: {e}")),
     }
@@ -452,7 +452,10 @@ fn resolve_link_physically(
                 }
                 return Ok(Some(real));
             }
-            Err(e) if is_missing_or_through_a_file(&e) || is_symlink_loop(&e) => {}
+            Err(e)
+                if is_missing_or_through_a_file(&e)
+                    || is_symlink_loop(&e)
+                    || is_name_too_long(&e) => {}
             Err(e) => {
                 return Err(format!(
                     "cannot resolve {prefix:?} for symlink {link:?}: {e}"
@@ -473,6 +476,14 @@ fn is_missing_or_through_a_file(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
     )
+}
+
+/// `ENAMETOOLONG` (36 on Linux, 63 on macOS), by kind: `InvalidFilename`
+/// is stable since 1.87. A link whose target has a component past the OS
+/// limit points at nothing any process can open, like a loop, so the
+/// physical rule skips it; the lexical rule still judges it.
+fn is_name_too_long(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidFilename
 }
 
 /// `ELOOP`, by its raw number: `io::ErrorKind::FilesystemLoop` is not stable
@@ -1167,6 +1178,23 @@ mod broken_honesty {
         let msg = check_extraction_contained(root.path(), &dest, &[])
             .expect_err("a file destination must fail");
         assert!(msg.contains("no longer a directory"), "{msg}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_with_an_unresolvably_long_component_is_judged_lexically_only() {
+        let (root, dest, input) = extraction_tree();
+        let long = "a".repeat(300);
+        // A component over NAME_MAX; the whole target stays under PATH_MAX,
+        // so the OS accepts creating it but cannot resolve it.
+        std::os::unix::fs::symlink(&long, dest.join("sub/ok")).unwrap();
+        check_extraction_contained(root.path(), &dest, &[&input])
+            .expect("a contained but unresolvable link is not a finding");
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink(format!("../../{long}"), dest.join("sub/bad")).unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("a lexically escaping link must still fail");
+        assert!(msg.contains("bad"), "{msg}");
     }
 
     #[cfg(unix)]
