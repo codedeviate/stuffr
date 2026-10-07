@@ -1285,3 +1285,34 @@ fn repeated_links_in_a_large_directory_stay_linear() {
     assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("b")));
     assert!(took < std::time::Duration::from_secs(5), "{took:?}");
 }
+
+/// Fix round 3: the run's record is keyed by exact path and never
+/// un-records. On a case-insensitive volume, file `a`, then file `A` (which
+/// replaces `a` on disk under `--force`), then link `A -> a`: the record
+/// holds both spellings for one file. The single-link inode check decides
+/// first, so the link is a self-link skip and the file keeps `A`'s bytes;
+/// trusting the record removed the one file and ended at exit 1.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_case_folded_link_after_a_case_folded_replace_is_a_self_link_skip() {
+    let root = tmp_dir();
+    std::fs::write(root.join("probe"), b"").unwrap();
+    if !root.join("PROBE").exists() {
+        return; // a case-sensitive volume: three distinct names
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[
+            file("a", b"first"),
+            file("A", b"second"),
+            hardlink("A", "a"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).expect("never exit 1");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("A", "it names itself as its hard-link target")]
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"second");
+}

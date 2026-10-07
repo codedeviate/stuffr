@@ -1339,27 +1339,38 @@ fn extract_hard_link(
 ///
 /// Same `(dev, ino)` from `symlink_metadata` on both is necessary but not
 /// enough: a genuine second hard link (a duplicate link entry, replaced
-/// under `--force`) shares the inode too. The run's own record tells them
-/// apart in O(1): an EXACT `link` path this run made is a distinct entry it
-/// created; an unrecorded one sharing the target's inode can only be the
-/// target under another spelling (the target is this run's, so nothing the
-/// destination held before shares its inode). `false` when either is
+/// under `--force`) shares the inode too, and always has `nlink >= 2`. So:
+/// one name for the inode means one entry; with several, the run's own
+/// record tells them apart in O(1) — an EXACT `link` path this run made is
+/// a distinct entry it created, and an unrecorded one sharing the target's
+/// inode can only be the target under another spelling (the target is this
+/// run's, so nothing the destination held before shares its inode). `false` when either is
 /// absent, and off unix, where there is no inode to ask and the exact-path
 /// check is all there is.
 fn is_same_entry(target: &Path, link: &Path, made: &MadeByRun) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if made.made(link) {
-            return false;
-        }
-        match (
+        let (Ok(t), Ok(l)) = (
             std::fs::symlink_metadata(target),
             std::fs::symlink_metadata(link),
-        ) {
-            (Ok(t), Ok(l)) => (t.dev(), t.ino()) == (l.dev(), l.ino()),
-            _ => false,
+        ) else {
+            return false;
+        };
+        if (t.dev(), t.ino()) != (l.dev(), l.ino()) {
+            return false;
         }
+        // One name for the inode: whatever the record says, `link` and
+        // `target` are one directory entry. The record is keyed by exact
+        // path and never un-records, so on a case-insensitive volume it can
+        // hold `a` AND `A` for one file (`A` replaced `a` under `--force`);
+        // trusting it here removed that one file and ended at exit 1.
+        if t.nlink() <= 1 {
+            return true;
+        }
+        // Several names: a genuine second link this run made at the exact
+        // path is distinct; anything else sharing the inode is a fold.
+        !made.made(link)
     }
     #[cfg(not(unix))]
     {
