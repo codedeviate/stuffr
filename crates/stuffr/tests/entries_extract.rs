@@ -1254,16 +1254,11 @@ fn an_over_long_final_name_under_a_new_parent_is_skipped_by_every_arm() {
     assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
 }
 
-/// Fix round 2, M3: the self-link check is O(1) per link (the run's own
-/// record), not a scan of the link's directory. 2,000 repeated `a -> b`
-/// entries under `--force`, beside 2,000 other files. Measured in debug on
-/// APFS: ~1.07 s (~0.27 s is the 2,000 files, then ~0.4 ms per link, which
-/// is the unlink/link syscalls); the per-link directory scan it replaced
-/// took ~2.69 s. The bound is generous on purpose: it catches a
-/// catastrophic regression without flaking on a loaded runner.
+/// 2,000 files, then 2,000 repeated `a -> b` hard-link entries: the archive
+/// [`repeated_links_in_a_large_directory_stay_linear`] and its timed
+/// reproducer both extract (under `--force`).
 #[cfg(unix)]
-#[test]
-fn repeated_links_in_a_large_directory_stay_linear() {
+fn extract_many_repeated_links() -> (PathBuf, stuffr::ops::Outcome, std::time::Duration) {
     let root = tmp_dir();
     let names: Vec<String> = (0..2000).map(|i| format!("f{i}")).collect();
     let mut fixtures: Vec<Fixture<'_>> = names.iter().map(|n| file(n, b"x")).collect();
@@ -1274,15 +1269,40 @@ fn repeated_links_in_a_large_directory_stay_linear() {
 
     let started = std::time::Instant::now();
     let outcome = extract_with(&archive, &dest, true).unwrap();
-    let took = started.elapsed();
-    eprintln!("repeated_links_in_a_large_directory_stay_linear: {took:?}");
+    (dest, outcome, started.elapsed())
+}
 
+/// Fix round 2, M3: 2,000 repeated `a -> b` entries under `--force`, beside
+/// 2,000 other files, all link `a` to `b` with no warning. The self-link
+/// check is O(1) per link (the run's own record), not a scan of the link's
+/// directory; the wall-clock half of that claim lives in the `#[ignore]`d
+/// reproducer below, because a time bound in the gate can flake on a loaded
+/// runner.
+#[cfg(unix)]
+#[test]
+fn repeated_links_in_a_large_directory_stay_linear() {
+    let (dest, outcome, _) = extract_many_repeated_links();
     assert!(
         outcome.fidelity.warnings.is_empty(),
         "{:?}",
         outcome.fidelity.warnings
     );
     assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("b")));
+}
+
+/// The timing reproducer for the test above, on demand:
+/// `cargo test -p stuffr --test entries_extract -- --ignored
+/// repeated_links_timing`. Measured in debug on APFS: ~1.07 s (~0.27 s is
+/// the 2,000 files, then ~0.4 ms per link, which is the unlink/link
+/// syscalls); the per-link directory scan it replaced took ~2.69 s. The
+/// bound is generous: it catches a catastrophic regression, not a 2x.
+#[cfg(unix)]
+#[test]
+#[ignore = "wall-clock bound; run on demand, not in the gate"]
+fn repeated_links_timing_reproducer() {
+    let (_, outcome, took) = extract_many_repeated_links();
+    eprintln!("repeated_links_timing_reproducer: {took:?}");
+    assert!(outcome.fidelity.warnings.is_empty());
     assert!(took < std::time::Duration::from_secs(5), "{took:?}");
 }
 
@@ -1290,8 +1310,10 @@ fn repeated_links_in_a_large_directory_stay_linear() {
 /// un-records. On a case-insensitive volume, file `a`, then file `A` (which
 /// replaces `a` on disk under `--force`), then link `A -> a`: the record
 /// holds both spellings for one file. The single-link inode check decides
-/// first, so the link is a self-link skip and the file keeps `A`'s bytes;
-/// trusting the record removed the one file and ended at exit 1.
+/// first, so the link is a self-link skip and the file keeps `A`'s bytes.
+/// Trusting the record (fix round 2) removed the one file, then found
+/// nothing to link or copy and skipped the link: exit 0 with the file
+/// silently gone — data loss reported as success, not an exit 1.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_case_folded_link_after_a_case_folded_replace_is_a_self_link_skip() {
