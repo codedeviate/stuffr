@@ -376,7 +376,8 @@ pub fn check_extraction_contained(
 /// resolves it: `Some(path)` to compare against the canonical destination,
 /// `None` for a loop, which points at nothing.
 ///
-/// A dangling link — `canonicalize` says `NotFound` — is NOT skipped: an
+/// A dangling link — `canonicalize` says `NotFound`, or `NotADirectory` for
+/// a link through a regular file — is NOT skipped: an
 /// escaping link whose last component happens not to exist (`dest/../.bashrc`)
 /// is still an escape. Its target is joined onto the link's own directory,
 /// the deepest prefix of that path which DOES resolve is canonicalized, and
@@ -393,7 +394,7 @@ fn resolve_link_physically(
     match std::fs::canonicalize(link) {
         Ok(real) => return Ok(Some(real)),
         Err(e) if is_symlink_loop(&e) => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if is_missing_or_through_a_file(&e) => {}
         Err(e) => return Err(format!("cannot resolve symlink {link:?}: {e}")),
     }
     let full = match link.parent() {
@@ -417,7 +418,7 @@ fn resolve_link_physically(
                 }
                 return Ok(Some(real));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound || is_symlink_loop(&e) => {}
+            Err(e) if is_missing_or_through_a_file(&e) || is_symlink_loop(&e) => {}
             Err(e) => {
                 return Err(format!(
                     "cannot resolve {prefix:?} for symlink {link:?}: {e}"
@@ -426,6 +427,18 @@ fn resolve_link_physically(
         }
     }
     Err(format!("no prefix of {full:?} (symlink {link:?}) resolves"))
+}
+
+/// `NotFound`, or `NotADirectory` (ENOTDIR): a path running THROUGH a
+/// regular file (`l -> a.txt/x`) is as unresolvable as a missing one, and
+/// for the same reason — nothing past that component exists. Both fall
+/// through to the prefix walk, where the file itself canonicalizes and the
+/// tail is re-applied. `ErrorKind::NotADirectory` is stable since 1.83.
+fn is_missing_or_through_a_file(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// `ELOOP`, by its raw number: `io::ErrorKind::FilesystemLoop` is not stable
@@ -1193,6 +1206,29 @@ mod broken_honesty {
         std::os::unix::fs::symlink("self", dest.join("self")).unwrap();
         check_extraction_contained(root.path(), &dest, &[&input])
             .expect("dangling contained links and loops are contained");
+    }
+
+    /// Fix round 2: a link THROUGH a regular file. `l -> sub/f/x` names
+    /// plain components, so extraction accepts it, and `canonicalize` fails
+    /// with `ENOTDIR`, not `NotFound` — which made the oracle abort on a
+    /// legitimate extraction. It resolves through the prefix walk like a
+    /// dangling link: contained here, escaping in the second half.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_through_a_regular_file_is_resolved_not_refused() {
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("sub/f/x", dest.join("l")).unwrap();
+        std::os::unix::fs::symlink("f/x/y", dest.join("sub/m")).unwrap();
+        check_extraction_contained(root.path(), &dest, &[&input])
+            .expect("a link through a file inside dest is contained");
+
+        // From `sub/`, through the input file BESIDE `dest`: escaping, and
+        // the physical rule (which runs first) is the one that says so.
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("../../input.tar/x", dest.join("sub/s")).unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("sub/s -> ../../input.tar/x escapes and must fail");
+        assert!(msg.contains("resolves physically"), "{msg}");
     }
 
     #[test]

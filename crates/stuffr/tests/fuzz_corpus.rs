@@ -1053,9 +1053,15 @@ fn symlink_chain_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
     let s1 = seed_tar_member(b"s1", b'2', b"x/s2/..", b"");
     let s2_first = [dir.clone(), s2.clone(), s1.clone()].concat();
     let s1_first = [dir, s1, s2].concat();
+    // A link THROUGH a regular file (fix round 2): plain names, so
+    // extraction accepts it, and `canonicalize` answers ENOTDIR — the
+    // oracle must resolve it, not abort.
+    let mut through_file = seed_tar_member(b"a.txt", b'0', b"", b"file\n");
+    through_file.extend(seed_tar_member(b"l", b'2', b"a.txt/x", b""));
     vec![
         ("tar-symlink-chain-s2-first", seed_tar_end(s2_first)),
         ("tar-symlink-chain-s1-first", seed_tar_end(s1_first)),
+        ("tar-symlink-through-file", seed_tar_end(through_file)),
     ]
 }
 
