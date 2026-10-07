@@ -125,10 +125,10 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
 /// The single component-classification loop both public functions share, so
 /// there is exactly ONE place that decides what `..`, `.`, a root and a
 /// normal component mean. Returns the refusal `reason` rather than a full
-/// `Error`, because the two callers name different things in the error's
-/// `path` field: `safe_join` names the entry, `check_symlink_target` names
-/// the TARGET — never the composed string, which is not something the user
-/// can find in their archive.
+/// `Error`, so each caller builds its own: `safe_join` names the entry with
+/// this reason, and `classify_symlink_target` replaces it with
+/// `CLIMBS_OUT_OF_DEST` and names the ENTRY too (0.10.1) — never the composed
+/// string, which is not something the user can find in their archive.
 ///
 /// Operates on `Path` components rather than a re-joined string, so nothing
 /// round-trips through `to_string_lossy` on the way. A lossy conversion was

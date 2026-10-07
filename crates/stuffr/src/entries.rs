@@ -1378,7 +1378,7 @@ fn is_same_entry(target: &Path, link: &Path, made: &MadeByRun) -> bool {
         // `target` are one directory entry. The record is keyed by exact
         // path and never un-records, so on a case-insensitive volume it can
         // hold `a` AND `A` for one file (`A` replaced `a` under `--force`);
-        // trusting it here removed that one file and ended at exit 1.
+        // trusting it here removed that one file — exit 0 with the file's bytes lost.
         if t.nlink() <= 1 {
             return true;
         }
