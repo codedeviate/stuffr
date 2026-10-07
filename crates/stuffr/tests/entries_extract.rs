@@ -1393,6 +1393,54 @@ fn a_symlink_target_climbing_through_another_link_is_skipped() {
     }
 }
 
+/// The skip never swallows a genuine escape: an absolute target, a leading
+/// `..` run past `dest`, and a `..`-after-a-name target that ALSO climbs out
+/// lexically all stay exit 7. And the refusal names the ENTRY (the final
+/// review's F2) — before, it named the target text (`../..`), which is not
+/// a name `stuffr list` shows.
+#[test]
+fn an_escaping_symlink_target_is_refused_naming_the_entry() {
+    for (target, reason) in [
+        ("/etc/passwd", "absolute symlink target"),
+        ("../../..", "symlink target climbs out of the destination"),
+        (
+            "../x/../../..",
+            "symlink target climbs out of the destination",
+        ),
+    ] {
+        let root = tmp_dir();
+        let archive = write_tar(
+            &root.join("l.tar"),
+            &[dir("sub"), symlink("sub/link", target)],
+        );
+        let dest = root.join("out");
+        let err = entries::extract(
+            Input::Path(archive),
+            &dest,
+            &Selection::All,
+            &ExtractOpts::default(),
+        )
+        .expect_err(&format!("{target}: an escape must be refused"));
+        match &err {
+            Error::UnsafePath { path, reason: r } => {
+                assert_eq!(path, "sub/link", "{target}: names the entry");
+                assert_eq!(*r, reason, "{target}");
+            }
+            other => panic!("{target}: expected UnsafePath, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 7, "{target}");
+        assert_eq!(
+            err.to_string(),
+            format!("unsafe entry path `sub/link` refused: {reason}"),
+            "{target}"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest.join("sub/link")).is_err(),
+            "{target}: the link must not have been created"
+        );
+    }
+}
+
 /// 0.10.1: an empty symlink target is skipped on every platform — before
 /// the fix round, macOS created `l -> ""` at exit 0 and Linux's
 /// `symlink(2)` answered ENOENT, which surfaced as `Error::Io`, exit 1; the

@@ -3336,9 +3336,13 @@ fn a_symlink_whose_target_escapes_the_destination_is_refused_before_it_is_create
         std::fs::symlink_metadata(dest.join("link")).is_err(),
         "the symlink must not have been created at all"
     );
+    // The ENTRY, not the target text (0.10.1 final review F2): `link` is
+    // what `stuffr list` shows and what the user can go and look at.
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("../../etc/passwd"),
-        "the refusal must name the offending target, got: {}",
+        String::from_utf8_lossy(&out.stderr).contains(
+            "unsafe entry path `link` refused: symlink target climbs out of the destination"
+        ),
+        "the refusal must name the offending entry, got: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -4782,7 +4786,8 @@ fn a_symlink_pointing_at_the_extraction_root_is_extracted_not_refused() {
 }
 
 /// The regression guard for the test above: one step further out is still
-/// an escape, and must still exit 7 with the entry's OWN target named.
+/// an escape, and must still exit 7 — naming the ENTRY since the 0.10.1
+/// final review's F2 (it named the target text, which `list` never shows).
 #[test]
 fn a_symlink_one_step_past_the_extraction_root_is_still_refused() {
     for (tag, target) in [
@@ -4810,8 +4815,8 @@ fn a_symlink_one_step_past_the_extraction_root_is_still_refused() {
         );
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         assert!(
-            stderr.contains(target),
-            "the refusal must name the archive's own target `{target}`, got: {stderr}"
+            stderr.contains("unsafe entry path `sub/top` refused"),
+            "the refusal must name the entry `sub/top`, got: {stderr}"
         );
         assert!(
             std::fs::symlink_metadata(dest.join("sub/top")).is_err(),

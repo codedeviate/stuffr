@@ -1176,13 +1176,13 @@ fn extract_symlink(
 ) -> Result<bool> {
     // The subtler escape: the link's own PATH is contained while its TARGET
     // is not, and a later entry written "through" the link lands wherever it
-    // points. A genuine escape aborts the whole extraction (exit 7), so
-    // that later entry is never reached. A target whose
+    // points. A genuine escape aborts the whole extraction (exit 7, naming
+    // this entry), so that later entry is never reached. A target whose
     // SHAPE cannot be proven contained (`..` after a name, or empty) is
     // skipped instead: the link is never created, so nothing can resolve
     // through it, and the rest of the archive is extracted.
     if let SymlinkVerdict::Skip(reason) =
-        classify_symlink_target(dest, at, link_target, link_target)?
+        classify_symlink_target(dest, at, &meta.name, link_target)?
     {
         warnings.push(Fidelity::EntrySkipped {
             entry: meta.name.clone(),

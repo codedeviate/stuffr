@@ -788,7 +788,8 @@ EXTRACTING AN ARCHIVE'S ENTRIES
   under --strict-fidelity). GNU tar's `--transform 's,^,pkg-1.0/,'`
   rewrites symlink targets too, so `bin/foo -> ../lib/foo` arrives as
   `pkg-1.0/../lib/foo` — that link is skipped, everything else lands. A
-  target that climbs out of the destination is still refused at exit 7.
+  target that climbs out of the destination is still refused at exit 7,
+  and the refusal names the ENTRY, as `stuffr list` shows it.
 
   An entry whose path runs THROUGH a symlink is refused too — a directory
   component that is a link, whether an earlier entry created it or somebody
