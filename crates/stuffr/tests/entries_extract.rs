@@ -1316,3 +1316,56 @@ fn a_case_folded_link_after_a_case_folded_replace_is_a_self_link_skip() {
     );
     assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"second");
 }
+
+/// 0.10.1: a symlink target that climbs AFTER a name is refused, exit 7.
+///
+/// `x/s2 -> ..` is contained (it names `dest`), and `s1 -> x/s2/..` nets to
+/// `x` lexically — but the OS resolves `x/s2` first, so `dest/s1` lands on
+/// `dest/..`. Both orders: `s1` ahead of `s2` would make a creation-time
+/// existence check useless, which is why the rule is about the target's
+/// SHAPE. As in `an_escaping_symlink_target_is_refused_before_the_link_exists`,
+/// the refused link is never created; what the run made before the refusal
+/// stays, and none of it resolves outside `dest`, physically.
+#[cfg(unix)]
+#[test]
+fn a_symlink_target_climbing_through_another_link_is_refused() {
+    for (tag, s2_first) in [("s2-first", true), ("s1-first", false)] {
+        let root = tmp_dir();
+        let mut entries = vec![dir("x")];
+        if s2_first {
+            entries.push(symlink("x/s2", ".."));
+            entries.push(symlink("s1", "x/s2/.."));
+        } else {
+            entries.push(symlink("s1", "x/s2/.."));
+            entries.push(symlink("x/s2", ".."));
+        }
+        let archive = write_tar(&root.join("chain.tar"), &entries);
+        let dest = root.join("out");
+
+        let err = entries::extract(
+            Input::Path(archive.clone()),
+            &dest,
+            &Selection::All,
+            &ExtractOpts::default(),
+        )
+        .expect_err(&format!(
+            "{tag}: a target climbing after a name must be refused"
+        ));
+        match &err {
+            Error::UnsafePath { path, reason } => {
+                assert_eq!(path, "x/s2/..", "{tag}: names the archive's own target");
+                assert!(reason.contains("after a name"), "{tag}: {reason}");
+            }
+            other => panic!("{tag}: expected UnsafePath, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 7, "{tag}");
+        assert!(
+            std::fs::symlink_metadata(dest.join("s1")).is_err(),
+            "{tag}: the refused link must not have been created"
+        );
+        // Nothing left on disk resolves outside `dest`, lexically or
+        // physically (`x/s2 -> ..`, when it was reached first, names `dest`).
+        stuffr_core::testing::check_extraction_contained(&root, &dest, &[&archive])
+            .unwrap_or_else(|e| panic!("{tag}: {e}"));
+    }
+}

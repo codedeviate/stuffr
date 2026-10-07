@@ -779,7 +779,10 @@ EXTRACTING AN ARCHIVE'S ENTRIES
   escape and is refused. Note the asymmetry with entry names, which is
   deliberate: an entry NAMED `sub/..` is refused, because no real archiver
   emits one and a name that pops back to the destination is more likely an
-  attack than an intent.
+  attack than an intent. A symlink target may use `..` only as a leading
+  run (`../../a/b`), never after a name (`x/s2/..`, `a/../b`): the system
+  resolves `x/s2` first, and if that is itself a link the `..` climbs from
+  wherever it points, so such a target is refused at exit 7.
 
   An entry whose path runs THROUGH a symlink is refused too — a directory
   component that is a link, whether an earlier entry created it or somebody

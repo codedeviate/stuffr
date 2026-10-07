@@ -166,6 +166,10 @@ fn walk_within(
     Ok(())
 }
 
+/// [`check_symlink_target`]'s reason for a target holding `..` after a name.
+pub(crate) const CLIMBS_AFTER_A_NAME: &str =
+    "symlink target uses `..` after a name, which can climb out through another link";
+
 /// Refuses a symlink whose target would resolve outside `dest`.
 ///
 /// The subtler escape: the link's own PATH can be perfectly contained while
@@ -190,6 +194,49 @@ fn walk_within(
 /// verdict differs, which is the whole point. Every genuine escape is still
 /// refused by the same walk: an absolute target, and any `..` run deeper
 /// than the link's own depth below `dest`.
+///
+/// # `..` only as a leading run (0.10.1)
+///
+/// A target may hold `..` only as a LEADING prefix — `..`, `../..`,
+/// `../../a/b` — never after a name: `x/s2/..`, `a/../b` and `./a/..` are
+/// refused (`CLIMBS_AFTER_A_NAME`) whatever they net to. `.` components
+/// are noise, exactly as [`walk_within`] treats them, so a leading `./` is
+/// harmless and `./..` is still a leading run.
+///
+/// Why: lexical normalisation reads `x/s2/..` as `x`, but the OS resolves
+/// `x/s2` FIRST, and if `x/s2` is itself a symlink the `..` climbs from
+/// wherever IT points. A tar holding `x/`, `x/s2 -> ..` (contained: it names
+/// `dest`) and `s1 -> x/s2/..` unpacked at exit 0 with `dest/s1` resolving
+/// to `dest/..`. Entry order is no defence — `s1` can precede `s2`, so no
+/// creation-time existence check sees the link it climbs through. The rule
+/// is therefore about the target's SHAPE, and needs no filesystem.
+///
+/// # Why that is sound — by induction over the links a run creates
+///
+/// Every link is created at a path with no symlinked ancestor (the
+/// extraction refuses one before creating anything — `stuffr`'s
+/// `refuse_symlinked_ancestors` — and never removes a directory it would
+/// have to replace with a link), so the link's own directory is a REAL
+/// directory inside `dest`. Resolving its target from there:
+///
+/// 1. The leading `..` run climbs through real directories only, so its
+///    lexical depth check above IS its physical answer: it ends at a real
+///    directory inside `dest`, or is refused.
+/// 2. Every component after that run is a name (or `.`). A name either is a
+///    real directory entry — descending, so still inside `dest` — or is
+///    another link this run created, which by the induction hypothesis
+///    resolves inside `dest`, and the walk continues from there, again only
+///    by names.
+/// 3. No `..` ever follows a name, so the walk never climbs out of whatever
+///    a link handed it. Hence every link resolves inside `dest`.
+///
+/// What the argument does not cover, by design: a symlink that was in
+/// `dest` before the run started, which a target could name through a plain
+/// component — that is the destination's owner's link, not the archive's —
+/// and a concurrent local writer, the check-then-use window
+/// `refuse_symlinked_ancestors` documents. The `container` fuzz target's
+/// oracle checks the result PHYSICALLY (`check_extraction_contained`), so a
+/// hole in this argument would be a finding there.
 pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Result<()> {
     let target_path = Path::new(target);
     // The sibling door to `safe_join`'s own NUL refusal, closed in the same
@@ -211,6 +258,23 @@ pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Resu
             path: target.to_string(),
             reason: "absolute symlink target",
         });
+    }
+
+    // The shape rule, before the depth walk: a `..` after a name is refused
+    // even when it nets inside `dest`, because only the OS knows where the
+    // name before it leads. `Component::CurDir` is skipped, like the walk.
+    let mut named = false;
+    for comp in target_path.components() {
+        match comp {
+            Component::Normal(_) => named = true,
+            Component::ParentDir if named => {
+                return Err(Error::UnsafePath {
+                    path: target.to_string(),
+                    reason: CLIMBS_AFTER_A_NAME,
+                });
+            }
+            _ => {}
+        }
     }
 
     let parent = link_path.parent().unwrap_or(dest);
@@ -385,8 +449,9 @@ mod tests {
         assert!(super::check_symlink_target(dest, &dest.join("sub/top"), "..").is_ok());
         // Two levels deep, netting exactly to `dest`.
         assert!(super::check_symlink_target(dest, &dest.join("a/b/top"), "../..").is_ok());
-        // Down and back up again, netting to `dest`.
-        assert!(super::check_symlink_target(dest, &dest.join("sub/top"), "../sub/..").is_ok());
+        // (`../sub/..`, down and back up again, was accepted here until
+        // 0.10.1: a `..` after a name is now refused whatever it nets to —
+        // see `a_symlink_target_climbing_after_a_name_is_refused`.)
         // A link directly under `dest` pointing at `dest`.
         assert!(super::check_symlink_target(dest, &dest.join("here"), ".").is_ok());
         // And the sibling shapes that already worked must keep working.
@@ -419,6 +484,60 @@ mod tests {
                 ),
                 other => panic!("expected UnsafePath for {target}, got {other:?}"),
             }
+        }
+    }
+
+    /// 0.10.1: a `..` after a name is refused, wherever the walk would land.
+    ///
+    /// Lexical normalisation reads `x/s2/..` as `x`, but the OS resolves
+    /// `x/s2` FIRST — and when `x/s2` is itself a symlink (`x/s2 -> ..`, an
+    /// ordinary contained link), the `..` climbs from wherever it points. A
+    /// tar holding `x/`, `x/s2 -> ..` and `s1 -> x/s2/..` unpacked at exit 0
+    /// and left `dest/s1` resolving to `dest/..`. Every shape here nets
+    /// INSIDE `dest` lexically, which is exactly why the depth walk alone
+    /// accepted them.
+    #[test]
+    fn a_symlink_target_climbing_after_a_name_is_refused() {
+        let dest = Path::new("/tmp/out");
+        for (link, target) in [
+            (dest.join("s1"), "x/s2/.."),
+            (dest.join("s1"), "a/../b"),
+            (dest.join("s1"), "./a/.."),
+            (dest.join("sub/top"), "../sub/.."),
+            (dest.join("a/b/l"), "../../x/y/../z"),
+            (dest.join("s1"), "a/./.."),
+        ] {
+            match super::check_symlink_target(dest, &link, target) {
+                Err(Error::UnsafePath { path, reason }) => {
+                    assert_eq!(path, target, "the refusal names the archive's target");
+                    assert_eq!(reason, super::CLIMBS_AFTER_A_NAME, "{target}");
+                }
+                other => panic!("{target} from {link:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// The over-strictness guard for the rule above: a LEADING `..` run
+    /// within the link's depth, plain names, and `.` anywhere stay accepted.
+    #[test]
+    fn a_leading_parent_run_and_plain_names_are_still_accepted() {
+        let dest = Path::new("/tmp/out");
+        for (link, target) in [
+            (dest.join("sub/top"), ".."),
+            (dest.join("sub/l"), "../a"),
+            (dest.join("a/b/l"), "../../a/b"),
+            (dest.join("a/b/l"), "./../.."),
+            (dest.join("l"), "a/b"),
+            (dest.join("l"), "./a"),
+            (dest.join("l"), "a/./b"),
+            (dest.join("l"), "a/b/."),
+            (dest.join("l"), "."),
+            (dest.join("l"), "..foo/...b"),
+        ] {
+            assert!(
+                super::check_symlink_target(dest, &link, target).is_ok(),
+                "{target} from {link:?} must be accepted"
+            );
         }
     }
 

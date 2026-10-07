@@ -867,7 +867,10 @@ domain, so:
   contained when each name is resolved component-wise and still lands outside the
   destination once the OS resolves it, so the extractor also refuses any entry
   with a symlinked path component (libarchive's `SECURE_SYMLINKS` shape, refused
-  rather than quietly unlinked).
+  rather than quietly unlinked). For the same reason a symlink target may use
+  `..` only as a leading run (`../../a/b`), never after a name (`x/s2/..`): the
+  OS resolves `x/s2` first, and if that is another link the `..` climbs from
+  wherever it points.
 - **Bomb limits.** Default caps on total output and expansion ratio, so a 42 KB
   zip that expands to 4.5 PB fails fast instead of filling the disk. The error
   names the entry that tripped it.
