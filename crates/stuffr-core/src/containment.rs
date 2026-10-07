@@ -166,19 +166,75 @@ fn walk_within(
     Ok(())
 }
 
-/// [`check_symlink_target`]'s reason for an empty target.
+/// [`classify_symlink_target`]'s skip reason for an empty target.
 pub(crate) const EMPTY_SYMLINK_TARGET: &str = "symlink target is empty";
 
-/// [`check_symlink_target`]'s reason for a target holding `..` after a name.
+/// [`classify_symlink_target`]'s skip reason for a target holding `..` after
+/// a name.
 pub(crate) const CLIMBS_AFTER_A_NAME: &str =
     "symlink target uses `..` after a name, which can climb out through another link";
 
+/// [`classify_symlink_target`]'s refusal for a leading `..` run that climbs
+/// past the destination.
+pub(crate) const CLIMBS_OUT_OF_DEST: &str = "symlink target climbs out of the destination";
+
+/// What extraction may do with one symlink entry, decided by
+/// [`classify_symlink_target`]. A genuine escape is not a verdict: it is
+/// `Err(Error::UnsafePath)`, exit 7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SymlinkVerdict {
+    /// Create the link: its target resolves inside the destination.
+    Allowed,
+    /// Do not create the link; name the entry in an
+    /// [`crate::Fidelity::EntrySkipped`] with this reason and carry on. The
+    /// target's SHAPE is one this extraction cannot prove contained (`..`
+    /// after a name) or names nothing (empty). Nothing is created, so
+    /// nothing can escape.
+    Skip(&'static str),
+}
+
 /// Refuses a symlink whose target would resolve outside `dest`.
 ///
-/// The subtler escape: the link's own PATH can be perfectly contained while
-/// its target is not, and a later entry written through that link lands
-/// wherever it points. The target is resolved relative to the link's parent,
-/// which is how the OS will resolve it.
+/// The original, all-or-nothing form of [`classify_symlink_target`], kept
+/// for its callers: a [`SymlinkVerdict::Skip`] is reported here as
+/// `Error::UnsafePath` too, so anything this accepts is a link
+/// `classify_symlink_target` would create. The refusal names the TARGET,
+/// as it always has; extraction calls `classify_symlink_target`, which names
+/// the entry.
+pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Result<()> {
+    match classify_symlink_target(dest, link_path, target, target)? {
+        SymlinkVerdict::Allowed => Ok(()),
+        SymlinkVerdict::Skip(reason) => Err(Error::UnsafePath {
+            path: target.to_string(),
+            reason,
+        }),
+    }
+}
+
+/// Decides one symlink entry named `entry`, to be created at `link_path`
+/// (what `safe_join` produced for it) pointing at `target`: create it,
+/// skip it, or refuse the extraction. **The one owner of that rule** —
+/// extraction, the hard-link-to-a-symlink path and the fuzz oracle's
+/// lexical rule all ask it.
+///
+/// - `Err(Error::UnsafePath)`, exit 7, naming `entry`: a genuine escape. An
+///   absolute target, a `..` run that climbs deeper than the link's own
+///   depth below `dest` (lexically — checked before the shape, so a target
+///   that escapes is never merely skipped), or a NUL byte.
+/// - `Ok(Skip(reason))`: a SHAPE this extraction will not create — `..`
+///   after a name (`CLIMBS_AFTER_A_NAME`) or an empty target
+///   (`EMPTY_SYMLINK_TARGET`). Skipped, not refused (user ruling,
+///   2026-10-07): GNU tar's `--transform 's,^,pkg-1.0/,'` rewrites symlink
+///   targets as well as names, so `bin/foo -> ../lib/foo` arrives as
+///   `pkg-1.0/../lib/foo`, and aborting the whole unpack over it left a
+///   half-written tree where 0.10.0 and GNU tar extract everything.
+/// - `Ok(Allowed)`: anything else.
+///
+/// The link's own PATH can be perfectly contained while its target is not,
+/// and a later entry written through that link lands wherever it points.
+/// The target is resolved relative to the link's parent, which is how the
+/// OS will resolve it.
 ///
 /// # Why this does not call `safe_join`
 ///
@@ -202,9 +258,9 @@ pub(crate) const CLIMBS_AFTER_A_NAME: &str =
 ///
 /// A target may hold `..` only as a LEADING prefix — `..`, `../..`,
 /// `../../a/b` — never after a name: `x/s2/..`, `a/../b` and `./a/..` are
-/// refused (`CLIMBS_AFTER_A_NAME`) whatever they net to. `.` components
+/// skipped (`CLIMBS_AFTER_A_NAME`) whatever they net to. `.` components
 /// are noise, exactly as [`walk_within`] treats them, so a leading `./` is
-/// harmless and `./..` is still a leading run. An EMPTY target is refused
+/// harmless and `./..` is still a leading run. An EMPTY target is skipped
 /// too (`EMPTY_SYMLINK_TARGET`): it names nothing, and Linux's `symlink(2)`
 /// rejects it with ENOENT, which would otherwise surface as exit 1.
 ///
@@ -218,8 +274,10 @@ pub(crate) const CLIMBS_AFTER_A_NAME: &str =
 ///
 /// # Why that is sound — by induction over the links a run creates
 ///
-/// Every link is created at a path with no symlinked ancestor (the
-/// extraction refuses one before creating anything — `stuffr`'s
+/// Only links that are CREATED have to obey the shape: a skipped link
+/// creates nothing, so it adds nothing to resolve through. Every link that
+/// is created sits at a path with no symlinked ancestor (the extraction
+/// refuses one before creating anything — `stuffr`'s
 /// `refuse_symlinked_ancestors` — and never removes a directory it would
 /// have to replace with a link), so the link's own directory is a REAL
 /// directory inside `dest`. Resolving its target from there:
@@ -233,7 +291,7 @@ pub(crate) const CLIMBS_AFTER_A_NAME: &str =
 ///    resolves inside `dest`, and the walk continues from there, again only
 ///    by names.
 /// 3. No `..` ever follows a name, so the walk never climbs out of whatever
-///    a link handed it. Hence every link resolves inside `dest`.
+///    a link handed it. Hence every created link resolves inside `dest`.
 ///
 /// What the argument does not cover, by design: a symlink that was in
 /// `dest` before the run started, which a target could name through a plain
@@ -242,7 +300,16 @@ pub(crate) const CLIMBS_AFTER_A_NAME: &str =
 /// `refuse_symlinked_ancestors` documents. The `container` fuzz target's
 /// oracle checks the result PHYSICALLY (`check_extraction_contained`), so a
 /// hole in this argument would be a finding there.
-pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Result<()> {
+pub fn classify_symlink_target(
+    dest: &Path,
+    link_path: &Path,
+    entry: &str,
+    target: &str,
+) -> Result<SymlinkVerdict> {
+    let refuse = |reason: &'static str| Error::UnsafePath {
+        path: entry.to_string(),
+        reason,
+    };
     let target_path = Path::new(target);
     // The sibling door to `safe_join`'s own NUL refusal, closed in the same
     // change and for the same reason: `std::os::unix::fs::symlink` rejects
@@ -251,46 +318,19 @@ pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Resu
     // Closing only the half the review measured would leave the class open
     // through a door two lines away.
     if target.contains('\0') {
-        return Err(Error::UnsafePath {
-            path: target.to_string(),
-            reason: "symlink target contains a NUL byte",
-        });
+        return Err(refuse("symlink target contains a NUL byte"));
     }
     // An empty target names nothing and has no components, so every rule
     // below would accept it — and `symlink(2)` on Linux answers ENOENT,
     // which reached the CLI as `Error::Io`, exit 1, on a target the archive
-    // chose (macOS creates `l -> ""` instead). The same refusal `safe_join`
-    // makes for an empty entry NAME.
+    // chose (macOS creates `l -> ""` instead). Skipped: nothing is created.
     if target.is_empty() {
-        return Err(Error::UnsafePath {
-            path: String::new(),
-            reason: EMPTY_SYMLINK_TARGET,
-        });
+        return Ok(SymlinkVerdict::Skip(EMPTY_SYMLINK_TARGET));
     }
     // Checked before the walk purely so the reason names symlinks — the
     // walk's own `RootDir` arm would refuse it anyway.
     if target_path.is_absolute() {
-        return Err(Error::UnsafePath {
-            path: target.to_string(),
-            reason: "absolute symlink target",
-        });
-    }
-
-    // The shape rule, before the depth walk: a `..` after a name is refused
-    // even when it nets inside `dest`, because only the OS knows where the
-    // name before it leads. `Component::CurDir` is skipped, like the walk.
-    let mut named = false;
-    for comp in target_path.components() {
-        match comp {
-            Component::Normal(_) => named = true,
-            Component::ParentDir if named => {
-                return Err(Error::UnsafePath {
-                    path: target.to_string(),
-                    reason: CLIMBS_AFTER_A_NAME,
-                });
-            }
-            _ => {}
-        }
+        return Err(refuse("absolute symlink target"));
     }
 
     let parent = link_path.parent().unwrap_or(dest);
@@ -301,17 +341,30 @@ pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Resu
     // `rel` came out of `safe_join`, so it holds only `Normal` components
     // and cannot fail — walked rather than asserted so the depth it
     // contributes is computed by the same code that consumes it.
-    walk_within(&mut out, &mut pushed, rel).map_err(|reason| Error::UnsafePath {
-        path: target.to_string(),
-        reason,
-    })?;
-    walk_within(&mut out, &mut pushed, target_path).map_err(|reason| Error::UnsafePath {
-        path: target.to_string(),
-        reason,
-    })?;
-    // No net-to-`dest` check here, deliberately: `out` being empty means the
-    // target resolves to `dest` itself, which is contained.
-    Ok(())
+    walk_within(&mut out, &mut pushed, rel).map_err(|_| refuse(CLIMBS_OUT_OF_DEST))?;
+
+    // The depth walk BEFORE the shape rule: a target whose lexical walk
+    // leaves `dest` is a genuine escape (exit 7) whatever its shape, and
+    // must not be downgraded to a skip by a `..` after a name — `../..`,
+    // and `a/../../..` alike.
+    walk_within(&mut out, &mut pushed, target_path).map_err(|_| refuse(CLIMBS_OUT_OF_DEST))?;
+
+    // The shape rule: a `..` after a name is skipped even when it nets
+    // inside `dest`, because only the OS knows where the name before it
+    // leads.
+    let mut named = false;
+    for comp in target_path.components() {
+        match comp {
+            Component::Normal(_) => named = true,
+            Component::ParentDir if named => {
+                return Ok(SymlinkVerdict::Skip(CLIMBS_AFTER_A_NAME));
+            }
+            _ => {}
+        }
+    }
+    // No net-to-`dest` check here, deliberately: a target resolving to
+    // `dest` itself is contained.
+    Ok(SymlinkVerdict::Allowed)
 }
 
 #[cfg(test)]
@@ -466,8 +519,8 @@ mod tests {
         // Two levels deep, netting exactly to `dest`.
         assert!(super::check_symlink_target(dest, &dest.join("a/b/top"), "../..").is_ok());
         // (`../sub/..`, down and back up again, was accepted here until
-        // 0.10.1: a `..` after a name is now refused whatever it nets to —
-        // see `a_symlink_target_climbing_after_a_name_is_refused`.)
+        // 0.10.1: a `..` after a name is now skipped whatever it nets to —
+        // see `a_symlink_target_climbing_after_a_name_is_skipped`.)
         // A link directly under `dest` pointing at `dest`.
         assert!(super::check_symlink_target(dest, &dest.join("here"), ".").is_ok());
         // And the sibling shapes that already worked must keep working.
@@ -503,7 +556,8 @@ mod tests {
         }
     }
 
-    /// 0.10.1: a `..` after a name is refused, wherever the walk would land.
+    /// 0.10.1: a `..` after a name is SKIPPED, wherever the walk would land
+    /// (user ruling 2026-10-07 — it was exit 7 until the final fix wave).
     ///
     /// Lexical normalisation reads `x/s2/..` as `x`, but the OS resolves
     /// `x/s2` FIRST — and when `x/s2` is itself a symlink (`x/s2 -> ..`, an
@@ -511,9 +565,10 @@ mod tests {
     /// tar holding `x/`, `x/s2 -> ..` and `s1 -> x/s2/..` unpacked at exit 0
     /// and left `dest/s1` resolving to `dest/..`. Every shape here nets
     /// INSIDE `dest` lexically, which is exactly why the depth walk alone
-    /// accepted them.
+    /// accepted them. The last is GNU tar's `--transform 's,^,pkg-1.0/,'`
+    /// rewrite of `bin/foo -> ../lib/foo`.
     #[test]
-    fn a_symlink_target_climbing_after_a_name_is_refused() {
+    fn a_symlink_target_climbing_after_a_name_is_skipped() {
         let dest = Path::new("/tmp/out");
         for (link, target) in [
             (dest.join("s1"), "x/s2/.."),
@@ -522,10 +577,17 @@ mod tests {
             (dest.join("sub/top"), "../sub/.."),
             (dest.join("a/b/l"), "../../x/y/../z"),
             (dest.join("s1"), "a/./.."),
+            (dest.join("pkg-1.0/bin/foo"), "pkg-1.0/../lib/foo"),
         ] {
+            assert_eq!(
+                super::classify_symlink_target(dest, &link, "e", target).unwrap(),
+                super::SymlinkVerdict::Skip(super::CLIMBS_AFTER_A_NAME),
+                "{target} from {link:?}"
+            );
+            // The all-or-nothing wrapper still refuses it, naming the target.
             match super::check_symlink_target(dest, &link, target) {
                 Err(Error::UnsafePath { path, reason }) => {
-                    assert_eq!(path, target, "the refusal names the archive's target");
+                    assert_eq!(path, target);
                     assert_eq!(reason, super::CLIMBS_AFTER_A_NAME, "{target}");
                 }
                 other => panic!("{target} from {link:?} must be refused, got {other:?}"),
@@ -533,19 +595,60 @@ mod tests {
         }
     }
 
-    /// 0.10.1 fix round 1: an EMPTY target names nothing and has no
-    /// components, so the walk accepted it — and `symlink(2)` on Linux
-    /// answers ENOENT, which reached the CLI as `Error::Io`, exit 1, on a
-    /// target the archive chose. (macOS creates `l -> ""` at exit 0.)
+    /// The skip never swallows a genuine escape: a target that ALSO climbs
+    /// out of `dest` lexically is exit 7 whatever its shape, and every
+    /// refusal names the ENTRY (F2 of the 0.10.1 final review), never the
+    /// target text, which is not something the user can find with `list`.
     #[test]
-    fn an_empty_symlink_target_is_refused() {
+    fn an_escape_is_refused_naming_the_entry_even_when_its_shape_would_skip() {
         let dest = Path::new("/tmp/out");
+        for (link, target, reason) in [
+            (dest.join("l"), "a/../../..", super::CLIMBS_OUT_OF_DEST),
+            (
+                dest.join("sub/l"),
+                "../sub/../..",
+                super::CLIMBS_OUT_OF_DEST,
+            ),
+            (dest.join("sub/l"), "../..", super::CLIMBS_OUT_OF_DEST),
+            (
+                dest.join("sub/l"),
+                "../../x/../y",
+                super::CLIMBS_OUT_OF_DEST,
+            ),
+            (dest.join("l"), "/etc/passwd", "absolute symlink target"),
+            (
+                dest.join("l"),
+                "a\0/..",
+                "symlink target contains a NUL byte",
+            ),
+        ] {
+            match super::classify_symlink_target(dest, &link, "the/entry", target) {
+                Err(Error::UnsafePath { path, reason: r }) => {
+                    assert_eq!(path, "the/entry", "{target:?}");
+                    assert_eq!(r, reason, "{target:?}");
+                }
+                other => panic!("{target:?} from {link:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    /// 0.10.1 fix round 1, then the final fix wave: an EMPTY target names
+    /// nothing and has no components, so the walk accepted it — and
+    /// `symlink(2)` on Linux answers ENOENT, which reached the CLI as
+    /// `Error::Io`, exit 1. (macOS creates `l -> ""` at exit 0.) Skipped.
+    #[test]
+    fn an_empty_symlink_target_is_skipped() {
+        let dest = Path::new("/tmp/out");
+        assert_eq!(
+            super::classify_symlink_target(dest, &dest.join("sub/l"), "sub/l", "").unwrap(),
+            super::SymlinkVerdict::Skip(super::EMPTY_SYMLINK_TARGET)
+        );
         match super::check_symlink_target(dest, &dest.join("sub/l"), "") {
             Err(Error::UnsafePath { path, reason }) => {
                 assert_eq!(path, "");
                 assert_eq!(reason, super::EMPTY_SYMLINK_TARGET);
             }
-            other => panic!("an empty target must be refused, got {other:?}"),
+            other => panic!("the wrapper must still refuse it, got {other:?}"),
         }
     }
 
@@ -569,6 +672,11 @@ mod tests {
             assert!(
                 super::check_symlink_target(dest, &link, target).is_ok(),
                 "{target} from {link:?} must be accepted"
+            );
+            assert_eq!(
+                super::classify_symlink_target(dest, &link, "e", target).unwrap(),
+                super::SymlinkVerdict::Allowed,
+                "{target} from {link:?}"
             );
         }
     }

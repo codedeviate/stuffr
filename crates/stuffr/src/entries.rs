@@ -9,8 +9,8 @@ use stuffr_core::{
     CreateOpts, DEFAULT_MAX_RATIO, DecodeOpts, EncodeOpts, Entry, EntryKind, EntryMeta, Error,
     Fidelity, FidelityReport, FormatId, MetaFields, OpenOpts, PROBE_LEN, PlainSink, RATIO_FLOOR,
     RatioGuard, Registry, Result, Rung, SeekRead, Sink, Source, SourceCaps, SpillPolicy,
-    SpillSource, SpillWriter, StreamPolicy, check_symlink_target, ladder, resolve_chain,
-    resolve_chain_deep_with, safe_join,
+    SpillSource, SpillWriter, StreamPolicy, SymlinkVerdict, classify_symlink_target, ladder,
+    resolve_chain, resolve_chain_deep_with, safe_join,
 };
 
 use crate::link_cache::{CachePolicy, LinkCache, Tee};
@@ -869,7 +869,7 @@ impl Default for ExtractOpts {
 /// 1. [`safe_join`] runs **before any filesystem call for that entry**.
 ///    Checking afterwards would already have created a file at the
 ///    attacker's path even if the write were then refused.
-/// 2. [`check_symlink_target`] is handed the path `safe_join` produced, not
+/// 2. [`classify_symlink_target`] is handed the path `safe_join` produced, not
 ///    the raw entry name — it derives the link's depth below `dest` from
 ///    that path, so a raw name would make it measure the wrong depth.
 /// 3. The budget is charged from bytes **actually read**, not from the size
@@ -921,7 +921,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
         let target = safe_join(dest, &meta.name)?;
         // A post-condition on `safe_join`, not a second opinion: it returns
         // either `dest` or `dest.join(..)`, so this cannot fire today.
-        // Asserting it anyway is what keeps `check_symlink_target`'s
+        // Asserting it anyway is what keeps `classify_symlink_target`'s
         // `parent.strip_prefix(dest).unwrap_or("")` fallback from silently
         // MASKING a bug here — handed a `link_path` outside `dest`, that
         // fallback measures the link as sitting directly under `dest`
@@ -1159,9 +1159,12 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
 }
 
 /// Creates a symlink entry at `at` — the `Symlink` arm of [`extract`], and
-/// the shape a hard link to an extracted symlink takes. `false` when
-/// [`place_entry`] skipped it (the warning is pushed); the caller records
-/// only a placed link.
+/// the shape a hard link to an extracted symlink takes. `false` when it was
+/// skipped (the warning is pushed) — by [`classify_symlink_target`]'s
+/// verdict on the target's shape, or by [`place_entry`]; the caller records
+/// only a placed link. `meta` is the entry being extracted, so a hard link
+/// that re-checks its symlink target is the entry named in the skip or the
+/// refusal.
 fn extract_symlink(
     dest: &Path,
     at: &Path,
@@ -1173,9 +1176,20 @@ fn extract_symlink(
 ) -> Result<bool> {
     // The subtler escape: the link's own PATH is contained while its TARGET
     // is not, and a later entry written "through" the link lands wherever it
-    // points. Refusing here aborts the whole extraction, so that later entry
-    // is never reached.
-    check_symlink_target(dest, at, link_target)?;
+    // points. A genuine escape aborts the whole extraction (exit 7), so
+    // that later entry is never reached. A target whose
+    // SHAPE cannot be proven contained (`..` after a name, or empty) is
+    // skipped instead: the link is never created, so nothing can resolve
+    // through it, and the rest of the archive is extracted.
+    if let SymlinkVerdict::Skip(reason) =
+        classify_symlink_target(dest, at, link_target, link_target)?
+    {
+        warnings.push(Fidelity::EntrySkipped {
+            entry: meta.name.clone(),
+            reason: reason.to_string(),
+        });
+        return Ok(false);
+    }
     if !place_entry(dest, at, &meta.name, false, made, force)?.proceed(warnings) {
         return Ok(false);
     }
@@ -5114,7 +5128,7 @@ fn normalize_for_match(s: &str) -> &str {
 
 /// Refuses an entry whose path is written *through* an existing symlink.
 ///
-/// [`safe_join`] and [`check_symlink_target`] are both lexical, which is what
+/// [`safe_join`] and [`classify_symlink_target`] are both lexical, which is what
 /// makes them filesystem-free, exhaustively testable and immune to a symlink
 /// appearing between the check and the write — an immunity this function,
 /// which does touch the filesystem, does NOT inherit; see the TOCTOU section
@@ -5152,7 +5166,7 @@ fn normalize_for_match(s: &str) -> &str {
 /// Against a hostile **archive**, the window is closed: the extraction loop
 /// is single-threaded and sequential, so nothing runs between the check and
 /// the write, and every symlink the archive itself creates has already been
-/// through [`check_symlink_target`].
+/// through [`classify_symlink_target`].
 ///
 /// Against a hostile archive **plus a concurrent local process with write
 /// access into `dest`**, it is open, and this function does not claim
@@ -6805,6 +6819,31 @@ mod tests {
 
     fn never_link(_: &Path, _: &Path) -> std::io::Result<()> {
         panic!("hard_link must not be reached")
+    }
+
+    /// 0.10.1 final fix wave: a hard link to a symlink re-checks the target
+    /// through `extract_symlink`, and a `Skip` verdict there skips the HARD
+    /// LINK, named, with the same reason. Unreachable from an archive — the
+    /// shape rule does not depend on where the link sits, so a target the
+    /// run created would classify `Allowed` again — hence the forged record:
+    /// the backstop must still hold if that ever changes.
+    #[test]
+    fn a_hard_link_to_a_symlink_whose_target_would_skip_is_skipped() {
+        let dest = link_scratch("symlink-skip");
+        let mut extracted = MadeByRun::default();
+        extracted.record("s", &dest.join("s"), MadeKind::Symlink("x/s2/..".into()));
+        let (r, w) = run_link(&dest, &link_meta("h", "s"), &mut extracted, never_link);
+        assert!(r.unwrap().is_none());
+        assert_eq!(
+            w,
+            [Fidelity::EntrySkipped {
+                entry: "h".into(),
+                reason: "symlink target uses `..` after a name, which can climb out \
+                         through another link"
+                    .into(),
+            }]
+        );
+        assert!(std::fs::symlink_metadata(dest.join("h")).is_err());
     }
 
     /// Carried ruling 3: a link naming itself is skipped and never reaches

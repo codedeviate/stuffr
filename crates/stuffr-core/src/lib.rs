@@ -30,7 +30,7 @@ pub use archive::{
     ArchiveRead, ArchiveWrite, Codec, Container, CreateOpts, DecodeOpts, EncodeOpts, Entry,
     EntryKind, EntryMeta, OpenOpts, PlainSink, Sink,
 };
-pub use containment::{check_symlink_target, safe_join};
+pub use containment::{SymlinkVerdict, check_symlink_target, classify_symlink_target, safe_join};
 pub use display::fmt_name;
 pub use error::{Error, Result};
 pub use fidelity::{Fidelity, FidelityReport, MetaFields, Rung};

@@ -272,9 +272,11 @@ pub fn check_entries_carried(
 ///    destination swapped for a symlink has moved everything beneath it.
 /// 2. **No escaping symlink inside `dest`.** Every symlink under `dest` is
 ///    resolved LEXICALLY from its own directory by
-///    [`crate::check_symlink_target`], the rule extraction enforces before
+///    [`crate::classify_symlink_target`], the rule extraction enforces before
 ///    creating one — so the oracle and the code it polices agree on what
-///    "escapes" means, and a disagreement between them is a finding.
+///    "escapes" means, and a disagreement between them is a finding. A link
+///    whose verdict is `Skip` fails too: extraction never creates one, so a
+///    skipped link is absent and only an existing one is checked.
 /// 3. **No symlink under `dest` resolves outside it PHYSICALLY** (0.10.1).
 ///    Each link is `canonicalize`d — the OS's own resolution, following
 ///    every link along the way — and the result must sit under
@@ -347,14 +349,30 @@ pub fn check_extraction_contained(
                              outside the destination {real_dest:?}"
                         ));
                     }
-                    crate::check_symlink_target(dest, &path, &target.to_string_lossy()).map_err(
-                        |e| {
-                            format!(
+                    // A link extraction would have SKIPPED must not exist
+                    // at all: a skipped link is absent by construction, so
+                    // finding one on disk means it was created anyway.
+                    let shown = path.to_string_lossy();
+                    match crate::classify_symlink_target(
+                        dest,
+                        &path,
+                        &shown,
+                        &target.to_string_lossy(),
+                    ) {
+                        Ok(crate::SymlinkVerdict::Allowed) => {}
+                        Ok(crate::SymlinkVerdict::Skip(reason)) => {
+                            return Err(format!(
+                                "symlink {path:?} -> {target:?} exists, but extraction \
+                                 skips that target ({reason}) and must not have created it"
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(format!(
                                 "symlink {path:?} -> {target:?} resolves outside the \
                                  destination {dest:?}: {e}"
-                            )
-                        },
-                    )?;
+                            ));
+                        }
+                    }
                 } else if kind.is_dir() {
                     pending.push(path);
                 }
@@ -1229,6 +1247,22 @@ mod broken_honesty {
         let msg = check_extraction_contained(root.path(), &dest, &[&input])
             .expect_err("sub/s -> ../../input.tar/x escapes and must fail");
         assert!(msg.contains("resolves physically"), "{msg}");
+    }
+
+    /// 0.10.1 final fix wave: extraction SKIPS a `..`-after-a-name target
+    /// rather than refusing the run, so the oracle must accept its absence
+    /// (it only walks what exists) and refuse its presence. `s -> sub/../sub/f`
+    /// resolves inside `dest` physically and lexically alike, so only the
+    /// skip verdict can catch it — a link extraction would never create.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_link_extraction_would_have_skipped_is_refused() {
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink("sub/../sub/f", dest.join("s")).unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("a link of a skipped shape must not exist");
+        assert!(msg.contains("must not have created it"), "{msg}");
+        assert!(msg.contains("after a name"), "{msg}");
     }
 
     #[test]

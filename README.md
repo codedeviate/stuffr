@@ -870,7 +870,10 @@ domain, so:
   rather than quietly unlinked). For the same reason a symlink target may use
   `..` only as a leading run (`../../a/b`), never after a name (`x/s2/..`): the
   OS resolves `x/s2` first, and if that is another link the `..` climbs from
-  wherever it points.
+  wherever it points. Such a link (and one with an empty target) is **skipped,
+  not created** — named in a warning, the rest extracted, exit 0 (4 under
+  `--strict-fidelity`) — since GNU tar's `--transform` rewrites targets into
+  exactly that shape; a target that actually climbs out is still exit 7.
 - **Bomb limits.** Default caps on total output and expansion ratio, so a 42 KB
   zip that expands to 4.5 PB fails fast instead of filling the disk. The error
   names the entry that tripped it.

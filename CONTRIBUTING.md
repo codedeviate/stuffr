@@ -699,7 +699,9 @@ same way a vacuous conformance property would be.
   symlink finds nothing outside `dest` except the caller's `allowed` files,
   `dest` is still a real directory, and no symlink under `dest` resolves
   outside it — lexically, from the link's own directory, by the same
-  `check_symlink_target` rule extraction enforces, and PHYSICALLY: each link
+  `classify_symlink_target` rule extraction enforces (a link whose verdict is
+  `Skip` fails too: extraction never creates one, so only its absence is
+  honest), and PHYSICALLY: each link
   is `canonicalize`d and must land under `canonicalize(dest)` (a dangling link
   is resolved through its deepest existing prefix plus the missing tail; only
   a loop is skipped). The physical half is what sees a chain the

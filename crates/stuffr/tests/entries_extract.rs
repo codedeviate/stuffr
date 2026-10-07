@@ -1317,18 +1317,37 @@ fn a_case_folded_link_after_a_case_folded_replace_is_a_self_link_skip() {
     assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"second");
 }
 
-/// 0.10.1: a symlink target that climbs AFTER a name is refused, exit 7.
+/// The skip reason `classify_symlink_target` gives a target with `..` after
+/// a name. Restated as a literal: the pin must not be derived from the code
+/// it checks.
+const CLIMBS_AFTER_A_NAME: &str =
+    "symlink target uses `..` after a name, which can climb out through another link";
+
+/// The `EntrySkipped` warnings alone; a symlink's lost mode and mtime ride
+/// alongside as `MetadataIncomplete`, which these tests do not pin.
+fn skips_of(outcome: &stuffr::ops::Outcome) -> Vec<Fidelity> {
+    outcome
+        .fidelity
+        .warnings
+        .iter()
+        .filter(|w| matches!(w, Fidelity::EntrySkipped { .. }))
+        .cloned()
+        .collect()
+}
+
+/// 0.10.1: a symlink target that climbs AFTER a name is SKIPPED, and the
+/// rest of the archive extracted (user ruling 2026-10-07; it aborted the
+/// whole unpack at exit 7 until the final fix wave).
 ///
 /// `x/s2 -> ..` is contained (it names `dest`), and `s1 -> x/s2/..` nets to
-/// `x` lexically — but the OS resolves `x/s2` first, so `dest/s1` lands on
-/// `dest/..`. Both orders: `s1` ahead of `s2` would make a creation-time
+/// `x` lexically — but the OS resolves `x/s2` first, so `dest/s1` would land
+/// on `dest/..`. Both orders: `s1` ahead of `s2` would make a creation-time
 /// existence check useless, which is why the rule is about the target's
-/// SHAPE. As in `an_escaping_symlink_target_is_refused_before_the_link_exists`,
-/// the refused link is never created; what the run made before the refusal
-/// stays, and none of it resolves outside `dest`, physically.
+/// SHAPE. The skipped link is never created, everything else is, and
+/// nothing on disk resolves outside `dest`, lexically or physically.
 #[cfg(unix)]
 #[test]
-fn a_symlink_target_climbing_through_another_link_is_refused() {
+fn a_symlink_target_climbing_through_another_link_is_skipped() {
     for (tag, s2_first) in [("s2-first", true), ("s1-first", false)] {
         let root = tmp_dir();
         let mut entries = vec![dir("x")];
@@ -1339,65 +1358,72 @@ fn a_symlink_target_climbing_through_another_link_is_refused() {
             entries.push(symlink("s1", "x/s2/.."));
             entries.push(symlink("x/s2", ".."));
         }
+        entries.push(file("after.txt", b"after"));
         let archive = write_tar(&root.join("chain.tar"), &entries);
         let dest = root.join("out");
 
-        let err = entries::extract(
+        let outcome = entries::extract(
             Input::Path(archive.clone()),
             &dest,
             &Selection::All,
             &ExtractOpts::default(),
         )
-        .expect_err(&format!(
-            "{tag}: a target climbing after a name must be refused"
-        ));
-        match &err {
-            Error::UnsafePath { path, reason } => {
-                assert_eq!(path, "x/s2/..", "{tag}: names the archive's own target");
-                assert!(reason.contains("after a name"), "{tag}: {reason}");
-            }
-            other => panic!("{tag}: expected UnsafePath, got {other:?}"),
-        }
-        assert_eq!(err.exit_code(), 7, "{tag}");
+        .unwrap_or_else(|e| panic!("{tag}: a skip, not a refusal: {e}"));
+        assert_eq!(
+            skips_of(&outcome),
+            [skipped("s1", CLIMBS_AFTER_A_NAME)],
+            "{tag}"
+        );
         assert!(
             std::fs::symlink_metadata(dest.join("s1")).is_err(),
-            "{tag}: the refused link must not have been created"
+            "{tag}: the skipped link must not have been created"
         );
-        // Nothing left on disk resolves outside `dest`, lexically or
-        // physically (`x/s2 -> ..`, when it was reached first, names `dest`).
+        assert_eq!(
+            std::fs::read_link(dest.join("x/s2")).unwrap(),
+            Path::new(".."),
+            "{tag}: the contained link is extracted"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("after.txt")).unwrap(),
+            b"after",
+            "{tag}: extraction continues past the skip"
+        );
         stuffr_core::testing::check_extraction_contained(&root, &dest, &[&archive])
             .unwrap_or_else(|e| panic!("{tag}: {e}"));
     }
 }
 
-/// 0.10.1 fix round 1: an empty symlink target is refused at exit 7 on
-/// every platform — before it, macOS created `l -> ""` at exit 0 and Linux's
-/// `symlink(2)` answered ENOENT, which surfaced as `Error::Io`, exit 1.
+/// 0.10.1: an empty symlink target is skipped on every platform — before
+/// the fix round, macOS created `l -> ""` at exit 0 and Linux's
+/// `symlink(2)` answered ENOENT, which surfaced as `Error::Io`, exit 1; the
+/// fix round made it exit 7, and the final fix wave a skip.
 #[test]
-fn an_empty_symlink_target_is_refused_as_unsafe() {
+fn an_empty_symlink_target_is_skipped() {
     let root = tmp_dir();
     let archive = write_tar(
         &root.join("empty.tar"),
-        &[file("a.txt", b"alpha"), symlink("l", "")],
+        &[
+            file("a.txt", b"alpha"),
+            symlink("l", ""),
+            file("z.txt", b"zulu"),
+        ],
     );
     let dest = root.join("out");
-    let err = entries::extract(
+    let outcome = entries::extract(
         Input::Path(archive),
         &dest,
         &Selection::All,
         &ExtractOpts::default(),
     )
-    .expect_err("an empty symlink target must be refused");
-    match &err {
-        Error::UnsafePath { path, reason } => {
-            assert_eq!(path, "");
-            assert!(reason.contains("empty"), "{reason}");
-        }
-        other => panic!("expected UnsafePath, got {other:?}"),
-    }
-    assert_eq!(err.exit_code(), 7);
+    .expect("an empty target is a skip");
+    assert_eq!(
+        skips_of(&outcome),
+        [skipped("l", "symlink target is empty")]
+    );
     assert!(
         std::fs::symlink_metadata(dest.join("l")).is_err(),
         "the link must not have been created"
     );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
 }

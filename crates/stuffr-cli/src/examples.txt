@@ -782,7 +782,13 @@ EXTRACTING AN ARCHIVE'S ENTRIES
   attack than an intent. A symlink target may use `..` only as a leading
   run (`../../a/b`), never after a name (`x/s2/..`, `a/../b`): the system
   resolves `x/s2` first, and if that is itself a link the `..` climbs from
-  wherever it points, so such a target is refused at exit 7.
+  wherever it points. Such a link, and one with an EMPTY target, is
+  SKIPPED rather than refused: it is not created, a warning names the
+  entry, the rest of the archive is extracted, and the run exits 0 (4
+  under --strict-fidelity). GNU tar's `--transform 's,^,pkg-1.0/,'`
+  rewrites symlink targets too, so `bin/foo -> ../lib/foo` arrives as
+  `pkg-1.0/../lib/foo` — that link is skipped, everything else lands. A
+  target that climbs out of the destination is still refused at exit 7.
 
   An entry whose path runs THROUGH a symlink is refused too — a directory
   component that is a link, whether an earlier entry created it or somebody

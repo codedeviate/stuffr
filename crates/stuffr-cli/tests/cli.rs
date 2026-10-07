@@ -4820,6 +4820,93 @@ fn a_symlink_one_step_past_the_extraction_root_is_still_refused() {
     }
 }
 
+/// 0.10.1 final review, Important 1, with the user's ruling: a `..` after a
+/// name in a symlink target is SKIPPED, not refused. GNU tar's `--transform`
+/// applies to symlink targets by default, so `--transform 's,^,pkg-1.0/,'`
+/// over `bin/foo -> ../lib/foo` stores `pkg-1.0/bin/foo ->
+/// pkg-1.0/../lib/foo`. 0.10.0 and GNU tar extract that archive; the first
+/// 0.10.1 build aborted at exit 7 with only `pkg-1.0/bin/` written. Now:
+/// exit 0, `lib/foo` extracted, one named skip; exit 4 under
+/// `--strict-fidelity`, with the same tree on disk.
+#[cfg(unix)]
+#[test]
+fn a_gnu_tar_transform_rewritten_symlink_target_is_skipped_not_fatal() {
+    let gtar = require_gnu_tar();
+    let dir = tmp_dir();
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("bin")).unwrap();
+    std::fs::create_dir_all(tree.join("lib")).unwrap();
+    std::fs::write(tree.join("lib/foo"), b"lib-bytes").unwrap();
+    std::os::unix::fs::symlink("../lib/foo", tree.join("bin/foo")).unwrap();
+    let archive = dir.join("pkg.tar");
+    let made = Command::new(&gtar)
+        .args([
+            "-cf",
+            archive.to_str().unwrap(),
+            "--transform",
+            "s,^,pkg-1.0/,",
+            "-C",
+        ])
+        .arg(&tree)
+        .args(["bin", "lib"])
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    // The premise: GNU tar really did rewrite the target.
+    let listed = Command::new(&gtar)
+        .args(["-tvf", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("pkg-1.0/bin/foo -> pkg-1.0/../lib/foo"),
+        "{}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    for (strict, code) in [(false, 0), (true, 4)] {
+        let dest = dir.join(if strict { "strict" } else { "plain" });
+        let mut args = vec![
+            "unpack",
+            archive.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ];
+        if strict {
+            args.push("--strict-fidelity");
+        }
+        let out = run_output(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "strict={strict}, stderr: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("pkg-1.0/lib/foo")).unwrap(),
+            b"lib-bytes",
+            "strict={strict}: extraction continues past the skip"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest.join("pkg-1.0/bin/foo")).is_err(),
+            "strict={strict}: the skipped link is not created"
+        );
+        assert_eq!(
+            stderr
+                .matches(
+                    "skipped entry `pkg-1.0/bin/foo`: symlink target uses `..` after a name, \
+                     which can climb out through another link"
+                )
+                .count(),
+            1,
+            "strict={strict}: one named skip, stderr: {stderr}"
+        );
+    }
+}
+
 /// The Phase 2 final review's I2, across the third dimension round 3
 /// missed: container × WRAPPED-IN-A-CODEC × source shape.
 ///

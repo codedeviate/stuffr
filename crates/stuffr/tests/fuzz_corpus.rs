@@ -1044,9 +1044,9 @@ fn conflict_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
 
 /// Symlink-chain tars (0.10.1): `x/`, `x/s2 -> ..` and `s1 -> x/s2/..`, in
 /// both orders. `s1` nets to `x` lexically, but the OS resolves `x/s2` first
-/// and lands on `dest/..` — the shape `check_symlink_target` refuses for its
-/// `..` after a name, and the extract leg's physical containment check
-/// catches if it ever lands. `(file stem, bytes)`.
+/// and lands on `dest/..` — the shape `classify_symlink_target` skips for its
+/// `..` after a name (never created), and the extract leg's physical
+/// containment check catches if it ever lands. `(file stem, bytes)`.
 fn symlink_chain_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
     let dir = seed_tar_member(b"x/", b'5', b"", b"");
     let s2 = seed_tar_member(b"x/s2", b'2', b"..", b"");
