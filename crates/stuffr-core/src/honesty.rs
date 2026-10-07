@@ -290,6 +290,14 @@ pub fn check_entries_carried(
 ///    Checked before rule 2, so a refusal that names "resolves physically"
 ///    is this rule's.
 ///
+/// **A missing `dest` is allowed** (0.10.1). `extract` can refuse an input
+/// before it creates the destination — an archive whose first header is
+/// corrupt fails in `open_archive`, exit 5 — and then nothing was extracted,
+/// so there is nothing under `dest` to contain. Rules 2 and 3 have nothing
+/// to inspect and are skipped; rule 1 still walks `root`, so anything
+/// written elsewhere fails. Only `NotFound` is allowed: a `dest` that is not
+/// a directory, or that cannot be inspected, is still an `Err`.
+///
 /// Read-only: it never changes a permission, so a directory it cannot read
 /// is a failure (it cannot vouch for what is inside), not a skip. A caller
 /// extracting archives that set restrictive directory modes makes them
@@ -306,21 +314,29 @@ pub fn check_extraction_contained(
             "the destination {dest:?} is not inside the scratch root {root:?}"
         ));
     }
-    match std::fs::symlink_metadata(dest) {
-        Ok(m) if m.file_type().is_dir() => {}
+    // `None` while `dest` is absent: `extract` may refuse an input before it
+    // creates the destination, and then nothing was extracted. The walk
+    // below still runs, so a stray file elsewhere under `root` still fails.
+    let dest_exists = match std::fs::symlink_metadata(dest) {
+        Ok(m) if m.file_type().is_dir() => true,
         Ok(m) => {
             return Err(format!(
                 "the destination {dest:?} is no longer a directory ({:?})",
                 m.file_type()
             ));
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(format!("cannot inspect the destination {dest:?}: {e}")),
-    }
+    };
     // Rule 3's yardstick. Canonical, because on macOS a temp `dest` under
     // `/var` resolves through `/private/var` and every link would otherwise
     // look like it escaped.
-    let real_dest = std::fs::canonicalize(dest)
-        .map_err(|e| format!("cannot resolve the destination {dest:?}: {e}"))?;
+    let real_dest = if dest_exists {
+        std::fs::canonicalize(dest)
+            .map_err(|e| format!("cannot resolve the destination {dest:?}: {e}"))?
+    } else {
+        dest.to_path_buf()
+    };
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let listing =
@@ -1119,6 +1135,38 @@ mod broken_honesty {
         let (root, dest, input) = extraction_tree();
         std::fs::create_dir(root.path().join("elsewhere")).unwrap();
         assert!(check_extraction_contained(root.path(), &dest, &[&input]).is_err());
+    }
+
+    #[test]
+    fn a_missing_destination_with_only_allowed_files_is_contained() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.tar");
+        std::fs::write(&input, b"bytes").unwrap();
+        let dest = root.path().join("out");
+        check_extraction_contained(root.path(), &dest, &[&input])
+            .expect("an extraction refused before creating dest wrote nothing");
+    }
+
+    #[test]
+    fn a_missing_destination_with_a_stray_file_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.tar");
+        std::fs::write(&input, b"bytes").unwrap();
+        std::fs::write(root.path().join("stray"), b"x").unwrap();
+        let dest = root.path().join("out");
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("a stray file must fail even with dest absent");
+        assert!(msg.contains("stray"), "must name the path: {msg}");
+    }
+
+    #[test]
+    fn a_destination_that_is_a_file_is_still_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = root.path().join("out");
+        std::fs::write(&dest, b"x").unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[])
+            .expect_err("a file destination must fail");
+        assert!(msg.contains("no longer a directory"), "{msg}");
     }
 
     #[cfg(unix)]
