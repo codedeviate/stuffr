@@ -633,16 +633,16 @@ pub(crate) const AR_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
     &[ErrorKind::InvalidData, ErrorKind::UnexpectedEof];
 
-/// The `InvalidInput` + `UnexpectedEof` pair again, measured against `zip`'s
-/// own payload readers — which are several, because a zip entry names its own
-/// codec, so this constant has to cover all of them at once rather than one
-/// backend.
+/// The `InvalidInput` + `Other` + `UnexpectedEof` TRIPLE, measured against
+/// `zip`'s own payload readers — which are several, because a zip entry names
+/// its own codec, so this constant has to cover all of them at once rather
+/// than one backend.
 ///
 /// Deliberately its own constant rather than a reuse of
 /// [`MALFORMED_AS_INVALID_INPUT_EOF`] above, whose doc pins that name to
-/// "flate2 and bzip2 measured directly". The KINDS coincide; the measurement
-/// is a different one, over a different set of readers, and a future change
-/// to either should not silently move the other:
+/// "flate2 and bzip2 measured directly". Two of the KINDS coincide; the
+/// measurement is a different one, over a different set of readers, and a
+/// future change to either should not silently move the other:
 ///
 /// * Every entry's payload passes through `zip::crc32::Crc32Reader`, which
 ///   raises `InvalidData` ("Invalid checksum") at end of stream when the
@@ -657,21 +657,84 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 ///   for corrupted deflate data — the identical pair measured for gzip.
 /// * A `Bzip2` entry decodes through the `bzip2` crate over
 ///   `libbz2-rs-sys`, measured in this tree as the same pair.
-/// * `Xz` and `Lzma` entries decode through `lzma-rust2`, the backend
-///   `xz_pure.rs` and `lzma_pure.rs` already fold onto `InvalidData` from the
-///   same kinds.
+/// * `Lzma` (method 14) and `Xz` (method 95) entries decode through
+///   `lzma-rust2` **0.16.5** — `zip 8.6.0`'s own dependency
+///   (`compression.rs`: `Decompressor::Lzma` wraps `lzma_rust2::LzmaReader::
+///   new_with_props`, `Decompressor::Xz` wraps `lzma_rust2::XzReader::new`),
+///   NOT the 0.20.1 this tree pins for `xz_pure.rs`, `lzma_pure.rs` and
+///   `lzip.rs`. Two copies build side by side, and none of those three
+///   modules' constants reaches a zip entry. That is where `Other` comes
+///   from, and why this list carries it.
 ///
-/// A genuine source failure still reaches this wrapper untouched: `Crc32Reader`
-/// and `Decompressor` both propagate an error their inner reader produced with
-/// its own kind, and neither manufactures `InvalidInput` or `UnexpectedEof` on
-/// its own behalf — which is what conformance property 10 checks.
+/// **`Other` was missing from this list until the `v0.10.0` tag's deep-fuzz
+/// run**, which aborted the `container` target on a 92-byte zip whose second
+/// local header names method 14: `a decoder raised Io(Custom { kind: Other,
+/// error: "dist overflow" }), which maps to exit code 1` — hostile input
+/// reaching exit 1. This doc used to say the `Xz`/`Lzma` readers "already
+/// fold onto `InvalidData` from the same kinds" as `xz_pure.rs` and
+/// `lzma_pure.rs`; it was wrong twice over — those two constants carry
+/// `Other` and this one did not, and the readers are a different version of
+/// the crate. Latent since `zip` landed (0.2.0) with its `lzma` and `xz`
+/// features on, so every published release carries it. Measured on the fix:
+/// `zip.rs`'s `no_corrupted_byte_of_an_lzma_entry_reaches_exit_1` flips every
+/// byte of a Python-written, compressible LZMA entry, and before `Other` was
+/// added here the forward rung reached exit 1 at the first `dist overflow`.
+///
+/// Every `Other` reachable on a zip payload read, traced in source (`zip
+/// 8.6.0`, `lzma-rust2 0.16.5`) rather than sampled:
+///
+/// * `"dist overflow"` — `lzma-rust2`'s `LzDecoder::repeat`
+///   (`src/lz/lz_decoder.rs:108`, via `error_other`, `src/lib.rs:433`): a
+///   match distance past everything decoded so far. Reached by BOTH methods,
+///   since `LzmaReader` and `XzReader`'s LZMA2 filter decode into the same
+///   `LzDecoder`. The finding.
+/// * `"slice doesn't match array size for u32 BE bytes"` —
+///   `src/range_dec.rs:468`, the range decoder's buffered-input path. The
+///   slice is a 4-byte `get(pos..pos + 4)` just above, so it cannot fail; mapped
+///   anyway, because it is the decoder's own state and never a source error.
+/// * `"Reader was not set while reading LZMA data"` / `"... PPMd data"` /
+///   `"Reader was not set"` — `zip`'s `compression.rs:393`, `:446`, `:566`,
+///   `:581`. The `Lzma` and `Ppmd` arms `take()` the inner reader BEFORE
+///   parsing their header, and a header error returned by `?` leaves them
+///   `Uninitialized` with no reader, so a caller that reads again after a
+///   malformed header meets `Other` instead of the original error. A
+///   consequence of malformed input, never of the disk.
+/// * `"Cannot transform header to u16"`/`"... u32"` — `compression.rs:401`,
+///   `:405`, `:419`: `try_into` of a fixed-width slice of a fixed-size
+///   array. Unreachable; covered by the same fold for free.
+/// * `"ZipFileReader was in an invalid state"` — `read/readers.rs:159`, the
+///   crate's own state machine. Not a source error either.
+///
+/// `ppmd-rust` 1.4.1 and `deflate64` 0.1.12 construct no `Other` at all
+/// (`InvalidData` and `InvalidInput` respectively, plus `UnexpectedEof`
+/// passed through), and the `zip` crate maps `ppmd_rust::Error` to
+/// `InvalidData`/`InvalidInput`/`OutOfMemory` itself; `OutOfMemory` is
+/// already `from_decode_io`'s own business.
+///
+/// `Other` is safe to fold HERE for the structural reason
+/// `TAR_MALFORMED_AS_OTHER`'s and
+/// `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s docs give,
+/// re-verified for this path: a genuine source failure reaches this wrapper
+/// untouched — `Crc32Reader`, `Decompressor` and `lzma-rust2`'s
+/// readers all propagate an error their inner reader produced by `?` with
+/// its own kind, and none manufactures `Other`, `InvalidInput` or
+/// `UnexpectedEof` out of one. `std` itself never raises `Other` (an OS
+/// error with no named kind is `Uncategorized`), and the one `Other`
+/// `zip.rs` constructs under a payload read — `SeekAdapter::seek`'s
+/// "source reported seekable but cannot seek" — is unreachable by its own
+/// doc and is not on the read path at all. Conformance property 10 (a
+/// `PermissionDenied` source stays `Error::Io`) still holds, and is what
+/// checks it.
 ///
 /// Gated `#[cfg(feature = "zip")]` for the same reason cpio's constant above
 /// is: an ungated `pub(crate) const` with no consumer warns under `-D
 /// warnings` on the tier that compiles it.
 #[cfg(feature = "zip")]
-pub(crate) const ZIP_MALFORMED_AS_INVALID_INPUT_EOF: &[ErrorKind] =
-    &[ErrorKind::InvalidInput, ErrorKind::UnexpectedEof];
+pub(crate) const ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF: &[ErrorKind] = &[
+    ErrorKind::InvalidInput,
+    ErrorKind::Other,
+    ErrorKind::UnexpectedEof,
+];
 
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,

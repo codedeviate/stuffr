@@ -150,7 +150,7 @@ use zip::CompressionMethod;
 use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 
-use crate::normalize::{NormalizeDecodeErrors, ZIP_MALFORMED_AS_INVALID_INPUT_EOF};
+use crate::normalize::{NormalizeDecodeErrors, ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF};
 
 pub const ZIP: FormatId = FormatId::new("zip");
 
@@ -1326,7 +1326,7 @@ impl ZipIndexed {
             meta,
             Box::new(NormalizeDecodeErrors::new(
                 payload,
-                ZIP_MALFORMED_AS_INVALID_INPUT_EOF,
+                ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF,
             )),
         ))
     }
@@ -1474,7 +1474,7 @@ impl ArchiveRead for ZipStreamed {
             meta,
             Box::new(NormalizeDecodeErrors::new(
                 payload,
-                ZIP_MALFORMED_AS_INVALID_INPUT_EOF,
+                ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF,
             )),
         )))
     }
@@ -1791,7 +1791,7 @@ fn read_symlink_target<R: Read>(
 /// The same rule [`NormalizeDecodeErrors`] applies to a caller-driven payload
 /// read, applied to the one payload this module reads for itself.
 fn normalize_payload_error(e: io::Error) -> io::Error {
-    if ZIP_MALFORMED_AS_INVALID_INPUT_EOF.contains(&e.kind()) {
+    if ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF.contains(&e.kind()) {
         return io::Error::new(ErrorKind::InvalidData, e.to_string());
     }
     e
@@ -4171,6 +4171,105 @@ z.close()\n";
         assert_eq!(got[0].1, "lzma payload ".repeat(64).as_bytes());
         assert_eq!(got[0].0.codec, Some(FormatId::new("lzma")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An LZMA (method 14) entry body whose first match points further back
+    /// than anything decoded so far: `lzma_rust2`'s `LzDecoder::repeat`
+    /// raises `io::Error::other("dist overflow")` for it. The 9-byte zip
+    /// LZMA header (version `00 00`, properties size `05 00`, props `00`,
+    /// dictionary `0x673`) followed by the range-coder bytes the fuzzer
+    /// found.
+    const DIST_OVERFLOW_LZMA_BODY: &[u8] = &[
+        0x00, 0x00, 0x05, 0x00, 0x00, 0x73, 0x06, 0x00, 0x00, 0x00, 0x04, 0x00, 0x04, 0x00, 0xf5,
+        0x00, 0x00, 0x00, 0xed, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// **The 0.10.0 tag's deep-fuzz finding**, verbatim (the fuzz slot
+    /// byte dropped): a stored directory entry, then a local header naming
+    /// method 14 over [`DIST_OVERFLOW_LZMA_BODY`], and no central
+    /// directory. The `container` target aborted on it with `a decoder
+    /// raised Io(Custom { kind: Other, error: "dist overflow" }), which maps
+    /// to exit code 1` — hostile input reaching exit 1, which the exit-code
+    /// contract forbids. `ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF`'s doc
+    /// carries the trace.
+    ///
+    /// The seekable rung needs a central directory, so it is asserted over
+    /// the same body re-laid by [`hand_built_zip`] with both method fields
+    /// patched to 14 — the decoder sees the identical bytes either way.
+    #[test]
+    fn a_malformed_lzma_entry_is_corruption_never_exit_1() {
+        let mut fuzzed = b"PK\x03\x04\x14\x00\x00\x00\x00\x00\xef\x25\x47\x5d\
+\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x07\x00\x00\x00sample/\
+PK\x03\x04\x14\x00\x00\x00\x0e\x00\x00\x00\x00\x00\x00\x00\x00\x00\
+\x00\x00\xed\x41\x41\x00\x00\x00\x00\x00\x00\x00"
+            .to_vec();
+        fuzzed.extend_from_slice(DIST_OVERFLOW_LZMA_BODY);
+        let err = read_all_forward(&fuzzed).expect_err("a dist overflow must be refused");
+        assert_eq!(err.exit_code(), 5, "forward rung: got {err:?}");
+        assert!(err.to_string().contains("dist overflow"), "{err}");
+
+        let body = DIST_OVERFLOW_LZMA_BODY;
+        let mut bytes = hand_built_zip("l.txt", 0, body.len() as u32, 65, body);
+        bytes[8..10].copy_from_slice(&14u16.to_le_bytes());
+        let central = 30 + "l.txt".len() + body.len();
+        assert_eq!(bytes[central..central + 4], SIG_CENTRAL_HEADER);
+        bytes[central + 10..central + 12].copy_from_slice(&14u16.to_le_bytes());
+        let err = read_all_seekable(&bytes).expect_err("a dist overflow must be refused");
+        assert_eq!(err.exit_code(), 5, "seekable rung: got {err:?}");
+        assert!(err.to_string().contains("dist overflow"), "{err}");
+    }
+
+    /// The sibling sweep behind the fix above: every byte of a real LZMA
+    /// entry's compressed payload (Python's `zipfile`, a COMPRESSIBLE text,
+    /// so corruption lands inside the LZ77 match machinery where `Other`
+    /// originates — see `XZ_PURE_MALFORMED_AS_INVALID_DATA_INPUT_OTHER_EOF`'s
+    /// doc for what an incompressible payload hides) is flipped in turn, and
+    /// no position may reach exit 1. A flip the crc32 and the decoder both
+    /// miss would read clean, so `Ok` is allowed; an error must be exit 5.
+    #[test]
+    fn no_corrupted_byte_of_an_lzma_entry_reaches_exit_1() {
+        let python = require_bin("python3");
+        let dir = scratch("lzma-corruption-sweep");
+        let out = std::process::Command::new(&python)
+            .arg("-c")
+            .arg(LZMA_ZIP_SCRIPT)
+            .arg(dir.join("l.zip"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "python3 could not write an LZMA zip: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bytes = std::fs::read(dir.join("l.zip")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[28], bytes[29]]) as usize;
+        let compressed = u32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]) as usize;
+        let start = 30 + name_len + extra_len;
+        let mut errors = 0;
+        for at in start..start + compressed {
+            let mut corrupt = bytes.clone();
+            corrupt[at] ^= 0xff;
+            for (rung, got) in [
+                ("forward", read_all_forward(&corrupt).map(|_| ())),
+                ("seekable", read_all_seekable(&corrupt).map(|_| ())),
+            ] {
+                if let Err(err) = got {
+                    errors += 1;
+                    assert_eq!(
+                        err.exit_code(),
+                        5,
+                        "{rung} rung, byte {at} of the payload flipped: {err:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            errors > 0,
+            "the sweep detected nothing, so it asserted nothing"
+        );
     }
 
     #[test]
