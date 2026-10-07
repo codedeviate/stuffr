@@ -133,12 +133,37 @@ read list.
 > Converting a tar into a container without
 > links keeps up to 64 MiB of recent payloads in memory, on top of the
 > usual buffers.
-> **Known issue:** an archive that places an entry where it earlier created
-> a directory, or beneath a file it created, makes `unpack` fail with exit
-> 1 rather than a classified code. Every entry kind is affected, now
-> including hard links; tracked for 0.10.x. `--index` reads still stop at
-> the last selected entry and skip the codec-trailer check (as in 0.9.0).
+> **Known issue (fixed in 0.10.1):** an archive that places an entry where
+> it earlier created a directory, or beneath a file it created, makes
+> `unpack` fail with exit 1. `--index` reads still stop at the last
+> selected entry and skip the codec-trailer check (as in 0.9.0).
 > **1771** tests under `--all-features`, **1707** on the
+> default tier — measured from this bump's own `make check`,
+> `GATE_EXIT=0`.
+>
+> `0.10.1` is a patch. **`unpack` no longer exits 1 on an archive that
+> contradicts itself on disk:** an entry placed onto a directory the
+> archive made, or beneath a file it made, is skipped and named (exit 0;
+> 4 under `--strict-fidelity`), and the rest is extracted; a conflict with
+> what the destination already held stays exit 2. A name too long for the
+> filesystem is skipped the same way, and salvage shares the rule.
+> **Symlinks:** a target with `..` after a name (`x/s2/..`, as GNU tar's
+> `--transform` writes) or an empty target is skipped and named — it could
+> climb out through another link (`x/s2 -> ..` then `s1 -> x/s2/..` left
+> `s1` pointing outside the destination in 0.10.0); a target that escapes
+> the destination outright is still exit 7, and that refusal now names the
+> entry rather than the target text. Additive library API:
+> `SymlinkVerdict`, `classify_symlink_target`,
+> `testing::check_extraction_contained`; `check_symlink_target` keeps its
+> signature, refuses those shapes too, and words a depth escape
+> differently. The `container` fuzz target now extracts every seekable
+> input to disk and checks containment, classification and that every
+> entry is accounted for. Release hygiene: `make check` builds
+> `stuffr-formats` alone under `-D warnings`, `make lint-latest` runs clippy
+> on the newest stable, and `deps-guard` warns at 500,000 entries.
+> **Follow-up:** `salvage` on a case-insensitive volume can still lose one of
+> two names that differ only in case (`README`/`readme`).
+> **1816** tests under `--all-features`, **1752** on the
 > default tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`.
 >
