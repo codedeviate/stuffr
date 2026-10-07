@@ -1218,7 +1218,7 @@ fn a_repeated_link_entry_under_force_is_not_a_self_link() {
 /// never reach the over-long final component; it is the arm's own create
 /// (`File::create`, `create_symlink`, `create_dir_all`, and the hard-link
 /// copy's create after `hard_link` fails) that meets the refusal, through
-/// `skip_if_name_too_long`.
+/// `skip_if_name_refused`.
 #[test]
 fn an_over_long_final_name_under_a_new_parent_is_skipped_by_every_arm() {
     let root = tmp_dir();
@@ -1493,6 +1493,40 @@ fn an_empty_symlink_target_is_skipped() {
     assert!(
         std::fs::symlink_metadata(dest.join("l")).is_err(),
         "the link must not have been created"
+    );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
+}
+
+/// A name APFS refuses (`EILSEQ`, os error 92): U+07B8 is an unassigned
+/// code point it will not store. The entry is skipped with a named reason
+/// and its neighbours are written, not an exit 1. Self-detecting: a volume
+/// that accepts the name has nothing to skip, so the test returns early.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_name_the_filesystem_refuses_is_skipped_not_an_io_error() {
+    let root = tmp_dir();
+    let probe = root.join("probe\u{7b8}");
+    if std::fs::File::create(&probe).is_ok() {
+        return;
+    }
+    let bad = "bad\u{7b8}name";
+    let nested = "new/dir\u{7b8}/f";
+    let archive = write_tar(
+        &root.join("illegal.tar"),
+        &[
+            file("a.txt", b"alpha"),
+            file(bad, b"x"),
+            file(nested, b"y"),
+            file("z.txt", b"zulu"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("skips, never exit 1");
+    let reason = "its name is not valid on this filesystem";
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped(bad, reason), skipped(nested, reason)]
     );
     assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
     assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");

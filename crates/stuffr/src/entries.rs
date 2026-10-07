@@ -1000,7 +1000,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                         return Ok(());
                     }
                     if let Err(w) =
-                        skip_if_name_too_long(std::fs::create_dir_all(&target), &meta.name)?
+                        skip_if_name_refused(std::fs::create_dir_all(&target), &meta.name)?
                     {
                         warnings.push(w);
                         return Ok(());
@@ -1043,7 +1043,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                     return Ok(());
                 }
                 let mut out =
-                    match skip_if_name_too_long(std::fs::File::create(&target), &meta.name)? {
+                    match skip_if_name_refused(std::fs::File::create(&target), &meta.name)? {
                         Ok(out) => out,
                         Err(w) => {
                             warnings.push(w);
@@ -1193,7 +1193,7 @@ fn extract_symlink(
     if !place_entry(dest, at, &meta.name, false, made, force)?.proceed(warnings) {
         return Ok(false);
     }
-    if let Err(w) = skip_if_name_too_long(create_symlink(link_target, at), &meta.name)? {
+    if let Err(w) = skip_if_name_refused(create_symlink(link_target, at), &meta.name)? {
         warnings.push(w);
         return Ok(false);
     }
@@ -1445,7 +1445,7 @@ fn copy_link_target(
     budget.charge(&meta.name, len)?;
     // `hard_link` failing on a name too long falls through to here, and
     // the create meets the same refusal: one skip, never exit 1.
-    let mut out = match skip_if_name_too_long(std::fs::File::create(link_path), &meta.name)? {
+    let mut out = match skip_if_name_refused(std::fs::File::create(link_path), &meta.name)? {
         Ok(out) => out,
         Err(w) => {
             warnings.push(w);
@@ -2815,7 +2815,7 @@ fn place_salvaged_entry(
                     Ok(()) => {}
                     Err(skipped) => return Ok(skipped),
                 }
-                match skip_if_name_too_long(std::fs::create_dir_all(&target), &entry.meta.name) {
+                match skip_if_name_refused(std::fs::create_dir_all(&target), &entry.meta.name) {
                     Ok(Ok(())) => {
                         made.record_path(&target, MadeKind::Dir);
                         Ok(SalvageDisposition::Directory(target))
@@ -3124,7 +3124,7 @@ fn open_salvage_target(
     // them is exactly how eight recovered records became six files at exit
     // 0. `claimed`, in the caller, is what separates them.
     place_salvaged(dest, write_target, name, false, made, true)?;
-    let out = match skip_if_name_too_long(std::fs::File::create(write_target), name) {
+    let out = match skip_if_name_refused(std::fs::File::create(write_target), name) {
         Ok(Ok(out)) => out,
         Ok(Err(w)) => return Err(unwritable_skip(w)),
         Err(e) => return Err(unwritable(e)),
@@ -4892,6 +4892,10 @@ fn conflict_reason_directory_in_the_way(name: &str) -> String {
 /// (`ENAMETOOLONG`) is skipped, by `unpack` and by salvage alike.
 const PATH_TOO_LONG_REASON: &str = "its path is too long for this filesystem";
 
+/// Why an entry whose name the destination filesystem rejects as an illegal
+/// byte sequence (`EILSEQ`) is skipped, by `unpack` and by salvage alike.
+const NAME_INVALID_REASON: &str = "its name is not valid on this filesystem";
+
 /// Salvage's reason for a file record whose path is a directory the
 /// destination already held. No `--force` clause: salvage has no such flag.
 const SALVAGE_REASON_DIRECTORY_IN_THE_WAY: &str =
@@ -5413,7 +5417,6 @@ fn place(
     };
     let components: Vec<_> = relative.components().collect();
     let parents = components.len().saturating_sub(1);
-    let too_long = || Placed::Skip(path_too_long(name));
 
     // Rule 1. Once one component is missing, nothing beneath it can exist,
     // so the walk stops there and rule 2 has nothing to look at.
@@ -5431,7 +5434,9 @@ fn place(
                 }));
             }
             Ok(_) => return Ok(Placed::Held(Held::NotADirectoryAbove(walked))),
-            Err(e) if is_name_too_long(&e) => return Ok(too_long()),
+            Err(e) if refusal_reason(&e).is_some() => {
+                return Ok(Placed::Skip(name_refused(name, &e)));
+            }
             Err(_) => {
                 first_missing = Some(i);
                 break;
@@ -5462,7 +5467,9 @@ fn place(
                 // written, and a failed write must not leave a stale record.
                 made.at.remove(target);
             }
-            Err(e) if is_name_too_long(&e) => return Ok(too_long()),
+            Err(e) if refusal_reason(&e).is_some() => {
+                return Ok(Placed::Skip(name_refused(name, &e)));
+            }
             Err(_) => {}
         }
     }
@@ -5479,7 +5486,9 @@ fn place(
                 // absent; a racing local writer is the TOCTOU window
                 // `refuse_symlinked_ancestors` documents.
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) if is_name_too_long(&e) => return Ok(too_long()),
+                Err(e) if refusal_reason(&e).is_some() => {
+                    return Ok(Placed::Skip(name_refused(name, &e)));
+                }
                 Err(e) => return Err(e.into()),
             }
         }
@@ -5500,11 +5509,39 @@ fn is_name_too_long(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::InvalidFilename || e.raw_os_error() == Some(ENAMETOOLONG)
 }
 
-/// The skip for an entry whose path the destination filesystem cannot hold.
-fn path_too_long(name: &str) -> Fidelity {
+/// `EILSEQ`, by its raw number: `std` maps it to no stable `ErrorKind`
+/// (`Uncategorized`). macOS (APFS) answers it for a name that is not valid
+/// Unicode in its required form; Linux reports 84. An unknown platform
+/// matches nothing, so the error stays an `Io` (fail closed).
+fn is_illegal_byte_sequence(e: &std::io::Error) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const EILSEQ: Option<i32> = Some(92);
+    #[cfg(target_os = "linux")]
+    const EILSEQ: Option<i32> = Some(84);
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    const EILSEQ: Option<i32> = None;
+    EILSEQ.is_some() && e.raw_os_error() == EILSEQ
+}
+
+/// Why the destination filesystem refused an entry's name, when `e` says so.
+fn refusal_reason(e: &std::io::Error) -> Option<&'static str> {
+    if is_name_too_long(e) {
+        Some(PATH_TOO_LONG_REASON)
+    } else if is_illegal_byte_sequence(e) {
+        Some(NAME_INVALID_REASON)
+    } else {
+        None
+    }
+}
+
+/// The skip for an entry whose name the destination filesystem refuses.
+/// `e` must satisfy [`refusal_reason`].
+fn name_refused(name: &str, e: &std::io::Error) -> Fidelity {
     Fidelity::EntrySkipped {
         entry: name.to_string(),
-        reason: PATH_TOO_LONG_REASON.to_string(),
+        reason: refusal_reason(e)
+            .unwrap_or(PATH_TOO_LONG_REASON)
+            .to_string(),
     }
 }
 
@@ -5513,13 +5550,13 @@ fn path_too_long(name: &str) -> Fidelity {
 /// hard-link copy's create): `Ok(Err(w))` when the filesystem refused the
 /// entry's name as too long, which the caller pushes and skips on; any other
 /// failure stays an error.
-fn skip_if_name_too_long<T, E: Into<Error>>(
+fn skip_if_name_refused<T, E: Into<Error>>(
     r: std::result::Result<T, E>,
     name: &str,
 ) -> Result<std::result::Result<T, Fidelity>> {
     match r.map_err(Into::into) {
         Ok(v) => Ok(Ok(v)),
-        Err(Error::Io(e)) if is_name_too_long(&e) => Ok(Err(path_too_long(name))),
+        Err(Error::Io(e)) if refusal_reason(&e).is_some() => Ok(Err(name_refused(name, &e))),
         Err(e) => Err(e),
     }
 }
