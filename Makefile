@@ -6,7 +6,7 @@
 
 CARGO ?= cargo
 
-.PHONY: help check deps-guard fmt fmt-check lint test test-pure release miri hooks clean fuzz-corpus fuzz
+.PHONY: help check lint-latest deps-guard fmt fmt-check lint test test-pure release miri hooks clean fuzz-corpus fuzz
 
 help:
 	@echo 'stuffr development targets:'
@@ -14,6 +14,7 @@ help:
 	@echo '  make fmt      format the workspace, and fuzz/ (excluded from it)'
 	@echo '  make lint     clippy, all targets and features, warnings denied'
 	@echo '                (the workspace, and fuzz/ --locked)'
+	@echo '  make lint-latest  clippy on the newest installed stable (own target dir)'
 	@echo '  make test     full test suite with all features'
 	@echo '  make test-pure  the default (pure) tier, where no C backend wins'
 	@echo '  make release  optimised build, plus the no-default-features check'
@@ -33,9 +34,11 @@ check: deps-guard fmt-check lint test test-pure release
 # stale ones. At 1,123,729 entries (34 GB of target/) a freshly linked test
 # binary took 20-22 s to START from that directory and 0 s from any other
 # (amfid busy; not Gatekeeper, not ESET), which turned a 166 s gate into
-# 6660 s. A fresh build holds ~6,000 entries. The threshold is a round number
-# well clear of both, not a measured knee. CI starts clean and never trips it.
-DEPS_GUARD_MAX ?= 100000
+# 6660 s. A fresh build holds ~6,000 entries. The threshold is a round number,
+# about half the measured 1.1M slow point; one release cycle added about 15k
+# entries per gate, so 100,000 tripped on a healthy tree. CI starts clean and
+# never trips it.
+DEPS_GUARD_MAX ?= 500000
 
 deps-guard:
 	@n=$$(ls -f target/debug/deps 2>/dev/null | wc -l | tr -d ' '); \
@@ -97,6 +100,15 @@ test:
 test-pure:
 	$(CARGO) test --workspace
 
+# Clippy on the newest installed `stable`, with the gate's exact arguments, in
+# its own target dir so the pinned toolchain's cache is untouched. CI's
+# `gate (stable)` job runs whatever stable is current; 0.10.0's first tag failed
+# there on a lint the pinned 1.95 did not have. Not part of `check`: update
+# stable first (`rustup update stable`) — the release skill says when.
+lint-latest:
+	CARGO_TARGET_DIR=target/lint-latest rustup run stable $(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+	CARGO_TARGET_DIR=target/lint-latest rustup run stable $(CARGO) clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+
 # The second build is not redundant: it proves stuffr-core still compiles with
 # no optional features, which is the guarantee behind "cargo install needs no
 # C toolchain".
@@ -134,20 +146,24 @@ test-pure:
 #   Verified clean: 0 warnings.
 # - `--features legacy --no-default-features` (no `pure`, no `c-backed`) is
 #   narrower still: legacy alone, isolated from every optional codec/
-#   container. It compiles too, but with 7 dead-code warnings in
-#   `stuffr-formats` (`normalize.rs`'s error-normalisation helpers, used only
-#   by the pure/c-backed codecs this configuration excludes) — expected, and
-#   not what a `--features legacy` user's build actually looks like (every
-#   real build of `stuffr-cli` now carries `pure` too — see the dependency-
-#   edge note in `crates/stuffr-cli/Cargo.toml`). Kept anyway as the same
+#   container. `normalize.rs`'s helpers are gated on their consumers, so it
+#   carries no dead-code warnings; it is still not what a `--features legacy`
+#   user's build actually looks like (every real build of `stuffr-cli` now
+#   carries `pure` too — see the dependency-edge note in
+#   `crates/stuffr-cli/Cargo.toml`). Kept anyway as the same
 #   zero-optional-features floor the two builds above check for
 #   `stuffr-core`/`stuffr-formats`, applied to `stuffr` under `legacy`
 #   specifically: it proves `legacy` does not silently lean on `pure` being
 #   compiled in, independent of whether a real build has `pure` on.
+# - `stuffr-formats --no-default-features` runs under `RUSTFLAGS="-D warnings"`:
+#   the shape `cargo publish --dry-run` verify-builds; 0.10.0's dry run printed
+#   six warnings nothing in the gate could see. `-D warnings` changes RUSTFLAGS,
+#   which would invalidate every dependency's cache in `target/`, so this one
+#   line gets its own target dir (`target/no-default-strict`).
 release:
 	$(CARGO) build --release --workspace
 	$(CARGO) build -p stuffr-core --no-default-features
-	$(CARGO) build -p stuffr-formats --no-default-features
+	RUSTFLAGS="-D warnings" CARGO_TARGET_DIR=target/no-default-strict $(CARGO) build -p stuffr-formats --no-default-features
 	$(CARGO) check -p stuffr --features pure --no-default-features
 	$(CARGO) check -p stuffr --features legacy --no-default-features
 

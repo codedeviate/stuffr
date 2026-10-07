@@ -54,6 +54,16 @@ redundant with the first build: it proves `stuffr-core` still compiles with no
 optional features, which is the guarantee behind "installing `stuffr` needs no C
 toolchain".
 
+The `release` step also builds `stuffr-formats` alone with no features under
+`-D warnings` (the shape `cargo publish --dry-run` verify-builds), in its own
+target dir, `target/no-default-strict`, so the changed `RUSTFLAGS` leave the
+main cache alone.
+
+`make lint-latest` is not part of the gate: it runs the gate's clippy on the
+newest installed `stable`, in `target/lint-latest`. CI's `gate (stable)` job
+runs whatever stable is current, so run `rustup update stable && make
+lint-latest` before tagging a release.
+
 ### What the gate costs, and the trap in the answer
 
 **~3 minutes, including a build from clean.** Measured 2026-10-06 on an
@@ -84,8 +94,9 @@ is not.
 
 **The fix is a one-time `cargo clean`.** `make check` runs `deps-guard`
 first, which warns (never fails) once `deps` passes `DEPS_GUARD_MAX`
-(100,000 entries, a round number well clear of both measurements, not a
-measured knee).
+(500,000 entries: about half the measured 1.1M slow point, and one
+release cycle added about 15k entries per gate, so the old 100,000 tripped on
+a healthy tree).
 
 This replaces earlier advice in this section, which blamed first-execution
 Gatekeeper evaluation (`syspolicyd`, 164.86 s for a first `--list`, 81.59 s
