@@ -235,6 +235,8 @@ cpio = "0.4"
 #
 # zip's `zstd` feature is reached only through `stuffr-formats/zip-zstd`,
 # which the `c-backed` bundle turns on — see that feature's own comment.
+# Bumping `zip` (or its `lzma-rust2`/`zstd` decoders): re-trace the `Other`
+# list on `normalize::ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF` first.
 zip = { version = "8.6", default-features = false, features = [
     "deflate-flate2",
     "bzip2",

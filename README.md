@@ -127,7 +127,10 @@ read list.
 > a usage error (exit 2) naming both. Writers without link support refuse
 > a `Hardlink` handed to them directly (exit 3). BSD `ar` members with an
 > odd `#1/N` name length now read correctly (they were misframed), and a
-> missing final pad is accepted. Converting a tar into a container without
+> missing final pad is accepted. A malformed LZMA or XZ zip entry (and,
+> on the `c-backed` tier, a malformed zstd one) is corrupt, exit 5 — every
+> release since 0.2.0 exited 1 on it (found by this tag's deep fuzz).
+> Converting a tar into a container without
 > links keeps up to 64 MiB of recent payloads in memory, on top of the
 > usual buffers.
 > **Known issue:** an archive that places an entry where it earlier created
@@ -135,7 +138,7 @@ read list.
 > 1 rather than a classified code. Every entry kind is affected, now
 > including hard links; tracked for 0.10.x. `--index` reads still stop at
 > the last selected entry and skip the codec-trailer check (as in 0.9.0).
-> **1769** tests under `--all-features`, **1705** on the
+> **1771** tests under `--all-features`, **1707** on the
 > default tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`.
 >

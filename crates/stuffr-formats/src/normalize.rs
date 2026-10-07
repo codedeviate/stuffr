@@ -681,7 +681,7 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// added here the forward rung reached exit 1 at the first `dist overflow`.
 ///
 /// Every `Other` reachable on a zip payload read, traced in source (`zip
-/// 8.6.0`, `lzma-rust2 0.16.5`) rather than sampled:
+/// 8.6.0`, `lzma-rust2 0.16.5`, `zstd 0.13.3`) rather than sampled:
 ///
 /// * `"dist overflow"` — `lzma-rust2`'s `LzDecoder::repeat`
 ///   (`src/lz/lz_decoder.rs:108`, via `error_other`, `src/lib.rs:433`): a
@@ -690,8 +690,9 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 ///   `LzDecoder`. The finding.
 /// * `"slice doesn't match array size for u32 BE bytes"` —
 ///   `src/range_dec.rs:468`, the range decoder's buffered-input path. The
-///   slice is a 4-byte `get(pos..pos + 4)` just above, so it cannot fail; mapped
-///   anyway, because it is the decoder's own state and never a source error.
+///   slice is a 4-byte `get(pos..pos + 4)` just above, so it cannot fail; the
+///   kind fold covers it anyway, because it is the decoder's own state and
+///   never a source error.
 /// * `"Reader was not set while reading LZMA data"` / `"... PPMd data"` /
 ///   `"Reader was not set"` — `zip`'s `compression.rs:393`, `:446`, `:566`,
 ///   `:581`. The `Lzma` and `Ppmd` arms `take()` the inner reader BEFORE
@@ -704,6 +705,13 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 ///   array. Unreachable; covered by the same fold for free.
 /// * `"ZipFileReader was in an invalid state"` — `read/readers.rs:159`, the
 ///   crate's own state machine. Not a source error either.
+/// * Every zstd decode error, under `zip-zstd` (the `c-backed` bundle):
+///   method 93 decodes through the `zstd` crate, whose `map_error_code`
+///   (`zstd-0.13.3/src/lib.rs:48-50`) raises `Other` for each one. Before
+///   this fold a corrupt zstd zip entry on a `c-backed` build exited 1 — the
+///   same latent bug, fixed by the same entry. zstd's own allocation failure
+///   ("Allocation error") is `Other` too and so lands at 5, not 6, exactly as
+///   the standalone `ZSTD_MALFORMED_AS_OTHER_EOF` already does.
 ///
 /// `ppmd-rust` 1.4.1 and `deflate64` 0.1.12 construct no `Other` at all
 /// (`InvalidData` and `InvalidInput` respectively, plus `UnexpectedEof`
@@ -723,8 +731,11 @@ pub(crate) const CPIO_MALFORMED_AS_INVALID_DATA_EOF: &[ErrorKind] =
 /// `zip.rs` constructs under a payload read — `SeekAdapter::seek`'s
 /// "source reported seekable but cannot seek" — is unreachable by its own
 /// doc and is not on the read path at all. Conformance property 10 (a
-/// `PermissionDenied` source stays `Error::Io`) still holds, and is what
-/// checks it.
+/// `PermissionDenied` source stays `Error::Io`) still holds, but it cannot
+/// notice a future `zip`, `lzma-rust2` or `zstd` that REWRAPS a source error
+/// as `Other` — that would be folded to corrupt silently. Re-trace this list
+/// whenever one of those versions changes (the `zip` pin in the workspace
+/// `Cargo.toml` says so).
 ///
 /// Gated `#[cfg(feature = "zip")]` for the same reason cpio's constant above
 /// is: an ungated `pub(crate) const` with no consumer warns under `-D
