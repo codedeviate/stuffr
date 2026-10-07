@@ -905,9 +905,12 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
     // its parent's mtime, and a directory whose archived mode is read-only
     // (0o555, say) could not be written into afterwards.
     let mut deferred_dirs: Vec<(PathBuf, EntryMeta)> = Vec::new();
-    // What this run wrote, for a later hard link to resolve against. Only
-    // what THIS run wrote: a file already in `dest` is never a link target.
-    let mut extracted = Extracted::default();
+    // What this run made, by path: what `place_entry` tells a self-
+    // contradicting archive (a skip) from a destination that already held
+    // something (exit 2) with, and what a later hard link resolves against.
+    // Only what THIS run wrote: a file already in `dest` is never a link
+    // target.
+    let mut made = MadeByRun::default();
 
     matched += visit_selected(ar.as_mut(), selection, |entry| {
         let meta = entry.meta().clone();
@@ -940,8 +943,9 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
         // a directory (os error 21)`, **exit 1** — "stuffr failed" for a
         // three-byte hostile name, which is the one code `check_error_is_
         // classified` exists to keep hostile input out of. A `Symlink` named
-        // `.` is worse still: `replace_conflicting` plus `create_symlink`
-        // would replace the destination directory with a link.
+        // `.` is worse still: removing what is in the way plus
+        // `create_symlink` would replace the destination directory with a
+        // link.
         //
         // Exit 7 (`UnsafePath`), argued against `error.rs`'s own rule rather
         // than picked for symmetry with the refusal above it:
@@ -987,12 +991,19 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                 // this is a no-op rather than an error, and nothing at that
                 // path may be replaced: `dest` may legitimately BE a symlink
                 // to a directory the caller named.
-                extracted.record(&meta.name, &target, ExtractedKind::Dir);
                 if target != dest {
-                    replace_conflicting(&target, o.force)?;
+                    // A skipped directory is not recorded and never reaches
+                    // `deferred_dirs`.
+                    if !place_entry(dest, &target, &meta.name, true, &mut made, o.force)?
+                        .proceed(&mut warnings)
+                    {
+                        return Ok(());
+                    }
                     std::fs::create_dir_all(&target)?;
+                    made.record(&meta.name, &target, MadeKind::Dir);
                     deferred_dirs.push((target.clone(), meta.clone()));
                 } else {
+                    made.record(&meta.name, &target, MadeKind::Dir);
                     // The destination is the caller's own directory, named by
                     // them — not something this extraction created. Re-moding
                     // it is not extraction, and reporting it as a loss would
@@ -1005,16 +1016,27 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
             EntryKind::Symlink {
                 target: link_target,
             } => {
-                extract_symlink(dest, &target, &meta, link_target, o.force, &mut warnings)?;
-                extracted.record(
-                    &meta.name,
+                let placed = extract_symlink(
+                    dest,
                     &target,
-                    ExtractedKind::Symlink(link_target.clone()),
-                );
+                    &meta,
+                    link_target,
+                    o.force,
+                    &mut made,
+                    &mut warnings,
+                )?;
+                if placed {
+                    made.record(&meta.name, &target, MadeKind::Symlink(link_target.clone()));
+                }
             }
             EntryKind::File => {
-                replace_conflicting(&target, o.force)?;
-                create_parent(&target)?;
+                // On a skip the payload is left unread, and the container
+                // steps past it on `next_entry`, as for an unselected entry.
+                if !place_entry(dest, &target, &meta.name, false, &mut made, o.force)?
+                    .proceed(&mut warnings)
+                {
+                    return Ok(());
+                }
                 let mut out = std::fs::File::create(&target)?;
                 // Charged as data streams, not from the declared size.
                 written += copy_charging(entry.reader(), &mut out, &meta.name, &mut budget)?;
@@ -1023,13 +1045,13 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                 // be redirected by a symlink appearing underneath it.
                 let missing = apply_metadata(&out, &meta);
                 warn_metadata(&mut warnings, &meta.name, missing);
-                extracted.record(&meta.name, &target, ExtractedKind::File);
+                made.record(&meta.name, &target, MadeKind::File);
             }
             // The link's own path has been through every check above. Its
             // reader yields nothing (`EntryKind::Hardlink`'s contract) and
             // is never read: the content is the target's, on disk already.
             EntryKind::Hardlink { target: link_to } => {
-                let made = extract_hard_link(
+                let linked = extract_hard_link(
                     HardLinkSite {
                         dest,
                         link_path: &target,
@@ -1037,14 +1059,14 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
                         link_to,
                         force: o.force,
                     },
-                    &extracted,
+                    &mut made,
                     &mut budget,
                     &mut warnings,
                     |from, to| std::fs::hard_link(from, to),
                 )?;
-                if let Some((kind, copied)) = made {
+                if let Some((kind, copied)) = linked {
                     written += copied;
-                    extracted.record(&meta.name, &target, kind);
+                    made.record(&meta.name, &target, kind);
                 }
             }
             // `EntryKind::Other` — a device node, fifo or socket, the honest
@@ -1125,22 +1147,26 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
 }
 
 /// Creates a symlink entry at `at` — the `Symlink` arm of [`extract`], and
-/// the shape a hard link to an extracted symlink takes.
+/// the shape a hard link to an extracted symlink takes. `false` when
+/// [`place_entry`] skipped it (the warning is pushed); the caller records
+/// only a placed link.
 fn extract_symlink(
     dest: &Path,
     at: &Path,
     meta: &EntryMeta,
     link_target: &str,
     force: bool,
+    made: &mut MadeByRun,
     warnings: &mut Vec<Fidelity>,
-) -> Result<()> {
+) -> Result<bool> {
     // The subtler escape: the link's own PATH is contained while its TARGET
     // is not, and a later entry written "through" the link lands wherever it
     // points. Refusing here aborts the whole extraction, so that later entry
     // is never reached.
     check_symlink_target(dest, at, link_target)?;
-    replace_conflicting(at, force)?;
-    create_parent(at)?;
+    if !place_entry(dest, at, &meta.name, false, made, force)?.proceed(warnings) {
+        return Ok(false);
+    }
     create_symlink(link_target, at)?;
     // A symlink's own mode and mtime cannot be set through `std`:
     // `set_permissions` and `File::set_times` both follow the link, and there
@@ -1153,46 +1179,7 @@ fn extract_symlink(
         ..Default::default()
     };
     warn_metadata(warnings, &meta.name, missing);
-    Ok(())
-}
-
-/// What [`extract`] left at a path it wrote, as far as a hard link to it
-/// cares.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ExtractedKind {
-    File,
-    /// A symlink, with its target text.
-    Symlink(String),
-    Dir,
-}
-
-/// What this run of [`extract`] wrote: each entry's exact name to the path it
-/// was written at, and each path to what is there NOW.
-///
-/// Two maps rather than one `name -> (path, kind)`, because two names can
-/// reach one path (`a` and `./a`, `d` and `d/`), and a later entry replacing
-/// what an earlier one wrote there (`--force`) must be what a link sees. A
-/// stale "file" record for a path that is now a directory would hand
-/// `hard_link` and then `copy` a directory, and fail at exit 1.
-#[derive(Default)]
-struct Extracted {
-    names: std::collections::HashMap<String, PathBuf>,
-    at: std::collections::HashMap<PathBuf, ExtractedKind>,
-}
-
-impl Extracted {
-    fn record(&mut self, name: &str, path: &Path, kind: ExtractedKind) {
-        self.names.insert(name.to_string(), path.to_path_buf());
-        self.at.insert(path.to_path_buf(), kind);
-    }
-
-    /// The path and current kind for an entry name, looked up by the EXACT
-    /// string, never a re-normalised one: GNU tar's `./b` link finds the
-    /// `./b` entry it wrote.
-    fn resolve(&self, name: &str) -> Option<(&Path, &ExtractedKind)> {
-        let path = self.names.get(name)?;
-        Some((path.as_path(), self.at.get(path)?))
-    }
+    Ok(true)
 }
 
 /// Where one hard-link entry lands: `link_path` is what [`safe_join`]
@@ -1221,16 +1208,20 @@ struct HardLinkSite<'a> {
 ///   `hard_link` or the copy, which would truncate it.
 /// - Target escaping `dest`, or reached through a symlink: `UnsafePath`
 ///   (exit 7) naming the link entry.
+/// - The link's OWN path blocked ([`place_entry`]): skipped, or `Usage` for
+///   the destination's prior state. Decided before `hard_link` and the copy,
+///   so a blocked path reaches neither — the copy writes exactly the path
+///   `place_entry` cleared for `hard_link`.
 ///
 /// `hard_link` is the injection seam the copy fallback is tested through;
 /// [`extract`] passes `std::fs::hard_link`.
 fn extract_hard_link(
     site: HardLinkSite<'_>,
-    extracted: &Extracted,
+    made: &mut MadeByRun,
     budget: &mut ArchiveBudget,
     warnings: &mut Vec<Fidelity>,
     hard_link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-) -> Result<Option<(ExtractedKind, u64)>> {
+) -> Result<Option<(MadeKind, u64)>> {
     let HardLinkSite {
         dest,
         link_path,
@@ -1252,29 +1243,37 @@ fn extract_hard_link(
     if link_to == meta.name {
         return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
     }
-    let Some((target_path, kind)) = extracted.resolve(link_to) else {
+    // Owned: `place_entry` below needs `made` mutably.
+    let Some((target_path, kind)) = made
+        .resolve(link_to)
+        .map(|(path, kind)| (path.to_path_buf(), kind.clone()))
+    else {
         return Ok(skip_link(
             warnings,
             meta,
             hard_link_reason_not_extracted(link_to),
         ));
     };
+    let target_path = target_path.as_path();
     // The same file under another spelling (`a` -> `./a`): replacing the
     // link's path would delete the target it is about to link to.
     if target_path == link_path {
         return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
     }
     match kind {
-        ExtractedKind::Dir => Ok(skip_link(
+        MadeKind::Dir => Ok(skip_link(
             warnings,
             meta,
             hard_link_reason_directory(link_to),
         )),
-        ExtractedKind::Symlink(text) => {
-            extract_symlink(dest, link_path, meta, text, force, warnings)?;
-            Ok(Some((ExtractedKind::Symlink(text.clone()), 0)))
+        MadeKind::Symlink(text) => {
+            if extract_symlink(dest, link_path, meta, &text, force, made, warnings)? {
+                Ok(Some((MadeKind::Symlink(text), 0)))
+            } else {
+                Ok(None)
+            }
         }
-        ExtractedKind::File => {
+        MadeKind::File | MadeKind::Hardlink => {
             // The target was checked when it was written, but a symlink
             // could have appeared in one of its ancestors since. Re-checked
             // here, so `hard_link` and `copy` never resolve through one. The
@@ -1297,10 +1296,14 @@ fn extract_hard_link(
                     hard_link_reason_not_extracted(link_to),
                 ));
             }
-            replace_conflicting(link_path, force)?;
-            create_parent(link_path)?;
+            // The ONE placement decision for this link: `hard_link` and the
+            // copy fallback both write exactly this path, so a blocked one
+            // reaches neither (Review Focus 4).
+            if !place_entry(dest, link_path, &meta.name, false, made, force)?.proceed(warnings) {
+                return Ok(None);
+            }
             if hard_link(target_path, link_path).is_ok() {
-                return Ok(Some((ExtractedKind::File, 0)));
+                return Ok(Some((MadeKind::Hardlink, 0)));
             }
             copy_link_target(target_path, link_path, meta, link_to, budget, warnings)
         }
@@ -1312,7 +1315,7 @@ fn skip_link(
     warnings: &mut Vec<Fidelity>,
     meta: &EntryMeta,
     reason: String,
-) -> Option<(ExtractedKind, u64)> {
+) -> Option<(MadeKind, u64)> {
     warnings.push(Fidelity::EntrySkipped {
         entry: meta.name.clone(),
         reason,
@@ -1335,6 +1338,10 @@ fn skip_link(
 /// The bytes are charged to the budget like a payload: an archive of one
 /// large file and many links must not fill the disk past the ratio a single
 /// payload is held to.
+///
+/// `link_path` has already been through [`place_entry`] in
+/// [`extract_hard_link`], for `hard_link`'s sake; a failed `hard_link`
+/// creates nothing, so that one decision covers this write too.
 fn copy_link_target(
     target_path: &Path,
     link_path: &Path,
@@ -1342,7 +1349,7 @@ fn copy_link_target(
     link_to: &str,
     budget: &mut ArchiveBudget,
     warnings: &mut Vec<Fidelity>,
-) -> Result<Option<(ExtractedKind, u64)>> {
+) -> Result<Option<(MadeKind, u64)>> {
     let unreadable = |warnings: &mut Vec<Fidelity>| {
         skip_link(warnings, meta, hard_link_reason_unreadable(link_to))
     };
@@ -1376,7 +1383,7 @@ fn copy_link_target(
     // the `File` arm gives a payload's, through the same open handle.
     let missing = apply_metadata(&out, meta);
     warn_metadata(warnings, &meta.name, missing);
-    Ok(Some((ExtractedKind::File, copied)))
+    Ok(Some((MadeKind::Hardlink, copied)))
 }
 
 /// The permission bits extraction restores.
@@ -2618,13 +2625,18 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     // one verb whose input can legitimately name the same file twice (that
     // is the whole feature), so "already there" has to mean "written by this
     // run", not "exists on disk" — a stale file from a previous attempt must
-    // still be replaced, which is what `replace_conflicting(.., true)` in
-    // `place_salvaged_file` is for and why it is NOT what closes this.
+    // still be replaced, which is what `place_entry(.., force: true)` in
+    // `open_salvage_target` is for and why it is NOT what closes this.
     let mut claimed: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+    // What this run made on disk, by path and kind — `place_entry`'s record,
+    // shared with `extract`. Separate from `claimed` on purpose: `claimed`
+    // decides which NAME a repeated file gets, this decides whether a path
+    // the run already made (a directory, a file) is in the way.
+    let mut made = MadeByRun::default();
 
     let mut entries = Vec::with_capacity(scan.entries.len());
     for entry in &scan.entries {
-        let disposition = place_salvaged_entry(path, opts, entry, &mut claimed, format)?;
+        let disposition = place_salvaged_entry(path, opts, entry, &mut claimed, &mut made, format)?;
         entries.push(SalvagedRecord {
             scan_position: entry.scan_position,
             name: entry.meta.name.clone(),
@@ -2661,6 +2673,7 @@ fn place_salvaged_entry(
     opts: &SalvageOpts,
     entry: &stuffr_core::salvage::SalvagedEntry,
     claimed: &mut std::collections::HashMap<PathBuf, usize>,
+    made: &mut MadeByRun,
     format: FormatId,
 ) -> Result<SalvageDisposition> {
     if let Some(earlier) = entry.shadows {
@@ -2703,8 +2716,19 @@ fn place_salvaged_entry(
                 // `SalvageDisposition::SkippedUnwritable`. A directory
                 // entry's name is as archive-controlled as a file's, and
                 // `mkdir` refuses an over-long component identically.
+                //
+                // `force: false`: salvage's "replace a stale file" licence
+                // is for a FILE's own path. A directory never removes what
+                // is at its path — least of all a file this run recovered.
+                match place_salvaged(dest, &target, &entry.meta.name, true, made, false) {
+                    Ok(()) => {}
+                    Err(skipped) => return Ok(skipped),
+                }
                 match std::fs::create_dir_all(&target) {
-                    Ok(()) => Ok(SalvageDisposition::Directory(target)),
+                    Ok(()) => {
+                        made.record_path(&target, MadeKind::Dir);
+                        Ok(SalvageDisposition::Directory(target))
+                    }
                     Err(e) => Ok(unwritable(e)),
                 }
             }
@@ -2718,6 +2742,7 @@ fn place_salvaged_entry(
             &opts.policy,
             entry,
             claimed,
+            made,
             format,
         ),
         _ => Ok(SalvageDisposition::SkippedUnsupportedKind),
@@ -2738,6 +2763,7 @@ fn place_salvaged_file(
     policy: &stuffr_core::salvage::SalvagePolicy,
     entry: &stuffr_core::salvage::SalvagedEntry,
     claimed: &mut std::collections::HashMap<PathBuf, usize>,
+    made: &mut MadeByRun,
     format: FormatId,
 ) -> Result<SalvageDisposition> {
     use stuffr_core::salvage::{PartialPolicy, SalvageStatus};
@@ -2882,9 +2908,9 @@ fn place_salvaged_file(
     // `SalvageDisposition::SkippedUnwritable` for the measurement (exit 1
     // on a 404-character entry name, every later entry lost) and for why
     // the fold is kind-blind.
-    let mut out = match open_salvage_target(&write_target) {
+    let mut out = match open_salvage_target(dest, &write_target, &entry.meta.name, made) {
         Ok(out) => out,
-        Err(e) => return Ok(unwritable(e)),
+        Err(skipped) => return Ok(skipped),
     };
     let completed =
         match write_salvaged_payload(format, archive_path, entry, compressed_len, &mut out) {
@@ -2975,33 +3001,69 @@ fn place_salvaged_file(
     }
 }
 
-/// Opens the destination file for one salvaged entry: replace whatever sits
-/// there from an earlier run, create the parents, create the file.
+/// Opens the destination file for one salvaged entry: [`place_entry`]
+/// decides what may sit there (and creates the parents), then the file is
+/// created and recorded.
 ///
 /// Exists so [`place_salvaged_file`] has ONE fallible step to fold rather
-/// than four `?`s to remember — and so a later edit adding a fifth
+/// than several `?`s to remember — and so a later edit adding another
 /// filesystem call puts it here, inside the fold, instead of beside it.
-/// Every call is the same one [`extract`] makes, unchanged: the difference
-/// between the two verbs is what happens when one of them fails, and that
-/// is decided by the caller.
-fn open_salvage_target(write_target: &Path) -> Result<std::fs::File> {
+/// The placement is the same one [`extract`] makes: the difference between
+/// the two verbs is what happens when it refuses, and here every refusal is
+/// the entry's own [`SalvageDisposition::SkippedUnwritable`].
+fn open_salvage_target(
+    dest: &Path,
+    write_target: &Path,
+    name: &str,
+    made: &mut MadeByRun,
+) -> std::result::Result<std::fs::File, SalvageDisposition> {
     // No `--force` concept exists for salvage (not in this feature's flag
     // list) and none is needed: recovery is meant to be re-run, and a stale
     // `.partial` (or a stale real-named file) from a previous attempt must
     // not block this one. `true` unconditionally, unlike `extract`'s own
-    // `o.force`. `replace_conflicting` is reused rather than a bare
-    // `File::create` specifically because it also removes a pre-existing
-    // SYMLINK sitting at the target — `File::create` would instead follow
-    // it, landing the recovered bytes wherever it points.
+    // `o.force`. `place_entry` is used rather than a bare `File::create`
+    // specifically because it also removes a pre-existing SYMLINK sitting
+    // at the target — `File::create` would instead follow it, landing the
+    // recovered bytes wherever it points.
     //
     // It is deliberately NOT what stops one salvage run overwriting its own
     // earlier output: "replace what was already on disk" and "two records
     // in this archive want one name" are different facts, and conflating
     // them is exactly how eight recovered records became six files at exit
     // 0. `claimed`, in the caller, is what separates them.
-    replace_conflicting(write_target, true)?;
-    create_parent(write_target)?;
-    Ok(std::fs::File::create(write_target)?)
+    place_salvaged(dest, write_target, name, false, made, true)?;
+    let out = std::fs::File::create(write_target).map_err(|e| unwritable(Error::Io(e)))?;
+    made.record_path(write_target, MadeKind::File);
+    Ok(out)
+}
+
+/// [`place_entry`] for salvage: every answer but "proceed" is this entry's
+/// own [`SalvageDisposition::SkippedUnwritable`], never the run's.
+///
+/// - A `Skip` (the archive contradicts itself on disk) carries
+///   `place_entry`'s reason, which names the conflict.
+/// - A `Usage` (the destination already held it) carries its message
+///   without the `usage error:` prefix: salvage folds it, so it is not a
+///   usage error here.
+/// - Anything else (`Error::Io`) is folded kind-blind, as every other
+///   filesystem failure on this path is.
+fn place_salvaged(
+    dest: &Path,
+    target: &Path,
+    name: &str,
+    placing_dir: bool,
+    made: &mut MadeByRun,
+    force: bool,
+) -> std::result::Result<(), SalvageDisposition> {
+    match place_entry(dest, target, name, placing_dir, made, force) {
+        Ok(Placement::Proceed) => Ok(()),
+        Ok(Placement::Skip(Fidelity::EntrySkipped { reason, .. })) => {
+            Err(SalvageDisposition::SkippedUnwritable { reason })
+        }
+        Ok(Placement::Skip(other)) => Err(unwritable(other)),
+        Err(Error::Usage(reason)) => Err(SalvageDisposition::SkippedUnwritable { reason }),
+        Err(e) => Err(unwritable(e)),
+    }
 }
 
 /// One entry could not be placed on disk: report it as that entry's own
@@ -4707,6 +4769,21 @@ fn special_entry_reason(not_what: &str) -> String {
     format!("device nodes, fifos and sockets are not {not_what}")
 }
 
+/// Why [`place_entry`] skips an entry beneath something this run made that
+/// is not a directory (`ancestor`, archive-relative). Raw; `Fidelity`'s
+/// `Display` escapes the whole reason.
+fn conflict_reason_not_a_directory(ancestor: &str, name: &str) -> String {
+    format!(
+        "`{ancestor}`, earlier in this archive, is not a directory, so `{name}` cannot be placed beneath it"
+    )
+}
+
+/// Why [`place_entry`] skips a non-directory entry whose path is a directory
+/// this run made. Raw, as above.
+fn conflict_reason_directory_in_the_way(name: &str) -> String {
+    format!("a directory `{name}` from earlier in this archive is in the way")
+}
+
 /// Why `unpack` skips a hard link: its target was not written by this run —
 /// filtered out by the selection, skipped, or never seen. The target is
 /// interpolated raw; `Fidelity`'s `Display` escapes the whole reason.
@@ -4985,7 +5062,7 @@ fn normalize_for_match(s: &str) -> &str {
 ///
 /// The entry's OWN final component is exempt: a symlink entry is supposed to
 /// become a symlink, and something already sitting at that exact path is
-/// [`replace_conflicting`]'s business, not this function's.
+/// [`place_entry`]'s business, not this function's.
 fn refuse_symlinked_ancestors(dest: &Path, target: &Path, name: &str) -> Result<()> {
     let Ok(relative) = target.strip_prefix(dest) else {
         // Unreachable: the caller has just asserted `target.starts_with(dest)`.
@@ -5012,48 +5089,215 @@ fn refuse_symlinked_ancestors(dest: &Path, target: &Path, name: &str) -> Result<
     Ok(())
 }
 
-/// Refuses — or, with `force`, removes — something already sitting at an
-/// entry's target path. Runs only AFTER containment, on a path [`safe_join`]
-/// produced.
-///
-/// Two jobs. The obvious one is applying `pack`/`unpack`'s existing "an
-/// existing output is refused unless --force" contract per entry. The second
-/// matters more: REMOVING what is in the way, rather than writing through
-/// it, is what stops a pre-existing symlink at the target path from
-/// redirecting the entry's bytes. `File::create` follows a symlink, so
-/// somebody who could plant `dest/x -> /etc/passwd` before extraction would
-/// otherwise have the payload land there.
-fn replace_conflicting(target: &Path, force: bool) -> Result<()> {
-    // `symlink_metadata`, not `metadata`: a dangling symlink still counts as
-    // something being there, and a symlink must report as a symlink rather
-    // than as whatever it points at. The same reasoning `Output::create`
-    // gives for the single-output path.
-    let Ok(md) = std::fs::symlink_metadata(target) else {
-        return Ok(());
-    };
-    if md.is_dir() {
-        // A real directory is written INTO — that is the ordinary shape of an
-        // archive carrying a directory and its contents — and is never
-        // removed, with or without --force: that would delete files the
-        // archive never mentioned.
-        return Ok(());
-    }
-    if !force {
-        return Err(Error::Usage(format!(
-            "{} already exists; pass --force to overwrite",
-            target.display()
-        )));
-    }
-    std::fs::remove_file(target)?;
-    Ok(())
+/// What this run made at a path, as far as [`place_entry`] and a later hard
+/// link care.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MadeKind {
+    /// A directory: an explicit entry, or a parent [`place_entry`] created.
+    Dir,
+    File,
+    /// A symlink, with its target text — what a hard link to it recreates.
+    Symlink(String),
+    /// A hard link this run made, by `hard_link` or by the copy fallback. A
+    /// regular file as far as a later link to it is concerned.
+    Hardlink,
 }
 
-/// Creates an entry's parent directories.
-fn create_parent(target: &Path) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)?;
+/// Every path this extraction created, by EXACT path: explicit entries and
+/// the directories [`place_entry`] created as parents. It is what tells "the
+/// archive contradicts itself" (a skip) from "the destination already held
+/// this" (a usage error). Lookups are hashed, so the parent-chain walk is
+/// O(depth) per entry and never a rescan.
+///
+/// Two maps rather than one `name -> (path, kind)`, because two names can
+/// reach one path (`a` and `./a`, `d` and `d/`), and a later entry replacing
+/// what an earlier one wrote there (`--force`) must be what a link sees. A
+/// stale "file" record for a path that is now a directory would hand
+/// `hard_link` and then `copy` a directory, and fail at exit 1. `names`
+/// holds explicit entries only: a hard link resolves by the entry name it
+/// carries, looked up by the EXACT string, never a re-normalised one.
+#[derive(Default)]
+struct MadeByRun {
+    names: HashMap<String, PathBuf>,
+    at: HashMap<PathBuf, MadeKind>,
+}
+
+impl MadeByRun {
+    /// An explicit entry `name`, written at `path`.
+    fn record(&mut self, name: &str, path: &Path, kind: MadeKind) {
+        self.names.insert(name.to_string(), path.to_path_buf());
+        self.record_path(path, kind);
     }
-    Ok(())
+
+    /// A path no entry named: a parent directory, or salvage's own output.
+    fn record_path(&mut self, path: &Path, kind: MadeKind) {
+        self.at.insert(path.to_path_buf(), kind);
+    }
+
+    /// Whether this run made what is at `path` now.
+    fn made(&self, path: &Path) -> bool {
+        self.at.contains_key(path)
+    }
+
+    /// The path and current kind for an entry name, by the exact string:
+    /// GNU tar's `./b` link finds the `./b` entry it wrote.
+    fn resolve(&self, name: &str) -> Option<(&Path, &MadeKind)> {
+        let path = self.names.get(name)?;
+        Some((path.as_path(), self.at.get(path)?))
+    }
+}
+
+/// [`place_entry`]'s answer when it does not refuse.
+#[derive(Debug)]
+enum Placement {
+    /// Nothing in the way (or a directory in the way of a directory); the
+    /// parents exist and are recorded. The caller writes the entry.
+    Proceed,
+    /// The archive contradicts itself on disk; the warning names the entry.
+    Skip(Fidelity),
+}
+
+impl Placement {
+    /// `true` to go on and write the entry; on `Skip`, the warning is pushed
+    /// and nothing may be written.
+    fn proceed(self, warnings: &mut Vec<Fidelity>) -> bool {
+        match self {
+            Placement::Proceed => true,
+            Placement::Skip(w) => {
+                warnings.push(w);
+                false
+            }
+        }
+    }
+}
+
+/// THE owner of "what may sit at `target`", for every kind `extract` writes
+/// (file, directory, symlink, hard link and its copy fallback) and for
+/// salvage's write path. Runs only AFTER containment, on a path [`safe_join`]
+/// produced, and after [`refuse_symlinked_ancestors`] (exit 7), which is
+/// unchanged and comes first. Nothing here follows a symlink: every probe is
+/// `symlink_metadata`.
+///
+/// Rules, in order (0.10.1 spec §1):
+///
+/// 1. **The parent chain**, from `dest` down. The first component that
+///    exists and is not a directory blocks the entry. Made by this run: a
+///    `Skip` naming it ([`conflict_reason_not_a_directory`]). Otherwise the
+///    destination held it before: `Usage`, exit 2. Every later entry beneath
+///    a blocked path is skipped by this same rule — the cascade.
+/// 2. **The target itself.**
+///    - Nothing there, or a directory when placing a directory: proceed. A
+///      real directory is written INTO, never removed.
+///    - A directory when placing a non-directory: made by this run, a `Skip`
+///      ([`conflict_reason_directory_in_the_way`]); otherwise `Usage`. Never
+///      removed, with or without `force` — that would delete files the
+///      archive never mentioned.
+///    - A non-directory (file, symlink, anything): the duplicate rule, as in
+///      0.10.0 — `Usage` without `force`; with it, REMOVED, so a planted
+///      `dest/x -> /etc/passwd` is replaced rather than written through
+///      (`File::create` follows a symlink).
+/// 3. **On proceed**, missing parents are created and each is recorded in
+///    `made`. The caller records the entry itself once it is written.
+///
+/// Genuine environment failures (`EACCES`, `ENOSPC`, a read-only
+/// filesystem) stay `Error::Io`, exit 1: they are the destination's, not
+/// the input's.
+fn place_entry(
+    dest: &Path,
+    target: &Path,
+    name: &str,
+    placing_dir: bool,
+    made: &mut MadeByRun,
+    force: bool,
+) -> Result<Placement> {
+    let Ok(relative) = target.strip_prefix(dest) else {
+        // Unreachable: every caller has asserted `target.starts_with(dest)`.
+        return Err(Error::UnsafePath {
+            path: name.to_string(),
+            reason: "resolved outside the destination",
+        });
+    };
+    let components: Vec<_> = relative.components().collect();
+    let parents = components.len().saturating_sub(1);
+
+    // Rule 1. Once one component is missing, nothing beneath it can exist,
+    // so the walk stops there and rule 2 has nothing to look at.
+    let mut walked = dest.to_path_buf();
+    let mut first_missing = None;
+    for (i, component) in components[..parents].iter().enumerate() {
+        walked.push(component);
+        match std::fs::symlink_metadata(&walked) {
+            Ok(md) if md.is_dir() => {}
+            Ok(_) if made.made(&walked) => {
+                let ancestor: PathBuf = components[..=i].iter().collect();
+                return Ok(Placement::Skip(Fidelity::EntrySkipped {
+                    entry: name.to_string(),
+                    reason: conflict_reason_not_a_directory(&ancestor.to_string_lossy(), name),
+                }));
+            }
+            Ok(_) => {
+                return Err(Error::Usage(format!(
+                    "`{}` exists and is not a directory, so `{name}` cannot be placed \
+                     beneath it",
+                    walked.display()
+                )));
+            }
+            Err(_) => {
+                first_missing = Some(i);
+                break;
+            }
+        }
+    }
+
+    // Rule 2.
+    if first_missing.is_none()
+        && let Ok(md) = std::fs::symlink_metadata(target)
+    {
+        if md.is_dir() {
+            if !placing_dir {
+                if made.made(target) {
+                    return Ok(Placement::Skip(Fidelity::EntrySkipped {
+                        entry: name.to_string(),
+                        reason: conflict_reason_directory_in_the_way(name),
+                    }));
+                }
+                return Err(Error::Usage(format!(
+                    "`{}` is an existing directory; stuffr never removes a directory, even \
+                     with --force",
+                    target.display()
+                )));
+            }
+        } else {
+            if !force {
+                return Err(Error::Usage(format!(
+                    "{} already exists; pass --force to overwrite",
+                    target.display()
+                )));
+            }
+            std::fs::remove_file(target)?;
+            // Gone: whatever replaces it is recorded by the caller once
+            // written, and a failed write must not leave a stale record.
+            made.at.remove(target);
+        }
+    }
+
+    // Rule 3.
+    if let Some(first) = first_missing {
+        let mut path = dest.to_path_buf();
+        path.extend(&components[..first]);
+        for component in &components[first..parents] {
+            path.push(component);
+            match std::fs::create_dir(&path) {
+                Ok(()) => made.record_path(&path, MadeKind::Dir),
+                // Only this run writes here, and the walk above found it
+                // absent; a racing local writer is the TOCTOU window
+                // `refuse_symlinked_ancestors` documents.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(Placement::Proceed)
 }
 
 /// Creates a symlink at `at` pointing to `link_target`.
@@ -6324,9 +6568,9 @@ mod tests {
     fn run_link(
         dest: &Path,
         meta: &EntryMeta,
-        extracted: &Extracted,
+        extracted: &mut MadeByRun,
         hard_link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
-    ) -> (Result<Option<(ExtractedKind, u64)>>, Vec<Fidelity>) {
+    ) -> (Result<Option<(MadeKind, u64)>>, Vec<Fidelity>) {
         let EntryKind::Hardlink { target } = &meta.kind else {
             unreachable!()
         };
@@ -6361,10 +6605,10 @@ mod tests {
     fn a_hard_link_naming_itself_is_skipped_and_its_file_survives() {
         let dest = link_scratch("self");
         std::fs::write(dest.join("a"), b"hello").unwrap();
-        let mut extracted = Extracted::default();
-        extracted.record("a", &dest.join("a"), ExtractedKind::File);
+        let mut extracted = MadeByRun::default();
+        extracted.record("a", &dest.join("a"), MadeKind::File);
 
-        let (r, w) = run_link(&dest, &link_meta("a", "a"), &extracted, never_link);
+        let (r, w) = run_link(&dest, &link_meta("a", "a"), &mut extracted, never_link);
         assert!(r.unwrap().is_none());
         assert_eq!(
             w,
@@ -6377,7 +6621,7 @@ mod tests {
 
         // The same path under another spelling is the same self-link: the
         // `--force` replace would otherwise delete the target first.
-        let (r, w) = run_link(&dest, &link_meta("./a", "a"), &extracted, never_link);
+        let (r, w) = run_link(&dest, &link_meta("./a", "a"), &mut extracted, never_link);
         assert!(r.unwrap().is_none());
         assert_eq!(w.len(), 1, "{w:?}");
         assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"hello");
@@ -6391,8 +6635,8 @@ mod tests {
     fn hard_link_failure_falls_back_to_a_copy() {
         let dest = link_scratch("copy");
         std::fs::write(dest.join("b"), b"hello").unwrap();
-        let mut extracted = Extracted::default();
-        extracted.record("b", &dest.join("b"), ExtractedKind::File);
+        let mut extracted = MadeByRun::default();
+        extracted.record("b", &dest.join("b"), MadeKind::File);
         let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
         let meta = EntryMeta {
             mode: Some(0o640),
@@ -6400,10 +6644,10 @@ mod tests {
             ..link_meta("sub/a", "b")
         };
 
-        let (r, w) = run_link(&dest, &meta, &extracted, |_, _| {
+        let (r, w) = run_link(&dest, &meta, &mut extracted, |_, _| {
             Err(std::io::Error::from(std::io::ErrorKind::CrossesDevices))
         });
-        assert_eq!(r.unwrap(), Some((ExtractedKind::File, 5)));
+        assert_eq!(r.unwrap(), Some((MadeKind::Hardlink, 5)));
         assert!(w.is_empty(), "a copy is no fidelity loss: {w:?}");
         let copy = dest.join("sub/a");
         assert_eq!(std::fs::read(&copy).unwrap(), b"hello");
@@ -6438,10 +6682,10 @@ mod tests {
             // Root reads through any mode; there is nothing to test.
             return;
         }
-        let mut extracted = Extracted::default();
-        extracted.record("b", &target, ExtractedKind::File);
+        let mut extracted = MadeByRun::default();
+        extracted.record("b", &target, MadeKind::File);
 
-        let (r, w) = run_link(&dest, &link_meta("a", "b"), &extracted, |_, _| {
+        let (r, w) = run_link(&dest, &link_meta("a", "b"), &mut extracted, |_, _| {
             Err(std::io::Error::from_raw_os_error(31)) // EMLINK
         });
         assert_eq!(r.unwrap(), None);
@@ -6464,8 +6708,8 @@ mod tests {
     fn the_copy_fallback_is_charged_to_the_budget() {
         let dest = link_scratch("budget");
         std::fs::write(dest.join("b"), vec![0u8; 64]).unwrap();
-        let mut extracted = Extracted::default();
-        extracted.record("b", &dest.join("b"), ExtractedKind::File);
+        let mut extracted = MadeByRun::default();
+        extracted.record("b", &dest.join("b"), MadeKind::File);
         let link_path = dest.join("a");
         let meta = link_meta("a", "b");
         // The ceiling is floored at `RATIO_FLOOR`; spend all but 10 bytes of
@@ -6481,7 +6725,7 @@ mod tests {
                 link_to: "b",
                 force: false,
             },
-            &extracted,
+            &mut extracted,
             &mut budget,
             &mut Vec::new(),
             |_, _| Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
@@ -6503,10 +6747,10 @@ mod tests {
         let elsewhere = link_scratch("ancestor-elsewhere");
         std::fs::write(elsewhere.join("f"), b"secret").unwrap();
         std::os::unix::fs::symlink(&elsewhere, dest.join("d")).unwrap();
-        let mut extracted = Extracted::default();
-        extracted.record("d/f", &dest.join("d/f"), ExtractedKind::File);
+        let mut extracted = MadeByRun::default();
+        extracted.record("d/f", &dest.join("d/f"), MadeKind::File);
 
-        let (r, _) = run_link(&dest, &link_meta("g", "d/f"), &extracted, never_link);
+        let (r, _) = run_link(&dest, &link_meta("g", "d/f"), &mut extracted, never_link);
         let err = r.unwrap_err();
         match &err {
             Error::UnsafePath { path, reason } => {
@@ -6522,6 +6766,92 @@ mod tests {
         assert!(!dest.join("g").exists());
         let _ = std::fs::remove_dir_all(&dest);
         let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// Review Focus 4 (0.10.1): file `a`, `l -> a`, file `d`, then link
+    /// `d/l2 -> a`. The target is fine; the link's own path is beneath a file
+    /// this run made. `place_entry` skips it BEFORE the link primitive, so
+    /// neither `hard_link` (`never_link` panics) nor the copy fallback (only
+    /// reached after `hard_link` fails) runs.
+    #[test]
+    fn a_blocked_link_path_never_reaches_the_copy_fallback() {
+        let dest = link_scratch("blocked");
+        std::fs::write(dest.join("a"), b"alpha").unwrap();
+        std::fs::write(dest.join("d"), b"delta").unwrap();
+        let mut made = MadeByRun::default();
+        made.record("a", &dest.join("a"), MadeKind::File);
+        made.record("l", &dest.join("l"), MadeKind::Hardlink);
+        made.record("d", &dest.join("d"), MadeKind::File);
+
+        let (r, w) = run_link(&dest, &link_meta("d/l2", "a"), &mut made, never_link);
+        assert_eq!(r.unwrap(), None);
+        assert_eq!(
+            w,
+            [Fidelity::EntrySkipped {
+                entry: "d/l2".into(),
+                reason: conflict_reason_not_a_directory("d", "d/l2"),
+            }]
+        );
+        assert_eq!(std::fs::read(dest.join("d")).unwrap(), b"delta");
+        assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// The two conflict reasons, pinned. Raw; `Fidelity`'s `Display` escapes
+    /// the whole reason once.
+    #[test]
+    fn conflict_reasons_are_pinned_and_escaped_once_by_display() {
+        assert_eq!(
+            conflict_reason_not_a_directory("a", "a/b"),
+            "`a`, earlier in this archive, is not a directory, so `a/b` cannot be placed \
+             beneath it"
+        );
+        assert_eq!(
+            conflict_reason_directory_in_the_way("x"),
+            "a directory `x` from earlier in this archive is in the way"
+        );
+        let w = Fidelity::EntrySkipped {
+            entry: "x\x1b".into(),
+            reason: conflict_reason_directory_in_the_way("x\x1b"),
+        };
+        assert_eq!(
+            w.to_string(),
+            "skipped entry `x\\x1b`: a directory `x\\x1b` from earlier in this archive is in \
+             the way"
+        );
+    }
+
+    /// Rule 3: parents `place_entry` creates are recorded as this run's, so
+    /// a later file onto one of them is a skip, not a usage error; and a
+    /// directory the destination already had is never recorded.
+    #[test]
+    fn place_entry_records_the_parents_it_creates_and_only_those() {
+        let dest = link_scratch("parents");
+        std::fs::create_dir(dest.join("old")).unwrap();
+        let mut made = MadeByRun::default();
+        let target = dest.join("old/new/deeper/f");
+        assert!(matches!(
+            place_entry(&dest, &target, "old/new/deeper/f", false, &mut made, false).unwrap(),
+            Placement::Proceed
+        ));
+        assert!(!made.made(&dest.join("old")), "the destination's own");
+        assert!(made.made(&dest.join("old/new")));
+        assert!(made.made(&dest.join("old/new/deeper")));
+        assert!(dest.join("old/new/deeper").is_dir());
+
+        let onto_parent = place_entry(
+            &dest,
+            &dest.join("old/new"),
+            "old/new",
+            false,
+            &mut made,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(onto_parent, Placement::Skip(_)), "{onto_parent:?}");
+        let onto_old = place_entry(&dest, &dest.join("old"), "old", false, &mut made, true);
+        assert_eq!(onto_old.unwrap_err().exit_code(), 2);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     /// The walk-specific rule `create_archive` relies on: an item the walk
@@ -8492,6 +8822,7 @@ mod salvage_strict_tests {
             opts,
             entry,
             &mut std::collections::HashMap::new(),
+            &mut MadeByRun::default(),
             FormatId::new("cpio"),
         )
         .expect("a placement decision, never a run-level error")

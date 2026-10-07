@@ -230,3 +230,95 @@ fn a_header_the_scan_cannot_gate_is_exit_3_not_nothing_recoverable() {
     assert_eq!(err.exit_code(), 3, "{err}");
     assert!(err.to_string().contains("stuffr list"), "{err}");
 }
+
+/// Review Focus 5 (0.10.1): salvage's write path shares `extract`'s ONE
+/// placement owner, `place_entry`. An archive that contradicts itself on
+/// disk — directory `x` then file `x`, file `a` then `a/b` — gives each
+/// later entry salvage's own `SkippedUnwritable` naming the conflict, the
+/// rest is written, and the run never ends at exit 1. `SkippedUnwritable`
+/// because it is the disposition for "this entry could not be placed on
+/// disk" and already folds every other placement failure; a skip here is
+/// the same fact with a better reason.
+#[test]
+fn a_self_contradicting_tar_salvages_with_named_unwritable_skips() {
+    use stuffr_core::{EntryKind, EntryMeta};
+    let scratch = Scratch::new("conflict");
+    let archive = scratch.0.join("c.tar");
+    {
+        let container = stuffr::registry()
+            .require_container(FormatId::new("tar"))
+            .unwrap();
+        let file = std::fs::File::create(&archive).unwrap();
+        let mut ar = container
+            .create(stuffr::PlainSink::new(Box::new(file)), &Default::default())
+            .unwrap();
+        let entries: [(&str, EntryKind, &[u8]); 5] = [
+            ("x", EntryKind::Dir, b""),
+            ("x", EntryKind::File, b"file over dir"),
+            ("a", EntryKind::File, b"alpha"),
+            ("a/b", EntryKind::File, b"beneath a file"),
+            ("ok.txt", EntryKind::File, b"fine"),
+        ];
+        for (name, kind, data) in entries {
+            let mut d = data;
+            let mode = if kind == EntryKind::Dir { 0o755 } else { 0o644 };
+            ar.add(
+                &EntryMeta {
+                    name: name.into(),
+                    size: Some(data.len() as u64),
+                    kind,
+                    mode: Some(mode),
+                    ..Default::default()
+                },
+                &mut d,
+            )
+            .unwrap();
+        }
+        ar.finish().unwrap().finish().unwrap();
+    }
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar")))
+        .expect("never a run-level error");
+
+    let by_name: Vec<(&str, &SalvageDisposition)> = outcome
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), &e.disposition))
+        .collect();
+    assert_eq!(by_name.len(), 5, "{by_name:?}");
+    assert!(
+        matches!(by_name[0], ("x", SalvageDisposition::Directory(_))),
+        "{by_name:?}"
+    );
+    assert_eq!(
+        by_name[1],
+        (
+            "x",
+            &SalvageDisposition::SkippedUnwritable {
+                reason: "a directory `x` from earlier in this archive is in the way".into()
+            }
+        )
+    );
+    assert!(
+        matches!(by_name[2], ("a", SalvageDisposition::Written(_))),
+        "{by_name:?}"
+    );
+    assert_eq!(
+        by_name[3],
+        (
+            "a/b",
+            &SalvageDisposition::SkippedUnwritable {
+                reason: "`a`, earlier in this archive, is not a directory, so `a/b` cannot \
+                         be placed beneath it"
+                    .into()
+            }
+        )
+    );
+    assert!(
+        matches!(by_name[4], ("ok.txt", SalvageDisposition::Written(_))),
+        "{by_name:?}"
+    );
+    assert!(dest.join("x").is_dir());
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(dest.join("ok.txt")).unwrap(), b"fine");
+}

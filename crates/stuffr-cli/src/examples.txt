@@ -739,7 +739,18 @@ EXTRACTING AN ARCHIVE'S ENTRIES
       way rather than writing through it: a symlink already sitting at an
       entry's path would otherwise redirect that entry's bytes wherever it
       points. An existing directory is never removed either way; entries
-      are written into it.
+      are written into it, and a FILE entry naming one is refused (exit 2),
+      --force or not. So is an entry beneath a file the destination
+      already held.
+
+      An archive can also contradict ITSELF on disk: a directory `x` and
+      later a file `x`, or a file `a` and later `a/b`. The later entry is
+      SKIPPED and named ("a directory `x` from earlier in this archive is
+      in the way", "`a`, earlier in this archive, is not a directory"),
+      every entry beneath a skipped path is skipped the same way, and the
+      rest is extracted: exit 0, or 4 under --strict-fidelity. --force
+      changes nothing here. A file named twice is not a contradiction; the
+      rule above applies, and with --force the later one wins.
 
   Path containment is not optional and cannot be switched off. An entry
   naming an absolute path, traversing above the destination with `..`, or a

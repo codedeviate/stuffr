@@ -14695,3 +14695,54 @@ fn convert_gnu_cpio_with_hard_links_to_zip_copies_them_strictly() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 0.10.1: an archive that contradicts itself on disk — directory `x` then
+/// file `x`, file `a` then `a/b` — used to exit 1 ("Is a directory" / "Not a
+/// directory"). Each later entry is now skipped and named, the rest is
+/// extracted, and `--strict-fidelity` turns the skips into exit 4.
+#[test]
+fn unpack_skips_entries_an_archive_contradicts() {
+    let dir = tmp_dir();
+    let tar = dir.join("c.tar");
+    {
+        let mut builder = Builder::new(std::fs::File::create(&tar).unwrap());
+        let mut d = Header::new_gnu();
+        d.set_entry_type(tar::EntryType::Directory);
+        d.set_size(0);
+        d.set_mode(0o755);
+        builder.append_data(&mut d, "x", std::io::empty()).unwrap();
+        append_tar_entry(&mut builder, "x", b"file over dir");
+        append_tar_entry(&mut builder, "a", b"alpha");
+        append_tar_entry(&mut builder, "a/b", b"beneath a file");
+        append_tar_entry(&mut builder, "ok.txt", b"fine");
+        builder.finish().unwrap();
+    }
+    let expect = [
+        "skipped entry `x`: a directory `x` from earlier in this archive is in the way",
+        "skipped entry `a/b`: `a`, earlier in this archive, is not a directory, so `a/b` \
+         cannot be placed beneath it",
+    ];
+
+    for (strict, code) in [(false, 0), (true, 4)] {
+        let dest = dir.join(format!("out-{strict}"));
+        let mut args = vec![
+            "unpack",
+            tar.to_str().unwrap(),
+            "-C",
+            dest.to_str().unwrap(),
+        ];
+        if strict {
+            args.push("--strict-fidelity");
+        }
+        let out = run_output(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "strict={strict}: {stderr}");
+        for line in expect {
+            assert!(stderr.contains(line), "strict={strict}: {stderr}");
+        }
+        assert_eq!(std::fs::read(dest.join("ok.txt")).unwrap(), b"fine");
+        assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
+        assert!(std::fs::symlink_metadata(dest.join("x")).unwrap().is_dir());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

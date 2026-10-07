@@ -816,3 +816,294 @@ fn an_escaping_hard_link_target_is_refused_as_unsafe() {
         );
     }
 }
+
+// ---- Path conflicts (0.10.1 Task 2) --------------------------------------
+//
+// An archive that contradicts ITSELF on disk (a file onto a directory it
+// made, an entry beneath a file it made) is skipped with a named warning and
+// the rest is extracted. A conflict with what the DESTINATION already held
+// is a usage error, exit 2. Neither is ever exit 1.
+
+fn extract_with(archive: &Path, dest: &Path, force: bool) -> stuffr::Result<stuffr::ops::Outcome> {
+    entries::extract(
+        Input::Path(archive.to_path_buf()),
+        dest,
+        &Selection::All,
+        &ExtractOpts {
+            force,
+            ..Default::default()
+        },
+    )
+}
+
+fn reason_not_a_directory(ancestor: &str, name: &str) -> String {
+    format!(
+        "`{ancestor}`, earlier in this archive, is not a directory, so `{name}` cannot be \
+         placed beneath it"
+    )
+}
+
+fn reason_directory_in_the_way(name: &str) -> String {
+    format!("a directory `{name}` from earlier in this archive is in the way")
+}
+
+#[test]
+fn a_file_onto_an_archive_directory_is_skipped_and_named() {
+    let root = tmp_dir();
+    let archive = write_tar(&root.join("c.tar"), &[dir("x"), file("x", b"hello")]);
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("a self-contradiction is a skip");
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("x", &reason_directory_in_the_way("x"))]
+    );
+    assert!(std::fs::symlink_metadata(dest.join("x")).unwrap().is_dir());
+}
+
+#[test]
+fn entries_beneath_an_archive_file_are_skipped_in_a_cascade() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[
+            file("a", b"alpha"),
+            file("a/b", b"beta"),
+            file("a/b/c", b"gamma"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("a cascade is skips");
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [
+            skipped("a/b", &reason_not_a_directory("a", "a/b")),
+            skipped("a/b/c", &reason_not_a_directory("a", "a/b/c")),
+        ]
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
+}
+
+#[test]
+fn a_symlink_and_a_hard_link_beneath_an_archive_file_are_skipped() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[
+            file("a", b"alpha"),
+            symlink("a/s", "x"),
+            hardlink("a/l", "a"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("both are skips");
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [
+            skipped("a/s", &reason_not_a_directory("a", "a/s")),
+            skipped("a/l", &reason_not_a_directory("a", "a/l")),
+        ]
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
+}
+
+/// The 0.10.0 regression shape: the link's own path is a directory the
+/// archive made. It used to reach `hard_link` and exit 1.
+#[test]
+fn a_hard_link_onto_an_archive_directory_is_skipped() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[dir("x"), file("f", b"hello"), hardlink("x", "f")],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("never exit 1");
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("x", &reason_directory_in_the_way("x"))]
+    );
+    assert!(std::fs::symlink_metadata(dest.join("x")).unwrap().is_dir());
+    assert_eq!(std::fs::read(dest.join("f")).unwrap(), b"hello");
+}
+
+/// Review Focus 4, end to end: file `a`, `l -> a`, file `d`, link `d/l2 -> a`.
+/// `d/l2` is skipped with the not-a-directory reason; `l` is a real link.
+/// (The unit test `a_blocked_link_path_never_reaches_the_copy_fallback` in
+/// `entries.rs` proves the link primitive and the copy are never reached.)
+#[test]
+fn a_blocked_link_path_is_skipped_while_its_target_is_fine() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[
+            file("a", b"alpha"),
+            hardlink("l", "a"),
+            file("d", b"delta"),
+            hardlink("d/l2", "a"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("a skip");
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("d/l2", &reason_not_a_directory("d", "d/l2"))]
+    );
+    assert_eq!(std::fs::read(dest.join("l")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(dest.join("d")).unwrap(), b"delta");
+}
+
+/// Review Focus 3: `--force` never removes a directory the archive made.
+#[test]
+fn force_never_removes_an_archive_directory() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[dir("x"), file("x/keep", b"k"), file("x", b"hello")],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).expect("still a skip under --force");
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("x", &reason_directory_in_the_way("x"))]
+    );
+    assert!(std::fs::symlink_metadata(dest.join("x")).unwrap().is_dir());
+    assert_eq!(std::fs::read(dest.join("x/keep")).unwrap(), b"k");
+}
+
+/// Review Focus 3's other half: a directory the destination already had is a
+/// usage error, with and without `--force`, and it survives.
+#[test]
+fn a_destination_directory_in_the_way_is_a_usage_error() {
+    for force in [false, true] {
+        let root = tmp_dir();
+        let archive = write_tar(&root.join("c.tar"), &[file("x", b"hello")]);
+        let dest = root.join("out");
+        std::fs::create_dir_all(dest.join("x")).unwrap();
+        std::fs::write(dest.join("x/mine"), b"m").unwrap();
+
+        let err = extract_with(&archive, &dest, force).expect_err("a usage error");
+        match &err {
+            Error::Usage(msg) => assert_eq!(
+                *msg,
+                format!(
+                    "`{}` is an existing directory; stuffr never removes a directory, even \
+                     with --force",
+                    dest.join("x").display()
+                ),
+                "force={force}"
+            ),
+            other => panic!("force={force}: expected Usage, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 2, "force={force}");
+        assert_eq!(std::fs::read(dest.join("x/mine")).unwrap(), b"m");
+    }
+}
+
+#[test]
+fn a_destination_file_above_an_entry_is_a_usage_error() {
+    for force in [false, true] {
+        let root = tmp_dir();
+        let archive = write_tar(&root.join("c.tar"), &[file("a/b", b"beta")]);
+        let dest = root.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("a"), b"mine").unwrap();
+
+        let err = extract_with(&archive, &dest, force).expect_err("a usage error");
+        match &err {
+            Error::Usage(msg) => assert_eq!(
+                *msg,
+                format!(
+                    "`{}` exists and is not a directory, so `a/b` cannot be placed beneath it",
+                    dest.join("a").display()
+                ),
+                "force={force}"
+            ),
+            other => panic!("force={force}: expected Usage, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 2, "force={force}");
+        assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"mine");
+    }
+}
+
+/// 0.10.0's documented duplicate-name rule, pinned unchanged: a second file
+/// under one name is a usage error without `--force`, and wins with it.
+#[test]
+fn duplicate_files_keep_the_force_rule() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[file("x", b"first"), file("x", b"second")],
+    );
+
+    let err = extract_with(&archive, &root.join("out1"), false).expect_err("refused");
+    assert!(matches!(err, Error::Usage(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("already exists; pass --force"),
+        "{err}"
+    );
+
+    let dest = root.join("out2");
+    let outcome = extract_with(&archive, &dest, true).expect("the later one wins");
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(std::fs::read(dest.join("x")).unwrap(), b"second");
+}
+
+/// Review Focus 2: once `a` is a file, every entry beneath it is skipped by
+/// the same rule, and the walk is O(depth) per entry, never a rescan of
+/// `MadeByRun`.
+#[test]
+fn a_deep_cascade_stays_linear() {
+    let root = tmp_dir();
+    let names: Vec<String> = (0..1000).map(|i| format!("a/n{i}")).collect();
+    let mut fixtures = vec![file("a", b"alpha")];
+    fixtures.extend(names.iter().map(|n| file(n, b"x")));
+    let archive = write_tar(&root.join("c.tar"), &fixtures);
+    let dest = root.join("out");
+
+    let started = std::time::Instant::now();
+    let outcome = extract_with(&archive, &dest, false).expect("every one a skip");
+    let took = started.elapsed();
+
+    assert_eq!(outcome.fidelity.warnings.len(), 1000);
+    for (w, n) in outcome.fidelity.warnings.iter().zip(&names) {
+        assert_eq!(*w, skipped(n, &reason_not_a_directory("a", n)));
+    }
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
+    // Measured at ~23 ms in a debug build (0.10.1): the bound has ~85x
+    // headroom, so it catches a quadratic rescan without flaking on a
+    // loaded runner.
+    assert!(
+        took < std::time::Duration::from_secs(2),
+        "1000 skips took {took:?}"
+    );
+}
+
+/// Review Focus 1: directory `A` then file `a` on a case-insensitive volume.
+/// `MadeByRun` is keyed by exact path and misses; the filesystem collides.
+/// The rule falls through to "the destination's prior state": a usage
+/// error, exit 2 — classified, never exit 1.
+#[cfg(target_os = "macos")]
+#[test]
+fn case_insensitive_collision_is_classified() {
+    let root = tmp_dir();
+    std::fs::write(root.join("probe"), b"").unwrap();
+    if !root.join("PROBE").exists() {
+        return; // a case-sensitive volume: nothing collides
+    }
+    let archive = write_tar(&root.join("c.tar"), &[dir("A"), file("a", b"hello")]);
+    let dest = root.join("out");
+    let err = extract_with(&archive, &dest, false).expect_err("a classified refusal");
+    assert!(matches!(err, Error::Usage(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert!(std::fs::symlink_metadata(dest.join("A")).unwrap().is_dir());
+}
