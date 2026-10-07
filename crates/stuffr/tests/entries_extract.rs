@@ -1213,3 +1213,75 @@ fn a_repeated_link_entry_under_force_is_not_a_self_link() {
     );
     assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("b")));
 }
+
+/// Fix round 2, M2: the parent `n*` is MISSING, so `place_entry`'s probes
+/// never reach the over-long final component; it is the arm's own create
+/// (`File::create`, `create_symlink`, `create_dir_all`, and the hard-link
+/// copy's create after `hard_link` fails) that meets the refusal, through
+/// `skip_if_name_too_long`.
+#[test]
+fn an_over_long_final_name_under_a_new_parent_is_skipped_by_every_arm() {
+    let root = tmp_dir();
+    let long = "L".repeat(300);
+    let f = format!("n1/{long}");
+    let s = format!("n2/{long}");
+    let d = format!("n3/{long}");
+    let h = format!("n4/{long}");
+    let archive = write_tar(
+        &root.join("arms.tar"),
+        &[
+            file("a.txt", b"alpha"),
+            file(&f, b"file"),
+            symlink(&s, "x"),
+            dir(&d),
+            hardlink(&h, "a.txt"),
+            file("z.txt", b"zulu"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("skips, never exit 1");
+
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [
+            skipped(&f, PATH_TOO_LONG),
+            skipped(&s, PATH_TOO_LONG),
+            skipped(&d, PATH_TOO_LONG),
+            skipped(&h, PATH_TOO_LONG),
+        ]
+    );
+    assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
+    assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
+}
+
+/// Fix round 2, M3: the self-link check is O(1) per link (the run's own
+/// record), not a scan of the link's directory. 2,000 repeated `a -> b`
+/// entries under `--force`, beside 2,000 other files. Measured in debug on
+/// APFS: ~1.07 s (~0.27 s is the 2,000 files, then ~0.4 ms per link, which
+/// is the unlink/link syscalls); the per-link directory scan it replaced
+/// took ~2.69 s. The bound is generous on purpose: it catches a
+/// catastrophic regression without flaking on a loaded runner.
+#[cfg(unix)]
+#[test]
+fn repeated_links_in_a_large_directory_stay_linear() {
+    let root = tmp_dir();
+    let names: Vec<String> = (0..2000).map(|i| format!("f{i}")).collect();
+    let mut fixtures: Vec<Fixture<'_>> = names.iter().map(|n| file(n, b"x")).collect();
+    fixtures.push(file("b", b"hello"));
+    fixtures.extend((0..2000).map(|_| hardlink("a", "b")));
+    let archive = write_tar(&root.join("many.tar"), &fixtures);
+    let dest = root.join("out");
+
+    let started = std::time::Instant::now();
+    let outcome = extract_with(&archive, &dest, true).unwrap();
+    let took = started.elapsed();
+    eprintln!("repeated_links_in_a_large_directory_stay_linear: {took:?}");
+
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("b")));
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+}

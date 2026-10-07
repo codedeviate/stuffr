@@ -384,3 +384,29 @@ fn a_file_at_a_directory_records_path_names_no_force() {
     assert_eq!(std::fs::read(dest.join("x")).unwrap(), b"stale");
     assert_eq!(std::fs::read(dest.join("ok.txt")).unwrap(), b"fine");
 }
+
+/// Fix round 2, M1: a directory record whose final component is too long,
+/// under a parent that does not exist yet, reaches the `Dir` arm's own
+/// `create_dir_all`; it is skipped with the pinned reason, not a generic
+/// i/o error.
+#[test]
+fn an_over_long_directory_record_is_skipped_with_the_pinned_reason() {
+    let scratch = Scratch::new("long-dir");
+    let long = format!("n/{}", "L".repeat(300));
+    let archive = conflict_tar(
+        &scratch.0.join("c.tar"),
+        &[
+            (long.as_str(), EntryKind::Dir, b""),
+            ("ok.txt", EntryKind::File, b"fine"),
+        ],
+    );
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar"))).unwrap();
+    assert_eq!(
+        outcome.entries[0].disposition,
+        SalvageDisposition::SkippedUnwritable {
+            reason: "its path is too long for this filesystem".into()
+        }
+    );
+    assert_eq!(std::fs::read(dest.join("ok.txt")).unwrap(), b"fine");
+}

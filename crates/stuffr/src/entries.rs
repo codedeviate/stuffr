@@ -1280,7 +1280,7 @@ fn extract_hard_link(
     // misses, and `--force` would remove the target itself before linking
     // to it. Asked of the filesystem, never followed through a symlink, and
     // decided before anything is removed.
-    if is_same_entry(target_path, link_path) {
+    if is_same_entry(target_path, link_path, made) {
         return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
     }
     match kind {
@@ -1339,37 +1339,31 @@ fn extract_hard_link(
 ///
 /// Same `(dev, ino)` from `symlink_metadata` on both is necessary but not
 /// enough: a genuine second hard link (a duplicate link entry, replaced
-/// under `--force`) shares the inode too. It is the same ENTRY when the inode
-/// has one name only, or when `link`'s exact name is not among its parent's
-/// entries. `false` when either is absent, and off unix, where there is no
-/// inode to ask and the exact-path check is all there is.
-fn is_same_entry(target: &Path, link: &Path) -> bool {
+/// under `--force`) shares the inode too. The run's own record tells them
+/// apart in O(1): an EXACT `link` path this run made is a distinct entry it
+/// created; an unrecorded one sharing the target's inode can only be the
+/// target under another spelling (the target is this run's, so nothing the
+/// destination held before shares its inode). `false` when either is
+/// absent, and off unix, where there is no inode to ask and the exact-path
+/// check is all there is.
+fn is_same_entry(target: &Path, link: &Path, made: &MadeByRun) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let (Ok(t), Ok(l)) = (
+        if made.made(link) {
+            return false;
+        }
+        match (
             std::fs::symlink_metadata(target),
             std::fs::symlink_metadata(link),
-        ) else {
-            return false;
-        };
-        if (t.dev(), t.ino()) != (l.dev(), l.ino()) {
-            return false;
-        }
-        if t.nlink() <= 1 {
-            return true;
-        }
-        let (Some(parent), Some(own)) = (link.parent(), link.file_name()) else {
-            return false;
-        };
-        match std::fs::read_dir(parent) {
-            Ok(entries) => !entries.flatten().any(|e| e.file_name() == own),
-            Err(_) => false,
+        ) {
+            (Ok(t), Ok(l)) => (t.dev(), t.ino()) == (l.dev(), l.ino()),
+            _ => false,
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (target, link);
+        let _ = (target, link, made);
         false
     }
 }
@@ -2796,11 +2790,12 @@ fn place_salvaged_entry(
                     Ok(()) => {}
                     Err(skipped) => return Ok(skipped),
                 }
-                match std::fs::create_dir_all(&target) {
-                    Ok(()) => {
+                match skip_if_name_too_long(std::fs::create_dir_all(&target), &entry.meta.name) {
+                    Ok(Ok(())) => {
                         made.record_path(&target, MadeKind::Dir);
                         Ok(SalvageDisposition::Directory(target))
                     }
+                    Ok(Err(w)) => Ok(unwritable_skip(w)),
                     Err(e) => Ok(unwritable(e)),
                 }
             }
@@ -7639,8 +7634,8 @@ mod salvage_tests {
                 outcome.entries[1].disposition
             );
         };
-        assert!(
-            !reason.is_empty(),
+        assert_eq!(
+            reason, PATH_TOO_LONG_REASON,
             "the skip must name why, or it is the silent-loss shape salvage exists to avoid"
         );
         assert_eq!(
