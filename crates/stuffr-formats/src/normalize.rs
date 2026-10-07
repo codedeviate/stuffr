@@ -28,12 +28,54 @@
 //! sense: one translates a KIND already carried by a real error, the other
 //! preserves a real error a backend would otherwise throw away.
 //!
-//! Both types are ungated — unlike the codec modules they serve, they carry
-//! no format dependency, so they compile in every feature combination,
-//! including `features = ["zlib"]` alone with no `gzip` module in the tree at
-//! all.
+//! Both types carry no format dependency, so they compile in every feature
+//! combination that uses them — but each item is gated on exactly its
+//! consumers (see the `Gated` line on each), so a standalone build with any
+//! one feature, or none, has no dead code under `-D warnings`.
 
-use std::io::{ErrorKind, Read, Write};
+#[cfg(feature = "brotli")]
+use std::io::Write;
+// `ErrorKind` serves every consumer of the items below, `cpio` included (its
+// constant needs `ErrorKind` alone); `Read` only `NormalizeDecodeErrors`.
+#[cfg(any(
+    feature = "gzip",
+    feature = "zlib",
+    feature = "deflate",
+    feature = "bzip2",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "zstd-c",
+    feature = "zstd-pure",
+    feature = "xz-c",
+    feature = "xz-pure",
+    feature = "lzma-c",
+    feature = "lzma-pure",
+    feature = "lzip",
+    feature = "tar",
+    feature = "ar",
+    feature = "zip",
+    feature = "cpio"
+))]
+use std::io::ErrorKind;
+#[cfg(any(
+    feature = "gzip",
+    feature = "zlib",
+    feature = "deflate",
+    feature = "bzip2",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "zstd-c",
+    feature = "zstd-pure",
+    feature = "xz-c",
+    feature = "xz-pure",
+    feature = "lzma-c",
+    feature = "lzma-pure",
+    feature = "lzip",
+    feature = "tar",
+    feature = "ar",
+    feature = "zip"
+))]
+use std::io::Read;
 
 /// The `InvalidInput` + `UnexpectedEof` pair, measured independently across
 /// two unrelated backends for malformed input.
@@ -52,6 +94,15 @@ use std::io::{ErrorKind, Read, Write};
 /// already shared by two: a future codec whose measurement comes back
 /// different still gets its own constant instead of being tempted to bend
 /// this one to fit.
+///
+/// Gated `#[cfg(any(feature = "gzip", feature = "zlib", feature = "deflate", feature = "bzip2"))]`: `gzip.rs`, `zlib.rs`, `deflate.rs` and `bzip2.rs` are the only consumer; ungated, a build without
+/// them warns under `-D warnings`.
+#[cfg(any(
+    feature = "gzip",
+    feature = "zlib",
+    feature = "deflate",
+    feature = "bzip2"
+))]
 pub(crate) const MALFORMED_AS_INVALID_INPUT_EOF: &[ErrorKind] =
     &[ErrorKind::InvalidInput, ErrorKind::UnexpectedEof];
 
@@ -89,6 +140,10 @@ pub(crate) const MALFORMED_AS_INVALID_INPUT_EOF: &[ErrorKind] =
 /// bytes as malformed, never a genuine I/O failure underneath it — see the
 /// negative test proving a real `PermissionDenied` still classifies as
 /// `Error::Io` (exit 1), not `Error::Corrupt` (exit 5).
+///
+/// Gated `#[cfg(feature = "snappy")]`: `snappy.rs` is the only consumer; ungated, a build without
+/// them warns under `-D warnings`.
+#[cfg(feature = "snappy")]
 pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
@@ -142,6 +197,10 @@ pub(crate) const SNAPPY_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
 /// to either `Other` or `InvalidData` directly, never `InvalidInput`), so
 /// including it would be a no-op at best and, per this file's own
 /// discipline, an unevidenced claim at worst.
+///
+/// Gated `#[cfg(feature = "lz4")]`: `lz4.rs` is the only consumer; ungated, a build without
+/// them warns under `-D warnings`.
+#[cfg(feature = "lz4")]
 pub(crate) const LZ4_MALFORMED_AS_OTHER_EOF: &[ErrorKind] =
     &[ErrorKind::Other, ErrorKind::UnexpectedEof];
 
@@ -747,17 +806,76 @@ pub(crate) const ZIP_MALFORMED_AS_INVALID_INPUT_OTHER_EOF: &[ErrorKind] = &[
     ErrorKind::UnexpectedEof,
 ];
 
+/// Gated `#[cfg(any(…))]` on every codec and container whose module wraps a
+/// reader in it (`gzip`, `zlib`, `deflate`, `bzip2`, `lz4`, `snappy`, `zstd-c`,
+/// `zstd-pure`, `xz-c`, `xz-pure`, `lzma-c`, `lzma-pure`, `lzip`, `tar`, `ar`,
+/// `zip`): those are the only consumers, and with none enabled the type is
+/// dead code under `-D warnings`.
+#[cfg(any(
+    feature = "gzip",
+    feature = "zlib",
+    feature = "deflate",
+    feature = "bzip2",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "zstd-c",
+    feature = "zstd-pure",
+    feature = "xz-c",
+    feature = "xz-pure",
+    feature = "lzma-c",
+    feature = "lzma-pure",
+    feature = "lzip",
+    feature = "tar",
+    feature = "ar",
+    feature = "zip"
+))]
 pub(crate) struct NormalizeDecodeErrors<R> {
     inner: R,
     malformed: &'static [ErrorKind],
 }
 
+#[cfg(any(
+    feature = "gzip",
+    feature = "zlib",
+    feature = "deflate",
+    feature = "bzip2",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "zstd-c",
+    feature = "zstd-pure",
+    feature = "xz-c",
+    feature = "xz-pure",
+    feature = "lzma-c",
+    feature = "lzma-pure",
+    feature = "lzip",
+    feature = "tar",
+    feature = "ar",
+    feature = "zip"
+))]
 impl<R> NormalizeDecodeErrors<R> {
     pub(crate) fn new(inner: R, malformed: &'static [ErrorKind]) -> Self {
         Self { inner, malformed }
     }
 }
 
+#[cfg(any(
+    feature = "gzip",
+    feature = "zlib",
+    feature = "deflate",
+    feature = "bzip2",
+    feature = "lz4",
+    feature = "snappy",
+    feature = "zstd-c",
+    feature = "zstd-pure",
+    feature = "xz-c",
+    feature = "xz-pure",
+    feature = "lzma-c",
+    feature = "lzma-pure",
+    feature = "lzip",
+    feature = "tar",
+    feature = "ar",
+    feature = "zip"
+))]
 impl<R: Read> Read for NormalizeDecodeErrors<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.inner.read(buf).map_err(|e| {
