@@ -146,7 +146,9 @@ read list.
 > archive made, or beneath a file it made, is skipped and named (exit 0;
 > 4 under `--strict-fidelity`), and the rest is extracted; a conflict with
 > what the destination already held stays exit 2. A name too long for the
-> filesystem is skipped the same way, and salvage shares the rule.
+> filesystem, or one it refuses outright (macOS APFS rejects some
+> unassigned code points, `EILSEQ`), is skipped the same way, and salvage
+> shares the rule.
 > **Symlinks:** a target with `..` after a name (`x/s2/..`, as GNU tar's
 > `--transform` writes) or an empty target is skipped and named — it could
 > climb out through another link (`x/s2 -> ..` then `s1 -> x/s2/..` left
@@ -163,7 +165,7 @@ read list.
 > on the newest stable, and `deps-guard` warns at 500,000 entries.
 > **Follow-up:** `salvage` on a case-insensitive volume can still lose one of
 > two names that differ only in case (`README`/`readme`).
-> **1816** tests under `--all-features`, **1752** on the
+> **1821** tests under `--all-features`, **1757** on the
 > default tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`.
 >
