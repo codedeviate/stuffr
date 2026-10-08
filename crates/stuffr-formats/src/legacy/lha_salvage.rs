@@ -285,19 +285,13 @@ use delharc::decode::{Decoder, DecoderAny};
 use delharc::header::CompressionMethod;
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry,
-    UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
+    Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
+    SalvagedEntry, UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
 use super::crc::{crc16_arc, crc16_arc_continued};
 use super::lha::{LEVEL1_HEADER_OVERHEAD, lha_mtime, lha_name_from_parts};
-
-/// Bytes read per [`find_next_method`] chunk. O(1) memory regardless of how
-/// far the next identifier is, or whether there is one at all — same figure,
-/// same reasoning, as `zip_salvage.rs`'s, `arc_salvage.rs`'s and
-/// `zoo_salvage.rs`'s own `SCAN_CHUNK`.
-const SCAN_CHUNK: usize = 64 * 1024;
 
 /// The most bytes a level-0/1 base header can occupy: the length byte, the
 /// checksum byte, and the `u8`-declared `header_len` bytes behind them.
@@ -613,11 +607,13 @@ struct EntryHeader {
 /// chain of `skip size` hops from the front of the file that a damaged
 /// header breaks for every entry behind it.
 ///
-/// Carries no state between calls beyond what [`SalvageScan::next_candidate`]
-/// itself receives — the same shape `ZipSalvage`, `ArcSalvage` and
-/// `ZooSalvage` have.
+/// Carries nothing about the archive's entries between calls beyond what
+/// [`SalvageScan::next_candidate`] itself receives — the same shape
+/// `ZipSalvage`, `ArcSalvage` and `ZooSalvage` have — only the
+/// [`ForwardSearch`] buffer and the sightings below.
 #[derive(Debug, Default)]
 pub struct LhaSalvage {
+    search: ForwardSearch,
     /// Header shapes this scan recognised and cannot gate — Ruling S-V. The
     /// one piece of state this scanner carries between calls, and it exists
     /// so [`salvage_lha`] can tell "this archive holds nothing recoverable"
@@ -635,22 +631,21 @@ impl LhaSalvage {
 impl SalvageScan for LhaSalvage {
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
-        // The identifier sits at the header's own offset 2, so a header at
-        // or after `from` has its identifier at or after `from + 2`.
-        let mut search_from = from.saturating_add(METHOD_I as u64);
+        let mut search_from = from;
         loop {
-            let Some(at) = find_next_method(src, search_from, file_len)? else {
+            let Some((offset, base)) =
+                find_next_header(&mut self.search, src, search_from, file_len)?
+            else {
                 return Ok(None);
             };
-            let offset = at - METHOD_I as u64;
-            match read_candidate_at(src, offset, file_len, &mut self.seen) {
+            match read_candidate_at(src, offset, base.as_deref(), file_len, &mut self.seen) {
                 Some(candidate) => return Ok(Some(candidate)),
                 // The identifier matched and the gate rejected everything
                 // around it: a coincidence, not a header. Resume one byte
-                // past the identifier itself, not past a whole assumed
-                // header, so a genuine header overlapping this false match
-                // is never skipped.
-                None => search_from = at + 1,
+                // past the header's start — whose identifier is two bytes
+                // on — not past a whole assumed header, so a genuine header
+                // overlapping this false match is never skipped.
+                None => search_from = offset + 1,
             }
         }
     }
@@ -709,47 +704,82 @@ impl SalvageScan for LhaSalvage {
     }
 }
 
-/// Searches forward from `from` for the next position holding a five-byte
-/// identifier [`Method::from_identifier`] accepts, in bounded chunks so
-/// memory use does not depend on how far through the source the next one is.
+/// Searches forward from `from` for the next header start whose bytes clear
+/// every criterion they alone can decide, through [`ForwardSearch`], and
+/// returns its offset — with its [`MAX_BASE_HEADER`] bytes when they were
+/// all in the search's window, so [`parse_header_at`] need not read them
+/// again.
 ///
-/// Carries at most four bytes across a chunk boundary — the longest a
-/// five-byte match can straddle — so a match split across two reads is never
-/// missed. `Ok(None)` when no identifier remains before `file_len`.
-fn find_next_method(src: &mut dyn SeekRead, from: u64, file_len: u64) -> io::Result<Option<u64>> {
-    if from >= file_len {
-        return Ok(None);
+/// **Judged inside the search, not after it (0.10.3).** Every search
+/// starts with a short read, and every candidate used to cost a fixed
+/// 257-byte base read, so a scan that left the search for each bare
+/// identifier, refused it and searched again from one byte on paid both
+/// per identifier: the read-amplification oracle measured 106x on a fuzz
+/// input that way. Judged here — the identifier, the level, and for levels
+/// 0 and 1 the name length, header length and 8-bit checksum — a refused
+/// identifier costs nothing beyond the search's own pass over it, and an
+/// accepted level-0 header costs no read of its own.
+///
+/// A header starting in the last `MAX_BASE_HEADER - 1` bytes cannot fill
+/// that window, so a second search over that tail tests only the fixed
+/// [`NAME_I`]-byte prefix and leaves the rest to [`parse_header_at`]; the
+/// tail is at most 256 offsets, read once per call that reaches it.
+fn find_next_header(
+    search: &mut ForwardSearch,
+    src: &mut dyn SeekRead,
+    from: u64,
+    file_len: u64,
+) -> io::Result<Option<(u64, Option<Vec<u8>>)>> {
+    let mut base = Vec::new();
+    let full = search.find(src, from, file_len, MAX_BASE_HEADER, |w| {
+        let hit = header_plausible(w);
+        if hit {
+            base = w.to_vec();
+        }
+        hit
+    })?;
+    if let Some(at) = full {
+        return Ok(Some((at, Some(base))));
     }
-    src.seek(SeekFrom::Start(from))?;
+    let tail_from = from.max(file_len.saturating_sub(MAX_BASE_HEADER as u64 - 1));
+    let tail = search.find(src, tail_from, file_len, NAME_I, header_plausible)?;
+    Ok(tail.map(|at| (at, None)))
+}
 
-    let mut window: Vec<u8> = Vec::with_capacity(SCAN_CHUNK + 4);
-    let mut window_start = from;
-    let mut buf = vec![0u8; SCAN_CHUNK];
-
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
+/// Whether the bytes `w` at a header start — the whole [`MAX_BASE_HEADER`]
+/// window, or only its first [`NAME_I`] bytes near EOF — could open a header
+/// [`parse_header_at`] accepts or records as a sighting. Decides only what
+/// `w` holds: a level-0/1 checksum whose run ends past `w` is left to the
+/// parser. Never refuses a header the parser would accept.
+fn header_plausible(w: &[u8]) -> bool {
+    // Every identifier the format assigned is `-` `x` `y` `z` `-`, so two
+    // byte comparisons reject essentially every position before the table
+    // is consulted at all.
+    if w[METHOD_I] != b'-' || w[METHOD_I + 4] != b'-' {
+        return false;
+    }
+    let ident = [w[2], w[3], w[4], w[5], w[6]];
+    if Method::from_identifier(&ident).is_none() {
+        return false;
+    }
+    match w[HEADER_LEVEL_I] {
+        level @ (0 | 1) => {
+            let header_len = usize::from(w[HEADER_LEN_I]);
+            let name_len = usize::from(w[NAME_LEN_I]);
+            let overhead = if level == 0 {
+                LEVEL0_HEADER_OVERHEAD
+            } else {
+                LEVEL1_HEADER_OVERHEAD
+            };
+            if name_len == 0 || header_len < overhead + name_len {
+                return false;
+            }
+            let base_len = METHOD_I + header_len;
+            base_len > w.len() || checksum_of(&w[METHOD_I..base_len]) == w[HEADER_CSUM_I]
         }
-        window.extend_from_slice(&buf[..n]);
-
-        if let Some(at) = window.windows(5).position(|w| {
-            // Every identifier the format assigned is `-` `x` `y` `z` `-`,
-            // so two byte comparisons reject essentially every position
-            // before the table is consulted at all.
-            w[0] == b'-'
-                && w[4] == b'-'
-                && Method::from_identifier(&[w[0], w[1], w[2], w[3], w[4]]).is_some()
-        }) {
-            return Ok(Some(window_start + at as u64));
-        }
-
-        // Keep only the last 4 bytes: the longest prefix of an identifier
-        // that could still be waiting for its remaining bytes in the next
-        // chunk.
-        let keep = window.len().saturating_sub(4);
-        window_start += keep as u64;
-        window.drain(..keep);
+        2 => true,
+        3 => w[HEADER_LEN_I] == 4 && w[HEADER_CSUM_I] == 0,
+        _ => false,
     }
 }
 
@@ -780,21 +810,31 @@ fn checksum_of(counted: &[u8]) -> u8 {
 fn parse_header_at(
     src: &mut dyn SeekRead,
     offset: u64,
+    window: Option<&[u8]>,
     file_len: u64,
     seen: &mut UngateableSightings,
 ) -> Option<EntryHeader> {
-    // Criterion 3, first half: read at most one base header's worth, and
-    // never past the end of the source. A fixed 257-byte read — the whole
-    // range a `u8` length field can describe, and comfortably more than
-    // level 2's fixed 26 — so nothing here is sized from anything the file
-    // declares.
+    // Criterion 3, first half: at most one base header's worth, and never
+    // past the end of the source. A fixed 257-byte read — the whole range a
+    // `u8` length field can describe, and comfortably more than level 2's
+    // fixed 26 — so nothing here is sized from anything the file declares.
+    // Those are exactly the bytes `find_next_header` hands over as
+    // `window` when its search already read them.
     let want = MAX_BASE_HEADER.min(usize::try_from(file_len.checked_sub(offset)?).ok()?);
     if want < NAME_I {
         return None;
     }
-    src.seek(SeekFrom::Start(offset)).ok()?;
-    let mut base = vec![0u8; want];
-    src.read_exact(&mut base).ok()?;
+    let read;
+    let base: &[u8] = match window {
+        Some(window) if window.len() == want => window,
+        _ => {
+            src.seek(SeekFrom::Start(offset)).ok()?;
+            let mut buf = vec![0u8; want];
+            src.read_exact(&mut buf).ok()?;
+            read = buf;
+            &read
+        }
+    };
 
     // Criterion 1. The caller found this identifier, but a candidate must
     // never stand on its caller's word for a field it can read itself.
@@ -802,8 +842,8 @@ fn parse_header_at(
 
     // Criterion 2.
     match base[HEADER_LEVEL_I] {
-        level @ (0 | 1) => parse_level_0_or_1(src, offset, file_len, &base, method, level),
-        2 => match parse_level_2(src, offset, file_len, &base, method) {
+        level @ (0 | 1) => parse_level_0_or_1(src, offset, file_len, base, method, level),
+        2 => match parse_level_2(src, offset, file_len, base, method) {
             Level2::Header(header) => Some(header),
             Level2::NoCommonHeader => {
                 seen.level_2_without_common_header = true;
@@ -1384,10 +1424,11 @@ fn walk_extra_headers(
 fn read_candidate_at(
     src: &mut dyn SeekRead,
     offset: u64,
+    window: Option<&[u8]>,
     file_len: u64,
     seen: &mut UngateableSightings,
 ) -> Option<Candidate> {
-    let header = parse_header_at(src, offset, file_len, seen)?;
+    let header = parse_header_at(src, offset, window, file_len, seen)?;
 
     let declared = header.declared_len;
     let available_len = match header.payload_start.checked_add(declared) {
@@ -1848,6 +1889,70 @@ mod tests {
     use super::*;
 
     const SAMPLE_LZH: &[u8] = include_bytes!("../../fixtures/legacy/sample.lzh");
+
+    /// The size of the allocation [`probe_canary`] makes. The allocator-probe
+    /// test below used to take the scan's own 64 KiB read buffer as proof
+    /// the recording allocator was attached; since 0.10.3 the scan's first
+    /// read is 257 bytes and allocates no such buffer for a small input, so
+    /// the proof is an allocation the test makes itself, inside the measured
+    /// closure — `cpio_salvage.rs`'s and `tar_salvage.rs`'s pattern.
+    const PROBE_CANARY: usize = 64 * 1024;
+
+    fn probe_canary() {
+        std::hint::black_box(vec![0u8; PROBE_CANARY]);
+    }
+
+    /// The 11-byte unit of a stream in which a level-0 header starts every
+    /// 11 bytes: `header_len` 255, the `-lh5-` identifier, level 0 at
+    /// `H+20`, name length 1 at `H+21` — each lands on its own residue mod
+    /// 11 — with the checksum byte chosen to agree (`valid`) or not.
+    fn level0_every_11_bytes(valid: bool) -> Vec<u8> {
+        for pad in 0..=255u8 {
+            for csum in 0..=255u8 {
+                let mut unit = vec![255, csum];
+                unit.extend_from_slice(b"-lh5-");
+                unit.extend_from_slice(&[pad, 0x20, 0, 1]);
+                let stream = unit.repeat(30);
+                let agrees = checksum_of(&stream[METHOD_I..MAX_BASE_HEADER]) == csum;
+                if agrees == valid {
+                    return unit;
+                }
+            }
+        }
+        unreachable!("some checksum byte agrees and some does not")
+    }
+
+    /// 0.10.3: dense identifiers, and dense level-0 headers whose checksum
+    /// disagrees or agrees, each 256 KiB, held to
+    /// `stuffr_core::testing::check_scan_is_linear`. Before the search
+    /// judged the base header and kept what it read across calls, these
+    /// read 12,749x and 5,795x their input (at 1 MiB).
+    #[test]
+    fn dense_identifiers_and_dense_headers_scan_linearly() {
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 256 * 1024;
+        let fill = |unit: &[u8]| unit.iter().copied().cycle().take(LEN).collect::<Vec<u8>>();
+        let shapes = [
+            ("bare identifiers", fill(b"-lh5-"), false),
+            (
+                "level 0, checksum disagrees",
+                fill(&level0_every_11_bytes(false)),
+                false,
+            ),
+            (
+                "level 0, checksum agrees",
+                fill(&level0_every_11_bytes(true)),
+                true,
+            ),
+        ];
+        for (shape, bytes, accepted) in shapes {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_lha(&mut src, &SalvagePolicy::default()).unwrap();
+            assert_eq!(!out.entries.is_empty(), accepted, "{shape}");
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+        }
+    }
 
     fn scan(bytes: &[u8]) -> SalvageOutcome {
         salvage_lha(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default())
@@ -2617,7 +2722,7 @@ mod tests {
         for (bytes, label) in cases {
             let mut ours = Cursor::new(bytes.clone());
             let mut seen = UngateableSightings::default();
-            let mine = parse_header_at(&mut ours, 0, bytes.len() as u64, &mut seen)
+            let mine = parse_header_at(&mut ours, 0, None, bytes.len() as u64, &mut seen)
                 .unwrap_or_else(|| panic!("{label}: this module's parser must accept it"));
 
             let mut theirs = Cursor::new(bytes.clone());
@@ -2912,7 +3017,10 @@ mod tests {
         let counted_len = usize::from(bytes[HEADER_LEN_I]);
         bytes[HEADER_CSUM_I] = checksum_of(&bytes[METHOD_I..METHOD_I + counted_len]);
 
-        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| scan(&bytes));
+        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
+            scan(&bytes)
+        });
         assert!(
             largest <= 1 << 20,
             "largest single allocation was {largest} bytes — a 4 GiB header field became a \
@@ -2924,14 +3032,15 @@ mod tests {
         // and `largest_single_allocation` reports `0`, which satisfies
         // `<= 1 << 20` perfectly while measuring nothing. Measured: with the
         // attribute patched to `#[cfg(any())]`, this test passed and its
-        // sibling below failed. `find_next_method` allocates a
-        // `SCAN_CHUNK`-sized read buffer on every scan, so that figure is a
-        // floor the probe cannot report unless it is actually attached.
+        // sibling below failed. The scan used to allocate a 64 KiB read
+        // buffer on every scan and served as that floor; since 0.10.3 its
+        // `ForwardSearch` reads 257 bytes first, so the floor is
+        // [`probe_canary`]'s own allocation inside the measured closure.
         assert!(
-            largest >= SCAN_CHUNK,
-            "largest single allocation was only {largest} bytes, below the {SCAN_CHUNK}-byte \
-             buffer every scan allocates — the recording allocator is not attached, so the \
-             ceiling above is measuring nothing"
+            largest >= PROBE_CANARY,
+            "largest single allocation was only {largest} bytes, below the {PROBE_CANARY}-byte \
+             canary allocated inside the measured closure — the recording allocator is not \
+             attached, so the ceiling above is measuring nothing"
         );
         assert_eq!(out.entries.len(), 1);
         assert_eq!(
@@ -3052,15 +3161,25 @@ mod tests {
         assert!(scan(&bytes).entries.is_empty());
     }
 
-    /// A match split across a [`SCAN_CHUNK`] boundary must still be found —
-    /// the four-byte carry `find_next_method` keeps exists for exactly this.
+    /// A header split across a [`ForwardSearch::MAX_CHUNK`] boundary must
+    /// still be found — the carry `ForwardSearch` keeps exists for exactly
+    /// this. Level 2, so the in-search gate has no checksum to refuse it
+    /// over.
     #[test]
     fn an_identifier_straddling_a_chunk_boundary_is_found() {
-        let mut bytes = vec![0u8; SCAN_CHUNK * 2];
-        let at = SCAN_CHUNK - 2;
-        bytes[at..at + 5].copy_from_slice(Method::Lh5.identifier());
-        let found = find_next_method(&mut Cursor::new(bytes), 0, (SCAN_CHUNK * 2) as u64).unwrap();
-        assert_eq!(found, Some(at as u64));
+        let chunk = ForwardSearch::MAX_CHUNK;
+        let mut bytes = vec![0u8; chunk * 2];
+        let at = chunk - 4;
+        bytes[at + METHOD_I..at + METHOD_I + 5].copy_from_slice(Method::Lh5.identifier());
+        bytes[at + HEADER_LEVEL_I] = 2;
+        let found = find_next_header(
+            &mut ForwardSearch::new(),
+            &mut Cursor::new(bytes),
+            0,
+            (chunk * 2) as u64,
+        )
+        .unwrap();
+        assert_eq!(found.map(|(o, _)| o), Some(at as u64));
     }
 
     /// The wiring `a_four_gigabyte_declaration_never_becomes_an_allocation`
