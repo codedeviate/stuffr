@@ -287,8 +287,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry,
-    UnverifiedCause, Verifier, annotate_candidates, collect_candidates, stream_bounded_copy,
+    Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
+    SalvagedEntry, UnverifiedCause, Verifier, annotate_candidates, collect_candidates,
+    stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
@@ -315,24 +316,19 @@ const MAX_LOCAL_NAME_LEN: u64 = 65_536;
 /// a data descriptor that follows the payload, not in this header.
 const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 
-/// Bytes read per [`find_next_local_header`] chunk. Kept O(1) memory rather
-/// than reading the remainder of a possibly enormous archive into one
-/// buffer: unlike every other bounded read in this module, this scanner has
-/// no idea how far the next match is when it starts looking.
-const SCAN_CHUNK: usize = 64 * 1024;
-
 /// Scans a zip for local file headers directly, without trusting any index.
 ///
-/// Carries no state between calls beyond what
-/// [`SalvageScan::next_candidate`] itself receives (a fresh archive offset
-/// each time, per that method's contract), so there is nothing to
-/// initialise beyond the unit value.
+/// Its only state is the [`ForwardSearch`] buffer reused across calls; it
+/// carries nothing about the archive between them beyond what
+/// [`SalvageScan::next_candidate`] itself receives.
 #[derive(Debug, Default)]
-pub struct ZipSalvage;
+pub struct ZipSalvage {
+    search: ForwardSearch,
+}
 
 impl ZipSalvage {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -341,10 +337,12 @@ impl SalvageScan for ZipSalvage {
         let file_len = src.seek(SeekFrom::End(0))?;
         let mut search_from = from;
         loop {
-            let Some(offset) = find_next_local_header(src, search_from, file_len)? else {
+            let Some((offset, fixed)) =
+                find_next_local_header(&mut self.search, src, search_from, file_len)?
+            else {
                 return Ok(None);
             };
-            match read_candidate_at(src, offset, file_len)? {
+            match read_candidate_at(src, offset, &fixed, file_len)? {
                 Some(candidate) => return Ok(Some(candidate)),
                 // The signature matched, but the gate rejected it: a
                 // coincidence, not a header. Resume one byte past the
@@ -377,68 +375,58 @@ impl SalvageScan for ZipSalvage {
     }
 }
 
-/// Searches forward from `from` for the next four-byte local-header
-/// signature, in bounded chunks so memory use does not depend on how far
-/// through the source the next match is (or whether there is one at all).
+/// Searches forward from `from` for the next local header whose FIXED part
+/// clears criteria 1-3 — the signature, a known version, a known method —
+/// and returns its offset with those 30 bytes, through [`ForwardSearch`].
 ///
-/// `Ok(None)` when the signature is not found before `file_len`. Carries at
-/// most three bytes across a chunk boundary — the longest a signature match
-/// can straddle one — so a match split across two reads is never missed.
+/// **The fixed-part criteria are judged inside the search, not after it
+/// (0.10.3).** Every search starts with a short read, so a scan that left
+/// the search for each bare signature, refused it, and searched again from
+/// one byte on paid a fresh first read plus a 30-byte header read per
+/// signature: `PK\x03\x04` repeated through a file then cost about 23 bytes
+/// read per input byte. Judged here, a refused signature costs nothing
+/// beyond the search's own pass over it. Only criteria 4-6, which need
+/// bytes past the fixed part, are left to [`read_candidate_at`].
+///
+/// `Ok(None)` when no such header starts before `file_len - 30`; one that
+/// starts later cannot hold its own fixed part, and was always refused.
 fn find_next_local_header(
+    search: &mut ForwardSearch,
     src: &mut dyn SeekRead,
     from: u64,
     file_len: u64,
-) -> io::Result<Option<u64>> {
-    if from >= file_len {
-        return Ok(None);
-    }
-    src.seek(SeekFrom::Start(from))?;
-
-    let mut window: Vec<u8> = Vec::with_capacity(SCAN_CHUNK + 3);
-    let mut window_start = from;
-    let mut buf = vec![0u8; SCAN_CHUNK];
-
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
+) -> io::Result<Option<(u64, [u8; LOCAL_HEADER_TOTAL as usize])>> {
+    let mut fixed = [0u8; LOCAL_HEADER_TOTAL as usize];
+    let at = search.find(src, from, file_len, fixed.len(), |w| {
+        let version = u16::from_le_bytes([w[4], w[5]]);
+        let method = u16::from_le_bytes([w[8], w[9]]);
+        let hit =
+            w[0..4] == SIG_LOCAL_HEADER && is_known_version(version) && is_known_method(method);
+        if hit {
+            fixed.copy_from_slice(w);
         }
-        window.extend_from_slice(&buf[..n]);
-
-        if let Some(at) = window
-            .windows(SIG_LOCAL_HEADER.len())
-            .position(|w| w == SIG_LOCAL_HEADER.as_slice())
-        {
-            return Ok(Some(window_start + at as u64));
-        }
-
-        // Keep only the last 3 bytes: the longest prefix of the magic that
-        // could still be waiting for its remaining bytes in the next chunk.
-        let keep = window.len().saturating_sub(3);
-        window_start += keep as u64;
-        window.drain(..keep);
-    }
+        hit
+    })?;
+    Ok(at.map(|at| (at, fixed)))
 }
 
-/// Reads the local header believed to start at `offset` and runs it through
+/// Runs the local header believed to start at `offset`, whose fixed part
+/// [`find_next_local_header`] already read and gated, through the rest of
 /// the validation gate described in the module doc. `Ok(None)` for ANY gate
-/// failure, including the header itself running past `file_len` — see the
-/// module doc for why a rejection here is never an error.
+/// failure, including the name or extra field running past `file_len` — see
+/// the module doc for why a rejection here is never an error.
 fn read_candidate_at(
     src: &mut dyn SeekRead,
     offset: u64,
+    fixed: &[u8; LOCAL_HEADER_TOTAL as usize],
     file_len: u64,
 ) -> Result<Option<Candidate>> {
-    src.seek(SeekFrom::Start(offset))?;
-    let mut fixed = [0u8; LOCAL_HEADER_TOTAL as usize];
-    if src.read_exact(&mut fixed).is_err() {
-        return Ok(None);
-    }
     debug_assert_eq!(
         fixed[0..4],
         SIG_LOCAL_HEADER,
         "caller already matched the signature"
     );
+    src.seek(SeekFrom::Start(offset + LOCAL_HEADER_TOTAL))?;
 
     let version = u16::from_le_bytes([fixed[4], fixed[5]]);
     let flags = u16::from_le_bytes([fixed[6], fixed[7]]);
@@ -456,17 +444,36 @@ fn read_candidate_at(
         return Ok(None);
     }
 
-    let mut name_bytes = vec![0u8; name_len as usize];
-    if src.read_exact(&mut name_bytes).is_err() {
-        return Ok(None);
-    }
-    let Ok(name) = String::from_utf8(name_bytes) else {
+    // The payload's START is computed unconditionally — even for a
+    // data-descriptor entry with no `declared_len` at all — because a
+    // consumer (`entries.rs`'s salvage write path) needs to know where a
+    // recovered entry's bytes begin regardless of whether this scan could
+    // also bound how many of them there are.
+    let Some(payload_start) = offset
+        .checked_add(LOCAL_HEADER_TOTAL)
+        .and_then(|v| v.checked_add(u64::from(name_len)))
+        .and_then(|v| v.checked_add(u64::from(extra_len)))
+    else {
+        // The header's own arithmetic overflowed u64 — nothing about this
+        // is a real record, so it stays a rejection.
         return Ok(None);
     };
-
-    if skip_forward(src, u64::from(extra_len)).is_err() {
+    // A name or extra field running past the source is refused BEFORE
+    // either is read (0.10.3). This used to read the name, then read and
+    // discard the extra field, and refuse on the short read — the same
+    // verdict, but each coincidental signature whose garbage lengths ran
+    // off the end first read everything up to EOF: 1,151,681 bytes
+    // delivered for an 11,201-byte fuzz input, the read-amplification
+    // oracle's measurement. The extra field is then skipped with a seek,
+    // which is now known to land inside the source.
+    if payload_start > file_len {
         return Ok(None);
     }
+
+    let Some(name) = read_utf8_name(src, usize::from(name_len))? else {
+        return Ok(None);
+    };
+    src.seek(SeekFrom::Start(payload_start))?;
 
     let has_data_descriptor = flags & FLAG_DATA_DESCRIPTOR != 0;
     let (declared_len, verifier, size) = if has_data_descriptor {
@@ -477,24 +484,6 @@ fn read_candidate_at(
             Some(Verifier::Crc32(crc32)),
             Some(u64::from(uncompressed_size)),
         )
-    };
-
-    // The payload's START is computed unconditionally — even for a
-    // data-descriptor entry with no `declared_len` at all — because a
-    // consumer (`entries.rs`'s salvage write path) needs to know where a
-    // recovered entry's bytes begin regardless of whether this scan could
-    // also bound how many of them there are. It is already unfalsifiable at
-    // this point: the name `read_exact` and the `extra_len` skip above both
-    // fail on a short read, so reaching this line means the cursor sits at
-    // `payload_start` with `payload_start <= file_len`.
-    let Some(payload_start) = offset
-        .checked_add(LOCAL_HEADER_TOTAL)
-        .and_then(|v| v.checked_add(u64::from(name_len)))
-        .and_then(|v| v.checked_add(u64::from(extra_len)))
-    else {
-        // The header's own arithmetic overflowed u64 — nothing about this
-        // is a real record, so it stays a rejection.
-        return Ok(None);
     };
 
     // Criterion 6: does the declared payload fit inside the source? A
@@ -538,6 +527,42 @@ fn read_candidate_at(
             .with_verifier(verifier)
             .with_available_len(available_len),
     ))
+}
+
+/// Reads a `len`-byte name from `src`'s position and decodes it as strict
+/// UTF-8 (criterion 5), or `None` when it is not UTF-8 or the source ends
+/// first.
+///
+/// **Read in growing pieces, and given up at the first invalid sequence
+/// (0.10.3).** The verdict is the one a whole read and one decode give, but
+/// a coincidental header in noise declares a garbage `name_len` of up to
+/// 64 KiB, and noise is rarely UTF-8 for long: reading the whole field
+/// before deciding cost 6.6 bytes read per input byte on one fuzz input,
+/// almost all of it names refused after their first few bytes.
+fn read_utf8_name(src: &mut dyn SeekRead, len: usize) -> io::Result<Option<String>> {
+    let mut name = Vec::with_capacity(len.min(64));
+    // Bytes before `valid` are known to be whole, valid UTF-8; it is always
+    // a character boundary.
+    let mut valid = 0;
+    let mut piece = 64;
+    while name.len() < len {
+        let old = name.len();
+        let want = piece.min(len - old);
+        name.resize(old + want, 0);
+        if src.read_exact(&mut name[old..]).is_err() {
+            return Ok(None);
+        }
+        // An error with a length is an invalid sequence, which no later
+        // byte can repair; one without is a sequence cut by this piece's
+        // end, which the next piece may complete.
+        match std::str::from_utf8(&name[valid..]) {
+            Ok(_) => valid = name.len(),
+            Err(e) if e.error_len().is_none() => valid += e.valid_up_to(),
+            Err(_) => return Ok(None),
+        }
+        piece = piece.saturating_mul(2);
+    }
+    Ok(String::from_utf8(name).ok())
 }
 
 /// Whether a local header's "version needed to extract" field is one the
@@ -587,20 +612,6 @@ fn codec_for_method(method: u16) -> Option<FormatId> {
         8 => Some(FormatId::new("deflate")),
         _ => None,
     }
-}
-
-/// Reads and discards exactly `n` bytes, failing on a short read rather than
-/// silently leaving the cursor wherever a bare seek would land — the same
-/// reasoning `zip.rs`'s own (private) `skip_forward` documents.
-fn skip_forward(src: &mut dyn SeekRead, n: u64) -> io::Result<()> {
-    let copied = io::copy(&mut src.take(n), &mut io::sink())?;
-    if copied != n {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("expected to skip {n} bytes, only {copied} were available"),
-        ));
-    }
-    Ok(())
 }
 
 /// Decides [`SalvageStatus`] for one candidate by re-reading the local
@@ -1375,18 +1386,97 @@ mod tests {
         assert_eq!(c2.meta.name, "second.bin");
     }
 
-    /// [`find_next_local_header`] carries at most three bytes across a
-    /// chunk boundary. This pins that a signature straddling two reads —
-    /// not merely landing inside one — is still found, by placing it one
-    /// byte before a chunk boundary in a buffer bigger than [`SCAN_CHUNK`].
+    /// [`find_next_local_header`] carries three bytes across a read
+    /// boundary. This pins that a signature straddling two reads — not
+    /// merely landing inside one — is still found, by placing it one byte
+    /// before a [`ForwardSearch::MAX_CHUNK`] boundary in a buffer twice that.
     #[test]
     fn a_signature_split_across_a_scan_chunk_boundary_is_still_found() {
-        let mut bytes = vec![0u8; SCAN_CHUNK * 2];
-        let at = SCAN_CHUNK - 1;
+        let chunk = ForwardSearch::MAX_CHUNK;
+        let mut bytes = vec![0u8; chunk * 2];
+        let at = chunk - 1;
         bytes[at..at + 4].copy_from_slice(&SIG_LOCAL_HEADER);
-        let found =
-            find_next_local_header(&mut Cursor::new(bytes), 0, (SCAN_CHUNK * 2) as u64).unwrap();
-        assert_eq!(found, Some(at as u64));
+        let found = find_next_local_header(
+            &mut ForwardSearch::new(),
+            &mut Cursor::new(bytes),
+            0,
+            (chunk * 2) as u64,
+        )
+        .unwrap();
+        assert_eq!(found.map(|(o, _)| o), Some(at as u64));
+    }
+
+    /// 0.10.3: the shapes the read-amplification oracle found or that
+    /// sit next to them, each 256 KiB, each held to
+    /// `stuffr_core::testing::check_scan_is_linear`. Before the search
+    /// judged the fixed header and before names were bounded and read in
+    /// pieces, these read 15,880x, 2,049x and 1,985x their input (measured
+    /// at 1 MiB).
+    #[test]
+    fn dense_signatures_and_refused_names_scan_linearly() {
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 256 * 1024;
+        let fill = |unit: &[u8]| unit.iter().copied().cycle().take(LEN).collect::<Vec<u8>>();
+        let header = |name_len: u16| {
+            let mut h = SIG_LOCAL_HEADER.to_vec();
+            for field in [20u16, 0, 0, 0, 0] {
+                h.extend_from_slice(&field.to_le_bytes());
+            }
+            for field in [0u32; 3] {
+                h.extend_from_slice(&field.to_le_bytes());
+            }
+            h.extend_from_slice(&name_len.to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes());
+            h
+        };
+        let shapes = [
+            ("bare signatures", fill(&SIG_LOCAL_HEADER)),
+            (
+                "one-byte invalid names",
+                fill(&[header(1), vec![0xFF]].concat()),
+            ),
+            (
+                "64 KiB names invalid at once",
+                fill(&[header(u16::MAX), vec![0xFF; 34]].concat()),
+            ),
+        ];
+        for (shape, bytes) in shapes {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_zip(&mut src, &SalvagePolicy::default()).unwrap();
+            assert!(out.entries.is_empty(), "{shape}");
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+        }
+    }
+
+    /// Reading a name in pieces never splits a verdict: a name whose
+    /// multi-byte characters straddle every piece boundary is accepted
+    /// whole, and one invalid byte anywhere — first, or last of 65,535 —
+    /// refuses it.
+    #[test]
+    fn a_name_read_in_pieces_decodes_exactly_as_one_read() {
+        // Two- and three-byte characters, offset so they straddle 64,
+        // 192, 448, ... — every piece boundary.
+        let name = format!("x{}", "é€".repeat(13_000));
+        let bytes = name.as_bytes().to_vec();
+        let got = read_utf8_name(&mut Cursor::new(bytes.clone()), bytes.len()).unwrap();
+        assert_eq!(got.as_deref(), Some(name.as_str()));
+
+        for bad_at in [0, 63, 64, 1_000, u16::MAX as usize - 1] {
+            let mut bytes = vec![b'a'; u16::MAX as usize];
+            bytes[bad_at] = 0xFF;
+            let len = bytes.len();
+            assert_eq!(
+                read_utf8_name(&mut Cursor::new(bytes), len).unwrap(),
+                None,
+                "invalid byte at {bad_at}"
+            );
+        }
+        // Cut short by EOF: refused, as a whole read refused it.
+        assert_eq!(
+            read_utf8_name(&mut Cursor::new(b"abc".to_vec()), 4).unwrap(),
+            None
+        );
     }
 
     // -------------------------------------------------------------------
