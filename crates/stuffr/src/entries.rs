@@ -1384,7 +1384,16 @@ fn is_same_entry(target: &Path, link: &Path, made: &MadeByRun) -> bool {
         }
         // Several names: a genuine second link this run made at the exact
         // path is distinct; anything else sharing the inode is a fold.
-        !made.made(link)
+        //
+        // EXACT path, deliberately not `made.made`: that also answers by
+        // identity, and `link` shares `target`'s inode here, which this run
+        // created — so it would say "made" for every link reaching this line
+        // and call every fold distinct. `--force` would then remove `link`,
+        // which IS `target`'s own directory entry under another spelling:
+        // 0.10.1's round-3 data loss, back by another road. The question is
+        // "is this SPELLING a distinct name this run made?", and only the
+        // exact-path record can answer it.
+        !made.made_exact(link)
     }
     #[cfg(not(unix))]
     {
@@ -5239,10 +5248,44 @@ enum MadeKind {
 /// `hard_link` and then `copy` a directory, and fail at exit 1. `names`
 /// holds explicit entries only: a hard link resolves by the entry name it
 /// carries, looked up by the EXACT string, never a re-normalised one.
+///
+/// **Identity (0.10.2).** An exact path misses whatever the filesystem
+/// folds: on a case-insensitive volume (APFS, the macOS default) `README`
+/// and `readme` are one directory entry, and on a normalisation-insensitive
+/// one so are U+00E9 and U+0065 U+0301. So every record also notes the
+/// `(dev, ino)` of what was just created, read with `symlink_metadata` AFTER
+/// creation (a symlink records its own inode, never its target's), and
+/// [`made`](Self::made) answers by exact path OR identity. What the
+/// destination held before the run is never recorded, so its inode is never
+/// in `ids` and a folded spelling of it stays the destination's prior state.
+/// A record is never removed from `ids` when `--force` replaces a path: the
+/// removed inode no longer exists anywhere a later lookup could reach (only
+/// this run creates in `dest`; a racing local writer is the TOCTOU window
+/// [`refuse_symlinked_ancestors`] documents), and the new one is recorded
+/// when written. Unix only; elsewhere `ids` stays empty and every identity
+/// lookup is false.
 #[derive(Default)]
 struct MadeByRun {
     names: HashMap<String, PathBuf>,
     at: HashMap<PathBuf, MadeKind>,
+    ids: HashSet<(u64, u64)>,
+}
+
+/// The `(dev, ino)` of the directory entry at `path`, never following a
+/// symlink. `None` when nothing is there, and off unix.
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|md| (md.dev(), md.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 impl MadeByRun {
@@ -5253,13 +5296,31 @@ impl MadeByRun {
     }
 
     /// A path no entry named: a parent directory, or salvage's own output.
+    /// Called once `path` exists, so its identity can be read.
     fn record_path(&mut self, path: &Path, kind: MadeKind) {
         self.at.insert(path.to_path_buf(), kind);
+        if let Some(id) = identity(path) {
+            self.ids.insert(id);
+        }
     }
 
-    /// Whether this run made what is at `path` now.
+    /// Whether this run made what is at `path` now, under whatever spelling
+    /// the filesystem folds onto it: the exact path, or its identity.
     fn made(&self, path: &Path) -> bool {
+        self.made_exact(path) || self.made_identity(path)
+    }
+
+    /// Whether this run recorded `path` itself, by its EXACT spelling.
+    /// [`is_same_entry`] needs this question and not [`made`](Self::made):
+    /// see the comment there.
+    fn made_exact(&self, path: &Path) -> bool {
         self.at.contains_key(path)
+    }
+
+    /// Whether what is at `path` now is an inode this run created, however
+    /// `path` is spelled. False when nothing is there, and off unix.
+    fn made_identity(&self, path: &Path) -> bool {
+        !self.ids.is_empty() && identity(path).is_some_and(|id| self.ids.contains(&id))
     }
 
     /// The path and current kind for an entry name, by the exact string:
@@ -5301,7 +5362,9 @@ impl Placement {
 /// unchanged and comes first. Nothing here follows a symlink: every probe is
 /// `symlink_metadata`.
 ///
-/// Rules, in order (0.10.1 spec §1):
+/// Rules, in order (0.10.1 spec §1). "Made by this run" is
+/// [`MadeByRun::made`]: the exact path or, since 0.10.2, the inode, so a
+/// spelling the filesystem folds onto an archive-made path is the archive's.
 ///
 /// 1. **The parent chain**, from `dest` down. The first component that
 ///    exists and is not a directory blocks the entry. Made by this run: a

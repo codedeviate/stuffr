@@ -1088,24 +1088,257 @@ fn a_deep_cascade_stays_linear() {
     );
 }
 
-/// Review Focus 1: directory `A` then file `a` on a case-insensitive volume.
-/// `MadeByRun` is keyed by exact path and misses; the filesystem collides.
-/// The rule falls through to "the destination's prior state": a usage
-/// error, exit 2 — classified, never exit 1.
+// ---- Identity, not spelling (0.10.2 Task 2) -------------------------------
+//
+// On a case-insensitive volume (APFS, the macOS default) `A` and `a` are one
+// directory entry, and on a normalisation-insensitive one so are U+00E9 and
+// U+0065 U+0301. `MadeByRun` recognises what this run made by `(dev, ino)`
+// as well as by exact path, so a folded spelling of an archive-made path is
+// the archive contradicting itself (a skip), never "the destination already
+// held this" (a usage error). 0.10.1 answered `Usage`, exit 2, for these.
+
+/// Whether `root`'s volume folds case: `probe` written, `PROBE` looked up.
+#[cfg(target_os = "macos")]
+fn folds_case(root: &Path) -> bool {
+    std::fs::write(root.join("probe"), b"").unwrap();
+    root.join("PROBE").exists()
+}
+
+/// Directory `A`, then file `a`: the archive's own directory is in the way.
+/// 0.10.1 missed the exact-path record and answered `Usage`.
 #[cfg(target_os = "macos")]
 #[test]
-fn case_insensitive_collision_is_classified() {
+fn a_case_folded_directory_conflict_is_attributed_to_the_archive() {
     let root = tmp_dir();
-    std::fs::write(root.join("probe"), b"").unwrap();
-    if !root.join("PROBE").exists() {
-        return; // a case-sensitive volume: nothing collides
+    if !folds_case(&root) {
+        return; // a case-sensitive volume: `A` and `a` are two entries
     }
     let archive = write_tar(&root.join("c.tar"), &[dir("A"), file("a", b"hello")]);
     let dest = root.join("out");
-    let err = extract_with(&archive, &dest, false).expect_err("a classified refusal");
-    assert!(matches!(err, Error::Usage(_)), "{err:?}");
-    assert_eq!(err.exit_code(), 2, "{err}");
+    let outcome = extract_with(&archive, &dest, false).expect("a self-contradiction is a skip");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("a", &reason_directory_in_the_way("a"))]
+    );
     assert!(std::fs::symlink_metadata(dest.join("A")).unwrap().is_dir());
+}
+
+/// File `A`, then `a/b`: the archive's own file is above the entry. The
+/// ancestor is named as the entry spells it, `a`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_case_folded_file_above_an_entry_is_attributed_to_the_archive() {
+    let root = tmp_dir();
+    if !folds_case(&root) {
+        return; // a case-sensitive volume: `a/` is a new directory
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[file("A", b"alpha"), file("a/b", b"beta")],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, false).expect("a self-contradiction is a skip");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("a/b", &reason_not_a_directory("a", "a/b"))]
+    );
+    assert_eq!(std::fs::read(dest.join("A")).unwrap(), b"alpha");
+}
+
+/// File `README`, then file `readme`: the duplicate rule, worded as the
+/// duplicate rule (exit 2 without `--force`; the later entry wins with it),
+/// never as a kind conflict with the destination.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_case_folded_duplicate_uses_the_duplicate_wording() {
+    let root = tmp_dir();
+    if !folds_case(&root) {
+        return; // a case-sensitive volume: two distinct files
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[file("README", b"first"), file("readme", b"second")],
+    );
+
+    let dest = root.join("out1");
+    let err = extract_with(&archive, &dest, false).expect_err("a duplicate");
+    match &err {
+        Error::Usage(msg) => {
+            assert_eq!(
+                *msg,
+                format!(
+                    "{} already exists; pass --force to overwrite",
+                    dest.join("readme").display()
+                )
+            );
+            assert!(!msg.contains("existing directory"), "{msg}");
+            assert!(!msg.contains("is not a directory"), "{msg}");
+        }
+        other => panic!("expected Usage, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(std::fs::read(dest.join("README")).unwrap(), b"first");
+
+    let dest = root.join("out2");
+    let outcome = extract_with(&archive, &dest, true).expect("the later one wins");
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(std::fs::read(dest.join("readme")).unwrap(), b"second");
+}
+
+/// Review Focus 3: U+00E9 (precomposed) and U+0065 U+0301 (decomposed) are
+/// one name on a normalisation-insensitive volume. Identity, not spelling,
+/// attributes both shapes to the archive.
+#[cfg(target_os = "macos")]
+#[test]
+fn unicode_normalisation_folds_are_attributed_to_the_archive() {
+    const PRECOMPOSED: &str = "\u{e9}";
+    const DECOMPOSED: &str = "e\u{301}";
+    let root = tmp_dir();
+    std::fs::write(root.join(format!("probe{PRECOMPOSED}")), b"").unwrap();
+    if !root.join(format!("probe{DECOMPOSED}")).exists() {
+        return; // the volume distinguishes the two spellings
+    }
+
+    let archive = write_tar(
+        &root.join("dir.tar"),
+        &[dir(PRECOMPOSED), file(DECOMPOSED, b"hello")],
+    );
+    let dest = root.join("out1");
+    let outcome = extract_with(&archive, &dest, false).expect("a self-contradiction is a skip");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped(
+            DECOMPOSED,
+            &reason_directory_in_the_way(DECOMPOSED)
+        )]
+    );
+    assert!(
+        std::fs::symlink_metadata(dest.join(PRECOMPOSED))
+            .unwrap()
+            .is_dir()
+    );
+
+    let below = format!("{DECOMPOSED}/b");
+    let archive = write_tar(
+        &root.join("above.tar"),
+        &[file(PRECOMPOSED, b"alpha"), file(&below, b"beta")],
+    );
+    let dest = root.join("out2");
+    let outcome = extract_with(&archive, &dest, false).expect("a self-contradiction is a skip");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped(&below, &reason_not_a_directory(DECOMPOSED, &below))]
+    );
+    assert_eq!(std::fs::read(dest.join(PRECOMPOSED)).unwrap(), b"alpha");
+}
+
+/// Review Focus 4: what the destination held BEFORE the run is not in the
+/// identity index, so a folded spelling of it is still the destination's
+/// prior state — a usage error naming the destination path, exit 2, and the
+/// user's file or directory untouched. Three shapes: a same-kind duplicate,
+/// a directory in the way, a file above the entry.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_destination_file_whose_spelling_folds_stays_destination_held() {
+    let root = tmp_dir();
+    if !folds_case(&root) {
+        return; // a case-sensitive volume: nothing folds
+    }
+
+    // The duplicate: `dest/README`, then the archive's `readme`.
+    let archive = write_tar(&root.join("dup.tar"), &[file("readme", b"archive")]);
+    let dest = root.join("out1");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("README"), b"mine").unwrap();
+    let err = extract_with(&archive, &dest, false).expect_err("the destination's file");
+    match &err {
+        Error::Usage(msg) => assert_eq!(
+            *msg,
+            format!(
+                "{} already exists; pass --force to overwrite",
+                dest.join("readme").display()
+            )
+        ),
+        other => panic!("expected Usage, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(std::fs::read(dest.join("README")).unwrap(), b"mine");
+
+    // A directory the user had, in the way of the archive's file.
+    for force in [false, true] {
+        let dest = root.join(format!("out-dir-{force}"));
+        std::fs::create_dir_all(dest.join("README")).unwrap();
+        std::fs::write(dest.join("README/keep"), b"k").unwrap();
+        let err = extract_with(&archive, &dest, force).expect_err("the destination's directory");
+        match &err {
+            Error::Usage(msg) => assert_eq!(
+                *msg,
+                format!(
+                    "`{}` is an existing directory; stuffr never removes a directory, even \
+                     with --force",
+                    dest.join("readme").display()
+                ),
+                "force={force}"
+            ),
+            other => panic!("force={force}: expected Usage, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 2, "force={force}");
+        assert_eq!(std::fs::read(dest.join("README/keep")).unwrap(), b"k");
+    }
+
+    // A file the user had, above the archive's entry.
+    let archive = write_tar(&root.join("above.tar"), &[file("a/b", b"beta")]);
+    for force in [false, true] {
+        let dest = root.join(format!("out-above-{force}"));
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("A"), b"mine").unwrap();
+        let err = extract_with(&archive, &dest, force).expect_err("the destination's file");
+        match &err {
+            Error::Usage(msg) => assert_eq!(
+                *msg,
+                format!(
+                    "`{}` exists and is not a directory, so `a/b` cannot be placed beneath it",
+                    dest.join("a").display()
+                ),
+                "force={force}"
+            ),
+            other => panic!("force={force}: expected Usage, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 2, "force={force}");
+        assert_eq!(std::fs::read(dest.join("A")).unwrap(), b"mine");
+    }
+}
+
+/// Review Focus 1, the shape identity would break: file `a`, a genuine
+/// second link `x -> a` (so `nlink` is 2 and the single-name shortcut does
+/// not decide), then `A -> a` under `--force`. `dest/A` IS `dest/a`. The
+/// self-link check must ask whether the EXACT path `A` was made by this run
+/// (it was not), not whether its inode was (it was, as `a`): asked by
+/// identity, the link reads as distinct, `--force` removes `a` to make room,
+/// and the archive's own `a` is gone.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_case_folded_self_link_beside_a_second_link_stays_a_self_link_skip() {
+    let root = tmp_dir();
+    if !folds_case(&root) {
+        return; // a case-sensitive volume: `A` is a third name
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[file("a", b"alpha"), hardlink("x", "a"), hardlink("A", "a")],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).expect("never exit 1");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("A", "it names itself as its hard-link target")]
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
+    assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("x")));
 }
 
 // ---- Names the filesystem cannot hold (0.10.1 Task 2, fix round 1) -------
