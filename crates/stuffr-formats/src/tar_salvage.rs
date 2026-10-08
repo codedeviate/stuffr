@@ -245,7 +245,7 @@
 //! header they reach: a real archive has one chain per header, so a header
 //! more converge on is reported as a [`Sighting`] and its further chains
 //! cost their header walk alone (see `ChainBudget`). Across the whole scan,
-//! extension payloads read are bounded too, at `4 × file_len + 1 MiB`
+//! extension payloads read are bounded too, at `2 × file_len + 1 MiB`
 //! (`extension_read_budget`): a real archive reads each chain once, and
 //! forged chains spread over many headers are refused past it, their
 //! headers reported the same way.
@@ -295,7 +295,7 @@
 //! the recording allocator, each paired with the lower bound that proves
 //! the allocator is attached.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -399,7 +399,7 @@ fn clears_criterion_3(src: &mut dyn SeekRead, offset: u64, file_len: u64, block:
     magic_is_ustar(block)
         || (magic_is_blank(block)
             && spelled_like_a_writer(&block[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN])
-            && !looks_like_a_shifted_twin(src, offset, file_len, SourceMustName::Yes))
+            && !looks_like_a_shifted_twin(src, offset, file_len, block, SourceMustName::Yes))
 }
 
 /// Whether the block at `offset` is a real header seen `k` bytes late, for
@@ -494,24 +494,57 @@ fn clears_criterion_3(src: &mut dyn SeekRead, offset: u64, file_len: u64, block:
 /// [`salvage_tar`] reports that refusal as a [`Sighting`] when the header
 /// sits on the recovered entries' block grid, which a real copy never does
 /// (`UngateableSightings::into_sightings`).
+///
+/// # One small read, not seven blocks (0.10.3 fix round 1)
+///
+/// `block` is the 512 bytes at `offset`, which every caller already holds.
+/// The seven earlier blocks all lie inside `offset - 7 .. offset + 505`, so
+/// only the up-to-seven bytes before `offset` are read, once, and each
+/// block `k` bytes earlier is a slice of those bytes followed by `block`.
+/// Reading each earlier block whole cost 3,584 bytes per blank-magic header
+/// — bare empty-named v7 headers reached ~11x their input. A `k` whose
+/// block would start before the file is skipped, as `checked_sub` skipped
+/// it; every block that does start in the file ends inside it, because the
+/// block at `offset` does. A failed read answers `false`, as a failed
+/// `read_block` did for each `k`.
 fn looks_like_a_shifted_twin(
     src: &mut dyn SeekRead,
     offset: u64,
     file_len: u64,
+    block: &[u8],
     source_must_name: SourceMustName,
 ) -> bool {
-    (1..=7u64).any(|k| {
+    debug_assert_eq!(block.len(), BLOCK);
+    debug_assert!(
         offset
-            .checked_sub(k)
-            .and_then(|at| read_block(src, at, file_len))
-            .is_some_and(|b| {
-                let earlier = tar::Header::from_byte_slice(&b);
-                spelled_like_a_writer(&b[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN])
-                    && magic_is_ustar_or_blank(&b)
-                    && earlier.mode().is_ok()
-                    && earlier.entry_size().is_ok()
-                    && (source_must_name == SourceMustName::No || !earlier.path_bytes().is_empty())
-            })
+            .checked_add(BLOCK_U64)
+            .is_some_and(|end| end <= file_len)
+    );
+    const MAX_SHIFT: usize = 7;
+    // `offset.min(7)` is at most 7, so the cast cannot truncate.
+    let before = offset.min(MAX_SHIFT as u64) as usize;
+    if before == 0 {
+        return false;
+    }
+    // `window[MAX_SHIFT - before..MAX_SHIFT]` holds the `before` bytes ahead
+    // of `offset`; `window[MAX_SHIFT..]` is `block`.
+    let mut window = [0u8; MAX_SHIFT + BLOCK];
+    let read = src.seek(SeekFrom::Start(offset - before as u64)).is_ok()
+        && src
+            .read_exact(&mut window[MAX_SHIFT - before..MAX_SHIFT])
+            .is_ok();
+    if !read {
+        return false;
+    }
+    window[MAX_SHIFT..].copy_from_slice(block);
+    (1..=before).any(|k| {
+        let b = &window[MAX_SHIFT - k..MAX_SHIFT - k + BLOCK];
+        let earlier = tar::Header::from_byte_slice(b);
+        spelled_like_a_writer(&b[CHECKSUM_AT..CHECKSUM_AT + CHECKSUM_LEN])
+            && magic_is_ustar_or_blank(b)
+            && earlier.mode().is_ok()
+            && earlier.entry_size().is_ok()
+            && (source_must_name == SourceMustName::No || !earlier.path_bytes().is_empty())
     })
 }
 
@@ -725,24 +758,39 @@ pub const MAX_CHAINS_PER_HEADER: usize = 4;
 
 /// Extension-payload bytes the whole scan may read, per byte of input — see
 /// [`extension_read_budget`].
-const EXTENSION_READS_PER_INPUT_BYTE: u64 = 4;
+const EXTENSION_READS_PER_INPUT_BYTE: u64 = 2;
 
 /// Extension-payload bytes the whole scan may read on top of
 /// [`EXTENSION_READS_PER_INPUT_BYTE`], so a small archive is never short.
 const EXTENSION_READ_SLACK: u64 = 1 << 20;
 
 /// The extension-payload bytes one scan of a `file_len`-byte input may read
-/// in all (pass 2 of `gate_chain_at`): `4 × file_len + 1 MiB` (0.10.3,
-/// Ruling T3-1).
+/// in all (pass 2 of `gate_chain_at`): `2 × file_len + 1 MiB` (0.10.3,
+/// Ruling T3-1, lowered from 4× in fix round 1).
 ///
-/// A legitimate archive reads each real chain's payload once, and a chain
-/// that yields a candidate is jumped with its entry, so its reads total at
-/// most `file_len` — four times that never trips on real input. What it
-/// bounds is forged chains spread over many headers, each under
+/// **What a legitimate archive reads.** A chain whose real header yields a
+/// candidate is read ONCE: a whole candidate is jumped with its payload, and
+/// a truncated one resumes the scan one byte past its header, beyond every
+/// head of its chain. Real chains' payloads are disjoint, so those reads
+/// total at most `file_len`. A chain is read again only when it reaches a
+/// header and still yields nothing — no name after its extensions
+/// (criterion 5) — because the scan then resumes one byte past its first
+/// head and re-gates each later head's sub-chain: `K`, `L`, `x` is read as
+/// `K+L+x`, then `L+x`, then `x`, at most 3× that chain's extension bytes.
+/// No writer produces such a chain (a pax header without `path` in front of
+/// an empty name field), so on real input the reads stay near `file_len` —
+/// measured at most 0.96× across the fix round's legitimate and damaged
+/// fixtures — and 2× never trips. Even an archive of nothing but such
+/// chains would read at most 3× its extension bytes, past 2× only when
+/// those are most of the file.
+///
+/// What it bounds is forged chains spread over many headers, each under
 /// [`MAX_CHAINS_PER_HEADER`]: once it is spent, a chain that needs a payload
 /// is refused without reading it and its header is reported as a
 /// [`Sighting`], so a real entry skipped that way is named, never lost
-/// silently. The scan goes on; a chain with no payload is unaffected.
+/// silently. The scan goes on; a chain with no payload is unaffected. 4×
+/// left too little of `stuffr_core::testing::check_scan_is_linear`'s 8× for
+/// the header walk: one forged chain per v7 terminal reached 8.4–9.0×.
 fn extension_read_budget(file_len: u64) -> u64 {
     file_len
         .saturating_mul(EXTENSION_READS_PER_INPUT_BYTE)
@@ -786,8 +834,10 @@ pub struct TarSalvage {
     /// The header search, its buffer reused across the whole scan.
     search: ForwardSearch,
     /// Terminal header offset → chains whose payloads were read for it —
-    /// [`ChainBudget`]'s count.
-    chains_read: HashMap<u64, usize>,
+    /// [`ChainBudget`]'s count. Pruned below the search position as the
+    /// scan moves on (see `next_candidate`), so it holds only the terminals
+    /// a chain could still reach, not one entry per chain in the archive.
+    chains_read: BTreeMap<u64, usize>,
     /// Extension-payload bytes read so far — against
     /// [`extension_read_budget`].
     payload_read: u64,
@@ -828,6 +878,19 @@ impl SalvageScan for TarSalvage {
             else {
                 return Ok(None);
             };
+            // Every chain from here on starts at or after `search_from`, and
+            // a chain only walks FORWARD (each span is added to its start),
+            // so a terminal before `search_from` can never be reached again.
+            // The search position never moves back: within this call it only
+            // grows, and the engine's next `from` is past the candidate this
+            // call returns, which is past every head it gated.
+            if self
+                .chains_read
+                .first_key_value()
+                .is_some_and(|(&at, _)| at < search_from)
+            {
+                self.chains_read = self.chains_read.split_off(&search_from);
+            }
             let mut budget = ChainBudget {
                 read: &mut self.chains_read,
                 converged: &mut self.seen.converged,
@@ -1110,7 +1173,7 @@ fn sighting_at(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8; 
     if header.entry_size().is_err() || header.path_bytes().is_empty() {
         return Scanned::NotAHeader;
     }
-    if looks_like_a_shifted_twin(src, offset, file_len, SourceMustName::No) {
+    if looks_like_a_shifted_twin(src, offset, file_len, block, SourceMustName::No) {
         return Scanned::Copy;
     }
     // Reached only for a block criterion 3 refused and that is no twin, so a
@@ -1131,7 +1194,7 @@ fn sighting_at(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8; 
 /// headers, four or fewer each, are bounded by [`extension_read_budget`]
 /// instead. Both apply.
 struct ChainBudget<'a> {
-    read: &'a mut HashMap<u64, usize>,
+    read: &'a mut BTreeMap<u64, usize>,
     converged: &'a mut BTreeSet<u64>,
     /// Extension-payload bytes read so far in this scan.
     payload_read: &'a mut u64,
@@ -2431,6 +2494,24 @@ mod tests {
         (outcome, src.bytes_read())
     }
 
+    /// The one work-bounded sighting a converging fixture must carry: at its
+    /// terminal, under either budget's shape. Which budget trips first
+    /// depends on the chains' spans — at ~1 MiB each, four of them exceed
+    /// the scan-wide `2 × file_len + 1 MiB` before the per-header count
+    /// reaches four; [`a_real_chain_behind_four_forged_ones_is_named_not_lost`]
+    /// and the CLI test pin [`CONVERGED_CHAINS_SHAPE`] itself.
+    fn assert_one_work_bounded_sighting_at(outcome: &SalvageOutcome, terminal_at: u64) {
+        use stuffr_core::salvage::SightingKind;
+        assert_eq!(outcome.sightings.len(), 1, "{:?}", outcome.sightings);
+        let s = &outcome.sightings[0];
+        assert_eq!(s.offset, terminal_at, "{s:?}");
+        assert_eq!(s.kind, SightingKind::WorkBounded, "{s:?}");
+        assert!(
+            [CONVERGED_CHAINS_SHAPE, EXTENSION_BUDGET_SHAPE].contains(&s.shape),
+            "{s:?}"
+        );
+    }
+
     #[test]
     fn converging_forged_chains_scan_linearly_and_are_reported() {
         use stuffr_core::testing::{CountingSource, check_scan_is_linear};
@@ -2440,14 +2521,7 @@ mod tests {
         let mut src = CountingSource::new(Cursor::new(data));
         let outcome = salvage_tar(&mut src, &SalvagePolicy::default()).unwrap();
         check_scan_is_linear(src.bytes_read(), len).unwrap();
-        assert!(
-            outcome
-                .sightings
-                .iter()
-                .any(|s| s.offset == terminal_at && s.shape == CONVERGED_CHAINS_SHAPE),
-            "{:?}",
-            outcome.sightings
-        );
+        assert_one_work_bounded_sighting_at(&outcome, terminal_at);
     }
 
     #[test]
@@ -2510,14 +2584,7 @@ mod tests {
         data.extend_from_slice(&[0u8; 1024]);
         let (outcome, _) = linear_scan(data);
         assert!(outcome.entries.is_empty(), "{:?}", outcome.entries);
-        assert_eq!(
-            outcome
-                .sightings
-                .iter()
-                .map(|s| (s.offset, s.shape))
-                .collect::<Vec<_>>(),
-            vec![(terminal_at, CONVERGED_CHAINS_SHAPE)]
-        );
+        assert_one_work_bounded_sighting_at(&outcome, terminal_at);
     }
 
     /// Adversarial variant: many terminals, each behind three forged `x`
@@ -2539,14 +2606,26 @@ mod tests {
         assert!(outcome.sightings.is_empty(), "{:?}", outcome.sightings);
     }
 
+    /// [`ustar_block`] with its magic and version blanked and its checksum
+    /// recomputed — a pre-POSIX (v7) header in GNU's `%06o\0 ` spelling, which
+    /// criterion 3 gates through the shifted-twin check.
+    fn v7_terminal_block(name: &str, typeflag: u8, size: u64) -> [u8; 512] {
+        let mut b = ustar_block(name, typeflag, size);
+        b[257..265].fill(0);
+        b[148..156].fill(b' ');
+        let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+        b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        b
+    }
+
     /// Forged chains spread over many empty-named headers, at most four per
-    /// header — `per` forged `x` heads, then a terminal, repeated `groups`
-    /// times, every head spanning to the terminal of the group about 1 MiB
-    /// later. The per-header budget never trips; each head's payload is up
-    /// to [`MAX_SALVAGE_PAX_SCAN`].
-    fn spread_chains(per: usize, groups: usize) -> Vec<u8> {
+    /// header — `per` forged `x` heads, then a terminal (v7 when `v7`),
+    /// repeated `groups` times, every head spanning to the terminal of the
+    /// group about `ahead_blocks` blocks later. The per-header budget never
+    /// trips; each head's payload is up to [`MAX_SALVAGE_PAX_SCAN`].
+    fn spread_chains(per: usize, groups: usize, v7: bool, ahead_blocks: usize) -> Vec<u8> {
         let g = per + 1;
-        let ahead = 2000 / g; // groups ahead: spans just under 1 MiB
+        let ahead = ahead_blocks / g;
         let mut data = Vec::new();
         for grp in 0..groups {
             for k in 0..per {
@@ -2558,30 +2637,80 @@ mod tests {
                     ((terminal - head - 1) * 512) as u64,
                 ));
             }
-            data.extend_from_slice(&ustar_block("", b'0', 0));
+            let terminal = if v7 {
+                v7_terminal_block("", b'0', 0)
+            } else {
+                ustar_block("", b'0', 0)
+            };
+            data.extend_from_slice(&terminal);
         }
         data.extend_from_slice(&[0u8; 1024]);
         data
     }
 
-    /// Ruling T3-1: the per-header budget's residual. Against 950b79f (the
-    /// per-header budget alone) the three-per-header leg read 1,618,675,198
-    /// bytes of a 2,098,176-byte input; the scan-wide extension-read budget
-    /// makes both legs linear and reports the headers it stopped reading
-    /// chains for.
+    /// Ruling T3-1 and fix round 1: the per-header budget's residual,
+    /// ~2 MiB per leg. Against 950b79f (the per-header budget alone) the
+    /// three-per-header ustar leg read 1,618,675,198 bytes of a
+    /// 2,098,176-byte input. Against 72c91cf (scan-wide budget at
+    /// `4 × file_len + 1 MiB`, a twin check reading seven whole blocks) the
+    /// one-per-header and v7 legs still broke the bound — see the task
+    /// report for each figure. Every leg is linear now and reports the
+    /// headers it stopped reading chains for.
     #[test]
     fn forged_chains_spread_over_many_headers_scan_linearly() {
-        for per in [3, 4] {
-            let (outcome, _) = linear_scan(spread_chains(per, 4096 / (per + 1)));
-            assert!(outcome.entries.is_empty(), "{per}");
-            assert!(
-                outcome
-                    .sightings
-                    .iter()
-                    .any(|s| s.shape == EXTENSION_BUDGET_SHAPE),
-                "{per}: {:?}",
-                outcome.sightings
-            );
+        for per in [1, 2, 3, 4] {
+            for (v7, ahead_blocks) in [(false, 2000), (true, 2000), (true, 64)] {
+                let label = format!("per={per} v7={v7} ahead={ahead_blocks}");
+                let (outcome, _) =
+                    linear_scan(spread_chains(per, 4096 / (per + 1), v7, ahead_blocks));
+                assert!(outcome.entries.is_empty(), "{label}");
+                assert!(
+                    outcome
+                        .sightings
+                        .iter()
+                        .any(|s| s.shape == EXTENSION_BUDGET_SHAPE),
+                    "{label}: {:?}",
+                    outcome.sightings
+                );
+            }
+        }
+    }
+
+    /// Fix round 1: bare empty-named v7 headers, one per block and no chain
+    /// at all. Each is gated through criterion 3's shifted-twin check, which
+    /// read the seven earlier blocks whole — 3,584 bytes per 512-byte header,
+    /// ~11x the input at 72c91cf. It reads the seven bytes before the header
+    /// now.
+    #[test]
+    fn bare_v7_headers_scan_linearly() {
+        let mut data = Vec::new();
+        for _ in 0..2048 {
+            data.extend_from_slice(&v7_terminal_block("", b'0', 0));
+        }
+        data.extend_from_slice(&[0u8; 1024]);
+        let (outcome, _) = linear_scan(data);
+        assert!(outcome.entries.is_empty());
+        assert!(outcome.sightings.is_empty(), "{:?}", outcome.sightings);
+    }
+
+    /// Fix round 1: short chains into empty-named v7 terminals — `x`, and
+    /// `K`, `L`, `x` of zero span — repeated. Every chain re-gates its v7
+    /// terminal, twin check included (~10.5x at 72c91cf).
+    #[test]
+    fn short_chains_into_v7_terminals_scan_linearly() {
+        for kl in [false, true] {
+            let mut data = Vec::new();
+            while data.len() < 1 << 20 {
+                if kl {
+                    data.extend_from_slice(&ustar_block("././@LongLink", b'K', 0));
+                    data.extend_from_slice(&ustar_block("././@LongLink", b'L', 0));
+                }
+                data.extend_from_slice(&ustar_block("", b'x', 0));
+                data.extend_from_slice(&v7_terminal_block("", b'0', 0));
+            }
+            data.extend_from_slice(&[0u8; 1024]);
+            let (outcome, _) = linear_scan(data);
+            assert!(outcome.entries.is_empty(), "kl={kl}");
         }
     }
 
