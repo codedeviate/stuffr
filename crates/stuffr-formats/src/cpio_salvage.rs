@@ -161,6 +161,7 @@
 //! allocator-probe tests below prove both, each paired with the lower bound
 //! that proves the probe is attached.
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -452,17 +453,13 @@ fn find_next_magic(
     Ok(at.zip(found))
 }
 
-/// A run of zero bytes this scan has already read: `[start, end)` is all
-/// zero, and `to_eof` says whether it ran to EOF (`end == file_len`) or
-/// stopped at a non-zero byte at `end`. One record, the most recent: the
-/// quadratic shape is many landing points inside ONE run, and that is what
-/// it answers.
-#[derive(Debug, Clone, Copy)]
-struct KnownZeros {
-    start: u64,
-    end: u64,
-    to_eof: bool,
-}
+/// The zero runs this scan has already read, as disjoint
+/// `start -> (end, to_eof)` records: `[start, end)` is all zero, and `to_eof`
+/// says whether it ran to EOF (`end == file_len`) or stopped at a non-zero
+/// byte at `end`. Many headers landing in a handful of runs, in any order,
+/// then read each zero byte at most once; memory is linear in the number of
+/// runs.
+type KnownZeros = BTreeMap<u64, (u64, bool)>;
 
 /// A candidate, and where the scan resumes after it.
 struct Found {
@@ -484,7 +481,7 @@ fn corroborates_the_size(
     src: &mut dyn SeekRead,
     next_header: u64,
     file_len: u64,
-    memo: &mut Option<KnownZeros>,
+    memo: &mut KnownZeros,
 ) -> bool {
     if next_header >= file_len {
         return true;
@@ -504,22 +501,18 @@ fn corroborates_the_size(
 /// uncorroborated jump costs a scan of the run once (the memo answers every
 /// later landing in it), never an entry.
 ///
-/// `memo` holds the most recent run this scan has read. A landing point
-/// inside it is answered with no read; a scan that reaches its first byte
-/// stops and adopts its answer. So a run is read once, however many headers
-/// land in it (0.10.3 §1: it was once read per header, quadratically).
-fn zeros_to_eof(
-    src: &mut dyn SeekRead,
-    from: u64,
-    file_len: u64,
-    memo: &mut Option<KnownZeros>,
-) -> bool {
-    if let Some(known) = *memo {
-        if known.start <= from && from < known.end {
-            return known.to_eof;
+/// `memo` holds every run this scan has read. A landing point inside one is
+/// answered with no read; a scan that reaches the first byte of one stops
+/// there and adopts its answer, merging the two. So a zero byte is read at
+/// most once, however many headers land in however many runs (0.10.3 §1: a
+/// run was once read per header, quadratically).
+fn zeros_to_eof(src: &mut dyn SeekRead, from: u64, file_len: u64, memo: &mut KnownZeros) -> bool {
+    if let Some((_, &(end, to_eof))) = memo.range(..=from).next_back() {
+        if from < end {
+            return to_eof;
         }
         // The byte at `end` is the non-zero one that stopped the run.
-        if from == known.end && !known.to_eof {
+        if from == end && !to_eof {
             return false;
         }
     }
@@ -530,22 +523,15 @@ fn zeros_to_eof(
     let mut pos = from;
     while pos < file_len {
         // Never read into a known run: stop at its first byte and adopt it.
-        let mut limit = file_len;
-        if let Some(known) = *memo
-            && known.start > pos
+        let next = memo.range(pos..).next().map(|(&s, &v)| (s, v));
+        if let Some((start, (end, to_eof))) = next
+            && start == pos
         {
-            limit = limit.min(known.start);
+            memo.remove(&start);
+            memo.insert(from, (end, to_eof));
+            return to_eof;
         }
-        if let Some(known) = *memo
-            && pos == known.start
-        {
-            *memo = Some(KnownZeros {
-                start: from,
-                end: known.end,
-                to_eof: known.to_eof,
-            });
-            return known.to_eof;
-        }
+        let limit = next.map_or(file_len, |(start, _)| start.min(file_len));
         let want = usize::try_from((limit - pos).min(buf.len() as u64)).unwrap_or(buf.len());
         match src.read(&mut buf[..want]) {
             Ok(0) | Err(_) => return false,
@@ -553,11 +539,7 @@ fn zeros_to_eof(
                 if let Some(i) = buf[..n].iter().position(|&b| b != 0) {
                     let end = pos + i as u64;
                     if end > from {
-                        *memo = Some(KnownZeros {
-                            start: from,
-                            end,
-                            to_eof: false,
-                        });
+                        memo.insert(from, (end, false));
                     }
                     return false;
                 }
@@ -565,11 +547,7 @@ fn zeros_to_eof(
             }
         }
     }
-    *memo = Some(KnownZeros {
-        start: from,
-        end: file_len,
-        to_eof: true,
-    });
+    memo.insert(from, (file_len, true));
     true
 }
 
@@ -585,7 +563,7 @@ fn scan_at(
     offset: u64,
     magic: Magic,
     file_len: u64,
-    memo: &mut Option<KnownZeros>,
+    memo: &mut KnownZeros,
 ) -> Scanned {
     match magic {
         Magic::Newc => match gate_newc_at(src, offset, file_len) {
@@ -625,7 +603,7 @@ fn candidate_from(
     offset: u64,
     newc: Newc,
     file_len: u64,
-    memo: &mut Option<KnownZeros>,
+    memo: &mut KnownZeros,
 ) -> Found {
     let size = newc.file_size();
     let (available_len, next_header) = match newc.payload_start.checked_add(size) {
@@ -685,8 +663,8 @@ fn candidate_from(
 pub struct CpioSalvage {
     resume: Option<Resume>,
     sightings: Vec<(u64, Variant)>,
-    /// The latest zero run this scan read — see [`KnownZeros`].
-    memo: Option<KnownZeros>,
+    /// The zero runs this scan has read — see [`KnownZeros`].
+    memo: KnownZeros,
     /// The magic search's reusable window.
     search: ForwardSearch,
 }
@@ -1725,6 +1703,7 @@ mod tests {
         let bytes = newc_entry_raw(NEWC_MAGIC, &name, b"data");
         let mut src = Cursor::new(bytes);
         let (out, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
             salvage_cpio(&mut src, &SalvagePolicy::default()).unwrap()
         });
         assert_eq!(out.entries.len(), 1);
@@ -1870,10 +1849,10 @@ mod tests {
 
     #[test]
     fn the_memo_answers_like_a_fresh_scan() {
-        // Two shapes, each salvaged twice: the results must equal the pre-memo
+        // Two shapes, each salvaged once: the results must equal the pre-memo
         // answers pinned here. (a) a run that reaches EOF (writer padding: the
         // jump IS taken); (b) a run ending in a non-zero byte (the jump is NOT
-        // taken). Landing points both inside and before an already-known run.
+        // taken), with every landing point inside one already-known run.
         let mut eof_padded = newc_header_only("a", 4);
         eof_padded.extend_from_slice(b"abcd");
         eof_padded.extend_from_slice(&newc_header_only("TRAILER!!!", 0));
@@ -1891,6 +1870,119 @@ mod tests {
                 .enumerate()
                 .all(|(i, e)| e.meta.name == format!("f{i}"))
         );
+    }
+
+    /// Headers landing alternately in `k` distinct zero runs, each ending in
+    /// a non-zero byte. A one-record memo evicted the other run's record on
+    /// every landing: quadratic. (Review of 0.10.3 Task 2.)
+    fn alternating_zero_runs(headers: usize, k: usize, run: usize) -> Vec<u8> {
+        let header_bytes: usize = (0..headers)
+            .map(|i| newc_header_only(&format!("f{i}"), 0).len())
+            .sum();
+        let run_start = |r: usize| header_bytes + r * (run + 4);
+        let mut out = Vec::new();
+        for i in 0..headers {
+            let h = newc_header_only(&format!("f{i}"), 0);
+            let payload_start = out.len() + h.len();
+            let landing = run_start(i % k) + 4 * (i / k + 1);
+            out.extend_from_slice(&newc_header_only(
+                &format!("f{i}"),
+                (landing - payload_start) as u32,
+            ));
+        }
+        for _ in 0..k {
+            out.resize(out.len() + run, 0);
+            out.extend_from_slice(&[1, 1, 1, 1]);
+        }
+        out
+    }
+
+    fn assert_scans_linearly_with(data: Vec<u8>, headers: usize) {
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        let len = data.len() as u64;
+        let mut src = CountingSource::new(Cursor::new(data));
+        let outcome = salvage_cpio(&mut src, &SalvagePolicy::default()).unwrap();
+        assert_eq!(outcome.entries.len(), headers);
+        check_scan_is_linear(src.bytes_read(), len).unwrap();
+    }
+
+    #[test]
+    fn headers_alternating_between_two_zero_runs_scan_linearly() {
+        assert_scans_linearly_with(alternating_zero_runs(2_000, 2, 450 * 1024), 2_000);
+    }
+
+    #[test]
+    fn headers_alternating_between_three_zero_runs_scan_linearly() {
+        assert_scans_linearly_with(alternating_zero_runs(2_000, 3, 300 * 1024), 2_000);
+    }
+
+    /// Landings that DESCEND through one run: each lands before the run
+    /// already known, so the scan must stop at the known start, adopt it and
+    /// merge.
+    #[test]
+    fn descending_landings_in_one_zero_run_scan_linearly() {
+        let headers = 2_000usize;
+        let run = 900 * 1024usize;
+        let header_bytes: usize = (0..headers)
+            .map(|i| newc_header_only(&format!("f{i}"), 0).len())
+            .sum();
+        let mut out = Vec::new();
+        for i in 0..headers {
+            let h = newc_header_only(&format!("f{i}"), 0);
+            let payload_start = out.len() + h.len();
+            let landing = header_bytes + run - 4 * (i + 1);
+            out.extend_from_slice(&newc_header_only(
+                &format!("f{i}"),
+                (landing - payload_start) as u32,
+            ));
+        }
+        out.resize(header_bytes + run, 0);
+        out.push(1);
+        assert_scans_linearly_with(out, headers);
+    }
+
+    /// The memo's answer equals a fresh all-zero check, and its records stay
+    /// disjoint and truthful, over random buffers and landing orders. Fixed
+    /// seed.
+    #[test]
+    fn the_memo_matches_a_fresh_zero_check_on_random_buffers() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..3_000 {
+            let len = (rnd() % 200 + 1) as usize;
+            let mut buf = vec![0u8; len];
+            for _ in 0..rnd() % 4 {
+                let p = (rnd() as usize) % len;
+                buf[p] = 1 + (rnd() % 255) as u8;
+            }
+            let mut memo = KnownZeros::new();
+            let mut src = Cursor::new(buf.clone());
+            for _ in 0..30 {
+                let from = rnd() % len as u64;
+                let fresh = buf[from as usize..].iter().all(|&b| b == 0);
+                assert_eq!(
+                    zeros_to_eof(&mut src, from, len as u64, &mut memo),
+                    fresh,
+                    "buf={buf:?} from={from} memo={memo:?}"
+                );
+                let mut prev_end = 0u64;
+                for (&start, &(end, to_eof)) in &memo {
+                    assert!(start < end && start >= prev_end, "{memo:?}");
+                    assert!(buf[start as usize..end as usize].iter().all(|&b| b == 0));
+                    if to_eof {
+                        assert_eq!(end, len as u64);
+                    } else {
+                        assert_ne!(buf[end as usize], 0);
+                    }
+                    prev_end = end;
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------
