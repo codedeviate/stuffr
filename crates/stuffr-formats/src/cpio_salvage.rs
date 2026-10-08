@@ -457,8 +457,8 @@ fn find_next_magic(
 /// `start -> (end, to_eof)` records: `[start, end)` is all zero, and `to_eof`
 /// says whether it ran to EOF (`end == file_len`) or stopped at a non-zero
 /// byte at `end`. Many headers landing in a handful of runs, in any order,
-/// then read each zero byte at most once; memory is linear in the number of
-/// runs.
+/// then read each zero byte at most once (plus one short chunk of overshoot
+/// per landing); memory is linear in the number of runs.
 type KnownZeros = BTreeMap<u64, (u64, bool)>;
 
 /// A candidate, and where the scan resumes after it.
@@ -486,26 +486,30 @@ fn corroborates_the_size(
     if next_header >= file_len {
         return true;
     }
-    match read_at(src, next_header, MAGIC_LEN as u64, file_len)
-        .as_deref()
-        .and_then(magic_of)
-    {
+    let head = read_at(src, next_header, MAGIC_LEN as u64, file_len);
+    match head.as_deref().and_then(magic_of) {
         Some(Magic::Newc | Magic::Crc) => gate_newc_at(src, next_header, file_len).is_ok(),
         Some(Magic::Odc) => gate_odc_at(src, next_header, file_len).is_ok(),
+        // No magic and a non-zero byte already in hand: the zeros cannot
+        // reach EOF, which is all `zeros_to_eof` would find at its first
+        // non-zero byte. (`None` from `read_at` — fewer than `MAGIC_LEN`
+        // bytes left — takes the ordinary path.)
+        None if head.as_deref().is_some_and(|h| h.iter().any(|&b| b != 0)) => false,
         None => zeros_to_eof(src, next_header, file_len, memo),
     }
 }
 
-/// Whether every byte from `from` to EOF is zero, read in small chunks and
-/// stopping at the first that is not. A read error answers `false`: an
+/// Whether every byte from `from` to EOF is zero, read in chunks that start
+/// at 64 bytes and double to 4096, stopping at the first that is not. A read error answers `false`: an
 /// uncorroborated jump costs a scan of the run once (the memo answers every
 /// later landing in it), never an entry.
 ///
 /// `memo` holds every run this scan has read. A landing point inside one is
 /// answered with no read; a scan that reaches the first byte of one stops
 /// there and adopts its answer, merging the two. So a zero byte is read at
-/// most once, however many headers land in however many runs (0.10.3 §1: a
-/// run was once read per header, quadratically).
+/// most once, plus at most one geometric chunk of overshoot per landing: a
+/// landing on a non-zero byte costs 64 bytes, not 4 KiB (0.10.3 §1: a run
+/// was once read per header, quadratically).
 fn zeros_to_eof(src: &mut dyn SeekRead, from: u64, file_len: u64, memo: &mut KnownZeros) -> bool {
     if let Some((_, &(end, to_eof))) = memo.range(..=from).next_back() {
         if from < end {
@@ -520,6 +524,7 @@ fn zeros_to_eof(src: &mut dyn SeekRead, from: u64, file_len: u64, memo: &mut Kno
         return false;
     }
     let mut buf = [0u8; 4096];
+    let mut chunk = 64usize;
     let mut pos = from;
     while pos < file_len {
         // Never read into a known run: stop at its first byte and adopt it.
@@ -532,7 +537,8 @@ fn zeros_to_eof(src: &mut dyn SeekRead, from: u64, file_len: u64, memo: &mut Kno
             return to_eof;
         }
         let limit = next.map_or(file_len, |(start, _)| start.min(file_len));
-        let want = usize::try_from((limit - pos).min(buf.len() as u64)).unwrap_or(buf.len());
+        let want = usize::try_from((limit - pos).min(chunk as u64)).unwrap_or(chunk);
+        chunk = (chunk * 2).min(buf.len());
         match src.read(&mut buf[..want]) {
             Ok(0) | Err(_) => return false,
             Ok(n) => {
@@ -1941,6 +1947,45 @@ mod tests {
         assert_scans_linearly_with(out, headers);
     }
 
+    /// `count` headers whose sizes land them `landing(i)` bytes into
+    /// `region`, which follows the headers.
+    fn headers_landing_in(
+        count: usize,
+        region: &[u8],
+        landing: impl Fn(usize) -> usize,
+    ) -> Vec<u8> {
+        let header_bytes: usize = (0..count)
+            .map(|i| newc_header_only(&format!("f{i}"), 0).len())
+            .sum();
+        let mut out = Vec::new();
+        for i in 0..count {
+            let h = newc_header_only(&format!("f{i}"), 0);
+            let payload_start = out.len() + h.len();
+            let at = header_bytes + landing(i);
+            out.extend_from_slice(&newc_header_only(
+                &format!("f{i}"),
+                (at - payload_start) as u32,
+            ));
+        }
+        out.extend_from_slice(region);
+        out
+    }
+
+    /// Every landing on a non-zero byte: a fixed 4 KiB read per landing that
+    /// recorded nothing, repeated 2,000 times (review round 2).
+    #[test]
+    fn landings_on_non_zero_bytes_scan_linearly() {
+        let region = vec![1u8; 4 * 2_001];
+        assert_scans_linearly_with(headers_landing_in(2_000, &region, |i| 4 * i), 2_000);
+    }
+
+    /// Every landing in its own 4-byte zero run (`0000 1111` repeated).
+    #[test]
+    fn landings_in_their_own_short_zero_runs_scan_linearly() {
+        let region: Vec<u8> = (0..2_001).flat_map(|_| [0, 0, 0, 0, 1, 1, 1, 1]).collect();
+        assert_scans_linearly_with(headers_landing_in(2_000, &region, |i| 8 * i), 2_000);
+    }
+
     /// The memo's answer equals a fresh all-zero check, and its records stay
     /// disjoint and truthful, over random buffers and landing orders. Fixed
     /// seed.
@@ -1953,8 +1998,12 @@ mod tests {
             seed ^= seed << 17;
             seed
         };
-        for _ in 0..3_000 {
-            let len = (rnd() % 200 + 1) as usize;
+        for _ in 0..1_500 {
+            let len = if rnd() % 4 == 0 {
+                (rnd() % 20_000 + 1) as usize
+            } else {
+                (rnd() % 200 + 1) as usize
+            };
             let mut buf = vec![0u8; len];
             for _ in 0..rnd() % 4 {
                 let p = (rnd() as usize) % len;
@@ -1970,16 +2019,19 @@ mod tests {
                     fresh,
                     "buf={buf:?} from={from} memo={memo:?}"
                 );
-                let mut prev_end = 0u64;
+                let mut prev_end: Option<u64> = None;
                 for (&start, &(end, to_eof)) in &memo {
-                    assert!(start < end && start >= prev_end, "{memo:?}");
+                    assert!(
+                        start < end && prev_end.is_none_or(|p| start > p),
+                        "{memo:?}"
+                    );
                     assert!(buf[start as usize..end as usize].iter().all(|&b| b == 0));
                     if to_eof {
                         assert_eq!(end, len as u64);
                     } else {
                         assert_ne!(buf[end as usize], 0);
                     }
-                    prev_end = end;
+                    prev_end = Some(end);
                 }
             }
         }
