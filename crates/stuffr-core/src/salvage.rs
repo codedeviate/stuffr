@@ -1017,9 +1017,26 @@ impl Default for SalvagePolicy {
 /// the distance it actually searched, never a fixed 64 KiB per call. That is
 /// the property `testing::check_scan_is_linear` holds every scanner to.
 /// O(1) memory however far the next signature is.
+///
+/// **The bytes a search read past its answer are kept for the next call
+/// (0.10.3 Task 4).** A call whose `from` lies inside what the previous
+/// call read tests those bytes again without reading them again, and reads
+/// only past them. Without that, every call paid at least its first read
+/// afresh, so candidates a few bytes apart — an accepted header every
+/// eleven bytes, say — cost a first read EACH: 64 bytes, or `2 * sig_len -
+/// 1` for a long signature, per candidate. A scan whose `from` only moves
+/// forward therefore reads each byte about once in its searches, however
+/// dense its candidates are.
+///
+/// **One `ForwardSearch` serves one source**, whose bytes do not change
+/// while it is in use — a scanner owns one per scan. Pass a different
+/// source and the kept bytes are that other source's. A call with a
+/// smaller `file_len` than the last never tests a kept byte at or past it.
 #[derive(Debug, Default)]
 pub struct ForwardSearch {
+    /// Bytes read from the source, starting at offset `window_start`.
     window: Vec<u8>,
+    window_start: u64,
 }
 
 impl ForwardSearch {
@@ -1050,37 +1067,77 @@ impl ForwardSearch {
         from: u64,
         file_len: u64,
         sig_len: usize,
+        matches: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<Option<u64>> {
+        self.find_to_eof(src, from, file_len, sig_len, sig_len, matches)
+    }
+
+    /// [`Self::find`] for a record whose length is not fixed: offsets with
+    /// at least `sig_len` bytes before `file_len` are offered exactly
+    /// `sig_len` bytes, and the last offsets — those with fewer, down to
+    /// `min_len` — are offered every byte left before `file_len`. A record
+    /// whose longest form is `sig_len` bytes can then be judged whole
+    /// inside the search, wherever it starts, without a second read near
+    /// EOF. `min_len` is at least 1 and at most `sig_len`.
+    pub fn find_to_eof(
+        &mut self,
+        src: &mut dyn SeekRead,
+        from: u64,
+        file_len: u64,
+        sig_len: usize,
+        min_len: usize,
         mut matches: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<Option<u64>> {
-        if sig_len == 0 || file_len.saturating_sub(from) < sig_len as u64 {
+        debug_assert!(1 <= min_len && min_len <= sig_len);
+        if min_len == 0 || file_len.saturating_sub(from) < min_len as u64 {
             return Ok(None);
         }
-        src.seek(SeekFrom::Start(from))?;
-        self.window.clear();
-        let mut window_start = from;
+        // Keep what the last call read from `from` on, if it read `from`;
+        // otherwise start empty. Never keep a byte at or past `file_len`.
+        let kept_end = self.window_start + self.window.len() as u64;
+        if from >= self.window_start && from < kept_end {
+            self.window.drain(..(from - self.window_start) as usize);
+            let fits = (file_len - from).min(self.window.len() as u64);
+            self.window.truncate(fits as usize);
+        } else {
+            self.window.clear();
+        }
+        self.window_start = from;
         let mut chunk = Self::FIRST_CHUNK.max(2 * sig_len - 1);
+        let mut at_eof = false;
         loop {
-            let old = self.window.len();
-            let remaining = file_len - (window_start + old as u64);
-            let want = (chunk as u64).min(remaining) as usize;
-            self.window.resize(old + want, 0);
-            let n = src.read(&mut self.window[old..])?;
-            self.window.truncate(old + n);
+            // Every offset with a full `sig_len` bytes in the window.
             if self.window.len() >= sig_len {
                 let last = self.window.len() - sig_len;
                 if let Some(at) = (0..=last).find(|&i| matches(&self.window[i..i + sig_len])) {
-                    return Ok(Some(window_start + at as u64));
+                    return Ok(Some(self.window_start + at as u64));
                 }
                 let tested = last + 1;
-                window_start += tested as u64;
+                self.window_start += tested as u64;
                 self.window.drain(..tested);
             }
-            if n == 0 || window_start + self.window.len() as u64 >= file_len {
-                return Ok(None);
+            let end = self.window_start + self.window.len() as u64;
+            if at_eof || end >= file_len {
+                // Nothing more to read: the offsets left have fewer than
+                // `sig_len` bytes, and are offered what there is down to
+                // `min_len`. They stay in the window, so a later call
+                // re-tests them without a read.
+                let short = self.window.len().saturating_sub(min_len - 1);
+                let tail = (0..short).find(|&i| matches(&self.window[i..]));
+                return Ok(tail.map(|at| self.window_start + at as u64));
             }
-            // Grow only on a full read: a source that trickles short reads
-            // must not make every call zero a 64 KiB buffer for 7 bytes.
-            if n == want {
+            let old = self.window.len();
+            let want = (chunk as u64).min(file_len - end) as usize;
+            src.seek(SeekFrom::Start(end))?;
+            self.window.resize(old + want, 0);
+            let n = src.read(&mut self.window[old..])?;
+            self.window.truncate(old + n);
+            if n == 0 {
+                at_eof = true;
+            } else if n == want {
+                // Grow only on a full read: a source that trickles short
+                // reads must not make every call zero a 64 KiB buffer for
+                // 7 bytes.
                 chunk = (chunk * 2).min(Self::MAX_CHUNK);
             }
         }
@@ -2208,6 +2265,96 @@ mod tests {
             Some(300)
         );
         assert_eq!(src.bytes_read(), 2 * 512 - 1);
+    }
+
+    /// Dense hits cost no first read each: what one call read past its
+    /// answer is tested by the next without reading it again. A hit every 7
+    /// bytes through 1 MiB used to cost 64 bytes read per hit (9x); kept,
+    /// the searches read each byte once.
+    #[test]
+    fn dense_hits_read_each_byte_about_once() {
+        use crate::testing::CountingSource;
+        let sig = b"070701";
+        let mut data = vec![b'x'; 1 << 20];
+        for at in (0..data.len() - sig.len()).step_by(7) {
+            data[at..at + sig.len()].copy_from_slice(sig);
+        }
+        let len = data.len() as u64;
+        let mut src = CountingSource::new(Cursor::new(data.clone()));
+        let mut search = ForwardSearch::new();
+        let (mut from, mut hits) = (0, Vec::new());
+        while let Some(at) = search
+            .find(&mut src, from, len, sig.len(), |w| w == sig)
+            .unwrap()
+        {
+            hits.push(at);
+            // A scanner reads its candidate between searches; the kept
+            // bytes must survive the source's position moving.
+            src.seek(SeekFrom::Start(at)).unwrap();
+            let mut header = [0u8; 6];
+            src.read_exact(&mut header).unwrap();
+            from = at + 1;
+        }
+        assert_eq!(hits, naive(&data, sig));
+        let header_reads = 6 * hits.len() as u64;
+        assert!(
+            src.bytes_read() - header_reads <= len + ForwardSearch::MAX_CHUNK as u64,
+            "searches read {} bytes of a {len}-byte input",
+            src.bytes_read() - header_reads
+        );
+    }
+
+    /// A call starting before what was kept, or past it, still answers
+    /// exactly what a fresh search answers.
+    #[test]
+    fn kept_bytes_never_change_an_answer() {
+        let sig = b"070701";
+        let mut data = vec![b'x'; 300_000];
+        for at in [5usize, 70, 4_000, 70_000, 250_000, 299_994] {
+            data[at..at + sig.len()].copy_from_slice(sig);
+        }
+        let len = data.len() as u64;
+        let mut kept = ForwardSearch::new();
+        let mut src = Cursor::new(data.clone());
+        for from in [
+            0u64, 6, 3, 71, 60, 4_001, 200_000, 69_000, 299_995, 250_001, 0,
+        ] {
+            for file_len in [len, 250_003, 70_006, 4_005] {
+                let fresh = ForwardSearch::new()
+                    .find(&mut Cursor::new(data.clone()), from, file_len, 6, |w| {
+                        w == sig
+                    })
+                    .unwrap();
+                let got = kept
+                    .find(&mut src, from, file_len, 6, |w| w == sig)
+                    .unwrap();
+                assert_eq!(got, fresh, "from {from}, file_len {file_len}");
+            }
+        }
+    }
+
+    /// `find_to_eof` offers the last offsets every byte left, down to
+    /// `min_len`, and offers the rest exactly `sig_len`.
+    #[test]
+    fn find_to_eof_offers_the_tail_what_is_left() {
+        let data: Vec<u8> = (0..100u8).collect();
+        let mut offered = Vec::new();
+        let found = ForwardSearch::new()
+            .find_to_eof(&mut Cursor::new(data.clone()), 10, 100, 20, 3, |w| {
+                offered.push((w[0], w.len()));
+                false
+            })
+            .unwrap();
+        assert_eq!(found, None);
+        let expected: Vec<(u8, usize)> = (10u8..=97)
+            .map(|at| (at, 20.min(100 - at as usize)))
+            .collect();
+        assert_eq!(offered, expected);
+        // A hit in the tail answers its offset.
+        let at = ForwardSearch::new()
+            .find_to_eof(&mut Cursor::new(data), 0, 100, 20, 1, |w| w[0] == 95)
+            .unwrap();
+        assert_eq!(at, Some(95));
     }
 
     /// Pins `annotate_candidates`' semantics across the Vec -> HashMap change:
