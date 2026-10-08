@@ -785,6 +785,65 @@ impl Read for ChunkedReader {
     }
 }
 
+/// A source that counts the bytes it DELIVERS — every byte a scanner asked
+/// for and got, re-reads included. Wrapped around the source handed to a
+/// `salvage_*` entry point, it measures the scan's work in the unit
+/// [`check_scan_is_linear`] bounds.
+#[derive(Debug)]
+pub struct CountingSource<R> {
+    inner: R,
+    read: u64,
+}
+
+impl<R> CountingSource<R> {
+    pub fn new(inner: R) -> Self {
+        Self { inner, read: 0 }
+    }
+    pub fn bytes_read(&self) -> u64 {
+        self.read
+    }
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for CountingSource<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(out)?;
+        self.read += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for CountingSource<R> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+/// The bound every salvage scan is held to: bytes delivered to the scanner
+/// at most `SCAN_READ_FACTOR × file_len + SCAN_READ_SLACK`. Provisional
+/// until 0.10.3 Task 4 measures the corpus and fixes it here.
+pub const SCAN_READ_FACTOR: u64 = 8;
+pub const SCAN_READ_SLACK: u64 = 64 * 1024;
+
+/// `Err` naming both figures when a scan read more than
+/// [`SCAN_READ_FACTOR`] × `file_len` + [`SCAN_READ_SLACK`] bytes — work
+/// that grows faster than its input, the class 0.10.3 closed in cpio
+/// (zero-run rescans) and tar (converging extension chains).
+pub fn check_scan_is_linear(bytes_read: u64, file_len: u64) -> std::result::Result<(), String> {
+    let bound = SCAN_READ_FACTOR
+        .saturating_mul(file_len)
+        .saturating_add(SCAN_READ_SLACK);
+    if bytes_read > bound {
+        return Err(format!(
+            "salvage scan read {bytes_read} bytes of a {file_len}-byte input, past the \
+             {SCAN_READ_FACTOR}x + {SCAN_READ_SLACK} bound: its work grows faster than its input"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,5 +1228,25 @@ mod tests {
             ..Default::default()
         };
         assert!(format!("{o:?}").contains("governor"));
+    }
+
+    #[test]
+    fn counting_source_counts_delivered_bytes() {
+        use std::io::{Cursor, Seek, SeekFrom};
+        let mut src = CountingSource::new(Cursor::new(vec![1u8; 100]));
+        let mut buf = [0u8; 30];
+        src.read_exact(&mut buf).unwrap();
+        src.seek(SeekFrom::Start(0)).unwrap();
+        src.read_exact(&mut buf).unwrap();
+        assert_eq!(src.bytes_read(), 60);
+    }
+
+    #[test]
+    fn the_linear_bound_is_factor_times_length_plus_slack() {
+        let len = 1_000_000;
+        assert!(check_scan_is_linear(SCAN_READ_FACTOR * len + SCAN_READ_SLACK, len).is_ok());
+        let err =
+            check_scan_is_linear(SCAN_READ_FACTOR * len + SCAN_READ_SLACK + 1, len).unwrap_err();
+        assert!(err.contains("read"), "{err}");
     }
 }

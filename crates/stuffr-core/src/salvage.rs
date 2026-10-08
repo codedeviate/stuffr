@@ -80,7 +80,8 @@
 //! [`UnverifiedCause::OverEntryCeiling`] for why it is a status there
 //! rather than a [`crate::Error`] anywhere.
 
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::io::{self, Read, SeekFrom, Write};
 use std::path::Path;
 
 use crate::archive::EntryMeta;
@@ -98,7 +99,7 @@ use crate::source::SeekRead;
 pub const MAX_SALVAGE_ENTRY: u64 = 4 * 1024 * 1024 * 1024;
 
 /// What a format can prove about a candidate it found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verifier {
     /// CRC-32, as zip, arj and gzip compute it.
     Crc32(u32),
@@ -946,6 +947,68 @@ impl Default for SalvagePolicy {
     }
 }
 
+/// Reusable scratch for a scanner's forward search for its next signature
+/// (a magic, a checksum-valid block). Reads start at [`Self::FIRST_CHUNK`]
+/// and double up to [`Self::MAX_CHUNK`], into one buffer kept across calls,
+/// so a search whose answer is a few bytes away reads a few bytes: a scan
+/// that resumes one byte past a refused candidate costs work proportional to
+/// the distance it actually searched, never a fixed 64 KiB per call. That is
+/// the property `testing::check_scan_is_linear` holds every scanner to.
+/// O(1) memory however far the next signature is.
+#[derive(Debug, Default)]
+pub struct ForwardSearch {
+    window: Vec<u8>,
+}
+
+impl ForwardSearch {
+    pub const FIRST_CHUNK: usize = 64;
+    pub const MAX_CHUNK: usize = 64 * 1024;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The first offset `>= from` at which `matches` accepts the `sig_len`
+    /// bytes starting there, or `None` when none does before `file_len`.
+    /// `matches` sees exactly `sig_len` bytes. Every offset is tested once,
+    /// carrying `sig_len - 1` bytes across a chunk boundary.
+    pub fn find(
+        &mut self,
+        src: &mut dyn SeekRead,
+        from: u64,
+        file_len: u64,
+        sig_len: usize,
+        mut matches: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<Option<u64>> {
+        if sig_len == 0 || file_len.saturating_sub(from) < sig_len as u64 {
+            return Ok(None);
+        }
+        src.seek(SeekFrom::Start(from))?;
+        self.window.clear();
+        let mut window_start = from;
+        let mut chunk = Self::FIRST_CHUNK.max(sig_len);
+        loop {
+            let old = self.window.len();
+            self.window.resize(old + chunk, 0);
+            let n = src.read(&mut self.window[old..])?;
+            self.window.truncate(old + n);
+            if self.window.len() >= sig_len {
+                let last = self.window.len() - sig_len;
+                if let Some(at) = (0..=last).find(|&i| matches(&self.window[i..i + sig_len])) {
+                    return Ok(Some(window_start + at as u64));
+                }
+                let tested = last + 1;
+                window_start += tested as u64;
+                self.window.drain(..tested);
+            }
+            if n == 0 {
+                return Ok(None);
+            }
+            chunk = (chunk * 2).min(Self::MAX_CHUNK);
+        }
+    }
+}
+
 /// The per-format seam. A scanner recognises its own format's record shape
 /// (a local header's magic, a member's checksum field) and reports what it
 /// finds as a stream of [`Candidate`]s; [`salvage_all`] supplies everything
@@ -1232,18 +1295,18 @@ pub fn annotate_candidates(
     // Earliest scan_position to report each distinct (name, declared_len,
     // verifier) triple seen so far — a candidate reporting one already in
     // here is shadowing that position. A degenerate zero-length checksum
-    // (every empty file, every directory entry) is never pushed here and
+    // (every empty file, every directory entry) is never inserted here and
     // never looked up here — see `is_degenerate` below.
-    let mut seen: Vec<(String, Option<u64>, Verifier, usize)> = Vec::new();
+    let mut seen: HashMap<(String, Option<u64>, Verifier), usize> = HashMap::new();
     // Earliest scan_position to report each distinct NAME, regardless of
     // anything else about the record — the weaker, directly-observed fact
     // `SalvagedEntry::collides_with` reports, and the one `stuffr list`'s
     // own fidelity warning is about. Kept separate from `seen` above rather
-    // than folded into it: that list is deliberately full of guards against
+    // than folded into it: that map is deliberately full of guards against
     // over-claiming a COPY (a verifier must exist, the declared length must
     // agree, a zero-length checksum never counts), and every one of them
     // would be wrong here, where nothing about content is being claimed.
-    let mut names_seen: Vec<(String, usize)> = Vec::new();
+    let mut names_seen: HashMap<String, usize> = HashMap::new();
 
     for (scan_position, candidate) in candidates.into_iter().enumerate() {
         // Bounded length, then the ceiling, then — only if it fits —
@@ -1274,13 +1337,8 @@ pub fn annotate_candidates(
             None
         } else {
             verifier.and_then(|v| {
-                seen.iter()
-                    .find(|&&(ref seen_name, seen_len, seen_verifier, _)| {
-                        seen_verifier == v
-                            && seen_len == declared_len
-                            && *seen_name == candidate.meta.name
-                    })
-                    .map(|&(_, _, _, earlier_position)| earlier_position)
+                seen.get(&(candidate.meta.name.clone(), declared_len, v))
+                    .copied()
             })
         };
 
@@ -1288,7 +1346,8 @@ pub fn annotate_candidates(
             && shadows.is_none()
             && let Some(v) = verifier
         {
-            seen.push((candidate.meta.name.clone(), declared_len, v, scan_position));
+            seen.entry((candidate.meta.name.clone(), declared_len, v))
+                .or_insert(scan_position);
         }
 
         // The two annotations are mutually exclusive: a record proven to be
@@ -1296,17 +1355,14 @@ pub fn annotate_candidates(
         // a duplicate of #2" is strictly more informative than "something
         // earlier used this name". Everything else that repeats a name is a
         // collision.
-        let earliest_with_name = names_seen
-            .iter()
-            .find(|(name, _)| *name == candidate.meta.name)
-            .map(|&(_, position)| position);
+        let earliest_with_name = names_seen.get(&candidate.meta.name).copied();
         let collides_with = if shadows.is_some() {
             None
         } else {
             earliest_with_name
         };
         if earliest_with_name.is_none() {
-            names_seen.push((candidate.meta.name.clone(), scan_position));
+            names_seen.insert(candidate.meta.name.clone(), scan_position);
         }
 
         let marked_deleted = candidate.marked_deleted;
@@ -1856,6 +1912,154 @@ mod tests {
             Some(0),
             "must point at the earliest matching position"
         );
+    }
+
+    fn find_all(data: &[u8], sig: &[u8]) -> Vec<u64> {
+        let mut search = ForwardSearch::new();
+        let mut src = Cursor::new(data.to_vec());
+        let len = data.len() as u64;
+        let mut from = 0;
+        let mut hits = Vec::new();
+        while let Some(at) = search
+            .find(&mut src, from, len, sig.len(), |w| w == sig)
+            .unwrap()
+        {
+            hits.push(at);
+            from = at + 1;
+        }
+        hits
+    }
+
+    fn naive(data: &[u8], sig: &[u8]) -> Vec<u64> {
+        (0..=data.len().saturating_sub(sig.len()))
+            .filter(|&i| data.len() >= sig.len() && &data[i..i + sig.len()] == sig)
+            .map(|i| i as u64)
+            .collect()
+    }
+
+    #[test]
+    fn forward_search_finds_what_a_naive_scan_finds() {
+        let sig = b"070701";
+        // Hits at 0, straddling every chunk size the search grows through, and
+        // flush against EOF.
+        let mut data = vec![b'x'; 200_000];
+        for at in [0usize, 62, 63, 127, 255, 4093, 65_533, 131_070, 199_994] {
+            data[at..at + sig.len()].copy_from_slice(sig);
+        }
+        assert_eq!(find_all(&data, sig), naive(&data, sig));
+    }
+
+    #[test]
+    fn forward_search_past_eof_and_on_short_input_is_none() {
+        let mut search = ForwardSearch::new();
+        let mut src = Cursor::new(b"0707".to_vec());
+        assert_eq!(search.find(&mut src, 0, 4, 6, |_| true).unwrap(), None);
+        assert_eq!(search.find(&mut src, 9, 4, 1, |_| true).unwrap(), None);
+    }
+
+    /// A source that returns at most 7 bytes per read.
+    struct Trickle(Cursor<Vec<u8>>);
+    impl Read for Trickle {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = out.len().min(7);
+            self.0.read(&mut out[..n])
+        }
+    }
+    impl Seek for Trickle {
+        fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(to)
+        }
+    }
+
+    #[test]
+    fn forward_search_survives_short_reads() {
+        let mut data = vec![0u8; 5_000];
+        data[4_321..4_327].copy_from_slice(b"070701");
+        let mut search = ForwardSearch::new();
+        let mut src = Trickle(Cursor::new(data));
+        assert_eq!(
+            search
+                .find(&mut src, 0, 5_000, 6, |w| w == b"070701")
+                .unwrap(),
+            Some(4_321)
+        );
+    }
+
+    #[test]
+    fn a_nearby_hit_reads_only_a_few_bytes() {
+        use crate::testing::CountingSource;
+        let mut data = vec![0u8; 1 << 20];
+        data[10..16].copy_from_slice(b"070701");
+        let mut src = CountingSource::new(Cursor::new(data));
+        let mut search = ForwardSearch::new();
+        assert_eq!(
+            search
+                .find(&mut src, 0, 1 << 20, 6, |w| w == b"070701")
+                .unwrap(),
+            Some(10)
+        );
+        assert!(
+            src.bytes_read() <= ForwardSearch::FIRST_CHUNK as u64,
+            "{}",
+            src.bytes_read()
+        );
+    }
+
+    /// Pins `annotate_candidates`' semantics across the Vec -> HashMap change:
+    /// a repeat's `collides_with` is the EARLIEST position with its name, and
+    /// a non-degenerate same-name/length/verifier repeat shadows the earliest.
+    #[test]
+    fn annotate_candidates_reports_the_earliest_position_at_scale() {
+        let names: Vec<&'static str> = (0..3_000)
+            .map(|i| &*Box::leak(format!("f{i}").into_boxed_str()))
+            .collect();
+        let mut plan = Vec::new();
+        for i in 0..3_000usize {
+            // Every tenth candidate repeats the name of an original (never a repeat),
+            // at position (i % 100) / 10 * 10.
+            let name = if i % 10 == 9 {
+                names[(i % 100) / 10 * 10]
+            } else {
+                names[i]
+            };
+            let declared = if i % 20 == 19 { Some(8) } else { Some(4) };
+            plan.push((
+                name,
+                declared,
+                Some(Verifier::Crc32(7)),
+                SalvageStatus::Intact,
+            ));
+        }
+        let lens: Vec<(&str, Option<u64>)> = plan.iter().map(|p| (p.0, p.1)).collect();
+        let mut scan = ScriptedCandidates { plan, next: 0 };
+        let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
+            .expect("scripted candidates must annotate cleanly");
+        assert_eq!(out.entries.len(), 3_000);
+        let mut earliest: HashMap<&str, usize> = HashMap::new();
+        for (i, e) in out.entries.iter().enumerate() {
+            let first = *earliest.entry(e.meta.name.as_str()).or_insert(i);
+            if first == i {
+                assert_eq!((e.shadows, e.collides_with), (None, None), "at {i}");
+            } else if e.shadows.is_some() {
+                // Same name, same length, same verifier: a copy of the earliest.
+                let first_triple = lens
+                    .iter()
+                    .position(|&(n, l)| n == lens[i].0 && l == lens[i].1)
+                    .unwrap();
+                assert_eq!(e.shadows, Some(first_triple), "at {i}");
+                assert_eq!(e.collides_with, None, "at {i}");
+            } else {
+                // Same name, different declared length: a collision only.
+                assert_eq!(e.collides_with, Some(first), "at {i}");
+            }
+        }
+        let shadowed = out.entries.iter().filter(|e| e.shadows.is_some()).count();
+        let collided = out
+            .entries
+            .iter()
+            .filter(|e| e.collides_with.is_some())
+            .count();
+        assert!(shadowed > 0 && collided > 0, "{shadowed} {collided}");
     }
 
     /// A candidate with no verifier at all (a format with no checksum, or a
