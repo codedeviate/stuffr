@@ -28,7 +28,7 @@
 //!
 //! 1. The marker byte matches ([`find_next_marker`]).
 //! 2. The method byte that follows is one ARC ever assigned (`1..=11` —
-//!    [`read_candidate_at`] mirrors `arc.rs`'s own `ARC_MAGIC` table rather
+//!    [`find_next_marker`] mirrors `arc.rs`'s own `ARC_MAGIC` table rather
 //!    than re-deriving a second list; `0` is the end-of-archive marker, not
 //!    an entry, and is deliberately excluded here for the identical reason
 //!    `ARC_MAGIC` excludes it — see that table's own doc). Recognised, not
@@ -99,8 +99,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry,
-    UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
+    Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
+    SalvagedEntry, UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
@@ -114,23 +114,21 @@ use super::arc::{ArcHeader, HEADER_LEN, MARKER, Method, arc_mtime, decode};
 /// carrying no further evidence at all.
 const KNOWN_METHOD_RANGE: std::ops::RangeInclusive<u8> = 1..=11;
 
-/// Bytes read per [`find_next_marker`] chunk. O(1) memory regardless of how
-/// far the next marker byte is, or whether there is one at all — same
-/// figure, same reasoning, as `zip_salvage.rs`'s own `SCAN_CHUNK`.
-const SCAN_CHUNK: usize = 64 * 1024;
-
 /// Scans an ARC/PAK archive for entry markers directly, without trusting a
 /// single linear pass to survive the whole file.
 ///
-/// Carries no state between calls beyond what
-/// [`SalvageScan::next_candidate`] itself receives, so there is nothing to
-/// initialise beyond the unit value — the same shape `ZipSalvage` has.
+/// Its only state is the [`ForwardSearch`] buffer reused across calls; it
+/// carries nothing about the archive between them beyond what
+/// [`SalvageScan::next_candidate`] itself receives — the same shape
+/// `ZipSalvage` has.
 #[derive(Debug, Default)]
-pub struct ArcSalvage;
+pub struct ArcSalvage {
+    search: ForwardSearch,
+}
 
 impl ArcSalvage {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -139,10 +137,12 @@ impl SalvageScan for ArcSalvage {
         let file_len = src.seek(SeekFrom::End(0))?;
         let mut search_from = from;
         loop {
-            let Some(offset) = find_next_marker(src, search_from, file_len)? else {
+            let Some((offset, record)) =
+                find_next_marker(&mut self.search, src, search_from, file_len)?
+            else {
                 return Ok(None);
             };
-            match read_candidate_at(src, offset, file_len)? {
+            match read_candidate_at(offset, &record, file_len)? {
                 Some(candidate) => return Ok(Some(candidate)),
                 // The marker byte matched, but the gate rejected everything
                 // behind it: a coincidence, not a header. Resume one byte
@@ -197,30 +197,40 @@ impl SalvageScan for ArcSalvage {
     }
 }
 
-/// Searches forward from `from` for the next [`MARKER`] byte, in bounded
-/// chunks so memory use does not depend on how far through the source the
-/// next one is. Unlike `zip_salvage.rs`'s equivalent, this signature is a
-/// single byte, so no match can straddle a chunk boundary and there is
-/// nothing to carry across reads.
+/// Searches forward from `from` for the next [`MARKER`] byte whose header
+/// clears criteria 2-3 — a known method, a real-looking name — and returns
+/// its offset with the [`HEADER_LEN`]-byte record after the marker, through
+/// [`ForwardSearch`].
 ///
-/// `Ok(None)` when no marker byte remains before `file_len`.
-fn find_next_marker(src: &mut dyn SeekRead, from: u64, file_len: u64) -> io::Result<Option<u64>> {
-    if from >= file_len {
-        return Ok(None);
-    }
-    src.seek(SeekFrom::Start(from))?;
-    let mut buf = vec![0u8; SCAN_CHUNK];
-    let mut pos = from;
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
+/// **Every criterion that reads only the header is judged inside the
+/// search (0.10.3).** The marker is one byte, so leaving the search for
+/// each one, re-reading its header and searching again from one byte on
+/// cost a fresh first read and a header read per marker: the
+/// read-amplification oracle measured 461x on a fuzz input that way.
+/// Judged here, a refused marker costs nothing beyond the search's own pass
+/// over it. A marker with fewer than [`HEADER_LEN`] bytes after it cannot
+/// hold a header, and was always refused.
+///
+/// `Ok(None)` when no such header starts before `file_len`.
+fn find_next_marker(
+    search: &mut ForwardSearch,
+    src: &mut dyn SeekRead,
+    from: u64,
+    file_len: u64,
+) -> io::Result<Option<(u64, [u8; HEADER_LEN])>> {
+    let mut record = [0u8; HEADER_LEN];
+    let at = search.find(src, from, file_len, 1 + HEADER_LEN, |w| {
+        // `w[1]` is the method byte — see `ArcHeader::parse`'s own layout.
+        // `0` is the end-of-archive marker, not an entry, and carries no
+        // further evidence at all; anything outside `KNOWN_METHOD_RANGE` is
+        // a value ARC never assigned. Both are treated identically here:
+        // not a real header.
+        w[0] == MARKER && KNOWN_METHOD_RANGE.contains(&w[1]) && {
+            record.copy_from_slice(&w[1..]);
+            name_looks_real(&ArcHeader::parse(&record).name)
         }
-        if let Some(at) = buf[..n].iter().position(|&b| b == MARKER) {
-            return Ok(Some(pos + at as u64));
-        }
-        pos += n as u64;
-    }
+    })?;
+    Ok(at.map(|at| (at, record)))
 }
 
 /// Whether an ARC header's decoded name looks like real header data rather
@@ -245,40 +255,24 @@ fn name_looks_real(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| (0x20..=0x7E).contains(&b))
 }
 
-/// Reads the marker+header believed to start at `offset` and runs it
-/// through the gate described in this module's doc. `Ok(None)` for ANY gate
-/// failure — including the header itself running past `file_len`, which
-/// means there was never a full 28-byte record to read in the first place —
-/// see the module doc for why a rejection here is never an error.
+/// Builds the candidate for the marker at `offset`, whose header
+/// [`find_next_marker`] already read and gated (criteria 1-3), and applies
+/// criterion 4. `Ok(None)` only when the offset arithmetic overflows — see
+/// the module doc for why a rejection here is never an error.
 fn read_candidate_at(
-    src: &mut dyn SeekRead,
     offset: u64,
+    record: &[u8; HEADER_LEN],
     file_len: u64,
 ) -> Result<Option<Candidate>> {
-    src.seek(SeekFrom::Start(offset))?;
-    let mut marker = [0u8; 1];
-    if src.read_exact(&mut marker).is_err() {
-        return Ok(None);
-    }
-    debug_assert_eq!(marker[0], MARKER, "caller already matched the marker");
-
-    let mut record = [0u8; HEADER_LEN];
-    if src.read_exact(&mut record).is_err() {
-        return Ok(None);
-    }
-    // `record[0]` is the method byte — see `ArcHeader::parse`'s own layout.
-    // `0` is the end-of-archive marker, not an entry, and carries no
-    // further evidence at all; anything outside `KNOWN_METHOD_RANGE` is a
-    // value ARC never assigned. Both are treated identically here: not a
-    // real header.
-    if !KNOWN_METHOD_RANGE.contains(&record[0]) {
-        return Ok(None);
-    }
-
-    let header = ArcHeader::parse(&record);
-    if !name_looks_real(&header.name) {
-        return Ok(None);
-    }
+    debug_assert!(
+        KNOWN_METHOD_RANGE.contains(&record[0]),
+        "caller already gated the method byte"
+    );
+    let header = ArcHeader::parse(record);
+    debug_assert!(
+        name_looks_real(&header.name),
+        "caller already gated the name"
+    );
 
     let compressed_size = u64::from(header.compressed_size);
     // Fix round 2, NEW-3: built with `checked_add` like every other offset
@@ -301,8 +295,8 @@ fn read_candidate_at(
         // Either the declared end overflows `u64`, or it runs past the
         // source. Both mean the same thing to a reader: fewer bytes are
         // present than the header promises. `payload_start` itself is
-        // already `<= file_len` (the marker+record `read_exact` above
-        // proved that many bytes exist), so this saturating subtraction
+        // already `<= file_len` (the search only matches a marker+record
+        // that fits), so this saturating subtraction
         // never underflows.
         _ => Some(file_len.saturating_sub(payload_start)),
     };
@@ -718,6 +712,40 @@ mod tests {
 
     use super::super::crc::crc16_arc;
     use super::*;
+
+    /// 0.10.3: dense markers, and dense headers the gate accepts, each
+    /// 256 KiB, held to `stuffr_core::testing::check_scan_is_linear`. Before
+    /// the search judged the header and kept what it read across calls,
+    /// these read 63,517x, 31,759x and 2,190x their input (at 1 MiB).
+    #[test]
+    fn dense_markers_and_dense_headers_scan_linearly() {
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 256 * 1024;
+        let fill = |unit: &[u8]| unit.iter().copied().cycle().take(LEN).collect::<Vec<u8>>();
+        // Method 2, a printable name, and a size far past EOF: every one is
+        // a candidate, reported `Partial`, and the scan resumes one byte on.
+        let mut accepted = vec![MARKER, 2];
+        accepted.extend_from_slice(b"A.TXT\0\0\0\0\0\0\0\0");
+        accepted.extend_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        accepted.extend_from_slice(&[0; 10]);
+        assert_eq!(accepted.len(), 1 + HEADER_LEN);
+        let shapes = [
+            ("bare markers", fill(&[MARKER]), 0),
+            ("marker and method", fill(&[MARKER, 2]), 0),
+            (
+                "accepted headers",
+                fill(&accepted),
+                LEN.div_ceil(accepted.len()) - 1,
+            ),
+        ];
+        for (shape, bytes, entries) in shapes {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_arc(&mut src, &SalvagePolicy::default()).unwrap();
+            assert_eq!(out.entries.len(), entries, "{shape}");
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+        }
+    }
 
     // -------------------------------------------------------------------
     // Test-only header builders — mirrors `arc.rs`'s own `build_arc_entry`
@@ -1150,8 +1178,8 @@ mod tests {
         let mut src = LyingLenPanicsOnBigRead {
             inner: Cursor::new(bytes),
             reported_len: u64::from(ABSURD_SIZE) * 4,
-            // Comfortably above `SCAN_CHUNK` (the discovery-time scan reads
-            // in 64 KiB chunks regardless of this test) and comfortably
+            // Comfortably above `ForwardSearch::MAX_CHUNK` (the discovery-
+            // time scan's reads grow to 64 KiB regardless of this test) and comfortably
             // below `ABSURD_SIZE` (~2.86 GiB) — wide enough that ordinary
             // header/scan reads never trip it, narrow enough that the
             // payload allocation this test forbids still would.
