@@ -686,14 +686,42 @@ pub struct Sighting {
     /// phrase per shape, shared with the scanner's own exit-3 refusal, so
     /// the two can never describe one shape two ways.
     pub shape: &'static str,
+    /// Why the header was not listed — which sentence
+    /// [`describe_sightings`] reports it in.
+    pub kind: SightingKind,
+}
+
+/// Why a [`Sighting`]'s header was not listed. The two are different claims,
+/// so [`describe_sightings`] words them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SightingKind {
+    /// A header with a header's structure, in a shape this build has no
+    /// gate for — every sighting before 0.10.3.
+    #[default]
+    Ungateable,
+    /// A header the scan could gate, but whose extension chains it stopped
+    /// reading because hostile-looking input had used up the work it will
+    /// spend on them (tar's per-header and scan-wide budgets, 0.10.3).
+    WorkBounded,
 }
 
 impl Sighting {
+    /// An [`SightingKind::Ungateable`] sighting.
     pub fn new(format: FormatId, offset: u64, shape: &'static str) -> Self {
         Self {
             format,
             offset,
             shape,
+            kind: SightingKind::Ungateable,
+        }
+    }
+
+    /// A [`SightingKind::WorkBounded`] sighting.
+    pub fn work_bounded(format: FormatId, offset: u64, shape: &'static str) -> Self {
+        Self {
+            kind: SightingKind::WorkBounded,
+            ..Self::new(format, offset, shape)
         }
     }
 }
@@ -716,10 +744,46 @@ const SIGHTING_OFFSETS_SHOWN: usize = 8;
 /// header: `stuffr list` refuses both variants at exit 3, naming them. A note
 /// telling a user to expect `list` to read them would be the false "list
 /// reads it" claim Task 2-N's fix round removed from tar.
+///
+/// **[`SightingKind::WorkBounded`] sightings get their own sentence**
+/// (0.10.3): "the structure of a header, but in a shape it has no gate for"
+/// is false of a header the scan gated and then stopped spending work on.
+/// When a run has both kinds, the two sentences are joined; the
+/// [`SightingKind::Ungateable`] one is worded exactly as before.
 pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
-    if sightings.is_empty() {
-        return None;
+    let ungateable: Vec<&Sighting> = sightings
+        .iter()
+        .filter(|s| s.kind != SightingKind::WorkBounded)
+        .collect();
+    let bounded: Vec<&Sighting> = sightings
+        .iter()
+        .filter(|s| s.kind == SightingKind::WorkBounded)
+        .collect();
+    let mut sentences = Vec::new();
+    if !ungateable.is_empty() {
+        sentences.push(format!(
+            "this build's salvage scanner saw {} — each with the structure of a header, but in \
+             a shape it has no gate for, so none is listed or recovered; `stuffr list` and \
+             `stuffr unpack` may read these headers normally, or name the variant they are in, \
+             and it is the SCAN that stops there",
+            sighting_groups(&ungateable)
+        ));
     }
+    if !bounded.is_empty() {
+        sentences.push(format!(
+            "this build's salvage scanner bounds the work it spends on extension chains, and \
+             stopped reading them for {} — the input looks forged there, so whatever those \
+             chains describe is not listed or recovered; `stuffr list` and `stuffr unpack` may \
+             read these headers normally, and it is the SCAN that stops there",
+            sighting_groups(&bounded)
+        ));
+    }
+    (!sentences.is_empty()).then(|| sentences.join("; and separately, "))
+}
+
+/// `"{count} {format} {shape} at offset(s) {offsets}"` per (format, shape),
+/// joined by `"; and "` — the middle of each [`describe_sightings`] sentence.
+fn sighting_groups(sightings: &[&Sighting]) -> String {
     // Grouped by (format, shape) in first-seen order: a handful of shapes
     // at most, so a linear search beats a map and keeps the order stable.
     let mut groups: Vec<((FormatId, &'static str), Vec<u64>)> = Vec::new();
@@ -751,13 +815,7 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
             )
         })
         .collect();
-    Some(format!(
-        "this build's salvage scanner saw {} — each with the structure of a header, but in a \
-         shape it has no gate for, so none is listed or recovered; `stuffr list` and \
-         `stuffr unpack` may read these headers normally, or name the variant they are in, \
-         and it is the SCAN that stops there",
-        parts.join("; and ")
-    ))
+    parts.join("; and ")
 }
 
 /// Where a scanner that can ONLY walk its format in order — record after
@@ -2541,6 +2599,31 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("`stuffr list`"), "{note}");
+    }
+
+    /// 0.10.3: a work-bounded sighting has its own sentence, and an
+    /// ungateable one keeps its sentence word for word — alone or alongside.
+    #[test]
+    fn describe_sightings_words_a_work_bounded_sighting_apart() {
+        let f = FormatId::new("fmt");
+        let old = describe_sightings(&[Sighting::new(f, 0, "a(s)")]).unwrap();
+        assert_eq!(
+            old,
+            "this build's salvage scanner saw 1 fmt a(s) at offset(s) 0 — each with the \
+             structure of a header, but in a shape it has no gate for, so none is listed or \
+             recovered; `stuffr list` and `stuffr unpack` may read these headers normally, or \
+             name the variant they are in, and it is the SCAN that stops there"
+        );
+        let bounded = describe_sightings(&[Sighting::work_bounded(f, 9, "b(s)")]).unwrap();
+        assert!(bounded.contains("1 fmt b(s) at offset(s) 9"), "{bounded}");
+        assert!(!bounded.contains("no gate for"), "{bounded}");
+        assert!(bounded.contains("bounds the work"), "{bounded}");
+        let both = describe_sightings(&[
+            Sighting::work_bounded(f, 9, "b(s)"),
+            Sighting::new(f, 0, "a(s)"),
+        ])
+        .unwrap();
+        assert_eq!(both, format!("{old}; and separately, {bounded}"));
     }
 
     /// Task 4: the walk-stop note. A hole says what the brief requires —
