@@ -961,9 +961,12 @@ pub struct ForwardSearch {
 }
 
 impl ForwardSearch {
+    /// Size of the first read of every search.
     pub const FIRST_CHUNK: usize = 64;
+    /// Ceiling the read size doubles up to.
     pub const MAX_CHUNK: usize = 64 * 1024;
 
+    /// An empty search; the buffer grows on first use and is then reused.
     pub fn new() -> Self {
         Self::default()
     }
@@ -971,7 +974,8 @@ impl ForwardSearch {
     /// The first offset `>= from` at which `matches` accepts the `sig_len`
     /// bytes starting there, or `None` when none does before `file_len`.
     /// `matches` sees exactly `sig_len` bytes. Every offset is tested once,
-    /// carrying `sig_len - 1` bytes across a chunk boundary.
+    /// carrying `sig_len - 1` bytes across a chunk boundary. Never reads at
+    /// or past `file_len`, and stops at EOF if the source is shorter.
     pub fn find(
         &mut self,
         src: &mut dyn SeekRead,
@@ -989,7 +993,9 @@ impl ForwardSearch {
         let mut chunk = Self::FIRST_CHUNK.max(sig_len);
         loop {
             let old = self.window.len();
-            self.window.resize(old + chunk, 0);
+            let remaining = file_len - (window_start + old as u64);
+            let want = (chunk as u64).min(remaining) as usize;
+            self.window.resize(old + want, 0);
             let n = src.read(&mut self.window[old..])?;
             self.window.truncate(old + n);
             if self.window.len() >= sig_len {
@@ -1001,10 +1007,14 @@ impl ForwardSearch {
                 window_start += tested as u64;
                 self.window.drain(..tested);
             }
-            if n == 0 {
+            if n == 0 || window_start + self.window.len() as u64 >= file_len {
                 return Ok(None);
             }
-            chunk = (chunk * 2).min(Self::MAX_CHUNK);
+            // Grow only on a full read: a source that trickles short reads
+            // must not make every call zero a 64 KiB buffer for 7 bytes.
+            if n == want {
+                chunk = (chunk * 2).min(Self::MAX_CHUNK);
+            }
         }
     }
 }
@@ -1940,8 +1950,9 @@ mod tests {
     #[test]
     fn forward_search_finds_what_a_naive_scan_finds() {
         let sig = b"070701";
-        // Hits at 0, straddling every chunk size the search grows through, and
-        // flush against EOF.
+        // Hits at 0, near small-chunk boundaries (each `find` restarts at
+        // FIRST_CHUNK, so large-chunk straddles are tested separately below),
+        // and flush against EOF.
         let mut data = vec![b'x'; 200_000];
         for at in [0usize, 62, 63, 127, 255, 4093, 65_533, 131_070, 199_994] {
             data[at..at + sig.len()].copy_from_slice(sig);
@@ -1986,6 +1997,112 @@ mod tests {
     }
 
     #[test]
+    fn forward_search_no_match_reads_each_byte_once_and_ends_at_eof() {
+        use crate::testing::CountingSource;
+        let data = vec![b'x'; 200_000];
+        let mut src = CountingSource::new(Cursor::new(data));
+        let mut search = ForwardSearch::new();
+        assert_eq!(
+            search
+                .find(&mut src, 0, 200_000, 6, |w| w == b"070701")
+                .unwrap(),
+            None
+        );
+        assert_eq!(src.bytes_read(), 200_000);
+    }
+
+    #[test]
+    fn forward_search_no_match_through_short_reads_ends_at_eof() {
+        let mut search = ForwardSearch::new();
+        let mut src = Trickle(Cursor::new(vec![b'x'; 200_000]));
+        assert_eq!(
+            search
+                .find(&mut src, 0, 200_000, 6, |w| w == b"070701")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn forward_search_on_a_truncated_source_ends_at_eof() {
+        let mut search = ForwardSearch::new();
+        let mut src = Cursor::new(vec![b'x'; 1_000]);
+        assert_eq!(
+            search
+                .find(&mut src, 0, 50_000, 6, |w| w == b"070701")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn forward_search_never_looks_past_an_understated_file_len() {
+        let mut data = vec![b'x'; 10_000];
+        data[5_000..5_006].copy_from_slice(b"070701");
+        let mut search = ForwardSearch::new();
+        let mut src = Cursor::new(data);
+        assert_eq!(
+            search
+                .find(&mut src, 0, 4_000, 6, |w| w == b"070701")
+                .unwrap(),
+            None
+        );
+        // A hit straddling file_len is not "before file_len" either.
+        assert_eq!(
+            search
+                .find(&mut src, 0, 5_003, 6, |w| w == b"070701")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            search
+                .find(&mut src, 0, 5_006, 6, |w| w == b"070701")
+                .unwrap(),
+            Some(5_000)
+        );
+    }
+
+    #[test]
+    fn forward_search_finds_a_hit_straddling_large_chunk_boundaries() {
+        let sig = b"070701";
+        // Cumulative end offset of each read in one `find` from 0.
+        let mut ends = Vec::new();
+        let (mut chunk, mut at) = (ForwardSearch::FIRST_CHUNK, 0usize);
+        while ends.len() < 14 {
+            at += chunk;
+            ends.push(at);
+            chunk = (chunk * 2).min(ForwardSearch::MAX_CHUNK);
+        }
+        // The read of MAX_CHUNK / 2 is the last doubling; the next read is
+        // the first of MAX_CHUNK size.
+        let (mut sizes, mut chunk) = (Vec::new(), ForwardSearch::FIRST_CHUNK);
+        for _ in 0..ends.len() {
+            sizes.push(chunk);
+            chunk = (chunk * 2).min(ForwardSearch::MAX_CHUNK);
+        }
+        let doubling = ends[sizes
+            .iter()
+            .position(|&c| c == ForwardSearch::MAX_CHUNK / 2)
+            .unwrap()];
+        let first_max = ends[sizes
+            .iter()
+            .position(|&c| c == ForwardSearch::MAX_CHUNK)
+            .unwrap()];
+        for boundary in [doubling, first_max, first_max + ForwardSearch::MAX_CHUNK] {
+            for start in [boundary - 5, boundary - 3, boundary - 1] {
+                let mut data = vec![b'x'; boundary + 100];
+                data[start..start + sig.len()].copy_from_slice(sig);
+                let mut search = ForwardSearch::new();
+                let mut src = Cursor::new(data.clone());
+                let found = search
+                    .find(&mut src, 0, data.len() as u64, sig.len(), |w| w == sig)
+                    .unwrap();
+                assert_eq!(found, Some(start as u64), "boundary {boundary}");
+            }
+        }
+    }
+
+    #[test]
     fn a_nearby_hit_reads_only_a_few_bytes() {
         use crate::testing::CountingSource;
         let mut data = vec![0u8; 1 << 20];
@@ -2023,35 +2140,43 @@ mod tests {
                 names[i]
             };
             let declared = if i % 20 == 19 { Some(8) } else { Some(4) };
+            // Some repeats carry a different checksum: same name and length
+            // but another verifier is a collision, not a shadow.
+            let crc = if i % 10 == 9 && (i / 10) % 2 == 0 {
+                8
+            } else {
+                7
+            };
             plan.push((
                 name,
                 declared,
-                Some(Verifier::Crc32(7)),
+                Some(Verifier::Crc32(crc)),
                 SalvageStatus::Intact,
             ));
         }
-        let lens: Vec<(&str, Option<u64>)> = plan.iter().map(|p| (p.0, p.1)).collect();
+        let keys: Vec<_> = plan.iter().map(|p| (p.0, p.1, p.2)).collect();
         let mut scan = ScriptedCandidates { plan, next: 0 };
         let out = salvage_all(&mut scan, &mut bytes(&[0u8; 16]), &SalvagePolicy::default())
             .expect("scripted candidates must annotate cleanly");
         assert_eq!(out.entries.len(), 3_000);
-        let mut earliest: HashMap<&str, usize> = HashMap::new();
+        let mut first_triple = HashMap::new();
+        let mut first_name = HashMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            first_triple.entry(*k).or_insert(i);
+            first_name.entry(k.0).or_insert(i);
+        }
         for (i, e) in out.entries.iter().enumerate() {
-            let first = *earliest.entry(e.meta.name.as_str()).or_insert(i);
-            if first == i {
-                assert_eq!((e.shadows, e.collides_with), (None, None), "at {i}");
-            } else if e.shadows.is_some() {
-                // Same name, same length, same verifier: a copy of the earliest.
-                let first_triple = lens
-                    .iter()
-                    .position(|&(n, l)| n == lens[i].0 && l == lens[i].1)
-                    .unwrap();
-                assert_eq!(e.shadows, Some(first_triple), "at {i}");
-                assert_eq!(e.collides_with, None, "at {i}");
+            let same_triple = first_triple[&keys[i]];
+            let same_name = first_name[keys[i].0];
+            let (want_shadow, want_collide) = if same_triple != i {
+                (Some(same_triple), None)
+            } else if same_name != i {
+                (None, Some(same_name))
             } else {
-                // Same name, different declared length: a collision only.
-                assert_eq!(e.collides_with, Some(first), "at {i}");
-            }
+                (None, None)
+            };
+            assert_eq!(e.shadows, want_shadow, "shadows at {i}");
+            assert_eq!(e.collides_with, want_collide, "collides_with at {i}");
         }
         let shadowed = out.entries.iter().filter(|e| e.shadows.is_some()).count();
         let collided = out
