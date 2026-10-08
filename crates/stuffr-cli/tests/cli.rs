@@ -11966,10 +11966,10 @@ fn salvage_reports_a_tar_header_too_many_chains_converge_on() {
     assert!(
         stderr.contains(&format!(
             "salvage -> this build's salvage scanner bounds the work it spends on extension \
-             chains, and stopped reading them for 1 tar {SHAPE} at offset(s) {terminal_at} — the \
-             input looks forged there, so whatever those chains describe is not listed or \
-             recovered; `stuffr list` and `stuffr unpack` may read these headers normally, and \
-             it is the SCAN that stops there\n"
+             chains, and did not read the chains in front of 1 tar {SHAPE} at offset(s) \
+             {terminal_at} — so whatever those chains describe is not listed or recovered there, \
+             though the scan went on past them; `stuffr list` and `stuffr unpack` may read these \
+             headers normally\n"
         )),
         "{stderr}"
     );

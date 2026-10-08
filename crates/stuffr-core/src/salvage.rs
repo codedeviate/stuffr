@@ -700,9 +700,11 @@ pub enum SightingKind {
     /// gate for — every sighting before 0.10.3.
     #[default]
     Ungateable,
-    /// A header the scan could gate, but whose extension chains it stopped
-    /// reading because hostile-looking input had used up the work it will
-    /// spend on them (tar's per-header and scan-wide budgets, 0.10.3).
+    /// A header the scan could gate, but whose extension chains it did not
+    /// read because a bound on the work it spends on them was reached —
+    /// tar's per-header and scan-wide budgets (0.10.3). The header itself
+    /// may be genuine: the scan-wide budget can be spent by forged chains
+    /// elsewhere in the file. The scan carries on past it.
     WorkBounded,
 }
 
@@ -772,9 +774,9 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
     if !bounded.is_empty() {
         sentences.push(format!(
             "this build's salvage scanner bounds the work it spends on extension chains, and \
-             stopped reading them for {} — the input looks forged there, so whatever those \
-             chains describe is not listed or recovered; `stuffr list` and `stuffr unpack` may \
-             read these headers normally, and it is the SCAN that stops there",
+             did not read the chains in front of {} — so whatever those chains describe is not \
+             listed or recovered there, though the scan went on past them; `stuffr list` and \
+             `stuffr unpack` may read these headers normally",
             sighting_groups(&bounded)
         ));
     }
@@ -2618,6 +2620,11 @@ mod tests {
         assert!(bounded.contains("1 fmt b(s) at offset(s) 9"), "{bounded}");
         assert!(!bounded.contains("no gate for"), "{bounded}");
         assert!(bounded.contains("bounds the work"), "{bounded}");
+        // Fix round 1: true for a genuine header starved by forgeries
+        // elsewhere, and for a scan that goes on past it.
+        assert!(bounded.contains("the scan went on past them"), "{bounded}");
+        assert!(!bounded.contains("forged"), "{bounded}");
+        assert!(!bounded.contains("SCAN that stops"), "{bounded}");
         let both = describe_sightings(&[
             Sighting::work_bounded(f, 9, "b(s)"),
             Sighting::new(f, 0, "a(s)"),
