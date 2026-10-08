@@ -179,9 +179,12 @@ read list.
 > file onto a directory it made, or beneath a file it made) is skipped and
 > named rather than blamed on the destination; a same-kind folded duplicate
 > (`README`, then `readme`) without `--force` is still exit 2, as an exact
-> duplicate is. Salvage's "not a directory" reason no longer prints the
-> destination path. The `container`
-> fuzz target extracts every seekable input a second time with `--force`,
+> duplicate is, and so is a directory entry onto a file the run made
+> (`a`, then `A/`), as it is for an exact name (replaced under `--force`).
+> A hard link whose path already holds its target's file removes nothing.
+> Salvage's "not a directory" reason no longer prints the destination
+> path. The `container` fuzz target extracts every seekable input a second
+> time with `--force`,
 > and its containment oracle tolerates names the filesystem refuses.
 > **1840** tests under `--all-features`, **1776** on the
 > default tier — measured from this bump's own `make check`,
