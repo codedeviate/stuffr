@@ -11905,8 +11905,9 @@ fn salvage_calls_a_tar_whose_only_header_lost_byte_0_nothing_recoverable() {
 
 /// 0.10.3 §2: forged pax `x` chains converging on one header. Five chains
 /// reach one empty-named ustar header; salvage reads four of them and
-/// reports the header as a sighting at its offset. Pinned at the CLI's
-/// existing sighting rule: exit 5 when nothing was recovered (the sighting
+/// reports the header as a sighting at its offset, in the work-bounded
+/// sentence (Ruling T3-3), never "a shape it has no gate for". Pinned at the
+/// CLI's existing sighting rule: exit 5 when nothing was recovered (the sighting
 /// note, then "nothing recoverable"), exit 4 when an ordinary entry before
 /// the chains was recovered alongside it.
 #[test]
@@ -11961,6 +11962,18 @@ fn salvage_reports_a_tar_header_too_many_chains_converge_on() {
         "{stderr}"
     );
     assert!(stderr.contains("nothing recoverable"), "{stderr}");
+    // Ruling T3-3: the work-bounded sentence, not the ungateable one.
+    assert!(
+        stderr.contains(&format!(
+            "salvage -> this build's salvage scanner bounds the work it spends on extension \
+             chains, and stopped reading them for 1 tar {SHAPE} at offset(s) {terminal_at} — the \
+             input looks forged there, so whatever those chains describe is not listed or \
+             recovered; `stuffr list` and `stuffr unpack` may read these headers normally, and \
+             it is the SCAN that stops there\n"
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no gate for"), "{stderr}");
 
     let mut entry = ustar_block(b"ok.txt", b'0', 4);
     entry.extend_from_slice(b"fine");
@@ -11982,6 +11995,11 @@ fn salvage_reports_a_tar_header_too_many_chains_converge_on() {
         stderr.contains(&format!("offset(s) {terminal_at}")),
         "{stderr}"
     );
+    assert!(
+        stderr.contains("bounds the work it spends on extension chains"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no gate for"), "{stderr}");
 }
 
 /// One POSIX ustar entry, as Python's `tarfile` writes one (`ustar\0` `00`

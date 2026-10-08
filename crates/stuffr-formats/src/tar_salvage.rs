@@ -244,7 +244,11 @@
 //! more than [`MAX_CHAINS_PER_HEADER`] chains' payloads are read for any one
 //! header they reach: a real archive has one chain per header, so a header
 //! more converge on is reported as a [`Sighting`] and its further chains
-//! cost their header walk alone (see `ChainBudget`).
+//! cost their header walk alone (see `ChainBudget`). Across the whole scan,
+//! extension payloads read are bounded too, at `4 × file_len + 1 MiB`
+//! (`extension_read_budget`): a real archive reads each chain once, and
+//! forged chains spread over many headers are refused past it, their
+//! headers reported the same way.
 //!
 //! A ceiling and a scan budget, both on METADATA rather than on an entry,
 //! and both checked before a byte is allocated for them:
@@ -563,6 +567,11 @@ const UNRECOGNISED_V7_SPELLING_SHAPE: &str = "pre-POSIX (v7) header(s) whose che
 const CONVERGED_CHAINS_SHAPE: &str =
     "header(s) reached by more than four extension chains, whose further chains were not read";
 
+/// The phrase for a terminal header whose chain was refused because the
+/// scan's extension-read budget ([`extension_read_budget`]) was spent.
+const EXTENSION_BUDGET_SHAPE: &str = "header(s) whose extension chains were not read because the \
+     scan's extension-read budget was spent";
+
 /// The phrase for a block refused as a shifted copy that sits on the
 /// recovered entries' own block boundaries — see
 /// [`UngateableSightings::into_sightings`].
@@ -588,6 +597,11 @@ struct UngateableSightings {
     /// part of [`Self::any`]: a converging-chain file is hostile input, not
     /// a header shape this build has no gate for.
     converged: BTreeSet<u64>,
+    /// Every terminal header at which a chain was refused because the
+    /// scan-wide [`extension_read_budget`] was spent — see [`ChainBudget`].
+    /// Reported like `converged`, and for the same reason not in
+    /// [`Self::any`].
+    starved: BTreeSet<u64>,
 }
 
 impl UngateableSightings {
@@ -663,7 +677,12 @@ impl UngateableSightings {
             .chain(
                 self.converged
                     .into_iter()
-                    .map(|at| Sighting::new(TAR, at, CONVERGED_CHAINS_SHAPE)),
+                    .map(|at| Sighting::work_bounded(TAR, at, CONVERGED_CHAINS_SHAPE)),
+            )
+            .chain(
+                self.starved
+                    .into_iter()
+                    .map(|at| Sighting::work_bounded(TAR, at, EXTENSION_BUDGET_SHAPE)),
             )
             .collect();
         sightings.sort_by_key(|s| s.offset);
@@ -691,17 +710,44 @@ pub const MAX_LONG_NAME: u64 = 65_536;
 /// are read for one header, and the header past it is reported as a
 /// [`Sighting`] (`ChainBudget`).
 /// `tests::converging_forged_chains_scan_linearly_and_are_reported` is the
-/// measurement, in bytes read rather than seconds. This budget still bounds
-/// each of those reads, so it stays small. What the per-header budget does
-/// NOT bound: forged chains spread over many empty-named headers, each
-/// reached by no more than four, still cost up to this budget per forged
-/// head (measured at 0.10.3: ~750x the input for a 2 MiB file).
+/// measurement, in bytes read rather than seconds. Forged chains spread
+/// over many headers, each reached by four or fewer, were the per-header
+/// budget's residual (measured at ~750x the input for a 2 MiB file); the
+/// scan-wide `extension_read_budget` closes it
+/// (`tests::forged_chains_spread_over_many_headers_scan_linearly`). This
+/// budget still bounds each single read, so it stays small.
 pub const MAX_SALVAGE_PAX_SCAN: u64 = 1 << 20;
 
 /// The most extension chains whose payloads salvage reads for one terminal
 /// header — see `ChainBudget`. A chain past it is not read, and the header
 /// is reported as a [`Sighting`].
 pub const MAX_CHAINS_PER_HEADER: usize = 4;
+
+/// Extension-payload bytes the whole scan may read, per byte of input — see
+/// [`extension_read_budget`].
+const EXTENSION_READS_PER_INPUT_BYTE: u64 = 4;
+
+/// Extension-payload bytes the whole scan may read on top of
+/// [`EXTENSION_READS_PER_INPUT_BYTE`], so a small archive is never short.
+const EXTENSION_READ_SLACK: u64 = 1 << 20;
+
+/// The extension-payload bytes one scan of a `file_len`-byte input may read
+/// in all (pass 2 of `gate_chain_at`): `4 × file_len + 1 MiB` (0.10.3,
+/// Ruling T3-1).
+///
+/// A legitimate archive reads each real chain's payload once, and a chain
+/// that yields a candidate is jumped with its entry, so its reads total at
+/// most `file_len` — four times that never trips on real input. What it
+/// bounds is forged chains spread over many headers, each under
+/// [`MAX_CHAINS_PER_HEADER`]: once it is spent, a chain that needs a payload
+/// is refused without reading it and its header is reported as a
+/// [`Sighting`], so a real entry skipped that way is named, never lost
+/// silently. The scan goes on; a chain with no payload is unaffected.
+fn extension_read_budget(file_len: u64) -> u64 {
+    file_len
+        .saturating_mul(EXTENSION_READS_PER_INPUT_BYTE)
+        .saturating_add(EXTENSION_READ_SLACK)
+}
 
 /// Renamed to [`MAX_SALVAGE_PAX_SCAN`] in 0.8.1. Not the ordinary path's
 /// 16 MiB `tar::MAX_PAX_EXTENSION` — this keeps 0.8.0's 1 MiB value.
@@ -742,6 +788,9 @@ pub struct TarSalvage {
     /// Terminal header offset → chains whose payloads were read for it —
     /// [`ChainBudget`]'s count.
     chains_read: HashMap<u64, usize>,
+    /// Extension-payload bytes read so far — against
+    /// [`extension_read_budget`].
+    payload_read: u64,
 }
 
 /// The last reported candidate whose payload fit in the file.
@@ -774,15 +823,19 @@ impl SalvageScan for TarSalvage {
             _ => from,
         };
         loop {
-            let Some(offset) = find_next_header(&mut self.search, src, search_from, file_len)?
+            let Some((offset, block)) =
+                find_next_header(&mut self.search, src, search_from, file_len)?
             else {
                 return Ok(None);
             };
             let mut budget = ChainBudget {
                 read: &mut self.chains_read,
                 converged: &mut self.seen.converged,
+                payload_read: &mut self.payload_read,
+                payload_limit: extension_read_budget(file_len),
+                starved: &mut self.seen.starved,
             };
-            match read_candidate_at(src, offset, file_len, &mut budget) {
+            match read_candidate_at(src, offset, file_len, block, &mut budget) {
                 Scanned::Found(found) => {
                     self.resume = found.next_header.map(|next_header| Resume {
                         header: found.candidate.offset,
@@ -887,37 +940,26 @@ pub(crate) fn header_checksum_agrees(block: &[u8]) -> bool {
 }
 
 /// Searches forward from `from` for the next offset whose 512 bytes clear
-/// gate criteria 1 and 2 — [`ForwardSearch`]'s reads start small and grow,
-/// so a header a few bytes on costs a few bytes, not a 64 KiB read-ahead.
-///
-/// The first block's worth of offsets is probed on its own, with exactly the
-/// `2 × BLOCK - 1` bytes that tests them. Left to `ForwardSearch`, whose
-/// first read is one signature long, a header 1..=511 bytes on cost a
-/// 512-byte read that tests ONE offset and then a 1,024-byte one: 1,536
-/// bytes to step one block, and a scan resuming one byte past each of a
-/// file of forged headers (the converging-chain shape) read three times the
-/// file for the search alone. The probe makes that 1,023, and a header
-/// exactly at `from` (the next entry, after a whole one) still costs 512.
+/// gate criteria 1 and 2, answering it with those 512 bytes —
+/// [`ForwardSearch`]'s reads start at `2 × BLOCK - 1` bytes, testing a
+/// block's worth of offsets, and grow, so a header a block on costs about a
+/// block, not a 64 KiB read-ahead. The block is copied out of the search's
+/// own window as it matches, so the caller does not read it a second time.
 fn find_next_header(
     search: &mut ForwardSearch,
     src: &mut dyn SeekRead,
     from: u64,
     file_len: u64,
-) -> io::Result<Option<u64>> {
-    let probe_end = from.saturating_add(2 * BLOCK_U64 - 1).min(file_len);
-    if let Some(at) = search.find(src, from, probe_end, BLOCK, header_checksum_agrees)? {
-        return Ok(Some(at));
-    }
-    if probe_end == file_len {
-        return Ok(None);
-    }
-    search.find(
-        src,
-        from + BLOCK_U64,
-        file_len,
-        BLOCK,
-        header_checksum_agrees,
-    )
+) -> io::Result<Option<(u64, [u8; BLOCK])>> {
+    let mut block = [0u8; BLOCK];
+    let found = search.find(src, from, file_len, BLOCK, |window| {
+        let agrees = header_checksum_agrees(window);
+        if agrees {
+            block.copy_from_slice(window);
+        }
+        agrees
+    })?;
+    Ok(found.map(|at| (at, block)))
 }
 
 /// Reads the 512-byte block at `at`, or `None` if the source does not hold
@@ -1041,20 +1083,16 @@ enum Scanned {
     NotAHeader,
 }
 
-/// Gates the block at `offset` and, if it is an extension, the chain it
-/// begins — see the module doc.
+/// Gates `block`, the checksum-valid block [`find_next_header`] found at
+/// `offset`, and, if it is an extension, the chain it begins — see the
+/// module doc.
 fn read_candidate_at(
     src: &mut dyn SeekRead,
     offset: u64,
     file_len: u64,
+    block: [u8; BLOCK],
     budget: &mut ChainBudget<'_>,
 ) -> Scanned {
-    let Some(block) = read_block(src, offset, file_len) else {
-        return Scanned::NotAHeader;
-    };
-    if !header_checksum_agrees(&block) {
-        return Scanned::NotAHeader;
-    }
     if !clears_criterion_3(src, offset, file_len, &block) {
         return sighting_at(src, offset, file_len, &block);
     }
@@ -1088,9 +1126,27 @@ fn sighting_at(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8; 
 /// extension chain in front of each header; more than
 /// [`MAX_CHAINS_PER_HEADER`] converging on one are forged, and reading each
 /// one's payload is what made converging chains cost ~1 s per MiB.
+///
+/// And payload bytes per SCAN — Ruling T3-1: forged chains spread over many
+/// headers, four or fewer each, are bounded by [`extension_read_budget`]
+/// instead. Both apply.
 struct ChainBudget<'a> {
     read: &'a mut HashMap<u64, usize>,
     converged: &'a mut BTreeSet<u64>,
+    /// Extension-payload bytes read so far in this scan.
+    payload_read: &'a mut u64,
+    /// [`extension_read_budget`] for this input.
+    payload_limit: u64,
+    starved: &'a mut BTreeSet<u64>,
+}
+
+impl ChainBudget<'_> {
+    /// Whether the scan-wide budget is spent: some chain has already been
+    /// refused for it. From then on every chain that needs a payload is
+    /// refused, the small ones too.
+    fn scan_budget_spent(&self) -> bool {
+        !self.starved.is_empty()
+    }
 }
 
 /// Gates the header at `offset` and, if it is an extension, the chain it
@@ -1108,14 +1164,16 @@ struct ChainBudget<'a> {
 ///
 /// Between the passes stands `budget`: a chain with at least one extension
 /// payload is read only while fewer than [`MAX_CHAINS_PER_HEADER`] chains
-/// have been read for the header it reached. A bare header is never counted
+/// have been read for the header it reached, and while the scan-wide
+/// [`extension_read_budget`] is not spent. A bare header is never counted
 /// and never refused.
 ///
 /// `first` is the block at `offset`, already read by the caller and already
 /// known to clear gate criteria 2 and 3 — read and checked once, not twice.
-/// A header whose budget is spent is refused before its block is read
-/// again: the budget is keyed only on blocks pass 1 already proved to be a
-/// chain's real header, and the same bytes prove the same thing.
+/// A header whose budget is spent — its own, or the scan's — is refused
+/// before its block is read again: the per-header map is keyed only on
+/// blocks pass 1 already proved to be a chain's real header, and the same
+/// bytes prove the same thing.
 fn gate_chain_at(
     src: &mut dyn SeekRead,
     offset: u64,
@@ -1133,13 +1191,15 @@ fn gate_chain_at(
         let block = match first.take() {
             Some(block) => block,
             None => {
-                if budget
-                    .read
-                    .get(&at)
-                    .is_some_and(|&read| read >= MAX_CHAINS_PER_HEADER)
-                {
-                    budget.converged.insert(at);
-                    return None;
+                if let Some(&read) = budget.read.get(&at) {
+                    if read >= MAX_CHAINS_PER_HEADER {
+                        budget.converged.insert(at);
+                        return None;
+                    }
+                    if budget.scan_budget_spent() {
+                        budget.starved.insert(at);
+                        return None;
+                    }
                 }
                 let block = read_block(src, at, file_len)?;
                 if !header_checksum_agrees(&block) || !clears_criterion_3(src, at, file_len, &block)
@@ -1186,12 +1246,26 @@ fn gate_chain_at(
         // budget.
         let has_payloads = long_name.is_some() || long_link.is_some() || pax.is_some();
         if has_payloads {
+            let planned: u64 = [long_name, long_link, pax]
+                .iter()
+                .flatten()
+                .map(|&(_, len, _)| len)
+                .sum();
+            let after = budget.payload_read.saturating_add(planned);
+            let over = budget.scan_budget_spent() || after > budget.payload_limit;
             let read = budget.read.entry(at).or_insert(0);
             if *read >= MAX_CHAINS_PER_HEADER {
                 budget.converged.insert(at);
                 return None;
             }
+            // A chain whose payloads would take the scan past its budget is
+            // refused whole, so the budget is a bound, never overshot.
+            if over {
+                budget.starved.insert(at);
+                return None;
+            }
             *read += 1;
+            *budget.payload_read = after;
         }
         let mut read = |planned: Option<(u64, u64, u64)>| match planned {
             Some((start, len, ceiling)) => {
@@ -2462,6 +2536,89 @@ mod tests {
         data.extend_from_slice(&[0u8; 1024]);
         let (outcome, _) = linear_scan(data);
         assert!(outcome.entries.is_empty());
+        assert!(outcome.sightings.is_empty(), "{:?}", outcome.sightings);
+    }
+
+    /// Forged chains spread over many empty-named headers, at most four per
+    /// header — `per` forged `x` heads, then a terminal, repeated `groups`
+    /// times, every head spanning to the terminal of the group about 1 MiB
+    /// later. The per-header budget never trips; each head's payload is up
+    /// to [`MAX_SALVAGE_PAX_SCAN`].
+    fn spread_chains(per: usize, groups: usize) -> Vec<u8> {
+        let g = per + 1;
+        let ahead = 2000 / g; // groups ahead: spans just under 1 MiB
+        let mut data = Vec::new();
+        for grp in 0..groups {
+            for k in 0..per {
+                let head = grp * g + k;
+                let terminal = (grp + ahead) * g + per;
+                data.extend_from_slice(&ustar_block(
+                    "",
+                    b'x',
+                    ((terminal - head - 1) * 512) as u64,
+                ));
+            }
+            data.extend_from_slice(&ustar_block("", b'0', 0));
+        }
+        data.extend_from_slice(&[0u8; 1024]);
+        data
+    }
+
+    /// Ruling T3-1: the per-header budget's residual. Against 950b79f (the
+    /// per-header budget alone) the three-per-header leg read 1,618,675,198
+    /// bytes of a 2,098,176-byte input; the scan-wide extension-read budget
+    /// makes both legs linear and reports the headers it stopped reading
+    /// chains for.
+    #[test]
+    fn forged_chains_spread_over_many_headers_scan_linearly() {
+        for per in [3, 4] {
+            let (outcome, _) = linear_scan(spread_chains(per, 4096 / (per + 1)));
+            assert!(outcome.entries.is_empty(), "{per}");
+            assert!(
+                outcome
+                    .sightings
+                    .iter()
+                    .any(|s| s.shape == EXTENSION_BUDGET_SHAPE),
+                "{per}: {:?}",
+                outcome.sightings
+            );
+        }
+    }
+
+    /// Ruling T3-1: a legitimate pax archive whose extension payloads are
+    /// most of the file — 150 entries, each behind a 3 KiB pax header
+    /// (`path` plus an extended attribute) — never trips the scan-wide
+    /// budget: each real chain's payload is read once.
+    #[test]
+    fn a_pax_heavy_archive_never_spends_the_extension_read_budget() {
+        let xattr = "v".repeat(3000);
+        let names: Vec<String> = (0..150).map(|i| format!("pax-heavy/{i:03}.txt")).collect();
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.mode(tar::HeaderMode::Deterministic);
+        for (i, name) in names.iter().enumerate() {
+            let data = format!("payload {i}");
+            builder
+                .append_pax_extensions([
+                    ("path", name.as_bytes()),
+                    ("SCHILY.xattr.user.big", xattr.as_bytes()),
+                ])
+                .unwrap();
+            let mut header = tar::Header::new_ustar();
+            header.set_path("placeholder").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, data.as_bytes()).unwrap();
+        }
+        let (outcome, _) = linear_scan(builder.into_inner().unwrap());
+        assert_eq!(
+            outcome
+                .entries
+                .iter()
+                .map(|e| e.meta.name.clone())
+                .collect::<Vec<_>>(),
+            names
+        );
         assert!(outcome.sightings.is_empty(), "{:?}", outcome.sightings);
     }
 
