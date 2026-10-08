@@ -196,13 +196,14 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry,
-    UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
+    Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
+    SalvagedEntry, UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
 use super::zoo::{
-    DirEntry, MAX_ZOO_ENTRY_LEN, Method, SIZ_FLDR, ZOO_TAG, decode, read_dir_entry, zoo_mtime,
+    DirEntry, FNAME_I, FNM_SIZ, MAX_ZOO_ENTRY_LEN, Method, SIZ_DIR, SIZ_DIRL, SIZ_FLDR,
+    VARDIRLEN_I, ZOO_TAG, decode, read_dir_entry, zoo_mtime,
 };
 
 /// The four bytes a directory entry opens with, little-endian [`ZOO_TAG`].
@@ -210,22 +211,21 @@ use super::zoo::{
 /// the two cannot drift.
 const TAG_BYTES: [u8; 4] = ZOO_TAG.to_le_bytes();
 
-/// Bytes read per [`find_next_tag`] chunk. O(1) memory regardless of how far
-/// the next tag is, or whether there is one at all — same figure, same
-/// reasoning, as `zip_salvage.rs`'s and `arc_salvage.rs`'s own `SCAN_CHUNK`.
-const SCAN_CHUNK: usize = 64 * 1024;
-
 /// Scans a ZOO archive for directory records directly, without following the
 /// chain of absolute offsets that a damaged archive's own damage may be in.
 ///
-/// Carries no state between calls beyond what [`SalvageScan::next_candidate`]
-/// itself receives — the same shape `ZipSalvage` and `ArcSalvage` have.
+/// Its only state is the [`ForwardSearch`] buffer reused across calls; it
+/// carries nothing about the archive between them beyond what
+/// [`SalvageScan::next_candidate`] itself receives — the same shape
+/// `ZipSalvage` and `ArcSalvage` have.
 #[derive(Debug, Default)]
-pub struct ZooSalvage;
+pub struct ZooSalvage {
+    search: ForwardSearch,
+}
 
 impl ZooSalvage {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -234,7 +234,7 @@ impl SalvageScan for ZooSalvage {
         let file_len = src.seek(SeekFrom::End(0))?;
         let mut search_from = from;
         loop {
-            let Some(offset) = find_next_tag(src, search_from, file_len)? else {
+            let Some(offset) = find_next_tag(&mut self.search, src, search_from, file_len)? else {
                 return Ok(None);
             };
             match read_candidate_at(src, offset, file_len) {
@@ -291,43 +291,43 @@ impl SalvageScan for ZooSalvage {
     }
 }
 
-/// Searches forward from `from` for the next four-byte [`TAG_BYTES`] match,
-/// in bounded chunks so memory use does not depend on how far through the
-/// source the next one is.
+/// Searches forward from `from` for the next [`TAG_BYTES`] match whose
+/// fixed record part clears every criterion that part alone can decide, and
+/// returns its offset, through [`ForwardSearch`]: a `type` of 0, 1 or 2 and
+/// a packing method `<=` [`Method::MAX_PACK`] (criteria 2-3), and for a type
+/// 0 or 1 record, whose name lives wholly in that part, criterion 4 too.
 ///
-/// Carries at most three bytes across a chunk boundary — the longest a
-/// four-byte match can straddle — so a match split across two reads is never
-/// missed. `Ok(None)` when no tag remains before `file_len`.
-fn find_next_tag(src: &mut dyn SeekRead, from: u64, file_len: u64) -> io::Result<Option<u64>> {
-    if from >= file_len {
-        return Ok(None);
-    }
-    src.seek(SeekFrom::Start(from))?;
-
-    let mut window: Vec<u8> = Vec::with_capacity(SCAN_CHUNK + 3);
-    let mut window_start = from;
-    let mut buf = vec![0u8; SCAN_CHUNK];
-
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
+/// **Judged inside the search, not after it (0.10.3).** Every search
+/// starts with a short read, so a scan that left it for each bare tag,
+/// re-read the record and searched again from one byte on paid a fresh
+/// first read and a record read per tag: the read-amplification oracle
+/// measured 131x on a fuzz input that way. Judged here, a refused tag costs
+/// nothing beyond the search's own pass over it. A type 2 record's name
+/// and `dir_crc` need its variable part, so [`read_candidate_at`] still
+/// decides those.
+///
+/// A tag with fewer than [`SIZ_DIR`] bytes after its start cannot hold a
+/// record, and was always refused. `Ok(None)` when none remains.
+fn find_next_tag(
+    search: &mut ForwardSearch,
+    src: &mut dyn SeekRead,
+    from: u64,
+    file_len: u64,
+) -> io::Result<Option<u64>> {
+    search.find(src, from, file_len, SIZ_DIR, |w| {
+        if w[0..4] != TAG_BYTES || w[5] > Method::MAX_PACK {
+            return false;
         }
-        window.extend_from_slice(&buf[..n]);
-
-        if let Some(at) = window
-            .windows(TAG_BYTES.len())
-            .position(|w| w == TAG_BYTES.as_slice())
-        {
-            return Ok(Some(window_start + at as u64));
+        match w[4] {
+            0 | 1 => {
+                let field = &w[FNAME_I..FNAME_I + FNM_SIZ];
+                let end = field.iter().position(|&b| b == 0).unwrap_or(field.len());
+                end > 0 && field[..end].iter().all(|b| (0x20..=0x7E).contains(b))
+            }
+            2 => true,
+            _ => false,
         }
-
-        // Keep only the last 3 bytes: the longest prefix of the tag that
-        // could still be waiting for its remaining bytes in the next chunk.
-        let keep = window.len().saturating_sub(3);
-        window_start += keep as u64;
-        window.drain(..keep);
-    }
+    })
 }
 
 /// Whether a record's decoded name looks like real header data rather than
@@ -370,6 +370,26 @@ fn record_looks_real(header: &DirEntry) -> bool {
     // all — so the record length is checked too, or "has no checksum" would
     // read as "its checksum verified".
     header.fixed_len == super::zoo::SIZ_DIRL && header.dir_crc_mismatch.is_none()
+}
+
+/// Whether the record at `offset` is type 2 and its `var_dir_len`-byte
+/// variable part ends past `file_len` — or its fixed part does. Reads two
+/// bytes, and only for a type 2 record.
+fn variable_part_overruns(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> io::Result<bool> {
+    src.seek(SeekFrom::Start(offset + 4))?;
+    let mut dir_type = [0u8; 1];
+    src.read_exact(&mut dir_type)?;
+    if dir_type[0] != 2 {
+        return Ok(false);
+    }
+    if offset.saturating_add(SIZ_DIRL as u64) > file_len {
+        return Ok(true);
+    }
+    src.seek(SeekFrom::Start(offset + VARDIRLEN_I as u64))?;
+    let mut var_len = [0u8; 2];
+    src.read_exact(&mut var_len)?;
+    let end = offset + SIZ_DIRL as u64 + u64::from(u16::from_le_bytes(var_len));
+    Ok(end > file_len)
 }
 
 /// Maps a ZOO packing-method byte to the [`FormatId`] [`EntryMeta::codec`]
@@ -415,6 +435,13 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// a record — so they fold here rather than propagating and ending a run
 /// over one coincidence.
 fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<Candidate> {
+    // A type 2 record whose variable part runs past the source is refused
+    // BEFORE `read_dir_entry` reads it (0.10.3): that read fails on the
+    // short read with the same verdict, but only after delivering every
+    // byte up to EOF, per coincidental tag.
+    if variable_part_overruns(src, offset, file_len).ok()? {
+        return None;
+    }
     let header = read_dir_entry(src, offset).ok()?;
     if header.method_byte > Method::MAX_PACK {
         return None;
@@ -790,6 +817,41 @@ mod tests {
 
     use super::super::zoo::test_archives::{Spec, build_zoo};
     use super::*;
+
+    /// 0.10.3: dense tags, and dense fixed records the gate refuses or
+    /// accepts, each 256 KiB, held to
+    /// `stuffr_core::testing::check_scan_is_linear`. Before the search
+    /// judged the fixed record and kept what it read across calls, these
+    /// read 15,885x and 1,246x their input (at 1 MiB).
+    #[test]
+    fn dense_tags_and_dense_records_scan_linearly() {
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 256 * 1024;
+        let fill = |unit: &[u8]| unit.iter().copied().cycle().take(LEN).collect::<Vec<u8>>();
+        let record = |name: &[u8]| {
+            let mut r = vec![0u8; SIZ_DIR];
+            r[..4].copy_from_slice(&TAG_BYTES);
+            r[24..28].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes()); // size_now
+            r[FNAME_I..FNAME_I + name.len()].copy_from_slice(name);
+            r
+        };
+        let shapes = [
+            ("bare tags", fill(&TAG_BYTES), 0),
+            ("type 0, unprintable name", fill(&record(b"\x01")), 0),
+            (
+                "type 0, accepted",
+                fill(&record(b"A.TXT")),
+                LEN.div_ceil(SIZ_DIR) - 1,
+            ),
+        ];
+        for (shape, bytes, entries) in shapes {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_zoo(&mut src, &SalvagePolicy::default()).unwrap();
+            assert_eq!(out.entries.len(), entries, "{shape}");
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+        }
+    }
 
     const STORE_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/store.zoo");
     const DEFAULT_ZOO: &[u8] = include_bytes!("../../fixtures/legacy/zoo/default.zoo");
@@ -1264,8 +1326,8 @@ mod tests {
         let mut src = LyingLenPanicsOnBigRead {
             inner: Cursor::new(bytes),
             reported_len: u64::from(ABSURD_SIZE) * 4,
-            // Comfortably above `SCAN_CHUNK` (discovery reads in 64 KiB
-            // chunks regardless of this test) and comfortably below
+            // Comfortably above `ForwardSearch::MAX_CHUNK` (discovery's
+            // reads grow to 64 KiB regardless of this test) and comfortably below
             // `ABSURD_SIZE` (~2.86 GiB).
             max_single_read: 128 * 1024,
         };
@@ -1332,8 +1394,7 @@ mod tests {
         // neutered, the status assertion fires first and hides the finding
         // this test exists for — which is exactly how the old version of
         // this test came to pass while the buffer was allocated. The scan
-        // itself allocates a `SCAN_CHUNK` buffer and a window of the same
-        // order, so this ceiling sits well above those and three orders of
+        // itself grows a `ForwardSearch` window to the order of 64 KiB, so this ceiling sits well above those and three orders of
         // magnitude below `ABSURD_SIZE` (~2.86 GiB).
         assert!(
             largest <= 1 << 20,
@@ -1712,14 +1773,24 @@ mod tests {
         );
     }
 
-    /// A tag match split across a [`SCAN_CHUNK`] boundary must still be
-    /// found — the carry `find_next_tag` keeps exists for exactly this.
+    /// A tag match split across a [`ForwardSearch::MAX_CHUNK`] boundary
+    /// must still be found — the carry `ForwardSearch` keeps exists for
+    /// exactly this. Type 2, so the fixed-part gate inside the search has
+    /// no name to refuse it over.
     #[test]
     fn a_tag_straddling_a_chunk_boundary_is_found() {
-        let mut bytes = vec![0u8; SCAN_CHUNK * 2];
-        let at = SCAN_CHUNK - 1;
+        let chunk = ForwardSearch::MAX_CHUNK;
+        let mut bytes = vec![0u8; chunk * 2];
+        let at = chunk - 1;
         bytes[at..at + 4].copy_from_slice(&TAG_BYTES);
-        let found = find_next_tag(&mut Cursor::new(bytes), 0, (SCAN_CHUNK * 2) as u64).unwrap();
+        bytes[at + 4] = 2;
+        let found = find_next_tag(
+            &mut ForwardSearch::new(),
+            &mut Cursor::new(bytes),
+            0,
+            (chunk * 2) as u64,
+        )
+        .unwrap();
         assert_eq!(found, Some(at as u64));
     }
 }
