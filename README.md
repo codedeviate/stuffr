@@ -163,9 +163,23 @@ read list.
 > entry is accounted for. Release hygiene: `make check` builds
 > `stuffr-formats` alone under `-D warnings`, `make lint-latest` runs clippy
 > on the newest stable, and `deps-guard` warns at 500,000 entries.
-> **Follow-up:** `salvage` on a case-insensitive volume can still lose one of
-> two names that differ only in case (`README`/`readme`).
 > **1821** tests under `--all-features`, **1757** on the
+> default tier — measured from this bump's own `make check`,
+> `GATE_EXIT=0`.
+>
+> `0.10.2` is a patch. **`salvage` keeps both of two names a
+> case-insensitive volume folds together** (`README` and `readme` on APFS;
+> Unicode normalisation forms on HFS+): before, the second removed the
+> first and the run still reported both written. The second is now written
+> as `NAME.salvaged-N` and reported disambiguated (exit 4), and a
+> disambiguated name never lands on an entry the archive itself named that
+> way. `unpack` recognises what this run made by file identity, not only by
+> spelling, so a case-folded clash with the archive's own entry is skipped
+> and named rather than blamed on the destination. Salvage's "not a
+> directory" reason no longer prints the destination path. The `container`
+> fuzz target extracts every seekable input a second time with `--force`,
+> and its containment oracle tolerates names the filesystem refuses.
+> **1840** tests under `--all-features`, **1776** on the
 > default tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`.
 >
