@@ -367,8 +367,74 @@ pub fn classify_symlink_target(
     Ok(SymlinkVerdict::Allowed)
 }
 
+/// Why a filesystem refused a NAME: the one definition of "the filesystem
+/// refuses this name", shared by extraction (which skips the entry) and the
+/// fuzz containment oracle (which cannot resolve such a link physically).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NameRefusal {
+    /// A component, or the whole path, is past the filesystem's limit
+    /// (`ENAMETOOLONG`).
+    TooLong,
+    /// The name is not valid on this filesystem (`EILSEQ`: APFS refuses a
+    /// name that is not valid Unicode in its required form).
+    InvalidOnThisFilesystem,
+}
+
+/// Whether `e` is the filesystem refusing a NAME, and why.
+///
+/// `ENAMETOOLONG` is recognised as `ErrorKind::InvalidFilename` (what `std`
+/// maps it to, stable since 1.87), with the raw errno as the fallback for a
+/// platform that reports it otherwise (63 on macOS and the BSDs, 36 on
+/// Linux). `EILSEQ` is matched by its raw number, since `std` maps it to no
+/// stable `ErrorKind`: 92 on macOS and iOS, 84 on Linux. An unknown platform
+/// matches no `EILSEQ`, so the error is `None` and the caller fails closed.
+#[must_use]
+pub fn name_refused_by_filesystem(e: &std::io::Error) -> Option<NameRefusal> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    const ENAMETOOLONG: i32 = 63;
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    const ENAMETOOLONG: i32 = 36;
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const EILSEQ: Option<i32> = Some(92);
+    #[cfg(target_os = "linux")]
+    const EILSEQ: Option<i32> = Some(84);
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    const EILSEQ: Option<i32> = None;
+    if e.kind() == std::io::ErrorKind::InvalidFilename || e.raw_os_error() == Some(ENAMETOOLONG) {
+        Some(NameRefusal::TooLong)
+    } else if EILSEQ.is_some() && e.raw_os_error() == EILSEQ {
+        Some(NameRefusal::InvalidOnThisFilesystem)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_filesystem_refusing_a_name_is_classified() {
+        use super::{NameRefusal, name_refused_by_filesystem};
+        use std::io::{Error as IoError, ErrorKind};
+        #[cfg(target_os = "macos")]
+        const EILSEQ: i32 = 92;
+        #[cfg(target_os = "linux")]
+        const EILSEQ: i32 = 84;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        assert_eq!(
+            name_refused_by_filesystem(&IoError::from_raw_os_error(EILSEQ)),
+            Some(NameRefusal::InvalidOnThisFilesystem)
+        );
+        assert_eq!(
+            name_refused_by_filesystem(&IoError::from(ErrorKind::InvalidFilename)),
+            Some(NameRefusal::TooLong)
+        );
+        assert_eq!(
+            name_refused_by_filesystem(&IoError::from(ErrorKind::PermissionDenied)),
+            None
+        );
+    }
+
     use std::path::Path;
 
     use crate::error::Error;

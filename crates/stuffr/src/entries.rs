@@ -5496,41 +5496,17 @@ fn place(
     Ok(Placed::Proceed)
 }
 
-/// Whether `e` is the filesystem refusing a NAME as too long, for one
-/// component or for the whole path. `InvalidFilename` is what `std` maps
-/// `ENAMETOOLONG` to (stable since 1.87); the raw errno is the fallback for
-/// a platform that reports it otherwise (63 on macOS and the BSDs, 36 on
-/// Linux).
-fn is_name_too_long(e: &std::io::Error) -> bool {
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    const ENAMETOOLONG: i32 = 63;
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
-    const ENAMETOOLONG: i32 = 36;
-    e.kind() == std::io::ErrorKind::InvalidFilename || e.raw_os_error() == Some(ENAMETOOLONG)
-}
-
-/// `EILSEQ`, by its raw number: `std` maps it to no stable `ErrorKind`
-/// (`Uncategorized`). macOS (APFS) answers it for a name that is not valid
-/// Unicode in its required form; Linux reports 84. An unknown platform
-/// matches nothing, so the error stays an `Io` (fail closed).
-fn is_illegal_byte_sequence(e: &std::io::Error) -> bool {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    const EILSEQ: Option<i32> = Some(92);
-    #[cfg(target_os = "linux")]
-    const EILSEQ: Option<i32> = Some(84);
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
-    const EILSEQ: Option<i32> = None;
-    EILSEQ.is_some() && e.raw_os_error() == EILSEQ
-}
-
 /// Why the destination filesystem refused an entry's name, when `e` says so.
+/// What counts as a refusal is `stuffr_core::name_refused_by_filesystem`, the
+/// one owner shared with the fuzz oracle; only the words live here.
 fn refusal_reason(e: &std::io::Error) -> Option<&'static str> {
-    if is_name_too_long(e) {
-        Some(PATH_TOO_LONG_REASON)
-    } else if is_illegal_byte_sequence(e) {
-        Some(NAME_INVALID_REASON)
-    } else {
-        None
+    use stuffr_core::NameRefusal;
+    match stuffr_core::name_refused_by_filesystem(e)? {
+        NameRefusal::TooLong => Some(PATH_TOO_LONG_REASON),
+        NameRefusal::InvalidOnThisFilesystem => Some(NAME_INVALID_REASON),
+        // `NameRefusal` is non-exhaustive: a refusal this build has no words
+        // for is a refusal still, so it reads as the longer-standing reason.
+        _ => Some(PATH_TOO_LONG_REASON),
     }
 }
 

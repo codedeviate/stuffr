@@ -6,6 +6,7 @@
 //! looks identical either way. Here each one has a broken double proving it
 //! can fail, exactly as `conformance.rs`'s `broken_codecs` does.
 
+use crate::containment::name_refused_by_filesystem;
 pub use crate::salvage::Attestation;
 use crate::salvage::SalvageStatus;
 use crate::{EntryKind, Error, Fidelity, FidelityReport};
@@ -420,6 +421,11 @@ pub fn check_extraction_contained(
 /// follow. A prefix that is itself dangling or looping is walked past the
 /// same way. Any other error fails the check: the oracle cannot vouch for a
 /// link it could not resolve.
+///
+/// A name the filesystem refuses (too long, or `EILSEQ` such as APFS
+/// rejecting an unassigned code point) is skipped like a loop: it points at
+/// nothing any process can open, and the lexical rule still judges it. What
+/// counts as refused is [`name_refused_by_filesystem`], the one owner.
 fn resolve_link_physically(
     link: &std::path::Path,
     target: &std::path::Path,
@@ -427,7 +433,9 @@ fn resolve_link_physically(
     use std::path::Component;
     match std::fs::canonicalize(link) {
         Ok(real) => return Ok(Some(real)),
-        Err(e) if is_symlink_loop(&e) || is_name_too_long(&e) => return Ok(None),
+        Err(e) if is_symlink_loop(&e) || name_refused_by_filesystem(&e).is_some() => {
+            return Ok(None);
+        }
         Err(e) if is_missing_or_through_a_file(&e) => {}
         Err(e) => return Err(format!("cannot resolve symlink {link:?}: {e}")),
     }
@@ -455,7 +463,7 @@ fn resolve_link_physically(
             Err(e)
                 if is_missing_or_through_a_file(&e)
                     || is_symlink_loop(&e)
-                    || is_name_too_long(&e) => {}
+                    || name_refused_by_filesystem(&e).is_some() => {}
             Err(e) => {
                 return Err(format!(
                     "cannot resolve {prefix:?} for symlink {link:?}: {e}"
@@ -476,14 +484,6 @@ fn is_missing_or_through_a_file(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
     )
-}
-
-/// `ENAMETOOLONG` (36 on Linux, 63 on macOS), by kind: `InvalidFilename`
-/// is stable since 1.87. A link whose target has a component past the OS
-/// limit points at nothing any process can open, like a loop, so the
-/// physical rule skips it; the lexical rule still judges it.
-fn is_name_too_long(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::InvalidFilename
 }
 
 /// `ELOOP`, by its raw number: `io::ErrorKind::FilesystemLoop` is not stable
@@ -1192,6 +1192,30 @@ mod broken_honesty {
             .expect("a contained but unresolvable link is not a finding");
         let (root, dest, input) = extraction_tree();
         std::os::unix::fs::symlink(format!("../../{long}"), dest.join("sub/bad")).unwrap();
+        let msg = check_extraction_contained(root.path(), &dest, &[&input])
+            .expect_err("a lexically escaping link must still fail");
+        assert!(msg.contains("bad"), "{msg}");
+    }
+
+    /// A symlink whose target holds a name the volume refuses (APFS answers
+    /// `EILSEQ` for U+07B8, which 0.10.1's fuzzing found): the OS cannot
+    /// resolve it, so the physical rule is skipped and the lexical rule
+    /// alone judges. Self-detecting: returns early where the volume accepts
+    /// the name.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_symlink_with_a_filesystem_refused_name_is_judged_lexically_only() {
+        let refused = "a\u{07B8}";
+        let probe = tempfile::tempdir().unwrap();
+        if std::fs::File::create(probe.path().join(refused)).is_ok() {
+            return; // this volume accepts the name: nothing to double
+        }
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink(refused, dest.join("sub/ok")).unwrap();
+        check_extraction_contained(root.path(), &dest, &[&input])
+            .expect("a contained link with a refused name is not a finding");
+        let (root, dest, input) = extraction_tree();
+        std::os::unix::fs::symlink(format!("../../{refused}"), dest.join("sub/bad")).unwrap();
         let msg = check_extraction_contained(root.path(), &dest, &[&input])
             .expect_err("a lexically escaping link must still fail");
         assert!(msg.contains("bad"), "{msg}");
