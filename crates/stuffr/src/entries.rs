@@ -1304,18 +1304,35 @@ fn extract_hard_link(
     if kind != MadeKind::Dir
         && let Some(already) = already_linked(target_path, link_path, made)
     {
-        return Ok(match already {
-            AlreadyLinked::OneEntry => skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()),
-            AlreadyLinked::Unattributed => {
-                skip_link(warnings, meta, HARD_LINK_REASON_ALREADY.to_string())
+        match already {
+            AlreadyLinked::OneEntry => {
+                return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
             }
-            // A genuine second name, already linked: satisfied, recorded
-            // by the caller, no warning — the result is a correct link.
-            AlreadyLinked::DistinctName => match kind {
-                MadeKind::Symlink(text) => Some((MadeKind::Symlink(text), 0)),
-                _ => Some((MadeKind::Hardlink, 0)),
-            },
-        });
+            AlreadyLinked::Unattributed => {
+                return Ok(skip_link(
+                    warnings,
+                    meta,
+                    HARD_LINK_REASON_ALREADY.to_string(),
+                ));
+            }
+            // A genuine second name, already linked, under `--force`:
+            // satisfied, recorded by the caller, no warning — the result
+            // is the correct link, and replacing it would change nothing.
+            AlreadyLinked::DistinctName if force => {
+                return Ok(Some(match kind {
+                    MadeKind::Symlink(text) => (MadeKind::Symlink(text), 0),
+                    _ => (MadeKind::Hardlink, 0),
+                }));
+            }
+            // Without `--force`, a repeated link entry is 0.10.0's
+            // duplicate rule, exactly as a repeated file is: the usage
+            // error (exit 2, "pass --force"). Falls through to the arm
+            // below, whose `place_entry` answers `Held` — and a non-forced
+            // `place_entry` never removes anything, so the invariant holds
+            // on this road too (fix round 3: round 2 answered success here
+            // in both modes, a silent exit 0 where 0.10.1 exited 2).
+            AlreadyLinked::DistinctName => {}
+        }
     }
     match kind {
         MadeKind::Dir => Ok(skip_link(
@@ -1369,7 +1386,8 @@ fn extract_hard_link(
 
 /// What [`already_linked`] found at a link path that is already its
 /// target's inode. Every answer means "remove nothing"; they differ only in
-/// what is reported.
+/// what is reported (and, for `DistinctName` without `--force`, in the
+/// duplicate rule's usage error).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AlreadyLinked {
     /// The inode has ONE name: `link` and `target` are one directory entry
@@ -1377,7 +1395,8 @@ enum AlreadyLinked {
     OneEntry,
     /// Both `link` and `target` are exact names this run recorded, each
     /// still holding the inode it was recorded with: two directory entries,
-    /// already linked. Satisfied, silently.
+    /// already linked. Satisfied, silently, under `--force`; without it,
+    /// the duplicate rule's usage error, as for a repeated file.
     DistinctName,
     /// Several names, and the run cannot say which one `link` is: a fold of
     /// the target, or of another link to it (`l` after `L -> a`). Skipped
@@ -1392,11 +1411,19 @@ enum AlreadyLinked {
 ///
 /// The classification needs the run's record, and the record needs its
 /// per-key identity ([`MadeByRun::made_exact`]): a key a fold superseded
-/// answers `false`, so a stale spelling is never taken for a distinct name.
+/// answers `false` while the inode at its path is a different one.
 /// `DistinctName` asks it of BOTH paths, because a stale key can sit on
 /// either side — the link's (`A`, `a` replacing it, `l -> a`, `A -> a`) or
-/// the target's (`a`, `A` replacing it, `l -> a`, `A -> a`). Neither path's
-/// answer decides a removal any more: every `Some` removes nothing.
+/// the target's (`a`, `A` replacing it, `l -> a`, `A -> a`).
+///
+/// It is not airtight, and it does not need to be. A stale key can become
+/// CURRENT again: `a`, `t -> a`, `A` (replacing `a` by fold; the key `a`
+/// keeps the first inode, still alive as `t`), then `A -> t` re-links the
+/// folded entry to that inode, so `a` reads current and a later `a -> t`
+/// is classed `DistinctName` though `a` is `A` under another spelling. The
+/// CONTENT is still right — every `Some` removes nothing, and the state
+/// the archive asks for holds — so only the report can be wrong: a silent
+/// satisfied link where a skip would have been more precise.
 ///
 /// Why a fold of the target and a fold of another link cannot be told
 /// apart: both share the inode and neither spelling is on disk as its own
@@ -5106,10 +5133,12 @@ fn hard_link_reason_directory(target: &str) -> String {
 /// resolved path.
 const HARD_LINK_REASON_SELF: &str = "it names itself as its hard-link target";
 
-/// Why `unpack` skips a hard link whose path already holds its target's
-/// file under a spelling the run cannot attribute ([`AlreadyLinked`]): a
-/// fold of the target, or of another link to it. True either way.
-const HARD_LINK_REASON_ALREADY: &str = "its path already holds its hard-link target's file";
+/// Why `unpack` skips a hard link whose path already holds its target
+/// under a spelling the run cannot attribute ([`AlreadyLinked`]): a fold of
+/// the target, or of another link to it. True either way, and for whatever
+/// kind is on disk — the recorded kind can be stale (a directory that
+/// replaced a file by fold), so the wording names no kind.
+const HARD_LINK_REASON_ALREADY: &str = "its path already holds its hard-link target";
 
 /// Why an entry whose name holds a NUL is not written into `container`, a
 /// target whose caps say `!nul_in_names`.
@@ -5434,11 +5463,13 @@ enum MadeKind {
 /// Since fix round 2 no removal depends on this: a hard link whose path is
 /// already its target's inode removes nothing whatever the record says
 /// ([`already_linked`]). The per-key identity now only keeps that arm's
-/// REPORT honest — a stale spelling is skipped and named, never passed off
-/// silently as a distinct link. Residual caveat, therefore about wording
-/// only: a filesystem that hands a freed inode number straight to the next
-/// file created could make a stale key match again; APFS and ext4 do not
-/// reuse numbers that way, and only this run creates in `dest`.
+/// REPORT honest — a stale spelling is skipped and named rather than passed
+/// off silently as a distinct link. Residual caveats, both about wording
+/// only: a filesystem that reuses a freed inode number (ext4 does, readily)
+/// can make a stale key match again, and a re-link can make one current
+/// again ([`already_linked`] has the shape). Either can only mislabel the
+/// report — a silent satisfied link where a skip was due — and never
+/// removes anything: no removal reads this record.
 #[derive(Default)]
 struct MadeByRun {
     names: HashMap<String, PathBuf>,

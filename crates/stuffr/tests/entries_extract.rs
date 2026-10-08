@@ -1326,7 +1326,7 @@ fn a_destination_file_whose_spelling_folds_stays_destination_held() {
 /// a fold of `x`, so the skip uses the wording that is true either way.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_case_folded_self_link_beside_a_second_link_stays_a_self_link_skip() {
+fn a_case_folded_link_beside_a_second_link_is_skipped_removing_nothing() {
     let root = tmp_dir();
     if !folds_case(&root) {
         return; // a case-sensitive volume: `A` is a third name
@@ -1432,7 +1432,9 @@ fn a_case_folded_hard_link_onto_its_own_target_is_a_self_link_skip() {
 }
 
 /// The inode check must not mistake a genuine second link for a self-link:
-/// a duplicate link entry under `--force` still replaces cleanly, silently.
+/// a duplicate link entry under `--force` is satisfied silently. Since fix
+/// round 2 that is a no-op — `a` is already `b`'s inode, so nothing is
+/// removed or re-linked — and the caller records it as written.
 #[cfg(unix)]
 #[test]
 fn a_repeated_link_entry_under_force_is_not_a_self_link() {
@@ -1449,6 +1451,42 @@ fn a_repeated_link_entry_under_force_is_not_a_self_link() {
         outcome.fidelity.warnings
     );
     assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("b")));
+}
+
+/// Fix round 3: a repeated hard-link entry keeps 0.10.0's duplicate rule.
+/// Without `--force` it is the usage error an exact duplicate file is
+/// (exit 2, "already exists; pass --force"), and nothing is removed; with
+/// it, the run succeeds silently. Fix round 2's "already linked" shortcut
+/// answered success in BOTH modes, turning the exit 2 into a silent exit 0.
+#[cfg(unix)]
+#[test]
+fn a_repeated_link_entry_keeps_the_force_rule() {
+    let root = tmp_dir();
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[file("a", b"hello"), hardlink("l", "a"), hardlink("l", "a")],
+    );
+
+    let plain = root.join("out1");
+    let err = extract_with(&archive, &plain, false).expect_err("refused");
+    assert!(matches!(err, Error::Usage(_)), "{err:?}");
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("already exists; pass --force"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read(plain.join("a")).unwrap(), b"hello");
+    assert_eq!(ino_nlink(&plain.join("a")), ino_nlink(&plain.join("l")));
+
+    let forced = root.join("out2");
+    let outcome = extract_with(&archive, &forced, true).expect("exit 0");
+    assert!(
+        outcome.fidelity.warnings.is_empty(),
+        "{:?}",
+        outcome.fidelity.warnings
+    );
+    assert_eq!(std::fs::read(forced.join("l")).unwrap(), b"hello");
+    assert_eq!(ino_nlink(&forced.join("a")), ino_nlink(&forced.join("l")));
 }
 
 /// Fix round 2, M2: the parent `n*` is MISSING, so `place_entry`'s probes
@@ -1529,10 +1567,13 @@ fn repeated_links_in_a_large_directory_stay_linear() {
 
 /// The timing reproducer for the test above, on demand:
 /// `cargo test -p stuffr --test entries_extract -- --ignored
-/// repeated_links_timing`. Measured in debug on APFS: ~1.07 s (~0.27 s is
-/// the 2,000 files, then ~0.4 ms per link, which is the unlink/link
-/// syscalls); the per-link directory scan it replaced took ~2.69 s. The
-/// bound is generous: it catches a catastrophic regression, not a 2x.
+/// repeated_links_timing`. Measured in debug on APFS at 0.10.1: ~1.07 s
+/// (~0.27 s is the 2,000 files, then ~0.4 ms per link, which was the
+/// unlink/link syscalls); the per-link directory scan it replaced took
+/// ~2.69 s. Since 0.10.2's fix round 2 a repeated link is a no-op (two
+/// `symlink_metadata` calls, no unlink or link), so the per-link cost is
+/// lower still. The bound is generous: it catches a catastrophic
+/// regression, not a 2x.
 #[cfg(unix)]
 #[test]
 #[ignore = "wall-clock bound; run on demand, not in the gate"]
@@ -1619,10 +1660,10 @@ fn a_stale_case_folded_record_never_removes_the_link_target() {
     assert_eq!(ino_nlink(&dest.join("a")).1, 2, "a and l, nothing else");
 }
 
-/// The skip reason for a link whose path already holds its target's file
-/// under a spelling the run cannot attribute: a fold of the target, or of
+/// The skip reason for a link whose path already holds its target under a
+/// spelling the run cannot attribute: a fold of the target, or of
 /// another link to it. Restated as a literal, as the self-link reason is.
-const ALREADY_HOLDS_TARGET: &str = "its path already holds its hard-link target's file";
+const ALREADY_HOLDS_TARGET: &str = "its path already holds its hard-link target";
 
 /// Fix round 2: `a`, then `A` (which replaces it under `--force` on a
 /// case-folding volume, leaving the TARGET's key `a` stale), `l -> a` (link

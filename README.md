@@ -181,7 +181,7 @@ read list.
 > (`README`, then `readme`) without `--force` is still exit 2, as an exact
 > duplicate is, and so is a directory entry onto a file the run made
 > (`a`, then `A/`), as it is for an exact name (replaced under `--force`).
-> A hard link whose path already holds its target's file removes nothing.
+> A hard link whose path already holds its target removes nothing.
 > Salvage's "not a directory" reason no longer prints the destination
 > path. The `container` fuzz target extracts every seekable input a second
 > time with `--force`,
