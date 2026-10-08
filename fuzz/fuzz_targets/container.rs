@@ -302,22 +302,26 @@ fn convert_opts() -> ConvertOpts {
     }
 }
 
-/// Extracts the archive at `input` into `root/out` (0.10.1), and checks what
-/// landed on disk:
+/// Extracts the archive at `input` into `root/out` with `force: false` (0.10.1)
+/// and again into `root/out-force` with `force: true` (0.10.2), and checks what
+/// landed on disk each time:
 ///
 /// 1. an `Err` is classified — never exit 1, which is how a path conflict the
 ///    archive makes with itself surfaced before `place_entry` owned them;
-/// 2. nothing exists under `root` outside `root/out` except `allowed` (the
-///    target's own files), and no symlink under `root/out` resolves outside
-///    it ([`check_extraction_contained`]) — run whether `extract` succeeded or
-///    not, since a refusal partway through leaves what it already wrote;
+/// 2. nothing exists under `root` outside the leg's own `dest` except `allowed`
+///    (the target's own files, and the other leg's tree), and no symlink under
+///    `dest` resolves outside it ([`check_extraction_contained`]) — run whether
+///    `extract` succeeded or not, since a refusal partway through leaves what
+///    it already wrote;
 /// 3. on `Ok`, when `same_archive` says the walk read what `extract` read,
 ///    every name the walk enumerated is on disk (at its `safe_join` path) or
 ///    named by a skip warning ([`check_entries_carried`]).
 ///
-/// `force: false` into a fresh directory, so a repeated name is the
-/// classified exit 2 it is for a user, and a destination-held conflict never
-/// arises.
+/// Both legs extract into a fresh directory, so a destination-held conflict
+/// never arises; what `force` changes is how the archive's own repeated names
+/// and links are resolved (a repeat is the classified exit 2 without it, a
+/// replacement with it), which is the code `MadeByRun` identity and
+/// `is_same_entry` guard.
 fn extract_leg(
     input: &Path,
     root: &Path,
@@ -326,24 +330,60 @@ fn extract_leg(
     source_names: &[String],
     same_archive: bool,
 ) {
-    let dest = root.join("out");
+    let plain = root.join("out");
+    let forced = root.join("out-force");
+    let with_plain: Vec<&Path> = allowed.iter().copied().chain([plain.as_path()]).collect();
+    extract_into(
+        input,
+        root,
+        &plain,
+        false,
+        allowed,
+        slot,
+        source_names,
+        same_archive,
+    );
+    extract_into(
+        input,
+        root,
+        &forced,
+        true,
+        &with_plain,
+        slot,
+        source_names,
+        same_archive,
+    );
+}
+
+/// One extraction of `input` into `dest`, checked as [`extract_leg`] says.
+#[allow(clippy::too_many_arguments)]
+fn extract_into(
+    input: &Path,
+    root: &Path,
+    dest: &Path,
+    force: bool,
+    allowed: &[&Path],
+    slot: &'static str,
+    source_names: &[String],
+    same_archive: bool,
+) {
     let copts = convert_opts();
     let opts = ExtractOpts {
         max_ratio: copts.max_ratio,
         memory_limit: copts.memory_limit,
-        force: false,
+        force,
         ..ExtractOpts::default()
     };
     let result = stuffr::entries::extract(
         Input::Path(input.to_path_buf()),
-        &dest,
+        dest,
         &Selection::All,
         &opts,
     );
     // An archive may set a directory's mode to 0o000; the containment walk
     // reads every directory, and the per-input `TempDir` must be removable.
-    make_traversable(&dest);
-    check_extraction_contained(root, &dest, allowed).expect("extract: contained");
+    make_traversable(dest);
+    check_extraction_contained(root, dest, allowed).expect("extract: contained");
 
     let outcome = match result {
         Ok(o) => o,
@@ -391,7 +431,7 @@ fn extract_leg(
     let on_disk: Vec<String> = source_names
         .iter()
         .filter(|n| {
-            stuffr_core::safe_join(&dest, n).is_ok_and(|p| std::fs::symlink_metadata(p).is_ok())
+            stuffr_core::safe_join(dest, n).is_ok_and(|p| std::fs::symlink_metadata(p).is_ok())
         })
         .cloned()
         .collect();

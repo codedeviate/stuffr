@@ -709,8 +709,16 @@ same way a vacuous conformance property would be.
   lexical rule could not until 0.10.1 — `x/s2 -> ..` plus `s1 -> x/s2/..`,
   which nets to `x` on paper and to `dest/..` on disk. It is the `container`
   target's extract leg: on the seekable path, after the convert oracle, the
-  target runs `entries::extract` (`force: false`, the convert oracle's
-  limits) into the per-input temp directory; an `Err` must be classified,
+  target runs `entries::extract` (the convert oracle's limits) into the
+  per-input temp directory, twice since 0.10.2: `force: false` into `out`,
+  then `force: true` into `out-force` (with `out` in `allowed`), so the
+  replace-on-repeat and hard-link paths (`MadeByRun` identity,
+  `is_same_entry`'s exact-path rule) are in the oracle's view. Measured at
+  the 0.10.2 change, the second leg cost nothing visible (205 exec/s before,
+  258 after, over the 6,979-input local corpus; run-to-run noise exceeds the
+  leg), so it is not gated. The `tar-case-hardlink` seed (`a`, `l -> a`,
+  `A -> a`) is the one that reaches `is_same_entry`'s exact-path rule: the
+  `l` link raises the link count above one. An `Err` must be classified,
   containment is checked either way, and on `Ok` every name the walk saw is
   on disk at its `safe_join` path or named by a skip warning
   (`check_entries_carried`'s rule). It is what catches a path conflict the
