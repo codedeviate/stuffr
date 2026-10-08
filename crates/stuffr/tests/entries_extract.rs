@@ -1663,6 +1663,7 @@ fn a_stale_case_folded_record_never_removes_the_link_target() {
 /// The skip reason for a link whose path already holds its target under a
 /// spelling the run cannot attribute: a fold of the target, or of
 /// another link to it. Restated as a literal, as the self-link reason is.
+#[cfg(target_os = "macos")]
 const ALREADY_HOLDS_TARGET: &str = "its path already holds its hard-link target";
 
 /// Fix round 2: `a`, then `A` (which replaces it under `--force` on a

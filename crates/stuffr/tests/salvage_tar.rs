@@ -470,6 +470,7 @@ fn folds_case(dir: &Path) -> bool {
 }
 
 /// `probé` precomposed (U+00E9) against `probé` decomposed (U+0065 U+0301).
+#[cfg(target_os = "macos")]
 fn folds_normalisation(dir: &Path) -> bool {
     folds(dir, "probe\u{e9}", "probee\u{301}")
 }
@@ -477,6 +478,7 @@ fn folds_normalisation(dir: &Path) -> bool {
 /// 0.10.2 §2: `first` and `second` are one name on this volume. Both
 /// records must survive salvage: the first under its own name, the second
 /// disambiguated by its scan position, never written over the first.
+#[cfg(target_os = "macos")]
 fn assert_a_folded_pair_both_survive(scratch: &Scratch, first: &str, second: &str) {
     let archive = conflict_tar(
         &scratch.0.join("fold.tar"),
