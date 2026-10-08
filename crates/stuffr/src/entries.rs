@@ -2993,20 +2993,40 @@ fn place_salvaged_file(
     // that folds case or Unicode normalisation, `readme` IS the `README` an
     // earlier record wrote, and replacing it lost that record's bytes at
     // exit 0. See [`Claimed`].
-    let taken_by = claimed.holder(&target, made).or_else(|| {
-        is_partial
-            .then(|| claimed.holder(&partial_path(&target), made))
-            .flatten()
-    });
-    let base_target = match taken_by {
-        Some(_) => disambiguated_path(&target, entry.scan_position),
-        None => target.clone(),
+    let as_written = |base: &Path| {
+        if is_partial {
+            partial_path(base)
+        } else {
+            base.to_path_buf()
+        }
     };
-    let write_target = if is_partial {
-        partial_path(&base_target)
-    } else {
-        base_target
+    let held = |base: &Path| {
+        claimed.holder(base).or_else(|| {
+            is_partial
+                .then(|| claimed.holder(&as_written(base)))
+                .flatten()
+        })
     };
+    let taken_by = held(&target);
+    // The disambiguated name can itself be held — not by another
+    // disambiguated name (each carries its own record's unique scan
+    // position), but by an entry the archive literally NAMED
+    // `x.salvaged-N`, or `x.salvaged-N.partial`, earlier in the scan, by
+    // spelling or by fold. Writing there replaced that entry's bytes (fix
+    // round 1, K1). So the suffix is applied again until neither the base
+    // nor its `.partial` form is held: deterministic, since it depends only
+    // on the claims and the position, and finite, since the claims are and
+    // each round lengthens the name. `disambiguated_path` stays the one
+    // owner of the spelling; `taken_by` keeps naming the claimant of the
+    // ORIGINAL name, which is the collision the user needs to read.
+    let mut base_target = target.clone();
+    if taken_by.is_some() {
+        base_target = disambiguated_path(&base_target, entry.scan_position);
+        while held(&base_target).is_some() {
+            base_target = disambiguated_path(&base_target, entry.scan_position);
+        }
+    }
+    let write_target = as_written(&base_target);
     // Both the name the entry ASKED for and the name it actually got are
     // claimed. The first is what makes a later record under the same name
     // disambiguate; the second matters because an archive is free to
@@ -3265,19 +3285,21 @@ fn partial_path(target: &Path) -> PathBuf {
 /// at exit 0 and left one file, because `readme` was unclaimed by spelling
 /// and `open_salvage_target` replaces what it finds. So `ids` also maps the
 /// `(dev, ino)` of every file this run WROTE to the position that wrote
-/// it, and [`holder`](Self::holder) answers by either. The identity check
-/// is gated on [`MadeByRun::made_identity`] — "this run created what is at
-/// this path" — and the map then names which record did. A run-made
-/// DIRECTORY is in `made` but never in `ids`, so a file record over a
-/// folded spelling of one falls through to [`place`]'s own archive-made
-/// skip, exactly as it does at the directory's exact spelling.
+/// it, and [`holder`](Self::holder) answers by either. `ids` is the
+/// scan-position index for the subset of [`MadeByRun`]'s identities that
+/// salvage WROTE as files, so a hit there already means "this run made
+/// it", with no separate `made` check. A run-made DIRECTORY is in `made`
+/// but never in `ids`, so a file record over a folded spelling of one
+/// falls through to [`place`]'s own archive-made skip, exactly as it does
+/// at the directory's exact spelling.
 ///
 /// A disambiguated name never folds onto ANOTHER disambiguated name: each
 /// carries its own record's scan position, unique per record, so two of
-/// them differ in the suffix whatever the volume folds in the stem. It
-/// CAN land on an entry the archive itself named `x.salvaged-N` earlier in
-/// the scan, by spelling or by fold, and replace it: a gap that predates
-/// identity and is recorded as a follow-up, not closed here.
+/// them differ in the suffix whatever the volume folds in the stem. It CAN
+/// meet an entry the archive itself named `x.salvaged-N` (or
+/// `x.salvaged-N.partial`) earlier in the scan, by spelling or by fold;
+/// [`place_salvaged_file`] asks `holder` of every candidate and suffixes
+/// again until one is free, so that entry is never replaced.
 #[derive(Default)]
 struct Claimed {
     paths: HashMap<PathBuf, usize>,
@@ -3289,11 +3311,11 @@ impl Claimed {
     /// spelling, or a file this run wrote that the filesystem folds `path`
     /// onto. `None` otherwise — including a stale file a previous run left,
     /// which is replaced, never disambiguated around.
-    fn holder(&self, path: &Path, made: &MadeByRun) -> Option<usize> {
+    fn holder(&self, path: &Path) -> Option<usize> {
         if let Some(&position) = self.paths.get(path) {
             return Some(position);
         }
-        if !made.made_identity(path) {
+        if self.ids.is_empty() {
             return None;
         }
         identity(path).and_then(|id| self.ids.get(&id).copied())

@@ -704,3 +704,256 @@ fn the_not_a_directory_reason_names_no_path() {
     }
     assert_eq!(std::fs::read(dest.join("held")).unwrap(), b"stale");
 }
+
+/// The payload of a record [`salvage_cut`] truncates: long enough that the
+/// cut lands well inside it.
+fn cut_payload() -> Vec<u8> {
+    (0..300u32).map(|i| b'a' + (i % 26) as u8).collect()
+}
+
+/// Salvages a tar of `records`, cut `keep` bytes into the LAST record's
+/// payload when `cut` is set (so that record is `Partial`), into `out/`.
+fn salvage_cut(
+    scratch: &Scratch,
+    records: &[(&str, &[u8])],
+    cut: bool,
+) -> (PathBuf, entries::SalvageOutcome) {
+    let as_files: Vec<(&str, EntryKind, &[u8])> = records
+        .iter()
+        .map(|(name, data)| (*name, EntryKind::File, *data))
+        .collect();
+    let whole = conflict_tar(&scratch.0.join("whole.tar"), &as_files);
+    let mut bytes = std::fs::read(&whole).unwrap();
+    if cut {
+        let last = records.last().unwrap().1;
+        let at = bytes
+            .windows(last.len())
+            .rposition(|w| w == last)
+            .expect("the last payload is in the archive");
+        bytes.truncate(at + CUT_KEEP);
+    }
+    let archive = scratch.0.join("salvage.tar");
+    std::fs::write(&archive, &bytes).unwrap();
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar")))
+        .expect("never a run-level error");
+    (dest, outcome)
+}
+
+const CUT_KEEP: usize = 100;
+
+/// Where K1's disambiguated record must land: the record at `index`,
+/// moved past a name an EARLIER record holds to exactly `path` (relative to
+/// `dest`), holding `bytes`, with `taken_by` the claimant of its ORIGINAL
+/// name.
+struct Landed<'a> {
+    index: usize,
+    taken_by: usize,
+    path: &'a str,
+    partial: Option<PartialCause>,
+    bytes: &'a [u8],
+}
+
+/// K1 (fix round 1): `landed` holds, and the literal entry at `literal`
+/// (relative) still holds `LITERAL`.
+fn assert_disambiguated_past_a_literal(
+    dest: &Path,
+    outcome: &entries::SalvageOutcome,
+    landed: Landed<'_>,
+    literal: &str,
+) {
+    assert_eq!(
+        outcome.entries[landed.index].disposition,
+        SalvageDisposition::WrittenDisambiguated {
+            path: dest.join(landed.path),
+            taken_by: landed.taken_by,
+            partial: landed.partial,
+        },
+        "{:?}",
+        outcome.entries
+    );
+    assert_eq!(
+        std::fs::read(dest.join(literal)).unwrap(),
+        b"LITERAL",
+        "the literal entry's bytes must not have been written over"
+    );
+    assert_eq!(std::fs::read(dest.join(landed.path)).unwrap(), landed.bytes);
+    assert_eq!(entries::salvage_exit_code(outcome), 4);
+}
+
+/// K1, exact form: a literal `x.salvaged-2`, then `x` twice. The third
+/// record's disambiguated name is the literal's: it goes on past it.
+#[test]
+fn a_disambiguated_name_never_replaces_a_literal_entry_of_that_name() {
+    let scratch = Scratch::new("k1-exact");
+    let (dest, outcome) = salvage_cut(
+        &scratch,
+        &[("x.salvaged-2", b"LITERAL"), ("x", b"one"), ("x", b"two")],
+        false,
+    );
+    assert_eq!(std::fs::read(dest.join("x")).unwrap(), b"one");
+    assert_disambiguated_past_a_literal(
+        &dest,
+        &outcome,
+        Landed {
+            index: 2,
+            taken_by: 1,
+            path: "x.salvaged-2.salvaged-2",
+            partial: None,
+            bytes: b"two",
+        },
+        "x.salvaged-2",
+    );
+}
+
+/// K1, fold form: the literal is `X.SALVAGED-2`, which `x.salvaged-2`
+/// folds onto.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_disambiguated_name_never_replaces_a_literal_it_folds_onto() {
+    let scratch = Scratch::new("k1-fold");
+    if !folds_case(&scratch.0) {
+        eprintln!("skipped: this volume distinguishes case");
+        return;
+    }
+    let (dest, outcome) = salvage_cut(
+        &scratch,
+        &[("X.SALVAGED-2", b"LITERAL"), ("x", b"one"), ("x", b"two")],
+        false,
+    );
+    assert_eq!(std::fs::read(dest.join("x")).unwrap(), b"one");
+    assert_disambiguated_past_a_literal(
+        &dest,
+        &outcome,
+        Landed {
+            index: 2,
+            taken_by: 1,
+            path: "x.salvaged-2.salvaged-2",
+            partial: None,
+            bytes: b"two",
+        },
+        "X.SALVAGED-2",
+    );
+}
+
+/// K1, partial form: the third record is cut, so it would land on
+/// `x.salvaged-2.partial` — a literal entry's name.
+#[test]
+fn a_disambiguated_partial_never_replaces_a_literal_entry_of_that_name() {
+    let scratch = Scratch::new("k1-partial");
+    let payload = cut_payload();
+    let (dest, outcome) = salvage_cut(
+        &scratch,
+        &[
+            ("x.salvaged-2.partial", b"LITERAL"),
+            ("x", b"one"),
+            ("x", &payload),
+        ],
+        true,
+    );
+    assert_eq!(std::fs::read(dest.join("x")).unwrap(), b"one");
+    assert_disambiguated_past_a_literal(
+        &dest,
+        &outcome,
+        Landed {
+            index: 2,
+            taken_by: 1,
+            path: "x.salvaged-2.salvaged-2.partial",
+            partial: Some(PartialCause::Truncated),
+            bytes: &payload[..CUT_KEEP],
+        },
+        "x.salvaged-2.partial",
+    );
+}
+
+/// K1, fold plus partial: `x.salvaged-2.partial` folds onto the literal
+/// `X.Salvaged-2.PARTIAL`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_disambiguated_partial_never_replaces_a_literal_it_folds_onto() {
+    let scratch = Scratch::new("k1-partial-fold");
+    if !folds_case(&scratch.0) {
+        eprintln!("skipped: this volume distinguishes case");
+        return;
+    }
+    let payload = cut_payload();
+    let (dest, outcome) = salvage_cut(
+        &scratch,
+        &[
+            ("X.Salvaged-2.PARTIAL", b"LITERAL"),
+            ("x", b"one"),
+            ("x", &payload),
+        ],
+        true,
+    );
+    assert_eq!(std::fs::read(dest.join("x")).unwrap(), b"one");
+    assert_disambiguated_past_a_literal(
+        &dest,
+        &outcome,
+        Landed {
+            index: 2,
+            taken_by: 1,
+            path: "x.salvaged-2.salvaged-2.partial",
+            partial: Some(PartialCause::Truncated),
+            bytes: &payload[..CUT_KEEP],
+        },
+        "X.Salvaged-2.PARTIAL",
+    );
+}
+
+/// The portable form of the `.partial` claim: a literal `x.partial`, then a
+/// partial `x`, whose real name nobody holds but whose `.partial` name the
+/// literal does. `taken_by` names that holder.
+#[test]
+fn a_partial_never_replaces_a_literal_entry_named_like_its_partial() {
+    let scratch = Scratch::new("lit-partial");
+    let payload = cut_payload();
+    let (dest, outcome) = salvage_cut(
+        &scratch,
+        &[("x.partial", b"LITERAL"), ("x", &payload)],
+        true,
+    );
+    assert_disambiguated_past_a_literal(
+        &dest,
+        &outcome,
+        Landed {
+            index: 1,
+            taken_by: 0,
+            path: "x.salvaged-1.partial",
+            partial: Some(PartialCause::Truncated),
+            bytes: &payload[..CUT_KEEP],
+        },
+        "x.partial",
+    );
+}
+
+/// A fold in a PARENT component: `dir/X` is `Dir/x` on a folding volume,
+/// though neither spelling matches the other anywhere. Identity sees it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_name_folded_through_its_parent_both_survive_salvage() {
+    let scratch = Scratch::new("parent-fold");
+    if !folds_case(&scratch.0) {
+        eprintln!("skipped: this volume distinguishes case");
+        return;
+    }
+    let (dest, outcome) = salvage_cut(&scratch, &[("Dir/x", b"ONE"), ("dir/X", b"TWO")], false);
+    assert_eq!(
+        outcome.entries[0].disposition,
+        SalvageDisposition::Written(dest.join("Dir/x"))
+    );
+    assert_eq!(
+        outcome.entries[1].disposition,
+        SalvageDisposition::WrittenDisambiguated {
+            path: dest.join("dir/X.salvaged-1"),
+            taken_by: 0,
+            partial: None,
+        }
+    );
+    assert_eq!(std::fs::read(dest.join("Dir/x")).unwrap(), b"ONE");
+    assert_eq!(
+        std::fs::read(dest.join("dir/X.salvaged-1")).unwrap(),
+        b"TWO"
+    );
+    assert_eq!(entries::salvage_exit_code(&outcome), 4);
+}
