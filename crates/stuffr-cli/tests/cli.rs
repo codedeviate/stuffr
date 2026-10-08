@@ -11903,6 +11903,87 @@ fn salvage_calls_a_tar_whose_only_header_lost_byte_0_nothing_recoverable() {
     }
 }
 
+/// 0.10.3 §2: forged pax `x` chains converging on one header. Five chains
+/// reach one empty-named ustar header; salvage reads four of them and
+/// reports the header as a sighting at its offset. Pinned at the CLI's
+/// existing sighting rule: exit 5 when nothing was recovered (the sighting
+/// note, then "nothing recoverable"), exit 4 when an ordinary entry before
+/// the chains was recovered alongside it.
+#[test]
+fn salvage_reports_a_tar_header_too_many_chains_converge_on() {
+    fn ustar_block(name: &[u8], typeflag: u8, size: u64) -> Vec<u8> {
+        let mut b = vec![0u8; 512];
+        b[..name.len()].copy_from_slice(name);
+        b[100..108].copy_from_slice(b"0000644\0");
+        b[108..116].copy_from_slice(b"0000000\0");
+        b[116..124].copy_from_slice(b"0000000\0");
+        b[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+        b[136..148].copy_from_slice(b"00000000000\0");
+        b[156] = typeflag;
+        b[257..263].copy_from_slice(b"ustar\0");
+        b[263..265].copy_from_slice(b"00");
+        b[148..156].fill(b' ');
+        let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+        b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        b
+    }
+    /// `prefix`, then five forged `x` heads all spanning to one empty-named
+    /// terminal; answers the bytes and the terminal's offset.
+    fn converging(prefix: &[u8]) -> (Vec<u8>, usize) {
+        let forged = 5;
+        let terminal_at = prefix.len() + forged * 512;
+        let mut out = prefix.to_vec();
+        for k in 0..forged {
+            let span = (terminal_at - prefix.len() - k * 512 - 512) as u64;
+            out.extend_from_slice(&ustar_block(b"", b'x', span));
+        }
+        out.extend_from_slice(&ustar_block(b"", b'0', 0));
+        out.extend_from_slice(&[0u8; 1024]);
+        (out, terminal_at)
+    }
+    const SHAPE: &str =
+        "header(s) reached by more than four extension chains, whose further chains were not read";
+
+    let dir = tmp_dir();
+    let salvage_list = |p: &Path| run_output(&["salvage", p.to_str().unwrap(), "--list"]);
+
+    let (bytes, terminal_at) = converging(&[]);
+    let archive = dir.join("converged.tar");
+    std::fs::write(&archive, &bytes).unwrap();
+    let out = salvage_list(&archive);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(5), "{stdout}{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains(SHAPE), "{stderr}");
+    assert!(
+        stderr.contains(&format!("offset(s) {terminal_at}")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("nothing recoverable"), "{stderr}");
+
+    let mut entry = ustar_block(b"ok.txt", b'0', 4);
+    entry.extend_from_slice(b"fine");
+    entry.resize(1024, 0);
+    let (bytes, terminal_at) = converging(&entry);
+    let archive = dir.join("mixed-converged.tar");
+    std::fs::write(&archive, &bytes).unwrap();
+    let out = salvage_list(&archive);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stdout}{stderr}");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("ok.txt") && stdout.contains("Complete"),
+        "{stdout}"
+    );
+    assert!(stderr.contains(SHAPE), "{stderr}");
+    assert!(
+        stderr.contains(&format!("offset(s) {terminal_at}")),
+        "{stderr}"
+    );
+}
+
 /// One POSIX ustar entry, as Python's `tarfile` writes one (`ustar\0` `00`
 /// magic, typeflag `0`, `%06o\0 ` checksum): [`v7_tar_entry`] with the magic
 /// and typeflag set and the checksum recomputed. With a name and payload
