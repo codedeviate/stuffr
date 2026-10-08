@@ -309,7 +309,7 @@ fn convert_opts() -> ConvertOpts {
 /// 1. an `Err` is classified — never exit 1, which is how a path conflict the
 ///    archive makes with itself surfaced before `place_entry` owned them;
 /// 2. nothing exists under `root` outside the leg's own `dest` except `allowed`
-///    (the target's own files, and the other leg's tree), and no symlink under
+///    (the target's own files, and nothing else), and no symlink under
 ///    `dest` resolves outside it ([`check_extraction_contained`]) — run whether
 ///    `extract` succeeded or not, since a refusal partway through leaves what
 ///    it already wrote;
@@ -322,6 +322,12 @@ fn convert_opts() -> ConvertOpts {
 /// and links are resolved (a repeat is the classified exit 2 without it, a
 /// replacement with it), which is the code `MadeByRun` identity and
 /// `is_same_entry` guard.
+///
+/// The first leg's tree is removed before the second runs (0.10.2 final
+/// review, M1), so both legs check against the SAME `allowed`: with `out`
+/// tolerated, a `--force` extraction that wrote into or removed from the
+/// first tree would have gone unseen. `make_traversable` already ran on it,
+/// so an archive's `0o000` directory cannot block the removal.
 fn extract_leg(
     input: &Path,
     root: &Path,
@@ -332,7 +338,6 @@ fn extract_leg(
 ) {
     let plain = root.join("out");
     let forced = root.join("out-force");
-    let with_plain: Vec<&Path> = allowed.iter().copied().chain([plain.as_path()]).collect();
     extract_into(
         input,
         root,
@@ -343,12 +348,17 @@ fn extract_leg(
         source_names,
         same_archive,
     );
+    match std::fs::remove_dir_all(&plain) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("extract: removing the first leg's tree: {e}"),
+    }
     extract_into(
         input,
         root,
         &forced,
         true,
-        &with_plain,
+        allowed,
         slot,
         source_names,
         same_archive,

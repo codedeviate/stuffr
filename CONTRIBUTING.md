@@ -712,7 +712,9 @@ same way a vacuous conformance property would be.
   target's extract leg: on the seekable path, after the convert oracle, the
   target runs `entries::extract` (the convert oracle's limits) into the
   per-input temp directory, twice since 0.10.2: `force: false` into `out`,
-  then `force: true` into `out-force` (with `out` in `allowed`), so the
+  then — once `out` is removed, so both legs are checked against the same
+  `allowed` and a write into the first tree cannot hide — `force: true`
+  into `out-force`, so the
   replace-on-repeat and hard-link paths (`MadeByRun` identity,
   `is_same_entry`'s exact-path rule) are in the oracle's view. Measured at
   the 0.10.2 change, the second leg cost nothing visible (205 exec/s before,
