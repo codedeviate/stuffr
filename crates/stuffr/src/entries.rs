@@ -1289,13 +1289,33 @@ fn extract_hard_link(
     if target_path == link_path {
         return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
     }
-    // The same file under a spelling only the FILESYSTEM folds (`A` and `a`
-    // on a case-insensitive volume): the paths differ, so the check above
-    // misses, and `--force` would remove the target itself before linking
-    // to it. Asked of the filesystem, never followed through a symlink, and
-    // decided before anything is removed.
-    if is_same_entry(target_path, link_path, made) {
-        return Ok(skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()));
+    // THE INVARIANT (0.10.2 final review, fix round 2): when the link's
+    // path and its target are already ONE inode, the state the archive asks
+    // for already holds, and NOTHING is removed — whatever any record says.
+    // The paths differ (the check above missed), so this is a spelling the
+    // FILESYSTEM folds (`A` and `a` on a case-insensitive volume) or a name
+    // already linked; removing what is at `link_path` could remove the
+    // target's only directory entry. Records are bookkeeping and have been
+    // wrong twice (a stale key for the link, then one for the TARGET); the
+    // inode comparison is the fact. [`already_linked`] only picks which
+    // outcome to report. Asked of the filesystem, never followed through a
+    // symlink, and decided before anything is removed. A directory target
+    // is left to its own arm below, which removes nothing either.
+    if kind != MadeKind::Dir
+        && let Some(already) = already_linked(target_path, link_path, made)
+    {
+        return Ok(match already {
+            AlreadyLinked::OneEntry => skip_link(warnings, meta, HARD_LINK_REASON_SELF.to_string()),
+            AlreadyLinked::Unattributed => {
+                skip_link(warnings, meta, HARD_LINK_REASON_ALREADY.to_string())
+            }
+            // A genuine second name, already linked: satisfied, recorded
+            // by the caller, no warning — the result is a correct link.
+            AlreadyLinked::DistinctName => match kind {
+                MadeKind::Symlink(text) => Some((MadeKind::Symlink(text), 0)),
+                _ => Some((MadeKind::Hardlink, 0)),
+            },
+        });
     }
     match kind {
         MadeKind::Dir => Ok(skip_link(
@@ -1347,68 +1367,65 @@ fn extract_hard_link(
     }
 }
 
-/// Whether `link` is just another spelling of `target`'s own directory
-/// entry — so removing what is at `link` would remove `target` — as only the
-/// filesystem can tell (case folding, Unicode normalisation).
+/// What [`already_linked`] found at a link path that is already its
+/// target's inode. Every answer means "remove nothing"; they differ only in
+/// what is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlreadyLinked {
+    /// The inode has ONE name: `link` and `target` are one directory entry
+    /// under two spellings. A self-link, said as one.
+    OneEntry,
+    /// Both `link` and `target` are exact names this run recorded, each
+    /// still holding the inode it was recorded with: two directory entries,
+    /// already linked. Satisfied, silently.
+    DistinctName,
+    /// Several names, and the run cannot say which one `link` is: a fold of
+    /// the target, or of another link to it (`l` after `L -> a`). Skipped
+    /// with wording that is true either way.
+    Unattributed,
+}
+
+/// `Some` when `link` and `target` are already one inode (same `(dev, ino)`
+/// from `symlink_metadata`, never following a symlink), saying which case
+/// it is; `None` when they differ, either is absent, and off unix, where
+/// there is no inode to ask and the exact-path check is all there is.
 ///
-/// Same `(dev, ino)` from `symlink_metadata` on both is necessary but not
-/// enough: a genuine second hard link (a duplicate link entry, replaced
-/// under `--force`) shares the inode too, and always has `nlink >= 2`. So:
-/// one name for the inode means one entry; with several, the run's own
-/// record tells them apart in O(1) — an EXACT `link` path this run made is
-/// a distinct entry it created, and an unrecorded one sharing the target's
-/// inode can only be the target under another spelling (the target is this
-/// run's, so nothing the destination held before shares its inode). `false` when either is
-/// absent, and off unix, where there is no inode to ask and the exact-path
-/// check is all there is.
-fn is_same_entry(target: &Path, link: &Path, made: &MadeByRun) -> bool {
+/// The classification needs the run's record, and the record needs its
+/// per-key identity ([`MadeByRun::made_exact`]): a key a fold superseded
+/// answers `false`, so a stale spelling is never taken for a distinct name.
+/// `DistinctName` asks it of BOTH paths, because a stale key can sit on
+/// either side — the link's (`A`, `a` replacing it, `l -> a`, `A -> a`) or
+/// the target's (`a`, `A` replacing it, `l -> a`, `A -> a`). Neither path's
+/// answer decides a removal any more: every `Some` removes nothing.
+///
+/// Why a fold of the target and a fold of another link cannot be told
+/// apart: both share the inode and neither spelling is on disk as its own
+/// entry. Only the filesystem's folding rule could say which name `link`
+/// folds onto, and it is not asked to reimplement one.
+fn already_linked(target: &Path, link: &Path, made: &MadeByRun) -> Option<AlreadyLinked> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let (Ok(t), Ok(l)) = (
-            std::fs::symlink_metadata(target),
-            std::fs::symlink_metadata(link),
-        ) else {
-            return false;
-        };
+        let t = std::fs::symlink_metadata(target).ok()?;
+        let l = std::fs::symlink_metadata(link).ok()?;
         if (t.dev(), t.ino()) != (l.dev(), l.ino()) {
-            return false;
+            return None;
         }
-        // One name for the inode: whatever the record says, `link` and
-        // `target` are one directory entry. The record is keyed by exact
-        // path and never un-records, so on a case-insensitive volume it can
-        // hold `a` AND `A` for one file (`A` replaced `a` under `--force`);
-        // trusting it here removed that one file — exit 0 with the file's bytes lost.
-        if t.nlink() <= 1 {
-            return true;
-        }
-        // Several names: a genuine second link this run made at the exact
-        // path is distinct; anything else sharing the inode is a fold.
-        //
-        // EXACT path, deliberately not `made.made`: that also answers by
-        // identity, and `link` shares `target`'s inode here, which this run
-        // created — so it would say "made" for every link reaching this line
-        // and call every fold distinct. `--force` would then remove `link`,
-        // which IS `target`'s own directory entry under another spelling:
-        // 0.10.1's round-3 data loss, back by another road. The question is
-        // "is this SPELLING a distinct name this run made?", and only the
-        // exact-path record can answer it.
-        //
-        // And only while the record is still CURRENT (0.10.2 final review,
-        // I1): `A`, then `a` replacing it under `--force`, then `l -> a`
-        // (nlink 2), then `A -> a`. The key `A` survived the fold that
-        // replaced it; read by key alone it called `A` distinct, and
-        // `--force` removed `a`'s only directory entry. `made_exact` now
-        // requires the inode recorded with the key to be the one at `link`
-        // now: the stale `A` recorded the removed inode and answers `false`
-        // (a fold), while a genuine second link (`l`) was recorded with the
-        // shared inode and stays distinct.
-        !made.made_exact(link)
+        Some(if t.nlink() <= 1 {
+            AlreadyLinked::OneEntry
+        } else if made.made_exact(link) && made.made_exact(target) {
+            // EXACT path, deliberately not `made.made`: that also answers
+            // by identity, and both paths share an inode this run created,
+            // so it would say "made" for every fold too.
+            AlreadyLinked::DistinctName
+        } else {
+            AlreadyLinked::Unattributed
+        })
     }
     #[cfg(not(unix))]
     {
         let _ = (target, link, made);
-        false
+        None
     }
 }
 
@@ -5089,6 +5106,11 @@ fn hard_link_reason_directory(target: &str) -> String {
 /// resolved path.
 const HARD_LINK_REASON_SELF: &str = "it names itself as its hard-link target";
 
+/// Why `unpack` skips a hard link whose path already holds its target's
+/// file under a spelling the run cannot attribute ([`AlreadyLinked`]): a
+/// fold of the target, or of another link to it. True either way.
+const HARD_LINK_REASON_ALREADY: &str = "its path already holds its hard-link target's file";
+
 /// Why an entry whose name holds a NUL is not written into `container`, a
 /// target whose caps say `!nul_in_names`.
 fn nul_name_reason(container: FormatId) -> String {
@@ -5401,16 +5423,22 @@ enum MadeKind {
 /// I1).** `at` never un-records a spelling a fold replaced: under `--force`,
 /// `a` replaces the run-made `A` — one directory entry — and `place_entry`
 /// removes only the key it was asked about, so the stale key `A` stays. Read
-/// by key alone it called `A` a distinct name this run made, and
-/// [`is_same_entry`] let `--force` remove `a`'s only directory entry. So each
+/// by key alone it called `A` a distinct name this run made, and the
+/// hard-link arm let `--force` remove `a`'s only directory entry. So each
 /// key keeps the `(dev, ino)` read when it was recorded, and
 /// [`made_exact`](Self::made_exact) answers only while that is still the
 /// identity at the path. A key recorded with no readable identity (off unix,
 /// or a record whose `symlink_metadata` failed) answers by key alone, as
-/// before: the record is the only evidence there is. Residual caveat: a
-/// filesystem that hands a freed inode number straight to the next file
-/// created could make a stale key match again; APFS and ext4 allocate
-/// forward and do not, and only this run creates in `dest`.
+/// before: the record is the only evidence there is.
+///
+/// Since fix round 2 no removal depends on this: a hard link whose path is
+/// already its target's inode removes nothing whatever the record says
+/// ([`already_linked`]). The per-key identity now only keeps that arm's
+/// REPORT honest — a stale spelling is skipped and named, never passed off
+/// silently as a distinct link. Residual caveat, therefore about wording
+/// only: a filesystem that hands a freed inode number straight to the next
+/// file created could make a stale key match again; APFS and ext4 do not
+/// reuse numbers that way, and only this run creates in `dest`.
 #[derive(Default)]
 struct MadeByRun {
     names: HashMap<String, PathBuf>,
@@ -5470,7 +5498,7 @@ impl MadeByRun {
     /// identity differs from the one at the path now (or whose path is now
     /// empty) is a spelling a fold or a removal superseded, and answers
     /// `false`. A key recorded without an identity answers by key alone (see
-    /// [`MadeByRun`]). [`is_same_entry`] needs this question and not
+    /// [`MadeByRun`]). [`already_linked`] needs this question and not
     /// [`made`](Self::made): see the comment there.
     fn made_exact(&self, path: &Path) -> bool {
         self.at.get(path).is_some_and(|rec| match rec.id {

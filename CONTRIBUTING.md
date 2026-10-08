@@ -715,19 +715,22 @@ same way a vacuous conformance property would be.
   then — once `out` is removed, so both legs are checked against the same
   `allowed` and a write into the first tree cannot hide — `force: true`
   into `out-force`, so the
-  replace-on-repeat and hard-link paths (`MadeByRun` identity,
-  `is_same_entry`'s exact-path rule) are in the oracle's view. Measured at
+  replace-on-repeat and hard-link paths (`MadeByRun` identity, the
+  hard-link arm's same-inode invariant) are in the oracle's view. Measured at
   the 0.10.2 change, the second leg cost nothing visible (205 exec/s before,
   258 after, over the 6,979-input local corpus; run-to-run noise exceeds the
   leg), so it is not gated. The `tar-case-hardlink` seed (`a`, `l -> a`,
-  `A -> a`) is the one that reaches `is_same_entry`'s exact-path rule: the
-  `l` link raises the link count above one. It bites only on a
-  case-insensitive volume (APFS, HFS+), where `A` and `a` are one file; on
-  a case-sensitive one the seed extracts as three plain names. Its sibling
-  `tar-case-hardlink-stale` (`A`, `a`, `l -> a`, `A -> a`; final review
-  I1) leaves the exact-path key `A` stale once `a` replaces it under
-  `--force`: only the identity recorded with each key keeps `A -> a` a
-  fold, and without it `a` vanished, which `check_entries_carried` sees. An `Err`
+  `A -> a`) is the one that reaches the hard-link arm's same-inode rule
+  past its one-name case: the `l` link raises the link count above one. It
+  bites only on a case-insensitive volume (APFS, HFS+), where `A` and `a`
+  are one file; on a case-sensitive one the seed extracts as three plain
+  names. Its siblings `tar-case-hardlink-stale` (`A`, `a`, `l -> a`,
+  `A -> a`) and `tar-case-hardlink-stale-target` (`a`, `A`, `l -> a`,
+  `A -> a`) leave a stale exact-path key on the link's side and on the
+  target's: in 0.10.2's final review each made `--force` remove `a`'s only
+  directory entry, which `check_entries_carried` sees. The fix is the
+  invariant, not the bookkeeping: a link path that is already its target's
+  inode removes nothing, whatever any record says. An `Err`
   must be classified, containment is checked either way, and on `Ok` every name the walk saw is
   on disk at its `safe_join` path or named by a skip warning
   (`check_entries_carried`'s rule). It is what catches a path conflict the

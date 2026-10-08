@@ -1320,6 +1320,10 @@ fn a_destination_file_whose_spelling_folds_stays_destination_held() {
 /// (it was not), not whether its inode was (it was, as `a`): asked by
 /// identity, the link reads as distinct, `--force` removes `a` to make room,
 /// and the archive's own `a` is gone.
+///
+/// Fix round 2: nothing is removed for a same-inode pair whatever the record
+/// says. With two names on the inode the run cannot tell a fold of `a` from
+/// a fold of `x`, so the skip uses the wording that is true either way.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_case_folded_self_link_beside_a_second_link_stays_a_self_link_skip() {
@@ -1335,7 +1339,7 @@ fn a_case_folded_self_link_beside_a_second_link_stays_a_self_link_skip() {
     let outcome = extract_with(&archive, &dest, true).expect("never exit 1");
     assert_eq!(
         outcome.fidelity.warnings,
-        [skipped("A", "it names itself as its hard-link target")]
+        [skipped("A", ALREADY_HOLDS_TARGET)]
     );
     assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
     assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("x")));
@@ -1582,10 +1586,11 @@ fn a_case_folded_link_after_a_case_folded_replace_is_a_self_link_skip() {
 /// exit 0, only `l` left, and no warning naming `a`.
 ///
 /// The correct semantics: `A` is `a` under another spelling, so the link
-/// entry `A -> a` names its own target and is a self-link skip naming `A`.
-/// `a` keeps its bytes at `a`, and `l` is a genuine second link to it. The
-/// run succeeds (exit 0 at the CLI; exit 4 only under `--strict-fidelity`,
-/// for the one skip warning).
+/// entry `A -> a` is skipped and named, removing nothing. `a` keeps its
+/// bytes at `a`, and `l` is a genuine second link to it. The run succeeds
+/// (exit 0 at the CLI; exit 4 only under `--strict-fidelity`, for the one
+/// skip warning). With two names on the inode the run cannot tell a fold of
+/// `a` from a fold of `l` (fix round 2), so the wording is the neutral one.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stale_case_folded_record_never_removes_the_link_target() {
@@ -1606,12 +1611,121 @@ fn a_stale_case_folded_record_never_removes_the_link_target() {
     let outcome = extract_with(&archive, &dest, true).expect("never an error");
     assert_eq!(
         outcome.fidelity.warnings,
-        [skipped("A", "it names itself as its hard-link target")]
+        [skipped("A", ALREADY_HOLDS_TARGET)]
     );
     assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"second");
     assert_eq!(std::fs::read(dest.join("l")).unwrap(), b"second");
     assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("l")));
     assert_eq!(ino_nlink(&dest.join("a")).1, 2, "a and l, nothing else");
+}
+
+/// The skip reason for a link whose path already holds its target's file
+/// under a spelling the run cannot attribute: a fold of the target, or of
+/// another link to it. Restated as a literal, as the self-link reason is.
+const ALREADY_HOLDS_TARGET: &str = "its path already holds its hard-link target's file";
+
+/// Fix round 2: `a`, then `A` (which replaces it under `--force` on a
+/// case-folding volume, leaving the TARGET's key `a` stale), `l -> a` (link
+/// count 2), then `A -> a`. The link path and the target are one inode, so
+/// the state the archive asks for already holds and nothing may be removed.
+/// Before, the link's own record (`A`, current) called the pair distinct and
+/// `--force` removed `A` — `a`'s only directory entry: exit 0, only `l` left.
+/// Now `a`'s bytes (the later `A`'s, which replaced it) stay at `a` and `l`,
+/// and the link is skipped and named. Exit 0 at the CLI (4 under
+/// `--strict-fidelity`).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stale_target_record_never_removes_the_link_target() {
+    let root = tmp_dir();
+    if !folds_case(&root) {
+        return; // a case-sensitive volume: four plain names
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[
+            file("a", b"first"),
+            file("A", b"second"),
+            hardlink("l", "a"),
+            hardlink("A", "a"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).expect("never an error");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("A", ALREADY_HOLDS_TARGET)]
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"second");
+    assert_eq!(std::fs::read(dest.join("l")).unwrap(), b"second");
+    assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("l")));
+    assert_eq!(ino_nlink(&dest.join("a")).1, 2, "A (alias a) and l");
+}
+
+/// Fix round 2: `a`, `l -> a`, `A` (replacing `a`'s directory entry; `l`
+/// keeps the first file), `m -> a`, `A -> a`. The same loss as above by
+/// another road: `A -> a` removed `A`, `m`'s only sibling name.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stale_target_record_beside_an_older_link_loses_nothing() {
+    let root = tmp_dir();
+    if !folds_case(&root) {
+        return;
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[
+            file("a", b"first"),
+            hardlink("l", "a"),
+            file("A", b"second"),
+            hardlink("m", "a"),
+            hardlink("A", "a"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).expect("never an error");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("A", ALREADY_HOLDS_TARGET)]
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"second");
+    assert_eq!(std::fs::read(dest.join("m")).unwrap(), b"second");
+    assert_eq!(std::fs::read(dest.join("l")).unwrap(), b"first");
+    assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("m")));
+    assert_eq!(ino_nlink(&dest.join("a")).1, 2);
+}
+
+/// Fix round 2, minor: `a`, file `l`, `L -> a` (replacing `l` by fold), then
+/// `l -> a`. `l` is really the link `L`, so "names itself" was false; the
+/// run cannot tell a fold of the target from a fold of another link, so the
+/// wording says only what is true. Nothing is removed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_folded_name_of_another_link_is_not_called_a_self_link() {
+    let root = tmp_dir();
+    if !folds_case(&root) {
+        return;
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[
+            file("a", b"x"),
+            file("l", b"y"),
+            hardlink("L", "a"),
+            hardlink("l", "a"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).expect("never an error");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("l", ALREADY_HOLDS_TARGET)]
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"x");
+    assert_eq!(std::fs::read(dest.join("L")).unwrap(), b"x");
+    assert_eq!(
+        ino_nlink(&dest.join("a")),
+        (ino_nlink(&dest.join("L")).0, 2)
+    );
 }
 
 /// The skip reason `classify_symlink_target` gives a target with `..` after

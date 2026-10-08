@@ -1039,9 +1039,9 @@ fn conflict_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
     let mut duplicate = seed_tar_member(b"x", b'0', b"", b"first\n");
     duplicate.extend(seed_tar_member(b"x", b'0', b"", b"second\n"));
     // `a`, then `A` hard-linked to `a`: on a case-folding volume `A` IS `a`,
-    // the self-entry `is_same_entry` must not mistake for a link to itself.
+    // the self-entry `already_linked` must not mistake for a distinct link.
     // The middle link `l` raises the inode's link count above one: with a
-    // single name `is_same_entry` answers "same" before it reaches the
+    // single name `already_linked` answers "one entry" before it reaches the
     // exact-path rule the seed exists to reach.
     let mut case_link = seed_tar_member(b"a", b'0', b"", b"file\n");
     case_link.extend(seed_tar_member(b"l", b'1', b"a", b""));
@@ -1055,11 +1055,23 @@ fn conflict_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
     case_link_stale.extend(seed_tar_member(b"a", b'0', b"", b"second\n"));
     case_link_stale.extend(seed_tar_member(b"l", b'1', b"a", b""));
     case_link_stale.extend(seed_tar_member(b"A", b'1', b"a", b""));
+    // Fix round 2: the same shape with the case swapped — `a`, then `A`
+    // (replacing it, so the TARGET's key `a` is the stale one), `l -> a`,
+    // `A -> a`. A link and target that are already one inode must remove
+    // nothing, whatever either record says.
+    let mut case_link_stale_target = seed_tar_member(b"a", b'0', b"", b"first\n");
+    case_link_stale_target.extend(seed_tar_member(b"A", b'0', b"", b"second\n"));
+    case_link_stale_target.extend(seed_tar_member(b"l", b'1', b"a", b""));
+    case_link_stale_target.extend(seed_tar_member(b"A", b'1', b"a", b""));
     vec![
         ("tar-case-pair", seed_tar_end(case_pair)),
         ("tar-duplicate-name", seed_tar_end(duplicate)),
         ("tar-case-hardlink", seed_tar_end(case_link)),
         ("tar-case-hardlink-stale", seed_tar_end(case_link_stale)),
+        (
+            "tar-case-hardlink-stale-target",
+            seed_tar_end(case_link_stale_target),
+        ),
         ("tar-conflict-dir-then-file", seed_tar_end(dir_then_file)),
         (
             "tar-conflict-file-then-child",

@@ -320,8 +320,8 @@ fn convert_opts() -> ConvertOpts {
 /// Both legs extract into a fresh directory, so a destination-held conflict
 /// never arises; what `force` changes is how the archive's own repeated names
 /// and links are resolved (a repeat is the classified exit 2 without it, a
-/// replacement with it), which is the code `MadeByRun` identity and
-/// `is_same_entry` guard.
+/// replacement with it), which is the code `MadeByRun` identity and the
+/// hard-link arm's same-inode invariant (`already_linked`) guard.
 ///
 /// The first leg's tree is removed before the second runs (0.10.2 final
 /// review, M1), so both legs check against the SAME `allowed`: with `out`
