@@ -2727,7 +2727,9 @@ pub fn salvage(path: &Path, opts: &SalvageOpts) -> Result<SalvageOutcome> {
     // run", not "exists on disk" — a stale file from a previous attempt must
     // still be replaced, which is what `place_entry(.., force: true)` in
     // `open_salvage_target` is for and why it is NOT what closes this.
-    let mut claimed: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
+    // "Written by this run" is answered by spelling or by identity: see
+    // [`Claimed`].
+    let mut claimed = Claimed::default();
     // What this run made on disk, by path and kind — `place_entry`'s record,
     // shared with `extract`. Separate from `claimed` on purpose: `claimed`
     // decides which NAME a repeated file gets, this decides whether a path
@@ -2772,7 +2774,7 @@ fn place_salvaged_entry(
     archive_path: &Path,
     opts: &SalvageOpts,
     entry: &stuffr_core::salvage::SalvagedEntry,
-    claimed: &mut std::collections::HashMap<PathBuf, usize>,
+    claimed: &mut Claimed,
     made: &mut MadeByRun,
     format: FormatId,
 ) -> Result<SalvageDisposition> {
@@ -2863,7 +2865,7 @@ fn place_salvaged_file(
     dest: &Option<PathBuf>,
     policy: &stuffr_core::salvage::SalvagePolicy,
     entry: &stuffr_core::salvage::SalvagedEntry,
-    claimed: &mut std::collections::HashMap<PathBuf, usize>,
+    claimed: &mut Claimed,
     made: &mut MadeByRun,
     format: FormatId,
 ) -> Result<SalvageDisposition> {
@@ -2981,7 +2983,21 @@ fn place_salvaged_file(
     // see `SalvageDisposition::WrittenDisambiguated` for the measurement
     // that made this necessary and for why the suffix names the scan
     // position.
-    let taken_by = claimed.get(&target).copied();
+    //
+    // "Already wrote this path" is asked of the name the entry asked for
+    // AND, for a partial record, of the `.partial` name it would land on
+    // without disambiguating — the second is a path this run may have
+    // written too (a partial `x` earlier, or an entry literally named
+    // `x.partial`), and `open_salvage_target` replaces what is there. Each
+    // is answered by exact spelling or by identity (0.10.2): on a volume
+    // that folds case or Unicode normalisation, `readme` IS the `README` an
+    // earlier record wrote, and replacing it lost that record's bytes at
+    // exit 0. See [`Claimed`].
+    let taken_by = claimed.holder(&target, made).or_else(|| {
+        is_partial
+            .then(|| claimed.holder(&partial_path(&target), made))
+            .flatten()
+    });
     let base_target = match taken_by {
         Some(_) => disambiguated_path(&target, entry.scan_position),
         None => target.clone(),
@@ -2998,8 +3014,9 @@ fn place_salvaged_file(
     // landing on one path is the defect being closed, not a shape to leave
     // one door open on. `or_insert` keeps the EARLIEST claimant, which is
     // the position `taken_by` must name.
-    claimed.entry(target).or_insert(entry.scan_position);
+    claimed.paths.entry(target).or_insert(entry.scan_position);
     claimed
+        .paths
         .entry(write_target.clone())
         .or_insert(entry.scan_position);
 
@@ -3042,6 +3059,10 @@ fn place_salvaged_file(
         let _ = std::fs::remove_file(&write_target);
         return Ok(unwritable(Error::Io(e)));
     }
+
+    // Only once the bytes are really there: a file removed on a failed write
+    // above frees its inode, and a stale identity must never name a holder.
+    claimed.record_written(&write_target, entry.scan_position);
 
     let partial_cause = is_partial.then(|| {
         partial_cause(
@@ -3229,6 +3250,61 @@ fn partial_path(target: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push(".partial");
     target.with_file_name(name)
+}
+
+/// Salvage's record of which destination names a FILE record of this run
+/// has taken, and by which scan position — what decides that a later
+/// record under a taken name is disambiguated rather than written over the
+/// earlier one. Directories are never claimed (see
+/// [`place_salvaged_entry`]).
+///
+/// **By exact path, and by identity (0.10.2).** `paths` is keyed by the
+/// exact spelling, as it always was. It cannot see what the filesystem
+/// folds: on APFS (case-insensitive by default, and normalisation-
+/// insensitive) a tar holding `README` and `readme` reported "2 written"
+/// at exit 0 and left one file, because `readme` was unclaimed by spelling
+/// and `open_salvage_target` replaces what it finds. So `ids` also maps the
+/// `(dev, ino)` of every file this run WROTE to the position that wrote
+/// it, and [`holder`](Self::holder) answers by either. The identity check
+/// is gated on [`MadeByRun::made_identity`] — "this run created what is at
+/// this path" — and the map then names which record did. A run-made
+/// DIRECTORY is in `made` but never in `ids`, so a file record over a
+/// folded spelling of one falls through to [`place`]'s own archive-made
+/// skip, exactly as it does at the directory's exact spelling.
+///
+/// A disambiguated name never folds onto ANOTHER disambiguated name: each
+/// carries its own record's scan position, unique per record, so two of
+/// them differ in the suffix whatever the volume folds in the stem. It
+/// CAN land on an entry the archive itself named `x.salvaged-N` earlier in
+/// the scan, by spelling or by fold, and replace it: a gap that predates
+/// identity and is recorded as a follow-up, not closed here.
+#[derive(Default)]
+struct Claimed {
+    paths: HashMap<PathBuf, usize>,
+    ids: HashMap<(u64, u64), usize>,
+}
+
+impl Claimed {
+    /// The earlier scan position holding `path`: claimed by this exact
+    /// spelling, or a file this run wrote that the filesystem folds `path`
+    /// onto. `None` otherwise — including a stale file a previous run left,
+    /// which is replaced, never disambiguated around.
+    fn holder(&self, path: &Path, made: &MadeByRun) -> Option<usize> {
+        if let Some(&position) = self.paths.get(path) {
+            return Some(position);
+        }
+        if !made.made_identity(path) {
+            return None;
+        }
+        identity(path).and_then(|id| self.ids.get(&id).copied())
+    }
+
+    /// `position` wrote the file now at `path`.
+    fn record_written(&mut self, path: &Path, position: usize) {
+        if let Some(id) = identity(path) {
+            self.ids.insert(id, position);
+        }
+    }
 }
 
 /// `name` becomes `name.salvaged-N`, where `N` is the record's own SCAN
@@ -9146,7 +9222,7 @@ mod salvage_strict_tests {
             Path::new("/nonexistent-strict-probe"),
             opts,
             entry,
-            &mut std::collections::HashMap::new(),
+            &mut Claimed::default(),
             &mut MadeByRun::default(),
             FormatId::new("cpio"),
         )

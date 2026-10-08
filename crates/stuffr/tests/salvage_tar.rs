@@ -410,3 +410,254 @@ fn an_over_long_directory_record_is_skipped_with_the_pinned_reason() {
     );
     assert_eq!(std::fs::read(dest.join("ok.txt")).unwrap(), b"fine");
 }
+
+/// Whether the volume holding `dir` treats `a` and `b` as one name: `a` is
+/// created, and `b` is looked up. Self-detecting rather than assumed, so a
+/// case-sensitive APFS volume, or a Linux tmpfs, answers for itself.
+fn folds(dir: &Path, a: &str, b: &str) -> bool {
+    let probe = dir.join("fold-probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    std::fs::write(probe.join(a), b"probe").unwrap();
+    let folded = std::fs::symlink_metadata(probe.join(b)).is_ok();
+    std::fs::remove_dir_all(&probe).unwrap();
+    folded
+}
+
+fn folds_case(dir: &Path) -> bool {
+    folds(dir, "probe", "PROBE")
+}
+
+/// `probé` precomposed (U+00E9) against `probé` decomposed (U+0065 U+0301).
+fn folds_normalisation(dir: &Path) -> bool {
+    folds(dir, "probe\u{e9}", "probee\u{301}")
+}
+
+/// 0.10.2 §2: `first` and `second` are one name on this volume. Both
+/// records must survive salvage: the first under its own name, the second
+/// disambiguated by its scan position, never written over the first.
+fn assert_a_folded_pair_both_survive(scratch: &Scratch, first: &str, second: &str) {
+    let archive = conflict_tar(
+        &scratch.0.join("fold.tar"),
+        &[
+            (first, EntryKind::File, b"the first spelling's bytes"),
+            (
+                second,
+                EntryKind::File,
+                b"the second spelling's bytes, longer",
+            ),
+        ],
+    );
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar")))
+        .expect("never a run-level error");
+    assert_eq!(outcome.entries.len(), 2, "{:?}", outcome.entries);
+    let (one, two) = (&outcome.entries[0], &outcome.entries[1]);
+
+    assert_eq!(
+        one.disposition,
+        SalvageDisposition::Written(dest.join(first))
+    );
+    let disambiguated = dest.join(format!("{second}.salvaged-{}", two.scan_position));
+    assert_eq!(
+        two.disposition,
+        SalvageDisposition::WrittenDisambiguated {
+            path: disambiguated.clone(),
+            taken_by: one.scan_position,
+            partial: None,
+        },
+        "the second spelling folds onto the first: it is claimed, by identity"
+    );
+    assert_eq!(
+        std::fs::read(dest.join(first)).unwrap(),
+        b"the first spelling's bytes",
+        "the first record's bytes must not have been written over"
+    );
+    assert_eq!(
+        std::fs::read(&disambiguated).unwrap(),
+        b"the second spelling's bytes, longer"
+    );
+    assert_eq!(
+        std::fs::read_dir(&dest).unwrap().count(),
+        2,
+        "both records exist on disk"
+    );
+    assert_eq!(entries::salvage_exit_code(&outcome), 4);
+}
+
+/// 0.10.2 §2, the measured defect: on APFS, `README` then `readme` printed
+/// "2 written" at exit 0 and left one file. macOS-gated, and returns early
+/// on a case-sensitive volume, where the control below runs instead.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_case_pair_both_survive_salvage() {
+    let scratch = Scratch::new("case-pair");
+    if !folds_case(&scratch.0) {
+        eprintln!("skipped: this volume distinguishes case");
+        return;
+    }
+    assert_a_folded_pair_both_survive(&scratch, "README", "readme");
+}
+
+/// Review Focus 3: identity, not case-folding, so a normalisation-folding
+/// volume is covered by the same check. Self-detecting: APFS folds
+/// normalisation, a case-sensitive volume may or may not.
+#[cfg(target_os = "macos")]
+#[test]
+fn unicode_normalisation_pair_both_survive_salvage() {
+    let scratch = Scratch::new("nfd-pair");
+    if !folds_normalisation(&scratch.0) {
+        eprintln!("skipped: this volume distinguishes normalisation forms");
+        return;
+    }
+    assert_a_folded_pair_both_survive(&scratch, "caf\u{e9}", "cafe\u{301}");
+}
+
+/// Review Focus 2: the second spelling is ALSO partial. It composes as
+/// `readme.salvaged-N.partial`, and `README`'s whole bytes are intact.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_case_pair_with_a_partial_second_survives() {
+    let scratch = Scratch::new("case-partial");
+    if !folds_case(&scratch.0) {
+        eprintln!("skipped: this volume distinguishes case");
+        return;
+    }
+    let second: Vec<u8> = (0..300u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let whole = conflict_tar(
+        &scratch.0.join("whole.tar"),
+        &[
+            ("README", EntryKind::File, b"the whole first record"),
+            ("readme", EntryKind::File, &second),
+        ],
+    );
+    let bytes = std::fs::read(&whole).unwrap();
+    let at = bytes
+        .windows(second.len())
+        .position(|w| w == second.as_slice())
+        .expect("the second payload is in the archive");
+    let keep = 100;
+    let archive = scratch.0.join("cut.tar");
+    std::fs::write(&archive, &bytes[..at + keep]).unwrap();
+
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar")))
+        .expect("never a run-level error");
+    assert_eq!(outcome.entries.len(), 2, "{:?}", outcome.entries);
+    let (one, two) = (&outcome.entries[0], &outcome.entries[1]);
+    assert_eq!(
+        one.disposition,
+        SalvageDisposition::Written(dest.join("README"))
+    );
+    assert_eq!(two.status, SalvageStatus::Partial);
+    let landed = dest.join(format!("readme.salvaged-{}.partial", two.scan_position));
+    assert_eq!(
+        two.disposition,
+        SalvageDisposition::WrittenDisambiguated {
+            path: landed.clone(),
+            taken_by: one.scan_position,
+            partial: Some(PartialCause::Truncated),
+        }
+    );
+    assert_eq!(
+        std::fs::read(dest.join("README")).unwrap(),
+        b"the whole first record"
+    );
+    assert_eq!(std::fs::read(&landed).unwrap(), &second[..keep]);
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 2);
+    assert_eq!(entries::salvage_exit_code(&outcome), 4);
+}
+
+/// Review Focus 2, the `.partial` half: a partial `readme` would land on
+/// `readme.partial`, which on a folding volume is the file an earlier
+/// record, literally named `README.PARTIAL`, was just written to — though
+/// no `readme` exists for the real-name check to find. The `.partial`
+/// target is claimed by identity too, exactly as an exact-path claim of
+/// it is.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_partial_whose_partial_name_folds_onto_a_written_file_survives() {
+    let scratch = Scratch::new("case-partial-name");
+    if !folds_case(&scratch.0) {
+        eprintln!("skipped: this volume distinguishes case");
+        return;
+    }
+    let second: Vec<u8> = (0..300u32).map(|i| b'a' + (i % 26) as u8).collect();
+    let whole = conflict_tar(
+        &scratch.0.join("whole.tar"),
+        &[
+            (
+                "README.PARTIAL",
+                EntryKind::File,
+                b"a real entry with that name",
+            ),
+            ("readme", EntryKind::File, &second),
+        ],
+    );
+    let bytes = std::fs::read(&whole).unwrap();
+    let at = bytes
+        .windows(second.len())
+        .position(|w| w == second.as_slice())
+        .expect("the second payload is in the archive");
+    let keep = 100;
+    let archive = scratch.0.join("cut.tar");
+    std::fs::write(&archive, &bytes[..at + keep]).unwrap();
+
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar")))
+        .expect("never a run-level error");
+    let (one, two) = (&outcome.entries[0], &outcome.entries[1]);
+    assert_eq!(
+        one.disposition,
+        SalvageDisposition::Written(dest.join("README.PARTIAL"))
+    );
+    let landed = dest.join(format!("readme.salvaged-{}.partial", two.scan_position));
+    assert_eq!(
+        two.disposition,
+        SalvageDisposition::WrittenDisambiguated {
+            path: landed.clone(),
+            taken_by: one.scan_position,
+            partial: Some(PartialCause::Truncated),
+        }
+    );
+    assert_eq!(
+        std::fs::read(dest.join("README.PARTIAL")).unwrap(),
+        b"a real entry with that name"
+    );
+    assert_eq!(std::fs::read(&landed).unwrap(), &second[..keep]);
+    assert_eq!(entries::salvage_exit_code(&outcome), 4);
+}
+
+/// The control: where the volume distinguishes case, `README` and `readme`
+/// are two names, so two plain files at exit 0 — identity must not make
+/// salvage disambiguate what never collided. Returns early where it folds.
+#[test]
+fn a_case_pair_is_two_plain_files_on_a_case_sensitive_volume() {
+    let scratch = Scratch::new("case-control");
+    if folds_case(&scratch.0) {
+        eprintln!("skipped: this volume folds case");
+        return;
+    }
+    let archive = conflict_tar(
+        &scratch.0.join("pair.tar"),
+        &[
+            ("README", EntryKind::File, b"upper"),
+            ("readme", EntryKind::File, b"lower"),
+        ],
+    );
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar"))).unwrap();
+    assert_eq!(
+        outcome
+            .entries
+            .iter()
+            .map(|r| r.disposition.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            SalvageDisposition::Written(dest.join("README")),
+            SalvageDisposition::Written(dest.join("readme")),
+        ]
+    );
+    assert_eq!(std::fs::read(dest.join("README")).unwrap(), b"upper");
+    assert_eq!(std::fs::read(dest.join("readme")).unwrap(), b"lower");
+    assert_eq!(entries::salvage_exit_code(&outcome), 0);
+}
