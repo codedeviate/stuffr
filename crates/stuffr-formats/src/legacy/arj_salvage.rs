@@ -296,8 +296,8 @@ use unarj_rs::date_time::DosDateTime;
 use unarj_rs::decode_fastest::decode_fastest;
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry,
-    UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
+    Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
+    SalvagedEntry, UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
@@ -309,12 +309,6 @@ use super::arj::{
 /// The two bytes every ARJ header opens with — spec, both header tables:
 /// "header id (main and local file header) = 0x60 0xEA".
 const HEADER_ID: [u8; 2] = [0x60, 0xEA];
-
-/// Bytes read per [`find_next_id`] chunk. O(1) memory regardless of how far
-/// the next id is, or whether there is one at all — same figure, same
-/// reasoning, as `zip_salvage.rs`'s, `arc_salvage.rs`'s, `zoo_salvage.rs`'s
-/// and `lha_salvage.rs`'s own `SCAN_CHUNK`.
-const SCAN_CHUNK: usize = 64 * 1024;
 
 /// The header id plus the `u16` basic header size that follows it — the
 /// bytes in front of a header's CONTENT.
@@ -573,17 +567,20 @@ struct EntryHeader {
 /// does — one damaged header ends that walk, and every entry behind it with
 /// it.
 ///
-/// Carries no state between calls beyond what [`SalvageScan::next_candidate`]
-/// itself receives — the same shape `ZipSalvage`, `ArcSalvage` and
-/// `ZooSalvage` have. Unlike `LhaSalvage` there is no Ruling S-V sighting to
+/// Its only state is the [`ForwardSearch`] buffer reused across calls; it
+/// carries nothing about the archive between them beyond what
+/// [`SalvageScan::next_candidate`] itself receives — the same shape
+/// `ZipSalvage`, `ArcSalvage` and `ZooSalvage` have. Unlike `LhaSalvage` there is no Ruling S-V sighting to
 /// carry: see this module's doc for why `file type == 2` deliberately gets no
 /// such channel.
 #[derive(Debug, Default)]
-pub struct ArjSalvage;
+pub struct ArjSalvage {
+    search: ForwardSearch,
+}
 
 impl ArjSalvage {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 }
 
@@ -592,10 +589,12 @@ impl SalvageScan for ArjSalvage {
         let file_len = src.seek(SeekFrom::End(0))?;
         let mut search_from = from;
         loop {
-            let Some(offset) = find_next_id(src, search_from, file_len)? else {
+            let Some((offset, envelope)) =
+                find_next_id(&mut self.search, src, search_from, file_len)?
+            else {
                 return Ok(None);
             };
-            match read_candidate_at(src, offset, file_len) {
+            match read_candidate_at(src, offset, &envelope, file_len) {
                 Some(candidate) => return Ok(Some(candidate)),
                 // The id matched and the gate rejected everything behind it:
                 // a coincidence, not a header. Resume one byte past the id
@@ -664,40 +663,35 @@ impl SalvageScan for ArjSalvage {
     }
 }
 
-/// Searches forward from `from` for the next [`HEADER_ID`] match, in bounded
-/// chunks so memory use does not depend on how far through the source the
-/// next one is.
+/// Searches forward from `from` for the next header whose envelope clears
+/// criteria 1-8, through [`ForwardSearch`], and returns its offset with the
+/// envelope bytes the search read — [`MAX_ENVELOPE`] of them, or all that
+/// was left before EOF.
 ///
-/// Carries one byte across a chunk boundary — the longest a two-byte match
-/// can straddle — so a match split across two reads is never missed.
-/// `Ok(None)` when no id remains before `file_len`.
-fn find_next_id(src: &mut dyn SeekRead, from: u64, file_len: u64) -> io::Result<Option<u64>> {
-    if from >= file_len {
-        return Ok(None);
-    }
-    src.seek(SeekFrom::Start(from))?;
-
-    let mut window: Vec<u8> = Vec::with_capacity(SCAN_CHUNK + 1);
-    let mut window_start = from;
-    let mut buf = vec![0u8; SCAN_CHUNK];
-
-    loop {
-        let n = src.read(&mut buf)?;
-        if n == 0 {
-            return Ok(None);
+/// **Criteria 1-8 are judged inside the search (0.10.3).** They need only
+/// the envelope, and judging them after it re-read up to 2,610 bytes per
+/// bare id: a run of `60 EA 28 0A` (an id declaring a 2,600-byte header)
+/// cost about 650 bytes read per input byte that way, and the
+/// read-amplification oracle measured 15x on a fuzz input. Judged here, a
+/// refused id costs nothing beyond the search's own pass over it, and an
+/// accepted one no read of its own. `find_to_eof` offers a header near EOF
+/// the bytes that are left, so one that ends exactly at EOF is still found.
+fn find_next_id(
+    search: &mut ForwardSearch,
+    src: &mut dyn SeekRead,
+    from: u64,
+    file_len: u64,
+) -> io::Result<Option<(u64, Vec<u8>)>> {
+    let mut envelope = Vec::new();
+    let min = (ENVELOPE_PREFIX + ENVELOPE_SUFFIX) as usize;
+    let at = search.find_to_eof(src, from, file_len, MAX_ENVELOPE, min, |w| {
+        let hit = basic_header(w).is_some();
+        if hit {
+            envelope = w.to_vec();
         }
-        window.extend_from_slice(&buf[..n]);
-
-        if let Some(at) = window.windows(2).position(|w| w == HEADER_ID) {
-            return Ok(Some(window_start + at as u64));
-        }
-
-        // Keep only the last byte: the longest prefix of the id that could
-        // still be waiting for its second byte in the next chunk.
-        let keep = window.len().saturating_sub(1);
-        window_start += keep as u64;
-        window.drain(..keep);
-    }
+        hit
+    })?;
+    Ok(at.map(|at| (at, envelope)))
 }
 
 /// Walks the extended-header chain that begins at `at` (the `u16` "1st
@@ -751,21 +745,32 @@ fn walk_extended_headers(src: &mut dyn SeekRead, at: u64, file_len: u64) -> Opti
     }
 }
 
-/// Reads and gates the header believed to start at `offset`, per the criteria
-/// in this module's doc.
-///
-/// `None` for ANY gate failure, including a genuine read error: to a SCANNER
-/// they all mean the same thing — these bytes are not a header — so they fold
-/// here rather than propagating and ending a run over one coincidence.
-fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<EntryHeader> {
+/// What criteria 1-8 learn from a header's envelope, which is all they
+/// need: [`basic_header`] judges them on bytes alone.
+struct BasicHeader<'a> {
+    content: &'a [u8],
+    method: Method,
+    file_type: u8,
+    first_hdr_size: usize,
+    name_len: usize,
+}
+
+/// The longest envelope a header can have: the id and size word, the
+/// largest content the spec allows, the CRC-32 and the first extended
+/// header's size word — every byte criteria 1-8 can need.
+const MAX_ENVELOPE: usize =
+    ENVELOPE_PREFIX as usize + MAX_ARJ_HEADER_SIZE + ENVELOPE_SUFFIX as usize;
+
+/// Criteria 1-8 on `envelope`, the bytes from a candidate offset onwards —
+/// [`MAX_ENVELOPE`] of them, or every byte left before EOF when fewer
+/// remain. Reads nothing, so [`find_next_id`] judges it inside its search.
+fn basic_header(envelope: &[u8]) -> Option<BasicHeader<'_>> {
     // Criterion 3, first half: the envelope's own fixed bytes must be there
     // before anything they describe is read.
-    if file_len.checked_sub(offset)? < ENVELOPE_PREFIX + ENVELOPE_SUFFIX {
+    if (envelope.len() as u64) < ENVELOPE_PREFIX + ENVELOPE_SUFFIX {
         return None;
     }
-    src.seek(SeekFrom::Start(offset)).ok()?;
-    let mut prefix = [0u8; 4];
-    src.read_exact(&mut prefix).ok()?;
+    let prefix = &envelope[..ENVELOPE_PREFIX as usize];
 
     // Criterion 1. The caller found this id, but a candidate must never stand
     // on its caller's word for a field it can read itself.
@@ -774,29 +779,22 @@ fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option
     }
 
     // Criterion 2. A declared size of zero is the end-of-archive marker, and
-    // the 2600-byte ceiling is the spec's own — bounding the read below to a
+    // the 2600-byte ceiling is the spec's own — bounding the envelope to a
     // fixed, small figure that nothing in the file can raise.
     let declared_header = usize::from(u16::from_le_bytes([prefix[2], prefix[3]]));
     if declared_header == 0 || declared_header > MAX_ARJ_HEADER_SIZE {
         return None;
     }
 
-    // Criterion 3, second half.
-    let content_at = offset.checked_add(ENVELOPE_PREFIX)?;
-    let content_end = content_at.checked_add(declared_header as u64)?;
-    if content_end.checked_add(ENVELOPE_SUFFIX)? > file_len {
+    // Criterion 3, second half. `envelope` is shorter than `MAX_ENVELOPE`
+    // only when it ends at EOF, so a header that does not fit in it runs
+    // past the source.
+    let content_end = ENVELOPE_PREFIX as usize + declared_header;
+    if content_end + ENVELOPE_SUFFIX as usize > envelope.len() {
         return None;
     }
-    let mut content = vec![0u8; declared_header];
-    src.read_exact(&mut content).ok()?;
-    let mut crc_bytes = [0u8; 4];
-    src.read_exact(&mut crc_bytes).ok()?;
-
-    // Criterion 4 — the strongest signal here by three orders of magnitude,
-    // and one of the three Step 5 falsifies.
-    if crc32_ieee(&content) != u32::from_le_bytes(crc_bytes) {
-        return None;
-    }
+    let content = &envelope[ENVELOPE_PREFIX as usize..content_end];
+    let crc_bytes: [u8; 4] = envelope[content_end..content_end + 4].try_into().ok()?;
 
     // Criterion 5.
     let first_hdr_size = usize::from(*content.get(FIRST_HDR_SIZE_I)?);
@@ -837,13 +835,55 @@ fn parse_header_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option
     // Criterion 8.
     let method = Method::from_byte(*content.get(METHOD_I)?)?;
 
+    // Criterion 4 — the strongest signal here by three orders of magnitude,
+    // and one of the three Step 5 falsifies. Checked LAST, though it is
+    // numbered fourth: every criterion is required, so the order changes no
+    // verdict, and inside the search this runs at every offset whose id and
+    // size word fit — a CRC-32 over up to 2,600 bytes there, where criteria
+    // 5-8 refuse nearly all of them for a few comparisons.
+    if crc32_ieee(content) != u32::from_le_bytes(crc_bytes) {
+        return None;
+    }
+    Some(BasicHeader {
+        content,
+        method,
+        file_type,
+        first_hdr_size,
+        name_len,
+    })
+}
+
+/// Gates the header at `offset`, per the criteria in this module's doc:
+/// 1-8 on `envelope` (see [`basic_header`]), which [`find_next_id`]'s
+/// search already read, and 9 by walking the extended-header chain.
+///
+/// `None` for ANY gate failure, including a genuine read error: to a SCANNER
+/// they all mean the same thing — these bytes are not a header — so they fold
+/// here rather than propagating and ending a run over one coincidence.
+fn parse_header_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    envelope: &[u8],
+    file_len: u64,
+) -> Option<EntryHeader> {
+    let BasicHeader {
+        content,
+        method,
+        file_type,
+        first_hdr_size,
+        name_len,
+    } = basic_header(envelope)?;
+    let content_end = offset
+        .checked_add(ENVELOPE_PREFIX)?
+        .checked_add(content.len() as u64)?;
+
     // Criterion 9.
     let payload_start = walk_extended_headers(src, content_end.checked_add(4)?, file_len)?;
 
-    let compressed_size = read_u32(&content, COMPRESSED_SIZE_I)?;
-    let original_size = read_u32(&content, ORIGINAL_SIZE_I)?;
-    let file_crc = read_u32(&content, ORIGINAL_CRC_I)?;
-    let packed_time = read_u32(&content, DATE_TIME_I)?;
+    let compressed_size = read_u32(content, COMPRESSED_SIZE_I)?;
+    let original_size = read_u32(content, ORIGINAL_SIZE_I)?;
+    let file_crc = read_u32(content, ORIGINAL_CRC_I)?;
+    let packed_time = read_u32(content, DATE_TIME_I)?;
     let access_mode = u16::from_le_bytes(
         content
             .get(FILE_ACCESS_MODE_I..FILE_ACCESS_MODE_I + 2)?
@@ -896,8 +936,13 @@ fn read_u32(content: &[u8], at: usize) -> Option<u32> {
 }
 
 /// Turns a gated [`EntryHeader`] into the [`Candidate`] the engine annotates.
-fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<Candidate> {
-    let header = parse_header_at(src, offset, file_len)?;
+fn read_candidate_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    envelope: &[u8],
+    file_len: u64,
+) -> Option<Candidate> {
+    let header = parse_header_at(src, offset, envelope, file_len)?;
 
     let declared = header.declared_len;
     let available_len = match header.payload_start.checked_add(declared) {
@@ -1456,6 +1501,60 @@ mod tests {
     use stuffr_core::salvage::MAX_SALVAGE_ENTRY;
 
     use super::*;
+
+    /// The size of the allocation [`probe_canary`] makes. The allocator-probe
+    /// tests below used to take the scan's own 64 KiB read buffer as proof
+    /// the recording allocator was attached; since 0.10.3 the scan's
+    /// `ForwardSearch` window starts smaller, so the proof is an allocation
+    /// the test makes itself, inside the measured closure —
+    /// `cpio_salvage.rs`'s and `tar_salvage.rs`'s pattern.
+    const PROBE_CANARY: usize = 64 * 1024;
+
+    fn probe_canary() {
+        std::hint::black_box(vec![0u8; PROBE_CANARY]);
+    }
+
+    /// 0.10.3: dense ids, ids whose content fails its CRC-32, and dense
+    /// headers the gate accepts, each 256 KiB, held to
+    /// `stuffr_core::testing::check_scan_is_linear`. Before the search
+    /// judged the envelope and kept what it read across calls, these read
+    /// 16,522x, 1,513x and 1,352x their input (at 1 MiB).
+    #[test]
+    fn dense_ids_and_dense_headers_scan_linearly() {
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 256 * 1024;
+        let fill = |unit: &[u8]| unit.iter().copied().cycle().take(LEN).collect::<Vec<u8>>();
+        // An id declaring the spec's largest header, 2,600 bytes.
+        let biggest = [HEADER_ID[0], HEADER_ID[1], 0x28, 0x0A];
+        let mut bad_crc = vec![HEADER_ID[0], HEADER_ID[1], 32, 0];
+        bad_crc.extend_from_slice(&[0; 38]);
+        // A real header declaring a payload far past EOF: every one is a
+        // candidate, reported `Partial`, and the scan resumes one byte on.
+        let accepted = wrap(&local_content(
+            b"a.txt",
+            Method::Stored.byte(),
+            0,
+            0x7FFF_FFFF,
+            0x7FFF_FFFF,
+            0,
+        ));
+        let shapes = [
+            ("ids declaring 2,600 bytes", fill(&biggest), 0),
+            ("CRC-32 disagrees", fill(&bad_crc), 0),
+            (
+                "accepted headers",
+                fill(&accepted),
+                LEN.div_ceil(accepted.len()) - 1,
+            ),
+        ];
+        for (shape, bytes, entries) in shapes {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_arj(&mut src, &SalvagePolicy::default()).unwrap();
+            assert_eq!(out.entries.len(), entries, "{shape}");
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+        }
+    }
 
     /// The checked-in fixture: two `Stored` entries, hand-built in Phase 3b
     /// from the published header tables. **Its provenance is the weakest in
@@ -2103,17 +2202,18 @@ mod tests {
         assert!(scan(&out).entries.is_empty());
     }
 
-    /// The id can straddle a [`SCAN_CHUNK`] boundary, and a scanner that
-    /// dropped the carry byte would silently miss every header at such a
-    /// position.
+    /// The id can straddle a [`ForwardSearch::MAX_CHUNK`] boundary, and a
+    /// scanner that dropped the carried bytes would silently miss every
+    /// header at such a position.
     #[test]
     fn an_id_straddling_a_chunk_boundary_is_found() {
+        let chunk = ForwardSearch::MAX_CHUNK;
         let entry = stored_entry(b"edge.txt", b"payload");
-        let mut bytes = vec![0u8; SCAN_CHUNK - 1];
+        let mut bytes = vec![0u8; chunk - 1];
         bytes.extend_from_slice(&entry);
         let out = scan(&bytes);
         assert_eq!(out.entries.len(), 1);
-        assert_eq!(out.entries[0].offset, SCAN_CHUNK as u64 - 1);
+        assert_eq!(out.entries[0].offset, chunk as u64 - 1);
     }
 
     // -------------------------------------------------------------------
@@ -2224,7 +2324,10 @@ mod tests {
         ));
         bytes.extend_from_slice(payload);
 
-        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| scan(&bytes));
+        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
+            scan(&bytes)
+        });
         assert!(
             largest <= 1 << 20,
             "largest single allocation was {largest} bytes — a {declared}-byte header field \
@@ -2235,14 +2338,15 @@ mod tests {
         // only an upper bound cannot notice the PROBE's own absence — detach
         // `alloc_probe`'s `#[global_allocator]` and
         // `largest_single_allocation` reports `0`, which satisfies
-        // `<= 1 << 20` perfectly while measuring nothing. `find_next_id`
-        // allocates a `SCAN_CHUNK`-sized read buffer on every scan, so that
-        // figure is a floor the probe cannot report unless it is attached.
+        // `<= 1 << 20` perfectly while measuring nothing. The scan
+        // used to allocate a 64 KiB read buffer and served as that floor;
+        // since 0.10.3 its `ForwardSearch` window starts smaller, so the
+        // floor is [`probe_canary`]'s allocation inside the measured closure.
         assert!(
-            largest >= SCAN_CHUNK,
-            "largest single allocation was only {largest} bytes, below the {SCAN_CHUNK}-byte \
-             buffer every scan allocates — the recording allocator is not attached, so the \
-             ceiling above is measuring nothing"
+            largest >= PROBE_CANARY,
+            "largest single allocation was only {largest} bytes, below the {PROBE_CANARY}-byte \
+             canary allocated inside the measured closure — the recording allocator is not \
+             attached, so the ceiling above is measuring nothing"
         );
         assert_eq!(out.entries.len(), 1);
         assert_eq!(
@@ -2341,7 +2445,7 @@ mod tests {
     /// before the check above refuses it.
     ///
     /// The upper bound alone cannot notice the probe's absence, so the
-    /// `SCAN_CHUNK` floor rides beside it — `alloc_probe`'s own rule.
+    /// [`PROBE_CANARY`] floor rides beside it — `alloc_probe`'s own rule.
     #[test]
     fn a_four_gigabyte_original_size_never_becomes_an_allocation() {
         let mut bytes = wrap(&local_content(
@@ -2354,16 +2458,20 @@ mod tests {
         ));
         bytes.extend_from_slice(b"ABCD");
 
-        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| scan(&bytes));
+        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
+            scan(&bytes)
+        });
         assert!(
             largest <= 1 << 20,
             "largest single allocation was {largest} bytes — a 4 GiB `original size` reached \
              `decode_fastest`'s own `Vec::with_capacity`"
         );
         assert!(
-            largest >= SCAN_CHUNK,
-            "largest single allocation was only {largest} bytes, below the {SCAN_CHUNK}-byte \
-             buffer every scan allocates — the recording allocator is not attached"
+            largest >= PROBE_CANARY,
+            "largest single allocation was only {largest} bytes, below the {PROBE_CANARY}-byte \
+             canary allocated inside the measured closure — the recording allocator is not \
+             attached"
         );
         assert!(matches!(
             out.entries[0].status,
@@ -2400,7 +2508,10 @@ mod tests {
         let payload_at = bytes.len() as u64;
         bytes.extend_from_slice(payload);
 
-        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| scan(&bytes));
+        let (out, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
+            scan(&bytes)
+        });
         assert_eq!(out.entries.len(), 1, "{:?}", out.entries);
         assert_eq!(
             out.entries[0].payload_start, payload_at,
@@ -2413,9 +2524,9 @@ mod tests {
              header became a buffer, which the walk's seek-past says cannot happen"
         );
         assert!(
-            largest >= SCAN_CHUNK,
-            "largest single allocation was only {largest} bytes — the recording allocator is \
-             not attached"
+            largest >= PROBE_CANARY,
+            "largest single allocation was only {largest} bytes, below the {PROBE_CANARY}-byte \
+             canary — the recording allocator is not attached"
         );
     }
 
