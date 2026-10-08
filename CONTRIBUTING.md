@@ -721,7 +721,11 @@ same way a vacuous conformance property would be.
   `A -> a`) is the one that reaches `is_same_entry`'s exact-path rule: the
   `l` link raises the link count above one. It bites only on a
   case-insensitive volume (APFS, HFS+), where `A` and `a` are one file; on
-  a case-sensitive one the seed extracts as three plain names. An `Err`
+  a case-sensitive one the seed extracts as three plain names. Its sibling
+  `tar-case-hardlink-stale` (`A`, `a`, `l -> a`, `A -> a`; final review
+  I1) leaves the exact-path key `A` stale once `a` replaces it under
+  `--force`: only the identity recorded with each key keeps `A -> a` a
+  fold, and without it `a` vanished, which `check_entries_carried` sees. An `Err`
   must be classified, containment is checked either way, and on `Ok` every name the walk saw is
   on disk at its `safe_join` path or named by a skip warning
   (`check_entries_carried`'s rule). It is what catches a path conflict the

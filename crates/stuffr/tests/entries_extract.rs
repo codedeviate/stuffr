@@ -1572,6 +1572,48 @@ fn a_case_folded_link_after_a_case_folded_replace_is_a_self_link_skip() {
     assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"second");
 }
 
+/// 0.10.2 final review, I1: file `A`, file `a`, link `l -> a`, link
+/// `A -> a`, under `--force`, on a case-insensitive volume. `a` replaces the
+/// run-made `A` (one directory entry), but the exact-path record kept a
+/// STALE key `A`. `l` raised `a`'s link count to 2, so `A -> a` passed the
+/// same-inode test, skipped the one-name return, and the stale key called
+/// `A` a distinct name this run made. `--force` removed it — `a`'s only
+/// directory entry — and `hard_link` and the copy fallback found nothing:
+/// exit 0, only `l` left, and no warning naming `a`.
+///
+/// The correct semantics: `A` is `a` under another spelling, so the link
+/// entry `A -> a` names its own target and is a self-link skip naming `A`.
+/// `a` keeps its bytes at `a`, and `l` is a genuine second link to it. The
+/// run succeeds (exit 0 at the CLI; exit 4 only under `--strict-fidelity`,
+/// for the one skip warning).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stale_case_folded_record_never_removes_the_link_target() {
+    let root = tmp_dir();
+    if !folds_case(&root) {
+        return; // a case-sensitive volume: `A` and `a` are two files
+    }
+    let archive = write_tar(
+        &root.join("c.tar"),
+        &[
+            file("A", b"first"),
+            file("a", b"second"),
+            hardlink("l", "a"),
+            hardlink("A", "a"),
+        ],
+    );
+    let dest = root.join("out");
+    let outcome = extract_with(&archive, &dest, true).expect("never an error");
+    assert_eq!(
+        outcome.fidelity.warnings,
+        [skipped("A", "it names itself as its hard-link target")]
+    );
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"second");
+    assert_eq!(std::fs::read(dest.join("l")).unwrap(), b"second");
+    assert_eq!(ino_nlink(&dest.join("a")), ino_nlink(&dest.join("l")));
+    assert_eq!(ino_nlink(&dest.join("a")).1, 2, "a and l, nothing else");
+}
+
 /// The skip reason `classify_symlink_target` gives a target with `..` after
 /// a name. Restated as a literal: the pin must not be derived from the code
 /// it checks.

@@ -1393,6 +1393,16 @@ fn is_same_entry(target: &Path, link: &Path, made: &MadeByRun) -> bool {
         // 0.10.1's round-3 data loss, back by another road. The question is
         // "is this SPELLING a distinct name this run made?", and only the
         // exact-path record can answer it.
+        //
+        // And only while the record is still CURRENT (0.10.2 final review,
+        // I1): `A`, then `a` replacing it under `--force`, then `l -> a`
+        // (nlink 2), then `A -> a`. The key `A` survived the fold that
+        // replaced it; read by key alone it called `A` distinct, and
+        // `--force` removed `a`'s only directory entry. `made_exact` now
+        // requires the inode recorded with the key to be the one at `link`
+        // now: the stale `A` recorded the removed inode and answers `false`
+        // (a fold), while a genuine second link (`l`) was recorded with the
+        // shared inode and stays distinct.
         !made.made_exact(link)
     }
     #[cfg(not(unix))]
@@ -5367,11 +5377,33 @@ enum MadeKind {
 /// [`refuse_symlinked_ancestors`] documents), and the new one is recorded
 /// when written. Unix only; elsewhere `ids` stays empty and every identity
 /// lookup is false.
+///
+/// **An exact-path record carries its identity too (0.10.2, final review
+/// I1).** `at` never un-records a spelling a fold replaced: under `--force`,
+/// `a` replaces the run-made `A` — one directory entry — and `place_entry`
+/// removes only the key it was asked about, so the stale key `A` stays. Read
+/// by key alone it called `A` a distinct name this run made, and
+/// [`is_same_entry`] let `--force` remove `a`'s only directory entry. So each
+/// key keeps the `(dev, ino)` read when it was recorded, and
+/// [`made_exact`](Self::made_exact) answers only while that is still the
+/// identity at the path. A key recorded with no readable identity (off unix,
+/// or a record whose `symlink_metadata` failed) answers by key alone, as
+/// before: the record is the only evidence there is. Residual caveat: a
+/// filesystem that hands a freed inode number straight to the next file
+/// created could make a stale key match again; APFS and ext4 allocate
+/// forward and do not, and only this run creates in `dest`.
 #[derive(Default)]
 struct MadeByRun {
     names: HashMap<String, PathBuf>,
-    at: HashMap<PathBuf, MadeKind>,
+    at: HashMap<PathBuf, MadeAt>,
     ids: HashSet<(u64, u64)>,
+}
+
+/// One exact-path record: what was made, and the identity it had when it
+/// was recorded (`None` when that could not be read). See [`MadeByRun`].
+struct MadeAt {
+    kind: MadeKind,
+    id: Option<(u64, u64)>,
 }
 
 /// The `(dev, ino)` of the directory entry at `path`, never following a
@@ -5401,8 +5433,9 @@ impl MadeByRun {
     /// A path no entry named: a parent directory, or salvage's own output.
     /// Called once `path` exists, so its identity can be read.
     fn record_path(&mut self, path: &Path, kind: MadeKind) {
-        self.at.insert(path.to_path_buf(), kind);
-        if let Some(id) = identity(path) {
+        let id = identity(path);
+        self.at.insert(path.to_path_buf(), MadeAt { kind, id });
+        if let Some(id) = id {
             self.ids.insert(id);
         }
     }
@@ -5413,11 +5446,18 @@ impl MadeByRun {
         self.made_exact(path) || self.made_identity(path)
     }
 
-    /// Whether this run recorded `path` itself, by its EXACT spelling.
-    /// [`is_same_entry`] needs this question and not [`made`](Self::made):
-    /// see the comment there.
+    /// Whether this run recorded `path` itself, by its EXACT spelling, AND
+    /// what is there now is still what it recorded: a key whose recorded
+    /// identity differs from the one at the path now (or whose path is now
+    /// empty) is a spelling a fold or a removal superseded, and answers
+    /// `false`. A key recorded without an identity answers by key alone (see
+    /// [`MadeByRun`]). [`is_same_entry`] needs this question and not
+    /// [`made`](Self::made): see the comment there.
     fn made_exact(&self, path: &Path) -> bool {
-        self.at.contains_key(path)
+        self.at.get(path).is_some_and(|rec| match rec.id {
+            Some(id) => identity(path) == Some(id),
+            None => true,
+        })
     }
 
     /// Whether what is at `path` now is an inode this run created, however
@@ -5430,7 +5470,7 @@ impl MadeByRun {
     /// GNU tar's `./b` link finds the `./b` entry it wrote.
     fn resolve(&self, name: &str) -> Option<(&Path, &MadeKind)> {
         let path = self.names.get(name)?;
-        Some((path.as_path(), self.at.get(path)?))
+        Some((path.as_path(), &self.at.get(path)?.kind))
     }
 }
 

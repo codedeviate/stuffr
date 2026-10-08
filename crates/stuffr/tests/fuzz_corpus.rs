@@ -1046,10 +1046,20 @@ fn conflict_tar_seeds() -> Vec<(&'static str, Vec<u8>)> {
     let mut case_link = seed_tar_member(b"a", b'0', b"", b"file\n");
     case_link.extend(seed_tar_member(b"l", b'1', b"a", b""));
     case_link.extend(seed_tar_member(b"A", b'1', b"a", b""));
+    // 0.10.2 final review, I1: `A`, then `a` (which replaces it under
+    // `--force` on a case-folding volume, leaving the exact-path key `A`
+    // stale), then `l -> a` (link count 2), then `A -> a`. Read by key
+    // alone, the stale `A` called the link distinct and `--force` removed
+    // `a`'s only directory entry; the record's identity must now say "fold".
+    let mut case_link_stale = seed_tar_member(b"A", b'0', b"", b"first\n");
+    case_link_stale.extend(seed_tar_member(b"a", b'0', b"", b"second\n"));
+    case_link_stale.extend(seed_tar_member(b"l", b'1', b"a", b""));
+    case_link_stale.extend(seed_tar_member(b"A", b'1', b"a", b""));
     vec![
         ("tar-case-pair", seed_tar_end(case_pair)),
         ("tar-duplicate-name", seed_tar_end(duplicate)),
         ("tar-case-hardlink", seed_tar_end(case_link)),
+        ("tar-case-hardlink-stale", seed_tar_end(case_link_stale)),
         ("tar-conflict-dir-then-file", seed_tar_end(dir_then_file)),
         (
             "tar-conflict-file-then-child",
