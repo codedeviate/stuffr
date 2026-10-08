@@ -948,8 +948,10 @@ impl Default for SalvagePolicy {
 }
 
 /// Reusable scratch for a scanner's forward search for its next signature
-/// (a magic, a checksum-valid block). Reads start at [`Self::FIRST_CHUNK`]
-/// and double up to [`Self::MAX_CHUNK`], into one buffer kept across calls,
+/// (a magic, a checksum-valid block). Reads start at [`Self::FIRST_CHUNK`],
+/// or at `2 * sig_len - 1` when that is larger, so the first read always
+/// tests `sig_len` offsets, and double up to [`Self::MAX_CHUNK`], into one
+/// buffer kept across calls,
 /// so a search whose answer is a few bytes away reads a few bytes: a scan
 /// that resumes one byte past a refused candidate costs work proportional to
 /// the distance it actually searched, never a fixed 64 KiB per call. That is
@@ -961,7 +963,8 @@ pub struct ForwardSearch {
 }
 
 impl ForwardSearch {
-    /// Size of the first read of every search.
+    /// Size of the first read of every search, unless the signature is long
+    /// enough that `2 * sig_len - 1` is larger — see [`Self::find`].
     pub const FIRST_CHUNK: usize = 64;
     /// Ceiling the read size doubles up to.
     pub const MAX_CHUNK: usize = 64 * 1024;
@@ -976,6 +979,11 @@ impl ForwardSearch {
     /// `matches` sees exactly `sig_len` bytes. Every offset is tested once,
     /// carrying `sig_len - 1` bytes across a chunk boundary. Never reads at
     /// or past `file_len`, and stops at EOF if the source is shorter.
+    ///
+    /// The first read is `max(FIRST_CHUNK, 2 * sig_len - 1)` bytes, so it
+    /// tests at least `sig_len` offsets. A first read of only `sig_len`
+    /// bytes tests ONE offset: for tar's 512-byte block, a header one block
+    /// on then cost 512 + 1,024 bytes, three times the distance searched.
     pub fn find(
         &mut self,
         src: &mut dyn SeekRead,
@@ -990,7 +998,7 @@ impl ForwardSearch {
         src.seek(SeekFrom::Start(from))?;
         self.window.clear();
         let mut window_start = from;
-        let mut chunk = Self::FIRST_CHUNK.max(sig_len);
+        let mut chunk = Self::FIRST_CHUNK.max(2 * sig_len - 1);
         loop {
             let old = self.window.len();
             let remaining = file_len - (window_start + old as u64);
@@ -2120,6 +2128,26 @@ mod tests {
             "{}",
             src.bytes_read()
         );
+    }
+
+    /// A long signature's first read tests `sig_len` offsets, not one: a
+    /// 512-byte signature 300 bytes on is found by ONE read of `2 * 512 - 1`
+    /// bytes. With a first read of `sig_len` it took 512 + 1,024.
+    #[test]
+    fn a_long_signature_s_first_read_tests_sig_len_offsets() {
+        use crate::testing::CountingSource;
+        let sig = [0xA5u8; 512];
+        let mut data = vec![0u8; 1 << 20];
+        data[300..812].copy_from_slice(&sig);
+        let mut src = CountingSource::new(Cursor::new(data));
+        let mut search = ForwardSearch::new();
+        assert_eq!(
+            search
+                .find(&mut src, 0, 1 << 20, 512, |w| w == sig)
+                .unwrap(),
+            Some(300)
+        );
+        assert_eq!(src.bytes_read(), 2 * 512 - 1);
     }
 
     /// Pins `annotate_candidates`' semantics across the Vec -> HashMap change:
