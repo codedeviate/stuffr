@@ -318,6 +318,18 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 /// [`every_salvage_seed_produces_records_and_reaches_its_top_tier`] forbids,
 /// on the rule that a seed is something the fuzzer degrades FROM. It needs a
 /// two-entry ZOO archive this project cannot write and has not borrowed.
+///
+/// **`cpio-zero-run` and `tar-converging` (0.10.3 Task 4) are the two
+/// hostile shapes the read-amplification oracle exists for**, at fuzz scale
+/// (about 13 KiB and 14 KiB): 60 `newc` headers whose sizes all land in one
+/// 6 KiB zero run that ends in a non-zero byte (`cpio_salvage.rs`'s
+/// zero-run memo), and 12 forged pax `x` heads converging on one header
+/// behind the sample tar (`tar_salvage.rs`'s chain budgets). Each is a shape
+/// a later change could make quadratic again, and the fuzz target now
+/// aborts when a scan reads more than `SCAN_READ_FACTOR` times its input
+/// plus `SCAN_READ_SLACK` — so the corpus starts every run next to both.
+/// Named `<slot>-…` like every other shape, so [`salvage_shape_slot`]
+/// routes them; a `salvage-` prefix would route them to `zip`.
 const SALVAGE_SHAPES: &[&str] = &[
     "healthy",
     "distinct-duplicates",
@@ -346,6 +358,8 @@ const SALVAGE_SHAPES: &[&str] = &[
     "ar-healthy",
     "ar-hole-at-second-header",
     "ar-truncated-tail",
+    "cpio-zero-run",
+    "tar-converging",
 ];
 
 /// The `SALVAGE_SLOTS` name a shape's seed carries in its selector byte: the
@@ -368,6 +382,63 @@ fn salvage_shape_slot(shape: &str) -> &'static str {
         .copied()
         .find(|&slot| slot == prefix)
         .unwrap_or("zip")
+}
+
+/// One `newc` header, name and padding included, declaring `size` payload
+/// bytes it does not carry — `cpio_salvage.rs`'s own test builder.
+fn newc_header_only(name: &str, size: u32) -> Vec<u8> {
+    let namesize = name.len() as u32 + 1;
+    let mut h = format!(
+        "070701{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
+        1, 0o100644, 0, 0, 1, 0, size, 0, 0, 0, 0, namesize, 0
+    )
+    .into_bytes();
+    h.extend_from_slice(name.as_bytes());
+    h.push(0);
+    while h.len() % 4 != 0 {
+        h.push(0);
+    }
+    h
+}
+
+/// `cpio-zero-run`: 60 headers, each declaring a size that lands it
+/// (4-aligned) at a different point inside one 6 KiB zero run that ends in a
+/// non-zero byte. Every landing asks whether zeros run to EOF from there;
+/// without the zero-run memo each asked by reading the run again.
+fn cpio_zero_run_seed() -> Vec<u8> {
+    const HEADERS: usize = 60;
+    const RUN: usize = 6 * 1024;
+    let names: Vec<String> = (0..HEADERS).map(|i| format!("f{i}")).collect();
+    let header_bytes: usize = names.iter().map(|n| newc_header_only(n, 0).len()).sum();
+    let mut out = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let payload_start = out.len() + newc_header_only(name, 0).len();
+        let landing = header_bytes + 4 * (i + 1);
+        out.extend_from_slice(&newc_header_only(name, (landing - payload_start) as u32));
+    }
+    out.resize(header_bytes + RUN, 0);
+    out.push(1); // the run does not reach EOF
+    out
+}
+
+/// `tar-converging`: the healthy sample tar, then 12 forged pax `x` heads
+/// whose declared spans all end on one empty-named header, then an
+/// end-of-archive marker. The sample's entries keep the seed at its top
+/// tier; past four chains the terminal is refused unread and reported as a
+/// work-bounded sighting (`tar_salvage.rs`'s `MAX_CHAINS_PER_HEADER`).
+fn tar_converging_seed(healthy_tar: &[u8]) -> Vec<u8> {
+    const FORGED: usize = 12;
+    let mut out = healthy_tar.to_vec();
+    let base = out.len() as u64;
+    let terminal_at = base + (FORGED * 512) as u64;
+    for k in 0..FORGED {
+        let head_at = base + (k * 512) as u64;
+        let span = (terminal_at - head_at - 512) as usize;
+        out.extend_from_slice(&seed_tar_header(b"", b'x', span, b""));
+    }
+    out.extend_from_slice(&seed_tar_header(b"", b'0', 0, b"")); // the terminal: empty name
+    out.extend_from_slice(&[0u8; 1024]); // end-of-archive
+    out
 }
 
 /// Builds one small sample tree every container/chain seed packs: a file at
@@ -1565,6 +1636,8 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
                     .expect("the sample tree's nested.txt is the last member");
                 healthy_ar[..at + 6].to_vec()
             }
+            "cpio-zero-run" => cpio_zero_run_seed(),
+            "tar-converging" => tar_converging_seed(&healthy_tar),
             other => unreachable!("SALVAGE_SHAPES lists an unhandled shape {other:?}"),
         };
         let slot = salvage_shape_slot(shape);
@@ -1898,6 +1971,48 @@ fn every_salvage_seed_produces_records_and_reaches_its_top_tier() {
     assert!(distinct.entries.iter().all(|r| r.shadows.is_none()));
     let identical = duplicates("identical-duplicates");
     assert!(identical.entries.iter().any(|r| r.shadows.is_some()));
+}
+
+/// The two hostile shapes must carry the shape they are named for, or the
+/// corpus starts the fuzzer next to two more healthy archives: every one of
+/// `cpio-zero-run`'s 60 headers is a candidate whose payload lands in the
+/// run, and `tar-converging`'s terminal is refused as a work-bounded
+/// sighting rather than read a twelfth time.
+#[test]
+fn the_hostile_salvage_seeds_carry_their_shape() {
+    use stuffr_core::salvage::SightingKind;
+
+    let dir = tempfile::tempdir().unwrap();
+    generate_corpus(dir.path()).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let scan = |shape: &str| {
+        let seed_path = dir.path().join("salvage").join(format!("{shape}.seed"));
+        let path = salvage_payload_path(&seed_path, scratch.path());
+        entries::salvage(
+            &path,
+            &entries::SalvageOpts {
+                dest: None,
+                policy: stuffr_core::salvage::SalvagePolicy::default(),
+                select: None,
+                format: None,
+            },
+        )
+        .unwrap()
+    };
+
+    let cpio = scan("cpio-zero-run");
+    let names: Vec<&str> = cpio.entries.iter().map(|r| r.name.as_str()).collect();
+    let expected: Vec<String> = (0..60).map(|i| format!("f{i}")).collect();
+    assert_eq!(names, expected);
+
+    let tar = scan("tar-converging");
+    assert!(
+        tar.sightings
+            .iter()
+            .any(|s| s.kind == SightingKind::WorkBounded),
+        "{:?}",
+        tar.sightings
+    );
 }
 
 /// Every `SALVAGE_SLOTS` entry must have a seed of its own.

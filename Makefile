@@ -293,7 +293,7 @@ FUZZ_SEED = 1
 # 'salvage': 2000 executions — OK` was true and proved nothing. Since
 # Salvage Stage 3 the oracle is asked about all three claim-bearing tiers
 # (`Intact`, `Complete`, `Unattested`). See `SALVAGE_SHAPES` in
-# `crates/stuffr/tests/fuzz_corpus.rs` for what each of its twenty-seven
+# `crates/stuffr/tests/fuzz_corpus.rs` for what each of its twenty-nine
 # seed shapes is for — at least one per `SALVAGE_SLOTS` entry, which
 # `every_salvage_slot_carries_at_least_one_seed` fails the build over.
 #

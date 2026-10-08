@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 use stuffr::entries::{self, SalvageOpts};
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
 use stuffr_core::testing::{
-    Attestation, SALVAGE_FUZZ_MAX_ENTRY, SALVAGE_SLOTS, check_error_is_classified,
-    check_salvage_claim,
+    Attestation, CountingSource, SALVAGE_FUZZ_MAX_ENTRY, SALVAGE_SLOTS, check_error_is_classified,
+    check_salvage_claim, check_scan_is_linear,
 };
 use stuffr_formats::legacy::{arc_salvage, arj_salvage, lha_salvage, zoo_salvage};
 use stuffr_formats::{ar_salvage, cpio_salvage, tar_salvage, zip_salvage};
@@ -501,6 +501,28 @@ fn trace(slot: &str, routed: &str, rows: usize, tally: Tally) {
     }
 }
 
+/// One line per input on stderr when `STUFFR_FUZZ_SCAN_TRACE` is set, and
+/// nothing otherwise: the bytes the independent second scan was delivered
+/// against the input's length — the two figures [`check_scan_is_linear`]
+/// judges, printed BEFORE it judges them so an aborting input still leaves
+/// its line.
+///
+/// ```text
+/// STUFFR_FUZZ_SCAN_TRACE=1 cargo +nightly fuzz run salvage -- -runs=0 2>&1 \
+///   | grep '^scan-trace '
+/// ```
+///
+/// This is how 0.10.3 Task 4 measured the corpus that
+/// `stuffr_core::testing::SCAN_READ_FACTOR` and `SCAN_READ_SLACK` cite, and
+/// how a later change to a scanner's resync loop re-measures it.
+fn scan_trace(slot: &str, len: u64, read: u64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("STUFFR_FUZZ_SCAN_TRACE").is_some()) {
+        let ratio = read as f64 / len.max(1) as f64;
+        eprintln!("scan-trace slot={slot} len={len} read={read} ratio={ratio:.3}");
+    }
+}
+
 /// What one input's loop counted, for [`trace`]. A struct rather than four
 /// positional `usize`s, because two of them (`claims` and `oracle`) are
 /// easy to transpose and the whole point of the line is that they differ.
@@ -645,7 +667,16 @@ fuzz_target!(|data: &[u8]| {
     // reasoning that skipping is "an honest 'not built yet', not a silent
     // pass" — see `no_cross_check_arm`'s own doc for the task that shipped
     // exactly that state and reported the opposite.
-    let mut cursor = Cursor::new(payload.to_vec());
+    //
+    // The source is wrapped in a `CountingSource` once, and every arm reads
+    // through it, so after the match it holds every byte this scan was
+    // delivered — re-reads included — and `check_scan_is_linear` holds the
+    // scan to work linear in its input. 0.10.3 closed two classes where a
+    // hostile input made a scanner re-read the same bytes per candidate
+    // (cpio zero runs, tar converging extension chains); this is the
+    // oracle that would have found them, for every slot at once. See
+    // `scan_trace` for the measurement it makes reproducible.
+    let mut cursor = CountingSource::new(Cursor::new(payload.to_vec()));
     let offsets: HashMap<usize, u64> = match name {
         "zip" => match zip_salvage::salvage_zip(&mut cursor, &opts.policy) {
             Ok(scan) => scan
@@ -737,6 +768,10 @@ fuzz_target!(|data: &[u8]| {
         },
         other => no_cross_check_arm(other),
     };
+    let len = payload.len() as u64;
+    scan_trace(name, len, cursor.bytes_read());
+    check_scan_is_linear(cursor.bytes_read(), len)
+        .expect("salvage: scan work is linear in its input");
 
     let mut intact = 0usize;
     let mut claims = 0usize;

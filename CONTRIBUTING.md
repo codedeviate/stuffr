@@ -756,6 +756,35 @@ module doc for the consequence it leaves open (a regression returning
 `Partial` for a fully decodable entry, without ever comparing, would be
 invisible to this oracle).
 
+`check_scan_is_linear` (0.10.3) is the `salvage` target's work oracle, and
+it lives in `stuffr_core::testing` beside `CountingSource` rather than in
+`honesty.rs`, because it judges a measurement, not an outcome. The target's
+independent second scan reads through a `CountingSource`, and after every
+format's arm the bytes it was delivered — re-reads included — must not
+exceed `SCAN_READ_FACTOR × len + SCAN_READ_SLACK` (8x + 64 KiB; the
+constants' doc carries the corpus measurement behind them). It is the
+oracle that would have found 0.10.3's two quadratic classes, cpio's zero-run
+rescans and tar's converging extension chains, and on first wiring it found
+the same waste in five more scanners: zip, arc, zoo, lha and arj each left
+its forward search for every bare signature, re-read a header and searched
+again, measured at up to 218x on a fuzz input and 63,517x on a dense 1 MiB
+file. It
+counts only reads made through the `Cursor` the target hands the scanner;
+there is no double proving it can fail, so a sabotage run stands in for
+one: with `cpio_salvage.rs`'s zero-run memo reverted, the `cpio-zero-run`
+seed aborts the target (`read 388865 bytes of a 13105-byte input`).
+`STUFFR_FUZZ_SCAN_TRACE=1` prints one line per input, printed before the
+check so an aborting input still leaves its figures:
+
+```bash
+STUFFR_FUZZ_SCAN_TRACE=1 cargo +nightly fuzz run salvage -- -runs=0 2>&1 \
+  | grep '^scan-trace '
+```
+
+Each line is `scan-trace slot=<slot> len=<bytes> read=<bytes> ratio=<read/len>`.
+The counting pass costs little: over one frozen 12,907-input corpus,
+`-runs=<corpus>+2000 -seed=1` ran at 219 exec/s before it and 196 after.
+
 The first invariant, `check_error_is_classified`, guards `Error::exit_code`'s
 `_ => 1` wildcard: hostile bytes may be refused, but never as exit 1, which
 means "stuffr itself failed" rather than "the input was bad". It found a real

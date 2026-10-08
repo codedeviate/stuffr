@@ -822,9 +822,38 @@ impl<R: std::io::Seek> std::io::Seek for CountingSource<R> {
 }
 
 /// The bound every salvage scan is held to: bytes delivered to the scanner
-/// at most `SCAN_READ_FACTOR × file_len + SCAN_READ_SLACK`. Provisional
-/// until 0.10.3 Task 4 measures the corpus and fixes it here.
+/// at most `SCAN_READ_FACTOR × file_len + SCAN_READ_SLACK`. The `salvage`
+/// fuzz target applies it to every input's independent second scan, and
+/// each scanner's own tests apply it to its hostile shapes at 256 KiB-1 MiB.
+///
+/// **Measured, 0.10.3 Task 4 (2026-10-09)**, over the local `salvage`
+/// corpus — 12,907 inputs, 12,723 reaching a scanner, 0 to 11,529 bytes
+/// (13.4 MiB in all) — with `STUFFR_FUZZ_SCAN_TRACE`. Largest ratio of bytes
+/// read to input length, per slot, after that task's scanner fixes (before
+/// them in brackets):
+///
+/// | slot | inputs | max ratio | before |
+/// |---|---|---|---|
+/// | `zip`  | 5,557 | 3.40 | 218.1 |
+/// | `zoo`  | 2,075 | 5.72 | 131.9 |
+/// | `lha`  |   606 | 3.24 | 106.2 |
+/// | `arc`  |   269 | 1.83 |  93.3 |
+/// | `arj`  |   202 | 1.09 |  15.0 |
+/// | `cpio` |   100 | 2.65 |   3.1 |
+/// | `tar`  | 2,792 | 1.60 |   2.2 |
+/// | `ar`   | 1,122 | 2.00 |   2.0 |
+///
+/// No input read past `8 × len`; the largest single scan read 65,499 bytes
+/// (`zoo`, an 11,454-byte input), so the tightest input sits 2.4x under
+/// this bound. The figures are kept at the plan's ceiling rather than
+/// lowered to the corpus: fuzz-scale inputs (≤ 11.5 KiB) sit almost wholly
+/// inside the slack, and the scanners' own MiB-scale hostile fixtures
+/// still reach 6-8x once fixed (`tar_salvage.rs`'s converging and
+/// mixed-chain shapes), which a tighter factor would fail. Re-measure with the
+/// `STUFFR_FUZZ_SCAN_TRACE` recipe in `CONTRIBUTING.md` before changing
+/// either figure, and never raise one to fit a scanner.
 pub const SCAN_READ_FACTOR: u64 = 8;
+/// See [`SCAN_READ_FACTOR`].
 pub const SCAN_READ_SLACK: u64 = 64 * 1024;
 
 /// `Err` naming both figures when a scan read more than
