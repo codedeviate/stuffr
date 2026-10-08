@@ -391,6 +391,7 @@ fn extract_into(
             check_error_is_classified(&e).expect("extract: error classification");
             extract_trace(
                 slot,
+                force,
                 source_names.len(),
                 0,
                 0,
@@ -417,6 +418,7 @@ fn extract_into(
     if !same_archive {
         extract_trace(
             slot,
+            force,
             source_names.len(),
             0,
             skips.len(),
@@ -439,6 +441,7 @@ fn extract_into(
         .expect("extract: every entry on disk or named");
     extract_trace(
         slot,
+        force,
         source_names.len(),
         on_disk.len(),
         skips.len(),
@@ -474,7 +477,8 @@ fn make_traversable(dir: &Path) {
     }
 }
 
-/// One line per input that reached [`extract_leg`], on stderr, when
+/// One line per extraction (two per input that reached [`extract_leg`]:
+/// `force=false`, then `force=true`), on stderr, when
 /// `STUFFR_FUZZ_EXTRACT_TRACE` is set — nothing otherwise. `extracted` is how
 /// many of the walk's names were found on disk (0 when not compared),
 /// `skips` the `EntrySkipped` warnings, `conflicts` those a self-contradicting
@@ -488,6 +492,7 @@ fn make_traversable(dir: &Path) {
 /// ```
 fn extract_trace(
     slot: &str,
+    force: bool,
     names: usize,
     extracted: usize,
     skips: usize,
@@ -497,7 +502,7 @@ fn extract_trace(
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("STUFFR_FUZZ_EXTRACT_TRACE").is_some()) {
         eprintln!(
-            "extract-trace slot={slot} names={names} extracted={extracted} skips={skips} \
+            "extract-trace slot={slot} force={force} names={names} extracted={extracted} skips={skips} \
              conflicts={conflicts} err={err}"
         );
     }

@@ -718,13 +718,16 @@ same way a vacuous conformance property would be.
   258 after, over the 6,979-input local corpus; run-to-run noise exceeds the
   leg), so it is not gated. The `tar-case-hardlink` seed (`a`, `l -> a`,
   `A -> a`) is the one that reaches `is_same_entry`'s exact-path rule: the
-  `l` link raises the link count above one. An `Err` must be classified,
-  containment is checked either way, and on `Ok` every name the walk saw is
+  `l` link raises the link count above one. It bites only on a
+  case-insensitive volume (APFS, HFS+), where `A` and `a` are one file; on
+  a case-sensitive one the seed extracts as three plain names. An `Err`
+  must be classified, containment is checked either way, and on `Ok` every name the walk saw is
   on disk at its `safe_join` path or named by a skip warning
   (`check_entries_carried`'s rule). It is what catches a path conflict the
   archive makes with itself reaching exit 1 again.
-  `STUFFR_FUZZ_EXTRACT_TRACE=1` prints one `extract-trace` line per input
-  that reached it.
+  `STUFFR_FUZZ_EXTRACT_TRACE=1` prints one `extract-trace` line per
+  extraction, two per input that reached it, labelled `force=false` and
+  `force=true`.
 
 `check_salvage_claim` refuses a status that claims more than the format or
 the scan supports. Since Salvage Stage 3 it takes the format's class of
