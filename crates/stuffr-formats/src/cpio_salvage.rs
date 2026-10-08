@@ -110,6 +110,9 @@
 //! the engine's own `offset + declared_len`, which measures the same
 //! unattested number from the header and would skip neighbours when the
 //! damage makes a size LARGER.
+//! A refused jump costs a scan of the zero run once; the scan's memo
+//! ([`KnownZeros`]) answers every later landing in it, so many headers
+//! pointing into one run stay linear.
 //!
 //! **What corroboration buys:** one damaged size costs at most its own
 //! entry's bytes (the entry is still reported, over what its header claims),
@@ -164,8 +167,8 @@ use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
 use stuffr_core::salvage::{
-    Candidate, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus, SalvagedEntry, Sighting,
-    UnverifiedCause, salvage_all, stream_bounded_copy,
+    Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
+    SalvagedEntry, Sighting, UnverifiedCause, salvage_all, stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
@@ -205,10 +208,6 @@ const ODC_NAMESIZE: usize = 8;
 
 /// The name `newc.rs`'s `Entry::is_trailer` ends an archive on.
 const TRAILER_NAME: &str = "TRAILER!!!";
-
-/// Bytes read per [`find_next_magic`] chunk — the figure every scanner's
-/// `SCAN_CHUNK` is.
-const SCAN_CHUNK: usize = 64 * 1024;
 
 /// The codec a `newc` entry carries in [`EntryMeta::codec`]. **Setting it at
 /// all is load-bearing**: `entries.rs` hands it to [`write_payload`], which
@@ -436,38 +435,33 @@ fn magic_of(bytes: &[u8]) -> Option<Magic> {
 }
 
 /// Searches forward from `from` for the next offset carrying one of the
-/// three magics, in bounded chunks, carrying `MAGIC_LEN - 1` bytes across a
-/// chunk boundary. O(1) memory however far the next one is.
+/// three magics, through [`ForwardSearch`]: a short first read that doubles
+/// only while the answer is still not found, so a hit a few bytes away costs
+/// a few bytes, not a fixed 64 KiB. O(1) memory however far the next one is.
 fn find_next_magic(
+    search: &mut ForwardSearch,
     src: &mut dyn SeekRead,
     from: u64,
     file_len: u64,
 ) -> io::Result<Option<(u64, Magic)>> {
-    if file_len.saturating_sub(from) < MAGIC_LEN as u64 {
-        return Ok(None);
-    }
-    src.seek(SeekFrom::Start(from))?;
-    let mut window: Vec<u8> = Vec::with_capacity(SCAN_CHUNK + MAGIC_LEN);
-    let mut window_start = from;
-    let mut buf = vec![0u8; SCAN_CHUNK];
-    loop {
-        let n = src.read(&mut buf)?;
-        window.extend_from_slice(&buf[..n]);
-        if window.len() >= MAGIC_LEN {
-            let last = window.len() - MAGIC_LEN;
-            if let Some((at, magic)) =
-                (0..=last).find_map(|i| magic_of(&window[i..i + MAGIC_LEN]).map(|magic| (i, magic)))
-            {
-                return Ok(Some((window_start + at as u64, magic)));
-            }
-            let tested = last + 1;
-            window_start += tested as u64;
-            window.drain(..tested);
-        }
-        if n == 0 {
-            return Ok(None);
-        }
-    }
+    let mut found = None;
+    let at = search.find(src, from, file_len, MAGIC_LEN, |w| {
+        found = magic_of(w);
+        found.is_some()
+    })?;
+    Ok(at.zip(found))
+}
+
+/// A run of zero bytes this scan has already read: `[start, end)` is all
+/// zero, and `to_eof` says whether it ran to EOF (`end == file_len`) or
+/// stopped at a non-zero byte at `end`. One record, the most recent: the
+/// quadratic shape is many landing points inside ONE run, and that is what
+/// it answers.
+#[derive(Debug, Clone, Copy)]
+struct KnownZeros {
+    start: u64,
+    end: u64,
+    to_eof: bool,
 }
 
 /// A candidate, and where the scan resumes after it.
@@ -486,7 +480,12 @@ struct Found {
 /// variant that clears its gate (a trailer included), EOF, or zeros all the
 /// way to EOF (a writer's block padding). See the module doc's jump section
 /// for what this buys and what it still cannot catch.
-fn corroborates_the_size(src: &mut dyn SeekRead, next_header: u64, file_len: u64) -> bool {
+fn corroborates_the_size(
+    src: &mut dyn SeekRead,
+    next_header: u64,
+    file_len: u64,
+    memo: &mut Option<KnownZeros>,
+) -> bool {
     if next_header >= file_len {
         return true;
     }
@@ -496,27 +495,81 @@ fn corroborates_the_size(src: &mut dyn SeekRead, next_header: u64, file_len: u64
     {
         Some(Magic::Newc | Magic::Crc) => gate_newc_at(src, next_header, file_len).is_ok(),
         Some(Magic::Odc) => gate_odc_at(src, next_header, file_len).is_ok(),
-        None => zeros_to_eof(src, next_header, file_len),
+        None => zeros_to_eof(src, next_header, file_len, memo),
     }
 }
 
-/// Whether every byte from `from` to EOF is zero, read in [`SCAN_CHUNK`]s
-/// and stopping at the first that is not. A read error answers `false`: an
-/// uncorroborated jump costs a rescan, never an entry.
-fn zeros_to_eof(src: &mut dyn SeekRead, from: u64, file_len: u64) -> bool {
+/// Whether every byte from `from` to EOF is zero, read in small chunks and
+/// stopping at the first that is not. A read error answers `false`: an
+/// uncorroborated jump costs a scan of the run once (the memo answers every
+/// later landing in it), never an entry.
+///
+/// `memo` holds the most recent run this scan has read. A landing point
+/// inside it is answered with no read; a scan that reaches its first byte
+/// stops and adopts its answer. So a run is read once, however many headers
+/// land in it (0.10.3 §1: it was once read per header, quadratically).
+fn zeros_to_eof(
+    src: &mut dyn SeekRead,
+    from: u64,
+    file_len: u64,
+    memo: &mut Option<KnownZeros>,
+) -> bool {
+    if let Some(known) = *memo {
+        if known.start <= from && from < known.end {
+            return known.to_eof;
+        }
+        // The byte at `end` is the non-zero one that stopped the run.
+        if from == known.end && !known.to_eof {
+            return false;
+        }
+    }
     if src.seek(SeekFrom::Start(from)).is_err() {
         return false;
     }
-    let mut left = file_len.saturating_sub(from);
-    let mut buf = vec![0u8; SCAN_CHUNK];
-    while left > 0 {
-        let want = usize::try_from(left.min(SCAN_CHUNK as u64)).unwrap_or(SCAN_CHUNK);
+    let mut buf = [0u8; 4096];
+    let mut pos = from;
+    while pos < file_len {
+        // Never read into a known run: stop at its first byte and adopt it.
+        let mut limit = file_len;
+        if let Some(known) = *memo
+            && known.start > pos
+        {
+            limit = limit.min(known.start);
+        }
+        if let Some(known) = *memo
+            && pos == known.start
+        {
+            *memo = Some(KnownZeros {
+                start: from,
+                end: known.end,
+                to_eof: known.to_eof,
+            });
+            return known.to_eof;
+        }
+        let want = usize::try_from((limit - pos).min(buf.len() as u64)).unwrap_or(buf.len());
         match src.read(&mut buf[..want]) {
             Ok(0) | Err(_) => return false,
-            Ok(n) if buf[..n].iter().any(|&b| b != 0) => return false,
-            Ok(n) => left -= n as u64,
+            Ok(n) => {
+                if let Some(i) = buf[..n].iter().position(|&b| b != 0) {
+                    let end = pos + i as u64;
+                    if end > from {
+                        *memo = Some(KnownZeros {
+                            start: from,
+                            end,
+                            to_eof: false,
+                        });
+                    }
+                    return false;
+                }
+                pos += n as u64;
+            }
         }
     }
+    *memo = Some(KnownZeros {
+        start: from,
+        end: file_len,
+        to_eof: true,
+    });
     true
 }
 
@@ -527,13 +580,19 @@ enum Scanned {
     NotAnEntry,
 }
 
-fn scan_at(src: &mut dyn SeekRead, offset: u64, magic: Magic, file_len: u64) -> Scanned {
+fn scan_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    magic: Magic,
+    file_len: u64,
+    memo: &mut Option<KnownZeros>,
+) -> Scanned {
     match magic {
         Magic::Newc => match gate_newc_at(src, offset, file_len) {
             // The reader's end of archive, never an entry — and not the end
             // of the SCAN, since archives are concatenated (initramfs).
             Ok(newc) if newc.is_trailer() => Scanned::NotAnEntry,
-            Ok(newc) => Scanned::Found(Box::new(candidate_from(src, offset, newc, file_len))),
+            Ok(newc) => Scanned::Found(Box::new(candidate_from(src, offset, newc, file_len, memo))),
             Err(_) => Scanned::NotAnEntry,
         },
         Magic::Crc => match gate_newc_at(src, offset, file_len) {
@@ -561,7 +620,13 @@ fn symlink_target(src: &mut dyn SeekRead, newc: &Newc, file_len: u64) -> Option<
 
 /// Builds the candidate for a header that cleared the gate, with the fields
 /// `cpio.rs`'s `entry_meta` reports and the kind from its own `entry_kind`.
-fn candidate_from(src: &mut dyn SeekRead, offset: u64, newc: Newc, file_len: u64) -> Found {
+fn candidate_from(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    newc: Newc,
+    file_len: u64,
+    memo: &mut Option<KnownZeros>,
+) -> Found {
     let size = newc.file_size();
     let (available_len, next_header) = match newc.payload_start.checked_add(size) {
         Some(end) if end <= file_len => (
@@ -575,7 +640,7 @@ fn candidate_from(src: &mut dyn SeekRead, offset: u64, newc: Newc, file_len: u64
     // Task 3 review, I1: nothing attests `c_filesize`, so the jump past this
     // payload is taken only where the landing point corroborates it.
     let resume_at = match next_header {
-        Some(next) if corroborates_the_size(src, next, file_len) => next,
+        Some(next) if corroborates_the_size(src, next, file_len, memo) => next,
         _ => offset + 1,
     };
     let mode = newc.fields[MODE];
@@ -620,6 +685,10 @@ fn candidate_from(src: &mut dyn SeekRead, offset: u64, newc: Newc, file_len: u64
 pub struct CpioSalvage {
     resume: Option<Resume>,
     sightings: Vec<(u64, Variant)>,
+    /// The latest zero run this scan read — see [`KnownZeros`].
+    memo: Option<KnownZeros>,
+    /// The magic search's reusable window.
+    search: ForwardSearch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -647,10 +716,12 @@ impl SalvageScan for CpioSalvage {
             _ => from,
         };
         loop {
-            let Some((offset, magic)) = find_next_magic(src, search_from, file_len)? else {
+            let Some((offset, magic)) =
+                find_next_magic(&mut self.search, src, search_from, file_len)?
+            else {
                 return Ok(None);
             };
-            match scan_at(src, offset, magic, file_len) {
+            match scan_at(src, offset, magic, file_len, &mut self.memo) {
                 Scanned::Found(found) => {
                     self.resume = Some(Resume {
                         header: found.candidate.offset,
@@ -813,6 +884,18 @@ mod tests {
 
     use super::*;
     use crate::cpio::CpioNewc;
+
+    /// The size of the allocation [`probe_canary`] makes. The allocator-probe
+    /// tests below used to take the scan's own 64 KiB read buffer as proof
+    /// the recording allocator was attached; since 0.10.3 the scan reads 64
+    /// bytes first and allocates no such buffer for a small input, so the
+    /// proof is now an allocation the test makes itself, inside the measured
+    /// closure.
+    const PROBE_CANARY: usize = 64 * 1024;
+
+    fn probe_canary() {
+        std::hint::black_box(vec![0u8; PROBE_CANARY]);
+    }
 
     fn scan(bytes: &[u8]) -> SalvageOutcome {
         salvage_cpio(&mut Cursor::new(bytes.to_vec()), &SalvagePolicy::default()).expect(
@@ -1229,7 +1312,8 @@ mod tests {
         // And nothing else in the corpus carries a magic at all.
         let mut hits = Vec::new();
         let mut from = 0;
-        while let Some((at, _)) = find_next_magic(&mut src, from, len).unwrap() {
+        let mut search = ForwardSearch::new();
+        while let Some((at, _)) = find_next_magic(&mut search, &mut src, from, len).unwrap() {
             hits.push(at as usize);
             from = at + 1;
         }
@@ -1618,6 +1702,7 @@ mod tests {
         );
         let mut src = Cursor::new(bytes);
         let (out, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
             salvage_cpio(&mut src, &SalvagePolicy::default()).unwrap()
         });
         assert!(out.entries.is_empty());
@@ -1626,9 +1711,9 @@ mod tests {
             "largest single allocation was {largest} bytes"
         );
         assert!(
-            largest >= SCAN_CHUNK,
-            "largest single allocation was only {largest} bytes, below the {SCAN_CHUNK}-byte \
-             buffer every scan allocates — the recording allocator is not attached"
+            largest >= PROBE_CANARY,
+            "largest single allocation was only {largest} bytes, below the {PROBE_CANARY}-byte \
+             canary the closure allocates — the recording allocator is not attached"
         );
     }
 
@@ -1652,7 +1737,7 @@ mod tests {
             "largest single allocation was {largest} bytes"
         );
         assert!(
-            largest >= SCAN_CHUNK,
+            largest >= PROBE_CANARY,
             "the recording allocator is not attached ({largest})"
         );
     }
@@ -1667,6 +1752,7 @@ mod tests {
         let archive = TempArchive::new(&bytes, "huge");
         let mut src = Cursor::new(bytes);
         let ((out, written), largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
             let out = salvage_cpio(&mut src, &SalvagePolicy::default()).unwrap();
             let written = write_payload(
                 &archive.0,
@@ -1682,7 +1768,7 @@ mod tests {
             "largest single allocation was {largest} bytes"
         );
         assert!(
-            largest >= SCAN_CHUNK,
+            largest >= PROBE_CANARY,
             "the recording allocator is not attached ({largest})"
         );
         assert_eq!(out.entries.len(), 1);
@@ -1701,6 +1787,7 @@ mod tests {
         let archive = TempArchive::new(&bytes, "whole");
         let mut src = Cursor::new(bytes);
         let ((status, completed), largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
             let out = salvage_cpio(&mut src, &SalvagePolicy::default()).unwrap();
             let completed = write_payload(
                 &archive.0,
@@ -1716,11 +1803,94 @@ mod tests {
             "largest single allocation was {largest} bytes"
         );
         assert!(
-            largest >= SCAN_CHUNK,
+            largest >= PROBE_CANARY,
             "the recording allocator is not attached ({largest})"
         );
         assert_eq!(status, SalvageStatus::Unattested);
         assert!(completed);
+    }
+
+    // -------------------------------------------------------------------
+    // 0.10.3 §1: the scan is linear (zero-run memo, `ForwardSearch`)
+    // -------------------------------------------------------------------
+
+    /// One newc header + NUL-terminated name, padded to 4, declaring `size`
+    /// payload bytes but carrying none (the caller lays out what follows).
+    fn newc_header_only(name: &str, size: u32) -> Vec<u8> {
+        let namesize = name.len() as u32 + 1;
+        let mut h = format!(
+            "070701{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}{:08X}",
+            1, 0o100644, 0, 0, 1, 0, size, 0, 0, 0, 0, namesize, 0
+        )
+        .into_bytes();
+        h.extend_from_slice(name.as_bytes());
+        h.push(0);
+        while h.len() % 4 != 0 {
+            h.push(0);
+        }
+        h
+    }
+
+    /// 0.10.3 §1: many headers whose declared sizes land in one long zero run
+    /// that ends in a non-zero byte. Before the memo every one rescanned the
+    /// run: quadratic.
+    fn dense_headers_into_a_zero_run() -> Vec<u8> {
+        let headers = 2_000usize;
+        let run = 900 * 1024usize;
+        let mut out = Vec::new();
+        let mut layout = Vec::new();
+        for i in 0..headers {
+            layout.push(newc_header_only(&format!("f{i}"), 0));
+        }
+        let header_bytes: usize = layout.iter().map(Vec::len).sum();
+        // Each header's size lands it (4-aligned) somewhere inside the run.
+        let mut at = 0usize;
+        for (i, h) in layout.iter().enumerate() {
+            let payload_start = at + h.len();
+            let landing = header_bytes + 4 * (i + 1);
+            let size = (landing - payload_start) as u32;
+            out.extend_from_slice(&newc_header_only(&format!("f{i}"), size));
+            at = out.len();
+        }
+        out.resize(header_bytes + run, 0);
+        out.push(1); // the run does not reach EOF
+        out
+    }
+
+    #[test]
+    fn dense_headers_into_a_zero_run_scan_linearly() {
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        let data = dense_headers_into_a_zero_run();
+        let len = data.len() as u64;
+        let mut src = CountingSource::new(Cursor::new(data));
+        let outcome = salvage_cpio(&mut src, &SalvagePolicy::default()).unwrap();
+        assert!(!outcome.entries.is_empty());
+        check_scan_is_linear(src.bytes_read(), len).unwrap();
+    }
+
+    #[test]
+    fn the_memo_answers_like_a_fresh_scan() {
+        // Two shapes, each salvaged twice: the results must equal the pre-memo
+        // answers pinned here. (a) a run that reaches EOF (writer padding: the
+        // jump IS taken); (b) a run ending in a non-zero byte (the jump is NOT
+        // taken). Landing points both inside and before an already-known run.
+        let mut eof_padded = newc_header_only("a", 4);
+        eof_padded.extend_from_slice(b"abcd");
+        eof_padded.extend_from_slice(&newc_header_only("TRAILER!!!", 0));
+        eof_padded.resize(eof_padded.len() + 4096, 0);
+        let a = salvage_cpio(&mut Cursor::new(eof_padded), &SalvagePolicy::default()).unwrap();
+        let names: Vec<_> = a.entries.iter().map(|e| e.meta.name.as_str()).collect();
+        assert_eq!(names, ["a"]);
+
+        let data = dense_headers_into_a_zero_run();
+        let b = salvage_cpio(&mut Cursor::new(data.clone()), &SalvagePolicy::default()).unwrap();
+        assert_eq!(b.entries.len(), 2_000);
+        assert!(
+            b.entries
+                .iter()
+                .enumerate()
+                .all(|(i, e)| e.meta.name == format!("f{i}"))
+        );
     }
 
     // -------------------------------------------------------------------
