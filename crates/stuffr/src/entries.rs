@@ -1913,7 +1913,13 @@ pub enum SalvageDisposition {
         /// Where the bytes actually landed — the suffixed name, plus
         /// `.partial` on top of it when [`Self::partial`] is `Some`.
         path: PathBuf,
-        /// The EARLIER scan position that wrote this entry's own name first.
+        /// The EARLIER scan position already holding the name this entry
+        /// would have landed on: its own name by exact spelling, a spelling
+        /// a case- or normalisation-insensitive volume folds onto it (`README`
+        /// for `readme`), or — for a partial record — its `.partial` form
+        /// (`x.partial`, which an earlier partial `x` or an entry literally
+        /// named `x.partial` may hold). Always the claimant of that ORIGINAL
+        /// name, never of a suffixed candidate stepped past on the way.
         taken_by: usize,
         /// `Some` when this record is ALSO `Partial`, carrying the same
         /// cause [`Self::WrittenPartial`] would. The two facts are
