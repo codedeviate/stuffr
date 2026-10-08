@@ -661,3 +661,46 @@ fn a_case_pair_is_two_plain_files_on_a_case_sensitive_volume() {
     assert_eq!(std::fs::read(dest.join("readme")).unwrap(), b"lower");
     assert_eq!(entries::salvage_exit_code(&outcome), 0);
 }
+
+/// 0.10.2 §4: salvage's reason is the error alone, never a path — the
+/// record's own name is printed beside it, and a destination path is
+/// neither the archive's nor short. Both variants of "a file above it is
+/// not a directory": one the ARCHIVE made (`a` then `a/b`), one the
+/// DESTINATION held (a stale file `held` under `held/c`).
+#[test]
+fn the_not_a_directory_reason_names_no_path() {
+    let scratch = Scratch::new("nad-reason");
+    let archive = conflict_tar(
+        &scratch.0.join("c.tar"),
+        &[
+            ("a", EntryKind::File, b"alpha"),
+            ("a/b", EntryKind::File, b"beneath an archive file"),
+            ("held/c", EntryKind::File, b"beneath a destination file"),
+        ],
+    );
+    let dest = scratch.0.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("held"), b"stale").unwrap();
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar"))).unwrap();
+
+    let reasons: Vec<&str> = outcome.entries[1..]
+        .iter()
+        .map(|r| match &r.disposition {
+            SalvageDisposition::SkippedUnwritable { reason } => reason.as_str(),
+            other => panic!("{}: {other:?}", r.name),
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            "`a`, earlier in this archive, is not a directory, so `a/b` cannot be placed \
+             beneath it",
+            "a file above it in its path is not a directory",
+        ]
+    );
+    let dest_text = dest.to_string_lossy();
+    for reason in &reasons {
+        assert!(!reason.contains(dest_text.as_ref()), "{reason}");
+    }
+    assert_eq!(std::fs::read(dest.join("held")).unwrap(), b"stale");
+}

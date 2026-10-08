@@ -3194,7 +3194,7 @@ fn place_salvaged(
         Ok(Placed::Proceed) => Ok(()),
         Ok(Placed::Skip(w)) => Err(unwritable_skip(w)),
         Ok(Placed::Held(held)) => Err(SalvageDisposition::SkippedUnwritable {
-            reason: held.salvage_reason(name),
+            reason: held.salvage_reason().to_string(),
         }),
         Err(e) => Err(unwritable(e)),
     }
@@ -4981,6 +4981,11 @@ const PATH_TOO_LONG_REASON: &str = "its path is too long for this filesystem";
 /// byte sequence (`EILSEQ`) is skipped, by `unpack` and by salvage alike.
 const NAME_INVALID_REASON: &str = "its name is not valid on this filesystem";
 
+/// Salvage's reason for a record beneath something the destination already
+/// held that is not a directory. It names no path (0.10.2): see
+/// [`Held::salvage_reason`].
+const SALVAGE_REASON_NOT_A_DIRECTORY_ABOVE: &str = "a file above it in its path is not a directory";
+
 /// Salvage's reason for a file record whose path is a directory the
 /// destination already held. No `--force` clause: salvage has no such flag.
 const SALVAGE_REASON_DIRECTORY_IN_THE_WAY: &str =
@@ -5520,12 +5525,15 @@ impl Held {
     }
 
     /// Salvage's wording: the reason of a `SkippedUnwritable`, printed
-    /// beside the record's own name, and naming no flag salvage lacks.
-    fn salvage_reason(&self, name: &str) -> String {
+    /// beside the record's own name, and naming no flag salvage lacks. The
+    /// error alone, never a path — [`unwritable`]'s convention: the name is
+    /// already beside it, and a destination path is long and not the
+    /// archive's.
+    fn salvage_reason(&self) -> &'static str {
         match self {
-            Held::NotADirectoryAbove(_) => self.usage_message(name),
-            Held::DirectoryInTheWay(_) => SALVAGE_REASON_DIRECTORY_IN_THE_WAY.to_string(),
-            Held::Exists(_) => SALVAGE_REASON_NOT_A_DIRECTORY_HERE.to_string(),
+            Held::NotADirectoryAbove(_) => SALVAGE_REASON_NOT_A_DIRECTORY_ABOVE,
+            Held::DirectoryInTheWay(_) => SALVAGE_REASON_DIRECTORY_IN_THE_WAY,
+            Held::Exists(_) => SALVAGE_REASON_NOT_A_DIRECTORY_HERE,
         }
     }
 }
