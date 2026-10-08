@@ -3029,10 +3029,23 @@ fn place_salvaged_file(
     // each round lengthens the name. `disambiguated_path` stays the one
     // owner of the spelling; `taken_by` keeps naming the claimant of the
     // ORIGINAL name, which is the collision the user needs to read.
+    //
+    // A candidate is ALSO stepped past when anything this run made is there
+    // (0.10.2 final review, M2): `Claimed` holds only the FILES salvage
+    // wrote, so a run-made DIRECTORY the archive named `x.salvaged-2/` was
+    // not "held", the second `x` chose that name, and `place` skipped the
+    // record with a reason naming the wrong path. No run-made thing at a
+    // disambiguated candidate is one this record may replace — every file
+    // salvage wrote is already claimed, and a directory is never replaced —
+    // so `made.made` (exact spelling or identity) is the whole test. Only
+    // the loop asks it: `taken_by` still names the claimant of the ORIGINAL
+    // name, and a run-made directory AT the original name stays `place`'s
+    // own archive-made skip, as before.
+    let run_made = |base: &Path| made.made(base) || (is_partial && made.made(&as_written(base)));
     let mut base_target = target.clone();
     if taken_by.is_some() {
         base_target = disambiguated_path(&base_target, entry.scan_position);
-        while held(&base_target).is_some() {
+        while held(&base_target).is_some() || run_made(&base_target) {
             base_target = disambiguated_path(&base_target, entry.scan_position);
         }
     }

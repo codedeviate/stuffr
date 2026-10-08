@@ -385,6 +385,48 @@ fn a_file_at_a_directory_records_path_names_no_force() {
     assert_eq!(std::fs::read(dest.join("ok.txt")).unwrap(), b"fine");
 }
 
+/// 0.10.2 final review, M2: the archive's own DIRECTORY `x.salvaged-2/`,
+/// then two `x` records. The second `x` (scan position 2) is disambiguated
+/// to `x.salvaged-2`, where the run just made a directory. `Claimed` holds
+/// only files, so the candidate read as free and the record was skipped
+/// with a reason blaming a directory `x`. Any run-made thing at a candidate
+/// is now held: the loop steps past it, both `x` records are recovered,
+/// and the directory is left alone.
+#[test]
+fn a_run_made_directory_at_the_disambiguated_name_is_stepped_past() {
+    let scratch = Scratch::new("dir-at-candidate");
+    let archive = conflict_tar(
+        &scratch.0.join("c.tar"),
+        &[
+            ("x.salvaged-2", EntryKind::Dir, b""),
+            ("x", EntryKind::File, b"one"),
+            ("x", EntryKind::File, b"two"),
+        ],
+    );
+    let dest = scratch.0.join("out");
+    let outcome = entries::salvage(&archive, &opts(Some(dest.clone()), Some("tar")))
+        .expect("never a run-level error");
+    assert_eq!(outcome.entries.len(), 3, "{:?}", outcome.entries);
+    let (one, two) = (&outcome.entries[1], &outcome.entries[2]);
+    assert_eq!(two.scan_position, 2, "the shape needs position 2");
+    assert_eq!(one.disposition, SalvageDisposition::Written(dest.join("x")));
+    let landed = dest.join("x.salvaged-2.salvaged-2");
+    assert_eq!(
+        two.disposition,
+        SalvageDisposition::WrittenDisambiguated {
+            path: landed.clone(),
+            taken_by: one.scan_position,
+            partial: None,
+        }
+    );
+    assert_eq!(std::fs::read(dest.join("x")).unwrap(), b"one");
+    assert_eq!(std::fs::read(&landed).unwrap(), b"two");
+    let dir = dest.join("x.salvaged-2");
+    assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "left alone");
+    assert_eq!(entries::salvage_exit_code(&outcome), 4);
+}
+
 /// Fix round 2, M1: a directory record whose final component is too long,
 /// under a parent that does not exist yet, reaches the `Dir` arm's own
 /// `create_dir_all`; it is skipped with the pinned reason, not a generic
