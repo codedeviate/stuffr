@@ -1587,6 +1587,48 @@ mod tests {
         }
     }
 
+    /// Ruling T4b-2: the same shape at fuzz scale. 8 KiB of local headers,
+    /// one every 64 bytes, each declaring an all-ASCII name that runs as
+    /// close to EOF as an ASCII `name_len` allows. With the budget's slack at
+    /// 1 MiB (166a51a) nothing here was refused and the scan read 536,640
+    /// bytes, past the 8x + 64 KiB bound; at 16 KiB it stays inside it.
+    #[test]
+    fn a_small_input_of_overlapping_names_scans_linearly() {
+        use stuffr_core::salvage::SightingKind;
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 8 * 1024;
+        let mut bytes = Vec::new();
+        while bytes.len() < LEN {
+            let mut name_len = LEN - bytes.len() - 30;
+            if name_len & 0x80 != 0 {
+                // Every byte of every name must be ASCII, this one included.
+                name_len = (name_len & !0xFF) | 0x7F;
+            }
+            let mut h = SIG_LOCAL_HEADER.to_vec();
+            for field in [20u16, 0, 0, 0, 0] {
+                h.extend_from_slice(&field.to_le_bytes());
+            }
+            for field in [0u32, 0x7F7F_7F7F, 0x7F7F_7F7F] {
+                h.extend_from_slice(&field.to_le_bytes());
+            }
+            h.extend_from_slice(&u16::try_from(name_len).unwrap().to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes());
+            h.resize(64, b'A');
+            bytes.extend_from_slice(&h);
+        }
+        bytes.truncate(LEN);
+        let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+        let out = salvage_zip(&mut src, &SalvagePolicy::default()).unwrap();
+        check_scan_is_linear(src.bytes_read(), LEN as u64).unwrap();
+        assert!(
+            out.sightings
+                .iter()
+                .any(|s| s.kind == SightingKind::VerdictBounded),
+            "{} entries, no sighting",
+            out.entries.len()
+        );
+    }
+
     /// Task 4b's other half: a legitimate archive whose every entry carries
     /// the longest name the format can hold reads each name once, and never
     /// comes near the budget — every entry intact, no sighting.
