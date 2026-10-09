@@ -873,6 +873,53 @@ pub fn check_scan_is_linear(bytes_read: u64, file_len: u64) -> std::result::Resu
     Ok(())
 }
 
+/// `Err` unless `sightings` came out of a [`crate::salvage::SightingLog`]
+/// with its default cap and stand for exactly `total` sightings (0.10.4):
+/// at most [`crate::salvage::SightingLog::DEFAULT_CAP`] stored per (format,
+/// shape, kind), each group's stored offsets strictly ascending — the
+/// smallest, so the offsets a caller lists are the ones an uncapped list
+/// would show — and the stored count plus every [`Sighting::more`] equal to
+/// `total`.
+///
+/// [`Sighting::more`]: crate::salvage::Sighting::more
+pub fn check_sightings_bounded(
+    sightings: &[crate::salvage::Sighting],
+    total: u64,
+) -> std::result::Result<(), String> {
+    use crate::salvage::{SightingKind, SightingLog};
+    let mut groups: Vec<((FormatId, &'static str, SightingKind), usize, u64)> = Vec::new();
+    for s in sightings {
+        let key = (s.format, s.shape, s.kind);
+        match groups.iter_mut().find(|(k, _, _)| *k == key) {
+            Some((_, stored, last)) => {
+                if s.offset <= *last {
+                    return Err(format!(
+                        "{} {:?} stored offset {} after {last}: not ascending",
+                        s.format, s.shape, s.offset
+                    ));
+                }
+                *stored += 1;
+                *last = s.offset;
+            }
+            None => groups.push((key, 1, s.offset)),
+        }
+    }
+    if let Some(((format, shape, _), stored, _)) = groups
+        .iter()
+        .find(|(_, stored, _)| *stored > SightingLog::DEFAULT_CAP)
+    {
+        return Err(format!(
+            "{stored} {format} {shape:?} sightings stored, past the cap of {}",
+            SightingLog::DEFAULT_CAP
+        ));
+    }
+    let counted: u64 = sightings.iter().map(|s| 1 + s.more).sum();
+    if counted != total {
+        return Err(format!("the sightings stand for {counted}, not {total}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

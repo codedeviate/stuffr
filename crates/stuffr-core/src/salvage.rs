@@ -791,6 +791,11 @@ impl SightingLog {
 
     /// An empty log keeping at most `cap` sightings per group. A `cap` of 0
     /// is raised to 1, so a group always has a sighting to carry its count.
+    ///
+    /// A `cap` below 8 (`SIGHTING_OFFSETS_SHOWN`) CHANGES the sentence
+    /// [`describe_sightings`] prints: it lists only the stored offsets, so a
+    /// group holding more than `cap` would show fewer offsets and a larger
+    /// "and N more" than an uncapped list. The count stays exact either way.
     pub fn with_cap(cap: usize) -> Self {
         Self {
             cap: cap.max(1),
@@ -836,6 +841,10 @@ impl SightingLog {
 
     /// The stored sightings, groups in first-seen order, each group's last
     /// one carrying the count of those not stored in [`Sighting::more`].
+    ///
+    /// The offsets kept are the first `cap` of each group in PUSH order, so
+    /// a scanner that wants the smallest listed must push each group in
+    /// ascending offset order.
     pub fn into_sightings(self) -> Vec<Sighting> {
         let mut out = Vec::new();
         for mut g in self.groups {
@@ -2988,6 +2997,55 @@ mod tests {
             describe_sightings(&log.into_sightings()),
             describe_sightings(&all)
         );
+    }
+
+    /// 0.10.4: the printed sentence is identical capped and uncapped for
+    /// every cap from [`SIGHTING_OFFSETS_SHOWN`] up, over 1000 deterministic
+    /// inputs that interleave formats, shapes and kinds.
+    #[test]
+    fn capping_keeps_the_sentence_identical_across_random_inputs() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let formats = [FormatId::new("zip"), FormatId::new("tar")];
+        let shapes = ["x", "y", "z"];
+        let kinds = [
+            SightingKind::Ungateable,
+            SightingKind::WorkBounded,
+            SightingKind::VerdictBounded,
+        ];
+        for _ in 0..1000 {
+            let len = (next() % 300) as usize;
+            let all: Vec<Sighting> = (0..len)
+                .map(|_| {
+                    let r = next();
+                    let s = Sighting::new(
+                        formats[(r % 2) as usize],
+                        (r >> 8) % 100_000,
+                        shapes[((r >> 2) % 3) as usize],
+                    );
+                    Sighting {
+                        kind: kinds[((r >> 4) % 3) as usize],
+                        ..s
+                    }
+                })
+                .collect();
+            for cap in [8, 9, 64] {
+                let mut log = SightingLog::with_cap(cap);
+                for s in all.clone() {
+                    log.push(s);
+                }
+                assert_eq!(
+                    describe_sightings(&log.into_sightings()),
+                    describe_sightings(&all),
+                    "cap {cap}, {len} sightings"
+                );
+            }
+        }
     }
 
     /// Task 2-N: the note a caller prints for its sightings. None for none —
