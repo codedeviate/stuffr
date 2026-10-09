@@ -1591,7 +1591,8 @@ mod tests {
     /// one every 64 bytes, each declaring an all-ASCII name that runs as
     /// close to EOF as an ASCII `name_len` allows. With the budget's slack at
     /// 1 MiB (166a51a) nothing here was refused and the scan read 536,640
-    /// bytes, past the 8x + 64 KiB bound; at 16 KiB it stays inside it.
+    /// bytes, past the 8x + 64 KiB bound; at 32 KiB it reads 65,536, half
+    /// the bound's 131,072.
     #[test]
     fn a_small_input_of_overlapping_names_scans_linearly() {
         use stuffr_core::salvage::SightingKind;

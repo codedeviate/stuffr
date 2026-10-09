@@ -245,7 +245,7 @@
 //! header they reach: a real archive has one chain per header, so a header
 //! more converge on is reported as a [`Sighting`] and its further chains
 //! cost their header walk alone (see `ChainBudget`). Across the whole scan,
-//! extension payloads read are bounded too, at `2 × file_len + 16 KiB`
+//! extension payloads read are bounded too, at `2 × file_len + 32 KiB`
 //! (`extension_read_budget`): a real archive reads each chain once, and
 //! forged chains spread over many headers are refused past it, their
 //! headers reported the same way.
@@ -761,18 +761,19 @@ pub const MAX_CHAINS_PER_HEADER: usize = 4;
 const EXTENSION_READS_PER_INPUT_BYTE: u64 = 2;
 
 /// Extension-payload bytes the whole scan may read on top of
-/// [`EXTENSION_READS_PER_INPUT_BYTE`]: rounding only — 16 KiB since Ruling
-/// T4b-2, down from 1 MiB, which let a 33,792-byte input of spread forged
-/// chains read 451,584 bytes, past `check_scan_is_linear`'s
-/// `8 × file_len + 64 KiB`. A real archive's extension payloads lie inside
-/// the file, so the per-byte term covers them on its own; see
-/// [`extension_read_budget`].
-const EXTENSION_READ_SLACK: u64 = 16 * 1024;
+/// [`EXTENSION_READS_PER_INPUT_BYTE`]: rounding only — 32 KiB since Rulings
+/// T4b-2 and T4b-5, down from 1 MiB, which let a 33,792-byte input of
+/// spread forged chains read 451,584 bytes, past `check_scan_is_linear`'s
+/// `8 × file_len + 64 KiB` (124,928 now). A real archive's extension
+/// payloads lie inside the file, so the per-byte term covers them on its
+/// own; see [`extension_read_budget`]. The same figure as
+/// `stuffr_core::salvage::ScanBudget::SLACK`.
+const EXTENSION_READ_SLACK: u64 = 32 * 1024;
 
 /// The extension-payload bytes one scan of a `file_len`-byte input may read
-/// in all (pass 2 of `gate_chain_at`): `2 × file_len + 16 KiB` (0.10.3,
+/// in all (pass 2 of `gate_chain_at`): `2 × file_len + 32 KiB` (0.10.3,
 /// Ruling T3-1, lowered from 4× in fix round 1; the slack lowered from
-/// 1 MiB by Ruling T4b-2).
+/// 1 MiB by Rulings T4b-2 and T4b-5).
 ///
 /// **What a legitimate archive reads.** A chain whose real header yields a
 /// candidate is read ONCE: a whole candidate is jumped with its payload, and
@@ -2503,7 +2504,7 @@ mod tests {
     /// The one work-bounded sighting a converging fixture must carry: at its
     /// terminal, under either budget's shape. Which budget trips first
     /// depends on the chains' spans — at ~1 MiB each, four of them exceed
-    /// the scan-wide `2 × file_len + 16 KiB` before the per-header count
+    /// the scan-wide `2 × file_len + 32 KiB` before the per-header count
     /// reaches four; [`a_real_chain_behind_four_forged_ones_is_named_not_lost`]
     /// and the CLI test pin [`CONVERGED_CHAINS_SHAPE`] itself.
     fn assert_one_work_bounded_sighting_at(outcome: &SalvageOutcome, terminal_at: u64) {
@@ -2685,7 +2686,8 @@ mod tests {
     /// Ruling T4b-2: forged chains spread over sixteen terminals, three per
     /// terminal, at fuzz scale — 33,792 bytes. With the extension budget's
     /// slack at 1 MiB (166a51a) none was refused and the scan read 451,584
-    /// bytes, past the 8x + 64 KiB bound; at 16 KiB it stays inside it.
+    /// bytes, past the 8x + 64 KiB bound; at 32 KiB it reads 124,928, inside
+    /// the bound's 335,872.
     ///
     /// Not 8 KiB, as the ruling's other test is: tar's headers sit on
     /// 512-byte blocks and at most four chains are read per terminal, so an

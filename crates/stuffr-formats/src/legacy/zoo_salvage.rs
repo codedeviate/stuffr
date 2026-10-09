@@ -233,12 +233,12 @@ pub struct ZooSalvage {
     /// record's name and `dir_crc` need its whole variable part, up to
     /// 64 KiB, and a refused record resumes the scan one byte on: type-2
     /// records packed every 64 bytes, each declaring 65,535 bytes, read 962x
-    /// the input. Each one is charged TWICE, before it is read: once for
-    /// this read, once for [`verify_candidate`]'s re-read of an accepted
-    /// record (accepted records whose payload is empty advance the scan one
-    /// byte too, and doubled the reads to 1,923x). A real archive still
-    /// spends at most `2 × file_len`, inside the budget. Built on the first
-    /// call, from the source's length; one per scan.
+    /// the input, and accepted ones with an empty payload, which advance the
+    /// scan one byte too, 1,923x — [`verify_candidate`] read each part
+    /// again. Each part is charged once, before it is read, and verify no
+    /// longer reads it (Ruling T4b-5): a real archive spends at most
+    /// `file_len`. Built on the first call, from the source's length; one
+    /// per scan.
     budget: Option<ScanBudget>,
     /// Every record refused because its variable part would have overspent
     /// [`Self::budget`], in scan order — reported as
@@ -515,12 +515,12 @@ fn gate_record_at(
     // BEFORE `read_dir_entry` reads it (0.10.3): that read fails on the
     // short read with the same verdict, but only after delivering every
     // byte up to EOF, per coincidental tag. One that fits is paid for
-    // first — twice, see `ZooSalvage::budget`.
+    // first — see `ZooSalvage::budget`.
     match variable_part(src, offset, file_len).map_err(|_| false)? {
         VariablePart::None => {}
         VariablePart::Overruns => return Err(false),
         VariablePart::Len(len) => {
-            if !budget.try_spend(len.saturating_mul(2)) {
+            if !budget.try_spend(len) {
                 return Err(true);
             }
         }
@@ -677,27 +677,32 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         return Ok(SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength));
     };
 
-    let Ok(header) = read_dir_entry(src, candidate.offset) else {
-        // The record parsed at discovery, so this is a genuine source
-        // failure rather than a shape change — one entry's problem.
-        return Ok(SalvageStatus::Partial);
+    // **The record is not read again (0.10.3, Ruling T4b-5).** Everything
+    // this needs from it, discovery already put on the candidate: the
+    // method (`EntryMeta::codec`, from the method byte), `org_size`
+    // (`EntryMeta::size`) and the name (`EntryMeta::name`), each exactly as
+    // `read_dir_entry` decoded it. Re-reading a type-2 record here re-read
+    // its variable part, up to 64 KiB, for every accepted candidate —
+    // outside the scan's budget, or charged to it twice.
+    let Some(method) = method_for_codec(candidate.meta.codec) else {
+        // `codec_for_zoo_method` answers `None` exactly when
+        // `Method::from_byte` refuses the byte. Unreachable through the gate
+        // (criterion 3 already refused a byte past `MAX_PACK`), but the
+        // honest answer if a future method byte is recognised without being
+        // decodable: the format DOES carry a checksum here, this build simply
+        // never attempted to check it. `Unverified`, never `Complete`.
+        return Ok(SalvageStatus::Unverified(
+            UnverifiedCause::UndecodableMethod,
+        ));
     };
-
-    let method = match Method::from_byte(header.method_byte, &header.name) {
-        Ok(method) => method,
-        // Unreachable through the gate (criterion 3 already refused a byte
-        // past `MAX_PACK`), but the honest answer if a future method byte is
-        // recognised without being decodable: the format DOES carry a
-        // checksum here, this build simply never attempted to check it.
-        // `Unverified`, never `Complete`.
-        Err(_) => {
-            return Ok(SalvageStatus::Unverified(
-                UnverifiedCause::UndecodableMethod,
-            ));
-        }
+    let Some(org_size_field) = candidate.meta.size.and_then(|n| u32::try_from(n).ok()) else {
+        // Unreachable: `read_candidate_at` reports `org_size`, a `u32`, on
+        // every candidate. The nearest cause, as for a missing verifier.
+        return Ok(SalvageStatus::Unverified(UnverifiedCause::NoDeclaredLength));
     };
+    let name = &candidate.meta.name;
 
-    let org_size = u64::from(header.org_size);
+    let org_size = u64::from(org_size_field);
     // **Only the arm that allocates from this field is bounded by it.** See
     // this function's doc for the whole rule, and fix round 1 (HIGH) for
     // what applying it to all three methods cost: a `Stored` entry whose
@@ -726,7 +731,7 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
         return Ok(SalvageStatus::Partial);
     }
 
-    let decoded = match decode(method, &payload, &header.name, header.org_size) {
+    let decoded = match decode(method, &payload, name, org_size_field) {
         Ok(decoded) => decoded,
         // A decode failure (malformed compressed data, or `zoo.rs`'s own
         // LZW output ceiling) is exactly as unproven as a checksum that
@@ -921,8 +926,8 @@ mod tests {
     /// one every 64 bytes, 1 MiB of them — the part read whole per record,
     /// and the scan resumed one byte past each. Two siblings: refused (an
     /// unprintable name, a `dir_crc` that disagrees) and accepted (a
-    /// printable name, an empty payload — so the scan advances one byte and
-    /// `verify_candidate` reads the part again). Before the scan-wide budget
+    /// printable name, an empty payload — so the scan advances one byte, and
+    /// `verify_candidate` used to read the part again). Before the budget
     /// these read 962x and 1,923x their input. The budget's refusals are
     /// reported as verdict-bounded sightings.
     #[test]
@@ -963,8 +968,8 @@ mod tests {
 
     /// Task 4b's other half: a legitimate archive whose every record carries
     /// the longest variable part the format can declare spends each part
-    /// twice at most — the scan and the verify — and never comes near the
-    /// budget: every entry intact, no sighting.
+    /// once, in the scan, and never comes near the budget: every entry
+    /// intact, no sighting.
     #[test]
     fn an_archive_of_maximum_variable_parts_spends_no_budget_sighting() {
         const NAMES: [&str; 4] = ["A.TXT", "B.TXT", "C.TXT", "D.TXT"];

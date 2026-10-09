@@ -1181,22 +1181,23 @@ impl ForwardSearch {
 /// extension chain, the bytes a header CRC covers), counted whether they come
 /// from the source or from a search window. A legitimate archive consumes
 /// each verdict's bytes once, at most `file_len` in total, so the limit of
-/// `2 × file_len + 16 KiB` never trips on real input; forged candidates
+/// `2 × file_len + 32 KiB` never trips on real input; forged candidates
 /// that would spend past it are refused unexamined and reported as a
 /// work-bounded sighting, and the scan goes on.
 ///
-/// **Why the slack is only 16 KiB (Ruling T4b-2).** A legitimate scan's
-/// verdict bytes all lie inside the file, so they total at most `file_len`
-/// — and where a scanner charges a re-read too (ZOO pays twice for the
-/// variable part `verify` reads again; cpio pays for a name in the scan and
-/// again when the header before it corroborates its size), at most
-/// `2 × file_len`. The per-byte term covers real input on its own, and the
-/// slack only rounds. It was 1 MiB, which let a fuzz-scale input of a few
-/// KiB spend about 1 MiB: an 8 KiB file of overlapping zip names read
-/// 536,640 bytes, past `stuffr_core::testing::check_scan_is_linear`'s
-/// `8 × file_len + 64 KiB`. With 16 KiB, the budget's own term sits well
-/// inside that bound at every size and leaves the rest of it to the
-/// search and the fixed headers; the same 8 KiB file reads 49,124 bytes.
+/// **Why the slack is only 32 KiB (Rulings T4b-2 and T4b-5).** A
+/// legitimate scan's verdict bytes all lie inside the file, so they total
+/// at most `file_len` — and where a scanner pays for a second read too
+/// (cpio pays for a name in the scan and again when the header before it
+/// corroborates its size), at most `2 × file_len`. The per-byte term covers
+/// real input on its own, and the slack only rounds. It was 1 MiB, which
+/// let a fuzz-scale input of a few KiB spend about 1 MiB: an 8 KiB file of
+/// overlapping zip names read 536,640 bytes, past
+/// `stuffr_core::testing::check_scan_is_linear`'s `8 × file_len + 64 KiB`.
+/// At 32 KiB the same file reads 65,536 bytes, half that bound. 16 KiB
+/// was tried first and changed the outcome of 27 fuzz-corpus ZOO inputs,
+/// whose overlapping type-2 records each read most of the file; at 32 KiB,
+/// with ZOO charging each variable part once, all 27 keep their outcome.
 ///
 /// **Why a scan needs one (0.10.3).** A scanner resumes one byte past every
 /// candidate it refuses, and past every candidate whose payload runs off the
@@ -1223,10 +1224,10 @@ impl ScanBudget {
     /// Verdict bytes the scan may spend on top of [`Self::PER_INPUT_BYTE`]:
     /// rounding only, and small enough that it never dominates a small
     /// input's `check_scan_is_linear` bound — see the type's doc.
-    pub const SLACK: u64 = 16 * 1024;
+    pub const SLACK: u64 = 32 * 1024;
 
     /// The budget for one scan of a `file_len`-byte input:
-    /// `2 × file_len + 16 KiB`.
+    /// `2 × file_len + 32 KiB`.
     pub fn for_input(file_len: u64) -> Self {
         Self {
             limit: file_len
@@ -2920,12 +2921,12 @@ mod tests {
         );
     }
 
-    /// Task 4b: the budget is exactly `2 × file_len + 16 KiB`, a charge
+    /// Task 4b: the budget is exactly `2 × file_len + 32 KiB`, a charge
     /// that lands on the limit fits, and one past it is refused WHOLE —
     /// nothing is charged, so a later, smaller charge can still fit.
     #[test]
     fn a_scan_budget_spends_to_its_exact_limit_and_refuses_past_it() {
-        let limit = 2 * 1000 + 16 * 1024;
+        let limit = 2 * 1000 + 32 * 1024;
         let mut budget = ScanBudget::for_input(1000);
         assert!(budget.try_spend(limit - 10));
         assert_eq!(budget.spent(), limit - 10);
