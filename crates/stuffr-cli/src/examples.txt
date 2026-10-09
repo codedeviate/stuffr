@@ -1440,11 +1440,20 @@ EXIT CODES
      shadow, --partial=skip, a kind this build has no shape for)
   5  archive or stream is corrupt, or a `salvage` scan found nothing
      recoverable in the archive at all
-  6  resource limit exceeded (--max-ratio or --memory-limit tripped, or
-     archive nesting exceeded the depth stuffr will peel through). NOT a
-     `salvage` entry over --max-entry: that is reported per entry as
-     `Unverified (over the ceiling)` and lands in 3, because one
-     oversized declaration must never cost a caller the rest of the archive
+  6  resource limit exceeded: --max-ratio or --memory-limit tripped, archive
+     nesting deeper than the depth stuffr will peel through, or a container's
+     fixed metadata ceiling (not configurable): a tar pax header or GNU long
+     name/link over 16 MiB, an ar GNU name table over 16 MiB or BSD name over
+     64 KiB, a cpio name or symlink target over 64 KiB or more than 65536
+     held hard-link names, a zip central-directory name or symlink target
+     over 64 KiB, an ARC/ARJ/ZOO entry over 256 MiB. NOT a `salvage` entry
+     over --max-entry: that is reported per entry as `Unverified (over the
+     ceiling)` and lands in 3, because one oversized declaration must never
+     cost a caller the rest of the archive. Nor any of `salvage`'s own scan
+     work caps (tar's per-header and scan-wide extension-chain budgets; the
+     scan-wide verdict budget of zip, zoo, lha, arj and cpio): what a cap
+     skips is reported as a sighting, and the run exits 4 when anything was
+     recovered alongside it, 5 when nothing was
   7  unsafe path refused. In a `salvage` run it is the entry that is
      refused, never the run: the rest of the archive is still recovered
      and the summary still prints, and 7 outranks 3 and 4 so a caller

@@ -1,3 +1,6 @@
+// Unix only: it spawns `unzip` from PATH and resolves binaries without
+// `.exe`, so it cannot run on Windows as written.
+#![cfg(unix)]
 //! The ZIP-on-a-pipe contract test — `0.2.0`'s namesake claim, pinned as its
 //! own file because it is the milestone's headline demonstration.
 //!
