@@ -302,7 +302,7 @@ use std::path::Path;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, Sighting, UnverifiedCause, salvage_all, stream_bounded_copy,
+    SalvagedEntry, Sighting, SightingLog, UnverifiedCause, salvage_all, stream_bounded_copy,
 };
 use stuffr_core::{EntryMeta, Error, FormatId, Result, SeekRead};
 
@@ -615,26 +615,39 @@ const POSSIBLE_SHIFTED_COPY_SHAPE: &str = "header(s) that read as a copy of anot
 /// candidate: a candidate would be advanced past by its declared length
 /// (`salvage.rs`'s `collect_candidates`), and that is how a phantom used to
 /// jump the scan past a real header.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+///
+/// **Bounded since 0.10.4.** Every group is a [`SightingLog`] or ends in one:
+/// each sighting is counted, and at most [`SightingLog::DEFAULT_CAP`] per
+/// shape are stored, so a hostile input's sightings cost bounded memory
+/// while the counts — the exit-3 refusal's and the printed note's — stay
+/// exact. A log keeps the FIRST it is given, and the note lists the first
+/// eight, so each group is pushed in ascending offset order: the scan
+/// position only grows, which orders `seen` and `copies`; the chain
+/// terminals are refused out of order and are held until the scan has
+/// passed them ([`TerminalLog`]).
+#[derive(Debug, Default)]
 struct UngateableSightings {
     /// Every ungateable header, in scan order.
-    seen: Vec<(u64, Ungateable)>,
+    seen: SightingLog,
+    /// The offset of the last header pushed to `seen` — the one a header
+    /// 1..=7 bytes later is a copy of.
+    last_seen: Option<u64>,
     /// Every block with a header's structure (checksum, size, name) that
     /// was refused ONLY because [`looks_like_a_shifted_twin`] matched it.
     /// Most are real copies and are dropped; see [`Self::into_sightings`]
     /// for the ones that are not.
-    copies: Vec<u64>,
+    copies: CopyBuckets,
     /// Every terminal header at which a chain was refused because
     /// [`MAX_CHAINS_PER_HEADER`] chains had already been read for it — see
     /// [`ChainBudget`]. Reported as one sighting each, and deliberately NOT
     /// part of [`Self::any`]: a converging-chain file is hostile input, not
     /// a header shape this build has no gate for.
-    converged: BTreeSet<u64>,
+    converged: TerminalLog,
     /// Every terminal header at which a chain was refused because the
     /// scan-wide [`extension_read_budget`] was spent — see [`ChainBudget`].
     /// Reported like `converged`, and for the same reason not in
     /// [`Self::any`].
-    starved: BTreeSet<u64>,
+    starved: TerminalLog,
 }
 
 impl UngateableSightings {
@@ -642,9 +655,25 @@ impl UngateableSightings {
         !self.seen.is_empty()
     }
 
-    /// How many of `kind` were seen.
-    fn count(&self, kind: Ungateable) -> usize {
-        self.seen.iter().filter(|(_, k)| *k == kind).count()
+    /// Records an ungateable header — or, 1..=7 bytes after the last one,
+    /// that one's copy (see `TarSalvage::next_candidate`).
+    fn ungateable(&mut self, offset: u64, kind: Ungateable) {
+        let late = self.last_seen.and_then(|at| offset.checked_sub(at));
+        if late.is_some_and(|k| (1..=7).contains(&k)) {
+            self.copies.push(offset);
+        } else {
+            self.seen.push(Sighting::new(TAR, offset, kind.shape()));
+            self.last_seen = Some(offset);
+        }
+    }
+
+    /// How many of `kind` were seen — exact, stored or not.
+    fn count(&self, kind: Ungateable) -> u64 {
+        self.seen.count(
+            TAR,
+            kind.shape(),
+            stuffr_core::salvage::SightingKind::Ungateable,
+        )
     }
 
     /// The sentence a run reports when it recovered nothing and saw one of
@@ -696,30 +725,135 @@ impl UngateableSightings {
         for entry in entries {
             grid[(entry.offset % BLOCK_U64) as usize] = true;
         }
-        let on_grid = |offset: u64| grid[(offset % BLOCK_U64) as usize];
-        let mut sightings: Vec<Sighting> = self
-            .seen
-            .into_iter()
-            .map(|(offset, kind)| Sighting::new(TAR, offset, kind.shape()))
-            .chain(
-                self.copies
-                    .into_iter()
-                    .filter(|&offset| on_grid(offset))
-                    .map(|offset| Sighting::new(TAR, offset, POSSIBLE_SHIFTED_COPY_SHAPE)),
-            )
-            .chain(
-                self.converged
-                    .into_iter()
-                    .map(|at| Sighting::work_bounded(TAR, at, CONVERGED_CHAINS_SHAPE)),
-            )
-            .chain(
-                self.starved
-                    .into_iter()
-                    .map(|at| Sighting::work_bounded(TAR, at, EXTENSION_BUDGET_SHAPE)),
-            )
-            .collect();
+        let mut sightings = self.seen.into_sightings();
+        sightings.extend(self.copies.on_grid(&grid));
+        sightings.extend(self.converged.into_sightings(CONVERGED_CHAINS_SHAPE));
+        sightings.extend(self.starved.into_sightings(EXTENSION_BUDGET_SHAPE));
+        // Stable: each group stays in its own ascending order, and no two
+        // groups share an offset, so the note lists what it always did.
         sightings.sort_by_key(|s| s.offset);
         sightings
+    }
+}
+
+/// The refused copies, bucketed by `offset % 512` (0.10.4). Which copies
+/// are reported is decided only at the end, by the recovered entries'
+/// grid, which is a set of residues mod 512 — so each residue keeps its own
+/// first [`SightingLog::DEFAULT_CAP`] offsets and an exact count, and the
+/// grid's filter still works per residue on what is kept. At most 512 × 64
+/// offsets, however many copies a hostile input holds.
+#[derive(Debug, Default)]
+struct CopyBuckets {
+    /// One per residue, allocated on the first copy.
+    buckets: Vec<CopyBucket>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct CopyBucket {
+    /// The first offsets pushed — the smallest, as the scan only moves
+    /// forward.
+    first: Vec<u64>,
+    /// Every copy of this residue, stored or not.
+    total: u64,
+}
+
+impl CopyBuckets {
+    fn push(&mut self, offset: u64) {
+        if self.buckets.is_empty() {
+            self.buckets.resize_with(BLOCK, CopyBucket::default);
+        }
+        let bucket = &mut self.buckets[(offset % BLOCK_U64) as usize];
+        bucket.total = bucket.total.saturating_add(1);
+        if bucket.first.len() < SightingLog::DEFAULT_CAP {
+            bucket.first.push(offset);
+        }
+    }
+
+    /// The sightings of every copy on `grid`, as one capped log of all of
+    /// them would hold: the smallest offsets of the union are among each
+    /// residue's first, so those are re-pushed in ascending order, and the
+    /// residues' uncounted remainder rides on the last.
+    fn on_grid(self, grid: &[bool; BLOCK]) -> Vec<Sighting> {
+        let mut offsets = Vec::new();
+        let mut uncounted = 0u64;
+        for (residue, bucket) in self.buckets.into_iter().enumerate() {
+            if grid[residue] {
+                uncounted = uncounted.saturating_add(bucket.total - bucket.first.len() as u64);
+                offsets.extend(bucket.first);
+            }
+        }
+        offsets.sort_unstable();
+        let mut log = SightingLog::new();
+        let last = offsets.len().saturating_sub(1);
+        for (i, offset) in offsets.into_iter().enumerate() {
+            let sighting = Sighting::new(TAR, offset, POSSIBLE_SHIFTED_COPY_SHAPE);
+            log.push(if i == last {
+                sighting.with_more(uncounted)
+            } else {
+                sighting
+            });
+        }
+        log.into_sightings()
+    }
+}
+
+/// The terminal headers refused for one chain budget (0.10.4): each
+/// reported once however many chains were refused at it, counted exactly,
+/// and at most [`SightingLog::DEFAULT_CAP`] stored.
+///
+/// Terminals are refused out of offset order — a chain from an early head
+/// may reach a later terminal before a later head reaches an earlier one —
+/// and one terminal is refused again and again. So a refusal waits in
+/// `pending`, deduplicated, until the scan passes it: a chain only walks
+/// forward from a head at or past the search position, so a terminal
+/// before that position is never refused again, and is moved to `log` then,
+/// in ascending order. Every pending terminal is also a key of
+/// `TarSalvage::chains_read` (each refusal follows that map's lookup or
+/// insert at the same offset), which is pruned at the same position, so
+/// `pending` never holds more than that map already does.
+#[derive(Debug, Default)]
+struct TerminalLog {
+    /// Refused terminals at or past the search position.
+    pending: BTreeSet<u64>,
+    /// Terminals the scan has passed, in ascending order.
+    log: SightingLog,
+    /// The search position of the last [`Self::settle_below`]: no refusal
+    /// may come before it.
+    settled_below: u64,
+}
+
+impl TerminalLog {
+    fn insert(&mut self, at: u64) {
+        debug_assert!(
+            at >= self.settled_below,
+            "terminal {at} refused after the scan passed {}",
+            self.settled_below
+        );
+        self.pending.insert(at);
+    }
+
+    /// Whether any terminal was refused.
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.log.is_empty()
+    }
+
+    /// Moves every pending terminal before `search_from` — which no chain
+    /// can reach again — to the log, in ascending order.
+    fn settle_below(&mut self, search_from: u64, shape: &'static str) {
+        self.settled_below = self.settled_below.max(search_from);
+        if self.pending.first().is_some_and(|&at| at < search_from) {
+            let rest = self.pending.split_off(&search_from);
+            for at in std::mem::replace(&mut self.pending, rest) {
+                self.log.push(Sighting::work_bounded(TAR, at, shape));
+            }
+        }
+    }
+
+    fn into_sightings(mut self, shape: &'static str) -> Vec<Sighting> {
+        for at in std::mem::take(&mut self.pending) {
+            self.log.push(Sighting::work_bounded(TAR, at, shape));
+        }
+        self.log.into_sightings()
     }
 }
 
@@ -905,6 +1039,13 @@ impl SalvageScan for TarSalvage {
             {
                 self.chains_read = self.chains_read.split_off(&search_from);
             }
+            // The same argument settles the refused terminals before it.
+            self.seen
+                .converged
+                .settle_below(search_from, CONVERGED_CHAINS_SHAPE);
+            self.seen
+                .starved
+                .settle_below(search_from, EXTENSION_BUDGET_SHAPE);
             let mut budget = ChainBudget {
                 read: &mut self.chains_read,
                 converged: &mut self.seen.converged,
@@ -929,16 +1070,7 @@ impl SalvageScan for TarSalvage {
                 // magic sources), so it joins the copies, which
                 // `into_sightings` still reports only when on the grid.
                 Scanned::Ungateable(kind) => {
-                    let late = self
-                        .seen
-                        .seen
-                        .last()
-                        .and_then(|&(at, _)| offset.checked_sub(at));
-                    if late.is_some_and(|k| (1..=7).contains(&k)) {
-                        self.seen.copies.push(offset);
-                    } else {
-                        self.seen.seen.push((offset, kind));
-                    }
+                    self.seen.ungateable(offset, kind);
                     search_from = offset + 1;
                 }
                 // Kept aside, and decided once the scan is over — see
@@ -1209,12 +1341,12 @@ fn sighting_at(src: &mut dyn SeekRead, offset: u64, file_len: u64, block: &[u8; 
 /// instead. Both apply.
 struct ChainBudget<'a> {
     read: &'a mut BTreeMap<u64, usize>,
-    converged: &'a mut BTreeSet<u64>,
+    converged: &'a mut TerminalLog,
     /// Extension-payload bytes read so far in this scan.
     payload_read: &'a mut u64,
     /// [`extension_read_budget`] for this input.
     payload_limit: u64,
-    starved: &'a mut BTreeSet<u64>,
+    starved: &'a mut TerminalLog,
 }
 
 impl ChainBudget<'_> {
@@ -3324,6 +3456,148 @@ mod tests {
             out.sightings,
             vec![Sighting::new(TAR, middle_at, POSSIBLE_SHIFTED_COPY_SHAPE)]
         );
+    }
+
+    // -------------------------------------------------------------------
+    // 0.10.4: dense fixtures for the bounded sighting log — one per stored
+    // group, each about 1 MiB (the chains one 2 MiB, so both chain budgets
+    // trip many times).
+    // -------------------------------------------------------------------
+
+    /// A healthy entry, then junk-magic and unmeasured-spelling v7 headers,
+    /// alternating, each with a one-block payload: two ungateable groups.
+    fn dense_ungateable() -> Vec<u8> {
+        let mut bytes = files(&[("ok.txt", b"fine")]);
+        let mut i = 0;
+        while bytes.len() < 1 << 20 {
+            let (spell, magic) = if i % 2 == 0 {
+                (V7_GNU_SPELLING, *b"JUNKJUNK")
+            } else {
+                (UNMEASURED_SPELLING, [0; 8])
+            };
+            bytes.extend_from_slice(&v7_block(&format!("j{i}.txt"), 4, spell, magic));
+            bytes.extend_from_slice(&padded(b"junk"));
+            i += 1;
+        }
+        bytes
+    }
+
+    /// [`self_twin_archive`]'s middle entry repeated: every one is refused as
+    /// a copy and sits on the grid of the entries recovered around it.
+    fn dense_copies() -> Vec<u8> {
+        let mut bytes = v7_block("first.txt", BLOCK_U64, V7_GNU_SPELLING, [0; 8]).to_vec();
+        bytes.extend_from_slice(&[b'x'; BLOCK]);
+        while bytes.len() < 1 << 20 {
+            bytes.extend_from_slice(&self_twin_block(BLOCK_U64));
+            bytes.extend_from_slice(&[b'x'; BLOCK]);
+        }
+        bytes.extend_from_slice(&v7_block("third.txt", 6, V7_GNU_SPELLING, [0; 8]));
+        bytes.extend_from_slice(&padded(b"third\n"));
+        bytes.extend_from_slice(&[0u8; 2 * BLOCK]);
+        bytes
+    }
+
+    /// Eight forged chains per terminal: the fifth to eighth converge, and
+    /// part-way through the scan-wide budget is spent.
+    fn dense_chains() -> Vec<u8> {
+        spread_chains(8, (2 << 20) / (9 * BLOCK), false, 0)
+    }
+
+    /// Five forged `x` heads per terminal, the heads first and the
+    /// terminals after them in REVERSE order — the first heads reach the
+    /// last terminal — so the scan refuses terminals in descending offset
+    /// order, each five times. The listed offsets must still be the
+    /// smallest, once each.
+    fn reversed_chains() -> Vec<u8> {
+        const TERMINALS: usize = 200;
+        const PER: usize = 5;
+        let heads = TERMINALS * PER;
+        let mut data = Vec::new();
+        for h in 0..heads {
+            let terminal = heads + (TERMINALS - 1 - h / PER);
+            data.extend_from_slice(&ustar_block("", b'x', ((terminal - h - 1) * BLOCK) as u64));
+        }
+        for _ in 0..TERMINALS {
+            data.extend_from_slice(&ustar_block("", b'0', 0));
+        }
+        data.extend_from_slice(&[0u8; 2 * BLOCK]);
+        data
+    }
+
+    /// 0.10.4: on a dense hostile input the scan stores at most
+    /// `SightingLog::DEFAULT_CAP` sightings per group, in ascending offset
+    /// order, and they still stand for every one it saw — even when the scan refuses terminals in descending order (`reversed_chains`) — the counts
+    /// and the offsets the printed sentence lists are those of the uncapped
+    /// list before the cap (pinned from 7244937, where every one was stored).
+    #[test]
+    fn dense_sightings_are_bounded_and_the_sentence_is_unchanged() {
+        use stuffr_core::salvage::describe_sightings;
+        use stuffr_core::testing::check_sightings_bounded;
+        let legs: [(&str, Vec<u8>, u64, &[&str]); 4] = [
+            (
+                "ungateable",
+                dense_ungateable(),
+                1022,
+                &[
+                    "511 tar header(s) whose magic",
+                    "at offset(s) 2048, 4096, 6144, 8192, 10240, 12288, 14336, 16384, and 503 more",
+                    "511 tar pre-POSIX",
+                    "at offset(s) 3072, 5120, 7168, 9216, 11264, 13312, 15360, 17408, and 503 more",
+                ][..],
+            ),
+            (
+                "copies",
+                dense_copies(),
+                1023,
+                &[
+                    "1023 tar header(s) that read as a copy",
+                    "at offset(s) 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, and 1015 more",
+                ][..],
+            ),
+            (
+                "chains",
+                dense_chains(),
+                455,
+                &[
+                    "375 tar header(s) reached by more",
+                    "at offset(s) 4096, 8704, 13312, 17920, 22528, 27136, 31744, 36352, and 367 more",
+                    "80 tar header(s) whose extension chains",
+                    "at offset(s) 1732096, 1736704, 1741312, 1745920, 1750528, 1755136, 1759744, 1764352, and 72 more",
+                ][..],
+            ),
+            (
+                "reversed",
+                reversed_chains(),
+                200,
+                &[
+                    "200 tar header(s) whose extension chains",
+                    "at offset(s) 512000, 512512, 513024, 513536, 514048, 514560, 515072, 515584, and 192 more",
+                ][..],
+            ),
+        ];
+        for (label, bytes, total, listed) in legs {
+            let out = salvage_tar(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+            check_sightings_bounded(&out.sightings, total)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let note = describe_sightings(&out.sightings).unwrap();
+            for fragment in listed {
+                assert!(
+                    note.contains(fragment),
+                    "{label}: {fragment:?} missing: {note}"
+                );
+            }
+        }
+        // And the exit-3 refusal, with the healthy entry gone, still counts
+        // every ungateable header.
+        let skip = files(&[("ok.txt", b"fine")]).len();
+        let err = salvage_tar(
+            &mut Cursor::new(dense_ungateable()[skip..].to_vec()),
+            &SalvagePolicy::default(),
+        )
+        .unwrap_err();
+        for count in ["511 header(s) whose magic", "511 pre-POSIX (v7) header(s)"] {
+            assert!(err.to_string().contains(count), "{count:?} missing: {err}");
+        }
     }
 
     /// **The witness for the spelling rule.** Every v7-capable writer on this
