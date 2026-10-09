@@ -197,13 +197,14 @@ use std::path::Path;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
+    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, Verifier, salvage_all,
+    stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
 use super::zoo::{
     DirEntry, FNAME_I, FNM_SIZ, MAX_ZOO_ENTRY_LEN, Method, SIZ_DIR, SIZ_DIRL, SIZ_FLDR,
-    VARDIRLEN_I, ZOO_TAG, decode, read_dir_entry, zoo_mtime,
+    VARDIRLEN_I, ZOO, ZOO_TAG, decode, read_dir_entry, zoo_mtime,
 };
 
 /// The four bytes a directory entry opens with, little-endian [`ZOO_TAG`].
@@ -211,16 +212,38 @@ use super::zoo::{
 /// the two cannot drift.
 const TAG_BYTES: [u8; 4] = ZOO_TAG.to_le_bytes();
 
+/// The phrase for a type-2 record refused because reading its variable
+/// part would have taken the scan past its [`ScanBudget`] — see
+/// [`ZooSalvage::budget`].
+const VARIABLE_PART_BUDGET_SHAPE: &str =
+    "type-2 record(s) whose variable part it did not read once that work was spent";
+
 /// Scans a ZOO archive for directory records directly, without following the
 /// chain of absolute offsets that a damaged archive's own damage may be in.
 ///
-/// Its only state is the [`ForwardSearch`] buffer reused across calls; it
-/// carries nothing about the archive between them beyond what
+/// Its state is the [`ForwardSearch`] buffer reused across calls and the
+/// scan's [`ScanBudget`] with the offsets it refused; it carries nothing
+/// about the archive's records between calls beyond what
 /// [`SalvageScan::next_candidate`] itself receives — the same shape
 /// `ZipSalvage` and `ArcSalvage` have.
 #[derive(Debug, Default)]
 pub struct ZooSalvage {
     search: ForwardSearch,
+    /// The variable-part bytes this scan may read — 0.10.3 Task 4b. A type-2
+    /// record's name and `dir_crc` need its whole variable part, up to
+    /// 64 KiB, and a refused record resumes the scan one byte on: type-2
+    /// records packed every 64 bytes, each declaring 65,535 bytes, read 962x
+    /// the input. Each one is charged TWICE, before it is read: once for
+    /// this read, once for [`verify_candidate`]'s re-read of an accepted
+    /// record (accepted records whose payload is empty advance the scan one
+    /// byte too, and doubled the reads to 1,923x). A real archive still
+    /// spends at most `2 × file_len`, inside the budget. Built on the first
+    /// call, from the source's length; one per scan.
+    budget: Option<ScanBudget>,
+    /// Every record refused because its variable part would have overspent
+    /// [`Self::budget`], in scan order — reported as
+    /// [`Sighting::verdict_bounded`].
+    over_budget: Vec<u64>,
 }
 
 impl ZooSalvage {
@@ -232,18 +255,26 @@ impl ZooSalvage {
 impl SalvageScan for ZooSalvage {
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
+        let budget = self
+            .budget
+            .get_or_insert_with(|| ScanBudget::for_input(file_len));
         let mut search_from = from;
         loop {
             let Some(offset) = find_next_tag(&mut self.search, src, search_from, file_len)? else {
                 return Ok(None);
             };
-            match read_candidate_at(src, offset, file_len) {
-                Some(candidate) => return Ok(Some(candidate)),
+            match read_candidate_at(src, offset, file_len, budget) {
+                Gate::Accepted(candidate) => return Ok(Some(*candidate)),
                 // The tag matched and the gate rejected everything behind
                 // it: a coincidence, not a record. Resume one byte past the
                 // tag itself, not past a whole fixed record, so a genuine
                 // record overlapping this false match is never skipped.
-                None => search_from = offset + 1,
+                Gate::Refused => search_from = offset + 1,
+                // Not judged: reported, and resumed exactly like a refusal.
+                Gate::OverBudget => {
+                    self.over_budget.push(offset);
+                    search_from = offset + 1;
+                }
             }
         }
     }
@@ -372,24 +403,38 @@ fn record_looks_real(header: &DirEntry) -> bool {
     header.fixed_len == super::zoo::SIZ_DIRL && header.dir_crc_mismatch.is_none()
 }
 
-/// Whether the record at `offset` is type 2 and its `var_dir_len`-byte
-/// variable part ends past `file_len` — or its fixed part does. Reads two
-/// bytes, and only for a type 2 record.
-fn variable_part_overruns(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> io::Result<bool> {
+/// What [`variable_part`] found behind a record's fixed part.
+enum VariablePart {
+    /// Type 0 or 1: there is none.
+    None,
+    /// Type 2, with this many bytes, all inside the source.
+    Len(u64),
+    /// Type 2, and it — or the fixed part — ends past `file_len`.
+    Overruns,
+}
+
+/// The type-2 variable part of the record at `offset`: its length when it
+/// lies wholly inside `file_len`, or that it runs past it. Reads one byte,
+/// and two more only for a type 2 record.
+fn variable_part(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> io::Result<VariablePart> {
     src.seek(SeekFrom::Start(offset + 4))?;
     let mut dir_type = [0u8; 1];
     src.read_exact(&mut dir_type)?;
     if dir_type[0] != 2 {
-        return Ok(false);
+        return Ok(VariablePart::None);
     }
     if offset.saturating_add(SIZ_DIRL as u64) > file_len {
-        return Ok(true);
+        return Ok(VariablePart::Overruns);
     }
     src.seek(SeekFrom::Start(offset + VARDIRLEN_I as u64))?;
     let mut var_len = [0u8; 2];
     src.read_exact(&mut var_len)?;
-    let end = offset + SIZ_DIRL as u64 + u64::from(u16::from_le_bytes(var_len));
-    Ok(end > file_len)
+    let len = u64::from(u16::from_le_bytes(var_len));
+    Ok(if offset + SIZ_DIRL as u64 + len > file_len {
+        VariablePart::Overruns
+    } else {
+        VariablePart::Len(len)
+    })
 }
 
 /// Maps a ZOO packing-method byte to the [`FormatId`] [`EntryMeta::codec`]
@@ -423,31 +468,69 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
     Method::all().find(|method| method.codec() == codec)
 }
 
+/// What [`read_candidate_at`] made of one record.
+enum Gate {
+    Accepted(Box<Candidate>),
+    /// Not a record: any gate failure.
+    Refused,
+    /// Not judged: reading its variable part would have overspent the
+    /// scan's [`ScanBudget`].
+    OverBudget,
+}
+
 /// Reads the record believed to start at `offset` and runs it through the
 /// gate described in this module's doc.
 ///
-/// `None` for ANY gate failure — including the record itself running past
-/// `file_len`, which means there was never a full record to read in the
-/// first place. A rejection here is never an error: see the module doc.
-/// [`read_dir_entry`]'s own `Err`s (a tag that does not match, a `type`
-/// above 2, a variable part that runs off the end of the file, a genuine
-/// read failure) all mean the same thing to a SCANNER — these bytes are not
-/// a record — so they fold here rather than propagating and ending a run
-/// over one coincidence.
-fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<Candidate> {
+/// [`Gate::Refused`] for ANY gate failure — including the record itself
+/// running past `file_len`, which means there was never a full record to
+/// read in the first place. A rejection here is never an error: see the
+/// module doc. [`read_dir_entry`]'s own `Err`s (a tag that does not match, a
+/// `type` above 2, a variable part that runs off the end of the file, a
+/// genuine read failure) all mean the same thing to a SCANNER — these bytes
+/// are not a record — so they fold here rather than propagating and ending a
+/// run over one coincidence. [`Gate::OverBudget`] when `budget` cannot pay
+/// for a type-2 variable part, which is then never read.
+fn read_candidate_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    budget: &mut ScanBudget,
+) -> Gate {
+    match gate_record_at(src, offset, file_len, budget) {
+        Ok(candidate) => Gate::Accepted(Box::new(candidate)),
+        Err(over_budget) if over_budget => Gate::OverBudget,
+        Err(_) => Gate::Refused,
+    }
+}
+
+/// [`read_candidate_at`]'s body: `Err(true)` for a record over budget,
+/// `Err(false)` for any other refusal.
+fn gate_record_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    file_len: u64,
+    budget: &mut ScanBudget,
+) -> std::result::Result<Candidate, bool> {
     // A type 2 record whose variable part runs past the source is refused
     // BEFORE `read_dir_entry` reads it (0.10.3): that read fails on the
     // short read with the same verdict, but only after delivering every
-    // byte up to EOF, per coincidental tag.
-    if variable_part_overruns(src, offset, file_len).ok()? {
-        return None;
+    // byte up to EOF, per coincidental tag. One that fits is paid for
+    // first — twice, see `ZooSalvage::budget`.
+    match variable_part(src, offset, file_len).map_err(|_| false)? {
+        VariablePart::None => {}
+        VariablePart::Overruns => return Err(false),
+        VariablePart::Len(len) => {
+            if !budget.try_spend(len.saturating_mul(2)) {
+                return Err(true);
+            }
+        }
     }
-    let header = read_dir_entry(src, offset).ok()?;
+    let header = read_dir_entry(src, offset).map_err(|_| false)?;
     if header.method_byte > Method::MAX_PACK {
-        return None;
+        return Err(false);
     }
     if !record_looks_real(&header) {
-        return None;
+        return Err(false);
     }
 
     // Built with `checked_add`, like every other offset computation in this
@@ -458,7 +541,8 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
     // `None`, never a panic or a wrapped value.
     let payload_start = offset
         .checked_add(header.record_len)
-        .and_then(|v| v.checked_add(SIZ_FLDR))?;
+        .and_then(|v| v.checked_add(SIZ_FLDR))
+        .ok_or(false)?;
 
     let declared = u64::from(header.size_now);
     let available_len = match payload_start.checked_add(declared) {
@@ -483,16 +567,14 @@ fn read_candidate_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Opti
     meta.mtime = zoo_mtime(header.packed_datetime);
     meta.codec = codec_for_zoo_method(header.method_byte);
 
-    Some(
-        Candidate::new(offset, payload_start, meta)
-            .with_declared_len(Some(declared))
-            .with_verifier(Some(Verifier::Crc16(header.crc16)))
-            .with_available_len(available_len)
-            // Ruling S-R. Reported, not dropped — and ANNOTATED, which is
-            // the half a review had to add: see this module's own section
-            // below and `Candidate::marked_deleted`'s doc.
-            .with_marked_deleted(header.deleted),
-    )
+    Ok(Candidate::new(offset, payload_start, meta)
+        .with_declared_len(Some(declared))
+        .with_verifier(Some(Verifier::Crc16(header.crc16)))
+        .with_available_len(available_len)
+        // Ruling S-R. Reported, not dropped — and ANNOTATED, which is
+        // the half a review had to add: see this module's own section
+        // below and `Candidate::marked_deleted`'s doc.
+        .with_marked_deleted(header.deleted))
 }
 
 /// Decides [`SalvageStatus`] for one candidate by re-reading its record,
@@ -808,7 +890,15 @@ fn write_payload_bounded(
 /// chain, not a table, and the raw scan is the only source there is.
 pub fn salvage_zoo(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
     let mut scanner = ZooSalvage::new();
-    salvage_all(&mut scanner, src, policy)
+    let mut outcome = salvage_all(&mut scanner, src, policy)?;
+    // 0.10.3 Task 4b: every record the scan's budget left unjudged — never
+    // an entry, and printed by the caller like any other sighting.
+    outcome.sightings = scanner
+        .over_budget
+        .iter()
+        .map(|&offset| Sighting::verdict_bounded(ZOO, offset, VARIABLE_PART_BUDGET_SHAPE))
+        .collect();
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -817,6 +907,85 @@ mod tests {
 
     use super::super::zoo::test_archives::{Spec, build_zoo};
     use super::*;
+
+    /// The size of the allocation [`probe_canary`] makes inside a measured
+    /// closure: the proof the recording allocator is attached, which an
+    /// upper bound alone cannot give.
+    const PROBE_CANARY: usize = 64 * 1024;
+
+    fn probe_canary() {
+        std::hint::black_box(vec![0u8; PROBE_CANARY]);
+    }
+
+    /// 0.10.3 Task 4b: type-2 records declaring a 65,535-byte variable part,
+    /// one every 64 bytes, 1 MiB of them — the part read whole per record,
+    /// and the scan resumed one byte past each. Two siblings: refused (an
+    /// unprintable name, a `dir_crc` that disagrees) and accepted (a
+    /// printable name, an empty payload — so the scan advances one byte and
+    /// `verify_candidate` reads the part again). Before the scan-wide budget
+    /// these read 962x and 1,923x their input. The budget's refusals are
+    /// reported as verdict-bounded sightings.
+    #[test]
+    fn long_variable_parts_spend_a_bounded_budget() {
+        use stuffr_core::salvage::SightingKind;
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 1024 * 1024;
+        let fill = |name: &[u8]| {
+            let mut r = [0u8; 64];
+            r[0..4].copy_from_slice(&TAG_BYTES);
+            r[4] = 2;
+            r[FNAME_I..FNAME_I + name.len()].copy_from_slice(name);
+            r[VARDIRLEN_I..VARDIRLEN_I + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+            r[54..56].copy_from_slice(&[0x12, 0x34]);
+            r.iter().copied().cycle().take(LEN).collect::<Vec<u8>>()
+        };
+        for (shape, bytes, accepted) in [
+            ("refused", fill(b"\x01"), false),
+            ("accepted, empty", fill(b"A.TXT"), true),
+        ] {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_zoo(&mut src, &SalvagePolicy::default()).unwrap();
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+            assert_eq!(!out.entries.is_empty(), accepted, "{shape}");
+            assert!(
+                !out.sightings.is_empty()
+                    && out
+                        .sightings
+                        .iter()
+                        .all(|s| s.kind == SightingKind::VerdictBounded
+                            && s.shape == VARIABLE_PART_BUDGET_SHAPE),
+                "{shape}: {:?}",
+                out.sightings.first()
+            );
+        }
+    }
+
+    /// Task 4b's other half: a legitimate archive whose every record carries
+    /// the longest variable part the format can declare spends each part
+    /// twice at most — the scan and the verify — and never comes near the
+    /// budget: every entry intact, no sighting.
+    #[test]
+    fn an_archive_of_maximum_variable_parts_spends_no_budget_sighting() {
+        const NAMES: [&str; 4] = ["A.TXT", "B.TXT", "C.TXT", "D.TXT"];
+        let specs: Vec<Spec> = (0..40)
+            .map(|i| Spec {
+                var_override: Some(vec![0u8; usize::from(u16::MAX)]),
+                ..Spec::stored(NAMES[i % NAMES.len()], b"payload")
+            })
+            .collect();
+        let bytes = build_zoo(&specs);
+        let out = salvage_zoo(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+        assert_eq!(out.entries.len(), 40);
+        assert!(
+            out.entries
+                .iter()
+                .all(|e| e.status == SalvageStatus::Intact),
+            "{:?}",
+            out.entries.iter().map(|e| &e.status).collect::<Vec<_>>()
+        );
+        assert!(out.sightings.is_empty(), "{:?}", out.sightings.first());
+    }
 
     /// 0.10.3: dense tags, and dense fixed records the gate refuses or
     /// accepts, each 256 KiB, held to
@@ -1387,6 +1556,7 @@ mod tests {
             max_single_read: 128 * 1024,
         };
         let (out, largest) = crate::alloc_probe::largest_single_allocation(|| {
+            probe_canary();
             salvage_zoo(&mut src, &SalvagePolicy::default())
                 .expect("an absurd org_size is one entry's problem, not the run's")
         });
@@ -1394,12 +1564,21 @@ mod tests {
         // neutered, the status assertion fires first and hides the finding
         // this test exists for — which is exactly how the old version of
         // this test came to pass while the buffer was allocated. The scan
-        // itself grows a `ForwardSearch` window to the order of 64 KiB, so this ceiling sits well above those and three orders of
-        // magnitude below `ABSURD_SIZE` (~2.86 GiB).
+        // itself grows a `ForwardSearch` window to the order of 64 KiB, so
+        // this ceiling sits well above those and three orders of magnitude
+        // below `ABSURD_SIZE` (~2.86 GiB).
         assert!(
             largest <= 1 << 20,
             "largest single allocation was {largest} bytes — `org_size` was allocated from \
              before anything refused it, which no source-side mock in this crate can see"
+        );
+        // And the floor that proves the probe is attached at all — an upper
+        // bound alone passes with no recording allocator behind it.
+        assert!(
+            largest >= PROBE_CANARY,
+            "largest single allocation was only {largest} bytes, below the {PROBE_CANARY}-byte \
+             canary allocated inside the measured closure — the recording allocator is not \
+             attached, so the ceiling above is measuring nothing"
         );
         assert_eq!(out.entries.len(), 1);
         assert_eq!(
