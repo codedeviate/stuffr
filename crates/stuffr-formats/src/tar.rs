@@ -448,6 +448,15 @@ impl Read for TrailerWatch {
 /// `salvage --max-entry` bounds an ENTRY's payload, not metadata.
 pub const MAX_PAX_EXTENSION: u64 = 16 * 1024 * 1024;
 
+/// The most bytes a GNU `L` (long name) or `K` (long link) payload may
+/// declare — the same 16 MiB as [`MAX_PAX_EXTENSION`], held to it for the
+/// same reason: the crate's `read_all` (`entry.rs:297-302`) bounds nothing,
+/// so the guard refuses a larger declaration on the crate's first payload
+/// read, before a byte is held. [`Error::ResourceLimit`] (exit 6). A real
+/// path is a few KiB at most (`PATH_MAX`). Salvage scans with its own
+/// narrower budget, `tar_salvage::MAX_LONG_NAME`. Fixed, not tunable.
+pub const MAX_GNU_LONG_NAME: u64 = 16 * 1024 * 1024;
+
 /// What `tar::Archive` reads from: [`TrailerWatch`] behind [`CrateNextGuard`].
 type TarSource = CrateNextGuard<TrailerWatch>;
 
@@ -556,7 +565,13 @@ enum GuardPhase {
     Extension(SparseRun),
     /// Payload, up to the crate's `next`, with the leading bytes of a pax
     /// `x` payload being collected when `pax` is set.
-    Payload { next: u64, pax: Option<PaxCapture> },
+    Payload {
+        next: u64,
+        pax: Option<PaxCapture>,
+        /// A GNU `L`/`K` header's declared payload length and what to call
+        /// it, checked against [`MAX_GNU_LONG_NAME`] on the first read.
+        long: Option<(u64, &'static str)>,
+    },
     /// The crate has stopped reading headers — an end-of-archive block, a
     /// short read, or a header it rejects. Bytes pass through.
     Done,
@@ -667,6 +682,7 @@ impl<R: Read> CrateNextGuard<R> {
                     bytes: Vec::new(),
                     len: size,
                 }),
+                long: None,
             };
         }
         // `:455-461` and `:524`.
@@ -680,7 +696,18 @@ impl<R: Read> CrateNextGuard<R> {
                 blocks: 0,
             });
         }
-        GuardPhase::Payload { next, pax: None }
+        let long = if consumed_by_crate && entry_type.is_gnu_longname() {
+            Some((size, "long-name (`L`)"))
+        } else if consumed_by_crate && entry_type.is_gnu_longlink() {
+            Some((size, "long-link (`K`)"))
+        } else {
+            None
+        };
+        GuardPhase::Payload {
+            next,
+            pax: None,
+            long,
+        }
     }
 }
 
@@ -733,6 +760,21 @@ fn pax_over_ceiling(len: u64) -> io::Error {
     )
 }
 
+/// The refusal: a GNU `L`/`K` header declaring a payload past
+/// [`MAX_GNU_LONG_NAME`]. `OutOfMemory`, so [`Error::from_decode_io`]
+/// classifies it as [`Error::ResourceLimit`] (exit 6), like
+/// [`pax_over_ceiling`].
+fn long_name_over_ceiling(len: u64, what: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        format!(
+            "tar GNU {what} header declares a payload of {len} bytes, past the \
+             {MAX_GNU_LONG_NAME}-byte ceiling this container reads eagerly; no legitimate \
+             archive's name is this long"
+        ),
+    )
+}
+
 impl<R: Read> Read for CrateNextGuard<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
@@ -781,12 +823,17 @@ impl<R: Read> Read for CrateNextGuard<R> {
                             GuardPhase::Payload {
                                 next: run.next,
                                 pax: None,
+                                long: None,
                             }
                         };
                     }
                     // A short block: "failed to read extension" (`:529`).
                 }
-                GuardPhase::Payload { next, mut pax } => {
+                GuardPhase::Payload {
+                    next,
+                    mut pax,
+                    long,
+                } => {
                     if let Some(capture) = &pax
                         && capture.len > MAX_PAX_EXTENSION
                     {
@@ -795,6 +842,11 @@ impl<R: Read> Read for CrateNextGuard<R> {
                         // checksum stays the crate's own `Corrupt`) and
                         // before either copy holds a payload byte.
                         return Err(pax_over_ceiling(capture.len));
+                    }
+                    if let Some((len, what)) = long
+                        && len > MAX_GNU_LONG_NAME
+                    {
+                        return Err(long_name_over_ceiling(len, what));
                     }
                     if self.pos == next {
                         if let Some(capture) = pax {
@@ -811,7 +863,7 @@ impl<R: Read> Read for CrateNextGuard<R> {
                         Err(e) => {
                             // A payload read error is the caller's to retry
                             // or not; the mirror stays where it was.
-                            self.phase = GuardPhase::Payload { next, pax };
+                            self.phase = GuardPhase::Payload { next, pax, long };
                             return Err(e);
                         }
                     };
@@ -821,7 +873,7 @@ impl<R: Read> Read for CrateNextGuard<R> {
                         capture.bytes.extend_from_slice(&out[..keep]);
                     }
                     self.pos += n as u64;
-                    self.phase = GuardPhase::Payload { next, pax };
+                    self.phase = GuardPhase::Payload { next, pax, long };
                     return Ok(n);
                 }
                 GuardPhase::Done => return self.inner.read(out),
@@ -2881,6 +2933,81 @@ mod tests {
                 drop(entry);
                 assert!(ar.next_entry().unwrap().is_none());
             }
+        }
+    }
+
+    /// A GNU header (`"ustar  \0"` magic) of `typeflag` declaring `size`.
+    fn gnu_block(name: &str, typeflag: u8, size: u64) -> [u8; BLOCK] {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name).unwrap();
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::new(typeflag));
+        header.set_size(size);
+        header.set_cksum();
+        *header.as_bytes()
+    }
+
+    /// A GNU `L`/`K` header declaring `payload_len`, its NUL-terminated
+    /// payload padded to a block, then a regular file and the trailer.
+    fn gnu_long(typeflag: u8, payload_len: u64) -> Vec<u8> {
+        let mut out = gnu_block("././@LongLink", typeflag, payload_len).to_vec();
+        let mut payload = vec![b'n'; usize::try_from(payload_len).unwrap()];
+        if let Some(last) = payload.last_mut() {
+            *last = 0;
+        }
+        payload.resize(payload.len().div_ceil(BLOCK) * BLOCK, 0);
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&gnu_block("short", b'0', 0));
+        out.extend_from_slice(&[0u8; 2 * BLOCK]);
+        out
+    }
+
+    /// The `L`/`K` ceiling, over by one byte: a `ResourceLimit` (exit 6)
+    /// for either, on both source shapes, naming the ceiling.
+    #[test]
+    fn a_long_name_over_the_ceiling_is_a_resource_limit() {
+        for typeflag in [b'L', b'K'] {
+            let bytes = gnu_long(typeflag, MAX_GNU_LONG_NAME + 1);
+            for (shape, ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
+                let err = walk(ar).expect_err("a long-name payload past the ceiling");
+                assert!(
+                    matches!(err, stuffr_core::Error::ResourceLimit(_)),
+                    "{} {shape}: {err:?}",
+                    typeflag as char
+                );
+                assert_eq!(err.exit_code(), 6, "{} {shape}: {err}", typeflag as char);
+                assert!(err.to_string().contains("ceiling"), "{err}");
+            }
+        }
+    }
+
+    /// Declared, not present: 4 GiB with 1 KiB behind it is still exit 6.
+    #[test]
+    fn a_long_name_declaring_4_gib_with_1_kib_present_is_a_resource_limit() {
+        let mut bytes = gnu_block("././@LongLink", b'L', 4 << 30).to_vec();
+        bytes.extend_from_slice(&[b'n'; 1024]);
+        let err = walk(open(&bytes)).expect_err("past the ceiling");
+        assert_eq!(err.exit_code(), 6, "{err}");
+    }
+
+    /// The inside edge, small: an ordinary and a PATH_MAX-sized name list.
+    #[test]
+    fn a_normal_long_name_lists() {
+        for len in [4096u64, 1 << 20] {
+            let bytes = gnu_long(b'L', len);
+            for ar in [open(&bytes), open_seekable(&bytes)] {
+                walk(ar).unwrap_or_else(|e| panic!("{len}: {e}"));
+            }
+        }
+    }
+
+    /// Exactly the ceiling passes. 16 MiB is held whole twice by the crate,
+    /// so this is the slow one: unignored only if it is quick in debug.
+    #[test]
+    fn a_long_name_at_the_ceiling_lists() {
+        let bytes = gnu_long(b'L', MAX_GNU_LONG_NAME);
+        for ar in [open(&bytes), open_seekable(&bytes)] {
+            walk(ar).expect("exactly the ceiling");
         }
     }
 

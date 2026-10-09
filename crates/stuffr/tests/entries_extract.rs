@@ -1962,3 +1962,109 @@ fn a_name_the_filesystem_refuses_is_skipped_not_an_io_error() {
     assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
     assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
 }
+
+// ---- GNU long-name / long-link payloads (0.10.3 Task 5) -------------------
+//
+// A GNU `L` (long name) or `K` (long link) payload is read whole, so the
+// ordinary reader caps its DECLARED size at 16 MiB (`MAX_GNU_LONG_NAME`):
+// `ResourceLimit`, exit 6, through `unpack` as through `list`.
+
+const GNU_CEILING: u64 = 16 * 1024 * 1024;
+
+/// One raw GNU header block (`"ustar  \0"` magic), checksum included.
+fn gnu_header(name: &str, typeflag: u8, size: u64, link: &str) -> [u8; 512] {
+    let mut b = [0u8; 512];
+    b[..name.len()].copy_from_slice(name.as_bytes());
+    b[100..108].copy_from_slice(b"0000644\0");
+    b[108..116].copy_from_slice(b"0000000\0");
+    b[116..124].copy_from_slice(b"0000000\0");
+    b[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+    b[136..148].copy_from_slice(b"14371402000\0");
+    b[148..156].copy_from_slice(b"        ");
+    b[156] = typeflag;
+    b[157..157 + link.len()].copy_from_slice(link.as_bytes());
+    b[257..265].copy_from_slice(b"ustar  \0");
+    let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+    b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    b
+}
+
+/// A GNU `L`/`K` member: the header declaring `len`, then `len` payload bytes
+/// (NUL-terminated, padded to a block).
+fn gnu_long_member(typeflag: u8, len: u64) -> Vec<u8> {
+    let mut out = gnu_header("././@LongLink", typeflag, len, "").to_vec();
+    let mut payload = vec![b'n'; len as usize];
+    if let Some(last) = payload.last_mut() {
+        *last = 0;
+    }
+    payload.resize(payload.len().div_ceil(512) * 512, 0);
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// A tar on disk: the `L` member of `len` bytes, a regular file `short`,
+/// and the trailer.
+fn tar_with_long_name(dir: &Path, len: u64) -> PathBuf {
+    let mut bytes = gnu_long_member(b'L', len);
+    bytes.extend_from_slice(&gnu_header("short", b'0', 0, ""));
+    bytes.extend_from_slice(&[0u8; 1024]);
+    let path = dir.join("long.tar");
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn a_long_name_over_the_ceiling_refuses_unpack_with_exit_6() {
+    for typeflag in [b'L', b'K'] {
+        let dir = tmp_dir();
+        let mut bytes = gnu_long_member(typeflag, GNU_CEILING + 1);
+        bytes.extend_from_slice(&gnu_header("short", b'0', 0, ""));
+        bytes.extend_from_slice(&[0u8; 1024]);
+        let archive = dir.join("over.tar");
+        std::fs::write(&archive, bytes).unwrap();
+        let dest = dir.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let err =
+            extract_with(&archive, &dest, false).expect_err("a long-name payload past the ceiling");
+        assert!(matches!(err, Error::ResourceLimit(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 6, "{err}");
+    }
+}
+
+#[test]
+fn a_long_name_at_the_ceiling_is_not_a_resource_limit_for_unpack() {
+    // A 16 MiB name cannot be created on any filesystem, so the entry is
+    // skipped as too long (not an error); what matters is that the ceiling
+    // itself is not refused.
+    let dir = tmp_dir();
+    let archive = tar_with_long_name(&dir, GNU_CEILING);
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    if let Err(err) = extract_with(&archive, &dest, false) {
+        assert_ne!(err.exit_code(), 6, "exactly the ceiling is allowed: {err}");
+    }
+}
+
+#[test]
+fn a_member_with_both_a_long_name_and_a_long_link_extracts() {
+    let dir = tmp_dir();
+    let name = format!("{}/{}/link", "a".repeat(120), "b".repeat(120));
+    let target = format!("{}/{}", "t".repeat(120), "u".repeat(120));
+    let mut bytes = Vec::new();
+    for (flag, text) in [(b'L', &name), (b'K', &target)] {
+        let mut payload = text.clone().into_bytes();
+        payload.push(0);
+        bytes.extend_from_slice(&gnu_header("././@LongLink", flag, payload.len() as u64, ""));
+        payload.resize(payload.len().div_ceil(512) * 512, 0);
+        bytes.extend_from_slice(&payload);
+    }
+    bytes.extend_from_slice(&gnu_header("short", b'2', 0, "short-target"));
+    bytes.extend_from_slice(&[0u8; 1024]);
+    let archive = dir.join("both.tar");
+    std::fs::write(&archive, bytes).unwrap();
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    extract_with(&archive, &dest, false).expect("L and K under the ceiling extract");
+    let link = dest.join(&name);
+    assert_eq!(std::fs::read_link(&link).unwrap(), Path::new(&target));
+}

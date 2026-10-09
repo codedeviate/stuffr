@@ -265,9 +265,9 @@
 //!   (`ResourceLimit`, exit 6, past it), while a byte-granular scan can read
 //!   one payload per candidate position, so salvage keeps the smaller figure.
 //!
-//! The ordinary reader does not bound a GNU `L`/`K` payload
-//! (`EntryFields::read_all` grows without limit), so [`MAX_LONG_NAME`] is a
-//! narrowing `list` does not share, and a documented one.
+//! The ordinary reader bounds a GNU `L`/`K` payload too, at `tar.rs`'s
+//! `MAX_GNU_LONG_NAME` (16 MiB, `ResourceLimit`, exit 6), so [`MAX_LONG_NAME`]
+//! is a narrower scan budget than `list`'s ceiling, and a documented one.
 //!
 //! pax `g` (global) headers are not consumed by `tar::Archive`, which hands
 //! them back as entries of kind `Other`; so does this scanner.
@@ -724,7 +724,9 @@ impl UngateableSightings {
 }
 
 /// The most bytes a GNU `L`/`K` payload may declare before this scanner
-/// refuses to read it — see the module doc's extension section.
+/// refuses to read it — see the module doc's extension section. Narrower
+/// than the ordinary reader's `tar::MAX_GNU_LONG_NAME` (16 MiB), which a
+/// byte-granular scan cannot afford once per candidate position.
 pub const MAX_LONG_NAME: u64 = 65_536;
 
 /// The most bytes a pax `x` payload may declare before this scanner declines
