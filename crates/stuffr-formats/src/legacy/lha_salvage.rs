@@ -1978,7 +1978,12 @@ pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     // not read); converting these flags is a recorded follow-up, and no LHA
     // writer mixes header levels within one archive.
     if outcome.entries.is_empty() && scanner.seen.any() {
-        return Err(Error::Unsupported(scanner.seen.refusal()));
+        return Err(Error::Unsupported(
+            stuffr_core::salvage::refusal_with_bounded_notes(
+                scanner.seen.refusal(),
+                scanner.over_budget.into_sightings(),
+            ),
+        ));
     }
     // 0.10.3 Task 4b: every header the scan's budget left unjudged — never
     // an entry, and printed by the caller like any other sighting.
@@ -2089,6 +2094,23 @@ mod tests {
                 out.sightings.first()
             );
         }
+    }
+
+    /// 0.10.4 Task 4: a refusal (exit 3) carries the verdict-bounded
+    /// sightings it would otherwise drop, after the level it names.
+    #[test]
+    fn a_refusal_carries_the_verdict_bounded_sightings_it_would_drop() {
+        let mut bytes = build_level3(b"level3.txt", b"level three payload");
+        bytes.extend_from_slice(&long_extension_units()[0]);
+        let err = salvage_lha(&mut Cursor::new(bytes), &SalvagePolicy::default())
+            .expect_err("nothing recovered, a level-3 header seen");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 3);
+        let msg = err.to_string();
+        assert!(msg.contains("level-3"), "{msg}");
+        assert!(msg.contains("did not judge"), "{msg}");
+        assert!(msg.contains("; and separately, "), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
     }
 
     /// [`long_extension_chains_spend_a_bounded_budget`]'s inputs: a level-2

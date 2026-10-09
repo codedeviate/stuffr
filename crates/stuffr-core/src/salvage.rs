@@ -936,6 +936,22 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
     (!sentences.is_empty()).then(|| sentences.join("; and separately, "))
 }
 
+/// `refusal` for an `Err(Unsupported)` that also carries what the scan would
+/// otherwise have dropped: the work- and verdict-bounded `sightings`, in
+/// [`describe_sightings`]' words, after `"; and separately, "`. Ungateable
+/// sightings are left out — the refusal already describes those shapes — and
+/// with no bounded sighting the refusal comes back unchanged. One line.
+pub fn refusal_with_bounded_notes(refusal: String, sightings: Vec<Sighting>) -> String {
+    let bounded: Vec<Sighting> = sightings
+        .into_iter()
+        .filter(|s| s.kind != SightingKind::Ungateable)
+        .collect();
+    match describe_sightings(&bounded) {
+        Some(note) => format!("{refusal}; and separately, {note}"),
+        None => refusal,
+    }
+}
+
 /// `"{count} {format} {shape} at offset(s) {offsets}"` per (format, shape),
 /// joined by `"; and "` — the middle of each [`describe_sightings`] sentence.
 fn sighting_groups(sightings: &[&Sighting]) -> String {

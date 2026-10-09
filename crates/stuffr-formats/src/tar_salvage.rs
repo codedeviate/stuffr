@@ -1667,7 +1667,14 @@ pub fn salvage_tar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     // not gate as `sightings`, which the caller prints. Before that, a mixed
     // run said nothing at all about an entry `stuffr list` shows.
     if outcome.entries.is_empty() && scanner.seen.any() {
-        return Err(Error::Unsupported(scanner.seen.refusal()));
+        // Nothing is gained by dropping what the scan was bounded from
+        // reading: the refusal carries those notes too (0.10.4). No grid
+        // without entries, so no copy is reported here.
+        let refusal = scanner.seen.refusal();
+        let sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
+        return Err(Error::Unsupported(
+            stuffr_core::salvage::refusal_with_bounded_notes(refusal, sightings),
+        ));
     }
     outcome.sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
     Ok(outcome)
@@ -3522,6 +3529,33 @@ mod tests {
         }
         data.extend_from_slice(&[0u8; 2 * BLOCK]);
         data
+    }
+
+    /// 0.10.4 Task 4: a refusal (exit 3) carries the work-bounded sightings
+    /// it would otherwise drop, after the ungateable shape it names — one
+    /// line, one sentence per kind.
+    #[test]
+    fn a_refusal_carries_the_bounded_sightings_it_would_drop() {
+        let mut bytes = v7_block("j.txt", 4, V7_GNU_SPELLING, *b"JUNKJUNK").to_vec();
+        bytes.extend_from_slice(&padded(b"junk"));
+        bytes.extend_from_slice(&reversed_chains());
+        let err = salvage_tar(&mut Cursor::new(bytes), &SalvagePolicy::default())
+            .expect_err("nothing recovered, an ungateable shape seen");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 3);
+        let msg = err.to_string();
+        assert!(msg.contains("magic field"), "{msg}");
+        assert!(msg.contains("did not read the chains"), "{msg}");
+        assert!(msg.contains("; and separately, "), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
+
+        // And without a bounded sighting the refusal is what it was.
+        let mut plain = v7_block("j.txt", 4, V7_GNU_SPELLING, *b"JUNKJUNK").to_vec();
+        plain.extend_from_slice(&padded(b"junk"));
+        let msg = salvage_tar(&mut Cursor::new(plain), &SalvagePolicy::default())
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.contains("separately"), "{msg}");
     }
 
     /// 0.10.4: on a dense hostile input the scan stores at most

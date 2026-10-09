@@ -12002,6 +12002,53 @@ fn salvage_reports_a_tar_header_too_many_chains_converge_on() {
     assert!(!stderr.contains("no gate for"), "{stderr}");
 }
 
+/// 0.10.4 Task 4: an exit-3 refusal (an ungateable header, nothing
+/// recovered) also carries the work-bounded sighting it would otherwise
+/// drop — on one line, after the refusal's own words.
+#[test]
+fn salvage_refusal_carries_the_bounded_sighting() {
+    fn block(name: &[u8], typeflag: u8, size: u64, magic: &[u8; 8]) -> Vec<u8> {
+        let mut b = vec![0u8; 512];
+        b[..name.len()].copy_from_slice(name);
+        b[100..108].copy_from_slice(b"0000644\0");
+        b[108..116].copy_from_slice(b"0000000\0");
+        b[116..124].copy_from_slice(b"0000000\0");
+        b[124..136].copy_from_slice(format!("{size:011o}\0").as_bytes());
+        b[136..148].copy_from_slice(b"00000000000\0");
+        b[156] = typeflag;
+        b[257..265].copy_from_slice(magic);
+        b[148..156].fill(b' ');
+        let sum: u32 = b.iter().map(|&x| u32::from(x)).sum();
+        b[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        b
+    }
+    // A checksum-valid header with unrecognised magic, then five forged
+    // chains converging on one terminal.
+    let mut bytes = block(b"j.txt", b'0', 0, b"JUNKJUNK");
+    let terminal_at = bytes.len() + 5 * 512;
+    let first_head = bytes.len();
+    for k in 0..5 {
+        let span = (terminal_at - first_head - k * 512 - 512) as u64;
+        bytes.extend_from_slice(&block(b"", b'x', span, b"ustar\x0000"));
+    }
+    bytes.extend_from_slice(&block(b"", b'0', 0, b"ustar\x0000"));
+    bytes.extend_from_slice(&[0u8; 1024]);
+
+    let dir = tmp_dir();
+    let archive = dir.join("refusal-with-note.tar");
+    std::fs::write(&archive, &bytes).unwrap();
+    let out = run_output(&["salvage", archive.to_str().unwrap(), "--list"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stdout}{stderr}");
+    assert!(stderr.contains("magic field"), "{stderr}");
+    assert!(stderr.contains("did not read the chains"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("offset(s) {terminal_at}")),
+        "{stderr}"
+    );
+}
+
 /// 0.10.3 Task 4b: zip local headers whose names the scan's verdict budget
 /// would not pay for. Each forged header declares an all-ASCII name that
 /// runs to the file's last byte, `0xFF`, so every name is read whole and

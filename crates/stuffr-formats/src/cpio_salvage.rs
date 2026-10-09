@@ -1104,7 +1104,13 @@ pub fn salvage_cpio(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sa
         .into_iter()
         .any(|variant| variant_count(&scanner.sightings, variant) > 0);
     if outcome.entries.is_empty() && variants {
-        return Err(Error::Unsupported(refusal(&scanner.sightings)));
+        let text = refusal(&scanner.sightings);
+        return Err(Error::Unsupported(
+            stuffr_core::salvage::refusal_with_bounded_notes(
+                text,
+                scanner.sightings.into_sightings(),
+            ),
+        ));
     }
     // 0.10.3 Task 4b: beside them, every header the scan's budget left
     // unjudged — never an entry, and printed by the caller like any other
@@ -2246,6 +2252,24 @@ mod tests {
         ] {
             assert!(err.to_string().contains(count), "{count:?} missing: {err}");
         }
+    }
+
+    /// 0.10.4 Task 4: a refusal (exit 3) carries the verdict-bounded
+    /// sightings it would otherwise drop, after the variant it names.
+    #[test]
+    fn a_refusal_carries_the_verdict_bounded_sightings_it_would_drop() {
+        let mut bytes = odc_entry("a", b"x");
+        bytes.resize(bytes.len().next_multiple_of(128), 0);
+        bytes.extend_from_slice(&long_name_units(0o100_644, 0, 0xFFFF, None));
+        let err = salvage_cpio(&mut Cursor::new(bytes), &SalvagePolicy::default())
+            .expect_err("nothing recovered, a variant seen");
+        assert!(matches!(err, Error::Unsupported(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 3);
+        let msg = err.to_string();
+        assert!(msg.contains("odc variant"), "{msg}");
+        assert!(msg.contains("did not judge"), "{msg}");
+        assert!(msg.contains("; and separately, "), "{msg}");
+        assert!(!msg.contains('\n'), "{msg}");
     }
 
     /// 0.10.3 Task 4b: `newc` headers one every 128 bytes, 1 MiB of them,
