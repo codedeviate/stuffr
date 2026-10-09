@@ -282,14 +282,15 @@
 //! invent a declared-but-absent payload was not changed to chase agreement
 //! with that result.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, Verifier, annotate_candidates,
-    collect_candidates, stream_bounded_copy,
+    SalvagedEntry, ScanBudget, Sighting, SightingLog, UnverifiedCause, Verifier,
+    annotate_candidates, collect_candidates, stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
@@ -347,9 +348,23 @@ pub struct ZipSalvage {
     /// scan, so it spends none of it.
     budget: Option<ScanBudget>,
     /// Every header refused because its name would have overspent
-    /// [`Self::budget`], in scan order — reported as
-    /// [`Sighting::verdict_bounded`].
-    over_budget: Vec<u64>,
+    /// [`Self::budget`] — reported as [`Sighting::verdict_bounded`] — at an
+    /// offset no central-directory record names. A [`SightingLog`]
+    /// (0.10.4): every one counted, at most [`SightingLog::DEFAULT_CAP`]
+    /// stored, pushed in ascending offset order because the scan only moves
+    /// forward, so the ones kept are the first.
+    over_budget: SightingLog,
+    /// The local-header offsets the central directory names, which
+    /// [`salvage_zip`] walks BEFORE the scan. Empty for a scan run on its
+    /// own, through [`SalvageScan`].
+    directory_names: HashSet<u64>,
+    /// Every header refused for its budget at an offset in
+    /// [`Self::directory_names`], in scan order: the directory may yet
+    /// recover it, so whether it is a sighting is decided once the
+    /// directory pass is done ([`budget_sightings`]). One per directory
+    /// record at most, so bounded by the directory `salvage_zip` holds in
+    /// memory anyway.
+    held_for_directory: Vec<u64>,
 }
 
 impl ZipSalvage {
@@ -381,7 +396,15 @@ impl SalvageScan for ZipSalvage {
                 Gate::Refused => search_from = offset + 1,
                 // Not judged: reported, and resumed exactly like a refusal.
                 Gate::OverBudget => {
-                    self.over_budget.push(offset);
+                    if self.directory_names.contains(&offset) {
+                        self.held_for_directory.push(offset);
+                    } else {
+                        self.over_budget.push(Sighting::verdict_bounded(
+                            ZIP,
+                            offset,
+                            NAME_BUDGET_SHAPE,
+                        ));
+                    }
                     search_from = offset + 1;
                 }
             }
@@ -940,12 +963,22 @@ impl std::io::Seek for SeekReadRef<'_> {
 /// destroyed or absent index), which is exactly the case the scan exists
 /// for.
 pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
+    // Walked before the scan (0.10.4), not after: the scan's budget
+    // sightings are capped as they are pushed, so it must already know
+    // which offsets the directory may recover — see `budget_sightings`.
+    // The walk reads only the directory, and the scan reads none of it
+    // through its budget, so neither changes what the other finds.
+    let cd_records = crate::zip::walk_central_directory(&mut SeekReadRef(&mut *src));
     let mut scanner = ZipSalvage::new();
+    scanner.directory_names = cd_records
+        .iter()
+        .flatten()
+        .map(|record| record.local_header_offset)
+        .collect();
     let mut candidates = collect_candidates(&mut scanner, src)?;
 
-    if let Some(cd_records) = crate::zip::walk_central_directory(&mut SeekReadRef(&mut *src)) {
-        let mut found_offsets: std::collections::HashSet<u64> =
-            candidates.iter().map(|c| c.offset).collect();
+    if let Some(cd_records) = cd_records {
+        let mut found_offsets: HashSet<u64> = candidates.iter().map(|c| c.offset).collect();
 
         for record in &cd_records {
             if found_offsets.contains(&record.local_header_offset) {
@@ -981,15 +1014,46 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     // the scan refused for its budget is exactly the kind the directory
     // pass above reaches by its own route, and a sighting there would say
     // "not listed or recovered" of an entry this very outcome lists.
-    let recovered: std::collections::HashSet<u64> =
-        outcome.entries.iter().map(|e| e.offset).collect();
-    outcome.sightings = scanner
-        .over_budget
-        .iter()
-        .filter(|offset| !recovered.contains(offset))
-        .map(|&offset| Sighting::verdict_bounded(ZIP, offset, NAME_BUDGET_SHAPE))
-        .collect();
+    let recovered: HashSet<u64> = outcome.entries.iter().map(|e| e.offset).collect();
+    outcome.sightings = budget_sightings(scanner, &recovered);
     Ok(outcome)
+}
+
+/// The scan's budget sightings, less every header the directory pass
+/// recovered — filtered BEFORE the cap, so the count stays exact (0.10.4).
+///
+/// A refused header at an offset no directory record names cannot be
+/// recovered, and went straight into the capped [`ZipSalvage::over_budget`]
+/// log. One a record names was held back whole; those the directory did
+/// not recover are merged in here. The capped log kept the smallest offsets
+/// of its own set, so the smallest of the union are among its stored ones
+/// and the held ones: re-pushed in ascending order into a fresh log, with
+/// the capped log's uncounted remainder carried on the last, the result is
+/// what one log of every unrecovered refusal would have held.
+fn budget_sightings(scanner: ZipSalvage, recovered: &HashSet<u64>) -> Vec<Sighting> {
+    let held: Vec<u64> = scanner
+        .held_for_directory
+        .into_iter()
+        .filter(|offset| !recovered.contains(offset))
+        .collect();
+    let direct = scanner.over_budget.into_sightings();
+    if held.is_empty() {
+        return direct;
+    }
+    let uncounted: u64 = direct.iter().map(|s| s.more).sum();
+    let mut offsets: Vec<u64> = direct.iter().map(|s| s.offset).chain(held).collect();
+    offsets.sort_unstable();
+    let mut log = SightingLog::new();
+    let last = offsets.len() - 1;
+    for (i, offset) in offsets.into_iter().enumerate() {
+        let sighting = Sighting::verdict_bounded(ZIP, offset, NAME_BUDGET_SHAPE);
+        log.push(if i == last {
+            sighting.with_more(uncounted)
+        } else {
+            sighting
+        });
+    }
+    log.into_sightings()
 }
 
 /// Builds a [`Candidate`] from a central-directory record the raw scan did
@@ -1557,20 +1621,7 @@ mod tests {
     fn overlapping_long_names_spend_a_bounded_budget() {
         use stuffr_core::salvage::SightingKind;
         use stuffr_core::testing::{CountingSource, check_scan_is_linear};
-        const LEN: usize = 1024 * 1024;
-        let unit = |flags: u16, size: u32| {
-            let mut h = SIG_LOCAL_HEADER.to_vec();
-            for field in [20u16, flags, 0, 0, 0] {
-                h.extend_from_slice(&field.to_le_bytes());
-            }
-            for field in [0u32, size, size] {
-                h.extend_from_slice(&field.to_le_bytes());
-            }
-            h.extend_from_slice(&0x7F7Fu16.to_le_bytes());
-            h.extend_from_slice(&0u16.to_le_bytes());
-            h.resize(64, b'A');
-            h.iter().copied().cycle().take(LEN).collect::<Vec<u8>>()
-        };
+        let unit = overlapping_name_units;
         let shapes = [
             ("accepted, truncated", unit(0, 0x7F7F_7F7F)),
             ("accepted, empty", unit(0, 0)),
@@ -1653,6 +1704,33 @@ mod tests {
     /// review's own reproducer: offsets 1,049,297 and 1,049,516).
     #[test]
     fn an_entry_the_directory_recovers_is_never_also_a_budget_sighting() {
+        let out = salvage(&budget_spent_before_a_real_zip());
+        let real: Vec<&SalvagedEntry> = out
+            .entries
+            .iter()
+            .filter(|e| e.meta.name.starts_with("real"))
+            .collect();
+        assert_eq!(real.len(), 5);
+        assert!(real.iter().all(|e| e.status == SalvageStatus::Intact));
+        assert!(
+            !out.sightings.is_empty(),
+            "the forged names still spend the budget"
+        );
+        let recovered: std::collections::HashSet<u64> =
+            out.entries.iter().map(|e| e.offset).collect();
+        let both: Vec<u64> = out
+            .sightings
+            .iter()
+            .map(|s| s.offset)
+            .filter(|at| recovered.contains(at))
+            .collect();
+        assert!(both.is_empty(), "recovered AND sighted at {both:?}");
+    }
+
+    /// [`an_entry_the_directory_recovers_is_never_also_a_budget_sighting`]'s
+    /// input: 1 MiB of forged names that spend the budget, then a genuine
+    /// five-entry zip whose local headers the scan refuses for it.
+    fn budget_spent_before_a_real_zip() -> Vec<u8> {
         const LEN: usize = 1024 * 1024;
         let mut unit = SIG_LOCAL_HEADER.to_vec();
         for field in [20u16, 0, 0, 0, 0] {
@@ -1680,27 +1758,141 @@ mod tests {
             }
             w.finish().unwrap();
         }
-        let out = salvage(&cursor.into_inner());
-        let real: Vec<&SalvagedEntry> = out
+        cursor.into_inner()
+    }
+
+    /// [`overlapping_long_names_spend_a_bounded_budget`]'s units: a local
+    /// header every 64 bytes, 1 MiB of them, each declaring a 0x7F7F-byte
+    /// all-ASCII name.
+    fn overlapping_name_units(flags: u16, size: u32) -> Vec<u8> {
+        const LEN: usize = 1024 * 1024;
+        let mut h = SIG_LOCAL_HEADER.to_vec();
+        for field in [20u16, flags, 0, 0, 0] {
+            h.extend_from_slice(&field.to_le_bytes());
+        }
+        for field in [0u32, size, size] {
+            h.extend_from_slice(&field.to_le_bytes());
+        }
+        h.extend_from_slice(&0x7F7Fu16.to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes());
+        h.resize(64, b'A');
+        h.iter().copied().cycle().take(LEN).collect()
+    }
+
+    /// 0.10.4: on a dense hostile input the scan stores at most
+    /// `SightingLog::DEFAULT_CAP` sightings per group, in ascending offset
+    /// order, and they still stand for every one it saw — the counts
+    /// and the offsets the printed sentence lists are those of the uncapped
+    /// list before the cap (pinned from 7244937, where every one was stored).
+    #[test]
+    fn dense_sightings_are_bounded_and_the_sentence_is_unchanged() {
+        use stuffr_core::salvage::describe_sightings;
+        use stuffr_core::testing::check_sightings_bounded;
+        let legs: [(&str, Vec<u8>, u64, &[&str]); 4] = [
+            (
+                "truncated",
+                overlapping_name_units(0, 0x7F7F_7F7F),
+                15809,
+                &[
+                    "15809 zip",
+                    "at offset(s) 4160, 4224, 4288, 4352, 4416, 4480, 4544, 4608, and 15801 more",
+                ][..],
+            ),
+            (
+                "empty",
+                overlapping_name_units(0, 0),
+                15809,
+                &[
+                    "15809 zip",
+                    "at offset(s) 4160, 4224, 4288, 4352, 4416, 4480, 4544, 4608, and 15801 more",
+                ][..],
+            ),
+            (
+                "descriptor",
+                overlapping_name_units(FLAG_DATA_DESCRIPTOR, 0),
+                15809,
+                &[
+                    "15809 zip",
+                    "at offset(s) 4160, 4224, 4288, 4352, 4416, 4480, 4544, 4608, and 15801 more",
+                ][..],
+            ),
+            (
+                "directory recovers",
+                budget_spent_before_a_real_zip(),
+                1630,
+                &[
+                    "1630 zip",
+                    "at offset(s) 999660, 999690, 999720, 999750, 999780, 999810, 999840, 999870, and 1622 more",
+                ][..],
+            ),
+        ];
+        for (label, bytes, total, listed) in legs {
+            let out = salvage_zip(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+            check_sightings_bounded(&out.sightings, total)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let note = describe_sightings(&out.sightings).unwrap();
+            for fragment in listed {
+                assert!(
+                    note.contains(fragment),
+                    "{label}: {fragment:?} missing: {note}"
+                );
+            }
+        }
+    }
+
+    /// 0.10.4: the directory leg. Every local header the directory
+    /// recovers was refused by the scan's budget, and is neither stored nor
+    /// counted as a sighting: the scan alone counts five more.
+    #[test]
+    fn a_header_the_directory_recovers_is_neither_stored_nor_counted() {
+        let bytes = budget_spent_before_a_real_zip();
+        let mut scanner = ZipSalvage::new();
+        collect_candidates(&mut scanner, &mut Cursor::new(bytes.clone())).unwrap();
+        let alone = scanner.over_budget.count(
+            ZIP,
+            NAME_BUDGET_SHAPE,
+            stuffr_core::salvage::SightingKind::VerdictBounded,
+        );
+        let out = salvage(&bytes);
+        let real: HashSet<u64> = out
             .entries
             .iter()
             .filter(|e| e.meta.name.starts_with("real"))
+            .map(|e| e.offset)
             .collect();
         assert_eq!(real.len(), 5);
-        assert!(real.iter().all(|e| e.status == SalvageStatus::Intact));
-        assert!(
-            !out.sightings.is_empty(),
-            "the forged names still spend the budget"
-        );
-        let recovered: std::collections::HashSet<u64> =
-            out.entries.iter().map(|e| e.offset).collect();
-        let both: Vec<u64> = out
-            .sightings
-            .iter()
-            .map(|s| s.offset)
-            .filter(|at| recovered.contains(at))
+        let counted: u64 = out.sightings.iter().map(|s| 1 + s.more).sum();
+        assert_eq!(counted, alone - 5);
+        assert!(out.sightings.iter().all(|s| !real.contains(&s.offset)));
+    }
+
+    /// 0.10.4: a header held back for the directory and NOT recovered is
+    /// merged into the capped log as if it had been pushed with the rest —
+    /// the sentence equals the uncapped one, listed offsets included.
+    #[test]
+    fn held_headers_the_directory_does_not_recover_merge_into_the_cap() {
+        use stuffr_core::salvage::describe_sightings;
+        let mut scanner = ZipSalvage::new();
+        let mut all = Vec::new();
+        for offset in (0..300u64).map(|i| i * 10) {
+            if offset % 70 == 0 {
+                scanner.held_for_directory.push(offset);
+            } else {
+                scanner
+                    .over_budget
+                    .push(Sighting::verdict_bounded(ZIP, offset, NAME_BUDGET_SHAPE));
+            }
+            if offset % 140 != 0 {
+                all.push(Sighting::verdict_bounded(ZIP, offset, NAME_BUDGET_SHAPE));
+            }
+        }
+        let recovered: HashSet<u64> = (0..300u64)
+            .map(|i| i * 10)
+            .filter(|o| o % 140 == 0)
             .collect();
-        assert!(both.is_empty(), "recovered AND sighted at {both:?}");
+        let merged = budget_sightings(scanner, &recovered);
+        stuffr_core::testing::check_sightings_bounded(&merged, all.len() as u64).unwrap();
+        assert_eq!(describe_sightings(&merged), describe_sightings(&all));
     }
 
     /// Task 4b's other half: a legitimate archive whose every entry carries
