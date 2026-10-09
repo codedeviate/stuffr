@@ -1673,7 +1673,7 @@ pub fn salvage_tar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
         let refusal = scanner.seen.refusal();
         let sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
         return Err(Error::Unsupported(
-            stuffr_core::salvage::refusal_with_bounded_notes(refusal, sightings),
+            stuffr_core::salvage::refusal_with_bounded_notes(refusal, sightings, true),
         ));
     }
     outcome.sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
@@ -3548,6 +3548,11 @@ mod tests {
         assert!(msg.contains("did not read the chains"), "{msg}");
         assert!(msg.contains("; and separately, "), "{msg}");
         assert!(!msg.contains('\n'), "{msg}");
+        assert_eq!(
+            msg,
+            r#"unsupported: this build's tar salvage scanner found 1 header(s) whose magic field (bytes 257..265) is neither `ustar` nor blank — each with a checksum that agrees, but in a shape it has no gate for, because a header seen one byte late takes exactly that shape; the archive itself may be perfectly readable — `stuffr list` and `stuffr unpack` read these headers normally, and it is the SCAN that stops here; and separately, this build's salvage scanner bounds the work it spends on extension chains, and did not read the chains in front of 200 tar header(s) whose extension chains were not read because the scan's extension-read budget was spent at offset(s) 513024, 513536, 514048, 514560, 515072, 515584, 516096, 516608, and 192 more — so whatever those chains describe is not listed or recovered there, though the scan went on past them"#,
+            "the whole message, so wording drift is caught (the totals are exact past the cap of 64)"
+        );
 
         // And without a bounded sighting the refusal is what it was.
         let mut plain = v7_block("j.txt", 4, V7_GNU_SPELLING, *b"JUNKJUNK").to_vec();

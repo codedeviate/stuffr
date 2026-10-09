@@ -1982,6 +1982,7 @@ pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
             stuffr_core::salvage::refusal_with_bounded_notes(
                 scanner.seen.refusal(),
                 scanner.over_budget.into_sightings(),
+                true,
             ),
         ));
     }
@@ -2111,6 +2112,11 @@ mod tests {
         assert!(msg.contains("did not judge"), "{msg}");
         assert!(msg.contains("; and separately, "), "{msg}");
         assert!(!msg.contains('\n'), "{msg}");
+        assert_eq!(
+            msg,
+            r#"unsupported: this build's LHA salvage scanner recognised a header shape but has no gate for level-3 headers, whose 32-bit length fields and 4-byte extension counters need a parser this build does not have; the archive itself may be perfectly readable — `stuffr list` and `stuffr unpack` handle these headers normally, and it is the SCAN that stops here; and separately, this build's salvage scanner bounds the work it spends judging candidate headers across the whole scan, and did not judge 15329 lha header(s) whose extension headers it did not read once that work was spent at offset(s) 2116, 2180, 2244, 2308, 2372, 2436, 2500, 2564, and 15321 more — so whatever those headers describe is not listed or recovered there, though the scan went on past them"#,
+            "the whole message, so wording drift is caught (the totals are exact past the cap of 64)"
+        );
     }
 
     /// [`long_extension_chains_spend_a_bounded_budget`]'s inputs: a level-2

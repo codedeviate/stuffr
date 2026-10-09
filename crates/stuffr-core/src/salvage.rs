@@ -899,6 +899,18 @@ const SIGHTING_OFFSETS_SHOWN: usize = 8;
 /// sentence that applies is joined in the same way, and the two older ones
 /// are worded exactly as before.
 pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
+    describe(sightings, true)
+}
+
+/// [`describe_sightings`], optionally without each sentence's closing
+/// "`stuffr list` and `stuffr unpack` may read these headers normally"
+/// clause — for a caller that has just said so itself.
+fn describe(sightings: &[Sighting], list_clause: bool) -> Option<String> {
+    let tail = if list_clause {
+        "; `stuffr list` and `stuffr unpack` may read these headers normally"
+    } else {
+        ""
+    };
     let of_kind = |kind: SightingKind| -> Vec<&Sighting> {
         sightings.iter().filter(|s| s.kind == kind).collect()
     };
@@ -919,8 +931,7 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
         sentences.push(format!(
             "this build's salvage scanner bounds the work it spends on extension chains, and \
              did not read the chains in front of {} — so whatever those chains describe is not \
-             listed or recovered there, though the scan went on past them; `stuffr list` and \
-             `stuffr unpack` may read these headers normally",
+             listed or recovered there, though the scan went on past them{tail}",
             sighting_groups(&bounded)
         ));
     }
@@ -928,8 +939,7 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
         sentences.push(format!(
             "this build's salvage scanner bounds the work it spends judging candidate headers \
              across the whole scan, and did not judge {} — so whatever those headers \
-             describe is not listed or recovered there, though the scan went on past them; \
-             `stuffr list` and `stuffr unpack` may read these headers normally",
+             describe is not listed or recovered there, though the scan went on past them{tail}",
             sighting_groups(&verdicts)
         ));
     }
@@ -941,12 +951,18 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
 /// [`describe_sightings`]' words, after `"; and separately, "`. Ungateable
 /// sightings are left out — the refusal already describes those shapes — and
 /// with no bounded sighting the refusal comes back unchanged. One line.
-pub fn refusal_with_bounded_notes(refusal: String, sightings: Vec<Sighting>) -> String {
+/// `refusal_says_list_reads_them` drops the note's closing list/unpack clause
+/// when the refusal has just said that itself.
+pub fn refusal_with_bounded_notes(
+    refusal: String,
+    sightings: Vec<Sighting>,
+    refusal_says_list_reads_them: bool,
+) -> String {
     let bounded: Vec<Sighting> = sightings
         .into_iter()
         .filter(|s| s.kind != SightingKind::Ungateable)
         .collect();
-    match describe_sightings(&bounded) {
+    match describe(&bounded, !refusal_says_list_reads_them) {
         Some(note) => format!("{refusal}; and separately, {note}"),
         None => refusal,
     }

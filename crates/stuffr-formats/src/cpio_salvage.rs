@@ -1109,6 +1109,7 @@ pub fn salvage_cpio(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sa
             stuffr_core::salvage::refusal_with_bounded_notes(
                 text,
                 scanner.sightings.into_sightings(),
+                false,
             ),
         ));
     }
@@ -2270,6 +2271,11 @@ mod tests {
         assert!(msg.contains("did not judge"), "{msg}");
         assert!(msg.contains("; and separately, "), "{msg}");
         assert!(!msg.contains('\n'), "{msg}");
+        assert_eq!(
+            msg,
+            r#"unsupported: this build's cpio salvage scanner found 1 header(s) in the odc variant (magic `070707`) — odc (POSIX "old character"/portable ASCII) and nothing it can recover: each is a well-formed header of a cpio variant this build does not read, so this says nothing about damage — the archive may be perfectly healthy. This build salvages `newc` (magic `070701`) only; `stuffr list` names the variant; and separately, this build's salvage scanner bounds the work it spends judging candidate headers across the whole scan, and did not judge 7648 cpio header(s) whose name or symlink target it did not read once that work was spent at offset(s) 4224, 4352, 4480, 4608, 4736, 4864, 4992, 5120, and 7640 more — so whatever those headers describe is not listed or recovered there, though the scan went on past them; `stuffr list` and `stuffr unpack` may read these headers normally"#,
+            "the whole message, so wording drift is caught (the totals are exact past the cap of 64)"
+        );
     }
 
     /// 0.10.3 Task 4b: `newc` headers one every 128 bytes, 1 MiB of them,
