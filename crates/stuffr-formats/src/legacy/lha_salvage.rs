@@ -619,9 +619,11 @@ const EXTENSION_BUDGET_SHAPE: &str =
 /// `ZipSalvage`, `ArcSalvage` and `ZooSalvage` have — only the
 /// [`ForwardSearch`] buffer and the sightings below.
 ///
-/// **One instance scans one source.** The scanner is stateful: its `ScanBudget`, the offsets that budget refused, its `ForwardSearch` window and its sightings.
-/// Reusing an instance across sources carries that spent state into the
-/// next scan, so build a fresh one (`LhaSalvage::default()`) per source.
+/// **One instance scans one source.** The scanner is stateful: its
+/// `ScanBudget`, the offsets that budget refused, its `ForwardSearch` window
+/// and its sightings. Reusing an instance across sources carries that spent
+/// state into the next scan, so build a fresh one (`LhaSalvage::default()`) per
+/// source.
 #[derive(Debug, Default)]
 pub struct LhaSalvage {
     search: ForwardSearch,

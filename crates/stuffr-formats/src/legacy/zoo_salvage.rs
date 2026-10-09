@@ -227,8 +227,9 @@ const VARIABLE_PART_BUDGET_SHAPE: &str =
 /// [`SalvageScan::next_candidate`] itself receives — the same shape
 /// `ZipSalvage` and `ArcSalvage` have.
 ///
-/// **One instance scans one source.** The scanner is stateful: its `ScanBudget`, the offsets that budget refused and its `ForwardSearch` window.
-/// Reusing an instance across sources carries that spent state into the
+/// **One instance scans one source.** The scanner is stateful: its
+/// `ScanBudget`, the offsets that budget refused and its `ForwardSearch`
+/// window. Reusing an instance across sources carries that spent state into the
 /// next scan, so build a fresh one (`ZooSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct ZooSalvage {

@@ -608,8 +608,8 @@ fn find_next_magic(
 /// `start -> (end, to_eof)` records: `[start, end)` is all zero, and `to_eof`
 /// says whether it ran to EOF (`end == file_len`) or stopped at a non-zero
 /// byte at `end`. Many headers landing in a handful of runs, in any order,
-/// then read each zero byte at most once (plus one short chunk of overshoot
-/// per landing); memory is linear in the number of runs.
+/// then read, in total, each zero byte at most once, plus one geometric chunk
+/// of overshoot per landing; memory is linear in the number of runs.
 type KnownZeros = BTreeMap<u64, (u64, bool)>;
 
 /// A candidate, and where the scan resumes after it.
@@ -869,11 +869,11 @@ fn candidate_from(
 /// `sightings` is every well-formed header of a variant this build does not
 /// read, in scan order.
 ///
-/// **One instance scans one source.** The scanner is stateful: its resume position, its
-/// sightings, its zero-run memo, its `ForwardSearch` window and its `ScanBudget`
-/// with the offsets it refused.
-/// Reusing an instance across sources carries that spent state into the
-/// next scan, so build a fresh one (`CpioSalvage::default()`) per source.
+/// **One instance scans one source.** The scanner is stateful: its resume
+/// position, its sightings, its zero-run memo, its `ForwardSearch` window and
+/// its `ScanBudget` with the offsets it refused. Reusing an instance across
+/// sources carries that spent state into the next scan, so build a fresh one
+/// (`CpioSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct CpioSalvage {
     resume: Option<Resume>,

@@ -74,8 +74,9 @@
 //! - A GNU **thin** archive (`!<thin>\n`) keeps each member's content in a
 //!   separate file, so the bytes after a header are the next header. Walked
 //!   as an ordinary archive, they would be written as a member's content.
-//! - A **symbol table** (`/`, `/SYM64/`, `__.SYMDEF`, `__.SYMDEF SORTED`;
-//!   `ar.rs`'s `symbol_table_name` owns the list) whose header `ar 0.9.0`
+//! - A **symbol table** (`/`, `__.SYMDEF`, `__.SYMDEF SORTED`; `ar.rs`'s
+//!   `symbol_table_name` owns the list, and also holds `/SYM64/`, which the
+//!   guard skips and the walk never stops at) whose header `ar 0.9.0`
 //!   cannot parse ends the walk with a [`WalkStopKind::UnsupportedShape`]
 //!   stop naming it; with nothing recovered before it, the run is exit 3
 //!   rather than "nothing recoverable". The case that motivated it — GNU
@@ -83,8 +84,7 @@
 //!   reaches it: since 0.8.1 `ar.rs`'s guard normalises that mode, so the
 //!   walk reads the table like `stuffr list` does (an inline one is a
 //!   member whose mode is unknown). What still stops here is a symbol table
-//!   damaged in a way the guard does not normalise. GNU's `/SYM64/` is no
-//!   longer one: the guard skips it like `/`.
+//!   damaged in a way the guard does not normalise.
 //!
 //! Any other global header that is not `!<arch>\n` is the ordinary reader's
 //! refusal: a stop at offset 0 and nothing recovered. An earlier version
@@ -213,8 +213,10 @@ const THIN_GLOBAL_HEADER: &[u8; 8] = b"!<thin>\n";
 /// Which symbol table, if any, the member header at `offset` names. Read
 /// straight from the file, after the walk has stopped there: the crate
 /// refused the header, so there is no parsed identifier to consult. The
-/// names themselves are `ar.rs`'s ([`symbol_table_name`]), the list the
-/// guard normalises from.
+/// names themselves are `ar.rs`'s ([`symbol_table_name`]): GNU's `/` and
+/// `/SYM64/` and BSD's two `__.SYMDEF` forms. Only a BSD one can be named
+/// here, since the walk never stops at the GNU two (the crate skips `/`, the
+/// guard skips `/SYM64/`).
 fn symbol_table_at(src: &mut dyn SeekRead, offset: u64, file_len: u64) -> Option<&'static str> {
     let header = read_at(src, offset, AR_ENTRY_HEADER_LEN as u64, file_len)?;
     match name_field(&header) {
@@ -394,10 +396,10 @@ fn candidate(
 /// members it found are handed out in order after that; the engine's `from`
 /// is not consulted, because a sequential walk has nowhere else to resume.
 ///
-/// **One instance scans one source.** The scanner is stateful: the members its one walk found
-/// and where that walk stopped.
-/// Reusing an instance across sources carries that spent state into the
-/// next scan, so build a fresh one (`ArSalvage::default()`) per source.
+/// **One instance scans one source.** The scanner is stateful: the members its
+/// one walk found and where that walk stopped. Reusing an instance across
+/// sources carries that spent state into the next scan, so build a fresh one
+/// (`ArSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct ArSalvage {
     walked: bool,
@@ -1343,6 +1345,7 @@ mod tests {
     fn gnu_with_sym64(sym64_len: usize) -> Vec<u8> {
         gnu_with_symtab("/SYM64/", sym64_len)
     }
+
     /// 0.10.3: salvage steps past `/SYM64/` like `/`.
     #[test]
     fn a_sym64_symbol_table_is_walked_past_like_slash() {
@@ -1972,8 +1975,8 @@ mod tests {
 
         /// Row 3/3 — **a header field corrupted, under ar's stated limit.**
         /// Three fields — the SIZE, the MODE and the MTIME, each made
-        /// unparseable — against every member in turn. Every member BEFORE the damage is `Unattested`
-        /// with exactly its input bytes; NONE after it is reported; the walk
+        /// unparseable — against every member in turn. Every member BEFORE the
+        /// damage is `Unattested` with exactly its input bytes; NONE after it is reported; the walk
         /// stops `Unreadable` at exactly that header with every byte from it
         /// to EOF counted, and its note says, with the offset, that those
         /// bytes' entries are unreachable by construction, not absent. The

@@ -970,10 +970,11 @@ pub const SPARSE: FormatId = FormatId::new("tar-sparse");
 /// payload ends, so the next scan can start there rather than inside the
 /// payload (the module doc's "jumps its payload" section).
 ///
-/// **One instance scans one source.** The scanner is stateful: its resume position, its ungateable
-/// sightings, its `ForwardSearch` window and its extension-chain budgets.
-/// Reusing an instance across sources carries that spent state into the
-/// next scan, so build a fresh one (`TarSalvage::default()`) per source.
+/// **One instance scans one source.** The scanner is stateful: its resume
+/// position, its ungateable sightings, its `ForwardSearch` window and its
+/// extension-chain budgets. Reusing an instance across sources carries that
+/// spent state into the next scan, so build a fresh one
+/// (`TarSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct TarSalvage {
     resume: Option<Resume>,
@@ -3569,7 +3570,8 @@ mod tests {
 
     /// 0.10.4: on a dense hostile input the scan stores at most
     /// `SightingLog::DEFAULT_CAP` sightings per group, in ascending offset
-    /// order, and they still stand for every one it saw — even when the scan refuses terminals in descending order (`reversed_chains`) — the counts
+    /// order, and they still stand for every one it saw — even when the scan
+    /// refuses terminals in descending order (`reversed_chains`) — the counts
     /// and the offsets the printed sentence lists are those of the uncapped
     /// list before the cap (pinned from 7244937, where every one was stored).
     #[test]

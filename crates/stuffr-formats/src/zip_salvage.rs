@@ -330,8 +330,9 @@ const NAME_BUDGET_SHAPE: &str =
 /// about the archive's entries between calls beyond what
 /// [`SalvageScan::next_candidate`] itself receives.
 ///
-/// **One instance scans one source.** The scanner is stateful: its `ScanBudget`, the offsets that budget refused and its `ForwardSearch` window.
-/// Reusing an instance across sources carries that spent state into the
+/// **One instance scans one source.** The scanner is stateful: its
+/// `ScanBudget`, the offsets that budget refused and its `ForwardSearch`
+/// window. Reusing an instance across sources carries that spent state into the
 /// next scan, so build a fresh one (`ZipSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct ZipSalvage {
