@@ -194,6 +194,30 @@ read list.
 > default tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`.
 >
+> `0.10.3` is a patch. **Hostile input now costs `salvage` work linear in
+> its size** in every format. Before, a crafted file could cost seconds per
+> MiB, for example cpio headers landing in shared zero runs, or tar
+> extension chains converging on one header, up to tens of thousands of
+> times the input in reads. Each scanner now searches ahead in growing
+> chunks, remembers what it has already read, and charges the bytes a
+> verdict needs (a long name, an extension chain, a checksummed header)
+> against a budget of `2 × file size + 32 KiB`. Whatever a budget skips is
+> reported as a sighting, never exit 6, and real archives never reach it.
+> The `salvage` fuzz target holds every scan to 8 × its input + 64 KiB.
+> **`list`/`unpack` refuse a GNU tar long name or link over 16 MiB** (exit
+> 6, as a pax header over 16 MiB already was). **GNU ar `/SYM64/` symbol
+> tables are skipped like `/`**, so 64-bit `ar` libraries list, unpack and
+> salvage. `make check` now builds the docs under `-D warnings`. Additive
+> library API: `ForwardSearch`, `ScanBudget`, `Sighting`'s work- and
+> verdict-bounded kinds, `testing::{CountingSource,
+> check_scan_is_linear}`, `tar::MAX_GNU_LONG_NAME`. **Source break, kept
+> as a patch under the pre-1.0 policy:** `ZipSalvage`, `ArcSalvage`,
+> `ZooSalvage` and `ArjSalvage` hold scan state, so they are no longer
+> unit structs. Build one per scan with `new()`.
+> **1921** tests under `--all-features`, **1857** on the
+> default tier — measured from this bump's own `make check`,
+> `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
