@@ -2652,6 +2652,26 @@ fn a_zip_symlink_target_over_64_kib_exits_6_and_one_at_the_ceiling_does_not() {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    let out = run_output(&["cat", big.to_str().unwrap(), "link"]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "`cat` too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = run_output(&[
+        "convert",
+        big.to_str().unwrap(),
+        dir.join("converted.tar").to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "`convert` too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

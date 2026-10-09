@@ -2990,6 +2990,70 @@ mod tests {
         assert_eq!(err.exit_code(), 6, "{err}");
     }
 
+    /// A bad-checksum `L` header declaring one byte past the ceiling is the
+    /// crate's own `Corrupt` (exit 5), not the guard's exit 6: the guard
+    /// refuses only a header the crate has accepted, as for a pax `x`.
+    #[test]
+    fn a_bad_checksum_long_name_over_the_ceiling_is_corrupt() {
+        let mut block = gnu_block("././@LongLink", b'L', MAX_GNU_LONG_NAME + 1);
+        block[148] ^= 0x01; // the checksum field
+        let mut bytes = block.to_vec();
+        bytes.extend_from_slice(&[b'n'; 1024]);
+        for (shape, ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
+            let err = walk(ar).expect_err("a header with a bad checksum");
+            assert!(
+                matches!(err, stuffr_core::Error::Corrupt(_)),
+                "{shape}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), 5, "{shape}: {err}");
+        }
+    }
+
+    /// A v7 header (no magic) with typeflag `L` is not a GNU long-name
+    /// header to the crate: it is an ordinary entry, so the guard does not
+    /// refuse it at exit 6. Declaring a payload that is not there, it is
+    /// truncated, exit 5 — pinned as it is today.
+    #[test]
+    fn a_v7_long_name_header_over_the_ceiling_is_an_ordinary_truncated_entry() {
+        let mut header = tar::Header::new_old();
+        header.set_path("plain").unwrap();
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::new(b'L'));
+        header.set_size(MAX_GNU_LONG_NAME + 1);
+        header.set_cksum();
+        let mut bytes = header.as_bytes().to_vec();
+        bytes.extend_from_slice(&[b'n'; 1024]);
+        for (shape, ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
+            let err = walk(ar).expect_err("a declared payload that is not there");
+            assert_eq!(err.exit_code(), 5, "{shape}: {err}");
+        }
+    }
+
+    /// An `L` after a pax `x` is still an `L`: over the ceiling it is exit 6.
+    #[test]
+    fn a_long_name_over_the_ceiling_after_a_pax_header_is_a_resource_limit() {
+        let buf = SharedBuf::new();
+        let mut builder =
+            tar::Builder::new(Box::new(buf.clone()) as Box<dyn std::io::Write + Send>);
+        builder
+            .append_pax_extensions([("comment", &b"hello"[..])])
+            .unwrap();
+        builder.into_inner().unwrap().flush().unwrap();
+        let mut bytes = buf.contents();
+        // `Builder` finished with the two-block trailer; the `L` follows the `x`.
+        bytes.truncate(bytes.len() - 2 * BLOCK);
+        bytes.extend_from_slice(&gnu_block("././@LongLink", b'L', MAX_GNU_LONG_NAME + 1));
+        bytes.extend_from_slice(&[b'n'; 1024]);
+        for (shape, ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
+            let err = walk(ar).expect_err("an L past the ceiling after an x");
+            assert!(
+                matches!(err, stuffr_core::Error::ResourceLimit(_)),
+                "{shape}: {err:?}"
+            );
+            assert_eq!(err.exit_code(), 6, "{shape}: {err}");
+        }
+    }
+
     /// The inside edge, small: an ordinary and a PATH_MAX-sized name list.
     #[test]
     fn a_normal_long_name_lists() {

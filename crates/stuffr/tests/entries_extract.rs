@@ -1993,7 +1993,7 @@ fn gnu_header(name: &str, typeflag: u8, size: u64, link: &str) -> [u8; 512] {
 /// (NUL-terminated, padded to a block).
 fn gnu_long_member(typeflag: u8, len: u64) -> Vec<u8> {
     let mut out = gnu_header("././@LongLink", typeflag, len, "").to_vec();
-    let mut payload = vec![b'n'; len as usize];
+    let mut payload = vec![b'n'; usize::try_from(len).unwrap()];
     if let Some(last) = payload.last_mut() {
         *last = 0;
     }
@@ -2034,15 +2034,18 @@ fn a_long_name_over_the_ceiling_refuses_unpack_with_exit_6() {
 #[test]
 fn a_long_name_at_the_ceiling_is_not_a_resource_limit_for_unpack() {
     // A 16 MiB name cannot be created on any filesystem, so the entry is
-    // skipped as too long (not an error); what matters is that the ceiling
-    // itself is not refused.
+    // skipped with the too-long-path reason (not an error); what matters is
+    // that the ceiling itself is not refused.
     let dir = tmp_dir();
     let archive = tar_with_long_name(&dir, GNU_CEILING);
     let dest = dir.join("out");
     std::fs::create_dir_all(&dest).unwrap();
-    if let Err(err) = extract_with(&archive, &dest, false) {
-        assert_ne!(err.exit_code(), 6, "exactly the ceiling is allowed: {err}");
-    }
+    let outcome = extract_with(&archive, &dest, false).expect("exactly the ceiling is allowed");
+    // The payload's NUL terminator is not part of the name.
+    let name = "n".repeat(usize::try_from(GNU_CEILING).unwrap() - 1);
+    assert_eq!(outcome.fidelity.warnings, [skipped(&name, PATH_TOO_LONG)]);
+    // The `L` names the one member behind it, so nothing is written.
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
 }
 
 #[test]
