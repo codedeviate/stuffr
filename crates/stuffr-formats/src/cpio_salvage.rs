@@ -169,7 +169,8 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, salvage_all, stream_bounded_copy,
+    SalvagedEntry, ScanBudget, Sighting, SightingKind, SightingLog, UnverifiedCause, salvage_all,
+    stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
@@ -876,7 +877,14 @@ fn candidate_from(
 #[derive(Debug, Default)]
 pub struct CpioSalvage {
     resume: Option<Resume>,
-    sightings: Vec<(u64, Variant)>,
+    /// Every variant header seen, and every header refused because a read
+    /// would have overspent [`Self::budget`] (a
+    /// [`Sighting::verdict_bounded`]; its own `over_budget` list before
+    /// 0.10.4). A [`SightingLog`]: each is
+    /// counted, at most [`SightingLog::DEFAULT_CAP`] stored per shape, pushed
+    /// in ascending offset order because the scan only moves forward, so the
+    /// ones kept are the first. The exit-3 refusal reads its counts from it.
+    sightings: SightingLog,
     /// The zero runs this scan has read — see [`KnownZeros`].
     memo: KnownZeros,
     /// The magic search's reusable window.
@@ -891,10 +899,6 @@ pub struct CpioSalvage {
     /// corroboration check alike ([`read_name`], [`symlink_target`]). Built
     /// on the first call, from the source's length; one per scan.
     budget: Option<ScanBudget>,
-    /// Every header refused because a read would have overspent
-    /// [`Self::budget`], in scan order — reported as
-    /// [`Sighting::verdict_bounded`].
-    over_budget: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -940,10 +944,17 @@ impl SalvageScan for CpioSalvage {
                 }
                 // Recorded, never a candidate: the engine must never advance
                 // by a length this build could not gate.
-                Scanned::Sighting(variant) => self.sightings.push((offset, variant)),
+                Scanned::Sighting(variant) => {
+                    self.sightings
+                        .push(Sighting::new(CPIO, offset, variant.shape()))
+                }
                 Scanned::NotAnEntry => {}
                 // Not judged: reported, and resumed exactly like a refusal.
-                Scanned::OverBudget => self.over_budget.push(offset),
+                Scanned::OverBudget => self.sightings.push(Sighting::verdict_bounded(
+                    CPIO,
+                    offset,
+                    VERDICT_BUDGET_SHAPE,
+                )),
             }
             // One byte on, so a genuine header overlapping this one is never
             // skipped.
@@ -1057,11 +1068,11 @@ pub fn write_payload(
 /// The sentence a run that recovered NOTHING reports when it saw variant
 /// headers — naming each variant, and that the archive is not thereby
 /// shown damaged.
-fn refusal(sightings: &[(u64, Variant)]) -> String {
+fn refusal(sightings: &SightingLog) -> String {
     let parts: Vec<String> = [Variant::Odc, Variant::Crc]
         .into_iter()
         .filter_map(|variant| {
-            let n = sightings.iter().filter(|(_, v)| *v == variant).count();
+            let n = variant_count(sightings, variant);
             (n > 0).then(|| format!("{n} {} — {}", variant.shape(), variant.name()))
         })
         .collect();
@@ -1074,6 +1085,11 @@ fn refusal(sightings: &[(u64, Variant)]) -> String {
     )
 }
 
+/// How many `variant` headers `sightings` counted — exact, stored or not.
+fn variant_count(sightings: &SightingLog, variant: Variant) -> u64 {
+    sightings.count(CPIO, variant.shape(), SightingKind::Ungateable)
+}
+
 /// Runs [`CpioSalvage`] over `src` and annotates the result — the whole
 /// scanner, matching every other format's `salvage_*` entry point. cpio has
 /// no index to reconcile against, so the raw scan is the only source.
@@ -1084,23 +1100,18 @@ pub fn salvage_cpio(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sa
     // BUILD (exit 3), never "nothing recoverable" about the archive (exit
     // 5). Only when nothing came back (Ruling S-X): a mixed run reports what
     // it got at its own code, and carries the sightings for the note.
-    if outcome.entries.is_empty() && !scanner.sightings.is_empty() {
+    let variants = [Variant::Odc, Variant::Crc]
+        .into_iter()
+        .any(|variant| variant_count(&scanner.sightings, variant) > 0);
+    if outcome.entries.is_empty() && variants {
         return Err(Error::Unsupported(refusal(&scanner.sightings)));
     }
     // 0.10.3 Task 4b: beside them, every header the scan's budget left
     // unjudged — never an entry, and printed by the caller like any other
     // sighting.
-    outcome.sightings = scanner
-        .sightings
-        .iter()
-        .map(|&(offset, variant)| Sighting::new(CPIO, offset, variant.shape()))
-        .chain(
-            scanner
-                .over_budget
-                .iter()
-                .map(|&offset| Sighting::verdict_bounded(CPIO, offset, VERDICT_BUDGET_SHAPE)),
-        )
-        .collect();
+    outcome.sightings = scanner.sightings.into_sightings();
+    // Stable, so each group keeps its ascending order and the sighting
+    // carrying its `more`.
     outcome.sightings.sort_by_key(|s| s.offset);
     Ok(outcome)
 }
@@ -2119,6 +2130,124 @@ mod tests {
         }
     }
 
+    /// [`long_names_and_symlink_targets_spend_a_bounded_budget`]'s units:
+    /// a `newc` header every 128 bytes, 1 MiB of them.
+    fn long_name_units(mode: u32, filesize: u32, namesize: u32, nul_at: Option<usize>) -> Vec<u8> {
+        const LEN: usize = 1024 * 1024;
+        let fields = [1, mode, 0, 0, 1, 0, filesize, 0, 0, 0, 0, namesize, 0];
+        let mut unit = NEWC_MAGIC.to_vec();
+        for field in fields {
+            unit.extend_from_slice(format!("{field:08X}").as_bytes());
+        }
+        if mode == 0o120_777 {
+            unit.extend_from_slice(b"a\0");
+        }
+        unit.resize(128, b'B');
+        if let Some(at) = nul_at {
+            unit[at] = 0;
+        }
+        unit.iter().copied().cycle().take(LEN).collect()
+    }
+
+    /// 0.10.4: `odc` and `newc-crc` entries alternating through 1 MiB, after
+    /// one healthy `newc` entry when `mixed` — two variant groups, every
+    /// header a sighting.
+    fn dense_variants(mixed: bool) -> Vec<u8> {
+        let mut bytes = if mixed {
+            files(&[("ok.txt", b"fine")])
+        } else {
+            Vec::new()
+        };
+        let mut i = 0;
+        while bytes.len() < 1 << 20 {
+            let name = format!("v{i}.txt");
+            if i % 2 == 0 {
+                bytes.extend_from_slice(&odc_entry(&name, b"data"));
+            } else {
+                let mut field = name.into_bytes();
+                field.push(0);
+                bytes.extend_from_slice(&newc_entry_raw(CRC_MAGIC, &field, b"data"));
+            }
+            i += 1;
+        }
+        bytes
+    }
+
+    /// 0.10.4: on a dense hostile input the scan stores at most
+    /// `SightingLog::DEFAULT_CAP` sightings per group, in ascending offset
+    /// order, and they still stand for every one it saw — the counts
+    /// and the offsets the printed sentence lists are those of the uncapped
+    /// list before the cap (pinned from 7244937, where every one was stored).
+    #[test]
+    fn dense_sightings_are_bounded_and_the_sentence_is_unchanged() {
+        use stuffr_core::salvage::describe_sightings;
+        use stuffr_core::testing::check_sightings_bounded;
+        let legs: [(&str, Vec<u8>, u64, &[&str]); 4] = [
+            (
+                "variants",
+                dense_variants(true),
+                9803,
+                &[
+                    "4902 cpio",
+                    "at offset(s) 248, 459, 670, 881, 1092, 1303, 1515, 1727, and 4894 more",
+                    "4901 cpio",
+                    "at offset(s) 335, 546, 757, 968, 1179, 1391, 1603, 1815, and 4893 more",
+                ][..],
+            ),
+            (
+                "refused names",
+                long_name_units(0o100_644, 0, 0xFFFF, None),
+                7648,
+                &[
+                    "7648 cpio",
+                    "at offset(s) 4096, 4224, 4352, 4480, 4608, 4736, 4864, 4992, and 7640 more",
+                ][..],
+            ),
+            (
+                "accepted names",
+                long_name_units(0o100_644, 0, 65_419, Some(120)),
+                7649,
+                &[
+                    "7649 cpio",
+                    "at offset(s) 4096, 4224, 4352, 4480, 4608, 4736, 4864, 4992, and 7641 more",
+                ][..],
+            ),
+            (
+                "symlink targets",
+                long_name_units(0o120_777, 0xFFFF, 2, None),
+                7648,
+                &[
+                    "7648 cpio",
+                    "at offset(s) 4096, 4224, 4352, 4480, 4608, 4736, 4864, 4992, and 7640 more",
+                ][..],
+            ),
+        ];
+        for (label, bytes, total, listed) in legs {
+            let out = salvage_cpio(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+            check_sightings_bounded(&out.sightings, total)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let note = describe_sightings(&out.sightings).unwrap();
+            for fragment in listed {
+                assert!(
+                    note.contains(fragment),
+                    "{label}: {fragment:?} missing: {note}"
+                );
+            }
+        }
+        // And the exit-3 refusal still counts every variant header.
+        let err = salvage_cpio(
+            &mut Cursor::new(dense_variants(false)),
+            &SalvagePolicy::default(),
+        )
+        .unwrap_err();
+        for count in [
+            "4903 header(s) in the odc variant",
+            "4903 header(s) in the newc-crc variant",
+        ] {
+            assert!(err.to_string().contains(count), "{count:?} missing: {err}");
+        }
+    }
+
     /// 0.10.3 Task 4b: `newc` headers one every 128 bytes, 1 MiB of them,
     /// each making its verdict read about 64 KiB — and each resuming the
     /// scan one byte on. Three siblings: names that are refused once read
@@ -2131,22 +2260,7 @@ mod tests {
     fn long_names_and_symlink_targets_spend_a_bounded_budget() {
         use stuffr_core::salvage::SightingKind;
         use stuffr_core::testing::{CountingSource, check_scan_is_linear};
-        const LEN: usize = 1024 * 1024;
-        let fill = |mode: u32, filesize: u32, namesize: u32, nul_at: Option<usize>| {
-            let fields = [1, mode, 0, 0, 1, 0, filesize, 0, 0, 0, 0, namesize, 0];
-            let mut unit = NEWC_MAGIC.to_vec();
-            for field in fields {
-                unit.extend_from_slice(format!("{field:08X}").as_bytes());
-            }
-            if mode == 0o120_777 {
-                unit.extend_from_slice(b"a\0");
-            }
-            unit.resize(128, b'B');
-            if let Some(at) = nul_at {
-                unit[at] = 0;
-            }
-            unit.iter().copied().cycle().take(LEN).collect::<Vec<u8>>()
-        };
+        let fill = long_name_units;
         // A 65,419-byte name ends on byte 120 of a later unit: 110 + 65,419
         // - 1 is 120 more than a multiple of 128.
         let shapes = [
