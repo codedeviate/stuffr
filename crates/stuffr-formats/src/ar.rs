@@ -49,7 +49,9 @@
 //! returns `Ok(None)` the moment a header read comes back completely empty,
 //! and an error for anything short of that — there is no second,
 //! indistinguishable "clean ending" shape for this module to disambiguate
-//! the way `tar.rs` has to. One consequence is worth stating because it is
+//! the way `tar.rs` has to — except a PAYLOAD the stream cuts short, which
+//! the crate passes over without error and the guard has to catch (see "A
+//! payload the file cuts short is corrupt, in every verb"). One consequence is worth stating because it is
 //! easy to get backwards: a genuinely EMPTY (zero-byte) stream is not a
 //! valid empty `ar` archive, it is a truncated one — `read_global_header_if_
 //! necessary`'s `read_exact` on the 8-byte magic raises `UnexpectedEof`
@@ -104,10 +106,27 @@
 //! the member itself, as the crate skips `/`: header, payload and pad byte
 //! are consumed from the source through a fixed stack buffer (nothing is
 //! sized from the declared length) and never reach the crate, which sees the
-//! next header. A payload cut by the end of the file ends the skip there and
-//! the crate sees a clean end of archive, as it does for a `/` table cut
-//! short. Skipping is not rewriting: the "never rewrites a symbol-table
-//! header" rule below still holds.
+//! next header. A payload cut by the end of the file is a truncated archive
+//! (`UnexpectedEof`, exit 5), as a `/` table cut short is. Skipping is not
+//! rewriting: the "never rewrites a symbol-table header" rule below still
+//! holds.
+//!
+//! # A payload the file cuts short is corrupt, in every verb
+//!
+//! `ar` 0.9.0 takes a short payload for the end of the archive in three
+//! places: it skips a `/` table with `io::copy(take(size))`, which ends at
+//! end of file without error (`lib.rs:247`); `Entry::drop` drains an unread
+//! payload and discards the result (`let _ = io::copy(..)`, `lib.rs:851-859`);
+//! and its pad-byte read ignores `UnexpectedEof` (`lib.rs:541-562`). So
+//! `list`, which reads no payload, saw a member cut by the end of the file as
+//! a clean end at exit 0 (0.10.3 and before). Since 0.10.4 the guard counts
+//! each payload against its header's size, and the read that finds the file
+//! ended with bytes still declared fails with `UnexpectedEof` (Corrupt, via
+//! `classify_ar_error`). The guard then STAYS failed
+//! (`ArGuardPhase::Truncated`): the crate swallows the first error in its
+//! drain and its pad read, but its next header read is a `?` that
+//! `next_entry` returns. The file ending at a member boundary, or where only
+//! the final pad byte is missing, stays a clean end.
 //!
 //! # Four header fields `ar` 0.9.0 trusts before use, and what this module does about each
 //!
@@ -819,9 +838,11 @@ fn is_sym64_header(hdr: &[u8; AR_ENTRY_HEADER_LEN]) -> bool {
 
 /// Discards `len` payload bytes and the pad byte (when `pad`) from `inner`
 /// through a fixed stack buffer, advancing `pos`, and tells `observer` the
-/// record ended where the payload did. End of file ends the skip silently:
-/// the caller's next header read then finds a clean end. A present pad byte
-/// that is not `\n` is the crate's own refusal, as for any member.
+/// record ended where the payload did. End of file before `len` bytes is a
+/// truncated archive, `UnexpectedEof`; the caller makes the guard stay failed
+/// ([`ArGuardPhase::Truncated`]). A missing pad byte is the archive's final
+/// one, accepted as everywhere else. A present pad byte that is not `\n` is
+/// the crate's own refusal, as for any member.
 fn skip_member_payload<R: Read, O: GuardObserver>(
     inner: &mut R,
     pos: &mut u64,
@@ -837,7 +858,14 @@ fn skip_member_payload<R: Read, O: GuardObserver>(
             .min(usize::try_from(left).unwrap_or(usize::MAX));
         let n = inner.read(&mut scratch[..want])?;
         if n == 0 {
-            return Ok(());
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "the ar `/SYM64/` symbol table ending at offset {} is {left} bytes \
+                     short of the size its header declares; the archive is truncated",
+                    *pos + left
+                ),
+            ));
         }
         *pos += n as u64;
         left -= n as u64;
@@ -899,6 +927,11 @@ enum ArGuardPhase {
         pad_after: PadAfter,
         ends_record: bool,
     },
+    /// The file ended inside a payload its header declared longer (see the
+    /// module doc's "A payload the file cuts short is corrupt"). Every read
+    /// fails with `UnexpectedEof` and `message`, so the crate's next header
+    /// read surfaces it even after its drain or pad read swallowed the first.
+    Truncated { message: String },
 }
 
 /// Told where [`ArGuardedReader`] finds each record boundary — the one thing
@@ -1094,13 +1127,20 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                         let scan =
                             scan_ar_header(&hdr, &mut self.variant, &mut self.name_table_len)?;
                         if self.variant == ar::Variant::GNU && is_sym64_header(&hdr) {
-                            skip_member_payload(
+                            if let Err(e) = skip_member_payload(
                                 &mut self.inner,
                                 &mut self.pos,
                                 scan.payload_len,
                                 scan.true_pad,
                                 &mut self.observer,
-                            )?;
+                            ) {
+                                if e.kind() == io::ErrorKind::UnexpectedEof {
+                                    self.phase = ArGuardPhase::Truncated {
+                                        message: e.to_string(),
+                                    };
+                                }
+                                return Err(e);
+                            }
                             // Nothing of this member reaches the crate.
                             buf.clear();
                             continue;
@@ -1173,11 +1213,26 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                         .min(usize::try_from(*remaining).unwrap_or(usize::MAX));
                     let n = self.inner.read(&mut out[..want])?;
                     if n == 0 {
-                        return Ok(0);
+                        let message = format!(
+                            "ar member ending at offset {} is {} bytes short of the size \
+                             its header declares; the archive is truncated",
+                            self.pos + *remaining,
+                            *remaining
+                        );
+                        self.phase = ArGuardPhase::Truncated {
+                            message: message.clone(),
+                        };
+                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, message));
                     }
                     self.pos += n as u64;
                     *remaining -= n as u64;
                     return Ok(n);
+                }
+                ArGuardPhase::Truncated { message } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        message.clone(),
+                    ));
                 }
             }
         }
@@ -1335,7 +1390,13 @@ impl Read for ArEntryPayload<'_> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let n = self.entry.read(buf)?;
+        // The guard reports the file ending inside this payload as
+        // `UnexpectedEof` (see `ArGuardPhase::Truncated`); said here instead
+        // with the entry's name, which the guard does not know.
+        let n = match self.entry.read(buf) {
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof && self.remaining > 0 => 0,
+            other => other?,
+        };
         if n == 0 && self.remaining > 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2918,8 +2979,9 @@ mod tests {
         }
     }
 
-    /// A declared size far beyond the file allocates nothing and a payload
-    /// cut by EOF behaves exactly as a cut `/` table does.
+    /// A declared size far beyond the file allocates nothing, and a payload
+    /// cut by EOF is corrupt (exit 5) exactly as a cut `/` table is: the same
+    /// error kind for both, at every cut.
     #[test]
     fn a_truncated_sym64_behaves_as_a_truncated_slash_table() {
         for cut in [70usize, 100, 150] {
@@ -2929,6 +2991,7 @@ mod tests {
                 b.truncate(cut);
                 read_all(&b).map(|v| v.len()).map_err(|e| e.exit_code())
             };
+            assert_eq!(outcome("/"), Err(5), "cut {cut}");
             assert_eq!(outcome("/SYM64/"), outcome("/"), "cut {cut}");
         }
         let mut huge = b"!<arch>\n".to_vec();
@@ -2936,5 +2999,75 @@ mod tests {
         h[48..58].copy_from_slice(b"9999999999");
         huge.extend(h);
         let _ = read_all(&huge);
+    }
+
+    /// Every entry's name, as `list` reads them: no payload is read, so a
+    /// cut one is drained by the crate when the next entry is asked for.
+    fn list_names(bytes: Vec<u8>) -> stuffr_core::Result<Vec<String>> {
+        let mut ar = open_guarded(bytes, 4096);
+        let mut names = Vec::new();
+        while let Some(entry) = ar.next_entry()? {
+            names.push(entry.meta().name.clone());
+        }
+        Ok(names)
+    }
+
+    fn gnu_archive_with_members() -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        out.extend(ar_member("/", &[0u8; 13]));
+        out.extend(ar_member("a.o/", b"first body"));
+        out.extend(ar_member("b.o/", b"second body!"));
+        out
+    }
+
+    /// 0.10.4: a member whose payload the file cuts short is corrupt in
+    /// `list` too, which reads no payload — the crate's drain of it used to
+    /// end the archive cleanly at exit 0.
+    #[test]
+    fn a_truncated_member_is_corrupt_when_listed() {
+        let full = gnu_archive_with_members();
+        for cut in [full.len() - 3, full.len() - 11] {
+            let err = list_names(full[..cut].to_vec()).unwrap_err();
+            assert_eq!(err.exit_code(), 5, "cut {cut}: {err}");
+        }
+    }
+
+    /// 0.10.4: a `/` or `/SYM64/` table cut by the end of the file is
+    /// corrupt, not an archive with no members.
+    #[test]
+    fn a_truncated_symbol_table_is_corrupt() {
+        for table in ["/", "/SYM64/"] {
+            let mut out = b"!<arch>\n".to_vec();
+            out.extend(ar_member(table, &[0u8; 200]));
+            out.extend(ar_member("a.o/", b"body"));
+            for cut in [70, 100, 150] {
+                let err = list_names(out[..cut].to_vec()).unwrap_err();
+                assert_eq!(err.exit_code(), 5, "{table} cut {cut}: {err}");
+            }
+        }
+    }
+
+    /// The endings that stay accepted: the file ending at a member boundary
+    /// is an archive of the members before it (the format has no end
+    /// marker), and a missing FINAL pad byte stays accepted — see
+    /// `a_missing_final_true_pad_is_accepted_and_a_cut_or_bad_one_is_corrupt`.
+    #[test]
+    fn an_archive_cut_at_a_member_boundary_still_lists() {
+        let full = gnu_archive_with_members();
+        let last = ar_member("b.o/", b"second body!").len();
+        let boundary = full.len() - last;
+        assert_eq!(list_names(full[..boundary].to_vec()).unwrap(), ["a.o"]);
+        assert_eq!(list_names(full).unwrap(), ["a.o", "b.o"]);
+    }
+
+    /// A GNU `//` long-name table cut short is corrupt (the crate's own
+    /// `read_exact` already said so; pinned beside the rest).
+    #[test]
+    fn a_cut_name_table_is_corrupt() {
+        let mut out = b"!<arch>\n".to_vec();
+        out.extend(ar_member("//", b"a_very_long_member_name.o/\n"));
+        out.extend(ar_member("/0", b"body"));
+        let cut = 8 + 60 + 10;
+        assert_eq!(list_names(out[..cut].to_vec()).unwrap_err().exit_code(), 5);
     }
 }

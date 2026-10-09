@@ -14,7 +14,9 @@
 
 use std::path::{Path, PathBuf};
 
-use stuffr::entries::{self, PartialCause, SalvageDisposition, SalvageOpts};
+use stuffr::entries::{
+    self, ExtractOpts, PartialCause, SalvageDisposition, SalvageOpts, Selection,
+};
 use stuffr::ops::{CompressOpts, Input, Output};
 use stuffr_core::FormatId;
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus, WalkStopKind};
@@ -181,4 +183,48 @@ fn a_truncated_ar_writes_its_genuine_prefix_as_partial() {
     );
     assert!(outcome.walk_stop.is_none());
     assert_eq!(entries::salvage_exit_code(&outcome), 4);
+}
+
+/// 0.10.4: the archive salvage reads as one `Partial` member is corrupt to
+/// every ordinary verb — `list` (which reads no payload, and used to exit 0),
+/// `test`, `unpack` and `cat` — exit 5 each, never a clean end.
+#[test]
+fn every_verb_calls_an_ar_cut_inside_a_member_corrupt() {
+    let scratch = Scratch::new("verbs");
+    let (whole, _) = packed_ar(&scratch.0);
+    let last_payload_at = whole
+        .windows(FILES[3].1.len())
+        .rposition(|w| w == FILES[3].1)
+        .expect("d.txt's payload");
+    let archive = scratch.0.join("cut.a");
+    std::fs::write(&archive, &whole[..last_payload_at + 4]).unwrap();
+    let input = || Input::Path(archive.clone());
+    let ratio = stuffr::DEFAULT_MAX_RATIO;
+
+    let list = entries::list(input(), ratio, None).expect_err("list");
+    let test = entries::test(input(), ratio, None).expect_err("test");
+    let unpack = entries::extract(
+        input(),
+        &scratch.0.join("out"),
+        &Selection::All,
+        &ExtractOpts::default(),
+    )
+    .expect_err("unpack");
+    let cat = entries::cat(
+        input(),
+        &Selection::Names(vec!["tree/d.txt".to_string()]),
+        ratio,
+        None,
+        &mut Vec::new(),
+    )
+    .expect_err("cat");
+    for (verb, err) in [
+        ("list", list),
+        ("test", test),
+        ("unpack", unpack),
+        ("cat", cat),
+    ] {
+        assert_eq!(err.exit_code(), 5, "{verb}: {err}");
+        assert!(err.to_string().contains("truncated"), "{verb}: {err}");
+    }
 }

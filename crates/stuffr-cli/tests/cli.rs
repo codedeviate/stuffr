@@ -12588,6 +12588,28 @@ fn salvage_of_a_truncated_ar_recovers_the_tail_and_says_no_more_than_that() {
     assert!(!stderr.contains("unreachable"), "{stderr}");
 }
 
+/// 0.10.4: `list` of an `ar` cut inside a member's payload reads no payload,
+/// and used to take the crate's drain of the cut one for a clean end: exit 0.
+/// It is corrupt, exit 5, from a file and from stdin alike.
+#[test]
+fn list_of_an_ar_cut_inside_a_member_exits_5_from_a_file_and_from_stdin() {
+    let dir = tmp_dir();
+    let (bytes, offsets) = ar_archive(&[("a.txt", b"alpha"), ("b.txt", b"bravo and more")]);
+    let cut = &bytes[..offsets[1] + 60 + 5];
+    let archive = dir.join("cut.a");
+    std::fs::write(&archive, cut).unwrap();
+
+    let out = run_output(&["list", archive.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(5), "{stderr}");
+    assert!(stderr.contains("truncated"), "{stderr}");
+
+    let out = run_with_stdin_output(&["list", "-"], cut);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(5), "{stderr}");
+    assert!(stderr.contains("truncated"), "{stderr}");
+}
+
 /// Nothing recovered at all — the FIRST header destroyed — is exit 5, and
 /// the note still says why, before the "nothing recoverable" line.
 #[test]

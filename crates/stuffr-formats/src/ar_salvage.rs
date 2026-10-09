@@ -27,8 +27,10 @@
 //! - **A truncated tail — the common damage — is recovered fully.** Every
 //!   member before the cut is reported `Unattested`; a member whose payload
 //!   the cut runs through is `Partial` and its genuine surviving prefix is
-//!   written as `NAME.partial`, never padded; a cut inside a member's
-//!   HEADER, its BSD `#1/N` name or a GNU `//` table ends the walk with a
+//!   written as `NAME.partial`, never padded (the ordinary reader calls the
+//!   same archive corrupt; here the `Partial` entry is the one place the cut
+//!   is named); a cut inside a member's HEADER, its BSD `#1/N` name, a GNU
+//!   `//` table or a symbol table ends the walk with a
 //!   [`WalkStopKind::CutShort`] stop — the reader ran out of bytes inside
 //!   that record, so nothing can follow it.
 //! - **A hole in the middle cannot be survived.** The walk stops at the
@@ -300,6 +302,19 @@ fn walk(src: &mut dyn SeekRead) -> Result<Walk> {
             }
         }
     };
+    // Since 0.10.4 the guard fails a payload the file cuts short (`ar.rs`'s
+    // `ArGuardPhase::Truncated`), and the crate surfaces that at its next
+    // header read. When that payload is the last candidate's — no header has
+    // started since, and the candidate is already `Partial` — the cut is
+    // already named, by that entry; a stop at the same offset would only say
+    // it twice. A cut `/`, `/SYM64/` or `//` table is no candidate, so it
+    // still stops the walk `CutShort`.
+    let failure = failure.filter(|(e, at)| {
+        !(e.kind() == io::ErrorKind::UnexpectedEof
+            && candidates
+                .last()
+                .is_some_and(|c| c.offset == at.header_at && c.available_len.is_some()))
+    });
     let stop = match failure {
         None => None,
         Some((e, at)) => {
@@ -853,6 +868,62 @@ mod tests {
                 assert!(!done, "cut {cut}");
                 assert_eq!(body.as_slice(), &data[..cut - payload], "never padded");
             }
+        }
+    }
+
+    /// 0.10.4: the ordinary reader now calls a GNU archive cut inside its
+    /// last member's payload corrupt (`ar.rs`'s
+    /// `a_truncated_member_is_corrupt_when_listed`), through the SAME guard
+    /// this walk reads. Salvage still recovers `a.o` whole and names the cut
+    /// once, as `b.o`'s `Partial` entry with its genuine prefix: the guard's
+    /// truncation error is that same record's, not a second stop after it.
+    #[test]
+    fn a_member_cut_by_the_end_of_the_file_is_partial_and_no_stop() {
+        let mut full = GLOBAL_HEADER.to_vec();
+        full.extend(member(b"/", 13, &[0u8; 13]));
+        full.extend(member(b"a.o/", 10, b"first body"));
+        let b_at = full.len();
+        full.extend(member(b"b.o/", 12, b"second body!"));
+        for keep in [1usize, 9] {
+            let cut = &full[..b_at + AR_ENTRY_HEADER_LEN + keep];
+            assert!(read_through_the_reader(cut).is_err(), "keep {keep}");
+            let out = scan(cut);
+            assert!(out.walk_stop.is_none(), "keep {keep}: {:?}", out.walk_stop);
+            assert_eq!(
+                names_and_statuses(&out),
+                [
+                    ("a.o".to_string(), SalvageStatus::Unattested),
+                    ("b.o".to_string(), SalvageStatus::Partial)
+                ],
+                "keep {keep}"
+            );
+            assert_eq!(out.entries[1].offset, b_at as u64);
+            let written = write_back(cut, &out);
+            assert_eq!(written[0].1, b"first body");
+            assert!(written[0].2);
+            assert_eq!(written[1].1, &b"second body!"[..keep]);
+            assert!(!written[1].2);
+        }
+    }
+
+    /// 0.10.4: a `/` symbol table cut by the end of the file used to end the
+    /// walk as a clean, empty archive; it is now a `CutShort` stop at the
+    /// table's header — the file ended inside that record.
+    #[test]
+    fn a_symbol_table_cut_by_the_end_of_the_file_is_cut_short() {
+        for table in [&b"/"[..], b"/SYM64/"] {
+            let mut full = GLOBAL_HEADER.to_vec();
+            full.extend(member(table, 200, &[0u8; 200]));
+            full.extend(member(b"a.o/", 4, b"body"));
+            let out = scan(&full[..100]);
+            assert!(out.entries.is_empty());
+            let stop = out.walk_stop.as_ref().expect("a cut table is a stop");
+            assert_eq!(
+                (stop.offset, stop.kind),
+                (GLOBAL_HEADER.len() as u64, WalkStopKind::CutShort),
+                "{}",
+                describe_walk_stop(stop)
+            );
         }
     }
 
