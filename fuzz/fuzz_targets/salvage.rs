@@ -643,14 +643,11 @@ fuzz_target!(|data: &[u8]| {
         format: Some(stuffr_core::FormatId::new(name)),
     };
 
-    let outcome = match entries::salvage(&path, &opts) {
-        Ok(o) => o,
-        Err(e) => {
-            check_error_is_classified(&e).expect("salvage error classification");
-            trace(name, routed, 0, Tally::default());
-            return;
-        }
-    };
+    // Held, not matched: the counted second pass and the linearity check
+    // below must run whether or not this pass erred. An `Err` (commonly
+    // `Unsupported`: nothing recovered plus one ungateable shape) used to
+    // `return` here, so exactly those inputs were never held to the bound.
+    let first_pass = entries::salvage(&path, &opts);
 
     // Independent second pass, at the core scanner level, over the
     // IDENTICAL bytes and policy — purely to recover each scan position's
@@ -772,6 +769,15 @@ fuzz_target!(|data: &[u8]| {
     scan_trace(name, len, cursor.bytes_read());
     check_scan_is_linear(cursor.bytes_read(), len)
         .expect("salvage: scan work is linear in its input");
+
+    let outcome = match first_pass {
+        Ok(o) => o,
+        Err(e) => {
+            check_error_is_classified(&e).expect("salvage error classification");
+            trace(name, routed, 0, Tally::default());
+            return;
+        }
+    };
 
     let mut intact = 0usize;
     let mut claims = 0usize;
