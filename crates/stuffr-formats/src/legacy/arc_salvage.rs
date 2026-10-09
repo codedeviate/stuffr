@@ -121,6 +121,10 @@ const KNOWN_METHOD_RANGE: std::ops::RangeInclusive<u8> = 1..=11;
 /// carries nothing about the archive between them beyond what
 /// [`SalvageScan::next_candidate`] itself receives — the same shape
 /// `ZipSalvage` has.
+///
+/// **One instance scans one source.** The scanner is stateful: its `ScanBudget`, the offsets that budget refused and its `ForwardSearch` window.
+/// Reusing an instance across sources carries that spent state into the
+/// next scan, so build a fresh one (`ArcSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct ArcSalvage {
     search: ForwardSearch,

@@ -1453,8 +1453,9 @@ EXIT CODES
      cost a caller the rest of the archive. Nor any of `salvage`'s own scan
      work caps (tar's per-header and scan-wide extension-chain budgets; the
      scan-wide verdict budget of zip, zoo, lha, arj and cpio): what a cap
-     skips is reported as a sighting, and the run exits 4 when anything was
-     recovered alongside it, 5 when nothing was
+     skips is reported as a sighting, and a work cap never gives exit 6: the
+     run exits by its ordinary rule (4, 3, 7 or 5 as the entries and the
+     shapes it could not gate dictate)
   7  unsafe path refused. In a `salvage` run it is the entry that is
      refused, never the run: the rest of the archive is still recovered
      and the summary still prints, and 7 outranks 3 and 4 so a caller

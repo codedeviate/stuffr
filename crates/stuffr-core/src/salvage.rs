@@ -806,7 +806,7 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
     if !verdicts.is_empty() {
         sentences.push(format!(
             "this build's salvage scanner bounds the work it spends judging candidate headers \
-             across the whole scan, and stopped judging at {} — so whatever those headers \
+             across the whole scan, and did not judge {} — so whatever those headers \
              describe is not listed or recovered there, though the scan went on past them; \
              `stuffr list` and `stuffr unpack` may read these headers normally",
             sighting_groups(&verdicts)
@@ -2905,7 +2905,7 @@ mod tests {
         assert_eq!(
             verdict,
             "this build's salvage scanner bounds the work it spends judging candidate headers \
-             across the whole scan, and stopped judging at 1 fmt c(s) at offset(s) 7 — so \
+             across the whole scan, and did not judge 1 fmt c(s) at offset(s) 7 — so \
              whatever those headers describe is not listed or recovered there, though the scan \
              went on past them; `stuffr list` and `stuffr unpack` may read these headers normally"
         );

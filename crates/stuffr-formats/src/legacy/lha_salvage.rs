@@ -618,6 +618,10 @@ const EXTENSION_BUDGET_SHAPE: &str =
 /// [`SalvageScan::next_candidate`] itself receives — the same shape
 /// `ZipSalvage`, `ArcSalvage` and `ZooSalvage` have — only the
 /// [`ForwardSearch`] buffer and the sightings below.
+///
+/// **One instance scans one source.** The scanner is stateful: its `ScanBudget`, the offsets that budget refused, its `ForwardSearch` window and its sightings.
+/// Reusing an instance across sources carries that spent state into the
+/// next scan, so build a fresh one (`LhaSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct LhaSalvage {
     search: ForwardSearch,
@@ -1960,11 +1964,12 @@ pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     // incompleteness rather than a contradiction: nothing false is claimed,
     // where exit 5 on a healthy file was. Saying more is now possible —
     // [`SalvageOutcome::sightings`] is that channel since Salvage Stage 3's
-    // Task 2-N, and the CLI prints it — but this scanner does not yet emit
-    // [`stuffr_core::salvage::Sighting`]s: its two flags carry no offsets,
-    // so a mixed LHA run is still silent about them. Converting them is a
-    // recorded follow-up; no LHA writer mixes header levels within one
-    // archive.
+    // Task 2-N, and the CLI prints it — but the two flags behind this refusal
+    // carry no offsets, so a mixed LHA run is still silent about them. The
+    // scanner does emit [`stuffr_core::salvage::Sighting`]s, but only
+    // verdict-bounded ones (headers whose extension headers its budget did
+    // not read); converting these flags is a recorded follow-up, and no LHA
+    // writer mixes header levels within one archive.
     if outcome.entries.is_empty() && scanner.seen.any() {
         return Err(Error::Unsupported(scanner.seen.refusal()));
     }

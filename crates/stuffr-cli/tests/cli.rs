@@ -12041,8 +12041,8 @@ fn salvage_reports_zip_headers_its_verdict_budget_did_not_judge() {
     }
     const SHAPE: &str = "local header(s) whose name it did not read once that work was spent";
     const OPENING: &str = "salvage -> this build's salvage scanner bounds the work it spends \
-                           judging candidate headers across the whole scan, and stopped judging \
-                           at ";
+                           judging candidate headers across the whole scan, and did not judge \
+                           ";
     const CLOSING: &str = " — so whatever those headers describe is not listed or recovered \
                            there, though the scan went on past them; `stuffr list` and `stuffr \
                            unpack` may read these headers normally\n";

@@ -378,6 +378,11 @@ fn candidate(
 /// runs once, on the first call to [`SalvageScan::next_candidate`], and the
 /// members it found are handed out in order after that; the engine's `from`
 /// is not consulted, because a sequential walk has nowhere else to resume.
+///
+/// **One instance scans one source.** The scanner is stateful: the members its one walk found
+/// and where that walk stopped.
+/// Reusing an instance across sources carries that spent state into the
+/// next scan, so build a fresh one (`ArSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct ArSalvage {
     walked: bool,

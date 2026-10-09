@@ -581,6 +581,10 @@ const VERDICT_BUDGET_SHAPE: &str =
 /// `ZipSalvage`, `ArcSalvage` and `ZooSalvage` have. Unlike `LhaSalvage`
 /// there is no Ruling S-V sighting to carry: see this module's doc for why
 /// `file type == 2` deliberately gets no such channel.
+///
+/// **One instance scans one source.** The scanner is stateful: its `ScanBudget`, the offsets that budget refused and its `ForwardSearch` window.
+/// Reusing an instance across sources carries that spent state into the
+/// next scan, so build a fresh one (`ArjSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct ArjSalvage {
     search: ForwardSearch,

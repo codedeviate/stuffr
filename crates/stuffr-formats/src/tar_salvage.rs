@@ -835,6 +835,11 @@ pub const SPARSE: FormatId = FormatId::new("tar-sparse");
 /// The one piece of state is `resume`: where the last WHOLE candidate's
 /// payload ends, so the next scan can start there rather than inside the
 /// payload (the module doc's "jumps its payload" section).
+///
+/// **One instance scans one source.** The scanner is stateful: its resume position, its ungateable
+/// sightings, its `ForwardSearch` window and its extension-chain budgets.
+/// Reusing an instance across sources carries that spent state into the
+/// next scan, so build a fresh one (`TarSalvage::default()`) per source.
 #[derive(Debug, Default)]
 pub struct TarSalvage {
     resume: Option<Resume>,
