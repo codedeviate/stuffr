@@ -2547,6 +2547,114 @@ fn a_zip_declaring_an_unreachable_local_header_offset_exits_5_not_1() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A stored zip holding one symlink entry (`S_IFLNK` in the central
+/// directory's external attributes) whose target payload is `target_len`
+/// bytes. Hand-built, so the size fields are exactly what the test says.
+fn zip_with_one_symlink(name: &str, target_len: usize) -> Vec<u8> {
+    let target = vec![b't'; target_len];
+    let crc = {
+        let mut c = 0xFFFF_FFFFu32;
+        for &b in &target {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 != 0 {
+                    (c >> 1) ^ 0xEDB8_8320
+                } else {
+                    c >> 1
+                };
+            }
+        }
+        !c
+    };
+    let size = target_len as u32;
+    let mut z = Vec::new();
+    // Local file header.
+    z.extend_from_slice(b"PK\x03\x04");
+    z.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0x21, 0]); // ver, flags, stored, time, date
+    z.extend_from_slice(&crc.to_le_bytes());
+    z.extend_from_slice(&size.to_le_bytes());
+    z.extend_from_slice(&size.to_le_bytes());
+    z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    z.extend_from_slice(&0u16.to_le_bytes());
+    z.extend_from_slice(name.as_bytes());
+    z.extend_from_slice(&target);
+    let cd_offset = z.len() as u32;
+    // Central directory record.
+    z.extend_from_slice(b"PK\x01\x02");
+    z.extend_from_slice(&[0x14, 0x03, 20, 0, 0, 0, 0, 0, 0, 0, 0x21, 0]); // made by unix
+    z.extend_from_slice(&crc.to_le_bytes());
+    z.extend_from_slice(&size.to_le_bytes());
+    z.extend_from_slice(&size.to_le_bytes());
+    z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    z.extend_from_slice(&[0; 8]); // extra, comment, disk, internal attrs
+    z.extend_from_slice(&(0o120_777u32 << 16).to_le_bytes());
+    z.extend_from_slice(&0u32.to_le_bytes()); // local header offset
+    z.extend_from_slice(name.as_bytes());
+    let cd_len = z.len() as u32 - cd_offset;
+    // End of central directory.
+    z.extend_from_slice(b"PK\x05\x06");
+    z.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+    z.extend_from_slice(&cd_len.to_le_bytes());
+    z.extend_from_slice(&cd_offset.to_le_bytes());
+    z.extend_from_slice(&0u16.to_le_bytes());
+    z
+}
+
+/// A zip symlink target declared over 64 KiB is a resource limit (exit 6),
+/// the same answer cpio gives for the same predicate against the same
+/// constant. It was exit 5 (corrupt) until 0.10.4. The control at exactly the
+/// ceiling proves the fixture is a readable zip and the refusal is the
+/// target's length, not the fixture's shape.
+#[test]
+fn a_zip_symlink_target_over_64_kib_exits_6_and_one_at_the_ceiling_does_not() {
+    let dir = tmp_dir();
+
+    let ok = dir.join("at-ceiling.zip");
+    std::fs::write(&ok, zip_with_one_symlink("link", 65_536)).unwrap();
+    let out = run_output(&["list", ok.to_str().unwrap()]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a 65,536-byte target is at the ceiling, not over it: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let big = dir.join("over-ceiling.zip");
+    std::fs::write(&big, zip_with_one_symlink("link", 65_537)).unwrap();
+    for verb_args in [
+        vec!["list", big.to_str().unwrap()],
+        vec!["test", big.to_str().unwrap()],
+    ] {
+        let out = run_output(&verb_args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(6),
+            "`{}` must refuse the target as a resource limit: {err}",
+            verb_args[0]
+        );
+        assert!(
+            err.contains("65537") && err.contains("65536"),
+            "the refusal names the declared length and the ceiling: {err}"
+        );
+    }
+
+    let out = run_output(&[
+        "unpack",
+        "-C",
+        dir.join("out").to_str().unwrap(),
+        big.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(6),
+        "`unpack` too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn list_refuses_a_plain_codec_stream_as_not_an_archive() {
     let dir = tmp_dir();

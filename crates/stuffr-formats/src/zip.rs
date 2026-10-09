@@ -1768,9 +1768,10 @@ fn read_symlink_target<R: Read>(
 ) -> Result<String> {
     let declared = file.size();
     if declared > MAX_SYMLINK_TARGET_LEN {
-        return Err(Error::Corrupt(format!(
-            "entry `{name}` is a symlink whose target is declared as {declared} bytes, past the \
-             {MAX_SYMLINK_TARGET_LEN}-byte limit; refusing to allocate that for a path"
+        return Err(Error::ResourceLimit(format!(
+            "entry `{name}` declares a symlink target of {declared} bytes, past the \
+             {MAX_SYMLINK_TARGET_LEN}-byte ceiling this container reads eagerly; no \
+             legitimate symlink target is this long"
         )));
     }
     let mut target = Vec::with_capacity(declared as usize);
@@ -3968,6 +3969,39 @@ mod tests {
             fwd[1].1, b"a.txt",
             "read forward, a symlink is a file holding its target — a real loss, and the one \
              `TrailingIndexUnread` reports"
+        );
+    }
+
+    /// A symlink whose target is declared (and delivered) past
+    /// `MAX_SYMLINK_TARGET_LEN` is a resource limit, exit 6, exactly as cpio's
+    /// identical check answers: the field was measured against a structural
+    /// ceiling and refused before it was read. It was `Corrupt`/5 until 0.10.4.
+    ///
+    /// The target is genuinely written at 65,537 bytes, so the reader's own
+    /// earlier checks (payload past EOF, size/offset sanity) have nothing to
+    /// object to and the guard under test is the one that answers.
+    #[test]
+    fn a_symlink_target_past_the_length_ceiling_is_refused_as_a_resource_limit() {
+        let mut link = EntryMeta::file("biglink");
+        link.kind = EntryKind::Symlink {
+            target: "t".repeat(MAX_SYMLINK_TARGET_LEN as usize + 1),
+        };
+        let bytes = build_with(&CreateOpts::default(), &[(link, &[][..])]);
+
+        let err = read_all_seekable(&bytes).expect_err("an oversized symlink target must refuse");
+        assert_eq!(
+            err.exit_code(),
+            6,
+            "a target past the ceiling is refused before it is read, so exit 6: {err}"
+        );
+        assert!(
+            matches!(err, Error::ResourceLimit(_)),
+            "must be ResourceLimit: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("biglink") && text.contains("65537") && text.contains("65536"),
+            "the refusal names the entry, the declared length and the ceiling: {text}"
         );
     }
 
