@@ -12002,6 +12002,104 @@ fn salvage_reports_a_tar_header_too_many_chains_converge_on() {
     assert!(!stderr.contains("no gate for"), "{stderr}");
 }
 
+/// 0.10.3 Task 4b: zip local headers whose names the scan's verdict budget
+/// would not pay for. Each forged header declares an all-ASCII name that
+/// runs to the file's last byte, `0xFF`, so every name is read whole and
+/// then refused; past the budget the rest are refused unread and reported
+/// in the verdict-bounded sentence — not the ungateable one, and not the
+/// extension-chain one. Pinned at the CLI's existing sighting rule: exit 5
+/// when nothing was recovered, exit 4 when an Intact entry before the
+/// forgeries was recovered alongside them.
+#[test]
+fn salvage_reports_zip_headers_its_verdict_budget_did_not_judge() {
+    /// `prefix`, then 32 KiB of forged headers, every one whose name length
+    /// is ASCII in both bytes.
+    fn forged(prefix: &[u8]) -> Vec<u8> {
+        const LEN: usize = 32 * 1024;
+        let mut out = prefix.to_vec();
+        let end = prefix.len() + LEN;
+        while out.len() + 64 <= end {
+            let name_len = end - out.len() - 30;
+            if name_len & 0x8080 == 0 {
+                out.extend_from_slice(b"PK\x03\x04");
+                for field in [20u16, 0, 0, 0, 0] {
+                    out.extend_from_slice(&field.to_le_bytes());
+                }
+                for field in [0u32, 0x7F7F_7F7F, 0x7F7F_7F7F] {
+                    out.extend_from_slice(&field.to_le_bytes());
+                }
+                out.extend_from_slice(&u16::try_from(name_len).unwrap().to_le_bytes());
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.resize(out.len() + 34, b'A');
+            } else {
+                out.resize(out.len() + 64, b'A');
+            }
+        }
+        out.resize(end - 1, b'A');
+        out.push(0xFF);
+        out
+    }
+    const SHAPE: &str = "local header(s) whose name it did not read once that work was spent";
+    const OPENING: &str = "salvage -> this build's salvage scanner bounds the work it spends \
+                           judging candidate headers across the whole scan, and stopped judging \
+                           at ";
+    const CLOSING: &str = " — so whatever those headers describe is not listed or recovered \
+                           there, though the scan went on past them; `stuffr list` and `stuffr \
+                           unpack` may read these headers normally\n";
+
+    let dir = tmp_dir();
+    let salvage_list = |p: &Path| run_output(&["salvage", p.to_str().unwrap(), "--list"]);
+
+    let archive = dir.join("budget.zip");
+    std::fs::write(&archive, forged(&[])).unwrap();
+    let out = salvage_list(&archive);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(5), "{stdout}{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    let note = stderr
+        .lines()
+        .find(|l| l.contains("bounds the work"))
+        .unwrap_or_else(|| panic!("no budget note: {stderr}"));
+    assert!(note.starts_with(OPENING), "{note}");
+    assert!(format!("{note}\n").ends_with(CLOSING), "{note}");
+    assert!(
+        note.contains(&format!(" zip {SHAPE} at offset(s) ")),
+        "{note}"
+    );
+    assert!(!stderr.contains("no gate for"), "{stderr}");
+    assert!(!stderr.contains("extension chains"), "{stderr}");
+    assert!(stderr.contains("nothing recoverable"), "{stderr}");
+
+    // An empty stored entry, whole and Intact, in front of the forgeries.
+    let mut entry = b"PK\x03\x04".to_vec();
+    for field in [20u16, 0, 0, 0, 0] {
+        entry.extend_from_slice(&field.to_le_bytes());
+    }
+    for field in [0u32, 0, 0] {
+        entry.extend_from_slice(&field.to_le_bytes());
+    }
+    entry.extend_from_slice(&6u16.to_le_bytes());
+    entry.extend_from_slice(&0u16.to_le_bytes());
+    entry.extend_from_slice(b"ok.txt");
+    let archive = dir.join("mixed-budget.zip");
+    std::fs::write(&archive, forged(&entry)).unwrap();
+    let out = salvage_list(&archive);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stdout}{stderr}");
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("ok.txt") && stdout.contains("Intact"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(OPENING) && stderr.contains(SHAPE),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no gate for"), "{stderr}");
+}
+
 /// One POSIX ustar entry, as Python's `tarfile` writes one (`ustar\0` `00`
 /// magic, typeflag `0`, `%06o\0 ` checksum): [`v7_tar_entry`] with the magic
 /// and typeflag set and the checksum recomputed. With a name and payload

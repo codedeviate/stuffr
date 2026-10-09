@@ -972,10 +972,17 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
 
     let mut outcome = annotate_candidates(&scanner, src, candidates, policy)?;
     // 0.10.3 Task 4b: every header the scan's budget left unjudged — never
-    // an entry, and printed by the caller like any other sighting.
+    // an entry, and printed by the caller like any other sighting. Unless
+    // the central directory recovered it after all (fix round 1): a header
+    // the scan refused for its budget is exactly the kind the directory
+    // pass above reaches by its own route, and a sighting there would say
+    // "not listed or recovered" of an entry this very outcome lists.
+    let recovered: std::collections::HashSet<u64> =
+        outcome.entries.iter().map(|e| e.offset).collect();
     outcome.sightings = scanner
         .over_budget
         .iter()
+        .filter(|offset| !recovered.contains(offset))
         .map(|&offset| Sighting::verdict_bounded(ZIP, offset, NAME_BUDGET_SHAPE))
         .collect();
     Ok(outcome)
@@ -1628,6 +1635,68 @@ mod tests {
             "{} entries, no sighting",
             out.entries.len()
         );
+    }
+
+    /// Task 4b fix round 1: a header the scan's budget refused may still be
+    /// recovered through the central directory, and must then not ALSO be
+    /// reported as "not listed or recovered". 1 MiB of local headers every
+    /// 30 bytes, each declaring a 64-byte all-ASCII name over the headers
+    /// after it, charges 64 bytes per 30 and spends the budget to within
+    /// one piece; a genuine five-entry stored zip follows, its names longer
+    /// than that piece and its central directory intact, so every one of
+    /// its local headers is refused by the scan and recovered through the
+    /// directory. Before the fix each was both Intact and sighted (the
+    /// review's own reproducer: offsets 1,049,297 and 1,049,516).
+    #[test]
+    fn an_entry_the_directory_recovers_is_never_also_a_budget_sighting() {
+        const LEN: usize = 1024 * 1024;
+        let mut unit = SIG_LOCAL_HEADER.to_vec();
+        for field in [20u16, 0, 0, 0, 0] {
+            unit.extend_from_slice(&field.to_le_bytes());
+        }
+        for field in [0u32, 0x7F7F_7F7F, 0x7F7F_7F7F] {
+            unit.extend_from_slice(&field.to_le_bytes());
+        }
+        unit.extend_from_slice(&64u16.to_le_bytes());
+        unit.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(unit.len(), 30);
+        let mut bytes: Vec<u8> = unit.iter().copied().cycle().take(LEN).collect();
+        bytes.resize(LEN + 64, b'A');
+        let mut cursor = Cursor::new(bytes);
+        cursor.seek(SeekFrom::End(0)).unwrap();
+        {
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            let mut w = zip::ZipWriter::new(&mut cursor);
+            for i in 0..5 {
+                w.start_file(format!("real{i}-{}.txt", "x".repeat(70)), opts)
+                    .unwrap();
+                w.write_all(format!("genuine entry {i}\n").as_bytes())
+                    .unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let out = salvage(&cursor.into_inner());
+        let real: Vec<&SalvagedEntry> = out
+            .entries
+            .iter()
+            .filter(|e| e.meta.name.starts_with("real"))
+            .collect();
+        assert_eq!(real.len(), 5);
+        assert!(real.iter().all(|e| e.status == SalvageStatus::Intact));
+        assert!(
+            !out.sightings.is_empty(),
+            "the forged names still spend the budget"
+        );
+        let recovered: std::collections::HashSet<u64> =
+            out.entries.iter().map(|e| e.offset).collect();
+        let both: Vec<u64> = out
+            .sightings
+            .iter()
+            .map(|s| s.offset)
+            .filter(|at| recovered.contains(at))
+            .collect();
+        assert!(both.is_empty(), "recovered AND sighted at {both:?}");
     }
 
     /// Task 4b's other half: a legitimate archive whose every entry carries

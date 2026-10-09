@@ -1183,7 +1183,8 @@ impl ForwardSearch {
 /// each verdict's bytes once, at most `file_len` in total, so the limit of
 /// `2 × file_len + 32 KiB` never trips on real input; forged candidates
 /// that would spend past it are refused unexamined and reported as a
-/// work-bounded sighting, and the scan goes on.
+/// verdict-bounded sighting ([`SightingKind::VerdictBounded`]), and the
+/// scan goes on.
 ///
 /// **Why the slack is only 32 KiB (Rulings T4b-2 and T4b-5).** A
 /// legitimate scan's verdict bytes all lie inside the file, so they total
