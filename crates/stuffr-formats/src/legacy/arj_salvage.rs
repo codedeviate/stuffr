@@ -297,7 +297,7 @@ use unarj_rs::decode_fastest::decode_fastest;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, Verifier, salvage_all,
+    SalvagedEntry, ScanBudget, Sighting, SightingLog, UnverifiedCause, Verifier, salvage_all,
     stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
@@ -603,8 +603,11 @@ pub struct ArjSalvage {
     budget: Option<ScanBudget>,
     /// Every header refused because one of those charges would have
     /// overspent [`Self::budget`], in scan order — reported as
-    /// [`Sighting::verdict_bounded`].
-    over_budget: Vec<u64>,
+    /// [`Sighting::verdict_bounded`]. A [`SightingLog`] (0.10.4): every one
+    /// is counted, at most [`SightingLog::DEFAULT_CAP`] stored — pushed in
+    /// ascending offset order, as the scan only moves forward, so the ones
+    /// kept are the first.
+    over_budget: SightingLog,
 }
 
 impl ArjSalvage {
@@ -639,7 +642,11 @@ impl SalvageScan for ArjSalvage {
                 Gate::Refused => search_from = offset + 1,
                 // Not judged: reported, and resumed exactly like a refusal.
                 Gate::OverBudget => {
-                    self.over_budget.push(offset);
+                    self.over_budget.push(Sighting::verdict_bounded(
+                        ARJ,
+                        offset,
+                        VERDICT_BUDGET_SHAPE,
+                    ));
                     search_from = offset + 1;
                 }
             }
@@ -1635,11 +1642,7 @@ pub fn salvage_arj(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     let mut outcome = salvage_all(&mut scanner, src, policy)?;
     // 0.10.3 Task 4b: every header the scan's budget left unjudged — never
     // an entry, and printed by the caller like any other sighting.
-    outcome.sightings = scanner
-        .over_budget
-        .iter()
-        .map(|&offset| Sighting::verdict_bounded(ARJ, offset, VERDICT_BUDGET_SHAPE))
-        .collect();
+    outcome.sightings = scanner.over_budget.into_sightings();
     Ok(outcome)
 }
 
@@ -1715,32 +1718,7 @@ mod tests {
     fn converging_extended_header_chains_spend_a_bounded_budget() {
         use stuffr_core::salvage::SightingKind;
         use stuffr_core::testing::{CountingSource, check_scan_is_linear};
-        const LEN: usize = 1024 * 1024;
-        const HEADERS: usize = 1_300;
-        let mut header = wrap(&local_content(
-            b"a.txt",
-            Method::Stored.byte(),
-            0,
-            0x7FFF_FFFF,
-            0x7FFF_FFFF,
-            0,
-        ));
-        let step = header.len();
-        let run_at = HEADERS * step + 8;
-        let mut block = Vec::new();
-        for i in 0..HEADERS {
-            // The size word ends this header; the hop it declares (plus
-            // its CRC-32) lands exactly on the run.
-            let declared = run_at - (i * step + step) - 4;
-            header.truncate(step - 2);
-            header.extend_from_slice(&u16::try_from(declared).unwrap().to_le_bytes());
-            block.extend_from_slice(&header);
-        }
-        block.resize(run_at, 0);
-        for _ in 0..37_460 {
-            block.extend_from_slice(&[1, 0, 0x55, 0, 0, 0, 0]);
-        }
-        let bytes: Vec<u8> = block.iter().copied().cycle().take(LEN).collect();
+        let bytes = converging_ext_chain_units();
         let mut src = CountingSource::new(Cursor::new(bytes.clone()));
         let out = salvage_arj(&mut src, &SalvagePolicy::default()).unwrap();
         check_scan_is_linear(src.bytes_read(), bytes.len() as u64).unwrap();
@@ -1766,6 +1744,59 @@ mod tests {
     fn dense_ids_whose_crc_fails_spend_a_bounded_budget() {
         use stuffr_core::salvage::SightingKind;
         use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        let bytes = dense_crc_failing_ids();
+        let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+        let out = salvage_arj(&mut src, &SalvagePolicy::default()).unwrap();
+        check_scan_is_linear(src.bytes_read(), bytes.len() as u64).unwrap();
+        assert!(out.entries.is_empty());
+        // 0.10.4: the sightings are counted, not all stored.
+        let counted: u64 = out.sightings.iter().map(|s| 1 + s.more).sum();
+        assert!(
+            counted > 10_000
+                && out.sightings.len() <= stuffr_core::salvage::SightingLog::DEFAULT_CAP
+                && out
+                    .sightings
+                    .iter()
+                    .all(|s| s.kind == SightingKind::VerdictBounded
+                        && s.shape == VERDICT_BUDGET_SHAPE),
+            "{counted} sightings, {} stored, first {:?}",
+            out.sightings.len(),
+            out.sightings.first()
+        );
+    }
+
+    /// [`converging_extended_header_chains_spend_a_bounded_budget`]'s input.
+    fn converging_ext_chain_units() -> Vec<u8> {
+        const LEN: usize = 1024 * 1024;
+        const HEADERS: usize = 1_300;
+        let mut header = wrap(&local_content(
+            b"a.txt",
+            Method::Stored.byte(),
+            0,
+            0x7FFF_FFFF,
+            0x7FFF_FFFF,
+            0,
+        ));
+        let step = header.len();
+        let run_at = HEADERS * step + 8;
+        let mut block = Vec::new();
+        for i in 0..HEADERS {
+            // The size word ends this header; the hop it declares (plus
+            // its CRC-32) lands exactly on the run.
+            let declared = run_at - (i * step + step) - 4;
+            header.truncate(step - 2);
+            header.extend_from_slice(&u16::try_from(declared).unwrap().to_le_bytes());
+            block.extend_from_slice(&header);
+        }
+        block.resize(run_at, 0);
+        for _ in 0..37_460 {
+            block.extend_from_slice(&[1, 0, 0x55, 0, 0, 0, 0]);
+        }
+        block.iter().copied().cycle().take(LEN).collect()
+    }
+
+    /// [`dense_ids_whose_crc_fails_spend_a_bounded_budget`]'s input.
+    fn dense_crc_failing_ids() -> Vec<u8> {
         const LEN: usize = 1024 * 1024;
         // 200 ids ten bytes apart, each declaring a content that ends on
         // the same name and comment terminators: every declared size odd
@@ -1784,22 +1815,50 @@ mod tests {
         block.extend_from_slice(b"CCCCC");
         block.push(0);
         block.extend_from_slice(&[0xAA; 8]);
-        let bytes: Vec<u8> = block.iter().copied().cycle().take(LEN).collect();
-        let mut src = CountingSource::new(Cursor::new(bytes.clone()));
-        let out = salvage_arj(&mut src, &SalvagePolicy::default()).unwrap();
-        check_scan_is_linear(src.bytes_read(), bytes.len() as u64).unwrap();
-        assert!(out.entries.is_empty());
-        assert!(
-            out.sightings.len() > 10_000
-                && out
-                    .sightings
-                    .iter()
-                    .all(|s| s.kind == SightingKind::VerdictBounded
-                        && s.shape == VERDICT_BUDGET_SHAPE),
-            "{} sightings, first {:?}",
-            out.sightings.len(),
-            out.sightings.first()
-        );
+        block.iter().copied().cycle().take(LEN).collect()
+    }
+
+    /// 0.10.4: on a dense hostile input the scan stores at most
+    /// `SightingLog::DEFAULT_CAP` sightings per group, in ascending offset
+    /// order, and they still stand for every one it saw — the counts
+    /// and the offsets the printed sentence lists are those of the uncapped
+    /// list before the cap (pinned from 7244937, where every one was stored).
+    #[test]
+    fn dense_sightings_are_bounded_and_the_sentence_is_unchanged() {
+        use stuffr_core::salvage::describe_sightings;
+        use stuffr_core::testing::check_sightings_bounded;
+        let legs: [(&str, Vec<u8>, u64, &[&str]); 2] = [
+            (
+                "converging",
+                converging_ext_chain_units(),
+                5164,
+                &[
+                    "5164 arj",
+                    "at offset(s) 1692, 1739, 1786, 1833, 1880, 1927, 1974, 2021, and 5156 more",
+                ][..],
+            ),
+            (
+                "crc ids",
+                dense_crc_failing_ids(),
+                88783,
+                &[
+                    "88783 arj",
+                    "at offset(s) 18680, 18690, 18700, 18710, 18720, 18730, 18740, 18750, and 88775 more",
+                ][..],
+            ),
+        ];
+        for (label, bytes, total, listed) in legs {
+            let out = salvage_arj(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+            check_sightings_bounded(&out.sightings, total)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let note = describe_sightings(&out.sightings).unwrap();
+            for fragment in listed {
+                assert!(
+                    note.contains(fragment),
+                    "{label}: {fragment:?} missing: {note}"
+                );
+            }
+        }
     }
 
     /// Task 4b's other half: a legitimate archive whose every header is the
