@@ -1178,11 +1178,12 @@ mod tests {
         let mut src = LyingLenPanicsOnBigRead {
             inner: Cursor::new(bytes),
             reported_len: u64::from(ABSURD_SIZE) * 4,
-            // Comfortably above `ForwardSearch::MAX_CHUNK` (the discovery-
-            // time scan's reads grow to 64 KiB regardless of this test) and comfortably
-            // below `ABSURD_SIZE` (~2.86 GiB) — wide enough that ordinary
-            // header/scan reads never trip it, narrow enough that the
-            // payload allocation this test forbids still would.
+            // Comfortably above `ForwardSearch::MAX_CHUNK` (the
+            // discovery-time scan's reads grow to 64 KiB regardless of this
+            // test) and comfortably below `ABSURD_SIZE` (~2.86 GiB) — wide
+            // enough that ordinary header/scan reads never trip it, narrow
+            // enough that the payload allocation this test forbids still
+            // would.
             max_single_read: 128 * 1024,
         };
         assert!(

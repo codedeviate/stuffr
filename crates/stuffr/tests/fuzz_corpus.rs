@@ -321,7 +321,7 @@ const CHAIN_SHAPES: &[&str] = &["plain-tar", "gzip-stream", "tar-gz-composed"];
 ///
 /// **`cpio-zero-run` and `tar-converging` (0.10.3 Task 4) are the two
 /// hostile shapes the read-amplification oracle exists for**, at fuzz scale
-/// (about 13 KiB and 14 KiB): 60 `newc` headers whose sizes all land in one
+/// (13,105 and 11,776 bytes): 60 `newc` headers whose sizes all land in one
 /// 6 KiB zero run that ends in a non-zero byte (`cpio_salvage.rs`'s
 /// zero-run memo), and 12 forged pax `x` heads converging on one header
 /// behind the sample tar (`tar_salvage.rs`'s chain budgets). Each is a shape

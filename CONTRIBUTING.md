@@ -768,11 +768,11 @@ rescans and tar's converging extension chains, and on first wiring it found
 the same waste in five more scanners: zip, arc, zoo, lha and arj each left
 its forward search for every bare signature, re-read a header and searched
 again, measured at up to 218x on a fuzz input and 63,517x on a dense 1 MiB
-file. It
-counts only reads made through the `Cursor` the target hands the scanner;
-there is no double proving it can fail, so a sabotage run stands in for
-one: with `cpio_salvage.rs`'s zero-run memo reverted, the `cpio-zero-run`
-seed aborts the target (`read 388865 bytes of a 13105-byte input`).
+file. It counts only reads made through the `Cursor` the target hands the
+scanner; there is no double proving it can fail, so a sabotage run stands
+in for one: with `cpio_salvage.rs`'s zero-run memo reverted, the
+`cpio-zero-run` seed aborts the target (`read 388865 bytes of a 13105-byte
+input`).
 `STUFFR_FUZZ_SCAN_TRACE=1` prints one line per input, printed before the
 check so an aborting input still leaves its figures:
 
