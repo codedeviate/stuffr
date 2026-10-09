@@ -939,9 +939,10 @@ impl RecordId {
             .identifier
             .as_ref()
             .map_or(String::new(), |id| format!(" (`{id}`)"));
+        let unit = if short == 1 { "byte" } else { "bytes" };
         format!(
             "the ar {}{named} at offset {} declares {} bytes, but the file ends {short} \
-             bytes short; the archive is truncated",
+             {unit} short; the archive is truncated",
             self.kind, self.at, self.declared
         )
     }

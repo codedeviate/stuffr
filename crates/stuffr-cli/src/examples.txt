@@ -969,9 +969,10 @@ RECOVERING A DAMAGED ARCHIVE (SALVAGE)
 
   Two members of five means the other three were never reached, not that
   they are gone: a hex editor at that offset is the next step. A file
-  that ends partway through a member's header, its long name or a GNU
-  long-name table is said to be cut short instead — the file ended inside
-  that member, so nothing is missing from the report. The exit code is
+  that ends partway through a member's header, its long name, a GNU
+  long-name table or a `/` or `/SYM64/` symbol table is said to be cut
+  short instead — the file ended inside that member, so nothing is
+  missing from the report. The exit code is
   the ordinary one: 4 when any member was recovered (they are
   `Unattested`), 5 when none was. Two healthy shapes this build cannot
   read are exit 3, naming them: a GNU thin archive (`!<thin>`, whose
@@ -1446,7 +1447,7 @@ EXIT CODES
      name/link over 16 MiB, an ar GNU name table over 16 MiB or BSD name over
      64 KiB, a cpio name or symlink target over 64 KiB or more than 65536
      held hard-link names, a zip central-directory name or symlink target
-     over 64 KiB, an ARC/ARJ/ZOO entry over 256 MiB. NOT a `salvage` entry
+     (seekable input) over 64 KiB, an ARC/ARJ/ZOO entry over 256 MiB. NOT a `salvage` entry
      over --max-entry: that is reported per entry as `Unverified (over the
      ceiling)` and lands in 3, because one oversized declaration must never
      cost a caller the rest of the archive. Nor any of `salvage`'s own scan
