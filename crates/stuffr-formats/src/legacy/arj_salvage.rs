@@ -297,12 +297,13 @@ use unarj_rs::decode_fastest::decode_fastest;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
+    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, Verifier, salvage_all,
+    stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
 use super::arj::{
-    ARJ_FIRST_HDR_SIZE, FILE_TYPE_DIRECTORY, HOST_OS_UNIX, MAIN_HEADER_FILE_TYPE,
+    ARJ, ARJ_FIRST_HDR_SIZE, FILE_TYPE_DIRECTORY, HOST_OS_UNIX, MAIN_HEADER_FILE_TYPE,
     MAX_ARJ_ENTRY_LEN, MAX_ARJ_HEADER_SIZE, crc32_ieee, dos_mtime,
 };
 
@@ -562,20 +563,44 @@ struct EntryHeader {
     payload_start: u64,
 }
 
+/// The phrase for a header refused because checking its CRC-32 or walking
+/// its extended headers would have taken the scan past its [`ScanBudget`] —
+/// see [`ArjSalvage::budget`].
+const VERDICT_BUDGET_SHAPE: &str =
+    "header(s) whose CRC-32 or extended headers it did not read once that work was spent";
+
 /// Scans an ARJ archive for local file headers directly, without walking
 /// forward from the archive's main header the way `unarj_rs::ArjArchieve`
 /// does — one damaged header ends that walk, and every entry behind it with
 /// it.
 ///
-/// Its only state is the [`ForwardSearch`] buffer reused across calls; it
-/// carries nothing about the archive between them beyond what
+/// Its state is the [`ForwardSearch`] buffer reused across calls and the
+/// scan's [`ScanBudget`] with the offsets it refused; it carries nothing
+/// about the archive's entries between calls beyond what
 /// [`SalvageScan::next_candidate`] itself receives — the same shape
-/// `ZipSalvage`, `ArcSalvage` and `ZooSalvage` have. Unlike `LhaSalvage` there is no Ruling S-V sighting to
-/// carry: see this module's doc for why `file type == 2` deliberately gets no
-/// such channel.
+/// `ZipSalvage`, `ArcSalvage` and `ZooSalvage` have. Unlike `LhaSalvage`
+/// there is no Ruling S-V sighting to carry: see this module's doc for why
+/// `file type == 2` deliberately gets no such channel.
 #[derive(Debug, Default)]
 pub struct ArjSalvage {
     search: ForwardSearch,
+    /// The verdict work this scan may spend — 0.10.3 Task 4b, two charges:
+    ///
+    /// - **the bytes criterion 4's CRC-32 covers**, charged before it runs,
+    ///   inside the search. Ids every ten bytes whose criteria 5-8 pass and
+    ///   whose CRC fails cost a CRC over up to 2,600 bytes per id: about
+    ///   0.8 s per MiB, with every byte read only once;
+    /// - **two bytes per extended-header hop**, charged before each is read
+    ///   ([`walk_extended_headers`]). CRC-valid headers whose chains all run
+    ///   into one long run of minimal hops walked it per header: 253x the
+    ///   input.
+    ///
+    /// Built on the first call, from the source's length; one per scan.
+    budget: Option<ScanBudget>,
+    /// Every header refused because one of those charges would have
+    /// overspent [`Self::budget`], in scan order — reported as
+    /// [`Sighting::verdict_bounded`].
+    over_budget: Vec<u64>,
 }
 
 impl ArjSalvage {
@@ -587,20 +612,32 @@ impl ArjSalvage {
 impl SalvageScan for ArjSalvage {
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
+        let budget = self
+            .budget
+            .get_or_insert_with(|| ScanBudget::for_input(file_len));
         let mut search_from = from;
         loop {
-            let Some((offset, envelope)) =
-                find_next_id(&mut self.search, src, search_from, file_len)?
-            else {
-                return Ok(None);
-            };
-            match read_candidate_at(src, offset, &envelope, file_len) {
-                Some(candidate) => return Ok(Some(candidate)),
+            let (offset, verdict) =
+                match find_next_id(&mut self.search, src, search_from, file_len, budget)? {
+                    Found::Envelope(offset, envelope) => (
+                        offset,
+                        read_candidate_at(src, offset, &envelope, file_len, budget),
+                    ),
+                    Found::OverBudget(offset) => (offset, Gate::OverBudget),
+                    Found::Nothing => return Ok(None),
+                };
+            match verdict {
+                Gate::Accepted(candidate) => return Ok(Some(*candidate)),
                 // The id matched and the gate rejected everything behind it:
                 // a coincidence, not a header. Resume one byte past the id
                 // itself, not past a whole assumed header, so a genuine
                 // header overlapping this false match is never skipped.
-                None => search_from = offset + 1,
+                Gate::Refused => search_from = offset + 1,
+                // Not judged: reported, and resumed exactly like a refusal.
+                Gate::OverBudget => {
+                    self.over_budget.push(offset);
+                    search_from = offset + 1;
+                }
             }
         }
     }
@@ -676,22 +713,70 @@ impl SalvageScan for ArjSalvage {
 /// refused id costs nothing beyond the search's own pass over it, and an
 /// accepted one no read of its own. `find_to_eof` offers a header near EOF
 /// the bytes that are left, so one that ends exactly at EOF is still found.
+///
+/// **Criterion 4's CRC-32 is paid for from `budget` before it runs (0.10.3
+/// Task 4b)**, by the bytes it covers. An envelope the budget cannot pay for
+/// ends the search as [`Found::OverBudget`] at its offset, unjudged, so the
+/// caller can report it; the next search resumes one byte on, inside the
+/// window this one kept.
 fn find_next_id(
     search: &mut ForwardSearch,
     src: &mut dyn SeekRead,
     from: u64,
     file_len: u64,
-) -> io::Result<Option<(u64, Vec<u8>)>> {
+    budget: &mut ScanBudget,
+) -> io::Result<Found> {
     let mut envelope = Vec::new();
+    let mut over_budget = false;
     let min = (ENVELOPE_PREFIX + ENVELOPE_SUFFIX) as usize;
     let at = search.find_to_eof(src, from, file_len, MAX_ENVELOPE, min, |w| {
-        let hit = basic_header(w).is_some();
+        let Some((header, recorded_crc)) = envelope_fields(w) else {
+            return false;
+        };
+        if !budget.try_spend(header.content.len() as u64) {
+            over_budget = true;
+            return true;
+        }
+        let hit = crc32_ieee(header.content) == recorded_crc;
         if hit {
             envelope = w.to_vec();
         }
         hit
     })?;
-    Ok(at.map(|at| (at, envelope)))
+    Ok(match at {
+        None => Found::Nothing,
+        Some(at) if over_budget => Found::OverBudget(at),
+        Some(at) => Found::Envelope(at, envelope),
+    })
+}
+
+/// What [`find_next_id`] found.
+enum Found {
+    /// An envelope clearing criteria 1-8, with its bytes.
+    Envelope(u64, Vec<u8>),
+    /// An envelope clearing criteria 1-3 and 5-8 whose CRC-32 the scan's
+    /// budget could not pay for.
+    OverBudget(u64),
+    Nothing,
+}
+
+/// What [`read_candidate_at`] made of one header.
+enum Gate {
+    Accepted(Box<Candidate>),
+    /// Not a header: any gate failure.
+    Refused,
+    /// Not judged: the scan's [`ScanBudget`] could not pay for it.
+    OverBudget,
+}
+
+/// What [`walk_extended_headers`] found.
+enum Walk {
+    /// The chain ended; the payload begins here.
+    Payload(u64),
+    /// The chain runs past the source or past [`MAX_EXT_CHAIN`].
+    Broken,
+    /// The next hop's size word would have overspent the scan's budget.
+    OverBudget,
 }
 
 /// Walks the extended-header chain that begins at `at` (the `u16` "1st
@@ -711,13 +796,37 @@ fn find_next_id(
 /// (criterion 4) is already thirty-two bits of gate; this walk is about
 /// ARITHMETIC, not about trust, so it reads two bytes per hop and SEEKS past
 /// everything else.
-fn walk_extended_headers(src: &mut dyn SeekRead, at: u64, file_len: u64) -> Option<u64> {
+///
+/// **Each hop's two bytes are paid for from `budget` before they are read
+/// (0.10.3 Task 4b)**: a chain of minimal hops runs to about 37,000 of them
+/// inside [`MAX_EXT_CHAIN`], and CRC-valid headers whose chains converge on
+/// one such run each walked all of it. [`Walk::OverBudget`] when a hop
+/// cannot be paid for.
+fn walk_extended_headers(
+    src: &mut dyn SeekRead,
+    at: u64,
+    file_len: u64,
+    budget: &mut ScanBudget,
+) -> Walk {
+    walk_chain(src, at, file_len, budget).unwrap_or(Walk::Broken)
+}
+
+/// [`walk_extended_headers`]' body; every `?` is a broken chain.
+fn walk_chain(
+    src: &mut dyn SeekRead,
+    at: u64,
+    file_len: u64,
+    budget: &mut ScanBudget,
+) -> Option<Walk> {
     let mut pos = at;
     let mut walked = 0u64;
     let mut size_buf = [0u8; 2];
     loop {
         if pos.checked_add(2)? > file_len {
             return None;
+        }
+        if !budget.try_spend(2) {
+            return Some(Walk::OverBudget);
         }
         src.seek(SeekFrom::Start(pos)).ok()?;
         src.read_exact(&mut size_buf).ok()?;
@@ -729,7 +838,7 @@ fn walk_extended_headers(src: &mut dyn SeekRead, at: u64, file_len: u64) -> Opti
             // The spec's terminator: "1st extended header size (0 if none)",
             // and `read_extended_headers` loops on the same rule. The payload
             // begins here.
-            return Some(pos);
+            return Some(Walk::Payload(pos));
         }
         // The header's own bytes plus the CRC-32 that follows every non-empty
         // one.
@@ -763,8 +872,16 @@ const MAX_ENVELOPE: usize =
 
 /// Criteria 1-8 on `envelope`, the bytes from a candidate offset onwards —
 /// [`MAX_ENVELOPE`] of them, or every byte left before EOF when fewer
-/// remain. Reads nothing, so [`find_next_id`] judges it inside its search.
+/// remain. Reads nothing.
 fn basic_header(envelope: &[u8]) -> Option<BasicHeader<'_>> {
+    let (header, recorded_crc) = envelope_fields(envelope)?;
+    (crc32_ieee(header.content) == recorded_crc).then_some(header)
+}
+
+/// Criteria 1-3 and 5-8 on `envelope`, with the CRC-32 the header records
+/// for criterion 4 — everything [`basic_header`] judges except the CRC
+/// itself, which [`find_next_id`] pays for from the scan's budget first.
+fn envelope_fields(envelope: &[u8]) -> Option<(BasicHeader<'_>, u32)> {
     // Criterion 3, first half: the envelope's own fixed bytes must be there
     // before anything they describe is read.
     if (envelope.len() as u64) < ENVELOPE_PREFIX + ENVELOPE_SUFFIX {
@@ -836,21 +953,22 @@ fn basic_header(envelope: &[u8]) -> Option<BasicHeader<'_>> {
     let method = Method::from_byte(*content.get(METHOD_I)?)?;
 
     // Criterion 4 — the strongest signal here by three orders of magnitude,
-    // and one of the three Step 5 falsifies. Checked LAST, though it is
-    // numbered fourth: every criterion is required, so the order changes no
-    // verdict, and inside the search this runs at every offset whose id and
-    // size word fit — a CRC-32 over up to 2,600 bytes there, where criteria
-    // 5-8 refuse nearly all of them for a few comparisons.
-    if crc32_ieee(content) != u32::from_le_bytes(crc_bytes) {
-        return None;
-    }
-    Some(BasicHeader {
-        content,
-        method,
-        file_type,
-        first_hdr_size,
-        name_len,
-    })
+    // and one of the three Step 5 falsifies — is left to the caller. Checked
+    // LAST, though it is numbered fourth: every criterion is required, so
+    // the order changes no verdict, and inside the search this runs at every
+    // offset whose id and size word fit — a CRC-32 over up to 2,600 bytes
+    // there, where criteria 5-8 refuse nearly all of them for a few
+    // comparisons.
+    Some((
+        BasicHeader {
+            content,
+            method,
+            file_type,
+            first_hdr_size,
+            name_len,
+        },
+        u32::from_le_bytes(crc_bytes),
+    ))
 }
 
 /// Gates the header at `offset`, per the criteria in this module's doc:
@@ -859,12 +977,16 @@ fn basic_header(envelope: &[u8]) -> Option<BasicHeader<'_>> {
 ///
 /// `None` for ANY gate failure, including a genuine read error: to a SCANNER
 /// they all mean the same thing — these bytes are not a header — so they fold
-/// here rather than propagating and ending a run over one coincidence.
+/// here rather than propagating and ending a run over one coincidence. A
+/// `None` with `over_budget` set is a header whose extended-header walk the
+/// scan's `budget` could not pay for: not judged.
 fn parse_header_at(
     src: &mut dyn SeekRead,
     offset: u64,
     envelope: &[u8],
     file_len: u64,
+    budget: &mut ScanBudget,
+    over_budget: &mut bool,
 ) -> Option<EntryHeader> {
     let BasicHeader {
         content,
@@ -878,7 +1000,15 @@ fn parse_header_at(
         .checked_add(content.len() as u64)?;
 
     // Criterion 9.
-    let payload_start = walk_extended_headers(src, content_end.checked_add(4)?, file_len)?;
+    let payload_start =
+        match walk_extended_headers(src, content_end.checked_add(4)?, file_len, budget) {
+            Walk::Payload(at) => at,
+            Walk::Broken => return None,
+            Walk::OverBudget => {
+                *over_budget = true;
+                return None;
+            }
+        };
 
     let compressed_size = read_u32(content, COMPRESSED_SIZE_I)?;
     let original_size = read_u32(content, ORIGINAL_SIZE_I)?;
@@ -941,9 +1071,18 @@ fn read_candidate_at(
     offset: u64,
     envelope: &[u8],
     file_len: u64,
-) -> Option<Candidate> {
-    let header = parse_header_at(src, offset, envelope, file_len)?;
+    budget: &mut ScanBudget,
+) -> Gate {
+    let mut over_budget = false;
+    match parse_header_at(src, offset, envelope, file_len, budget, &mut over_budget) {
+        Some(header) => Gate::Accepted(Box::new(candidate_from(offset, header, file_len))),
+        None if over_budget => Gate::OverBudget,
+        None => Gate::Refused,
+    }
+}
 
+/// The [`Candidate`] for a header that cleared the gate.
+fn candidate_from(offset: u64, header: EntryHeader, file_len: u64) -> Candidate {
     let declared = header.declared_len;
     let available_len = match header.payload_start.checked_add(declared) {
         Some(end) if end <= file_len => None,
@@ -991,12 +1130,10 @@ fn read_candidate_at(
     // EXTFILE, PATHSYM and BACKUP, none of which marks a record removed.
     // See `Candidate::marked_deleted`'s own doc for why that is a plain
     // `false` rather than an `Option`.
-    Some(
-        Candidate::new(offset, header.payload_start, meta)
-            .with_declared_len(Some(declared))
-            .with_verifier(Some(Verifier::Crc32(header.file_crc)))
-            .with_available_len(available_len),
-    )
+    Candidate::new(offset, header.payload_start, meta)
+        .with_declared_len(Some(declared))
+        .with_verifier(Some(Verifier::Crc32(header.file_crc)))
+        .with_available_len(available_len)
 }
 
 /// A `Read` over `delharc`'s all-or-nothing [`Decoder::fill_buffer`], bounded
@@ -1491,7 +1628,15 @@ fn recover_the_last_chunk(
 /// 2` deliberately gets no sighting channel.
 pub fn salvage_arj(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
     let mut scanner = ArjSalvage::new();
-    salvage_all(&mut scanner, src, policy)
+    let mut outcome = salvage_all(&mut scanner, src, policy)?;
+    // 0.10.3 Task 4b: every header the scan's budget left unjudged — never
+    // an entry, and printed by the caller like any other sighting.
+    outcome.sightings = scanner
+        .over_budget
+        .iter()
+        .map(|&offset| Sighting::verdict_bounded(ARJ, offset, VERDICT_BUDGET_SHAPE))
+        .collect();
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -1554,6 +1699,128 @@ mod tests {
             check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
                 .unwrap_or_else(|e| panic!("{shape}: {e}"));
         }
+    }
+
+    /// 0.10.3 Task 4b: 1,300 CRC-valid headers whose extended-header chains
+    /// all jump into one run of minimal (seven-byte) hops, repeated to
+    /// 1 MiB — each header walks the run two bytes per hop until
+    /// [`MAX_EXT_CHAIN`]. Before the scan-wide budget this read 253x the
+    /// input. The budget's refusals are reported as verdict-bounded
+    /// sightings.
+    #[test]
+    fn converging_extended_header_chains_spend_a_bounded_budget() {
+        use stuffr_core::salvage::SightingKind;
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 1024 * 1024;
+        const HEADERS: usize = 1_300;
+        let mut header = wrap(&local_content(
+            b"a.txt",
+            Method::Stored.byte(),
+            0,
+            0x7FFF_FFFF,
+            0x7FFF_FFFF,
+            0,
+        ));
+        let step = header.len();
+        let run_at = HEADERS * step + 8;
+        let mut block = Vec::new();
+        for i in 0..HEADERS {
+            // The size word ends this header; the hop it declares (plus
+            // its CRC-32) lands exactly on the run.
+            let declared = run_at - (i * step + step) - 4;
+            header.truncate(step - 2);
+            header.extend_from_slice(&u16::try_from(declared).unwrap().to_le_bytes());
+            block.extend_from_slice(&header);
+        }
+        block.resize(run_at, 0);
+        for _ in 0..37_460 {
+            block.extend_from_slice(&[1, 0, 0x55, 0, 0, 0, 0]);
+        }
+        let bytes: Vec<u8> = block.iter().copied().cycle().take(LEN).collect();
+        let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+        let out = salvage_arj(&mut src, &SalvagePolicy::default()).unwrap();
+        check_scan_is_linear(src.bytes_read(), bytes.len() as u64).unwrap();
+        assert!(out.entries.is_empty());
+        assert!(
+            !out.sightings.is_empty()
+                && out
+                    .sightings
+                    .iter()
+                    .all(|s| s.kind == SightingKind::VerdictBounded
+                        && s.shape == VERDICT_BUDGET_SHAPE),
+            "{:?}",
+            out.sightings.first()
+        );
+    }
+
+    /// Task 4b and the Task 4 review's arj CRC finding: ids every ten bytes
+    /// whose criteria 5-8 pass and whose CRC-32 fails each made the search
+    /// run a CRC over up to 2,600 bytes — every byte read once, but 0.79 s
+    /// of CPU per MiB. The CRC's bytes are charged to the budget before it
+    /// runs, so past the budget those ids are reported unjudged instead.
+    #[test]
+    fn dense_ids_whose_crc_fails_spend_a_bounded_budget() {
+        use stuffr_core::salvage::SightingKind;
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 1024 * 1024;
+        // 200 ids ten bytes apart, each declaring a content that ends on
+        // the same name and comment terminators: every declared size odd
+        // and at least 256, so no size byte is a NUL that would end a name.
+        let (ids, gap) = (200usize, 300usize);
+        let name_nul = ids * 10 + gap;
+        let mut block = Vec::new();
+        for k in 0..ids {
+            let declared = name_nul + 6 - k * 10 - 3;
+            block.extend_from_slice(&HEADER_ID);
+            block.extend_from_slice(&u16::try_from(declared).unwrap().to_le_bytes());
+            block.extend_from_slice(&[ARJ_FIRST_HDR_SIZE, 1, 1, 2, 1, 1]);
+        }
+        block.resize(name_nul, b'N');
+        block.push(0);
+        block.extend_from_slice(b"CCCCC");
+        block.push(0);
+        block.extend_from_slice(&[0xAA; 8]);
+        let bytes: Vec<u8> = block.iter().copied().cycle().take(LEN).collect();
+        let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+        let out = salvage_arj(&mut src, &SalvagePolicy::default()).unwrap();
+        check_scan_is_linear(src.bytes_read(), bytes.len() as u64).unwrap();
+        assert!(out.entries.is_empty());
+        assert!(
+            out.sightings.len() > 10_000
+                && out
+                    .sightings
+                    .iter()
+                    .all(|s| s.kind == SightingKind::VerdictBounded
+                        && s.shape == VERDICT_BUDGET_SHAPE),
+            "{} sightings, first {:?}",
+            out.sightings.len(),
+            out.sightings.first()
+        );
+    }
+
+    /// Task 4b's other half: a legitimate archive whose every header is the
+    /// largest the spec allows (2,600 bytes of content, all of it under the
+    /// CRC) pays for each CRC once and never comes near the budget — every
+    /// entry intact, no sighting.
+    #[test]
+    fn an_archive_of_maximum_size_headers_spends_no_budget_sighting() {
+        let bytes: Vec<u8> = (0..400u16)
+            .flat_map(|i| {
+                let mut name = vec![b'n'; MAX_ARJ_HEADER_SIZE - ARJ_FIRST_HDR_SIZE as usize - 2];
+                name[..2].copy_from_slice(&i.to_le_bytes().map(|b| b'a' + b % 26));
+                stored_entry(&name, b"payload")
+            })
+            .collect();
+        let out = scan(&bytes);
+        assert_eq!(out.entries.len(), 400);
+        assert!(
+            out.entries
+                .iter()
+                .all(|e| e.status == SalvageStatus::Intact),
+            "{:?}",
+            out.entries.iter().map(|e| &e.status).collect::<Vec<_>>()
+        );
+        assert!(out.sightings.is_empty(), "{:?}", out.sightings.first());
     }
 
     /// The checked-in fixture: two `Stored` entries, hand-built in Phase 3b

@@ -1264,17 +1264,40 @@ const FILESPEC_POSITION: u16 = 0;
 /// makes for its own copy. Both are pinned to the identical published check
 /// value, so a transcription error in one cannot silently agree with a
 /// transcription error in the other.
+///
+/// **Table-driven since 0.10.3**, one lookup per byte rather than eight
+/// shifts: `arj_salvage.rs` runs it inside its header search, at every
+/// offset whose criteria 5-8 pass, and ids every ten bytes whose CRCs fail
+/// cost 0.79 s per MiB bitwise. The table is built at compile time from the
+/// same polynomial, so there is still no dependency and no second copy of
+/// the algorithm to drift.
 pub(super) fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = (crc >> 8) ^ CRC32_TABLE[usize::from(crc as u8 ^ b)];
     }
     !crc
 }
+
+/// [`crc32_ieee`]'s table: entry `n` is the bitwise CRC of the byte `n`
+/// with no init or xorout, built by the eight-shift loop the function used
+/// to run per byte.
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut n = 0;
+    while n < 256 {
+        let mut crc = n as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            bit += 1;
+        }
+        table[n] = crc;
+        n += 1;
+    }
+    table
+};
 
 /// Packs a `SystemTime` into the DOS `YYYYYYYM MMMDDDDD hhhhhmmm mmmsssss`
 /// word an ARJ header's `date time modified` field holds — the exact inverse
@@ -1688,6 +1711,29 @@ mod tests {
         // so an error in the polynomial or the init value cannot hide
         // behind our own expectations.
         assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// 0.10.3: the table-driven CRC agrees with the bitwise recipe on every
+    /// length up to a whole ARJ header and past it, over bytes that reach
+    /// every table entry.
+    #[test]
+    fn the_table_driven_crc32_agrees_with_the_bitwise_one() {
+        let mut state = 0x2545_F491u32;
+        let bytes: Vec<u8> = (0..3_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        for len in (0..=600).chain([2_599, 2_600, 3_000]) {
+            assert_eq!(
+                crc32_ieee(&bytes[..len]),
+                fixture_crc32(&bytes[..len]),
+                "{len}"
+            );
+        }
     }
 
     #[test]
