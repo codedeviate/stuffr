@@ -689,6 +689,11 @@ pub struct Sighting {
     /// Why the header was not listed — which sentence
     /// [`describe_sightings`] reports it in.
     pub kind: SightingKind,
+    /// How many further sightings of this same (format, shape, kind) a
+    /// [`SightingLog`] saw but did not store, folded into this one. 0 from
+    /// every constructor. [`describe_sightings`] adds it to the count it
+    /// prints, so a capped log reports the same total as an uncapped one.
+    pub more: u64,
 }
 
 /// Why a [`Sighting`]'s header was not listed. The two are different claims,
@@ -725,7 +730,15 @@ impl Sighting {
             offset,
             shape,
             kind: SightingKind::Ungateable,
+            more: 0,
         }
+    }
+
+    /// This sighting standing for `more` further ones that were counted but
+    /// not stored (see [`Sighting::more`]).
+    #[must_use]
+    pub fn with_more(self, more: u64) -> Self {
+        Self { more, ..self }
     }
 
     /// A [`SightingKind::WorkBounded`] sighting.
@@ -744,6 +757,105 @@ impl Sighting {
             kind: SightingKind::VerdictBounded,
             ..Self::new(format, offset, shape)
         }
+    }
+}
+
+/// A bounded store for [`Sighting`]s: at most `cap` per (format, shape,
+/// kind) are kept, so the memory one scan spends on them is at most
+/// groups x cap however hostile the input, while the count of each group
+/// stays exact. [`Self::count`] gives the exact total pushed, and
+/// [`Self::into_sightings`] folds the uncounted remainder into the last
+/// stored sighting's [`Sighting::more`], so [`describe_sightings`] prints
+/// the same sentence it would for every sighting stored.
+#[derive(Debug, Clone)]
+pub struct SightingLog {
+    cap: usize,
+    groups: Vec<LogGroup>,
+}
+
+#[derive(Debug, Clone)]
+struct LogGroup {
+    key: (FormatId, &'static str, SightingKind),
+    stored: Vec<Sighting>,
+    total: u64,
+}
+
+impl SightingLog {
+    /// The default per-group cap.
+    pub const DEFAULT_CAP: usize = 64;
+
+    /// An empty log with [`Self::DEFAULT_CAP`].
+    pub fn new() -> Self {
+        Self::with_cap(Self::DEFAULT_CAP)
+    }
+
+    /// An empty log keeping at most `cap` sightings per group. A `cap` of 0
+    /// is raised to 1, so a group always has a sighting to carry its count.
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            cap: cap.max(1),
+            groups: Vec::new(),
+        }
+    }
+
+    /// Record `sighting`: stored while its group holds fewer than the cap,
+    /// and always counted. A sighting's own [`Sighting::more`] is counted
+    /// too.
+    pub fn push(&mut self, sighting: Sighting) {
+        let key = (sighting.format, sighting.shape, sighting.kind);
+        let idx = match self.groups.iter().position(|g| g.key == key) {
+            Some(i) => i,
+            None => {
+                self.groups.push(LogGroup {
+                    key,
+                    stored: Vec::new(),
+                    total: 0,
+                });
+                self.groups.len() - 1
+            }
+        };
+        let g = &mut self.groups[idx];
+        g.total = g.total.saturating_add(1).saturating_add(sighting.more);
+        if g.stored.len() < self.cap {
+            g.stored.push(sighting);
+        }
+    }
+
+    /// The exact number of sightings of this group pushed, stored or not.
+    pub fn count(&self, format: FormatId, shape: &'static str, kind: SightingKind) -> u64 {
+        self.groups
+            .iter()
+            .find(|g| g.key == (format, shape, kind))
+            .map_or(0, |g| g.total)
+    }
+
+    /// Whether nothing has been pushed.
+    pub fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The stored sightings, groups in first-seen order, each group's last
+    /// one carrying the count of those not stored in [`Sighting::more`].
+    pub fn into_sightings(self) -> Vec<Sighting> {
+        let mut out = Vec::new();
+        for mut g in self.groups {
+            let stored_weight: u64 = g
+                .stored
+                .iter()
+                .fold(0u64, |a, s| a.saturating_add(1).saturating_add(s.more));
+            let rest = g.total.saturating_sub(stored_weight);
+            if let Some(last) = g.stored.last_mut() {
+                last.more = last.more.saturating_add(rest);
+            }
+            out.extend(g.stored);
+        }
+        out
+    }
+}
+
+impl Default for SightingLog {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -820,33 +932,31 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
 fn sighting_groups(sightings: &[&Sighting]) -> String {
     // Grouped by (format, shape) in first-seen order: a handful of shapes
     // at most, so a linear search beats a map and keeps the order stable.
-    let mut groups: Vec<((FormatId, &'static str), Vec<u64>)> = Vec::new();
+    // `extra` is the sightings a [`SightingLog`] counted but did not store.
+    let mut groups: Vec<((FormatId, &'static str), Vec<u64>, u64)> = Vec::new();
     for s in sightings {
         let key = (s.format, s.shape);
-        match groups.iter_mut().find(|(k, _)| *k == key) {
-            Some((_, offsets)) => offsets.push(s.offset),
-            None => groups.push((key, vec![s.offset])),
+        match groups.iter_mut().find(|(k, _, _)| *k == key) {
+            Some((_, offsets, extra)) => {
+                offsets.push(s.offset);
+                *extra = extra.saturating_add(s.more);
+            }
+            None => groups.push((key, vec![s.offset], s.more)),
         }
     }
     let parts: Vec<String> = groups
         .iter()
-        .map(|((format, shape), offsets)| {
+        .map(|((format, shape), offsets, extra)| {
+            let count = offsets.len() as u64 + extra;
             let mut shown: Vec<String> = offsets
                 .iter()
                 .take(SIGHTING_OFFSETS_SHOWN)
                 .map(u64::to_string)
                 .collect();
-            if offsets.len() > SIGHTING_OFFSETS_SHOWN {
-                shown.push(format!(
-                    "and {} more",
-                    offsets.len() - SIGHTING_OFFSETS_SHOWN
-                ));
+            if count > SIGHTING_OFFSETS_SHOWN as u64 {
+                shown.push(format!("and {} more", count - shown.len() as u64));
             }
-            format!(
-                "{} {format} {shape} at offset(s) {}",
-                offsets.len(),
-                shown.join(", ")
-            )
+            format!("{count} {format} {shape} at offset(s) {}", shown.join(", "))
         })
         .collect();
     parts.join("; and ")
@@ -2840,6 +2950,44 @@ mod tests {
         assert_eq!(annotated.shadows, Some(1));
         assert_eq!(annotated.collides_with, Some(2));
         assert!(annotated.marked_deleted);
+    }
+
+    /// 0.10.4: a log stores at most its cap per (format, shape, kind), and
+    /// the count it keeps is exact.
+    #[test]
+    fn a_log_stores_at_most_the_cap_per_group_and_counts_the_rest() {
+        let mut log = SightingLog::with_cap(4);
+        for off in 0..10u64 {
+            log.push(Sighting::verdict_bounded(FormatId::new("zip"), off, "x"));
+        }
+        log.push(Sighting::new(FormatId::new("zip"), 99, "y"));
+        assert_eq!(
+            log.count(FormatId::new("zip"), "x", SightingKind::VerdictBounded),
+            10
+        );
+        let out = log.into_sightings();
+        let x: Vec<_> = out.iter().filter(|s| s.shape == "x").collect();
+        assert_eq!(x.iter().map(|s| s.offset).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(x.iter().map(|s| s.more).sum::<u64>(), 6);
+        assert_eq!(x.last().unwrap().more, 6);
+        assert_eq!(out.iter().filter(|s| s.shape == "y").count(), 1);
+    }
+
+    /// 0.10.4: capping never changes the sentence a caller prints.
+    #[test]
+    fn capping_keeps_the_printed_sentence_identical() {
+        let all: Vec<Sighting> = (0..500u64)
+            .map(|o| Sighting::verdict_bounded(FormatId::new("zip"), o * 3, "x"))
+            .chain((0..20u64).map(|o| Sighting::new(FormatId::new("tar"), o, "y")))
+            .collect();
+        let mut log = SightingLog::new();
+        for s in all.clone() {
+            log.push(s);
+        }
+        assert_eq!(
+            describe_sightings(&log.into_sightings()),
+            describe_sightings(&all)
+        );
     }
 
     /// Task 2-N: the note a caller prints for its sightings. None for none —
