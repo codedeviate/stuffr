@@ -204,7 +204,7 @@
 //! of unbounded length, and no wrapper around the reader can intervene: the
 //! count is consumed inside the crate.
 //!
-//! The decoder is now [`XzPureDecoder`], a `Read` loop over the crate's
+//! The decoder is now `XzPureDecoder`, a `Read` loop over the crate's
 //! sans-I/O `XzStream`, built with `new_mem_limit` — which checks every
 //! block header against the limit as it is parsed, and whose index handling
 //! never preallocates by a declared count. See that type's own doc for the
@@ -235,11 +235,11 @@
 //! allocation before any output exists.
 //!
 //! `XzStream`'s bounded `new_mem_limit` constructor now closes this from
-//! underneath — see [`XzPureDecoder`]. It was passed over in Phase 1f on the
+//! underneath — see `XzPureDecoder`. It was passed over in Phase 1f on the
 //! reading that getting there from a `Read`-shaped codec meant a push-to-pull
 //! bridge of the kind Phase 1e cancelled; that reading was wrong, and
-//! [`XzPureDecoder`]'s doc says why. Above it, and still load-bearing for the
-//! message a user meets, [`declared_dictionary_bytes`] parses just enough of the stream header and
+//! `XzPureDecoder`'s doc says why. Above it, and still load-bearing for the
+//! message a user meets, `declared_dictionary_bytes` parses just enough of the stream header and
 //! block header to read the LZMA2 filter's dictionary-size byte directly, and
 //! `decoder` below checks it against [`DecodeOpts::memory_limit`] *before*
 //! any decoder is constructed — a pre-flight above a bounded decoder, not
@@ -247,7 +247,7 @@
 //!
 //! **Verified against real `xz` output at four presets** (`-0`, `-3`, `-6`,
 //! `-9`) and confirmed to match the documented preset dictionaries exactly —
-//! see [`declared_dictionary_bytes`]'s own tests for the byte-level fixtures.
+//! see `declared_dictionary_bytes`'s own tests for the byte-level fixtures.
 //! Two traps, both exercised by a test:
 //!
 //! 1. **A BCJ-filtered stream has TWO filters, LZMA2 last, not first.**

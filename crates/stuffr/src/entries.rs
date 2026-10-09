@@ -47,7 +47,7 @@ impl ArchiveBudget {
     }
 
     /// Attaches the input's running compressed-byte tally, from
-    /// [`open_archive`].
+    /// `open_archive`.
     ///
     /// Only affects the unknown-size (pipe) path; with a known
     /// `compressed_total` the ratio already has a denominator.
@@ -698,7 +698,7 @@ fn visit_by_index(
 /// Lists every entry in an archive, extracting nothing.
 ///
 /// `memory_limit` bounds the codec layer beneath the container — see
-/// [`open_archive`]. `None` is unbounded, the library default; the CLI
+/// `open_archive`. `None` is unbounded, the library default; the CLI
 /// always resolves a value. "Reads nothing and extracts nothing" is only
 /// true of the ENTRIES: reaching the container's first header still decodes
 /// whatever codec sits above it, so this verb is as exposed to a crafted
@@ -820,7 +820,7 @@ pub struct ExtractOpts {
     /// Without it an existing target is refused, the same contract
     /// `pack`/`unpack` already apply to a single output file.
     pub force: bool,
-    /// Bounds the codec layer beneath the container — see [`open_archive`].
+    /// Bounds the codec layer beneath the container — see `open_archive`.
     /// `None` is unbounded, the library default; the CLI always resolves a
     /// value.
     pub memory_limit: Option<u64>,
@@ -1754,7 +1754,7 @@ pub fn cat(
 /// `salvage` unconditionally (writing every recoverable entry) and then
 /// filtering the RETURNED report — which never touched what actually landed
 /// on disk, so `--index N -C DIR` measurably left every other entry in `DIR`
-/// too. Both now gate the write itself, inside [`place_salvaged_entry`],
+/// too. Both now gate the write itself, inside `place_salvaged_entry`,
 /// before anything is ever opened for writing.
 pub struct SalvageOpts {
     /// Where recovered entries land, as a directory tree — one file (or
@@ -1774,7 +1774,7 @@ pub struct SalvageOpts {
     /// `None` recovers every eligible entry, as before. `Some(set)` reports
     /// every scan position NOT in `set` as
     /// [`SalvageDisposition::NotSelected`] — checked in
-    /// [`place_salvaged_entry`] right after shadow detection (which stays
+    /// `place_salvaged_entry` right after shadow detection (which stays
     /// first, unchanged: a shadow is never written regardless of selection,
     /// and that is a more permanent fact about the entry than what the
     /// caller happened to ask for) and before any path is ever joined
@@ -1782,7 +1782,7 @@ pub struct SalvageOpts {
     /// file of the same name sitting in `dest` already.
     pub select: Option<HashSet<usize>>,
     /// Forces which format [`salvage`] scans `path` as, instead of detecting
-    /// one from its magic bytes and extension ([`resolve_salvage_format`]).
+    /// one from its magic bytes and extension (`resolve_salvage_format`).
     ///
     /// `None` is the common case: detect. `Some` is Task 2's `--format`,
     /// widened from Stage 1's accept-or-reject-`zip` scaffolding to select
@@ -1828,7 +1828,7 @@ pub struct SalvageOpts {
 ///
 /// The discriminator was available the whole time and is not a checksum: an
 /// entry's declared payload either fits inside the archive file or it does
-/// not ([`declared_payload_is_all_present`], the ops-layer twin of
+/// not (`declared_payload_is_all_present`, the ops-layer twin of
 /// [`stuffr_core::salvage::Candidate::available_len`] — measured
 /// independently here rather than carried across, so the two are two
 /// observations rather than one restated). Each variant now names a
@@ -1955,7 +1955,7 @@ pub enum SalvageDisposition {
     /// caller who scripted this needs to know a name had to be changed.
     WrittenDisambiguated {
         /// Where the bytes actually landed — the suffixed name, plus
-        /// `.partial` on top of it when [`Self::partial`] is `Some`.
+        /// `.partial` on top of it when `Self::partial` is `Some`.
         path: PathBuf,
         /// The EARLIER scan position already holding the name this entry
         /// would have landed on: its own name by exact spelling, a spelling
@@ -2145,7 +2145,7 @@ pub enum SalvageDisposition {
     /// this fold.
     ///
     /// **An `Intact` entry that decodes SHORT on write — `Error::Corrupt`,
-    /// exit 5** (see [`place_salvaged_file`]'s closing arm). This one was
+    /// exit 5** (see `place_salvaged_file`'s closing arm). This one was
     /// genuinely open until fix round 5 decided it, and the decision is:
     /// **keep the abort, because it is not a fact about one entry.** The
     /// scan already proved these exact bytes decode to their full length,
@@ -2173,7 +2173,7 @@ pub enum SalvageDisposition {
     SkippedUnwritable { reason: String },
     /// Not written: **stuffr itself refused this entry's name** —
     /// [`Error::UnsafePath`], raised by [`safe_join`] or
-    /// [`refuse_symlinked_ancestors`] before any filesystem call. The entry
+    /// `refuse_symlinked_ancestors` before any filesystem call. The entry
     /// escapes `dest`, names `dest` itself without being a directory, is
     /// empty, or reaches through a symlinked ancestor. Nothing is written
     /// under it, ever.
@@ -2245,7 +2245,7 @@ pub enum SalvageDisposition {
     /// `Unverified`, not excluded by `select`, and — if `Partial` — the
     /// policy in effect would have kept it), but there is no destination for
     /// its bytes to land in. A `Partial` entry that reaches this point
-    /// instead of here — see [`place_salvaged_file`] — still resolves to
+    /// instead of here — see `place_salvaged_file` — still resolves to
     /// `SkippedPartial` with its cause, since "no destination" and "policy
     /// declined it" both mean nothing is decoded to a real file, and the
     /// cause is worth reporting either way.
@@ -2649,7 +2649,7 @@ fn salvage_scanner(format: FormatId) -> Result<SalvageScanner> {
 
 /// The class of evidence `format`'s salvage scanner can offer for an
 /// entry, or `None` when this build has no scanner for it — see
-/// [`salvage_scanner`] for which format has which class, and why this is
+/// `salvage_scanner` for which format has which class, and why this is
 /// the one place that says so.
 ///
 /// `stuffr formats` renders it (SALVAGE `yes` only for
@@ -2687,7 +2687,7 @@ fn refuse_unsalvageable(registry: &Registry, format: FormatId) -> Result<()> {
     }
 }
 
-/// Recovers what this build's per-format scanner ([`salvage_scan`]) finds in
+/// Recovers what this build's per-format scanner (`salvage_scan`) finds in
 /// a damaged archive at `path`, writing what can safely be written into
 /// `opts.dest`.
 ///
@@ -2708,7 +2708,7 @@ fn refuse_unsalvageable(registry: &Registry, format: FormatId) -> Result<()> {
 /// # Containment is reused, never reimplemented
 ///
 /// Every entry this function decides to place on disk goes through
-/// [`safe_join`] and [`refuse_symlinked_ancestors`] — the SAME calls
+/// [`safe_join`] and `refuse_symlinked_ancestors` — the SAME calls
 /// [`extract`] makes, in the same order, including the `target == dest`
 /// refusal for a non-directory entry. A hostile name escaping `opts.dest`
 /// is **refused and never written**, and the run **exits 7**; salvage's
@@ -2736,18 +2736,18 @@ fn refuse_unsalvageable(registry: &Registry, format: FormatId) -> Result<()> {
 /// # Payload decoding is each format's own job (rewritten, Task 3c)
 ///
 /// Stage 2 now has TWO wired scanners — [`stuffr_formats::zip_salvage`] and
-/// [`stuffr_formats::legacy::arc_salvage`]; see [`salvage_scan`] for the
-/// scan-side dispatch and [`write_salvaged_payload`] for the write-side
+/// [`stuffr_formats::legacy::arc_salvage`]; see `salvage_scan` for the
+/// scan-side dispatch and `write_salvaged_payload` for the write-side
 /// one, every format outside both refuses through. This function itself
 /// never decodes anything: it hands each entry to
-/// [`write_salvaged_payload`], which hands it on to the resolved format's
+/// `write_salvaged_payload`, which hands it on to the resolved format's
 /// own `write_payload` — [`stuffr_formats::zip_salvage::write_payload`] or
 /// [`stuffr_formats::legacy::arc_salvage::write_payload`] today, one more
 /// per format as zoo/lha/arj each land.
 ///
 /// This section used to say the opposite of all three of those facts —
 /// "exactly one wired scanner", decoding "goes through
-/// [`crate::registry`]'s own decoder for `deflate`", and "the dispatch
+/// `crate::registry`'s own decoder for `deflate`", and "the dispatch
 /// below never reaches past Stored/Deflate" — because it was written when
 /// zip really was the only scanner and its write path really did live
 /// inline, below, dispatching through the registry. Task 3c moved the
@@ -3587,7 +3587,7 @@ fn write_salvaged_payload(
 /// inside `codec`.
 ///
 /// A named file becomes one entry; a named DIRECTORY becomes its whole tree,
-/// walked by [`crate::walk`] and named beneath the directory's own final
+/// walked by `crate::walk` and named beneath the directory's own final
 /// component. Both go through the same walk, so a file packed on its own and
 /// the same file packed as part of its parent carry identical metadata —
 /// ownership included, which is what an earlier hand-built `EntryMeta` here
@@ -3609,7 +3609,7 @@ fn write_salvaged_payload(
 /// The `Outcome`'s `fidelity` is no longer a hardcoded `Rung::Exact` with an
 /// empty warning list. The rung stays `Exact` — it describes a READ ladder,
 /// and there is no ladder on the write side — but the warnings are real:
-/// anything the walk met and could not store (see [`crate::walk::ItemSource`]),
+/// anything the walk met and could not store (see `crate::walk::ItemSource`),
 /// anything this container has no shape for (`ar` has neither directories nor
 /// symlinks), any file that could not be OPENED when its turn came, any entry
 /// whose ownership was never learned, and a summary of hardlinks that will
@@ -3623,8 +3623,8 @@ fn write_salvaged_payload(
 /// previous run. Left unhandled, every run nests the last one inside the
 /// new one and the file grows without bound; GNU tar's answer to the same
 /// shape is `file is the archive; not dumped`, and this is that same
-/// refusal applied per-file rather than at the top. See [`canonical_output_path`]
-/// and [`is_output_file`] for how the comparison is made honest against
+/// refusal applied per-file rather than at the top. See `canonical_output_path`
+/// and `is_output_file` for how the comparison is made honest against
 /// relative walk paths and a destination that does not exist yet.
 ///
 /// # A plan that would write nothing worth having is refused

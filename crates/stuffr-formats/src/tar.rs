@@ -54,7 +54,7 @@
 //!
 //! 1. A cut INSIDE an entry's payload. `EntryIo::Data` is a `Take` over the
 //!    source, so end-of-stream is `Ok(0)` — a short read reported as a
-//!    complete entry. [`EntryPayload`] compares delivered bytes against the
+//!    complete entry. `EntryPayload` compares delivered bytes against the
 //!    size the entry's own header declares and raises `InvalidData` itself.
 //! 2. A missing or partial END-OF-ARCHIVE MARKER. `try_read_all` returns
 //!    `Ok(false)` when the first read of a header comes back empty, which
@@ -63,8 +63,8 @@
 //!    zero block and never looks at what follows, so it cannot see a stream
 //!    that was cut inside the marker either.
 //!
-//!    [`TrailerWatch`] therefore counts what the source delivers, and
-//!    [`TarRead::verify_end_of_archive`] asks one question AT TAR'S OWN STOP
+//!    `TrailerWatch` therefore counts what the source delivers, and
+//!    `TarRead::verify_end_of_archive` asks one question AT TAR'S OWN STOP
 //!    POSITION — the position being the load-bearing part, since the same
 //!    question asked at end of stream is both too strict and too lax at
 //!    once, as an earlier version of this module was:
@@ -133,7 +133,7 @@
 //! A GNU sparse header declaring a size within a few blocks of `2^64` makes
 //! `tar` 0.4.46 add past `u64::MAX` (`archive.rs:532`): a panic under debug
 //! assertions, which `cargo fuzz` enables, and a silent wrap in release.
-//! [`CrateNextGuard`] sits between the source and the crate, mirrors the
+//! `CrateNextGuard` sits between the source and the crate, mirrors the
 //! crate's next-header offset, and refuses exactly that extension block as
 //! `Corrupt`. Its doc derives the bound.
 //!
@@ -438,7 +438,7 @@ impl Read for TrailerWatch {
 /// real pax header, while stopping a declared payload from buying unbounded
 /// memory. It has to be held whole twice — once by the crate's own
 /// `read_all` (`entry.rs:297-302`, which bounds nothing) and once by
-/// [`CrateNextGuard`], which needs its `size=` record — so the guard refuses
+/// `CrateNextGuard`, which needs its `size=` record — so the guard refuses
 /// a header declaring more BEFORE the crate reads a payload byte, which
 /// bounds both copies. [`Error::ResourceLimit`] (exit 6): refused on the
 /// declared size, before an allocator is asked.

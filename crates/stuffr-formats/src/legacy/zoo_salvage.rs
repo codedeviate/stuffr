@@ -21,7 +21,7 @@
 //!   bytes `DC A7 C4 FD`), a FOUR-byte anchor — as strong as zip's
 //!   `PK\x03\x04` and far stronger than ARC's two-byte marker+method pair,
 //!   which recurs by chance roughly every 8 KiB;
-//! - and its payload sits [`SIZ_FLDR`] = **5** bytes past the record's own
+//! - and its payload sits `SIZ_FLDR` = **5** bytes past the record's own
 //!   end, `zoo.h`'s `FILE_LEADER "@)#("` plus its NUL, because `zooadd.c`
 //!   computes `direntry.offset = this_dir_offset + SIZ_DIRL + var_dir_len +
 //!   SIZ_FLDR`.
@@ -50,7 +50,7 @@
 //! reader uses the record's own `offset` field, and the difference is
 //! deliberate.** `offset` is an absolute file position: for a zoo-written
 //! archive the two always agree (proven over all four borrowed fixtures by
-//! [`tests::the_structural_payload_position_agrees_with_the_records_own_offset_field`]),
+//! `tests::the_structural_payload_position_agrees_with_the_records_own_offset_field`),
 //! but in a DAMAGED archive `offset` is one more attacker-controlled link,
 //! exactly like `next`, and a corrupt one would make salvage read some other
 //! entry's bytes and report them under this record's name. The structural
@@ -72,8 +72,8 @@
 //! of their archives is damaged would answer "damaged" for all of them.
 //! Task 4's report records that falsification run and its output.
 //!
-//! **Nothing here carries its own copy of that layout.** [`read_dir_entry`],
-//! [`DirEntry`], [`Method`], [`decode`] and the constants are `zoo.rs`'s
+//! **Nothing here carries its own copy of that layout.** `read_dir_entry`,
+//! `DirEntry`, `Method`, `decode` and the constants are `zoo.rs`'s
 //! own, reused across the module boundary for exactly this reason: a second
 //! copy would be one edit away from disagreeing with the reader beside it
 //! and nothing would fail to say so. The test-only `raw_entries` in
@@ -87,19 +87,19 @@
 //! an order that never allocates or trusts anything before it is cheap to
 //! check:
 //!
-//! 1. The four-byte tag matches ([`find_next_tag`]).
-//! 2. The record PARSES: [`read_dir_entry`] accepts its `type` (0, 1 or 2 —
+//! 1. The four-byte tag matches (`find_next_tag`).
+//! 2. The record PARSES: `read_dir_entry` accepts its `type` (0, 1 or 2 —
 //!    `portable.c` asserts `type <= 2`) and the `var_dir_len`-many bytes of
 //!    its variable part are actually present. That allocation is bounded by
 //!    the field's own `u16` type, 64 KiB, and needs no ceiling of its own.
 //! 3. The packing method is one the format ever assigned — `<= `
-//!    [`Method::MAX_PACK`], `zoo.h`'s `#define MAX_PACK 2`, read from
+//!    `Method::MAX_PACK`, `zoo.h`'s `#define MAX_PACK 2`, read from
 //!    `zoo.rs` rather than re-derived here. Recognised, not necessarily
 //!    DECODABLE: all three are decodable in this build, so unlike ARC there
 //!    is no gap between the two, but the distinction is kept in the same
 //!    place so a future method cannot silently close it.
 //! 4. The name is non-empty, AND either prints as ASCII or the record's own
-//!    `dir_crc` reproduces. See [`name_looks_real`] and the section below.
+//!    `dir_crc` reproduces. See `name_looks_real` and the section below.
 //!
 //! Any failure at 2-4 is not an error — it means these four bytes were a
 //! coincidence, not a record, and the scan resumes one byte past the tag.
@@ -130,7 +130,7 @@
 //! name: a record whose own checksum reproduces is real whatever its 13-byte
 //! DOS name field decodes to — a CP437 name with high-bit characters is
 //! exactly the shape a floppy-era archive carries and exactly the shape
-//! [`name_looks_real`] refuses. Narrowing on it instead (demanding the CRC
+//! `name_looks_real` refuses. Narrowing on it instead (demanding the CRC
 //! verify) would refuse a record damaged in its own header, which is the
 //! archive a caller reached for salvage to rescue.
 //!
@@ -147,8 +147,8 @@
 //! # Verification reuses `zoo.rs`'s own decoders, never a second stack
 //!
 //! [`ZooSalvage::verify`] re-reads the record at the candidate's own offset,
-//! dispatches through [`Method::from_byte`] — the SAME capability gate
-//! `zoo.rs`'s container applies — and hands the payload to [`decode`], the
+//! dispatches through `Method::from_byte` — the SAME capability gate
+//! `zoo.rs`'s container applies — and hands the payload to `decode`, the
 //! identical whole-buffer decoder [`super::zoo`]'s reader calls. ZOO decodes
 //! an entry whole (its CRC-16 covers the entire decoded entry and neither
 //! the LZW nor the LH5 layer has a streaming form here), so the decoded
@@ -286,7 +286,7 @@ impl SalvageScan for ZooSalvage {
     /// every payload it verifies through a `take` and declares no ceiling of
     /// its own.
     ///
-    /// [`MAX_ZOO_ENTRY_LEN`] is the identical 256 MiB figure `zoo.rs`'s own
+    /// `MAX_ZOO_ENTRY_LEN` is the identical 256 MiB figure `zoo.rs`'s own
     /// `read_payload` enforces, read from that module rather than restated.
     ///
     /// **Declaring it HERE is what makes it a per-entry refusal.**
@@ -753,11 +753,11 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 /// `write_payload` exactly.
 ///
 /// Uses [`SalvagedEntry::payload_start`] directly, computed once by
-/// [`read_candidate_at`] at discovery — see that field's own doc for why a
+/// `read_candidate_at` at discovery — see that field's own doc for why a
 /// consumer must never re-derive a payload's location from `offset`.
 ///
 /// An entry reaching this function was already reported `Intact` or
-/// `Partial` by [`verify_candidate`] — never `Unverified`, which
+/// `Partial` by `verify_candidate` — never `Unverified`, which
 /// `entries.rs`'s `place_salvaged_file` refuses before calling any payload
 /// writer. So a decode that fails here is re-running bytes
 /// `verify_candidate` already examined (or a genuine prefix of them), and is
@@ -770,18 +770,18 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 ///
 /// `arc_salvage.rs`'s fix rounds 1 and 2 are inherited rather than
 /// rediscovered. A `Partial` entry reaches this function having been
-/// reported `Partial` at [`verify_candidate`]'s very first line, so its
+/// reported `Partial` at `verify_candidate`'s very first line, so its
 /// header's declarations have been bounded by nothing at that point:
 ///
 /// - the compressed read is bounded by the SOURCE's own remaining length
 ///   (`available` below, from a fresh `seek(End(0))`), so a truncated
-///   entry's genuine surviving prefix reaches [`decode`] and is written
+///   entry's genuine surviving prefix reaches `decode` and is written
 ///   rather than the whole `read_exact` failing and nothing being written;
 /// - what is genuinely PRESENT can itself still exceed the ceiling, and that
 ///   is folded into `Ok(false)`, never propagated;
 /// - `org_size` is bounded too — **on the LH5 arm alone**, because that is
-///   the only arm of [`decode`] that sizes a buffer from it. See
-///   [`verify_candidate`]'s own doc for the field, and fix round 1 (HIGH)
+///   the only arm of `decode` that sizes a buffer from it. See
+///   `verify_candidate`'s own doc for the field, and fix round 1 (HIGH)
 ///   for what bounding all three arms by it cost.
 ///
 /// Through `stuffr::entries::salvage` the ceiling branches are unreachable

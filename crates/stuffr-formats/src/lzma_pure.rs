@@ -49,7 +49,7 @@
 //! errors only against what a later `.read()` call returns; property 10 cuts
 //! as short as 1 byte. A codec whose `decoder()` itself fails on a 1-byte
 //! input would panic there instead of exercising the property it exists to
-//! check. [`LazyLzmaDecoder`] defers construction to the first `read`, the
+//! check. `LazyLzmaDecoder` defers construction to the first `read`, the
 //! same fix `zstd_pure.rs`'s `LazyRuzstdDecoder` needed for the same reason —
 //! see that type's doc for the fuller statement of the contract.
 //!
@@ -93,7 +93,7 @@
 //! after decode cannot tell these two apart; the two cases are
 //! indistinguishable from outside the crate's own read calls.
 //!
-//! The fix: [`GuardedReader`] wraps the underlying source and records
+//! The fix: `GuardedReader` wraps the underlying source and records
 //! whether **any** `read()` call during decode ever genuinely returned `Ok(0)`
 //! — real physical EOF, as opposed to the crate's own internal sentinel
 //! substitution, which never touches the wrapped reader at all once it has
@@ -104,7 +104,7 @@
 //! more bytes also produces (in addition to the crate's own internal
 //! consistency check failing); the one-byte cut is the sole case where the
 //! crate's own logic reports success anyway, so `hit_eof` is what catches
-//! it. Separately, [`GuardedReader::has_more`] answers the *other* question —
+//! it. Separately, `GuardedReader::has_more` answers the *other* question —
 //! whether bytes remain unconsumed after a clean, non-truncated finish — via
 //! one non-destructive `BufRead::fill_buf` call, the same mechanism
 //! `lzma_c.rs`'s `RejectTrailingGarbage` uses. The two checks are
@@ -122,7 +122,7 @@
 //! NUL padding too, not just a second genuine stream — measured here against
 //! `lzma-rust2` directly: both cases decode the first stream's payload with
 //! `Ok` and no error from the raw crate (it never reads far enough to notice
-//! anything follows), so [`GuardedReader::has_more`] is exactly what makes
+//! anything follows), so `GuardedReader::has_more` is exactly what makes
 //! this codec agree with the C backend and the reference tools instead of
 //! silently truncating.
 //!
@@ -178,9 +178,9 @@
 //! codec's own writer via `LzmaWriter::new_use_header(.., None)`) writes
 //! the all-ones "unknown" sentinel there, even when the input length was
 //! known up front — streaming-only is the convention in practice, not just
-//! in principle. [`GuardedReader::header_uncompressed_size_is_plausible`]
+//! in principle. `GuardedReader::header_uncompressed_size_is_plausible`
 //! trusts the resource-limit refusal only when that field is the sentinel
-//! or at least within [`PLAUSIBLE_UNCOMPRESSED_SIZE_MAX`] (a bound with
+//! or at least within `PLAUSIBLE_UNCOMPRESSED_SIZE_MAX` (a bound with
 //! slack above any real archive, but far below where a genuinely random
 //! 64-bit value lands almost every time). **This is a heuristic, not a
 //! signature check** — a format with no magic cannot tell "hostile LZMA1"
@@ -247,7 +247,7 @@ impl Codec for Lzma {
     ///
     /// Wrapped in `NormalizeDecodeErrors` — see
     /// `LZMA_PURE_MALFORMED_AS_INVALID_DATA_OTHER_EOF`'s doc for the
-    /// measured kinds folded here. [`LazyLzmaDecoder`] itself raises
+    /// measured kinds folded here. `LazyLzmaDecoder` itself raises
     /// `InvalidData` directly for the two cases only it can detect (a
     /// stream truncated by exactly one byte, and trailing bytes appended
     /// after a complete one) — see the module doc's "Truncation by exactly

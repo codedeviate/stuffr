@@ -26,7 +26,7 @@
 //! (`while let Some(entry) = ar.next_entry()? { out.push(entry.meta().clone()); }`,
 //! dropping `entry` at the end of every loop body without ever touching its
 //! reader) — consumed the whole archive before the property's byte counter
-//! was ever read. [`ArRead::current`] is what closes that gap: it stores the
+//! was ever read. `ArRead::current` is what closes that gap: it stores the
 //! in-progress `Entry` in `self` and hands the caller a payload that BORROWS
 //! it, so the caller dropping THEIR wrapper only ends that borrow — the
 //! actual drain happens where `ArRead::next_entry` chooses to run it, at the
@@ -55,7 +55,7 @@
 //! necessary`'s `read_exact` on the 8-byte magic raises `UnexpectedEof`
 //! before `next_entry` ever gets the chance to say "no entries". A valid
 //! empty archive is the 8-byte magic and nothing else, which is exactly what
-//! [`ArWrite::finish`] writes when [`ArchiveWrite::add`] was never called —
+//! `ArWrite::finish` writes when [`ArchiveWrite::add`] was never called —
 //! `ar::Builder` only writes that magic lazily, on the first `append`, so a
 //! zero-entry archive built purely through it would be zero bytes, not
 //! eight. Measured against the system `ar` on this machine (`ar t` accepts a
@@ -91,16 +91,16 @@
 //! GNU binutils' `ar rc`, `ar rcs` and `ranlib` over Mach-O objects write an
 //! inline `__.SYMDEF` whose mode field is all spaces; the crate requires an
 //! octal mode (`lib.rs:292`), so `list` used to exit 5 over a healthy
-//! library. [`ArGuardedReader`] rewrites an all-space mode to
-//! [`NORMALISED_MODE`] on a BSD-named symbol table ONLY, and says so through
-//! [`GuardObserver::header_scanned`], so [`entry_meta`] reports that mode as
+//! library. `ArGuardedReader` rewrites an all-space mode to
+//! `NORMALISED_MODE` on a BSD-named symbol table ONLY, and says so through
+//! `GuardObserver::header_scanned`, so `entry_meta` reports that mode as
 //! unknown. The crate hands an inline `__.SYMDEF` back as an ordinary member
 //! (`is_symbol_lookup_table_id`, `lib.rs:498-507`: `Common => false`), so
 //! `list` shows it, as Apple's `ar t` does; nothing about it is invented. A
 //! blank mode on any other member is still the crate's refusal.
 //!
 //! GNU's `/SYM64/` (the 64-bit symbol table) is one the crate cannot read: it
-//! parses the name as a `/N` reference. [`ArGuardedReader`] therefore skips
+//! parses the name as a `/N` reference. `ArGuardedReader` therefore skips
 //! the member itself, as the crate skips `/`: header, payload and pad byte
 //! are consumed from the source through a fixed stack buffer (nothing is
 //! sized from the declared length) and never reach the crate, which sees the
@@ -131,7 +131,7 @@
 //! `Archive::symbols()` (and `count_entries`/`jump_to_entry`, which call
 //! `scan_if_necessary` but never parse the symbol table themselves), and all
 //! three live in `impl<R: Read + Seek> Archive<R>` (`ar-0.9.0/src/lib.rs:626`)
-//! while [`ArSource`] is [`ArGuardedReader`], which implements `Read` and not
+//! while `ArSource` is `ArGuardedReader`, which implements `Read` and not
 //! `Seek` — as did the `Box<dyn Source>` it replaced, since `Source: Read +
 //! Send`. **Calling any of them from here would not compile.**
 //!
@@ -144,7 +144,7 @@
 //! bounding it would mean peeking into a payload this container never asks
 //! the crate to parse, for code the compiler will not let this module reach.
 //! **If `ar` ever grows a real `by_index` or `symbols` surface — which means
-//! giving [`ArSource`] a `Seek` impl, the very thing that unlocks these
+//! giving `ArSource` a `Seek` impl, the very thing that unlocks these
 //! methods — this is the site that must be bounded FIRST, before that
 //! lands.**
 //!
@@ -153,7 +153,7 @@
 //! from `buffer[1..16]` with no bounds check, which **panics** — exit 101,
 //! on a 68-byte file. Task 5d enumerated the three allocation sites in this
 //! very function and did not look for the non-allocation one. It is bounded
-//! by [`refuse_an_out_of_range_name_table_index`], which is also where the
+//! by `refuse_an_out_of_range_name_table_index`, which is also where the
 //! reasoning for its different error kind lives: `Corrupt` (exit 5), not
 //! `ResourceLimit` (exit 6) like the two guards beside it.
 //!
@@ -176,7 +176,7 @@
 //! there is no way to reach back into a live `ar::Archive`'s private reader
 //! to peek mid-archive even once that call returns.
 //!
-//! So the guard lives BELOW the crate instead of above it: [`ArGuardedReader`]
+//! So the guard lives BELOW the crate instead of above it: `ArGuardedReader`
 //! wraps the real source and is what `ar::Archive` reads from for the whole
 //! archive's lifetime. `cpio.rs` ended up with the SAME below-the-crate shape
 //! (`CpioSource`) even though a peek-per-entry guard was available to it, and
@@ -188,7 +188,7 @@
 //! The wrapper mirrors just enough of `ar::Header::read`'s own
 //! state machine — global header, optional one-byte pad, 60-byte header,
 //! payload — to recognise a header BOUNDARY and hold the full 60 bytes back
-//! (never releasing a partial header to the crate) until [`scan_ar_header`]
+//! (never releasing a partial header to the crate) until `scan_ar_header`
 //! has checked the one or two length fields it carries. A refusal happens
 //! before any of those 60 bytes ever reach the crate, which is what makes it
 //! run before the crate's own `vec![0; ...]` rather than merely before this
@@ -202,11 +202,11 @@
 //! `ar` 0.9.0 pads by the payload alone (`next_entry`, `lib.rs:578-580`), so
 //! whenever `N` is odd its decision is inverted and, copied faithfully, the
 //! guard and the crate both read every later member one byte off. So
-//! [`scan_ar_header`] reports both decisions and [`PadAfter::reconcile`]
+//! `scan_ar_header` reports both decisions and `PadAfter::reconcile`
 //! settles them: a true pad byte the crate will not read is consumed by the
 //! guard (and must be a real `\n`), and a pad byte the crate will read that
 //! is not there is handed to it synthetically — read only by its padding
-//! skip, never by a payload (see [`PadAfter::Synthesize`]). GNU members and
+//! skip, never by a payload (see `PadAfter::Synthesize`). GNU members and
 //! this module's own writer (which pads a `#1/N` name to a multiple of four)
 //! never reach either branch. `ar_salvage.rs` walks through this same guard
 //! and inherits the rule; it keeps no pad rule of its own.
@@ -224,10 +224,10 @@
 //! - The largest real BSD extended identifier was **100 bytes** — a path,
 //!   the same shape `MAX_CPIO_NAME_LEN`/`MAX_SYMLINK_TARGET_LEN` bound.
 //!
-//! [`MAX_BSD_IDENTIFIER_LEN`] follows Task 5c's own figure and reasoning
+//! `MAX_BSD_IDENTIFIER_LEN` follows Task 5c's own figure and reasoning
 //! unchanged: a single identifier is exactly as path-shaped as a symlink
 //! target or a cpio entry name, and 65,536 bytes is generous over the
-//! largest real one measured (100) by 655x. [`MAX_GNU_NAME_TABLE_LEN`] does
+//! largest real one measured (100) by 655x. `MAX_GNU_NAME_TABLE_LEN` does
 //! NOT reuse that figure — a name table is a TABLE, not a path, and a real
 //! one can legitimately hold thousands of names. 16 MiB is ~608x the largest
 //! real one measured (a library with 100,000 members averaging 40-byte names

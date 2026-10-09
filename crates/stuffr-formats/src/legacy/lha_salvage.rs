@@ -36,11 +36,11 @@
 //! 3. **This project's own `lha.rs::write_level1_header`** — a level-1
 //!    header writer whose output `lhasa 0.6.0`, an implementation sharing no
 //!    code with `delharc`, reads byte-for-byte
-//!    (`lha.rs`'s `lhasa_reads_what_we_write`). [`LEVEL1_HEADER_OVERHEAD`]
+//!    (`lha.rs`'s `lhasa_reads_what_we_write`). `LEVEL1_HEADER_OVERHEAD`
 //!    is imported from it rather than re-spelled here.
 //!
 //! The layout, for a **level 0 or 1** header beginning at byte `H` (level
-//! 2's is a separate, fixed 26 bytes — see [`LEVEL2_BASE_LEN`] and its
+//! 2's is a separate, fixed 26 bytes — see `LEVEL2_BASE_LEN` and its
 //! neighbours, cited the same way):
 //!
 //! | offset | size | field | source |
@@ -65,7 +65,7 @@
 //! `header_len - min_len` bytes between the OS-TYPE byte and this field
 //! (`parser.rs:227-245`), so `H+25+F` is where it sits only when that area is
 //! empty — which is every archive this project writes and every one it has a
-//! fixture for, and not a guarantee. [`parse_level_0_or_1`] reads it as the
+//! fixture for, and not a guarantee. `parse_level_0_or_1` reads it as the
 //! LAST two bytes of the base header (`base_len - 2`) instead, which is
 //! correct either way.
 //!
@@ -78,7 +78,7 @@
 //! it is confirmed twice in-tree: `write_level1_header` emits exactly
 //! `LEVEL1_HEADER_OVERHEAD + name.len()` counted bytes behind a length byte
 //! holding that same figure, and
-//! [`tests::the_header_geometry_agrees_with_delharcs_own_parser`] re-derives
+//! `tests::the_header_geometry_agrees_with_delharcs_own_parser` re-derives
 //! it at runtime from `delharc`'s own stream position after
 //! `LhaHeader::read` returns, over every fixture and every shape these
 //! tests build.
@@ -115,7 +115,7 @@
 //! **Level 2's gate is MANDATORY where `delharc`'s is advisory**, and that
 //! is the one deliberate narrowing: `LhaHeader::read` accepts a level-2
 //! header with no common extension header (there is simply nothing to
-//! compare), and [`parse_level_2`] refuses one, because a scanner with no
+//! compare), and `parse_level_2` refuses one, because a scanner with no
 //! checksum has nothing to tell a real header from five coincidental bytes.
 //! `a_level_2_header_with_no_common_extension_header_is_not_scanned` pins
 //! both halves, `delharc`'s acceptance included, so the narrowing is visible
@@ -141,7 +141,7 @@
 //! the BUILD. `examples.txt` documenting it was not enough — nothing at
 //! runtime told a user which of the two situations they were in.
 //!
-//! [`UngateableSightings`] records such a sighting and [`salvage_lha`] turns
+//! `UngateableSightings` records such a sighting and [`salvage_lha`] turns
 //! a run that recovered NOTHING while seeing one into
 //! [`Error::Unsupported`] — **exit 3**, the code `entries.rs`'s own
 //! `salvage_scan` already spends on precisely this distinction — naming the
@@ -172,8 +172,8 @@
 //! check:
 //!
 //! 1. The five-byte method identifier at `H+2` is one the format assigned
-//!    ([`Method::from_identifier`]). Recognised, not necessarily DECODABLE —
-//!    see [`Method::decodable`].
+//!    (`Method::from_identifier`). Recognised, not necessarily DECODABLE —
+//!    see `Method::decodable`.
 //! 2. The header level at `H+20` is 0, 1 or 2 (see above).
 //! 3. The declared header length reaches at least as far as the fields the
 //!    level in question requires, and the whole header is present in the
@@ -181,9 +181,9 @@
 //!    `H+0` for level 2.
 //! 4. **A checksum over the header reproduces.** For levels 0 and 1 that is
 //!    the 8-bit sum: `sum(H+2 .. H+2+header_len) mod 256` equals the byte at
-//!    `H+1` ([`checksum_of`]). For level 2 it is the `EXT_HEADER_COMMON`
+//!    `H+1` (`checksum_of`). For level 2 it is the `EXT_HEADER_COMMON`
 //!    extension header's **CRC-16 over the whole header** with its own two
-//!    checksum bytes zeroed ([`walk_extra_headers`], [`parse_level_2`]) —
+//!    checksum bytes zeroed (`walk_extra_headers`, `parse_level_2`) —
 //!    sixteen bits rather than eight, and mandatory.
 //! 5. There is a name. Levels 0 and 1 require a non-zero filename length in
 //!    the base header; level 2 requires the chain to have yielded a `0x01`
@@ -191,7 +191,7 @@
 //!    writer produces, and it is what a run of zeroed bytes behind a
 //!    coincidental method string looks like.
 //! 6. For levels 1 and 2, the extra-header chain walks to its terminator
-//!    inside the source, inside [`MAX_EXTRA_CHAIN`], and inside the budget
+//!    inside the source, inside `MAX_EXTRA_CHAIN`, and inside the budget
 //!    the header itself declared — the skip size for level 1 (which is what
 //!    makes the compressed payload length, `skip size` minus the chain,
 //!    computable at all) and the total header size for level 2.
@@ -208,7 +208,7 @@
 //! 2, so `stuffr list` and `stuffr salvage` reported two different sizes for
 //! one healthy entry (measured: 5,000 against 100), which the CRC gate kept
 //! from ever becoming a false `Intact` but which is the self-contradiction
-//! this project refuses on principle. [`ExtraChain::msdos_size`] carries it
+//! this project refuses on principle. `ExtraChain::msdos_size` carries it
 //! now, and the delharc cross-check has a fixture for it.
 //!
 //! **Reported, never rejected:** a declared payload length whose bytes do
@@ -235,9 +235,9 @@
 //! gone quietly vacuous with every test green.
 //!
 //! The noise corpus therefore carries **two spliced archives, one per
-//! checksum**: [`tests::CHECKSUM_ONLY_DEFECT_OFFSET`] is a level-1 archive
+//! checksum**: `tests::CHECKSUM_ONLY_DEFECT_OFFSET` is a level-1 archive
 //! whose only defect is its 8-bit header checksum, and
-//! [`tests::LEVEL2_CRC_ONLY_DEFECT_OFFSET`] a level-2 one whose only defect
+//! `tests::LEVEL2_CRC_ONLY_DEFECT_OFFSET` a level-2 one whose only defect
 //! is its common-header CRC-16. Deleting either check turns that splice into
 //! a phantom entry and the anti-vacuity test goes red. Two splices rather
 //! than one because criterion 4 is two different comparisons — a single
@@ -269,7 +269,7 @@
 //!
 //! # Names are `lha.rs`'s, exactly
 //!
-//! [`super::lha::lha_name_from_parts`] is shared rather than reimplemented.
+//! `super::lha::lha_name_from_parts` is shared rather than reimplemented.
 //! This project's reported LHA names are deliberately NOT `delharc`'s (three
 //! documented differences — see `lha.rs`'s `raw_pathname`), and name
 //! matching in this project is EXACT, so a scanner with its own copy of the
@@ -705,12 +705,12 @@ impl SalvageScan for LhaSalvage {
     /// those two containers decode an entry WHOLE: a declared length really
     /// does become one allocation there. LHA does not. `delharc`'s decoders
     /// are `fill_buffer`-shaped over a fixed dictionary window, so
-    /// [`verify_candidate`] streams a candidate through
+    /// `verify_candidate` streams a candidate through
     /// [`crate::salvage_verify::stream_verify`]'s 64 KiB window and
     /// [`write_payload`] through [`stream_bounded_copy`]'s, and **nothing in
     /// this module is ever sized from a header field** — the one buffer that
     /// is (a level-1 extra header) is bounded by its own `u16` type, 64 KiB,
-    /// and again by [`MAX_EXTRA_CHAIN`].
+    /// and again by `MAX_EXTRA_CHAIN`.
     ///
     /// That is the same answer `zip_salvage.rs` gives, for the same reason,
     /// and it is deliberately not the conservative one: a ceiling declared
@@ -724,7 +724,7 @@ impl SalvageScan for LhaSalvage {
     /// still in force above it — which for LHA is the whole of the range its
     /// own `u32` size fields can express.
     ///
-    /// [`tests::a_four_gigabyte_declaration_never_becomes_an_allocation`]
+    /// `tests::a_four_gigabyte_declaration_never_becomes_an_allocation`
     /// proves the premise with the recording allocator rather than asserting
     /// it.
     fn max_whole_entry(&self) -> u64 {
@@ -1762,7 +1762,7 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 /// `zoo_salvage.rs`'s `write_payload` exactly.
 ///
 /// Uses [`SalvagedEntry::payload_start`] directly, computed once by
-/// [`read_candidate_at`] at discovery — see that field's own doc for why a
+/// `read_candidate_at` at discovery — see that field's own doc for why a
 /// consumer must never re-derive a payload's location from `offset`.
 ///
 /// # What is bounded, and what needs no bound
@@ -1777,7 +1777,7 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 /// unlike ARC's and ZOO's own writers there is no `org_size`-shaped
 /// allocation for a ceiling to sit in front of.
 ///
-/// A decode that fails here is re-running bytes [`verify_candidate`] already
+/// A decode that fails here is re-running bytes `verify_candidate` already
 /// examined (or a genuine prefix of them), and is folded into `Ok(false)` for
 /// the same reason that function folds the same failures into `Partial`: one
 /// entry's damage must never abort the recovery of every other entry in the

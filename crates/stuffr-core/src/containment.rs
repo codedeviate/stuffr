@@ -249,7 +249,7 @@ pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Resu
 /// (`sub/..`) that is not an entry in the archive at all, so the user could
 /// not find it.
 ///
-/// The component walk is shared ([`walk_within`]); only the net-to-`dest`
+/// The component walk is shared (`walk_within`); only the net-to-`dest`
 /// verdict differs, which is the whole point. Every genuine escape is still
 /// refused by the same walk: an absolute target, and any `..` run deeper
 /// than the link's own depth below `dest`.
@@ -259,7 +259,7 @@ pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Resu
 /// A target may hold `..` only as a LEADING prefix — `..`, `../..`,
 /// `../../a/b` — never after a name: `x/s2/..`, `a/../b` and `./a/..` are
 /// skipped (`CLIMBS_AFTER_A_NAME`) whatever they net to. `.` components
-/// are noise, exactly as [`walk_within`] treats them, so a leading `./` is
+/// are noise, exactly as `walk_within` treats them, so a leading `./` is
 /// harmless and `./..` is still a leading run. An EMPTY target is skipped
 /// too (`EMPTY_SYMLINK_TARGET`): it names nothing, and Linux's `symlink(2)`
 /// rejects it with ENOENT, which would otherwise surface as exit 1.

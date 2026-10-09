@@ -4,7 +4,7 @@
 //!
 //! [`resolve_chain`] is the single-layer resolution: outer format only, with
 //! the inner layer decided from the path's remaining extensions when one is
-//! given ([`inner_from_path`]) and [`Chain::Raw`] otherwise. [`resolve_chain_deep`]
+//! given (`inner_from_path`) and [`Chain::Raw`] otherwise. [`resolve_chain_deep`]
 //! closes that gap: whenever the outer layer is a codec and the inner layer
 //! is still [`Chain::Raw`] — no path at all (stdin), or a path whose
 //! extensions ran out — it decodes that layer, peeks [`PROBE_LEN`] of the

@@ -39,10 +39,10 @@
 //!
 //! 1. **The magic is `070701`** — the anchor the scan searches for.
 //! 2. **All 110 header bytes are present, and every one of the thirteen
-//!    fields is eight ASCII hex digits** ([`hex8`]). The reader parses the
+//!    fields is eight ASCII hex digits** (`hex8`). The reader parses the
 //!    same fields with `u32::from_str_radix`, which also accepts a leading
 //!    `+`; this gate does not, since no writer emits one.
-//! 3. **`c_namesize` is at most [`MAX_CPIO_NAME_LEN`]** — `cpio.rs`'s own
+//! 3. **`c_namesize` is at most `MAX_CPIO_NAME_LEN`** — `cpio.rs`'s own
 //!    ceiling (65,536), reused rather than restated, and checked BEFORE the
 //!    name is allocated.
 //! 4. **The whole name is inside the source.**
@@ -83,7 +83,7 @@
 //! measured. So the noise corpus carries **one crafted splice per
 //! criterion 2-7** (plus one for the trailer rule), each a whole entry
 //! whose ONLY defect is that criterion; see
-//! [`tests::the_noise_corpus_reaches_each_criterion_it_claims_to`] and the
+//! `tests::the_noise_corpus_reaches_each_criterion_it_claims_to` and the
 //! task report's falsification table.
 //!
 //! # Byte-granular, and a payload is jumped only when the jump is corroborated
@@ -104,20 +104,20 @@
 //! changed `0`→`F` — `two.txt` vanished, with no row and no note, and
 //! `one.txt` was written holding `two.txt`'s header. So the jump is taken
 //! only when the bytes it lands on corroborate the size
-//! ([`corroborates_the_size`]): a header of any cpio variant that clears its
+//! (`corroborates_the_size`): a header of any cpio variant that clears its
 //! gate (the trailer included), EOF, or zero padding all the way to EOF.
 //! Anything else and the scan resumes **one byte past the header** — not at
 //! the engine's own `offset + declared_len`, which measures the same
 //! unattested number from the header and would skip neighbours when the
 //! damage makes a size LARGER.
 //! A refused jump costs a scan of the zero run once; the scan's memo
-//! ([`KnownZeros`]) answers every later landing in it, so many headers
+//! (`KnownZeros`) answers every later landing in it, so many headers
 //! pointing into one run stay linear.
 //!
 //! **What corroboration buys:** one damaged size costs at most its own
 //! entry's bytes (the entry is still reported, over what its header claims),
 //! never the entry behind it —
-//! [`tests::a_damaged_size_never_costs_the_entry_behind_it`] pins the
+//! `tests::a_damaged_size_never_costs_the_entry_behind_it` pins the
 //! review's reproducer and its larger-size twin. **What it still cannot
 //! catch:** a damaged size that happens to land exactly on another valid
 //! header — a size shrunk or grown by a whole number of entries, or landing
@@ -157,7 +157,7 @@
 //! and [`write_payload`] streams them through `stream_bounded_copy`, so no
 //! payload length ever sizes a buffer; the only header field that does is
 //! `c_namesize`, bounded by criterion 3 before its allocation, and a
-//! symlink's target, bounded by `cpio.rs`'s [`MAX_SYMLINK_TARGET_LEN`]. The
+//! symlink's target, bounded by `cpio.rs`'s `MAX_SYMLINK_TARGET_LEN`. The
 //! allocator-probe tests below prove both, each paired with the lower bound
 //! that proves the probe is attached.
 
@@ -864,7 +864,7 @@ fn candidate_from(
 ///
 /// `resume` is where the scan carries on after the last candidate: past its
 /// payload when the size is corroborated, one byte past its header when it
-/// is not — see [`Found::resume_at`].
+/// is not — see `Found::resume_at`.
 /// `sightings` is every well-formed header of a variant this build does not
 /// read, in scan order.
 #[derive(Debug, Default)]

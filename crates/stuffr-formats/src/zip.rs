@@ -44,11 +44,11 @@
 //!
 //! Left alone, that is the one failure mode this tool exists to rule out:
 //! `list` printing six rows and `test` announcing "exact fidelity" over an
-//! archive two of whose entries no caller can reach. So [`read_declared_index`]
+//! archive two of whose entries no caller can reach. So `read_declared_index`
 //! parses the end-of-central-directory record directly — the crate exposes no
 //! accessor for the count, `mod spec` being private and
 //! `CentralDirectoryInfo::number_of_files` `pub(crate)` — and
-//! [`note_unreachable_records`] raises [`Fidelity::EntryCountMismatch`] naming
+//! `note_unreachable_records` raises [`Fidelity::EntryCountMismatch`] naming
 //! both figures whenever the enumeration falls short. `--strict-fidelity` then
 //! refuses it at exit 4.
 //!
@@ -65,7 +65,7 @@
 //! in its central directory or its end-of-central-directory record reads back
 //! as COMPLETE, which conformance property 9 (a cut one byte from the end)
 //! catches immediately. This is the same class of hole `tar.rs`'s
-//! `verify_end_of_archive` exists for, and [`verify_trailing_index`] closes
+//! `verify_end_of_archive` exists for, and `verify_trailing_index` closes
 //! it the same way: after `Ok(None)`, walk the central directory's own framing
 //! forward — fixed block, name, extra, comment, repeat — through the optional
 //! zip64 records and require a whole end-of-central-directory record to be
@@ -99,9 +99,9 @@
 //!
 //! A zip local header must therefore carry the crc32 and the compressed size,
 //! and neither is known until the payload has been compressed. Something has
-//! to hold bytes back. [`Spool`] holds back exactly ONE entry: it presents a
+//! to hold bytes back. `Spool` holds back exactly ONE entry: it presents a
 //! `Write + Seek` face to `ZipWriter` over an in-memory window, and
-//! [`ZipWrite::add`] commits everything below the new entry's header offset to
+//! `ZipWrite::add` commits everything below the new entry's header offset to
 //! the real destination as soon as `start_file` has fixed up the PREVIOUS
 //! entry's header. Peak memory is one entry's compressed size, not the
 //! archive's — which is the true floor for zip-without-seek, and is asserted
@@ -117,7 +117,7 @@
 //! `impl<W: Write + Seek> Drop for ZipWriter<W>` finalizes the archive and
 //! writes any failure to **stderr**, losing it. Conformance property 4 exists
 //! for precisely this hazard (`tar::Builder` has the same shape), so
-//! [`ZipWrite::finish`] takes the writer out of its `Option` and calls
+//! `ZipWrite::finish` takes the writer out of its `Option` and calls
 //! `ZipWriter::finish` itself.
 //!
 //! # The one capability difference between the build tiers
@@ -745,7 +745,7 @@ fn note_unreachable_records(
 /// One central-directory file header, physically enumerated.
 ///
 /// Unlike `zip::ZipArchive`'s own view (an `IndexMap` keyed by name — see
-/// [`DeclaredIndex`]'s doc for why that collapses two records sharing a name
+/// `DeclaredIndex`'s doc for why that collapses two records sharing a name
 /// down to the last one), a `CdRecord` is one PER RECORD: an archive with
 /// eight central-directory records under six names yields eight of these,
 /// two of which repeat a `name` already seen at a different
@@ -783,7 +783,7 @@ const MAX_CD_NAME_LEN: u64 = 65_536;
 /// archive's own end-of-central-directory record declares, recovering every
 /// record the archive physically holds.
 ///
-/// `None` only when the walk cannot even begin: [`read_declared_index`]
+/// `None` only when the walk cannot even begin: `read_declared_index`
 /// could not read the EOCD with certainty (it already refuses to guess
 /// there), or the initial seek to `cd_offset` itself fails. Once under way,
 /// this is a RECOVERY rather than a verifier — carrying `read_declared_

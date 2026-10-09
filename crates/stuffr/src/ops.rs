@@ -672,7 +672,7 @@ pub(crate) fn refuse_directory_input(
     Ok(())
 }
 
-/// [`refuse_directory_input`] worded for a read verb (`list`, `test`, `cat`,
+/// `refuse_directory_input` worded for a read verb (`list`, `test`, `cat`,
 /// `unpack`, `info`, `salvage`): the one message they share, naming the verb
 /// and the way to archive a directory. Must run before anything is opened or
 /// created, so a refused call leaves nothing behind. Public so the CLI can
@@ -1327,7 +1327,7 @@ pub struct Inspection {
     /// `false` only when a forward read of THIS container could actually
     /// have lost something — a container declaring `trailing_index` that
     /// will NOT be read authoritatively. See
-    /// [`fidelity_is_knowable_without_opening`] for the full rule and for
+    /// `fidelity_is_knowable_without_opening` for the full rule and for
     /// which `ContainerCaps` flags count.
     ///
     /// So, concretely: `false` for a piped zip, and for a zip under a codec

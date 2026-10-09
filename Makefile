@@ -6,7 +6,7 @@
 
 CARGO ?= cargo
 
-.PHONY: help check lint-latest deps-guard fmt fmt-check lint test test-pure release miri hooks clean fuzz-corpus fuzz
+.PHONY: help check lint-latest deps-guard fmt fmt-check lint doc test test-pure release miri hooks clean fuzz-corpus fuzz
 
 help:
 	@echo 'stuffr development targets:'
@@ -25,7 +25,7 @@ help:
 	@echo '  make fuzz     short, seeded smoke pass over the five targets (mirrors CI)'
 
 # Ordered so the cheapest gate fails first.
-check: deps-guard fmt-check lint test test-pure release
+check: deps-guard fmt-check lint doc test test-pure release
 	@echo '✓ all gates passed'
 
 # Warns, never fails, when `target/debug/deps` has grown large enough to slow
@@ -83,6 +83,13 @@ fmt-check:
 lint:
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 	$(CARGO) clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
+
+# Rustdoc under `-D warnings`: a public item's doc comment that links a private
+# item, or a link that no longer resolves, renders as dead text on docs.rs and
+# nothing else in the gate notices. 0.10.2 had 288 of them. Write a private
+# item as a plain code span, not an intra-doc link.
+doc:
+	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --all-features
 
 test:
 	$(CARGO) test --workspace --all-features

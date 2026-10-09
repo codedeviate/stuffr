@@ -306,7 +306,7 @@ impl FidelityReport {
     /// codec's own report merged with the inner container's, once a chain has
     /// more than one — rather than for a single container's own findings,
     /// which it now records by calling [`Self::warn`] directly on the report
-    /// it inherited from the ladder (see [`crate::ladder::seed_report`]). A
+    /// it inherited from the ladder (see `crate::ladder::seed_report`). A
     /// warning already present is not repeated, so folding the same loss in
     /// from two sources still tells the caller about it once.
     pub fn merge(&mut self, other: &FidelityReport) {

@@ -125,14 +125,14 @@ impl Codec for Gzip {
         }
     }
 
-    /// Decodes with [`MultiMemberGzip`], never a bare single-member
+    /// Decodes with `MultiMemberGzip`, never a bare single-member
     /// `GzDecoder`.
     ///
     /// Concatenated gzip members are valid gzip, and every parallel encoder
     /// produces them. A bare `GzDecoder` stops after the first member and
     /// returns a short read *without an error*, silently truncating exactly
     /// the files this project will generate itself once 1c lands
-    /// multi-member encode. [`MultiMemberGzip`]'s own doc explains why that
+    /// multi-member encode. `MultiMemberGzip`'s own doc explains why that
     /// type — not `flate2::read::MultiGzDecoder` — is what closes this: it
     /// ALSO fixes Finding 7 (trailing NUL/`'X'` padding wrongly rejected)
     /// without reopening this truncation gap.

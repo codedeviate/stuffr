@@ -54,8 +54,8 @@
 //! genuinely returns `Ok(0)` — a real "I have nothing left" signal — at the
 //! moment `read_block`'s `read_exact` tries to fetch that word, and
 //! `read_exact` folds that into the same swallowed `UnexpectedEof` described
-//! above. So [`TrackedRead`] records one fact per read attempt — did the
-//! wrapped source's `read` return `Ok(0)` — and [`EnforceEndMark`] checks
+//! above. So `TrackedRead` records one fact per read attempt — did the
+//! wrapped source's `read` return `Ok(0)` — and `EnforceEndMark` checks
 //! that fact, not stream content, when `FrameDecoder` reports `Ok(0)`: a
 //! genuine EndMark was read using ordinary nonzero reads (fact is `false`);
 //! a stream cut anywhere the parser still expected more hit real source
@@ -94,7 +94,7 @@
 //! apart from "some of the next frame's header arrived, then nothing" —
 //! both look identical to it.
 //!
-//! `served_since_probe` (see [`TrackedRead`]'s own doc) is the fact that
+//! `served_since_probe` (see `TrackedRead`'s own doc) is the fact that
 //! actually distinguishes them: reset to `false` the instant a probe begins
 //! (right when `awaiting_concat_probe` is set), and latched `true` by ANY
 //! byte `TrackedRead` serves afterward, from either sub-read above. Zero
@@ -417,7 +417,7 @@ impl Codec for Lz4 {
     }
 
     /// Wrapped in `NormalizeDecodeErrors`, folding
-    /// [`crate::normalize::LZ4_MALFORMED_AS_OTHER_EOF`] — its OWN constant,
+    /// `crate::normalize::LZ4_MALFORMED_AS_OTHER_EOF` — its OWN constant,
     /// not the shared `MALFORMED_AS_INVALID_INPUT_EOF` this used to reuse.
     ///
     /// **That reuse was wrong, and the probe that used to justify it could
@@ -442,8 +442,8 @@ impl Codec for Lz4 {
     /// showing `Other` here always means `lz4_flex` itself rejected the
     /// bytes, never a wrapped source's I/O error passed through.
     ///
-    /// Also wrapped, outermost, in [`EnforceEndMark`] — over a source first
-    /// wrapped in [`TrackedRead`] — closing the truncation gap this module's
+    /// Also wrapped, outermost, in `EnforceEndMark` — over a source first
+    /// wrapped in `TrackedRead` — closing the truncation gap this module's
     /// doc comment describes: without it, `FrameDecoder` itself reports a
     /// stream cut at a block boundary (or missing its final EndMark) as a
     /// clean `Ok(0)`, indistinguishable from a real one. Every truncation

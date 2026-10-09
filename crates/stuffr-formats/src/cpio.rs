@@ -12,16 +12,16 @@
 //! `cpio::newc::Reader<R>` OWNS the reader it was constructed from and hands
 //! it back only through `finish(self) -> io::Result<R>`, consuming itself —
 //! there is no borrowed `Entry<'a, R>` type the way `ar::Entry` or
-//! `tar::Entry` are. [`CpioState`] models the two shapes that ownership
+//! `tar::Entry` are. `CpioState` models the two shapes that ownership
 //! implies (holding the raw reader between entries, holding a live `Reader`
 //! while one entry's payload is being read) as a plain enum, and
-//! [`CpioEntryPayload`] borrows `&mut CpioState` rather than owning a `Reader`
+//! `CpioEntryPayload` borrows `&mut CpioState` rather than owning a `Reader`
 //! outright. Borrowing (not owning) is what makes this safe without
 //! `unsafe`: the trait's own `next_entry(&mut self) -> Result<Option<Entry<'_>>>`
 //! already ties the returned `Entry`'s lifetime to `&mut self`, so the
 //! borrow checker refuses a second call to `next_entry` until the previous
 //! `Entry` — and the borrow of `self.state` inside it — has been dropped.
-//! That is the exact guarantee [`CpioRead::next_entry`] depends on to finish
+//! That is the exact guarantee `CpioRead::next_entry` depends on to finish
 //! the PREVIOUS entry (draining whatever the caller did not read, then
 //! recovering the reader) before the next header is parsed.
 //!
@@ -48,7 +48,7 @@
 //! # The `u32` size field
 //!
 //! `newc::Builder::write`'s `file_size` parameter is `u32` — a hard 4 GiB
-//! per-entry ceiling this format cannot express past. [`check_u32_size`]
+//! per-entry ceiling this format cannot express past. `check_u32_size`
 //! refuses an oversized entry with a typed error naming the limit, checked
 //! against the caller's DECLARED size before anything is read (so the
 //! refusal costs nothing) and again against what was actually measured, in
@@ -62,7 +62,7 @@
 //! Unlike tar's `linkname` header field, `newc` has nowhere to put a
 //! symlink's target except the entry's PAYLOAD — the mode field's `S_IFLNK`
 //! bits (`0o120000`) are the only signal that an entry even IS one.
-//! [`CpioRead::next_entry`] detects this from the header alone (before
+//! `CpioRead::next_entry` detects this from the header alone (before
 //! deciding what kind of reader to hand back) and, only for this one kind,
 //! reads the payload EAGERLY, right there, rather than deferring it to the
 //! caller the way every other entry's data is. This is deliberately narrow:
@@ -73,7 +73,7 @@
 //! this path is never on its critical path.
 //!
 //! A hostile archive claiming an implausibly large symlink "target" is
-//! refused outright by [`MAX_SYMLINK_TARGET_LEN`], checked BEFORE a single
+//! refused outright by `MAX_SYMLINK_TARGET_LEN`, checked BEFORE a single
 //! byte is read — deliberately not left to `--max-ratio`: `entries::
 //! open_archive` does wrap the source in a `RatioGuardedSource`, but that
 //! bounds decoded bytes against COMPRESSED ones, which is ~1:1 for a plain,
@@ -133,8 +133,8 @@
 //! name, each header carrying the same `(c_devmajor, c_devminor, c_ino)` and
 //! `c_nlink > 1`, and GNU cpio stores the shared content on the LAST link
 //! only, giving every earlier one `c_filesize == 0`. Read naively, that
-//! extracts as several empty files and one full one. [`CpioRead`] therefore
-//! groups regular files with `nlink > 1` by that key ([`LinkGroups`]):
+//! extracts as several empty files and one full one. `CpioRead` therefore
+//! groups regular files with `nlink > 1` by that key (`LinkGroups`):
 //!
 //! - A zero-size member of a group that has not yet produced data is **held
 //!   back**: nothing is returned for it yet, and the loop reads the next
@@ -161,9 +161,9 @@
 //! on every entry (and some other writers write `ino=0` too), so `nlink > 1`
 //! with `ino == 0` is treated as `nlink == 1`, exactly as before.
 //!
-//! **Bounded.** Held-back names are capped at [`MAX_HELD_LINK_NAMES`],
+//! **Bounded.** Held-back names are capped at `MAX_HELD_LINK_NAMES`,
 //! checked before each one is stored; past it is `Error::ResourceLimit`
-//! (exit 6). Each name is already bounded by [`MAX_CPIO_NAME_LEN`]. An
+//! (exit 6). Each name is already bounded by `MAX_CPIO_NAME_LEN`. An
 //! archive that ends without a trailer while names are held is the ordinary
 //! truncation error (exit 5): the held names are simply never returned.
 //! Resolved groups keep their data member's name for the rest of the
@@ -269,7 +269,7 @@ impl Container for CpioNewc {
     /// format's capabilities would look: `newc`'s per-entry size field is
     /// `u32` — a hard 4 GiB ceiling this format cannot express past. An
     /// entry larger than that is refused by `add` with a typed error naming
-    /// the limit (see [`check_u32_size`]), never silently truncated to the
+    /// the limit (see `check_u32_size`), never silently truncated to the
     /// wrong length.
     fn caps(&self) -> ContainerCaps {
         ContainerCaps {
@@ -301,8 +301,8 @@ impl Container for CpioNewc {
     }
 
     /// Reads no byte of `resolved`, deliberately. The magic check that
-    /// [`refuse_a_recognised_variant_this_crate_cannot_read`] performs
-    /// happens on the first [`CpioRead::next_entry`] instead, because
+    /// `refuse_a_recognised_variant_this_crate_cannot_read` performs
+    /// happens on the first `CpioRead::next_entry` instead, because
     /// container-harness property 10 requires a source error to surface as
     /// itself from a READ rather than from `open` — a container that opens
     /// eagerly turns a bad disk into an open failure and fails that

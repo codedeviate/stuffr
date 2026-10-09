@@ -27,7 +27,7 @@
 //! - The encoder reuses this module's own field layout, so encoder and
 //!   decoder cannot DRIFT. That is the opposite of independent evidence —
 //!   shared definitions guarantee agreement — which is why it is only half.
-//! - [`spec_constraints_the_reader_never_checks`] asserts, on the bytes the
+//! - `spec_constraints_the_reader_never_checks` asserts, on the bytes the
 //!   encoder actually emits, the constraints the SPECIFICATION states and
 //!   `unarj-rs` ignores. Each is cited to its line of "ARJ TECHNICAL
 //!   INFORMATION" (April 1993, ARJ Software Inc.; the copy read is
@@ -37,16 +37,16 @@
 //!
 //! The same discipline applies to the fields the spec does NOT constrain,
 //! and there are four: `archiver version number`, `minimum archiver version
-//! to extract`, `security version` and [`FILESPEC_POSITION`]. Each is
+//! to extract`, `security version` and `FILESPEC_POSITION`. Each is
 //! written as 0, each is ARGUED — in `fixtures/legacy/MANIFEST.md`'s
 //! `sample.arj` block, and for the last one in its own constant's doc — and
 //! each is pinned by a test, so a zero nobody chose cannot appear among
 //! zeros that were chosen. The last of the four was enumerated only in Task
 //! 7's fix round, which is the point of writing the list down.
 //!
-//! [`the_encoder_reproduces_the_hand_built_fixture_byte_for_byte`] is the
+//! `the_encoder_reproduces_the_hand_built_fixture_byte_for_byte` is the
 //! third leg and the nearest thing here to a second opinion: `build_arj` (the
-//! fixture recipe, hand-transcribed in Phase 3b) and [`ArjWrite`] (written
+//! fixture recipe, hand-transcribed in Phase 3b) and `ArjWrite` (written
 //! for this task) are two independent transcriptions of the same header
 //! tables, and they agree byte for byte on the same two entries. That is
 //! weaker than `lhasa` reading an `.lzh` — both transcriptions are this
@@ -143,8 +143,8 @@
 //! crate's own source (there is no independent tool to check this fixture
 //! or this reasoning against — see `fixtures/legacy/MANIFEST.md`) shows
 //! `compressed_size` is allocated FIRST and unconditionally, so
-//! [`refuse_if_over_ceiling`] is called on both fields, in that order,
-//! before [`ArjRead::next_entry`] ever calls `read`. This is the same shape
+//! `refuse_if_over_ceiling` is called on both fields, in that order,
+//! before `ArjRead::next_entry` ever calls `read`. This is the same shape
 //! `cpio.rs`'s `MAX_CPIO_NAME_LEN`/`refuse_an_oversized_namesize` and
 //! `MAX_SYMLINK_TARGET_LEN`/`read_symlink_target` close: a header field
 //! reaching an allocator before anything has validated it.
@@ -153,13 +153,13 @@
 //! `cpio.rs` gives for its own two guards — `DecodeOpts::memory_limit`
 //! binds a CODEC's dictionary/window allocation, but a container opens
 //! through [`OpenOpts`], which carries no memory field at all. There is
-//! nothing to bind against here; [`MAX_ARJ_ENTRY_LEN`] is a fixed structural
+//! nothing to bind against here; `MAX_ARJ_ENTRY_LEN` is a fixed structural
 //! ceiling for the identical reason `MAX_CPIO_NAME_LEN` is.
 //!
 //! # Error mapping has no wildcard
 //!
 //! `unarj-rs` surfaces a bare `io::Error`, never a typed enum. Two things
-//! matter about how it uses that type, and [`classify_arj_io`] handles both:
+//! matter about how it uses that type, and `classify_arj_io` handles both:
 //!
 //! - Every DELIBERATE failure the crate raises (a header checksum mismatch,
 //!   a CRC-32 mismatch on the decoded payload, an unrecognised compression
@@ -187,14 +187,14 @@
 //! fields, and a `Symlink` or `Other` entry kind — ARJ's `file type` table
 //! has no value for a link, so writing one as a regular file would put the
 //! target text in the file's contents. Never a silent truncation, never a
-//! quietly different kind. See [`ArjWrite::add`].
+//! quietly different kind. See `ArjWrite::add`.
 //!
 //! An entry whose `compression_method` is `NoData`, `NoDataNoCrc` or
 //! `Unknown` has no decoder in `unarj-rs` at all — `ArjArchieve::read`'s own
 //! match falls to an arm that raises `io::ErrorKind::InvalidData` for these,
 //! which would otherwise fold onto `Error::Corrupt` via the rule above. That
 //! is the wrong answer: the archive is not damaged, this crate simply has no
-//! decoder for that method. [`ArjRead::next_entry`] checks
+//! decoder for that method. `ArjRead::next_entry` checks
 //! `compression_method` itself, before calling `read`, and raises
 //! [`Error::Unsupported`] (exit 3) directly for these three — the same
 //! capability-vs-damage distinction `legacy::lha`'s `is_decoder_supported()`
@@ -203,7 +203,7 @@
 //! # Entry kinds
 //!
 //! Only `FileType::Directory` gets special handling (no payload is decoded;
-//! see [`ArjRead::next_entry`]). `Binary` and `Text7Bit` are
+//! see `ArjRead::next_entry`). `Binary` and `Text7Bit` are
 //! [`EntryKind::File`]. `VolumeLabel`, `ChapterLabel`, `CommentHeader` and
 //! any `Unknown` value are [`EntryKind::Other`] — the kind that exists for
 //! exactly this: an entry this container can read the bytes of but cannot
@@ -217,7 +217,7 @@
 //! `needs_seek: true` plus `forward_parse: false` means `resolve` never
 //! hands this container a forward-only source at all (see the module doc
 //! above). Every source [`Arj::open`] ever sees is seekable, so
-//! [`ArjRead::by_index`] has exactly one answer on every call:
+//! `ArjRead::by_index` has exactly one answer on every call:
 //! `Error::Unsupported`, naming that ARJ carries no entry index of its own
 //! — `ArjArchieve` exposes only forward iteration via `get_next_entry`. This
 //! routes `entries.rs`'s `by_index` fallback to a counted forward walk,
@@ -294,7 +294,7 @@ impl Container for Arj {
     ///
     /// `stores_dirs: true` is a separate, narrower claim and it is genuine:
     /// a directory goes out with the spec's own `file type` value `3`
-    /// (`3 = directory`), carries no payload, and [`ArjRead::next_entry`]
+    /// (`3 = directory`), carries no payload, and `ArjRead::next_entry`
     /// reads it back as [`EntryKind::Dir`].
     ///
     /// `stores_symlinks` stays false, and here the format is the reason
@@ -351,7 +351,7 @@ impl Container for Arj {
         }))
     }
 
-    /// Writes ARJ headers with `Stored` payloads. See [`ArjWrite`].
+    /// Writes ARJ headers with `Stored` payloads. See `ArjWrite`.
     ///
     /// `CreateOpts::level` is deliberately ignored rather than validated,
     /// the same ruling `lha.rs`'s `create` records for the same reason: this
@@ -366,7 +366,7 @@ impl Container for Arj {
     /// harness's own `build()` unwraps with a generic panic, so a write
     /// failure surfacing from here would kill property 4 in setup instead
     /// of being the error that property exists to catch. It is written by
-    /// whichever of [`ArjWrite::add`] or [`ArjWrite::finish`] runs first.
+    /// whichever of `ArjWrite::add` or `ArjWrite::finish` runs first.
     fn create(&self, dst: Box<dyn Sink>, _o: &CreateOpts) -> Result<Box<dyn ArchiveWrite>> {
         Ok(Box::new(ArjWrite {
             dst: Some(dst),

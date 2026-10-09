@@ -26,9 +26,9 @@
 //! an order that never allocates or trusts anything before it is cheap to
 //! check:
 //!
-//! 1. The marker byte matches ([`find_next_marker`]).
+//! 1. The marker byte matches (`find_next_marker`).
 //! 2. The method byte that follows is one ARC ever assigned (`1..=11` —
-//!    [`find_next_marker`] mirrors `arc.rs`'s own `ARC_MAGIC` table rather
+//!    `find_next_marker` mirrors `arc.rs`'s own `ARC_MAGIC` table rather
 //!    than re-deriving a second list; `0` is the end-of-archive marker, not
 //!    an entry, and is deliberately excluded here for the identical reason
 //!    `ARC_MAGIC` excludes it — see that table's own doc). Recognised, not
@@ -38,7 +38,7 @@
 //!    coincidence (discovery's job).
 //! 3. The name (`ArcHeader::parse`'s own NUL-truncated field) decodes as
 //!    non-empty, printable ASCII with no substitution character — see
-//!    [`name_looks_real`] for why this is a REAL filter here where a lossy
+//!    `name_looks_real` for why this is a REAL filter here where a lossy
 //!    decode is not (the same asymmetry `zip_salvage.rs`'s own module doc
 //!    argues for strict UTF-8 over CP437).
 //! 4. `marker_offset + 1 + HEADER_LEN + compressed_size` fits inside the
@@ -56,7 +56,7 @@
 //! obviously noise (unlike zip's 16-bit `name_len`, nothing about ARC's
 //! format makes a large `u32` implausible) nor safe to allocate from
 //! blindly. It is bounded one step later instead, by
-//! [`ArcSalvage::max_whole_entry`] — [`super::arc::MAX_ARC_ENTRY_LEN`], the
+//! [`ArcSalvage::max_whole_entry`] — `super::arc::MAX_ARC_ENTRY_LEN`, the
 //! identical ceiling `arc.rs`'s own `read_payload` enforces — which
 //! `stuffr_core::salvage::annotate_candidates` applies immediately before
 //! the payload buffer it would size is allocated, reporting
@@ -76,14 +76,14 @@
 //! # Verification reuses `arc.rs`'s own decoder, never a second one
 //!
 //! [`ArcSalvage::verify`] re-reads the header at a candidate's own offset,
-//! decodes its method via [`super::arc::Method::from_byte`] (the SAME
+//! decodes its method via `super::arc::Method::from_byte` (the SAME
 //! capability gate `arc.rs`'s own container applies — methods 5-7 and 10-11
 //! answer [`SalvageStatus::Unverified`], never [`SalvageStatus::Complete`]:
 //! ARC entries always carry a CRC-16, so `Complete` — "no checksum to
 //! offer" — would be a lie here, unlike tar/cpio/ar), then hands the
 //! payload — already bounded by the ceiling above, before this ever runs —
-//! to [`super::arc::decode`]
-//! — the identical whole-buffer decoder `arc.rs`'s own [`ArcRead`] calls,
+//! to `super::arc::decode`
+//! — the identical whole-buffer decoder `arc.rs`'s own `ArcRead` calls,
 //! not a second decompression stack built for salvage. `arc.rs`'s own module
 //! doc records that this container "decodes whole and cannot stream"
 //! (`MAX_ARC_ENTRY_LEN`'s doc), so unlike zip's Deflate branch this cannot
@@ -154,15 +154,15 @@ impl SalvageScan for ArcSalvage {
         }
     }
 
-    /// ARC decodes an entry WHOLE — [`super::arc::MAX_ARC_ENTRY_LEN`]'s own
+    /// ARC decodes an entry WHOLE — `super::arc::MAX_ARC_ENTRY_LEN`'s own
     /// doc records that this container "decodes whole and cannot stream" —
     /// so a candidate's declared length really does become one allocation
     /// here, unlike zip, which streams every payload it verifies through a
     /// `take` and therefore declares no ceiling of its own.
     ///
     /// Declaring it HERE is what makes it a per-entry refusal. Fix rounds 1
-    /// and 2 of Task 3c both left [`verify_candidate`] calling
-    /// [`super::arc::refuse_if_over_ceiling`] with a `?`, and an `Err` out
+    /// and 2 of Task 3c both left `verify_candidate` calling
+    /// `super::arc::refuse_if_over_ceiling` with a `?`, and an `Err` out
     /// of `verify` aborts the entire run: measured at the CLI on a healthy
     /// `A.TXT` followed by a 300 MiB entry whose declared bytes were all
     /// genuinely present, `stuffr salvage --format arc --list` printed **no
@@ -489,7 +489,7 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// `PartialCause`, matching `zip_salvage.rs`'s own `write_payload` exactly.
 ///
 /// Uses [`SalvagedEntry::payload_start`] directly, computed once by
-/// [`read_candidate_at`] at discovery time — see that field's own doc for
+/// `read_candidate_at` at discovery time — see that field's own doc for
 /// why a consumer must never re-derive a payload's location from `offset`
 /// itself. Before Task 3c, `entries.rs`'s salvage write path did exactly
 /// that, unconditionally as if every candidate were zip-shaped: it read 30
@@ -497,10 +497,10 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// near end-of-file ran past EOF and raised `Error::Io` (exit 1) — the
 /// wildcard this project treats as a defect — rather than anything
 /// classified. Locating the payload is this scanner's own job now, decided
-/// once by [`read_candidate_at`] and never repeated here.
+/// once by `read_candidate_at` and never repeated here.
 ///
 /// An entry reaching this function was already reported `Intact`,
-/// `Complete` or `Partial` by [`verify_candidate`] — never `Unverified`,
+/// `Complete` or `Partial` by `verify_candidate` — never `Unverified`,
 /// which `entries.rs`'s `place_salvaged_file` already refuses before
 /// calling this. So a decode that fails here is re-running bytes
 /// `verify_candidate` already examined (or a genuine prefix of them — see
@@ -513,10 +513,10 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// never by what `compressed_len` DECLARES
 ///
 /// The first version of this function called
-/// [`super::arc::refuse_if_over_ceiling`] on `compressed_len` directly —
+/// `super::arc::refuse_if_over_ceiling` on `compressed_len` directly —
 /// the header's own declaration — and then `read_exact`'d exactly that many
 /// bytes. For a `Partial` entry whose payload is TRUNCATED,
-/// [`verify_candidate`] returns `Partial` at its very first line, before
+/// `verify_candidate` returns `Partial` at its very first line, before
 /// its OWN ceiling check ever runs — so a truncated header could declare an
 /// arbitrary multi-hundred-megabyte figure and reach this function with
 /// nothing having bounded it yet. That reproduced, in a second code path,
@@ -536,7 +536,7 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// never by the header's declaration alone. The subsequent `read_exact`
 /// can no longer fail on a truncated entry's own short length, so a
 /// truncated Stored (or Rle90) entry's genuine surviving bytes now reach
-/// [`super::arc::decode`] and are written, same as zip's truncated-tail
+/// `super::arc::decode` and are written, same as zip's truncated-tail
 /// case. The non-streamable methods (`Squeezed`, `Crunched`, `Squashed`)
 /// still legitimately produce nothing on a truncated input — they decode
 /// whole, like `arc.rs`'s own reader, and a mid-stream cut Huffman tree or
@@ -549,11 +549,11 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// Round 1's bound closed the common case (a truncated header lying about
 /// a payload that never follows) but left the ceiling CHECK propagating a
 /// real `Err` when the bytes that genuinely exist are themselves still
-/// over [`super::arc::MAX_ARC_ENTRY_LEN`] — measured, on a 283 MB archive
+/// over `super::arc::MAX_ARC_ENTRY_LEN` — measured, on a 283 MB archive
 /// whose only fault was one entry's truncated tail also being larger than
 /// the ceiling, `salvage --list` still aborted at exit 6 with NO rows
 /// printed at all, the exact symptom HIGH-1 was raised about, on the same
-/// input class. [`write_payload_bounded`] below folds that refusal into
+/// input class. `write_payload_bounded` below folds that refusal into
 /// `Ok(false)` instead — reported as this one entry not completing, never
 /// propagated as an `Err` that takes every other entry in the archive down
 /// with it, matching every other unrecoverable condition this function
@@ -567,7 +567,7 @@ fn method_for_codec(codec: Option<FormatId>) -> Option<Method> {
 /// is upstream of this function too: the real decision now belongs to
 /// [`ArcSalvage::max_whole_entry`], which
 /// `stuffr_core::salvage::annotate_candidates` applies before
-/// [`verify_candidate`] ever runs, so an over-ceiling entry is
+/// `verify_candidate` ever runs, so an over-ceiling entry is
 /// `Unverified(OverEntryCeiling)` and `entries.rs`'s `place_salvaged_file`
 /// refuses every `Unverified` entry BEFORE calling a payload writer at all.
 /// Through `stuffr::entries::salvage` the branch below is therefore

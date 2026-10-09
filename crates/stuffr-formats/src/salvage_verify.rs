@@ -24,12 +24,12 @@
 //!
 //! # One fixed-size window, incremental state per width
 //!
-//! Both arms stream through the same [`VERIFY_CHUNK`]-sized window and never
+//! Both arms stream through the same `VERIFY_CHUNK`-sized window and never
 //! materialise a whole payload — see `zip_salvage.rs`'s module doc
 //! ("Verification") for the allocation defect that discipline closes and why
 //! it is load-bearing, not a micro-optimisation. `Verifier::Crc32` resumes
 //! `crc32_ieee_update`'s running state exactly as Stage 1 did; `Verifier::
-//! Crc16` resumes [`crate::legacy::crc::crc16_arc_continued`] the identical
+//! Crc16` resumes `crate::legacy::crc::crc16_arc_continued` the identical
 //! way — the function Phase 3c already built for exactly this: incremental
 //! CRC-16/ARC over a fixed window, pinned against the published check value
 //! `"123456789"` -> `0xBB3D`.

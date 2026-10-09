@@ -1073,7 +1073,7 @@ pub fn assert_container_conforms_with(
 ///
 /// `expected_skipped` names, in the FIXTURE numbering (1-10), exactly the
 /// properties this container's caps and fixture make unrunnable. A
-/// [`PropertyLedger`] records every property as run or skipped and asserts
+/// `PropertyLedger` records every property as run or skipped and asserts
 /// the three things its doc describes at the end.
 ///
 /// This did not exist until the Phase 3c final review: the ledger was wired
@@ -1480,7 +1480,7 @@ pub fn assert_container_conforms(container: &dyn Container, meta: &FormatMeta) {
 /// caller states what it expects to happen.
 ///
 /// Passing the list is mandatory rather than advisory, and the reason is in
-/// [`PropertyLedger`]'s own doc: before this existed a property could stop
+/// `PropertyLedger`'s own doc: before this existed a property could stop
 /// running with nothing failing, and one demonstrably did — truncation
 /// detection, silently disabled for every `needs_seek` container, whole
 /// suite green.

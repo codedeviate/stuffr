@@ -112,12 +112,12 @@ impl Codec for Bzip2 {
         }
     }
 
-    /// Decodes with [`MultiMemberBzip2`], never a bare single-stream
+    /// Decodes with `MultiMemberBzip2`, never a bare single-stream
     /// `BzDecoder` and never `bzip2::read::MultiBzDecoder` — concatenated
     /// bzip2 streams are valid bzip2, `pbzip2` produces them, and a bare
     /// single-stream decoder stops after the first without erroring,
     /// silently truncating exactly the files a parallel bzip2 encoder
-    /// produces. [`MultiMemberBzip2`]'s own doc explains why its own
+    /// produces. `MultiMemberBzip2`'s own doc explains why its own
     /// chaining — not `MultiBzDecoder` — is what closes this without
     /// reopening Finding 7 (trailing NUL/`'X'` padding wrongly rejected).
     ///

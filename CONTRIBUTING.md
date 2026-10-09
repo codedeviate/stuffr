@@ -4,7 +4,7 @@
 
 ```bash
 make hooks   # once per clone — installs the commit-msg hook
-make check   # the full gate: fmt, lint, test, release build
+make check   # the full gate: fmt, lint, doc, test, release build
 ```
 
 `make hooks` sets `core.hooksPath`, which git does not do for you: hooks live
@@ -45,6 +45,7 @@ brew install gnu-tar cpio binutils
 |---|---|
 | Format | `cargo fmt --all --check` |
 | Lint | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
+| Doc | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features` |
 | Test | `cargo test --workspace --all-features` |
 | Release | `cargo build --release --workspace` |
 | Feature floor | `cargo build -p stuffr-core --no-default-features` |

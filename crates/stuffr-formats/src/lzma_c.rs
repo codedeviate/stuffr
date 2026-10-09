@@ -52,8 +52,8 @@
 //! corrupt` and exit nonzero — after having already written the first
 //! stream's decoded bytes to stdout. So the reference tool's behavior is:
 //! decode as far as the embedded end-of-payload marker, then treat anything
-//! left over in the input as corruption. [`decoder`] below matches that:
-//! [`RejectTrailingGarbage`] checks, once the inner decoder reports it has
+//! left over in the input as corruption. `decoder` below matches that:
+//! `RejectTrailingGarbage` checks, once the inner decoder reports it has
 //! reached the LZMA1 end marker, whether the buffered reader still holds
 //! any unconsumed bytes — via one `BufRead::fill_buf` call, which returns
 //! whatever is already buffered without necessarily doing more I/O — and

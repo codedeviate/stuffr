@@ -60,11 +60,11 @@
 //! stream can name it
 //!
 //! `free_ent` is the NEXT dictionary slot to be assigned, and
-//! [`LzwZReader::advance_running`] only ever assigns one while
+//! `LzwZReader::advance_running` only ever assigns one while
 //! `free_ent < maxmaxcode`. So the moment `free_ent` reaches `maxmaxcode` the
 //! dictionary has FROZEN: slot `free_ent` will never be written, and no
 //! conforming encoder can emit a code naming it — this module's own
-//! [`LzwEncoder::push_byte`] stops learning pairs under the identical
+//! `LzwEncoder::push_byte` stops learning pairs under the identical
 //! condition. **Every valid code is therefore `< maxmaxcode`**, which is also
 //! exactly the length of the `prefix`/`suffix` tables.
 //!
@@ -72,7 +72,7 @@
 //! `maxbits >= 10` that is harmless because such a code is not even
 //! REPRESENTABLE: the width settles at `n_bits == maxbits`, so the largest
 //! code the bit stream can carry is `maxmaxcode - 1`. `maxbits == 9` is the
-//! sole exception, for the reason [`synth_z`]'s doc sets out at length —
+//! sole exception, for the reason `synth_z`'s doc sets out at length —
 //! `INIT_BITS == maxbits == 9`, so the `n_bits == maxbits` cap never fires and
 //! the width widens to **10** once the 512 entries are used up (correct, and
 //! externally confirmed against BSD `compress -b 9` + GNU `uncompress`). A
@@ -137,7 +137,7 @@
 //!    fine for a test encoding a few kilobytes, wrong for a `Sink`, which
 //!    must not accumulate an encode of arbitrary length in memory.
 //!    `LzwEncoder::output`/`finish` now take the destination buffer as a
-//!    parameter instead of owning one, so [`CompressZSink::write`] can flush
+//!    parameter instead of owning one, so `CompressZSink::write` can flush
 //!    each completed group straight to the underlying `Write` and hold onto
 //!    nothing bigger than one code group (at most 16 bits) between calls.
 //!    Memory is otherwise bounded exactly the way the DECODER's is: the
@@ -227,7 +227,7 @@ impl Codec for CompressZ {
         }
     }
 
-    /// See the module doc for why this is [`LzwZReader`], a from-scratch
+    /// See the module doc for why this is `LzwZReader`, a from-scratch
     /// incremental port of `newtua-lzw-z`'s own algorithm, rather than a
     /// wrapper over that crate's `Decoder`.
     fn decoder(&self, src: Box<dyn Source>, _o: &DecodeOpts) -> Result<Box<dyn Source>> {
@@ -246,7 +246,7 @@ impl Codec for CompressZ {
         }
     }
 
-    /// Wraps [`LzwEncoder`] in [`CompressZSink`] — see the module doc for why
+    /// Wraps `LzwEncoder` in `CompressZSink` — see the module doc for why
     /// the encoder streams instead of buffering, and why it never emits a
     /// block-mode CLEAR.
     fn encoder(&self, mut dst: Box<dyn Write + Send>, o: &EncodeOpts) -> Result<Box<dyn Sink>> {

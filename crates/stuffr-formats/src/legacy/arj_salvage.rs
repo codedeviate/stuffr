@@ -153,26 +153,26 @@
 //! 1. The two-byte header id `0x60 0xEA` sits at the candidate offset.
 //! 2. The basic header size at `H+2` is **non-zero** — zero is the spec's
 //!    end-of-archive marker, a real structural element and not an entry —
-//!    and **at most [`MAX_ARJ_HEADER_SIZE`] (2600)**, the spec's stated
+//!    and **at most `MAX_ARJ_HEADER_SIZE` (2600)**, the spec's stated
 //!    maximum for both header tables.
 //! 3. The whole envelope is present in the source: `4 + N + 4 + 2` bytes from
 //!    `H`.
 //! 4. **The basic header CRC-32 over the content reproduces** the value the
 //!    envelope records — `unarj_rs::arj_archive::read_header`'s own check,
-//!    computed here with `arj.rs`'s [`crc32_ieee`] rather than by calling
+//!    computed here with `arj.rs`'s `crc32_ieee` rather than by calling
 //!    into the dependency, so the gate stays falsifiable from inside this
 //!    crate. Thirty-two bits, and by far the strongest single signal here.
-//! 5. `first_hdr_size` is at least [`ARJ_FIRST_HDR_SIZE`] (30, the spec's own
+//! 5. `first_hdr_size` is at least `ARJ_FIRST_HDR_SIZE` (30, the spec's own
 //!    standard header) and no larger than the content itself.
 //! 6. **The basic-header-size identity holds**: `first_hdr_size +
 //!    strlen(filename) + 1 + strlen(comment) + 1` equals the declared basic
 //!    header size, with both NUL terminators inside the content, and the
 //!    filename is not empty.
 //! 7. The `file type` byte is not 2 — see the section above.
-//! 8. The `method` byte is one the format assigned ([`Method::from_byte`]).
-//!    Recognised, not necessarily DECODABLE — see [`Method::decodable`].
+//! 8. The `method` byte is one the format assigned (`Method::from_byte`).
+//!    Recognised, not necessarily DECODABLE — see `Method::decodable`.
 //! 9. The extended-header chain behind the basic header walks to its
-//!    terminator inside the source and inside [`MAX_EXT_CHAIN`], which is
+//!    terminator inside the source and inside `MAX_EXT_CHAIN`, which is
 //!    what makes the payload's position computable at all.
 //!
 //! Any failure at 2-9 is not an error — it means these two bytes were a
@@ -214,8 +214,8 @@
 //! measured that its six bare seeded identifiers produced ZERO phantoms with
 //! the checksum gate deleted, so a single-splice corpus would have gone
 //! quietly vacuous with every test green. See
-//! [`tests::CRC_ONLY_DEFECT_OFFSET`], [`tests::IDENTITY_ONLY_DEFECT_OFFSET`]
-//! and [`tests::OVERSIZED_HEADER_OFFSET`]; the task report records the run
+//! `tests::CRC_ONLY_DEFECT_OFFSET`, `tests::IDENTITY_ONLY_DEFECT_OFFSET`
+//! and `tests::OVERSIZED_HEADER_OFFSET`; the task report records the run
 //! with each check deleted in turn.
 //!
 //! # Verification reuses the decoders `unarj-rs` itself dispatches to
@@ -229,7 +229,7 @@
 //! - **methods 1-3** — `delharc`'s [`DecoderAny`] over
 //!   `CompressionMethod::Lh6`, which is exactly what
 //!   `unarj_rs::ArjArchieve::read` hands those three methods, reached
-//!   directly so it can be driven in [`DECODE_CHUNK`] steps instead of one
+//!   directly so it can be driven in `DECODE_CHUNK` steps instead of one
 //!   whole-entry `fill_buffer`;
 //! - **method 4 (`CompressedFastest`)** — `unarj_rs::decode_fastest`, the
 //!   only arm with no streaming form: it takes the whole compressed slice and
@@ -250,7 +250,7 @@
 //! # A guard-refused method-4 entry is labelled `Partial (decode failed)`
 //!
 //! **Fix round 1's F4, RECORDED here and then fixed one crate up in Task 7's
-//! fix round (Ruling S-AA).** [`starts_with_a_backreference`] refuses a
+//! fix round (Ruling S-AA).** `starts_with_a_backreference` refuses a
 //! method-4 stream before decoding, on an entry whose payload is entirely
 //! present and not truncated at all. That reached `stuffr salvage --list` as
 //! `Partial (truncated)` — the right refusal under the wrong word, since
@@ -273,7 +273,7 @@
 //! above stream and would need no ceiling; **method 4 does not**, and one arm
 //! that materialises a header-declared length is enough to make this the
 //! ARC/ZOO case rather than the LHA/zip one. The figure is
-//! [`MAX_ARJ_ENTRY_LEN`], read from `arj.rs` rather than restated, so `list`,
+//! `MAX_ARJ_ENTRY_LEN`, read from `arj.rs` rather than restated, so `list`,
 //! `unpack` and `salvage` cannot come to disagree about one archive: the
 //! ordinary reader already refuses an entry past it at exit 6, on both size
 //! fields, before `ArjArchieve::read` allocates.
@@ -655,7 +655,7 @@ impl SalvageScan for ArjSalvage {
     ///
     /// ARJ is the second kind, and only just: three of its four decodable
     /// arms stream here (method 0 copies; methods 1-3 run through
-    /// [`DecodedReader`]'s fixed window), but **method 4 has no streaming
+    /// `DecodedReader`'s fixed window), but **method 4 has no streaming
     /// form at all** — `unarj_rs::decode_fastest` takes the whole compressed
     /// slice and returns the whole decoded `Vec`. One arm that materialises a
     /// header-declared length is enough: `max_whole_entry` is scanner-wide,
@@ -665,14 +665,14 @@ impl SalvageScan for ArjSalvage {
     /// already owns — exactly the shape three of Task 3c's fix rounds
     /// deleted.
     ///
-    /// [`MAX_ARJ_ENTRY_LEN`] is read from `arj.rs` rather than restated, and
+    /// `MAX_ARJ_ENTRY_LEN` is read from `arj.rs` rather than restated, and
     /// that is what keeps this build self-consistent: the ORDINARY reader
     /// already refuses an entry past this figure at exit 6, on both size
     /// fields, before `ArjArchieve::read` allocates — so salvage refusing the
     /// same entry costs nothing `list` or `unpack` could have done, and a
     /// user cannot get two different answers about one archive.
     ///
-    /// [`tests::a_stored_entry_just_under_the_ceiling_never_becomes_an_allocation`]
+    /// `tests::a_stored_entry_just_under_the_ceiling_never_becomes_an_allocation`
     /// proves the three streaming arms really do stream, with the recording
     /// allocator rather than by assertion.
     fn max_whole_entry(&self) -> u64 {
@@ -1428,7 +1428,7 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 /// `zoo_salvage.rs`'s and `lha_salvage.rs`'s `write_payload` exactly.
 ///
 /// Uses [`SalvagedEntry::payload_start`] directly, computed once by
-/// [`read_candidate_at`] at discovery — see that field's own doc for why a
+/// `read_candidate_at` at discovery — see that field's own doc for why a
 /// consumer must never re-derive a payload's location from `offset`.
 ///
 /// # What is bounded, and what needs no bound
@@ -1440,13 +1440,13 @@ fn verify_candidate(src: &mut dyn SeekRead, candidate: &Candidate) -> Result<Sal
 /// written — `arc_salvage.rs`'s fix rounds 1 and 2, inherited rather than
 /// rediscovered.
 ///
-/// Both ceiling branches are gated to [`Method::allocates_from_original_size`]
+/// Both ceiling branches are gated to `Method::allocates_from_original_size`
 /// — method 4 — and through `stuffr::entries::salvage` neither is reachable at
 /// all (the engine's own `max_whole_entry` refuses such an entry before any
 /// writer is called). They are kept because this function is `pub`: a direct
 /// caller supplying its own [`SalvagedEntry`] gets the bound too.
 ///
-/// A decode that fails here is re-running bytes [`verify_candidate`] already
+/// A decode that fails here is re-running bytes `verify_candidate` already
 /// examined (or a genuine prefix of them), and is folded into `Ok(false)` for
 /// the same reason that function folds the same failures into `Partial`: one
 /// entry's damage must never abort the recovery of every other entry in the

@@ -84,7 +84,7 @@
 //! | 11 | Distilled | [`Error::Unsupported`] |
 //!
 //! **Method 1 is treated exactly as method 2**, and that is a ruling, not a
-//! verified fact — see [`Method::from_byte`].
+//! verified fact — see `Method::from_byte`.
 //!
 //! **Methods 5, 6 and 7 are refused even though `unarc-rs` routes them
 //! through its method-8 decoder.** The borrowed corpus contains no entry
@@ -125,7 +125,7 @@
 //!
 //! - `--max-ratio` is a coarser bound here than on a streaming container,
 //!   because there is no partial read to charge against it incrementally.
-//!   The real backstop is [`MAX_ARC_ENTRY_LEN`], a fixed structural ceiling
+//!   The real backstop is `MAX_ARC_ENTRY_LEN`, a fixed structural ceiling
 //!   — checked against the header's declared `compressed_size` BEFORE the
 //!   buffer that field would size is allocated, and against the decoded
 //!   output as it grows.
@@ -140,7 +140,7 @@
 //! the exception written down where they are. `next_entry` decodes and
 //! checks both the declared size and the CRC-16 before yielding an entry,
 //! so a metadata-only verb pays the whole decode. Kept, for two reasons:
-//! the eager decode is what makes [`check_declared_size`] possible at all
+//! the eager decode is what makes `check_declared_size` possible at all
 //! (a size lie is invisible until something produces the bytes), and ARC is
 //! a floppy-era format whose archives are small by construction. The costs,
 //! stated rather than hidden: `list` on a large multi-entry `.arc` does
@@ -159,7 +159,7 @@
 //! # Error mapping has no wildcard
 //!
 //! - A method this build cannot decode → [`Error::Unsupported`] (exit 3).
-//! - A declared `compressed_size` past [`MAX_ARC_ENTRY_LEN`], or a decode
+//! - A declared `compressed_size` past `MAX_ARC_ENTRY_LEN`, or a decode
 //!   whose output grows past it → [`Error::ResourceLimit`] (exit 6),
 //!   refused before the allocation it would size. Exit 6 rather than 5 for
 //!   the reason `Error::exit_code`'s own doc gives: nothing was read and
@@ -170,7 +170,7 @@
 //! - A decoded entry whose CRC-16 disagrees with the one its header stores
 //!   → [`Error::Corrupt`] (exit 5), naming both values.
 //! - A genuine source failure passes through as ITSELF ([`Error::Io`]),
-//!   never relabelled as corruption: [`classify_arc_io`] folds
+//!   never relabelled as corruption: `classify_arc_io` folds
 //!   `UnexpectedEof` alone, exactly as `lha.rs` and `arj.rs` do and for the
 //!   same reason. Container-conformance fixture property 9 is the standing
 //!   proof.

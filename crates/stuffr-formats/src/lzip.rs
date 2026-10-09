@@ -52,7 +52,7 @@
 //! data loss, indistinguishable from a short, honest file.
 //!
 //! **The same branch is in `LzipStream`**, which is the decoder this codec
-//! actually uses as of Phase 3b (see [`LzipPureDecoder`] for why it moved
+//! actually uses as of Phase 3b (see `LzipPureDecoder` for why it moved
 //! off `LzipReader`) — `process`'s `LzipState::Header` arm finishes the
 //! stream instead of raising when `parse_header` fails behind a member that
 //! already decoded. So none of what follows is obsolete; the guard is
@@ -64,7 +64,7 @@
 //!
 //! ## The fix: two checks, closing two different gaps
 //!
-//! [`GuardedLzipReader`] adds exactly the two checks the raw crate cannot
+//! `GuardedLzipReader` adds exactly the two checks the raw crate cannot
 //! do for itself, and they are not redundant with each other:
 //!
 //! 1. **The first member's magic is verified before `LzipReader` ever sees
@@ -77,7 +77,7 @@
 //!    what the stream could not use** — NOT a blanket "any
 //!    unconsumed byte is corrupt" (Review Round 1 caught that: it rejected
 //!    files the reference `lzip` binary itself accepts, e.g. NUL-padded
-//!    trailing garbage), but [`GuardedLzipReader::classify_trailing_data`],
+//!    trailing garbage), but `GuardedLzipReader::classify_trailing_data`,
 //!    which reproduces reference lzip's own forgiveness rule bit-for-bit —
 //!    see "Matching the reference tool's trailing-data rule" below for the
 //!    derivation. A genuinely finished stream has nothing left, which this
@@ -101,11 +101,11 @@
 //!
 //! Both checks raise `io::ErrorKind::InvalidData` directly (they are this
 //! codec's own classification, not a raw error the backend produced), so
-//! neither needs folding through [`crate::normalize::NormalizeDecodeErrors`]
+//! neither needs folding through `crate::normalize::NormalizeDecodeErrors`
 //! — that wrapper exists for the raw error kinds the backend itself raises
 //! on a genuinely malformed member it DOES detect (CRC/data-size/member-size
 //! mismatch, a corrupted embedded LZMA1 body), which is a different set. See
-//! [`crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF`]'s doc for that
+//! `crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF`'s doc for that
 //! measurement.
 //!
 //! ## Matching the reference tool's trailing-data rule
@@ -155,10 +155,10 @@
 //!   verified directly against the binary. This project's own upfront
 //!   magic check (check 1 above) already independently confirms the first
 //!   four bytes of the whole stream before `LzipReader` ever runs, so the
-//!   only way [`GuardedLzipReader::classify_trailing_data`] is reached
+//!   only way `GuardedLzipReader::classify_trailing_data` is reached
 //!   with no member decoded yet is a bad version or dictionary-size byte
 //!   in that very first member — which the reference also rejects
-//!   unconditionally. [`TrailingVerdict::Reject`] unconditionally in this
+//!   unconditionally. `TrailingVerdict::Reject` unconditionally in this
 //!   case, no further inspection.
 //! - **At least one member decoded, and the stream then truly ends** (no
 //!   more bytes exist anywhere: the bytes `LzipStream` handed back as
@@ -186,7 +186,7 @@
 //! immediately at position 0, contiguity broken), but the identical 4
 //! bytes followed by more data are REJECTED (`check_corrupt`'s count of 3
 //! doesn't care about contiguity at all). Both directions are pinned by
-//! [`the_two_trailing_data_rules_are_genuinely_different`] with fixtures
+//! `the_two_trailing_data_rules_are_genuinely_different` with fixtures
 //! this project constructed and then asked the reference tool to judge —
 //! not the tool's own vocabulary assumed and hard-coded, which is exactly
 //! what let the original, too-strict version through review undetected.
@@ -210,7 +210,7 @@
 //! stopped pre-filling before handing a codec its source, THIS codec would
 //! break on a slow/fragmented pipe and its own tests — which all construct
 //! sources from an in-memory `Cursor`, not a genuinely slow pipe — would
-//! not catch it. [`GuardedLzipReader::classify_trailing_data`] (check 2, at
+//! not catch it. `GuardedLzipReader::classify_trailing_data` (check 2, at
 //! the tail of the stream rather than the head) does not share this
 //! dependency: it loops its own reads rather than trusting one `fill_buf`,
 //! precisely
@@ -230,7 +230,7 @@
 //! contradicts that claim — a damaged header WAS a silent, undetected failure
 //! before this codec's own checks existed. It does not survive scrutiny: that
 //! blind spot lived entirely in the raw `lzma_rust2::LzipReader`, not in the
-//! format's own CRC32 guarantee, and it is exactly what [`GuardedLzipReader`]
+//! format's own CRC32 guarantee, and it is exactly what `GuardedLzipReader`
 //! closes. With the fix in place, a corrupted header is caught by check 1 or
 //! check 2 above, and a corrupted payload is caught by the mandated CRC32 the
 //! same as always. Measured directly with the same sweep methodology used
@@ -323,11 +323,11 @@
 //! which panics rather than skipping if it is absent — the same convention
 //! `ar.rs`, `cpio.rs` and `zip.rs` use through their own `require_bin`; CI
 //! installs `lzip` explicitly for exactly this reason):
-//! [`the_system_lzip_tool_accepts_what_this_writes`]
+//! `the_system_lzip_tool_accepts_what_this_writes`
 //! writes with this codec and confirms `lzip -t` and `lzip -dc` both accept
-//! it and decode it byte-for-byte; [`this_codec_decodes_what_the_system_lzip_tool_writes`]
+//! it and decode it byte-for-byte; `this_codec_decodes_what_the_system_lzip_tool_writes`
 //! is the reverse direction, decoding a member the reference tool produced;
-//! [`the_system_lzip_tool_agrees_on_a_two_member_concatenation`] targets this
+//! `the_system_lzip_tool_agrees_on_a_two_member_concatenation` targets this
 //! task's whole reason for existing directly — LZIP's own multi-member
 //! concatenation, decoded independently by this codec and by `lzip -dc`,
 //! must agree — this is the same defect CLASS (a concatenated stream
@@ -348,7 +348,7 @@
 //! an 8-byte size field, wrapping the same kind of raw LZMA1 stream
 //! `lzma_c.rs` and `lzma_pure.rs` already validate against `liblzma`. So a
 //! member's payload can be re-wrapped in a synthesized `.lzma`-alone header
-//! and handed to `liblzma` directly. [`the_alone_reconstruction_is_decoded_correctly_by_liblzma`]
+//! and handed to `liblzma` directly. `the_alone_reconstruction_is_decoded_correctly_by_liblzma`
 //! does exactly that, and it passed: `liblzma` decoded the reconstruction
 //! byte-for-byte. This is complementary to the `lzip`-binary checks above,
 //! not redundant with them: it validates the compressed LZMA1 DATA member by
@@ -373,7 +373,7 @@
 //! is 512 MiB and the format carries no index, so there is nothing here
 //! like the record count that turned 117 bytes into a 227 GiB reservation.
 //!
-//! The decoder is now [`LzipPureDecoder`], a `Read` loop over the crate's
+//! The decoder is now `LzipPureDecoder`, a `Read` loop over the crate's
 //! sans-I/O `LzipStream`, built with `new_mem_limit` — which checks EVERY
 //! member's declared dictionary against the limit inside `start_member`,
 //! before that member's `LzmaStream` exists. See that type's own doc for the
@@ -381,7 +381,7 @@
 //! cancelled. The pre-flight below is KEPT above it: it refuses a first
 //! member's declaration before a byte is decoded and before any decoder is
 //! built, with a message naming `--memory-limit`, and that is the message
-//! most users meet. [`rename_oom`] gives the same naming to the refusals
+//! most users meet. `rename_oom` gives the same naming to the refusals
 //! that come from inside the stream, where the crate's own text names
 //! `mem_limit_kb`, an argument no user of this tool has ever seen.
 //!
@@ -409,12 +409,12 @@
 //! preset size), so this pre-flight cannot assume a preset default the way a
 //! level-only check could — it has to read the byte.
 //!
-//! The pre-flight itself: [`declared_dictionary_bytes`] parses header byte 5
+//! The pre-flight itself: `declared_dictionary_bytes` parses header byte 5
 //! directly out of the buffered prefix and `decoder` below checks it against
 //! [`DecodeOpts::memory_limit`] *before* any decoder is built. Phase 1f
 //! stopped there, on the reading that reaching `LzipStream`'s own bounded
 //! constructor meant the push-to-pull bridge Phase 1e cancelled; that
-//! reading was wrong — see [`LzipPureDecoder`]'s doc, and `lzma_pure.rs`'s
+//! reading was wrong — see `LzipPureDecoder`'s doc, and `lzma_pure.rs`'s
 //! module doc for what the cancelled bridge actually was.
 //!
 //! The formula, verified against reference `lzip` 1.26's own output:
@@ -429,7 +429,7 @@
 //!
 //! **`None` means ALLOW, not refuse.** Fewer than 6 bytes in the prefix means
 //! a truncated header, which is corruption belonging to
-//! [`GuardedLzipReader`]'s own checks (or the backend's), not to this
+//! `GuardedLzipReader`'s own checks (or the backend's), not to this
 //! resource check. That is the pre-flight's rule alone: a member it cannot
 //! read a declaration out of is still bounded underneath it, by the stream.
 
@@ -504,7 +504,7 @@ impl Codec for Lzip {
     /// this codec surfaces as random access, so decoded output must not
     /// claim seekability.
     ///
-    /// Wrapped in [`GuardedLzipReader`] before `NormalizeDecodeErrors` — see
+    /// Wrapped in `GuardedLzipReader` before `NormalizeDecodeErrors` — see
     /// the module doc's "The fix" section for why both of its checks are
     /// needed and raise `InvalidData` directly. Wrapped in
     /// `NormalizeDecodeErrors` for the raw kinds the backend itself raises
@@ -512,7 +512,7 @@ impl Codec for Lzip {
     /// `crate::normalize::LZIP_MALFORMED_AS_INVALID_DATA_OTHER_EOF`'s doc.
     ///
     /// **Memory pre-flight**: before `GuardedLzipReader` (and the
-    /// [`LzipPureDecoder`] it wraps) ever exists, header byte 5's declared
+    /// `LzipPureDecoder` it wraps) ever exists, header byte 5's declared
     /// dictionary size is read out of the buffered prefix and checked
     /// against [`DecodeOpts::memory_limit`] — see the module doc's "Decode
     /// memory bound" section. `None` (cannot decide) means allow. It is a

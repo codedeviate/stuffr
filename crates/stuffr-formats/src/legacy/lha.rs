@@ -33,7 +33,7 @@
 //! - An EMPTY archive has no other spelling. `LhaDecodeReader::new` raises
 //!   `"a header is missing"` the moment its first header read comes back
 //!   empty, so a zero-byte file is not a readable empty LHA archive at all.
-//!   [`LhaWrite::finish`] writes the marker when nothing was added, and
+//!   `LhaWrite::finish` writes the marker when nothing was added, and
 //!   [`Lha::open`] peeks one byte to turn it back into "no entries" instead
 //!   of `Error::Corrupt`.
 //! - For a NON-empty archive the marker is redundant, and writing it would
@@ -76,7 +76,7 @@
 //! entry" cursor directly: `header()` describes it, `Read` decodes it, and
 //! `next_file()` advances past whatever of it was not consumed. That means
 //! this module needs none of `cpio.rs`'s or `tar.rs`'s self-referential
-//! `Box::into_raw` machinery — [`LhaRead`] just owns the `LhaDecodeReader`
+//! `Box::into_raw` machinery — `LhaRead` just owns the `LhaDecodeReader`
 //! outright and hands back an `Entry` whose reader borrows `&mut self`.
 //!
 //! # The fixture's expectation comes from `lhasa`, not `delharc`
@@ -105,20 +105,20 @@
 //!   capability answer, not damage: the archive is fine, this build's `delharc`
 //!   feature set (`std`, `lh1`, `lz` — no `lhx`) cannot decode that entry's
 //!   method. Directories (`-lhd-`) are the one case where an unsupported
-//!   decoder is NOT an error — see [`LhaRead::next_entry`].
+//!   decoder is NOT an error — see `LhaRead::next_entry`.
 //! - A failed `crc_check()` → `io::ErrorKind::InvalidData`, surfaced from the
 //!   entry's own `Read` impl once its payload is fully consumed (see
-//!   [`LhaEntryReader`]). Downstream, `entries.rs`'s `copy_charging` applies
+//!   `LhaEntryReader`). Downstream, `entries.rs`'s `copy_charging` applies
 //!   [`Error::from_decode_io`] to this, which is what turns it into
 //!   [`Error::Corrupt`] (exit 5) for a real caller.
 //! - A payload that stops short of its declared length → the same
 //!   `InvalidData`, folded from delharc's `UnexpectedEof` by
-//!   [`fold_truncated_payload`], for the same reason and at the same
+//!   `fold_truncated_payload`, for the same reason and at the same
 //!   boundary. Left alone it was exit 1 — the Phase 3a honesty oracle's
 //!   finding; see that function's doc.
-//! - Malformed header structure, encountered while [`LhaRead::next_entry`]
+//! - Malformed header structure, encountered while `LhaRead::next_entry`
 //!   advances via `next_file()` (or while [`Lha::open`] parses the first
-//!   header), is classified directly by [`classify_lha_error`] into
+//!   header), is classified directly by `classify_lha_error` into
 //!   [`Error::Corrupt`] — a `crate::Error` constructed straight from
 //!   `next_entry`'s own `Result`, never routed through the generic
 //!   `io::Error -> Error::Io` `?`-conversion that would otherwise demote it
@@ -131,16 +131,16 @@
 //!   the FORMAT this build writes, named, never a silent truncation or a
 //!   quietly different entry kind. The one exception is the encoder itself
 //!   failing, which is [`Error::Io`] (exit 1) deliberately: see
-//!   [`LhaWrite::add`].
+//!   `LhaWrite::add`.
 //!
 //! # Two crates, and why the name parsing is this module's own
 //!
 //! `delharc` cannot write and `oxiarc-lzhuf` does not parse headers, so this
-//! module owns the header layout in both directions ([`write_level1_header`])
+//! module owns the header layout in both directions (`write_level1_header`)
 //! and delegates only the `-lh5-` bitstream. It also parses entry NAMES
 //! itself: `delharc`'s own accessor strips `..`, `.` and empty components,
 //! which would destroy the evidence the ops-layer containment refusal depends
-//! on. See [`raw_pathname`].
+//! on. See `raw_pathname`.
 
 use std::fmt::Write as _;
 use std::io::{self, Read, Write};
@@ -213,7 +213,7 @@ impl Container for Lha {
     /// `stores_dirs: true` is a separate, narrower claim and it is genuine:
     /// a directory goes out as an `-lhd-` entry, which is the format's own
     /// marker for "this is a directory, there is no payload", and
-    /// [`LhaRead::next_entry`] reads it back as [`EntryKind::Dir`].
+    /// `LhaRead::next_entry` reads it back as [`EntryKind::Dir`].
     /// `-lhd-` is a KIND marker rather than a compression method, so it does
     /// not widen the "one method" claim above.
     ///
@@ -264,7 +264,7 @@ impl Container for Lha {
     /// header read comes back empty for TWO different inputs: end-of-file,
     /// and a header-length byte of `0`. The second of those is LHA's own
     /// end-of-archive marker, so at offset 0 it means an archive with no
-    /// entries — a perfectly valid thing for [`LhaWrite::finish`] to have
+    /// entries — a perfectly valid thing for `LhaWrite::finish` to have
     /// produced, and the only spelling an empty LHA archive HAS (there is no
     /// header to hold a count and no trailer to state one). Handed straight
     /// to `delharc` it came back as `Error::Corrupt`: an empty archive
@@ -305,7 +305,7 @@ impl Container for Lha {
         }))
     }
 
-    /// Writes LHA level-1 headers with `-lh5-` payloads. See [`LhaWrite`].
+    /// Writes LHA level-1 headers with `-lh5-` payloads. See `LhaWrite`.
     ///
     /// `CreateOpts::level` is deliberately ignored rather than validated:
     /// LHA's method letter IS its level, this build writes one method, and

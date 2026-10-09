@@ -41,8 +41,8 @@
 //! header's name, size, mode, mtime and typeflag identically by
 //! construction: octal and GNU base-256 numbers, the ustar `prefix` join,
 //! the GNU/ustar magic test. The name→kind table is `tar.rs`'s own
-//! [`crate::tar::entry_kind`] and the mtime is `tar.rs`'s own
-//! [`crate::tar::header_mtime`], reached rather than restated.
+//! `crate::tar::entry_kind` and the mtime is `tar.rs`'s own
+//! `crate::tar::header_mtime`, reached rather than restated.
 //!
 //! The one field this module locates for itself is the checksum, because
 //! the gate must be falsifiable from inside this crate and `tar` computes it
@@ -50,7 +50,7 @@
 //!
 //! | what | value | source |
 //! |---|---|---|
-//! | block size | 512 | `tar.rs`'s [`crate::tar::BLOCK`]; `tar` 0.4.46 `archive.rs` `BLOCK_SIZE` |
+//! | block size | 512 | `tar.rs`'s `crate::tar::BLOCK`; `tar` 0.4.46 `archive.rs` `BLOCK_SIZE` |
 //! | checksum field | bytes `148..156` | `tar` 0.4.46 `header.rs:55-67` (`OldHeader`: name 100, mode 8, uid 8, gid 8, size 12, mtime 12, then `cksum: [u8; 8]`) |
 //! | magic and version | bytes `257..265` | `tar.rs`'s `TAR_MAGIC` (`ustar` at 257); `tar` 0.4.46 `header.rs:71-84` (`UstarHeader`: the 257 bytes above, then `magic: [u8; 6]`, `version: [u8; 2]`) and `:201-209` (`is_ustar`, `is_gnu`) |
 //! | checksum rule | unsigned sum of all 512 bytes, the checksum field counted as eight spaces | `tar` 0.4.46 `archive.rs:316-325`; POSIX.1-1988 ustar, `chksum` |
@@ -65,11 +65,11 @@
 //! project's own writer (`tar.rs`'s `create`, itself built on the `tar`
 //! crate's `Builder`), it proves agreement with the crate and nothing more,
 //! and says so. The independent witnesses are the reference writers
-//! [`tests::every_reference_writer_s_archive_is_recovered_whole`] drives —
+//! `tests::every_reference_writer_s_archive_is_recovered_whole` drives —
 //! the platform's `tar` (bsdtar here, GNU on the CI runner), `gtar` and
 //! Python's `tarfile`, none of which shares a line of code with the `tar`
 //! crate — and the checksum rule's own definition in POSIX, which
-//! [`tests::the_checksum_rule_matches_its_definition_on_a_foreign_header`]
+//! `tests::the_checksum_rule_matches_its_definition_on_a_foreign_header`
 //! applies to a header Python wrote.
 //!
 //! # The gate
@@ -86,9 +86,9 @@
 //!    `ustar\0` and GNU's `ustar ` both begin so); or all eight bytes of
 //!    magic and version are zero, as a pre-POSIX (v7) header leaves them,
 //!    AND the checksum field is spelled the way a measured writer spells it
-//!    ([`spelled_like_a_writer`]), AND no block up to seven bytes earlier
+//!    (`spelled_like_a_writer`), AND no block up to seven bytes earlier
 //!    looks like the header this one would be a copy of
-//!    ([`looks_like_a_shifted_twin`]). See the next section for why.
+//!    (`looks_like_a_shifted_twin`). See the next section for why.
 //! 4. The size field parses (`tar::Header::entry_size`), since without it
 //!    nothing locates the payload.
 //! 5. The name, after any extension, is not empty. A block of zeros whose
@@ -104,7 +104,7 @@
 //! The checksum is the criterion with the strength against NOISE: the field
 //! must hold octal text (about ten byte values in 256 each), and that text
 //! must then equal a 17-bit sum. Its strength against an ADVERSARY is none —
-//! anyone can write a valid header. See [`tests::CHECKSUM_ONLY_DEFECT_OFFSET`]
+//! anyone can write a valid header. See `tests::CHECKSUM_ONLY_DEFECT_OFFSET`
 //! for the splice that proves the noise test can reach the gate, and the
 //! task report for the run with the comparison deleted.
 //!
@@ -136,7 +136,7 @@
 //!
 //! The magic field is what a shift cannot carry: a shifted POSIX or GNU
 //! header reads `star` at 257, which is neither `ustar` nor blank.
-//! [`tests::SHIFTED_HEADER_OFFSET`] is the splice.
+//! `tests::SHIFTED_HEADER_OFFSET` is the splice.
 //!
 //! **A v7 header has no magic to shift** — zeros before, zeros after — and
 //! the first version of this criterion accepted any blank magic, so Task 2's
@@ -148,15 +148,15 @@
 //!
 //! What a v7 shift DOES move is the checksum field's terminator (Ruling
 //! 3-J). Every measured writer ends its digits at index 6 or 7
-//! ([`spelled_like_a_writer`]'s table, measured on bsdtar 3.5.3, GNU tar
+//! (`spelled_like_a_writer`'s table, measured on bsdtar 3.5.3, GNU tar
 //! 1.35, macOS `pax`, Python `tarfile` and the `tar` crate); a copy seen `k`
 //! bytes late has that terminator at `6 - k` or `7 - k`, inside the digits.
 //! The one exception — `%07o\0` with a space typeflag, one byte late — is
-//! closed by [`looks_like_a_shifted_twin`], which recognises the genuine
+//! closed by `looks_like_a_shifted_twin`, which recognises the genuine
 //! header seven bytes or fewer upstream. Both layers are checked
 //! exhaustively over every typeflag byte, each with the other disabled, by
-//! [`tests::every_writer_spelling_refuses_its_own_shifted_copy`].
-//! [`tests::V7_SHIFTED_HEADER_OFFSET`] is the v7 splice.
+//! `tests::every_writer_spelling_refuses_its_own_shifted_copy`.
+//! `tests::V7_SHIFTED_HEADER_OFFSET` is the v7 splice.
 //!
 //! **What it costs** is headers this build cannot gate: a magic area
 //! holding anything but `ustar` or zeros, or a v7 checksum field spelled in
@@ -167,7 +167,7 @@
 //!
 //! A block that clears criteria 2, 4 and 5 — checksum agrees, size parses,
 //! name present — and is refused by criterion 3 alone, and is not
-//! [`looks_like_a_shifted_twin`], is COUNTED ([`UngateableSightings`]),
+//! `looks_like_a_shifted_twin`, is COUNTED (`UngateableSightings`),
 //! never listed. A run that recovered nothing while counting one is
 //! [`Error::Unsupported`], **exit 3**, naming the shape and saying the
 //! ordinary verbs still read the archive — never "the scan found nothing
@@ -190,7 +190,7 @@
 //! entries the run recovered. A real copy lies 1..7 bytes off the grid its
 //! source is on, so a block ON it is a genuine header the check could not
 //! tell from the window before it (Task 2-N, N1) — reported, still never
-//! listed. See [`looks_like_a_shifted_twin`] for the layout that does this.
+//! listed. See `looks_like_a_shifted_twin` for the layout that does this.
 //!
 //! # Byte-granular, deliberately not 512-aligned
 //!
@@ -199,7 +199,7 @@
 //! archive this verb exists for is not healthy: a download missing its first
 //! N bytes, a tar carved out of a disk image, or one with bytes inserted
 //! mid-file has lost that alignment, and a block-stepping scan finds NOTHING
-//! in it. [`tests::a_tar_shifted_off_its_block_alignment_is_still_found`]
+//! in it. `tests::a_tar_shifted_off_its_block_alignment_is_still_found`
 //! pins the difference. The cost is CPU (one field parse per byte offset, a
 //! 512-byte sum only when the field parses), not correctness.
 //!
@@ -211,7 +211,7 @@
 //! contents of every tar STORED inside a tar as entries of the outer one:
 //! their headers are real, 512-aligned and checksum-valid, and nothing in
 //! the format tells an inner archive from an outer one.
-//! [`tests::a_tar_stored_inside_a_tar_is_one_entry_not_its_contents`] pins
+//! `tests::a_tar_stored_inside_a_tar_is_one_entry_not_its_contents` pins
 //! it.
 //!
 //! That trust is the engine's own ruling (`collect_candidates` advances by
@@ -290,8 +290,8 @@
 //! streams them through `stream_bounded_copy`'s fixed window. No header
 //! field ever becomes a buffer, so a ceiling would stand in front of no
 //! allocation and would only cost recoverable entries.
-//! [`tests::an_eight_gigabyte_declaration_never_becomes_an_allocation`] and
-//! [`tests::a_whole_entry_is_written_without_being_buffered`] prove that with
+//! `tests::an_eight_gigabyte_declaration_never_becomes_an_allocation` and
+//! `tests::a_whole_entry_is_written_without_being_buffered` prove that with
 //! the recording allocator, each paired with the lower bound that proves
 //! the allocator is attached.
 

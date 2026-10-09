@@ -108,7 +108,7 @@
 //!   SIZ_DIRL + var_dir_len + SIZ_FLDR` and then sets `next = zootell()`
 //!   immediately past the payload. So for any zoo-WRITTEN archive a forward
 //!   parse is demonstrably feasible, `offset` included. This reader enforces
-//!   the chain half of that rule — see [`ZooRead::next_entry`].
+//!   the chain half of that rule — see `ZooRead::next_entry`.
 //! - **Against:** what `zooadd.c` shows is what one writer does, not what
 //!   the FORMAT requires — `offset` is an absolute position and nothing in
 //!   `portable.c`'s reader constrains it, where the chain at least has
@@ -130,7 +130,7 @@
 //! # The chain must advance, and that is zoo's own rule
 //!
 //! `next` is attacker-controlled and a self-referential or cyclic chain
-//! would spin forever. [`ZooRead::next_entry`] refuses any `next` that does
+//! would spin forever. `ZooRead::next_entry` refuses any `next` that does
 //! not clear the current record's own bytes, as [`Error::Corrupt`] (exit 5)
 //! — the file contradicting its own shape, `Error::exit_code`'s rule, and
 //! nothing was allocated on its say-so.
@@ -151,7 +151,7 @@
 //! | byte | method | here |
 //! |---|---|---|
 //! | 0 | Stored | the payload IS the content |
-//! | 1 | Compressed | zoo's own `lzd` LZW, from scratch — see [`lzw_decode`] |
+//! | 1 | Compressed | zoo's own `lzd` LZW, from scratch — see `lzw_decode` |
 //! | 2 | CompressedLh5 | `delharc`'s `Lh5Decoder` over the raw stream |
 //! | 3.. | — | [`Error::Unsupported`] (exit 3) |
 //!
@@ -169,7 +169,7 @@
 //! therefore a first free code of 258 rather than 257. A shared engine
 //! would have to be parameterised over all of that. What IS shared is the
 //! bit reader, which is the same computation three times over — see
-//! [`super::bits`], extracted in this task for the reason `legacy::dos` was.
+//! `super::bits`, extracted in this task for the reason `legacy::dos` was.
 //!
 //! **The 13-bit ceiling is measured, not inherited.** `lzconst.h` gives
 //! `MAXBITS 13`, `CLEAR 256`, `Z_EOF 257`, `FIRST_FREE 258`, `MAXMAX
@@ -189,7 +189,7 @@
 //! LH5 layer has a streaming form here, so every entry is decoded into
 //! memory and handed back as a `Cursor`. Same two consequences `arc.rs`
 //! spells out: `--max-ratio` is a coarser bound than on a streaming
-//! container, and the real backstop is [`MAX_ZOO_ENTRY_LEN`], a fixed
+//! container, and the real backstop is `MAX_ZOO_ENTRY_LEN`, a fixed
 //! structural ceiling checked against `size_now` and `org_size` BEFORE the
 //! buffers those fields would size are allocated, and against the LZW
 //! output as it grows. It is deliberately not `--memory-limit`, which binds
@@ -198,7 +198,7 @@
 //!
 //! So `stuffr list old.zoo` decodes every entry, as it does for `arc` and
 //! `arj` and does not for the other four containers. Kept for the same
-//! reason: the eager decode is what makes [`check_declared_size`] possible
+//! reason: the eager decode is what makes `check_declared_size` possible
 //! at all.
 //!
 //! # Which readings no borrowed byte witnesses
@@ -229,7 +229,7 @@
 //!   those separately and does not list them, and `zoo x` does not extract
 //!   them. This reader does the same, and counts it as a record ON the chain
 //!   — which is what keeps an all-deleted archive out of
-//!   [`ZooRead::refuse_a_chain_that_reaches_nothing`]'s way.
+//!   `ZooRead::refuse_a_chain_that_reaches_nothing`'s way.
 //! - **The directory name in the variable part is NOT joined onto the entry
 //!   name.** Every borrowed fixture sets it to `..` — and zoo 2.10's own
 //!   `frd_dir` strips `../` components out of that field for
@@ -253,7 +253,7 @@
 //! - A directory-entry `type` above 2 → [`Error::Unsupported`] (exit 3):
 //!   `portable.c` asserts `type <= 2`, so a higher one is a shape from
 //!   outside the format rather than damage inside it.
-//! - A declared `size_now`/`org_size` past [`MAX_ZOO_ENTRY_LEN`], or an LZW
+//! - A declared `size_now`/`org_size` past `MAX_ZOO_ENTRY_LEN`, or an LZW
 //!   decode that grows past it → [`Error::ResourceLimit`] (exit 6), refused
 //!   before the allocation it would size.
 //! - Malformed framing — a missing tag, a truncated record or payload, a
@@ -262,7 +262,7 @@
 //! - A decoded entry whose CRC-16/ARC disagrees with its own header →
 //!   [`Error::Corrupt`] (exit 5), naming both values.
 //! - A genuine source failure passes through as ITSELF ([`Error::Io`]):
-//!   [`classify_zoo_io`] folds `UnexpectedEof` alone, exactly as `arc.rs`,
+//!   `classify_zoo_io` folds `UnexpectedEof` alone, exactly as `arc.rs`,
 //!   `lha.rs` and `arj.rs` do. Container-conformance fixture property 9 is
 //!   the standing proof.
 //! - `create()` → [`Error::CapabilityUnavailable`] (exit 3), the one shared

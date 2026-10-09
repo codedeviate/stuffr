@@ -16,15 +16,15 @@
 //! order that never allocates or trusts anything before it is cheap to
 //! check:
 //!
-//! 1. The four-byte signature matches ([`find_next_local_header`]).
+//! 1. The four-byte signature matches (`find_next_local_header`).
 //! 2. `version needed to extract` is a value this format could plausibly
-//!    have written (see [`is_known_version`]).
+//!    have written (see `is_known_version`).
 //! 3. `compression method` is one this project recognises at all (see
-//!    [`is_known_method`]) — recognised, not necessarily decodable by this
+//!    `is_known_method`) — recognised, not necessarily decodable by this
 //!    build. A method this build cannot decode is still real zip metadata;
 //!    refusing to decode it is a later concern (verification), not this
 //!    one's (discovery).
-//! 4. `name_len` is within [`MAX_LOCAL_NAME_LEN`], checked before a name
+//! 4. `name_len` is within `MAX_LOCAL_NAME_LEN`, checked before a name
 //!    buffer is ever allocated from it — same discipline, same numeral, as
 //!    `zip.rs`'s `MAX_CD_NAME_LEN`. As that constant's own note records, a
 //!    real header can never exceed it (the field is 16 bits), so this can
@@ -62,7 +62,7 @@
 //! **Criterion 6 is the one that is not a rejection**, and it used to be.
 //! A candidate whose declared payload runs past the end of the source is
 //! reported with [`Candidate::available_len`] naming how many of its bytes
-//! are actually present, and [`verify_candidate`] answers `Partial` for it
+//! are actually present, and `verify_candidate` answers `Partial` for it
 //! without decoding anything.
 //!
 //! It was a rejection until the final whole-branch review measured what
@@ -117,13 +117,13 @@
 //! lie, so a candidate found this way carries `declared_len: None` and
 //! `verifier: None` instead: an honest "found a header, cannot bound or
 //! verify its payload from here" — the same asymmetry [`Candidate::verifier`]
-//! documents for a format with no checksum at all. [`verify_candidate`]
+//! documents for a format with no checksum at all. `verify_candidate`
 //! reports such a candidate `Unverified(NoDeclaredLength)` — NOT `Complete`,
 //! which this module reported here until Ruling R-M: `Complete` asserts
 //! every DECLARED byte was present, and a data-descriptor candidate declares
 //! none, so there was nothing whose presence had been confirmed. A
 //! CD-reconciled data-descriptor entry is a different case entirely — see
-//! [`candidate_from_cd_record`], which trusts the central directory's own
+//! `candidate_from_cd_record`, which trusts the central directory's own
 //! length and CRC and can honestly reach `Intact` or `Partial`.
 //!
 //! # Verification, and the two methods it actually checks (Task 4)
@@ -197,7 +197,7 @@
 //! every central-directory record whose `local_header_offset` the scan did
 //! NOT already find — a name the scan's UTF-8 gate rejected, or a length the
 //! scan's own "fits inside the file" check refused — recovers it
-//! independently via [`candidate_from_cd_record`], which trusts the
+//! independently via `candidate_from_cd_record`, which trusts the
 //! CENTRAL-DIRECTORY's declared name/size/CRC (already lossily decoded and
 //! already past `zip.rs`'s own record-level checks) rather than re-deriving
 //! them from the raw header.
@@ -842,7 +842,7 @@ fn open_bounded_payload(archive_path: &Path, start: u64, len: u64) -> Result<imp
 /// `PartialCause`.
 ///
 /// Uses [`SalvagedEntry::payload_start`] directly — computed once by
-/// [`read_candidate_at`]/[`candidate_from_cd_record`] at discovery time —
+/// `read_candidate_at`/`candidate_from_cd_record` at discovery time —
 /// rather than re-parsing a local header here. Before Task 3c this
 /// function (then living in `entries.rs`) re-read a 30-byte zip local
 /// header from `entry.offset` on every call, which was silently WRONG for

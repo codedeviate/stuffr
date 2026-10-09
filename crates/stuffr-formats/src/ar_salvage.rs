@@ -47,7 +47,7 @@
 //! # One reader, not a second parser
 //!
 //! The walk is the ORDINARY reader: `ar::Archive` over `ar.rs`'s own
-//! [`ArGuardedReader`], so what this scanner accepts as a member header is,
+//! `ArGuardedReader`, so what this scanner accepts as a member header is,
 //! by construction, exactly what `stuffr list` accepts — GNU long-name tables
 //! (`//` and `/N`), BSD `#1/N` extended names, both symbol-table shapes
 //! skipped, the `\n` pad byte after an odd-sized member checked. And the two
@@ -55,7 +55,7 @@
 //! 65,536 bytes) are enforced by the guard itself, before the crate
 //! allocates, with no second copy of either figure here. The one thing the
 //! crate does not expose is WHERE each member lies, so the guard reports its
-//! record boundaries through a [`GuardObserver`]; it already finds them to
+//! record boundaries through a `GuardObserver`; it already finds them to
 //! do its own job, so that adds no mirrored fact of its own about
 //! `ar = "=0.9.0"` (the list is in `Cargo.toml`'s ar pin note).
 //!
