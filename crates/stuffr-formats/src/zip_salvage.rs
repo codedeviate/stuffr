@@ -288,12 +288,13 @@ use std::path::Path;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, UnverifiedCause, Verifier, annotate_candidates, collect_candidates,
-    stream_bounded_copy,
+    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, Verifier, annotate_candidates,
+    collect_candidates, stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
 use crate::salvage_verify::stream_verify;
+use crate::zip::ZIP;
 
 /// Local file header. What every zip entry starts with (`zip.rs`'s private
 /// `SIG_LOCAL_HEADER`, duplicated here rather than exported: it is a magic
@@ -316,14 +317,35 @@ const MAX_LOCAL_NAME_LEN: u64 = 65_536;
 /// a data descriptor that follows the payload, not in this header.
 const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 
+/// The phrase for a local header refused because reading its name would
+/// have taken the scan past its [`ScanBudget`] — see [`ZipSalvage::budget`].
+const NAME_BUDGET_SHAPE: &str =
+    "local header(s) whose name it did not read once that work was spent";
+
 /// Scans a zip for local file headers directly, without trusting any index.
 ///
-/// Its only state is the [`ForwardSearch`] buffer reused across calls; it
-/// carries nothing about the archive between them beyond what
+/// Its state is the [`ForwardSearch`] buffer reused across calls and the
+/// scan's [`ScanBudget`] with the offsets it refused; it carries nothing
+/// about the archive's entries between calls beyond what
 /// [`SalvageScan::next_candidate`] itself receives.
 #[derive(Debug, Default)]
 pub struct ZipSalvage {
     search: ForwardSearch,
+    /// The name bytes this scan may read — 0.10.3 Task 4b. A local header
+    /// whose fixed part clears the gate has its name read to decide
+    /// criterion 5, up to 64 KiB, and a candidate whose payload runs past
+    /// EOF resumes the scan one byte on: all-ASCII 32 KiB names packed
+    /// every 64 bytes, each accepted as a truncated entry, read 495x the
+    /// input. Charged per piece of name read ([`read_utf8_name`]), so a name
+    /// refused at its first invalid byte costs only what was read. Built on
+    /// the first call, from the source's length; one per scan. The
+    /// central-directory pass ([`salvage_zip`]) reads no name through the
+    /// scan, so it spends none of it.
+    budget: Option<ScanBudget>,
+    /// Every header refused because its name would have overspent
+    /// [`Self::budget`], in scan order — reported as
+    /// [`Sighting::verdict_bounded`].
+    over_budget: Vec<u64>,
 }
 
 impl ZipSalvage {
@@ -335,6 +357,9 @@ impl ZipSalvage {
 impl SalvageScan for ZipSalvage {
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
+        let budget = self
+            .budget
+            .get_or_insert_with(|| ScanBudget::for_input(file_len));
         let mut search_from = from;
         loop {
             let Some((offset, fixed)) =
@@ -342,14 +367,19 @@ impl SalvageScan for ZipSalvage {
             else {
                 return Ok(None);
             };
-            match read_candidate_at(src, offset, &fixed, file_len)? {
-                Some(candidate) => return Ok(Some(candidate)),
+            match read_candidate_at(src, offset, &fixed, file_len, budget)? {
+                Gate::Accepted(candidate) => return Ok(Some(*candidate)),
                 // The signature matched, but the gate rejected it: a
                 // coincidence, not a header. Resume one byte past the
                 // signature's OWN first byte — not past the whole fixed
                 // block — so a genuine header overlapping this false match
                 // is never skipped over.
-                None => search_from = offset + 1,
+                Gate::Refused => search_from = offset + 1,
+                // Not judged: reported, and resumed exactly like a refusal.
+                Gate::OverBudget => {
+                    self.over_budget.push(offset);
+                    search_from = offset + 1;
+                }
             }
         }
     }
@@ -410,17 +440,29 @@ fn find_next_local_header(
     Ok(at.map(|at| (at, fixed)))
 }
 
+/// What [`read_candidate_at`] made of one local header.
+enum Gate {
+    Accepted(Box<Candidate>),
+    /// Not a header: any gate failure.
+    Refused,
+    /// Not judged: reading its name would have overspent the scan's
+    /// [`ScanBudget`].
+    OverBudget,
+}
+
 /// Runs the local header believed to start at `offset`, whose fixed part
 /// [`find_next_local_header`] already read and gated, through the rest of
-/// the validation gate described in the module doc. `Ok(None)` for ANY gate
-/// failure, including the name or extra field running past `file_len` — see
-/// the module doc for why a rejection here is never an error.
+/// the validation gate described in the module doc. [`Gate::Refused`] for
+/// ANY gate failure, including the name or extra field running past
+/// `file_len` — see the module doc for why a rejection here is never an
+/// error — and [`Gate::OverBudget`] when `budget` cannot pay for the name.
 fn read_candidate_at(
     src: &mut dyn SeekRead,
     offset: u64,
     fixed: &[u8; LOCAL_HEADER_TOTAL as usize],
     file_len: u64,
-) -> Result<Option<Candidate>> {
+    budget: &mut ScanBudget,
+) -> Result<Gate> {
     debug_assert_eq!(
         fixed[0..4],
         SIG_LOCAL_HEADER,
@@ -438,10 +480,10 @@ fn read_candidate_at(
     let extra_len = u16::from_le_bytes([fixed[28], fixed[29]]);
 
     if !is_known_version(version) || !is_known_method(method) {
-        return Ok(None);
+        return Ok(Gate::Refused);
     }
     if u64::from(name_len) > MAX_LOCAL_NAME_LEN {
-        return Ok(None);
+        return Ok(Gate::Refused);
     }
 
     // The payload's START is computed unconditionally — even for a
@@ -456,7 +498,7 @@ fn read_candidate_at(
     else {
         // The header's own arithmetic overflowed u64 — nothing about this
         // is a real record, so it stays a rejection.
-        return Ok(None);
+        return Ok(Gate::Refused);
     };
     // A name or extra field running past the source is refused BEFORE
     // either is read (0.10.3). This used to read the name, then read and
@@ -467,11 +509,13 @@ fn read_candidate_at(
     // oracle's measurement. The extra field is then skipped with a seek,
     // which is now known to land inside the source.
     if payload_start > file_len {
-        return Ok(None);
+        return Ok(Gate::Refused);
     }
 
-    let Some(name) = read_utf8_name(src, usize::from(name_len))? else {
-        return Ok(None);
+    let name = match read_utf8_name_within(src, usize::from(name_len), budget)? {
+        NameRead::Name(name) => name,
+        NameRead::Refused => return Ok(Gate::Refused),
+        NameRead::OverBudget => return Ok(Gate::OverBudget),
     };
     src.seek(SeekFrom::Start(payload_start))?;
 
@@ -521,12 +565,34 @@ fn read_candidate_at(
     // `marked_deleted` is left at `Candidate::new`'s `false`: ZIP has no
     // deleted flag at all — see `Candidate::marked_deleted`'s own doc for
     // why that is a plain `false` rather than an `Option`.
-    Ok(Some(
+    Ok(Gate::Accepted(Box::new(
         Candidate::new(offset, payload_start, meta)
             .with_declared_len(declared_len)
             .with_verifier(verifier)
             .with_available_len(available_len),
-    ))
+    )))
+}
+
+/// [`read_utf8_name_within`] with no budget to spend — the tests' entry
+/// point, whose verdicts are the budgeted one's whenever the budget holds.
+#[cfg(test)]
+fn read_utf8_name(src: &mut dyn SeekRead, len: usize) -> io::Result<Option<String>> {
+    Ok(
+        match read_utf8_name_within(src, len, &mut ScanBudget::for_input(u64::MAX))? {
+            NameRead::Name(name) => Some(name),
+            NameRead::Refused | NameRead::OverBudget => None,
+        },
+    )
+}
+
+/// What [`read_utf8_name_within`] read.
+enum NameRead {
+    Name(String),
+    /// Not UTF-8, or the source ended first (criterion 5).
+    Refused,
+    /// The next piece would have overspent the scan's [`ScanBudget`]; the
+    /// name was not read to its end, so nothing was decided.
+    OverBudget,
 }
 
 /// Reads a `len`-byte name from `src`'s position and decodes it as strict
@@ -539,7 +605,15 @@ fn read_candidate_at(
 /// 64 KiB, and noise is rarely UTF-8 for long: reading the whole field
 /// before deciding cost 6.6 bytes read per input byte on one fuzz input,
 /// almost all of it names refused after their first few bytes.
-fn read_utf8_name(src: &mut dyn SeekRead, len: usize) -> io::Result<Option<String>> {
+///
+/// **Each piece is charged to `budget` before it is read (0.10.3 Task 4b)**,
+/// so the scan pays for exactly the name bytes it reads; a piece that would
+/// overspend it ends the read with [`NameRead::OverBudget`].
+fn read_utf8_name_within(
+    src: &mut dyn SeekRead,
+    len: usize,
+    budget: &mut ScanBudget,
+) -> io::Result<NameRead> {
     let mut name = Vec::with_capacity(len.min(64));
     // Bytes before `valid` are known to be whole, valid UTF-8; it is always
     // a character boundary.
@@ -548,9 +622,12 @@ fn read_utf8_name(src: &mut dyn SeekRead, len: usize) -> io::Result<Option<Strin
     while name.len() < len {
         let old = name.len();
         let want = piece.min(len - old);
+        if !budget.try_spend(want as u64) {
+            return Ok(NameRead::OverBudget);
+        }
         name.resize(old + want, 0);
         if src.read_exact(&mut name[old..]).is_err() {
-            return Ok(None);
+            return Ok(NameRead::Refused);
         }
         // An error with a length is an invalid sequence, which no later
         // byte can repair; one without is a sequence cut by this piece's
@@ -558,11 +635,11 @@ fn read_utf8_name(src: &mut dyn SeekRead, len: usize) -> io::Result<Option<Strin
         match std::str::from_utf8(&name[valid..]) {
             Ok(_) => valid = name.len(),
             Err(e) if e.error_len().is_none() => valid += e.valid_up_to(),
-            Err(_) => return Ok(None),
+            Err(_) => return Ok(NameRead::Refused),
         }
         piece = piece.saturating_mul(2);
     }
-    Ok(String::from_utf8(name).ok())
+    Ok(String::from_utf8(name).map_or(NameRead::Refused, NameRead::Name))
 }
 
 /// Whether a local header's "version needed to extract" field is one the
@@ -893,7 +970,15 @@ pub fn salvage_zip(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
         candidates.sort_by_key(|c| c.offset);
     }
 
-    annotate_candidates(&scanner, src, candidates, policy)
+    let mut outcome = annotate_candidates(&scanner, src, candidates, policy)?;
+    // 0.10.3 Task 4b: every header the scan's budget left unjudged — never
+    // an entry, and printed by the caller like any other sighting.
+    outcome.sightings = scanner
+        .over_budget
+        .iter()
+        .map(|&offset| Sighting::verdict_bounded(ZIP, offset, NAME_BUDGET_SHAPE))
+        .collect();
+    Ok(outcome)
 }
 
 /// Builds a [`Candidate`] from a central-directory record the raw scan did
@@ -1447,6 +1532,82 @@ mod tests {
             check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
                 .unwrap_or_else(|e| panic!("{shape}: {e}"));
         }
+    }
+
+    /// 0.10.3 Task 4b: overlapping local headers whose all-ASCII 32 KiB
+    /// names are read whole, one every 64 bytes, 1 MiB of them — a name
+    /// read per header, and the scan resumes one byte past each. Three
+    /// siblings: accepted as truncated (the scan resumes because the payload
+    /// runs past EOF), accepted whole and empty (it advances by a zero
+    /// length), and data-descriptor headers (no length at all). Before the
+    /// scan-wide budget these read 495x, 496x and 495x their input. The
+    /// budget's refusals are reported as verdict-bounded sightings.
+    #[test]
+    fn overlapping_long_names_spend_a_bounded_budget() {
+        use stuffr_core::salvage::SightingKind;
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 1024 * 1024;
+        let unit = |flags: u16, size: u32| {
+            let mut h = SIG_LOCAL_HEADER.to_vec();
+            for field in [20u16, flags, 0, 0, 0] {
+                h.extend_from_slice(&field.to_le_bytes());
+            }
+            for field in [0u32, size, size] {
+                h.extend_from_slice(&field.to_le_bytes());
+            }
+            h.extend_from_slice(&0x7F7Fu16.to_le_bytes());
+            h.extend_from_slice(&0u16.to_le_bytes());
+            h.resize(64, b'A');
+            h.iter().copied().cycle().take(LEN).collect::<Vec<u8>>()
+        };
+        let shapes = [
+            ("accepted, truncated", unit(0, 0x7F7F_7F7F)),
+            ("accepted, empty", unit(0, 0)),
+            ("data descriptor", unit(FLAG_DATA_DESCRIPTOR, 0)),
+        ];
+        for (shape, bytes) in shapes {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_zip(&mut src, &SalvagePolicy::default()).unwrap();
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+            assert!(
+                !out.entries.is_empty(),
+                "{shape}: the budget's worth is judged"
+            );
+            assert!(
+                !out.sightings.is_empty()
+                    && out
+                        .sightings
+                        .iter()
+                        .all(|s| s.kind == SightingKind::VerdictBounded
+                            && s.shape == NAME_BUDGET_SHAPE),
+                "{shape}: {:?}",
+                out.sightings.first()
+            );
+        }
+    }
+
+    /// Task 4b's other half: a legitimate archive whose every entry carries
+    /// the longest name the format can hold reads each name once, and never
+    /// comes near the budget — every entry intact, no sighting.
+    #[test]
+    fn an_archive_of_maximum_length_names_spends_no_budget_sighting() {
+        let bytes: Vec<u8> = (0..40u8)
+            .flat_map(|i| {
+                let name = format!("{}{}", char::from(b'a' + i % 26), "n".repeat(65_534));
+                minimal_local_header(20, 0, &name, b"")
+            })
+            .collect();
+        let out = salvage(&bytes);
+        assert_eq!(out.entries.len(), 40);
+        assert!(
+            out.entries
+                .iter()
+                .all(|e| e.status == SalvageStatus::Intact),
+            "{:?}",
+            out.entries.iter().map(|e| &e.status).collect::<Vec<_>>()
+        );
+        assert!(out.sightings.is_empty(), "{:?}", out.sightings.first());
     }
 
     /// Reading a name in pieces never splits a verdict: a name whose
