@@ -2965,10 +2965,6 @@ mod tests {
     /// The `L`/`K` ceiling, over by one byte: a `ResourceLimit` (exit 6)
     /// for either, on both source shapes, naming the ceiling.
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "builds 16 MiB payloads; hours under Miri, and it exercises no unsafe"
-    )]
     fn a_long_name_over_the_ceiling_is_a_resource_limit() {
         for typeflag in *b"LK" {
             let bytes = gnu_long(typeflag, MAX_GNU_LONG_NAME + 1);
@@ -3008,10 +3004,6 @@ mod tests {
     /// Exactly the ceiling passes. 16 MiB is held whole twice by the crate,
     /// so this is the slow one: unignored only if it is quick in debug.
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "builds a 16 MiB payload; hours under Miri, and it exercises no unsafe"
-    )]
     fn a_long_name_at_the_ceiling_lists() {
         let bytes = gnu_long(b'L', MAX_GNU_LONG_NAME);
         for ar in [open(&bytes), open_seekable(&bytes)] {

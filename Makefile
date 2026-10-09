@@ -206,7 +206,8 @@ release:
 # to find. `cargo miri test` fails hard on the first unsupported operation,
 # so a newly added subprocess test shows up as a loud Miri failure and is
 # added here deliberately. Tests that only exercise multi-megabyte limits
-# (the 16 MiB pax ceiling) are skipped under Miri too: they don't touch the
+# (the 16 MiB pax ceiling) and the GNU long-name ceiling tests (16 MiB and a
+# 1 MiB long name, 0.10.3) are skipped under Miri too: they don't touch the
 # unsafe regions and Miri runs them for hours.
 MIRI_SKIP = --skip system_tar_ --skip we_accept_what_system_tar_ \
             --skip every_reference_writer_ --skip system_ar_ \
@@ -214,6 +215,7 @@ MIRI_SKIP = --skip system_tar_ --skip we_accept_what_system_tar_ \
             --skip a_gnu_tar_sparse_archive_ --skip gnu_ar_on_mach_o_ \
             --skip a_pax_header_past_the_ceiling_ \
             --skip a_pax_header_inside_the_ceiling_ \
+            --skip a_long_name_ --skip a_normal_long_name_ \
             --skip bsd_ar_with_odd_names_
 # `-Zmiri-disable-isolation` because several of these tests write a real temp
 # file (tar's `by_index` test needs a genuinely seekable source, which a
