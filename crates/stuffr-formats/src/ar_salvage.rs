@@ -81,8 +81,8 @@
 //!   reaches it: since 0.8.1 `ar.rs`'s guard normalises that mode, so the
 //!   walk reads the table like `stuffr list` does (an inline one is a
 //!   member whose mode is unknown). What still stops here is a symbol table
-//!   damaged in a way the guard does not normalise, and GNU's `/SYM64/`,
-//!   which the crate cannot read at all.
+//!   damaged in a way the guard does not normalise. GNU's `/SYM64/` is no
+//!   longer one: the guard skips it like `/`.
 //!
 //! Any other global header that is not `!<arch>\n` is the ordinary reader's
 //! refusal: a stop at offset 0 and nothing recovered. An earlier version
@@ -1237,6 +1237,47 @@ mod tests {
     /// that is neither blank nor octal), is a shape this build does not
     /// read. With nothing recovered before it, exit 3 naming it — never
     /// exit 5 "nothing recoverable" over a possibly healthy archive.
+    fn sym_member(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut h = format!(
+            "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            0,
+            0,
+            0,
+            644,
+            payload.len()
+        )
+        .into_bytes();
+        assert_eq!(h.len(), 60);
+        h.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            h.push(b'\n');
+        }
+        h
+    }
+
+    fn gnu_with_symtab(name: &str, sym_len: usize) -> Vec<u8> {
+        let mut out = GLOBAL_HEADER.to_vec();
+        out.extend(sym_member(name, &vec![0u8; sym_len]));
+        out.extend(sym_member("//", b"a_very_long_member_name.o/\n"));
+        out.extend(sym_member("/0", b"long body"));
+        out.extend(sym_member("short.o/", b"short body"));
+        out
+    }
+
+    fn gnu_with_sym64(sym64_len: usize) -> Vec<u8> {
+        gnu_with_symtab("/SYM64/", sym64_len)
+    }
+    /// 0.10.3: salvage steps past `/SYM64/` like `/`.
+    #[test]
+    fn a_sym64_symbol_table_is_walked_past_like_slash() {
+        for len in [8, 13] {
+            let out = scan(&gnu_with_sym64(len));
+            assert!(out.walk_stop.is_none(), "{len}: {:?}", out.walk_stop);
+            let names: Vec<&str> = out.entries.iter().map(|e| e.meta.name.as_str()).collect();
+            assert_eq!(names, ["a_very_long_member_name.o", "short.o"], "{len}");
+        }
+    }
+
     #[test]
     fn an_unparseable_symbol_table_first_is_exit_3_naming_it() {
         for ident in [&b"__.SYMDEF"[..], b"__.SYMDEF SORTED"] {

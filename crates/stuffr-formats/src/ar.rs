@@ -97,8 +97,17 @@
 //! unknown. The crate hands an inline `__.SYMDEF` back as an ordinary member
 //! (`is_symbol_lookup_table_id`, `lib.rs:498-507`: `Common => false`), so
 //! `list` shows it, as Apple's `ar t` does; nothing about it is invented. A
-//! blank mode on any other member is still the crate's refusal. GNU's
-//! `/SYM64/` remains unreadable: the crate parses it as a `/N` reference.
+//! blank mode on any other member is still the crate's refusal.
+//!
+//! GNU's `/SYM64/` (the 64-bit symbol table) is one the crate cannot read: it
+//! parses the name as a `/N` reference. [`ArGuardedReader`] therefore skips
+//! the member itself, as the crate skips `/`: header, payload and pad byte
+//! are consumed from the source through a fixed stack buffer (nothing is
+//! sized from the declared length) and never reach the crate, which sees the
+//! next header. A payload cut by the end of the file ends the skip there and
+//! the crate sees a clean end of archive, as it does for a `/` table cut
+//! short. Skipping is not rewriting: the "never rewrites a symbol-table
+//! header" rule below still holds.
 //!
 //! # Four header fields `ar` 0.9.0 trusts before use, and what this module does about each
 //!
@@ -398,7 +407,8 @@ const MAX_GNU_NAME_TABLE_LEN: u64 = 16 * 1024 * 1024;
 /// GNU's symbol-table member identifiers: `/` (`ar-0.9.0/src/lib.rs:109`,
 /// skipped by the crate before it parses a mode, `lib.rs:257-259`) and
 /// `/SYM64/` (which the crate does not recognise at all: it parses
-/// `buffer[1..16]` as a long-name index, `lib.rs:267`, and refuses it).
+/// `buffer[1..16]` as a long-name index, `lib.rs:267`, and refuses it, so
+/// [`ArGuardedReader`] skips that member whole instead).
 /// Listed so [`symbol_table_name`] can name either one; the guard never
 /// rewrites a header that carries one of these.
 const GNU_SYMBOL_TABLE_NAMES: [&str; 2] = ["/", "/SYM64/"];
@@ -798,6 +808,56 @@ fn scan_ar_header(
     })
 }
 
+/// Whether the header names GNU's 64-bit symbol table, `/SYM64/`.
+fn is_sym64_header(hdr: &[u8; AR_ENTRY_HEADER_LEN]) -> bool {
+    let mut id = &hdr[0..16];
+    while let [rest @ .., b' '] = id {
+        id = rest;
+    }
+    id == b"/SYM64/"
+}
+
+/// Discards `len` payload bytes and the pad byte (when `pad`) from `inner`
+/// through a fixed stack buffer, advancing `pos`, and tells `observer` the
+/// record ended where the payload did. End of file ends the skip silently:
+/// the caller's next header read then finds a clean end. A present pad byte
+/// that is not `\n` is the crate's own refusal, as for any member.
+fn skip_member_payload<R: Read, O: GuardObserver>(
+    inner: &mut R,
+    pos: &mut u64,
+    len: u64,
+    pad: bool,
+    observer: &mut O,
+) -> io::Result<()> {
+    let mut scratch = [0u8; 4096];
+    let mut left = len;
+    while left > 0 {
+        let want = scratch
+            .len()
+            .min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = inner.read(&mut scratch[..want])?;
+        if n == 0 {
+            return Ok(());
+        }
+        *pos += n as u64;
+        left -= n as u64;
+    }
+    observer.record_ends(*pos);
+    if pad {
+        let n = inner.read(&mut scratch[..1])?;
+        if n == 1 {
+            *pos += 1;
+            if scratch[0] != b'\n' {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid padding byte ({})", scratch[0]),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Where [`ArGuardedReader::read`] currently is in the archive, mirroring
 /// `ar::Archive`'s own private position tracking closely enough to find
 /// every header boundary — see the module doc for why this has to live
@@ -1033,6 +1093,18 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                             .expect("just checked buf.len() == AR_ENTRY_HEADER_LEN");
                         let scan =
                             scan_ar_header(&hdr, &mut self.variant, &mut self.name_table_len)?;
+                        if self.variant == ar::Variant::GNU && is_sym64_header(&hdr) {
+                            skip_member_payload(
+                                &mut self.inner,
+                                &mut self.pos,
+                                scan.payload_len,
+                                scan.true_pad,
+                                &mut self.observer,
+                            )?;
+                            // Nothing of this member reaches the crate.
+                            buf.clear();
+                            continue;
+                        }
                         let mode_unknown = hdr[MODE_FIELD].iter().all(|&b| b == b' ')
                             && names_a_bsd_symbol_table(
                                 &mut self.inner,
@@ -2796,5 +2868,73 @@ mod tests {
             .map(|(name, data)| (name.to_string(), Some(DEFAULT_MODE), data.to_vec()))
             .collect();
         assert_eq!(got, want);
+    }
+
+    fn ar_member(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut h = format!(
+            "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            0,
+            0,
+            0,
+            644,
+            payload.len()
+        )
+        .into_bytes();
+        assert_eq!(h.len(), 60);
+        h.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            h.push(b'\n');
+        }
+        h
+    }
+
+    fn gnu_with_symtab(name: &str, sym_len: usize) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        out.extend(ar_member(name, &vec![0u8; sym_len]));
+        out.extend(ar_member("//", b"a_very_long_member_name.o/\n"));
+        out.extend(ar_member("/0", b"long body"));
+        out.extend(ar_member("short.o/", b"short body"));
+        out
+    }
+
+    fn gnu_with_sym64(sym64_len: usize) -> Vec<u8> {
+        gnu_with_symtab("/SYM64/", sym64_len)
+    }
+
+    /// 0.10.3: GNU's `/SYM64/` is skipped like `/`; an odd payload carries a
+    /// pad byte, and `//` plus `/N` members after it still resolve.
+    #[test]
+    fn a_sym64_symbol_table_is_skipped_like_slash() {
+        for sym64_len in [8, 13, 0] {
+            let got = read_all(&gnu_with_sym64(sym64_len)).expect("list");
+            let names: Vec<&str> = got.iter().map(|e| e.0.as_str()).collect();
+            assert_eq!(
+                names,
+                ["a_very_long_member_name.o", "short.o"],
+                "{sym64_len}"
+            );
+            assert_eq!(got[0].2, b"long body");
+            assert_eq!(got[1].2, b"short body");
+        }
+    }
+
+    /// A declared size far beyond the file allocates nothing and a payload
+    /// cut by EOF behaves exactly as a cut `/` table does.
+    #[test]
+    fn a_truncated_sym64_behaves_as_a_truncated_slash_table() {
+        for cut in [70usize, 100, 150] {
+            let outcome = |name: &str| {
+                let mut b = b"!<arch>\n".to_vec();
+                b.extend(ar_member(name, &[0u8; 200]));
+                b.truncate(cut);
+                read_all(&b).map(|v| v.len()).map_err(|e| e.exit_code())
+            };
+            assert_eq!(outcome("/SYM64/"), outcome("/"), "cut {cut}");
+        }
+        let mut huge = b"!<arch>\n".to_vec();
+        let mut h = ar_member("/SYM64/", b"");
+        h[48..58].copy_from_slice(b"9999999999");
+        huge.extend(h);
+        let _ = read_all(&huge);
     }
 }

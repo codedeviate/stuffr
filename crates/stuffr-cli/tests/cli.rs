@@ -14494,6 +14494,47 @@ fn bsd_ar_with_odd_names_lists_and_unpacks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 0.10.3: `llvm-ar` writes GNU's 64-bit symbol table (`/SYM64/`) past
+/// `SYM64_THRESHOLD`, which `list` used to refuse as corrupt. Optional
+/// cross-tool witness: skipped (not failed) when `llvm-ar` or `cc` is absent,
+/// as neither is on a stock CI image or macOS.
+#[test]
+fn llvm_ar_with_a_sym64_symbol_table_lists() {
+    let llvm_ar = which("llvm-ar").or_else(|| {
+        let p = PathBuf::from("/opt/homebrew/opt/llvm/bin/llvm-ar");
+        p.is_file().then_some(p)
+    });
+    let (Some(llvm_ar), Some(cc)) = (llvm_ar, which("cc")) else {
+        eprintln!("skipped: needs llvm-ar and cc");
+        return;
+    };
+    let dir = tmp_dir();
+    std::fs::write(dir.join("obj.c"), "int f(void) { return 1; }\n").unwrap();
+    let st = Command::new(cc)
+        .current_dir(&dir)
+        .args(["-c", "obj.c", "-o", "obj.o"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let st = Command::new(llvm_ar)
+        .current_dir(&dir)
+        .env("SYM64_THRESHOLD", "0")
+        .args(["rcs", "--format=gnu", "out.a", "obj.o"])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let bytes = std::fs::read(dir.join("out.a")).unwrap();
+    if !bytes[8..].starts_with(b"/SYM64/") {
+        eprintln!("skipped: this llvm-ar did not write /SYM64/");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let out = run_output(&["list", dir.join("out.a").to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("obj.o"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A hostile entry name inside a library error message must not reach the
 /// terminal raw: a truncated ar member named `a<ESC>[31mbc` is reported
 /// with the escape written out, and the exit code stays the classified 5.
