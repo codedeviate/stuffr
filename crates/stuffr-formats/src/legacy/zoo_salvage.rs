@@ -197,7 +197,7 @@ use std::path::Path;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, Verifier, salvage_all,
+    SalvagedEntry, ScanBudget, Sighting, SightingLog, UnverifiedCause, Verifier, salvage_all,
     stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
@@ -246,8 +246,11 @@ pub struct ZooSalvage {
     budget: Option<ScanBudget>,
     /// Every record refused because its variable part would have overspent
     /// [`Self::budget`], in scan order — reported as
-    /// [`Sighting::verdict_bounded`].
-    over_budget: Vec<u64>,
+    /// [`Sighting::verdict_bounded`]. A [`SightingLog`] (0.10.4): every one
+    /// is counted, at most [`SightingLog::DEFAULT_CAP`] stored — pushed in
+    /// ascending offset order, as the scan only moves forward, so the ones
+    /// kept are the first.
+    over_budget: SightingLog,
 }
 
 impl ZooSalvage {
@@ -276,7 +279,11 @@ impl SalvageScan for ZooSalvage {
                 Gate::Refused => search_from = offset + 1,
                 // Not judged: reported, and resumed exactly like a refusal.
                 Gate::OverBudget => {
-                    self.over_budget.push(offset);
+                    self.over_budget.push(Sighting::verdict_bounded(
+                        ZOO,
+                        offset,
+                        VARIABLE_PART_BUDGET_SHAPE,
+                    ));
                     search_from = offset + 1;
                 }
             }
@@ -902,11 +909,7 @@ pub fn salvage_zoo(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     let mut outcome = salvage_all(&mut scanner, src, policy)?;
     // 0.10.3 Task 4b: every record the scan's budget left unjudged — never
     // an entry, and printed by the caller like any other sighting.
-    outcome.sightings = scanner
-        .over_budget
-        .iter()
-        .map(|&offset| Sighting::verdict_bounded(ZOO, offset, VARIABLE_PART_BUDGET_SHAPE))
-        .collect();
+    outcome.sightings = scanner.over_budget.into_sightings();
     Ok(outcome)
 }
 
@@ -938,16 +941,7 @@ mod tests {
     fn long_variable_parts_spend_a_bounded_budget() {
         use stuffr_core::salvage::SightingKind;
         use stuffr_core::testing::{CountingSource, check_scan_is_linear};
-        const LEN: usize = 1024 * 1024;
-        let fill = |name: &[u8]| {
-            let mut r = [0u8; 64];
-            r[0..4].copy_from_slice(&TAG_BYTES);
-            r[4] = 2;
-            r[FNAME_I..FNAME_I + name.len()].copy_from_slice(name);
-            r[VARDIRLEN_I..VARDIRLEN_I + 2].copy_from_slice(&u16::MAX.to_le_bytes());
-            r[54..56].copy_from_slice(&[0x12, 0x34]);
-            r.iter().copied().cycle().take(LEN).collect::<Vec<u8>>()
-        };
+        let fill = long_variable_part_units;
         for (shape, bytes, accepted) in [
             ("refused", fill(b"\x01"), false),
             ("accepted, empty", fill(b"A.TXT"), true),
@@ -967,6 +961,63 @@ mod tests {
                 "{shape}: {:?}",
                 out.sightings.first()
             );
+        }
+    }
+
+    /// [`long_variable_parts_spend_a_bounded_budget`]'s units: a type-2
+    /// record every 64 bytes, 1 MiB of them, each declaring a 65,535-byte
+    /// variable part.
+    fn long_variable_part_units(name: &[u8]) -> Vec<u8> {
+        const LEN: usize = 1024 * 1024;
+        let mut r = [0u8; 64];
+        r[0..4].copy_from_slice(&TAG_BYTES);
+        r[4] = 2;
+        r[FNAME_I..FNAME_I + name.len()].copy_from_slice(name);
+        r[VARDIRLEN_I..VARDIRLEN_I + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        r[54..56].copy_from_slice(&[0x12, 0x34]);
+        r.iter().copied().cycle().take(LEN).collect()
+    }
+
+    /// 0.10.4: on a dense hostile input the scan stores at most
+    /// `SightingLog::DEFAULT_CAP` sightings per group, in ascending offset
+    /// order, and they still stand for every one it saw — the counts
+    /// and the offsets the printed sentence lists are those of the uncapped
+    /// list before the cap (pinned from 7244937, where every one was stored).
+    #[test]
+    fn dense_sightings_are_bounded_and_the_sentence_is_unchanged() {
+        use stuffr_core::salvage::describe_sightings;
+        use stuffr_core::testing::check_sightings_bounded;
+        let legs: [(&str, Vec<u8>, u64, &[&str]); 2] = [
+            (
+                "refused",
+                long_variable_part_units(b"\x01"),
+                15328,
+                &[
+                    "15328 zoo",
+                    "at offset(s) 2048, 2112, 2176, 2240, 2304, 2368, 2432, 2496, and 15320 more",
+                ][..],
+            ),
+            (
+                "accepted",
+                long_variable_part_units(b"A.TXT"),
+                15328,
+                &[
+                    "15328 zoo",
+                    "at offset(s) 2048, 2112, 2176, 2240, 2304, 2368, 2432, 2496, and 15320 more",
+                ][..],
+            ),
+        ];
+        for (label, bytes, total, listed) in legs {
+            let out = salvage_zoo(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+            check_sightings_bounded(&out.sightings, total)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let note = describe_sightings(&out.sightings).unwrap();
+            for fragment in listed {
+                assert!(
+                    note.contains(fragment),
+                    "{label}: {fragment:?} missing: {note}"
+                );
+            }
         }
     }
 
