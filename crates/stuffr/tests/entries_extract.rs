@@ -2015,7 +2015,7 @@ fn tar_with_long_name(dir: &Path, len: u64) -> PathBuf {
 
 #[test]
 fn a_long_name_over_the_ceiling_refuses_unpack_with_exit_6() {
-    for typeflag in [b'L', b'K'] {
+    for typeflag in *b"LK" {
         let dir = tmp_dir();
         let mut bytes = gnu_long_member(typeflag, GNU_CEILING + 1);
         bytes.extend_from_slice(&gnu_header("short", b'0', 0, ""));

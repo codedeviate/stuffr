@@ -2966,7 +2966,7 @@ mod tests {
     /// for either, on both source shapes, naming the ceiling.
     #[test]
     fn a_long_name_over_the_ceiling_is_a_resource_limit() {
-        for typeflag in [b'L', b'K'] {
+        for typeflag in *b"LK" {
             let bytes = gnu_long(typeflag, MAX_GNU_LONG_NAME + 1);
             for (shape, ar) in [("pipe", open(&bytes)), ("file", open_seekable(&bytes))] {
                 let err = walk(ar).expect_err("a long-name payload past the ceiling");
