@@ -706,6 +706,15 @@ pub enum SightingKind {
     /// may be genuine: the scan-wide budget can be spent by forged chains
     /// elsewhere in the file. The scan carries on past it.
     WorkBounded,
+    /// A candidate header whose verdict needed a long field — a name, a
+    /// variable part, an extension chain, the bytes a header CRC covers —
+    /// that the scan did not read, because its [`ScanBudget`] was spent
+    /// (0.10.3). Like [`Self::WorkBounded`] the header itself may be
+    /// genuine, starved by forged candidates elsewhere in the file, and the
+    /// scan carries on past it. Its own kind rather than
+    /// [`Self::WorkBounded`] because that one's sentence names extension
+    /// chains, which is false of a zip name or a CRC.
+    VerdictBounded,
 }
 
 impl Sighting {
@@ -723,6 +732,16 @@ impl Sighting {
     pub fn work_bounded(format: FormatId, offset: u64, shape: &'static str) -> Self {
         Self {
             kind: SightingKind::WorkBounded,
+            ..Self::new(format, offset, shape)
+        }
+    }
+
+    /// A [`SightingKind::VerdictBounded`] sighting: the candidate at
+    /// `offset` was refused unexamined because the scan's [`ScanBudget`]
+    /// was spent.
+    pub fn verdict_bounded(format: FormatId, offset: u64, shape: &'static str) -> Self {
+        Self {
+            kind: SightingKind::VerdictBounded,
             ..Self::new(format, offset, shape)
         }
     }
@@ -752,15 +771,19 @@ const SIGHTING_OFFSETS_SHOWN: usize = 8;
 /// is false of a header the scan gated and then stopped spending work on.
 /// When a run has both kinds, the two sentences are joined; the
 /// [`SightingKind::Ungateable`] one is worded exactly as before.
+///
+/// **So do [`SightingKind::VerdictBounded`] ones** (0.10.3 Task 4b): the
+/// work-bounded sentence names extension chains, which is false of a zip
+/// name, a ZOO variable part or the bytes an ARJ header CRC covers. Each
+/// sentence that applies is joined in the same way, and the two older ones
+/// are worded exactly as before.
 pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
-    let ungateable: Vec<&Sighting> = sightings
-        .iter()
-        .filter(|s| s.kind != SightingKind::WorkBounded)
-        .collect();
-    let bounded: Vec<&Sighting> = sightings
-        .iter()
-        .filter(|s| s.kind == SightingKind::WorkBounded)
-        .collect();
+    let of_kind = |kind: SightingKind| -> Vec<&Sighting> {
+        sightings.iter().filter(|s| s.kind == kind).collect()
+    };
+    let ungateable = of_kind(SightingKind::Ungateable);
+    let bounded = of_kind(SightingKind::WorkBounded);
+    let verdicts = of_kind(SightingKind::VerdictBounded);
     let mut sentences = Vec::new();
     if !ungateable.is_empty() {
         sentences.push(format!(
@@ -778,6 +801,15 @@ pub fn describe_sightings(sightings: &[Sighting]) -> Option<String> {
              listed or recovered there, though the scan went on past them; `stuffr list` and \
              `stuffr unpack` may read these headers normally",
             sighting_groups(&bounded)
+        ));
+    }
+    if !verdicts.is_empty() {
+        sentences.push(format!(
+            "this build's salvage scanner bounds the work it spends judging candidate headers \
+             across the whole scan, and stopped judging at {} — so whatever those headers \
+             describe is not listed or recovered there, though the scan went on past them; \
+             `stuffr list` and `stuffr unpack` may read these headers normally",
+            sighting_groups(&verdicts)
         ));
     }
     (!sentences.is_empty()).then(|| sentences.join("; and separately, "))
@@ -1141,6 +1173,71 @@ impl ForwardSearch {
                 chunk = (chunk * 2).min(Self::MAX_CHUNK);
             }
         }
+    }
+}
+
+/// The work one salvage scan may spend judging candidates beyond their
+/// fixed headers: bytes a verdict consumes (a long name, a variable part, an
+/// extension chain, the bytes a header CRC covers), counted whether they come
+/// from the source or from a search window. A legitimate archive consumes
+/// each verdict's bytes once, at most `file_len` in total, so the limit of
+/// `2 × file_len + 1 MiB` never trips on real input; forged candidates
+/// that would spend past it are refused unexamined and reported as a
+/// work-bounded sighting, and the scan goes on.
+///
+/// **Why a scan needs one (0.10.3).** A scanner resumes one byte past every
+/// candidate it refuses, and past every candidate whose payload runs off the
+/// end of the file, so candidates can overlap. Where a candidate's verdict
+/// needs a field the format lets run to 64 KiB — a zip name, a ZOO type-2
+/// variable part, an LHA extension chain — packing such candidates every few
+/// dozen bytes made the scan read that field once per candidate: measured at
+/// 495x, 962x and 957x the input. No verdict can be reached by reading less,
+/// so the WORK is bounded instead, across the whole scan: tar's extension-read
+/// budget (Ruling T3-1), generalised.
+///
+/// One per scan, shared by every pass the scan makes. A refused candidate is
+/// reported through [`Sighting::verdict_bounded`], so a genuine header
+/// starved by forgeries elsewhere is named, never lost silently.
+#[derive(Debug)]
+pub struct ScanBudget {
+    limit: u64,
+    spent: u64,
+}
+
+impl ScanBudget {
+    /// Verdict bytes the scan may spend per byte of input.
+    pub const PER_INPUT_BYTE: u64 = 2;
+    /// Verdict bytes the scan may spend on top of [`Self::PER_INPUT_BYTE`],
+    /// so a small archive is never short.
+    pub const SLACK: u64 = 1024 * 1024;
+
+    /// The budget for one scan of a `file_len`-byte input:
+    /// `2 × file_len + 1 MiB`.
+    pub fn for_input(file_len: u64) -> Self {
+        Self {
+            limit: file_len
+                .saturating_mul(Self::PER_INPUT_BYTE)
+                .saturating_add(Self::SLACK),
+            spent: 0,
+        }
+    }
+
+    /// Charges `bytes` if they fit; `false` (charging nothing) if they would
+    /// take the scan past its limit: the caller refuses the candidate
+    /// without examining it.
+    pub fn try_spend(&mut self, bytes: u64) -> bool {
+        match self.spent.checked_add(bytes) {
+            Some(total) if total <= self.limit => {
+                self.spent = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Bytes charged so far.
+    pub fn spent(&self) -> u64 {
+        self.spent
     }
 }
 
@@ -2778,6 +2875,70 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(both, format!("{old}; and separately, {bounded}"));
+    }
+
+    /// 0.10.3 Task 4b: a verdict-bounded sighting has a third sentence —
+    /// not the extension-chain one, which would be false of a zip name —
+    /// and the other two keep their words beside it.
+    #[test]
+    fn describe_sightings_words_a_verdict_bounded_sighting_apart() {
+        let f = FormatId::new("fmt");
+        let old = describe_sightings(&[Sighting::new(f, 0, "a(s)")]).unwrap();
+        let bounded = describe_sightings(&[Sighting::work_bounded(f, 9, "b(s)")]).unwrap();
+        let verdict = describe_sightings(&[Sighting::verdict_bounded(f, 7, "c(s)")]).unwrap();
+        assert_eq!(
+            verdict,
+            "this build's salvage scanner bounds the work it spends judging candidate headers \
+             across the whole scan, and stopped judging at 1 fmt c(s) at offset(s) 7 — so \
+             whatever those headers describe is not listed or recovered there, though the scan \
+             went on past them; `stuffr list` and `stuffr unpack` may read these headers normally"
+        );
+        assert!(!verdict.contains("extension chains"), "{verdict}");
+        let all = describe_sightings(&[
+            Sighting::verdict_bounded(f, 7, "c(s)"),
+            Sighting::work_bounded(f, 9, "b(s)"),
+            Sighting::new(f, 0, "a(s)"),
+        ])
+        .unwrap();
+        assert_eq!(
+            all,
+            format!("{old}; and separately, {bounded}; and separately, {verdict}")
+        );
+    }
+
+    /// Task 4b: the budget is exactly `2 × file_len + 1 MiB`, a charge that
+    /// lands on the limit fits, and one past it is refused WHOLE — nothing
+    /// is charged, so a later, smaller charge can still fit.
+    #[test]
+    fn a_scan_budget_spends_to_its_exact_limit_and_refuses_past_it() {
+        let limit = 2 * 1000 + 1024 * 1024;
+        let mut budget = ScanBudget::for_input(1000);
+        assert!(budget.try_spend(limit - 10));
+        assert_eq!(budget.spent(), limit - 10);
+        assert!(!budget.try_spend(11), "one byte past the limit");
+        assert_eq!(budget.spent(), limit - 10, "a refusal charges nothing");
+        assert!(budget.try_spend(10), "exactly to the limit");
+        assert_eq!(budget.spent(), limit);
+        assert!(!budget.try_spend(1));
+        assert_eq!(budget.spent(), limit);
+    }
+
+    /// Spending zero always fits, even on a spent budget, and a charge whose
+    /// sum overflows `u64` is a refusal, never a wrap.
+    #[test]
+    fn a_scan_budget_takes_zero_and_refuses_an_overflowing_charge() {
+        let mut budget = ScanBudget::for_input(0);
+        assert!(budget.try_spend(0));
+        assert_eq!(budget.spent(), 0);
+        assert!(budget.try_spend(ScanBudget::SLACK));
+        assert!(budget.try_spend(0), "zero fits a spent budget");
+        assert!(!budget.try_spend(u64::MAX));
+        assert_eq!(budget.spent(), ScanBudget::SLACK);
+
+        let mut huge = ScanBudget::for_input(u64::MAX);
+        assert!(huge.try_spend(u64::MAX), "the limit saturates at u64::MAX");
+        assert!(!huge.try_spend(1), "and a sum past it does not wrap");
+        assert_eq!(huge.spent(), u64::MAX);
     }
 
     /// Task 4: the walk-stop note. A hole says what the brief requires —
