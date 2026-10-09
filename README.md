@@ -218,6 +218,23 @@ read list.
 > default tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`.
 >
+> `0.10.4` is a patch. **A truncated `ar` archive is exit 5 in every verb.**
+> Before, `list` (and `test` for a symbol table) reported a clean end at
+> exit 0 when the file ended inside a member, a `/` or `/SYM64/` symbol
+> table or the `//` name table, silently losing every later member. The
+> message now names the table or member and its offset; salvage reports a
+> cut table as cut short. **A zip symlink target over 64 KiB is exit 6**
+> (seekable input), like cpio's identical limit, where it was exit 5.
+> **A salvage refusal (exit 3) keeps its work- and verdict-bounded notes**
+> instead of dropping them. **Stored salvage sightings are capped at 64 per
+> shape** (the count stays exact and the printed note is unchanged), so a
+> hostile file no longer costs ~4 MB of memory per MiB. Additive library
+> API: `Sighting.more`, `SightingLog`, `RefusalSays`,
+> `refusal_with_bounded_notes`, `testing::check_sightings_bounded`.
+> **1951** tests under `--all-features`, **1887** on the
+> default tier — measured from this bump's own `make check`,
+> `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
