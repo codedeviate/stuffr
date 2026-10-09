@@ -1982,7 +1982,7 @@ pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
             stuffr_core::salvage::refusal_with_bounded_notes(
                 scanner.seen.refusal(),
                 scanner.over_budget.into_sightings(),
-                true,
+                stuffr_core::salvage::RefusalSays::ListReadsThem,
             ),
         ));
     }

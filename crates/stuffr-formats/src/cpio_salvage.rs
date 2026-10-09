@@ -1109,7 +1109,7 @@ pub fn salvage_cpio(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sa
             stuffr_core::salvage::refusal_with_bounded_notes(
                 text,
                 scanner.sightings.into_sightings(),
-                false,
+                stuffr_core::salvage::RefusalSays::NothingAboutList,
             ),
         ));
     }

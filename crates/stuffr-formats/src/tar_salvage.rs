@@ -1673,7 +1673,11 @@ pub fn salvage_tar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
         let refusal = scanner.seen.refusal();
         let sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
         return Err(Error::Unsupported(
-            stuffr_core::salvage::refusal_with_bounded_notes(refusal, sightings, true),
+            stuffr_core::salvage::refusal_with_bounded_notes(
+                refusal,
+                sightings,
+                stuffr_core::salvage::RefusalSays::ListReadsThem,
+            ),
         ));
     }
     outcome.sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);

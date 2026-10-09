@@ -946,23 +946,39 @@ fn describe(sightings: &[Sighting], list_clause: bool) -> Option<String> {
     (!sentences.is_empty()).then(|| sentences.join("; and separately, "))
 }
 
+/// What a salvage refusal's own text already says about `stuffr list` and
+/// `stuffr unpack`, which decides whether [`refusal_with_bounded_notes`]'s
+/// note repeats the point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefusalSays {
+    /// The refusal has just said that `stuffr list` and `stuffr unpack` read
+    /// these headers normally (tar, lha): the note leaves its closing clause
+    /// to that.
+    ListReadsThem,
+    /// The refusal says nothing of the kind (cpio's names the variant, not
+    /// the verbs): the note closes with "`stuffr list` and `stuffr unpack`
+    /// may read these headers normally".
+    NothingAboutList,
+}
+
 /// `refusal` for an `Err(Unsupported)` that also carries what the scan would
 /// otherwise have dropped: the work- and verdict-bounded `sightings`, in
 /// [`describe_sightings`]' words, after `"; and separately, "`. Ungateable
 /// sightings are left out — the refusal already describes those shapes — and
 /// with no bounded sighting the refusal comes back unchanged. One line.
-/// `refusal_says_list_reads_them` drops the note's closing list/unpack clause
-/// when the refusal has just said that itself.
+/// `says` is what `refusal` already says about the list/unpack verbs; see
+/// [`RefusalSays`].
 pub fn refusal_with_bounded_notes(
     refusal: String,
     sightings: Vec<Sighting>,
-    refusal_says_list_reads_them: bool,
+    says: RefusalSays,
 ) -> String {
     let bounded: Vec<Sighting> = sightings
         .into_iter()
         .filter(|s| s.kind != SightingKind::Ungateable)
         .collect();
-    match describe(&bounded, !refusal_says_list_reads_them) {
+    match describe(&bounded, says == RefusalSays::NothingAboutList) {
         Some(note) => format!("{refusal}; and separately, {note}"),
         None => refusal,
     }
