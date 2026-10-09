@@ -286,12 +286,13 @@ use delharc::header::CompressionMethod;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, UnverifiedCause, Verifier, salvage_all, stream_bounded_copy,
+    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, Verifier, salvage_all,
+    stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
 
 use super::crc::{crc16_arc, crc16_arc_continued};
-use super::lha::{LEVEL1_HEADER_OVERHEAD, lha_mtime, lha_name_from_parts};
+use super::lha::{LEVEL1_HEADER_OVERHEAD, LHA, lha_mtime, lha_name_from_parts};
 
 /// The most bytes a level-0/1 base header can occupy: the length byte, the
 /// checksum byte, and the `u8`-declared `header_len` bytes behind them.
@@ -603,6 +604,12 @@ struct EntryHeader {
     payload_start: u64,
 }
 
+/// The phrase for a header refused because walking its extension headers
+/// would have taken the scan past its [`ScanBudget`] — see
+/// [`LhaSalvage::budget`].
+const EXTENSION_BUDGET_SHAPE: &str =
+    "header(s) whose extension headers it did not read once that work was spent";
+
 /// Scans an LHA/LZH archive for entry headers directly, without walking the
 /// chain of `skip size` hops from the front of the file that a damaged
 /// header breaks for every entry behind it.
@@ -620,6 +627,34 @@ pub struct LhaSalvage {
     /// apart from "this build cannot gate what this archive holds". See
     /// [`UngateableSightings`].
     seen: UngateableSightings,
+    /// The extension-header bytes this scan may read — 0.10.3 Task 4b. A
+    /// level-1 or level-2 header's verdict walks its extension chain, up to
+    /// 64 KiB, and a refused header resumes the scan one byte on: level-2
+    /// headers packed every 64 bytes, each opening a 65,280-byte extension
+    /// header, read 957x the input, and level-1 ones the same. Charged per
+    /// extension header, before it is read ([`walk_extra_headers`]). Built
+    /// on the first call, from the source's length; one per scan.
+    budget: Option<ScanBudget>,
+    /// Every header refused because its chain would have overspent
+    /// [`Self::budget`], in scan order — reported as
+    /// [`Sighting::verdict_bounded`].
+    over_budget: Vec<u64>,
+}
+
+/// The scan's [`ScanBudget`] as one header's verdict spends it, remembering
+/// whether a charge was refused — which is what tells "not a header" apart
+/// from "not judged" once the parse has answered `None`.
+struct Spend<'a> {
+    budget: &'a mut ScanBudget,
+    refused: bool,
+}
+
+impl Spend<'_> {
+    fn try_spend(&mut self, bytes: u64) -> bool {
+        let fits = self.budget.try_spend(bytes);
+        self.refused |= !fits;
+        fits
+    }
 }
 
 impl LhaSalvage {
@@ -631,6 +666,9 @@ impl LhaSalvage {
 impl SalvageScan for LhaSalvage {
     fn next_candidate(&mut self, src: &mut dyn SeekRead, from: u64) -> Result<Option<Candidate>> {
         let file_len = src.seek(SeekFrom::End(0))?;
+        let budget = self
+            .budget
+            .get_or_insert_with(|| ScanBudget::for_input(file_len));
         let mut search_from = from;
         loop {
             let Some((offset, base)) =
@@ -638,8 +676,18 @@ impl SalvageScan for LhaSalvage {
             else {
                 return Ok(None);
             };
-            match read_candidate_at(src, offset, base.as_deref(), file_len, &mut self.seen) {
+            let mut spend = Spend {
+                budget: &mut *budget,
+                refused: false,
+            };
+            let window = base.as_deref();
+            match read_candidate_at(src, offset, window, file_len, &mut self.seen, &mut spend) {
                 Some(candidate) => return Ok(Some(candidate)),
+                // Not judged: reported, and resumed exactly like a refusal.
+                None if spend.refused => {
+                    self.over_budget.push(offset);
+                    search_from = offset + 1;
+                }
                 // The identifier matched and the gate rejected everything
                 // around it: a coincidence, not a header. Resume one byte
                 // past the header's start — whose identifier is two bytes
@@ -807,12 +855,16 @@ fn checksum_of(counted: &[u8]) -> u8 {
 /// checksum bytes with one `u16` total size, moves every field behind the
 /// (absent) filename, and is gated on a 16-bit CRC in an extension header
 /// instead. Level 3 is not scanned — see this module's doc.
-fn parse_header_at(
+///
+/// `spend` pays for the extension chain a level-1 or level-2 header walks;
+/// a `None` with [`Spend::refused`] set means the header was not judged.
+fn parse_header_within(
     src: &mut dyn SeekRead,
     offset: u64,
     window: Option<&[u8]>,
     file_len: u64,
     seen: &mut UngateableSightings,
+    spend: &mut Spend<'_>,
 ) -> Option<EntryHeader> {
     // Criterion 3, first half: at most one base header's worth, and never
     // past the end of the source. A fixed 257-byte read — the whole range a
@@ -842,8 +894,8 @@ fn parse_header_at(
 
     // Criterion 2.
     match base[HEADER_LEVEL_I] {
-        level @ (0 | 1) => parse_level_0_or_1(src, offset, file_len, base, method, level),
-        2 => match parse_level_2(src, offset, file_len, base, method) {
+        level @ (0 | 1) => parse_level_0_or_1(src, offset, file_len, base, method, level, spend),
+        2 => match parse_level_2(src, offset, file_len, base, method, spend) {
             Level2::Header(header) => Some(header),
             Level2::NoCommonHeader => {
                 seen.level_2_without_common_header = true;
@@ -872,6 +924,24 @@ fn parse_header_at(
         }
         _ => None,
     }
+}
+
+/// [`parse_header_within`] with no budget to spend — the tests' entry point,
+/// whose verdicts are the budgeted one's whenever the budget holds.
+#[cfg(test)]
+fn parse_header_at(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    window: Option<&[u8]>,
+    file_len: u64,
+    seen: &mut UngateableSightings,
+) -> Option<EntryHeader> {
+    let mut unbounded = ScanBudget::for_input(u64::MAX);
+    let mut spend = Spend {
+        budget: &mut unbounded,
+        refused: false,
+    };
+    parse_header_within(src, offset, window, file_len, seen, &mut spend)
 }
 
 /// Header shapes the scan RECOGNISED and has no gate for — Ruling S-V.
@@ -958,6 +1028,7 @@ fn parse_level_0_or_1(
     base: &[u8],
     method: Method,
     level: u8,
+    spend: &mut Spend<'_>,
 ) -> Option<EntryHeader> {
     // Criterion 3, second half.
     let header_len = usize::from(base[HEADER_LEN_I]);
@@ -1031,6 +1102,7 @@ fn parse_level_0_or_1(
             u64::from(first),
             u64::from(skip_size),
             0,
+            spend,
         )?;
         (
             base_end.checked_add(walk.total)?,
@@ -1129,11 +1201,12 @@ fn parse_level_2(
     file_len: u64,
     base: &[u8],
     method: Method,
+    spend: &mut Spend<'_>,
 ) -> Level2 {
     // Every `?` in the body below means "that field is not there", which is
     // the same answer as every other structural failure: not a header.
     // Folded once, here, rather than spelled out at each site.
-    parse_level_2_inner(src, offset, file_len, base, method).unwrap_or(Level2::NotAHeader)
+    parse_level_2_inner(src, offset, file_len, base, method, spend).unwrap_or(Level2::NotAHeader)
 }
 
 fn parse_level_2_inner(
@@ -1142,6 +1215,7 @@ fn parse_level_2_inner(
     file_len: u64,
     base: &[u8],
     method: Method,
+    spend: &mut Spend<'_>,
 ) -> Option<Level2> {
     if base.len() < LEVEL2_BASE_LEN {
         return Some(Level2::NotAHeader);
@@ -1185,7 +1259,15 @@ fn parse_level_2_inner(
     // fixed base header and carried through the chain walk.
     let seed = crc16_arc(&base[..LEVEL2_BASE_LEN]);
     let base_end = offset.checked_add(LEVEL2_BASE_LEN as u64)?;
-    let walk = walk_extra_headers(src, base_end, file_len, u64::from(first), total, seed)?;
+    let walk = walk_extra_headers(
+        src,
+        base_end,
+        file_len,
+        u64::from(first),
+        total,
+        seed,
+        spend,
+    )?;
 
     let mut consumed = LEVEL2_BASE_LEN as u64 + walk.total;
     let mut running = walk.crc;
@@ -1323,6 +1405,10 @@ struct ExtraChain {
 /// `crc_seed` is the running CRC-16/ARC over whatever the caller has already
 /// walked (level 2's fixed base header); level 1 passes `0` and ignores the
 /// result, because no level-1 gate uses it.
+///
+/// Each header is charged to `spend` before it is read (0.10.3 Task 4b), so
+/// the scan pays for exactly the chain bytes it reads; a header the budget
+/// cannot pay for ends the walk with `None` and [`Spend::refused`] set.
 fn walk_extra_headers(
     src: &mut dyn SeekRead,
     start: u64,
@@ -1330,6 +1416,7 @@ fn walk_extra_headers(
     first_len: u64,
     budget: u64,
     crc_seed: u16,
+    spend: &mut Spend<'_>,
 ) -> Option<ExtraChain> {
     let mut chain = ExtraChain {
         total: 0,
@@ -1353,6 +1440,9 @@ fn walk_extra_headers(
         }
         let end = pos.checked_add(next)?;
         if end > file_len {
+            return None;
+        }
+        if !spend.try_spend(next) {
             return None;
         }
         src.seek(SeekFrom::Start(pos)).ok()?;
@@ -1427,8 +1517,9 @@ fn read_candidate_at(
     window: Option<&[u8]>,
     file_len: u64,
     seen: &mut UngateableSightings,
+    spend: &mut Spend<'_>,
 ) -> Option<Candidate> {
-    let header = parse_header_at(src, offset, window, file_len, seen)?;
+    let header = parse_header_within(src, offset, window, file_len, seen, spend)?;
 
     let declared = header.declared_len;
     let available_len = match header.payload_start.checked_add(declared) {
@@ -1851,7 +1942,7 @@ fn recover_the_last_chunk(
 /// raw scan is the only source there is.
 pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<SalvageOutcome> {
     let mut scanner = LhaSalvage::new();
-    let outcome = salvage_all(&mut scanner, src, policy)?;
+    let mut outcome = salvage_all(&mut scanner, src, policy)?;
 
     // **Ruling S-V.** A run that recovered NOTHING while recognising a
     // header shape it cannot gate must not fall through to the engine's
@@ -1877,6 +1968,13 @@ pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     if outcome.entries.is_empty() && scanner.seen.any() {
         return Err(Error::Unsupported(scanner.seen.refusal()));
     }
+    // 0.10.3 Task 4b: every header the scan's budget left unjudged — never
+    // an entry, and printed by the caller like any other sighting.
+    outcome.sightings = scanner
+        .over_budget
+        .iter()
+        .map(|&offset| Sighting::verdict_bounded(LHA, offset, EXTENSION_BUDGET_SHAPE))
+        .collect();
     Ok(outcome)
 }
 
@@ -1952,6 +2050,81 @@ mod tests {
             check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
                 .unwrap_or_else(|e| panic!("{shape}: {e}"));
         }
+    }
+
+    /// 0.10.3 Task 4b: headers opening a 65,280-byte extension header, one
+    /// every 64 bytes, 1 MiB of them — the extension read whole per header,
+    /// and the scan resumed one byte past each. Both levels that walk a
+    /// chain: level 2, gated by nothing before the walk, and level 1, whose
+    /// 8-bit base checksum agrees. Before the scan-wide budget these read
+    /// 957x and 958x their input. The budget's refusals are reported as
+    /// verdict-bounded sightings.
+    #[test]
+    fn long_extension_chains_spend_a_bounded_budget() {
+        use stuffr_core::salvage::SightingKind;
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 1024 * 1024;
+        let fill = |unit: [u8; 64]| unit.iter().copied().cycle().take(LEN).collect::<Vec<u8>>();
+        let mut level2 = [0u8; 64];
+        level2[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        level2[METHOD_I..METHOD_I + 5].copy_from_slice(b"-lh5-");
+        level2[HEADER_LEVEL_I] = 2;
+        level2[LEVEL2_FIRST_EXTRA_I..LEVEL2_FIRST_EXTRA_I + 2]
+            .copy_from_slice(&0xFF00u16.to_le_bytes());
+        let mut level1 = [0u8; 64];
+        level1[HEADER_LEN_I] = (LEVEL1_HEADER_OVERHEAD + 1) as u8;
+        level1[METHOD_I..METHOD_I + 5].copy_from_slice(b"-lh5-");
+        level1[COMPRESSED_SIZE_I..COMPRESSED_SIZE_I + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        level1[HEADER_LEVEL_I] = 1;
+        level1[NAME_LEN_I] = 1;
+        level1[NAME_I] = b'a';
+        level1[26..28].copy_from_slice(&0xFF00u16.to_le_bytes());
+        level1[HEADER_CSUM_I] = checksum_of(&level1[METHOD_I..28]);
+        for (shape, bytes) in [("level 2", fill(level2)), ("level 1", fill(level1))] {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_lha(&mut src, &SalvagePolicy::default()).unwrap();
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+            assert!(out.entries.is_empty(), "{shape}");
+            assert!(
+                !out.sightings.is_empty()
+                    && out
+                        .sightings
+                        .iter()
+                        .all(|s| s.kind == SightingKind::VerdictBounded
+                            && s.shape == EXTENSION_BUDGET_SHAPE),
+                "{shape}: {:?}",
+                out.sightings.first()
+            );
+        }
+    }
+
+    /// Task 4b's other half: a legitimate level-2 archive whose every header
+    /// carries the longest extension chain its `u16` total allows walks each
+    /// chain once and never comes near the budget — every entry intact, no
+    /// sighting.
+    #[test]
+    fn an_archive_of_maximum_extension_chains_spends_no_budget_sighting() {
+        let mut bytes: Vec<u8> = (0..40u8)
+            .flat_map(|i| {
+                let mut name = vec![b'n'; 65_500];
+                name[0] = b'a' + i % 26;
+                let mut entry = build_level2(&name, b"-lh0-", b"payload");
+                entry.pop(); // the end-of-archive marker, kept once below
+                entry
+            })
+            .collect();
+        bytes.push(0);
+        let out = scan(&bytes);
+        assert_eq!(out.entries.len(), 40);
+        assert!(
+            out.entries
+                .iter()
+                .all(|e| e.status == SalvageStatus::Intact),
+            "{:?}",
+            out.entries.iter().map(|e| &e.status).collect::<Vec<_>>()
+        );
+        assert!(out.sightings.is_empty(), "{:?}", out.sightings.first());
     }
 
     fn scan(bytes: &[u8]) -> SalvageOutcome {
