@@ -286,7 +286,7 @@ use delharc::header::CompressionMethod;
 
 use stuffr_core::salvage::{
     Candidate, ForwardSearch, SalvageOutcome, SalvagePolicy, SalvageScan, SalvageStatus,
-    SalvagedEntry, ScanBudget, Sighting, UnverifiedCause, Verifier, salvage_all,
+    SalvagedEntry, ScanBudget, Sighting, SightingLog, UnverifiedCause, Verifier, salvage_all,
     stream_bounded_copy,
 };
 use stuffr_core::{EntryKind, EntryMeta, Error, FormatId, Result, SeekRead};
@@ -641,8 +641,11 @@ pub struct LhaSalvage {
     budget: Option<ScanBudget>,
     /// Every header refused because its chain would have overspent
     /// [`Self::budget`], in scan order — reported as
-    /// [`Sighting::verdict_bounded`].
-    over_budget: Vec<u64>,
+    /// [`Sighting::verdict_bounded`]. A [`SightingLog`] (0.10.4): every one
+    /// is counted, at most [`SightingLog::DEFAULT_CAP`] stored — pushed in
+    /// ascending offset order, as the scan only moves forward, so the ones
+    /// kept are the first.
+    over_budget: SightingLog,
 }
 
 /// The scan's [`ScanBudget`] as one header's verdict spends it, remembering
@@ -689,7 +692,11 @@ impl SalvageScan for LhaSalvage {
                 Some(candidate) => return Ok(Some(candidate)),
                 // Not judged: reported, and resumed exactly like a refusal.
                 None if spend.refused => {
-                    self.over_budget.push(offset);
+                    self.over_budget.push(Sighting::verdict_bounded(
+                        LHA,
+                        offset,
+                        EXTENSION_BUDGET_SHAPE,
+                    ));
                     search_from = offset + 1;
                 }
                 // The identifier matched and the gate rejected everything
@@ -1975,11 +1982,7 @@ pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     }
     // 0.10.3 Task 4b: every header the scan's budget left unjudged — never
     // an entry, and printed by the caller like any other sighting.
-    outcome.sightings = scanner
-        .over_budget
-        .iter()
-        .map(|&offset| Sighting::verdict_bounded(LHA, offset, EXTENSION_BUDGET_SHAPE))
-        .collect();
+    outcome.sightings = scanner.over_budget.into_sightings();
     Ok(outcome)
 }
 
@@ -2068,6 +2071,30 @@ mod tests {
     fn long_extension_chains_spend_a_bounded_budget() {
         use stuffr_core::salvage::SightingKind;
         use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        let [level2, level1] = long_extension_units();
+        for (shape, bytes) in [("level 2", level2), ("level 1", level1)] {
+            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
+            let out = salvage_lha(&mut src, &SalvagePolicy::default()).unwrap();
+            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
+                .unwrap_or_else(|e| panic!("{shape}: {e}"));
+            assert!(out.entries.is_empty(), "{shape}");
+            assert!(
+                !out.sightings.is_empty()
+                    && out
+                        .sightings
+                        .iter()
+                        .all(|s| s.kind == SightingKind::VerdictBounded
+                            && s.shape == EXTENSION_BUDGET_SHAPE),
+                "{shape}: {:?}",
+                out.sightings.first()
+            );
+        }
+    }
+
+    /// [`long_extension_chains_spend_a_bounded_budget`]'s inputs: a level-2
+    /// and a level-1 header every 64 bytes, 1 MiB of each, each opening a
+    /// 65,280-byte extension header.
+    fn long_extension_units() -> [Vec<u8>; 2] {
         const LEN: usize = 1024 * 1024;
         let fill = |unit: [u8; 64]| unit.iter().copied().cycle().take(LEN).collect::<Vec<u8>>();
         let mut level2 = [0u8; 64];
@@ -2085,22 +2112,49 @@ mod tests {
         level1[NAME_I] = b'a';
         level1[26..28].copy_from_slice(&0xFF00u16.to_le_bytes());
         level1[HEADER_CSUM_I] = checksum_of(&level1[METHOD_I..28]);
-        for (shape, bytes) in [("level 2", fill(level2)), ("level 1", fill(level1))] {
-            let mut src = CountingSource::new(Cursor::new(bytes.clone()));
-            let out = salvage_lha(&mut src, &SalvagePolicy::default()).unwrap();
-            check_scan_is_linear(src.bytes_read(), bytes.len() as u64)
-                .unwrap_or_else(|e| panic!("{shape}: {e}"));
-            assert!(out.entries.is_empty(), "{shape}");
-            assert!(
-                !out.sightings.is_empty()
-                    && out
-                        .sightings
-                        .iter()
-                        .all(|s| s.kind == SightingKind::VerdictBounded
-                            && s.shape == EXTENSION_BUDGET_SHAPE),
-                "{shape}: {:?}",
-                out.sightings.first()
-            );
+        [fill(level2), fill(level1)]
+    }
+
+    /// 0.10.4: on a dense hostile input the scan stores at most
+    /// `SightingLog::DEFAULT_CAP` sightings per group, in ascending offset
+    /// order, and they still stand for every one it saw — the counts
+    /// and the offsets the printed sentence lists are those of the uncapped
+    /// list before the cap (pinned from 7244937, where every one was stored).
+    #[test]
+    fn dense_sightings_are_bounded_and_the_sentence_is_unchanged() {
+        use stuffr_core::salvage::describe_sightings;
+        use stuffr_core::testing::check_sightings_bounded;
+        let legs: [(&str, Vec<u8>, u64, &[&str]); 2] = [
+            (
+                "level 2",
+                long_extension_units()[0].clone(),
+                15329,
+                &[
+                    "15329 lha",
+                    "at offset(s) 2048, 2112, 2176, 2240, 2304, 2368, 2432, 2496, and 15321 more",
+                ][..],
+            ),
+            (
+                "level 1",
+                long_extension_units()[1].clone(),
+                15332,
+                &[
+                    "15332 lha",
+                    "at offset(s) 2048, 2112, 2176, 2240, 2304, 2368, 2432, 2496, and 15324 more",
+                ][..],
+            ),
+        ];
+        for (label, bytes, total, listed) in legs {
+            let out = salvage_lha(&mut Cursor::new(bytes), &SalvagePolicy::default()).unwrap();
+            check_sightings_bounded(&out.sightings, total)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let note = describe_sightings(&out.sightings).unwrap();
+            for fragment in listed {
+                assert!(
+                    note.contains(fragment),
+                    "{label}: {fragment:?} missing: {note}"
+                );
+            }
         }
     }
 
