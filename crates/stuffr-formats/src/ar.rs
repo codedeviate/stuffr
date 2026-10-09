@@ -51,9 +51,10 @@
 //! indistinguishable "clean ending" shape for this module to disambiguate
 //! the way `tar.rs` has to — except a PAYLOAD the stream cuts short, which
 //! the crate passes over without error and the guard has to catch (see "A
-//! payload the file cuts short is corrupt, in every verb"). One consequence is worth stating because it is
-//! easy to get backwards: a genuinely EMPTY (zero-byte) stream is not a
-//! valid empty `ar` archive, it is a truncated one — `read_global_header_if_
+//! payload the file cuts short is corrupt, in every verb"). One consequence
+//! is worth stating because it is easy to get backwards: a genuinely EMPTY
+//! (zero-byte) stream is not a valid empty `ar` archive, it is a truncated
+//! one — `read_global_header_if_
 //! necessary`'s `read_exact` on the 8-byte magic raises `UnexpectedEof`
 //! before `next_entry` ever gets the chance to say "no entries". A valid
 //! empty archive is the 8-byte magic and nothing else, which is exactly what
@@ -848,6 +849,7 @@ fn skip_member_payload<R: Read, O: GuardObserver>(
     pos: &mut u64,
     len: u64,
     pad: bool,
+    record: &RecordId,
     observer: &mut O,
 ) -> io::Result<()> {
     let mut scratch = [0u8; 4096];
@@ -860,11 +862,7 @@ fn skip_member_payload<R: Read, O: GuardObserver>(
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!(
-                    "the ar `/SYM64/` symbol table ending at offset {} is {left} bytes \
-                     short of the size its header declares; the archive is truncated",
-                    *pos + left
-                ),
+                record.truncated(left),
             ));
         }
         *pos += n as u64;
@@ -884,6 +882,69 @@ fn skip_member_payload<R: Read, O: GuardObserver>(
         }
     }
     Ok(())
+}
+
+/// Which record a payload belongs to, kept from its header to the end of its
+/// payload so a cut one can be named when the file ends inside it. The
+/// guard sees only the header's raw name field, never the resolved name of
+/// an ordinary member (`/17` and `#1/12` are indexes and lengths), so a
+/// member is named by its offset alone.
+#[derive(Clone, Debug)]
+struct RecordId {
+    /// "symbol table", "long-name table" or "member".
+    kind: &'static str,
+    /// The identifier a table is written under (`/`, `//`, `/SYM64/`,
+    /// `__.SYMDEF`), shown with its kind; `None` for a member.
+    identifier: Option<String>,
+    /// The source offset of the record's header.
+    at: u64,
+    /// The payload length the header declares, as the raw size field says.
+    declared: u64,
+}
+
+impl RecordId {
+    /// The record `hdr`, at source offset `at`, is the start of.
+    fn of_header(hdr: &[u8; AR_ENTRY_HEADER_LEN], at: u64, declared: u64) -> Self {
+        let NameField::Inline(id) = name_field(hdr) else {
+            return Self::member(at, declared);
+        };
+        let kind = if id == b"//" {
+            "long-name table"
+        } else if symbol_table_name(&id).is_some() {
+            "symbol table"
+        } else {
+            return Self::member(at, declared);
+        };
+        RecordId {
+            kind,
+            identifier: Some(String::from_utf8_lossy(&id).into_owned()),
+            at,
+            declared,
+        }
+    }
+
+    fn member(at: u64, declared: u64) -> Self {
+        RecordId {
+            kind: "member",
+            identifier: None,
+            at,
+            declared,
+        }
+    }
+
+    /// The message for the file ending `short` bytes before this record's
+    /// payload does.
+    fn truncated(&self, short: u64) -> String {
+        let named = self
+            .identifier
+            .as_ref()
+            .map_or(String::new(), |id| format!(" (`{id}`)"));
+        format!(
+            "the ar {}{named} at offset {} declares {} bytes, but the file ends {short} \
+             bytes short; the archive is truncated",
+            self.kind, self.at, self.declared
+        )
+    }
 }
 
 /// Where [`ArGuardedReader::read`] currently is in the archive, mirroring
@@ -916,6 +977,7 @@ enum ArGuardPhase {
         /// False for the truncated remainder: nothing follows it, so it ends
         /// no record a [`GuardObserver`] should hear about.
         ends_record: bool,
+        record: RecordId,
     },
     /// Passing through `remaining` payload bytes verbatim — covers a BSD
     /// identifier's own bytes plus the entry's real data, or a skipped GNU
@@ -926,6 +988,7 @@ enum ArGuardPhase {
         remaining: u64,
         pad_after: PadAfter,
         ends_record: bool,
+        record: RecordId,
     },
     /// The file ended inside a payload its header declared longer (see the
     /// module doc's "A payload the file cuts short is corrupt"). Every read
@@ -1119,6 +1182,8 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                         return Ok(0);
                     }
                     let whole = buf.len() == AR_ENTRY_HEADER_LEN;
+                    let header_at = self.pos - buf.len() as u64;
+                    let mut record = RecordId::member(header_at, 0);
                     let (payload_len, pad_after) = if whole {
                         let hdr: [u8; AR_ENTRY_HEADER_LEN] = buf
                             .as_slice()
@@ -1126,12 +1191,14 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                             .expect("just checked buf.len() == AR_ENTRY_HEADER_LEN");
                         let scan =
                             scan_ar_header(&hdr, &mut self.variant, &mut self.name_table_len)?;
+                        record = RecordId::of_header(&hdr, header_at, scan.payload_len);
                         if self.variant == ar::Variant::GNU && is_sym64_header(&hdr) {
                             if let Err(e) = skip_member_payload(
                                 &mut self.inner,
                                 &mut self.pos,
                                 scan.payload_len,
                                 scan.true_pad,
+                                &record,
                                 &mut self.observer,
                             ) {
                                 if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -1175,6 +1242,7 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                         remaining: payload_len - read_ahead,
                         pad_after,
                         ends_record: whole,
+                        record,
                     };
                 }
                 ArGuardPhase::Serving {
@@ -1183,6 +1251,7 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                     remaining,
                     pad_after,
                     ends_record,
+                    record,
                 } => {
                     if *pos < buf.len() {
                         let n = (buf.len() - *pos).min(out.len());
@@ -1194,12 +1263,14 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                         remaining: *remaining,
                         pad_after: *pad_after,
                         ends_record: *ends_record,
+                        record: record.clone(),
                     };
                 }
                 ArGuardPhase::Payload {
                     remaining,
                     pad_after,
                     ends_record,
+                    record,
                 } => {
                     if *remaining == 0 {
                         if *ends_record {
@@ -1213,12 +1284,7 @@ impl<R: Read, O: GuardObserver> Read for ArGuardedReader<R, O> {
                         .min(usize::try_from(*remaining).unwrap_or(usize::MAX));
                     let n = self.inner.read(&mut out[..want])?;
                     if n == 0 {
-                        let message = format!(
-                            "ar member ending at offset {} is {} bytes short of the size \
-                             its header declares; the archive is truncated",
-                            self.pos + *remaining,
-                            *remaining
-                        );
+                        let message = record.truncated(*remaining);
                         self.phase = ArGuardPhase::Truncated {
                             message: message.clone(),
                         };
@@ -3045,6 +3111,78 @@ mod tests {
                 assert_eq!(err.exit_code(), 5, "{table} cut {cut}: {err}");
             }
         }
+    }
+
+    /// 0.10.4: the truncation message names the record the file ended in,
+    /// where its header is and how much it declared, with the bytes short.
+    /// Each stays corrupt (exit 5).
+    #[test]
+    fn a_truncated_record_is_named_by_kind_and_offset() {
+        let cut_after = |member: Vec<u8>, keep: usize| {
+            let mut out = b"!<arch>\n".to_vec();
+            out.extend(member);
+            out.truncate(8 + 60 + keep);
+            list_names(out).unwrap_err()
+        };
+        let cases: [(&str, Vec<u8>, usize, &str); 5] = [
+            (
+                "/",
+                ar_member("/", &[0u8; 200]),
+                32,
+                "the ar symbol table (`/`) at offset 8 declares 200 bytes, but the file ends \
+                 168 bytes short; the archive is truncated",
+            ),
+            (
+                "/SYM64/",
+                ar_member("/SYM64/", &[0u8; 200]),
+                32,
+                "the ar symbol table (`/SYM64/`) at offset 8 declares 200 bytes, but the file \
+                 ends 168 bytes short; the archive is truncated",
+            ),
+            (
+                "//",
+                ar_member("//", b"a_very_long_member_name.o/\n"),
+                10,
+                "the ar long-name table (`//`) at offset 8 declares 27 bytes, but the file \
+                 ends 17 bytes short; the archive is truncated",
+            ),
+            (
+                "member",
+                ar_member("a.o/", &[7u8; 100]),
+                40,
+                "the ar member at offset 8 declares 100 bytes, but the file ends 60 bytes \
+                 short; the archive is truncated",
+            ),
+            (
+                "__.SYMDEF",
+                ar_member("__.SYMDEF", &[0u8; 100]),
+                40,
+                "the ar symbol table (`__.SYMDEF`) at offset 8 declares 100 bytes, but the \
+                 file ends 60 bytes short; the archive is truncated",
+            ),
+        ];
+        for (what, member, keep, message) in cases {
+            let err = cut_after(member, keep);
+            assert_eq!(err.exit_code(), 5, "{what}: {err}");
+            assert!(err.to_string().contains(message), "{what}: {err}");
+        }
+    }
+
+    /// A BSD `#1/N` member cut inside its name bytes never reaches the
+    /// guard's message: the crate reads the name with a `read_exact` and
+    /// words the failure itself, so the text is the crate's. Still corrupt
+    /// (exit 5), pinned so a change in either is seen.
+    #[test]
+    fn a_bsd_member_cut_inside_its_name_is_the_crates_own_corrupt() {
+        let mut out = b"!<arch>\n".to_vec();
+        out.extend(ar_header_raw(&bsd_ext_identifier_field(12), 12 + 5));
+        out.extend(b"abcd");
+        let err = list_names(out).unwrap_err();
+        assert_eq!(err.exit_code(), 5, "{err}");
+        assert!(
+            err.to_string().contains("extended entry identifier"),
+            "{err}"
+        );
     }
 
     /// The endings that stay accepted: the file ending at a member boundary
