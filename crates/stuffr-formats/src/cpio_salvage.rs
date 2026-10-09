@@ -364,15 +364,34 @@ fn gate_newc_at(
 ) -> std::result::Result<Newc, Refusal> {
     let header =
         read_at(src, offset, NEWC_HEADER_LEN as u64, file_len).ok_or(Refusal::ShortHeader)?;
+    newc_named(src, offset, newc_fields(&header)?, file_len)
+}
+
+/// Gate criteria 2 and 3 on a `newc`-shaped header's [`NEWC_HEADER_LEN`]
+/// fixed bytes alone: thirteen hex fields, and a name size under the
+/// ceiling. Reads nothing, so [`find_next_header`] judges it inside its
+/// search.
+fn newc_fields(header: &[u8]) -> std::result::Result<[u32; NEWC_FIELDS], Refusal> {
     let mut fields = [0u32; NEWC_FIELDS];
     for (i, slot) in fields.iter_mut().enumerate() {
         let at = MAGIC_LEN + i * NEWC_FIELD_LEN;
         *slot = hex8(&header[at..at + NEWC_FIELD_LEN]).ok_or(Refusal::NotHex)?;
     }
-    let namesize = u64::from(fields[NAMESIZE]);
-    if namesize > MAX_CPIO_NAME_LEN {
+    if u64::from(fields[NAMESIZE]) > MAX_CPIO_NAME_LEN {
         return Err(Refusal::NameOverCeiling);
     }
+    Ok(fields)
+}
+
+/// Gate criteria 4-7 for the `newc`-shaped header at `offset` whose fixed
+/// fields [`newc_fields`] already cleared: the name read behind them.
+fn newc_named(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    fields: [u32; NEWC_FIELDS],
+    file_len: u64,
+) -> std::result::Result<Newc, Refusal> {
+    let namesize = u64::from(fields[NAMESIZE]);
     let name_at = offset
         .checked_add(NEWC_HEADER_LEN as u64)
         .ok_or(Refusal::NameRunsPastEnd)?;
@@ -397,6 +416,13 @@ fn gate_odc_at(
 ) -> std::result::Result<String, Refusal> {
     let header =
         read_at(src, offset, ODC_HEADER_LEN as u64, file_len).ok_or(Refusal::ShortHeader)?;
+    odc_named(src, offset, odc_namesize(&header)?, file_len)
+}
+
+/// [`newc_fields`]' `odc` twin: every field octal and the name size under
+/// the ceiling, on the [`ODC_HEADER_LEN`] fixed bytes alone. Answers the
+/// name size.
+fn odc_namesize(header: &[u8]) -> std::result::Result<u64, Refusal> {
     let mut at = MAGIC_LEN;
     let mut namesize = 0;
     for (i, width) in ODC_FIELD_WIDTHS.into_iter().enumerate() {
@@ -409,6 +435,17 @@ fn gate_odc_at(
     if namesize > MAX_CPIO_NAME_LEN {
         return Err(Refusal::NameOverCeiling);
     }
+    Ok(namesize)
+}
+
+/// The name behind an `odc` header whose fixed fields [`odc_namesize`]
+/// already cleared.
+fn odc_named(
+    src: &mut dyn SeekRead,
+    offset: u64,
+    namesize: u64,
+    file_len: u64,
+) -> std::result::Result<String, Refusal> {
     let name_at = offset
         .checked_add(ODC_HEADER_LEN as u64)
         .ok_or(Refusal::NameRunsPastEnd)?;
@@ -435,10 +472,65 @@ fn magic_of(bytes: &[u8]) -> Option<Magic> {
     }
 }
 
+/// A header whose fixed bytes cleared gate criteria 1-3 inside the search
+/// ([`find_next_header`]), with what the rest of the gate needs from them.
+#[derive(Debug, Clone, Copy)]
+enum Fixed {
+    /// `070701` or, with `crc`, `070702`.
+    Newc {
+        crc: bool,
+        fields: [u32; NEWC_FIELDS],
+    },
+    /// `070707`, with its name size.
+    Odc(u64),
+}
+
+/// Gate criteria 1-3 on the bytes `w` at a header start — [`NEWC_HEADER_LEN`]
+/// of them, or every byte left before EOF down to [`ODC_HEADER_LEN`].
+/// `None` for anything the gate refuses before reading a name, which is
+/// every verdict those bytes alone can decide.
+fn fixed_header(w: &[u8]) -> Option<Fixed> {
+    match magic_of(&w[..MAGIC_LEN])? {
+        magic @ (Magic::Newc | Magic::Crc) => Some(Fixed::Newc {
+            crc: magic == Magic::Crc,
+            fields: newc_fields(w.get(..NEWC_HEADER_LEN)?).ok()?,
+        }),
+        Magic::Odc => odc_namesize(&w[..ODC_HEADER_LEN]).ok().map(Fixed::Odc),
+    }
+}
+
+/// Searches forward from `from` for the next header whose fixed bytes clear
+/// gate criteria 1-3 ([`fixed_header`]), through [`ForwardSearch`], and
+/// returns its offset with what they say.
+///
+/// **Judged inside the search, not after it (0.10.3 Task 4b).** The scan
+/// used to search for a bare magic and read the 110-byte header behind
+/// each, resuming one byte past every refusal: `070701` repeated through a
+/// file — every field of it hex — read 19x its input that way, one header
+/// per six bytes. Judged here, a refused magic costs nothing beyond the
+/// search's own pass over it. A magic with fewer than [`ODC_HEADER_LEN`]
+/// bytes behind it cannot hold any header, and was always refused.
+fn find_next_header(
+    search: &mut ForwardSearch,
+    src: &mut dyn SeekRead,
+    from: u64,
+    file_len: u64,
+) -> io::Result<Option<(u64, Fixed)>> {
+    let mut found = None;
+    let at = search.find_to_eof(src, from, file_len, NEWC_HEADER_LEN, ODC_HEADER_LEN, |w| {
+        found = fixed_header(w);
+        found.is_some()
+    })?;
+    Ok(at.zip(found))
+}
+
 /// Searches forward from `from` for the next offset carrying one of the
 /// three magics, through [`ForwardSearch`]: a short first read that doubles
 /// only while the answer is still not found, so a hit a few bytes away costs
 /// a few bytes, not a fixed 64 KiB. O(1) memory however far the next one is.
+/// The tests' census of where a corpus carries a magic at all; the scan
+/// itself searches with [`find_next_header`].
+#[cfg(test)]
 fn find_next_magic(
     search: &mut ForwardSearch,
     src: &mut dyn SeekRead,
@@ -564,26 +656,28 @@ enum Scanned {
     NotAnEntry,
 }
 
+/// Gates the header at `offset` whose fixed bytes the search already
+/// cleared: criteria 4-7, the name behind them.
 fn scan_at(
     src: &mut dyn SeekRead,
     offset: u64,
-    magic: Magic,
+    fixed: Fixed,
     file_len: u64,
     memo: &mut KnownZeros,
 ) -> Scanned {
-    match magic {
-        Magic::Newc => match gate_newc_at(src, offset, file_len) {
+    match fixed {
+        Fixed::Newc { crc: false, fields } => match newc_named(src, offset, fields, file_len) {
             // The reader's end of archive, never an entry — and not the end
             // of the SCAN, since archives are concatenated (initramfs).
             Ok(newc) if newc.is_trailer() => Scanned::NotAnEntry,
             Ok(newc) => Scanned::Found(Box::new(candidate_from(src, offset, newc, file_len, memo))),
             Err(_) => Scanned::NotAnEntry,
         },
-        Magic::Crc => match gate_newc_at(src, offset, file_len) {
+        Fixed::Newc { crc: true, fields } => match newc_named(src, offset, fields, file_len) {
             Ok(newc) if !newc.is_trailer() => Scanned::Sighting(Variant::Crc),
             Ok(_) | Err(_) => Scanned::NotAnEntry,
         },
-        Magic::Odc => match gate_odc_at(src, offset, file_len) {
+        Fixed::Odc(namesize) => match odc_named(src, offset, namesize, file_len) {
             Ok(name) if name != TRAILER_NAME => Scanned::Sighting(Variant::Odc),
             Ok(_) | Err(_) => Scanned::NotAnEntry,
         },
@@ -700,12 +794,12 @@ impl SalvageScan for CpioSalvage {
             _ => from,
         };
         loop {
-            let Some((offset, magic)) =
-                find_next_magic(&mut self.search, src, search_from, file_len)?
+            let Some((offset, fixed)) =
+                find_next_header(&mut self.search, src, search_from, file_len)?
             else {
                 return Ok(None);
             };
-            match scan_at(src, offset, magic, file_len, &mut self.memo) {
+            match scan_at(src, offset, fixed, file_len, &mut self.memo) {
                 Scanned::Found(found) => {
                     self.resume = Some(Resume {
                         header: found.candidate.offset,
@@ -1851,6 +1945,25 @@ mod tests {
         let outcome = salvage_cpio(&mut src, &SalvagePolicy::default()).unwrap();
         assert!(!outcome.entries.is_empty());
         check_scan_is_linear(src.bytes_read(), len).unwrap();
+    }
+
+    /// 0.10.3 Task 4b: each magic repeated through 256 KiB — `070701` and
+    /// `070702` repeated are hex in every field, `070707` octal, so every
+    /// one reaches the fixed header's name-size check. Before the search
+    /// judged the fixed header, a magic every six bytes read a 110- or
+    /// 76-byte header each: 19x, 19x and 39x the input (at 1 MiB).
+    #[test]
+    fn dense_magics_scan_linearly() {
+        use stuffr_core::testing::{CountingSource, check_scan_is_linear};
+        const LEN: usize = 256 * 1024;
+        for magic in [NEWC_MAGIC, CRC_MAGIC, ODC_MAGIC] {
+            let data: Vec<u8> = magic.iter().copied().cycle().take(LEN).collect();
+            let mut src = CountingSource::new(Cursor::new(data));
+            let outcome = salvage_cpio(&mut src, &SalvagePolicy::default()).unwrap();
+            assert!(outcome.entries.is_empty() && outcome.sightings.is_empty());
+            check_scan_is_linear(src.bytes_read(), LEN as u64)
+                .unwrap_or_else(|e| panic!("{magic:?}: {e}"));
+        }
     }
 
     #[test]
