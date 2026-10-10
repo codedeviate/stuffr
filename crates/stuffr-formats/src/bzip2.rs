@@ -178,6 +178,120 @@ impl Sink for Bzip2Sink {
     }
 }
 
+/// Why a [`StreamReader::read`] stopped short, in libbzip2's own classes.
+///
+/// [`Codec::decoder`] folds all of these into one "corrupt" error and chains
+/// streams on its own, which is right for `stuffr` but loses what `bzip2(1)`
+/// reports: a bad magic on the first stream ("not a bzip2 file") is not a bad
+/// magic on a later one ("trailing garbage"), and neither is a CRC failure or
+/// a cut-short file. The `bzip2` compatibility mode of the `stuffr` binary
+/// needs those distinctions to reproduce bzip2's messages and exit codes.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StreamError {
+    /// `BZ_DATA_ERROR_MAGIC`: the stream does not start with `BZh1`..`BZh9`.
+    Magic,
+    /// `BZ_DATA_ERROR`: a malformed block or a CRC mismatch.
+    Data,
+    /// `BZ_UNEXPECTED_EOF`: the source ended inside the stream.
+    UnexpectedEof,
+    /// `BZ_MEM_ERROR`.
+    Memory,
+    /// Reading the source failed.
+    Io(std::io::Error),
+    /// A result libbzip2 never gives for a well-formed call sequence.
+    Unexpected,
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Magic => f.write_str("bzip2: bad magic number"),
+            Self::Data => f.write_str("bzip2: data integrity error"),
+            Self::UnexpectedEof => f.write_str("bzip2: stream ends unexpectedly"),
+            Self::Memory => f.write_str("bzip2: out of memory"),
+            Self::Io(e) => write!(f, "bzip2: {e}"),
+            Self::Unexpected => f.write_str("bzip2: unexpected decoder state"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {}
+
+/// One bzip2 stream, decoded with libbzip2's `BZ2_bzRead` contract.
+///
+/// Each [`read`](Self::read) fills its buffer completely, or up to the end of
+/// the stream, or fails; on failure the partly filled buffer is lost, exactly
+/// as `BZ2_bzRead` returns 0 on an error. The source is consumed only as far
+/// as the decoder used it, so after the stream ends the bytes left in the
+/// `BufRead` are libbzip2's "unused" bytes: the start of the next stream, or
+/// trailing garbage.
+pub struct StreamReader {
+    d: bzip2::Decompress,
+    ended: bool,
+}
+
+impl std::fmt::Debug for StreamReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamReader")
+            .field("ended", &self.ended)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamReader {
+    /// A reader for one stream. `small` selects libbzip2's low-memory
+    /// decoder; the output is the same either way.
+    pub fn new(small: bool) -> Self {
+        Self {
+            d: bzip2::Decompress::new(small),
+            ended: false,
+        }
+    }
+
+    /// Fill `out` from `src`. `Ok((n, true))` means the stream ended after
+    /// `n` bytes; `Ok((n, false))` means `n == out.len()` and more follows.
+    pub fn read<R: BufRead + ?Sized>(
+        &mut self,
+        src: &mut R,
+        out: &mut [u8],
+    ) -> std::result::Result<(usize, bool), StreamError> {
+        use bzip2::Status;
+        if self.ended {
+            return Ok((0, true));
+        }
+        let mut filled = 0;
+        loop {
+            let input = src.fill_buf().map_err(StreamError::Io)?;
+            let (in0, out0) = (self.d.total_in(), self.d.total_out());
+            let ret = self.d.decompress(input, &mut out[filled..]);
+            let consumed = (self.d.total_in() - in0) as usize;
+            let all_used = consumed == input.len();
+            filled += (self.d.total_out() - out0) as usize;
+            src.consume(consumed);
+            match ret {
+                Err(bzip2::Error::DataMagic) => return Err(StreamError::Magic),
+                Err(bzip2::Error::Data) => return Err(StreamError::Data),
+                Err(_) => return Err(StreamError::Unexpected),
+                Ok(Status::MemNeeded) => return Err(StreamError::Memory),
+                Ok(Status::StreamEnd) => {
+                    self.ended = true;
+                    return Ok((filled, true));
+                }
+                Ok(_) => {}
+            }
+            if filled == out.len() {
+                return Ok((filled, false));
+            }
+            // `BZ2_bzRead`: OK, the input used up and the file at its end,
+            // with room left in the output, is a stream cut short.
+            if all_used && src.fill_buf().map_err(StreamError::Io)?.is_empty() {
+                return Err(StreamError::UnexpectedEof);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,5 +545,95 @@ mod tests {
     #[test]
     fn bzip2_conforms() {
         stuffr_core::testing::assert_codec_conforms(&Bzip2, &meta());
+    }
+
+    /// Drain one stream through `StreamReader` in 5000-byte reads, as
+    /// `bzip2(1)` does: the decoded bytes, and what stopped it.
+    fn one_stream(src: &mut &[u8]) -> (Vec<u8>, Option<StreamError>) {
+        let mut sr = StreamReader::new(false);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 5000];
+        loop {
+            match sr.read(src, &mut buf) {
+                Ok((n, end)) => {
+                    out.extend_from_slice(&buf[..n]);
+                    if end {
+                        return (out, None);
+                    }
+                }
+                Err(e) => return (out, Some(e)),
+            }
+        }
+    }
+
+    #[test]
+    fn stream_reader_stops_at_the_end_of_one_stream_and_leaves_the_rest() {
+        let mut two = compress(b"first-");
+        let second = compress(b"second");
+        two.extend_from_slice(&second);
+        two.extend_from_slice(b"tail");
+        let mut src = &two[..];
+        let (a, e) = one_stream(&mut src);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(a, b"first-");
+        let (b, e) = one_stream(&mut src);
+        assert!(e.is_none(), "{e:?}");
+        assert_eq!(b, b"second");
+        assert_eq!(src, b"tail");
+        assert!(matches!(one_stream(&mut src).1, Some(StreamError::Magic)));
+    }
+
+    #[test]
+    fn stream_reader_classifies_like_libbzip2() {
+        let good = compress(&b"classify me ".repeat(500));
+        type Want = fn(&StreamError) -> bool;
+        let cases: Vec<(&str, Vec<u8>, Want)> = vec![
+            ("empty", vec![], |e| matches!(e, StreamError::UnexpectedEof)),
+            ("one byte B", b"B".to_vec(), |e| {
+                matches!(e, StreamError::UnexpectedEof)
+            }),
+            ("BZh", b"BZh".to_vec(), |e| {
+                matches!(e, StreamError::UnexpectedEof)
+            }),
+            ("bad digit", b"BZhX....".to_vec(), |e| {
+                matches!(e, StreamError::Magic)
+            }),
+            ("garbage", b"garbage".to_vec(), |e| {
+                matches!(e, StreamError::Magic)
+            }),
+            ("block magic", b"BZh9xxxxxxxxxx".to_vec(), |e| {
+                matches!(e, StreamError::Data)
+            }),
+            ("truncated", good[..good.len() / 2].to_vec(), |e| {
+                matches!(e, StreamError::UnexpectedEof)
+            }),
+        ];
+        for (what, bytes, want) in cases {
+            let (_, e) = one_stream(&mut &bytes[..]);
+            let e = e.unwrap_or_else(|| panic!("{what}: decoded without error"));
+            assert!(want(&e), "{what}: got {e:?}");
+        }
+        // A flipped bit in the stored stream CRC (the last bytes before the
+        // padding) is a data error, found only after all output is produced.
+        let mut bad = good.clone();
+        let n = bad.len();
+        bad[n - 2] ^= 0x01;
+        assert!(matches!(
+            one_stream(&mut &bad[..]).1,
+            Some(StreamError::Data)
+        ));
+    }
+
+    #[test]
+    fn stream_reader_fills_the_buffer_before_returning() {
+        let plain: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let packed = compress(&plain);
+        let mut sr = StreamReader::new(true);
+        let mut src = &packed[..];
+        let mut buf = [0u8; 5000];
+        for _ in 0..4 {
+            assert_eq!(sr.read(&mut src, &mut buf).unwrap().0, 5000);
+        }
+        assert_eq!(sr.read(&mut src, &mut buf).unwrap(), (0, true));
     }
 }

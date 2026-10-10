@@ -11,6 +11,14 @@
 pub use stuffr_core as core;
 pub use stuffr_core::*;
 
+/// bzip2 one stream at a time, with libbzip2's own error classes — what the
+/// `stuffr` binary's `bzip2` compatibility mode drives to reproduce
+/// `bzip2(1)`'s messages. Not part of the stable API.
+#[cfg(feature = "bzip2")]
+#[doc(hidden)]
+pub mod bzip2_stream {
+    pub use stuffr_formats::bzip2::{StreamError, StreamReader};
+}
 pub mod entries;
 mod link_cache;
 pub mod ops;
