@@ -45,6 +45,9 @@ pub struct Case<'a> {
     /// What a compressed stdout should decompress to, when that is not the
     /// stdin (or every input file concatenated in order).
     pub expect_stdout_plain: Option<Vec<u8>>,
+    /// Run in the working directory after `files` are created and before the
+    /// program starts: symlinks, hard links, permission changes.
+    pub setup: Option<fn(&Path)>,
 }
 
 /// File bytes, mode (permission bits) and mtime (seconds).
@@ -124,6 +127,9 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
         let f = fs::OpenOptions::new().write(true).open(&p).unwrap();
         f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(INPUT_MTIME))
             .unwrap();
+    }
+    if let Some(setup) = c.setup {
+        setup(&work);
     }
 
     let guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -220,15 +226,33 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
     }
 }
 
+/// The only normalisation: the program path becomes the bare invoked name.
+/// Only a whole occurrence is replaced, one followed by `:`, whitespace or
+/// the end of the text, so a longer path that merely starts with the
+/// program path (`/x/bzip2.bak`) is left alone.
+pub fn normalise_stderr(raw: &[u8], exe: &Path, name: &str) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let path = exe.to_str().unwrap();
+    let mut out = String::with_capacity(text.len());
+    let mut rest: &str = &text;
+    while let Some(i) = rest.find(path) {
+        let after = &rest[i + path.len()..];
+        let whole = after
+            .chars()
+            .next()
+            .is_none_or(|c| c == ':' || c.is_whitespace());
+        out.push_str(&rest[..i]);
+        out.push_str(if whole { name } else { path });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Read to end-of-file on a worker thread. A pty master reports hang-up as
 /// 0 on macOS and as `EIO` on Linux, and only those two count as end of file.
 /// `Interrupted` is retried; anything else panics, so the `join().unwrap()`
 /// surfaces it rather than handing back a silently truncated stream.
-/// The only normalisation: the program path becomes the bare invoked name.
-pub fn normalise_stderr(raw: &[u8], exe: &Path, name: &str) -> String {
-    String::from_utf8_lossy(raw).replace(exe.to_str().unwrap(), name)
-}
-
 fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut v = Vec::new();
@@ -321,7 +345,9 @@ fn walk(root: &Path, dir: &Path, t: &mut Tree) {
                 ),
             );
         } else {
-            t.insert(rel, (fs::read(&p).unwrap(), mode, md.mtime()));
+            // A file the case made unreadable is recorded, not fatal.
+            let bytes = fs::read(&p).unwrap_or_else(|_| b"<unreadable>".to_vec());
+            t.insert(rel, (bytes, mode, md.mtime()));
         }
     }
 }
