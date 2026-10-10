@@ -106,6 +106,11 @@ Adding the terminal app under *System Settings → Privacy & Security →
 Developer Tools* removed that cost (a fresh copy outside `deps` starts in
 0.54 s), and `cargo clean` is now the cure, not the trap.
 
+**Since 0.11.0 the `compat_bzip2` test binary adds about 20 s to each
+leg**: its differential cases each spawn the system `bzip2` and a stuffr
+link, eight at a time. Approximate, from the implementing task's own runs;
+the gate's measured figure is re-taken at the bump.
+
 For the record, the slowest actual TEST is
 `lzma_pure::tests::corruption_sweep_is_detected_almost_everywhere` at
 **19.17 s** — 91% of the slowest binary's wall time on the `--all-features`
@@ -236,7 +241,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.10.2` | File identity, not spelling: `salvage` keeps both of two names a case-insensitive volume folds together (`NAME.salvaged-N`, exit 4) and never disambiguates onto an archive-named entry; `unpack` attributes a case-folded clash to the archive; the containment oracle skips names the filesystem refuses; a `--force` extraction leg in the `container` fuzz target. |
 | `0.10.3` | Linear salvage scans: `ForwardSearch` (growing-chunk forward search, window kept per source), cpio zero-run memo, tar per-header chain and scan-wide extension budgets, a scan-wide verdict budget (`ScanBudget`, `2 × file_len + 32 KiB`) in zip, zoo, lha, arj and cpio, reported as work- or verdict-bounded sightings; the `salvage` fuzz oracle `check_scan_is_linear` (8× + 64 KiB); GNU tar `L`/`K` capped at 16 MiB (exit 6); GNU ar `/SYM64/` read; `cargo doc -D warnings` gated. |
 | `0.10.4` | Honest ends: a truncated `ar` (member, `/`, `/SYM64/`, `//`) is exit 5 in every verb, the message naming the record; a zip symlink target over 64 KiB is exit 6 (seekable); a salvage refusal keeps its bounded notes; stored sightings capped at 64 per shape (`SightingLog`, `Sighting.more`). |
-| `0.11.x`/later | The rest of Phase 5 — compatibility symlinks with `install-links`, polish. Not yet claimed by a single number; whichever lands next takes the next open one. |
+| `0.11.0` | Phase 5's first part — compatibility links: `argv[0]` dispatch, `stuffr install-links --dir DIR` (opt-in, Homebrew's stable `opt` target), the differential harness, and the bzip2 family (`bzip2`, `bunzip2`, `bzcat`, `bzip2recover`) behaving as bzip2 1.0.8 — flags, files, exit codes and stderr byte-identical, compressed output byte-identical on both tiers; the `compat` fuzz target; `stuffr-cli` licensed `MIT AND bzip2-1.0.6`. A MINOR because it is a new user-facing surface. |
+| `0.12.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (gzip, then xz/lzma, zstd, lz4, then `unzip`/`zipinfo`; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -592,10 +598,20 @@ Phase 2 and both the same shape:
 
 Each is a **self-referential struct**: an owning box leaked to a raw pointer
 so a borrowed iterator can live beside the thing it borrows from, reclaimed
-in `Drop`. There is no other `unsafe` anywhere in the workspace, and adding
-a third place is a design decision, not a patch — reach for an owning API
-(the way `cpio.rs` does, with a plain state enum and no `unsafe` at all)
-before reaching for a raw pointer.
+in `Drop`. There is no other self-referential `unsafe` in the workspace,
+and adding a third place is a design decision, not a patch — reach for an
+owning API (the way `cpio.rs` does, with a plain state enum and no `unsafe`
+at all) before reaching for a raw pointer.
+
+**`0.11.0` added one FFI call of a different kind**, once in each
+compatibility entry point (`compat/bzip2/mod.rs`, `compat/bzip2recover/mod.rs`):
+`libc::signal(SIGPIPE, SIG_DFL)`, so that a closed pipe kills the process as
+it kills bzip2. It installs no handler and touches no Rust state, it runs only
+on the compatibility path (never under `stuffr` itself, and never in the
+in-process `run_in` the fuzz target drives), and it carries its `SAFETY:`
+comment. It is why `libc` is a `cfg(unix)` dependency of `stuffr-cli`. Test
+code calls `libc` too (the compat tests' `openpty`, `geteuid`,
+`getrusage`); none of it is in a shipped binary.
 
 Rules for touching either region:
 
@@ -987,6 +1003,71 @@ gate sits there.
 invariants (or which codec/container property) it violates, and add it as a
 named unit or CLI test the normal way — the artifact itself is not the
 fix and is not meant to be committed.
+
+## Compatibility families
+
+A compatibility family is a set of names under which the `stuffr` binary
+behaves as another tool (README, "Compatibility links"). bzip2 (`bzip2`,
+`bunzip2`, `bzcat`, `bzip2recover`) is the first, in `0.11.0`. **The family's
+own spec decides its byte-identity promise** before any code is written:
+which tier, against which tool and version, byte-identical or compatible
+behaviour only. The planned tiers come from the Phase 5 design's Decision 2,
+and a family never promises more than its spec states.
+
+Adding a family touches these places, and the tests fail if one is missed:
+
+- **`compat::NAMES`** in `crates/stuffr-cli/src/compat/mod.rs`: one row per
+  name, mapped to a `Family` variant, plus that family's arm in `dispatch`
+  and in `run_in`. `install-links` and `compat::names()` read the same
+  table, so the links follow by themselves.
+- **`compat/<family>/mod.rs`** holds the entry point,
+  `run(name, args) -> ExitCode`, which gets the arguments after `argv[0]`.
+  A tool that prints its own `argv[0]` gets it instead, as
+  `bzip2recover::run(argv0, args)` does. The module doc carries the
+  attribution and the family's list of known deviations. **`messages.rs`**
+  beside it holds every string verbatim from the reference source, each
+  commented with the function it comes from.
+- **The lint exemption.** `cli.rs`'s
+  `no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation`
+  skips exactly `src/compat/<family>/messages.rs`, matched by whole path
+  components (`is_verbatim_reference_messages`), because that file is
+  verbatim reference text whose bytes the differential harness pins. Keep a
+  family's strings there; the same text in `run.rs` would be flagged.
+- **The differential harness** is `crates/stuffr-cli/tests/compat_harness/`
+  (unix only). A `Case` runs once under the reference tool and once under a
+  symlink to stuffr, each in a fresh directory, and `assert_same` compares
+  exit code, stdout, stderr (with only the program path normalised), the
+  file tree, bytes, modes and mtimes, listing every difference. Each family
+  gets its own `tests/compat_<family>.rs`. Every reference lookup goes
+  through `require_reference`, which skips with a note locally and **panics
+  when `CI` is set**, so a runner without the tool cannot pass vacuously.
+- **The fuzz table** `stuffr_core::testing::COMPAT_NAMES` is the `compat`
+  target's tool selector, and it is append-only like every slot table (see
+  Fuzzing). The unit test `compat::tests::fuzz_names_match_the_dispatch_table`
+  keeps it equal to `compat::names()`, in order, so a name added to one and
+  not the other fails the gate rather than going unfuzzed.
+- **`examples.txt`** documents the names under COMPATIBILITY LINKS.
+
+**Reference tools.** The bzip2 family is tested against the system
+`/usr/bin/bzip2` and `/usr/bin/bzip2recover`, which are not the same program
+on both CI platforms:
+
+- **macOS ships upstream bzip2 1.0.8.** That is the oracle the family was
+  built against, and every case runs there.
+- **ubuntu-latest ships Debian's 1.0.8-6**, and two of its patches change
+  observable behaviour. `20-legacy.patch` makes `-V`/`-L` exit after the
+  licence, where upstream carries on and compresses stdin.
+  `bzip2recover-race-open-output.diff` opens each `rec*` output with
+  `O_EXCL`, mode 0600, so it refuses a name that already exists, where
+  upstream truncates it or writes through a symlink.
+- **stuffr keeps upstream's behaviour**, and the tests probe for each patch
+  (`reference_exits_after_license` in `compat_bzip2.rs`, `debian_reference`
+  in `compat_bzip2recover.rs`). On a patched reference they skip the cases
+  the patch changes, with a note naming the patch, and on Debian they still
+  check stuffr's own `rec*` mode. That is a deviation of the test oracle,
+  not of stuffr.
+- **The `perror` text after a cut-short stream** is compared exactly on
+  macOS and blanked on both sides elsewhere.
 
 ## Testing
 

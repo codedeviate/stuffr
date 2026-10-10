@@ -235,6 +235,25 @@ read list.
 > default tier — measured from this bump's own `make check`,
 > `GATE_EXIT=0`.
 >
+> `0.11.0` is a MINOR, the first part of Phase 5: **compatibility links,
+> bzip2 family.** Invoked as `bzip2`, `bunzip2`, `bzcat` or `bzip2recover`
+> (through a symlink the new `stuffr install-links --dir DIR` makes, never
+> automatically), the binary behaves as bzip2 1.0.8: the same flags, files,
+> exit codes (0–3) and stderr, byte for byte, and compressed output
+> byte-identical on both build tiers. `--version`/`-L` name stuffr on their
+> first line; the known deviations are listed under
+> [Compatibility links](#compatibility-links). Links point at Homebrew's
+> stable `opt` path, so they survive `brew upgrade`. Invoking `stuffr`
+> itself is unchanged. **Licence:** `stuffr-cli` now carries code ported
+> from bzip2 1.0.8, so its licence metadata is `MIT AND bzip2-1.0.6`
+> (`crates/stuffr-cli/LICENSE-bzip2`). Additive library API, all
+> `#[doc(hidden)]` or behind `testing`: `stuffr::bzip2_stream` (a
+> per-stream bzip2 reader that keeps libbzip2's error kinds),
+> `testing::{COMPAT_NAMES, COMPAT_TOKENS, COMPAT_FILES, CompatCase,
+> encode_compat_case, decode_compat_case}`; a sixth fuzz target, `compat`.
+> <!-- test counts: re-measure from the bump's own `make check` and add the
+> "**N** tests under `--all-features`, **M** on the default tier" line. -->
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
@@ -821,6 +840,114 @@ cargo add stuffr                # the facade; re-exports stuffr-core + stuffr-fo
 | [`stuffr-formats`](https://crates.io/crates/stuffr-formats) | codec and container implementations |
 | [`stuffr-core`](https://crates.io/crates/stuffr-core) | traits, stream ladder, fidelity, governor, registry — zero format dependencies |
 
+## Compatibility links
+
+Invoked as `bzip2`, `bunzip2`, `bzcat` or `bzip2recover`, the `stuffr` binary
+behaves as **bzip2 1.0.8**: that tool's flags, files, exit codes and messages,
+not stuffr's. The binary reads the name from `argv[0]`, the file name only,
+before parsing anything. Any other name, `stuffr` included, runs the stuffr
+CLI unchanged. So does a link you make by hand under a name stuffr does not
+handle: `gzip -> stuffr` runs `stuffr`, not gzip.
+
+### Opting in
+
+**Links are never created automatically**, not by `cargo install` and not by
+Homebrew. One verb makes them:
+
+```sh
+stuffr install-links --dir ~/.local/bin                  # all four names
+stuffr install-links --dir ~/.local/bin --names bzcat    # comma-separated subset
+stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
+stuffr install-links --dir ~/.local/bin --force          # replace what is already there
+stuffr install-links --dir ~/.local/bin --remove         # remove stuffr's links, nothing else
+```
+
+- **Each link points at this stuffr.** Under Homebrew the target is the
+  stable `<prefix>/opt/stuffr/bin/stuffr`, not the versioned
+  `Cellar/stuffr/<ver>/` path that `brew upgrade` deletes, so the links
+  survive an upgrade. A link left dangling into a stuffr that was deleted
+  (one made by an older install) still counts as stuffr's: a re-run replaces
+  it without `--force`, and `--remove` removes it.
+- **A second run** reports `already present` and changes nothing.
+- **Anything else at a link's name** (a regular file, or a link to another
+  tool) is refused at exit 2, naming the path, and left untouched; `--force`
+  replaces it. A directory is never replaced. Every name is checked before
+  anything is changed, so a refusal leaves DIR as it was.
+- **`--remove` touches only stuffr's links**: a link whose text is the
+  target, one that resolves to this stuffr, or a dangling one into a file
+  named `stuffr`. Every other entry of the same name stays, with a
+  `left PATH: not a stuffr link` (or `not a link`) line.
+- **Errors:** a missing DIR is exit 2; one that cannot be written to is
+  exit 1, naming the link and the operating system's reason. On Windows the
+  verb is refused at exit 3.
+
+### The promise
+
+- **Flags, files, exit codes and stderr are those of bzip2 1.0.8,
+  byte for byte.** That covers every documented flag, short and long, in
+  clusters (`-dkv`), with `--`, and the `BZIP2` then `BZIP` environment
+  words. Output names, kept or removed inputs, copied mtime and permissions
+  all match. The exit codes are bzip2's, not stuffr's 0–7: 0 success,
+  1 environment problem, 2 corrupt input, 3 internal error; `bzip2recover`
+  exits 0 or 1. Every message matches, including the `-v` statistics line
+  and `--help`. Where `bzip2.c` surprises, stuffr follows it: `-V` and `-L`
+  print and carry on, a terminal is refused even under `-f`, and `-s` caps
+  the compression block size at 200k.
+- **Compressed output is byte-identical** to bzip2 1.0.8 at every level, on
+  both build tiers. The default level is 9, not stuffr's own 6.
+  `bzip2recover`'s `rec*` files are byte-identical too.
+- **The one intended difference:** `--version`, `-V`, `--license` and `-L`
+  name stuffr and its version on the first line. The rest of that text is
+  verbatim.
+
+A differential suite runs each case through the system's bzip2 and through
+a stuffr link, and compares exit code, stdout, stderr, files, bytes, modes
+and mtimes.
+
+### Known deviations
+
+- **`-vv` behaves as `-v`.** libbzip2's internal trace (block CRCs, sorting
+  statistics) is not reachable through stuffr's codec API.
+- **An interrupted run leaves a hidden `.stuffr-bzip2-*.tmp` file.** Output
+  is written under a temporary name and renamed into place. bzip2's signal
+  handler deletes its partial output; stuffr has no such handler.
+- **When the parent ignores `SIGPIPE`**, bzip2 reports a Broken pipe I/O
+  error and exits 1; stuffr dies of `SIGPIPE`. The Rust runtime ignores the
+  signal before `main`, so the inherited setting cannot be read. Under the
+  default setting both die of `SIGPIPE`.
+- **The `perror` line after a cut-short stream** reproduces the `errno`
+  bzip2 leaves behind on macOS. Elsewhere stuffr prints `strerror(0)`.
+- **bzip2recover at exactly 50000 blocks.** At 50000 magics with at least 40
+  bits after the last, bzip2recover 1.0.8 writes past its arrays and, on
+  macOS, silently drops block 1. stuffr writes it. Upstream's undefined
+  behaviour is never reproduced.
+- **bzip2recover and existing files.** As upstream does, it writes its
+  `rec*` files through a symlink already at that name and truncates a file
+  already there. This differs from Debian's patched build, which refuses
+  both (it opens with `O_EXCL`, mode 0600).
+
+### Roadmap
+
+One family per release, each with its own spec stating its byte-identity
+promise: **gzip next, then xz/lzma, zstd, lz4, then `unzip`/`zipinfo`.**
+`tar` is excluded (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)). The planned
+tiers:
+
+- **Byte-identical:** bzip2, on both tiers; xz/lzma and zstd on the
+  `c-backed` tier, against stated tool versions; gzip against BSD gzip on
+  the `c-backed` tier, via zlib.
+- **Compatible behaviour only** (the same flags, files, exit codes and
+  messages, and output the real tool reads): lz4; GNU gzip's exact bytes;
+  every family except bzip2 on the pure tier.
+
+### Attribution
+
+The bzip2 family is ported from bzip2 1.0.8's `bzip2.c` and
+`bzip2recover.c`, copyright (C) 1996-2019 Julian Seward, under the bzip2
+licence reproduced in
+[`crates/stuffr-cli/LICENSE-bzip2`](crates/stuffr-cli/LICENSE-bzip2).
+`stuffr-cli`'s licence metadata is therefore `MIT AND bzip2-1.0.6`.
+
 ## Why another one
 
 Three specific gaps, rather than a general wish for tidiness.
@@ -909,8 +1036,8 @@ OOM killer.
 six round-trip containers
 (`ar`, `arj`, `cpio`, `lha`, `tar`, `zip`/`zip64`) `stuffr formats` lists — `pack`/`unpack`/
 `cat` are entry-aware for every container, with extraction-time path
-containment and bomb limits on by default. `convert` works too;
-`install-links` is not implemented yet. `pack` walks a directory tree, and
+containment and bomb limits on by default. `convert` and `install-links`
+work too (the bzip2 family only, so far). `pack` walks a directory tree, and
 `pack -o bundle.tar.gz` composes a container on top of a codec in one pass.
 `salvage` is the one recovery-biased verb, and everything else here stays
 as uncompromising as it was before it existed. It recovered zip archives
@@ -946,8 +1073,10 @@ codec with no magic bytes nested inside another (gzip over brotli) is not
 peeled and stays in the output, as with `unpack`.
 
 `ARCHIVE` accepts `-` for stdin everywhere. Optional compat symlinks
-argv[0]-dispatch into the same code, so `gzip`, `gunzip`, `zcat`, `bzip2`, `xz`,
-`zstd`, `unzip` and friends drop into existing scripts unchanged.
+argv[0]-dispatch into the same binary, so the tools they are named for drop
+into existing scripts unchanged: `bzip2`, `bunzip2`, `bzcat` and
+`bzip2recover` today, then `gzip`, `xz`, `zstd`, `lz4`, `unzip` and friends, one
+family per release — see [Compatibility links](#compatibility-links).
 
 ### Two safety defaults that are not negotiable
 
@@ -1087,8 +1216,17 @@ already taken on crates.io, and the command was `stf` to match them.
 
 [MIT](LICENSE).
 
-That covers this project's own code. It does **not** extend to dependencies, and
-two are worth naming.
+That covers this project's own code, with one exception inside it: the
+compatibility links' bzip2 family (`crates/stuffr-cli/src/compat/bzip2/` and
+`compat/bzip2recover/`) is ported from bzip2 1.0.8 and stays under Julian
+Seward's bzip2 licence, reproduced in
+[`crates/stuffr-cli/LICENSE-bzip2`](crates/stuffr-cli/LICENSE-bzip2). That
+is why `stuffr-cli`'s licence metadata is `MIT AND bzip2-1.0.6`; the other
+three crates are MIT. The bzip2 licence is a permissive BSD-style one: it
+asks that the notice be kept, the origin not be misrepresented, and altered
+source be plainly marked as such.
+
+Neither licence extends to dependencies, and two are worth naming.
 
 `lzma-rust2`, which provides the pure-Rust xz, LZMA1 and LZIP backends, is
 **Apache-2.0**. It is the first non-MIT dependency in a *default* build — until
