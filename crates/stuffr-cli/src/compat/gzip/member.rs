@@ -271,9 +271,15 @@ pub(crate) fn inflate_member<R: Read>(
     })
 }
 
-/// A `BufRead` over any `Read` whose `fill_buf` yields at least two bytes
+/// How many bytes [`Lookahead::fill_buf`] guarantees (EOF aside): enough for
+/// `1f 8b` at a member boundary and for the longest magic the sniffer reads
+/// (the four-byte `PK\x03\x04`, `\xfd7zX`, `LZIP`).
+pub(crate) const PEEK: usize = 4;
+
+/// A `BufRead` over any `Read` whose `fill_buf` yields at least [`PEEK`] bytes
 /// unless the stream is at EOF, so [`after_member`] can always see a possible
-/// `1f 8b` whole whatever the source's read sizes. Callers walking
+/// `1f 8b` whole, and `sniff::detect` a whole magic, whatever the source's
+/// read sizes. Callers walking
 /// multi-member input wrap their source in this once and use it throughout.
 pub(crate) struct Lookahead<R: Read> {
     inner: R,
@@ -308,11 +314,11 @@ impl<R: Read> Read for Lookahead<R> {
 
 impl<R: Read> BufRead for Lookahead<R> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if self.end - self.pos < 2 {
+        if self.end - self.pos < PEEK {
             self.buf.copy_within(self.pos..self.end, 0);
             self.end -= self.pos;
             self.pos = 0;
-            while self.end < 2 {
+            while self.end < PEEK {
                 match self.inner.read(&mut self.buf[self.end..]) {
                     Ok(0) => break,
                     Ok(n) => self.end += n,

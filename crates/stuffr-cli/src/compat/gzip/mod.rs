@@ -5,3 +5,4 @@
 #![allow(dead_code)] // wired into dispatch in Task 7
 
 pub(crate) mod member;
+pub(crate) mod sniff;
