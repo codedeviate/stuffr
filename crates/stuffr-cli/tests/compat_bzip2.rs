@@ -40,6 +40,19 @@ mod unix {
         assert_same(&c, &a, &b);
     }
 
+    /// A missing reference skips locally and fails on CI.
+    #[test]
+    fn a_missing_reference_fails_only_on_ci() {
+        let missing = std::path::Path::new("/nonexistent/stuffr-no-such-tool");
+        let r = std::panic::catch_unwind(|| require_reference(missing));
+        if std::env::var_os("CI").is_some() {
+            assert!(r.is_err(), "CI is set, so a missing reference must panic");
+        } else {
+            assert_eq!(r.ok(), Some(false));
+        }
+        assert!(require_reference(std::path::Path::new("/bin/sh")));
+    }
+
     /// A pty on stdout makes bzip2 refuse to write compressed data to it.
     #[test]
     fn tty_stdout_is_a_terminal_for_the_reference() {
@@ -397,9 +410,11 @@ mod differential {
     }
 
     /// Compress with the reference tool; `None` when it is not installed.
+    /// Compress with the reference; `None` when it is missing (a panic on
+    /// CI, see `require_reference`).
     fn ref_bz(data: &[u8], level: &str) -> Option<Vec<u8>> {
         let exe = Path::new(REFERENCE_DIR).join("bzip2");
-        if !exe.exists() {
+        if !require_reference(&exe) {
             return None;
         }
         let mut child = Command::new(exe)
@@ -649,7 +664,7 @@ mod differential {
     /// compresses stdin, so `bzip2 -V </dev/null` writes an empty stream.
     fn reference_exits_after_license() -> Option<bool> {
         let exe = Path::new(REFERENCE_DIR).join("bzip2");
-        if !exe.exists() {
+        if !require_reference(&exe) {
             return None;
         }
         let out = Command::new(exe)
@@ -1265,7 +1280,7 @@ mod differential {
             "stuffr as bzcat: {ours:?}"
         );
         let reference = Path::new(REFERENCE_DIR).join("bzcat");
-        if reference.exists() {
+        if require_reference(&reference) {
             let theirs = closed_pipe_status(&reference, &dir);
             assert_eq!(
                 theirs.signal(),

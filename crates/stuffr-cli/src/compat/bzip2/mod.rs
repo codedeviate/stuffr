@@ -17,6 +17,10 @@
 //! - Output is written under a temporary name and renamed into place, so an
 //!   interrupted run leaves a `.stuffr-bzip2-*.tmp` file where bzip2's signal
 //!   handler would have deleted its partial output.
+//! - When the parent ignores `SIGPIPE` (`SIG_IGN` inherited across exec),
+//!   bzip2 reports a Broken pipe I/O error and exits 1; stuffr dies of
+//!   `SIGPIPE`, because the Rust runtime sets `SIG_IGN` before `main` and the
+//!   inherited disposition cannot be read on stable Rust.
 //! - The `perror` text after a cut-short stream reproduces the `errno` that
 //!   bzip2 happens to leave behind as measured on macOS; elsewhere it prints
 //!   `strerror(0)`.

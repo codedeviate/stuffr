@@ -93,12 +93,28 @@ impl Drop for Scratch {
     }
 }
 
-/// Run the reference tool `tool_dir/<name>`. `None` (after printing
-/// `skipped: <tool> not installed`) when it is missing.
+/// Whether the reference tool `exe` is installed. When it is not, print
+/// `skipped: <tool> not installed` and return false — except on CI (the
+/// `CI` environment variable is set), where a missing reference is a
+/// failure: every test that skips on it would otherwise pass vacuously.
+pub fn require_reference(exe: &Path) -> bool {
+    if exe.exists() {
+        return true;
+    }
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "CI is set but the reference tool {} is not installed",
+        exe.display()
+    );
+    eprintln!("skipped: {} not installed", exe.display());
+    false
+}
+
+/// Run the reference tool `tool_dir/<name>`. `None` when it is missing (see
+/// [`require_reference`], which panics instead on CI).
 pub fn reference(tool_dir: &str, c: &Case) -> Option<Run> {
     let exe = Path::new(tool_dir).join(c.name);
-    if !exe.exists() {
-        eprintln!("skipped: {} not installed", c.name);
+    if !require_reference(&exe) {
         return None;
     }
     let s = Scratch::new();
