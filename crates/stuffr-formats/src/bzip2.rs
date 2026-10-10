@@ -188,6 +188,7 @@ impl Sink for Bzip2Sink {
 /// needs those distinctions to reproduce bzip2's messages and exit codes.
 #[derive(Debug)]
 #[non_exhaustive]
+#[doc(hidden)]
 pub enum StreamError {
     /// `BZ_DATA_ERROR_MAGIC`: the stream does not start with `BZh1`..`BZh9`.
     Magic,
@@ -226,6 +227,7 @@ impl std::error::Error for StreamError {}
 /// as the decoder used it, so after the stream ends the bytes left in the
 /// `BufRead` are libbzip2's "unused" bytes: the start of the next stream, or
 /// trailing garbage.
+#[doc(hidden)]
 pub struct StreamReader {
     d: bzip2::Decompress,
     ended: bool,

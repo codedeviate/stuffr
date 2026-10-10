@@ -1108,6 +1108,21 @@ mod differential {
             ),
             case("bzip2", &["sub/a.txt"], vec![("sub/a.txt", t.clone())]),
         ];
+        // `bzip2 -f /dev/null` compresses the device and then removes its
+        // input, as both tools do: run as root, that deletes /dev/null.
+        let root = unsafe { libc::geteuid() } == 0;
+        let cases: Vec<_> = cases
+            .into_iter()
+            .filter(|c| {
+                let destructive = c.name == "bzip2" && c.args == ["-f", "/dev/null"];
+                if root && destructive {
+                    eprintln!(
+                        "files: skipping `bzip2 -f /dev/null` as root (it removes /dev/null)"
+                    );
+                }
+                !(root && destructive)
+            })
+            .collect();
         check_all("files", &cases);
     }
 

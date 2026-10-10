@@ -134,6 +134,13 @@ pub(crate) fn copy_metadata_from(meta: &std::fs::Metadata, to: &Path) -> io::Res
 mod tests {
     use super::*;
 
+    /// The `compat` fuzz target picks its tool from `COMPAT_NAMES`; a name
+    /// added here and not there would go unfuzzed.
+    #[test]
+    fn fuzz_names_match_the_dispatch_table() {
+        assert_eq!(stuffr::testing::COMPAT_NAMES, names());
+    }
+
     #[test]
     fn compat_names_are_recognised_by_file_name_only() {
         use std::ffi::OsStr;

@@ -126,7 +126,7 @@ pub fn install_links(
                 dir.display()
             )));
         }
-        Err(e) => return Err(at(&dir, e)),
+        Err(e) => return Err(at(dir, e)),
     };
     let file = target.canonicalize().ok();
 
