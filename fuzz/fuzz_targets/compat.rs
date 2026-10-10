@@ -19,8 +19,9 @@
 //!   `1` environment, `2` corrupt, `3` internal), 0 or 1 for bzip2recover;
 //! - nothing is created, changed or removed outside the run's directory:
 //!   each run gets a fresh directory inside a per-process sandbox parent, and
-//!   `check_extraction_contained` walks the parent afterwards; nothing named
-//!   like an output appears in the real working directory either;
+//!   `check_extraction_contained` walks the parent afterwards (the parent is
+//!   removed at the end of every iteration); no name the tools could write
+//!   appears in, changes in or vanishes from the real working directory;
 //! - bzip2recover reads its input at most twice (two opens, at most
 //!   `2 × len` bytes: its two passes) and within `check_scan_is_linear`'s
 //!   bound, creates at most 50000 outputs, and writes at most the input's
@@ -35,18 +36,20 @@
 #![no_main]
 
 use std::cell::Cell;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use libfuzzer_sys::fuzz_target;
 use stuffr_cli::compat::{self, bzip2recover};
 use stuffr_core::testing::{
-    COMPAT_FUZZ_MAX_INPUT, check_extraction_contained, check_scan_is_linear, decode_compat_case,
+    COMPAT_FILES, COMPAT_FUZZ_MAX_INPUT, check_extraction_contained, check_scan_is_linear,
+    decode_compat_case,
 };
 
 /// `BZ_MAX_HANDLED_BLOCKS`: bzip2recover writes no more outputs than this.
@@ -57,44 +60,84 @@ const MAX_HANDLED_BLOCKS: u64 = 50_000;
 /// byte for a block whose bits end mid-byte.
 const RECOVER_FRAME: u64 = 4 + 6 + 6 + 4 + 1;
 
-/// The per-process sandbox parent; each run's directory is made inside it.
+/// The per-process sandbox parent. Each iteration creates it, makes its run
+/// directory inside, and removes the whole parent at the end, so only a
+/// crash leaves it behind. Per pid, so `-jobs` workers never share one.
 fn sandbox() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
-        let d = std::env::temp_dir().join(format!("stuffr-fuzz-compat-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).expect("create the sandbox parent");
-        d
+        std::env::temp_dir().join(format!("stuffr-fuzz-compat-{}", std::process::id()))
     })
 }
 
-/// The real working directory's entries before the first run.
-fn cwd_before() -> &'static (PathBuf, BTreeSet<OsString>) {
-    static CWD: OnceLock<(PathBuf, BTreeSet<OsString>)> = OnceLock::new();
+/// Whether `name` is one the tools could write in their working directory:
+/// a `COMPAT_FILES` name or one derived from it (`.bz2` added, a suffix
+/// mapped to `.tar` or `.out`, a `.bz2` stripped), a bzip2recover output
+/// (`rec` and five digits), or bzip2's temporary (`.stuffr-bzip2-*`).
+fn could_be_written(name: &str) -> bool {
+    let mut bases: Vec<String> = Vec::new();
+    for f in COMPAT_FILES {
+        bases.push((*f).to_owned());
+        for (z, u) in [
+            (".bz2", ""),
+            (".bz", ""),
+            (".tbz2", ".tar"),
+            (".tbz", ".tar"),
+        ] {
+            if let Some(stem) = f.strip_suffix(z) {
+                bases.push(format!("{stem}{u}"));
+            }
+        }
+    }
+    let derived = |b: &str| [b.to_owned(), format!("{b}.bz2"), format!("{b}.out")];
+    let rec = name
+        .strip_prefix("rec")
+        .is_some_and(|r| r.len() >= 5 && r.as_bytes()[..5].iter().all(u8::is_ascii_digit));
+    rec || name.starts_with(".stuffr-bzip2-")
+        || bases.iter().any(|b| derived(b).iter().any(|d| d == name))
+}
+
+/// Names the tools could write, each with its length and modification time.
+type Snapshot = BTreeMap<OsString, (u64, Option<SystemTime>)>;
+
+/// Every name in `dir` the tools could write, with its length and
+/// modification time.
+fn writable_names(dir: &Path) -> Snapshot {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return BTreeMap::new();
+    };
+    listing
+        .flatten()
+        .filter(|e| could_be_written(&e.file_name().to_string_lossy()))
+        .map(|e| {
+            let meta = std::fs::symlink_metadata(e.path()).ok();
+            let len = meta.as_ref().map_or(0, |m| m.len());
+            let mtime = meta.and_then(|m| m.modified().ok());
+            (e.file_name(), (len, mtime))
+        })
+        .collect()
+}
+
+/// The real working directory's writable names before the first run.
+fn cwd_before() -> &'static (PathBuf, Snapshot) {
+    static CWD: OnceLock<(PathBuf, Snapshot)> = OnceLock::new();
     CWD.get_or_init(|| {
         let cwd = std::env::current_dir().expect("current dir");
-        (cwd.clone(), listing(&cwd))
+        let names = writable_names(&cwd);
+        (cwd, names)
     })
 }
 
-fn listing(dir: &Path) -> BTreeSet<OsString> {
-    std::fs::read_dir(dir)
-        .map(|l| l.flatten().map(|e| e.file_name()).collect())
-        .unwrap_or_default()
-}
-
-/// No entry the tools could have written (an operand, an output, a
-/// temporary) has appeared in the real working directory. Only those names
-/// are compared, so libFuzzer's own files there never trip it.
+/// No name the tools could write (an operand, an output, a temporary) has
+/// appeared in, changed in or vanished from the real working directory.
+/// Only such names are compared, so libFuzzer's own files never trip it.
 fn check_cwd_untouched() {
     let (cwd, before) = cwd_before();
-    for name in listing(cwd).difference(before) {
-        let n = name.to_string_lossy();
-        assert!(
-            !(n.starts_with('a') || n.starts_with("rec") || n.starts_with(".stuffr-bzip2-")),
-            "compat: {n:?} appeared in the real working directory {cwd:?}"
-        );
-    }
+    let now = writable_names(cwd);
+    assert!(
+        &now == before,
+        "compat: the real working directory {cwd:?} changed: before {before:?}, now {now:?}"
+    );
 }
 
 /// bzip2recover's file system, inside the run's directory, counting what
@@ -215,8 +258,9 @@ fuzz_target!(|data: &[u8]| {
     };
     cwd_before();
     let parent = sandbox();
+    let _ = std::fs::remove_dir_all(parent);
+    std::fs::create_dir_all(parent).expect("create the sandbox parent");
     let dir = parent.join("run");
-    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir(&dir).expect("create the run directory");
     for f in &case.files {
         std::fs::write(dir.join(f), case.payload).expect("write a case file");
@@ -231,5 +275,5 @@ fuzz_target!(|data: &[u8]| {
 
     check_extraction_contained(parent, &dir, &[]).expect("compat: contained");
     check_cwd_untouched();
-    std::fs::remove_dir_all(&dir).expect("remove the run directory");
+    std::fs::remove_dir_all(parent).expect("remove the sandbox parent");
 });

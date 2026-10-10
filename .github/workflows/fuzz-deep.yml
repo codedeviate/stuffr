@@ -81,6 +81,16 @@ jobs:
       fail-fast: false
       matrix:
         target: [codec, container, chain, roundtrip, salvage, compat]
+        # Extra libFuzzer flags for one target. `compat` gets a per-input
+        # timeout: a bzip2 stream of a few dozen bytes decodes to tens of
+        # MB, and `run_in`'s 8 MiB budget is what bounds that work (decode
+        # under `-t` included). 60 s is far past any bounded input, so a
+        # timeout here means that bound regressed, reported as a finding
+        # rather than as a job that hangs to its limit. The other targets
+        # keep libFuzzer's default.
+        include:
+          - target: compat
+            extra: -timeout=60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -123,7 +133,7 @@ jobs:
       # smoke job's few seconds.
       - name: fuzz ${{ matrix.target }} (20 minutes)
         run: |
-          cmd="cargo fuzz run ${{ matrix.target }} -- -max_total_time=1200"
+          cmd="cargo fuzz run ${{ matrix.target }} -- -max_total_time=1200 ${{ matrix.extra }}"
           echo "==> $cmd"
           $cmd
       # A red scheduled run is opened by whoever gets the email, possibly

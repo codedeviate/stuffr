@@ -2374,10 +2374,11 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
             seed.len()
         );
         let case = decode_compat_case(&seed).unwrap();
-        assert!(
-            shape.starts_with(case.name),
-            "{shape} decodes as {}",
-            case.name
+        // Exact: `bzip2recover-…` also starts with `bzip2`.
+        assert_eq!(
+            shape.split('-').next(),
+            Some(case.name),
+            "{shape} decodes as the wrong tool"
         );
         if shape.starts_with("bzip2recover-") && *shape != "bzip2recover-usage" {
             let blocks = block_magics(case.payload);

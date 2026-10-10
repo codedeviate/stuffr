@@ -220,8 +220,20 @@ pub const COMPAT_TOKENS: &[&str] = &[
 /// the corpus generator's test can hold every seed under it. A bzip2 block
 /// holds at most 900k, but a fuzz-scale case never needs one: 64 KiB fits a
 /// multi-block stream of compressible text at level 1 (the bzip2recover
-/// seed) and keeps a run in the milliseconds; what a decompression bomb
-/// inside it can write is bounded by `run_in`'s own output cap.
+/// seed) and keeps a run in the milliseconds.
+///
+/// **This is not the limit that binds in practice.** libFuzzer's effective
+/// `-max_len` defaults to the largest seed, about 15.7 KiB (the bzip2recover
+/// seeds), so mutated inputs stay near that unless `-max_len` is passed.
+///
+/// **The input cap does not bound decode work; `run_in`'s 8 MiB budget
+/// does.** A 50-byte bzip2 stream decodes to 45 MB (one 900k block through
+/// RLE1), so a 15.7 KiB input of ~300 such streams is ~14 GB of decoding,
+/// about 30 s in a release build at the measured 0.1 s per stream and longer
+/// instrumented. Output to stdout or files is capped by `run_in`, and since
+/// fix round 1 so are the bytes `-t` decodes, which go nowhere and were the
+/// one uncapped path; fuzz-deep.yml runs `compat` with `-timeout=60` so a
+/// regression there is reported as a slow input rather than a hung job.
 pub const COMPAT_FUZZ_MAX_INPUT: usize = 64 * 1024;
 
 /// At most this many arguments per `compat` case (`argc % (MAX + 1)`).
