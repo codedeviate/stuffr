@@ -214,6 +214,8 @@ pub mod lzip;
 pub mod lzma_c;
 #[cfg(feature = "lzma-pure")]
 pub mod lzma_pure;
+#[doc(hidden)]
+pub mod pack;
 #[cfg(feature = "snappy")]
 pub mod snappy;
 #[cfg(feature = "tar")]

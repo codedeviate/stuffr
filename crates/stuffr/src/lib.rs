@@ -19,6 +19,13 @@ pub use stuffr_core::*;
 pub mod bzip2_stream {
     pub use stuffr_formats::bzip2::{StreamError, StreamReader};
 }
+/// The old Unix `pack` (`.z`) decoder — what the `stuffr` binary's gzip
+/// compatibility personalities use for the pack files both references read.
+/// Not part of the stable API.
+#[doc(hidden)]
+pub mod pack_stream {
+    pub use stuffr_formats::pack::{PackError, PackReader};
+}
 /// Raw deflate through C zlib, byte-identical to stock zlib's — what the
 /// `stuffr` binary's Apple gzip personality compresses with on the C tier.
 /// Not part of the stable API.
