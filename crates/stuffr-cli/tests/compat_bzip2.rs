@@ -1366,7 +1366,8 @@ mod differential {
     /// hundreds of MiB among them (CI measured 220-233 MiB). The claim under
     /// test is that the decoder does not hold the input or the output, which
     /// is anonymous memory; it is flat after the first block, so sampling
-    /// loses nothing. The `/proc` status line at the peak is printed.
+    /// loses nothing. Only samples taken once `/proc/<pid>/exe` is stuffr
+    /// count. The `/proc` status at the peak and a timeline are printed.
     #[cfg(target_os = "linux")]
     fn linux_bzcat_peak(bz: &[u8], plain: &[u8]) -> u64 {
         use std::io::Read;
@@ -1392,25 +1393,47 @@ mod differential {
             out.read_to_end(&mut v).unwrap();
             v
         });
+        let exe_link = format!("/proc/{}/exe", child.id());
+        let stuffr_exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_stuffr")).unwrap();
         let mut peak = 0u64;
         let mut at_peak = String::new();
+        let mut timeline = Vec::new();
+        let t0 = std::time::Instant::now();
         while child.try_wait().unwrap().is_none() {
+            // Count a sample only once the process IS stuffr: before the
+            // exec completes, `/proc/<pid>` can still describe the spawning
+            // test process (its 64 MiB input and copies), which is what CI
+            // measured as 155 MiB of RssAnon with this test binary's 1.1 MiB
+            // of text.
+            let is_stuffr = std::fs::read_link(&exe_link).is_ok_and(|e| e == stuffr_exe);
             if let Ok(s) = std::fs::read_to_string(&status)
                 && let Some(kb) = s
                     .lines()
                     .find_map(|l| l.strip_prefix("RssAnon:"))
                     .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-                && kb * 1024 > peak
             {
-                peak = kb * 1024;
-                at_peak = s
-                    .lines()
-                    .filter(|l| l.starts_with("Vm") || l.starts_with("Rss"))
-                    .collect::<Vec<_>>()
-                    .join("; ");
+                if timeline.len() < 40 {
+                    timeline.push(format!(
+                        "{}ms:{}{}k",
+                        t0.elapsed().as_millis(),
+                        if is_stuffr { "" } else { "(not stuffr)" },
+                        kb
+                    ));
+                }
+                if is_stuffr && kb * 1024 > peak {
+                    peak = kb * 1024;
+                    at_peak = s
+                        .lines()
+                        .filter(|l| {
+                            l.starts_with("Name") || l.starts_with("Vm") || l.starts_with("Rss")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        eprintln!("RssAnon timeline: {}", timeline.join(" "));
         let st = child.wait().unwrap();
         let got = reader.join().unwrap();
         let mut err = String::new();
@@ -1419,7 +1442,10 @@ mod differential {
         assert!(st.success(), "{st:?}: {err}");
         assert_eq!(err, "");
         assert!(got == plain, "decoded output differs");
-        assert!(peak > 0, "RssAnon was never sampled");
+        assert!(
+            peak > 0,
+            "RssAnon was never sampled while the process was stuffr"
+        );
         eprintln!("/proc status at the peak: {at_peak}");
         peak
     }
