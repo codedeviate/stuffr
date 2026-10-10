@@ -251,8 +251,8 @@ read list.
 > per-stream bzip2 reader that keeps libbzip2's error kinds),
 > `testing::{COMPAT_NAMES, COMPAT_TOKENS, COMPAT_FILES, CompatCase,
 > encode_compat_case, decode_compat_case}`; a sixth fuzz target, `compat`.
-> <!-- test counts: re-measure from the bump's own `make check` and add the
-> "**N** tests under `--all-features`, **M** on the default tier" line. -->
+> **2046** tests under `--all-features`, **1982** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
