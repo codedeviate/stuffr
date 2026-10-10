@@ -6,8 +6,8 @@ use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::run::CHUNK;
 
@@ -137,6 +137,8 @@ pub(super) struct Input {
 pub(super) enum InputSrc {
     File(File),
     Stdin(io::Stdin),
+    /// A sandboxed run's standard input: read like a pipe, never rewound.
+    Bytes(io::Cursor<Vec<u8>>),
 }
 
 impl Read for InputSrc {
@@ -144,6 +146,7 @@ impl Read for InputSrc {
         match self {
             InputSrc::File(f) => f.read(buf),
             InputSrc::Stdin(s) => s.read(buf),
+            InputSrc::Bytes(c) => c.read(buf),
         }
     }
 }
@@ -159,6 +162,11 @@ impl Input {
             Ok(f) => Self::file(f),
             Err(_) => Self::new(InputSrc::Stdin(io::stdin()), Kind::Pipe),
         }
+    }
+
+    /// Bytes standing in for standard input, as a pipe would deliver them.
+    pub(super) fn bytes(data: Vec<u8>) -> Self {
+        Self::new(InputSrc::Bytes(io::Cursor::new(data)), Kind::Pipe)
     }
 
     fn new(src: InputSrc, kind: Kind) -> Self {
@@ -263,13 +271,122 @@ impl<W: Write> Write for Counting<W> {
     }
 }
 
-/// The output of a decompression: stdout, or the temporary file.
-pub(super) fn out_writer(f: Option<File>) -> BufWriter<Box<dyn Write + Send>> {
-    let w: Box<dyn Write + Send> = match f {
-        Some(f) => Box::new(f),
-        None => stdout_writer(),
-    };
-    BufWriter::with_capacity(64 * 1024, w)
+/// What the family takes from its process: the directory operands resolve
+/// against, standard input and output, and whether those are terminals.
+/// Standard error is passed separately, as it always was.
+pub(super) enum Host {
+    /// The process itself.
+    Real,
+    /// `run_in`'s: nothing of the process is touched.
+    Sandbox(Sandbox),
+}
+
+/// A sandboxed run's stand-ins for the process state.
+pub(super) struct Sandbox {
+    /// Operands resolve against this directory, never the process's cwd.
+    pub(super) dir: PathBuf,
+    /// Standard input, taken by the first read of it (a run reads it once).
+    pub(super) stdin: Option<Vec<u8>>,
+    /// Standard output, captured.
+    pub(super) stdout: Arc<Mutex<Vec<u8>>>,
+    /// Bytes still allowed to reach standard output and output files, all
+    /// together; past it a write fails as a full disk does.
+    pub(super) budget: Arc<AtomicU64>,
+}
+
+impl Host {
+    /// An operand, or a name derived from one, as a path to open.
+    pub(super) fn path(&self, b: &[u8]) -> PathBuf {
+        match self {
+            Host::Real => path(b),
+            Host::Sandbox(s) => s.dir.join(path(b)),
+        }
+    }
+
+    /// `isatty(fileno(stdin))`; a sandbox has no terminal.
+    pub(super) fn stdin_is_tty(&self) -> bool {
+        matches!(self, Host::Real) && crate::compat::stdin_is_tty()
+    }
+
+    /// `isatty(fileno(stdout))`; a sandbox has no terminal.
+    pub(super) fn stdout_is_tty(&self) -> bool {
+        matches!(self, Host::Real) && crate::compat::stdout_is_tty()
+    }
+
+    /// Standard input as a decompression or compression input.
+    pub(super) fn stdin(&mut self) -> Input {
+        match self {
+            Host::Real => Input::stdin(),
+            Host::Sandbox(s) => Input::bytes(s.stdin.take().unwrap_or_default()),
+        }
+    }
+
+    /// The output of a run: standard output, or the temporary file.
+    pub(super) fn out_writer(&self, f: Option<File>) -> BufWriter<Box<dyn Write + Send>> {
+        let w: Box<dyn Write + Send> = match (self, f) {
+            (Host::Real, Some(f)) => Box::new(f),
+            (Host::Real, None) => stdout_writer(),
+            (Host::Sandbox(s), f) => {
+                let inner: Box<dyn Write + Send> = match f {
+                    Some(f) => Box::new(f),
+                    None => Box::new(Captured(s.stdout.clone())),
+                };
+                Box::new(Capped {
+                    inner,
+                    budget: s.budget.clone(),
+                })
+            }
+        };
+        BufWriter::with_capacity(64 * 1024, w)
+    }
+}
+
+/// A sandboxed run's standard output.
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut v = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        v.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A writer that fails with `ENOSPC` once its shared budget is spent: what
+/// bzip2 meets on a full disk, which it reports as an I/O error, exit 1.
+struct Capped {
+    inner: Box<dyn Write + Send>,
+    budget: Arc<AtomicU64>,
+}
+
+impl Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let left = self.budget.load(Ordering::Relaxed);
+        if left == 0 && !buf.is_empty() {
+            return Err(no_space());
+        }
+        let take = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+        let n = self.inner.write(&buf[..take])?;
+        self.budget.fetch_sub(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn no_space() -> io::Error {
+    #[cfg(unix)]
+    {
+        io::Error::from_raw_os_error(libc::ENOSPC)
+    }
+    #[cfg(not(unix))]
+    {
+        io::Error::from(io::ErrorKind::StorageFull)
+    }
 }
 
 /// Set only the access and modification times (`utime`).

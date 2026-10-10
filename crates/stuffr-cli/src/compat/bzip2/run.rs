@@ -19,10 +19,10 @@ use stuffr::{EncodeOpts, FormatId};
 use super::args::{MAX_NAME, OpMode, Settings, SrcMode};
 use super::messages::{self as m, printf};
 use super::streams::{
-    Counting, Input, Kind, c_remove, count_hard_links, errno_text, not_a_standard_file, out_writer,
-    path, set_times, strerror,
+    Counting, Host, Input, Kind, c_remove, count_hard_links, errno_text, not_a_standard_file,
+    set_times, strerror,
 };
-use crate::compat::{copy_metadata_from, stdin_is_tty, stdout_is_tty};
+use crate::compat::copy_metadata_from;
 
 /// `BZ_MAX_UNUSED`: libbzip2's read size, and bzip2's output chunk.
 pub(super) const CHUNK: usize = 5000;
@@ -56,8 +56,8 @@ impl From<io::Error> for Failure {
     }
 }
 
-/// Run the operation `s` describes; returns the exit code.
-pub(super) fn execute(prog: &'static str, s: Settings, err: &mut dyn Write) -> u8 {
+/// Run the operation `s` describes against `host`; returns the exit code.
+pub(super) fn execute(prog: &'static str, s: Settings, host: &mut Host, err: &mut dyn Write) -> u8 {
     let files = s.files.clone();
     let mut bz = Bz {
         prog,
@@ -70,6 +70,7 @@ pub(super) fn execute(prog: &'static str, s: Settings, err: &mut dyn Write) -> u
         pending: None,
         unz_fails: false,
         test_fails: false,
+        host,
         err,
     };
     let _ = bz.main(&files);
@@ -91,6 +92,8 @@ struct Bz<'a> {
     pending: Option<PathBuf>,
     unz_fails: bool,
     test_fails: bool,
+    /// Where operands resolve and standard input and output come from.
+    host: &'a mut Host,
     err: &'a mut dyn Write,
 }
 
@@ -191,7 +194,7 @@ impl Bz<'_> {
     /// Create the temporary output for `out_name` in its directory, mode
     /// 0600. Fails as bzip2's `O_CREAT|O_EXCL` open of `out_name` would.
     fn create_output(&self) -> io::Result<(PathBuf, File)> {
-        let out = path(&self.out_name);
+        let out = self.host.path(&self.out_name);
         if self.out_name.is_empty() {
             return Err(io::Error::from_raw_os_error(2)); // ENOENT
         }
@@ -226,7 +229,7 @@ impl Bz<'_> {
         let (p, inp, out) = (self.p(), self.in_name.clone(), self.out_name.clone());
         let src = self.s.src;
         if src != SrcMode::I2O
-            && let Err(e) = File::open(path(&inp))
+            && let Err(e) = File::open(self.host.path(&inp))
         {
             self.refuse(m::CANT_OPEN_INPUT, &[p, &inp, &strerror(&e)]);
             return Ok(None);
@@ -242,11 +245,11 @@ impl Bz<'_> {
                 }
             }
         }
-        if src != SrcMode::I2O && fs::metadata(path(&inp)).is_ok_and(|md| md.is_dir()) {
+        if src != SrcMode::I2O && fs::metadata(self.host.path(&inp)).is_ok_and(|md| md.is_dir()) {
             self.refuse(m::IS_DIRECTORY, &[p, &inp]);
             return Ok(None);
         }
-        if src == SrcMode::F2F && !self.s.force && not_a_standard_file(&path(&inp)) {
+        if src == SrcMode::F2F && !self.s.force && not_a_standard_file(&self.host.path(&inp)) {
             if self.s.noisy {
                 self.say(m::NOT_NORMAL_FILE, &[p, &inp]);
             }
@@ -256,16 +259,16 @@ impl Bz<'_> {
         if cant_guess && self.s.noisy {
             self.say(m::CANT_GUESS, &[p, &inp, &out]);
         }
-        if src == SrcMode::F2F && File::open(path(&out)).is_ok() {
+        if src == SrcMode::F2F && File::open(self.host.path(&out)).is_ok() {
             if self.s.force {
-                c_remove(&path(&out));
+                c_remove(&self.host.path(&out));
             } else {
                 self.refuse(m::OUTPUT_EXISTS, &[p, &out]);
                 return Ok(None);
             }
         }
         if src == SrcMode::F2F && !self.s.force {
-            let n = count_hard_links(&path(&inp));
+            let n = count_hard_links(&self.host.path(&inp));
             if n > 0 {
                 let s: &[u8] = if n > 1 { b"s" } else { b"" };
                 self.refuse(m::HARD_LINKS, &[p, &inp, n.to_string().as_bytes(), s]);
@@ -280,7 +283,7 @@ impl Bz<'_> {
         if self.s.src != SrcMode::F2F {
             return Ok(None);
         }
-        match fs::metadata(path(&self.in_name)) {
+        match fs::metadata(self.host.path(&self.in_name)) {
             Ok(md) => Ok(Some(md)),
             Err(e) => Err(self.fail(Failure::Io(e))),
         }
@@ -290,7 +293,7 @@ impl Bz<'_> {
     /// as bzip2 does (the output's failure first). `None`: move on.
     fn open_f2f(&mut self) -> Option<(File, PathBuf, File)> {
         let p = self.p();
-        let inp = File::open(path(&self.in_name));
+        let inp = File::open(self.host.path(&self.in_name));
         let out = match self.create_output() {
             Ok(o) => o,
             Err(e) => {
@@ -324,7 +327,7 @@ impl Bz<'_> {
     /// has already removed any existing output, and rename keeps that intent.
     fn commit(&mut self) -> Result<bool, Fatal> {
         if let Some(tmp) = self.pending.clone() {
-            let out = path(&self.out_name);
+            let out = self.host.path(&self.out_name);
             let published = if self.s.force {
                 fs::rename(&tmp, &out)
             } else {
@@ -346,7 +349,7 @@ impl Bz<'_> {
         }
         self.pending = None;
         if !self.s.keep
-            && let Err(e) = fs::remove_file(path(&self.in_name))
+            && let Err(e) = fs::remove_file(self.host.path(&self.in_name))
         {
             return Err(self.fail(Failure::Io(e)));
         }
@@ -380,15 +383,15 @@ impl Bz<'_> {
 
         let (input, out_file): (Box<dyn Read>, Option<File>) = match self.s.src {
             SrcMode::I2O => {
-                if stdout_is_tty() {
+                if self.host.stdout_is_tty() {
                     self.refuse_tty(m::NO_TTY_OUTPUT);
                     return Ok(());
                 }
-                (Box::new(Input::stdin()), None)
+                (Box::new(self.host.stdin()), None)
             }
             SrcMode::F2O => {
-                let inp = File::open(path(&self.in_name));
-                if stdout_is_tty() {
+                let inp = File::open(self.host.path(&self.in_name));
+                if self.host.stdout_is_tty() {
                     self.refuse_tty(m::NO_TTY_OUTPUT);
                     return Ok(());
                 }
@@ -445,7 +448,7 @@ impl Bz<'_> {
         };
         let nout = Arc::new(AtomicU64::new(0));
         let dst = Counting {
-            inner: out_writer(out_file),
+            inner: self.host.out_writer(out_file),
             n: nout.clone(),
         };
         let opts = EncodeOpts {
@@ -512,13 +515,13 @@ impl Bz<'_> {
 
         let (mut input, out_file) = match self.s.src {
             SrcMode::I2O => {
-                if stdin_is_tty() {
+                if self.host.stdin_is_tty() {
                     self.refuse_tty(m::NO_TTY_INPUT);
                     return Ok(());
                 }
-                (Input::stdin(), None)
+                (self.host.stdin(), None)
             }
-            SrcMode::F2O => match File::open(path(&self.in_name)) {
+            SrcMode::F2O => match File::open(self.host.path(&self.in_name)) {
                 Ok(f) => (Input::file(f), None),
                 Err(e) => {
                     let (p, n) = (self.p(), self.in_name.clone());
@@ -536,7 +539,7 @@ impl Bz<'_> {
         };
 
         self.verbose_prefix();
-        let mut out = out_writer(out_file);
+        let mut out = self.host.out_writer(out_file);
         let r = self.uncompress_stream(&mut input, &mut out, meta.as_ref());
         drop(out);
         let magic_ok = match r {
@@ -653,23 +656,23 @@ impl Bz<'_> {
         }
         let (p, inp) = (self.p(), self.in_name.clone());
         if self.s.src != SrcMode::I2O {
-            if let Err(e) = File::open(path(&inp)) {
+            if let Err(e) = File::open(self.host.path(&inp)) {
                 self.refuse(m::CANT_OPEN_INPUT_TEST, &[p, &inp, &strerror(&e)]);
                 return Ok(());
             }
-            if fs::metadata(path(&inp)).is_ok_and(|md| md.is_dir()) {
+            if fs::metadata(self.host.path(&inp)).is_ok_and(|md| md.is_dir()) {
                 self.refuse(m::IS_DIRECTORY, &[p, &inp]);
                 return Ok(());
             }
         }
         let mut input = if self.s.src == SrcMode::I2O {
-            if stdin_is_tty() {
+            if self.host.stdin_is_tty() {
                 self.refuse_tty(m::NO_TTY_INPUT);
                 return Ok(());
             }
-            Input::stdin()
+            self.host.stdin()
         } else {
-            match File::open(path(&inp)) {
+            match File::open(self.host.path(&inp)) {
                 Ok(f) => Input::file(f),
                 Err(e) => {
                     self.refuse(m::CANT_OPEN_INPUT_NOSPACE, &[p, &inp, &strerror(&e)]);
@@ -828,7 +831,7 @@ impl Bz<'_> {
             && let Some(tmp) = self.pending.take()
         {
             let out = self.out_name.clone();
-            if fs::metadata(path(&self.in_name)).is_ok() {
+            if fs::metadata(self.host.path(&self.in_name)).is_ok() {
                 if self.s.noisy {
                     self.say(m::DELETING_OUTPUT, &[p, &out]);
                 }
@@ -837,7 +840,7 @@ impl Bz<'_> {
                 }
             } else {
                 // bzip2 keeps the partial output when the input has gone.
-                let _ = fs::rename(&tmp, path(&out));
+                let _ = fs::rename(&tmp, self.host.path(&out));
                 self.say(m::DELETION_SUPPRESSED, &[p]);
                 self.say(m::SINCE_INPUT_GONE, &[p]);
                 self.say(m::MAY_BE_INCOMPLETE, &[p, &out]);
@@ -898,6 +901,7 @@ mod tests {
             fs::write(&tmp, b"new").unwrap();
             fs::write(&out, b"appeared").unwrap();
             let mut err = Vec::new();
+            let mut host = Host::Real;
             let mut bz = Bz {
                 prog: "bzip2",
                 s: settings(force),
@@ -909,6 +913,7 @@ mod tests {
                 pending: Some(tmp.clone()),
                 unz_fails: false,
                 test_fails: false,
+                host: &mut host,
                 err: &mut err,
             };
             let published = bz.commit().ok().unwrap();

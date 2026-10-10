@@ -45,7 +45,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod bits;
@@ -81,9 +81,24 @@ pub fn run(argv0: OsString, args: Vec<OsString>) -> ExitCode {
     ExitCode::from(code)
 }
 
+/// [`run`] without the process: names resolve against `dir`, and standard
+/// error is captured and returned with the exit code (bzip2recover writes
+/// nothing to standard output). `SIGPIPE` is left alone. For the fuzz
+/// target; not a stable interface.
+#[doc(hidden)]
+pub fn run_in(dir: &Path, argv0: &[u8], args: &[OsString]) -> (i32, Vec<u8>) {
+    let args: Vec<Vec<u8>> = args.iter().map(|a| bytes(a)).collect();
+    let mut err = Vec::new();
+    let mut fs = DirFs(dir.to_path_buf());
+    let code = recover(argv0, &args, &mut fs, &mut err);
+    (i32::from(code), err)
+}
+
 /// Where the input is read from and the outputs are written to, so the
-/// scan can be run (and its reads counted) without a file system.
-pub(crate) trait Fs {
+/// scan can be run (and its reads counted) without a file system. Public
+/// only for the fuzz target, which counts them; not a stable interface.
+#[doc(hidden)]
+pub trait Fs {
     /// `fopen(name, "rb")`.
     fn open(&mut self, name: &[u8]) -> io::Result<Box<dyn Read>>;
     /// `fopen(name, "wb")`.
@@ -98,14 +113,30 @@ impl Fs for RealFs {
         Ok(Box::new(File::open(path(name))?))
     }
     fn create(&mut self, name: &[u8]) -> io::Result<Box<dyn Write>> {
-        // `fopen(.., "wb")`: O_WRONLY|O_CREAT|O_TRUNC, mode 0666 less umask.
-        let f = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path(name))?;
-        Ok(Box::new(f))
+        create(&path(name))
     }
+}
+
+/// The real file system, with names resolved against a directory.
+struct DirFs(PathBuf);
+
+impl Fs for DirFs {
+    fn open(&mut self, name: &[u8]) -> io::Result<Box<dyn Read>> {
+        Ok(Box::new(File::open(self.0.join(path(name)))?))
+    }
+    fn create(&mut self, name: &[u8]) -> io::Result<Box<dyn Write>> {
+        create(&self.0.join(path(name)))
+    }
+}
+
+/// `fopen(.., "wb")`: O_WRONLY|O_CREAT|O_TRUNC, mode 0666 less umask.
+fn create(p: &Path) -> io::Result<Box<dyn Write>> {
+    let f = File::options()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(p)?;
+    Ok(Box::new(f))
 }
 
 fn bytes(s: &OsStr) -> Vec<u8> {
@@ -191,8 +222,10 @@ fn shift(hi: &mut u32, lo: &mut u32, b: u32) -> bool {
 }
 
 /// bzip2recover's `main`, from the argument checks to the end. `prog` is
-/// `argv[0]`, `args` the rest. Returns the exit code.
-pub(crate) fn recover(prog: &[u8], args: &[Vec<u8>], fs: &mut dyn Fs, err: &mut dyn Write) -> u8 {
+/// `argv[0]`, `args` the rest. Returns the exit code. Public only for the
+/// fuzz target; not a stable interface.
+#[doc(hidden)]
+pub fn recover(prog: &[u8], args: &[Vec<u8>], fs: &mut dyn Fs, err: &mut dyn Write) -> u8 {
     // strncpy into progName[BZ_MAX_FILENAME], then terminated.
     let prog = &prog[..prog.len().min(MAX_FILENAME - 1)];
     m::printf(err, m::BANNER, &[]);

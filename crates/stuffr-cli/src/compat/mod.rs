@@ -64,6 +64,30 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
     })
 }
 
+/// Run the compatibility tool `name` names in-process, without touching the
+/// process: operands resolve against `dir`, `stdin` stands in for standard
+/// input, and the exit code, standard output and standard error come back.
+/// Neither stream is a terminal, the environment is not read and `SIGPIPE`
+/// keeps its disposition. `None` when `name` is not a compatibility name.
+/// Same code as [`dispatch`] below the process boundary; for the fuzz
+/// target, not a stable interface.
+#[doc(hidden)]
+pub fn run_in(
+    dir: &Path,
+    name: &str,
+    args: Vec<OsString>,
+    stdin: &[u8],
+) -> Option<(i32, Vec<u8>, Vec<u8>)> {
+    let (family, canonical) = family_for(OsStr::new(name))?;
+    Some(match family {
+        Family::Bzip2 if canonical == "bzip2recover" => {
+            let (code, err) = bzip2recover::run_in(dir, name.as_bytes(), &args);
+            (code, Vec::new(), err)
+        }
+        Family::Bzip2 => bzip2::run_in(dir, canonical, &args, stdin),
+    })
+}
+
 /// Whether stdin is a terminal.
 pub(crate) fn stdin_is_tty() -> bool {
     io::stdin().is_terminal()
@@ -151,6 +175,57 @@ mod tests {
         assert!(dispatch(vec![bad]).is_none());
         let bad = OsStr::from_bytes(b"/x/\xffbzip2").to_os_string();
         assert!(dispatch(vec![bad]).is_none());
+    }
+
+    /// `run_in` reaches both families, resolves operands against its
+    /// directory and captures standard output.
+    #[test]
+    fn run_in_works_inside_its_directory() {
+        let dir = std::env::temp_dir().join(format!("stuffr-run-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), b"hello hello hello\n").unwrap();
+        let (code, out, err) = run_in(&dir, "bzip2", vec!["-k".into(), "a".into()], b"").unwrap();
+        assert_eq!(
+            (code, out.len()),
+            (0, 0),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        let packed = std::fs::read(dir.join("a.bz2")).unwrap();
+        assert!(packed.starts_with(b"BZh9"));
+        let (code, out, _) = run_in(&dir, "bzcat", vec![], &packed).unwrap();
+        assert_eq!((code, out.as_slice()), (0, &b"hello hello hello\n"[..]));
+        let (code, out, err) = run_in(&dir, "bzip2recover", vec!["a.bz2".into()], b"").unwrap();
+        assert_eq!(
+            (code, out.len()),
+            (0, 0),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(dir.join("rec00001a.bz2").exists());
+        // A damaged stream from stdin: exit 2, stdin is never a terminal.
+        let (code, _, err) = run_in(&dir, "bunzip2", vec![], b"BZh9garbage").unwrap();
+        assert_eq!(code, 2, "{}", String::from_utf8_lossy(&err));
+        assert!(run_in(&dir, "stuffr", vec![], b"").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Output past the sandbox's cap fails as a full disk does: exit 1.
+    #[test]
+    fn run_in_caps_what_a_run_writes() {
+        let dir = std::env::temp_dir().join(format!("stuffr-run-in-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = vec![0u8; 9 * 1024 * 1024];
+        let (code, packed, _) = run_in(&dir, "bzip2", vec![], &big).unwrap();
+        assert_eq!(code, 0);
+        let (code, out, err) = run_in(&dir, "bzcat", vec![], &packed).unwrap();
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!(code, 1, "{err}");
+        assert_eq!(out.len(), 8 * 1024 * 1024);
+        assert!(err.contains("I/O or other error"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

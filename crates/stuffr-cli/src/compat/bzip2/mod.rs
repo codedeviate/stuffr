@@ -26,8 +26,13 @@
 //!   `strerror(0)`.
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
+
+use streams::{Host, Sandbox};
 
 mod args;
 mod messages;
@@ -45,10 +50,54 @@ pub fn run(name: &'static str, args: Vec<OsString>) -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
-    let mut err = io::stderr();
-    let code = match args::parse(name, &args, &|k| std::env::var_os(k), &mut err) {
+    let env = |k: &str| std::env::var_os(k);
+    ExitCode::from(main(name, &args, &env, &mut Host::Real, &mut io::stderr()))
+}
+
+/// bzip2.c's `main` after the program name: the flags, then the run.
+fn main(
+    name: &'static str,
+    args: &[OsString],
+    env: &dyn Fn(&str) -> Option<OsString>,
+    host: &mut Host,
+    err: &mut dyn Write,
+) -> u8 {
+    match args::parse(name, args, env, err) {
         args::Parsed::Exit(c) => c,
-        args::Parsed::Run(s) => run::execute(name, s, &mut err),
-    };
-    ExitCode::from(code)
+        args::Parsed::Run(s) => run::execute(name, s, host, err),
+    }
+}
+
+/// The most a [`run_in`] run may write, to standard output and files
+/// together. Past it a write fails with `ENOSPC`, which bzip2 reports as an
+/// I/O error and exit 1, the code it gives a full disk. A bzip2 stream of a
+/// few dozen bytes can expand to tens of MiB, so without a cap a fuzzer's
+/// short input could fill memory or disk; 8 MiB is past any block's
+/// ordinary output (a 900k block of text) and bounds what a bomb can cost.
+const SANDBOX_OUTPUT_CAP: u64 = 8 * 1024 * 1024;
+
+/// [`run`] without the process: operands resolve against `dir`, standard
+/// input is `stdin` (read as a pipe), standard output and error are
+/// captured and returned with the exit code, neither is a terminal, `$BZIP2`
+/// and `$BZIP` are unset, and `SIGPIPE` is left alone. Output is capped at
+/// [`SANDBOX_OUTPUT_CAP`]. For the fuzz target; not a stable interface.
+#[doc(hidden)]
+pub fn run_in(
+    dir: &Path,
+    name: &'static str,
+    args: &[OsString],
+    stdin: &[u8],
+) -> (i32, Vec<u8>, Vec<u8>) {
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let mut host = Host::Sandbox(Sandbox {
+        dir: dir.to_path_buf(),
+        stdin: Some(stdin.to_vec()),
+        stdout: stdout.clone(),
+        budget: Arc::new(AtomicU64::new(SANDBOX_OUTPUT_CAP)),
+    });
+    let mut err = Vec::new();
+    let code = main(name, args, &|_| None, &mut host, &mut err);
+    drop(host);
+    let out = std::mem::take(&mut *stdout.lock().unwrap_or_else(|p| p.into_inner()));
+    (i32::from(code), out, err)
 }
