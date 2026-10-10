@@ -155,17 +155,27 @@ mod differential {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("x.bz2"), bz).unwrap();
             std::fs::write(dir.join("rec00001x.bz2"), b"old").unwrap();
-            let st = Command::new(&exe)
+            let out = Command::new(&exe)
                 .arg("x.bz2")
                 .current_dir(&dir)
                 .env_clear()
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
+                .stderr(Stdio::piped())
+                .output()
                 .unwrap();
+            let rec = std::fs::read(dir.join("rec00001x.bz2")).unwrap_or_default();
             let _ = std::fs::remove_dir_all(&dir);
-            let debian = !st.success();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let refused = stderr.contains("can't write") && rec == b"old";
+            let overwritten = out.status.success() && rec.starts_with(b"BZh9");
+            assert!(
+                refused != overwritten,
+                "the Debian probe matched neither upstream nor Debian: {:?}, \
+                 rec00001x.bz2 = {rec:?}, stderr:\n{stderr}",
+                out.status
+            );
+            let debian = refused;
             if debian {
                 println!(
                     "note: the reference bzip2recover carries Debian's \
@@ -176,8 +186,24 @@ mod differential {
         })
     }
 
-    /// On a Debian reference, check its outputs are 0600 and give them
-    /// stuffr's (upstream's) modes before comparing.
+    /// `0o666 & !umask`, read back from a freshly created file (reading the
+    /// umask itself would race other threads).
+    fn created_mode() -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        static MODE: OnceLock<u32> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            let p =
+                std::env::temp_dir().join(format!("stuffr-recover-umask-{}", std::process::id()));
+            let _ = std::fs::remove_file(&p);
+            std::fs::File::create(&p).unwrap();
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o7777;
+            let _ = std::fs::remove_file(&p);
+            mode
+        })
+    }
+
+    /// On a Debian reference, check its outputs are 0600, check stuffr's
+    /// are upstream's `0o666 & !umask`, then make them equal for comparing.
     fn debian_modes(r: &mut Run, s: &mut Run) {
         if debian_reference() != Some(true) {
             return;
@@ -189,6 +215,11 @@ mod differential {
             }
             assert_eq!(*mode, 0o600, "Debian reference output {name} is not 0600");
             if let Some((_, m, _)) = s.tree.get(name) {
+                assert_eq!(
+                    *m,
+                    created_mode(),
+                    "stuffr's output {name} is not 0666 less the umask"
+                );
                 *mode = *m;
             }
         }
@@ -481,33 +512,162 @@ mod differential {
         check_all("outputs", &cases);
     }
 
-    /// At 50000 blocks bzip2recover 1.0.8 writes one element past its
-    /// `bEnd` array when the last block has no end marker. With the macOS
-    /// layout that lands on `rbStart[0]`, so block 1 is not written. The
-    /// layout is the compiler's, so this is pinned on macOS only.
-    #[cfg(target_os = "macos")]
+    /// Bits, most significant first, packed into zero-padded bytes.
+    #[derive(Default)]
+    struct Bits(Vec<bool>);
+    impl Bits {
+        fn bytes(&mut self, b: &[u8]) -> &mut Self {
+            for &x in b {
+                for i in (0..8).rev() {
+                    self.0.push((x >> i) & 1 == 1);
+                }
+            }
+            self
+        }
+        fn zeros(&mut self, n: usize) -> &mut Self {
+            self.0.extend(std::iter::repeat_n(false, n));
+            self
+        }
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn pack(&self) -> Vec<u8> {
+            self.0
+                .chunks(8)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0u8, |a, (i, &b)| a | (u8::from(b) << (7 - i)))
+                })
+                .collect()
+        }
+    }
+
+    /// What bzip2recover writes for a block whose `n` bits are all zero:
+    /// `BZh9`, the block magic, the bits, the end-of-stream magic and the
+    /// stored CRC (the block's first 32 bits, so zero) as the combined CRC.
+    fn zero_block_stream(n: usize) -> Vec<u8> {
+        let mut b = Bits::default();
+        b.bytes(b"BZh9")
+            .bytes(&BLOCK_MAGIC)
+            .zeros(n)
+            .bytes(&END_MAGIC)
+            .zeros(32);
+        b.pack()
+    }
+
+    /// The stderr of a run that records `blocks` (start, end), ends with an
+    /// incomplete block and writes blocks 1 and 2.
+    fn cap_stderr(blocks: &[(u64, u64)], incomplete: (u64, u64)) -> String {
+        let mut e = String::from(
+            "bzip2recover 1.0.8: extracts blocks from damaged .bz2 files.\n\
+             bzip2recover: searching for block boundaries ...\n",
+        );
+        for (i, (a, b)) in blocks.iter().enumerate() {
+            e += &format!("   block {} runs from {a} to {b}\n", i + 1);
+        }
+        e += &format!(
+            "   block {} runs from {} to {} (incomplete)\n",
+            blocks.len() + 1,
+            incomplete.0,
+            incomplete.1
+        );
+        e += "bzip2recover: splitting into blocks\n";
+        e += "   writing block 1 to `rec00001d.bz2' ...\n";
+        e += "   writing block 2 to `rec00002d.bz2' ...\n";
+        e += "bzip2recover: finished\n";
+        e
+    }
+
+    fn expect_two_blocks(data: Vec<u8>, rec1: Vec<u8>, rec2: Vec<u8>, stderr: &str) {
+        let c = case(&["d.bz2"], vec![("d.bz2", data.clone())]);
+        let s = stuffr_as(&c);
+        assert_eq!(s.code, 0, "{}", s.stderr);
+        let names: Vec<&str> = s.tree.keys().map(String::as_str).collect();
+        assert_eq!(names, ["d.bz2", "rec00001d.bz2", "rec00002d.bz2"]);
+        assert_eq!(s.tree["rec00001d.bz2"].0, rec1, "rec00001d.bz2");
+        assert_eq!(s.tree["rec00002d.bz2"].0, rec2, "rec00002d.bz2");
+        if s.stderr != stderr {
+            let at = s
+                .stderr
+                .bytes()
+                .zip(stderr.bytes())
+                .position(|(a, b)| a != b)
+                .unwrap_or(s.stderr.len().min(stderr.len()));
+            panic!(
+                "stderr differs at byte {at}: got {:?}, want {:?}",
+                &s.stderr[at.saturating_sub(80)..(at + 80).min(s.stderr.len())],
+                &stderr[at.saturating_sub(80)..(at + 80).min(stderr.len())]
+            );
+        }
+    }
+
+    /// At exactly 50000 magics with at least 40 bits after the last,
+    /// bzip2recover 1.0.8 writes past its `bEnd` array; on macOS that lands
+    /// on `rbStart[0]` and block 1 is silently dropped. stuffr writes it, as
+    /// if the arrays were 50001 long: this is a deliberate deviation, so it
+    /// is checked against literal expectations, not the reference.
     #[test]
-    fn the_block_cap_overflow_as_measured_on_macos() {
-        let mut v = b"BZh9".to_vec();
+    fn the_block_cap_overflow_still_writes_block_1() {
+        // BZh9, 20 zero bytes, then (magic, 20 zero bytes) twice, 49998
+        // magics back to back, 20 zero bytes: 50000 magics in all.
         let z = [0u8; 20];
+        let mut v = b"BZh9".to_vec();
         v.extend_from_slice(&z);
         for _ in 0..2 {
             v.extend_from_slice(&BLOCK_MAGIC);
             v.extend_from_slice(&z);
         }
         v.extend(packed_magics(49_998).split_off(4));
-        v.extend_from_slice(&z);
         let short = {
             let mut s = v.clone();
-            s.truncate(s.len() - 20);
-            s.push(0);
+            s.push(0); // 8 bits after the last magic: under 40, no overflow
             s
         };
-        let cases = vec![
-            case(&["d.bz2"], vec![("d.bz2", v)]),
-            case(&["d.bz2"], vec![("d.bz2", short)]),
-        ];
-        check_all("block cap overflow", &cases);
+        v.extend_from_slice(&z);
+        // Magic k (k >= 3) ends at bit 656 + 48 (k - 3); a block starts
+        // after its magic and ends 49 bits before the next magic ends.
+        let mut blocks = vec![(240, 399), (448, 607)];
+        blocks.extend((3..50_000u64).map(|k| (656 + 48 * (k - 3), 655 + 48 * (k - 3))));
+        let last = 656 + 48 * 49_997;
+        assert_eq!(v.len() as u64 * 8, last + 160);
+        expect_two_blocks(
+            v,
+            zero_block_stream(160),
+            zero_block_stream(160),
+            &cap_stderr(&blocks, (last, last + 160)),
+        );
+        check_all(
+            "block cap control",
+            &[case(&["d.bz2"], vec![("d.bz2", short)])],
+        );
+    }
+
+    /// The same overflow from a genuinely stream-shaped input: 49999 blocks,
+    /// the end-of-stream magic, its CRC and 7 padding bits, so 40 bits
+    /// follow the 50000th magic.
+    #[test]
+    fn the_block_cap_overflow_at_end_of_stream_still_writes_block_1() {
+        let mut b = Bits::default();
+        b.bytes(b"BZh9").bytes(&BLOCK_MAGIC).zeros(160);
+        b.bytes(&BLOCK_MAGIC).zeros(161);
+        for _ in 0..49_997 {
+            b.bytes(&BLOCK_MAGIC);
+        }
+        b.bytes(&END_MAGIC)
+            .bytes(&[0xde, 0xad, 0xbe, 0xef])
+            .zeros(7);
+        assert_eq!(b.len() % 8, 0);
+        let mut blocks = vec![(80, 239), (288, 448)];
+        blocks.extend((3..50_000u64).map(|k| (497 + 48 * (k - 3), 496 + 48 * (k - 3))));
+        let last = 497 + 48 * 49_997;
+        assert_eq!(b.len(), last + 39);
+        expect_two_blocks(
+            b.pack(),
+            zero_block_stream(160),
+            zero_block_stream(161),
+            &cap_stderr(&blocks, (last, last + 39)),
+        );
     }
 
     /// Every output decompresses with the reference bzip2, and together

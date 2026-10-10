@@ -20,7 +20,9 @@
 //! - outputs are `rec%05d` and the input's base name, split at the last
 //!   `/`, with `.bz2` appended unless the result already ends in it, opened
 //!   as `fopen(.., "wb")` does (created mode 0666 less the umask, or an
-//!   existing file truncated);
+//!   existing file truncated). So, as upstream does, an output is written
+//!   through a symlink already at its name and truncates a file already
+//!   there; Debian's `bzip2recover-race-open-output.diff` refuses both;
 //! - the limits: `BZ_MAX_FILENAME` (an operand of 1980 bytes or more is
 //!   refused) and `BZ_MAX_HANDLED_BLOCKS` (50000), with their messages; every
 //!   failure exits 1.
@@ -30,12 +32,10 @@
 //!
 //! Known deviations from bzip2recover 1.0.8:
 //!
-//! - At exactly 50000 blocks, 1.0.8 writes one element past its `bStart`
-//!   array, and, when the input then ends at least 40 bits into a block,
-//!   one past `bEnd` too. Where those writes land is the compiler's choice
-//!   of layout; stuffr reproduces the layout measured on macOS, where the
-//!   second overwrites `rbStart[0]` (so block 1 is not written). Another
-//!   layout may differ there.
+//! - At exactly 50000 magics (for example 49999 blocks plus the
+//!   end-of-stream marker) with at least 40 bits after the last, 1.0.8
+//!   writes past its `bEnd` array and, on macOS, silently drops block 1;
+//!   stuffr writes it, as if the arrays were 50001 long.
 //! - Like bzip2, a read error is reported with its `strerror` text; a stale
 //!   `errno` that the C library left nonzero at a clean end of file (which
 //!   would make 1.0.8 report a read error) is not reproduced.
@@ -258,13 +258,6 @@ impl Recover<'_> {
                             m::BLOCK_INCOMPLETE,
                             &[c.as_bytes(), num(b_start).as_bytes(), num(b_end).as_bytes()],
                         );
-                    }
-                    // bEnd[50000] is one past the array; in the layout
-                    // measured on macOS it is rbStart[0].
-                    if curr_block == MAX_HANDLED_BLOCKS
-                        && let Some(first) = blocks.first_mut()
-                    {
-                        first.0 = b_end;
                     }
                 }
                 break;

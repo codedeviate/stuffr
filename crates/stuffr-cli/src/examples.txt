@@ -1296,7 +1296,10 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       names, the binary behaves as that tool, with its flags, messages and
       exit codes. This is opt-in: nothing creates these links unless you run
       this verb. The directory must exist (exit 2 if not). A second run
-      reports "already present" and changes nothing.
+      reports "already present" and changes nothing. As bzip2recover does,
+      the bzip2recover link writes its rec* files through a symlink already
+      at that name and truncates a file already there (Debian's patched
+      bzip2recover refuses both).
 
   stuffr install-links ~/.local/bin --names bzcat
       Only the named links; --names takes a comma-separated list. A name that
