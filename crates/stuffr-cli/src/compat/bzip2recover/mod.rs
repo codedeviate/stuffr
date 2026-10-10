@@ -35,7 +35,9 @@
 //! - At exactly 50000 magics (for example 49999 blocks plus the
 //!   end-of-stream marker) with at least 40 bits after the last, 1.0.8
 //!   writes past its `bEnd` array and, on macOS, silently drops block 1;
-//!   stuffr writes it, as if the arrays were 50001 long.
+//!   stuffr writes it, as if the arrays were 50001 long. Debian's gcc build
+//!   of the same source instead stops at the 50000th magic ("more than
+//!   50000 blocks", exit 1); stuffr, like upstream, stops at the 50001st.
 //! - Like bzip2, a read error is reported with its `strerror` text; a stale
 //!   `errno` that the C library left nonzero at a clean end of file (which
 //!   would make 1.0.8 report a read error) is not reproduced.

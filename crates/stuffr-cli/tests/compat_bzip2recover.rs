@@ -13,6 +13,18 @@
 //! patch, and the reference's 0600 output modes are checked and then set to
 //! stuffr's before comparing. That is a deviation of the test oracle, not of
 //! stuffr.
+//!
+//! **A reference that caps one magic early.** Debian's 1.0.8-6 build stops
+//! at the 50000th magic with "appears to contain more than 50000 blocks"
+//! (exit 1, no outputs), where upstream 1.0.8 (macOS) lists block 50000 and
+//! stops only at the 50001st. No Debian patch touches this: its
+//! `bzip2recover.c` has upstream's check, and upstream writes `bStart[50000]`
+//! one past the array at that magic, so this is the same undefined
+//! behaviour compiled differently (most likely gcc's optimiser using the
+//! out-of-bounds store to fire the check a magic early). stuffr keeps
+//! upstream's observable behaviour. [`early_cap_reference`] probes for it;
+//! on such a reference the cases with 50000 or more magics are skipped,
+//! counted as known oracle skips. A deviation of the test oracle again.
 
 #[cfg(unix)]
 mod compat_harness;
@@ -202,6 +214,63 @@ mod differential {
         })
     }
 
+    /// Whether the reference stops at the 50000th magic instead of the
+    /// 50001st (see the file's doc). Probed once with exactly 50000
+    /// back-to-back magics: exit 1 with "more than 50000 blocks" is the
+    /// early cap, success is upstream, anything else panics. `None` when the
+    /// reference is missing.
+    fn early_cap_reference() -> Option<bool> {
+        static PROBE: OnceLock<Option<bool>> = OnceLock::new();
+        *PROBE.get_or_init(|| {
+            let exe = Path::new(REFERENCE_DIR).join("bzip2recover");
+            if !require_reference(&exe) {
+                return None;
+            }
+            let dir =
+                std::env::temp_dir().join(format!("stuffr-recover-cap-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("m.bz2"), packed_magics(50_000)).unwrap();
+            let out = Command::new(&exe)
+                .arg("m.bz2")
+                .current_dir(&dir)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let early = out.status.code() == Some(1)
+                && stderr.contains("appears to contain more than 50000 blocks");
+            assert!(
+                early || out.status.success(),
+                "the block-cap probe matched neither upstream nor the early \
+                 cap: {:?}, stderr tail:\n{}",
+                out.status,
+                &stderr[stderr.len().saturating_sub(400)..]
+            );
+            if early {
+                println!(
+                    "note: the reference bzip2recover stops at the 50000th \
+                     magic, one before upstream 1.0.8 (the out-of-bounds \
+                     bStart[50000] store compiled differently)"
+                );
+            }
+            Some(early)
+        })
+    }
+
+    /// Cases skipped on purpose because the reference is known to differ
+    /// from upstream 1.0.8 there; they count as accounted for on CI.
+    struct Skipped<'a> {
+        count: usize,
+        why: &'a str,
+    }
+
+    const NONE_SKIPPED: Skipped<'static> = Skipped { count: 0, why: "" };
+
     /// On a Debian reference, check its outputs are 0600, check stuffr's
     /// are upstream's `0o666 & !umask`, then make them equal for comparing.
     fn debian_modes(r: &mut Run, s: &mut Run) {
@@ -234,10 +303,15 @@ mod differential {
             .unwrap_or_default()
     }
 
+    fn check_all(group: &str, cases: &[Case]) {
+        check_all_skipping(group, cases, NONE_SKIPPED);
+    }
+
     /// Run every case against the reference and stuffr, a few at a time, and
     /// fail once listing every case that differed. Prints "N of M cases
-    /// compared"; on CI every case must have run.
-    fn check_all(group: &str, cases: &[Case]) {
+    /// compared" (M includes the known oracle skips, which are named); on CI
+    /// every case not skipped for a known reason must have run.
+    fn check_all_skipping(group: &str, cases: &[Case], skipped: Skipped) {
         let one = |c: &Case| -> Result<bool, String> {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let Some(mut r) = reference(REFERENCE_DIR, c) else {
@@ -277,7 +351,15 @@ mod differential {
                 Err(p) => failures.push(p),
             }
         }
-        println!("{group}: {ran} of {} cases compared", cases.len());
+        let total = cases.len() + skipped.count;
+        if skipped.count > 0 {
+            println!(
+                "{group}: {ran} of {total} cases compared, {} skipped: {}",
+                skipped.count, skipped.why
+            );
+        } else {
+            println!("{group}: {ran} of {total} cases compared");
+        }
         if std::env::var_os("CI").is_some() {
             assert_eq!(
                 ran,
@@ -451,12 +533,30 @@ mod differential {
         ] {
             files.push(("truncated", bz[..cut].to_vec()));
         }
+        let early_cap = early_cap_reference() == Some(true);
+        let at_cap = |label: &str| label.starts_with("5000") && label.ends_with("magics");
+        let skip = if early_cap {
+            files.iter().filter(|(l, _)| at_cap(l)).count()
+        } else {
+            0
+        };
         let cases: Vec<Case> = files
             .into_iter()
+            .filter(|(l, _)| !(early_cap && at_cap(l)))
             .map(|(_, data)| case(&["d.bz2"], vec![("d.bz2", data)]))
             .collect();
-        check_all("recover", &cases);
+        check_all_skipping(
+            "recover",
+            &cases,
+            Skipped {
+                count: skip,
+                why: EARLY_CAP_SKIP,
+            },
+        );
     }
+
+    const EARLY_CAP_SKIP: &str = "50000+ magics: the reference stops at the 50000th \
+                                  magic, one before upstream 1.0.8";
 
     /// Whether a block magic starts at bit `i` of `data`.
     fn bit_magic_at(data: &[u8], i: usize) -> bool {
@@ -500,16 +600,17 @@ mod differential {
             with_setup(case(&["d.bz2"], d()), first_output_is_a_symlink),
             with_setup(case(&["d.bz2"], d()), first_output_dangles),
         ];
-        if debian {
-            println!(
-                "outputs: skipped {} pre-existing-output cases: the reference \
-                 carries Debian's bzip2recover-race-open-output.diff",
-                upstream_only.len()
-            );
+        let skipped = if debian {
+            Skipped {
+                count: upstream_only.len(),
+                why: "pre-existing outputs: the reference carries Debian's \
+                      bzip2recover-race-open-output.diff",
+            }
         } else {
             cases.extend(upstream_only);
-        }
-        check_all("outputs", &cases);
+            NONE_SKIPPED
+        };
+        check_all_skipping("outputs", &cases, skipped);
     }
 
     /// Bits, most significant first, packed into zero-padded bytes.
@@ -637,10 +738,21 @@ mod differential {
             zero_block_stream(160),
             &cap_stderr(&blocks, (last, last + 160)),
         );
-        check_all(
-            "block cap control",
-            &[case(&["d.bz2"], vec![("d.bz2", short)])],
-        );
+        if early_cap_reference() == Some(true) {
+            check_all_skipping(
+                "block cap control",
+                &[],
+                Skipped {
+                    count: 1,
+                    why: EARLY_CAP_SKIP,
+                },
+            );
+        } else {
+            check_all(
+                "block cap control",
+                &[case(&["d.bz2"], vec![("d.bz2", short)])],
+            );
+        }
     }
 
     /// The same overflow from a genuinely stream-shaped input: 49999 blocks,
