@@ -197,7 +197,13 @@ impl<R: Read> PackReader<R> {
             let l = self.level;
             if self.code >= self.inodes[l] {
                 let idx = self.code - self.inodes[l];
-                if idx >= self.leaves[l] {
+                // unpack.c rejects only `idx > leaves`. At `idx == leaves`
+                // on a non-last level it reads the next level's first
+                // symbol (defined, odd: reproduced, `symbols` is flat). On
+                // the last level that is one past the symbol table, which
+                // is undefined behaviour in the C, so it stays Corrupt
+                // (the "never reproduce UB" rule).
+                if idx > self.leaves[l] || (idx == self.leaves[l] && l == last) {
                     return Err(corrupt("File corrupt"));
                 }
                 let at = self.first[l] + idx as usize;
@@ -455,6 +461,16 @@ mod tests {
         let mut p = encode(b"hello world");
         p[5] -= 1; // EOB arrives with a byte still owed to the length
         assert!(matches!(decode(&p), Err(PackError::Corrupt(_))));
+    }
+
+    #[test]
+    fn an_index_one_past_a_non_last_level_reads_the_next_levels_symbol() {
+        // Levels 3, leaves per level [1, 0, 2]: level 0 has no internal
+        // node, so code 1 is index 1 == leaves[0], which unpack.c resolves
+        // to the next level's first symbol ('B'). `/usr/bin/gzip -dc` on
+        // these exact bytes prints BAAAAAAA.
+        let p = b"\x1f\x1e\x00\x00\x00\x08\x03\x01\x00\x00AB\x80";
+        assert_eq!(decode(p).unwrap(), b"BAAAAAAA");
     }
 
     #[test]
