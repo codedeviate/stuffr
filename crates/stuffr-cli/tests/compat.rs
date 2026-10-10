@@ -18,16 +18,21 @@ mod unix {
         bzcat
     }
 
+    /// Only the invoked name counts, not what the chain resolves to: the
+    /// usage text names the program it was called as.
     #[test]
-    fn symlink_named_bzcat_dispatches_to_the_compat_stub() {
+    fn symlink_named_bzcat_dispatches_to_bzcat() {
         let dir = std::env::temp_dir().join(format!("stuffr-compat-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let bzcat = link_chain(&dir);
-        let out = Command::new(&bzcat).output().unwrap();
+        let out = Command::new(&bzcat).arg("-h").output().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(out.status.code(), Some(3));
+        assert_eq!(out.status.code(), Some(0));
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("bzcat: not yet implemented"), "stderr: {err}");
+        assert!(
+            err.contains("usage: bzcat [flags and input files in any order]"),
+            "stderr: {err}"
+        );
     }
 
     const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");

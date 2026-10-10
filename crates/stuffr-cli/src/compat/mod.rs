@@ -49,32 +49,35 @@ pub fn family_for(argv0: &OsStr) -> Option<(Family, &'static str)> {
 }
 
 /// Run the compatibility tool `args[0]` names, or return `None` when it names
-/// none (the caller then behaves as `stuffr`).
+/// none (the caller then behaves as `stuffr`). The tool gets the arguments
+/// after `args[0]`.
 pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
     let (family, name) = family_for(args.first()?)?;
+    let rest = args.into_iter().skip(1).collect();
     Some(match family {
-        Family::Bzip2 => bzip2::run(name, args),
+        Family::Bzip2 => bzip2::run(name, rest),
     })
 }
 
 /// Whether stdin is a terminal.
-#[allow(dead_code)] // first caller lands with the bzip2 entry point
 pub(crate) fn stdin_is_tty() -> bool {
     io::stdin().is_terminal()
 }
 
 /// Whether stdout is a terminal.
-#[allow(dead_code)] // first caller lands with the bzip2 entry point
 pub(crate) fn stdout_is_tty() -> bool {
     io::stdout().is_terminal()
 }
 
-/// Copy `from`'s access and modification times, permission bits and (where
-/// permitted) owner onto `to`. A refused `chown` (`EPERM`) is ignored, as the
-/// reference tools do; every other failure is returned.
-#[allow(dead_code)] // first caller lands with the bzip2 entry point
-pub(crate) fn copy_metadata(from: &Path, to: &Path) -> io::Result<()> {
-    let meta = std::fs::metadata(from)?;
+/// Copy the access and modification times, permission bits and (where
+/// permitted) owner in `meta` onto `to`. A refused `chown` (`EPERM`) is
+/// ignored, as the reference tools do; every other failure is returned.
+///
+/// Takes metadata rather than a path because bzip2 saves its input's
+/// metadata before reading it, so the access time it copies is the one from
+/// before the read. `to` is opened for writing to set the times, so call
+/// this before restricting `to`'s permissions any further.
+pub(crate) fn copy_metadata_from(meta: &std::fs::Metadata, to: &Path) -> io::Result<()> {
     let mut times = std::fs::FileTimes::new();
     if let Ok(t) = meta.accessed() {
         times = times.set_accessed(t);
@@ -183,7 +186,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o640)).unwrap();
         }
-        copy_metadata(&a, &b).unwrap();
+        copy_metadata_from(&std::fs::metadata(&a).unwrap(), &b).unwrap();
         let (ma, mb) = (
             std::fs::metadata(&a).unwrap(),
             std::fs::metadata(&b).unwrap(),
