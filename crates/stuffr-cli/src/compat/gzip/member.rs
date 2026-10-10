@@ -1,6 +1,12 @@
 //! The gzip member layer: RFC 1952 headers, bodies and trailers as typed
 //! facts. No messages and no exit codes live here; each personality words a
 //! failure its own way.
+//!
+//! Every entry point that reads takes `&mut Lookahead<R>`, never a plain
+//! `BufRead`: a member boundary is `1f 8b`, and only `Lookahead` guarantees
+//! both bytes are visible at once whatever the source's read sizes. The
+//! guarantee is the type, so forgetting to wrap does not compile. A flavour
+//! builds one `Lookahead::new(source)` per input and passes it throughout.
 
 use std::io::{self, BufRead, Read, Write};
 
@@ -122,7 +128,7 @@ impl HeaderReader<'_> {
 }
 
 /// Read one header from `r`; `Truncated(Header)` at EOF inside it.
-pub(crate) fn read_header(r: &mut dyn BufRead) -> Result<Header, MemberError> {
+pub(crate) fn read_header<R: Read>(r: &mut Lookahead<R>) -> Result<Header, MemberError> {
     let mut hr = HeaderReader {
         r,
         crc: flate2::Crc::new(),
@@ -180,8 +186,8 @@ pub(crate) fn read_header(r: &mut dyn BufRead) -> Result<Header, MemberError> {
 
 /// Inflate one member's body and verify its trailer, writing plain bytes to
 /// `out` as they are produced (so partial output exists before an error).
-pub(crate) fn inflate_member(
-    r: &mut dyn BufRead,
+pub(crate) fn inflate_member<R: Read>(
+    r: &mut Lookahead<R>,
     header: Header,
     out: &mut dyn Write,
 ) -> Result<MemberInfo, MemberError> {
@@ -322,10 +328,9 @@ impl<R: Read> BufRead for Lookahead<R> {
 /// or trailing bytes (consumed to EOF in bounded chunks; `all_zero` if every
 /// one is NUL). `offset` is where the trailing bytes start.
 ///
-/// `r` must guarantee two bytes of lookahead (wrap the source in
-/// [`Lookahead`]): a plain `BufRead` whose buffer ends on a lone `1f` is
-/// classified as trailing, because `BufRead` cannot peek past its buffer.
-pub(crate) fn after_member(r: &mut dyn BufRead, offset: u64) -> io::Result<After> {
+/// Taking a [`Lookahead`] is what guarantees the two bytes of `1f 8b` are
+/// visible together, so a member boundary is never taken for trailing data.
+pub(crate) fn after_member<R: Read>(r: &mut Lookahead<R>, offset: u64) -> io::Result<After> {
     let first = loop {
         match r.fill_buf() {
             Ok(b) => break b,
@@ -450,6 +455,10 @@ pub(crate) fn compress_member(
 mod tests {
     use super::*;
 
+    fn la(b: &[u8]) -> Lookahead<&[u8]> {
+        Lookahead::new(b)
+    }
+
     fn plain(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 % 251) as u8).collect()
     }
@@ -483,7 +492,7 @@ mod tests {
     }
 
     fn inflate(bytes: &[u8]) -> (Result<MemberInfo, MemberError>, Vec<u8>) {
-        let mut r = bytes;
+        let mut r = la(bytes);
         let h = read_header(&mut r).expect("header");
         let mut out = Vec::new();
         let res = inflate_member(&mut r, h, &mut out);
@@ -541,10 +550,10 @@ mod tests {
         for h in cases {
             let mut buf = Vec::new();
             write_header(&h, &mut buf).unwrap();
-            let mut r = &buf[..];
+            let mut r = la(&buf[..]);
             let got = read_header(&mut r).unwrap();
             assert_eq!(got.len, buf.len() as u64);
-            assert!(r.is_empty());
+            assert!(r.fill_buf().unwrap().is_empty());
             assert_eq!(got, Header { len: got.len, ..h });
         }
     }
@@ -553,7 +562,7 @@ mod tests {
     fn bad_method() {
         let mut b = member(&hdr(), 6, b"x");
         b[2] = 7;
-        let mut r = &b[..];
+        let mut r = la(&b[..]);
         assert!(matches!(
             read_header(&mut r),
             Err(MemberError::Fault(Fault::BadMethod(7)))
@@ -564,7 +573,7 @@ mod tests {
     fn reserved_flag_bits() {
         let mut b = member(&hdr(), 6, b"x");
         b[3] = 0x20;
-        let mut r = &b[..];
+        let mut r = la(&b[..]);
         assert!(matches!(
             read_header(&mut r),
             Err(MemberError::Fault(Fault::BadFlags(0x20)))
@@ -577,7 +586,7 @@ mod tests {
         h.hcrc = true;
         let mut b = member(&h, 6, b"x");
         b[10] ^= 0xff;
-        let mut r = &b[..];
+        let mut r = la(&b[..]);
         assert!(matches!(
             read_header(&mut r),
             Err(MemberError::Fault(Fault::BadHeaderCrc))
@@ -590,7 +599,7 @@ mod tests {
         h.name = Some(b"name".to_vec());
         let b = member(&h, 6, b"x");
         for cut in [0, 1, 5, 9, 11, 13] {
-            let mut r = &b[..cut];
+            let mut r = la(&b[..cut]);
             assert!(
                 matches!(
                     read_header(&mut r),
@@ -666,29 +675,26 @@ mod tests {
 
     #[test]
     fn after_member_classifies_eof_next_trailing_and_zeros() {
-        assert!(matches!(
-            after_member(&mut &b""[..], 5).unwrap(),
-            After::End
-        ));
-        let mut r = &[0x1f, 0x8b, 8][..];
+        assert!(matches!(after_member(&mut la(b""), 5).unwrap(), After::End));
+        let mut r = la(&[0x1f, 0x8b, 8]);
         assert!(matches!(
             after_member(&mut r, 5).unwrap(),
             After::NextMember
         ));
-        assert_eq!(r.len(), 3, "not consumed");
-        let mut r = &[0u8; 100][..];
+        assert_eq!(r.fill_buf().unwrap().len(), 3, "not consumed");
+        let mut r = la(&[0u8; 100]);
         match after_member(&mut r, 42).unwrap() {
             After::Trailing { offset, all_zero } => assert!(offset == 42 && all_zero),
             _ => panic!(),
         }
-        assert!(r.is_empty());
+        assert!(r.fill_buf().unwrap().is_empty());
         let mut v = vec![0u8; 200_000];
         v[199_999] = 1;
-        match after_member(&mut &v[..], 7).unwrap() {
+        match after_member(&mut la(&v), 7).unwrap() {
             After::Trailing { offset, all_zero } => assert!(offset == 7 && !all_zero),
             _ => panic!(),
         }
-        match after_member(&mut &b"junk"[..], 0).unwrap() {
+        match after_member(&mut la(b"junk"), 0).unwrap() {
             After::Trailing { all_zero, .. } => assert!(!all_zero),
             _ => panic!(),
         }
@@ -709,13 +715,13 @@ mod tests {
     fn fname_is_bounded() {
         let mut b = vec![0x1f, 0x8b, 8, 8, 0, 0, 0, 0, 0, 3];
         b.extend(std::iter::repeat_n(b'a', MAX_FIELD + 10));
-        let mut r = &b[..];
+        let mut r = la(&b[..]);
         assert!(matches!(
             read_header(&mut r),
             Err(MemberError::Fault(Fault::Truncated(Where::Header)))
         ));
         // And a NUL-less name that simply ends is the same fact.
-        let mut r = &b[..20];
+        let mut r = la(&b[..20]);
         assert!(matches!(
             read_header(&mut r),
             Err(MemberError::Fault(Fault::Truncated(Where::Header)))
@@ -735,7 +741,7 @@ mod tests {
                 Ok(1)
             }
         }
-        fn walk(r: &mut dyn BufRead) -> Vec<Vec<u8>> {
+        fn walk<R: io::Read>(r: &mut Lookahead<R>) -> Vec<Vec<u8>> {
             let mut got = Vec::new();
             loop {
                 let h = read_header(r).unwrap();
@@ -758,11 +764,27 @@ mod tests {
         assert_eq!(walk(&mut r), parts);
         let mut r = Lookahead::new(OneByte(&all));
         assert_eq!(walk(&mut r), parts);
-        // Split `1f | 8b` exactly at a source read edge, at every boundary.
+        // Split `1f | 8b` exactly at a source read edge, at every boundary:
+        // the first read ends on `1f`, the next begins with `8b`.
+        struct Split<'a>(&'a [u8], usize);
+        impl io::Read for Split<'_> {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                let lim = if self.1 > 0 {
+                    self.1.min(self.0.len())
+                } else {
+                    self.0.len()
+                };
+                let n = lim.min(b.len());
+                b[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                self.1 = self.1.saturating_sub(n);
+                Ok(n)
+            }
+        }
         let mut edge = 0;
         for p in &parts[..3] {
             edge += member(&hdr(), 6, p).len();
-            let mut r = Lookahead::new((&all[..edge + 1]).chain(&all[edge + 1..]));
+            let mut r = Lookahead::new(Split(&all, edge + 1));
             assert_eq!(walk(&mut r), parts);
         }
     }
