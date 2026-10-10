@@ -269,6 +269,42 @@ fn drop_without_finish_does_not_leak_or_crash() {
     assert!(d.finish().is_err());
 }
 
+/// An inner-writer error inside `write` poisons the encoder: zlib has
+/// consumed the input and the output is lost, so a later `write` or `finish`
+/// must error rather than produce a silently corrupt stream, even once the
+/// writer has recovered.
+#[test]
+fn a_write_error_poisons_the_encoder() {
+    struct FailsOnce(bool, Vec<u8>);
+    impl Write for FailsOnce {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            if self.0 {
+                self.0 = false;
+                return Err(io::Error::other("transient"));
+            }
+            self.1.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    // 1 MiB of seeded random: incompressible, so zlib must emit output
+    // during `write`, long before `finish`.
+    let mut r = Rng(0x706f_6973);
+    let data: Vec<u8> = (0..1 << 20).map(|_| r.next() as u8).collect();
+    let mut d = RawDeflate::new(FailsOnce(true, Vec::new()), 6).unwrap();
+    assert!(
+        d.write_all(&data).is_err(),
+        "the failing write is inside write"
+    );
+    let e = d.write(b"more").expect_err("a later write refuses");
+    assert!(e.to_string().contains("earlier write error"), "{e}");
+    assert!(d.write(b"").is_err(), "even an empty write refuses");
+    let e = d.finish().err().expect("finish refuses");
+    assert!(e.to_string().contains("earlier write error"), "{e}");
+}
+
 #[test]
 fn rejects_level_0_and_10() {
     for level in [0, 10, u32::MAX] {

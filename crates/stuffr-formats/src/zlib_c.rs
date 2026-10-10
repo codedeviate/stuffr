@@ -94,6 +94,11 @@ pub struct RawDeflate<W: Write> {
     buf: Vec<u8>,
     /// Whether `deflateEnd` is still owed (set by a successful init).
     live: bool,
+    /// Set when a `deflate` call or a write of its output fails. zlib has
+    /// already consumed the input by then and the output may be half
+    /// written, so the stream is corrupt: every later `write` and `finish`
+    /// refuses rather than emit a silently broken stream.
+    poisoned: bool,
 }
 
 impl<W: Write> RawDeflate<W> {
@@ -148,12 +153,26 @@ impl<W: Write> RawDeflate<W> {
             out: Some(out),
             buf: vec![0; OUT_CHUNK],
             live: true,
+            poisoned: false,
         })
     }
 
     /// One `deflate` call over `input` with `flush`, writing whatever it
     /// produced. Returns (zlib's code, bytes consumed, bytes produced).
     fn step(&mut self, input: &[u8], flush: c_int) -> io::Result<(c_int, usize, usize)> {
+        if self.poisoned {
+            return Err(io::Error::other(
+                "deflate stream unusable after an earlier write error",
+            ));
+        }
+        let res = self.step_inner(input, flush);
+        if res.is_err() {
+            self.poisoned = true;
+        }
+        res
+    }
+
+    fn step_inner(&mut self, input: &[u8], flush: c_int) -> io::Result<(c_int, usize, usize)> {
         let avail_in = c_uint::try_from(input.len()).unwrap_or(c_uint::MAX);
         self.stream.next_in = input.as_ptr().cast_mut();
         self.stream.avail_in = avail_in;
@@ -190,6 +209,7 @@ impl<W: Write> RawDeflate<W> {
                 break;
             }
             if rc == z::Z_BUF_ERROR && made == 0 {
+                self.poisoned = true;
                 return Err(zlib_error("deflate (finish, no progress)", rc));
             }
         }
@@ -214,7 +234,7 @@ impl<W: Write> RawDeflate<W> {
 
 impl<W: Write> Write for RawDeflate<W> {
     fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        if input.is_empty() {
+        if input.is_empty() && !self.poisoned {
             return Ok(0);
         }
         loop {
@@ -225,6 +245,7 @@ impl<W: Write> Write for RawDeflate<W> {
             // Nothing consumed: the output buffer filled and has been
             // written out, so go again. Only no progress at all is a fault.
             if rc == z::Z_BUF_ERROR && made == 0 {
+                self.poisoned = true;
                 return Err(zlib_error("deflate (no progress)", rc));
             }
         }
