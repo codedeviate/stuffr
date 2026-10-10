@@ -1290,7 +1290,7 @@ WHAT THIS BUILD CAN DO
 
 COMPATIBILITY LINKS (INSTALL-LINKS)
 
-  stuffr install-links ~/.local/bin
+  stuffr install-links --dir ~/.local/bin
       Creates symlinks named bzip2, bunzip2, bzcat and bzip2recover in that
       directory, each pointing at this stuffr binary. Run under one of those
       names, the binary behaves as that tool, with its flags, messages and
@@ -1304,22 +1304,22 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       already at that name and truncates a file already there (Debian's
       patched bzip2recover refuses both).
 
-  stuffr install-links ~/.local/bin --names bzcat
+  stuffr install-links --dir ~/.local/bin --names bzcat
       Only the named links; --names takes a comma-separated list. A name that
       is not a compatibility name is a usage error (exit 2).
 
-  stuffr install-links ~/.local/bin --force
+  stuffr install-links --dir ~/.local/bin --force
       A regular file or a link to something else already called bzip2 is
       refused (exit 2, naming the path) and left untouched. --force replaces
       it. A directory is never replaced. A stale stuffr link (one left
       dangling into a stuffr an upgrade deleted) is replaced without --force.
 
-  stuffr install-links ~/.local/bin --remove
+  stuffr install-links --dir ~/.local/bin --remove
       Removes the links that point at this stuffr, and stale stuffr links. A
       foreign symlink or a regular file of the same name is left where it
       is, with a "left PATH: why" line for each.
 
-  stuffr install-links ~/.local/bin --dry-run
+  stuffr install-links --dir ~/.local/bin --dry-run
       Prints "would create ..." (or "would remove ...") lines and changes
       nothing. Combines with --force and --remove. Not available on Windows
       (exit 3).

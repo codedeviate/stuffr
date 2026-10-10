@@ -61,6 +61,7 @@ mod unix {
     fn il(dir: &Path, args: &[&str]) -> std::process::Output {
         Command::new(STUFFR)
             .arg("install-links")
+            .arg("--dir")
             .arg(dir)
             .args(args)
             .output()
@@ -280,6 +281,21 @@ mod unix {
     }
 
     #[test]
+    fn install_links_takes_the_directory_only_as_dir() {
+        let s = Scratch::new("positional");
+        let o = Command::new(STUFFR)
+            .arg("install-links")
+            .arg(&s.0)
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 0);
+        let o = Command::new(STUFFR).arg("install-links").output().unwrap();
+        assert_eq!(o.status.code(), Some(2));
+        assert!(stderr(&o).contains("--dir"), "{}", stderr(&o));
+    }
+
+    #[test]
     fn install_links_duplicate_names_equal_one_name() {
         let s = Scratch::new("dup");
         let o = il(&s.0, &["--names", "bzcat,bzcat"]);
@@ -379,7 +395,7 @@ mod unix {
         let out = Command::new(STUFFR).arg("--examples").output().unwrap();
         let text = stdout(&out);
         for needle in [
-            "install-links",
+            "install-links --dir",
             "--names",
             "--force",
             "--remove",

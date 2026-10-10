@@ -273,6 +273,7 @@ pub enum Command {
     /// `bzip2recover`) to this binary in a directory. Opt-in, never automatic.
     InstallLinks {
         /// Directory to put the links in. It must already exist.
+        #[arg(long, value_name = "DIR")]
         dir: std::path::PathBuf,
         /// Only these names, comma-separated or repeated. Default: all.
         #[arg(long, value_name = "NAME", value_delimiter = ',')]
