@@ -30,8 +30,9 @@ pub struct Case<'a> {
     /// Created in the working directory before running.
     pub files: Vec<(&'a str, Vec<u8>)>,
     /// Fed to stdin: through a pipe, or, with `tty_stdin`, typed at the
-    /// terminal (framed with `\n` if needed, then ^D). Canonical-mode lines
-    /// are limited to about 4 KiB, so keep tty input small.
+    /// terminal (framed with `\n` if needed, then ^D). A canonical-mode line
+    /// is limited by `MAX_CANON` (1024 bytes on macOS), so keep tty input to
+    /// about 1 KiB of plain text with no control characters.
     pub stdin: Option<Vec<u8>>,
     pub tty_stdin: bool,
     pub tty_stdout: bool,
@@ -196,15 +197,16 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    if let Some(w) = writer {
-        let _ = w.join();
-    }
+    // Deliberately not joined: a child that never reads the terminal leaves
+    // the writer blocked once the pty buffer is full, and joining would hang
+    // the test. Dropping the handle detaches it; the thread ends when the
+    // master (and its clone) close or the write fails.
+    drop(writer);
     let stdout = out_t.map(|t| t.join().unwrap()).unwrap_or_default();
     drop(stdin_master);
     let stderr_raw = err_t.map(|t| t.join().unwrap()).unwrap_or_default();
 
-    // The only normalisation: the program path becomes the bare name.
-    let stderr = String::from_utf8_lossy(&stderr_raw).replace(exe.to_str().unwrap(), c.name);
+    let stderr = normalise_stderr(&stderr_raw, exe, c.name);
 
     let code = status
         .code()
@@ -219,8 +221,14 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
 }
 
 /// Read to end-of-file on a worker thread. A pty master reports hang-up as
-/// 0 on macOS and as `EIO` on Linux; any error other than `Interrupted`
-/// therefore counts as end of file.
+/// 0 on macOS and as `EIO` on Linux, and only those two count as end of file.
+/// `Interrupted` is retried; anything else panics, so the `join().unwrap()`
+/// surfaces it rather than handing back a silently truncated stream.
+/// The only normalisation: the program path becomes the bare invoked name.
+pub fn normalise_stderr(raw: &[u8], exe: &Path, name: &str) -> String {
+    String::from_utf8_lossy(raw).replace(exe.to_str().unwrap(), name)
+}
+
 fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut v = Vec::new();
@@ -230,7 +238,8 @@ fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>>
                 Ok(0) => break,
                 Ok(n) => v.extend_from_slice(&buf[..n]),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break, // EIO on Linux
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break, // Linux hang-up
+                Err(e) => panic!("read failed: {e}"),
             }
         }
         v
@@ -322,7 +331,7 @@ fn is_bz2_name(n: &str) -> bool {
 }
 
 /// Decompress with the reference `bzip2 -dc`; `Err` carries its stderr.
-fn ref_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
+pub fn ref_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     let mut child = Command::new(Path::new(REFERENCE_DIR).join("bzip2"))
         .arg("-dc")
         .env_clear()
@@ -456,8 +465,10 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
     let names: std::collections::BTreeSet<&String> = r.tree.keys().chain(s.tree.keys()).collect();
     for n in names {
         match (r.tree.get(n), s.tree.get(n)) {
-            (Some(_), None) => d.push(format!("tree: {n} exists in reference only")),
-            (None, Some(_)) => d.push(format!("tree: {n} exists in stuffr only")),
+            (Some(_), None) => d.push(format!(
+                "tree: {n} removed in stuffr (exists in reference only)"
+            )),
+            (None, Some(_)) => d.push(format!("tree: {n} added in stuffr (exists in stuffr only)")),
             (Some((rb, rm, rt)), Some((sb, sm, st))) => {
                 if rm != sm {
                     d.push(format!("tree: {n} mode reference {rm:o} vs stuffr {sm:o}"));
