@@ -72,12 +72,7 @@ const SPLIT: u8 = if cfg!(windows) { b'\\' } else { b'/' };
 pub fn run(argv0: OsString, args: Vec<OsString>) -> ExitCode {
     // bzip2recover dies of SIGPIPE when stderr is a closed pipe; Rust
     // ignores the signal by default, so restore its default action.
-    #[cfg(unix)]
-    // SAFETY: setting a signal's disposition to SIG_DFL installs no handler
-    // and touches no Rust state; it is done before any other thread or I/O.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+    super::host::reset_sigpipe();
     let args: Vec<Vec<u8>> = args.iter().map(|a| bytes(a)).collect();
     let code = recover(&bytes(&argv0), &args, &mut RealFs, &mut io::stderr());
     ExitCode::from(code)

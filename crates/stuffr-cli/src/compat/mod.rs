@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 pub mod bzip2;
 pub mod bzip2recover;
+mod host;
 pub mod links;
 
 /// A family of tools the binary can impersonate.

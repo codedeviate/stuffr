@@ -32,24 +32,17 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
-use streams::{Host, Sandbox};
+use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
 mod args;
 mod messages;
 mod run;
-mod streams;
 
 /// Entry point for `bzip2`, `bunzip2` and `bzcat`; `name` is the canonical
 /// invoked name and `args` the arguments after `argv[0]`.
 pub fn run(name: &'static str, args: Vec<OsString>) -> ExitCode {
-    // bzip2 dies of SIGPIPE writing to a closed pipe; Rust ignores the
-    // signal by default, so restore its default action, on this path only.
-    #[cfg(unix)]
-    // SAFETY: setting a signal's disposition to SIG_DFL installs no handler
-    // and touches no Rust state; it is done before any other thread or I/O.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
+    // bzip2 dies of SIGPIPE writing to a closed pipe.
+    reset_sigpipe();
     let env = |k: &str| std::env::var_os(k);
     ExitCode::from(main(name, &args, &env, &mut Host::Real, &mut io::stderr()))
 }
@@ -67,17 +60,6 @@ fn main(
         args::Parsed::Run(s) => run::execute(name, s, host, err),
     }
 }
-
-/// The most a [`run_in`] run may write, to standard output and files
-/// together. Past it a write fails with `ENOSPC`, which bzip2 reports as an
-/// I/O error and exit 1, the code it gives a full disk. A bzip2 stream of a
-/// few dozen bytes can expand to tens of MiB, so without a cap a fuzzer's
-/// short input could fill memory or disk; 8 MiB is past any block's
-/// ordinary output (a 900k block of text) and bounds what a bomb can cost.
-/// `-t` writes nothing but decodes just as much (one 50-byte stream is 45 MB
-/// of zeros), so its decoded bytes are charged too: every path a sandboxed
-/// run takes is bounded by this one figure.
-const SANDBOX_OUTPUT_CAP: u64 = 8 * 1024 * 1024;
 
 /// [`run`] without the process: operands resolve against `dir`, standard
 /// input is `stdin` (read as a pipe), standard output and error are

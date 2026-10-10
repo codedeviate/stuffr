@@ -1,6 +1,12 @@
-//! Files and streams for the bzip2 family: names as bytes, C library
-//! behaviours bzip2 relies on (`strerror`, `remove`, sticky end of file),
-//! and the input reader that reads the way libbzip2 does.
+//! The process plumbing shared by the compatibility families: names as
+//! bytes, C library behaviours the ported tools rely on (`strerror`, sticky
+//! end of file), the input reader that reads the way libbzip2 does, the
+//! sandbox the fuzz targets run under, and the helpers that create and
+//! publish an output file (`create_temp`, `publish`) and restore `SIGPIPE`
+//! (`reset_sigpipe`).
+//!
+//! Nothing here knows a tool's messages or flags; each family keeps its own
+//! checks and wording and calls these helpers.
 
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
@@ -9,10 +15,88 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::run::CHUNK;
+/// `BZ_MAX_UNUSED`: libbzip2's read size, and bzip2's output chunk.
+pub(crate) const CHUNK: usize = 5000;
+
+/// The most a sandboxed run may write, to standard output and files
+/// together. Past it a write fails with `ENOSPC`, the code a full disk gives.
+/// A bzip2 stream of a few dozen bytes can expand to tens of MiB, so without
+/// a cap a fuzzer's short input could fill memory or disk; 8 MiB is past any
+/// block's ordinary output (a 900k block of text) and bounds what a bomb can
+/// cost.
+pub(crate) const SANDBOX_OUTPUT_CAP: u64 = 8 * 1024 * 1024;
+
+/// Restore `SIGPIPE`'s default action. The tools die of it writing to a
+/// closed pipe; Rust ignores the signal by default, so a compat entry point
+/// restores it, on that path only.
+pub(crate) fn reset_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: setting a signal's disposition to SIG_DFL installs no handler
+    // and touches no Rust state; it is done before any other thread or I/O.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// Create a temporary output file in `dir`, `create_new`, mode 0600, named
+/// `.stuffr-{family}-{pid}-{n}.tmp`; a name already taken moves on to the
+/// next `n`.
+pub(crate) fn create_temp(dir: &Path, family: &str) -> io::Result<(PathBuf, File)> {
+    let mut opts = File::options();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    for n in 0u32.. {
+        let tmp = dir.join(format!(".stuffr-{family}-{}-{n}.tmp", std::process::id()));
+        match opts.open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 1000 => {}
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the loop returns")
+}
+
+/// What [`publish`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Published {
+    /// The temporary file is now `out`.
+    Done,
+    /// `out` appeared meanwhile; it was left alone and the temporary file
+    /// was removed.
+    Exists,
+}
+
+/// Publish the finished temporary file `tmp` as `out`.
+///
+/// Without `force`, publishing must not replace anything: an `O_EXCL` open
+/// of `out` would refuse a file that appeared after the existence check, and
+/// a rename would silently replace it. So the temporary is hard-linked to
+/// `out`, which fails with `EEXIST` exactly where that open would, and then
+/// unlinked. Where the filesystem has no hard links, rename is the fallback.
+/// With `force`, any existing output was already removed on purpose, and
+/// rename keeps that intent.
+pub(crate) fn publish(tmp: &Path, out: &Path, force: bool) -> io::Result<Published> {
+    if force {
+        fs::rename(tmp, out)?;
+        return Ok(Published::Done);
+    }
+    match fs::hard_link(tmp, out) {
+        Ok(()) => fs::remove_file(tmp)?,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(tmp);
+            return Ok(Published::Exists);
+        }
+        Err(_) => fs::rename(tmp, out)?,
+    }
+    Ok(Published::Done)
+}
 
 /// Bytes to a path. On unix this is exact.
-pub(super) fn path(b: &[u8]) -> PathBuf {
+pub(crate) fn path(b: &[u8]) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt;
@@ -26,35 +110,27 @@ pub(super) fn path(b: &[u8]) -> PathBuf {
 
 /// C's `strerror(errno)` for an error: the OS text without Rust's
 /// ` (os error N)` suffix.
-pub(super) fn strerror(e: &io::Error) -> Vec<u8> {
+pub(crate) fn strerror(e: &io::Error) -> Vec<u8> {
     match e.raw_os_error() {
         Some(n) => errno_text(n),
         None => e.to_string().into_bytes(),
     }
 }
 
-pub(super) fn errno_text(n: i32) -> Vec<u8> {
+pub(crate) fn errno_text(n: i32) -> Vec<u8> {
     let s = io::Error::from_raw_os_error(n).to_string();
     let suffix = format!(" (os error {n})");
     s.strip_suffix(&suffix).unwrap_or(&s).as_bytes().to_vec()
 }
 
-/// C's `remove`: a file, or failing that an empty directory. The result is
-/// ignored where bzip2 ignores it.
-pub(super) fn c_remove(p: &Path) {
-    if fs::remove_file(p).is_err() {
-        let _ = fs::remove_dir(p);
-    }
-}
-
 /// `notAStandardFile`: anything but a regular file, judged without following
 /// a final symlink; "if in doubt, return True".
-pub(super) fn not_a_standard_file(p: &Path) -> bool {
+pub(crate) fn not_a_standard_file(p: &Path) -> bool {
     fs::symlink_metadata(p).map_or(true, |m| !m.file_type().is_file())
 }
 
 /// `countHardLinks`.
-pub(super) fn count_hard_links(p: &Path) -> u64 {
+pub(crate) fn count_hard_links(p: &Path) -> u64 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -70,13 +146,13 @@ pub(super) fn count_hard_links(p: &Path) -> u64 {
 /// What kind of file an input is: what `perror` says about a cut-short
 /// stream depends on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     Regular,
     Device,
     Pipe,
 }
 
-pub(super) fn kind_of(f: &File) -> Kind {
+pub(crate) fn kind_of(f: &File) -> Kind {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileTypeExt;
@@ -95,7 +171,7 @@ pub(super) fn kind_of(f: &File) -> Kind {
 
 /// Standard input as a `File`, so it can be rewound (bzip2's `-f` copy of a
 /// non-bzip2 input) and read without Rust's own stdin buffer.
-pub(super) fn stdin_file() -> io::Result<File> {
+pub(crate) fn stdin_file() -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;
@@ -108,7 +184,7 @@ pub(super) fn stdin_file() -> io::Result<File> {
 }
 
 /// Standard output, unbuffered by Rust (the caller buffers).
-pub(super) fn stdout_writer() -> Box<dyn Write + Send> {
+pub(crate) fn stdout_writer() -> Box<dyn Write + Send> {
     #[cfg(unix)]
     {
         use std::os::fd::AsFd;
@@ -125,16 +201,16 @@ pub(super) fn stdout_writer() -> Box<dyn Write + Send> {
 /// pipe, where bzip2's `-f` copy of a non-bzip2 input can only copy what
 /// libbzip2 has not yet taken. End of file is sticky, as in C stdio, so a
 /// terminal's ^D ends the input once and for all.
-pub(super) struct Input {
+pub(crate) struct Input {
     src: InputSrc,
     buf: Box<[u8; CHUNK]>,
     pos: usize,
     len: usize,
     eof: bool,
-    pub(super) kind: Kind,
+    pub(crate) kind: Kind,
 }
 
-pub(super) enum InputSrc {
+pub(crate) enum InputSrc {
     File(File),
     Stdin(io::Stdin),
     /// A sandboxed run's standard input: read like a pipe, never rewound.
@@ -152,12 +228,12 @@ impl Read for InputSrc {
 }
 
 impl Input {
-    pub(super) fn file(f: File) -> Self {
+    pub(crate) fn file(f: File) -> Self {
         let kind = kind_of(&f);
         Self::new(InputSrc::File(f), kind)
     }
 
-    pub(super) fn stdin() -> Self {
+    pub(crate) fn stdin() -> Self {
         match stdin_file() {
             Ok(f) => Self::file(f),
             Err(_) => Self::new(InputSrc::Stdin(io::stdin()), Kind::Pipe),
@@ -165,7 +241,7 @@ impl Input {
     }
 
     /// Bytes standing in for standard input, as a pipe would deliver them.
-    pub(super) fn bytes(data: Vec<u8>) -> Self {
+    pub(crate) fn bytes(data: Vec<u8>) -> Self {
         Self::new(InputSrc::Bytes(io::Cursor::new(data)), Kind::Pipe)
     }
 
@@ -200,7 +276,7 @@ impl Input {
 
     /// Copy the input to `out` as bzip2's `trycat` does: from the start when
     /// it can be rewound, otherwise whatever libbzip2 has not yet read.
-    pub(super) fn copy_raw(&mut self, out: &mut dyn Write) -> io::Result<()> {
+    pub(crate) fn copy_raw(&mut self, out: &mut dyn Write) -> io::Result<()> {
         // `rewind`, whose failure (on a pipe) bzip2 ignores. Either way the
         // buffered bytes are gone: about to be re-read, or already consumed.
         if let InputSrc::File(f) = &mut self.src
@@ -255,9 +331,9 @@ impl BufRead for Input {
 }
 
 /// Counts what passes through to the destination: `nbytes_out`.
-pub(super) struct Counting<W> {
-    pub(super) inner: W,
-    pub(super) n: Arc<AtomicU64>,
+pub(crate) struct Counting<W> {
+    pub(crate) inner: W,
+    pub(crate) n: Arc<AtomicU64>,
 }
 
 impl<W: Write> Write for Counting<W> {
@@ -274,7 +350,7 @@ impl<W: Write> Write for Counting<W> {
 /// What the family takes from its process: the directory operands resolve
 /// against, standard input and output, and whether those are terminals.
 /// Standard error is passed separately, as it always was.
-pub(super) enum Host {
+pub(crate) enum Host {
     /// The process itself.
     Real,
     /// `run_in`'s: nothing of the process is touched.
@@ -282,21 +358,21 @@ pub(super) enum Host {
 }
 
 /// A sandboxed run's stand-ins for the process state.
-pub(super) struct Sandbox {
+pub(crate) struct Sandbox {
     /// Operands resolve against this directory, never the process's cwd.
-    pub(super) dir: PathBuf,
+    pub(crate) dir: PathBuf,
     /// Standard input, taken by the first read of it (a run reads it once).
-    pub(super) stdin: Option<Vec<u8>>,
+    pub(crate) stdin: Option<Vec<u8>>,
     /// Standard output, captured.
-    pub(super) stdout: Arc<Mutex<Vec<u8>>>,
+    pub(crate) stdout: Arc<Mutex<Vec<u8>>>,
     /// Bytes still allowed to reach standard output and output files, all
     /// together; past it a write fails as a full disk does.
-    pub(super) budget: Arc<AtomicU64>,
+    pub(crate) budget: Arc<AtomicU64>,
 }
 
 impl Host {
     /// An operand, or a name derived from one, as a path to open.
-    pub(super) fn path(&self, b: &[u8]) -> PathBuf {
+    pub(crate) fn path(&self, b: &[u8]) -> PathBuf {
         match self {
             Host::Real => path(b),
             Host::Sandbox(s) => s.dir.join(path(b)),
@@ -304,17 +380,17 @@ impl Host {
     }
 
     /// `isatty(fileno(stdin))`; a sandbox has no terminal.
-    pub(super) fn stdin_is_tty(&self) -> bool {
+    pub(crate) fn stdin_is_tty(&self) -> bool {
         matches!(self, Host::Real) && crate::compat::stdin_is_tty()
     }
 
     /// `isatty(fileno(stdout))`; a sandbox has no terminal.
-    pub(super) fn stdout_is_tty(&self) -> bool {
+    pub(crate) fn stdout_is_tty(&self) -> bool {
         matches!(self, Host::Real) && crate::compat::stdout_is_tty()
     }
 
     /// Standard input as a decompression or compression input.
-    pub(super) fn stdin(&mut self) -> Input {
+    pub(crate) fn stdin(&mut self) -> Input {
         match self {
             Host::Real => Input::stdin(),
             Host::Sandbox(s) => Input::bytes(s.stdin.take().unwrap_or_default()),
@@ -325,7 +401,7 @@ impl Host {
     /// the real process; in a sandbox they are charged to the same budget
     /// as output, because a few dozen bytes of bzip2 can decode to tens of
     /// MiB and `-t` would otherwise be the one unbounded path.
-    pub(super) fn charge(&self, n: u64) -> io::Result<()> {
+    pub(crate) fn charge(&self, n: u64) -> io::Result<()> {
         match self {
             Host::Real => Ok(()),
             Host::Sandbox(s) => take(&s.budget, n),
@@ -333,7 +409,7 @@ impl Host {
     }
 
     /// The output of a run: standard output, or the temporary file.
-    pub(super) fn out_writer(&self, f: Option<File>) -> BufWriter<Box<dyn Write + Send>> {
+    pub(crate) fn out_writer(&self, f: Option<File>) -> BufWriter<Box<dyn Write + Send>> {
         let w: Box<dyn Write + Send> = match (self, f) {
             (Host::Real, Some(f)) => Box::new(f),
             (Host::Real, None) => stdout_writer(),
@@ -422,7 +498,7 @@ fn no_space() -> io::Error {
 }
 
 /// Set only the access and modification times (`utime`).
-pub(super) fn set_times(meta: &Metadata, to: &Path) -> io::Result<()> {
+pub(crate) fn set_times(meta: &Metadata, to: &Path) -> io::Result<()> {
     let mut times = fs::FileTimes::new();
     if let Ok(t) = meta.accessed() {
         times = times.set_accessed(t);
@@ -455,5 +531,64 @@ mod tests {
         assert_eq!(budget.load(Ordering::Relaxed), 0);
         assert!(w.write(b"x").is_err());
         assert_eq!(w.write(b"").unwrap(), 0);
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stuffr-host-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// An output that appears between the existence check and publishing is
+    /// reported, never clobbered, and the temporary is removed.
+    #[test]
+    fn publish_never_replaces_an_output_that_appeared_meanwhile() {
+        let dir = scratch("exists");
+        let (tmp, out) = (dir.join(".tmp"), dir.join("a.out"));
+        fs::write(&tmp, b"new").unwrap();
+        fs::write(&out, b"appeared").unwrap();
+        assert_eq!(publish(&tmp, &out, false).unwrap(), Published::Exists);
+        assert!(!tmp.exists(), "the temporary is left");
+        assert_eq!(fs::read(&out).unwrap(), b"appeared");
+        fs::write(&tmp, b"new").unwrap();
+        fs::remove_file(&out).unwrap();
+        assert_eq!(publish(&tmp, &out, false).unwrap(), Published::Done);
+        assert!(!tmp.exists());
+        assert_eq!(fs::read(&out).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publish_with_force_replaces() {
+        let dir = scratch("force");
+        let (tmp, out) = (dir.join(".tmp"), dir.join("a.out"));
+        fs::write(&tmp, b"new").unwrap();
+        fs::write(&out, b"old").unwrap();
+        assert_eq!(publish(&tmp, &out, true).unwrap(), Published::Done);
+        assert!(!tmp.exists());
+        assert_eq!(fs::read(&out).unwrap(), b"new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_names_the_family_and_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("temp");
+        let (a, _fa) = create_temp(&dir, "gzip").unwrap();
+        let (b, _fb) = create_temp(&dir, "gzip").unwrap();
+        assert_ne!(a, b);
+        let name = a.file_name().unwrap().to_str().unwrap().to_owned();
+        assert!(
+            name.starts_with(&format!(".stuffr-gzip-{}-", std::process::id()))
+                && name.ends_with(".tmp"),
+            "{name}"
+        );
+        assert_eq!(
+            fs::metadata(&a).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

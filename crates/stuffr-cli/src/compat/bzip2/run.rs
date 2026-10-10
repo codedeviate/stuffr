@@ -9,7 +9,7 @@
 
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,14 +18,19 @@ use stuffr::{EncodeOpts, FormatId};
 
 use super::args::{MAX_NAME, OpMode, Settings, SrcMode};
 use super::messages::{self as m, printf};
-use super::streams::{
-    Counting, Host, Input, Kind, c_remove, count_hard_links, errno_text, not_a_standard_file,
-    set_times, strerror,
-};
 use crate::compat::copy_metadata_from;
+use crate::compat::host::{
+    CHUNK, Counting, Host, Input, Kind, Published, count_hard_links, create_temp, errno_text,
+    not_a_standard_file, publish, set_times, strerror,
+};
 
-/// `BZ_MAX_UNUSED`: libbzip2's read size, and bzip2's output chunk.
-pub(super) const CHUNK: usize = 5000;
+/// C's `remove`: a file, or failing that an empty directory. The result is
+/// ignored where bzip2 ignores it.
+fn c_remove(p: &Path) {
+    if fs::remove_file(p).is_err() {
+        let _ = fs::remove_dir(p);
+    }
+}
 
 /// `zSuffix` and `unzSuffix`.
 const SUFFIXES: [(&[u8], &[u8]); 4] = [
@@ -205,22 +210,7 @@ impl Bz<'_> {
             Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
             _ => PathBuf::from("."),
         };
-        let mut opts = File::options();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        for n in 0u32.. {
-            let tmp = dir.join(format!(".stuffr-bzip2-{}-{n}.tmp", std::process::id()));
-            match opts.open(&tmp) {
-                Ok(f) => return Ok((tmp, f)),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && n < 1000 => {}
-                Err(e) => return Err(e),
-            }
-        }
-        unreachable!("the loop returns")
+        create_temp(&dir, "bzip2")
     }
 
     /// The checks `compress` and `uncompress` share after the name mapping,
@@ -328,23 +318,15 @@ impl Bz<'_> {
     fn commit(&mut self) -> Result<bool, Fatal> {
         if let Some(tmp) = self.pending.clone() {
             let out = self.host.path(&self.out_name);
-            let published = if self.s.force {
-                fs::rename(&tmp, &out)
-            } else {
-                match fs::hard_link(&tmp, &out) {
-                    Ok(()) => fs::remove_file(&tmp),
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                        self.pending = None;
-                        let _ = fs::remove_file(&tmp);
-                        let (p, o) = (self.p(), self.out_name.clone());
-                        self.refuse(m::OUTPUT_EXISTS, &[p, &o]);
-                        return Ok(false);
-                    }
-                    Err(_) => fs::rename(&tmp, &out),
+            match publish(&tmp, &out, self.s.force) {
+                Ok(Published::Done) => {}
+                Ok(Published::Exists) => {
+                    self.pending = None;
+                    let (p, o) = (self.p(), self.out_name.clone());
+                    self.refuse(m::OUTPUT_EXISTS, &[p, &o]);
+                    return Ok(false);
                 }
-            };
-            if let Err(e) = published {
-                return Err(self.fail(Failure::Io(e)));
+                Err(e) => return Err(self.fail(Failure::Io(e))),
             }
         }
         self.pending = None;
