@@ -1324,8 +1324,11 @@ mod differential {
         #[cfg(target_os = "linux")]
         {
             let peak = linux_bzcat_peak(&bz, &plain);
-            eprintln!("peak RSS (VmHWM): {:.1} MiB", peak as f64 / 1048576.0);
-            assert!(peak < 64 << 20, "peak RSS {peak} bytes is not under 64 MiB");
+            eprintln!("peak RssAnon: {:.1} MiB", peak as f64 / 1048576.0);
+            assert!(
+                peak < 64 << 20,
+                "peak RssAnon {peak} bytes is not under 64 MiB"
+            );
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -1352,16 +1355,18 @@ mod differential {
         }
     }
 
-    /// Linux: run stuffr as `bzcat` on `bz` and return its peak RSS, from
-    /// `/proc/<pid>/status`'s `VmHWM` sampled while it runs.
+    /// Linux: run stuffr as `bzcat` on `bz` and return its peak anonymous
+    /// resident memory (the heap and stacks), the largest `RssAnon` in
+    /// `/proc/<pid>/status` sampled every 5 ms while it runs.
     ///
     /// Not `getrusage`: on Linux a child's `ru_maxrss` includes the parent's
-    /// resident set at spawn (exec records the vforked mm's high-water mark),
-    /// and this test process holds the 64 MiB input and its copies, so CI
-    /// measured 264-268 MiB for a decoder that peaks near 15 MiB. `VmHWM`
-    /// belongs to the post-exec mm alone and never decreases, so the last
-    /// sample before exit is the peak up to that moment; the decoder's memory
-    /// is flat after its first block, so sampling every 5 ms loses nothing.
+    /// resident set at spawn, and this test process holds the 64 MiB input
+    /// and its copies (CI measured 264-268 MiB). Not `VmHWM` either: it also
+    /// counts file-backed pages, the touched part of a debug binary of
+    /// hundreds of MiB among them (CI measured 220-233 MiB). The claim under
+    /// test is that the decoder does not hold the input or the output, which
+    /// is anonymous memory; it is flat after the first block, so sampling
+    /// loses nothing. The `/proc` status line at the peak is printed.
     #[cfg(target_os = "linux")]
     fn linux_bzcat_peak(bz: &[u8], plain: &[u8]) -> u64 {
         use std::io::Read;
@@ -1388,14 +1393,21 @@ mod differential {
             v
         });
         let mut peak = 0u64;
+        let mut at_peak = String::new();
         while child.try_wait().unwrap().is_none() {
             if let Ok(s) = std::fs::read_to_string(&status)
                 && let Some(kb) = s
                     .lines()
-                    .find_map(|l| l.strip_prefix("VmHWM:"))
+                    .find_map(|l| l.strip_prefix("RssAnon:"))
                     .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+                && kb * 1024 > peak
             {
-                peak = peak.max(kb * 1024);
+                peak = kb * 1024;
+                at_peak = s
+                    .lines()
+                    .filter(|l| l.starts_with("Vm") || l.starts_with("Rss"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -1407,7 +1419,8 @@ mod differential {
         assert!(st.success(), "{st:?}: {err}");
         assert_eq!(err, "");
         assert!(got == plain, "decoded output differs");
-        assert!(peak > 0, "VmHWM was never sampled");
+        assert!(peak > 0, "RssAnon was never sampled");
+        eprintln!("/proc status at the peak: {at_peak}");
         peak
     }
 }
