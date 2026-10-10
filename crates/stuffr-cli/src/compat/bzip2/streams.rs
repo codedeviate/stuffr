@@ -396,14 +396,18 @@ impl Write for Capped {
 }
 
 /// Take `n` from `budget`, or fail with `ENOSPC` when less than `n` is
-/// left. Never wraps.
+/// left. Never wraps. A `compare_exchange` loop rather than `fetch_update`:
+/// clippy on stable 1.99 denies `fetch_update` as deprecated (renamed
+/// `try_update`), and `try_update` is newer than the 1.88 MSRV.
 fn take(budget: &AtomicU64, n: u64) -> io::Result<()> {
-    budget
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-            left.checked_sub(n)
-        })
-        .map(|_| ())
-        .map_err(|_| no_space())
+    let mut left = budget.load(Ordering::Relaxed);
+    loop {
+        let rest = left.checked_sub(n).ok_or_else(no_space)?;
+        match budget.compare_exchange_weak(left, rest, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(()),
+            Err(now) => left = now,
+        }
+    }
 }
 
 fn no_space() -> io::Error {
