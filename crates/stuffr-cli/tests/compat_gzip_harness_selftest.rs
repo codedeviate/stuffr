@@ -156,9 +156,7 @@ mod unix {
              head -c $((n - 8)) $T\nprintf '\\0\\0\\0\\0'\ntail -c 4 $T\nrm -f $T\nexit $rc",
         );
         let c = case(vec!["-c", "a.txt"], false);
-        let Some(v) = verdict(&c, &stub) else { return };
-        let msg = v.expect("assert_same did not notice the difference");
-        assert!(msg.contains("stdout"), "{msg}");
+        notices(&c, &stub, "rejects stuffr's stdout");
     }
 
     #[test]
