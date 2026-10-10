@@ -497,6 +497,29 @@ fn no_space() -> io::Error {
     }
 }
 
+/// Write `fmt` with `%s`/`%d` replaced by `args` in order and `%%` by `%`,
+/// as C's `fprintf` does for these formats. Write errors are ignored, as
+/// the reference tools ignore `fprintf`'s result.
+pub(crate) fn printf(w: &mut dyn Write, fmt: &str, args: &[&[u8]]) {
+    let mut out = Vec::with_capacity(fmt.len() + 64);
+    let mut args = args.iter();
+    let mut bytes = fmt.as_bytes().iter().copied();
+    while let Some(b) = bytes.next() {
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        match bytes.next() {
+            Some(b'%') => out.push(b'%'),
+            Some(b's' | b'd') => out.extend_from_slice(args.next().copied().unwrap_or_default()),
+            // Only `%s`, `%d` and `%%` occur in the strings above.
+            Some(other) => out.extend_from_slice(&[b'%', other]),
+            None => out.push(b'%'),
+        }
+    }
+    let _ = w.write_all(&out);
+}
+
 /// Set only the access and modification times (`utime`).
 pub(crate) fn set_times(meta: &Metadata, to: &Path) -> io::Result<()> {
     let mut times = fs::FileTimes::new();

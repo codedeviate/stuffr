@@ -168,4 +168,31 @@ mod unix {
         let (major, minor) = gnu_gzip_version().expect("gzip --version should parse");
         assert!(major == 1 && minor >= 12, "unexpected {major}.{minor}");
     }
+
+    /// `-S` is found in every spelling, clusters included, and never after
+    /// `--` or as `-b`'s operand.
+    #[test]
+    fn the_custom_suffix_is_found_in_clusters() {
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&["-S", ".x", "a"], Some(".x")),
+            (&["-S.x", "a"], Some(".x")),
+            (&["--suffix", ".x", "a"], Some(".x")),
+            (&["--suffix=.x", "a"], Some(".x")),
+            (&["--su=.x", "a"], Some(".x")),
+            (&["--suf", ".x", "a"], Some(".x")),
+            (&["--s=.x", "a"], None),
+            (&["--stdout", "a"], None),
+            (&["-kS", ".z", "a"], Some(".z")),
+            (&["-kS.z", "a"], Some(".z")),
+            (&["-vkfS", "_q", "a"], Some("_q")),
+            (&["-k", "a"], None),
+            (&["--", "-S", ".x"], None),
+            (&["-bS", "a"], None),
+            (&["-b", "-S", ".y"], None),
+            (&["-b", "3", "-S", ".y"], Some(".y")),
+        ];
+        for (args, want) in cases {
+            assert_eq!(gzip_custom_suffix(args), *want, "{args:?}");
+        }
+    }
 }

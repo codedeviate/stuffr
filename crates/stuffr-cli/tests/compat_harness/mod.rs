@@ -459,20 +459,50 @@ fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
     }
 }
 
-/// The `-S`/`--suffix` operand of `args`, if any.
-fn gzip_custom_suffix<'a>(args: &[&'a str]) -> Option<&'a str> {
+/// The `-S`/`--suffix` operand of `args`, if any: `-S X`, `-SX`, `--suffix X`,
+/// `--suffix=X` (or an abbreviation, `--su=X`), and `S` inside a short cluster (`-kS .z`, `-kS.z`). A
+/// cluster's `b` takes the rest of it as its own operand, so an `S` after
+/// it is not an option. Options after `--` are operands and do not count.
+pub fn gzip_custom_suffix<'a>(args: &[&'a str]) -> Option<&'a str> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
-        if *a == "-S" || *a == "--suffix" {
-            return it.next().copied();
+        if *a == "--" {
+            break;
         }
-        if let Some(v) = a.strip_prefix("--suffix=") {
-            return Some(v);
+        // `--suffix` or any unambiguous abbreviation of it (`--su`), with
+        // its operand inline or next.
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (long, None),
+            };
+            if name.len() >= 2 && "suffix".starts_with(name) {
+                return inline.or_else(|| it.next().copied());
+            }
+            continue;
         }
-        if let Some(v) = a.strip_prefix("-S")
-            && !v.is_empty()
-        {
-            return Some(v);
+        let Some(cluster) = a.strip_prefix('-').filter(|c| !c.starts_with('-')) else {
+            continue;
+        };
+        for (i, ch) in cluster.char_indices() {
+            match ch {
+                'S' => {
+                    let rest = &cluster[i + 1..];
+                    return if rest.is_empty() {
+                        it.next().copied()
+                    } else {
+                        Some(rest)
+                    };
+                }
+                // `-b N`: the rest of the cluster (or the next word) is N.
+                'b' => {
+                    if i + 1 == cluster.len() {
+                        it.next();
+                    }
+                    break;
+                }
+                _ => {}
+            }
         }
     }
     None
@@ -737,4 +767,65 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
                 .join("\n")
         );
     }
+}
+
+// ---- deterministic test data (no RNG dependency) ----
+
+struct XorShift(u64);
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+}
+
+/// `n` pseudo-random bytes from `seed` (nonzero).
+pub fn random(n: usize, seed: u64) -> Vec<u8> {
+    let mut r = XorShift(seed);
+    (0..n).map(|_| (r.next() >> 24) as u8).collect()
+}
+
+const WORDS: &[&str] = &[
+    "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "stuffr", "gzip", "member",
+    "deflate", "header", "and", "of", "a", "to", "in", "file",
+];
+
+/// Plain text: words, spaces and newlines only (safe to type at a tty).
+pub fn text(n: usize, seed: u64) -> Vec<u8> {
+    let mut r = XorShift(seed);
+    let mut v = Vec::with_capacity(n + 16);
+    while v.len() < n {
+        v.extend_from_slice(WORDS[(r.next() % WORDS.len() as u64) as usize].as_bytes());
+        v.push(if r.next().is_multiple_of(9) {
+            b'\n'
+        } else {
+            b' '
+        });
+    }
+    v.truncate(n);
+    v
+}
+
+/// Text interleaved with runs of random bytes and long repeats.
+pub fn mixed(n: usize, seed: u64) -> Vec<u8> {
+    let mut r = XorShift(seed);
+    let mut v = Vec::with_capacity(n + 4096);
+    while v.len() < n {
+        match r.next() % 3 {
+            0 => v.extend(text(2048, r.next())),
+            1 => v.extend(random(512, r.next() | 1)),
+            _ => v.extend(std::iter::repeat_n(b'z', (r.next() % 3000) as usize)),
+        }
+    }
+    v.truncate(n);
+    v
+}
+
+/// A short period repeated to `n` bytes.
+pub fn repetitive(n: usize) -> Vec<u8> {
+    b"abcabcabd".iter().copied().cycle().take(n).collect()
 }

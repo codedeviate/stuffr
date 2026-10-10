@@ -7781,9 +7781,16 @@ fn is_column_label(prefix: &str) -> bool {
 /// reference's own layout, not a defect. Nothing else is exempt.
 fn is_verbatim_reference_messages(path: &std::path::Path) -> bool {
     let parts: Vec<&std::ffi::OsStr> = path.components().map(|c| c.as_os_str()).collect();
+    // `src/compat/<family>/messages.rs`, or a family with one personality
+    // per reference: `src/compat/<family>/<flavour>/messages.rs` (gzip's
+    // `gnu` and `bsd`).
     matches!(
         parts.as_slice(),
         [.., src, compat, _family, file]
+            if *src == "src" && *compat == "compat" && *file == "messages.rs"
+    ) || matches!(
+        parts.as_slice(),
+        [.., src, compat, _family, _flavour, file]
             if *src == "src" && *compat == "compat" && *file == "messages.rs"
     )
 }
@@ -7888,6 +7895,15 @@ fn no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation() 
     )));
     assert!(!is_verbatim_reference_messages(Path::new(
         "crates/stuffr-cli/src/compat/bzip2/xmessages.rs"
+    )));
+    assert!(is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/gzip/gnu/messages.rs"
+    )));
+    assert!(!is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/gzip/gnu/run.rs"
+    )));
+    assert!(!is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/gzip/gnu/x/messages.rs"
     )));
 
     // And now the workspace itself.

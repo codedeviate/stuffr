@@ -7,8 +7,6 @@
 //! The one deliberate change is [`LICENSE_FIRST_LINE`]: the licence text
 //! names stuffr and its version on its first line, as `--version` must.
 
-use std::io::Write;
-
 /// `BZ2_bzlibVersion()` in bzip2 1.0.8, which `usage` and `license` print.
 pub(super) const BZLIB_VERSION: &str = "1.0.8, 13-Jul-2019";
 
@@ -232,28 +230,8 @@ pub(super) const OUT_OF_MEMORY: &str = "\n%s: couldn't allocate enough memory\n"
 /// What C's `perror(s)` prints.
 pub(super) const PERROR: &str = "%s: %s\n";
 
-/// Write `fmt` with `%s`/`%d` replaced by `args` in order and `%%` by `%`,
-/// as C's `fprintf` does for these formats. Write errors are ignored, as
-/// bzip2 ignores `fprintf`'s result.
-pub(super) fn printf(w: &mut dyn Write, fmt: &str, args: &[&[u8]]) {
-    let mut out = Vec::with_capacity(fmt.len() + 64);
-    let mut args = args.iter();
-    let mut bytes = fmt.as_bytes().iter().copied();
-    while let Some(b) = bytes.next() {
-        if b != b'%' {
-            out.push(b);
-            continue;
-        }
-        match bytes.next() {
-            Some(b'%') => out.push(b'%'),
-            Some(b's' | b'd') => out.extend_from_slice(args.next().copied().unwrap_or_default()),
-            // Only `%s`, `%d` and `%%` occur in the strings above.
-            Some(other) => out.extend_from_slice(&[b'%', other]),
-            None => out.push(b'%'),
-        }
-    }
-    let _ = w.write_all(&out);
-}
+/// C's `fprintf` for these formats; shared with the other families.
+pub(super) use crate::compat::host::printf;
 
 /// `compressStream`: the `-v` statistics line, whose C format is
 /// `"%6.3f:1, %6.3f bits/byte, %5.2f%% saved, %s in, %s out.\n"`, with the
