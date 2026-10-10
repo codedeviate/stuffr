@@ -204,9 +204,9 @@ pub(crate) fn inflate_member(
         } else {
             FlushDecompress::None
         };
-        let status = d
-            .decompress(input, &mut buf, flush)
-            .map_err(|_| MemberError::Fault(Fault::Data))?;
+        let res = d.decompress(input, &mut buf, flush);
+        // Totals advance even when inflate reports an error, so what it
+        // produced before failing is still flushed ahead of `Fault::Data`.
         let used = (d.total_in() - in0) as usize;
         let made = (d.total_out() - out0) as usize;
         r.consume(used);
@@ -215,6 +215,7 @@ pub(crate) fn inflate_member(
             written += made as u64;
             out.write_all(&buf[..made]).map_err(io_err)?;
         }
+        let status = res.map_err(|_| MemberError::Fault(Fault::Data))?;
         match status {
             Status::StreamEnd => break,
             _ if eof && made == 0 => {
@@ -259,12 +260,71 @@ pub(crate) fn inflate_member(
     })
 }
 
+/// A `BufRead` over any `Read` whose `fill_buf` yields at least two bytes
+/// unless the stream is at EOF, so [`after_member`] can always see a possible
+/// `1f 8b` whole whatever the source's read sizes. Callers walking
+/// multi-member input wrap their source in this once and use it throughout.
+pub(crate) struct Lookahead<R: Read> {
+    inner: R,
+    buf: Vec<u8>,
+    pos: usize,
+    end: usize,
+}
+
+impl<R: Read> Lookahead<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Lookahead {
+            inner,
+            buf: vec![0; CHUNK],
+            pos: 0,
+            end: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for Lookahead<R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let n = {
+            let avail = self.fill_buf()?;
+            let n = avail.len().min(out.len());
+            out[..n].copy_from_slice(&avail[..n]);
+            n
+        };
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl<R: Read> BufRead for Lookahead<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.end - self.pos < 2 {
+            self.buf.copy_within(self.pos..self.end, 0);
+            self.end -= self.pos;
+            self.pos = 0;
+            while self.end < 2 {
+                match self.inner.read(&mut self.buf[self.end..]) {
+                    Ok(0) => break,
+                    Ok(n) => self.end += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(&self.buf[self.pos..self.end])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.end);
+    }
+}
+
 /// What follows a member: EOF, another member (peeked `1f 8b`, not consumed),
 /// or trailing bytes (consumed to EOF in bounded chunks; `all_zero` if every
 /// one is NUL). `offset` is where the trailing bytes start.
 ///
-/// A reader that yields a lone `1f` before more data arrives is classified as
-/// trailing: `BufRead` cannot peek past its buffer.
+/// `r` must guarantee two bytes of lookahead (wrap the source in
+/// [`Lookahead`]): a plain `BufRead` whose buffer ends on a lone `1f` is
+/// classified as trailing, because `BufRead` cannot peek past its buffer.
 pub(crate) fn after_member(r: &mut dyn BufRead, offset: u64) -> io::Result<After> {
     let first = loop {
         match r.fill_buf() {
@@ -660,5 +720,67 @@ mod tests {
             read_header(&mut r),
             Err(MemberError::Fault(Fault::Truncated(Where::Header)))
         ));
+    }
+
+    #[test]
+    fn multi_member_survives_every_buffer_boundary() {
+        struct OneByte<'a>(&'a [u8]);
+        impl io::Read for OneByte<'_> {
+            fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() || b.is_empty() {
+                    return Ok(0);
+                }
+                b[0] = self.0[0];
+                self.0 = &self.0[1..];
+                Ok(1)
+            }
+        }
+        fn walk(r: &mut dyn BufRead) -> Vec<Vec<u8>> {
+            let mut got = Vec::new();
+            loop {
+                let h = read_header(r).unwrap();
+                let mut out = Vec::new();
+                assert!(inflate_member(r, h, &mut out).is_ok());
+                got.push(out);
+                match after_member(r, 0).unwrap() {
+                    After::NextMember => {}
+                    After::End => return got,
+                    After::Trailing { .. } => panic!("member boundary lost"),
+                }
+            }
+        }
+        let parts: Vec<Vec<u8>> = (1..=4).map(|i| plain(i * 37)).collect();
+        let mut all = Vec::new();
+        for p in &parts {
+            all.extend(member(&hdr(), 6, p));
+        }
+        let mut r = Lookahead::new(io::BufReader::with_capacity(1, &all[..]));
+        assert_eq!(walk(&mut r), parts);
+        let mut r = Lookahead::new(OneByte(&all));
+        assert_eq!(walk(&mut r), parts);
+        // Split `1f | 8b` exactly at a source read edge, at every boundary.
+        let mut edge = 0;
+        for p in &parts[..3] {
+            edge += member(&hdr(), 6, p).len();
+            let mut r = Lookahead::new((&all[..edge + 1]).chain(&all[edge + 1..]));
+            assert_eq!(walk(&mut r), parts);
+        }
+    }
+
+    #[test]
+    fn partial_output_precedes_a_data_error() {
+        use flate2::{Compress, Compression, FlushCompress};
+        let data = plain(1000);
+        let mut c = Compress::new(Compression::new(6), false);
+        let mut body = vec![0u8; 4096];
+        c.compress(&data, &mut body, FlushCompress::Sync).unwrap();
+        body.truncate(c.total_out() as usize);
+        body.push(0x07); // final block, reserved BTYPE 11
+        let mut b = Vec::new();
+        write_header(&hdr(), &mut b).unwrap();
+        b.extend(body);
+        let (res, out) = inflate(&b);
+        assert!(matches!(fault(res), Fault::Data));
+        assert_eq!(out, data);
     }
 }
