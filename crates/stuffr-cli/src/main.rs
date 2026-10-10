@@ -669,6 +669,25 @@ fn dispatch(command: Command) -> stuffr::Result<()> {
             Ok(())
         }
         Command::Formats => print_formats(),
+        Command::InstallLinks {
+            dir,
+            names,
+            force,
+            remove,
+            dry_run,
+        } => {
+            use stuffr_cli::compat::links;
+            let target = links::current_target()?;
+            let chosen: Vec<&str> = if names.is_empty() {
+                stuffr_cli::compat::names().to_vec()
+            } else {
+                names.iter().map(String::as_str).collect()
+            };
+            for a in links::install_links(&dir, &chosen, force, remove, dry_run, &target)? {
+                println!("{}", a.describe(&target));
+            }
+            Ok(())
+        }
         Command::List {
             input,
             json,

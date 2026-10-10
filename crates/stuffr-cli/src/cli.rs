@@ -269,6 +269,24 @@ pub enum Command {
     },
     /// List the formats this build contains.
     Formats,
+    /// Create compatibility symlinks (`bzip2`, `bunzip2`, `bzcat`,
+    /// `bzip2recover`) to this binary in a directory. Opt-in, never automatic.
+    InstallLinks {
+        /// Directory to put the links in. It must already exist.
+        dir: std::path::PathBuf,
+        /// Only these names, comma-separated or repeated. Default: all.
+        #[arg(long, value_name = "NAME", value_delimiter = ',')]
+        names: Vec<String>,
+        /// Replace an existing file or foreign link of the same name.
+        #[arg(long)]
+        force: bool,
+        /// Remove stuffr's links instead of creating them.
+        #[arg(long)]
+        remove: bool,
+        /// Say what would change, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List an archive's entries without extracting.
     ///
     /// The first column is the entry's 0-based position in archive order,

@@ -1288,6 +1288,36 @@ WHAT THIS BUILD CAN DO
       SALVAGE reads weak for: tar, cpio, ar.
 
 
+COMPATIBILITY LINKS (INSTALL-LINKS)
+
+  stuffr install-links ~/.local/bin
+      Creates symlinks named bzip2, bunzip2, bzcat and bzip2recover in that
+      directory, each pointing at this stuffr binary. Run under one of those
+      names, the binary behaves as that tool, with its flags, messages and
+      exit codes. This is opt-in: nothing creates these links unless you run
+      this verb. The directory must exist (exit 2 if not). A second run
+      reports "already present" and changes nothing.
+
+  stuffr install-links ~/.local/bin --names bzcat
+      Only the named links; --names takes a comma-separated list. A name that
+      is not a compatibility name is a usage error (exit 2).
+
+  stuffr install-links ~/.local/bin --force
+      A regular file or a link to something else already called bzip2 is
+      refused (exit 2, naming the path) and left untouched. --force replaces
+      it. A directory is never replaced.
+
+  stuffr install-links ~/.local/bin --remove
+      Removes the links that point at this stuffr. A foreign symlink or a
+      regular file of the same name is left where it is.
+
+  stuffr install-links ~/.local/bin --dry-run
+      Prints "would create ..." (or "would remove ...") lines and changes
+      nothing. Combines with --force and --remove. A directory that cannot
+      be written to is exit 1, with the operating system's reason. Not
+      available on Windows (exit 3).
+
+
 GUARDING AGAINST DECOMPRESSION BOMBS
 
   stuffr unpack bomb.gz --max-ratio 100

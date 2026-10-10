@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 pub mod bzip2;
+pub mod links;
 
 /// A family of tools the binary can impersonate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +27,12 @@ const NAMES: &[(&str, Family)] = &[
     ("bzcat", Family::Bzip2),
     ("bzip2recover", Family::Bzip2),
 ];
+
+/// Every compatibility name, from the one table `family_for` also reads.
+pub fn names() -> &'static [&'static str] {
+    static LIST: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| NAMES.iter().map(|&(n, _)| n).collect())
+}
 
 /// The family and canonical name for an `argv[0]`, or `None` when it is not a
 /// compatibility name. Only the final path component counts, and on Windows a
@@ -135,6 +142,26 @@ mod tests {
     #[test]
     fn stuffr_itself_does_not_dispatch() {
         assert!(dispatch(vec!["stuffr".into(), "list".into()]).is_none());
+    }
+
+    #[test]
+    fn dispatch_ignores_an_empty_argv() {
+        assert!(dispatch(Vec::new()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatch_ignores_a_non_utf8_argv0() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = OsStr::from_bytes(b"bzip2\xff").to_os_string();
+        assert!(dispatch(vec![bad]).is_none());
+        let bad = OsStr::from_bytes(b"/x/\xffbzip2").to_os_string();
+        assert!(dispatch(vec![bad]).is_none());
+    }
+
+    #[test]
+    fn names_lists_the_table() {
+        assert_eq!(names(), ["bzip2", "bunzip2", "bzcat", "bzip2recover"]);
     }
 
     #[test]
