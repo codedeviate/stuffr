@@ -63,3 +63,9 @@ serde_json = "1"
 # so a read-side bug there cannot also hide in the fixture that exercises it.
 tar = { workspace = true }
 flate2 = { workspace = true }
+
+# `compat_harness` opens a pseudo-terminal with `openpty` so a differential
+# case can make stdin or stdout a tty. `libc` is already in the lock (a
+# transitive dependency), so this adds a manifest edge, not a new crate.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
