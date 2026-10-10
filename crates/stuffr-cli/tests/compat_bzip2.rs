@@ -24,6 +24,7 @@ mod unix {
             compare_output_bytes: true,
             expect_stdout_plain: None,
             setup: None,
+            roundtrip: Roundtrip::Bzip2,
         }
     }
 
@@ -448,6 +449,7 @@ mod differential {
             compare_output_bytes: true,
             expect_stdout_plain: None,
             setup: None,
+            roundtrip: Roundtrip::Bzip2,
         }
     }
 

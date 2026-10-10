@@ -23,6 +23,50 @@ pub const REFERENCE_DIR: &str = "/usr/bin";
 pub const INPUT_MTIME: u64 = 1_000_000_000;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Apple's gzip (one program; the invoked name sets the mode).
+pub const APPLE_GZIP_DIR: &str = "/usr/bin";
+
+/// GNU gzip's directory on this platform: Linux `/usr/bin`, macOS the
+/// keg-only Homebrew install (never `brew link`ed; addressed by path).
+pub fn gnu_gzip_dir() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "/opt/homebrew/opt/gzip/bin"
+    } else {
+        "/usr/bin"
+    }
+}
+
+/// The installed GNU gzip's `(major, minor)`, parsed from the last word of
+/// `gzip --version`'s first line (`gzip 1.12`). `None` when the binary is
+/// absent or the line does not parse.
+pub fn gnu_gzip_version() -> Option<(u32, u32)> {
+    let exe = Path::new(gnu_gzip_dir()).join("gzip");
+    let out = Command::new(exe)
+        .arg("--version")
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let word = text.lines().next()?.split_whitespace().last()?.to_owned();
+    let mut it = word.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// How compressed output is judged when its bytes are not promised
+/// identical, and which tool decodes it.
+#[derive(Clone, Copy, Debug)]
+pub enum Roundtrip {
+    /// bzip2 streams (`BZh`, `.bz2`), decoded by the reference `bzip2 -dc`.
+    Bzip2,
+    /// gzip members (`1f 8b`, `.gz`/`.tgz`/`-S`), decoded by `ref_gzip -dc`
+    /// (an absolute path). The header up to the end of FNAME is compared
+    /// byte-for-byte.
+    Gzip { ref_gzip: &'static str },
+}
+
 pub struct Case<'a> {
     /// The invoked name, e.g. `"bunzip2"`.
     pub name: &'a str,
@@ -48,6 +92,8 @@ pub struct Case<'a> {
     /// Run in the working directory after `files` are created and before the
     /// program starts: symlinks, hard links, permission changes.
     pub setup: Option<fn(&Path)>,
+    /// Which compressed format the comparison understands.
+    pub roundtrip: Roundtrip,
 }
 
 /// File bytes, mode (permission bits) and mtime (seconds).
@@ -374,14 +420,23 @@ fn is_bz2_name(n: &str) -> bool {
 
 /// Decompress with the reference `bzip2 -dc`; `Err` carries its stderr.
 pub fn ref_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut child = Command::new(Path::new(REFERENCE_DIR).join("bzip2"))
+    ref_decompress_with(&Roundtrip::Bzip2, data)
+}
+
+/// Decompress with the reference tool `rt` names; `Err` carries its stderr.
+pub fn ref_decompress_with(rt: &Roundtrip, data: &[u8]) -> Result<Vec<u8>, String> {
+    let (exe, what) = match rt {
+        Roundtrip::Bzip2 => (Path::new(REFERENCE_DIR).join("bzip2"), "bzip2"),
+        Roundtrip::Gzip { ref_gzip } => (PathBuf::from(ref_gzip), "gzip"),
+    };
+    let mut child = Command::new(exe)
         .arg("-dc")
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("cannot run reference bzip2: {e}"))?;
+        .map_err(|e| format!("cannot run reference {what}: {e}"))?;
     let mut si = child.stdin.take().unwrap();
     let data = data.to_vec();
     let w = std::thread::spawn(move || {
@@ -396,13 +451,108 @@ pub fn ref_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Whether `b` opens with the compressed-stream magic of `rt`.
+fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
+    match rt {
+        Roundtrip::Bzip2 => b.starts_with(b"BZh"),
+        Roundtrip::Gzip { .. } => b.starts_with(&[0x1f, 0x8b]),
+    }
+}
+
+/// The `-S`/`--suffix` operand of `args`, if any.
+fn gzip_custom_suffix<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if *a == "-S" || *a == "--suffix" {
+            return it.next().copied();
+        }
+        if let Some(v) = a.strip_prefix("--suffix=") {
+            return Some(v);
+        }
+        if let Some(v) = a.strip_prefix("-S")
+            && !v.is_empty()
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Whether tree entry `n` is a compressed output of this case.
+fn is_compressed_name(c: &Case, n: &str) -> bool {
+    match c.roundtrip {
+        Roundtrip::Bzip2 => is_bz2_name(n),
+        Roundtrip::Gzip { .. } => {
+            n.ends_with(".gz")
+                || n.ends_with(".tgz")
+                || gzip_custom_suffix(&c.args).is_some_and(|s| !s.is_empty() && n.ends_with(s))
+        }
+    }
+}
+
+/// Length of the gzip header through the end of FNAME (the NUL included), or
+/// of the fixed 10 bytes plus FEXTRA when there is no FNAME. `None` when the
+/// bytes are not a well-formed gzip header that far.
+fn gzip_header_through_fname(b: &[u8]) -> Option<usize> {
+    if b.len() < 10 || b[0] != 0x1f || b[1] != 0x8b {
+        return None;
+    }
+    let flg = b[3];
+    let mut at = 10;
+    if flg & 0x04 != 0 {
+        let xlen = u16::from_le_bytes([*b.get(at)?, *b.get(at + 1)?]) as usize;
+        at += 2 + xlen;
+        if at > b.len() {
+            return None;
+        }
+    }
+    if flg & 0x08 != 0 {
+        let nul = b.get(at..)?.iter().position(|&x| x == 0)?;
+        at += nul + 1;
+    }
+    Some(at)
+}
+
+/// Difference in the gzip header up to the end of FNAME, if any.
+fn gzip_header_mismatch(reference: &[u8], ours: &[u8]) -> Option<String> {
+    let (rl, sl) = (
+        gzip_header_through_fname(reference),
+        gzip_header_through_fname(ours),
+    );
+    match (rl, sl) {
+        (Some(rl), Some(sl)) if reference[..rl] == ours[..sl] => None,
+        (Some(rl), Some(sl)) => Some(format!(
+            "gzip header (through FNAME) differs:\n    reference: {}\n    stuffr:    {}",
+            describe_bytes(&reference[..rl]),
+            describe_bytes(&ours[..sl])
+        )),
+        _ => Some(format!(
+            "gzip header (through FNAME) unreadable: reference {}, stuffr {}",
+            if rl.is_some() { "ok" } else { "malformed" },
+            if sl.is_some() { "ok" } else { "malformed" }
+        )),
+    }
+}
+
 /// The original a compressed output named `name` should decompress to.
 fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
-    let base = name.strip_suffix(".bz2").map(str::to_owned).or_else(|| {
-        name.strip_suffix(".tbz2")
-            .or(name.strip_suffix(".tbz"))
-            .map(|b| format!("{b}.tar"))
-    })?;
+    let base = match c.roundtrip {
+        Roundtrip::Bzip2 => name.strip_suffix(".bz2").map(str::to_owned).or_else(|| {
+            name.strip_suffix(".tbz2")
+                .or(name.strip_suffix(".tbz"))
+                .map(|b| format!("{b}.tar"))
+        })?,
+        Roundtrip::Gzip { .. } => name
+            .strip_suffix(".gz")
+            .map(str::to_owned)
+            .or_else(|| name.strip_suffix(".tgz").map(|b| format!("{b}.tar")))
+            .or_else(|| {
+                gzip_custom_suffix(&c.args)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| name.strip_suffix(s))
+                    .map(str::to_owned)
+            })?,
+    };
     c.files
         .iter()
         .find(|(n, _)| *n == base)
@@ -455,6 +605,23 @@ fn mtime_ok(r: i64, r_start: i64, s: i64, s_start: i64, now: i64) -> bool {
     within(r, r_start) && within(s, s_start)
 }
 
+fn tool_name(rt: &Roundtrip) -> &'static str {
+    match rt {
+        Roundtrip::Bzip2 => "bzip2",
+        Roundtrip::Gzip { .. } => "gzip",
+    }
+}
+
+/// The format-specific part of comparing two compressed streams whose bytes
+/// are not promised identical: bzip2's block-size digit, or gzip's header
+/// through FNAME.
+fn stream_mismatch(rt: &Roundtrip, reference: &[u8], ours: &[u8]) -> Option<String> {
+    match rt {
+        Roundtrip::Bzip2 => block_digit_mismatch(reference, ours),
+        Roundtrip::Gzip { .. } => gzip_header_mismatch(reference, ours),
+    }
+}
+
 /// Full comparison of `r` (reference) against `s` (stuffr). Panics with every
 /// difference listed, not just the first.
 pub fn assert_same(c: &Case, r: &Run, s: &Run) {
@@ -473,7 +640,7 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
     }
 
     // stdout
-    if c.compare_output_bytes || !s.stdout.starts_with(b"BZh") {
+    if c.compare_output_bytes || !has_magic(&c.roundtrip, &s.stdout) {
         if r.stdout != s.stdout {
             d.push(format!(
                 "stdout differs ({}):\n  reference: {}\n  stuffr:    {}",
@@ -488,17 +655,20 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
             .clone()
             .or_else(|| c.stdin.clone())
             .unwrap_or_else(|| c.files.iter().flat_map(|(_, b)| b.clone()).collect());
-        if let Some(e) = block_digit_mismatch(&r.stdout, &s.stdout) {
+        if let Some(e) = stream_mismatch(&c.roundtrip, &r.stdout, &s.stdout) {
             d.push(format!("stdout {e}"));
         }
-        match ref_decompress(&s.stdout) {
+        match ref_decompress_with(&c.roundtrip, &s.stdout) {
             Ok(got) if got == want => {}
             Ok(got) => d.push(format!(
                 "stdout round-trip mismatch: want {}, got {}",
                 describe_bytes(&want),
                 describe_bytes(&got)
             )),
-            Err(e) => d.push(format!("reference bzip2 rejects stuffr's stdout: {e}")),
+            Err(e) => d.push(format!(
+                "reference {} rejects stuffr's stdout: {e}",
+                tool_name(&c.roundtrip)
+            )),
         }
     }
 
@@ -521,11 +691,13 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
                 if rb == sb {
                     continue;
                 }
-                if !c.compare_output_bytes && is_bz2_name(n) {
-                    if let Some(e) = block_digit_mismatch(rb, sb) {
+                if !c.compare_output_bytes
+                    && (is_compressed_name(c, n) || has_magic(&c.roundtrip, sb))
+                {
+                    if let Some(e) = stream_mismatch(&c.roundtrip, rb, sb) {
                         d.push(format!("tree: {n} {e}"));
                     }
-                    match (ref_decompress(sb), original_for(c, n)) {
+                    match (ref_decompress_with(&c.roundtrip, sb), original_for(c, n)) {
                         (Ok(got), Some(want)) if got == want => {}
                         (Ok(got), Some(want)) => d.push(format!(
                             "tree: {n} round-trip mismatch: want {}, got {}",
@@ -535,9 +707,10 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
                         (Ok(_), None) => d.push(format!(
                             "tree: {n} decompresses but its original is unknown"
                         )),
-                        (Err(e), _) => {
-                            d.push(format!("tree: reference bzip2 rejects stuffr's {n}: {e}"))
-                        }
+                        (Err(e), _) => d.push(format!(
+                            "tree: reference {} rejects stuffr's {n}: {e}",
+                            tool_name(&c.roundtrip)
+                        )),
                     }
                 } else {
                     d.push(format!(
