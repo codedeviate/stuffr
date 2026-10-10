@@ -83,7 +83,10 @@ use std::path::{Path, PathBuf};
 use stuffr::entries;
 use stuffr::ops::{self, CompressOpts, Input, Output};
 use stuffr_core::FormatId;
-use stuffr_core::testing::{CODEC_SLOTS, CONTAINER_SLOTS, SALVAGE_SLOTS};
+use stuffr_core::testing::{
+    CODEC_SLOTS, COMPAT_FUZZ_MAX_INPUT, CONTAINER_SLOTS, SALVAGE_SLOTS, decode_compat_case,
+    encode_compat_case,
+};
 
 /// The chain target's seeds carry no selector byte, so there is no slot
 /// table to derive an expected count from the way `codec`/`container` do.
@@ -616,6 +619,148 @@ pub struct CorpusCounts {
     pub chain: usize,
     pub roundtrip: usize,
     pub salvage: usize,
+    pub compat: usize,
+}
+
+// ---------------------------------------------------------------------
+// The `compat` target's seeds (0.11.0 Task 6): one case each, encoded with
+// `encode_compat_case` — `[tool][argc][token; argc][file mask] ++ payload`.
+// ---------------------------------------------------------------------
+
+/// What each `compat` seed is for. The payload of every one is a real bzip2
+/// stream written by this build's encoder, a damaged or cut copy of one, or
+/// plain text; see `compat_seed` for each shape's bytes.
+const COMPAT_SHAPES: &[&str] = &[
+    // Compression, through stdin and through a file.
+    "bzip2-stdin-to-stdout",
+    "bzip2-keep-file",
+    "bzip2-force-verbose-existing-output",
+    // Decompression of a healthy stream: to a file, a `.tbz2` to `.tar`, to
+    // stdout, and with `-s` (the small-memory decoder).
+    "bunzip2-keep-file",
+    "bunzip2-tbz2",
+    "bzcat-file",
+    "bzip2-small-decompress",
+    // Integrity tests, of a healthy and of a damaged stream.
+    "bzip2-test-valid-verbose",
+    "bzip2-test-damaged",
+    // Hostile streams on stdin: a flipped byte, a cut tail.
+    "bunzip2-stdin-damaged",
+    "bunzip2-stdin-truncated",
+    // Two streams and trailing garbage; a non-bzip2 input copied by `-f`.
+    "bunzip2-multistream-garbage",
+    "bzcat-force-not-bzip2",
+    // Argument mixes: clusters, `--` then `-` as a file, help, a bad flag,
+    // and `-c` with `-t`.
+    "bzip2-args-mix",
+    "bzip2-help",
+    "bzip2-bad-flag",
+    "bzip2-stdout-and-test",
+    // bzip2recover: a multi-block stream, a damaged one, and no operand.
+    "bzip2recover-multiblock",
+    "bzip2recover-damaged",
+    "bzip2recover-usage",
+];
+
+/// A bzip2 stream of `plain` at `level`, through this build's encoder.
+fn bzip2_of(work: &Path, plain: &[u8], level: i32) -> stuffr_core::Result<Vec<u8>> {
+    let src = work.join("compat-plain");
+    let dst = work.join("compat-plain.bz2");
+    std::fs::write(&src, plain)?;
+    let _ = std::fs::remove_file(&dst);
+    let o = CompressOpts {
+        format: Some(FormatId::new("bzip2")),
+        level: Some(level),
+        sync: false,
+        ..Default::default()
+    };
+    ops::compress(Input::Path(src), Output::Path(dst.clone()), &o)?;
+    Ok(read_all(&dst)?)
+}
+
+/// Text that spans `n` bytes and compresses well without being one run.
+fn compat_text(n: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n + 64);
+    let mut i = 0u64;
+    while v.len() < n {
+        v.extend_from_slice(
+            format!("seed line {i}: the quick brown fox {}\n", i * 7919 % 1000).as_bytes(),
+        );
+        i += 1;
+    }
+    v.truncate(n);
+    v
+}
+
+/// One byte in the middle flipped.
+fn damaged(bytes: &[u8]) -> Vec<u8> {
+    let mut v = bytes.to_vec();
+    let mid = v.len() / 2;
+    v[mid] ^= 0x55;
+    v
+}
+
+/// The `compat` seed for `shape`.
+fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
+    let text = compat_text(4000);
+    let valid = bzip2_of(work, &text, 9)?;
+    let e = encode_compat_case;
+    Ok(match shape {
+        "bzip2-stdin-to-stdout" => e("bzip2", &[], &[], true, &text),
+        "bzip2-keep-file" => e("bzip2", &["-k", "a"], &["a"], false, &text),
+        "bzip2-force-verbose-existing-output" => {
+            e("bzip2", &["-f", "-v", "a"], &["a", "a.bz2"], false, &text)
+        }
+        "bunzip2-keep-file" => e("bunzip2", &["-k", "a.bz2"], &["a.bz2"], false, &valid),
+        "bunzip2-tbz2" => e("bunzip2", &["a.tbz2"], &["a.tbz2"], false, &valid),
+        "bzcat-file" => e("bzcat", &["a.bz2"], &["a.bz2"], false, &valid),
+        "bzip2-small-decompress" => e(
+            "bzip2",
+            &["-d", "-s", "-c", "a.bz2"],
+            &["a.bz2"],
+            false,
+            &valid,
+        ),
+        "bzip2-test-valid-verbose" => e("bzip2", &["-tv", "a.bz2"], &["a.bz2"], false, &valid),
+        "bzip2-test-damaged" => e(
+            "bzip2",
+            &["-t", "a.bz2"],
+            &["a.bz2"],
+            false,
+            &damaged(&valid),
+        ),
+        "bunzip2-stdin-damaged" => e("bunzip2", &[], &[], true, &damaged(&valid)),
+        "bunzip2-stdin-truncated" => e("bunzip2", &["-c"], &[], true, &valid[..valid.len() - 10]),
+        "bunzip2-multistream-garbage" => {
+            let mut two = valid.clone();
+            two.extend_from_slice(&bzip2_of(work, b"a second stream\n", 1)?);
+            two.extend_from_slice(b"trailing garbage");
+            e("bunzip2", &["-c", "a.bz2"], &["a.bz2"], false, &two)
+        }
+        "bzcat-force-not-bzip2" => e("bzcat", &["-f"], &[], true, &text),
+        "bzip2-args-mix" => e(
+            "bzip2",
+            &["-vvv", "--small", "-s1", "--keep", "--", "a", "-"],
+            &["a"],
+            false,
+            &text,
+        ),
+        "bzip2-help" => e("bzip2", &["-h"], &[], false, b""),
+        "bzip2-bad-flag" => e("bzip2", &["--bogus", "a"], &["a"], false, &text),
+        "bzip2-stdout-and-test" => e("bzip2", &["-c", "-t", "a.bz2"], &["a.bz2"], false, &valid),
+        "bzip2recover-multiblock" | "bzip2recover-damaged" => {
+            // Level 1: 100k blocks, so 250 KB of text is three of them.
+            let multi = bzip2_of(work, &compat_text(250_000), 1)?;
+            let bytes = if shape == "bzip2recover-damaged" {
+                damaged(&multi)
+            } else {
+                multi
+            };
+            e("bzip2recover", &["a.bz2"], &["a.bz2"], false, &bytes)
+        }
+        "bzip2recover-usage" => e("bzip2recover", &[], &[], false, b""),
+        other => unreachable!("COMPAT_SHAPES lists an unhandled shape {other:?}"),
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -1200,6 +1345,8 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
     let chain_dir = root.join("chain");
     let roundtrip_dir = root.join("roundtrip");
     let salvage_dir = root.join("salvage");
+    let compat_dir = root.join("compat");
+    std::fs::create_dir_all(&compat_dir)?;
     std::fs::create_dir_all(&codec_dir)?;
     std::fs::create_dir_all(&container_dir)?;
     std::fs::create_dir_all(&chain_dir)?;
@@ -1647,12 +1794,23 @@ pub fn generate_corpus(root: &Path) -> stuffr_core::Result<CorpusCounts> {
         salvage_count += 1;
     }
 
+    // --- compat/ -------------------------------------------------------
+    // One case per `COMPAT_SHAPES` entry, already in the target's wire
+    // format (`encode_compat_case`).
+    let mut compat_count = 0usize;
+    for shape in COMPAT_SHAPES {
+        let seed = compat_seed(work.path(), shape)?;
+        std::fs::write(compat_dir.join(format!("{shape}.seed")), &seed)?;
+        compat_count += 1;
+    }
+
     Ok(CorpusCounts {
         codec: codec_count,
         container: container_count,
         chain: chain_count,
         roundtrip: roundtrip_count,
         salvage: salvage_count,
+        compat: compat_count,
     })
 }
 
@@ -1677,6 +1835,7 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
     let expected_chain = CHAIN_SHAPES.len();
     let expected_roundtrip = writable_codec_slots().len() + writable_container_slots().len();
     let expected_salvage = SALVAGE_SHAPES.len();
+    let expected_compat = COMPAT_SHAPES.len();
 
     for (target, got, expected) in [
         ("codec", counts.codec, expected_codec),
@@ -1684,6 +1843,7 @@ fn the_generated_corpus_has_exactly_one_seed_per_registered_slot() {
         ("chain", counts.chain, expected_chain),
         ("roundtrip", counts.roundtrip, expected_roundtrip),
         ("salvage", counts.salvage, expected_salvage),
+        ("compat", counts.compat, expected_compat),
     ] {
         assert!(
             expected > 0,
@@ -2184,6 +2344,54 @@ fn every_salvage_seed_is_recognised_as_the_slot_its_shape_names() {
     }
 }
 
+/// How many 48-bit bzip2 block magics `bytes` holds, at any bit offset —
+/// what bzip2recover's first pass counts.
+fn block_magics(bytes: &[u8]) -> usize {
+    let mut w = 0u64;
+    let mut n = 0;
+    for &b in bytes {
+        for k in (0..8).rev() {
+            w = ((w << 1) | u64::from((b >> k) & 1)) & 0xffff_ffff_ffff;
+            if w == 0x3141_5926_5359 {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Every `compat` seed decodes to the tool and case its shape names, fits
+/// under the target's input cap (a seed past it is skipped by every run),
+/// and the bzip2recover seeds carry the several blocks they exist for.
+#[test]
+fn every_compat_seed_decodes_fits_and_carries_its_shape() {
+    let work = tempfile::tempdir().unwrap();
+    for shape in COMPAT_SHAPES {
+        let seed = compat_seed(work.path(), shape).unwrap();
+        assert!(
+            seed.len() <= COMPAT_FUZZ_MAX_INPUT,
+            "compat seed {shape} is {} bytes, past the target's {COMPAT_FUZZ_MAX_INPUT}",
+            seed.len()
+        );
+        let case = decode_compat_case(&seed).unwrap();
+        assert!(
+            shape.starts_with(case.name),
+            "{shape} decodes as {}",
+            case.name
+        );
+        if shape.starts_with("bzip2recover-") && *shape != "bzip2recover-usage" {
+            let blocks = block_magics(case.payload);
+            assert!(blocks >= 3, "{shape} holds {blocks} block(s)");
+        }
+        if !case.files.is_empty() || case.stdin {
+            assert!(
+                !case.payload.is_empty() || *shape == "bzip2-help",
+                "{shape}"
+            );
+        }
+    }
+}
+
 #[test]
 #[ignore = "writes fuzz/corpus/*; run explicitly via `make fuzz-corpus`"]
 fn generate_corpus_writes_the_real_seed_corpus() {
@@ -2196,7 +2404,8 @@ fn generate_corpus_writes_the_real_seed_corpus() {
             && counts.container > 0
             && counts.chain > 0
             && counts.roundtrip > 0
-            && counts.salvage > 0,
+            && counts.salvage > 0
+            && counts.compat > 0,
         "wrote an empty corpus for at least one target: {counts:?}"
     );
 }

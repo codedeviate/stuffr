@@ -137,6 +137,175 @@ pub const SALVAGE_SLOTS: &[&str] = &["zip", "arc", "zoo", "lha", "arj", "tar", "
 /// cannot end a run or take the entries around it with it.
 pub const SALVAGE_FUZZ_MAX_ENTRY: u64 = 256 * 1024;
 
+/// The `compat` fuzz target's tool selector: byte `n % COMPAT_NAMES.len()`
+/// names the compatibility tool a case runs as.
+///
+/// These three tables live here for the reason [`SALVAGE_SLOTS`] does: they
+/// are the wire format of the seeds `crates/stuffr/tests/fuzz_corpus.rs`
+/// writes, and `fuzz/` is outside the workspace. **Append-only, never
+/// reorder, never remove**, the rule [`CODEC_SLOTS`] states.
+pub const COMPAT_NAMES: &[&str] = &["bzip2", "bunzip2", "bzcat", "bzip2recover"];
+
+/// The files a `compat` case may create in its directory before the run,
+/// one bit of the case's file mask each. Every one is also a token in
+/// [`COMPAT_TOKENS`], so an operand can name it. Append-only.
+pub const COMPAT_FILES: &[&str] = &["a", "a.bz2", "a.tbz2", "a.out"];
+
+/// The `compat` target's argument vocabulary: byte `n % len` is one argument.
+/// Every bzip2 1.0.8 short flag, an unknown one, some clusters, every long
+/// flag, an unknown one, `--`, `-`, and the [`COMPAT_FILES`] names. Drawing
+/// arguments from a fixed set, rather than from raw bytes, is what keeps
+/// every operand inside the case's directory: no token is absolute, holds a
+/// `/` or names `..`. Append-only.
+pub const COMPAT_TOKENS: &[&str] = &[
+    "-c",
+    "-d",
+    "-z",
+    "-f",
+    "-t",
+    "-k",
+    "-s",
+    "-q",
+    "-v",
+    "-V",
+    "-L",
+    "-h",
+    "-1",
+    "-2",
+    "-3",
+    "-4",
+    "-5",
+    "-6",
+    "-7",
+    "-8",
+    "-9",
+    "-x",
+    "-dc",
+    "-cd",
+    "-tv",
+    "-kf",
+    "-dfk",
+    "-qt",
+    "-vvv",
+    "-zc",
+    "-s1",
+    "-dq",
+    "--stdout",
+    "--decompress",
+    "--compress",
+    "--force",
+    "--test",
+    "--keep",
+    "--small",
+    "--quiet",
+    "--version",
+    "--license",
+    "--exponential",
+    "--repetitive-best",
+    "--repetitive-fast",
+    "--fast",
+    "--best",
+    "--verbose",
+    "--help",
+    "--bogus",
+    "--",
+    "-",
+    "a",
+    "a.bz2",
+    "a.tbz2",
+    "a.out",
+];
+
+/// The largest input the `compat` target runs. Here, not in the target, so
+/// the corpus generator's test can hold every seed under it. A bzip2 block
+/// holds at most 900k, but a fuzz-scale case never needs one: 64 KiB fits a
+/// multi-block stream of compressible text at level 1 (the bzip2recover
+/// seed) and keeps a run in the milliseconds; what a decompression bomb
+/// inside it can write is bounded by `run_in`'s own output cap.
+pub const COMPAT_FUZZ_MAX_INPUT: usize = 64 * 1024;
+
+/// At most this many arguments per `compat` case (`argc % (MAX + 1)`).
+pub const COMPAT_MAX_ARGS: usize = 8;
+
+/// Mask bit: standard input carries the payload (otherwise it is empty).
+pub const COMPAT_STDIN_BIT: u8 = 1 << 4;
+
+/// One `compat` fuzz case, decoded by [`decode_compat_case`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompatCase<'a> {
+    /// The tool, from [`COMPAT_NAMES`].
+    pub name: &'static str,
+    /// The arguments after `argv[0]`, from [`COMPAT_TOKENS`].
+    pub args: Vec<&'static str>,
+    /// The [`COMPAT_FILES`] created before the run, each holding `payload`.
+    pub files: Vec<&'static str>,
+    /// Whether standard input carries `payload`.
+    pub stdin: bool,
+    /// The bytes every created file (and, with `stdin`, standard input)
+    /// holds.
+    pub payload: &'a [u8],
+}
+
+/// Decode `[name][argc][token; argc][mask] ++ payload`, the `compat` target's
+/// wire format. `None` when `data` ends before the mask.
+pub fn decode_compat_case(data: &[u8]) -> Option<CompatCase<'_>> {
+    let (&name, rest) = data.split_first()?;
+    let (&argc, rest) = rest.split_first()?;
+    let argc = argc as usize % (COMPAT_MAX_ARGS + 1);
+    if rest.len() < argc + 1 {
+        return None;
+    }
+    let (tokens, rest) = rest.split_at(argc);
+    let (&mask, payload) = rest.split_first()?;
+    Some(CompatCase {
+        name: COMPAT_NAMES[name as usize % COMPAT_NAMES.len()],
+        args: tokens
+            .iter()
+            .map(|&t| COMPAT_TOKENS[t as usize % COMPAT_TOKENS.len()])
+            .collect(),
+        files: COMPAT_FILES
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| mask & (1 << i) != 0)
+            .map(|(_, &f)| f)
+            .collect(),
+        stdin: mask & COMPAT_STDIN_BIT != 0,
+        payload,
+    })
+}
+
+/// The inverse of [`decode_compat_case`], for the corpus generator.
+///
+/// # Panics
+///
+/// On a name, token or file outside its table, or more than
+/// [`COMPAT_MAX_ARGS`] arguments: a seed that cannot be encoded is a bug in
+/// the generator.
+pub fn encode_compat_case(
+    name: &str,
+    args: &[&str],
+    files: &[&str],
+    stdin: bool,
+    payload: &[u8],
+) -> Vec<u8> {
+    let index = |table: &[&str], s: &str| {
+        table
+            .iter()
+            .position(|t| *t == s)
+            .unwrap_or_else(|| panic!("{s:?} is not in its compat table"))
+    };
+    assert!(args.len() <= COMPAT_MAX_ARGS, "too many compat arguments");
+    let mut v = vec![index(COMPAT_NAMES, name) as u8, args.len() as u8];
+    v.extend(args.iter().map(|a| index(COMPAT_TOKENS, a) as u8));
+    let mut mask = if stdin { COMPAT_STDIN_BIT } else { 0 };
+    for f in files {
+        mask |= 1 << index(COMPAT_FILES, f);
+    }
+    v.push(mask);
+    v.extend_from_slice(payload);
+    v
+}
+
 pub const MOCK_CODEC: FormatId = FormatId::new("mock-codec");
 pub const MOCK_CONTAINER: FormatId = FormatId::new("mock-container");
 
@@ -1315,6 +1484,32 @@ mod tests {
         src.seek(SeekFrom::Start(0)).unwrap();
         src.read_exact(&mut buf).unwrap();
         assert_eq!(src.bytes_read(), 60);
+    }
+
+    #[test]
+    fn a_compat_case_round_trips_through_its_wire_format() {
+        let seed = encode_compat_case("bunzip2", &["-k", "--", "a.bz2"], &["a.bz2"], true, b"BZh9");
+        let case = decode_compat_case(&seed).unwrap();
+        assert_eq!(
+            case,
+            CompatCase {
+                name: "bunzip2",
+                args: vec!["-k", "--", "a.bz2"],
+                files: vec!["a.bz2"],
+                stdin: true,
+                payload: b"BZh9",
+            }
+        );
+        // Cut before the mask: nothing to run.
+        assert!(decode_compat_case(&seed[..5]).is_none());
+        // Every file is a token, so an operand can name it.
+        assert!(COMPAT_FILES.iter().all(|f| COMPAT_TOKENS.contains(f)));
+        // No token leaves the case's directory.
+        assert!(
+            COMPAT_TOKENS
+                .iter()
+                .all(|t| !t.contains('/') && !t.contains(".."))
+        );
     }
 
     #[test]

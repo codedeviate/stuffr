@@ -46,6 +46,9 @@ stuffr-formats = { path = "../crates/stuffr-formats", features = [
     "cpio",
     "ar",
 ] }
+# `compat.rs` (0.11.0 Task 6): the bzip2 compatibility family lives in the
+# CLI crate, and only `compat::run_in` runs it without touching the process.
+stuffr-cli = { path = "../crates/stuffr-cli" }
 tempfile = "3"
 # Only for `container.rs`'s independent EOCD re-parse (Ruling A's second
 # guard) — opens a SECOND `zip::ZipArchive` over the same bytes stuffr's own
@@ -94,6 +97,18 @@ bench = false
 [[bin]]
 name = "salvage"
 path = "fuzz_targets/salvage.rs"
+test = false
+doc = false
+bench = false
+
+# 0.11.0 Task 6. The bzip2 compatibility family (`bzip2`, `bunzip2`, `bzcat`,
+# `bzip2recover`) run in-process with arguments drawn from a fixed token set:
+# exit codes stay bzip2's, nothing is written outside the run's directory,
+# and bzip2recover reads its input no more than its two passes need. Sixth
+# target, and the only fuzz coverage of `stuffr::bzip2_stream`.
+[[bin]]
+name = "compat"
+path = "fuzz_targets/compat.rs"
 test = false
 doc = false
 bench = false

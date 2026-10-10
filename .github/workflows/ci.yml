@@ -200,7 +200,7 @@ jobs:
       - run: make miri
 
   fuzz-smoke:
-    name: fuzz smoke (codec, container, chain, roundtrip, salvage — pure tier)
+    name: fuzz smoke (codec, container, chain, roundtrip, salvage, compat — pure tier)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -309,13 +309,13 @@ jobs:
       # at its top: the run then exits with no "Done N runs" line at all,
       # and this check correctly refuses it. See task-5-report.md for the
       # quoted failure).
-      - name: fuzz all five targets (short, seeded; see Ruling G — not deterministic)
+      - name: fuzz all six targets (short, seeded; see Ruling G — not deterministic)
         run: |
           set -u
           FUZZ_RUNS=2000
           FUZZ_SEED=1
           status=0
-          # Every one of the five is SEEDED by the `make fuzz-corpus` step
+          # Every one of the six is SEEDED by the `make fuzz-corpus` step
           # above, `salvage` included. This comment said the opposite —
           # "`salvage` has no seeded corpus of its own ... it runs from
           # nothing here" — from Salvage Stage 1 Task 8 until Stage 2 Task 8,
@@ -325,7 +325,7 @@ jobs:
           # its own oracle. A stale comment claiming a target is unseeded is
           # exactly how the next reader concludes a low coverage figure is
           # expected.
-          for target in codec container chain roundtrip salvage; do
+          for target in codec container chain roundtrip salvage compat; do
             # libFuzzer counts the corpus load against `-runs`, so size it
             # to the seeds `make fuzz-corpus` wrote (same as the Makefile).
             corpus=$(find fuzz/corpus/$target -type f 2>/dev/null | wc -l | tr -d ' ' || true)

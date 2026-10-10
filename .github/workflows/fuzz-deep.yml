@@ -75,12 +75,12 @@ jobs:
     # that gap, not the schedule trigger's own default behaviour. It covers
     # the `push: tags` trigger too, which a fork gets for free by pushing any
     # `v*` tag of its own; that one would otherwise burn a fork's runner
-    # minutes on five 20-minute jobs without being asked.
+    # minutes on six 20-minute jobs without being asked.
     if: github.repository == 'codedeviate/stuffr'
     strategy:
       fail-fast: false
       matrix:
-        target: [codec, container, chain, roundtrip, salvage]
+        target: [codec, container, chain, roundtrip, salvage, compat]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -107,7 +107,7 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       # Generated, not committed (`fuzz/.gitignore`'s `/corpus`) — regenerated
       # fresh for every scheduled run, exactly as ci.yml's smoke job does.
-      # This step seeds ALL FIVE matrix entries, `salvage` included. It said
+      # This step seeds ALL SIX matrix entries, `salvage` included. It said
       # otherwise ("`salvage` ... has no seed generator, so its matrix entry
       # below runs from an empty corpus directory") from Salvage Stage 1 Task
       # 8 until Stage 2 Task 8, and it was false from the moment that task's
@@ -188,6 +188,14 @@ jobs:
              `STUFFR_FUZZ_SALVAGE_TRACE=1 cargo +nightly fuzz run salvage
              PATH/TO/INPUT` and read the `slot=` and `routed=` fields rather
              than deriving the format from the byte.
+
+             A `compat` input is `[tool][argc][token; argc][file mask]`
+             followed by the payload, decoded by `decode_compat_case` in
+             crates/stuffr-core/src/testing.rs (COMPAT_NAMES, COMPAT_TOKENS,
+             COMPAT_FILES). Its panics name what failed: an exit code outside
+             the tool's set, a write outside the run's directory, or
+             bzip2recover reading or writing past its bounds. See the header
+             of fuzz/fuzz_targets/compat.rs.
 
           5. Crash artifacts are kept for 30 days. Copy the input out of the
              artifact before then, or the finding is lost with it.
