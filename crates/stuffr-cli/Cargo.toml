@@ -57,6 +57,12 @@ stuffr = { path = "../stuffr", version = "0.10.4", features = ["serde"] }
 clap = { workspace = true }
 serde_json = "1"
 
+# The bzip2 compatibility mode restores `SIGPIPE`'s default action, so a
+# closed pipe ends it the way it ends bzip2. Already in the lock (a
+# transitive dependency, and this crate's own unix dev-dependency).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Fixture builders for the `list`/`test` integration tests: real tar and
 # real gzip, independent of `stuffr-formats`' own `Tar`/gzip implementations,

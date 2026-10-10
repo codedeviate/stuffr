@@ -14,8 +14,6 @@
 //!   trace (block CRCs, sorting statistics) is not reachable through stuffr's
 //!   codec API, and bzip2.c's own extra blank lines at that level only frame
 //!   that trace, so they are left out with it.
-//! - A write to a closed pipe ends the run silently with exit 1, where bzip2
-//!   is killed by `SIGPIPE`.
 //! - Output is written under a temporary name and renamed into place, so an
 //!   interrupted run leaves a `.stuffr-bzip2-*.tmp` file where bzip2's signal
 //!   handler would have deleted its partial output.
@@ -40,6 +38,14 @@ pub fn run(name: &'static str, args: Vec<OsString>) -> ExitCode {
     if name == "bzip2recover" {
         Prog { name }.err(format_args!("not yet implemented"));
         return ExitCode::from(3);
+    }
+    // bzip2 dies of SIGPIPE writing to a closed pipe; Rust ignores the
+    // signal by default, so restore its default action, on this path only.
+    #[cfg(unix)]
+    // SAFETY: setting a signal's disposition to SIG_DFL installs no handler
+    // and touches no Rust state; it is done before any other thread or I/O.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let mut err = io::stderr();
     let code = match args::parse(name, &args, &|k| std::env::var_os(k), &mut err) {

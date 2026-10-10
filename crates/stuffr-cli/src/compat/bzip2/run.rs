@@ -311,13 +311,38 @@ impl Bz<'_> {
         }
     }
 
-    /// Rename the finished temporary output into place, then remove the
+    /// Publish the finished temporary output under its name, then remove the
     /// input unless it is kept (the tail of `compress` and `uncompress`).
-    fn commit(&mut self) -> Step {
-        if let Some(tmp) = self.pending.clone()
-            && let Err(e) = fs::rename(&tmp, path(&self.out_name))
-        {
-            return Err(self.fail(Failure::Io(e)));
+    /// `Ok(false)`: the output appeared meanwhile and was refused.
+    ///
+    /// Without `-f`, publishing must not replace anything: bzip2 creates its
+    /// output with `O_EXCL`, so a file that appears after the existence check
+    /// is refused, never clobbered. A rename would silently replace it, so the
+    /// temporary is hard-linked to the name instead, which fails with
+    /// `EEXIST` exactly where bzip2's open would, and then unlinked. Where the
+    /// filesystem has no hard links, rename is the fallback. With `-f`, bzip2
+    /// has already removed any existing output, and rename keeps that intent.
+    fn commit(&mut self) -> Result<bool, Fatal> {
+        if let Some(tmp) = self.pending.clone() {
+            let out = path(&self.out_name);
+            let published = if self.s.force {
+                fs::rename(&tmp, &out)
+            } else {
+                match fs::hard_link(&tmp, &out) {
+                    Ok(()) => fs::remove_file(&tmp),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        self.pending = None;
+                        let _ = fs::remove_file(&tmp);
+                        let (p, o) = (self.p(), self.out_name.clone());
+                        self.refuse(m::OUTPUT_EXISTS, &[p, &o]);
+                        return Ok(false);
+                    }
+                    Err(_) => fs::rename(&tmp, &out),
+                }
+            };
+            if let Err(e) = published {
+                return Err(self.fail(Failure::Io(e)));
+            }
         }
         self.pending = None;
         if !self.s.keep
@@ -325,7 +350,7 @@ impl Bz<'_> {
         {
             return Err(self.fail(Failure::Io(e)));
         }
-        Ok(())
+        Ok(true)
     }
 
     // ---- compress ----
@@ -520,8 +545,8 @@ impl Bz<'_> {
         };
 
         if magic_ok {
-            if self.s.src == SrcMode::F2F {
-                self.commit()?;
+            if self.s.src == SrcMode::F2F && !self.commit()? {
+                return Ok(());
             }
         } else {
             self.unz_fails = true;
@@ -760,14 +785,6 @@ impl Bz<'_> {
     fn fail(&mut self, f: Failure) -> Fatal {
         let p = self.p();
         match f {
-            // Writing to a closed pipe: bzip2 dies of SIGPIPE, silently.
-            Failure::Io(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                if let Some(tmp) = self.pending.take() {
-                    let _ = fs::remove_file(tmp);
-                }
-                self.set_exit(1);
-                Fatal
-            }
             Failure::Io(e) => {
                 self.say(m::IO_ERROR, &[p]);
                 self.perror(&strerror(&e));
@@ -847,5 +864,71 @@ fn stream_failure(e: StreamError, kind: Kind) -> Failure {
         StreamError::Memory => Failure::Memory,
         StreamError::Io(e) => Failure::Io(e),
         _ => Failure::Panic("decompress:unexpected error"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(force: bool) -> Settings {
+        Settings {
+            op: OpMode::Compress,
+            src: SrcMode::F2F,
+            verbosity: 0,
+            keep: true,
+            small: false,
+            force,
+            noisy: true,
+            level: 9,
+            longest: 7,
+            files: vec![],
+        }
+    }
+
+    /// An output that appears between the existence check and publishing is
+    /// refused, as bzip2's `O_EXCL` open would refuse it, never clobbered.
+    #[test]
+    fn publishing_never_replaces_an_output_that_appeared_meanwhile() {
+        let dir = std::env::temp_dir().join(format!("stuffr-bz-commit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (tmp, out) = (dir.join(".tmp"), dir.join("a.bz2"));
+        for force in [false, true] {
+            fs::write(&tmp, b"new").unwrap();
+            fs::write(&out, b"appeared").unwrap();
+            let mut err = Vec::new();
+            let mut bz = Bz {
+                prog: "bzip2",
+                s: settings(force),
+                num_files: 1,
+                exit: 0,
+                processed: 1,
+                in_name: b"a".to_vec(),
+                out_name: out.as_os_str().as_encoded_bytes().to_vec(),
+                pending: Some(tmp.clone()),
+                unz_fails: false,
+                test_fails: false,
+                err: &mut err,
+            };
+            let published = bz.commit().ok().unwrap();
+            let exit = bz.exit;
+            let msg = String::from_utf8(err).unwrap();
+            assert!(!tmp.exists(), "force={force}: the temporary is left");
+            if force {
+                assert!(published);
+                assert_eq!(fs::read(&out).unwrap(), b"new");
+                assert_eq!(exit, 0);
+            } else {
+                assert!(!published);
+                assert_eq!(fs::read(&out).unwrap(), b"appeared");
+                assert_eq!(exit, 1);
+                assert_eq!(
+                    msg,
+                    format!("bzip2: Output file {} already exists.\n", out.display())
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
