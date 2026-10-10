@@ -7772,6 +7772,22 @@ fn is_column_label(prefix: &str) -> bool {
     }
 }
 
+/// Whether `path` is a compatibility family's message table,
+/// `src/compat/<family>/messages.rs`, matched by whole path components.
+///
+/// Those files hold another tool's text copied verbatim (bzip2.c's licence
+/// and usage indent with three spaces), and the differential harness pins
+/// every byte of it against the real tool, so a "collapsed" run there is the
+/// reference's own layout, not a defect. Nothing else is exempt.
+fn is_verbatim_reference_messages(path: &std::path::Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = path.components().map(|c| c.as_os_str()).collect();
+    matches!(
+        parts.as_slice(),
+        [.., src, compat, _family, file]
+            if *src == "src" && *compat == "compat" && *file == "messages.rs"
+    )
+}
+
 /// Phase 2's final review found three multi-line literals in `main.rs`
 /// collapsed with their continuation indentation left in, so users saw runs of
 /// 22-30 spaces mid-sentence:
@@ -7856,6 +7872,24 @@ fn no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation() 
         "a `\"` inside a char literal must not desynchronise the scan"
     );
 
+    // The verbatim-reference exemption is exactly one shape of path.
+    use std::path::Path;
+    assert!(is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/bzip2/messages.rs"
+    )));
+    assert!(!is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/bzip2/run.rs"
+    )));
+    assert!(!is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/messages.rs"
+    )));
+    assert!(!is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/messages.rs"
+    )));
+    assert!(!is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/bzip2/xmessages.rs"
+    )));
+
     // And now the workspace itself.
     let files = workspace_source_files();
     assert!(
@@ -7870,7 +7904,12 @@ fn no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation() 
 
     let mut scanned = 0usize;
     let mut offenders = Vec::new();
+    let mut exempted = 0usize;
     for file in &files {
+        if is_verbatim_reference_messages(file) {
+            exempted += 1;
+            continue;
+        }
         let src = std::fs::read_to_string(file).unwrap();
         for (line, text) in rust_string_literals(&src) {
             scanned += 1;
@@ -7886,6 +7925,10 @@ fn no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation() 
     assert!(
         scanned > 1000,
         "only {scanned} literals scanned, which is not this workspace"
+    );
+    assert!(
+        exempted >= 1,
+        "the bzip2 message table was not found, so the exemption matched nothing"
     );
     assert!(
         offenders.is_empty(),

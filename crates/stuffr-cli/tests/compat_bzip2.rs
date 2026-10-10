@@ -447,14 +447,14 @@ mod differential {
     /// case that differed. `adjust` may edit stuffr's run before comparing.
     /// Cases run a few at a time: each is two independent processes in
     /// their own scratch directories.
-    fn check_all_with(group: &str, cases: &[Case], adjust: fn(&Run, &mut Run)) {
+    fn check_all_with(group: &str, cases: &[Case], adjust: fn(&mut Run, &mut Run)) {
         let one = |c: &Case| -> Result<bool, String> {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let Some(r) = reference(REFERENCE_DIR, c) else {
+                let Some(mut r) = reference(REFERENCE_DIR, c) else {
                     return false;
                 };
                 let mut s = stuffr_as(c);
-                adjust(&r, &mut s);
+                adjust(&mut r, &mut s);
                 assert_same(c, &r, &s);
                 true
             }))
@@ -488,7 +488,17 @@ mod differential {
                 Err(p) => failures.push(p),
             }
         }
-        eprintln!("{group}: {ran} of {} cases compared", cases.len());
+        println!("{group}: {ran} of {} cases compared", cases.len());
+        // A missing reference skips a case; on CI that must not pass quietly.
+        if std::env::var_os("CI").is_some() {
+            assert_eq!(
+                ran,
+                cases.len(),
+                "{group}: CI is set but only {ran} of {} cases were compared \
+                 (is the reference bzip2 installed?)",
+                cases.len()
+            );
+        }
         assert!(
             failures.is_empty(),
             "{group}: {} of {} cases differ:\n\n{}",
@@ -633,52 +643,107 @@ mod differential {
         check_all("flags", &cases);
     }
 
+    /// Whether the reference exits straight after printing the licence, as
+    /// Debian's bzip2 does (its `20-legacy.patch` adds `exit(0)` after
+    /// `license()`; ubuntu-latest inherits it). Upstream 1.0.8 carries on and
+    /// compresses stdin, so `bzip2 -V </dev/null` writes an empty stream.
+    fn reference_exits_after_license() -> Option<bool> {
+        let exe = Path::new(REFERENCE_DIR).join("bzip2");
+        if !exe.exists() {
+            return None;
+        }
+        let out = Command::new(exe)
+            .arg("-V")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .unwrap();
+        Some(out.stdout.is_empty())
+    }
+
+    const REF_LICENSE_FIRST: &str =
+        "bzip2, a block-sorting file compressor.  Version 1.0.8, 13-Jul-2019.\n";
+
+    /// Swap stuffr's licence first line for upstream's, after checking it.
+    fn licence_line(r: &mut Run, s: &mut Run) {
+        let first = format!(
+            "bzip2 (stuffr {}), a block-sorting file compressor.  \
+             Version 1.0.8, 13-Jul-2019.\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(
+            r.stderr.contains(REF_LICENSE_FIRST),
+            "reference has no licence line"
+        );
+        assert!(
+            s.stderr.contains(&first),
+            "stuffr's licence line is not {first:?}: {:?}",
+            s.stderr
+        );
+        // Only the licence's own first line differs; usage() keeps it.
+        assert!(!s.stderr.contains(&format!("{REF_LICENSE_FIRST}   \n")));
+        s.stderr = s.stderr.replace(&first, REF_LICENSE_FIRST);
+    }
+
+    /// For a reference that exits after the licence: compare the licence
+    /// text only. What follows it (stdout, files, exit code) is the patched
+    /// reference's behaviour, not upstream's, which stuffr follows.
+    fn licence_text_only(r: &mut Run, s: &mut Run) {
+        licence_line(r, s);
+        s.code = r.code;
+        s.stdout = r.stdout.clone();
+        s.tree = r.tree.clone();
+    }
+
     /// `-L`, `-V`, `--license` and `--version` print bzip2's licence text; the
     /// first line names stuffr, and everything after it is bzip2's verbatim.
+    /// The licence does not stop upstream bzip2, so each case also checks
+    /// what happens next.
+    ///
+    /// A deviation of the test oracle, not of stuffr: on a reference carrying
+    /// Debian's `20-legacy.patch` (exit after the licence) the continuation
+    /// cases are skipped and only the licence text is compared.
     #[test]
     fn license_and_version() {
+        let Some(legacy) = reference_exits_after_license() else {
+            return;
+        };
         let t = kib_text();
-        let Some(bz) = ref_bz(b"x", "-9") else { return };
+        let bz = ref_bz(b"x", "-9").unwrap();
         let a = || vec![("a.txt", t.clone())];
-        // The licence does not stop the run, so the decompressing names read
-        // stdin afterwards: give them a stream.
+        // The decompressing names read stdin after the licence: give them a
+        // stream.
         let fed = |name: &'static str, args: &[&'static str]| {
             let mut c = case(name, args, vec![]);
             c.stdin = Some(bz.clone());
             c
         };
-        let cases = vec![
+        let alone = vec![
             case("bzip2", &["-L"], vec![]),
             case("bzip2", &["-V"], vec![]),
             case("bzip2", &["--license"], vec![]),
             case("bzip2", &["--version"], vec![]),
+        ];
+        if legacy {
+            println!(
+                "license: the reference exits after the licence (Debian's \
+                 20-legacy.patch); skipping the continuation cases and \
+                 comparing the licence text only"
+            );
+            check_all_with("license", &alone, licence_text_only);
+            return;
+        }
+        let mut cases = alone;
+        cases.extend([
             case("bzip2", &["-LV"], vec![]),
             case("bzip2", &["-V", "-k", "a.txt"], a()),
             case("bzip2", &["-V", "-x"], vec![]),
             fed("bunzip2", &["-L"]),
             fed("bzcat", &["--version"]),
-        ];
-        check_all_with("license", &cases, |r, s| {
-            let first = format!(
-                "bzip2 (stuffr {}), a block-sorting file compressor.  \
-                 Version 1.0.8, 13-Jul-2019.\n",
-                env!("CARGO_PKG_VERSION")
-            );
-            let ref_first = "bzip2, a block-sorting file compressor.  \
-                             Version 1.0.8, 13-Jul-2019.\n";
-            assert!(
-                r.stderr.contains(ref_first),
-                "reference has no licence line"
-            );
-            assert!(
-                s.stderr.contains(&first),
-                "stuffr's licence line is not {first:?}: {:?}",
-                s.stderr
-            );
-            // Only the licence's own first line differs; usage() keeps it.
-            assert!(!s.stderr.contains(&format!("{ref_first}   \n")));
-            s.stderr = s.stderr.replace(&first, ref_first);
-        });
+        ]);
+        check_all_with("license", &cases, licence_line);
     }
 
     /// Levels 1-9 and the default, over six inputs, compressed bytes compared
@@ -809,10 +874,46 @@ mod differential {
         check_all("decompress", &cases);
     }
 
+    /// The line `perror` prints after "*Possible* reason follows.", blanked:
+    /// its text is whatever `errno` libc left behind.
+    fn blank_perror(stderr: &str) -> String {
+        const AFTER: &str = "*Possible* reason follows.\n";
+        let mut out = String::with_capacity(stderr.len());
+        let mut rest = stderr;
+        while let Some(i) = rest.find(AFTER) {
+            let (head, tail) = rest.split_at(i + AFTER.len());
+            out.push_str(head);
+            let end = tail.find('\n').map_or(tail.len(), |n| n + 1);
+            out.push_str("<perror>\n");
+            rest = &tail[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn perror_blanked(r: &mut Run, s: &mut Run) {
+        r.stderr = blank_perror(&r.stderr);
+        s.stderr = blank_perror(&s.stderr);
+    }
+
+    #[test]
+    fn blank_perror_replaces_only_that_line() {
+        let text = "\nbunzip2: Compressed file ends unexpectedly;\n\tperhaps it is \
+                    corrupted?  *Possible* reason follows.\nbunzip2: Success\n\tInput \
+                    file = a, output file = b\n";
+        assert_eq!(
+            blank_perror(text),
+            "\nbunzip2: Compressed file ends unexpectedly;\n\tperhaps it is \
+             corrupted?  *Possible* reason follows.\n<perror>\n\tInput file = a, \
+             output file = b\n"
+        );
+        assert_eq!(blank_perror("no such line\n"), "no such line\n");
+    }
+
     /// A stream cut short is reported with `perror`, whose text is whatever
-    /// `errno` libc left behind — measured per platform, so these cases run
-    /// only where the emulation was measured.
-    #[cfg(target_os = "macos")]
+    /// `errno` libc left behind. stuffr reproduces it as measured on macOS,
+    /// where the comparison is exact; elsewhere only that one line is
+    /// blanked on both sides, and everything else is still compared.
     #[test]
     fn decompress_truncated() {
         let big = mixed(300_000, 22);
@@ -852,7 +953,11 @@ mod differential {
         // A character device (and, as stdin, /dev/null) is empty: cut short.
         cases.push(case("bunzip2", &["-c", "/dev/null"], vec![]));
         cases.push(case("bunzip2", &[], vec![]));
-        check_all("decompress_truncated", &cases);
+        if cfg!(target_os = "macos") {
+            check_all("decompress_truncated", &cases);
+        } else {
+            check_all_with("decompress_truncated", &cases, perror_blanked);
+        }
     }
 
     /// Existing outputs, `-k`, symlinks, non-regular and unreadable inputs,
@@ -1103,6 +1208,74 @@ mod differential {
         assert_eq!(s.code, 2);
         assert_eq!(s.tree.len(), 1, "{:?}", s.tree.keys());
         assert_eq!(s.tree["c.bz2"].0, bz);
+    }
+
+    /// Run `exe big.bz2` with stdout a pipe whose read end is closed after
+    /// the first read; how the process ended.
+    fn closed_pipe_status(exe: &Path, dir: &Path) -> std::process::ExitStatus {
+        use std::io::Read;
+        let mut child = Command::new(exe)
+            .arg("big.bz2")
+            .current_dir(dir)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = out.read(&mut buf).unwrap();
+        drop(out);
+        let st = child.wait().unwrap();
+        let mut err = String::new();
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        assert_eq!(err, "", "{exe:?} wrote to stderr");
+        st
+    }
+
+    /// bzip2 is killed by SIGPIPE writing to a closed pipe, silently, and so
+    /// is stuffr as `bzcat` (it restores the signal's default action on the
+    /// compatibility path only).
+    #[test]
+    fn a_closed_stdout_pipe_ends_bzcat_by_sigpipe() {
+        use std::os::unix::process::ExitStatusExt;
+        let plain = text(4 << 20, 51);
+        let dir = std::env::temp_dir().join(format!("stuffr-sigpipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let link = dir.join("bin").join("bzcat");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        // Compress with stuffr itself, so the test runs without a reference.
+        let zip = dir.join("bin").join("bzip2");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &zip).unwrap();
+        std::fs::write(dir.join("big"), &plain).unwrap();
+        let st = Command::new(&zip)
+            .arg("big")
+            .current_dir(&dir)
+            .env_clear()
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let ours = closed_pipe_status(&link, &dir);
+        assert_eq!(
+            ours.signal(),
+            Some(libc::SIGPIPE),
+            "stuffr as bzcat: {ours:?}"
+        );
+        let reference = Path::new(REFERENCE_DIR).join("bzcat");
+        if reference.exists() {
+            let theirs = closed_pipe_status(&reference, &dir);
+            assert_eq!(
+                theirs.signal(),
+                Some(libc::SIGPIPE),
+                "reference: {theirs:?}"
+            );
+        } else {
+            println!("skipped the reference half: bzcat not installed");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Review focus 4: `bzcat` streams a 64 MiB input in bounded memory.
