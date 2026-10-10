@@ -29,20 +29,14 @@ use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
-use super::Prog;
-
 mod args;
 mod messages;
 mod run;
 mod streams;
 
-/// Entry point for the bzip2 family; `name` is the canonical invoked name and
-/// `args` the arguments after `argv[0]`.
+/// Entry point for `bzip2`, `bunzip2` and `bzcat`; `name` is the canonical
+/// invoked name and `args` the arguments after `argv[0]`.
 pub fn run(name: &'static str, args: Vec<OsString>) -> ExitCode {
-    if name == "bzip2recover" {
-        Prog { name }.err(format_args!("not yet implemented"));
-        return ExitCode::from(3);
-    }
     // bzip2 dies of SIGPIPE writing to a closed pipe; Rust ignores the
     // signal by default, so restore its default action, on this path only.
     #[cfg(unix)]

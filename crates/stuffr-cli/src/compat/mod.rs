@@ -3,12 +3,12 @@
 //! messages and exit codes, not stuffr's.
 
 use std::ffi::{OsStr, OsString};
-use std::fmt;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::process::ExitCode;
 
 pub mod bzip2;
+pub mod bzip2recover;
 pub mod links;
 
 /// A family of tools the binary can impersonate.
@@ -50,11 +50,16 @@ pub fn family_for(argv0: &OsStr) -> Option<(Family, &'static str)> {
 
 /// Run the compatibility tool `args[0]` names, or return `None` when it names
 /// none (the caller then behaves as `stuffr`). The tool gets the arguments
-/// after `args[0]`.
+/// after `args[0]`; `bzip2recover`, which prints its `argv[0]` verbatim,
+/// gets `args[0]` as well.
 pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
     let (family, name) = family_for(args.first()?)?;
-    let rest = args.into_iter().skip(1).collect();
+    let mut args = args.into_iter();
+    let argv0 = args.next().unwrap_or_default();
+    let rest = args.collect();
     Some(match family {
+        // bzip2recover prints its argv[0] in full, so it gets it.
+        Family::Bzip2 if name == "bzip2recover" => bzip2recover::run(argv0, rest),
         Family::Bzip2 => bzip2::run(name, rest),
     })
 }
@@ -99,20 +104,6 @@ pub(crate) fn copy_metadata_from(meta: &std::fs::Metadata, to: &Path) -> io::Res
     }
     // After `chown`, which may clear set-id bits.
     std::fs::set_permissions(to, meta.permissions())
-}
-
-/// A compatibility program's identity, for its diagnostics.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Prog {
-    /// The canonical invoked name, for example `"bunzip2"`.
-    pub(crate) name: &'static str,
-}
-
-impl Prog {
-    /// Write `"{name}: {msg}"` and a newline to stderr.
-    pub(crate) fn err(&self, msg: fmt::Arguments) {
-        let _ = writeln!(io::stderr().lock(), "{}: {}", self.name, msg);
-    }
 }
 
 #[cfg(test)]
