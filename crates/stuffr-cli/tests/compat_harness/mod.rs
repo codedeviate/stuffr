@@ -13,13 +13,14 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Where the reference tools live; also used to decompress stuffr's output.
 pub const REFERENCE_DIR: &str = "/usr/bin";
 /// The mtime every input file gets, so runs cannot differ by wall clock.
-const INPUT_MTIME: u64 = 1_000_000_000;
+pub const INPUT_MTIME: u64 = 1_000_000_000;
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Case<'a> {
@@ -28,7 +29,9 @@ pub struct Case<'a> {
     pub args: Vec<&'a str>,
     /// Created in the working directory before running.
     pub files: Vec<(&'a str, Vec<u8>)>,
-    /// Piped to stdin. Ignored when `tty_stdin` is set.
+    /// Fed to stdin: through a pipe, or, with `tty_stdin`, typed at the
+    /// terminal (framed with `\n` if needed, then ^D). Canonical-mode lines
+    /// are limited to about 4 KiB, so keep tty input small.
     pub stdin: Option<Vec<u8>>,
     pub tty_stdin: bool,
     pub tty_stdout: bool,
@@ -38,6 +41,9 @@ pub struct Case<'a> {
     /// Byte identity of compressed output is promised. When false, stuffr's
     /// compressed outputs are instead round-tripped through the reference.
     pub compare_output_bytes: bool,
+    /// What a compressed stdout should decompress to, when that is not the
+    /// stdin (or every input file concatenated in order).
+    pub expect_stdout_plain: Option<Vec<u8>>,
 }
 
 /// File bytes, mode (permission bits) and mtime (seconds).
@@ -48,7 +54,20 @@ pub struct Run {
     pub stdout: Vec<u8>,
     pub stderr: String,
     pub tree: Tree,
+    /// Unix seconds when this run began (before its inputs were created).
+    pub start: i64,
 }
+
+pub fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Serialises pty creation through spawn so no concurrently spawned child
+/// can inherit a master between `openpty` and its close-on-exec flag.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -94,6 +113,7 @@ pub fn stuffr_as(c: &Case) -> Run {
 
 fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
     let work = s.0.join("work");
+    let start = now_secs();
     for (name, bytes) in &c.files {
         let p = work.join(name);
         if let Some(parent) = p.parent() {
@@ -105,6 +125,7 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
             .unwrap();
     }
 
+    let guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut cmd = Command::new(exe);
     cmd.args(&c.args)
         .current_dir(&work)
@@ -113,12 +134,12 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
         .env("LANG", "C")
         .envs(c.env.iter().copied());
 
-    let mut stdin_master = None;
-    let mut stdout_master = None;
+    let mut stdin_master: Option<std::fs::File> = None;
+    let mut stdout_master: Option<std::fs::File> = None;
     if c.tty_stdin {
         let (m, sl) = openpty();
         cmd.stdin(Stdio::from(sl));
-        stdin_master = Some(m);
+        stdin_master = Some(std::fs::File::from(m));
     } else if c.stdin.is_some() {
         cmd.stdin(Stdio::piped());
     } else {
@@ -127,7 +148,7 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
     if c.tty_stdout {
         let (m, sl) = openpty();
         cmd.stdout(Stdio::from(sl));
-        stdout_master = Some(m);
+        stdout_master = Some(std::fs::File::from(m));
     } else {
         cmd.stdout(Stdio::piped());
     }
@@ -135,18 +156,32 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
 
     let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {exe:?}: {e}"));
     drop(cmd); // closes our copies of the pty slaves
+    drop(guard);
 
-    let writer = if !c.tty_stdin {
+    let writer = if let Some(m) = &stdin_master {
+        // Type the input, then end-of-file. Canonical mode honours ^D only at
+        // the start of a line, so add a newline unless the data ends in one.
+        let mut data = c.stdin.clone().unwrap_or_default();
+        if !data.is_empty() && !data.ends_with(b"\n") {
+            data.push(b'\n');
+        }
+        data.push(0x04);
+        let mut m = m.try_clone().unwrap();
+        Some(std::thread::spawn(move || {
+            let _ = m.write_all(&data); // child may exit early
+        }))
+    } else {
         child.stdin.take().map(|mut si| {
             let data = c.stdin.clone().unwrap_or_default();
             std::thread::spawn(move || {
                 let _ = si.write_all(&data); // child may exit early
             })
         })
-    } else {
-        None
     };
-    let out_t = child.stdout.take().map(drain);
+    let out_t = stdout_master
+        .take()
+        .map(drain)
+        .or_else(|| child.stdout.take().map(drain));
     let err_t = child.stderr.take().map(drain);
 
     let deadline = Instant::now() + TIMEOUT;
@@ -164,10 +199,7 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
     if let Some(w) = writer {
         let _ = w.join();
     }
-    let mut stdout = out_t.map(|t| t.join().unwrap()).unwrap_or_default();
-    if let Some(m) = stdout_master {
-        stdout = read_master(m);
-    }
+    let stdout = out_t.map(|t| t.join().unwrap()).unwrap_or_default();
     drop(stdin_master);
     let stderr_raw = err_t.map(|t| t.join().unwrap()).unwrap_or_default();
 
@@ -182,13 +214,25 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
         stdout,
         stderr,
         tree: snapshot(&work),
+        start,
     }
 }
 
+/// Read to end-of-file on a worker thread. A pty master reports hang-up as
+/// 0 on macOS and as `EIO` on Linux; any error other than `Interrupted`
+/// therefore counts as end of file.
 fn drain<R: Read + Send + 'static>(mut r: R) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut v = Vec::new();
-        let _ = r.read_to_end(&mut v);
+        let mut buf = [0u8; 65536];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => v.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break, // EIO on Linux
+            }
+        }
         v
     })
 }
@@ -221,24 +265,20 @@ fn openpty() -> (OwnedFd, OwnedFd) {
     let (m, s) = unsafe { (OwnedFd::from_raw_fd(m), OwnedFd::from_raw_fd(s)) };
     for fd in [&m, &s] {
         // SAFETY: valid descriptor.
-        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        assert_eq!(rc, 0, "fcntl: {}", std::io::Error::last_os_error());
+    }
+    // Typed input must not echo into the master's read queue, and `\r` must
+    // not turn into `\n`; canonical mode stays on so ^D means end of file.
+    // SAFETY: `t` is fully initialised by a successful tcgetattr.
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        assert_eq!(libc::tcgetattr(s.as_raw_fd(), &mut t), 0);
+        t.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        t.c_iflag &= !libc::ICRNL;
+        assert_eq!(libc::tcsetattr(s.as_raw_fd(), libc::TCSANOW, &t), 0);
     }
     (m, s)
-}
-
-/// Everything the child wrote to the terminal, once all slaves are closed.
-fn read_master(m: OwnedFd) -> Vec<u8> {
-    let mut f = std::fs::File::from(m);
-    let mut v = Vec::new();
-    let mut buf = [0u8; 8192];
-    // Linux reports EIO at hang-up, macOS reports 0; both end the loop.
-    while let Ok(n) = f.read(&mut buf) {
-        if n == 0 {
-            break;
-        }
-        v.extend_from_slice(&buf[..n]);
-    }
-    v
 }
 
 fn snapshot(work: &Path) -> Tree {
@@ -335,6 +375,35 @@ fn first_diff(a: &[u8], b: &[u8]) -> String {
     }
 }
 
+/// Both outputs are bzip2 streams (`BZh<N>`) and the block-size digits differ.
+fn block_digit_mismatch(reference: &[u8], ours: &[u8]) -> Option<String> {
+    if reference.len() > 3 && reference.starts_with(b"BZh") && ours.len() > 3 {
+        let (r, s) = (reference[3], ours[3]);
+        if r != s {
+            return Some(format!(
+                "block-size digit differs: reference {:?} vs stuffr {:?}",
+                r as char, s as char
+            ));
+        }
+    }
+    None
+}
+
+/// An mtime pair is acceptable when equal; otherwise a copied input mtime
+/// (`INPUT_MTIME`) must match exactly, and freshly created files must each
+/// lie within a couple of seconds of their own run's wall-clock window.
+fn mtime_ok(r: i64, r_start: i64, s: i64, s_start: i64, now: i64) -> bool {
+    if r == s {
+        return true;
+    }
+    let pinned = INPUT_MTIME as i64;
+    if r == pinned || s == pinned {
+        return false;
+    }
+    let within = |t: i64, start: i64| t >= start - 2 && t <= now + 2;
+    within(r, r_start) && within(s, s_start)
+}
+
 /// Full comparison of `r` (reference) against `s` (stuffr). Panics with every
 /// difference listed, not just the first.
 pub fn assert_same(c: &Case, r: &Run, s: &Run) {
@@ -364,9 +433,13 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
         }
     } else {
         let want = c
-            .stdin
+            .expect_stdout_plain
             .clone()
+            .or_else(|| c.stdin.clone())
             .unwrap_or_else(|| c.files.iter().flat_map(|(_, b)| b.clone()).collect());
+        if let Some(e) = block_digit_mismatch(&r.stdout, &s.stdout) {
+            d.push(format!("stdout {e}"));
+        }
         match ref_decompress(&s.stdout) {
             Ok(got) if got == want => {}
             Ok(got) => d.push(format!(
@@ -379,6 +452,7 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
     }
 
     // tree
+    let now = now_secs();
     let names: std::collections::BTreeSet<&String> = r.tree.keys().chain(s.tree.keys()).collect();
     for n in names {
         match (r.tree.get(n), s.tree.get(n)) {
@@ -388,13 +462,16 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
                 if rm != sm {
                     d.push(format!("tree: {n} mode reference {rm:o} vs stuffr {sm:o}"));
                 }
-                if rt != st {
+                if !mtime_ok(*rt, r.start, *st, s.start, now) {
                     d.push(format!("tree: {n} mtime reference {rt} vs stuffr {st}"));
                 }
                 if rb == sb {
                     continue;
                 }
                 if !c.compare_output_bytes && is_bz2_name(n) {
+                    if let Some(e) = block_digit_mismatch(rb, sb) {
+                        d.push(format!("tree: {n} {e}"));
+                    }
                     match (ref_decompress(sb), original_for(c, n)) {
                         (Ok(got), Some(want)) if got == want => {}
                         (Ok(got), Some(want)) => d.push(format!(
