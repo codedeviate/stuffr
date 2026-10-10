@@ -22,10 +22,13 @@ use stuffr::pack_stream::PackReader;
 
 use super::member::{Lookahead, PEEK};
 
-/// Which reference a personality follows.
+/// Which reference the gzip family follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Flavour {
+pub enum Flavour {
+    /// GNU gzip 1.15, the default outside the BSDs and macOS.
     Gnu,
+    /// Apple's gzip (FreeBSD/NetBSD lineage), the default on macOS and the
+    /// BSDs.
     Bsd,
 }
 

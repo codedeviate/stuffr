@@ -36,7 +36,16 @@ mod unix {
     }
 
     const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
-    const ALL: [&str; 4] = ["bzip2", "bunzip2", "bzcat", "bzip2recover"];
+    const ALL: [&str; 8] = [
+        "bzip2",
+        "bunzip2",
+        "bzcat",
+        "bzip2recover",
+        "gzip",
+        "gunzip",
+        "zcat",
+        "gzcat",
+    ];
 
     /// A scratch directory removed on drop.
     struct Scratch(PathBuf);
@@ -90,7 +99,7 @@ mod unix {
         assert_eq!(o.status.code(), Some(0));
         assert_eq!(
             stdout(&o).matches("already present").count(),
-            4,
+            ALL.len(),
             "{}",
             stdout(&o)
         );
@@ -120,9 +129,9 @@ mod unix {
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert!(s.0.join("bzcat").symlink_metadata().is_ok());
         assert!(s.0.join("bzip2").symlink_metadata().is_err());
-        let o = il(&s.0, &["--names", "gzip"]);
+        let o = il(&s.0, &["--names", "xz"]);
         assert_eq!(o.status.code(), Some(2));
-        assert!(stderr(&o).contains("gzip"));
+        assert!(stderr(&o).contains("xz"));
     }
 
     #[test]
@@ -219,7 +228,12 @@ mod unix {
         make_stale();
         let o = il(&links, &["--remove"]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert_eq!(stdout(&o).matches("removed").count(), 4, "{}", stdout(&o));
+        assert_eq!(
+            stdout(&o).matches("removed").count(),
+            ALL.len(),
+            "{}",
+            stdout(&o)
+        );
         assert_eq!(std::fs::read_dir(&links).unwrap().count(), 0);
 
         make_stale();
@@ -227,13 +241,18 @@ mod unix {
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert_eq!(
             stdout(&o).matches("would replace").count(),
-            4,
+            ALL.len(),
             "{}",
             stdout(&o)
         );
         let o = il(&links, &[]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert_eq!(stdout(&o).matches("replaced").count(), 4, "{}", stdout(&o));
+        assert_eq!(
+            stdout(&o).matches("replaced").count(),
+            ALL.len(),
+            "{}",
+            stdout(&o)
+        );
         for n in ALL {
             assert_eq!(std::fs::read_link(links.join(n)).unwrap(), canon_stuffr());
         }
@@ -321,7 +340,7 @@ mod unix {
         assert_eq!(o.status.code(), Some(0));
         assert_eq!(
             stdout(&o).matches("would create").count(),
-            4,
+            ALL.len(),
             "{}",
             stdout(&o)
         );
@@ -335,8 +354,8 @@ mod unix {
         std::fs::remove_file(s.0.join("bzip2")).unwrap();
         std::os::unix::fs::symlink(canon_stuffr(), s.0.join("bzip2")).unwrap();
         let o = il(&s.0, &["--remove", "--dry-run"]);
-        assert_eq!(stdout(&o).matches("would remove").count(), 4);
-        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 4);
+        assert_eq!(stdout(&o).matches("would remove").count(), ALL.len());
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), ALL.len());
     }
 
     #[test]
@@ -388,6 +407,99 @@ mod unix {
         );
         assert_eq!(std::fs::read(other.join("bzip2")).unwrap(), b"keep");
         assert!(stdout(&o).contains(&real.canonicalize().unwrap().display().to_string()));
+    }
+
+    #[test]
+    fn install_links_creates_the_gzip_names() {
+        let s = Scratch::new("gzip");
+        let o = il(&s.0, &[]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        let dir = s.0.canonicalize().unwrap();
+        for n in ["gzip", "gunzip", "zcat", "gzcat"] {
+            assert_eq!(
+                std::fs::read_link(dir.join(n)).unwrap(),
+                canon_stuffr(),
+                "{n}"
+            );
+        }
+        let one = Scratch::new("gzcat");
+        let o = il(&one.0, &["--names", "gzcat"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 1);
+        // A link it made runs as gzip.
+        let o = Command::new(dir.join("gzip"))
+            .arg("-h")
+            .env("STUFFR_GZIP_FLAVOR", "gnu")
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert!(stdout(&o).starts_with("Usage: gzip "), "{}", stdout(&o));
+    }
+
+    /// Run `exe` (with `stdin` piped in) under `flavor` as the only extra
+    /// variable; `None` leaves `STUFFR_GZIP_FLAVOR` unset.
+    fn run_with_flavor(
+        exe: &Path,
+        args: &[&str],
+        stdin: &[u8],
+        flavor: Option<&str>,
+    ) -> std::process::Output {
+        use std::io::Write;
+        let mut cmd = Command::new(exe);
+        cmd.args(args)
+            .env_remove("STUFFR_GZIP_FLAVOR")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(v) = flavor {
+            cmd.env("STUFFR_GZIP_FLAVOR", v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// Review Focus 4: `STUFFR_GZIP_FLAVOR` never leaks. Set to `bsd` or to
+    /// garbage, it changes nothing for `stuffr` itself or for `bzip2`; under
+    /// a gzip name an unknown value is refused, exit 1, in stuffr's words.
+    #[test]
+    fn the_flavour_variable_touches_only_the_gzip_family() {
+        let s = Scratch::new("flavour");
+        let stuffr = s.0.join("stuffr");
+        std::os::unix::fs::symlink(STUFFR, &stuffr).unwrap();
+        for n in ["bzip2", "gzip", "gunzip", "zcat", "gzcat"] {
+            std::os::unix::fs::symlink(STUFFR, s.0.join(n)).unwrap();
+        }
+        let data = b"the flavour variable touches only the gzip family\n".repeat(20);
+        let same = |exe: &Path, args: &[&str]| {
+            let base = run_with_flavor(exe, args, &data, None);
+            assert_eq!(base.status.code(), Some(0), "{}", stderr(&base));
+            for v in ["bsd", "gnu", "garbage", ""] {
+                let o = run_with_flavor(exe, args, &data, Some(v));
+                assert_eq!(o.status.code(), base.status.code(), "{v:?} {args:?}");
+                assert_eq!(o.stdout, base.stdout, "{v:?} {args:?}");
+                assert_eq!(o.stderr, base.stderr, "{v:?} {args:?}");
+            }
+        };
+        same(&stuffr, &["--version"]);
+        same(&s.0.join("bzip2"), &["-c"]);
+        for n in ["gzip", "gunzip", "zcat", "gzcat"] {
+            let o = run_with_flavor(&s.0.join(n), &["-c"], &data, Some("garbage"));
+            assert_eq!(o.status.code(), Some(1), "{n}");
+            assert_eq!(
+                stderr(&o),
+                format!("{n}: STUFFR_GZIP_FLAVOR must be gnu or bsd, not 'garbage'\n")
+            );
+            assert!(o.stdout.is_empty(), "{n}");
+        }
+        // `gnu` selects GNU gzip whatever the platform's default.
+        let o = run_with_flavor(&s.0.join("gzip"), &[], &data, Some("gnu"));
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert!(
+            o.stdout.starts_with(&[0x1f, 0x8b, 8]),
+            "{:?}",
+            &o.stdout[..4]
+        );
     }
 
     #[test]

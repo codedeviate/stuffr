@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 pub mod bzip2;
 pub mod bzip2recover;
-pub(crate) mod gzip;
+pub mod gzip;
 mod host;
 pub mod links;
 
@@ -19,6 +19,9 @@ pub mod links;
 pub enum Family {
     /// `bzip2`, `bunzip2`, `bzcat`.
     Bzip2,
+    /// `gzip`, `gunzip`, `zcat`, `gzcat`, in the flavour
+    /// [`gzip::default_flavour`] or `STUFFR_GZIP_FLAVOR` picks.
+    Gzip,
 }
 
 /// Invoked name to family. The name is matched exactly, after the directory
@@ -28,6 +31,10 @@ const NAMES: &[(&str, Family)] = &[
     ("bunzip2", Family::Bzip2),
     ("bzcat", Family::Bzip2),
     ("bzip2recover", Family::Bzip2),
+    ("gzip", Family::Gzip),
+    ("gunzip", Family::Gzip),
+    ("zcat", Family::Gzip),
+    ("gzcat", Family::Gzip),
 ];
 
 /// Every compatibility name, from the one table `family_for` also reads.
@@ -63,6 +70,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         // bzip2recover prints its argv[0] in full, so it gets it.
         Family::Bzip2 if name == "bzip2recover" => bzip2recover::run(argv0, rest),
         Family::Bzip2 => bzip2::run(name, rest),
+        Family::Gzip => gzip::run(name, rest),
     })
 }
 
@@ -71,6 +79,8 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
 /// input, and the exit code, standard output and standard error come back.
 /// Neither stream is a terminal, the environment is not read and `SIGPIPE`
 /// keeps its disposition. `None` when `name` is not a compatibility name.
+/// The gzip family runs as `gzip_flavour` (the environment's
+/// `STUFFR_GZIP_FLAVOR` is not read); the other families ignore it.
 /// Same code as [`dispatch`] below the process boundary; for the fuzz
 /// target, not a stable interface.
 #[doc(hidden)]
@@ -79,6 +89,7 @@ pub fn run_in(
     name: &str,
     args: Vec<OsString>,
     stdin: &[u8],
+    gzip_flavour: gzip::Flavour,
 ) -> Option<(i32, Vec<u8>, Vec<u8>)> {
     let (family, canonical) = family_for(OsStr::new(name))?;
     Some(match family {
@@ -87,6 +98,7 @@ pub fn run_in(
             (code, Vec::new(), err)
         }
         Family::Bzip2 => bzip2::run_in(dir, canonical, &args, stdin),
+        Family::Gzip => gzip::run_in(gzip_flavour, dir, canonical, &args, stdin, &|_| None),
     })
 }
 
@@ -135,6 +147,9 @@ pub(crate) fn copy_metadata_from(meta: &std::fs::Metadata, to: &Path) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gzip flavour `run_in` gets; the bzip2 family ignores it.
+    const G: gzip::Flavour = gzip::Flavour::Gnu;
 
     /// The `compat` fuzz target picks its tool from `COMPAT_NAMES`; a name
     /// added here and not there would go unfuzzed.
@@ -194,7 +209,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a"), b"hello hello hello\n").unwrap();
-        let (code, out, err) = run_in(&dir, "bzip2", vec!["-k".into(), "a".into()], b"").unwrap();
+        let (code, out, err) =
+            run_in(&dir, "bzip2", vec!["-k".into(), "a".into()], b"", G).unwrap();
         assert_eq!(
             (code, out.len()),
             (0, 0),
@@ -203,9 +219,9 @@ mod tests {
         );
         let packed = std::fs::read(dir.join("a.bz2")).unwrap();
         assert!(packed.starts_with(b"BZh9"));
-        let (code, out, _) = run_in(&dir, "bzcat", vec![], &packed).unwrap();
+        let (code, out, _) = run_in(&dir, "bzcat", vec![], &packed, G).unwrap();
         assert_eq!((code, out.as_slice()), (0, &b"hello hello hello\n"[..]));
-        let (code, out, err) = run_in(&dir, "bzip2recover", vec!["a.bz2".into()], b"").unwrap();
+        let (code, out, err) = run_in(&dir, "bzip2recover", vec!["a.bz2".into()], b"", G).unwrap();
         assert_eq!(
             (code, out.len()),
             (0, 0),
@@ -214,9 +230,9 @@ mod tests {
         );
         assert!(dir.join("rec00001a.bz2").exists());
         // A damaged stream from stdin: exit 2, stdin is never a terminal.
-        let (code, _, err) = run_in(&dir, "bunzip2", vec![], b"BZh9garbage").unwrap();
+        let (code, _, err) = run_in(&dir, "bunzip2", vec![], b"BZh9garbage", G).unwrap();
         assert_eq!(code, 2, "{}", String::from_utf8_lossy(&err));
-        assert!(run_in(&dir, "stuffr", vec![], b"").is_none());
+        assert!(run_in(&dir, "stuffr", vec![], b"", G).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -227,9 +243,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let big = vec![0u8; 9 * 1024 * 1024];
-        let (code, packed, _) = run_in(&dir, "bzip2", vec![], &big).unwrap();
+        let (code, packed, _) = run_in(&dir, "bzip2", vec![], &big, G).unwrap();
         assert_eq!(code, 0);
-        let (code, out, err) = run_in(&dir, "bzcat", vec![], &packed).unwrap();
+        let (code, out, err) = run_in(&dir, "bzcat", vec![], &packed, G).unwrap();
         let err = String::from_utf8_lossy(&err);
         assert_eq!(code, 1, "{err}");
         // A write the budget cannot hold fails whole, so the output stops
@@ -242,7 +258,7 @@ mod tests {
         );
         assert!(err.contains("I/O or other error"), "{err}");
         // `-t` writes nothing, but its decoding is charged to the same cap.
-        let (code, out, err) = run_in(&dir, "bzip2", vec!["-t".into()], &packed).unwrap();
+        let (code, out, err) = run_in(&dir, "bzip2", vec!["-t".into()], &packed, G).unwrap();
         let err = String::from_utf8_lossy(&err);
         assert_eq!((code, out.len()), (1, 0), "{err}");
         assert!(err.contains("I/O or other error"), "{err}");
@@ -251,7 +267,19 @@ mod tests {
 
     #[test]
     fn names_lists_the_table() {
-        assert_eq!(names(), ["bzip2", "bunzip2", "bzcat", "bzip2recover"]);
+        assert_eq!(
+            names(),
+            [
+                "bzip2",
+                "bunzip2",
+                "bzcat",
+                "bzip2recover",
+                "gzip",
+                "gunzip",
+                "zcat",
+                "gzcat"
+            ]
+        );
     }
 
     #[test]

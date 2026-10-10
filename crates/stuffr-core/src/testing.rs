@@ -144,7 +144,16 @@ pub const SALVAGE_FUZZ_MAX_ENTRY: u64 = 256 * 1024;
 /// are the wire format of the seeds `crates/stuffr/tests/fuzz_corpus.rs`
 /// writes, and `fuzz/` is outside the workspace. **Append-only, never
 /// reorder, never remove**, the rule [`CODEC_SLOTS`] states.
-pub const COMPAT_NAMES: &[&str] = &["bzip2", "bunzip2", "bzcat", "bzip2recover"];
+pub const COMPAT_NAMES: &[&str] = &[
+    "bzip2",
+    "bunzip2",
+    "bzcat",
+    "bzip2recover",
+    "gzip",
+    "gunzip",
+    "zcat",
+    "gzcat",
+];
 
 /// The files a `compat` case may create in its directory before the run,
 /// one bit of the case's file mask each. Every one is also a token in

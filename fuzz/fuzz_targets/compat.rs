@@ -237,11 +237,13 @@ fn run_recover(dir: &Path, args: &[&str]) {
     );
 }
 
-/// The bzip2 family through `run_in`.
+/// The bzip2 family through `run_in`. (The gzip names reach here too, as
+/// GNU, until the gzip family's own oracles land: their exit codes, 0-2,
+/// fit this one.)
 fn run_bzip2(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, _out, err) =
-        compat::run_in(dir, name, args, stdin).expect("a COMPAT_NAMES entry is a compat name");
+    let (code, _out, err) = compat::run_in(dir, name, args, stdin, compat::gzip::Flavour::Gnu)
+        .expect("a COMPAT_NAMES entry is a compat name");
     assert!(
         (0..=3).contains(&code),
         "{name}: exit {code} is not a bzip2 exit code\n{}",
