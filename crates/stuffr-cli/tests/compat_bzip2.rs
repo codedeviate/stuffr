@@ -1321,29 +1321,93 @@ mod differential {
         let Some(bz) = ref_bz(&plain, "-9") else {
             return;
         };
-        let mut c = case("bzcat", &["big.bz2"], vec![("big.bz2", bz)]);
-        c.expect_stdout_plain = Some(plain.clone());
-        let s = stuffr_as(&c);
-        assert_eq!(s.code, 0, "{}", s.stderr);
-        assert_eq!(s.stderr, "");
-        assert!(s.stdout == plain, "decoded output differs");
+        #[cfg(target_os = "linux")]
+        {
+            let peak = linux_bzcat_peak(&bz, &plain);
+            eprintln!("peak RSS (VmHWM): {:.1} MiB", peak as f64 / 1048576.0);
+            assert!(peak < 64 << 20, "peak RSS {peak} bytes is not under 64 MiB");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut c = case("bzcat", &["big.bz2"], vec![("big.bz2", bz)]);
+            c.expect_stdout_plain = Some(plain.clone());
+            let s = stuffr_as(&c);
+            assert_eq!(s.code, 0, "{}", s.stderr);
+            assert_eq!(s.stderr, "");
+            assert!(s.stdout == plain, "decoded output differs");
 
-        // SAFETY: `ru` is a valid out-pointer; getrusage only writes it.
-        let ru = unsafe {
-            let mut ru: libc::rusage = std::mem::zeroed();
-            assert_eq!(libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru), 0);
-            ru
-        };
-        // macOS reports bytes, Linux kilobytes.
-        let peak = if cfg!(target_os = "macos") {
-            ru.ru_maxrss as u64
-        } else {
-            ru.ru_maxrss as u64 * 1024
-        };
-        eprintln!("peak child RSS: {:.1} MiB", peak as f64 / 1048576.0);
-        // RUSAGE_CHILDREN is the largest child this process has waited for,
-        // so it covers stuffr's run (and the reference compressor's, which
-        // is smaller still).
-        assert!(peak < 64 << 20, "peak RSS {peak} bytes is not under 64 MiB");
+            // SAFETY: `ru` is a valid out-pointer; getrusage only writes it.
+            let ru = unsafe {
+                let mut ru: libc::rusage = std::mem::zeroed();
+                assert_eq!(libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru), 0);
+                ru
+            };
+            // macOS reports bytes. RUSAGE_CHILDREN is the largest child this
+            // process has waited for, so it covers stuffr's run (and the
+            // reference compressor's, which is smaller still). macOS spawns
+            // without copying the parent, so the figure is the child's own.
+            let peak = ru.ru_maxrss as u64;
+            eprintln!("peak child RSS: {:.1} MiB", peak as f64 / 1048576.0);
+            assert!(peak < 64 << 20, "peak RSS {peak} bytes is not under 64 MiB");
+        }
+    }
+
+    /// Linux: run stuffr as `bzcat` on `bz` and return its peak RSS, from
+    /// `/proc/<pid>/status`'s `VmHWM` sampled while it runs.
+    ///
+    /// Not `getrusage`: on Linux a child's `ru_maxrss` includes the parent's
+    /// resident set at spawn (exec records the vforked mm's high-water mark),
+    /// and this test process holds the 64 MiB input and its copies, so CI
+    /// measured 264-268 MiB for a decoder that peaks near 15 MiB. `VmHWM`
+    /// belongs to the post-exec mm alone and never decreases, so the last
+    /// sample before exit is the peak up to that moment; the decoder's memory
+    /// is flat after its first block, so sampling every 5 ms loses nothing.
+    #[cfg(target_os = "linux")]
+    fn linux_bzcat_peak(bz: &[u8], plain: &[u8]) -> u64 {
+        use std::io::Read;
+        let dir = std::env::temp_dir().join(format!("stuffr-rss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let link = dir.join("bin").join("bzcat");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        std::fs::write(dir.join("big.bz2"), bz).unwrap();
+        let mut child = Command::new(&link)
+            .arg("big.bz2")
+            .current_dir(&dir)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = format!("/proc/{}/status", child.id());
+        let mut out = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut v = Vec::new();
+            out.read_to_end(&mut v).unwrap();
+            v
+        });
+        let mut peak = 0u64;
+        while child.try_wait().unwrap().is_none() {
+            if let Ok(s) = std::fs::read_to_string(&status)
+                && let Some(kb) = s
+                    .lines()
+                    .find_map(|l| l.strip_prefix("VmHWM:"))
+                    .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            {
+                peak = peak.max(kb * 1024);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let st = child.wait().unwrap();
+        let got = reader.join().unwrap();
+        let mut err = String::new();
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(st.success(), "{st:?}: {err}");
+        assert_eq!(err, "");
+        assert!(got == plain, "decoded output differs");
+        assert!(peak > 0, "VmHWM was never sampled");
+        peak
     }
 }
