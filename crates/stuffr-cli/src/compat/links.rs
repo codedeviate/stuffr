@@ -19,6 +19,8 @@ pub enum LinkAction {
     Removed(PathBuf),
     /// Dry run: the link would be created (or replaced).
     WouldCreate(PathBuf),
+    /// Dry run: an existing file or foreign link would be replaced.
+    WouldReplace(PathBuf),
     /// Dry run: the link would be removed.
     WouldRemove(PathBuf),
 }
@@ -33,6 +35,7 @@ impl LinkAction {
             LinkAction::Replaced(p) => format!("replaced {} -> {t}", p.display()),
             LinkAction::Removed(p) => format!("removed {}", p.display()),
             LinkAction::WouldCreate(p) => format!("would create {} -> {t}", p.display()),
+            LinkAction::WouldReplace(p) => format!("would replace {} -> {t}", p.display()),
             LinkAction::WouldRemove(p) => format!("would remove {}", p.display()),
         }
     }
@@ -58,7 +61,9 @@ pub fn install_links(
     use std::io::ErrorKind;
     use stuffr::Error;
 
-    for n in names {
+    let mut seen = std::collections::HashSet::new();
+    let names: Vec<&str> = names.iter().copied().filter(|n| seen.insert(*n)).collect();
+    for n in &names {
         if !super::names().contains(n) {
             return Err(Error::Usage(format!(
                 "`{n}` is not a compatibility name (known: {})",
@@ -82,11 +87,12 @@ pub fn install_links(
         }
         Err(e) => return Err(e.into()),
     };
-    // Whether the link at `p` leads to this stuffr.
-    let ours = |p: &Path| -> bool {
-        std::fs::read_link(p).is_ok_and(|t| t == target)
-            || p.canonicalize().is_ok_and(|c| c == target)
-    };
+    // The link at `p` records exactly this stuffr as its target. `--remove`
+    // trusts only this: a link through another link is the user's own.
+    let exact = |p: &Path| std::fs::read_link(p).is_ok_and(|t| t == target);
+    // The link at `p` leads to this stuffr, directly or through other links.
+    // Enough to leave it alone on install, never enough to delete it.
+    let resolves = |p: &Path| exact(p) || p.canonicalize().is_ok_and(|c| c == target);
 
     enum Step {
         Create,
@@ -95,7 +101,7 @@ pub fn install_links(
         Remove,
     }
     let mut plan = Vec::new();
-    for &name in names {
+    for &name in &names {
         let path = dir.join(name);
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(m) => Some(m),
@@ -106,7 +112,7 @@ pub fn install_links(
             (None, true) => continue,
             (None, false) => Step::Create,
             (Some(m), true) => {
-                if m.file_type().is_symlink() && ours(&path) {
+                if m.file_type().is_symlink() && exact(&path) {
                     Step::Remove
                 } else {
                     continue;
@@ -114,7 +120,7 @@ pub fn install_links(
             }
             (Some(m), false) => {
                 let is_link = m.file_type().is_symlink();
-                if is_link && ours(&path) {
+                if is_link && resolves(&path) {
                     Step::Keep
                 } else if m.is_dir() {
                     return Err(Error::Usage(format!(
@@ -139,15 +145,24 @@ pub fn install_links(
     for (path, step) in plan {
         actions.push(match step {
             Step::Keep => LinkAction::AlreadyPresent(path),
-            Step::Create | Step::Replace if dry_run => LinkAction::WouldCreate(path),
+            Step::Create if dry_run => LinkAction::WouldCreate(path),
+            Step::Replace if dry_run => LinkAction::WouldReplace(path),
             Step::Remove if dry_run => LinkAction::WouldRemove(path),
             Step::Create => {
                 std::os::unix::fs::symlink(target, &path)?;
                 LinkAction::Created(path)
             }
             Step::Replace => {
-                std::fs::remove_file(&path)?;
-                std::os::unix::fs::symlink(target, &path)?;
+                // Atomic: build the new link beside the old entry, then
+                // rename over it, so a failure leaves the original intact.
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let tmp = path.with_file_name(format!(".{name}.stuffr-tmp-{}", std::process::id()));
+                let _ = std::fs::remove_file(&tmp);
+                std::os::unix::fs::symlink(target, &tmp)?;
+                if let Err(e) = std::fs::rename(&tmp, &path) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e.into());
+                }
                 LinkAction::Replaced(path)
             }
             Step::Remove => {

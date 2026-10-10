@@ -153,6 +153,41 @@ mod unix {
     }
 
     #[test]
+    fn install_links_remove_spares_a_link_through_another_link() {
+        let s = Scratch::new("via-link");
+        let canon = s.0.canonicalize().unwrap();
+        let l = canon.join("L");
+        std::os::unix::fs::symlink(canon_stuffr(), &l).unwrap();
+        std::os::unix::fs::symlink(&l, canon.join("bzip2")).unwrap();
+        let o = il(&s.0, &["--remove"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(std::fs::read_link(canon.join("bzip2")).unwrap(), l);
+        // Install leaves it too, reporting it as present.
+        let o = il(&s.0, &["--names", "bzip2"]);
+        assert!(stdout(&o).contains("already present"), "{}", stdout(&o));
+        assert_eq!(std::fs::read_link(canon.join("bzip2")).unwrap(), l);
+    }
+
+    #[test]
+    fn install_links_duplicate_names_equal_one_name() {
+        let s = Scratch::new("dup");
+        let o = il(&s.0, &["--names", "bzcat,bzcat"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(stdout(&o).lines().count(), 1, "{}", stdout(&o));
+        assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn install_links_replace_leaves_no_temp_files() {
+        let s = Scratch::new("atomic");
+        std::fs::write(s.0.join("bzip2"), b"x").unwrap();
+        let o = il(&s.0, &["--force", "--names", "bzip2"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        let names: Vec<_> = std::fs::read_dir(&s.0).unwrap().collect();
+        assert_eq!(names.len(), 1);
+    }
+
+    #[test]
     fn install_links_dry_run_changes_nothing() {
         let s = Scratch::new("dry");
         let o = il(&s.0, &["--dry-run"]);
@@ -165,6 +200,13 @@ mod unix {
         );
         assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 0);
         assert_eq!(il(&s.0, &[]).status.code(), Some(0));
+        std::fs::remove_file(s.0.join("bzip2")).unwrap();
+        std::fs::write(s.0.join("bzip2"), b"x").unwrap();
+        let o = il(&s.0, &["--force", "--dry-run"]);
+        assert!(stdout(&o).contains("would replace"), "{}", stdout(&o));
+        assert_eq!(std::fs::read(s.0.join("bzip2")).unwrap(), b"x");
+        std::fs::remove_file(s.0.join("bzip2")).unwrap();
+        std::os::unix::fs::symlink(canon_stuffr(), s.0.join("bzip2")).unwrap();
         let o = il(&s.0, &["--remove", "--dry-run"]);
         assert_eq!(stdout(&o).matches("would remove").count(), 4);
         assert_eq!(std::fs::read_dir(&s.0).unwrap().count(), 4);
