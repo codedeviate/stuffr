@@ -701,8 +701,16 @@ impl Bz<'_> {
             stream_no += 1;
             loop {
                 match sr.read(input, &mut obuf) {
-                    Ok((_, true)) => break,
-                    Ok(_) => {}
+                    Ok((n, end)) => {
+                        // Free outside a sandbox; in one, decoding counts
+                        // against the output budget, so `-t` is bounded too.
+                        if let Err(e) = self.host.charge(n as u64) {
+                            return Err(self.fail(Failure::Io(e)));
+                        }
+                        if end {
+                            break;
+                        }
+                    }
                     Err(e) => break 'streams e,
                 }
             }

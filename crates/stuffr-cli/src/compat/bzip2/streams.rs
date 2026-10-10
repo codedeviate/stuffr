@@ -321,6 +321,17 @@ impl Host {
         }
     }
 
+    /// Count `n` bytes a test decoded, which go nowhere. Always `Ok` for
+    /// the real process; in a sandbox they are charged to the same budget
+    /// as output, because a few dozen bytes of bzip2 can decode to tens of
+    /// MiB and `-t` would otherwise be the one unbounded path.
+    pub(super) fn charge(&self, n: u64) -> io::Result<()> {
+        match self {
+            Host::Real => Ok(()),
+            Host::Sandbox(s) => take(&s.budget, n),
+        }
+    }
+
     /// The output of a run: standard output, or the temporary file.
     pub(super) fn out_writer(&self, f: Option<File>) -> BufWriter<Box<dyn Write + Send>> {
         let w: Box<dyn Write + Send> = match (self, f) {
@@ -364,18 +375,35 @@ struct Capped {
 
 impl Write for Capped {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let left = self.budget.load(Ordering::Relaxed);
-        if left == 0 && !buf.is_empty() {
-            return Err(no_space());
-        }
-        let take = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
-        let n = self.inner.write(&buf[..take])?;
-        self.budget.fetch_sub(n as u64, Ordering::Relaxed);
+        // Reserve the whole write first, so the budget can never wrap; a
+        // write the budget cannot hold fails whole, as a full disk would.
+        let want = buf.len() as u64;
+        take(&self.budget, want)?;
+        let n = match self.inner.write(buf) {
+            Ok(n) => n,
+            Err(e) => {
+                self.budget.fetch_add(want, Ordering::Relaxed);
+                return Err(e);
+            }
+        };
+        // Give back what a short write did not use.
+        self.budget.fetch_add(want - n as u64, Ordering::Relaxed);
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// Take `n` from `budget`, or fail with `ENOSPC` when less than `n` is
+/// left. Never wraps.
+fn take(budget: &AtomicU64, n: u64) -> io::Result<()> {
+    budget
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            left.checked_sub(n)
+        })
+        .map(|_| ())
+        .map_err(|_| no_space())
 }
 
 fn no_space() -> io::Error {
@@ -399,4 +427,29 @@ pub(super) fn set_times(meta: &Metadata, to: &Path) -> io::Result<()> {
         times = times.set_modified(t);
     }
     File::options().write(true).open(to)?.set_times(times)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A write the budget cannot hold fails whole and leaves the budget
+    /// as it was; nothing wraps.
+    #[test]
+    fn the_capped_writer_never_wraps_its_budget() {
+        let budget = Arc::new(AtomicU64::new(10));
+        let mut w = Capped {
+            inner: Box::new(io::sink()),
+            budget: budget.clone(),
+        };
+        assert_eq!(w.write(b"1234567").unwrap(), 7);
+        assert_eq!(budget.load(Ordering::Relaxed), 3);
+        let e = w.write(b"1234567").unwrap_err();
+        assert_eq!(e.kind(), no_space().kind());
+        assert_eq!(budget.load(Ordering::Relaxed), 3);
+        assert_eq!(w.write(b"123").unwrap(), 3);
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+        assert!(w.write(b"x").is_err());
+        assert_eq!(w.write(b"").unwrap(), 0);
+    }
 }

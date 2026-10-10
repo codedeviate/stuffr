@@ -223,7 +223,19 @@ mod tests {
         let (code, out, err) = run_in(&dir, "bzcat", vec![], &packed).unwrap();
         let err = String::from_utf8_lossy(&err);
         assert_eq!(code, 1, "{err}");
-        assert_eq!(out.len(), 8 * 1024 * 1024);
+        // A write the budget cannot hold fails whole, so the output stops
+        // within one buffered write (64 KiB) of the cap, never past it.
+        let cap = 8 * 1024 * 1024;
+        assert!(
+            out.len() <= cap && out.len() > cap - 64 * 1024,
+            "{}",
+            out.len()
+        );
+        assert!(err.contains("I/O or other error"), "{err}");
+        // `-t` writes nothing, but its decoding is charged to the same cap.
+        let (code, out, err) = run_in(&dir, "bzip2", vec!["-t".into()], &packed).unwrap();
+        let err = String::from_utf8_lossy(&err);
+        assert_eq!((code, out.len()), (1, 0), "{err}");
         assert!(err.contains("I/O or other error"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

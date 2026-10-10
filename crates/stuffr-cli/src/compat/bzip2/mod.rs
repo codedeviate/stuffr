@@ -74,13 +74,17 @@ fn main(
 /// few dozen bytes can expand to tens of MiB, so without a cap a fuzzer's
 /// short input could fill memory or disk; 8 MiB is past any block's
 /// ordinary output (a 900k block of text) and bounds what a bomb can cost.
+/// `-t` writes nothing but decodes just as much (one 50-byte stream is 45 MB
+/// of zeros), so its decoded bytes are charged too: every path a sandboxed
+/// run takes is bounded by this one figure.
 const SANDBOX_OUTPUT_CAP: u64 = 8 * 1024 * 1024;
 
 /// [`run`] without the process: operands resolve against `dir`, standard
 /// input is `stdin` (read as a pipe), standard output and error are
 /// captured and returned with the exit code, neither is a terminal, `$BZIP2`
 /// and `$BZIP` are unset, and `SIGPIPE` is left alone. Output is capped at
-/// [`SANDBOX_OUTPUT_CAP`]. For the fuzz target; not a stable interface.
+/// [`SANDBOX_OUTPUT_CAP`], and the bytes `-t` decodes (which go nowhere)
+/// are charged to the same cap. For the fuzz target; not a stable interface.
 #[doc(hidden)]
 pub fn run_in(
     dir: &Path,
