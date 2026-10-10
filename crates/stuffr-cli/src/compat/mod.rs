@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 pub mod bzip2;
 pub mod bzip2recover;
+pub(crate) mod gzip;
 mod host;
 pub mod links;
 

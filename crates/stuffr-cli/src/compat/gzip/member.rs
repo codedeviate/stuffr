@@ -1,0 +1,664 @@
+//! The gzip member layer: RFC 1952 headers, bodies and trailers as typed
+//! facts. No messages and no exit codes live here; each personality words a
+//! failure its own way.
+
+use std::io::{self, BufRead, Read, Write};
+
+/// Longest FNAME/FCOMMENT accepted. A longer one is reported as
+/// `Truncated(Header)`; what each reference does with such names is pinned by
+/// the differential suites, not decided here.
+pub(crate) const MAX_FIELD: usize = 1 << 20;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Header {
+    pub text: bool,
+    pub mtime: u32,
+    pub xfl: u8,
+    pub os: u8,
+    pub extra: Option<Vec<u8>>,
+    pub name: Option<Vec<u8>>,
+    pub comment: Option<Vec<u8>>,
+    pub hcrc: bool,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Where {
+    Header,
+    Body,
+    Trailer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fault {
+    BadMagic,
+    BadMethod(u8),
+    BadFlags(u8),
+    BadHeaderCrc,
+    Truncated(Where),
+    Data,
+    Crc { stored: u32, computed: u32 },
+    Length { stored: u32, computed: u32 },
+}
+
+#[derive(Debug)]
+pub(crate) enum MemberError {
+    Fault(Fault),
+    Io(io::Error),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MemberInfo {
+    pub header: Header,
+    pub compressed: u64,
+    pub uncompressed: u64,
+    pub crc: u32,
+    pub isize: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum After {
+    End,
+    NextMember,
+    Trailing { offset: u64, all_zero: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Engine {
+    Miniz,
+}
+
+const CHUNK: usize = 64 * 1024;
+
+const FTEXT: u8 = 1;
+const FHCRC: u8 = 2;
+const FEXTRA: u8 = 4;
+const FNAME: u8 = 8;
+const FCOMMENT: u8 = 16;
+
+/// Reads bytes, tracking the count and the CRC32 of everything read, and maps
+/// EOF to `Truncated(Header)`.
+struct HeaderReader<'a> {
+    r: &'a mut dyn BufRead,
+    crc: flate2::Crc,
+    len: u64,
+}
+
+impl HeaderReader<'_> {
+    fn bytes(&mut self, n: usize) -> Result<Vec<u8>, MemberError> {
+        let mut v = vec![0u8; n];
+        let mut at = 0;
+        while at < n {
+            let got = loop {
+                match self.r.read(&mut v[at..]) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    other => break other.map_err(MemberError::Io)?,
+                }
+            };
+            if got == 0 {
+                return Err(MemberError::Fault(Fault::Truncated(Where::Header)));
+            }
+            at += got;
+        }
+        self.crc.update(&v);
+        self.len += n as u64;
+        Ok(v)
+    }
+
+    /// A NUL-terminated field, without the NUL. Capped at [`MAX_FIELD`].
+    fn cstr(&mut self) -> Result<Vec<u8>, MemberError> {
+        let mut out = Vec::new();
+        loop {
+            let b = self.bytes(1)?[0];
+            if b == 0 {
+                return Ok(out);
+            }
+            if out.len() >= MAX_FIELD {
+                return Err(MemberError::Fault(Fault::Truncated(Where::Header)));
+            }
+            out.push(b);
+        }
+    }
+}
+
+/// Read one header from `r`; `Truncated(Header)` at EOF inside it.
+pub(crate) fn read_header(r: &mut dyn BufRead) -> Result<Header, MemberError> {
+    let mut hr = HeaderReader {
+        r,
+        crc: flate2::Crc::new(),
+        len: 0,
+    };
+    let fixed = hr.bytes(10)?;
+    if fixed[0] != 0x1f || fixed[1] != 0x8b {
+        return Err(MemberError::Fault(Fault::BadMagic));
+    }
+    if fixed[2] != 8 {
+        return Err(MemberError::Fault(Fault::BadMethod(fixed[2])));
+    }
+    let flg = fixed[3];
+    if flg & 0xe0 != 0 {
+        return Err(MemberError::Fault(Fault::BadFlags(flg)));
+    }
+    let mtime = u32::from_le_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+    let extra = if flg & FEXTRA != 0 {
+        let l = hr.bytes(2)?;
+        let n = usize::from(u16::from_le_bytes([l[0], l[1]]));
+        Some(hr.bytes(n)?)
+    } else {
+        None
+    };
+    let name = if flg & FNAME != 0 {
+        Some(hr.cstr()?)
+    } else {
+        None
+    };
+    let comment = if flg & FCOMMENT != 0 {
+        Some(hr.cstr()?)
+    } else {
+        None
+    };
+    let hcrc = flg & FHCRC != 0;
+    if hcrc {
+        let computed = (hr.crc.sum() & 0xffff) as u16;
+        let stored = hr.bytes(2)?;
+        if u16::from_le_bytes([stored[0], stored[1]]) != computed {
+            return Err(MemberError::Fault(Fault::BadHeaderCrc));
+        }
+    }
+    Ok(Header {
+        text: flg & FTEXT != 0,
+        mtime,
+        xfl: fixed[8],
+        os: fixed[9],
+        extra,
+        name,
+        comment,
+        hcrc,
+        len: hr.len,
+    })
+}
+
+/// Inflate one member's body and verify its trailer, writing plain bytes to
+/// `out` as they are produced (so partial output exists before an error).
+pub(crate) fn inflate_member(
+    r: &mut dyn BufRead,
+    header: Header,
+    out: &mut dyn Write,
+) -> Result<MemberInfo, MemberError> {
+    use flate2::{Decompress, FlushDecompress, Status};
+    let io_err = MemberError::Io;
+    let mut d = Decompress::new(false);
+    let mut crc = flate2::Crc::new();
+    let mut buf = vec![0u8; CHUNK];
+    let mut written = 0u64;
+    loop {
+        let input = match r.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(io_err(e)),
+        };
+        let eof = input.is_empty();
+        let (in0, out0) = (d.total_in(), d.total_out());
+        let flush = if eof {
+            FlushDecompress::Finish
+        } else {
+            FlushDecompress::None
+        };
+        let status = d
+            .decompress(input, &mut buf, flush)
+            .map_err(|_| MemberError::Fault(Fault::Data))?;
+        let used = (d.total_in() - in0) as usize;
+        let made = (d.total_out() - out0) as usize;
+        r.consume(used);
+        if made > 0 {
+            crc.update(&buf[..made]);
+            written += made as u64;
+            out.write_all(&buf[..made]).map_err(io_err)?;
+        }
+        match status {
+            Status::StreamEnd => break,
+            _ if eof && made == 0 => {
+                return Err(MemberError::Fault(Fault::Truncated(Where::Body)));
+            }
+            _ if used == 0 && made == 0 => return Err(MemberError::Fault(Fault::Data)),
+            _ => {}
+        }
+    }
+    let body = d.total_in();
+    let mut trailer = [0u8; 8];
+    let mut at = 0;
+    while at < 8 {
+        match r.read(&mut trailer[at..]) {
+            Ok(0) => return Err(MemberError::Fault(Fault::Truncated(Where::Trailer))),
+            Ok(n) => at += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io_err(e)),
+        }
+    }
+    let stored_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let stored_len = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+    let computed = crc.sum();
+    if stored_crc != computed {
+        return Err(MemberError::Fault(Fault::Crc {
+            stored: stored_crc,
+            computed,
+        }));
+    }
+    if stored_len != written as u32 {
+        return Err(MemberError::Fault(Fault::Length {
+            stored: stored_len,
+            computed: written as u32,
+        }));
+    }
+    Ok(MemberInfo {
+        compressed: header.len + body + 8,
+        header,
+        uncompressed: written,
+        crc: computed,
+        isize: stored_len,
+    })
+}
+
+/// What follows a member: EOF, another member (peeked `1f 8b`, not consumed),
+/// or trailing bytes (consumed to EOF in bounded chunks; `all_zero` if every
+/// one is NUL). `offset` is where the trailing bytes start.
+///
+/// A reader that yields a lone `1f` before more data arrives is classified as
+/// trailing: `BufRead` cannot peek past its buffer.
+pub(crate) fn after_member(r: &mut dyn BufRead, offset: u64) -> io::Result<After> {
+    let first = loop {
+        match r.fill_buf() {
+            Ok(b) => break b,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    };
+    if first.is_empty() {
+        return Ok(After::End);
+    }
+    if first.len() >= 2 && first[0] == 0x1f && first[1] == 0x8b {
+        return Ok(After::NextMember);
+    }
+    let mut all_zero = true;
+    loop {
+        let b = match r.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if b.is_empty() {
+            return Ok(After::Trailing { offset, all_zero });
+        }
+        all_zero &= b.iter().all(|&x| x == 0);
+        let n = b.len();
+        r.consume(n);
+    }
+}
+
+pub(crate) fn write_header(h: &Header, w: &mut dyn Write) -> io::Result<()> {
+    let mut flg = 0u8;
+    if h.text {
+        flg |= FTEXT;
+    }
+    if h.hcrc {
+        flg |= FHCRC;
+    }
+    if h.extra.is_some() {
+        flg |= FEXTRA;
+    }
+    if h.name.is_some() {
+        flg |= FNAME;
+    }
+    if h.comment.is_some() {
+        flg |= FCOMMENT;
+    }
+    let mut b = vec![0x1f, 0x8b, 8, flg];
+    b.extend_from_slice(&h.mtime.to_le_bytes());
+    b.extend_from_slice(&[h.xfl, h.os]);
+    if let Some(e) = &h.extra {
+        let n = u16::try_from(e.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "FEXTRA over 65535 bytes"))?;
+        b.extend_from_slice(&n.to_le_bytes());
+        b.extend_from_slice(e);
+    }
+    for s in [&h.name, &h.comment].into_iter().flatten() {
+        b.extend_from_slice(s);
+        b.push(0);
+    }
+    if h.hcrc {
+        let mut c = flate2::Crc::new();
+        c.update(&b);
+        b.extend_from_slice(&((c.sum() & 0xffff) as u16).to_le_bytes());
+    }
+    w.write_all(&b)
+}
+
+/// Compress `input` as one member: header `h`, raw deflate at `level` by
+/// `engine`, then CRC32 and ISIZE. Returns (crc, uncompressed length).
+pub(crate) fn compress_member(
+    h: &Header,
+    level: u32,
+    engine: Engine,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> io::Result<(u32, u64)> {
+    use flate2::{Compress, Compression, FlushCompress, Status};
+    let Engine::Miniz = engine;
+    write_header(h, out)?;
+    let mut c = Compress::new(Compression::new(level), false);
+    let mut crc = flate2::Crc::new();
+    let mut total = 0u64;
+    let mut inbuf = vec![0u8; CHUNK];
+    let mut outbuf = vec![0u8; CHUNK];
+    let bad = |e: flate2::CompressError| io::Error::other(e.to_string());
+    loop {
+        let n = match input.read(&mut inbuf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if n == 0 {
+            break;
+        }
+        crc.update(&inbuf[..n]);
+        total += n as u64;
+        let mut rest = &inbuf[..n];
+        while !rest.is_empty() {
+            let (i0, o0) = (c.total_in(), c.total_out());
+            c.compress(rest, &mut outbuf, FlushCompress::None)
+                .map_err(bad)?;
+            rest = &rest[(c.total_in() - i0) as usize..];
+            out.write_all(&outbuf[..(c.total_out() - o0) as usize])?;
+        }
+    }
+    loop {
+        let o0 = c.total_out();
+        let st = c
+            .compress(&[], &mut outbuf, FlushCompress::Finish)
+            .map_err(bad)?;
+        out.write_all(&outbuf[..(c.total_out() - o0) as usize])?;
+        if st == Status::StreamEnd {
+            break;
+        }
+    }
+    out.write_all(&crc.sum().to_le_bytes())?;
+    out.write_all(&(total as u32).to_le_bytes())?;
+    Ok((crc.sum(), total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 7 % 251) as u8).collect()
+    }
+
+    fn hdr() -> Header {
+        Header {
+            text: false,
+            mtime: 0,
+            xfl: 0,
+            os: 3,
+            extra: None,
+            name: None,
+            comment: None,
+            hcrc: false,
+            len: 0,
+        }
+    }
+
+    fn member(h: &Header, level: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        compress_member(h, level, Engine::Miniz, &mut &data[..], &mut out).unwrap();
+        out
+    }
+
+    fn fault(r: Result<MemberInfo, MemberError>) -> Fault {
+        match r {
+            Err(MemberError::Fault(f)) => f,
+            Err(MemberError::Io(e)) => panic!("io error {e}"),
+            Ok(_) => panic!("expected a fault"),
+        }
+    }
+
+    fn inflate(bytes: &[u8]) -> (Result<MemberInfo, MemberError>, Vec<u8>) {
+        let mut r = bytes;
+        let h = read_header(&mut r).expect("header");
+        let mut out = Vec::new();
+        let res = inflate_member(&mut r, h, &mut out);
+        (res, out)
+    }
+
+    #[test]
+    fn round_trips_every_level() {
+        let data = plain(200_000);
+        for level in 1..=9 {
+            let bytes = member(&hdr(), level, &data);
+            let mut dec = Vec::new();
+            flate2::read::MultiGzDecoder::new(&bytes[..])
+                .read_to_end(&mut dec)
+                .unwrap();
+            assert_eq!(dec, data, "level {level}");
+            let (res, out) = inflate(&bytes);
+            let info = res.unwrap_or_else(|_| panic!("level {level}"));
+            assert_eq!(out, data);
+            assert_eq!(info.uncompressed, data.len() as u64);
+            assert_eq!(info.compressed, bytes.len() as u64);
+            assert_eq!(info.isize, data.len() as u32);
+        }
+    }
+
+    #[test]
+    fn header_fields_round_trip() {
+        let mut cases = Vec::new();
+        let mut t = hdr();
+        t.text = true;
+        cases.push(t);
+        let mut e = hdr();
+        e.extra = Some(vec![1, 2, 3, 4]);
+        cases.push(e);
+        let mut n = hdr();
+        n.name = Some(b"file.txt".to_vec());
+        cases.push(n);
+        let mut c = hdr();
+        c.comment = Some(b"hello".to_vec());
+        cases.push(c);
+        let mut f = hdr();
+        f.hcrc = true;
+        cases.push(f);
+        cases.push(Header {
+            text: true,
+            mtime: 0x1234_5678,
+            xfl: 2,
+            os: 7,
+            extra: Some(vec![9; 300]),
+            name: Some(b"a/b.txt".to_vec()),
+            comment: Some(b"c".to_vec()),
+            hcrc: true,
+            len: 0,
+        });
+        for h in cases {
+            let mut buf = Vec::new();
+            write_header(&h, &mut buf).unwrap();
+            let mut r = &buf[..];
+            let got = read_header(&mut r).unwrap();
+            assert_eq!(got.len, buf.len() as u64);
+            assert!(r.is_empty());
+            assert_eq!(got, Header { len: got.len, ..h });
+        }
+    }
+
+    #[test]
+    fn bad_method() {
+        let mut b = member(&hdr(), 6, b"x");
+        b[2] = 7;
+        let mut r = &b[..];
+        assert!(matches!(
+            read_header(&mut r),
+            Err(MemberError::Fault(Fault::BadMethod(7)))
+        ));
+    }
+
+    #[test]
+    fn reserved_flag_bits() {
+        let mut b = member(&hdr(), 6, b"x");
+        b[3] = 0x20;
+        let mut r = &b[..];
+        assert!(matches!(
+            read_header(&mut r),
+            Err(MemberError::Fault(Fault::BadFlags(0x20)))
+        ));
+    }
+
+    #[test]
+    fn bad_header_crc() {
+        let mut h = hdr();
+        h.hcrc = true;
+        let mut b = member(&h, 6, b"x");
+        b[10] ^= 0xff;
+        let mut r = &b[..];
+        assert!(matches!(
+            read_header(&mut r),
+            Err(MemberError::Fault(Fault::BadHeaderCrc))
+        ));
+    }
+
+    #[test]
+    fn truncated_in_header() {
+        let mut h = hdr();
+        h.name = Some(b"name".to_vec());
+        let b = member(&h, 6, b"x");
+        for cut in [0, 1, 5, 9, 11, 13] {
+            let mut r = &b[..cut];
+            assert!(
+                matches!(
+                    read_header(&mut r),
+                    Err(MemberError::Fault(Fault::Truncated(Where::Header)))
+                ),
+                "cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_in_body() {
+        let b = member(&hdr(), 6, &plain(5000));
+        let (res, _) = inflate(&b[..b.len() / 2]);
+        assert!(matches!(fault(res), Fault::Truncated(Where::Body)));
+    }
+
+    #[test]
+    fn truncated_in_trailer() {
+        let b = member(&hdr(), 6, &plain(5000));
+        for cut in 1..=7 {
+            let (res, _) = inflate(&b[..b.len() - cut]);
+            assert!(
+                matches!(fault(res), Fault::Truncated(Where::Trailer)),
+                "cut {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_body_is_data() {
+        let mut b = member(&hdr(), 6, b"hello hello hello");
+        b[10] = 0xff; // BTYPE 11 is reserved
+        b[11] = 0xff;
+        let (res, _) = inflate(&b);
+        assert!(matches!(fault(res), Fault::Data));
+    }
+
+    #[test]
+    fn crc_mismatch_reports_both_values() {
+        let data = b"some bytes to check";
+        let mut b = member(&hdr(), 6, data);
+        let n = b.len();
+        let good = flate2::Crc::new();
+        let mut c = good;
+        c.update(data);
+        b[n - 8] ^= 1;
+        let (res, _) = inflate(&b);
+        match fault(res) {
+            Fault::Crc { stored, computed } => {
+                assert_eq!(computed, c.sum());
+                assert_eq!(stored, c.sum() ^ 1);
+            }
+            f => panic!("{f:?}"),
+        }
+    }
+
+    #[test]
+    fn length_mismatch_reports_both_values() {
+        let data = b"some bytes to check";
+        let mut b = member(&hdr(), 6, data);
+        let n = b.len();
+        b[n - 4] = 99;
+        let (res, _) = inflate(&b);
+        assert!(matches!(
+            fault(res),
+            Fault::Length {
+                stored: 99,
+                computed: 19
+            }
+        ));
+    }
+
+    #[test]
+    fn after_member_classifies_eof_next_trailing_and_zeros() {
+        assert!(matches!(
+            after_member(&mut &b""[..], 5).unwrap(),
+            After::End
+        ));
+        let mut r = &[0x1f, 0x8b, 8][..];
+        assert!(matches!(
+            after_member(&mut r, 5).unwrap(),
+            After::NextMember
+        ));
+        assert_eq!(r.len(), 3, "not consumed");
+        let mut r = &[0u8; 100][..];
+        match after_member(&mut r, 42).unwrap() {
+            After::Trailing { offset, all_zero } => assert!(offset == 42 && all_zero),
+            _ => panic!(),
+        }
+        assert!(r.is_empty());
+        let mut v = vec![0u8; 200_000];
+        v[199_999] = 1;
+        match after_member(&mut &v[..], 7).unwrap() {
+            After::Trailing { offset, all_zero } => assert!(offset == 7 && !all_zero),
+            _ => panic!(),
+        }
+        match after_member(&mut &b"junk"[..], 0).unwrap() {
+            After::Trailing { all_zero, .. } => assert!(!all_zero),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn partial_output_precedes_a_crc_error() {
+        let data = plain(1000);
+        let mut b = member(&hdr(), 6, &data);
+        let n = b.len();
+        b[n - 8] ^= 0x55;
+        let (res, out) = inflate(&b);
+        assert!(matches!(fault(res), Fault::Crc { .. }));
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn fname_is_bounded() {
+        let mut b = vec![0x1f, 0x8b, 8, 8, 0, 0, 0, 0, 0, 3];
+        b.extend(std::iter::repeat_n(b'a', MAX_FIELD + 10));
+        let mut r = &b[..];
+        assert!(matches!(
+            read_header(&mut r),
+            Err(MemberError::Fault(Fault::Truncated(Where::Header)))
+        ));
+        // And a NUL-less name that simply ends is the same fact.
+        let mut r = &b[..20];
+        assert!(matches!(
+            read_header(&mut r),
+            Err(MemberError::Fault(Fault::Truncated(Where::Header)))
+        ));
+    }
+}

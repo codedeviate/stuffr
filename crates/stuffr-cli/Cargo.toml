@@ -58,6 +58,10 @@ zoo = ["stuffr/zoo"]
 stuffr = { path = "../stuffr", version = "0.11.0", features = ["serde"] }
 clap = { workspace = true }
 serde_json = "1"
+# The gzip compatibility family's member layer: raw deflate/inflate and CRC32.
+# Already in every build's graph through stuffr-formats; the backend is never
+# changed here (no zlib/zlib-ng/zlib-rs feature anywhere).
+flate2 = { workspace = true }
 
 # The bzip2 compatibility mode restores `SIGPIPE`'s default action, so a
 # closed pipe ends it the way it ends bzip2. Already in the lock (a
@@ -73,7 +77,6 @@ stuffr = { path = "../stuffr", features = ["testing"] }
 # real gzip, independent of `stuffr-formats`' own `Tar`/gzip implementations,
 # so a read-side bug there cannot also hide in the fixture that exercises it.
 tar = { workspace = true }
-flate2 = { workspace = true }
 
 # `compat_harness` opens a pseudo-terminal with `openpty` so a differential
 # case can make stdin or stdout a tty. `libc` is already in the lock (a
