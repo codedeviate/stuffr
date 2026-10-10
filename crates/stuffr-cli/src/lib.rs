@@ -7,4 +7,5 @@
 //! is what keeps the assertion honest as the surface grows.
 
 pub mod cli;
+pub mod compat;
 pub mod size;

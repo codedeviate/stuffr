@@ -32,6 +32,9 @@ fn output_of(s: &str) -> Output {
 }
 
 fn main() -> ExitCode {
+    if let Some(code) = stuffr_cli::compat::dispatch(std::env::args_os().collect()) {
+        return code;
+    }
     let cli = Cli::parse();
 
     if cli.examples {
