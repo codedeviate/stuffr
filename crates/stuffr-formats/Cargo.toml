@@ -21,6 +21,9 @@ lz4 = ["dep:lz4_flex"]
 snappy = ["dep:snap"]
 zstd-c = ["dep:zstd"]
 zstd-pure = ["dep:ruzstd"]
+# Raw deflate through C zlib, for byte-identical Apple gzip output. Reached
+# only through `stuffr/c-backed`; never a flate2 backend.
+zlib-c = ["dep:libz-sys"]
 xz-c = ["dep:liblzma"]
 xz-pure = ["dep:lzma-rust2"]
 lzma-c = ["dep:liblzma"]
@@ -99,6 +102,7 @@ snap = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 ruzstd = { workspace = true, optional = true }
 liblzma = { workspace = true, optional = true }
+libz-sys = { workspace = true, optional = true }
 lzma-rust2 = { workspace = true, optional = true }
 tar = { workspace = true, optional = true }
 ar = { workspace = true, optional = true }

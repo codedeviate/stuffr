@@ -71,7 +71,12 @@ pub(crate) enum After {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Engine {
+    /// flate2 over miniz_oxide: valid deflate, not zlib's bytes.
     Miniz,
+    /// C zlib, `deflateInit2(level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY)`:
+    /// byte-identical to stock zlib, which is what Apple's gzip links.
+    #[cfg(feature = "zlib-c")]
+    ZlibC,
 }
 
 const CHUNK: usize = 64 * 1024;
@@ -407,15 +412,31 @@ pub(crate) fn compress_member(
     input: &mut dyn Read,
     out: &mut dyn Write,
 ) -> io::Result<(u32, u64)> {
-    use flate2::{Compress, Compression, FlushCompress, Status};
-    let Engine::Miniz = engine;
     write_header(h, out)?;
-    let mut c = Compress::new(Compression::new(level), false);
+    let (crc, total) = match engine {
+        Engine::Miniz => deflate_miniz(level, input, out)?,
+        #[cfg(feature = "zlib-c")]
+        Engine::ZlibC => {
+            let mut d = stuffr::zlib_c::RawDeflate::new(&mut *out, level)?;
+            let sums = pump(input, &mut |chunk| d.write_all(chunk))?;
+            d.finish()?;
+            sums
+        }
+    };
+    out.write_all(&crc.to_le_bytes())?;
+    out.write_all(&(total as u32).to_le_bytes())?;
+    Ok((crc, total))
+}
+
+/// Read `input` to EOF in chunks, handing each to `sink` and returning the
+/// CRC32 and length of everything read.
+fn pump(
+    input: &mut dyn Read,
+    sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<(u32, u64)> {
     let mut crc = flate2::Crc::new();
     let mut total = 0u64;
     let mut inbuf = vec![0u8; CHUNK];
-    let mut outbuf = vec![0u8; CHUNK];
-    let bad = |e: flate2::CompressError| io::Error::other(e.to_string());
     loop {
         let n = match input.read(&mut inbuf) {
             Ok(n) => n,
@@ -423,11 +444,21 @@ pub(crate) fn compress_member(
             Err(e) => return Err(e),
         };
         if n == 0 {
-            break;
+            return Ok((crc.sum(), total));
         }
         crc.update(&inbuf[..n]);
         total += n as u64;
-        let mut rest = &inbuf[..n];
+        sink(&inbuf[..n])?;
+    }
+}
+
+/// Raw deflate through flate2 (miniz_oxide).
+fn deflate_miniz(level: u32, input: &mut dyn Read, out: &mut dyn Write) -> io::Result<(u32, u64)> {
+    use flate2::{Compress, Compression, FlushCompress, Status};
+    let mut c = Compress::new(Compression::new(level), false);
+    let mut outbuf = vec![0u8; CHUNK];
+    let bad = |e: flate2::CompressError| io::Error::other(e.to_string());
+    let sums = pump(input, &mut |mut rest| {
         while !rest.is_empty() {
             let (i0, o0) = (c.total_in(), c.total_out());
             c.compress(rest, &mut outbuf, FlushCompress::None)
@@ -435,7 +466,8 @@ pub(crate) fn compress_member(
             rest = &rest[(c.total_in() - i0) as usize..];
             out.write_all(&outbuf[..(c.total_out() - o0) as usize])?;
         }
-    }
+        Ok(())
+    })?;
     loop {
         let o0 = c.total_out();
         let st = c
@@ -443,12 +475,9 @@ pub(crate) fn compress_member(
             .map_err(bad)?;
         out.write_all(&outbuf[..(c.total_out() - o0) as usize])?;
         if st == Status::StreamEnd {
-            break;
+            return Ok(sums);
         }
     }
-    out.write_all(&crc.sum().to_le_bytes())?;
-    out.write_all(&(total as u32).to_le_bytes())?;
-    Ok((crc.sum(), total))
 }
 
 #[cfg(test)]
@@ -787,6 +816,47 @@ mod tests {
             let mut r = Lookahead::new(Split(&all, edge + 1));
             assert_eq!(walk(&mut r), parts);
         }
+    }
+
+    /// The C engine's member decodes through both the member layer and
+    /// flate2, and its body is exactly what `RawDeflate` alone produces.
+    #[cfg(feature = "zlib-c")]
+    #[test]
+    fn zlib_c_engine_round_trips() {
+        let data = plain(200_000);
+        let mut h = hdr();
+        h.name = Some(b"plain.bin".to_vec());
+        for level in 1..=9 {
+            let mut bytes = Vec::new();
+            let (crc, n) =
+                compress_member(&h, level, Engine::ZlibC, &mut &data[..], &mut bytes).unwrap();
+            assert_eq!(n, data.len() as u64);
+            let mut dec = Vec::new();
+            flate2::read::MultiGzDecoder::new(&bytes[..])
+                .read_to_end(&mut dec)
+                .unwrap();
+            assert_eq!(dec, data, "level {level}");
+            let mut r = la(&bytes);
+            let got = read_header(&mut r).unwrap();
+            let hlen = got.len as usize;
+            let mut out = Vec::new();
+            let info = inflate_member(&mut r, got, &mut out).unwrap();
+            assert_eq!(out, data);
+            assert_eq!(info.crc, crc);
+            assert_eq!(info.compressed, bytes.len() as u64);
+            let mut raw = stuffr::zlib_c::RawDeflate::new(Vec::new(), level).unwrap();
+            raw.write_all(&data).unwrap();
+            assert_eq!(
+                &bytes[hlen..bytes.len() - 8],
+                &raw.finish().unwrap()[..],
+                "level {level}"
+            );
+        }
+        // Empty input is a valid member too.
+        let mut bytes = Vec::new();
+        compress_member(&hdr(), 6, Engine::ZlibC, &mut &b""[..], &mut bytes).unwrap();
+        let (res, out) = inflate(&bytes);
+        assert!(res.is_ok() && out.is_empty());
     }
 
     #[test]

@@ -19,6 +19,14 @@ pub use stuffr_core::*;
 pub mod bzip2_stream {
     pub use stuffr_formats::bzip2::{StreamError, StreamReader};
 }
+/// Raw deflate through C zlib, byte-identical to stock zlib's — what the
+/// `stuffr` binary's Apple gzip personality compresses with on the C tier.
+/// Not part of the stable API.
+#[cfg(feature = "zlib-c")]
+#[doc(hidden)]
+pub mod zlib_c {
+    pub use stuffr_formats::zlib_c::RawDeflate;
+}
 pub mod entries;
 mod link_cache;
 pub mod ops;

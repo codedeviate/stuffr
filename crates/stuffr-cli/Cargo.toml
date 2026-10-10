@@ -35,9 +35,14 @@ path = "src/main.rs"
 # table does not carry.
 [features]
 pure = ["stuffr/pure"]
-c-backed = ["stuffr/c-backed"]
+# `zlib-c` is a passthrough so this crate's own `cfg(feature = "zlib-c")` and
+# its integration tests can see it; `c-backed` implies it, and `full` names
+# `c-backed` itself — `stuffr/full` alone would turn on stuffr's `zlib-c` but
+# not this crate's, and the byte suite would silently run the compatible tier.
+c-backed = ["stuffr/c-backed", "zlib-c"]
+zlib-c = ["stuffr/zlib-c"]
 legacy = ["stuffr/legacy"]
-full = ["stuffr/full"]
+full = ["stuffr/full", "c-backed"]
 lha = ["stuffr/lha"]
 arj = ["stuffr/arj"]
 compress = ["stuffr/compress"]

@@ -252,6 +252,8 @@ pub mod zip_salvage;
 pub mod salvage_verify;
 #[cfg(feature = "zlib")]
 pub mod zlib;
+#[cfg(feature = "zlib-c")]
+pub mod zlib_c;
 #[cfg(feature = "zstd-c")]
 pub mod zstd_c;
 #[cfg(feature = "zstd-pure")]
