@@ -141,36 +141,142 @@ mod unix {
             Path::new("/bin/ls")
         );
         assert_eq!(std::fs::read(s.0.join("bunzip2")).unwrap(), b"x");
+        let dir = s.0.canonicalize().unwrap();
+        for (n, why) in [("bzcat", "not a stuffr link"), ("bunzip2", "not a link")] {
+            let line = format!("left {}: {why}", dir.join(n).display());
+            assert!(stdout(&o).lines().any(|l| l == line), "{}", stdout(&o));
+        }
     }
 
     #[test]
     fn install_links_remove_tells_this_stuffr_from_elsewhere() {
         let s = Scratch::new("stale");
         let canon = s.0.canonicalize().unwrap();
-        // Stale: leads to a path that no longer exists, so it is not ours.
+        // Dangling, but to a file named `stuffr`: a stale stuffr link.
         std::os::unix::fs::symlink(canon.join("gone/stuffr"), s.0.join("bzip2")).unwrap();
         // Ours by its recorded target.
         std::os::unix::fs::symlink(canon_stuffr(), s.0.join("bzcat")).unwrap();
+        // Dangling to something else: never ours.
+        std::os::unix::fs::symlink(canon.join("gone/other-tool"), s.0.join("bunzip2")).unwrap();
         let o = il(&s.0, &["--remove"]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert!(s.0.join("bzip2").symlink_metadata().is_ok());
+        assert!(s.0.join("bzip2").symlink_metadata().is_err());
         assert!(s.0.join("bzcat").symlink_metadata().is_err());
+        assert_eq!(
+            std::fs::read_link(s.0.join("bunzip2")).unwrap(),
+            canon.join("gone/other-tool")
+        );
+        assert!(
+            stdout(&o).contains(&format!(
+                "left {}: not a stuffr link",
+                canon.join("bunzip2").display()
+            )),
+            "{}",
+            stdout(&o)
+        );
     }
 
+    /// A link through another link resolves to this stuffr, so it is ours.
     #[test]
-    fn install_links_remove_spares_a_link_through_another_link() {
+    fn install_links_treats_a_link_through_another_link_as_ours() {
         let s = Scratch::new("via-link");
         let canon = s.0.canonicalize().unwrap();
         let l = canon.join("L");
         std::os::unix::fs::symlink(canon_stuffr(), &l).unwrap();
         std::os::unix::fs::symlink(&l, canon.join("bzip2")).unwrap();
-        let o = il(&s.0, &["--remove"]);
-        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
-        assert_eq!(std::fs::read_link(canon.join("bzip2")).unwrap(), l);
-        // Install leaves it too, reporting it as present.
+        // Install leaves it, reporting it as present.
         let o = il(&s.0, &["--names", "bzip2"]);
         assert!(stdout(&o).contains("already present"), "{}", stdout(&o));
         assert_eq!(std::fs::read_link(canon.join("bzip2")).unwrap(), l);
+        // Remove deletes the link, never what it leads through.
+        let o = il(&s.0, &["--remove"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert!(canon.join("bzip2").symlink_metadata().is_err());
+        assert_eq!(std::fs::read_link(&l).unwrap(), canon_stuffr());
+    }
+
+    /// The Homebrew shape: links made by an older version point into a
+    /// `Cellar/stuffr/<ver>` that `brew upgrade` and cleanup deleted.
+    #[test]
+    fn install_links_recovers_links_left_dangling_by_an_upgrade() {
+        let s = Scratch::new("upgrade");
+        let canon = s.0.canonicalize().unwrap();
+        let bin = canon.join("Cellar/stuffr/0.10.4/bin");
+        let links = canon.join("links");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&links).unwrap();
+        let old = bin.join("stuffr");
+        let make_stale = || {
+            std::fs::write(&old, b"old stuffr").unwrap();
+            for n in ALL {
+                let _ = std::fs::remove_file(links.join(n));
+                std::os::unix::fs::symlink(&old, links.join(n)).unwrap();
+            }
+            std::fs::remove_file(&old).unwrap();
+        };
+
+        make_stale();
+        let o = il(&links, &["--remove"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(stdout(&o).matches("removed").count(), 4, "{}", stdout(&o));
+        assert_eq!(std::fs::read_dir(&links).unwrap().count(), 0);
+
+        make_stale();
+        let o = il(&links, &["--dry-run"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(
+            stdout(&o).matches("would replace").count(),
+            4,
+            "{}",
+            stdout(&o)
+        );
+        let o = il(&links, &[]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(stdout(&o).matches("replaced").count(), 4, "{}", stdout(&o));
+        for n in ALL {
+            assert_eq!(std::fs::read_link(links.join(n)).unwrap(), canon_stuffr());
+        }
+    }
+
+    #[test]
+    fn install_links_refuses_a_dangling_link_to_another_tool() {
+        let s = Scratch::new("other-dangling");
+        let canon = s.0.canonicalize().unwrap();
+        let t = canon.join("gone/other-tool");
+        std::os::unix::fs::symlink(&t, canon.join("bzip2")).unwrap();
+        let o = il(&s.0, &[]);
+        assert_eq!(o.status.code(), Some(2), "{}", stdout(&o));
+        assert!(stderr(&o).contains("bzip2"), "{}", stderr(&o));
+        assert_eq!(std::fs::read_link(canon.join("bzip2")).unwrap(), t);
+        assert!(canon.join("bzcat").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn install_links_leaves_a_link_to_another_live_binary() {
+        let s = Scratch::new("other-live");
+        let canon = s.0.canonicalize().unwrap();
+        let other = canon.join("stuffr-not");
+        std::fs::write(&other, b"another program").unwrap();
+        // Even a live binary that happens to be named `stuffr`.
+        std::fs::create_dir_all(canon.join("elsewhere")).unwrap();
+        let named = canon.join("elsewhere/stuffr");
+        std::fs::write(&named, b"another stuffr").unwrap();
+        std::os::unix::fs::symlink(&other, canon.join("bzip2")).unwrap();
+        std::os::unix::fs::symlink(&named, canon.join("bzcat")).unwrap();
+        let o = il(&s.0, &["--names", "bzip2"]);
+        assert_eq!(o.status.code(), Some(2));
+        let o = il(&s.0, &["--names", "bzcat"]);
+        assert_eq!(o.status.code(), Some(2));
+        let o = il(&s.0, &["--remove"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(
+            stdout(&o).matches("not a stuffr link").count(),
+            2,
+            "{}",
+            stdout(&o)
+        );
+        assert_eq!(std::fs::read_link(canon.join("bzip2")).unwrap(), other);
+        assert_eq!(std::fs::read_link(canon.join("bzcat")).unwrap(), named);
     }
 
     #[test]
@@ -239,6 +345,12 @@ mod unix {
         }
         assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
         assert!(stderr(&o).contains("ermission denied"), "{}", stderr(&o));
+        let link = s.0.canonicalize().unwrap().join("bzip2");
+        assert!(
+            stderr(&o).contains(&link.display().to_string()),
+            "{}",
+            stderr(&o)
+        );
     }
 
     #[test]

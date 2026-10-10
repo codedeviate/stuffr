@@ -1295,11 +1295,14 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       directory, each pointing at this stuffr binary. Run under one of those
       names, the binary behaves as that tool, with its flags, messages and
       exit codes. This is opt-in: nothing creates these links unless you run
-      this verb. The directory must exist (exit 2 if not). A second run
-      reports "already present" and changes nothing. As bzip2recover does,
-      the bzip2recover link writes its rec* files through a symlink already
-      at that name and truncates a file already there (Debian's patched
-      bzip2recover refuses both).
+      this verb. The directory must exist (exit 2 if not); one that cannot
+      be written to is exit 1, naming the link and the operating system's
+      reason. A second run reports "already present" and changes nothing.
+      Under Homebrew the links point at the stable opt/stuffr path, not the
+      versioned Cellar one, so they survive `brew upgrade`. As bzip2recover
+      does, the bzip2recover link writes its rec* files through a symlink
+      already at that name and truncates a file already there (Debian's
+      patched bzip2recover refuses both).
 
   stuffr install-links ~/.local/bin --names bzcat
       Only the named links; --names takes a comma-separated list. A name that
@@ -1308,17 +1311,18 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
   stuffr install-links ~/.local/bin --force
       A regular file or a link to something else already called bzip2 is
       refused (exit 2, naming the path) and left untouched. --force replaces
-      it. A directory is never replaced.
+      it. A directory is never replaced. A stale stuffr link (one left
+      dangling into a stuffr an upgrade deleted) is replaced without --force.
 
   stuffr install-links ~/.local/bin --remove
-      Removes the links that point at this stuffr. A foreign symlink or a
-      regular file of the same name is left where it is.
+      Removes the links that point at this stuffr, and stale stuffr links. A
+      foreign symlink or a regular file of the same name is left where it
+      is, with a "left PATH: why" line for each.
 
   stuffr install-links ~/.local/bin --dry-run
       Prints "would create ..." (or "would remove ...") lines and changes
-      nothing. Combines with --force and --remove. A directory that cannot
-      be written to is exit 1, with the operating system's reason. Not
-      available on Windows (exit 3).
+      nothing. Combines with --force and --remove. Not available on Windows
+      (exit 3).
 
 
 GUARDING AGAINST DECOMPRESSION BOMBS
