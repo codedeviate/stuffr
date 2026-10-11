@@ -34,7 +34,7 @@ use super::super::list::Entry;
 use super::super::messages::{self as m, PROGRAM, printf, quote};
 use super::{Gz, Step, Stop, open_input, parent_of};
 use crate::compat::gzip::member::{Header, Lookahead};
-use crate::compat::host::{Host, Input, create_temp, stdin_file, strerror};
+use crate::compat::host::{Host, InFile, Input, create_temp, stdin_file, strerror};
 
 /// What is appended, after `-S`'s suffix, to an operand that does not
 /// exist (observed: `gzip -dc f` finds `f.gz`, `f.z`, `f-z` and, on a
@@ -154,11 +154,11 @@ impl Gz<'_> {
         &mut self,
         name: &[u8],
         follow: bool,
-    ) -> Result<(Vec<u8>, PathBuf, File, Metadata), (Vec<u8>, io::Error)> {
+    ) -> Result<(Vec<u8>, PathBuf, InFile, Metadata), (Vec<u8>, io::Error)> {
         let host = &*self.host;
-        let try_open = |n: &[u8]| -> io::Result<(PathBuf, File, Metadata)> {
+        let try_open = |n: &[u8]| -> io::Result<(PathBuf, InFile, Metadata)> {
             let p = host.path(n);
-            let f = open_input(&p, follow)?;
+            let f = open_input(host, &p, follow)?;
             let md = f.metadata()?;
             Ok((p, f, md))
         };
@@ -369,7 +369,7 @@ impl Gz<'_> {
         &mut self,
         name: &[u8],
         path: &Path,
-        file: File,
+        file: InFile,
         meta: &Metadata,
         suffix: &[u8],
     ) -> Step {

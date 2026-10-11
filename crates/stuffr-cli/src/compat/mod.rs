@@ -2,9 +2,10 @@
 //! (through a symlink), it behaves as that tool, with that tool's flags,
 //! messages and exit codes, not stuffr's.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub mod bzip2;
@@ -12,6 +13,14 @@ pub mod bzip2recover;
 pub mod gzip;
 mod host;
 pub mod links;
+
+#[doc(hidden)]
+pub use host::InputReads;
+
+/// What [`run_in_counted`] returns: the exit code, standard output,
+/// standard error, and the inputs opened with what was read from each.
+#[doc(hidden)]
+pub type CountedRun = (i32, Vec<u8>, Vec<u8>, BTreeMap<PathBuf, InputReads>);
 
 /// A family of tools the binary can impersonate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,14 +100,31 @@ pub fn run_in(
     stdin: &[u8],
     gzip_flavour: gzip::Flavour,
 ) -> Option<(i32, Vec<u8>, Vec<u8>)> {
+    run_in_counted(dir, name, args, stdin, gzip_flavour).map(|(code, out, err, _)| (code, out, err))
+}
+
+/// [`run_in`], also returning the inputs the run opened and what it read
+/// from each, by path. Only the gzip family counts its inputs; the map is
+/// empty for the others.
+#[doc(hidden)]
+pub fn run_in_counted(
+    dir: &Path,
+    name: &str,
+    args: Vec<OsString>,
+    stdin: &[u8],
+    gzip_flavour: gzip::Flavour,
+) -> Option<CountedRun> {
     let (family, canonical) = family_for(OsStr::new(name))?;
     Some(match family {
         Family::Bzip2 if canonical == "bzip2recover" => {
             let (code, err) = bzip2recover::run_in(dir, name.as_bytes(), &args);
-            (code, Vec::new(), err)
+            (code, Vec::new(), err, BTreeMap::new())
         }
-        Family::Bzip2 => bzip2::run_in(dir, canonical, &args, stdin),
-        Family::Gzip => gzip::run_in(gzip_flavour, dir, canonical, &args, stdin, &|_| None),
+        Family::Bzip2 => {
+            let (code, out, err) = bzip2::run_in(dir, canonical, &args, stdin);
+            (code, out, err, BTreeMap::new())
+        }
+        Family::Gzip => gzip::run_in_counted(gzip_flavour, dir, canonical, &args, stdin, &|_| None),
     })
 }
 
@@ -243,6 +269,42 @@ mod tests {
         let (code, _, err) = run_in(&dir, "bunzip2", vec![], b"BZh9garbage", G).unwrap();
         assert_eq!(code, 2, "{}", String::from_utf8_lossy(&err));
         assert!(run_in(&dir, "stuffr", vec![], b"", G).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `run_in_counted` reports, for the gzip family in either flavour, each
+    /// input opened, how often, its length and the bytes read from it; a
+    /// file only listed (`-l`) is still an open; the bzip2 family counts
+    /// nothing.
+    #[test]
+    fn run_in_counted_counts_the_gzip_familys_inputs() {
+        let dir = std::env::temp_dir().join(format!("stuffr-run-in-count-{}", std::process::id()));
+        for flavour in [gzip::Flavour::Gnu, gzip::Flavour::Bsd] {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("a"), b"hello hello hello\n").unwrap();
+            let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+            let (code, _, err, reads) =
+                run_in_counted(&dir, "gzip", args(&["-k", "a"]), b"", flavour).unwrap();
+            assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+            let a = reads[&dir.join("a")];
+            assert_eq!((a.opens, a.bytes, a.len), (1, 18, 18), "{flavour:?}");
+            assert_eq!(reads.len(), 1, "{reads:?}");
+
+            let len = std::fs::metadata(dir.join("a.gz")).unwrap().len();
+            for mode in [&["-t", "a.gz", "a.gz"][..], &["-l", "a.gz"]] {
+                let (code, _, err, reads) =
+                    run_in_counted(&dir, "gzip", args(mode), b"", flavour).unwrap();
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+                let gz = reads[&dir.join("a.gz")];
+                assert_eq!(gz.opens, mode.len() as u64 - 1, "{flavour:?} {mode:?}");
+                assert_eq!(gz.len, len);
+                assert!(gz.bytes > 0 && gz.bytes <= 2 * len * gz.opens, "{gz:?}");
+            }
+            let (_, _, _, reads) =
+                run_in_counted(&dir, "bzip2", args(&["-k", "a"]), b"", flavour).unwrap();
+            assert!(reads.is_empty(), "{reads:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

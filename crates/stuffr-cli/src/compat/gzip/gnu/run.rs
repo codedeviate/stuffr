@@ -23,7 +23,7 @@ use super::args::{Mode, Settings};
 use super::list::Lister;
 use super::messages::{self as m, PROGRAM, printf, quote, ratio};
 use crate::compat::gzip::member::{Engine, Header, compress_member};
-use crate::compat::host::{Host, Published, create_temp, publish, stdin_file, strerror};
+use crate::compat::host::{Host, InFile, Published, create_temp, publish, stdin_file, strerror};
 
 mod decompress;
 
@@ -204,7 +204,8 @@ impl Gz<'_> {
         let qname = quote(name);
         let path = self.host.path(name);
         let follow = self.s.force || self.s.to_stdout;
-        let opened = open_input(&path, follow).and_then(|f| f.metadata().map(|md| (f, md)));
+        let opened =
+            open_input(self.host, &path, follow).and_then(|f| f.metadata().map(|md| (f, md)));
         let (file, meta) = match opened {
             Ok(x) => x,
             Err(e) => {
@@ -283,7 +284,7 @@ impl Gz<'_> {
     }
 
     /// `-c`: one member onto standard output.
-    fn compress_to_stdout(&mut self, name: &[u8], mut file: File, meta: &Metadata) -> Step {
+    fn compress_to_stdout(&mut self, name: &[u8], mut file: InFile, meta: &Metadata) -> Step {
         let qname = quote(name);
         self.stdin_named = true;
         self.verbose_name(&qname);
@@ -302,7 +303,7 @@ impl Gz<'_> {
     }
 
     /// Compress `name` to `name` + suffix.
-    fn compress_to_file(&mut self, name: &[u8], path: PathBuf, mut file: File, meta: &Metadata) {
+    fn compress_to_file(&mut self, name: &[u8], path: PathBuf, mut file: InFile, meta: &Metadata) {
         let qname = quote(name);
         if !self.s.force
             && let Some(suf) = self.suffix_of(name)
@@ -563,8 +564,12 @@ fn pack(h: &Header, level: u32, input: &mut dyn Read, out: &mut dyn Write) -> io
 
 /// Open an input as GNU does: without following a final symlink unless
 /// `follow` (its error is then `ELOOP`), and without blocking on a FIFO
-/// that has no writer (non-blocking for the open only).
-fn open_input(path: &Path, follow: bool) -> io::Result<File> {
+/// that has no writer (non-blocking for the open only). Tracked by `host`.
+fn open_input(host: &Host, path: &Path, follow: bool) -> io::Result<InFile> {
+    open_file(path, follow).map(|f| host.track(path, f))
+}
+
+fn open_file(path: &Path, follow: bool) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;

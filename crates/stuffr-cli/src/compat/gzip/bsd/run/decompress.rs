@@ -36,7 +36,7 @@ use super::super::{unlz, zread::ZRead};
 use super::{BUFLEN, Gz, PATH_MAX, create_exclusive, eexist, print_ratio};
 use crate::compat::gzip::member::Lookahead;
 use crate::compat::gzip::sniff::{self, Detected, Flavour};
-use crate::compat::host::{Host, Published, SANDBOX_OUTPUT_CAP, publish, stdin_file};
+use crate::compat::host::{Host, InFile, Published, SANDBOX_OUTPUT_CAP, publish, stdin_file};
 
 /// `exit(2)` from `maybe_err`/`maybe_errx`: the message is printed (unless
 /// `-q`), the run stops.
@@ -63,7 +63,7 @@ impl Default for ListTotals {
 
 /// `print_list`'s descriptor: a file, standard input, or `-1` (the totals).
 enum ListFd<'f> {
-    File(&'f mut File),
+    File(&'f mut InFile),
     Stdin,
     Totals,
 }
@@ -321,7 +321,7 @@ impl Gz<'_> {
     ) -> Result<Option<u64>, Fatal> {
         let path = self.host.path(file);
         let mut fd = match File::open(&path) {
-            Ok(f) => f,
+            Ok(f) => self.host.track(&path, f),
             Err(e) => {
                 self.set_errno(&e);
                 self.warn(m::CANT_OPEN, &[file], &e);
@@ -531,7 +531,7 @@ impl Gz<'_> {
     fn decode_file(
         &mut self,
         method: Detected,
-        fd: &mut File,
+        fd: &mut InFile,
         file: &[u8],
         outfile: &[u8],
         in_size: u64,
@@ -1533,7 +1533,7 @@ fn raw_fd(f: &File) -> i32 {
 }
 
 /// `pread`: up to `buf.len()` bytes at `pos`, short at the end of the file.
-fn pread(f: &mut File, buf: &mut [u8], pos: u64) -> io::Result<usize> {
+fn pread(f: &mut InFile, buf: &mut [u8], pos: u64) -> io::Result<usize> {
     f.seek(SeekFrom::Start(pos))?;
     read_full(f, buf)
 }

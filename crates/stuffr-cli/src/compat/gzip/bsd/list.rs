@@ -11,8 +11,9 @@
 //! failure makes the size 0. The state is a few integers whatever the
 //! number of records.
 
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
+
+use crate::compat::host::InFile;
 
 /// `ctime(&ts) + 4` cut at 12 bytes: `"Sep  9 01:46"`, local time.
 pub(super) fn ctime_short(ts: i64) -> String {
@@ -73,7 +74,7 @@ const UNPADDED_SIZE_MIN: u64 = 5;
 const UNPADDED_SIZE_MAX: u64 = VLI_MAX & !3;
 
 /// `io_pread`: exactly `buf.len()` bytes at `pos`.
-fn pread(f: &mut File, buf: &mut [u8], pos: u64) -> io::Result<()> {
+fn pread(f: &mut InFile, buf: &mut [u8], pos: u64) -> io::Result<()> {
     f.seek(SeekFrom::Start(pos))?;
     f.read_exact(buf)
 }
@@ -91,12 +92,12 @@ fn check_of(flags: &[u8]) -> Option<u8> {
 }
 
 /// `unxz_len`: the uncompressed size, or 0 when the indexes cannot be read.
-pub(super) fn unxz_len(f: &mut File) -> u64 {
+pub(super) fn unxz_len(f: &mut InFile) -> u64 {
     parse_indexes(f).unwrap_or(0)
 }
 
 /// `parse_indexes`: the sum of every stream's records.
-fn parse_indexes(f: &mut File) -> Option<u64> {
+fn parse_indexes(f: &mut InFile) -> Option<u64> {
     let size = f.metadata().ok()?.len();
     if size < 2 * HEADER_SIZE {
         return None;
@@ -166,7 +167,7 @@ fn parse_indexes(f: &mut File) -> Option<u64> {
 
 /// The bytes of an index, counted and summed into its CRC32.
 struct IndexBytes<'f> {
-    src: io::Take<&'f mut File>,
+    src: io::Take<&'f mut InFile>,
     buf: Vec<u8>,
     at: usize,
     filled: usize,
@@ -215,7 +216,7 @@ impl IndexBytes<'_> {
 /// An index of `len` bytes at `pos` (`lzma_index_decoder`): the records'
 /// uncompressed sizes summed, and the blocks' total size (each unpadded
 /// size rounded up to four), checked as liblzma checks them.
-fn read_index(f: &mut File, pos: u64, len: u64) -> Option<(u64, u64)> {
+fn read_index(f: &mut InFile, pos: u64, len: u64) -> Option<(u64, u64)> {
     f.seek(SeekFrom::Start(pos)).ok()?;
     let mut r = IndexBytes {
         src: f.take(len),

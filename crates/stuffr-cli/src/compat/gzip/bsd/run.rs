@@ -425,7 +425,7 @@ impl Gz<'_> {
     fn file_compress(&mut self, file: &[u8]) -> Option<(Vec<u8>, u64)> {
         let path = self.host.path(file);
         let mut input = match File::open(&path) {
-            Ok(f) => f,
+            Ok(f) => self.host.track(&path, f),
             Err(e) => {
                 self.warn(m::CANT_OPEN, &[file], &e);
                 return None;

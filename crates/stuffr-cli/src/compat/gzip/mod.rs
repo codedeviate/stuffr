@@ -20,6 +20,7 @@
 //! Anything else in it is refused, exit 1, in stuffr's own words (neither
 //! reference has the variable).
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::Path;
@@ -27,6 +28,7 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
+use super::CountedRun;
 use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
 mod bsd;
@@ -144,12 +146,28 @@ pub fn run_in(
     stdin: &[u8],
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> (i32, Vec<u8>, Vec<u8>) {
+    let (code, out, err, _) = run_in_counted(flavour, dir, name, args, stdin, env);
+    (code, out, err)
+}
+
+/// [`run_in`], also returning what the run opened and read, by path.
+#[doc(hidden)]
+pub fn run_in_counted(
+    flavour: Flavour,
+    dir: &Path,
+    name: &'static str,
+    args: &[OsString],
+    stdin: &[u8],
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> CountedRun {
     let stdout = Arc::new(Mutex::new(Vec::new()));
+    let reads = Arc::new(Mutex::new(BTreeMap::new()));
     let mut host = Host::Sandbox(Sandbox {
         dir: dir.to_path_buf(),
         stdin: Some(stdin.to_vec()),
         stdout: stdout.clone(),
         budget: Arc::new(AtomicU64::new(SANDBOX_OUTPUT_CAP)),
+        reads: reads.clone(),
     });
     let mut err = Vec::new();
     let code = main(
@@ -163,7 +181,8 @@ pub fn run_in(
     );
     drop(host);
     let out = std::mem::take(&mut *stdout.lock().unwrap_or_else(|p| p.into_inner()));
-    (i32::from(code), out, err)
+    let reads = std::mem::take(&mut *reads.lock().unwrap_or_else(|p| p.into_inner()));
+    (i32::from(code), out, err, reads)
 }
 
 #[cfg(test)]

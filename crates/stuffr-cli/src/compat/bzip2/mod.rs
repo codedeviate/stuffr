@@ -80,6 +80,7 @@ pub fn run_in(
         stdin: Some(stdin.to_vec()),
         stdout: stdout.clone(),
         budget: Arc::new(AtomicU64::new(SANDBOX_OUTPUT_CAP)),
+        reads: Default::default(),
     });
     let mut err = Vec::new();
     let code = main(name, args, &|_| None, &mut host, &mut err);

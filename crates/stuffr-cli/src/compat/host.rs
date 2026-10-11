@@ -8,6 +8,7 @@
 //! Nothing here knows a tool's messages or flags; each family keeps its own
 //! checks and wording and calls these helpers.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufRead, BufWriter, Read, Seek, SeekFrom, Write};
@@ -195,6 +196,76 @@ pub(crate) fn stdout_writer() -> Box<dyn Write + Send> {
     Box::new(io::stdout())
 }
 
+/// What a sandboxed run did to one input path: how many times it opened it,
+/// how many bytes it read from it over all those opens, and the largest
+/// length it had when opened (a run can rewrite a file it later opens:
+/// `gzip -f a a.gz`). Only inputs
+/// opened through [`Host::track`] are counted (the gzip family's); the fuzz
+/// target holds each to its read bound.
+#[doc(hidden)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct InputReads {
+    /// Successful opens.
+    pub opens: u64,
+    /// Bytes read, over every open.
+    pub bytes: u64,
+    /// The largest length the file had at an open.
+    pub len: u64,
+}
+
+/// A sandboxed run's [`InputReads`], by the path opened.
+pub(crate) type ReadLog = Arc<Mutex<BTreeMap<PathBuf, InputReads>>>;
+
+/// An input file, counting what is read from it when the run is
+/// sandboxed ([`Host::track`]). Derefs to the `File` for metadata and the
+/// descriptor; reads go through `Read`, so they are counted. Never read
+/// through `&File` (`Read for &File`), which would bypass the count.
+pub(crate) struct InFile {
+    file: File,
+    log: Option<(ReadLog, PathBuf)>,
+}
+
+impl InFile {
+    /// Another handle on the same open file, counted against the same path.
+    pub(crate) fn try_clone(&self) -> io::Result<InFile> {
+        Ok(InFile {
+            file: self.file.try_clone()?,
+            log: self.log.clone(),
+        })
+    }
+}
+
+impl From<File> for InFile {
+    /// An uncounted input.
+    fn from(file: File) -> Self {
+        InFile { file, log: None }
+    }
+}
+
+impl std::ops::Deref for InFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.file
+    }
+}
+
+impl Read for InFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.file.read(buf)?;
+        if let Some((log, path)) = &self.log {
+            let mut log = log.lock().unwrap_or_else(|p| p.into_inner());
+            log.entry(path.clone()).or_default().bytes += n as u64;
+        }
+        Ok(n)
+    }
+}
+
+impl Seek for InFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
 /// The input of a decompression or test, read the way libbzip2 reads it:
 /// `CHUNK` bytes at a time, each read filling its buffer unless the input
 /// ends, the next one only once the last is used up. That matters for a
@@ -211,7 +282,7 @@ pub(crate) struct Input {
 }
 
 pub(crate) enum InputSrc {
-    File(File),
+    File(InFile),
     Stdin(io::Stdin),
     /// A sandboxed run's standard input: read like a pipe, never rewound.
     Bytes(io::Cursor<Vec<u8>>),
@@ -228,7 +299,8 @@ impl Read for InputSrc {
 }
 
 impl Input {
-    pub(crate) fn file(f: File) -> Self {
+    pub(crate) fn file(f: impl Into<InFile>) -> Self {
+        let f = f.into();
         let kind = kind_of(&f);
         Self::new(InputSrc::File(f), kind)
     }
@@ -368,6 +440,8 @@ pub(crate) struct Sandbox {
     /// Bytes still allowed to reach standard output and output files, all
     /// together; past it a write fails as a full disk does.
     pub(crate) budget: Arc<AtomicU64>,
+    /// What the run opened and read, by path ([`Host::track`]).
+    pub(crate) reads: ReadLog,
 }
 
 impl Host {
@@ -376,6 +450,25 @@ impl Host {
         match self {
             Host::Real => path(b),
             Host::Sandbox(s) => s.dir.join(path(b)),
+        }
+    }
+
+    /// An input `f`, just opened at `path`: counted (one open, and every
+    /// byte read through it) in a sandbox, plain for the real process.
+    pub(crate) fn track(&self, path: &Path, f: File) -> InFile {
+        match self {
+            Host::Real => InFile::from(f),
+            Host::Sandbox(s) => {
+                let len = f.metadata().map_or(0, |m| m.len());
+                let mut log = s.reads.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = log.entry(path.to_path_buf()).or_default();
+                entry.opens += 1;
+                entry.len = entry.len.max(len);
+                InFile {
+                    file: f,
+                    log: Some((s.reads.clone(), path.to_path_buf())),
+                }
+            }
         }
     }
 
