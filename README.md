@@ -979,8 +979,10 @@ carries both and picks one:
 - **A `.Z` whose header claims fewer than 9 bits** is "corrupt input." with
   no output; GNU writes about 22 bytes of garbage first.
 - **An input that is also the output is never lost.** `gzip -dNf` on a file
-  whose stored name is its own name, or a symbolic link whose compressed
-  name leads back to itself, makes both tools unlink the input before
+  whose stored name is its own name (on a case-insensitive volume, such as
+  macOS's default APFS, also in another case: `X.GZ` for `x.gz`), or a
+  symbolic link whose compressed name leads back to itself, makes both
+  tools unlink the input before
   decoding, so a failure loses it (GNU loses both files). stuffr prints and
   exits the same, keeps the input on failure and replaces it only with a
   finished output.

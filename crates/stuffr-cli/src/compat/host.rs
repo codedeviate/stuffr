@@ -130,6 +130,24 @@ pub(crate) fn not_a_standard_file(p: &Path) -> bool {
     fs::symlink_metadata(p).map_or(true, |m| !m.file_type().is_file())
 }
 
+/// Whether `a` and `b` describe one file: the same device and inode.
+/// Spelling never decides this: on a case-insensitive or normalising file
+/// system two different paths can name one file. Off unix there is no
+/// identity to compare, and the answer is `None`; each caller says what
+/// that means for it.
+pub(crate) fn same_file(a: &Metadata, b: &Metadata) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(a.dev() == b.dev() && a.ino() == b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        None
+    }
+}
+
 /// `countHardLinks`.
 pub(crate) fn count_hard_links(p: &Path) -> u64 {
     #[cfg(unix)]

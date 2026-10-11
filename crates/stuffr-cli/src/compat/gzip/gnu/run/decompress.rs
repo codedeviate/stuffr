@@ -387,7 +387,7 @@ impl Gz<'_> {
         let out_name = self.output_name(name, Some(suffix), opened.header.as_ref());
         let qout = quote(&out_name);
         let out_path = self.host.path(&out_name);
-        let Some(replace) = self.may_write(&out_path, &qout, path) else {
+        let Some(replace) = self.may_write(&out_path, &qout, path, meta) else {
             return Ok(());
         };
         // A stored name that is empty or ends in `/` cannot be a file: GNU

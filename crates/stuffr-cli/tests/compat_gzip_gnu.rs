@@ -1873,6 +1873,64 @@ mod differential {
         }
     }
 
+    /// Whether the directory the harness works in (`temp_dir()`) folds
+    /// case: a file `a` is also found as `A`.
+    fn scratch_folds_case() -> bool {
+        let d = std::env::temp_dir().join(format!("stuffr-fold-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("a"), b"").unwrap();
+        let folds = d.join("A").exists();
+        let _ = std::fs::remove_dir_all(&d);
+        folds
+    }
+
+    /// Final review, item 1: the same guard by file identity, not by
+    /// spelling. On a case-insensitive file system a stored name `X.GZ`
+    /// names the input `x.gz`; GNU's `-f` unlinks it (the input) before
+    /// decoding and removes `x.gz` (by then the output) afterwards, so
+    /// both are lost with exit 0. stuffr prints and exits as GNU does and
+    /// keeps the decoded file (or, when the body is corrupt, the input).
+    /// Runs only where the scratch directory folds case.
+    #[test]
+    fn a_stored_name_folding_to_the_input_keeps_the_output() {
+        if !scratch_folds_case() {
+            println!(
+                "skipped: {} is case-sensitive, so `X.GZ` cannot name `x.gz`",
+                std::env::temp_dir().display()
+            );
+            return;
+        }
+        let t = txt();
+        let good = gzm(&t, b"X.GZ");
+        let crc = member_with(
+            Member {
+                name: Some(b"X.GZ"),
+                ..plain_member(&t)
+            },
+            Some(1),
+            None,
+        );
+        for (bytes, ok) in [(good, true), (crc, false)] {
+            for args in [&["-dNf", "x.gz"][..], &["-dNfv", "x.gz"]] {
+                let c = dz("gzip", args, vec![("x.gz", bytes.clone())]);
+                let s = stuffr_as(&c);
+                if let Some(r) = reference(gnu_gzip_dir(), &c) {
+                    assert_eq!(
+                        (r.code, &r.stdout, &r.stderr),
+                        (s.code, &s.stdout, &s.stderr),
+                        "{args:?}"
+                    );
+                }
+                assert_eq!(s.code, if ok { 0 } else { 1 }, "{}", s.stderr);
+                assert_eq!(s.tree.len(), 1, "{args:?}: {:?}", s.tree.keys());
+                let kept = &s.tree.values().next().unwrap().0;
+                let want = if ok { &t } else { &bytes };
+                assert!(kept == want, "{args:?}: the wrong bytes survived");
+            }
+        }
+    }
+
     /// Review focus 2: `gunzip a.gz b.gz c.gz` with `b.gz` corrupt keeps
     /// `b.gz`, leaves no partial `b`, and exits with the worst code. GNU
     /// ends the run at a CRC error or a cut-short input (so `c.gz` is left

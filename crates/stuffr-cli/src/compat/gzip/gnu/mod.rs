@@ -78,11 +78,13 @@
 //! - A zip refused as "not a valid zip file" with its data-descriptor flag
 //!   set makes GNU check the *next* input's gzip trailer as a data
 //!   descriptor ("crc/length error"); that leaked state is not reproduced.
-//! - `gzip -dNf` on an input whose stored name is its own name: GNU
-//!   removes the input before decoding and the output after, losing both
-//!   whether the body decodes or not; stuffr says and exits the same but
-//!   keeps the decoded file on success and the untouched input on failure
-//!   (Rulings T8-4, T8-5).
+//! - `gzip -dNf` on an input whose stored name is its own name (or, on a
+//!   case-insensitive or normalising volume, any spelling of it: `X.GZ`
+//!   for `x.gz`): GNU removes the input before decoding and the output
+//!   after, losing both whether the body decodes or not; stuffr says and
+//!   exits the same but keeps the decoded file on success and the
+//!   untouched input on failure (Rulings T8-4, T8-5). "The same file" is
+//!   judged by device and inode; off unix, by spelling only.
 //! - Read and write failures say `gzip: NAME: strerror`, exit 1, and end
 //!   the run: the shape every other file error has, not observed.
 

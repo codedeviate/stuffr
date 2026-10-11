@@ -23,7 +23,9 @@ use super::args::{Mode, Settings};
 use super::list::Lister;
 use super::messages::{self as m, PROGRAM, printf, quote, ratio};
 use crate::compat::gzip::member::{Engine, Header, compress_member};
-use crate::compat::host::{Host, InFile, Published, create_temp, publish, stdin_file, strerror};
+use crate::compat::host::{
+    Host, InFile, Published, create_temp, publish, same_file, stdin_file, strerror,
+};
 
 mod decompress;
 
@@ -323,7 +325,7 @@ impl Gz<'_> {
         let out_name = [name, &self.s.suffix].concat();
         let qout = quote(&out_name);
         let out_path = self.host.path(&out_name);
-        let Some(replace) = self.may_write(&out_path, &qout, &path) else {
+        let Some(replace) = self.may_write(&out_path, &qout, &path, meta) else {
             return;
         };
         let (tmp, tmp_file) = match create_temp(&parent_of(&out_path), "gzip") {
@@ -361,17 +363,26 @@ impl Gz<'_> {
     /// `a` says `gzip: a: Operation not permitted`, macOS's `unlink` error,
     /// and so does `gzip -f a` with a directory `a.gz`); otherwise a
     /// terminal on standard input is asked. Ruling T8-5: when the output
-    /// is the input itself (`input`; `gzip -dNf a.gz` storing `a.gz`), it
-    /// is not removed first, so a failed decode leaves the input; the
-    /// publish's rename replaces it on success.
-    fn may_write(&mut self, out_path: &Path, qout: &[u8], input: &Path) -> Option<bool> {
+    /// is the input itself (`gzip -dNf a.gz` storing `a.gz`, or `A.GZ` on
+    /// a case-insensitive volume), it is not removed first, so a failed
+    /// decode leaves the input; the publish's rename replaces it on
+    /// success. "Is the input" is judged by identity (`input_meta`, the
+    /// opened input's), never by spelling; off unix, where there is no
+    /// identity, by `input`'s spelling.
+    fn may_write(
+        &mut self,
+        out_path: &Path,
+        qout: &[u8],
+        input: &Path,
+        input_meta: &Metadata,
+    ) -> Option<bool> {
         if fs::symlink_metadata(out_path).is_err() {
             return Some(false);
         }
         if self.s.force {
-            if out_path != input
-                && let Err(e) = fs::remove_file(out_path)
-            {
+            let is_input = fs::metadata(out_path)
+                .is_ok_and(|o| same_file(&o, input_meta).unwrap_or(out_path == input));
+            if !is_input && let Err(e) = fs::remove_file(out_path) {
                 self.error(m::IO_FAILED, &[PROGRAM, qout, &strerror(&e)]);
                 return None;
             }
@@ -438,10 +449,11 @@ impl Gz<'_> {
             }
         }
         // Ruling T8-4: never remove the input when the output now stands in
-        // its place (`gzip -dNf a.gz` with a stored name `a.gz`): GNU loses
-        // both, stuffr keeps the decoded file.
+        // its place (`gzip -dNf a.gz` with a stored name `a.gz`, or `A.GZ`
+        // on a case-insensitive volume): GNU loses both, stuffr keeps the
+        // decoded file.
         if !self.s.keep
-            && path != out_path
+            && still_the_input(path, meta, out_path)
             && let Err(e) = fs::remove_file(path)
         {
             self.error(m::IO_FAILED, &[PROGRAM, qname, &strerror(&e)]);
@@ -548,6 +560,24 @@ fn parent_of(out_path: &Path) -> PathBuf {
     match out_path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
         _ => PathBuf::from("."),
+    }
+}
+
+/// Whether the input's name `path` should be removed after the output
+/// `out_path` was published: it still names the input (`meta`'s file) and
+/// not the output. Judged by identity, so a name that differs from
+/// `out_path` only in case, on a volume that folds case, is not removed.
+/// When `path` cannot be looked up its removal is attempted, so the error
+/// is GNU's; off unix, where there is no identity, the spellings decide.
+fn still_the_input(path: &Path, meta: &Metadata, out_path: &Path) -> bool {
+    let Ok(now) = fs::metadata(path) else {
+        return path != out_path;
+    };
+    let out = fs::metadata(out_path).ok();
+    match (same_file(&now, meta), out.and_then(|o| same_file(&now, &o))) {
+        (Some(was_input), Some(is_output)) => was_input && !is_output,
+        (Some(was_input), None) => was_input,
+        _ => path != out_path,
     }
 }
 

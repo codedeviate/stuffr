@@ -29,7 +29,7 @@ use super::messages::{self as m, printf};
 mod decompress;
 
 use crate::compat::gzip::member::{Engine, Header, compress_body, write_header, write_trailer};
-use crate::compat::host::{Host, Published, create_temp, publish, stdin_file, strerror};
+use crate::compat::host::{self, Host, Published, create_temp, publish, stdin_file, strerror};
 pub(super) use decompress::Fatal;
 
 /// `BUFLEN`: gzip's read and write size.
@@ -706,7 +706,11 @@ impl Gz<'_> {
     /// `unlink_input`: unless `-k`, remove the input if its name still
     /// names the file that was read (a symbolic link given with `-f` is
     /// removed, not its target). Never the output itself (Ruling T8-4's
-    /// rule, carried over).
+    /// rule, carried over): by identity, since once published the output
+    /// is a new file, so a name that folds onto it (`x.gz` for a stored
+    /// `X.GZ` on a case-insensitive volume) no longer names `isb`'s file.
+    /// The spelling check first is what guards this off unix, where
+    /// `same_file` cannot tell; on unix it is subsumed.
     fn unlink_input(&mut self, path: &Path, isb: &Metadata, out_path: &Path) {
         if self.s.keep || path == out_path {
             return;
@@ -993,17 +997,12 @@ fn nlink(md: &Metadata) -> u64 {
     }
 }
 
+/// `host::same_file`; off unix, where there is no identity to compare,
+/// two files are taken to be one (so an existing output is never unlinked
+/// first, and the input is removed only when its name differs from the
+/// output's, the check `unlink_input` makes first).
 fn same_file(a: &Metadata, b: &Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        a.dev() == b.dev() && a.ino() == b.ino()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (a, b);
-        true
-    }
+    host::same_file(a, b).unwrap_or(true)
 }
 
 fn ebadf() -> i32 {
