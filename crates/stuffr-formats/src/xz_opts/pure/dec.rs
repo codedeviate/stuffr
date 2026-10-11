@@ -103,6 +103,23 @@ enum Lz {
     Lzma1(Box<LzmaStream>),
 }
 
+/// The dictionary window to ask `lzma-rust2` for: the declared one, but
+/// never more than a declared uncompressed `size` needs (at least 4 KiB,
+/// liblzma's floor). `lzma-rust2` zero-fills its whole window up front
+/// where liblzma only reserves it, so without the cap a few hostile header
+/// bytes would commit gigabytes; no match can reach further back than the
+/// data decoded so far, so the output and the verdict are the same. With
+/// no size declared (raw, `.lz`, an `.xz` Block Header without one, a
+/// `.lzma` of unknown size) the declared dictionary is taken as it is — a
+/// stated pure-tier deviation.
+fn window(dict_size: u32, size: Option<u64>) -> u32 {
+    let dict = dict_size.min(lzma_rust2::DICT_SIZE_MAX);
+    match size {
+        Some(n) => dict.min(u32::try_from(n.max(4096)).unwrap_or(u32::MAX)),
+        None => dict,
+    }
+}
+
 /// A raw filter chain's decoder (`lzma_raw_decoder`), also each `.xz`
 /// Block's payload.
 struct RawDec {
@@ -113,47 +130,47 @@ struct RawDec {
     /// After an LZMA1 stream's end: bytes taken in by earlier calls that
     /// follow the stream (`LzmaStream` reads ahead up to 40 bytes).
     leftover: Vec<u8>,
+    /// The dictionary window asked of `lzma-rust2` ([`window`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    window: u32,
 }
 
 impl RawDec {
-    /// The decoder for a validated chain.
-    fn new(chain: &[Filter]) -> Result<RawDec, XzError> {
+    /// The decoder for a validated chain whose uncompressed size, if
+    /// declared, is `size`.
+    fn new(chain: &[Filter], size: Option<u64>) -> Result<RawDec, XzError> {
         let (last, pre) = chain.split_last().ok_or(XzError::Options)?;
-        let lz = match last {
+        let (lz, w) = match last {
             Filter::Lzma2(l) => {
                 if l.preset_dict.is_some() {
                     return Err(XzError::Options);
                 }
-                Lz::Lzma2(Box::new(Lzma2Stream::new(l.dict_size)))
+                let w = window(l.dict_size, size);
+                (Lz::Lzma2(Box::new(Lzma2Stream::new(w))), w)
             }
             Filter::Lzma1(l) | Filter::Lzma1Ext(l) => {
-                return RawDec::lzma1(u64::MAX, l, pre, l.preset_dict.as_deref());
+                return RawDec::lzma1(None, l, pre, l.preset_dict.as_deref());
             }
             _ => return Err(XzError::Options),
         };
-        RawDec::with(lz, pre)
+        RawDec::with(lz, pre, w)
     }
 
-    /// LZMA1 of `size` (`u64::MAX`: unknown, ended by its marker).
+    /// LZMA1 of `size` (`None`: unknown, ended by its marker).
     fn lzma1(
-        size: u64,
+        size: Option<u64>,
         l: &Lzma,
         pre: &[Filter],
         preset_dict: Option<&[u8]>,
     ) -> Result<RawDec, XzError> {
-        let s = LzmaStream::new(
-            size,
-            l.lc,
-            l.lp,
-            l.pb,
-            l.dict_size.min(lzma_rust2::DICT_SIZE_MAX),
-            preset_dict,
-        )
-        .map_err(|_| XzError::Options)?;
-        RawDec::with(Lz::Lzma1(Box::new(s)), pre)
+        // A preset dictionary sits in the window too.
+        let w = window(l.dict_size, size.filter(|_| preset_dict.is_none()));
+        let s = LzmaStream::new(size.unwrap_or(u64::MAX), l.lc, l.lp, l.pb, w, preset_dict)
+            .map_err(|_| XzError::Options)?;
+        RawDec::with(Lz::Lzma1(Box::new(s)), pre, w)
     }
 
-    fn with(lz: Lz, pre: &[Filter]) -> Result<RawDec, XzError> {
+    fn with(lz: Lz, pre: &[Filter], window: u32) -> Result<RawDec, XzError> {
         let mut pipes = Vec::new();
         for f in pre.iter().rev() {
             let config = match *f {
@@ -183,6 +200,7 @@ impl RawDec {
             tmp: vec![0; OUT_CHUNK],
             ended: false,
             leftover: Vec::new(),
+            window,
         })
     }
 
@@ -711,6 +729,9 @@ struct XzDec {
     single: bool,
     /// `mem_direct_mode`: the memusage of the last Block decoded.
     mem_direct: u64,
+    /// The largest window a Block's decoder asked for.
+    #[cfg_attr(not(test), allow(dead_code))]
+    max_window: u32,
     /// The Stream Flags of the current Stream.
     flags: [u8; 2],
     blocks: HashInfo,
@@ -728,6 +749,7 @@ impl XzDec {
             memlimit: limit_of(o.memlimit),
             single,
             mem_direct: 0,
+            max_window: 0,
             flags: [0; 2],
             blocks: HashInfo::new(),
             pad_pos: 0,
@@ -780,7 +802,8 @@ impl XzDec {
                 limit: self.memlimit,
             });
         }
-        let raw = RawDec::new(&header.filters)?;
+        let raw = RawDec::new(&header.filters, header.uncompressed)?;
+        self.max_window = self.max_window.max(raw.window);
         self.mem_direct = mem;
         let check_size = check::check_size(check_id) as u64;
         Ok(BlockDec {
@@ -1012,7 +1035,7 @@ impl AloneDec {
                     }
                     let (lc, lp, pb) = lclppb_decode(h[0]).expect("checked at byte 1");
                     self.raw = Some(RawDec::lzma1(
-                        size,
+                        (size != u64::MAX).then_some(size),
                         &lzma_with(dict, lc, lp, pb),
                         &[],
                         None,
@@ -1174,7 +1197,7 @@ impl LzipDec {
                             limit: self.memlimit,
                         });
                     }
-                    let raw = RawDec::lzma1(u64::MAX, &lzma_with(dict, 3, 0, 2), &[], None)?;
+                    let raw = RawDec::lzma1(None, &lzma_with(dict, 3, 0, 2), &[], None)?;
                     self.seq = LzipSeq::Lzma(Box::new(raw));
                 }
                 LzipSeq::Lzma(raw) => {
@@ -1348,7 +1371,7 @@ impl Decoder {
                 if needed > limit {
                     return failed(self, XzError::MemLimit { needed, limit });
                 }
-                match RawDec::new(&o.raw_filters) {
+                match RawDec::new(&o.raw_filters, None) {
                     Ok(r) => Machine::Raw(Box::new(RawOnly(r))),
                     Err(e) => return failed(self, e),
                 }
@@ -1452,6 +1475,17 @@ impl Decoder {
         Progress {
             in_bytes: self.used - self.returned(),
             out_bytes: self.out_bytes,
+        }
+    }
+
+    /// The largest dictionary window asked of `lzma-rust2` so far.
+    #[cfg(test)]
+    pub(crate) fn window(&self) -> u32 {
+        match &self.machine {
+            Machine::Xz(x) => x.max_window,
+            Machine::Alone(a) => a.raw.as_ref().map_or(0, |r| r.window),
+            Machine::Raw(r) => r.0.window,
+            Machine::Lzip(_) | Machine::None => 0,
         }
     }
 

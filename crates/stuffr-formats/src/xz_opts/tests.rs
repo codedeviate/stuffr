@@ -2016,3 +2016,106 @@ fn reference_profile_is_xzs_list_figure() {
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A header declaring a 4 GiB dictionary over a few bytes of known size
+/// costs the pure tier a window of the size, not of the dictionary, and
+/// decodes as before: `.lzma` with a known size, and an `.xz` Block whose
+/// header carries its Uncompressed Size.
+#[cfg(feature = "xz-pure")]
+#[test]
+fn pure_window_is_capped_at_the_declared_size() {
+    use std::io::Write;
+    let plain = text(5_000, 51);
+    let decode = |o: &DecodeOptions, data: &[u8]| {
+        let mut d = crate::xz_opts::pure::Decoder::new(o).unwrap();
+        let mut out = Vec::new();
+        d.feed(data, &mut out).unwrap();
+        d.finish(&mut out).unwrap();
+        (out, d.window())
+    };
+    // `.lzma`, size known (no end marker), dictionary patched to 0xFFFFFFFF.
+    let opts = lzma_rust2::LzmaOptions::with_preset(1);
+    let mut w =
+        lzma_rust2::LzmaWriter::new(Vec::new(), &opts, true, false, Some(plain.len() as u64))
+            .unwrap();
+    w.write_all(&plain).unwrap();
+    let mut lzma = w.finish().unwrap();
+    lzma[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+    let o = DecodeOptions {
+        format: Format::Lzma,
+        ..DecodeOptions::default()
+    };
+    let (out, window) = decode(&o, &lzma);
+    assert!(out == plain);
+    assert_eq!(window, 5_000);
+    // `.xz`: one Block whose header records both sizes and declares LZMA2
+    // dictionary byte 40 (0xFFFFFFFF), built by hand around raw LZMA2.
+    let lzma2 = pure_codec::encode(
+        &EncodeOptions {
+            format: Format::Raw,
+            filters: vec![Filter::Lzma2(Lzma::preset(1, false).unwrap())],
+            ..EncodeOptions::default()
+        },
+        &plain,
+        plain.len(),
+    )
+    .unwrap();
+    let xz = xz_one_block(&lzma2, plain.len() as u64, 40);
+    let (out, window) = decode(&DecodeOptions::default(), &xz);
+    assert!(out == plain);
+    assert_eq!(window, 5_000);
+    // Without a declared size, the window is the dictionary's.
+    let o = EncodeOptions {
+        filters: vec![Filter::Lzma2(Lzma::preset(1, false).unwrap())],
+        ..EncodeOptions::default()
+    };
+    let packed = pure_codec::encode(&o, &plain, plain.len()).unwrap();
+    let (out, window) = decode(&DecodeOptions::default(), &packed);
+    assert!(out == plain);
+    assert_eq!(window, 1 << 20);
+}
+
+/// A one-Block `.xz` Stream (no check) around raw LZMA2 data, its Block
+/// Header recording both sizes and LZMA2 dictionary byte `dict_prop`.
+#[cfg(feature = "xz-pure")]
+fn xz_one_block(lzma2: &[u8], uncompressed: u64, dict_prop: u8) -> Vec<u8> {
+    use super::check::crc32;
+    fn vli(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    let mut out = vec![0xFD, b'7', b'z', b'X', b'Z', 0, 0, 0];
+    out.extend_from_slice(&crc32(&[0, 0], 0).to_le_bytes());
+    let mut h = vec![0, 0xC0];
+    vli(lzma2.len() as u64, &mut h);
+    vli(uncompressed, &mut h);
+    h.extend_from_slice(&[0x21, 0x01, dict_prop]);
+    let size = (h.len() + 4 + 3) & !3;
+    h[0] = (size / 4 - 1) as u8;
+    h.resize(size - 4, 0);
+    let crc = crc32(&h, 0);
+    h.extend_from_slice(&crc.to_le_bytes());
+    let unpadded = (h.len() + lzma2.len()) as u64;
+    out.extend_from_slice(&h);
+    out.extend_from_slice(lzma2);
+    out.resize(out.len().next_multiple_of(4), 0);
+    let start = out.len();
+    out.push(0);
+    vli(1, &mut out);
+    vli(unpadded, &mut out);
+    vli(uncompressed, &mut out);
+    out.resize(start + (out.len() - start).next_multiple_of(4), 0);
+    let crc = crc32(&out[start..], 0);
+    out.extend_from_slice(&crc.to_le_bytes());
+    let mut tail = (((out.len() - start) / 4 - 1) as u32)
+        .to_le_bytes()
+        .to_vec();
+    tail.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(&crc32(&tail, 0).to_le_bytes());
+    out.extend_from_slice(&tail);
+    out.extend_from_slice(b"YZ");
+    out
+}

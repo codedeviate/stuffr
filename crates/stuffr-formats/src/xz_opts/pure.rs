@@ -71,6 +71,14 @@
 //!   which liblzma calls [`XzError::Data`]. The exit status is the same;
 //!   the message is "Unexpected end of input" for "Compressed data is
 //!   corrupt". `.xz` is not affected: its container ends each Block.
+//! - **Memory for a declared dictionary:** `lzma-rust2` zero-fills its whole
+//!   window when it allocates it, where liblzma only reserves it. The
+//!   window is capped at the declared uncompressed size wherever there is
+//!   one (a `.lzma` of known size, an `.xz` Block Header recording its
+//!   Uncompressed Size), which changes neither output nor verdict. Where
+//!   none is declared (raw, `.lz`, `.xz` Blocks without one, `.lzma` of
+//!   unknown size), a stream declaring a dictionary far larger than it
+//!   needs commits that memory on the pure tier; a memory limit bounds it.
 //! - **`.lzma` with a known size and an end marker:** liblzma accepts the
 //!   marker (`LZMA_LZMA1EXT_ALLOW_EOPM`); `LzmaStream` does not, so the
 //!   pure tier calls it corrupt. No encoder `xz` knows writes it.
