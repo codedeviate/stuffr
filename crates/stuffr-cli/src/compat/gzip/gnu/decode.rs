@@ -516,15 +516,23 @@ fn lzw<R: Read + Send + 'static>(
         note(Note::ZFlags(flags & 0x60));
     }
     let start = sink.n;
-    let mut r =
-        sniff::foreign_reader(Detected::Compress, Box::new(s)).map_err(|_| Fail::ZCorrupt(0))?;
+    // The decoder words its own findings as `InvalidData` ("corrupt
+    // input."); any other kind is the source's, a read error.
+    let fail = |e: io::Error, written: u64| {
+        if e.kind() == io::ErrorKind::InvalidData {
+            Fail::ZCorrupt(written)
+        } else {
+            Fail::Read(e)
+        }
+    };
+    let mut r = sniff::foreign_reader(Detected::Compress, Box::new(s)).map_err(|e| fail(e, 0))?;
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = match r.read(&mut buf) {
             Ok(0) => return Ok(()),
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return Err(Fail::ZCorrupt(sink.n - start)),
+            Err(e) => return Err(fail(e, sink.n - start)),
         };
         sink.write_all(&buf[..n]).map_err(Fail::Write)?;
     }
@@ -630,5 +638,66 @@ fn inflate_raw<R: Read>(s: &mut Stream<R>, sink: &mut Sink<'_>) -> Result<(), Fa
             _ if used == 0 && made == 0 => return Err(Fail::FormatViolated),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `.Z` source that gives its header and a few bytes, then fails with
+    /// `kind`.
+    struct Failing {
+        head: Vec<u8>,
+        kind: io::ErrorKind,
+    }
+
+    impl Read for Failing {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.head.is_empty() {
+                return Err(io::Error::from(self.kind));
+            }
+            let n = buf.len().min(self.head.len());
+            buf[..n].copy_from_slice(&self.head[..n]);
+            self.head.drain(..n);
+            Ok(n)
+        }
+    }
+
+    fn lzw_over(head: &[u8], kind: io::ErrorKind) -> Result<(), Fail> {
+        let (counted, _) = Counted::new(Failing {
+            head: head.to_vec(),
+            kind,
+        });
+        let s = Lookahead::new(counted);
+        let mut out = Vec::new();
+        let mut sink = Sink {
+            inner: &mut out,
+            n: 0,
+            crc: flate2::Crc::new(),
+            failed: false,
+        };
+        lzw(s, &mut sink, &mut |_| {})
+    }
+
+    /// Fix round 1: a read error under a `.Z` is a read error (GNU's
+    /// `gzip: NAME: strerror` shape), and only the decoder's own
+    /// `InvalidData` is "corrupt input.".
+    #[test]
+    fn a_read_error_under_lzw_is_not_corruption() {
+        if sniff::detect(&mut Lookahead::new(&b"\x1f\x9d\x90\x00"[..]), Flavour::Gnu).unwrap()
+            != Detected::Compress
+        {
+            return; // no `compress` codec in this build
+        }
+        let head = b"\x1f\x9d\x90\x61\x00";
+        assert!(matches!(
+            lzw_over(head, io::ErrorKind::PermissionDenied),
+            Err(Fail::Read(e)) if e.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(matches!(
+            lzw_over(head, io::ErrorKind::InvalidData),
+            Err(Fail::ZCorrupt(_))
+        ));
     }
 }

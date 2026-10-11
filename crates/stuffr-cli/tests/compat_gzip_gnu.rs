@@ -1967,6 +1967,14 @@ mod differential {
             mtime: 1_234_567_890,
             ..plain_member(b"x")
         });
+        // The brief's ">4 GiB ISIZE wraparound", made cheap. A true
+        // wraparound needs a member over 4 GiB, whose ISIZE (length mod
+        // 2^32) is honest, and GNU 1.12+ lists the decoded count, not the
+        // field; decoding 4 GiB per side is too slow for this suite. Any
+        // member small enough to build has length < 2^32, so the only way
+        // to make ISIZE disagree with the data is to make it lie, and
+        // len + 1 is the smallest lie: it pins that GNU (and stuffr)
+        // decode and report a length error instead of trusting the field.
         let lies = member_with(plain_member(&t), None, Some(t.len() as u32 + 1));
         let crc = member_with(plain_member(&t), Some(1), None);
         let junk = [small.clone(), b"junk".to_vec()].concat();
