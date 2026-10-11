@@ -226,6 +226,12 @@ pub mod tar_salvage;
 pub mod xz_c;
 #[cfg(feature = "xz-pure")]
 pub mod xz_pure;
+// The `xz` compatibility family's options seam over liblzma (C tier) and
+// lzma-rust2 (pure tier), reached through `stuffr-cli` only; not part of the
+// public surface.
+#[cfg(any(feature = "xz-c", feature = "xz-pure"))]
+#[doc(hidden)]
+pub mod xz_opts;
 #[cfg(feature = "zip")]
 pub mod zip;
 #[cfg(feature = "zip")]

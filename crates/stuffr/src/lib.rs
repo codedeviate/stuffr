@@ -35,6 +35,14 @@ pub mod pack_stream {
 pub mod xz_stream {
     pub use stuffr_formats::xz_c::RawXz;
 }
+/// The `xz` tool's options seam — filter chains, checks, threads, block
+/// lists — and the streaming coder over them, what the `stuffr` binary's xz
+/// compatibility family runs. Not part of the stable API.
+#[cfg(any(feature = "xz-c", feature = "xz-pure"))]
+#[doc(hidden)]
+pub mod xz_opts {
+    pub use stuffr_formats::xz_opts::*;
+}
 /// Raw deflate through C zlib, byte-identical to stock zlib's — what the
 /// `stuffr` binary's Apple gzip personality compresses with on the C tier.
 /// Not part of the stable API.
