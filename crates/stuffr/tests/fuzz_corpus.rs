@@ -741,6 +741,10 @@ const COMPAT_SHAPES: &[&str] = &[
     "gunzip-bsd-damaged",
     "gunzip-gnu-lzh",
     "zcat-bsd-appends-dot-z",
+    // Fix round 2: a file that decompresses, then an empty standard input
+    // that fails (exit 1): the file's output is legitimate, not a partial.
+    "gunzip-gnu-file-then-empty-stdin",
+    "gunzip-bsd-file-then-empty-stdin",
 ];
 
 /// A bzip2 stream of `plain` at `level`, through this build's encoder.
@@ -1132,6 +1136,7 @@ fn gzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         }
         "test-pack" => g(&["-t", "a.z"], &["a.z"], false, &pack_ab(&ab_text())),
         "damaged" => g(&["a.gz"], &["a.gz"], false, &damaged(&gz)),
+        "file-then-empty-stdin" => g(&["a.gz", "-"], &["a.gz"], false, &gz),
         "lzh" => {
             let mut v = vec![0x1f, 0xa0];
             v.extend_from_slice(&text[..64]);

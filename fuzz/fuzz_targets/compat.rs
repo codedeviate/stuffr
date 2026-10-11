@@ -299,8 +299,9 @@ fn run_bzip2(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
 }
 
 /// The arguments in operand position: after `--`, everything; before it,
-/// anything not starting with `-` that is not `-S`/`--suffix`'s value
-/// (both getopts permute, and `-` alone is standard input, no file).
+/// `-` alone (standard input; no file name starts with it, so it names no
+/// path in the read bound) and anything not starting with `-` that is not
+/// `-S`/`--suffix`'s value (both getopts permute).
 fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
     let mut out = Vec::new();
     let (mut after_dashes, mut suffix_value) = (false, false);
@@ -313,7 +314,7 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
             after_dashes = true;
         } else if a == "-S" || a == "--suffix" {
             suffix_value = true;
-        } else if !a.starts_with('-') {
+        } else if a == "-" || !a.starts_with('-') {
             out.push(a);
         }
     }
@@ -372,8 +373,9 @@ fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], pa
     check_gzip_no_partial(dir, name, flavour, args, code, &err, payload, &before);
 }
 
-/// A failed run leaves no partial output: a run with exactly one operand
-/// (`operands`) that fails creates or changes no file in its directory,
+/// A failed run leaves no partial output: a run whose only operand
+/// (`operands`) is one file, so that standard input is not read, creates
+/// or changes no file in its directory when it fails,
 /// where "fails" is:
 ///
 /// - GNU: exit 1, unless standard error carries a later member's header
@@ -392,8 +394,10 @@ fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], pa
 ///
 /// Not detected: a partial output in a run with several operands (which
 /// one failed is not known from outside, and an earlier one's output is
-/// legitimate), with no operand (standard input goes to standard output),
-/// or one that a GNU later-header refusal's message accompanies.
+/// legitimate), in a run that reads standard input at all (a `-` operand,
+/// or no operand: its failure may follow a file operand's whole output, as
+/// in `gunzip a.gz -` with an empty standard input), or one that a GNU
+/// later-header refusal's message accompanies.
 #[allow(clippy::too_many_arguments)]
 fn check_gzip_no_partial(
     dir: &Path,
@@ -405,7 +409,8 @@ fn check_gzip_no_partial(
     payload: &[u8],
     before: &Contents,
 ) {
-    if operands(args).len() != 1 || code != 1 {
+    let operands = operands(args);
+    if operands.len() != 1 || operands.contains(&"-") || code != 1 {
         return;
     }
     let text = String::from_utf8_lossy(err);
