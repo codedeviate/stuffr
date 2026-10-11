@@ -110,6 +110,9 @@ pub(super) struct Settings {
     pub(super) no_name: bool,
     /// `-n`/`-N`/`-m`/`-M`: the modification time is not stored.
     pub(super) no_time: bool,
+    /// Decompressing: `-N` was the last of `-n`/`-N`, so the stored name
+    /// and time are restored (`-n` is the default when decompressing).
+    pub(super) restore: bool,
     pub(super) level: u32,
     pub(super) suffix: Vec<u8>,
     /// `---presume-input-tty`: standard input counts as a terminal.
@@ -289,6 +292,7 @@ pub(super) fn parse(
         verbose: 0,
         no_name: false,
         no_time: false,
+        restore: false,
         level: 6,
         suffix: b".gz".to_vec(),
         presume_tty: false,
@@ -371,10 +375,12 @@ fn apply(
         Key::Ch(b'n') => {
             s.no_name = true;
             s.no_time = true;
+            s.restore = false;
         }
         Key::Ch(b'N') => {
             s.no_name = false;
             s.no_time = false;
+            s.restore = true;
         }
         Key::Ch(b'q') => {
             s.quiet = true;
@@ -547,7 +553,9 @@ mod tests {
         let s = run(&["-Nm"], &[]).0.unwrap();
         assert!(!s.no_name && s.no_time);
         let s = run(&["-n", "-N"], &[]).0.unwrap();
-        assert!(!s.no_name && !s.no_time);
+        assert!(!s.no_name && !s.no_time && s.restore);
+        assert!(!run(&["-N", "-n"], &[]).0.unwrap().restore);
+        assert!(!run(&[], &[]).0.unwrap().restore);
     }
 
     #[test]

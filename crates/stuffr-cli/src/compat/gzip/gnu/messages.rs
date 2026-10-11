@@ -11,8 +11,8 @@
 //! The deliberate changes: `--version`/`-V`/`-L` (and the `gunzip`/`zcat`
 //! scripts' `--version`) name stuffr and its version on the first line and
 //! print stuffr's own MIT notice after it, never GNU's (Ruling T7-2).
-//! [`BSD_NOT_BUILT`] and [`NOT_YET`] are stuffr's own, for paths later
-//! tasks fill in.
+//! [`BSD_NOT_BUILT`] is stuffr's own, for the flavour a later task fills
+//! in.
 
 pub(super) use crate::compat::host::printf;
 
@@ -250,6 +250,160 @@ pub(super) const STDIN_NAME: &[u8] = b"stdin";
 /// not reproduced); the shape is the one every other file error has.
 pub(super) const IO_FAILED: &str = "%s: %s: %s\n";
 
+// ---- decompression, -t and -l ----
+//
+// A leading `\n` is part of the text where the binary prints one: it does
+// for every data error and for a failure to create the output, whether or
+// not anything was written before it (observed: `gzip -dc empty.gz` prints
+// `\ngzip: empty.gz: unexpected end of file`), and not for the refusals
+// read from a header's fixed fields (method, flags) or a suffix.
+
+/// Observed: `gzip -d < x.gz` with a terminal on standard input (also `-t`;
+/// `-l` reads the terminal; exit 1, the run stops; `-q` silences it).
+pub(super) const NOT_FROM_TERMINAL: &str = concat!(
+    "%s: compressed data not read from a terminal. ",
+    "Use -f to force decompression.\n",
+    "For help, type: %s -h\n"
+);
+
+/// Observed: `gzip -d f.x` (exit 2; with `-q` silent and exit 0; under `-r`
+/// only with `-v`).
+pub(super) const UNKNOWN_SUFFIX: &str = "%s: %s: unknown suffix -- ignored\n";
+
+/// Observed: `gzip -dc notgz` (exit 1, the run goes on).
+pub(super) const NOT_GZIP: &str = "\n%s: %s: not in gzip format\n";
+
+/// Observed: `gzip -dc` on an empty, a one-byte or a cut-short input (exit
+/// 1, the run stops there).
+pub(super) const UNEXPECTED_EOF: &str = "\n%s: %s: unexpected end of file\n";
+
+/// Observed: `gzip -dc` on a member whose CRC32 trailer is wrong.
+pub(super) const CRC_ERROR: &str = "\n%s: %s: invalid compressed data--crc error\n";
+
+/// Observed: `gzip -dc` on a member whose ISIZE trailer is wrong, and on a
+/// pack stream whose length field is.
+pub(super) const LENGTH_ERROR: &str = "\n%s: %s: invalid compressed data--length error\n";
+
+/// Observed: `gzip -dc` on a zip entry whose data descriptor is wrong or
+/// cut short.
+pub(super) const CRC_LENGTH_ERROR: &str = "\n%s: %s: invalid compressed data--crc/length error\n";
+
+/// Observed: `gzip -dc` on a corrupt deflate body (the run stops there).
+pub(super) const FORMAT_VIOLATED: &str = "\n%s: %s: invalid compressed data--format violated\n";
+
+/// Observed: `gzip -dc` on a member whose method byte is 7.
+pub(super) const UNKNOWN_METHOD: &str = "%s: %s: unknown method %d -- not supported\n";
+
+/// Observed: `gzip -dc` on a member with flag bit 0x20 set (any others too).
+pub(super) const ENCRYPTED: &str = "%s: %s is encrypted -- not supported\n";
+
+/// Observed: `gzip -dc` on a member with flag 0x40 or 0x80 set and not
+/// 0x20; the whole flag byte is printed (`0x48`).
+pub(super) const HAS_FLAGS: &str = "%s: %s has flags 0x%s -- not supported\n";
+
+/// Observed: `gzip -dc` on a member whose FHCRC is wrong: the stored and
+/// the computed value, `%04x` (exit 1, the run goes on).
+pub(super) const HEADER_CRC: &str = "%s: %s: header checksum 0x%s != computed checksum 0x%s\n";
+
+/// Observed: `gzip -dcv` on a member with FEXTRA (only with `-v`).
+pub(super) const EXTRA_FIELD: &str = "%s: %s: extra field of %d bytes ignored\n";
+
+/// Observed: `gzip -dc` on a member followed by bytes not all zero (exit 2;
+/// `-q` silences it).
+pub(super) const TRAILING_GARBAGE: &str = "\n%s: %s: decompression OK, trailing garbage ignored\n";
+
+/// Observed: `gzip -dcv` on a member followed by zero bytes (only with
+/// `-v`, then exit 2; silent and exit 0 otherwise).
+pub(super) const TRAILING_ZEROS: &str = "\n%s: %s: decompression OK, trailing zero bytes ignored\n";
+
+/// Observed: `gzip -dc` on a zip whose first entry has flag bit 0 set.
+pub(super) const ZIP_ENCRYPTED: &str = "\n%s: %s: encrypted file -- use unzip\n";
+
+/// Observed: `gzip -dc` on a zip whose first entry is bzip2 (12) or LZMA.
+pub(super) const ZIP_METHOD: &str = "\n%s: %s: first entry not deflated or stored -- use unzip\n";
+
+/// Observed: `gzip -dc` on a zip entry whose uncompressed size field is
+/// `ffffffff` (what `zip - -` writes).
+pub(super) const ZIP64: &str = "\n%s: %s: Zip64 entry -- not supported, use unzip\n";
+
+/// Observed: `gzip -dc` on `PK\3\4` alone, a cut-short local header, and a
+/// stored entry with a data descriptor or unequal sizes.
+pub(super) const ZIP_INVALID: &str = "\n%s: %s: not a valid zip file\n";
+
+/// Observed: `gzip -dc two.zip` (exit 2; `-q` silences it; also `-t`, `-l`).
+pub(super) const ZIP_MORE: &str = "%s: %s has more than one entry--rest ignored\n";
+
+/// Observed: `gzip -d -S .zip two.zip` (exit 1, no output, the run stops).
+pub(super) const ZIP_MORE_UNCHANGED: &str = "%s: %s has more than one entry -- unchanged\n";
+
+/// Observed: `gzip -dc` on a `.Z` whose header says 17 bits.
+pub(super) const Z_BITS: &str = "\n%s: %s: compressed with %d bits, can only handle %d bits\n";
+
+/// Observed: `gzip -dc` on a `.Z` whose header byte has 0x60 set (exit 2,
+/// then it decodes; `-q` silences it).
+pub(super) const Z_FLAGS: &str = "\n%s: %s: warning, unknown flags 0x%s\n";
+
+/// Observed: `gzip -dc` (and `-t`) on a `.Z` with a code past the table
+/// (exit 1, the run stops).
+pub(super) const Z_CORRUPT: &str = "\n%s: %s: corrupt input.\n";
+
+/// Observed: `gzip -d` (to a file) on the same `.Z`.
+pub(super) const Z_CORRUPT_FILE: &str = "\n%s: %s: corrupt input. Use zcat to recover some data.\n";
+
+/// Observed: `gzip -dc` on a pack stream whose code lengths leave codes
+/// unused (exit 1, the run stops).
+pub(super) const PACK_FEW: &str = "\n%s: %s: too few leaves in Huffman tree\n";
+
+/// Observed: `gzip -dc` on a pack stream whose code lengths oversubscribe
+/// the tree, or that has more than 257 leaves.
+pub(super) const PACK_MANY: &str = "\n%s: %s: too many leaves in Huffman tree\n";
+
+/// Observed: `gzip -dc` on a pack stream claiming 0 or more than 25 levels.
+pub(super) const PACK_BIT_LENGTH: &str =
+    "\n%s: %s: invalid compressed data -- Huffman code bit length out of range\n";
+
+/// Observed: `gzip -dN` on a member whose FNAME is empty: the output could
+/// not be created (`%s` the OS's text).
+pub(super) const CREATE_FAILED: &str = "\n%s: %s: %s\n";
+
+/// Observed: `gzip -tv a.gz`, after the name.
+pub(super) const TEST_OK: &str = " OK\n";
+
+/// Observed: `gzip -l` on standard input: the name column.
+pub(super) const LIST_STDIN_NAME: &[u8] = b"stdout";
+
+/// Observed: `gzip -l a.gz`.
+pub(super) const LIST_HEADER: &str =
+    "         compressed        uncompressed  ratio uncompressed_name\n";
+
+/// Observed: `gzip -lv a.gz`.
+pub(super) const LIST_HEADER_VERBOSE: &str = concat!(
+    "method  crc     date  time  ",
+    "         compressed        uncompressed  ratio uncompressed_name\n"
+);
+
+/// Observed: `gzip -l a.gz b.gz`: the last line's name column.
+pub(super) const LIST_TOTALS: &[u8] = b"(totals)";
+
+/// Observed: `gzip -lv`'s method column, by the last member's format.
+pub(super) const METHOD_DEFLATE: &str = "defla";
+/// Observed: `gzip -lv` on a stored zip entry.
+pub(super) const METHOD_STORED: &str = "store";
+/// Observed: `gzip -lv a.Z`.
+pub(super) const METHOD_COMPRESS: &str = "compr";
+/// Observed: `gzip -lv a.z` (a pack stream).
+pub(super) const METHOD_PACK: &str = "pack ";
+
+/// Observed: `gzip -lv` on anything whose last member is not gzip: the CRC
+/// column is `-1` printed as a 64-bit hex number.
+pub(super) const NO_CRC: &str = "ffffffffffffffff";
+
+/// Observed: `gzip -lv`'s date column: month, day and time of day, never
+/// the year (`Jan  1 01:00` for time 0 in CET).
+pub(super) const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 // ---- stuffr's own ----
 
 /// stuffr's own: Apple's personality is built by a later task.
@@ -257,11 +411,6 @@ pub(super) const BSD_NOT_BUILT: &str = concat!(
     "%s: stuffr's BSD gzip personality is not built yet; ",
     "set STUFFR_GZIP_FLAVOR=gnu\n"
 );
-
-/// stuffr's own: GNU decompression, `-t` and `-l` are built by a later
-/// task.
-pub(super) const NOT_YET: &str =
-    "%s: decompression, -t and -l are not built yet in stuffr's GNU personality\n";
 
 /// GNU's `-v` ratio, `%5.1f%%` of `100 * (in - out) / in`, where `out`
 /// counts the deflate body only (header and trailer excluded); matched

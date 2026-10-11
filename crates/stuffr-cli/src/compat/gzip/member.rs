@@ -40,7 +40,7 @@ pub(crate) enum Fault {
     BadMagic,
     BadMethod(u8),
     BadFlags(u8),
-    BadHeaderCrc,
+    BadHeaderCrc { stored: u16, computed: u16 },
     Truncated(Where),
     Data,
     Crc { stored: u32, computed: u32 },
@@ -133,27 +133,49 @@ impl HeaderReader<'_> {
 }
 
 /// Read one header from `r`; `Truncated(Header)` at EOF inside it.
+///
+/// The magic is `1f 8b`, or the old gzip's `1f 9e`, which both references
+/// decode as gzip (Apple's `file_gettype` lists it; GNU 1.15 was observed
+/// to: `gzip -dc` on a member whose second magic byte is `0x9e`, and on
+/// one following a `1f 8b` member, prints the data, exit 0).
 pub(crate) fn read_header<R: Read>(r: &mut Lookahead<R>) -> Result<Header, MemberError> {
+    read_header_with(r, &mut |_| {})
+}
+
+/// [`read_header`], calling `on_extra` with FEXTRA's length as soon as it
+/// is read, before the field itself: GNU's `-v` reports the length even
+/// when the field is then cut short.
+pub(crate) fn read_header_with<R: Read>(
+    r: &mut Lookahead<R>,
+    on_extra: &mut dyn FnMut(usize),
+) -> Result<Header, MemberError> {
     let mut hr = HeaderReader {
         r,
         crc: flate2::Crc::new(),
         len: 0,
     };
-    let fixed = hr.bytes(10)?;
-    if fixed[0] != 0x1f || fixed[1] != 0x8b {
+    // Each fixed field is judged as soon as it is read, so a member cut
+    // short after a bad method byte reports the method, not the shortfall
+    // (observed: GNU 1.15 on `1f 8b` + `junk` says "unknown method 106").
+    let mut fixed = hr.bytes(2)?;
+    if fixed[0] != 0x1f || (fixed[1] != 0x8b && fixed[1] != 0x9e) {
         return Err(MemberError::Fault(Fault::BadMagic));
     }
+    fixed.extend(hr.bytes(1)?);
     if fixed[2] != 8 {
         return Err(MemberError::Fault(Fault::BadMethod(fixed[2])));
     }
+    fixed.extend(hr.bytes(1)?);
     let flg = fixed[3];
     if flg & 0xe0 != 0 {
         return Err(MemberError::Fault(Fault::BadFlags(flg)));
     }
+    fixed.extend(hr.bytes(6)?);
     let mtime = u32::from_le_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
     let extra = if flg & FEXTRA != 0 {
         let l = hr.bytes(2)?;
         let n = usize::from(u16::from_le_bytes([l[0], l[1]]));
+        on_extra(n);
         Some(hr.bytes(n)?)
     } else {
         None
@@ -172,8 +194,9 @@ pub(crate) fn read_header<R: Read>(r: &mut Lookahead<R>) -> Result<Header, Membe
     if hcrc {
         let computed = (hr.crc.sum() & 0xffff) as u16;
         let stored = hr.bytes(2)?;
-        if u16::from_le_bytes([stored[0], stored[1]]) != computed {
-            return Err(MemberError::Fault(Fault::BadHeaderCrc));
+        let stored = u16::from_le_bytes([stored[0], stored[1]]);
+        if stored != computed {
+            return Err(MemberError::Fault(Fault::BadHeaderCrc { stored, computed }));
         }
     }
     Ok(Header {
@@ -605,6 +628,36 @@ mod tests {
     }
 
     #[test]
+    fn the_old_magic_reads_as_gzip_and_others_do_not() {
+        let mut b = member(&hdr(), 6, b"old");
+        b[1] = 0x9e;
+        let mut r = la(&b[..]);
+        let h = read_header(&mut r).unwrap();
+        let mut out = Vec::new();
+        inflate_member(&mut r, h, &mut out).unwrap();
+        assert_eq!(out, b"old");
+        b[1] = 0x9d;
+        assert!(matches!(
+            read_header(&mut la(&b[..])),
+            Err(MemberError::Fault(Fault::BadMagic))
+        ));
+    }
+
+    #[test]
+    fn the_extra_length_is_reported_before_the_field() {
+        let mut h = hdr();
+        h.extra = Some(vec![7; 10]);
+        let b = member(&h, 6, b"x");
+        let mut seen = Vec::new();
+        let r = read_header_with(&mut la(&b[..14]), &mut |n| seen.push(n));
+        assert!(matches!(
+            r,
+            Err(MemberError::Fault(Fault::Truncated(Where::Header)))
+        ));
+        assert_eq!(seen, [10]);
+    }
+
+    #[test]
     fn reserved_flag_bits() {
         let mut b = member(&hdr(), 6, b"x");
         b[3] = 0x20;
@@ -624,7 +677,7 @@ mod tests {
         let mut r = la(&b[..]);
         assert!(matches!(
             read_header(&mut r),
-            Err(MemberError::Fault(Fault::BadHeaderCrc))
+            Err(MemberError::Fault(Fault::BadHeaderCrc { .. }))
         ));
     }
 

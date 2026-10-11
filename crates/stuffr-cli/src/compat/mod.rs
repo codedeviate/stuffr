@@ -121,11 +121,21 @@ pub(crate) fn stdout_is_tty() -> bool {
 /// before the read. `to` is opened for writing to set the times, so call
 /// this before restricting `to`'s permissions any further.
 pub(crate) fn copy_metadata_from(meta: &std::fs::Metadata, to: &Path) -> io::Result<()> {
+    copy_metadata_with_mtime(meta, to, None)
+}
+
+/// [`copy_metadata_from`], with `mtime` as the modification time instead of
+/// `meta`'s when given (a gzip header's stored time, under `gunzip -N`).
+pub(crate) fn copy_metadata_with_mtime(
+    meta: &std::fs::Metadata,
+    to: &Path,
+    mtime: Option<std::time::SystemTime>,
+) -> io::Result<()> {
     let mut times = std::fs::FileTimes::new();
     if let Ok(t) = meta.accessed() {
         times = times.set_accessed(t);
     }
-    if let Ok(t) = meta.modified() {
+    if let Some(t) = mtime.or_else(|| meta.modified().ok()) {
         times = times.set_modified(t);
     }
     std::fs::File::options()

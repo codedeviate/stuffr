@@ -33,6 +33,27 @@
 //! - `-v` prints the name before compressing and the ratio after, so a
 //!   timestamp warning lands between them.
 //!
+//! Decompression, `-t` and `-l` (`run/decompress.rs`, `decode.rs`,
+//! `unpack.rs`, `list.rs`; each module doc lists what the binary showed):
+//!
+//! - gzip (and the old magic `1f 9e`), `.Z`, pack and a zip's first entry;
+//!   members of any of the first three may follow one another;
+//! - a missing operand is looked for with a suffix added; `-N` restores the
+//!   stored name's last component only, beside the input, and the last
+//!   stored time;
+//! - which failures end the whole run (truncation, a corrupt body, a
+//!   corrupt `.Z`, any pack failure, and CRC or length errors under `-d`)
+//!   and which do not, and that standard input refused at its header ends
+//!   it too;
+//! - a later member whose header is refused keeps the output and removes
+//!   the input, exit 1 (under `-k` the output goes instead); a run-ending
+//!   failure in an input's header removes the previous `-k` output;
+//! - `-f` copies what is not compressed when the output is standard
+//!   output, and trailing data after the last member likewise;
+//! - `-l` decodes every input in full, prints a totals line in place of an
+//!   input that does not decode cleanly, quotes names, and dates a piped
+//!   standard input with the previous input's time.
+//!
 //! Known deviations:
 //!
 //! - `--version`/`-V`/`-L` print stuffr's first line and its own MIT notice,
@@ -50,7 +71,15 @@
 //!   path.
 //! - Output is written under a temporary name and renamed into place, so an
 //!   interrupted run leaves a `.stuffr-gzip-*.tmp` file.
-//! - Decompression, `-t` and `-l` are not built yet (a later task).
+//! - LZH (`1f a0`, `compress -H`) is not decoded: a first member is "not in
+//!   gzip format", a later one trailing garbage (Ruling T5).
+//! - A `.Z` header claiming fewer than 9 bits is "corrupt input." before
+//!   any output; GNU writes a few bytes first.
+//! - A zip refused as "not a valid zip file" with its data-descriptor flag
+//!   set makes GNU check the *next* input's gzip trailer as a data
+//!   descriptor ("crc/length error"); that leaked state is not reproduced.
+//! - Read and write failures say `gzip: NAME: strerror`, exit 1, and end
+//!   the run: the shape every other file error has, not observed.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -58,8 +87,11 @@ use std::io::Write;
 use crate::compat::host::Host;
 
 mod args;
+mod decode;
+mod list;
 mod messages;
 mod run;
+mod unpack;
 
 use messages::{self as m, PROGRAM, printf};
 

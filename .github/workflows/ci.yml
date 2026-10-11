@@ -399,11 +399,13 @@ jobs:
       # GNU gzip, for the gzip suites. The harness addresses the keg by path
       # (`gnu_gzip_dir()`: /opt/homebrew/opt/gzip/bin), so it does not matter
       # whether brew links it; never `brew link` it, which would shadow
-      # Apple's /usr/bin/gzip (the other reference) on PATH.
-      - run: brew install gzip
+      # Apple's /usr/bin/gzip (the other reference) on PATH. ncompress makes
+      # the `.Z` inputs of `compat_gzip_gnu`'s foreign-format group (also by
+      # keg path: Apple's /usr/bin/compress is another program).
+      - run: brew install gzip ncompress
       # `CI` is set by Actions, so `require_reference` panics if a reference
-      # tool is missing instead of skipping. Tasks 8 and 10 add the gzip
-      # suites (`compat_gzip_gnu`, `compat_gzip_bsd`, `compat_gzip_bytes`) to
-      # this line and to a second, `--no-default-features --features
-      # pure,legacy`, run for the compatible tier.
-      - run: cargo test -p stuffr-cli --all-features --test compat_bzip2 --test compat_gzip_harness_selftest
+      # tool is missing instead of skipping. Task 10 adds `compat_gzip_bsd`
+      # and `compat_gzip_bytes` to both lines; the second runs the gzip
+      # suites again on the compatible tier.
+      - run: cargo test -p stuffr-cli --all-features --test compat_bzip2 --test compat_gzip_harness_selftest --test compat_gzip_gnu
+      - run: cargo test -p stuffr-cli --no-default-features --features pure,legacy --test compat_gzip_gnu

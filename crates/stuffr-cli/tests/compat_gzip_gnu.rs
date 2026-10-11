@@ -3,7 +3,10 @@
 //! Homebrew keg on macOS, the distribution's on Linux).
 //!
 //! Part 1 (0.12.0 Task 7): arguments, messages and compression. Part 2
-//! (Task 8) adds decompression, `-t`, `-l` and `-r`.
+//! (Task 8): decompression, `-t`, `-l` and `-r`, over inputs built here
+//! (gzip members by hand over flate2's raw deflate, pack by a small
+//! encoder, zip by hand, `.Z` by the system's `compress`), so both sides
+//! read the same bytes and every ratio is compared exactly.
 //!
 //! Compressed bytes are not promised identical (GNU's deflate is its own),
 //! so every case round-trips stuffr's output through the reference and
@@ -276,6 +279,17 @@ mod differential {
     /// compared" (M includes the known oracle skips, which are named); on CI
     /// every case not skipped for a known reason must have run.
     fn check_all_skipping(group: &str, cases: &[Case], skipped: Skipped) {
+        check_all_with(group, cases, skipped, true);
+    }
+
+    /// [`check_all_skipping`] without blanking `-v`'s ratios: for
+    /// decompression, whose inputs are the same bytes on both sides, so
+    /// every ratio is compared exactly.
+    fn check_exact(group: &str, cases: &[Case], skipped: Skipped) {
+        check_all_with(group, cases, skipped, false);
+    }
+
+    fn check_all_with(group: &str, cases: &[Case], skipped: Skipped, blank: bool) {
         let one = |c: &Case| -> Result<bool, String> {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let refc = renamed(c, reference_name(c.name));
@@ -286,7 +300,9 @@ mod differential {
                 script_usage(&mut r);
                 script_usage(&mut s);
                 version_text(&mut r, &mut s);
-                blank_both(&mut r, &mut s);
+                if blank {
+                    blank_both(&mut r, &mut s);
+                }
                 assert_same(c, &r, &s);
                 true
             }))
@@ -1077,5 +1093,1228 @@ mod differential {
             blank_lines("gzip: a.gz already exists;\tnot overwritten\n"),
             "gzip: a.gz already exists;\tnot overwritten\n"
         );
+    }
+
+    // ======== part 2: decompression, -t, -l, -r (Task 8) ========
+
+    // ---- fixtures, built here so both sides read the same bytes ----
+
+    /// A gzip member's header fields; `magic2` is `0x8b`, or `0x9e` for the
+    /// old magic.
+    #[derive(Clone, Copy)]
+    struct Member<'b> {
+        data: &'b [u8],
+        name: Option<&'b [u8]>,
+        mtime: u32,
+        extra: Option<&'b [u8]>,
+        comment: Option<&'b [u8]>,
+        hcrc: bool,
+        magic2: u8,
+    }
+
+    fn plain_member(data: &[u8]) -> Member<'_> {
+        Member {
+            data,
+            name: None,
+            mtime: 0,
+            extra: None,
+            comment: None,
+            hcrc: false,
+            magic2: 0x8b,
+        }
+    }
+
+    fn crc32(b: &[u8]) -> u32 {
+        let mut c = flate2::Crc::new();
+        c.update(b);
+        c.sum()
+    }
+
+    fn deflate_raw(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// One member, the header written by hand (RFC 1952) over flate2's raw
+    /// deflate; `crc`/`isize` override the trailer.
+    fn member_with(m: Member, crc: Option<u32>, isize: Option<u32>) -> Vec<u8> {
+        let mut flg = 0u8;
+        for (on, bit) in [
+            (m.hcrc, 2),
+            (m.extra.is_some(), 4),
+            (m.name.is_some(), 8),
+            (m.comment.is_some(), 16),
+        ] {
+            if on {
+                flg |= bit;
+            }
+        }
+        let mut v = vec![0x1f, m.magic2, 8, flg];
+        v.extend_from_slice(&m.mtime.to_le_bytes());
+        v.extend_from_slice(&[0, 3]);
+        if let Some(e) = m.extra {
+            v.extend_from_slice(&(e.len() as u16).to_le_bytes());
+            v.extend_from_slice(e);
+        }
+        for f in [m.name, m.comment].into_iter().flatten() {
+            v.extend_from_slice(f);
+            v.push(0);
+        }
+        if m.hcrc {
+            let c = (crc32(&v) & 0xffff) as u16;
+            v.extend_from_slice(&c.to_le_bytes());
+        }
+        v.extend(deflate_raw(m.data));
+        v.extend_from_slice(&crc.unwrap_or_else(|| crc32(m.data)).to_le_bytes());
+        v.extend_from_slice(&isize.unwrap_or(m.data.len() as u32).to_le_bytes());
+        v
+    }
+
+    fn member(m: Member) -> Vec<u8> {
+        member_with(m, None, None)
+    }
+
+    /// A member storing `name`.
+    fn gzm(data: &[u8], name: &[u8]) -> Vec<u8> {
+        member(Member {
+            name: Some(name),
+            ..plain_member(data)
+        })
+    }
+
+    /// The old Unix `pack` format: a canonical Huffman code in pack's
+    /// layout (level `i` holds codes of length `i + 1`, internal nodes take
+    /// a level's smallest codes, EOB is the last leaf), as
+    /// `stuffr-formats`' own `pack.rs` tests encode it.
+    fn pack(data: &[u8]) -> Vec<u8> {
+        let mut freq = [0u64; 256];
+        for &b in data {
+            freq[b as usize] += 1;
+        }
+        let mut syms: Vec<usize> = (0..256).filter(|&b| freq[b] > 0).collect();
+        if syms.is_empty() {
+            syms.push(0);
+        }
+        let n = syms.len() + 1;
+        let mut w: Vec<u64> = syms.iter().map(|&b| freq[b]).collect();
+        w.push(0);
+        let mut parent = vec![usize::MAX; 2 * n];
+        let mut live: Vec<usize> = (0..n).collect();
+        while live.len() > 1 {
+            live.sort_by_key(|&i| std::cmp::Reverse((w[i], i)));
+            let a = live.pop().unwrap();
+            let b = live.pop().unwrap();
+            let p = w.len();
+            w.push(w[a] + w[b]);
+            parent[a] = p;
+            parent[b] = p;
+            live.push(p);
+        }
+        let len: Vec<usize> = (0..n)
+            .map(|i| {
+                let (mut d, mut c) = (0, i);
+                while parent[c] != usize::MAX {
+                    c = parent[c];
+                    d += 1;
+                }
+                d
+            })
+            .collect();
+        let maxlen = *len.iter().max().unwrap();
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| (len[i], i == n - 1, i));
+        let mut count = vec![0usize; maxlen];
+        for &i in &order {
+            count[len[i] - 1] += 1;
+        }
+        let mut inodes = vec![0u32; maxlen];
+        for l in (0..maxlen - 1).rev() {
+            inodes[l] = (inodes[l + 1] + count[l + 1] as u32) / 2;
+        }
+        let mut code = vec![0u32; n];
+        let mut at = vec![0u32; maxlen];
+        for &i in &order {
+            let l = len[i] - 1;
+            code[i] = inodes[l] + at[l];
+            at[l] += 1;
+        }
+        let mut out = vec![0x1f, 0x1e];
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.push(maxlen as u8);
+        for (l, &c) in count.iter().enumerate() {
+            out.push(if l + 1 == maxlen { c - 2 } else { c } as u8);
+        }
+        for &i in &order {
+            if i != n - 1 {
+                out.push(syms[i] as u8);
+            }
+        }
+        let mut pos = [usize::MAX; 256];
+        for (k, &b) in syms.iter().enumerate() {
+            pos[b] = k;
+        }
+        let (mut acc, mut nb) = (0u32, 0u32);
+        let mut put = |c: u32, l: usize, out: &mut Vec<u8>| {
+            for bit in (0..l).rev() {
+                acc = (acc << 1) | ((c >> bit) & 1);
+                nb += 1;
+                if nb == 8 {
+                    out.push(acc as u8);
+                    acc = 0;
+                    nb = 0;
+                }
+            }
+        };
+        for &b in data {
+            let k = pos[b as usize];
+            put(code[k], len[k], &mut out);
+        }
+        put(code[n - 1], len[n - 1], &mut out);
+        if nb > 0 {
+            out.push((acc << (8 - nb)) as u8);
+        }
+        out
+    }
+
+    /// A zip entry: method 0 (stored) or 8 (deflated); any other method's
+    /// data is the plain bytes (GNU refuses those before reading). With
+    /// flag 8 the sizes and CRC follow in a signed data descriptor.
+    struct ZipEntry<'b> {
+        name: &'b [u8],
+        data: &'b [u8],
+        method: u16,
+        flags: u16,
+    }
+
+    fn zip(entries: &[ZipEntry]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for e in entries {
+            let body = if e.method == 8 {
+                deflate_raw(e.data)
+            } else {
+                e.data.to_vec()
+            };
+            let crc = crc32(e.data);
+            let dd = e.flags & 8 != 0;
+            let offset = out.len() as u32;
+            let (lcrc, lc, lu) = if dd {
+                (0, 0, 0)
+            } else {
+                (crc, body.len() as u32, e.data.len() as u32)
+            };
+            out.extend_from_slice(b"PK\x03\x04");
+            for v in [20u16, e.flags, e.method, 0, 0] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [lcrc, lc, lu] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(e.name);
+            out.extend_from_slice(&body);
+            if dd {
+                out.extend_from_slice(b"PK\x07\x08");
+                for v in [crc, body.len() as u32, e.data.len() as u32] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            central.extend_from_slice(b"PK\x01\x02");
+            for v in [20u16, 20, e.flags, e.method, 0, 0] {
+                central.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [crc, body.len() as u32, e.data.len() as u32] {
+                central.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [e.name.len() as u16, 0, 0, 0, 0] {
+                central.extend_from_slice(&v.to_le_bytes());
+            }
+            central.extend_from_slice(&0u32.to_le_bytes());
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(e.name);
+        }
+        let cd_at = out.len() as u32;
+        let cd_len = central.len() as u32;
+        out.extend(central);
+        out.extend_from_slice(b"PK\x05\x06");
+        for v in [0u16, 0, entries.len() as u16, entries.len() as u16] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&cd_len.to_le_bytes());
+        out.extend_from_slice(&cd_at.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    fn zip1(data: &[u8], method: u16, flags: u16) -> Vec<u8> {
+        zip(&[ZipEntry {
+            name: b"plain",
+            data,
+            method,
+            flags,
+        }])
+    }
+
+    /// The system `compress` (ncompress): Homebrew's keg on macOS (Apple's
+    /// `/usr/bin/compress` is another program), `/usr/bin/compress` on
+    /// Linux (CI installs `ncompress`).
+    fn ref_compress(data: &[u8], args: &[&str]) -> Option<Vec<u8>> {
+        let exe = if cfg!(target_os = "macos") {
+            "/opt/homebrew/opt/ncompress/bin/compress"
+        } else {
+            "/usr/bin/compress"
+        };
+        filter_through(exe, args, data)
+    }
+
+    /// The reference gzip as a filter (`-c`, plus `args`).
+    fn ref_gzip_c(data: &[u8], args: &[&str]) -> Option<Vec<u8>> {
+        let mut a = vec!["-c"];
+        a.extend_from_slice(args);
+        filter_through(ref_gzip(), &a, data)
+    }
+
+    fn filter_through(exe: &str, args: &[&str], data: &[u8]) -> Option<Vec<u8>> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        if !require_reference(Path::new(exe)) {
+            return None;
+        }
+        let mut child = Command::new(exe)
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut si = child.stdin.take().unwrap();
+        let d = data.to_vec();
+        let w = std::thread::spawn(move || {
+            let _ = si.write_all(&d);
+        });
+        let out = child.wait_with_output().unwrap();
+        w.join().unwrap();
+        assert!(out.status.success(), "{exe} {args:?}");
+        Some(out.stdout)
+    }
+
+    /// A decompression case: outputs are compared byte for byte.
+    fn dz<'a>(name: &'a str, args: &[&'a str], files: Vec<(&'a str, Vec<u8>)>) -> Case<'a> {
+        let mut c = case(name, args, files);
+        c.compare_output_bytes = true;
+        c
+    }
+
+    fn txt() -> Vec<u8> {
+        text(20_000, 21)
+    }
+
+    // ---- groups ----
+
+    /// Every name and suffix that decompresses (`.gz .z -gz -z _z .tgz
+    /// .taz` in any case, `-S`'s), and an unknown one; an operand found by
+    /// adding a suffix; `-N` (name and time restored), `-n` and neither;
+    /// multi-member input; existing outputs; `-k`, `-f`, `-v`, `-q`.
+    #[test]
+    fn decompress() {
+        let t = txt();
+        let g = || gzm(&t, b"orig.txt");
+        let mut cases = Vec::new();
+        for (file, args) in [
+            ("a.gz", &[][..]),
+            ("a.z", &[]),
+            ("a-gz", &[]),
+            ("a-z", &[]),
+            ("a_z", &[]),
+            ("a.tgz", &[]),
+            ("a.taz", &[]),
+            ("a.GZ", &[]),
+            ("a.Tgz", &[]),
+            ("a_Z", &[]),
+            ("a.x", &["-S", ".x"]),
+            ("a.x", &["--suffix=.x"]),
+            ("a.x", &[]),
+            ("a.gzip", &[]),
+            ("a.bz2", &[]),
+            (".gz", &[]),
+        ] {
+            for name in ["gunzip", "gzip"] {
+                let mut args = args.to_vec();
+                if name == "gzip" {
+                    args.insert(0, "-d");
+                }
+                args.push(file);
+                cases.push(dz(name, &args, vec![(file, g())]));
+            }
+            cases.push(dz("zcat", &[file], vec![(file, g())]));
+        }
+        for args in [
+            &["-d", "a.gz"][..],
+            &["-dv", "a.gz"],
+            &["-dq", "a.gz"],
+            &["-dk", "a.gz"],
+            &["-dkv", "a.gz"],
+            &["-dN", "a.gz"],
+            &["-dNv", "a.gz"],
+            &["-dn", "a.gz"],
+            &["-dnN", "a.gz"],
+            &["-dNn", "a.gz"],
+            &["-dc", "a.gz"],
+            &["-dcv", "a.gz"],
+            &["-dckv", "a.gz"],
+            &["-dcN", "a.gz"],
+            &["--decompress", "a.gz"],
+            &["--uncompress", "a.gz"],
+            &["--stdout", "-d", "a.gz"],
+            &["-dq", "a.x"],
+            &["-dv", "a.x"],
+        ] {
+            cases.push(dz("gzip", args, vec![("a.gz", g()), ("a.x", g())]));
+        }
+        for name in ["gunzip", "zcat", "gzcat"] {
+            for args in [&["a.gz"][..], &["-v", "a.gz"], &["-N", "a.gz"], &["-"]] {
+                cases.push(fed(dz(name, args, vec![("a.gz", g())]), &g()));
+            }
+        }
+        // -N with a stored time, and with none (the input's is kept).
+        let stamped = member(Member {
+            name: Some(b"stamped.txt"),
+            mtime: 1_234_567_890,
+            ..plain_member(&t)
+        });
+        let unstamped = member(Member {
+            name: Some(b"unstamped.txt"),
+            ..plain_member(&t)
+        });
+        for args in [
+            &["-dN", "s.gz"][..],
+            &["-d", "s.gz"],
+            &["-dkN", "s.gz", "u.gz"],
+        ] {
+            cases.push(dz(
+                "gzip",
+                args,
+                vec![("s.gz", stamped.clone()), ("u.gz", unstamped.clone())],
+            ));
+        }
+        // Several members: the first's name, the last stored time.
+        let multi = [
+            member(Member {
+                name: Some(b"first"),
+                mtime: 1_234_567_890,
+                ..plain_member(b"one\n")
+            }),
+            member(Member {
+                name: Some(b"second"),
+                mtime: 1_300_000_000,
+                ..plain_member(&t)
+            }),
+            member(plain_member(b"three\n")),
+        ]
+        .concat();
+        for args in [
+            &["-d", "m.gz"][..],
+            &["-dN", "m.gz"],
+            &["-dv", "m.gz"],
+            &["-dc", "m.gz"],
+        ] {
+            cases.push(dz("gzip", args, vec![("m.gz", multi.clone())]));
+        }
+        cases.push(fed(dz("zcat", &[], vec![]), &multi));
+        // An operand that does not exist is looked for with a suffix.
+        for (args, files) in [
+            (&["-d", "a"][..], vec![("a.gz", g())]),
+            (&["-d", "a"], vec![("a.z", g())]),
+            (&["-d", "a"], vec![("a-z", g())]),
+            (&["-dc", "a"], vec![("a-gz", g())]),
+            (
+                &["-d", "-S", ".x", "a"],
+                vec![("a.x", g()), ("a.gz", gzm(b"other", b"o"))],
+            ),
+            (&["-d", "a.tar"], vec![("a.tgz", g())]),
+            (&["-d", "nonexist"], vec![]),
+            (&["-dc", "nonexist"], vec![]),
+            (&["-d", "-S", "z", "g"], vec![]),
+            (&["-d", "x.gz"], vec![]),
+            (&["-t", "a"], vec![("a.gz", g())]),
+            (&["-l", "a"], vec![("a.gz", g())]),
+        ] {
+            cases.push(dz("gzip", args, files));
+        }
+        // An existing output.
+        for args in [
+            &["-d", "a.gz"][..],
+            &["-df", "a.gz"],
+            &["-dq", "a.gz"],
+            &["-dv", "a.gz"],
+            &["-dk", "a.gz"],
+            &["-dN", "a.gz"],
+        ] {
+            cases.push(dz(
+                "gzip",
+                args,
+                vec![
+                    ("a.gz", g()),
+                    ("a", b"old".to_vec()),
+                    ("orig.txt", b"old".to_vec()),
+                ],
+            ));
+        }
+        for answer in [&b"y\n"[..], b"n\n"] {
+            let mut c = dz(
+                "gzip",
+                &["-d", "a.gz"],
+                vec![("a.gz", g()), ("a", b"old".to_vec())],
+            );
+            c.stdin = Some(answer.to_vec());
+            c.tty_stdin = true;
+            cases.push(c);
+        }
+        // Links and modes, as compression checks them.
+        cases.extend([
+            with_setup(
+                dz("gzip", &["-d", "l.gz"], vec![("a.gz", g()), ("l.gz", g())]),
+                |d| {
+                    std::fs::remove_file(d.join("l.gz")).unwrap();
+                    std::os::unix::fs::symlink("a.gz", d.join("l.gz")).unwrap();
+                },
+            ),
+            with_setup(
+                dz("gzip", &["-df", "l.gz"], vec![("a.gz", g()), ("l.gz", g())]),
+                |d| {
+                    std::fs::remove_file(d.join("l.gz")).unwrap();
+                    std::os::unix::fs::symlink("a.gz", d.join("l.gz")).unwrap();
+                },
+            ),
+            with_setup(
+                dz("gzip", &["-d", "h.gz"], vec![("a.gz", g()), ("h.gz", g())]),
+                |d| {
+                    std::fs::remove_file(d.join("h.gz")).unwrap();
+                    std::fs::hard_link(d.join("a.gz"), d.join("h.gz")).unwrap();
+                },
+            ),
+            with_setup(dz("gzip", &["-d", "a.gz"], vec![("a.gz", g())]), |d| {
+                set_mode(d, "a.gz", 0o640)
+            }),
+            with_setup(dz("gzip", &["-d", "a.gz"], vec![("a.gz", g())]), |d| {
+                set_mode(d, "a.gz", 0o4755)
+            }),
+            with_setup(dz("gzip", &["-df", "a.gz"], vec![("a.gz", g())]), |d| {
+                set_mode(d, "a.gz", 0o1644)
+            }),
+            with_setup(dz("gzip", &["-d", "d"], vec![("a.gz", g())]), subdir),
+        ]);
+        check_exact("decompress", &cases, none_skipped());
+    }
+
+    /// Every row of the spec's divergence table, as GNU 1.15 behaves.
+    #[test]
+    fn probe_table() {
+        let t = txt();
+        let good = gzm(&t, b"a");
+        let crc_bad = member_with(plain_member(&t), Some(0x1234_5678), None);
+        let len_bad = member_with(plain_member(&t), None, Some(5));
+        let cut = good[..good.len() / 2].to_vec();
+        let cut_trailer = good[..good.len() - 3].to_vec();
+        let junk = [good.clone(), b"junk".to_vec()].concat();
+        let nuls = [good.clone(), vec![0; 100]].concat();
+        let mixed_tail = [good.clone(), b"\0\0x".to_vec()].concat();
+        let corrupt = {
+            let mut b = member(plain_member(&t));
+            b[10..14].copy_from_slice(&[0xff; 4]);
+            b
+        };
+        let mut cases = Vec::new();
+        for (file, bytes) in [
+            ("junk.gz", &junk),
+            ("nuls.gz", &nuls),
+            ("mixed.gz", &mixed_tail),
+            ("crc.gz", &crc_bad),
+            ("len.gz", &len_bad),
+            ("cut.gz", &cut),
+            ("trailer.gz", &cut_trailer),
+            ("corrupt.gz", &corrupt),
+            ("notgz.gz", &t),
+        ] {
+            for args in [
+                &["-dc"][..],
+                &["-dcv"],
+                &["-dcq"],
+                &["-d"],
+                &["-dv"],
+                &["-dcf"],
+            ] {
+                let mut a = args.to_vec();
+                a.push(file);
+                cases.push(dz("gzip", &a, vec![(file, bytes.clone())]));
+            }
+            cases.push(fed(dz("zcat", &[], vec![]), bytes));
+        }
+        // An unknown option under each name.
+        for name in ["gunzip", "zcat", "gzcat"] {
+            cases.push(dz(name, &["-x", "a.gz"], vec![("a.gz", good.clone())]));
+        }
+        // A terminal on standard output: decompressed output is written.
+        for (name, args) in [
+            ("zcat", &["a.gz"][..]),
+            ("gunzip", &["-c", "a.gz"]),
+            ("gzip", &["-d"]),
+        ] {
+            let mut c = fed(
+                dz(name, args, vec![("a.gz", gzm(b"hi there\n", b"a"))]),
+                &good,
+            );
+            c.tty_stdout = true;
+            cases.push(c);
+        }
+        // A terminal on standard input is refused under -d and -t (the run
+        // stops there), unless -f; -l reads it.
+        for (name, args) in [
+            ("gunzip", &[][..]),
+            ("gzip", &["-d"]),
+            ("gzip", &["-dq"]),
+            ("gzip", &["-t"]),
+            ("zcat", &[]),
+            ("gzip", &["-d", "-", "a.gz"]),
+            ("gzip", &["-d", "nonexist", "-"]),
+            ("gzip", &["-l"]),
+            ("gzip", &["-d", "---presume-input-tty"]),
+        ] {
+            let mut c = dz(name, args, vec![("a.gz", good.clone())]);
+            c.stdin = Some(Vec::new());
+            c.tty_stdin = true;
+            cases.push(c);
+        }
+        // `---presume-input-tty` refuses a pipe too, unless -f.
+        cases.push(fed(
+            dz("gzip", &["-d", "---presume-input-tty"], vec![]),
+            &good,
+        ));
+        cases.push(fed(
+            dz("gzip", &["-df", "---presume-input-tty"], vec![]),
+            &good,
+        ));
+        let mut skipped = none_skipped();
+        // `-l` on two members: 1.12 and 1.13 report the last member only
+        // (survey row 1).
+        let two = [good.clone(), gzm(b"second\n", b"b")].concat();
+        let lists = vec![
+            dz("gzip", &["-l", "two.gz"], vec![("two.gz", two.clone())]),
+            dz("gzip", &["-lv", "two.gz"], vec![("two.gz", two.clone())]),
+        ];
+        let cases = gated(cases, lists, (1, 14), "-l on several members", &mut skipped);
+        check_exact("probe_table", &cases, skipped);
+    }
+
+    /// The formats GNU's `gunzip` reads besides gzip: `.Z`, pack, the first
+    /// entry of a zip (stored or deflated), the old gzip magic; and the
+    /// ones it refuses (`.bz2`, `.xz`, `.zst`, other zip methods,
+    /// encryption). LZH is a documented gap (`lzh_is_a_documented_gap`).
+    #[test]
+    fn foreign_formats() {
+        let t = txt();
+        let Some(z) = ref_compress(&t, &["-c"]) else {
+            return;
+        };
+        let z12 = ref_compress(&t, &["-c", "-b12"]).unwrap();
+        let mut zbad = z.clone();
+        zbad[3] = 0xff;
+        zbad[4] = 0xff;
+        let mut zbits = z.clone();
+        zbits[2] = (zbits[2] & 0xe0) | 17;
+        let mut zflags = z.clone();
+        zflags[2] |= 0x60;
+        let zcut = z[..z.len() / 3].to_vec();
+        let p = pack(&t);
+        let mut p_long = p.clone();
+        p_long[5] ^= 1;
+        let p_cut = p[..p.len() / 2].to_vec();
+        // Apple decodes this table as BAAAAAAA; GNU finds too few leaves.
+        let p_apple = b"\x1f\x1e\x00\x00\x00\x08\x03\x01\x00\x00AB\x80".to_vec();
+        let p_many = b"\x1f\x1e\x00\x00\x00\x01\x02\x01\x01ABC\x00".to_vec();
+        let p_levels = b"\x1f\x1e\x00\x00\x00\x01\x1a".to_vec();
+        let p_junk = [p.clone(), b"junk".to_vec()].concat();
+        let p_two = [p.clone(), pack(b"again\n")].concat();
+        let stored = zip1(&t, 0, 0);
+        let deflated = zip1(&t, 8, 0);
+        let two = zip(&[
+            ZipEntry {
+                name: b"one",
+                data: &t,
+                method: 8,
+                flags: 0,
+            },
+            ZipEntry {
+                name: b"two",
+                data: b"second entry\n",
+                method: 8,
+                flags: 0,
+            },
+        ]);
+        let encrypted = zip1(&t, 8, 1);
+        let bzip2_method = zip1(&t, 12, 0);
+        let empty_entry = zip1(b"", 8, 0);
+        let mut zip_crc = deflated.clone();
+        zip_crc[14] ^= 0xff;
+        let zip_cut = deflated[..deflated.len() / 3].to_vec();
+        let old = member(Member {
+            magic2: 0x9e,
+            name: Some(b"old"),
+            ..plain_member(&t)
+        });
+        let gz_then = |tail: &[u8]| [gzm(b"first\n", b"f"), tail.to_vec()].concat();
+        let mut cases = Vec::new();
+        let inputs: Vec<(&str, Vec<u8>)> = vec![
+            ("a.Z", z.clone()),
+            ("b12.Z", z12),
+            ("bad.Z", zbad),
+            ("bits.Z", zbits),
+            ("flags.Z", zflags),
+            ("cut.Z", zcut),
+            ("p.z", p.clone()),
+            ("long.z", p_long),
+            ("cut.z", p_cut),
+            ("apple.z", p_apple),
+            ("many.z", p_many),
+            ("levels.z", p_levels),
+            ("junk.z", p_junk),
+            ("two.z", p_two),
+            ("stored.zip", stored),
+            ("deflated.zip", deflated),
+            ("two.zip", two),
+            ("enc.zip", encrypted),
+            ("bz.zip", bzip2_method),
+            ("empty.zip", empty_entry),
+            ("crc.zip", zip_crc),
+            ("cut.zip", zip_cut),
+            ("old.gz", old),
+            ("gzZ.gz", gz_then(&z)),
+            ("gzp.gz", gz_then(&p)),
+            ("gzzip.gz", gz_then(&zip1(b"x", 8, 0))),
+            ("a.bz2", b"BZh91AY&SY\x00\x00\x00\x00".to_vec()),
+            ("a.xz", b"\xfd7zXZ\x00\x00\x04\xe6\xd6\xb4\x46".to_vec()),
+            ("a.zst", b"\x28\xb5\x2f\xfd\x00\x00\x00\x00".to_vec()),
+        ];
+        for (file, bytes) in &inputs {
+            for args in [
+                &["-dc"][..],
+                &["-dcv"],
+                &["-t"],
+                &["-l"],
+                &["-lv"],
+                &["-dcf"],
+            ] {
+                let mut a = args.to_vec();
+                a.push(file);
+                cases.push(dz("gzip", &a, vec![(file, bytes.clone())]));
+            }
+            cases.push(fed(dz("zcat", &[], vec![]), bytes));
+        }
+        // To a file, where the suffix allows it.
+        for (args, file) in [
+            (&["-d"][..], "a.Z"),
+            (&["-dv"], "a.Z"),
+            (&["-d"], "bad.Z"),
+            (&["-d"], "bits.Z"),
+            (&["-dk"], "bits.Z"),
+            (&["-d"], "flags.Z"),
+            (&["-d"], "p.z"),
+            (&["-d"], "long.z"),
+            (&["-d", "-S", ".zip"], "deflated.zip"),
+            (&["-dv", "-S", ".zip"], "two.zip"),
+            (&["-d", "-S", ".zip"], "enc.zip"),
+            (&["-d"], "old.gz"),
+            (&["-dN"], "old.gz"),
+        ] {
+            let mut a = args.to_vec();
+            a.push(file);
+            let bytes = inputs.iter().find(|(n, _)| *n == file).unwrap().1.clone();
+            cases.push(dz("gzip", &a, vec![(file, bytes), ("z.gz", gzm(&t, b"z"))]));
+            // And a good file after it: whether the run went on.
+            let mut b = a.clone();
+            b.push("z.gz");
+            let bytes = inputs.iter().find(|(n, _)| *n == file).unwrap().1.clone();
+            cases.push(dz("gzip", &b, vec![(file, bytes), ("z.gz", gzm(&t, b"z"))]));
+        }
+        let mut skipped = none_skipped();
+        // NEWS 1.15: zip data descriptors and the "not a valid zip file"
+        // wording (survey row 6); `-Inf%` for an empty output (row 9).
+        let newer = vec![
+            dz("gzip", &["-dc", "dd.zip"], vec![("dd.zip", zip1(&t, 8, 8))]),
+            dz(
+                "gzip",
+                &["-dc", "dds.zip"],
+                vec![("dds.zip", zip1(&t, 0, 8))],
+            ),
+            dz(
+                "gzip",
+                &["-dc", "pk.zip"],
+                vec![("pk.zip", b"PK\x03\x04".to_vec())],
+            ),
+            dz("gzip", &["-dcv", "e.zip"], vec![("e.zip", zip1(b"", 8, 0))]),
+        ];
+        let cases = gated(cases, newer, (1, 15), "zip data descriptors", &mut skipped);
+        check_exact("foreign_formats", &cases, skipped);
+    }
+
+    /// LZH (`1f a0`, `compress -H`) has no decoder in stuffr: GNU decodes
+    /// it, stuffr says "not in gzip format" (a first member) or reports
+    /// trailing garbage (a later one). Reference-free: this pins the gap.
+    #[test]
+    fn lzh_is_a_documented_gap() {
+        let lzh = [&[0x1f, 0xa0][..], &[0u8; 20]].concat();
+        let c = dz("gzip", &["-dc", "a.lzh"], vec![("a.lzh", lzh.clone())]);
+        let s = stuffr_as(&c);
+        assert_eq!(s.code, 1);
+        assert_eq!(s.stderr, "\ngzip: a.lzh: not in gzip format\n");
+        assert!(s.stdout.is_empty());
+        let after = [gzm(b"hi\n", b"h"), lzh].concat();
+        let c = dz("gzip", &["-dc", "b.gz"], vec![("b.gz", after)]);
+        let s = stuffr_as(&c);
+        assert_eq!(s.code, 2);
+        assert_eq!(s.stdout, b"hi\n");
+        assert_eq!(
+            s.stderr,
+            "\ngzip: b.gz: decompression OK, trailing garbage ignored\n"
+        );
+    }
+
+    /// `-t` on good, bad, cut-short and trailing-garbage inputs, alone and
+    /// several at once (a CRC error does not stop `-t`; a cut-short input
+    /// does).
+    #[test]
+    fn test_option() {
+        let t = txt();
+        let good = gzm(&t, b"a");
+        let crc = member_with(plain_member(&t), Some(1), None);
+        let cut = good[..good.len() / 2].to_vec();
+        let junk = [good.clone(), b"junk".to_vec()].concat();
+        let notgz = t.clone();
+        let all = || {
+            vec![
+                ("good.gz", good.clone()),
+                ("crc.gz", crc.clone()),
+                ("cut.gz", cut.clone()),
+                ("junk.gz", junk.clone()),
+                ("notgz", notgz.clone()),
+            ]
+        };
+        let mut cases = Vec::new();
+        for f in ["good.gz", "crc.gz", "cut.gz", "junk.gz", "notgz"] {
+            for args in [&["-t"][..], &["-tv"], &["-tq"], &["--test"], &["-tf"]] {
+                let mut a = args.to_vec();
+                a.push(f);
+                cases.push(dz("gzip", &a, all()));
+            }
+            let bytes = all().into_iter().find(|(n, _)| *n == f).unwrap().1;
+            cases.push(fed(dz("gzip", &["-tv"], vec![]), &bytes));
+        }
+        for args in [
+            &["-tv", "good.gz", "crc.gz", "junk.gz", "notgz", "good.gz"][..],
+            &["-t", "good.gz", "cut.gz", "good.gz"],
+            &["-tv", "good.gz", "nonexist", "good.gz"],
+            &["-tv", "-", "good.gz"],
+            &["-tv", "good.gz", "-"],
+        ] {
+            cases.push(fed(dz("gzip", args, all()), &junk));
+        }
+        for name in ["gunzip", "zcat"] {
+            cases.push(dz(name, &["-tv", "good.gz", "crc.gz"], all()));
+        }
+        check_exact("test_option", &cases, none_skipped());
+    }
+
+    /// `-l`, `-lv`, `-lq`: single and several inputs, standard input, a
+    /// file that is not gzip, inputs that do not decode cleanly (no line;
+    /// totals instead), `-N`'s name and time, and a member whose ISIZE lies
+    /// (as a size past 4 GiB would read): GNU decodes, so it is a length
+    /// error, not a wrong figure.
+    #[test]
+    fn list() {
+        let t = txt();
+        let good = gzm(&t, b"stored-name");
+        let small = member(Member {
+            name: Some(b"s"),
+            mtime: 1_234_567_890,
+            ..plain_member(b"x")
+        });
+        let lies = member_with(plain_member(&t), None, Some(t.len() as u32 + 1));
+        let crc = member_with(plain_member(&t), Some(1), None);
+        let junk = [small.clone(), b"junk".to_vec()].concat();
+        let nuls = [small.clone(), vec![0; 10]].concat();
+        let files = || {
+            vec![
+                ("good.gz", good.clone()),
+                ("small.gz", small.clone()),
+                ("lies.gz", lies.clone()),
+                ("crc.gz", crc.clone()),
+                ("junk.gz", junk.clone()),
+                ("nuls.gz", nuls.clone()),
+                ("plain", t.clone()),
+                ("d/x.tgz", good.clone()),
+            ]
+        };
+        let mut cases = Vec::new();
+        for flags in [
+            &["-l"][..],
+            &["-lv"],
+            &["-lq"],
+            &["-lN"],
+            &["-lvN"],
+            &["--list"],
+        ] {
+            for ops in [
+                &["good.gz"][..],
+                &["small.gz"],
+                &["good.gz", "small.gz"],
+                &["lies.gz"],
+                &["crc.gz"],
+                &["good.gz", "crc.gz", "small.gz"],
+                &["junk.gz"],
+                &["good.gz", "junk.gz"],
+                &["good.gz", "nuls.gz", "small.gz"],
+                &["nuls.gz", "good.gz"],
+                &["plain"],
+                &["plain", "good.gz"],
+                &["good.gz", "nonexist"],
+                &["d/x.tgz"],
+                &["good.gz", "-"],
+                &["-", "good.gz", "small.gz"],
+            ] {
+                let mut a = flags.to_vec();
+                a.extend_from_slice(ops);
+                cases.push(fed(dz("gzip", &a, files()), &small));
+            }
+            cases.push(fed(dz("gzip", flags, vec![]), &good));
+        }
+        for name in ["gunzip", "zcat"] {
+            cases.push(dz(name, &["-l", "good.gz", "small.gz"], files()));
+        }
+        // Standard input that fails: refused at its header, the run stops;
+        // later, it is not listed and prints no totals of its own.
+        for stdin in [&t, &junk, &crc] {
+            for args in [
+                &["-l", "good.gz", "-", "small.gz"][..],
+                &["-l", "-", "good.gz"],
+            ] {
+                cases.push(fed(dz("gzip", args, files()), stdin));
+            }
+        }
+        check_exact("list", &cases, none_skipped());
+    }
+
+    /// `-r` over a tree of plain files, `.gz` files, a symbolic link to a
+    /// file and one to a directory: compressed (`gzip -r`, compared by
+    /// round trip) and decompressed (`gunzip -r`, byte for byte), and
+    /// `-t`/`-l`/`-c` under `-r` (which skip names without a suffix, except
+    /// `-c`).
+    #[test]
+    fn recursive() {
+        let t = txt();
+        let tree = || {
+            vec![
+                ("d/a.gz", gzm(&t, b"a")),
+                ("d/b.txt", b"plain\n".to_vec()),
+                ("d/s/c.gz", gzm(b"see\n", b"c")),
+                ("d/s/t.tgz", gzm(b"tar\n", b"t")),
+                ("e/x.gz", gzm(b"ex\n", b"x")),
+                ("e/y.txt", b"why\n".to_vec()),
+            ]
+        };
+        fn links(d: &Path) {
+            std::os::unix::fs::symlink("a.gz", d.join("d/l.gz")).unwrap();
+            std::os::unix::fs::symlink("../e", d.join("d/ld")).unwrap();
+        }
+        let mut cases = Vec::new();
+        for args in [
+            &["-dr", "d"][..],
+            &["-drv", "d"],
+            &["-drk", "d"],
+            &["-drf", "d"],
+            &["-tr", "d"],
+            &["-trv", "d"],
+            &["-lr", "d"],
+            &["-lrv", "d"],
+            &["-dcr", "d/s"],
+            &["-dr", "d/b.txt"],
+            &["-drv", "d/b.txt"],
+            &["-dr", "d", "e"],
+            &["-dr", "e/x"],
+        ] {
+            cases.push(with_setup(dz("gzip", args, tree()), links));
+            cases.push(dz("gzip", args, tree()));
+        }
+        cases.push(with_setup(dz("gunzip", &["-r", "d"], tree()), links));
+        // Compressing the same tree (`.gz` files skipped silently, links
+        // refused); the outputs are compared by round trip.
+        for args in [&["-r", "d"][..], &["-rv", "d"]] {
+            let mut c = with_setup(dz("gzip", args, tree()), links);
+            c.compare_output_bytes = false;
+            cases.push(c);
+        }
+        check_exact("recursive", &cases, none_skipped());
+    }
+
+    /// Review focus 1: `gunzip -N` never writes outside the operand's
+    /// directory. A stored `../x`, `/tmp/stuffr-escape-<pid>` or `a/b` is
+    /// written as its last component beside the input, as GNU does; both
+    /// trees must agree and the absolute target must not exist afterwards.
+    #[test]
+    fn a_header_name_with_a_path_never_escapes_the_directory() {
+        let escape = format!("/tmp/stuffr-escape-{}", std::process::id());
+        let _ = std::fs::remove_file(&escape);
+        let t = txt();
+        let names: [&[u8]; 3] = [b"../x", escape.as_bytes(), b"a/b"];
+        let mut cases = Vec::new();
+        for stored in names {
+            let m = member(Member {
+                name: Some(stored),
+                mtime: 1_234_567_890,
+                ..plain_member(&t)
+            });
+            for args in [
+                &["-dN", "s/in.gz"][..],
+                &["-dNv", "s/in.gz"],
+                &["-dNk", "s/in.gz"],
+                &["-dNf", "s/in.gz"],
+                &["-lN", "s/in.gz"],
+            ] {
+                cases.push(dz("gzip", args, vec![("s/in.gz", m.clone())]));
+            }
+            cases.push(dz("gunzip", &["-N", "in.gz"], vec![("in.gz", m.clone())]));
+        }
+        check_exact("header_name_escape", &cases, none_skipped());
+        assert!(
+            !Path::new(&escape).exists(),
+            "{escape} was written outside the directory"
+        );
+        // And on stuffr's side alone, whatever the reference did.
+        for stored in names {
+            let m = member(Member {
+                name: Some(stored),
+                ..plain_member(b"payload\n")
+            });
+            let c = dz("gzip", &["-dN", "s/in.gz"], vec![("s/in.gz", m)]);
+            let s = stuffr_as(&c);
+            assert_eq!(s.code, 0, "{}", s.stderr);
+            let last = stored.rsplit(|&b| b == b'/').next().unwrap();
+            let want = format!("s/{}", String::from_utf8_lossy(last));
+            let keys: Vec<&String> = s.tree.keys().collect();
+            assert_eq!(keys, [&"s/".to_owned(), &want], "{stored:?}");
+        }
+        assert!(!Path::new(&escape).exists());
+    }
+
+    /// Review focus 2: `gunzip a.gz b.gz c.gz` with `b.gz` corrupt keeps
+    /// `b.gz`, leaves no partial `b`, and exits with the worst code. GNU
+    /// ends the run at a CRC error or a cut-short input (so `c.gz` is left
+    /// alone) and goes on after one that is not gzip.
+    #[test]
+    fn a_corrupt_input_leaves_no_output_and_keeps_the_input() {
+        let t = txt();
+        let good = gzm(&t, b"a");
+        let crc = member_with(plain_member(&t), Some(1), None);
+        let cut = good[..good.len() * 2 / 3].to_vec();
+        let mut cases = Vec::new();
+        let mut middles = Vec::new();
+        for (what, bytes) in [("crc", crc), ("cut", cut), ("notgz", t.clone())] {
+            middles.push((what, bytes.clone()));
+            for args in [
+                &["-d"][..],
+                &["-dv"],
+                &["-dk"],
+                &["-df"],
+                &["-dq"],
+                &["-t"],
+                &["-dc"],
+            ] {
+                let mut a = args.to_vec();
+                a.extend(["a.gz", "b.gz", "c.gz"]);
+                cases.push(dz(
+                    "gzip",
+                    &a,
+                    vec![
+                        ("a.gz", good.clone()),
+                        ("b.gz", bytes.clone()),
+                        ("c.gz", good.clone()),
+                    ],
+                ));
+            }
+        }
+        check_exact("corrupt_middle", &cases, none_skipped());
+        // stuffr alone: the corrupt input is intact and has no output, no
+        // temporary file is left, and `a` was written whole.
+        for (what, bytes) in middles {
+            let c = dz(
+                "gzip",
+                &["-d", "a.gz", "b.gz", "c.gz"],
+                vec![
+                    ("a.gz", good.clone()),
+                    ("b.gz", bytes.clone()),
+                    ("c.gz", good.clone()),
+                ],
+            );
+            let s = stuffr_as(&c);
+            assert_eq!(s.code, 1, "{what}: {}", s.stderr);
+            assert_eq!(s.tree["b.gz"].0, bytes, "{what}: b.gz changed");
+            assert!(!s.tree.contains_key("b"), "{what}: a partial b was left");
+            assert_eq!(s.tree["a"].0, t, "{what}");
+            assert!(
+                s.tree.keys().all(|k| !k.contains(".stuffr-")),
+                "{what}: a temporary file was left: {:?}",
+                s.tree.keys()
+            );
+        }
+    }
+
+    /// Review focus 3: `zcat` streams a 64 MiB input in bounded memory
+    /// (0.11.0's `bzcat_streams_a_large_input` measurement, shared through
+    /// the harness). The decoder holds a 64 KiB window, a 64 KiB input
+    /// buffer and a 64 KiB output buffer whatever the size; 64 MiB is the
+    /// ceiling (the output alone would exceed it if it were held).
+    #[test]
+    fn zcat_streams_a_large_input() {
+        const N: usize = 64 << 20;
+        let plain = mixed(N, 43);
+        let Some(z) = ref_gzip_c(&plain, &["-1"]) else {
+            return;
+        };
+        let peak = decoder_peak_rss(
+            "zcat",
+            "big.gz",
+            &z,
+            &plain,
+            &[("STUFFR_GZIP_FLAVOR", "gnu")],
+        );
+        assert!(
+            peak < 64 << 20,
+            "peak memory {peak} bytes is not under 64 MiB"
+        );
+    }
+
+    /// Run `exe big.gz` with standard output a pipe whose read end is
+    /// closed after the first read; how the process ended. Standard error
+    /// must stay empty.
+    fn closed_pipe_status(exe: &Path, dir: &Path) -> std::process::ExitStatus {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(exe)
+            .arg("big.gz")
+            .current_dir(dir)
+            .env_clear()
+            .env("PATH", gnu_path())
+            .env("STUFFR_GZIP_FLAVOR", "gnu")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = out.read(&mut buf).unwrap();
+        drop(out);
+        let st = child.wait().unwrap();
+        let mut err = String::new();
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        assert_eq!(err, "", "{exe:?} wrote to stderr");
+        st
+    }
+
+    /// Review focus 3: `zcat big.gz | head` ends stuffr by SIGPIPE, with
+    /// nothing on standard error, as it ends GNU's (whose `zcat` execs
+    /// `gzip`, so the signal is the process's own).
+    #[test]
+    fn zcat_into_a_closed_pipe() {
+        use std::os::unix::process::ExitStatusExt;
+        let plain = text(4 << 20, 53);
+        let dir = std::env::temp_dir().join(format!("stuffr-zcat-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let link = dir.join("bin").join("zcat");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        std::fs::write(dir.join("big.gz"), gzm(&plain, b"big")).unwrap();
+        let ours = closed_pipe_status(&link, &dir);
+        assert_eq!(
+            ours.signal(),
+            Some(libc::SIGPIPE),
+            "stuffr as zcat: {ours:?}"
+        );
+        let reference = Path::new(gnu_gzip_dir()).join("zcat");
+        if require_reference(&reference) {
+            let theirs = closed_pipe_status(&reference, &dir);
+            assert_eq!(
+                theirs.signal(),
+                Some(libc::SIGPIPE),
+                "reference: {theirs:?}"
+            );
+        } else {
+            println!("skipped the reference half: GNU zcat not installed");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review focus 5: an empty file, a member with an empty body, a member
+    /// followed by an empty one, an empty one followed by a member, and a
+    /// member with FEXTRA, FCOMMENT and FHCRC (also with a wrong FHCRC),
+    /// through `-d`, `-t` and `-l`.
+    #[test]
+    fn odd_members() {
+        let t = txt();
+        let empty_body = member(plain_member(b""));
+        let all_fields = member(Member {
+            name: Some(b"n"),
+            comment: Some(b"a comment"),
+            extra: Some(b"AB\x02\x00xy"),
+            hcrc: true,
+            mtime: 1_234_567_890,
+            ..plain_member(&t)
+        });
+        let mut bad_hcrc = all_fields.clone();
+        let at = 10 + 2 + 6 + 2 + 10; // fixed, XLEN, extra, "n\0", comment
+        bad_hcrc[at] ^= 0xff;
+        let inputs: Vec<(&str, Vec<u8>)> = vec![
+            ("empty.gz", Vec::new()),
+            ("ebody.gz", empty_body.clone()),
+            ("cat.gz", [gzm(&t, b"a"), empty_body.clone()].concat()),
+            ("cat2.gz", [empty_body.clone(), gzm(&t, b"a")].concat()),
+            ("fields.gz", all_fields),
+            ("badhcrc.gz", bad_hcrc),
+        ];
+        let mut cases = Vec::new();
+        let mut later = Vec::new();
+        for (file, bytes) in &inputs {
+            for args in [
+                &["-d"][..],
+                &["-dv"],
+                &["-dc"],
+                &["-dcv"],
+                &["-dN"],
+                &["-t"],
+                &["-tv"],
+            ] {
+                let mut a = args.to_vec();
+                a.push(file);
+                let c = dz("gzip", &a, vec![(file, bytes.clone())]);
+                // An empty output's ratio is `-Inf%` (1.15, survey row 9).
+                if *file == "ebody.gz" && args.iter().any(|a| a.contains('v')) {
+                    later.push(c);
+                } else {
+                    cases.push(c);
+                }
+            }
+            for args in [&["-l"][..], &["-lv"]] {
+                let mut a = args.to_vec();
+                a.push(file);
+                // -l on several members (row 1) or an empty output (row 9).
+                later.push(dz("gzip", &a, vec![(file, bytes.clone())]));
+            }
+            cases.push(fed(dz("zcat", &[], vec![]), bytes));
+        }
+        let mut skipped = none_skipped();
+        let cases = gated(cases, later, (1, 15), "-l of these, -Inf%", &mut skipped);
+        check_exact("odd_members", &cases, skipped);
     }
 }

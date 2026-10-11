@@ -29,9 +29,8 @@ use std::sync::{Arc, Mutex};
 use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
 mod gnu;
-// The read side (`read_header`, `inflate_member`, `after_member`) and the
-// sniffer are the decompression path, which GNU's Task 8 and the BSD
-// personality wire in; only the writing side is used so far.
+// `after_member` and parts of the sniffer (`ZipEntry::data`, the BSD table's
+// codecs) are the BSD personality's, which a later task wires in.
 #[allow(dead_code)]
 pub(crate) mod member;
 #[allow(dead_code)]

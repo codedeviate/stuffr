@@ -1,8 +1,10 @@
 //! The file loop and the compress path, in the order GNU gzip 1.15 was
 //! observed to check things for each operand: open (without following a
 //! final symlink unless `-f` or `-c`), then directory, regular file,
-//! set-user-ID, sticky bit and link count, then the suffix, then the output's existence; compress;
-//! copy the input's mode, owner and times; remove the input.
+//! set-user-ID, sticky bit and link count, then the suffix, then the
+//! output's existence; compress; copy the input's mode, owner and times;
+//! remove the input. Decompression, `-t` and `-l` (`decompress.rs`) follow
+//! the same order with their own suffix rules.
 //!
 //! Exit codes: 0, 1 for an error, 2 for a warning; across operands an error
 //! is never lowered to a warning.
@@ -18,10 +20,12 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use super::args::{Mode, Settings};
+use super::list::Lister;
 use super::messages::{self as m, PROGRAM, printf, quote, ratio};
-use crate::compat::copy_metadata_from;
 use crate::compat::gzip::member::{Engine, Header, compress_member};
 use crate::compat::host::{Host, Published, create_temp, publish, stdin_file, strerror};
+
+mod decompress;
 
 /// The suffixes gzip will not compress again, matched without regard to
 /// ASCII case (observed: `gzip f.GZ`, `f-Z`, `f.TAZ` are skipped; `f.bz2`,
@@ -38,10 +42,6 @@ type Step = Result<(), Stop>;
 
 /// Run the operation `s` describes against `host`; returns the exit code.
 pub(super) fn execute(mut s: Settings, host: &mut Host, err: &mut dyn Write) -> u8 {
-    if s.mode != Mode::Compress {
-        printf(err, m::NOT_YET, &[PROGRAM]);
-        return 1;
-    }
     let files = std::mem::take(&mut s.files);
     let mut g = Gz {
         s,
@@ -50,12 +50,22 @@ pub(super) fn execute(mut s: Settings, host: &mut Host, err: &mut dyn Write) -> 
         exit: 0,
         stdout: None,
         stdin_named: false,
+        list: Lister::default(),
+        stale: None,
+        time_stamp: 0,
     };
-    let _ = if files.is_empty() {
+    let run = if files.is_empty() {
         g.treat_stdin()
     } else {
         files.iter().try_for_each(|f| g.treat(f))
     };
+    // `-l`'s totals, unless the run was stopped.
+    if run.is_ok() && g.s.mode == Mode::List {
+        let (verbose, quiet) = (g.s.verbose > 0, g.s.quiet);
+        let mut list = std::mem::take(&mut g.list);
+        list.finish(g.stdout_writer(), verbose, quiet, files.len());
+        g.list = list;
+    }
     g.finish();
     g.exit
 }
@@ -72,6 +82,15 @@ struct Gz<'a> {
     /// under the name `stdin` (observed: `gzip a -` names it, `gzip - a`
     /// does not).
     stdin_named: bool,
+    /// `-l`'s running state.
+    list: Lister,
+    /// The last output written under `-k`, which a run-ending failure in
+    /// the next input's header removes (see `decompress::refused`).
+    stale: Option<PathBuf>,
+    /// The time `-lv` dates an input by: the last input file's
+    /// modification time (or `-N`'s stored one), which a pipe on standard
+    /// input does not change.
+    time_stamp: i64,
 }
 
 /// Counts the bytes written through it.
@@ -132,6 +151,9 @@ impl Gz<'_> {
 
     /// Compress standard input to standard output (`-` or no operands).
     fn treat_stdin(&mut self) -> Step {
+        if self.s.mode != Mode::Compress {
+            return self.decompress_stdin();
+        }
         if !self.s.force && (self.host.stdout_is_tty() || self.s.presume_tty) {
             if !self.s.quiet {
                 self.say(m::NOT_TO_TERMINAL, &[PROGRAM, PROGRAM]);
@@ -176,6 +198,9 @@ impl Gz<'_> {
         if name == b"-" {
             return self.treat_stdin();
         }
+        if self.s.mode != Mode::Compress {
+            return self.treat_compressed(name);
+        }
         let qname = quote(name);
         let path = self.host.path(name);
         let follow = self.s.force || self.s.to_stdout;
@@ -195,33 +220,41 @@ impl Gz<'_> {
             self.warn(m::IS_DIRECTORY, &[PROGRAM, &qname]);
             return Ok(());
         }
-        if !self.s.to_stdout {
-            if !meta.is_file() {
-                self.warn(m::NOT_REGULAR, &[PROGRAM, &qname]);
-                return Ok(());
-            }
-            let mode = mode_of(&meta);
-            if mode & 0o4000 != 0 {
-                self.warn(m::SET_USER_ID, &[PROGRAM, &qname]);
-                return Ok(());
-            }
-            if mode & 0o1000 != 0 && !self.s.force {
-                self.warn(m::STICKY, &[PROGRAM, &qname]);
-                return Ok(());
-            }
-            let others = other_links(&meta);
-            if others > 0 && !self.s.force {
-                let s: &[u8] = if others > 1 { b"s" } else { b"" };
-                let n = others.to_string();
-                self.warn(m::HAS_LINKS, &[PROGRAM, &qname, n.as_bytes(), s]);
-                return Ok(());
-            }
+        if !self.s.to_stdout && !self.file_checks(&qname, &meta) {
+            return Ok(());
         }
         if self.s.to_stdout {
             return self.compress_to_stdout(name, file, &meta);
         }
         self.compress_to_file(name, path, file, &meta);
         Ok(())
+    }
+
+    /// The checks an input meets when it is to be replaced by an output
+    /// file: a regular file, not set-user-ID, not sticky (unless `-f`), no
+    /// other links (unless `-f`). False, with the warning given, if not.
+    fn file_checks(&mut self, qname: &[u8], meta: &Metadata) -> bool {
+        if !meta.is_file() {
+            self.warn(m::NOT_REGULAR, &[PROGRAM, qname]);
+            return false;
+        }
+        let mode = mode_of(meta);
+        if mode & 0o4000 != 0 {
+            self.warn(m::SET_USER_ID, &[PROGRAM, qname]);
+            return false;
+        }
+        if mode & 0o1000 != 0 && !self.s.force {
+            self.warn(m::STICKY, &[PROGRAM, qname]);
+            return false;
+        }
+        let others = other_links(meta);
+        if others > 0 && !self.s.force {
+            let s: &[u8] = if others > 1 { b"s" } else { b"" };
+            let n = others.to_string();
+            self.warn(m::HAS_LINKS, &[PROGRAM, qname, n.as_bytes(), s]);
+            return false;
+        }
+        true
     }
 
     /// `-r` on a directory: every entry, in the order the directory lists
@@ -264,7 +297,7 @@ impl Gz<'_> {
                 return Err(Stop);
             }
         };
-        self.verbose_done(&p, m::STDOUT_NAME);
+        self.verbose_done(p.bytes_in, p.body, m::STDOUT_NAME);
         Ok(())
     }
 
@@ -289,30 +322,10 @@ impl Gz<'_> {
         let out_name = [name, &self.s.suffix].concat();
         let qout = quote(&out_name);
         let out_path = self.host.path(&out_name);
-        let mut replace = false;
-        if fs::symlink_metadata(&out_path).is_ok() {
-            if self.s.force {
-                replace = true;
-            } else {
-                self.say(m::ALREADY_EXISTS, &[PROGRAM, &qout]);
-                if self.host.stdin_is_tty() {
-                    self.say(m::ASK_OVERWRITE, &[]);
-                    replace = ask_yes();
-                }
-                if !replace {
-                    self.say(m::NOT_OVERWRITTEN, &[]);
-                    if self.exit == 0 {
-                        self.exit = 2;
-                    }
-                    return;
-                }
-            }
-        }
-        let dir = match out_path.parent() {
-            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
-            _ => PathBuf::from("."),
+        let Some(replace) = self.may_write(&out_path, &qout) else {
+            return;
         };
-        let (tmp, tmp_file) = match create_temp(&dir, "gzip") {
+        let (tmp, tmp_file) = match create_temp(&parent_of(&out_path), "gzip") {
             Ok(t) => t,
             Err(e) => {
                 self.error(m::OPEN_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
@@ -335,42 +348,87 @@ impl Gz<'_> {
                 return;
             }
         };
+        if self.commit(&tmp, &out_path, &qout, meta, None, replace, &path, &qname) {
+            self.verbose_done(p.bytes_in, p.body, &qout);
+        }
+    }
+
+    /// Whether the output `out_path` may be written: `Some(replace)`, or
+    /// `None` when it exists and is not to be replaced (said, exit 2). With
+    /// `-f` it is replaced; otherwise a terminal on standard input is asked.
+    fn may_write(&mut self, out_path: &Path, qout: &[u8]) -> Option<bool> {
+        if fs::symlink_metadata(out_path).is_err() {
+            return Some(false);
+        }
+        if self.s.force {
+            return Some(true);
+        }
+        self.say(m::ALREADY_EXISTS, &[PROGRAM, qout]);
+        if self.host.stdin_is_tty() {
+            self.say(m::ASK_OVERWRITE, &[]);
+            if ask_yes() {
+                return Some(true);
+            }
+        }
+        self.say(m::NOT_OVERWRITTEN, &[]);
+        if self.exit == 0 {
+            self.exit = 2;
+        }
+        None
+    }
+
+    /// Finish a written output `tmp`: the input's mode, owner and times
+    /// (the modification time `mtime` instead, when given), then publish it
+    /// as `out_path` and remove the input `path` unless `-k`. False if it
+    /// was not published (said).
+    #[allow(clippy::too_many_arguments)]
+    fn commit(
+        &mut self,
+        tmp: &Path,
+        out_path: &Path,
+        qout: &[u8],
+        meta: &Metadata,
+        mtime: Option<std::time::SystemTime>,
+        replace: bool,
+        path: &Path,
+        qname: &[u8],
+    ) -> bool {
         // The mode, owner and times of the input, as GNU copies them; a
         // failure to copy them does not undo the output.
-        let _ = copy_metadata_from(meta, &tmp);
+        let _ = crate::compat::copy_metadata_with_mtime(meta, tmp, mtime);
         // The output never keeps the sticky bit (observed: `chmod 1644 a;
         // gzip -f a` makes a 0644 `a.gz`).
         #[cfg(unix)]
         if mode_of(meta) & 0o1000 != 0 {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(
-                &tmp,
+                tmp,
                 fs::Permissions::from_mode(mode_of(meta) & 0o7777 & !0o1000),
             );
         }
-        match publish(&tmp, &out_path, replace) {
+        match publish(tmp, out_path, replace) {
             Ok(Published::Done) => {}
             Ok(Published::Exists) => {
-                self.say(m::ALREADY_EXISTS, &[PROGRAM, &qout]);
+                self.say(m::ALREADY_EXISTS, &[PROGRAM, qout]);
                 self.say(m::NOT_OVERWRITTEN, &[]);
                 if self.exit == 0 {
                     self.exit = 2;
                 }
-                return;
+                return false;
             }
             Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                self.error(m::IO_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
-                return;
+                let _ = fs::remove_file(tmp);
+                self.error(m::IO_FAILED, &[PROGRAM, qout, &strerror(&e)]);
+                return false;
             }
         }
         if !self.s.keep
-            && let Err(e) = fs::remove_file(&path)
+            && let Err(e) = fs::remove_file(path)
         {
-            self.error(m::IO_FAILED, &[PROGRAM, &qname, &strerror(&e)]);
-            return;
+            self.error(m::IO_FAILED, &[PROGRAM, qname, &strerror(&e)]);
+            return false;
         }
-        self.verbose_done(&p, &qout);
+        true
     }
 
     /// The suffix `name` already has, as written in `name`, or `None`. Only
@@ -450,9 +508,11 @@ impl Gz<'_> {
         }
     }
 
-    fn verbose_done(&mut self, p: &Packed, out: &[u8]) {
+    /// `-v`'s ratio of `whole` bytes against `part` (the compressed side
+    /// less what is not counted), then the output's name.
+    fn verbose_done(&mut self, whole: u64, part: u64, out: &[u8]) {
         if self.s.verbose > 0 {
-            let r = ratio(p.bytes_in, p.body);
+            let r = ratio(whole, part);
             let _ = self.err.write_all(r.as_bytes());
             let tail = if self.s.keep {
                 m::CREATED
@@ -461,6 +521,14 @@ impl Gz<'_> {
             };
             self.say(tail, &[out]);
         }
+    }
+}
+
+/// The directory an output goes in.
+fn parent_of(out_path: &Path) -> PathBuf {
+    match out_path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+        _ => PathBuf::from("."),
     }
 }
 
@@ -566,6 +634,7 @@ mod tests {
             verbose: 0,
             no_name: false,
             no_time: false,
+            restore: false,
             level: 6,
             suffix: suffix.to_vec(),
             presume_tty: false,
@@ -583,6 +652,9 @@ mod tests {
             exit: 0,
             stdout: None,
             stdin_named: false,
+            list: Lister::default(),
+            stale: None,
+            time_stamp: 0,
         };
         g.suffix_of(name).map(|s| String::from_utf8(s).unwrap())
     }

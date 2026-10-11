@@ -7,7 +7,8 @@
 //! `1f 9e`), bzip2 (`BZh` and a digit), `.Z` (`1f 9d`), pack (`1f 1e`), xz
 //! (`fd 37 7a 58`, four bytes only: the source says "we only have 4 bytes")
 //! and lzip (`LZIP`). GNU's is its manual's list (gzip, zip, compress, pack,
-//! LZH) checked by running `gzip -dc` on samples; see the ruling on LZH on
+//! LZH) checked by running `gzip -dc` on samples, plus the old gzip magic
+//! `1f 9e`, which GNU 1.15 also decodes; see the ruling on LZH on
 //! [`Detected::Lzh`].
 //!
 //! Every magic is at most four bytes, so [`detect`] takes the [`Lookahead`]
@@ -63,9 +64,11 @@ pub(crate) fn detect<R: Read>(r: &mut Lookahead<R>, flavour: Flavour) -> io::Res
     Ok(if available(d) { d } else { Detected::Unknown })
 }
 
+/// GNU's table. `1f 9e` (the old gzip magic) is gzip: GNU 1.15 decodes a
+/// member carrying it (observed: `gzip -dc` on one, exit 0; Ruling T5-1).
 fn detect_gnu(m: &[u8]) -> Detected {
     match m {
-        [0x1f, 0x8b, ..] => Detected::Gzip,
+        [0x1f, 0x8b | 0x9e, ..] => Detected::Gzip,
         [b'P', b'K', 3, 4] => Detected::Zip,
         [0x1f, 0x9d, ..] => Detected::Compress,
         [0x1f, 0x1e, ..] => Detected::Pack,
@@ -230,6 +233,7 @@ mod tests {
         let lzip = if has("lzip") { Lzip } else { Unknown };
         let table: &[(&[u8], Flavour, Detected)] = &[
             (b"\x1f\x8b\x08\x00", Flavour::Gnu, Gzip),
+            (b"\x1f\x9e\x08\x00", Flavour::Gnu, Gzip),
             (b"PK\x03\x04", Flavour::Gnu, Zip),
             (b"\x1f\x9d\x90\x00", Flavour::Gnu, compress),
             (b"\x1f\x1e\x00\x00", Flavour::Gnu, Pack),
