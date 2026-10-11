@@ -199,4 +199,87 @@ mod unix {
             assert_eq!(gzip_custom_suffix(args), *want, "{args:?}");
         }
     }
+
+    // ---- the Apple normalisations (`apple_compare`'s helpers) ----
+
+    /// Apple's `-v` ratio is blanked after `name:\t\t  ` (and `\t  `) and
+    /// at the start of standard input's line, and only the ratio: the
+    /// rest of the line still differs.
+    #[test]
+    fn apple_ratios_are_blanked_and_nothing_else() {
+        let a = blank_apple_ratios("a:\t\t  -99.9% -- replaced with a.gz\n");
+        let b = blank_apple_ratios("a:\t\t   12.5% -- replaced with a.gz\n");
+        assert_eq!(a, "a:\t\t<ratio> -- replaced with a.gz\n");
+        assert_eq!(a, b);
+        let long = blank_apple_ratios("abcdefg:\t  50.0% -- replaced with abcdefg.gz\n");
+        assert_eq!(long, "abcdefg:\t<ratio> -- replaced with abcdefg.gz\n");
+        assert_eq!(blank_apple_ratios("  0.4%\n"), "<ratio>\n");
+        assert_eq!(blank_apple_ratios("-99.9%\n"), "<ratio>\n");
+        // Outside the ratio, differences survive.
+        assert_ne!(
+            a,
+            blank_apple_ratios("a:\t\t  -99.9% -- replaced with b.gz\n")
+        );
+        assert_ne!(
+            a,
+            blank_apple_ratios("a:\t  -99.9% -- replaced with a.gz\n")
+        );
+        // A line that holds no ratio is left alone.
+        let msg = "gzip: a: not in gzip format\n";
+        assert_eq!(blank_apple_ratios(msg), msg);
+    }
+
+    fn run_with(stdout: Vec<u8>, start: i64) -> Run {
+        Run {
+            code: 0,
+            stdout,
+            stderr: String::new(),
+            tree: Tree::new(),
+            start,
+        }
+    }
+
+    /// A member header with MTIME `t`, then fixed bytes.
+    fn member(t: u32) -> Vec<u8> {
+        let mut v = vec![0x1f, 0x8b, 8, 0];
+        v.extend_from_slice(&t.to_le_bytes());
+        v.extend_from_slice(&[0, 3, 0xcb, 0x48, 0xcd, 0xc9, 0x01, 0x02, 0x03, 0x04]);
+        v
+    }
+
+    /// Standard input's stored time is masked only when both lie in their
+    /// own run's wall-clock window, and nothing else is.
+    #[test]
+    fn stdin_mtimes_are_masked_only_inside_the_window() {
+        let now = now_secs();
+        let t = now as u32;
+        let c = case(vec![], true);
+        // Two members, each a second apart: masked, then equal.
+        let r = run_with([member(t), member(t)].concat(), now);
+        let mut s = run_with([member(t + 1), member(t + 1)].concat(), now);
+        mask_stdin_mtimes(&r, &mut s);
+        assert_eq!(r.stdout, s.stdout);
+        assert_same(&c, &r, &s);
+        // A time outside the window (a file's 2001 mtime) is not masked.
+        let r = run_with(member(t), now);
+        let mut s = run_with(member(1_000_000_000), now);
+        let before = s.stdout.clone();
+        mask_stdin_mtimes(&r, &mut s);
+        assert_eq!(s.stdout, before);
+        let caught = std::panic::catch_unwind(|| assert_same(&c, &r, &s));
+        assert!(panic_text(caught.unwrap_err()).contains("stdout differs"));
+        // A difference outside MTIME still fails after masking.
+        let r = run_with(member(t), now);
+        let mut other = member(t + 1);
+        let last = other.len() - 1;
+        other[last] ^= 0xff;
+        let mut s = run_with(other, now);
+        mask_stdin_mtimes(&r, &mut s);
+        let caught = std::panic::catch_unwind(|| assert_same(&c, &r, &s));
+        let text = panic_text(caught.unwrap_err());
+        assert!(
+            text.contains("stdout differs") && text.contains("in 1 way(s)"),
+            "{text}"
+        );
+    }
 }
