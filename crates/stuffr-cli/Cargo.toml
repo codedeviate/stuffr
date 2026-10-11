@@ -5,8 +5,11 @@ description = "The stuffr command line interface"
 edition.workspace = true
 rust-version.workspace = true
 # Not the workspace's MIT alone: `compat` ports code from bzip2.c and
-# bzip2recover.c, whose licence ships as LICENSE-bzip2.
-license = "MIT AND bzip2-1.0.6"
+# bzip2recover.c, whose licence ships as LICENSE-bzip2, and from Apple's
+# (FreeBSD's, NetBSD's) gzip.c, whose BSD-2-Clause notice ships as
+# LICENSE-gzip-bsd. SPDX deprecated `BSD-2-Clause-NetBSD` and
+# `-FreeBSD` for `BSD-2-Clause`, whose text they share.
+license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause"
 repository.workspace = true
 keywords = ["compression", "archive", "cli", "unzip", "extract"]
 categories = ["command-line-utilities", "compression"]

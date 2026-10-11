@@ -11,8 +11,9 @@
 //!   behaves as `zcat`. The module doc of `gnu/mod.rs` lists the behaviours
 //!   reproduced and the deviations.
 //! - **BSD** (`bsd/`): Apple's gzip 487, ported from `file_cmds`
-//!   (BSD-2-Clause). Not built yet: under this flavour every name reports
-//!   that and exits 1.
+//!   (BSD-2-Clause, `LICENSE-gzip-bsd`); its compressed bytes are Apple's
+//!   on the C tier. The module doc of `bsd/mod.rs` lists the behaviours
+//!   reproduced and the deviations.
 //!
 //! The flavour is [`default_flavour`] unless `STUFFR_GZIP_FLAVOR` says `gnu`
 //! or `bsd`; [`run`] reads the variable once, before any argument.
@@ -28,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
+mod bsd;
 mod gnu;
 // `after_member` and parts of the sniffer (`ZipEntry::data`, the BSD table's
 // codecs) are the BSD personality's, which a later task wires in.
@@ -118,10 +120,7 @@ fn main(
 ) -> u8 {
     match flavour {
         Flavour::Gnu => gnu::main(name, argv0, args, env, host, err),
-        Flavour::Bsd => {
-            gnu::bsd_not_built(name, err);
-            1
-        }
+        Flavour::Bsd => bsd::main(name, args, env, host, err),
     }
 }
 

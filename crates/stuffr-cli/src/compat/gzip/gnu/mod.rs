@@ -150,8 +150,3 @@ fn flushed(mut out: impl Write, code: u8) -> u8 {
     let _ = out.flush();
     code
 }
-
-/// What any name says under the BSD flavour until it is built.
-pub(super) fn bsd_not_built(name: &str, err: &mut dyn Write) {
-    printf(err, m::BSD_NOT_BUILT, &[name.as_bytes()]);
-}

@@ -442,19 +442,38 @@ pub(crate) fn compress_member(
     out: &mut dyn Write,
 ) -> io::Result<(u32, u64)> {
     write_header(h, out)?;
-    let (crc, total) = match engine {
-        Engine::Miniz => deflate_miniz(level, input, out)?,
+    let (crc, total) = compress_body(level, engine, input, out)?;
+    write_trailer(crc, total, out)?;
+    Ok((crc, total))
+}
+
+/// The raw deflate body of a member: `input` at `level` by `engine`, to
+/// `out`. Returns (crc, uncompressed length), for the trailer.
+pub(crate) fn compress_body(
+    level: u32,
+    engine: Engine,
+    input: &mut dyn Read,
+    out: &mut dyn Write,
+) -> io::Result<(u32, u64)> {
+    match engine {
+        Engine::Miniz => deflate_miniz(level, input, out),
         #[cfg(feature = "zlib-c")]
         Engine::ZlibC => {
             let mut d = stuffr::zlib_c::RawDeflate::new(&mut *out, level)?;
             let sums = pump(input, &mut |chunk| d.write_all(chunk))?;
             d.finish()?;
-            sums
+            Ok(sums)
         }
-    };
-    out.write_all(&crc.to_le_bytes())?;
-    out.write_all(&(total as u32).to_le_bytes())?;
-    Ok((crc, total))
+    }
+}
+
+/// A member's trailer: CRC32, then the length modulo 2^32, little-endian,
+/// in one write.
+pub(crate) fn write_trailer(crc: u32, total: u64, out: &mut dyn Write) -> io::Result<()> {
+    let mut t = [0u8; 8];
+    t[..4].copy_from_slice(&crc.to_le_bytes());
+    t[4..].copy_from_slice(&(total as u32).to_le_bytes());
+    out.write_all(&t)
 }
 
 /// Read `input` to EOF in chunks, handing each to `sink` and returning the

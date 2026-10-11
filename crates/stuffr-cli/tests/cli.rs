@@ -7899,6 +7899,12 @@ fn no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation() 
     assert!(is_verbatim_reference_messages(Path::new(
         "crates/stuffr-cli/src/compat/gzip/gnu/messages.rs"
     )));
+    assert!(is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/gzip/bsd/messages.rs"
+    )));
+    assert!(!is_verbatim_reference_messages(Path::new(
+        "crates/stuffr-cli/src/compat/gzip/bsd/run.rs"
+    )));
     assert!(!is_verbatim_reference_messages(Path::new(
         "crates/stuffr-cli/src/compat/gzip/gnu/run.rs"
     )));

@@ -11,8 +11,6 @@
 //! The deliberate changes: `--version`/`-V`/`-L` (and the `gunzip`/`zcat`
 //! scripts' `--version`) name stuffr and its version on the first line and
 //! print stuffr's own MIT notice after it, never GNU's (Ruling T7-2).
-//! [`BSD_NOT_BUILT`] is stuffr's own, for the flavour a later task fills
-//! in.
 
 pub(super) use crate::compat::host::printf;
 
@@ -406,13 +404,7 @@ pub(super) const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
-// ---- stuffr's own ----
-
-/// stuffr's own: Apple's personality is built by a later task.
-pub(super) const BSD_NOT_BUILT: &str = concat!(
-    "%s: stuffr's BSD gzip personality is not built yet; ",
-    "set STUFFR_GZIP_FLAVOR=gnu\n"
-);
+// ---- formatting ----
 
 /// GNU's `-v` ratio, `%5.1f%%` of `100 * (in - out) / in`, where `out`
 /// counts the deflate body only (header and trailer excluded); matched
