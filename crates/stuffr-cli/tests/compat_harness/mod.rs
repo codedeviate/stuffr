@@ -55,6 +55,222 @@ pub fn gnu_gzip_version() -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+const XZ_VERSION_LINE: &str = "XZ_VERSION=50080042";
+const XZ_LINKS: [&str; 5] = ["unxz", "xzcat", "lzma", "unlzma", "lzcat"];
+
+/// Whether `<dir>/xz --robot --version` says it is XZ Utils 5.8.4.
+fn is_xz_5_8_4(dir: &Path) -> bool {
+    Command::new(dir.join("xz"))
+        .args(["--robot", "--version"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(XZ_VERSION_LINE))
+}
+
+/// A directory holding `xz` and its five links. `xz` itself is `exe`; when
+/// the links are not all beside it (a bare binary), they are made, as
+/// symlinks to it, in a temporary directory that lives as long as the test
+/// process's temp dir (a few inodes; never removed).
+fn dir_with_links(exe: &Path) -> Option<PathBuf> {
+    let parent = exe.parent()?;
+    if XZ_LINKS.iter().all(|l| parent.join(l).exists()) {
+        return Some(parent.to_path_buf());
+    }
+    let dir = std::env::temp_dir().join(format!("stuffr-xz-links-{}", std::process::id()));
+    fs::create_dir_all(&dir).ok()?;
+    let target = fs::canonicalize(exe).ok()?;
+    for name in std::iter::once("xz").chain(XZ_LINKS) {
+        let l = dir.join(name);
+        let _ = fs::remove_file(&l);
+        std::os::unix::fs::symlink(&target, &l).ok()?;
+    }
+    Some(dir)
+}
+
+/// `xz` on `PATH`, like a shell's lookup.
+fn xz_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join("xz"))
+        .find(|p| p.is_file())
+}
+
+/// The directory holding XZ Utils 5.8.4's `xz` and its links `unxz`,
+/// `xzcat`, `lzma`, `unlzma` and `lzcat`.
+///
+/// Looked up in this order, the first one that is exactly 5.8.4 (`xz
+/// --robot --version` prints `XZ_VERSION=50080042`) winning:
+/// 1. `$STUFFR_XZ_REFERENCE`, the path of an `xz` (CI builds the release
+///    tarball there; `make install` puts the five links beside it, and if
+///    they are absent they are made in a temp dir);
+/// 2. Homebrew's keg, `/opt/homebrew/opt/xz/bin`;
+/// 3. `xz` on `PATH`.
+///
+/// `None` when there is none: a skip with a note locally, a panic under `CI`
+/// (the rule of [`require_reference`]), so every test that skips on it would
+/// otherwise pass vacuously. A tool of another release is no reference:
+/// stuffr promises 5.8.4's bytes.
+pub fn xz_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let found = DIR.get_or_init(|| {
+        let candidates = [
+            std::env::var_os("STUFFR_XZ_REFERENCE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            Some(PathBuf::from("/opt/homebrew/opt/xz/bin/xz")),
+            xz_on_path(),
+        ];
+        for exe in candidates.into_iter().flatten() {
+            if !exe.is_file() {
+                continue;
+            }
+            let Some(dir) = dir_with_links(&exe) else {
+                continue;
+            };
+            if is_xz_5_8_4(&dir) {
+                return dir.to_str().map(str::to_owned);
+            }
+        }
+        None
+    });
+    match found {
+        Some(d) => Some(d.as_str()),
+        None => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is set but there is no XZ Utils 5.8.4 reference (looked at \
+                 $STUFFR_XZ_REFERENCE, /opt/homebrew/opt/xz/bin, PATH)"
+            );
+            eprintln!("skipped: XZ Utils 5.8.4 not installed");
+            None
+        }
+    }
+}
+
+/// Whether `s` is an xz elapsed time: `m:ss` or `h:mm:ss`.
+fn is_xz_elapsed(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(':').collect();
+    let digits = |p: &str, n: Option<usize>| {
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && n.is_none_or(|n| p.len() == n)
+    };
+    match parts.as_slice() {
+        [m, ss] => digits(m, None) && digits(ss, Some(2)),
+        [h, mm, ss] => digits(h, None) && digits(mm, Some(2)) && digits(ss, Some(2)),
+        _ => false,
+    }
+}
+
+/// Whether `s` is an xz speed: `123 KiB/s`, `1.2 MiB/s` (K, M or G).
+fn is_xz_speed(s: &str) -> bool {
+    let Some((num, unit)) = s.split_once(' ') else {
+        return false;
+    };
+    matches!(unit, "KiB/s" | "MiB/s" | "GiB/s")
+        && !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        && num.bytes().filter(|&b| b == b'.').count() <= 1
+        && !num.starts_with('.')
+        && !num.ends_with('.')
+}
+
+/// Split a progress line after the `= 0.611` ratio of its size block
+/// (`<n> <unit> / <n> <unit> = <ratio>`). `None` when `line` has no such
+/// block.
+fn split_after_ratio(line: &str) -> Option<(&str, &str)> {
+    let eq = line.find(" = ")?;
+    if !line[..eq].contains(" / ") {
+        return None;
+    }
+    let after = &line[eq + 3..];
+    let end = after
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(after.len());
+    let ratio = &after[..end];
+    let ok = ratio.len() >= 2 && ratio.bytes().filter(|&b| b == b'.').count() == 1;
+    ok.then(|| line.split_at(eq + 3 + end))
+}
+
+/// Replace the speed and elapsed-time fields of xz's `-v` progress lines
+/// with `<speed>` and `<elapsed>`, and nothing else: they are the only part
+/// of xz's output that depends on how fast the run was.
+///
+/// Both shapes of the final line are covered:
+/// - stderr not a terminal (what the differential suite sees):
+///   `name: 19.1 MiB / 19.1 MiB = 1.000, 3.9 MiB/s, 0:04`, the speed present
+///   from 3 s and the time from 1 s (`message.c` `progress_flush`);
+/// - the terminal format, `\r 100 %   1,234 B / 300.0 KiB = 0.004
+///   1.2 MiB/s   0:00`, whose column padding follows the speed's width, so
+///   its blanks are collapsed.
+///
+/// A line is touched only if it carries a size block (`a / b = ratio`) and
+/// the field's whole text has xz's exact shape; the sizes, the ratio, the
+/// name and every other line stay as they are.
+pub fn normalise_xz_progress(stderr: &str) -> String {
+    let mut out = String::with_capacity(stderr.len());
+    for line in stderr.split_inclusive('\n') {
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        let Some((head, tail)) = split_after_ratio(body) else {
+            out.push_str(line);
+            continue;
+        };
+        out.push_str(head);
+        if let Some(fields) = tail.strip_prefix(", ") {
+            // Non-terminal: `, <speed>`, `, <elapsed>`, `, <speed>, <elapsed>`.
+            let fs: Vec<&str> = fields.split(", ").collect();
+            let ok = match fs.as_slice() {
+                [t] => is_xz_elapsed(t),
+                [s, t] => is_xz_speed(s) && is_xz_elapsed(t),
+                _ => false,
+            };
+            if ok {
+                for f in fs {
+                    out.push_str(", ");
+                    out.push_str(if is_xz_elapsed(f) {
+                        "<elapsed>"
+                    } else {
+                        "<speed>"
+                    });
+                }
+            } else {
+                out.push_str(tail);
+            }
+        } else if tail.starts_with(' ') {
+            // Terminal: blanks, speed, blanks, time, blanks.
+            let toks: Vec<&str> = tail.split_whitespace().collect();
+            let mut mapped: Vec<&str> = Vec::new();
+            let mut i = 0;
+            let mut ok = true;
+            while i < toks.len() {
+                if i + 1 < toks.len() && is_xz_speed(&format!("{} {}", toks[i], toks[i + 1])) {
+                    mapped.push("<speed>");
+                    i += 2;
+                } else if is_xz_elapsed(toks[i]) {
+                    mapped.push("<elapsed>");
+                    i += 1;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                for m in mapped {
+                    out.push(' ');
+                    out.push_str(m);
+                }
+            } else {
+                out.push_str(tail);
+            }
+        } else {
+            out.push_str(tail);
+        }
+        out.push_str(nl);
+    }
+    out
+}
+
 /// How compressed output is judged when its bytes are not promised
 /// identical, and which tool decodes it.
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +281,12 @@ pub enum Roundtrip {
     /// (an absolute path). The header up to the end of FNAME is compared
     /// byte-for-byte.
     Gzip { ref_gzip: &'static str },
+    /// xz streams (`fd 37 7a 58 5a 00`, `.xz`/`.txz`; `.lzma`/`.tlz` and raw
+    /// by name or `-S`), decoded by `ref_xz -dc` (an absolute path), with
+    /// `--format=lzma|raw` added as the case's arguments or invoked name
+    /// ask. The stream header (magic, stream flags) is compared byte for
+    /// byte.
+    Xz { ref_xz: &'static str },
 }
 
 pub struct Case<'a> {
@@ -425,12 +647,81 @@ pub fn ref_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decompress with the reference tool `rt` names; `Err` carries its stderr.
 pub fn ref_decompress_with(rt: &Roundtrip, data: &[u8]) -> Result<Vec<u8>, String> {
+    ref_decompress_args(rt, &[], data)
+}
+
+/// Decompress for case `c`: as [`ref_decompress_with`], with the reference
+/// told the stream format (and raw filter chain) `c` compressed with.
+pub fn ref_decompress_case(c: &Case, data: &[u8]) -> Result<Vec<u8>, String> {
+    let extra = match c.roundtrip {
+        Roundtrip::Xz { .. } => xz_decode_args(c),
+        _ => Vec::new(),
+    };
+    ref_decompress_args(&c.roundtrip, &extra, data)
+}
+
+/// The `xz -dc` options that make the reference read what `c` wrote: the
+/// last `--format`/`-F` (else `lzma` when `c` is invoked as `lzma`, `unlzma`
+/// or `lzcat`), and for `raw` the filter options of `c`, since a raw stream
+/// carries no header to say which chain it is.
+fn xz_decode_args(c: &Case) -> Vec<String> {
+    const FILTERS: [&str; 9] = [
+        "--lzma1",
+        "--lzma2",
+        "--delta",
+        "--x86",
+        "--arm",
+        "--powerpc",
+        "--ia64",
+        "--sparc",
+        "--riscv",
+    ];
+    let mut format: Option<String> = match c.name {
+        "lzma" | "unlzma" | "lzcat" => Some("lzma".into()),
+        _ => None,
+    };
+    let mut filters: Vec<String> = Vec::new();
+    let mut it = c.args.iter();
+    while let Some(a) = it.next() {
+        if *a == "--" {
+            break;
+        }
+        let value = if let Some(v) = a.strip_prefix("--format=") {
+            Some(v.to_owned())
+        } else if *a == "--format" || *a == "-F" {
+            it.next().map(|v| (*v).to_owned())
+        } else {
+            a.strip_prefix("-F")
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        if let Some(v) = value {
+            format = Some(v);
+        } else if FILTERS.iter().any(|f| a.starts_with(f)) {
+            filters.push((*a).to_owned());
+        }
+    }
+    let mut v = Vec::new();
+    match format.as_deref() {
+        Some("lzma" | "alone") => v.push("--format=lzma".to_owned()),
+        Some("raw") => {
+            v.push("--format=raw".to_owned());
+            v.extend(filters);
+        }
+        _ => {}
+    }
+    v
+}
+
+fn ref_decompress_args(rt: &Roundtrip, extra: &[String], data: &[u8]) -> Result<Vec<u8>, String> {
     let (exe, what) = match rt {
         Roundtrip::Bzip2 => (Path::new(REFERENCE_DIR).join("bzip2"), "bzip2"),
         Roundtrip::Gzip { ref_gzip } => (PathBuf::from(ref_gzip), "gzip"),
+        Roundtrip::Xz { ref_xz } => (PathBuf::from(ref_xz), "xz"),
     };
     let mut child = Command::new(exe)
         .arg("-dc")
+        .args(extra)
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -456,8 +747,13 @@ fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
     match rt {
         Roundtrip::Bzip2 => b.starts_with(b"BZh"),
         Roundtrip::Gzip { .. } => b.starts_with(&[0x1f, 0x8b]),
+        Roundtrip::Xz { .. } => b.starts_with(&XZ_MAGIC),
     }
 }
+
+/// The magic of an `.xz` stream header. `.lzma` and raw streams have none:
+/// they are recognised by name (`is_compressed_name`) only.
+const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0];
 
 /// The `-S`/`--suffix` operand of `args`, if any: `-S X`, `-SX`, `--suffix X`,
 /// `--suffix=X` (or an abbreviation, `--su=X`), and `S` inside a short cluster
@@ -534,6 +830,12 @@ fn is_compressed_name(c: &Case, n: &str) -> bool {
                 || n.ends_with(".tgz")
                 || case_suffix(c).is_some_and(|s| !s.is_empty() && n.ends_with(s))
         }
+        Roundtrip::Xz { .. } => {
+            [".xz", ".txz", ".lzma", ".tlz"]
+                .iter()
+                .any(|s| n.ends_with(s))
+                || gzip_custom_suffix(&c.args).is_some_and(|s| !s.is_empty() && n.ends_with(s))
+        }
     }
 }
 
@@ -599,6 +901,21 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
                     .and_then(|s| name.strip_suffix(s))
                     .map(str::to_owned)
             })?,
+        Roundtrip::Xz { .. } => name
+            .strip_suffix(".xz")
+            .or_else(|| name.strip_suffix(".lzma"))
+            .map(str::to_owned)
+            .or_else(|| {
+                name.strip_suffix(".txz")
+                    .or_else(|| name.strip_suffix(".tlz"))
+                    .map(|b| format!("{b}.tar"))
+            })
+            .or_else(|| {
+                gzip_custom_suffix(&c.args)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| name.strip_suffix(s))
+                    .map(str::to_owned)
+            })?,
     };
     c.files
         .iter()
@@ -656,6 +973,7 @@ fn tool_name(rt: &Roundtrip) -> &'static str {
     match rt {
         Roundtrip::Bzip2 => "bzip2",
         Roundtrip::Gzip { .. } => "gzip",
+        Roundtrip::Xz { .. } => "xz",
     }
 }
 
@@ -666,7 +984,25 @@ fn stream_mismatch(rt: &Roundtrip, reference: &[u8], ours: &[u8]) -> Option<Stri
     match rt {
         Roundtrip::Bzip2 => block_digit_mismatch(reference, ours),
         Roundtrip::Gzip { .. } => gzip_header_mismatch(reference, ours),
+        Roundtrip::Xz { .. } => xz_header_mismatch(reference, ours),
     }
+}
+
+/// Difference in an `.xz` stream header's magic and stream flags (the first
+/// eight bytes: they carry the check type), if both are `.xz` streams. The
+/// header's CRC32 follows from them, so it is not compared.
+fn xz_header_mismatch(reference: &[u8], ours: &[u8]) -> Option<String> {
+    if !(reference.starts_with(&XZ_MAGIC) && ours.starts_with(&XZ_MAGIC)) {
+        return None;
+    }
+    let (r, s) = (reference.get(..8)?, ours.get(..8)?);
+    (r != s).then(|| {
+        format!(
+            "xz stream header differs:\n    reference: {}\n    stuffr:    {}",
+            describe_bytes(r),
+            describe_bytes(s)
+        )
+    })
 }
 
 /// Full comparison of `r` (reference) against `s` (stuffr). Panics with every
@@ -705,7 +1041,7 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
         if let Some(e) = stream_mismatch(&c.roundtrip, &r.stdout, &s.stdout) {
             d.push(format!("stdout {e}"));
         }
-        match ref_decompress_with(&c.roundtrip, &s.stdout) {
+        match ref_decompress_case(c, &s.stdout) {
             Ok(got) if got == want => {}
             Ok(got) => d.push(format!(
                 "stdout round-trip mismatch: want {}, got {}",
@@ -744,7 +1080,7 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
                     if let Some(e) = stream_mismatch(&c.roundtrip, rb, sb) {
                         d.push(format!("tree: {n} {e}"));
                     }
-                    match (ref_decompress_with(&c.roundtrip, sb), original_for(c, n)) {
+                    match (ref_decompress_case(c, sb), original_for(c, n)) {
                         (Ok(got), Some(want)) if got == want => {}
                         (Ok(got), Some(want)) => d.push(format!(
                             "tree: {n} round-trip mismatch: want {}, got {}",
