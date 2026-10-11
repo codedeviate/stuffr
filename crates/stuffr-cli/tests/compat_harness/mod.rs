@@ -769,6 +769,138 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
     }
 }
 
+// ---- peak memory of a streaming decoder ----
+
+/// Run stuffr as `name` on `file` (written with `input`) in a scratch
+/// directory, with only `env` in the environment; check it exits 0 having
+/// printed exactly `plain` and nothing on standard error; return its peak
+/// memory in bytes. Shared by 0.11.0's `bzcat_streams_a_large_input` and
+/// 0.12.0's `zcat_streams_a_large_input` (Ruling P6).
+///
+/// - **Linux:** the largest `RssAnon` in `/proc/<pid>/status`, sampled
+///   every 5 ms, counting only samples taken once `/proc/<pid>/exe` is the
+///   stuffr binary. Not `getrusage`: there a child's `ru_maxrss` includes
+///   the parent's resident set at spawn, and this test process holds the
+///   64 MiB input and its copies (CI measured 264-268 MiB). Not `VmHWM`
+///   either: it also counts file-backed pages, the touched part of a debug
+///   binary of hundreds of MiB among them (CI measured 220-233 MiB). The
+///   claim under test is that the decoder holds neither the input nor the
+///   output, which is anonymous memory, flat after the first block, so
+///   sampling loses nothing. Before the exec completes `/proc/<pid>` can
+///   still describe the spawning test process (CI measured 155 MiB of
+///   RssAnon that way). The status at the peak and a timeline are printed.
+/// - **Elsewhere:** `getrusage(RUSAGE_CHILDREN)`'s `ru_maxrss`, the largest
+///   child this process has waited for (bytes on macOS, which spawns
+///   without copying the parent, so the figure is the child's own).
+pub fn decoder_peak_rss(
+    name: &str,
+    file: &str,
+    input: &[u8],
+    plain: &[u8],
+    env: &[(&str, &str)],
+) -> u64 {
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "stuffr-rss-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("bin")).unwrap();
+    let link = dir.join("bin").join(name);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+    fs::write(dir.join(file), input).unwrap();
+    let mut child = Command::new(&link)
+        .arg(file)
+        .current_dir(&dir)
+        .env_clear()
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        out.read_to_end(&mut v).unwrap();
+        v
+    });
+    #[cfg(target_os = "linux")]
+    let peak = linux_rss_anon_peak(&mut child);
+    let st = child.wait().unwrap();
+    let got = reader.join().unwrap();
+    let mut err = String::new();
+    let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(st.success(), "{st:?}: {err}");
+    assert_eq!(err, "");
+    assert!(got == plain, "decoded output differs");
+    #[cfg(not(target_os = "linux"))]
+    let peak = {
+        // SAFETY: `ru` is a valid out-pointer; getrusage only writes it.
+        let ru = unsafe {
+            let mut ru: libc::rusage = std::mem::zeroed();
+            assert_eq!(libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru), 0);
+            ru
+        };
+        let peak = ru.ru_maxrss as u64;
+        eprintln!("peak child RSS: {:.1} MiB", peak as f64 / 1048576.0);
+        peak
+    };
+    peak
+}
+
+/// The sampling loop of [`decoder_peak_rss`] on Linux: until `child`
+/// exits, the largest `RssAnon` seen while it is stuffr.
+#[cfg(target_os = "linux")]
+fn linux_rss_anon_peak(child: &mut std::process::Child) -> u64 {
+    let status = format!("/proc/{}/status", child.id());
+    let exe_link = format!("/proc/{}/exe", child.id());
+    let stuffr_exe = fs::canonicalize(env!("CARGO_BIN_EXE_stuffr")).unwrap();
+    let mut peak = 0u64;
+    let mut at_peak = String::new();
+    let mut timeline = Vec::new();
+    let t0 = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        let is_stuffr = fs::read_link(&exe_link).is_ok_and(|e| e == stuffr_exe);
+        if let Ok(s) = fs::read_to_string(&status)
+            && let Some(kb) = s
+                .lines()
+                .find_map(|l| l.strip_prefix("RssAnon:"))
+                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+        {
+            if timeline.len() < 40 {
+                timeline.push(format!(
+                    "{}ms:{}{}k",
+                    t0.elapsed().as_millis(),
+                    if is_stuffr { "" } else { "(not stuffr)" },
+                    kb
+                ));
+            }
+            if is_stuffr && kb * 1024 > peak {
+                peak = kb * 1024;
+                at_peak = s
+                    .lines()
+                    .filter(|l| {
+                        l.starts_with("Name") || l.starts_with("Vm") || l.starts_with("Rss")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    eprintln!("RssAnon timeline: {}", timeline.join(" "));
+    assert!(
+        peak > 0,
+        "RssAnon was never sampled while the process was stuffr"
+    );
+    eprintln!("/proc status at the peak: {at_peak}");
+    eprintln!("peak RssAnon: {:.1} MiB", peak as f64 / 1048576.0);
+    peak
+}
+
 // ---- deterministic test data (no RNG dependency) ----
 
 struct XorShift(u64);
