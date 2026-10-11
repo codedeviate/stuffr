@@ -1,14 +1,19 @@
-//! The bzip2 compatibility family (0.11.0 Task 6): `bzip2`, `bunzip2`,
-//! `bzcat` and `bzip2recover`, run in-process through
-//! `stuffr_cli::compat::run_in` and `bzip2recover::recover`.
+//! The compatibility families, run in-process: the bzip2 family (0.11.0
+//! Task 6: `bzip2`, `bunzip2`, `bzcat`, `bzip2recover`) and the gzip family
+//! (0.12.0 Task 11: `gzip`, `gunzip`, `zcat`, `gzcat`, each as GNU and as
+//! Apple/BSD), through `stuffr_cli::compat::run_in_counted` and
+//! `bzip2recover::recover`.
 //!
 //! The only fuzz coverage of `stuffr::bzip2_stream::StreamReader`, the
-//! libbzip2-shaped decoder only the compat layer reaches: every decompress and
-//! test path below goes through it.
+//! libbzip2-shaped decoder only the compat layer reaches, and of the gzip
+//! personalities' own decoders: GNU's member reader, pack and `.Z` paths and
+//! its zip entry; Apple's `gz_uncompress` state machine, `unlz`, `zread`, the
+//! xz index reader behind `-l`, and the raw bzip2/xz/pack steps.
 //!
 //! An input is `[tool][argc][token; argc][file mask] ++ payload`, decoded by
 //! `stuffr_core::testing::decode_compat_case` (whose tables are the wire
-//! format of the seeds `crates/stuffr/tests/fuzz_corpus.rs` writes). Each
+//! format of the seeds `crates/stuffr/tests/fuzz_corpus.rs` writes). The
+//! tool byte also picks the gzip flavour, `(byte / names) & 1` (R7). Each
 //! file the mask names is created holding the payload; with the mask's stdin
 //! bit, standard input carries it too.
 //!
@@ -16,7 +21,13 @@
 //!
 //! - no panic;
 //! - the exit code is one the tool has: 0-3 for the bzip2 family (`0` ok,
-//!   `1` environment, `2` corrupt, `3` internal), 0 or 1 for bzip2recover;
+//!   `1` environment, `2` corrupt, `3` internal), 0 or 1 for bzip2recover,
+//!   and 0-2 for the gzip family in both flavours (GNU: 0 ok, 1 error, 2
+//!   warning; Apple's `gzip.c` exits only through `exit(exit_value)` with
+//!   0, 1 or 2, `maybe_err[x]`'s `exit(2)`, `err(1)`/`errx(1)`, and `exit(0)`
+//!   after usage, version and licence; its decoders `unbzip2.c`, `unxz.c`,
+//!   `unpack.c`, `unlz.c` and `zuncompress.c` add none; stuffr's own 3-7
+//!   must never appear);
 //! - nothing is created, changed or removed outside the run's directory:
 //!   each run gets a fresh directory inside a per-process sandbox parent, and
 //!   `check_extraction_contained` walks the parent afterwards (the parent is
@@ -25,13 +36,23 @@
 //! - bzip2recover reads its input at most twice (two opens, at most
 //!   `2 × len` bytes: its two passes) and within `check_scan_is_linear`'s
 //!   bound, creates at most 50000 outputs, and writes at most the input's
-//!   bytes plus a fixed per-output frame.
+//!   bytes plus a fixed per-output frame;
+//! - the gzip family opens each input at most twice, and reads at most
+//!   `2 × len` bytes of it, per operand that can name it (see
+//!   `check_gzip_reads`, and its doc for what each mode was measured at);
+//!   it opens no file an operand cannot name; it leaves no `.stuffr-gzip-*`
+//!   temporary behind, and (unless `-N` lets a member's stored name choose
+//!   the output) no name in the run's directory that `could_be_written`
+//!   does not allow. A partial output kept after a foreign-format failure
+//!   (Apple's `maybe_err` exit 2 for `.bz2`, `.xz`, lzip, pack and `.Z`,
+//!   Ruling T10-2) is such a name: an operand less its suffix.
 //!
-//! Inputs past `COMPAT_FUZZ_MAX_INPUT` (64 KiB; see its doc) are skipped. The bzip2 family's output, to
-//! standard output and files together, is capped by `run_in` itself
-//! (8 MiB, failing as a full disk does: bzip2's exit 1), because a bzip2
-//! stream of a few dozen bytes can expand to tens of MiB, and a payload is
-//! written up to four times over plus standard input.
+//! Inputs past `COMPAT_FUZZ_MAX_INPUT` (64 KiB; see its doc) are skipped.
+//! Both families' output, to standard output and files together, is capped
+//! by `run_in` itself (8 MiB, failing as a full disk does: exit 1), because
+//! a bzip2 stream of a few dozen bytes can expand to tens of MiB, and a
+//! payload is written up to seven times over plus standard input; the bytes
+//! `-t` decodes are charged to the same budget (`Host::charge`).
 
 #![no_main]
 
@@ -46,10 +67,10 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use libfuzzer_sys::fuzz_target;
-use stuffr_cli::compat::{self, bzip2recover};
+use stuffr_cli::compat::{self, bzip2recover, gzip::Flavour};
 use stuffr_core::testing::{
-    COMPAT_FILES, COMPAT_FUZZ_MAX_INPUT, check_extraction_contained, check_scan_is_linear,
-    decode_compat_case,
+    COMPAT_FILES, COMPAT_FUZZ_MAX_INPUT, COMPAT_TOKENS, check_extraction_contained,
+    check_scan_is_linear, decode_compat_case,
 };
 
 /// `BZ_MAX_HANDLED_BLOCKS`: bzip2recover writes no more outputs than this.
@@ -70,31 +91,53 @@ fn sandbox() -> &'static Path {
     })
 }
 
+/// The suffixes the tools add or strip, beyond the tokens (any token can be
+/// `-S`'s suffix): bzip2's, `.out`, both gzips' tables and `.tar`.
+const SUFFIXES: &[&str] = &[
+    ".bz2", ".bz", ".tbz2", ".tbz", ".out", ".gz", ".tgz", ".taz", ".z", ".Z", "-gz", "-z", "_z",
+    ".xz", ".lz", ".tar",
+];
+
+/// Suffixes a decompressor maps to `.tar` rather than strip.
+const TAR_SUFFIXES: &[&str] = &[".tbz2", ".tbz", ".tgz", ".taz"];
+
 /// Whether `name` is one the tools could write in their working directory:
-/// a `COMPAT_FILES` name or one derived from it (`.bz2` added, a suffix
-/// mapped to `.tar` or `.out`, a `.bz2` stripped), a bzip2recover output
-/// (`rec` and five digits), or bzip2's temporary (`.stuffr-bzip2-*`).
+/// a `COMPAT_FILES` name or one derived from it (a suffix or token stripped,
+/// or mapped to `.tar`; then a suffix or token added: gzip's `-S` takes any
+/// token), a bzip2recover output (`rec` and five digits), or a temporary
+/// (`.stuffr-bzip2-*`, `.stuffr-gzip-*`).
+///
+/// Generous on purpose: it is the real working directory's snapshot filter
+/// (a superset only snapshots more) and the run directory's stray-file
+/// check (where it has to admit every output a run may legitimately leave,
+/// Apple's kept partial outputs included).
 fn could_be_written(name: &str) -> bool {
+    let affixes = || SUFFIXES.iter().chain(COMPAT_TOKENS);
     let mut bases: Vec<String> = Vec::new();
     for f in COMPAT_FILES {
         bases.push((*f).to_owned());
-        for (z, u) in [
-            (".bz2", ""),
-            (".bz", ""),
-            (".tbz2", ".tar"),
-            (".tbz", ".tar"),
-        ] {
-            if let Some(stem) = f.strip_suffix(z) {
-                bases.push(format!("{stem}{u}"));
+        for s in affixes() {
+            if let Some(stem) = f.strip_suffix(s) {
+                bases.push(stem.to_owned());
+            }
+        }
+        for t in TAR_SUFFIXES {
+            if let Some(stem) = f.strip_suffix(t) {
+                bases.push(format!("{stem}.tar"));
             }
         }
     }
-    let derived = |b: &str| [b.to_owned(), format!("{b}.bz2"), format!("{b}.out")];
     let rec = name
         .strip_prefix("rec")
         .is_some_and(|r| r.len() >= 5 && r.as_bytes()[..5].iter().all(u8::is_ascii_digit));
     rec || name.starts_with(".stuffr-bzip2-")
-        || bases.iter().any(|b| derived(b).iter().any(|d| d == name))
+        || name.starts_with(".stuffr-gzip-")
+        || bases.iter().any(|b| {
+            name == b
+                || name
+                    .strip_prefix(b.as_str())
+                    .is_some_and(|rest| affixes().any(|s| *s == rest))
+        })
 }
 
 /// Names the tools could write, each with its length and modification time.
@@ -237,18 +280,112 @@ fn run_recover(dir: &Path, args: &[&str]) {
     );
 }
 
-/// The bzip2 family through `run_in`. (The gzip names reach here too, as
-/// GNU, until the gzip family's own oracles land: their exit codes, 0-2,
-/// fit this one.)
+/// The bzip2 family through `run_in`.
 fn run_bzip2(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-    let (code, _out, err) = compat::run_in(dir, name, args, stdin, compat::gzip::Flavour::Gnu)
+    let (code, _out, err) = compat::run_in(dir, name, args, stdin, Flavour::Gnu)
         .expect("a COMPAT_NAMES entry is a compat name");
     assert!(
         (0..=3).contains(&code),
         "{name}: exit {code} is not a bzip2 exit code\n{}",
         String::from_utf8_lossy(&err)
     );
+}
+
+/// The gzip family through `run_in_counted`, as `flavour`.
+fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
+    let flavour = if flavour == 0 {
+        Flavour::Gnu
+    } else {
+        Flavour::Bsd
+    };
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, _out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, flavour)
+        .expect("a COMPAT_NAMES entry is a compat name");
+    let why = || String::from_utf8_lossy(&err).into_owned();
+    if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
+        eprintln!("compat: {name} {flavour:?} {args:?} -> {code}");
+        for (path, r) in &reads {
+            eprintln!("compat:   {path:?} {r:?}");
+        }
+    }
+    assert!(
+        (0..=2).contains(&code),
+        "{name} ({flavour:?}): exit {code} is not a gzip exit code\n{}",
+        why()
+    );
+    check_gzip_reads(dir, name, flavour, args, &reads);
+    check_gzip_leftovers(dir, name, flavour, args);
+}
+
+/// The gzip family's read bound: for every path a run opened, at most two
+/// opens and `2 × len` bytes read per operand that can name it, where an
+/// operand can name a path when the path's file name starts with it (the
+/// operand itself, or the operand plus a suffix a missing operand is
+/// retried with: GNU's suffix search, Apple's `.gz`/`-S` retry and `zcat`'s
+/// `.Z`), and `len` is the largest length the file had when opened (a run
+/// can rewrite a file a later operand opens: `gzip -f a a.gz`). A path no
+/// operand can name must not be opened at all.
+///
+/// Measured over the seeds and the 20-minute run (both flavours; the
+/// report of 0.12.0 Task 11 has the table): every mode opens an operand
+/// once. GNU reads it once (compress, `-d`, `-t`, `-l`, `-r`). Apple's
+/// decompression reads the first 4 bytes, then (gzip) the 4-byte
+/// timestamp at offset 4 and, under `-N`, up to 1024 bytes of name at
+/// offset 10, then rewinds and decodes from the start: under `2 × len` for
+/// every length. Apple's `-l` reads the last 8 bytes (gzip) or walks the xz
+/// indexes backwards from the footer (each index read once, the stream
+/// padding and headers in 12-byte steps), under `len`; `-lt` lists and
+/// then tests from where the listing left the descriptor. So no mode needs
+/// a bound looser than `2 × len`.
+fn check_gzip_reads(
+    dir: &Path,
+    name: &str,
+    flavour: Flavour,
+    args: &[&str],
+    reads: &BTreeMap<PathBuf, compat::InputReads>,
+) {
+    for (path, r) in reads {
+        let file = path
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_else(|| panic!("{name} ({flavour:?}): opened {path:?}, outside {dir:?}"));
+        let operands = args.iter().filter(|a| file.starts_with(**a)).count() as u64;
+        assert!(
+            r.opens <= 2 * operands,
+            "{name} ({flavour:?}) {args:?}: {} opens of {file:?}, which {operands} operand(s) can name",
+            r.opens
+        );
+        assert!(
+            r.bytes <= 2 * r.len * operands,
+            "{name} ({flavour:?}) {args:?}: read {} bytes of the {}-byte {file:?}, \
+             which {operands} operand(s) can name",
+            r.bytes,
+            r.len
+        );
+    }
+}
+
+/// No `.stuffr-gzip-*` temporary survives a run, and (unless `-N` lets a
+/// stored name choose an output) every name in the run's directory is one
+/// `could_be_written` allows.
+fn check_gzip_leftovers(dir: &Path, name: &str, flavour: Flavour, args: &[&str]) {
+    let stored_names = args.iter().any(|a| *a == "-N" || *a == "--name");
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in listing.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        assert!(
+            !n.starts_with(".stuffr-gzip-"),
+            "{name} ({flavour:?}) {args:?}: left its temporary {n:?}"
+        );
+        assert!(
+            stored_names || could_be_written(&n),
+            "{name} ({flavour:?}) {args:?}: left a stray {n:?}"
+        );
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -269,10 +406,12 @@ fuzz_target!(|data: &[u8]| {
     }
     let stdin: &[u8] = if case.stdin { case.payload } else { b"" };
 
-    if case.name == "bzip2recover" {
-        run_recover(&dir, &case.args);
-    } else {
-        run_bzip2(&dir, case.name, &case.args, stdin);
+    match case.name {
+        "bzip2recover" => run_recover(&dir, &case.args),
+        "gzip" | "gunzip" | "zcat" | "gzcat" => {
+            run_gzip(&dir, case.name, case.flavour, &case.args, stdin)
+        }
+        _ => run_bzip2(&dir, case.name, &case.args, stdin),
     }
 
     check_extraction_contained(parent, &dir, &[]).expect("compat: contained");

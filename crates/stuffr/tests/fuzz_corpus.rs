@@ -627,9 +627,11 @@ pub struct CorpusCounts {
 // `encode_compat_case` — `[tool][argc][token; argc][file mask] ++ payload`.
 // ---------------------------------------------------------------------
 
-/// What each `compat` seed is for. The payload of every one is a real bzip2
-/// stream written by this build's encoder, a damaged or cut copy of one, or
-/// plain text; see `compat_seed` for each shape's bytes.
+/// What each `compat` seed is for. The payload of every one is a real stream
+/// written by this build's encoders (or, for gzip members, pack and zip,
+/// built here by hand), a damaged or cut copy of one, or plain text; see
+/// `compat_seed` for each shape's bytes. A gzip-family shape names its
+/// flavour second (`gzip-gnu-…`, `gzip-bsd-…`).
 const COMPAT_SHAPES: &[&str] = &[
     // Compression, through stdin and through a file.
     "bzip2-stdin-to-stdout",
@@ -660,22 +662,229 @@ const COMPAT_SHAPES: &[&str] = &[
     "bzip2recover-multiblock",
     "bzip2recover-damaged",
     "bzip2recover-usage",
+    // The gzip family (0.12.0 Task 11), in both flavours: compression
+    // through stdin and files, with the flags bzip2 lacks.
+    "gzip-gnu-stdin-to-stdout",
+    "gzip-bsd-stdin-to-stdout",
+    "gzip-gnu-keep-verbose-file",
+    "gzip-bsd-keep-verbose-file",
+    "gzip-gnu-force-suffix-no-name",
+    "gzip-bsd-force-suffix-no-name",
+    "gzip-gnu-recursive-best",
+    "gzip-bsd-recursive-best",
+    "gzip-gnu-args-mix",
+    "gzip-bsd-args-mix",
+    "gzip-gnu-bad-flag",
+    "gzip-bsd-bad-flag",
+    "gzip-gnu-help",
+    "gzip-bsd-help",
+    "gzip-gnu-version-license",
+    "gzip-bsd-version-license",
+    // Decompression of healthy members: to a file, `.tgz` to `.tar`, to
+    // stdout, several members with trailing garbage, and an odd member
+    // (FEXTRA, FNAME, FCOMMENT, FHCRC) under `-N`.
+    "gunzip-gnu-keep-file",
+    "gunzip-bsd-keep-file",
+    "gunzip-gnu-tgz",
+    "gunzip-bsd-tgz",
+    "zcat-gnu-file",
+    "zcat-bsd-file",
+    "gzcat-gnu-multimember-garbage",
+    "gzcat-bsd-multimember-garbage",
+    "gunzip-gnu-name-odd-member",
+    "gunzip-bsd-name-odd-member",
+    // Tests and listings, of healthy and damaged input.
+    "gzip-gnu-test-verbose",
+    "gzip-bsd-test-verbose",
+    "gzip-gnu-test-damaged",
+    "gzip-bsd-test-damaged",
+    "gzip-gnu-list-verbose",
+    "gzip-bsd-list-verbose",
+    "gunzip-gnu-stdin-truncated",
+    "gunzip-bsd-stdin-truncated",
+    // The GNU 1.12-1.15 probe table's inputs (compat.md): `-l` of several
+    // members (row 1), of an empty member (row 9) and of an empty file.
+    "gzip-gnu-list-multimember",
+    "gzip-bsd-list-multimember",
+    "gzip-gnu-list-empty-member",
+    "gzip-bsd-list-empty-member",
+    "gzip-gnu-list-empty-file",
+    "gzip-bsd-list-empty-file",
+    // The foreign formats both read: pack (`.z`) and `.Z`.
+    "gunzip-gnu-pack",
+    "gunzip-bsd-pack",
+    "gunzip-gnu-compress",
+    "gunzip-bsd-compress",
+    // GNU's zip entry: stored, deflated with a data descriptor (probe row
+    // 6), and a bare `PK\3\4` (row 6's probe).
+    "gunzip-gnu-zip-stored",
+    "gunzip-gnu-zip-descriptor",
+    "gunzip-gnu-pk-only",
+    // Apple's foreign formats, whole and damaged: bzip2 (a cut stream exits
+    // 2 and keeps its partial output, Ruling T10-2), xz (and `-l`'s index
+    // reader, over two streams and padding), lzip, `.Z` cut short, and
+    // pack under `-t` (which writes to stdout there).
+    "gunzip-bsd-bzip2",
+    "gunzip-bsd-bzip2-truncated",
+    "gunzip-bsd-xz",
+    "gunzip-bsd-xz-truncated",
+    "gzip-bsd-list-xz",
+    "gzip-bsd-list-xz-multistream",
+    "gunzip-bsd-lzip",
+    "gunzip-bsd-lzip-damaged",
+    "zcat-bsd-compress-truncated",
+    "gzip-bsd-test-pack",
 ];
 
 /// A bzip2 stream of `plain` at `level`, through this build's encoder.
 fn bzip2_of(work: &Path, plain: &[u8], level: i32) -> stuffr_core::Result<Vec<u8>> {
+    encoded(work, plain, "bzip2", Some(level))
+}
+
+/// `plain` through this build's `format` encoder.
+fn encoded(
+    work: &Path,
+    plain: &[u8],
+    format: &'static str,
+    level: Option<i32>,
+) -> stuffr_core::Result<Vec<u8>> {
     let src = work.join("compat-plain");
-    let dst = work.join("compat-plain.bz2");
+    let dst = work.join("compat-plain.out");
     std::fs::write(&src, plain)?;
     let _ = std::fs::remove_file(&dst);
     let o = CompressOpts {
-        format: Some(FormatId::new("bzip2")),
-        level: Some(level),
+        format: Some(FormatId::new(format)),
+        level,
         sync: false,
         ..Default::default()
     };
     ops::compress(Input::Path(src), Output::Path(dst.clone()), &o)?;
     Ok(read_all(&dst)?)
+}
+
+/// CRC-32 (ISO-HDLC, gzip's and zip's), bit at a time.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= u32::from(b);
+        for _ in 0..8 {
+            c = if c & 1 == 1 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+        }
+    }
+    !c
+}
+
+/// gzip's header flags.
+const FHCRC: u8 = 2;
+const FEXTRA: u8 = 4;
+const FNAME: u8 = 8;
+const FCOMMENT: u8 = 16;
+
+/// One gzip member of `plain`, built by hand around this build's raw
+/// deflate: `flags` picks the optional fields (an extra subfield, the name
+/// `a.out`, a comment, the header CRC), the time is 1e9, the OS unix.
+fn gzip_member(work: &Path, plain: &[u8], flags: u8) -> stuffr_core::Result<Vec<u8>> {
+    let mut m = vec![0x1f, 0x8b, 8, flags];
+    m.extend_from_slice(&1_000_000_000u32.to_le_bytes());
+    m.extend_from_slice(&[0, 3]);
+    if flags & FEXTRA != 0 {
+        m.extend_from_slice(&[6, 0, b'S', b'F', 2, 0, b'o', b'k']);
+    }
+    if flags & FNAME != 0 {
+        m.extend_from_slice(b"a.out\0");
+    }
+    if flags & FCOMMENT != 0 {
+        m.extend_from_slice(b"a comment\0");
+    }
+    if flags & FHCRC != 0 {
+        let h = (crc32(&m) & 0xffff) as u16;
+        m.extend_from_slice(&h.to_le_bytes());
+    }
+    m.extend_from_slice(&encoded(work, plain, "deflate", None)?);
+    m.extend_from_slice(&crc32(plain).to_le_bytes());
+    m.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+    Ok(m)
+}
+
+/// `plain`, every byte `a` or `b`, as an old Unix `pack` file, with the
+/// fixed tree `a` = `1`, `b` = `00`, end of block = `01`: levels 1 and 2,
+/// one leaf on the first, two on the second (stored less two).
+fn pack_ab(plain: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x1f, 0x1e];
+    out.extend_from_slice(&(plain.len() as u32).to_be_bytes());
+    out.extend_from_slice(&[2, 1, 0, b'a', b'b']);
+    let (mut acc, mut nb) = (0u8, 0u32);
+    let mut put = |code: u8, len: u32, out: &mut Vec<u8>| {
+        for bit in (0..len).rev() {
+            acc = (acc << 1) | ((code >> bit) & 1);
+            nb += 1;
+            if nb == 8 {
+                out.push(acc);
+                (acc, nb) = (0, 0);
+            }
+        }
+    };
+    for &b in plain {
+        match b {
+            b'a' => put(1, 1, &mut out),
+            b'b' => put(0, 2, &mut out),
+            other => unreachable!("pack_ab packs only a and b, not {other:#x}"),
+        }
+    }
+    put(1, 2, &mut out);
+    if nb > 0 {
+        out.push(acc << (8 - nb));
+    }
+    out
+}
+
+/// The text `pack_ab` packs.
+fn ab_text() -> Vec<u8> {
+    b"abbaab".iter().copied().cycle().take(3000).collect()
+}
+
+/// A zip holding `plain` as `a.txt`: stored, or deflated with its CRC and
+/// sizes in a signed data descriptor (flag 8). Only the local header and
+/// data: GNU gunzip reads no further than the first entry.
+fn zip_of(work: &Path, plain: &[u8], deflated: bool) -> stuffr_core::Result<Vec<u8>> {
+    let (method, flags, data) = if deflated {
+        (8u16, 8u16, encoded(work, plain, "deflate", None)?)
+    } else {
+        (0, 0, plain.to_vec())
+    };
+    let (crc, csize, usize) = (crc32(plain), data.len() as u32, plain.len() as u32);
+    let mut z = b"PK\x03\x04".to_vec();
+    z.extend_from_slice(&20u16.to_le_bytes());
+    z.extend_from_slice(&flags.to_le_bytes());
+    z.extend_from_slice(&method.to_le_bytes());
+    z.extend_from_slice(&[0; 4]); // time, date
+    for v in if deflated {
+        [0, 0, 0]
+    } else {
+        [crc, csize, usize]
+    } {
+        z.extend_from_slice(&v.to_le_bytes());
+    }
+    z.extend_from_slice(&5u16.to_le_bytes());
+    z.extend_from_slice(&0u16.to_le_bytes());
+    z.extend_from_slice(b"a.txt");
+    z.extend_from_slice(&data);
+    if deflated {
+        z.extend_from_slice(b"PK\x07\x08");
+        for v in [crc, csize, usize] {
+            z.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    Ok(z)
+}
+
+/// The first `n` bytes of `v`.
+fn cut(v: &[u8], n: usize) -> Vec<u8> {
+    v[..n.min(v.len())].to_vec()
 }
 
 /// Text that spans `n` bytes and compresses well without being one run.
@@ -700,11 +909,18 @@ fn damaged(bytes: &[u8]) -> Vec<u8> {
     v
 }
 
+/// A bzip2-family case: the flavour byte is GNU's, which they ignore.
+fn e(name: &str, args: &[&str], files: &[&str], stdin: bool, payload: &[u8]) -> Vec<u8> {
+    encode_compat_case(name, 0, args, files, stdin, payload)
+}
+
 /// The `compat` seed for `shape`.
 fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
+    if let Some(seed) = gzip_seed(work, shape)? {
+        return Ok(seed);
+    }
     let text = compat_text(4000);
     let valid = bzip2_of(work, &text, 9)?;
-    let e = encode_compat_case;
     Ok(match shape {
         "bzip2-stdin-to-stdout" => e("bzip2", &[], &[], true, &text),
         "bzip2-keep-file" => e("bzip2", &["-k", "a"], &["a"], false, &text),
@@ -761,6 +977,155 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
         "bzip2recover-usage" => e("bzip2recover", &[], &[], false, b""),
         other => unreachable!("COMPAT_SHAPES lists an unhandled shape {other:?}"),
     })
+}
+
+/// The `compat` seed for a gzip-family `shape` (`<tool>-<flavour>-<case>`),
+/// or `None` for another family's.
+fn gzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
+    let mut parts = shape.splitn(3, '-');
+    let (Some(tool), Some(flavour), Some(case)) = (parts.next(), parts.next(), parts.next()) else {
+        return Ok(None);
+    };
+    let flavour = match (tool, flavour) {
+        ("gzip" | "gunzip" | "zcat" | "gzcat", "gnu") => 0,
+        ("gzip" | "gunzip" | "zcat" | "gzcat", "bsd") => 1,
+        _ => return Ok(None),
+    };
+    // Apple's `zcat` (that name only) looks for `NAME.Z` unless `-f`.
+    let g = |args: &[&str], files: &[&str], stdin: bool, payload: &[u8]| {
+        let forced = [&["-f"][..], args].concat();
+        let args = if tool == "zcat" && flavour == 1 {
+            &forced
+        } else {
+            args
+        };
+        encode_compat_case(tool, flavour, args, files, stdin, payload)
+    };
+    let text = compat_text(4000);
+    let gz = gzip_member(work, &text, 0)?;
+    let second = gzip_member(work, b"a second member\n", FNAME)?;
+    let two = [gz.as_slice(), &second].concat();
+    Ok(Some(match case {
+        "stdin-to-stdout" => g(&[], &[], true, &text),
+        "keep-verbose-file" => g(&["-k", "-v", "a"], &["a"], false, &text),
+        "force-suffix-no-name" => g(
+            &["-f", "-n", "-S", ".x", "a", "a.gz"],
+            &["a", "a.gz"],
+            false,
+            &text,
+        ),
+        "recursive-best" => g(&["-r", "--best", "-k", "a"], &["a"], false, &text),
+        "args-mix" => g(
+            &[
+                "--fast",
+                "--rsyncable",
+                "--synchronous",
+                "-a",
+                "--ascii",
+                "-q",
+                "a",
+            ],
+            &["a"],
+            false,
+            &text,
+        ),
+        "bad-flag" => g(&["--bogus", "a"], &["a"], false, &text),
+        "help" => g(&["-h"], &[], false, b""),
+        "version-license" => g(&["-V", "-L"], &[], false, b""),
+        "keep-file" => g(&["-k", "a.gz"], &["a.gz"], false, &gz),
+        "tgz" => g(&["a.tgz"], &["a.tgz"], false, &gz),
+        "file" => g(&["a.gz"], &["a.gz"], false, &gz),
+        "multimember-garbage" => {
+            let mut v = two.clone();
+            v.extend_from_slice(b"trailing garbage");
+            g(&["a.gz"], &["a.gz"], false, &v)
+        }
+        "name-odd-member" => {
+            let odd = gzip_member(work, &text, FEXTRA | FNAME | FCOMMENT | FHCRC)?;
+            g(&["-N", "-k", "a.gz"], &["a.gz"], false, &odd)
+        }
+        "test-verbose" => g(&["-tv", "a.gz"], &["a.gz"], false, &gz),
+        "test-damaged" => g(&["-t", "a.gz"], &["a.gz"], false, &damaged(&gz)),
+        "list-verbose" => g(
+            &["-l", "-v", "a.gz", "a.tgz"],
+            &["a.gz", "a.tgz"],
+            false,
+            &gz,
+        ),
+        "stdin-truncated" => g(&["-c"], &[], true, &cut(&gz, gz.len() - 10)),
+        "list-multimember" => g(&["--list", "a.gz"], &["a.gz"], false, &two),
+        "list-empty-member" => {
+            let empty = gzip_member(work, b"", 0)?;
+            g(&["-l", "a.gz"], &["a.gz"], false, &empty)
+        }
+        "list-empty-file" => g(&["-l", "a.gz"], &["a.gz"], false, b""),
+        "pack" => g(&["-k", "a.z"], &["a.z"], false, &pack_ab(&ab_text())),
+        "compress" => {
+            let z = encoded(work, &text, "compress", None)?;
+            g(&["-c", "a.gz"], &["a.gz"], false, &z)
+        }
+        "zip-stored" => g(
+            &["-c", "a.gz"],
+            &["a.gz"],
+            false,
+            &zip_of(work, &text, false)?,
+        ),
+        "zip-descriptor" => g(
+            &["-c", "a.gz"],
+            &["a.gz"],
+            false,
+            &zip_of(work, &text, true)?,
+        ),
+        "pk-only" => g(&["a.gz"], &["a.gz"], false, b"PK\x03\x04"),
+        "bzip2" => g(
+            &["-k", "a.gz"],
+            &["a.gz"],
+            false,
+            &bzip2_of(work, &text, 9)?,
+        ),
+        "bzip2-truncated" => {
+            let bz = bzip2_of(work, &text, 9)?;
+            g(&["a.bz2"], &["a.bz2"], false, &cut(&bz, bz.len() / 2))
+        }
+        "xz" => g(
+            &["-k", "a.gz"],
+            &["a.gz"],
+            false,
+            &encoded(work, &text, "xz", None)?,
+        ),
+        "xz-truncated" => {
+            let xz = encoded(work, &text, "xz", None)?;
+            g(&["a.gz"], &["a.gz"], false, &cut(&xz, xz.len() - 20))
+        }
+        "list-xz" => g(
+            &["-l", "a.gz"],
+            &["a.gz"],
+            false,
+            &encoded(work, &text, "xz", None)?,
+        ),
+        "list-xz-multistream" => {
+            let mut v = encoded(work, &text, "xz", None)?;
+            v.extend_from_slice(&[0; 4]);
+            v.extend_from_slice(&encoded(work, b"another stream\n", "xz", None)?);
+            g(&["-l", "-v", "a.gz"], &["a.gz"], false, &v)
+        }
+        "lzip" => g(
+            &["-c", "a.gz"],
+            &["a.gz"],
+            false,
+            &encoded(work, &text, "lzip", None)?,
+        ),
+        "lzip-damaged" => {
+            let lz = encoded(work, &text, "lzip", None)?;
+            g(&["a.gz"], &["a.gz"], false, &damaged(&lz))
+        }
+        "compress-truncated" => {
+            let z = encoded(work, &text, "compress", None)?;
+            g(&["a.gz"], &["a.gz"], false, &cut(&z, z.len() / 2))
+        }
+        "test-pack" => g(&["-t", "a.z"], &["a.z"], false, &pack_ab(&ab_text())),
+        other => unreachable!("COMPAT_SHAPES lists an unhandled gzip shape {other:?}"),
+    }))
 }
 
 // ---------------------------------------------------------------------
@@ -2360,9 +2725,10 @@ fn block_magics(bytes: &[u8]) -> usize {
     n
 }
 
-/// Every `compat` seed decodes to the tool and case its shape names, fits
-/// under the target's input cap (a seed past it is skipped by every run),
-/// and the bzip2recover seeds carry the several blocks they exist for.
+/// Every `compat` seed decodes to the tool and case its shape names (the
+/// gzip family's in the flavour its shape names), fits under the target's
+/// input cap (a seed past it is skipped by every run), and the bzip2recover
+/// seeds carry the several blocks they exist for.
 #[test]
 fn every_compat_seed_decodes_fits_and_carries_its_shape() {
     let work = tempfile::tempdir().unwrap();
@@ -2380,17 +2746,61 @@ fn every_compat_seed_decodes_fits_and_carries_its_shape() {
             Some(case.name),
             "{shape} decodes as the wrong tool"
         );
+        let gzip_family = matches!(case.name, "gzip" | "gunzip" | "zcat" | "gzcat");
+        let flavour = match shape.split('-').nth(1) {
+            Some("bsd") if gzip_family => 1,
+            Some("gnu") if gzip_family => 0,
+            _ => {
+                assert!(!gzip_family, "{shape} names no flavour");
+                0
+            }
+        };
+        assert_eq!(
+            case.flavour, flavour,
+            "{shape} decodes as the wrong flavour"
+        );
         if shape.starts_with("bzip2recover-") && *shape != "bzip2recover-usage" {
             let blocks = block_magics(case.payload);
             assert!(blocks >= 3, "{shape} holds {blocks} block(s)");
         }
         if !case.files.is_empty() || case.stdin {
             assert!(
-                !case.payload.is_empty() || *shape == "bzip2-help",
+                !case.payload.is_empty() || shape.ends_with("-empty-file"),
                 "{shape}"
             );
         }
     }
+}
+
+/// The hand-built inputs are what they claim: the pack seed unpacks to its
+/// text, and a gzip member's header CRC and trailer agree with a decoder.
+#[test]
+fn the_hand_built_compat_payloads_decode() {
+    let text = ab_text();
+    let mut out = Vec::new();
+    stuffr::pack_stream::PackReader::new(&pack_ab(&text)[..])
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    assert_eq!(out, text);
+
+    let work = tempfile::tempdir().unwrap();
+    let plain = compat_text(5000);
+    for flags in [0, FEXTRA | FNAME | FCOMMENT | FHCRC] {
+        let member = gzip_member(work.path(), &plain, flags).unwrap();
+        let gz = work.path().join("m.gz");
+        std::fs::write(&gz, &member).unwrap();
+        let back = work.path().join("m");
+        let _ = std::fs::remove_file(&back);
+        ops::decompress(
+            Input::Path(gz),
+            Output::Path(back.clone()),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(read_all(&back).unwrap(), plain, "flags {flags:#x}");
+    }
+    assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
 }
 
 #[test]
