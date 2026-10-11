@@ -297,6 +297,87 @@ impl Sink for XzSink {
     }
 }
 
+/// One `.xz` decoder driven an `lzma_code` call at a time with the
+/// caller's buffers: `lzma_stream_decoder(UINT64_MAX,
+/// LZMA_TELL_UNSUPPORTED_CHECK | LZMA_CONCATENATED)`, what Apple gzip's
+/// `unxz` runs. The `stuffr` binary's Apple gzip personality ports that
+/// loop over it, so its messages (which name `lzma_ret` values) and what
+/// reaches the output before a failure are liblzma's. Not part of the
+/// stable API.
+#[doc(hidden)]
+pub struct RawXz {
+    s: liblzma::stream::Stream,
+}
+
+impl std::fmt::Debug for RawXz {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawXz").finish_non_exhaustive()
+    }
+}
+
+impl RawXz {
+    /// `lzma_stream_decoder` with `memlimit` (`UINT64_MAX` for none);
+    /// `Err` is the `lzma_ret` it returned.
+    pub fn new(memlimit: u64) -> std::result::Result<Self, u32> {
+        use liblzma::stream::{CONCATENATED, Stream, TELL_UNSUPPORTED_CHECK};
+        Stream::new_stream_decoder(memlimit, TELL_UNSUPPORTED_CHECK | CONCATENATED)
+            .map(|s| RawXz { s })
+            .map_err(ret_of)
+    }
+
+    /// One `lzma_code` over `input` into `out` (`LZMA_FINISH` when
+    /// `finish`): `(consumed, produced, lzma_ret)`, the `lzma_ret` as its
+    /// number (`LZMA_OK` 0, `LZMA_STREAM_END` 1, `LZMA_DATA_ERROR` 9,
+    /// `LZMA_BUF_ERROR` 10, ...).
+    pub fn code(&mut self, input: &[u8], out: &mut [u8], finish: bool) -> (usize, usize, u32) {
+        use liblzma::stream::{Action, Status};
+        let (in0, out0) = (self.s.total_in(), self.s.total_out());
+        let action = if finish { Action::Finish } else { Action::Run };
+        let r = self.s.process(input, out, action);
+        let consumed = (self.s.total_in() - in0) as usize;
+        let produced = (self.s.total_out() - out0) as usize;
+        let ret = match r {
+            Ok(Status::Ok) => lzma_ret::OK,
+            Ok(Status::StreamEnd) => lzma_ret::STREAM_END,
+            Ok(Status::GetCheck) => lzma_ret::GET_CHECK,
+            Ok(Status::MemNeeded) => lzma_ret::BUF_ERROR,
+            Err(e) => ret_of(e),
+        };
+        (consumed, produced, ret)
+    }
+}
+
+/// `lzma_ret`'s values (`lzma/base.h`).
+mod lzma_ret {
+    pub(super) const OK: u32 = 0;
+    pub(super) const STREAM_END: u32 = 1;
+    pub(super) const NO_CHECK: u32 = 2;
+    pub(super) const UNSUPPORTED_CHECK: u32 = 3;
+    pub(super) const GET_CHECK: u32 = 4;
+    pub(super) const MEM_ERROR: u32 = 5;
+    pub(super) const MEMLIMIT_ERROR: u32 = 6;
+    pub(super) const FORMAT_ERROR: u32 = 7;
+    pub(super) const OPTIONS_ERROR: u32 = 8;
+    pub(super) const DATA_ERROR: u32 = 9;
+    pub(super) const BUF_ERROR: u32 = 10;
+    pub(super) const PROG_ERROR: u32 = 11;
+}
+
+/// The `lzma_ret` behind a `liblzma` error.
+fn ret_of(e: liblzma::stream::Error) -> u32 {
+    use liblzma::stream::Error;
+    match e {
+        Error::Data => lzma_ret::DATA_ERROR,
+        Error::Options => lzma_ret::OPTIONS_ERROR,
+        Error::Format => lzma_ret::FORMAT_ERROR,
+        Error::MemLimit => lzma_ret::MEMLIMIT_ERROR,
+        Error::Mem => lzma_ret::MEM_ERROR,
+        Error::Program => lzma_ret::PROG_ERROR,
+        Error::NoCheck => lzma_ret::NO_CHECK,
+        Error::UnsupportedCheck => lzma_ret::UNSUPPORTED_CHECK,
+    }
+}
+
 /// Compresses `plain` with this codec's default options, for tests only.
 ///
 /// Mirrors `zstd_c.rs`'s helper of the same name: not exercised by this
@@ -320,6 +401,41 @@ mod tests {
     use std::io::Read;
     use stuffr_core::ReaderSource;
     use stuffr_core::testing::SharedBuf;
+
+    /// `RawXz` an `lzma_code` at a time: a header with no output room is
+    /// judged first; a stream decodes to `LZMA_STREAM_END` under
+    /// `LZMA_FINISH`; a cut-short one is `LZMA_BUF_ERROR` (10) and a broken
+    /// header `LZMA_DATA_ERROR` (9), as `unxz` names them.
+    #[test]
+    fn raw_xz_codes_like_lzma_code() {
+        let plain = b"raw xz, one call at a time\n".repeat(400);
+        let packed = compress(&plain);
+        let mut x = RawXz::new(u64::MAX).unwrap();
+        let (used, made, ret) = x.code(&packed, &mut [], false);
+        assert_eq!((made, ret), (0, 0));
+        let mut out = vec![0u8; plain.len() + 10];
+        let (_, made, ret) = x.code(&packed[used..], &mut out, true);
+        assert_eq!(ret, 1);
+        assert_eq!(&out[..made], &plain[..]);
+        // liblzma answers `LZMA_OK` while it makes progress and to the
+        // first call that makes none, then `LZMA_BUF_ERROR`.
+        let mut x = RawXz::new(u64::MAX).unwrap();
+        let mut cut = &packed[..packed.len() - 3];
+        let mut rets = Vec::new();
+        for _ in 0..4 {
+            let (used, _, ret) = x.code(cut, &mut out, true);
+            cut = &cut[used..];
+            rets.push(ret);
+            if ret != 0 {
+                break;
+            }
+        }
+        assert_eq!(rets.last(), Some(&10), "{rets:?}");
+        let mut bad = packed.clone();
+        bad[8] ^= 0xff;
+        let mut x = RawXz::new(u64::MAX).unwrap();
+        assert_eq!(x.code(&bad, &mut [], false).2, 9);
+    }
 
     fn compress(plain: &[u8]) -> Vec<u8> {
         let buf = SharedBuf::new();

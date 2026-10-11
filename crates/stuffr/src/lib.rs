@@ -13,11 +13,12 @@ pub use stuffr_core::*;
 
 /// bzip2 one stream at a time, with libbzip2's own error classes — what the
 /// `stuffr` binary's `bzip2` compatibility mode drives to reproduce
-/// `bzip2(1)`'s messages. Not part of the stable API.
+/// `bzip2(1)`'s messages, and (`RawStream`, a call at a time) its Apple
+/// gzip personality's `unbzip2`. Not part of the stable API.
 #[cfg(feature = "bzip2")]
 #[doc(hidden)]
 pub mod bzip2_stream {
-    pub use stuffr_formats::bzip2::{StreamError, StreamReader};
+    pub use stuffr_formats::bzip2::{RawStream, StreamError, StreamReader};
 }
 /// The old Unix `pack` (`.z`) decoder — what the `stuffr` binary's gzip
 /// compatibility personalities use for the pack files both references read.
@@ -25,6 +26,14 @@ pub mod bzip2_stream {
 #[doc(hidden)]
 pub mod pack_stream {
     pub use stuffr_formats::pack::{PackError, PackReader};
+}
+/// `.xz` an `lzma_code` call at a time through liblzma — what the `stuffr`
+/// binary's Apple gzip personality runs `unxz` over on the C tier. Not
+/// part of the stable API.
+#[cfg(feature = "xz-c")]
+#[doc(hidden)]
+pub mod xz_stream {
+    pub use stuffr_formats::xz_c::RawXz;
 }
 /// Raw deflate through C zlib, byte-identical to stock zlib's — what the
 /// `stuffr` binary's Apple gzip personality compresses with on the C tier.

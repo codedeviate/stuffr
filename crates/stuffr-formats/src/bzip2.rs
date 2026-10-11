@@ -294,6 +294,63 @@ impl StreamReader {
     }
 }
 
+/// One bzip2 stream driven a `BZ2_bzDecompress` call at a time, with the
+/// caller's buffers.
+///
+/// [`StreamReader`] keeps `BZ2_bzRead`'s contract, which fills a whole
+/// buffer across calls and loses all of it on an error. Apple gzip's
+/// `unbzip2` loop instead hands each call a fresh output buffer, writes
+/// what that one call produced, and loses only a failing call's output; the
+/// `stuffr` binary's Apple gzip personality reproduces that loop with this.
+#[doc(hidden)]
+pub struct RawStream {
+    d: bzip2::Decompress,
+}
+
+impl std::fmt::Debug for RawStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawStream").finish_non_exhaustive()
+    }
+}
+
+impl Default for RawStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RawStream {
+    /// A fresh decoder (`BZ2_bzDecompressInit(&s, 0, 0)`).
+    pub fn new() -> Self {
+        Self {
+            d: bzip2::Decompress::new(false),
+        }
+    }
+
+    /// One `BZ2_bzDecompress` call over `input` into `out`:
+    /// `Ok((consumed, produced, stream_ended))`. On an error what the call
+    /// produced is not reported, as libbzip2's caller cannot know it.
+    pub fn decompress(
+        &mut self,
+        input: &[u8],
+        out: &mut [u8],
+    ) -> std::result::Result<(usize, usize, bool), StreamError> {
+        use bzip2::Status;
+        let (in0, out0) = (self.d.total_in(), self.d.total_out());
+        let ret = self.d.decompress(input, out);
+        let consumed = (self.d.total_in() - in0) as usize;
+        let produced = (self.d.total_out() - out0) as usize;
+        match ret {
+            Err(bzip2::Error::DataMagic) => Err(StreamError::Magic),
+            Err(bzip2::Error::Data) => Err(StreamError::Data),
+            Err(_) => Err(StreamError::Unexpected),
+            Ok(Status::MemNeeded) => Err(StreamError::Memory),
+            Ok(Status::StreamEnd) => Ok((consumed, produced, true)),
+            Ok(_) => Ok((consumed, produced, false)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +374,40 @@ mod tests {
         let mut out = Vec::new();
         dec.read_to_end(&mut out).unwrap();
         out
+    }
+
+    /// `RawStream` call by call: a stream decodes to its bytes and ends;
+    /// a broken block is `Data`, a wrong magic `Magic`.
+    #[test]
+    fn raw_stream_decodes_call_by_call_and_names_its_errors() {
+        let plain = b"raw stream, one call at a time\n".repeat(500);
+        let packed = compress(&plain);
+        let mut raw = RawStream::new();
+        let (mut at, mut got, mut ended) = (0, Vec::new(), false);
+        while !ended {
+            let mut out = [0u8; 1000];
+            let (c, p, e) = raw
+                .decompress(&packed[at..(at + 64).min(packed.len())], &mut out)
+                .unwrap();
+            at += c;
+            got.extend_from_slice(&out[..p]);
+            ended = e;
+        }
+        assert_eq!(got, plain);
+        assert_eq!(at, packed.len());
+        let mut bad = packed.clone();
+        bad[10] ^= 0xff; // the block CRC
+        let mut raw = RawStream::new();
+        let mut out = vec![0u8; 1 << 20];
+        assert!(matches!(
+            raw.decompress(&bad, &mut out),
+            Err(StreamError::Data)
+        ));
+        let mut raw = RawStream::new();
+        assert!(matches!(
+            raw.decompress(b"BZx9junk", &mut out),
+            Err(StreamError::Magic)
+        ));
     }
 
     #[test]

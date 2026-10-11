@@ -14,8 +14,21 @@
 //!
 //! The full BSD-2-Clause notice ships with this crate as
 //! `LICENSE-unpack-bsd`. Where the C relies on undefined behaviour (an
-//! out-of-range leaf index, a read one past the symbol table) this decoder
-//! reports `Corrupt` instead of reproducing it.
+//! out-of-range leaf index, a read one past the symbol table, a header
+//! shorter than its seven bytes) this decoder reports an error instead of
+//! reproducing it.
+//!
+//! What `unpack.c` does and this reader reproduces, observed against
+//! Apple's `/usr/bin/gzip -dc`:
+//!
+//! - every symbol decoded is output, past the header's length too; only
+//!   EOB checks the length, and the end of the input with a different
+//!   count is "Premature EOF" (so is a stream that stops short);
+//! - the input may end without EOB once the length is reached, and
+//!   whatever follows EOB is ignored;
+//! - what was decoded before a failure reaches the caller (unpack.c has
+//!   `fputc`'d it): a `read` returns those bytes, and the failure comes
+//!   from the next one.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -25,9 +38,12 @@ use std::io::{self, Read};
 pub enum PackError {
     /// The first two bytes are not `1f 1e`.
     BadMagic,
-    /// Reserved: a header field that is impossible on its face.
+    /// The header is shorter than its seven bytes (unpack.c then reads
+    /// bytes it never filled, undefined behaviour).
     BadHeader(&'static str),
-    /// The input ended inside the header, the tables or the bitstream.
+    /// The input ended inside the level counts ("File appears to be
+    /// truncated"; the symbol table and the bitstream have their own
+    /// words, see [`PackError::Corrupt`]).
     Truncated,
     /// The bytes contradict themselves; the reason names which check failed.
     Corrupt(&'static str),
@@ -81,6 +97,9 @@ pub struct PackReader<R: Read> {
     code: u32,
     produced: u64,
     done: bool,
+    /// A failure met after some bytes of a `read` were decoded: those are
+    /// returned first, this from the next `read`.
+    pending: Option<io::Error>,
 }
 
 fn eof_is_truncated(e: io::Error) -> PackError {
@@ -95,7 +114,13 @@ impl<R: Read> PackReader<R> {
     /// Reads the header and builds the tree.
     pub fn new(mut inner: R) -> Result<Self, PackError> {
         let mut hdr = [0u8; 7];
-        inner.read_exact(&mut hdr).map_err(eof_is_truncated)?;
+        inner.read_exact(&mut hdr).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                PackError::BadHeader("header shorter than 7 bytes")
+            } else {
+                PackError::Io(e)
+            }
+        })?;
         if hdr[0] != 0x1f || hdr[1] != 0x1e {
             return Err(PackError::BadMagic);
         }
@@ -151,6 +176,7 @@ impl<R: Read> PackReader<R> {
             code: 0,
             produced: 0,
             done: false,
+            pending: None,
         })
     }
 
@@ -225,40 +251,55 @@ fn corrupt(why: &'static str) -> io::Error {
 
 impl<R: Read> Read for PackReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if let Some(e) = self.pending.take() {
+            return Err(e);
+        }
         if self.done || out.is_empty() {
             return Ok(0);
         }
         let want = u64::from(self.original_len);
         let mut n = 0;
-        while n < out.len() {
-            match self.next_symbol()? {
-                // The bitstream ended. Between symbols with every byte
-                // delivered is fine (the C accepts it); otherwise short.
-                None => {
+        let failure = loop {
+            if n == out.len() {
+                break None;
+            }
+            match self.next_symbol() {
+                // The bitstream ended: fine once every byte the header
+                // promised is out, with or without EOB (the C's loop ends
+                // at EOF and checks the count); otherwise short.
+                Ok(None) => {
                     self.done = true;
-                    if self.produced != want {
-                        return Err(io::Error::other(PackError::Truncated));
-                    }
-                    break;
+                    break (self.produced != want).then(|| corrupt("Premature EOF"));
                 }
-                Some(None) => {
+                // EOB ends the stream when the count is right. Otherwise
+                // unpack.c outputs the byte one past its symbol table and
+                // goes on (undefined behaviour): stopped here instead,
+                // worded as a short stream.
+                Ok(Some(None)) => {
                     self.done = true;
-                    if self.produced != want {
-                        return Err(corrupt("Premature EOF"));
-                    }
-                    break;
+                    break (self.produced != want).then(|| corrupt("Premature EOF"));
                 }
-                Some(Some(b)) => {
-                    if self.produced == want {
-                        return Err(corrupt("File corrupt"));
-                    }
+                // Every other symbol is output, past the length too.
+                Ok(Some(Some(b))) => {
                     out[n] = b;
                     n += 1;
                     self.produced += 1;
                 }
+                Err(e) => break Some(e),
+            }
+        };
+        match failure {
+            None => Ok(n),
+            Some(e) => {
+                self.done = true;
+                if n == 0 {
+                    Err(e)
+                } else {
+                    self.pending = Some(e);
+                    Ok(n)
+                }
             }
         }
-        Ok(n)
     }
 }
 
@@ -420,22 +461,150 @@ mod tests {
         assert!(matches!(PackReader::new(&p[..]), Err(PackError::BadMagic)));
     }
 
+    /// Everything a reader returns, and the failure that ended it.
+    fn decode_partial(bytes: &[u8], chunk: usize) -> (Vec<u8>, Option<PackError>) {
+        let mut r = match PackReader::new(bytes) {
+            Ok(r) => r,
+            Err(e) => return (Vec::new(), Some(e)),
+        };
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; chunk];
+        loop {
+            match r.read(&mut buf) {
+                Ok(0) => return (out, None),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) => {
+                    let p = e
+                        .into_inner()
+                        .and_then(|i| i.downcast::<PackError>().ok())
+                        .map(|p| *p);
+                    return (out, p);
+                }
+            }
+        }
+    }
+
+    fn says(e: &Option<PackError>, words: &str) -> bool {
+        matches!(e, Some(PackError::Corrupt(w)) if *w == words)
+    }
+
     #[test]
     fn truncated_header() {
         let p = encode(b"hello world");
-        for cut in [0, 1, 5, 6, 7, 8] {
+        // Short of the seven bytes: unpack.c reads bytes it never filled.
+        for cut in [0, 1, 5, 6] {
+            assert!(
+                matches!(PackReader::new(&p[..cut]), Err(PackError::BadHeader(_))),
+                "cut {cut}"
+            );
+        }
+        // In the level counts: "File appears to be truncated".
+        let levels = usize::from(p[6]);
+        for cut in 7..7 + levels {
             assert!(
                 matches!(PackReader::new(&p[..cut]), Err(PackError::Truncated)),
                 "cut {cut}"
             );
         }
+        // In the symbol table.
+        assert!(matches!(
+            PackReader::new(&p[..7 + levels]),
+            Err(PackError::Corrupt("Symbol table truncated"))
+        ));
     }
 
+    /// A bitstream cut short: what was decoded comes out, then "Premature
+    /// EOF" (Apple's `gzip -dc`; Task 4's "File appears to be truncated"
+    /// was not unpack.c's word for it).
     #[test]
-    fn truncated_body() {
-        let p = encode(&text());
+    fn truncated_body_outputs_what_it_decoded_then_premature_eof() {
+        let t = text();
+        let p = encode(&t);
         let cut = &p[..p.len() - 3];
-        assert!(matches!(decode(cut), Err(PackError::Truncated)));
+        for chunk in [1, 7, 4096, 1 << 20] {
+            let (out, e) = decode_partial(cut, chunk);
+            assert!(says(&e, "Premature EOF"), "chunk {chunk}: {e:?}");
+            assert!(!out.is_empty() && t.starts_with(&out), "chunk {chunk}");
+        }
+    }
+
+    /// Symbols past the header's length are output; the end of the input
+    /// then says "Premature EOF". Observed: `/usr/bin/gzip -dc` on these
+    /// bytes (length 4, a stream of `B` and fifteen `A`) prints the
+    /// sixteen bytes and that message, exit 2.
+    #[test]
+    fn symbols_past_the_length_are_output() {
+        let p = b"\x1f\x1e\x00\x00\x00\x04\x03\x01\x00\x00AB\x80\x00";
+        let (out, e) = decode_partial(p, 3);
+        assert_eq!(out, b"BAAAAAAAAAAAAAAA");
+        assert!(says(&e, "Premature EOF"), "{e:?}");
+    }
+
+    /// A length the stream never reaches: the bytes, then "Premature EOF"
+    /// (observed: length 10, eight bytes printed).
+    #[test]
+    fn a_length_never_reached_is_premature_eof() {
+        let p = b"\x1f\x1e\x00\x00\x00\x0a\x03\x01\x00\x00AB\x80";
+        let (out, e) = decode_partial(p, 64);
+        assert_eq!(out, b"BAAAAAAA");
+        assert!(says(&e, "Premature EOF"), "{e:?}");
+        // No bitstream at all.
+        let (out, e) = decode_partial(&p[..p.len() - 1], 64);
+        assert!(out.is_empty());
+        assert!(says(&e, "Premature EOF"), "{e:?}");
+    }
+
+    /// Once the length is reached, EOB is not needed, and what follows
+    /// EOB is ignored.
+    #[test]
+    fn eob_is_optional_at_the_length_and_ends_the_stream() {
+        let t = b"hello world".to_vec();
+        let mut p = encode(&t);
+        p.extend_from_slice(b"junk after EOB");
+        assert_eq!(decode(&p).unwrap(), t);
+        // "AB\x80": B and seven A, the length 8, no EOB.
+        let p = b"\x1f\x1e\x00\x00\x00\x08\x03\x01\x00\x00AB\x80";
+        assert_eq!(decode(p).unwrap(), b"BAAAAAAA");
+    }
+
+    /// A failure after some bytes of a `read` returns those bytes first;
+    /// the failure comes from the next call, and the reader stays failed.
+    #[test]
+    fn decoded_bytes_reach_the_caller_before_the_failure() {
+        let t = text();
+        let p = encode(&t);
+        let cut = &p[..p.len() / 2];
+        let mut r = PackReader::new(cut).unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        let n = r.read(&mut buf).unwrap();
+        assert!(n > 0 && t.starts_with(&buf[..n]));
+        assert!(r.read(&mut buf).is_err());
+        assert_eq!(r.read(&mut buf).unwrap(), 0);
+    }
+
+    /// More than 256 symbols (`symbol_size` counts EOB).
+    #[test]
+    fn a_table_past_256_symbols_is_refused() {
+        let p = [&b"\x1f\x1e\x00\x00\x00\x08\x02\xff\x01"[..], &[0; 600]].concat();
+        assert!(matches!(
+            PackReader::new(&p[..]),
+            Err(PackError::Corrupt("Bad symbol table"))
+        ));
+    }
+
+    /// A leaf index past a level's leaves (and its one-past read) is "File
+    /// corrupt": counts `[0, 0, 0]` leave level 0 no leaf, so a first bit
+    /// of 1 there asks for index 1. Observed: `/usr/bin/gzip -dc` prints
+    /// "File corrupt" for `80`, and `A` then "File corrupt" for `40`.
+    #[test]
+    fn codes_past_a_level_are_corrupt() {
+        let p = b"\x1f\x1e\x00\x00\x00\x08\x03\x00\x00\x00A\x80";
+        let (out, e) = decode_partial(p, 64);
+        assert!(out.is_empty() && says(&e, "File corrupt"), "{e:?} {out:?}");
+        let p = b"\x1f\x1e\x00\x00\x00\x08\x03\x00\x00\x00A\x40";
+        let (out, e) = decode_partial(p, 64);
+        assert_eq!(out, b"A");
+        assert!(says(&e, "File corrupt"), "{e:?}");
     }
 
     #[test]
@@ -454,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn length_mismatch_is_corrupt() {
+    fn length_mismatch_is_an_error() {
         let mut p = encode(b"hello world");
         p[5] += 1; // promises one more byte than the stream holds
         assert!(decode(&p).is_err());
