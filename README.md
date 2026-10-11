@@ -254,6 +254,28 @@ read list.
 > **2046** tests under `--all-features`, **1982** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.12.0` is a MINOR, Phase 5's second family: **compatibility links,
+> gzip family.** Invoked as `gzip`, `gunzip`, `zcat` or `gzcat`, the binary
+> behaves as the platform's own gzip — GNU gzip on Linux and elsewhere,
+> Apple's gzip on macOS and the BSDs (`STUFFR_GZIP_FLAVOR=gnu|bsd`
+> overrides it): the same flags, files, exit codes and stderr, byte for
+> byte, including the foreign formats each one reads (GNU: zip's first
+> entry, `.Z`, pack; Apple: `.bz2`, `.xz`, lzip, pack, `.Z`). Apple's
+> compressed output is byte-identical on the C tier (`c-backed`, which
+> builds zlib); everywhere else it is compatible. GNU `-V`/`-L` print
+> stuffr's own MIT notice. The known differences are listed under
+> [Compatibility links](#compatibility-links); an input that turns out to
+> be its own output is never lost, even where the reference loses it.
+> **Licence:** the Apple personality is ported from Apple's BSD-licensed
+> gzip sources, so `stuffr-cli` is now `MIT AND bzip2-1.0.6 AND
+> BSD-2-Clause AND BSD-3-Clause` (`LICENSE-gzip-bsd`) and `stuffr-formats`
+> is `MIT AND BSD-2-Clause` (`LICENSE-unpack-bsd`, the pack decoder).
+> Additive library API, all `#[doc(hidden)]`: `stuffr::pack_stream`,
+> `stuffr::zlib_c`, `stuffr::xz_stream`, `bzip2_stream::RawStream`; the
+> `compat` fuzz target now covers both gzip flavours.
+> **2222** tests under `--all-features`, **2150** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
