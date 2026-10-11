@@ -10,7 +10,9 @@ use lzma_rust2::filter::StreamFilter;
 use lzma_rust2::{Action, FilterConfig, FilterType, Lzma2Stream, LzmaStream, Status};
 
 use super::super::check::{self, Running, Sha256, crc32};
-use super::super::memusage::{MEMUSAGE_BASE, decoder_memusage, lzma_decoder_memusage_nocheck};
+use super::super::memusage::{
+    MEMUSAGE_BASE, Profile, decoder_memusage, lzma_decoder_memusage_nocheck,
+};
 use super::super::{DecodeOptions, Filter, Format, Lzma, MatchFinder, Mode, Progress, XzError};
 use super::{FOOTER_MAGIC, HEADER_MAGIC, bcj_aligned, bcj_type, coder_error, limit_of, vli_size};
 
@@ -1000,7 +1002,8 @@ impl AloneDec {
                         return Err(XzError::Format);
                     }
                     let dict = read32le(&h[1..5]);
-                    let needed = lzma_decoder_memusage_nocheck(dict) + MEMUSAGE_BASE;
+                    let needed =
+                        lzma_decoder_memusage_nocheck(Profile::LiblzmaSys, dict) + MEMUSAGE_BASE;
                     if needed > self.memlimit {
                         return Err(XzError::MemLimit {
                             needed,
@@ -1163,7 +1166,8 @@ impl LzipDec {
                         return Err(XzError::Data);
                     }
                     let dict = (1 << b2log) - (fracnum << (b2log - 4));
-                    let needed = lzma_decoder_memusage_nocheck(dict) + MEMUSAGE_BASE;
+                    let needed =
+                        lzma_decoder_memusage_nocheck(Profile::LiblzmaSys, dict) + MEMUSAGE_BASE;
                     if needed > self.memlimit {
                         return Err(XzError::MemLimit {
                             needed,

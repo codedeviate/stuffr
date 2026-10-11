@@ -1936,3 +1936,66 @@ mod cross_tier {
         assert!(seen.keys().any(|k| k.starts_with("memlimit")), "{seen:?}");
     }
 }
+
+/// What [`Profile::Reference`] adds to [`Profile::LiblzmaSys`]:
+/// `LZ_DICT_EXTRA` on x86 with SSE2, `clk_id` per `mythread_cond` where
+/// `configure` defines `HAVE_CLOCK_GETTIME`.
+#[test]
+fn reference_profile_differs_where_configure_does() {
+    let l = Lzma::preset(6, false).unwrap();
+    let chain = [Filter::Lzma2(l)];
+    let dec = |p| memusage::decoder_memusage_with(p, &chain).unwrap();
+    let extra = if cfg!(target_arch = "x86_64") { 32 } else { 0 };
+    assert_eq!(dec(Profile::Reference) - dec(Profile::LiblzmaSys), extra);
+    let clock = cfg!(any(target_os = "linux", target_vendor = "apple"));
+    for threads in [1, 4] {
+        let o = EncodeOptions {
+            threads,
+            ..EncodeOptions::default()
+        };
+        let enc = |p| memusage::encoder_memusage_with(p, &o).unwrap();
+        let want = if clock {
+            8 * (u64::from(threads) + 1)
+        } else {
+            0
+        };
+        assert_eq!(enc(Profile::Reference) - enc(Profile::LiblzmaSys), want);
+    }
+}
+
+/// [`Profile::Reference`]'s decoder figure is what the reference `xz`
+/// prints: `--robot -lvv`'s `summary` memory usage for a `-6` and a `-9`
+/// file (8454776 for `-6` on arm64).
+#[cfg(target_os = "macos")]
+#[test]
+fn reference_profile_is_xzs_list_figure() {
+    let Some(xz) = reference() else {
+        eprintln!("skipped: no xz 5.8.4");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("stuffr-xz-opts-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for level in [6, 9] {
+        let packed = run_reference(&xz, &["-T1", &format!("-{level}")], b"some input");
+        let file = dir.join(format!("p{level}.xz"));
+        std::fs::write(&file, &packed).unwrap();
+        let out = std::process::Command::new(&xz)
+            .args(["--robot", "-lvv"])
+            .arg(&file)
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let summary = text
+            .lines()
+            .find(|l| l.starts_with("summary\t"))
+            .unwrap_or_else(|| panic!("no summary line:\n{text}"));
+        let listed: u64 = summary.split('\t').nth(1).unwrap().parse().unwrap();
+        let chain = [Filter::Lzma2(Lzma::preset(level, false).unwrap())];
+        assert_eq!(
+            memusage::decoder_memusage_with(Profile::Reference, &chain),
+            Some(listed),
+            "-{level}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

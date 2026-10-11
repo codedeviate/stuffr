@@ -1,22 +1,48 @@
-//! liblzma 5.8.4's memory-usage formulas, ported so the pure tier reports
-//! what liblzma reports: the figures `xz` prints ("N MiB of memory is
-//! required") and the limits it enforces come from these.
+//! liblzma 5.8.4's memory-usage formulas, ported: the figures `xz` prints
+//! ("N MiB of memory is required", `--list`'s memory column, `-vv`) and the
+//! limits it enforces come from these.
 //!
-//! Every function names the C function it ports. The struct sizes
-//! (`sizeof(...)`) are constants measured against the liblzma that
-//! `liblzma-sys` 0.4.9 builds on a 64-bit target, and
-//! `memusage_formulas_match_liblzma` pins them in every `--all-features`
-//! run. `liblzma-sys` builds `lz_decoder.h` with `LZMA_LZ_DECODER_CONFIG`
-//! 1 (no `HAVE_IMMINTRIN_H`), so `LZ_DICT_EXTRA` is 0 here; an `xz` built
-//! by its own `configure` on x86-64 uses 2, and its decoder figures are 32
-//! bytes larger.
+//! Every function names the C function it ports. Two builds of liblzma
+//! disagree by a few bytes, so every figure is for a [`Profile`]:
+//!
+//! - [`Profile::LiblzmaSys`] is the liblzma `liblzma-sys` 0.4.9 compiles
+//!   into this build: `memusage_formulas_match_liblzma` pins it against
+//!   `c::` in every `--all-features` run. The unsuffixed
+//!   [`decoder_memusage`]/[`encoder_memusage`] are this profile, and the
+//!   pure tier's `MemLimit.needed` too, so the two tiers report alike.
+//! - [`Profile::Reference`] is `xz` 5.8.4 built by its own `configure` on
+//!   the host target — the binary the compatibility promise is made
+//!   against. What the CLI prints comes from this one.
+//!
+//! What differs between them (`liblzma-sys`'s `config.h` against
+//! `configure`'s):
+//!
+//! - `LZ_DICT_EXTRA` (`lz/lz_decoder.h`): 32 bytes when
+//!   `LZMA_LZ_DECODER_CONFIG` is 2, which needs
+//!   `TUKLIB_FAST_UNALIGNED_ACCESS`, `HAVE_IMMINTRIN_H` and SSE2 — what
+//!   `configure` finds on x86 and x86-64 and `liblzma-sys` never defines.
+//!   0 otherwise.
+//! - `mythread_cond` (`common/mythread.h`) carries a `clockid_t clk_id`
+//!   when `HAVE_CLOCK_GETTIME` is defined: by `configure` on Linux and
+//!   macOS, by `liblzma-sys` only on Solaris. The threaded encoder's
+//!   `lzma_stream_coder` and each `worker_thread` hold one, so its figure
+//!   moves by `8 * (threads + 1)` (the 4-byte field padded to the struct's
+//!   8-byte alignment).
+//!
+//! The struct sizes themselves are per target. Each was measured (macOS
+//! arm64) as the residual of the C function against the formula without
+//! it, and the threaded encoder's two are split into what does not depend
+//! on the platform's thread types plus `pthread_mutex_t` and
+//! `pthread_cond_t` (or Windows' `CRITICAL_SECTION` and
+//! `CONDITION_VARIABLE`), whose sizes are the platform ABI's: see
+//! [`MUTEX`] and [`COND`].
 //!
 //! XZ Utils 5.8.4 (`src/liblzma/`), 0BSD: see `LICENSE-xz-memusage`.
 
 use super::{EncodeOptions, Filter, Format, Lzma, MatchFinder};
 
 /// `LZMA_MEMUSAGE_BASE` (`common/common.h`).
-pub(crate) const MEMUSAGE_BASE: u64 = 1 << 15;
+pub const MEMUSAGE_BASE: u64 = 1 << 15;
 
 /// `LZMA_THREADS_MAX` (`common/common.h`).
 const THREADS_MAX: u32 = 16384;
@@ -37,9 +63,8 @@ const LOOP_INPUT_MAX: u32 = OPTS + 1;
 const HASH_2_SIZE: u32 = 1 << 10;
 const HASH_3_SIZE: u32 = 1 << 16;
 
-/// `LZ_DICT_REPEAT_MAX` and `LZ_DICT_EXTRA` (`lz/lz_decoder.h`, config 1).
+/// `LZ_DICT_REPEAT_MAX` (`lz/lz_decoder.h`).
 const LZ_DICT_REPEAT_MAX: u64 = 288;
-const LZ_DICT_EXTRA: u64 = 0;
 
 /// `sizeof(lzma_lzma1_decoder) + sizeof(lzma_coder)` of `lz_decoder.c`.
 const LZMA1_DECODER_STRUCTS: u64 = 32_640;
@@ -51,12 +76,78 @@ const DELTA_CODER_STRUCT: u64 = 352;
 const LZMA1_ENCODER_STRUCTS: u64 = 249_792;
 /// `sizeof(lzma_lzma2_coder)` of `lzma2_encoder.c`.
 const LZMA2_ENCODER_STRUCT: u64 = 65_704;
-/// `sizeof(lzma_stream_coder)` of `stream_encoder_mt.c`.
-const MT_STREAM_CODER_STRUCT: u64 = 584;
+/// `sizeof(lzma_stream_coder)` of `stream_encoder_mt.c` less its
+/// `mythread_mutex` and `mythread_cond`: 584 measured on macOS arm64,
+/// less 64 + 48.
+const MT_STREAM_CODER_REST: u64 = 472;
 /// `sizeof(worker_thread)` of `stream_encoder_mt.c` plus the two
 /// `sizeof(lzma_outbuf)` its output queue keeps per thread
-/// (`GET_BUFS_LIMIT`).
-const MT_PER_THREAD_STRUCTS: u64 = 688;
+/// (`GET_BUFS_LIMIT`), less the worker's `mythread_mutex` and
+/// `mythread_cond`: 688 measured on macOS arm64, less 64 + 48.
+const MT_PER_THREAD_REST: u64 = 576;
+
+/// `sizeof(pthread_mutex_t)`, `mythread_mutex` on POSIX: 64 on macOS, 40
+/// on glibc and musl x86-64, 48 on glibc aarch64; Windows'
+/// `CRITICAL_SECTION` is 40. Other targets are taken as 40, unverified.
+#[cfg(target_vendor = "apple")]
+pub const MUTEX: u64 = 64;
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub const MUTEX: u64 = 48;
+#[cfg(not(any(
+    target_vendor = "apple",
+    all(target_os = "linux", target_arch = "aarch64")
+)))]
+pub const MUTEX: u64 = 40;
+
+/// `sizeof(pthread_cond_t)`: 48 on macOS and glibc (x86-64 and aarch64)
+/// alike; Windows' `CONDITION_VARIABLE` is 8.
+#[cfg(windows)]
+pub const COND: u64 = 8;
+#[cfg(not(windows))]
+pub const COND: u64 = 48;
+
+/// Whose liblzma a figure is for (see the module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// The liblzma `liblzma-sys` compiles into this build.
+    LiblzmaSys,
+    /// `xz` 5.8.4 built by its own `configure` on the host target.
+    Reference,
+}
+
+impl Profile {
+    /// `LZ_DICT_EXTRA`.
+    fn lz_dict_extra(self) -> u64 {
+        let config2 = cfg!(any(
+            target_arch = "x86_64",
+            all(target_arch = "x86", target_feature = "sse2")
+        ));
+        if self == Profile::Reference && config2 {
+            32
+        } else {
+            0
+        }
+    }
+
+    /// `sizeof(mythread_cond)`: the condition variable, with `clk_id`
+    /// padded in where `HAVE_CLOCK_GETTIME` is defined.
+    fn cond(self) -> u64 {
+        let clock = cfg!(any(target_os = "linux", target_vendor = "apple"));
+        if self == Profile::Reference && clock {
+            COND + 8
+        } else {
+            COND
+        }
+    }
+
+    fn mt_stream_coder(self) -> u64 {
+        MT_STREAM_CODER_REST + MUTEX + self.cond()
+    }
+
+    fn mt_per_thread(self) -> u64 {
+        MT_PER_THREAD_REST + MUTEX + self.cond()
+    }
+}
 
 /// What a filter adds when it has no memusage function: 1 KiB
 /// (`lzma_raw_coder_memusage`).
@@ -68,9 +159,10 @@ fn lclppb_valid(l: &Lzma) -> bool {
 }
 
 /// `lzma_lz_decoder_memusage` (`lz/lz_decoder.c`) plus
-/// `lzma_lzma_decoder_memusage_nocheck` (`lzma/lzma_decoder.c`).
-pub(crate) fn lzma_decoder_memusage_nocheck(dict_size: u32) -> u64 {
-    LZMA1_DECODER_STRUCTS + u64::from(dict_size) + 2 * LZ_DICT_REPEAT_MAX + LZ_DICT_EXTRA
+/// `lzma_lzma_decoder_memusage_nocheck` (`lzma/lzma_decoder.c`): what
+/// `.lzma` and `.lz` add `LZMA_MEMUSAGE_BASE` to for their `needed`.
+pub fn lzma_decoder_memusage_nocheck(profile: Profile, dict_size: u32) -> u64 {
+    LZMA1_DECODER_STRUCTS + u64::from(dict_size) + 2 * LZ_DICT_REPEAT_MAX + profile.lz_dict_extra()
 }
 
 /// The `match_finder` value liblzma gives each [`MatchFinder`].
@@ -170,6 +262,11 @@ fn delta_memusage(dist: u32) -> Option<u64> {
 /// `lzma_raw_coder_memusage` (`common/filter_common.c`) and the decoders'
 /// memusage functions; `None` is liblzma's `UINT64_MAX`.
 pub fn decoder_memusage(filters: &[Filter]) -> Option<u64> {
+    decoder_memusage_with(Profile::LiblzmaSys, filters)
+}
+
+/// [`decoder_memusage`] for `profile`.
+pub fn decoder_memusage_with(profile: Profile, filters: &[Filter]) -> Option<u64> {
     if !chain_valid(filters) {
         return None;
     }
@@ -181,10 +278,12 @@ pub fn decoder_memusage(filters: &[Filter]) -> Option<u64> {
                 if !lclppb_valid(l) {
                     return None;
                 }
-                lzma_decoder_memusage_nocheck(l.dict_size)
+                lzma_decoder_memusage_nocheck(profile, l.dict_size)
             }
             // `lzma_lzma2_decoder_memusage`: no validation at all.
-            Filter::Lzma2(l) => LZMA2_DECODER_STRUCT + lzma_decoder_memusage_nocheck(l.dict_size),
+            Filter::Lzma2(l) => {
+                LZMA2_DECODER_STRUCT + lzma_decoder_memusage_nocheck(profile, l.dict_size)
+            }
             Filter::Bcj { .. } => NO_MEMUSAGE_FILTER,
             Filter::Delta { dist } => delta_memusage(*dist)?,
         };
@@ -253,6 +352,7 @@ fn block_buffer_bound64(uncompressed_size: u64) -> u64 {
 /// `lzma_mt` of `threads`, `block_size` (`0`: the chain's
 /// [`mt_block_size`]) and `filters`.
 pub(crate) fn stream_encoder_mt_memusage(
+    profile: Profile,
     threads: u32,
     block_size: u64,
     filters: &[Filter],
@@ -282,7 +382,7 @@ pub(crate) fn stream_encoder_mt_memusage(
         return None;
     }
     let outq_memusage = 2 * threads * outbuf_size_max;
-    let total = MEMUSAGE_BASE + MT_STREAM_CODER_STRUCT + threads * MT_PER_THREAD_STRUCTS;
+    let total = MEMUSAGE_BASE + profile.mt_stream_coder() + threads * profile.mt_per_thread();
     total
         .checked_add(inbuf_memusage)?
         .checked_add(filters_memusage)?
@@ -294,6 +394,11 @@ pub(crate) fn stream_encoder_mt_memusage(
 /// memusage over the chains the block list uses, threaded or not, with
 /// `lzma_mt.block_size` as it sets it.
 pub fn encoder_memusage(o: &EncodeOptions) -> Option<u64> {
+    encoder_memusage_with(Profile::LiblzmaSys, o)
+}
+
+/// [`encoder_memusage`] for `profile`.
+pub fn encoder_memusage_with(profile: Profile, o: &EncodeOptions) -> Option<u64> {
     if o.format == Format::Lzip {
         return None;
     }
@@ -307,7 +412,7 @@ pub fn encoder_memusage(o: &EncodeOptions) -> Option<u64> {
     let mut max = 0;
     for chain in chains {
         let usage = if threaded {
-            stream_encoder_mt_memusage(o.threads, block_size, chain)?
+            stream_encoder_mt_memusage(profile, o.threads, block_size, chain)?
         } else {
             raw_encoder_memusage(chain)?
         };

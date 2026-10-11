@@ -15,7 +15,10 @@
 //! [`liblzma_version`] are the C tier's (`xz-c`, in `c`) whenever it is
 //! compiled, else the pure tier's (`xz-pure`, in `pure`), as the
 //! registered codecs pick theirs; `physmem` and `cputhreads` exist on
-//! the C tier only. The pure tier is compiled whenever `xz-pure` is, so an
+//! the C tier only. [`memusage`] is liblzma's formulas on either tier,
+//! with [`Profile`] choosing this build's liblzma or the reference `xz`'s
+//! figures ([`decoder_memusage_with`], [`encoder_memusage_with`]). The pure
+//! tier is compiled whenever `xz-pure` is, so an
 //! `--all-features` build tests the two against each other. Not part of
 //! the stable API.
 //!
@@ -27,14 +30,14 @@
 pub mod c;
 #[cfg(feature = "xz-pure")]
 mod check;
-#[cfg(any(feature = "xz-pure", test))]
-pub(crate) mod memusage;
+pub mod memusage;
 #[cfg(feature = "xz-pure")]
 pub mod pure;
 #[cfg(feature = "xz-c")]
 pub use c::{
     Decoder, Encoder, cputhreads, decoder_memusage, encoder_memusage, liblzma_version, physmem,
 };
+pub use memusage::{Profile, decoder_memusage_with, encoder_memusage_with};
 #[cfg(all(feature = "xz-pure", not(feature = "xz-c")))]
 pub use pure::{Decoder, Encoder, decoder_memusage, encoder_memusage, liblzma_version};
 
