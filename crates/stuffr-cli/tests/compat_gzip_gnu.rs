@@ -14,11 +14,12 @@
 //! which counts compressed bytes, is blanked on both sides before comparing;
 //! `ratio_of_an_empty_input_is_exact` checks the one ratio both agree on.
 //!
-//! **The oracle's version.** Linux CI has 1.12, this suite targets 1.15.
-//! Cases whose reference behaviour changed in between (the survey in
-//! `.claude/rules/compat.md`, "gzip family") are skipped on an older
-//! reference and counted as known oracle skips, as 0.11.0's
-//! `compat_bzip2recover.rs` does for Debian.
+//! **The oracle's version.** Linux CI has 1.12, the macOS runner's
+//! Homebrew 1.14, and this suite targets 1.15. Cases whose reference
+//! behaviour changed in between are skipped on an older reference and
+//! counted as known oracle skips, as 0.11.0's `compat_bzip2recover.rs`
+//! does for Debian. Every such behaviour is one row of the `Since` table,
+//! with its release and evidence.
 
 #[cfg(unix)]
 mod compat_harness;
@@ -226,31 +227,136 @@ mod differential {
         Skipped::none()
     }
 
-    /// Keep the cases this reference can judge: those built by `newer` need
-    /// at least `min`; on an older reference they become a counted skip.
-    fn gated<'a>(
-        mut cases: Vec<Case<'a>>,
-        newer: Vec<Case<'a>>,
-        min: (u32, u32),
-        why: &str,
-        skipped: &mut Skipped,
-    ) -> Vec<Case<'a>> {
-        if version() >= min || version() == (0, 0) {
-            cases.extend(newer);
-        } else {
-            skipped.add(
-                newer.len(),
-                &format!(
-                    "{} on a {}.{} reference ({why}, {}.{}+)",
-                    newer.len(),
-                    version().0,
-                    version().1,
-                    min.0,
-                    min.1
-                ),
-            );
+    // ---- the reference's version: the one table ----
+
+    /// Every place this suite's reference behaves differently by release.
+    /// stuffr models GNU gzip 1.15; CI's references are older (ubuntu's
+    /// 1.12, the macOS runner's Homebrew 1.14). Each row names the release
+    /// a behaviour arrived in and the evidence: GNU's NEWS, and what CI's
+    /// 1.12 and 1.14 printed (run 38132192489). A case that depends on a
+    /// row is added through [`Gated::since`], and on an older reference it
+    /// is a counted, named skip, which CI's all-ran rule accepts. A new
+    /// version difference is a new row here, never a `version()` test in a
+    /// group.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+    enum Since {
+        /// NEWS 1.14: "'gzip -S' now rejects suffixes containing '/'"
+        /// (survey row 2).
+        SlashSuffix,
+        /// NEWS 1.14: `GZIP` is ignored except the level options (row 3).
+        GzipEnv,
+        /// NEWS 1.14: "'gzip -l' no longer misreports lengths of
+        /// multimember inputs [bug introduced in gzip-1.12]" (row 1). The
+        /// same totals feed `-dv`'s ratio: 1.12 printed `-75416.7%` for
+        /// three members where 1.14 and 1.15 print `77.4%`.
+        MultiMember,
+        /// The help, version and licence texts, and the scripts', are
+        /// 1.15's (the release and copyright lines).
+        HelpText,
+        /// NEWS 1.15: "gzip diagnostics now quote file names containing
+        /// unusual characters" (row 7).
+        QuotedNames,
+        /// The same 1.15 change reworded the bad-suffix error: 1.12 and
+        /// 1.14 print `gzip: invalid suffix ''`, 1.15 `gzip: '': invalid
+        /// suffix` (CI run 38132192489, ubuntu and macOS).
+        SuffixMessage,
+        /// NEWS 1.15: "gzip -l now reports \"-Inf%\" instead of \"0.0%\"
+        /// for the infinite compression ratio of an empty file" (row 9);
+        /// `-v` says the same.
+        InfRatio,
+        /// NEWS 1.15: "gzip -d no longer rejects PKZIP signatures, local
+        /// header, and data descriptors" (row 6).
+        ZipDescriptors,
+        /// `-l` of the odd members: an empty one (`-Inf%`, 1.15) or
+        /// several (1.14). One row, at the later release, as first gated.
+        OddMembersList,
+        /// A data descriptor (1.15) and `-l` of two members (1.14) with
+        /// both the CRC and the length wrong. One row, at the later
+        /// release, as first gated.
+        BothWrongNewer,
+    }
+
+    impl Since {
+        /// The first release with the behaviour, and a short reason for
+        /// the skip line.
+        fn row(self) -> ((u32, u32), &'static str) {
+            match self {
+                Since::SlashSuffix => ((1, 14), "a `/` suffix is refused"),
+                Since::GzipEnv => ((1, 14), "GZIP sets the level only"),
+                Since::MultiMember => ((1, 14), "lengths of several members"),
+                Since::HelpText => ((1, 15), "help and version text is 1.15's"),
+                Since::QuotedNames => ((1, 15), "names are quoted"),
+                Since::SuffixMessage => ((1, 15), "`'': invalid suffix` wording"),
+                Since::InfRatio => ((1, 15), "-Inf%"),
+                Since::ZipDescriptors => ((1, 15), "zip data descriptors"),
+                Since::OddMembersList => ((1, 15), "-l of these, -Inf%"),
+                Since::BothWrongNewer => ((1, 15), "a data descriptor, -l of two members"),
+            }
         }
-        cases
+
+        /// Whether this reference has the behaviour (or is absent, when
+        /// every case is skipped by `reference` anyway).
+        fn holds(self) -> bool {
+            version() >= self.row().0 || version() == (0, 0)
+        }
+    }
+
+    /// A group's cases: those this reference can judge, and per [`Since`]
+    /// row the number it cannot.
+    struct Gated<'a> {
+        cases: Vec<Case<'a>>,
+        held: Vec<(Since, usize)>,
+    }
+
+    impl<'a> Gated<'a> {
+        fn new(cases: Vec<Case<'a>>) -> Self {
+            Gated {
+                cases,
+                held: Vec::new(),
+            }
+        }
+
+        /// Add `c`, which needs `row`'s behaviour.
+        fn since(&mut self, row: Since, c: Case<'a>) {
+            if row.holds() {
+                self.cases.push(c);
+            } else if let Some(h) = self.held.iter_mut().find(|(r, _)| *r == row) {
+                h.1 += 1;
+            } else {
+                self.held.push((row, 1));
+            }
+        }
+
+        fn since_all(&mut self, row: Since, cs: Vec<Case<'a>>) {
+            for c in cs {
+                self.since(row, c);
+            }
+        }
+
+        /// The cases to run and the skips to report.
+        fn done(self) -> (Vec<Case<'a>>, Skipped) {
+            let mut skipped = Skipped::none();
+            for (row, n) in self.held {
+                let ((major, minor), why) = row.row();
+                let (v0, v1) = version();
+                skipped.add(
+                    n,
+                    &format!("{n} on a {v0}.{v1} reference ({why}, {major}.{minor}+)"),
+                );
+            }
+            (self.cases, skipped)
+        }
+    }
+
+    /// `cases`, plus `newer`, which needs `row`'s behaviour.
+    fn gated<'a>(
+        cases: Vec<Case<'a>>,
+        newer: Vec<Case<'a>>,
+        row: Since,
+    ) -> (Vec<Case<'a>>, Skipped) {
+        let mut g = Gated::new(cases);
+        g.since_all(row, newer);
+        g.done()
     }
 
     fn check_all(group: &str, cases: &[Case]) {
@@ -394,9 +500,6 @@ mod differential {
             &["--su=.x", "a.txt"],
             &["-S", "_", "a.txt"],
             &["-S", "abcdefghijklmnopqrstuvwxyzabcd", "a.txt"],
-            &["-S", "abcdefghijklmnopqrstuvwxyzabcde", "a.txt"],
-            &["-S", "", "a.txt"],
-            &["--suffix=", "a.txt"],
             &["-S"],
             &["--suffix"],
             &["--su"],
@@ -444,7 +547,6 @@ mod differential {
             &["--ascii", "a.txt"],
             &["-qa", "a.txt"],
             &["-a", "-q", "a.txt"],
-            &["-a", "-S", "", "a.txt"],
             &["-a", "-x"],
             &["-b", "3", "a.txt"],
             &["-b3", "a.txt"],
@@ -485,21 +587,27 @@ mod differential {
             "POSIXLY_CORRECT",
             "1",
         ));
-        let mut skipped = none_skipped();
-        // NEWS 1.14: a suffix holding `/` is refused (survey row 2).
-        let slash = vec![
-            gz(&["-S", "x/y", "a.txt"], a()),
-            gz(&["-S", "x/y", "-c", "a.txt"], a()),
-            gz(&["-S", "x/y", "-S", ".z", "a.txt"], a()),
-            gz(&["-S", "x/y", "-x"], a()),
-        ];
-        let cases = gated(
-            cases,
-            slash,
-            (1, 14),
-            "a `/` suffix is refused",
-            &mut skipped,
+        let mut g = Gated::new(cases);
+        // A bad suffix: 1.15's wording.
+        for args in [
+            &["-S", "abcdefghijklmnopqrstuvwxyzabcde", "a.txt"][..],
+            &["-S", "", "a.txt"],
+            &["--suffix=", "a.txt"],
+            &["-a", "-S", "", "a.txt"],
+        ] {
+            g.since(Since::SuffixMessage, gz(args, a()));
+        }
+        // A suffix holding `/` is refused.
+        g.since_all(
+            Since::SlashSuffix,
+            vec![
+                gz(&["-S", "x/y", "a.txt"], a()),
+                gz(&["-S", "x/y", "-c", "a.txt"], a()),
+                gz(&["-S", "x/y", "-S", ".z", "a.txt"], a()),
+                gz(&["-S", "x/y", "-x"], a()),
+            ],
         );
+        let (cases, skipped) = g.done();
         check_all_skipping("flags", &cases, skipped);
     }
 
@@ -538,14 +646,7 @@ mod differential {
         ] {
             texts.push(gz(args, a()));
         }
-        let mut skipped = none_skipped();
-        let cases = gated(
-            Vec::new(),
-            texts,
-            (1, 15),
-            "help and version text is 1.15's",
-            &mut skipped,
-        );
+        let (cases, skipped) = gated(Vec::new(), texts, Since::HelpText);
         check_all_skipping("help_version_and_license", &cases, skipped);
     }
 
@@ -788,8 +889,7 @@ mod differential {
             c.tty_stdin = true;
             cases.push(c);
         }
-        let mut skipped = none_skipped();
-        // NEWS 1.15: names with unusual characters are quoted (row 7).
+        // Names with unusual characters are quoted.
         let q = |n: &'static str| vec![(n, t.clone())];
         let quoted = vec![
             gz(&["-v", "a b"], q("a b")),
@@ -808,7 +908,7 @@ mod differential {
                 vec![("a", t.clone()), ("a b", b"old".to_vec())],
             ),
         ];
-        let cases = gated(cases, quoted, (1, 15), "names are quoted", &mut skipped);
+        let (cases, skipped) = gated(cases, quoted, Since::QuotedNames);
         check_all_skipping("files", &cases, skipped);
     }
 
@@ -880,14 +980,7 @@ mod differential {
         // The command line wins over the environment.
         env_cases.push(with_env(gz(&["-1", "a.txt"], a()), "GZIP", "-9"));
         env_cases.push(with_env(fed(gz(&["-c"], vec![]), &t), "GZIP", "-9"));
-        let mut skipped = none_skipped();
-        let cases = gated(
-            Vec::new(),
-            env_cases,
-            (1, 14),
-            "GZIP sets the level only",
-            &mut skipped,
-        );
+        let (cases, skipped) = gated(Vec::new(), env_cases, Since::GzipEnv);
         check_all_skipping("gzip_env", &cases, skipped);
     }
 
@@ -900,18 +993,18 @@ mod differential {
     fn dispatch() {
         let t = kib_text();
         let a = || vec![("a.txt", t.clone())];
-        let mut cases = vec![fed(gz(&[], a()), &t), fed(gz(&["-v"], a()), &t)];
+        let mut g = Gated::new(vec![fed(gz(&[], a()), &t), fed(gz(&["-v"], a()), &t)]);
         for name in ["gunzip", "zcat", "gzcat"] {
+            g.since(Since::SuffixMessage, case(name, &["-S", "", "a.txt"], a()));
             for args in [
                 &["-x"][..],
                 &["--bogus"],
-                &["-S", "", "a.txt"],
                 &["-Z"],
                 &["-b", "x"],
                 &["-z", "a.txt"],
                 &["-S"],
             ] {
-                cases.push(case(name, args, a()));
+                g.cases.push(case(name, args, a()));
             }
         }
         let mut texts = Vec::new();
@@ -930,14 +1023,8 @@ mod differential {
                 texts.push(case(name, args, a()));
             }
         }
-        let mut skipped = none_skipped();
-        let cases = gated(
-            cases,
-            texts,
-            (1, 15),
-            "help and version text is 1.15's",
-            &mut skipped,
-        );
+        g.since_all(Since::HelpText, texts);
+        let (cases, skipped) = g.done();
         check_all_skipping("dispatch", &cases, skipped);
     }
 
@@ -951,8 +1038,7 @@ mod differential {
             gz(&["-cv", "e"], vec![("e", vec![])]),
             fed(gz(&["-v"], vec![]), b""),
         ];
-        let mut skipped = none_skipped();
-        let cases = gated(Vec::new(), cases, (1, 15), "-Inf%", &mut skipped);
+        let (cases, skipped) = gated(Vec::new(), cases, Since::InfRatio);
         // No blanking here: a dedicated runner.
         for c in &cases {
             let Some(r) = reference(gnu_gzip_dir(), c) else {
@@ -1173,14 +1259,11 @@ mod differential {
             member(plain_member(b"three\n")),
         ]
         .concat();
-        for args in [
-            &["-d", "m.gz"][..],
-            &["-dN", "m.gz"],
-            &["-dv", "m.gz"],
-            &["-dc", "m.gz"],
-        ] {
+        for args in [&["-d", "m.gz"][..], &["-dN", "m.gz"], &["-dc", "m.gz"]] {
             cases.push(dz("gzip", args, vec![("m.gz", multi.clone())]));
         }
+        // `-v`'s ratio counts every member.
+        let several = vec![dz("gzip", &["-dv", "m.gz"], vec![("m.gz", multi.clone())])];
         cases.push(fed(dz("zcat", &[], vec![]), &multi));
         // An operand that does not exist is looked for with a suffix.
         for (args, files) in [
@@ -1278,7 +1361,8 @@ mod differential {
                 vec![("a.gz", g()), ("a/f", Vec::new()), ("b.gz", g())],
             ));
         }
-        check_exact("decompress", &cases, none_skipped());
+        let (cases, skipped) = gated(cases, several, Since::MultiMember);
+        check_exact("decompress", &cases, skipped);
     }
 
     /// Every row of the spec's divergence table, as GNU 1.15 behaves.
@@ -1368,15 +1452,13 @@ mod differential {
             dz("gzip", &["-df", "---presume-input-tty"], vec![]),
             &good,
         ));
-        let mut skipped = none_skipped();
-        // `-l` on two members: 1.12 and 1.13 report the last member only
-        // (survey row 1).
+        // `-l` on two members: 1.12 and 1.13 report the last member only.
         let two = [good.clone(), gzm(b"second\n", b"b")].concat();
         let lists = vec![
             dz("gzip", &["-l", "two.gz"], vec![("two.gz", two.clone())]),
             dz("gzip", &["-lv", "two.gz"], vec![("two.gz", two.clone())]),
         ];
-        let cases = gated(cases, lists, (1, 14), "-l on several members", &mut skipped);
+        let (cases, skipped) = gated(cases, lists, Since::MultiMember);
         check_exact("probe_table", &cases, skipped);
     }
 
@@ -1437,7 +1519,6 @@ mod differential {
             ..plain_member(&t)
         });
         let gz_then = |tail: &[u8]| [gzm(b"first\n", b"f"), tail.to_vec()].concat();
-        let mut cases = Vec::new();
         let inputs: Vec<(&str, Vec<u8>)> = vec![
             ("a.Z", z.clone()),
             ("b12.Z", z12),
@@ -1469,6 +1550,16 @@ mod differential {
             ("a.xz", b"\xfd7zXZ\x00\x00\x04\xe6\xd6\xb4\x46".to_vec()),
             ("a.zst", b"\x28\xb5\x2f\xfd\x00\x00\x00\x00".to_vec()),
         ];
+        // The ratio (`-v`, `-l`) of an empty entry, and of several
+        // members or a member and a `.Z` or pack stream after it.
+        let since = |file: &str, args: &[&str]| match (file, args) {
+            ("empty.zip", ["-dcv" | "-l" | "-lv"]) => Some(Since::InfRatio),
+            ("two.z", ["-dcv" | "-l" | "-lv"]) | ("gzZ.gz" | "gzp.gz", ["-l" | "-lv"]) => {
+                Some(Since::MultiMember)
+            }
+            _ => None,
+        };
+        let mut g = Gated::new(Vec::new());
         for (file, bytes) in &inputs {
             for args in [
                 &["-dc"][..],
@@ -1480,9 +1571,13 @@ mod differential {
             ] {
                 let mut a = args.to_vec();
                 a.push(file);
-                cases.push(dz("gzip", &a, vec![(file, bytes.clone())]));
+                let c = dz("gzip", &a, vec![(file, bytes.clone())]);
+                match since(file, args) {
+                    Some(row) => g.since(row, c),
+                    None => g.cases.push(c),
+                }
             }
-            cases.push(fed(dz("zcat", &[], vec![]), bytes));
+            g.cases.push(fed(dz("zcat", &[], vec![]), bytes));
         }
         // To a file, where the suffix allows it.
         for (args, file) in [
@@ -1503,31 +1598,35 @@ mod differential {
             let mut a = args.to_vec();
             a.push(file);
             let bytes = inputs.iter().find(|(n, _)| *n == file).unwrap().1.clone();
-            cases.push(dz("gzip", &a, vec![(file, bytes), ("z.gz", gzm(&t, b"z"))]));
+            g.cases
+                .push(dz("gzip", &a, vec![(file, bytes), ("z.gz", gzm(&t, b"z"))]));
             // And a good file after it: whether the run went on.
             let mut b = a.clone();
             b.push("z.gz");
             let bytes = inputs.iter().find(|(n, _)| *n == file).unwrap().1.clone();
-            cases.push(dz("gzip", &b, vec![(file, bytes), ("z.gz", gzm(&t, b"z"))]));
+            g.cases
+                .push(dz("gzip", &b, vec![(file, bytes), ("z.gz", gzm(&t, b"z"))]));
         }
-        let mut skipped = none_skipped();
-        // NEWS 1.15: zip data descriptors and the "not a valid zip file"
-        // wording (survey row 6); `-Inf%` for an empty output (row 9).
-        let newer = vec![
-            dz("gzip", &["-dc", "dd.zip"], vec![("dd.zip", zip1(&t, 8, 8))]),
-            dz(
-                "gzip",
-                &["-dc", "dds.zip"],
-                vec![("dds.zip", zip1(&t, 0, 8))],
-            ),
-            dz(
-                "gzip",
-                &["-dc", "pk.zip"],
-                vec![("pk.zip", b"PK\x03\x04".to_vec())],
-            ),
-            dz("gzip", &["-dcv", "e.zip"], vec![("e.zip", zip1(b"", 8, 0))]),
-        ];
-        let cases = gated(cases, newer, (1, 15), "zip data descriptors", &mut skipped);
+        // Zip data descriptors and the "not a valid zip file" wording; `-Inf%`
+        // for an empty output.
+        g.since_all(
+            Since::ZipDescriptors,
+            vec![
+                dz("gzip", &["-dc", "dd.zip"], vec![("dd.zip", zip1(&t, 8, 8))]),
+                dz(
+                    "gzip",
+                    &["-dc", "dds.zip"],
+                    vec![("dds.zip", zip1(&t, 0, 8))],
+                ),
+                dz(
+                    "gzip",
+                    &["-dc", "pk.zip"],
+                    vec![("pk.zip", b"PK\x03\x04".to_vec())],
+                ),
+                dz("gzip", &["-dcv", "e.zip"], vec![("e.zip", zip1(b"", 8, 0))]),
+            ],
+        );
+        let (cases, skipped) = g.done();
         check_exact("foreign_formats", &cases, skipped);
     }
 
@@ -2049,9 +2148,7 @@ mod differential {
             dz("gzip", &["-dc", "dd.gz"], vec![("dd.gz", dd)]),
             dz("gzip", &["-l", "m.gz"], vec![("m.gz", multi)]),
         ];
-        let mut skipped = none_skipped();
-        let what = "a data descriptor, -l of two members";
-        let cases = gated(cases, newer, (1, 15), what, &mut skipped);
+        let (cases, skipped) = gated(cases, newer, Since::BothWrongNewer);
         check_exact("crc_and_length_both_wrong", &cases, skipped);
     }
 
@@ -2393,6 +2490,7 @@ mod differential {
         ];
         let mut cases = Vec::new();
         let mut later = Vec::new();
+        let mut several = Vec::new();
         for (file, bytes) in &inputs {
             for args in [
                 &["-d"][..],
@@ -2409,6 +2507,9 @@ mod differential {
                 // An empty output's ratio is `-Inf%` (1.15, survey row 9).
                 if *file == "ebody.gz" && args.iter().any(|a| a.contains('v')) {
                     later.push(c);
+                } else if *file == "cat.gz" && matches!(args, ["-dv" | "-dcv"]) {
+                    // `-v`'s ratio counts both members.
+                    several.push(c);
                 } else {
                     cases.push(c);
                 }
@@ -2421,8 +2522,12 @@ mod differential {
             }
             cases.push(fed(dz("zcat", &[], vec![]), bytes));
         }
-        let mut skipped = none_skipped();
-        let cases = gated(cases, later, (1, 15), "-l of these, -Inf%", &mut skipped);
+        let mut g = Gated::new(cases);
+        g.since_all(Since::OddMembersList, later);
+        for c in several {
+            g.since(Since::MultiMember, c);
+        }
+        let (cases, skipped) = g.done();
         check_exact("odd_members", &cases, skipped);
     }
 }
