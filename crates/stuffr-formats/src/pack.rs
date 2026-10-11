@@ -12,8 +12,8 @@
 //! Copyright (c) 2009 Xin LI <delphij@FreeBSD.org>
 //! ```
 //!
-//! The full BSD-2-Clause notice is in the `stuffr-cli` crate's
-//! `LICENSE-gzip-bsd`. Where the C relies on undefined behaviour (an
+//! The full BSD-2-Clause notice ships with this crate as
+//! `LICENSE-unpack-bsd`. Where the C relies on undefined behaviour (an
 //! out-of-range leaf index, a read one past the symbol table) this decoder
 //! reports `Corrupt` instead of reproducing it.
 
