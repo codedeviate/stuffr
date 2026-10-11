@@ -13,6 +13,7 @@ pub mod bzip2recover;
 pub mod gzip;
 mod host;
 pub mod links;
+pub mod xz;
 
 #[doc(hidden)]
 pub use host::InputReads;
@@ -31,6 +32,8 @@ pub enum Family {
     /// `gzip`, `gunzip`, `zcat`, `gzcat`, in the flavour
     /// [`gzip::default_flavour`] or `STUFFR_GZIP_FLAVOR` picks.
     Gzip,
+    /// `xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`.
+    Xz,
 }
 
 /// Invoked name to family. The name is matched exactly, after the directory
@@ -44,6 +47,12 @@ const NAMES: &[(&str, Family)] = &[
     ("gunzip", Family::Gzip),
     ("zcat", Family::Gzip),
     ("gzcat", Family::Gzip),
+    ("xz", Family::Xz),
+    ("unxz", Family::Xz),
+    ("xzcat", Family::Xz),
+    ("lzma", Family::Xz),
+    ("unlzma", Family::Xz),
+    ("lzcat", Family::Xz),
 ];
 
 /// Every compatibility name, from the one table `family_for` also reads.
@@ -80,6 +89,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Family::Bzip2 if name == "bzip2recover" => bzip2recover::run(argv0, rest),
         Family::Bzip2 => bzip2::run(name, rest),
         Family::Gzip => gzip::run(name, rest),
+        Family::Xz => xz::run(name, rest),
     })
 }
 
@@ -105,7 +115,8 @@ pub fn run_in(
 
 /// [`run_in`], also returning the inputs the run opened and what it read
 /// from each, by path. Only the gzip family counts its inputs; the map is
-/// empty for the others.
+/// empty for the others. The xz family runs with a fixed machine and a
+/// capped decoder memory limit ([`xz::run_in_counted`]).
 #[doc(hidden)]
 pub fn run_in_counted(
     dir: &Path,
@@ -125,6 +136,7 @@ pub fn run_in_counted(
             (code, out, err, BTreeMap::new())
         }
         Family::Gzip => gzip::run_in_counted(gzip_flavour, dir, canonical, &args, stdin, &|_| None),
+        Family::Xz => xz::run_in_counted(dir, canonical, &args, stdin, &|_| None),
     })
 }
 
@@ -349,7 +361,13 @@ mod tests {
                 "gzip",
                 "gunzip",
                 "zcat",
-                "gzcat"
+                "gzcat",
+                "xz",
+                "unxz",
+                "xzcat",
+                "lzma",
+                "unlzma",
+                "lzcat"
             ]
         );
     }

@@ -1,0 +1,20 @@
+Ported from XZ Utils 5.8.4 `src/xz/` by Lasse Collin and contributors.
+
+The `stuffr` binary's xz compatibility family (crates/stuffr-cli/src/compat/xz/)
+ports XZ Utils 5.8.4's src/xz/ (args.c, coder.c, file_io.c, hardware.c, list.c,
+main.c, message.c, options.c, signals.c, suffix.c, util.c), and from the same
+tree src/liblzma/common/string_conversion.c (the --filters syntax) and
+src/common/tuklib_physmem.c and tuklib_cpucores.c. Every file of it carries
+SPDX-License-Identifier: 0BSD. The licence follows, copied verbatim.
+
+Permission to use, copy, modify, and/or distribute this
+software for any purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL
+THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
+CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.

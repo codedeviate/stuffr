@@ -36,7 +36,7 @@ mod unix {
     }
 
     const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
-    const ALL: [&str; 8] = [
+    const ALL: [&str; 14] = [
         "bzip2",
         "bunzip2",
         "bzcat",
@@ -45,6 +45,12 @@ mod unix {
         "gunzip",
         "zcat",
         "gzcat",
+        "xz",
+        "unxz",
+        "xzcat",
+        "lzma",
+        "unlzma",
+        "lzcat",
     ];
 
     /// A scratch directory removed on drop.
@@ -129,9 +135,9 @@ mod unix {
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert!(s.0.join("bzcat").symlink_metadata().is_ok());
         assert!(s.0.join("bzip2").symlink_metadata().is_err());
-        let o = il(&s.0, &["--names", "xz"]);
+        let o = il(&s.0, &["--names", "zstd"]);
         assert_eq!(o.status.code(), Some(2));
-        assert!(stderr(&o).contains("xz"));
+        assert!(stderr(&o).contains("zstd"));
     }
 
     #[test]
@@ -434,6 +440,38 @@ mod unix {
             .unwrap();
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert!(stdout(&o).starts_with("Usage: gzip "), "{}", stdout(&o));
+    }
+
+    /// The six xz names are links like the rest, and a link runs as its
+    /// name: each prints its own name in `--help`'s usage line, and
+    /// `--robot --version` is XZ Utils 5.8.4's.
+    #[test]
+    fn install_links_creates_the_xz_names() {
+        let s = Scratch::new("xz");
+        let o = il(&s.0, &[]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        let dir = s.0.canonicalize().unwrap();
+        for n in ["xz", "unxz", "xzcat", "lzma", "unlzma", "lzcat"] {
+            let link = dir.join(n);
+            assert_eq!(std::fs::read_link(&link).unwrap(), canon_stuffr(), "{n}");
+            let o = Command::new(&link).arg("--help").output().unwrap();
+            assert_eq!(o.status.code(), Some(0), "{n}: {}", stderr(&o));
+            let want = format!("Usage: {} [OPTION]... [FILE]...\n", link.display());
+            assert!(stdout(&o).starts_with(&want), "{n}: {}", stdout(&o));
+            let o = Command::new(&link)
+                .args(["--robot", "--version"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                stdout(&o),
+                "XZ_VERSION=50080042\nLIBLZMA_VERSION=50080042\n",
+                "{n}"
+            );
+        }
+        let one = Scratch::new("lzcat");
+        let o = il(&one.0, &["--names", "lzcat,unxz"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
     }
 
     /// Run `exe` (with `stdin` piped in) under `flavor` as the only extra

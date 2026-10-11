@@ -1292,8 +1292,8 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
 
   stuffr install-links --dir ~/.local/bin
       Creates symlinks named bzip2, bunzip2, bzcat, bzip2recover, gzip,
-      gunzip, zcat and gzcat in that directory, each pointing at this stuffr
-      binary. Run under one of those
+      gunzip, zcat, gzcat, xz, unxz, xzcat, lzma, unlzma and lzcat in that
+      directory, each pointing at this stuffr binary. Run under one of those
       names, the binary behaves as that tool, with its flags, messages and
       exit codes. This is opt-in: nothing creates these links unless you run
       this verb. The directory must exist (exit 2 if not); one that cannot
@@ -1311,6 +1311,12 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       real tool. Apple-style compressed bytes are identical to /usr/bin/gzip
       on a --features c-backed build and merely compatible otherwise; GNU's
       are always compatible only. GNU -V and -L print stuffr's own MIT notice.
+
+      The xz names behave as XZ Utils 5.8.4's xz: unxz and xzcat decompress
+      (xzcat to standard output), and lzma, unlzma and lzcat use the .lzma
+      format. XZ_DEFAULTS and XZ_OPT are read before the command line, as xz
+      reads them. --version's first line names stuffr; --robot --version is
+      xz's own.
 
   stuffr install-links --dir ~/.local/bin --names bzcat,zcat
       Only the named links; --names takes a comma-separated list. A name that

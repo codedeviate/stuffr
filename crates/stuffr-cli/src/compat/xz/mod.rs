@@ -1,0 +1,322 @@
+//! The xz family (`xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`):
+//! stuffr behaving as XZ Utils 5.8.4's `xz`.
+//!
+//! Ported from XZ Utils 5.8.4 `src/xz/` by Lasse Collin and contributors
+//! (0BSD; the licence ships as `LICENSE-xz`), one module per C file:
+//! `args.rs` (args.c, with the parts of coder.c and util.c the options
+//! reach), `options.rs` (options.c, and liblzma's string_conversion.c for
+//! `--filters`), `suffix.rs` (suffix.c), `hardware.rs` (hardware.c, with
+//! tuklib_physmem/tuklib_cpucores), `message.rs` (message.c, main.c's exit
+//! status, tuklib_exit.c) and this module (main.c). Every string is in
+//! `messages.rs`.
+//!
+//! **Names** (R2): all six map to this family, and the mode comes from the
+//! invoked name by args.c's substring rule, so `unxz` decompresses,
+//! `xzcat` and `lzcat` decompress to standard output, and the `lzma` names
+//! use the `.lzma` format.
+//!
+//! **Hardware** (R3): the real process reads the machine (physical memory,
+//! processor threads, resource limits); a sandboxed run ([`run_in_counted`])
+//! sees two threads and 4 GiB, so fuzzing is deterministic, and its decoder
+//! is limited to 256 MiB (Ruling P7).
+//!
+//! Known deviations:
+//!
+//! - `--version`'s first line names stuffr (`xz (stuffr X.Y.Z; XZ Utils
+//!   5.8.4 compatible)`); its second line and `--robot --version` are the
+//!   reference's, on both tiers.
+//! - Compression, decompression, `--test` and `--list` arrive with the
+//!   coder (0.13.0 Tasks 6 and 7); until then every input is refused with
+//!   stuffr's own error, exit 1.
+
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::Path;
+use std::process::ExitCode;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex};
+
+use super::CountedRun;
+use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe, strerror};
+
+pub(crate) mod args;
+pub(crate) mod hardware;
+pub(crate) mod message;
+mod messages;
+pub(crate) mod options;
+// The output name is the coder's to ask for (Task 6); until then only
+// `suffix::check` (`--suffix`) has a caller outside the tests.
+#[allow(dead_code)]
+pub(crate) mod suffix;
+
+use args::{Args, OpMode};
+use hardware::Hardware;
+use message::{Messages, Status, Verbosity, mask_nonprint};
+
+/// Entry point for the six names; `name` is the canonical invoked name and
+/// `args` the arguments after `argv[0]`.
+pub fn run(name: &'static str, args: Vec<OsString>) -> ExitCode {
+    // xz dies of SIGPIPE writing to a closed pipe (observed: `xz -dc big.xz
+    // | head -c1` exits 141 in bash). Before any interrupt cleanup is armed
+    // (Ruling P8).
+    reset_sigpipe();
+    let argv0 = std::env::args_os()
+        .next()
+        .map(|a| a.as_encoded_bytes().to_vec())
+        .unwrap_or_else(|| name.as_bytes().to_vec());
+    let env = |k: &str| std::env::var_os(k);
+    let mut err = io::stderr();
+    let code = main(
+        name,
+        &argv0,
+        &args,
+        &env,
+        &mut Host::Real,
+        Hardware::detect(),
+        &mut err,
+    );
+    ExitCode::from(code)
+}
+
+/// [`run`] without the process: operands resolve against `dir`, standard
+/// input is `stdin` (a pipe), standard output and error are captured and
+/// returned with the exit code, neither is a terminal, `env` stands in for
+/// the environment (`XZ_DEFAULTS`, `XZ_OPT`, `POSIXLY_CORRECT`) and
+/// `SIGPIPE` is left alone. The machine is R3's fixed two threads and
+/// 4 GiB, and the decoder's memory limit is at most 256 MiB whatever the
+/// arguments say (Ruling P7: the pure tier zero-fills a dictionary as it
+/// allocates it, so a fuzzed header must not reach gigabytes). Standard
+/// output and output files share the [`SANDBOX_OUTPUT_CAP`] budget. For
+/// the fuzz target; not a stable interface.
+#[doc(hidden)]
+pub fn run_in_counted(
+    dir: &Path,
+    name: &'static str,
+    args: &[OsString],
+    stdin: &[u8],
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> CountedRun {
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let reads = Arc::new(Mutex::new(BTreeMap::new()));
+    let mut host = Host::Sandbox(Sandbox {
+        dir: dir.to_path_buf(),
+        stdin: Some(stdin.to_vec()),
+        stdout: stdout.clone(),
+        budget: Arc::new(AtomicU64::new(SANDBOX_OUTPUT_CAP)),
+        reads: reads.clone(),
+    });
+    let mut err = Vec::new();
+    let code = main(
+        name,
+        name.as_bytes(),
+        args,
+        env,
+        &mut host,
+        Hardware::SANDBOX,
+        &mut err,
+    );
+    drop(host);
+    let out = std::mem::take(&mut *stdout.lock().unwrap_or_else(|p| p.into_inner()));
+    let reads = std::mem::take(&mut *reads.lock().unwrap_or_else(|p| p.into_inner()));
+    (i32::from(code), out, err, reads)
+}
+
+/// main.c: main, below the process boundary.
+fn main(
+    name: &str,
+    argv0: &[u8],
+    args: &[OsString],
+    env: &dyn Fn(&str) -> Option<OsString>,
+    host: &mut Host,
+    hw: Hardware,
+    err: &mut dyn Write,
+) -> u8 {
+    let mut out = host.out_writer(None);
+    let (mut a, mut msg) = match args::parse(name, argv0, env, args, host, hw, &mut out, err) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    if a.op != OpMode::List && a.robot {
+        return msg.fatal(err, messages::ROBOT_CODING, &[]);
+    }
+    // Refuse to write compressed data to a terminal.
+    if a.op == OpMode::Compress
+        && (a.to_stdout || a.files == [b"-".to_vec()])
+        && is_tty_stdout(host, &mut msg, err)
+    {
+        msg.try_help(err);
+        return Status::Error as u8;
+    }
+    // signals_init() is armed with the coder (Task 6).
+    let names = std::mem::take(&mut a.files);
+    for n in &names {
+        let mut file = n.as_slice();
+        if file == b"-" {
+            if a.op == OpMode::Compress {
+                if is_tty_stdout(host, &mut msg, err) {
+                    continue;
+                }
+            } else if host.stdin_is_tty() {
+                msg.error(err, messages::TTY_STDIN, &[]);
+                continue;
+            }
+            if a.files_from.as_ref().is_some_and(|f| f.name.is_none()) {
+                msg.error(err, messages::STDIN_BOTH, &[]);
+                continue;
+            }
+            file = messages::STDIN_NAME;
+        }
+        run_one(&a, file, host, &mut msg, err);
+    }
+    if let Some(from) = a.files_from.take() {
+        let delim = from.delim;
+        let display = from.display_name().to_vec();
+        let source: Box<dyn Read + '_> = match from.file {
+            Some(f) => Box::new(f),
+            None => Box::new(host.stdin()),
+        };
+        let mut reader = BufReader::new(source);
+        while let Some(name) = read_name(&mut reader, delim, &display, &mut msg, err) {
+            run_one(&a, &name, host, &mut msg, err);
+        }
+    }
+    // list_totals() for --list comes with list.c (Task 7).
+    let status = msg.final_status();
+    message::exit(
+        status,
+        &msg.progname,
+        &mut out,
+        err,
+        msg.verbosity != Verbosity::Silent,
+    )
+}
+
+/// util.c: is_tty_stdout, which reports a terminal as an error.
+fn is_tty_stdout(host: &Host, msg: &mut Messages, err: &mut dyn Write) -> bool {
+    let tty = host.stdout_is_tty();
+    if tty {
+        msg.error(err, messages::TTY_STDOUT, &[]);
+    }
+    tty
+}
+
+/// coder.c: coder_run, or list.c: list_file under `--list`, for one input
+/// (`(stdin)` is standard input). Until the coder lands (Tasks 6 and 7)
+/// every input is refused.
+fn run_one(_a: &Args, name: &[u8], _host: &mut Host, msg: &mut Messages, err: &mut dyn Write) {
+    msg.error(err, messages::NOT_YET, &[&mask_nonprint(name)]);
+}
+
+/// main.c: read_name: the next name from `--files`/`--files0`'s source,
+/// skipping empty ones; `None` at the end or after an error (said).
+fn read_name(
+    r: &mut dyn BufRead,
+    delim: u8,
+    display: &[u8],
+    msg: &mut Messages,
+    err: &mut dyn Write,
+) -> Option<Vec<u8>> {
+    let mut name = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        match r.read(&mut byte) {
+            Ok(0) => {
+                if !name.is_empty() {
+                    msg.error(
+                        err,
+                        messages::NAMES_UNEXPECTED_END,
+                        &[&mask_nonprint(display)],
+                    );
+                }
+                return None;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                msg.error(
+                    err,
+                    messages::READ_NAMES_FAILED,
+                    &[&mask_nonprint(display), &strerror(&e)],
+                );
+                return None;
+            }
+        }
+        let c = byte[0];
+        if c == delim {
+            if name.is_empty() {
+                continue;
+            }
+            return Some(name);
+        }
+        if c == 0 {
+            msg.error(err, messages::NAMES_NUL, &[&mask_nonprint(display)]);
+            return None;
+        }
+        name.push(c);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(data: &[u8], delim: u8) -> (Vec<String>, String, Status) {
+        let mut msg = Messages::new(b"xz");
+        let mut err = Vec::new();
+        let mut r = data;
+        let mut got = Vec::new();
+        while let Some(n) = read_name(&mut r, delim, b"(stdin)", &mut msg, &mut err) {
+            got.push(String::from_utf8(n).unwrap());
+        }
+        (got, String::from_utf8(err).unwrap(), msg.status)
+    }
+
+    #[test]
+    fn read_name_splits_and_skips_empty_names() {
+        assert_eq!(
+            names(b"a\n\nb\n", b'\n'),
+            (vec!["a".into(), "b".into()], String::new(), Status::Success)
+        );
+        assert_eq!(names(b"a\0b\0", 0).0, ["a", "b"]);
+        let (got, err, st) = names(b"a\nb", b'\n');
+        assert_eq!(got, ["a"]);
+        assert_eq!(
+            (err.as_str(), st),
+            (
+                "xz: (stdin): Unexpected end of input when reading filenames\n",
+                Status::Error
+            )
+        );
+        let (got, err, _) = names(b"a\0b\n", b'\n');
+        assert!(got.is_empty());
+        assert!(err.contains("Null character found"), "{err}");
+    }
+
+    #[test]
+    fn run_in_counted_parses_in_the_sandbox() {
+        let dir = std::env::temp_dir();
+        let (code, out, err, reads) = run_in_counted(&dir, "xz", &["-h".into()], b"", &|_| None);
+        assert_eq!((code, err.len(), reads.len()), (0, 0, 0));
+        assert!(out.starts_with(b"Usage: xz [OPTION]... [FILE]...\n"));
+        // R3: the sandbox's machine.
+        let (code, out, _, _) = run_in_counted(
+            &dir,
+            "xz",
+            &["--robot".into(), "--info-memory".into()],
+            b"",
+            &|_| None,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "4294967296\t0\t0\t268435456\t1073741824\t2\n"
+        );
+        let (code, _, err, _) = run_in_counted(&dir, "xz", &["--robot".into()], b"", &|_| None);
+        assert_eq!(code, 1);
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "xz: Compression and decompression with --robot are not supported yet.\n"
+        );
+    }
+}

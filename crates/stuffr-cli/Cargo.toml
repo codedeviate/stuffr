@@ -13,7 +13,9 @@ rust-version.workspace = true
 # `BSD-2-Clause`, whose text they share.
 # One caveat: the Lzd notice in unlz.c is BSD-style but not word for word the
 # SPDX BSD-2-Clause text; the full notice ships in LICENSE-gzip-bsd.
-license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause"
+# The xz family ports XZ Utils 5.8.4's `src/xz/` (0BSD), whose licence
+# ships as LICENSE-xz.
+license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD"
 repository.workspace = true
 keywords = ["compression", "archive", "cli", "unzip", "extract"]
 categories = ["command-line-utilities", "compression"]

@@ -160,6 +160,12 @@ pub const COMPAT_NAMES: &[&str] = &[
     "gunzip",
     "zcat",
     "gzcat",
+    "xz",
+    "unxz",
+    "xzcat",
+    "lzma",
+    "unlzma",
+    "lzcat",
 ];
 
 /// The files a `compat` case may create in its directory before the run,
@@ -1746,7 +1752,7 @@ mod tests {
     #[test]
     fn flavour_from_name_byte() {
         let len = COMPAT_NAMES.len() as u8;
-        assert_eq!(len, 8);
+        assert_eq!(len, 14);
         let at = |byte: u8| {
             let seed = [byte, 0, 0];
             let case = decode_compat_case(&seed).unwrap();
@@ -1755,11 +1761,13 @@ mod tests {
         assert_eq!(at(0), ("bzip2", 0));
         assert_eq!(at(4), ("gzip", 0));
         assert_eq!(at(7), ("gzcat", 0));
-        assert_eq!(at(8), ("bzip2", 1));
-        assert_eq!(at(12), ("gzip", 1));
-        assert_eq!(at(15), ("gzcat", 1));
-        assert_eq!(at(20), ("gzip", 0));
-        assert_eq!(at(255), ("gzcat", 1));
+        assert_eq!(at(8), ("xz", 0));
+        assert_eq!(at(13), ("lzcat", 0));
+        assert_eq!(at(14), ("bzip2", 1));
+        assert_eq!(at(18), ("gzip", 1));
+        assert_eq!(at(21), ("gzcat", 1));
+        assert_eq!(at(28), ("bzip2", 0));
+        assert_eq!(at(255), ("bzip2recover", 0));
         for (i, name) in COMPAT_NAMES.iter().enumerate() {
             for flavour in 0..2u8 {
                 let seed = encode_compat_case(name, flavour, &[], &[], false, b"");
