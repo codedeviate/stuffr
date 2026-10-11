@@ -2195,6 +2195,31 @@ mod differential {
         );
     }
 
+    /// Review focus 3, fix round 1: notes are said as they arise, never
+    /// collected per input. 1.5 million empty-body members, each with an
+    /// empty FEXTRA (22 bytes apiece, 33 MB), once kept a 16-byte note per
+    /// member until the input ended; GNU 1.15 decodes such a stream in
+    /// about 2 MiB. Bounded at 24 MiB, well under what the notes took.
+    #[test]
+    fn zcat_of_many_extra_field_members_is_bounded() {
+        const MEMBERS: usize = 1_500_000;
+        let one: [u8; 22] = [
+            0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 3, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let input = one.repeat(MEMBERS);
+        let peak = decoder_peak_rss(
+            "zcat",
+            "many.gz",
+            &input,
+            b"",
+            &[("STUFFR_GZIP_FLAVOR", "gnu")],
+        );
+        assert!(
+            peak < 24 << 20,
+            "peak memory {peak} bytes is not under 24 MiB"
+        );
+    }
+
     /// Run `exe big.gz` with standard output a pipe whose read end is
     /// closed after the first read; how the process ended. Standard error
     /// must stay empty.

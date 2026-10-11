@@ -204,7 +204,7 @@ fn read_fail(e: io::Error) -> Fail {
 pub(super) fn open<R: Read>(
     s: &mut Stream<R>,
     copy_ok: bool,
-    notes: &mut Vec<Note>,
+    note: &mut dyn FnMut(Note),
 ) -> Result<Opened, Fail> {
     let opened = |kind| Opened {
         kind,
@@ -228,7 +228,7 @@ pub(super) fn open<R: Read>(
     let detected = sniff::detect(s, Flavour::Gnu).map_err(read_fail)?;
     match detected {
         Detected::Gzip => Ok(Opened {
-            header: Some(gzip_header(s, notes)?),
+            header: Some(gzip_header(s, note)?),
             ..opened(Kind::Gzip)
         }),
         Detected::Zip => {
@@ -248,8 +248,8 @@ pub(super) fn open<R: Read>(
 /// One gzip header, its failures as GNU words them (a wrong FHCRC with
 /// both values, observed: `header checksum 0x0012 != computed checksum
 /// 0x003f`).
-fn gzip_header<R: Read>(s: &mut Stream<R>, notes: &mut Vec<Note>) -> Result<Header, Fail> {
-    match read_header_with(s, &mut |n| notes.push(Note::Extra(n))) {
+fn gzip_header<R: Read>(s: &mut Stream<R>, note: &mut dyn FnMut(Note)) -> Result<Header, Fail> {
+    match read_header_with(s, &mut |n| note(Note::Extra(n))) {
         Ok(h) => Ok(h),
         Err(MemberError::Io(e)) => Err(read_fail(e)),
         Err(MemberError::Fault(f)) => Err(match f {
@@ -343,14 +343,15 @@ pub(super) struct Progress {
 }
 
 /// The member stage: decode everything `open` found to `out`. `copy_ok` as
-/// for [`open`]. Notes are pushed as they arise; output already written
+/// for [`open`]. Each note goes to `note` as it arises, never kept, so
+/// memory is bounded whatever the member count; output already written
 /// stays written when it fails.
 pub(super) fn finish<R: Read + Send + 'static>(
     mut s: Stream<R>,
     o: Opened,
     copy_ok: bool,
     out: &mut dyn Write,
-    notes: &mut Vec<Note>,
+    note: &mut dyn FnMut(Note),
     progress: &mut Progress,
 ) -> Result<Done, Fail> {
     let mut sink = Sink {
@@ -368,17 +369,17 @@ pub(super) fn finish<R: Read + Send + 'static>(
     };
     let mut header = o.header;
     let mut kind = o.kind;
-    let mut members = 0u32;
+    // Whether a second member followed the first.
+    let mut several = false;
     let mut method;
     let mut crc;
     let mut trailing = false;
     loop {
-        members += 1;
         match kind {
             Kind::Gzip => {
                 let h = match header.take() {
                     Some(h) => h,
-                    None => gzip_header(&mut s, notes)?,
+                    None => gzip_header(&mut s, note)?,
                 };
                 if h.mtime != 0 {
                     progress.stamp = Some(h.mtime);
@@ -409,7 +410,7 @@ pub(super) fn finish<R: Read + Send + 'static>(
                 crc = None;
             }
             Kind::Compress => {
-                lzw(s, &mut sink, notes)?;
+                lzw(s, &mut sink, note)?;
                 return Ok(Done {
                     method: Method::Compress,
                     crc: None,
@@ -421,7 +422,7 @@ pub(super) fn finish<R: Read + Send + 'static>(
                 let z = o.zip.expect("a zip was opened");
                 zip_entry(&mut s, z, &mut sink)?;
                 if s.fill_buf().map_err(read_fail)?.starts_with(b"PK\x03\x04") {
-                    notes.push(Note::ZipMore);
+                    note(Note::ZipMore);
                 }
                 return Ok(Done {
                     method: if z.method == 0 {
@@ -471,7 +472,7 @@ pub(super) fn finish<R: Read + Send + 'static>(
                         let n = b.len();
                         s.consume(n);
                     }
-                    notes.push(if all_zero {
+                    note(if all_zero {
                         Note::TrailingZeros
                     } else {
                         Note::TrailingGarbage
@@ -481,8 +482,9 @@ pub(super) fn finish<R: Read + Send + 'static>(
             }
         };
         kind = next;
+        several = true;
     }
-    let single = members == 1 && !trailing && first_kind == Kind::Gzip;
+    let single = !several && !trailing && first_kind == Kind::Gzip;
     Ok(Done {
         method,
         crc,
@@ -499,7 +501,7 @@ pub(super) fn finish<R: Read + Send + 'static>(
 fn lzw<R: Read + Send + 'static>(
     mut s: Stream<R>,
     sink: &mut Sink<'_>,
-    notes: &mut Vec<Note>,
+    note: &mut dyn FnMut(Note),
 ) -> Result<(), Fail> {
     let b = s.fill_buf().map_err(read_fail)?;
     if b.len() < 3 {
@@ -511,7 +513,7 @@ fn lzw<R: Read + Send + 'static>(
         return Err(Fail::ZBits(bits));
     }
     if flags & 0x60 != 0 {
-        notes.push(Note::ZFlags(flags & 0x60));
+        note(Note::ZFlags(flags & 0x60));
     }
     let start = sink.n;
     let mut r =

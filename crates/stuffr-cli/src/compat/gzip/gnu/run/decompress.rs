@@ -31,7 +31,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use super::super::args::Mode;
 use super::super::decode::{self, Counted, Fail, Note, Progress};
 use super::super::list::Entry;
-use super::super::messages::{self as m, PROGRAM, quote};
+use super::super::messages::{self as m, PROGRAM, printf, quote};
 use super::{Gz, Step, Stop, open_input, parent_of};
 use crate::compat::gzip::member::{Header, Lookahead};
 use crate::compat::host::{Host, Input, create_temp, stdin_file, strerror};
@@ -249,9 +249,10 @@ impl Gz<'_> {
         let (counted, read) = Counted::new(input);
         let mut st = Lookahead::new(counted);
         let copy_ok = self.s.force && mode != Mode::List;
-        let mut notes = Vec::new();
-        let opened = decode::open(&mut st, copy_ok, &mut notes);
-        self.say_notes(qname, &notes);
+        let opened = {
+            let mut noter = self.noter(qname, false);
+            decode::open(&mut st, copy_ok, &mut |n| noter.note(n))
+        };
         let opened = match opened {
             Ok(o) => o,
             Err(f) => {
@@ -266,16 +267,28 @@ impl Gz<'_> {
         if named.is_some() && self.s.verbose > 0 && mode != Mode::List {
             self.say(m::VERBOSE_NAME, &[qname]);
         }
-        let mut notes = Vec::new();
         let mut progress = Progress::default();
-        let r = if mode == Mode::Decompress {
-            let out = self.stdout_writer();
-            decode::finish(st, opened, copy_ok, out, &mut notes, &mut progress)
-        } else {
-            let mut sink = Charged(&*self.host);
-            decode::finish(st, opened, copy_ok, &mut sink, &mut notes, &mut progress)
+        let (verbose, quiet) = (self.s.verbose > 0, self.s.quiet);
+        let host = &*self.host;
+        let mut noter = Noter {
+            qname,
+            verbose,
+            quiet,
+            err: &mut *self.err,
+            exit: &mut self.exit,
+            file_mode: false,
+            zip_more: false,
+            unclean: false,
         };
-        self.say_notes(qname, &notes);
+        let mut note = |n| noter.note(n);
+        let r = if mode == Mode::Decompress {
+            let out = self.stdout.get_or_insert_with(|| host.out_writer(None));
+            decode::finish(st, opened, copy_ok, out, &mut note, &mut progress)
+        } else {
+            let mut sink = Charged(host);
+            decode::finish(st, opened, copy_ok, &mut sink, &mut note, &mut progress)
+        };
+        let unclean = noter.unclean;
         let done = match r {
             Ok(d) => d,
             Err(f) => {
@@ -289,9 +302,6 @@ impl Gz<'_> {
         };
         let size = size.unwrap_or_else(|| read.load(std::sync::atomic::Ordering::Relaxed));
         let compressed = size.saturating_sub(done.header_bytes);
-        let unclean = notes
-            .iter()
-            .any(|n| matches!(n, Note::TrailingGarbage | Note::TrailingZeros));
         match mode {
             Mode::Decompress => {
                 if named.is_some() {
@@ -365,9 +375,10 @@ impl Gz<'_> {
         let qname = quote(name);
         let (counted, _) = Counted::new(Input::file(file));
         let mut st = Lookahead::new(counted);
-        let mut notes = Vec::new();
-        let opened = decode::open(&mut st, false, &mut notes);
-        self.say_notes(&qname, &notes);
+        let opened = {
+            let mut noter = self.noter(&qname, true);
+            decode::open(&mut st, false, &mut |n| noter.note(n))
+        };
         let opened = match opened {
             Ok(o) => o,
             Err(f) => return self.refused(f, &qname, b""),
@@ -405,19 +416,34 @@ impl Gz<'_> {
         if self.s.verbose > 0 {
             self.say(m::VERBOSE_NAME, &[&qname]);
         }
-        let mut notes = Vec::new();
         let mut progress = Progress::default();
-        let r = {
+        let more = {
             let mut w = self.host.out_writer(Some(tmp_file));
-            decode::finish(st, opened, false, &mut w, &mut notes, &mut progress)
-                .and_then(|d| w.flush().map(|()| d).map_err(Fail::Write))
+            let mut noter = Noter {
+                qname: &qname,
+                verbose: self.s.verbose > 0,
+                quiet: self.s.quiet,
+                err: &mut *self.err,
+                exit: &mut self.exit,
+                file_mode: true,
+                zip_more: false,
+                unclean: false,
+            };
+            let r = decode::finish(
+                st,
+                opened,
+                false,
+                &mut w,
+                &mut |n| noter.note(n),
+                &mut progress,
+            )
+            .and_then(|d| w.flush().map(|()| d).map_err(Fail::Write));
+            (r, noter.zip_more)
         };
+        let (r, more) = more;
         let mtime = self
             .stored_time(progress.stamp)
             .map(|t| UNIX_EPOCH + Duration::from_secs(u64::from(t)));
-        let more = notes.contains(&Note::ZipMore);
-        notes.retain(|n| *n != Note::ZipMore);
-        self.say_notes(&qname, &notes);
         if more {
             // Observed: a zip with a second entry is refused whole when
             // decompressing to a file (and the run stops).
@@ -476,31 +502,17 @@ impl Gz<'_> {
         step
     }
 
-    /// Say what decoding noted, as GNU does: FEXTRA's length only under
-    /// `-v`; trailing zeros only under `-v` (then exit 2); trailing
-    /// garbage, unknown `.Z` flags and a zip's second entry as warnings.
-    fn say_notes(&mut self, qname: &[u8], notes: &[Note]) {
-        for n in notes {
-            match *n {
-                Note::Extra(len) => {
-                    if self.s.verbose > 0 {
-                        let len = len.to_string();
-                        self.say(m::EXTRA_FIELD, &[PROGRAM, qname, len.as_bytes()]);
-                    }
-                }
-                Note::ZFlags(f) => {
-                    let f = format!("{f:x}");
-                    self.warn(m::Z_FLAGS, &[PROGRAM, qname, f.as_bytes()]);
-                }
-                Note::TrailingGarbage => self.warn(m::TRAILING_GARBAGE, &[PROGRAM, qname]),
-                Note::TrailingZeros => {
-                    if self.s.verbose > 0 {
-                        self.say(m::TRAILING_ZEROS, &[PROGRAM, qname]);
-                        self.warned();
-                    }
-                }
-                Note::ZipMore => self.warn(m::ZIP_MORE, &[PROGRAM, qname]),
-            }
+    /// A [`Noter`] for `qname` on this run's settings.
+    fn noter<'n>(&'n mut self, qname: &'n [u8], file_mode: bool) -> Noter<'n> {
+        Noter {
+            qname,
+            verbose: self.s.verbose > 0,
+            quiet: self.s.quiet,
+            err: &mut *self.err,
+            exit: &mut self.exit,
+            file_mode,
+            zip_more: false,
+            unclean: false,
         }
     }
 
@@ -550,6 +562,71 @@ impl Gz<'_> {
             Fail::Write(e) => self.error(m::IO_FAILED, &[p, qout, &strerror(e)]),
         }
         if fatal { Err(Stop) } else { Ok(()) }
+    }
+}
+
+/// Says what decoding notes the moment it is noted, so nothing is kept per
+/// member (fix round 1: a stream of a million FEXTRA members once kept a
+/// million notes). As GNU does: FEXTRA's length only under `-v`; trailing
+/// zeros only under `-v` (then exit 2); trailing garbage, unknown `.Z`
+/// flags and a zip's second entry as warnings, except that to a file the
+/// second entry is a refusal the caller reports (`zip_more`).
+struct Noter<'e> {
+    qname: &'e [u8],
+    verbose: bool,
+    quiet: bool,
+    err: &'e mut dyn Write,
+    exit: &'e mut u8,
+    file_mode: bool,
+    /// A zip's second entry, when decoding to a file.
+    zip_more: bool,
+    /// Data followed the last member (zeros or not).
+    unclean: bool,
+}
+
+impl Noter<'_> {
+    fn say(&mut self, fmt: &str, args: &[&[u8]]) {
+        printf(self.err, fmt, args);
+    }
+
+    fn warn(&mut self, fmt: &str, args: &[&[u8]]) {
+        if !self.quiet {
+            self.say(fmt, args);
+        }
+        if *self.exit == 0 {
+            *self.exit = 2;
+        }
+    }
+
+    fn note(&mut self, n: Note) {
+        let q = self.qname;
+        match n {
+            Note::Extra(len) => {
+                if self.verbose {
+                    let len = len.to_string();
+                    self.say(m::EXTRA_FIELD, &[PROGRAM, q, len.as_bytes()]);
+                }
+            }
+            Note::ZFlags(f) => {
+                let f = format!("{f:x}");
+                self.warn(m::Z_FLAGS, &[PROGRAM, q, f.as_bytes()]);
+            }
+            Note::TrailingGarbage => {
+                self.unclean = true;
+                self.warn(m::TRAILING_GARBAGE, &[PROGRAM, q]);
+            }
+            Note::TrailingZeros => {
+                self.unclean = true;
+                if self.verbose {
+                    self.say(m::TRAILING_ZEROS, &[PROGRAM, q]);
+                    if *self.exit == 0 {
+                        *self.exit = 2;
+                    }
+                }
+            }
+            Note::ZipMore if self.file_mode => self.zip_more = true,
+            Note::ZipMore => self.warn(m::ZIP_MORE, &[PROGRAM, q]),
+        }
     }
 }
 
