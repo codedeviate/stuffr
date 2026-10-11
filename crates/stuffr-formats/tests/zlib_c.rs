@@ -193,7 +193,8 @@ fn input(name: &str) -> Vec<u8> {
     }
 }
 
-#[cfg(feature = "gzip")]
+/// Only the macOS fixture check walks every input by name.
+#[cfg(all(target_os = "macos", feature = "gzip"))]
 const INPUTS: [&str; 5] = ["text", "binary", "random", "empty", "abc"];
 
 fn deflate(data: &[u8], level: u32) -> Vec<u8> {
