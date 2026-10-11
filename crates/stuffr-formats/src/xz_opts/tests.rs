@@ -1477,19 +1477,32 @@ mod cross_tier {
         }
     }
 
+    /// The window of [`agree`]'s one tolerated difference, in bytes before
+    /// the end of the input.
+    const END_WINDOW: u64 = 20;
+
+    /// The verdict [`agree`] reports for a tolerated difference.
+    const TOLERATED: &str = "corrupt in the last 20 bytes: BufError on the pure tier";
+
     /// Decodes `data` with both tiers in `piece`-byte feeds and asserts
     /// they agree; the verdict.
     fn agree(what: &str, o: &DecodeOptions, data: &[u8], piece: usize) -> String {
         let (c_out, c_res, c_used, c_warn) = c_codec::decode(o, data, piece);
         let (p_out, p_res, p_used, p_warn) = pure_codec::decode(o, data, piece);
         let (cv, pv) = (verdict(&c_res), verdict(&p_res));
-        // The last 20 bytes of input under a raw, `.lzma` or `.lz` stream,
-        // as the pure module doc says: corruption liblzma finds only there
-        // is, on the pure tier, the stream running out.
+        // The stated pure-tier deviation (the pure module doc): under a
+        // raw, `.lzma` or `.lz` stream, corruption liblzma finds only once
+        // it is within the last 20 bytes of the input (`lzma-rust2` starts
+        // a symbol only with 20 bytes in hand) is, on the pure tier, the
+        // input running out. Bounded by where liblzma stopped, and counted.
         let lzma1 = matches!(o.format, Format::Raw | Format::Lzma | Format::Lzip)
             || (o.auto && data.first() != Some(&0xFD));
-        if lzma1 && matches!(c_res, Err(XzError::Data)) && matches!(p_res, Err(XzError::BufError)) {
-            return "Compressed data is corrupt, or the end".to_owned();
+        if lzma1
+            && matches!(c_res, Err(XzError::Data))
+            && matches!(p_res, Err(XzError::BufError))
+            && c_used + END_WINDOW >= data.len() as u64
+        {
+            return TOLERATED.to_owned();
         }
         assert_eq!(pv, cv, "{what} (piece {piece}): pure vs liblzma");
         assert_eq!(p_warn, c_warn, "{what} (piece {piece}): warnings");
@@ -1934,6 +1947,10 @@ mod cross_tier {
             assert!(seen.contains_key(v), "never saw {v:?}: {seen:?}");
         }
         assert!(seen.keys().any(|k| k.starts_with("memlimit")), "{seen:?}");
+        // Measured 2026-10-11: every one of these had liblzma stop within 16
+        // bytes of the end. A change in the count means the sweep or the
+        // deviation moved; look before updating it.
+        assert_eq!(seen.get(TOLERATED), Some(&92), "{seen:?}");
     }
 }
 

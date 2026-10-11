@@ -62,6 +62,15 @@
 //!   which is always so at one thread. At two or more, a refusal after
 //!   Blocks it decoded threaded can report more (its cached buffers), a
 //!   figure that depends on timing in liblzma itself.
+//! - **Corruption at the very end of a raw, `.lzma` or `.lz` stream:**
+//!   `lzma-rust2` starts a symbol only with 20 bytes in hand and cannot be
+//!   asked how far a failing one read, so the end of the input is found
+//!   with a sentinel (see `RawDec::run`): a stream cut short is
+//!   [`XzError::BufError`], as in liblzma, but so is corruption that
+//!   liblzma only detects once it is within the last 20 bytes of the input,
+//!   which liblzma calls [`XzError::Data`]. The exit status is the same;
+//!   the message is "Unexpected end of input" for "Compressed data is
+//!   corrupt". `.xz` is not affected: its container ends each Block.
 //! - **`.lzma` with a known size and an end marker:** liblzma accepts the
 //!   marker (`LZMA_LZMA1EXT_ALLOW_EOPM`); `LzmaStream` does not, so the
 //!   pure tier calls it corrupt. No encoder `xz` knows writes it.
