@@ -322,7 +322,7 @@ impl Gz<'_> {
         let out_name = [name, &self.s.suffix].concat();
         let qout = quote(&out_name);
         let out_path = self.host.path(&out_name);
-        let Some(replace) = self.may_write(&out_path, &qout) else {
+        let Some(replace) = self.may_write(&out_path, &qout, &path) else {
             return;
         };
         let (tmp, tmp_file) = match create_temp(&parent_of(&out_path), "gzip") {
@@ -359,13 +359,18 @@ impl Gz<'_> {
     /// (exit 1, the run goes on; observed: `gzip -df a.gz` with a directory
     /// `a` says `gzip: a: Operation not permitted`, macOS's `unlink` error,
     /// and so does `gzip -f a` with a directory `a.gz`); otherwise a
-    /// terminal on standard input is asked.
-    fn may_write(&mut self, out_path: &Path, qout: &[u8]) -> Option<bool> {
+    /// terminal on standard input is asked. Ruling T8-5: when the output
+    /// is the input itself (`input`; `gzip -dNf a.gz` storing `a.gz`), it
+    /// is not removed first, so a failed decode leaves the input; the
+    /// publish's rename replaces it on success.
+    fn may_write(&mut self, out_path: &Path, qout: &[u8], input: &Path) -> Option<bool> {
         if fs::symlink_metadata(out_path).is_err() {
             return Some(false);
         }
         if self.s.force {
-            if let Err(e) = fs::remove_file(out_path) {
+            if out_path != input
+                && let Err(e) = fs::remove_file(out_path)
+            {
                 self.error(m::IO_FAILED, &[PROGRAM, qout, &strerror(&e)]);
                 return None;
             }

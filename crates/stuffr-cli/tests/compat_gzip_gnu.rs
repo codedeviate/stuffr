@@ -2192,6 +2192,42 @@ mod differential {
         }
     }
 
+    /// Ruling T8-5: the same with a corrupt or cut-short body. GNU unlinks
+    /// the existing output (the input itself) before decoding, so the
+    /// failure leaves nothing. stuffr prints and exits as GNU does but
+    /// skips that unlink when the output is the input, so the input
+    /// survives unchanged.
+    #[test]
+    fn a_corrupt_input_named_by_its_own_stored_name_survives() {
+        let t = txt();
+        let good = gzm(&t, b"a.gz");
+        let crc = member_with(
+            Member {
+                name: Some(b"a.gz"),
+                ..plain_member(&t)
+            },
+            Some(1),
+            None,
+        );
+        let cut = good[..good.len() / 2].to_vec();
+        for bytes in [crc, cut] {
+            for args in [&["-dNf", "a.gz"][..], &["-dNfv", "a.gz"]] {
+                let c = dz("gzip", args, vec![("a.gz", bytes.clone())]);
+                let s = stuffr_as(&c);
+                if let Some(r) = reference(gnu_gzip_dir(), &c) {
+                    assert_eq!(
+                        (r.code, &r.stdout, &r.stderr),
+                        (s.code, &s.stdout, &s.stderr)
+                    );
+                    assert!(r.tree.is_empty(), "GNU kept {:?}", r.tree.keys());
+                }
+                assert_eq!(s.code, 1, "{}", s.stderr);
+                assert_eq!(s.tree.len(), 1, "{:?}", s.tree.keys());
+                assert_eq!(s.tree["a.gz"].0, bytes, "the input must survive unchanged");
+            }
+        }
+    }
+
     /// Review focus 2: `gunzip a.gz b.gz c.gz` with `b.gz` corrupt keeps
     /// `b.gz`, leaves no partial `b`, and exits with the worst code. GNU
     /// ends the run at a CRC error or a cut-short input (so `c.gz` is left

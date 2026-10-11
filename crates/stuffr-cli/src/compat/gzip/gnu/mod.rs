@@ -79,9 +79,10 @@
 //!   set makes GNU check the *next* input's gzip trailer as a data
 //!   descriptor ("crc/length error"); that leaked state is not reproduced.
 //! - `gzip -dNf` on an input whose stored name is its own name: GNU
-//!   replaces the input with the output and then removes it, losing both;
-//!   stuffr says and exits the same but keeps the decoded file (Ruling
-//!   T8-4).
+//!   removes the input before decoding and the output after, losing both
+//!   whether the body decodes or not; stuffr says and exits the same but
+//!   keeps the decoded file on success and the untouched input on failure
+//!   (Rulings T8-4, T8-5).
 //! - Read and write failures say `gzip: NAME: strerror`, exit 1, and end
 //!   the run: the shape every other file error has, not observed.
 
