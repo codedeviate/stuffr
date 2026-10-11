@@ -404,8 +404,10 @@ jobs:
       # keg path: Apple's /usr/bin/compress is another program).
       - run: brew install gzip ncompress
       # `CI` is set by Actions, so `require_reference` panics if a reference
-      # tool is missing instead of skipping. Task 10 adds `compat_gzip_bsd`
-      # and `compat_gzip_bytes` to both lines; the second runs the gzip
-      # suites again on the compatible tier.
-      - run: cargo test -p stuffr-cli --all-features --test compat_bzip2 --test compat_gzip_harness_selftest --test compat_gzip_gnu
-      - run: cargo test -p stuffr-cli --no-default-features --features pure,legacy --test compat_gzip_gnu
+      # tool is missing instead of skipping. The second line runs the gzip
+      # suites again on the compatible tier. The Apple suites target Apple
+      # gzip 487.0.1; on a runner whose macOS ships another release, every
+      # differing case says so (`apple_compare`), so a release's change is
+      # named, not hidden.
+      - run: cargo test -p stuffr-cli --all-features --test compat_bzip2 --test compat_gzip_harness_selftest --test compat_gzip_gnu --test compat_gzip_bsd --test compat_gzip_bytes
+      - run: cargo test -p stuffr-cli --no-default-features --features pure,legacy --test compat_gzip_gnu --test compat_gzip_bsd --test compat_gzip_bytes

@@ -1177,6 +1177,9 @@ pub fn mask_stdin_mtimes(r: &Run, s: &mut Run) {
 /// - on the compatible tier only (`!c.compare_output_bytes`), `-v`'s
 ///   ratios (Ruling T9-2).
 ///
+/// When the installed release is not [`APPLE_GZIP_VERSION_LINE`]'s, each
+/// difference is prefixed with both releases.
+///
 /// False when the reference is absent (skip; panics instead under `CI`).
 pub fn apple_compare(c: &Case) -> bool {
     let Some(mut r) = reference(APPLE_GZIP_DIR, c) else {
@@ -1203,6 +1206,325 @@ pub fn apple_compare(c: &Case) -> bool {
         r.stderr = blank_apple_ratios(&r.stderr);
         s.stderr = blank_apple_ratios(&s.stderr);
     }
-    assert_same(c, &r, &s);
+    // Another release on this macOS: every difference says so, since it
+    // may be the release's and not stuffr's.
+    match apple_gzip_version_line().filter(|l| *l != APPLE_GZIP_VERSION_LINE) {
+        None => assert_same(c, &r, &s),
+        Some(release) => {
+            let same = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_same(c, &r, &s);
+            }));
+            if let Err(p) = same {
+                panic!(
+                    "[the reference is {release}; this suite targets {APPLE_GZIP_VERSION_LINE}, \
+                     so this difference may be the release's]\n{}",
+                    panic_text(p)
+                );
+            }
+        }
+    }
     true
+}
+
+// ---- gzip-family fixtures, built here so both sides read the same bytes ----
+
+/// A gzip member's header fields; `magic2` is `0x8b`, or `0x9e` for the
+/// old magic.
+#[derive(Clone, Copy)]
+pub struct Member<'b> {
+    pub data: &'b [u8],
+    pub name: Option<&'b [u8]>,
+    pub mtime: u32,
+    pub extra: Option<&'b [u8]>,
+    pub comment: Option<&'b [u8]>,
+    pub hcrc: bool,
+    pub magic2: u8,
+}
+
+pub fn plain_member(data: &[u8]) -> Member<'_> {
+    Member {
+        data,
+        name: None,
+        mtime: 0,
+        extra: None,
+        comment: None,
+        hcrc: false,
+        magic2: 0x8b,
+    }
+}
+
+pub fn crc32(b: &[u8]) -> u32 {
+    let mut c = flate2::Crc::new();
+    c.update(b);
+    c.sum()
+}
+
+pub fn deflate_raw(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+    e.write_all(data).unwrap();
+    e.finish().unwrap()
+}
+
+/// One member, the header written by hand (RFC 1952) over flate2's raw
+/// deflate; `crc`/`isize` override the trailer.
+pub fn member_with(m: Member, crc: Option<u32>, isize: Option<u32>) -> Vec<u8> {
+    let mut flg = 0u8;
+    for (on, bit) in [
+        (m.hcrc, 2),
+        (m.extra.is_some(), 4),
+        (m.name.is_some(), 8),
+        (m.comment.is_some(), 16),
+    ] {
+        if on {
+            flg |= bit;
+        }
+    }
+    let mut v = vec![0x1f, m.magic2, 8, flg];
+    v.extend_from_slice(&m.mtime.to_le_bytes());
+    v.extend_from_slice(&[0, 3]);
+    if let Some(e) = m.extra {
+        v.extend_from_slice(&(e.len() as u16).to_le_bytes());
+        v.extend_from_slice(e);
+    }
+    for f in [m.name, m.comment].into_iter().flatten() {
+        v.extend_from_slice(f);
+        v.push(0);
+    }
+    if m.hcrc {
+        let c = (crc32(&v) & 0xffff) as u16;
+        v.extend_from_slice(&c.to_le_bytes());
+    }
+    v.extend(deflate_raw(m.data));
+    v.extend_from_slice(&crc.unwrap_or_else(|| crc32(m.data)).to_le_bytes());
+    v.extend_from_slice(&isize.unwrap_or(m.data.len() as u32).to_le_bytes());
+    v
+}
+
+pub fn member(m: Member) -> Vec<u8> {
+    member_with(m, None, None)
+}
+
+/// A member storing `name`.
+pub fn gzm(data: &[u8], name: &[u8]) -> Vec<u8> {
+    member(Member {
+        name: Some(name),
+        ..plain_member(data)
+    })
+}
+
+/// The old Unix `pack` format: a canonical Huffman code in pack's
+/// layout (level `i` holds codes of length `i + 1`, internal nodes take
+/// a level's smallest codes, EOB is the last leaf), as
+/// `stuffr-formats`' own `pack.rs` tests encode it.
+pub fn pack(data: &[u8]) -> Vec<u8> {
+    let mut freq = [0u64; 256];
+    for &b in data {
+        freq[b as usize] += 1;
+    }
+    let mut syms: Vec<usize> = (0..256).filter(|&b| freq[b] > 0).collect();
+    if syms.is_empty() {
+        syms.push(0);
+    }
+    let n = syms.len() + 1;
+    let mut w: Vec<u64> = syms.iter().map(|&b| freq[b]).collect();
+    w.push(0);
+    let mut parent = vec![usize::MAX; 2 * n];
+    let mut live: Vec<usize> = (0..n).collect();
+    while live.len() > 1 {
+        live.sort_by_key(|&i| std::cmp::Reverse((w[i], i)));
+        let a = live.pop().unwrap();
+        let b = live.pop().unwrap();
+        let p = w.len();
+        w.push(w[a] + w[b]);
+        parent[a] = p;
+        parent[b] = p;
+        live.push(p);
+    }
+    let len: Vec<usize> = (0..n)
+        .map(|i| {
+            let (mut d, mut c) = (0, i);
+            while parent[c] != usize::MAX {
+                c = parent[c];
+                d += 1;
+            }
+            d
+        })
+        .collect();
+    let maxlen = *len.iter().max().unwrap();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| (len[i], i == n - 1, i));
+    let mut count = vec![0usize; maxlen];
+    for &i in &order {
+        count[len[i] - 1] += 1;
+    }
+    let mut inodes = vec![0u32; maxlen];
+    for l in (0..maxlen - 1).rev() {
+        inodes[l] = (inodes[l + 1] + count[l + 1] as u32) / 2;
+    }
+    let mut code = vec![0u32; n];
+    let mut at = vec![0u32; maxlen];
+    for &i in &order {
+        let l = len[i] - 1;
+        code[i] = inodes[l] + at[l];
+        at[l] += 1;
+    }
+    let mut out = vec![0x1f, 0x1e];
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.push(maxlen as u8);
+    for (l, &c) in count.iter().enumerate() {
+        out.push(if l + 1 == maxlen { c - 2 } else { c } as u8);
+    }
+    for &i in &order {
+        if i != n - 1 {
+            out.push(syms[i] as u8);
+        }
+    }
+    let mut pos = [usize::MAX; 256];
+    for (k, &b) in syms.iter().enumerate() {
+        pos[b] = k;
+    }
+    let (mut acc, mut nb) = (0u32, 0u32);
+    let mut put = |c: u32, l: usize, out: &mut Vec<u8>| {
+        for bit in (0..l).rev() {
+            acc = (acc << 1) | ((c >> bit) & 1);
+            nb += 1;
+            if nb == 8 {
+                out.push(acc as u8);
+                acc = 0;
+                nb = 0;
+            }
+        }
+    };
+    for &b in data {
+        let k = pos[b as usize];
+        put(code[k], len[k], &mut out);
+    }
+    put(code[n - 1], len[n - 1], &mut out);
+    if nb > 0 {
+        out.push((acc << (8 - nb)) as u8);
+    }
+    out
+}
+
+/// A zip entry: method 0 (stored) or 8 (deflated); any other method's
+/// data is the plain bytes (GNU refuses those before reading). With
+/// flag 8 the sizes and CRC follow in a signed data descriptor.
+pub struct ZipEntry<'b> {
+    pub name: &'b [u8],
+    pub data: &'b [u8],
+    pub method: u16,
+    pub flags: u16,
+}
+
+pub fn zip(entries: &[ZipEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut central = Vec::new();
+    for e in entries {
+        let body = if e.method == 8 {
+            deflate_raw(e.data)
+        } else {
+            e.data.to_vec()
+        };
+        let crc = crc32(e.data);
+        let dd = e.flags & 8 != 0;
+        let offset = out.len() as u32;
+        let (lcrc, lc, lu) = if dd {
+            (0, 0, 0)
+        } else {
+            (crc, body.len() as u32, e.data.len() as u32)
+        };
+        out.extend_from_slice(b"PK\x03\x04");
+        for v in [20u16, e.flags, e.method, 0, 0] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [lcrc, lc, lu] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(e.name);
+        out.extend_from_slice(&body);
+        if dd {
+            out.extend_from_slice(b"PK\x07\x08");
+            for v in [crc, body.len() as u32, e.data.len() as u32] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        central.extend_from_slice(b"PK\x01\x02");
+        for v in [20u16, 20, e.flags, e.method, 0, 0] {
+            central.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [crc, body.len() as u32, e.data.len() as u32] {
+            central.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [e.name.len() as u16, 0, 0, 0, 0] {
+            central.extend_from_slice(&v.to_le_bytes());
+        }
+        central.extend_from_slice(&0u32.to_le_bytes());
+        central.extend_from_slice(&offset.to_le_bytes());
+        central.extend_from_slice(e.name);
+    }
+    let cd_at = out.len() as u32;
+    let cd_len = central.len() as u32;
+    out.extend(central);
+    out.extend_from_slice(b"PK\x05\x06");
+    for v in [0u16, 0, entries.len() as u16, entries.len() as u16] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&cd_len.to_le_bytes());
+    out.extend_from_slice(&cd_at.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out
+}
+
+pub fn zip1(data: &[u8], method: u16, flags: u16) -> Vec<u8> {
+    zip(&[ZipEntry {
+        name: b"plain",
+        data,
+        method,
+        flags,
+    }])
+}
+
+pub fn filter_through(exe: &str, args: &[&str], data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if !require_reference(Path::new(exe)) {
+        return None;
+    }
+    let mut child = Command::new(exe)
+        .args(args)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut si = child.stdin.take().unwrap();
+    let d = data.to_vec();
+    let w = std::thread::spawn(move || {
+        let _ = si.write_all(&d);
+    });
+    let out = child.wait_with_output().unwrap();
+    w.join().unwrap();
+    assert!(out.status.success(), "{exe} {args:?}");
+    Some(out.stdout)
+}
+
+/// `data` compressed by stuffr's own `id` codec (`bzip2`, `xz`, `lzip`,
+/// `compress`), at `level` or the format's default: inputs for the foreign
+/// formats a `gunzip` reads, with no tool beyond the reference needed.
+pub fn stuffr_encode(id: &'static str, data: &[u8], level: Option<i32>) -> Vec<u8> {
+    let codec = stuffr::registry()
+        .codec(stuffr::FormatId::new(id))
+        .unwrap_or_else(|| panic!("{id} is not in this build"));
+    let buf = stuffr::testing::SharedBuf::new();
+    let opts = stuffr::EncodeOpts {
+        level,
+        ..Default::default()
+    };
+    let mut sink = codec.encoder(Box::new(buf.clone()), &opts).unwrap();
+    sink.write_all(data).unwrap();
+    sink.finish().unwrap();
+    buf.contents()
 }
