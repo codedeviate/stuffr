@@ -8,8 +8,9 @@
 //! caller, `%%` is a literal percent sign) and print through
 //! [`printf`].
 //!
-//! The deliberate changes: the first line of `--version`/`-V`/`-L` (and of
-//! the `gunzip`/`zcat` scripts' `--version`) names stuffr and its version.
+//! The deliberate changes: `--version`/`-V`/`-L` (and the `gunzip`/`zcat`
+//! scripts' `--version`) name stuffr and its version on the first line and
+//! print stuffr's own MIT notice after it, never GNU's (Ruling T7-2).
 //! [`BSD_NOT_BUILT`] and [`NOT_YET`] are stuffr's own, for paths later
 //! tasks fill in.
 
@@ -57,18 +58,19 @@ pub(super) const HELP: &str = concat!(
 pub(super) const VERSION_FIRST_LINE: &str =
     concat!("gzip (stuffr ", env!("CARGO_PKG_VERSION"), ") 1.15\n");
 
-/// Observed: `gzip -L` (standard output, exit 0): everything after the
-/// first line. `--version`/`-V` print this and then [`WRITTEN_BY`].
+/// Ruling T7-2: after the first line, `-L`/`--license` print stuffr's own
+/// notice in the shape of GNU's block, never GNU's copyright or licence
+/// text (stuffr is MIT and holds no GNU code). The holder is the
+/// workspace `LICENSE`'s.
 pub(super) const LICENSE_REST: &str = concat!(
-    "Copyright (C) 2026 Free Software Foundation, Inc.\n",
-    "Copyright (C) 1993 Jean-loup Gailly.\n",
-    "This is free software.  You may redistribute copies of it under the terms of\n",
-    "the GNU General Public License <https://www.gnu.org/licenses/gpl.html>.\n",
-    "There is NO WARRANTY, to the extent permitted by law.\n",
+    "Copyright (c) 2026 Thomas Bjork\n",
+    "License MIT: <https://opensource.org/license/mit>.\n",
+    "This is stuffr emulating GNU gzip's command-line interface; it contains no GNU code.\n",
+    "It is provided as is, without warranty of any kind.\n",
 );
 
-/// Observed: `gzip --version` (after [`LICENSE_REST`]).
-pub(super) const WRITTEN_BY: &str = "\nWritten by Jean-loup Gailly.\n";
+/// Ruling T7-2: what `--version`/`-V` add after [`LICENSE_REST`].
+pub(super) const WRITTEN_BY: &str = "\nWritten by Thomas Bjork, for stuffr.\n";
 
 /// Observed: `gunzip --help`, the script's own text when `--help` is its
 /// first argument; `%s` is the script's `$0`.
@@ -124,14 +126,15 @@ pub(super) const ZCAT_HELP: &str = concat!(
 pub(super) const SCRIPT_VERSION_FIRST_LINE: &str =
     concat!("%s (stuffr ", env!("CARGO_PKG_VERSION"), ") 1.15\n");
 
-/// Observed: `gunzip --version`, after the first line.
+/// Ruling T7-2: the scripts' `--version` after the first line: stuffr's
+/// notice, as [`LICENSE_REST`] and [`WRITTEN_BY`].
 pub(super) const SCRIPT_VERSION_REST: &str = concat!(
-    "Copyright (C) 2026 Free Software Foundation, Inc.\n",
-    "This is free software.  You may redistribute copies of it under the terms of\n",
-    "the GNU General Public License <https://www.gnu.org/licenses/gpl.html>.\n",
-    "There is NO WARRANTY, to the extent permitted by law.\n",
+    "Copyright (c) 2026 Thomas Bjork\n",
+    "License MIT: <https://opensource.org/license/mit>.\n",
+    "This is stuffr emulating GNU gzip's command-line interface; it contains no GNU code.\n",
+    "It is provided as is, without warranty of any kind.\n",
     "\n",
-    "Written by Paul Eggert.\n",
+    "Written by Thomas Bjork, for stuffr.\n",
 );
 
 // ---- getopt (prefixed by the full argv[0]) ----
@@ -388,5 +391,17 @@ mod tests {
     fn the_version_line_names_stuffr_in_gnus_layout() {
         assert!(VERSION_FIRST_LINE.starts_with("gzip (stuffr "));
         assert!(VERSION_FIRST_LINE.ends_with(") 1.15\n"));
+        // Ruling T7-2: no GNU licence or authorship claim.
+        for text in [LICENSE_REST, WRITTEN_BY, SCRIPT_VERSION_REST] {
+            for banned in [
+                "Free Software Foundation",
+                "GNU General Public",
+                "Gailly",
+                "Eggert",
+            ] {
+                assert!(!text.contains(banned), "{banned}");
+            }
+            assert!(text.contains("MIT") || text.contains("Bjork"));
+        }
     }
 }

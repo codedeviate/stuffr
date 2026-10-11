@@ -33,6 +33,8 @@
 //!
 //! Known deviations:
 //!
+//! - `--version`/`-V`/`-L` print stuffr's first line and its own MIT notice,
+//!   not GNU's copyright and licence text (Ruling T7-2).
 //! - The compressed bytes are stuffr's deflate, not GNU's (GNU's deflate is
 //!   its own and GPL): the reference decodes them to the same bytes and the
 //!   header through FNAME matches, but the size, and so `-v`'s ratio,

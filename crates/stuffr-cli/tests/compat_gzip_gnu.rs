@@ -184,32 +184,37 @@ mod differential {
         }
     }
 
-    /// stuffr's version line names stuffr (`NAME (stuffr X) 1.15`); swap it
-    /// for the reference's after checking both, so the rest is compared.
-    fn version_line(r: &mut Run, s: &mut Run) {
-        let ours_end = match s.stdout.iter().position(|&b| b == b'\n') {
-            Some(n) => n + 1,
-            None => return,
+    /// Ruling T7-2: `-V`, `-L` and the scripts' `--version` print stuffr's
+    /// own notice, not GNU's text, so their stdout is not compared byte for
+    /// byte. When stuffr's first line names stuffr (`NAME (stuffr X) 1.15`),
+    /// check the reference printed its version line, both stderrs are
+    /// empty and stuffr's text has more than that line; then take the
+    /// reference's stdout so `assert_same` compares everything else (exit
+    /// code, stderr, files).
+    fn version_text(r: &mut Run, s: &mut Run) {
+        let Some(end) = s.stdout.iter().position(|&b| b == b'\n') else {
+            return;
         };
-        let ours = String::from_utf8_lossy(&s.stdout[..ours_end]).into_owned();
+        let ours = String::from_utf8_lossy(&s.stdout[..=end]).into_owned();
         let tag = format!(" (stuffr {}) 1.15\n", env!("CARGO_PKG_VERSION"));
         let Some(prog) = ours.strip_suffix(&tag) else {
             return;
         };
-        let theirs_end = r
-            .stdout
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(0, |n| n + 1);
-        let theirs = String::from_utf8_lossy(&r.stdout[..theirs_end]).into_owned();
+        let theirs = String::from_utf8_lossy(&r.stdout);
         let want = match prog {
             "gzip" => "gzip 1.15\n".to_owned(),
             p => format!("{} (gzip) 1.15\n", reference_name(p)),
         };
-        assert_eq!(theirs, want, "the reference's version line");
-        let mut v = theirs.into_bytes();
-        v.extend_from_slice(&s.stdout[ours_end..]);
-        s.stdout = v;
+        assert!(
+            theirs.starts_with(&want),
+            "the reference's version: {theirs:?}"
+        );
+        assert!(
+            s.stdout.len() > end + 1,
+            "stuffr's notice is only its first line"
+        );
+        assert_eq!((r.stderr.as_str(), s.stderr.as_str()), ("", ""));
+        s.stdout = r.stdout.clone();
     }
 
     // ---- the group runner ----
@@ -280,7 +285,7 @@ mod differential {
                 let mut s = stuffr_as(c);
                 script_usage(&mut r);
                 script_usage(&mut s);
-                version_line(&mut r, &mut s);
+                version_text(&mut r, &mut s);
                 blank_both(&mut r, &mut s);
                 assert_same(c, &r, &s);
                 true
@@ -542,10 +547,11 @@ mod differential {
     }
 
     /// `-h`, `--help`, `-H`, `-L`, `-V` and `--version`: printed on standard
-    /// output, exit 0, at the point they appear. The version and licence
-    /// name stuffr on the first line; the rest is compared. The text is
-    /// 1.15's (its copyright year among it), so an older reference is a
-    /// documented skip.
+    /// output, exit 0, at the point they appear. Help is compared byte for
+    /// byte; the version and licence are stuffr's own (Ruling T7-2), so
+    /// only their first line, exit code and empty stderr are checked
+    /// (`version_text`). Both need a 1.15 reference (help's text, the
+    /// `gzip 1.15` line), so an older one is a documented skip.
     #[test]
     fn help_version_and_license() {
         let t = kib_text();
@@ -955,6 +961,50 @@ mod differential {
             skipped.count,
             skipped.why
         );
+    }
+
+    /// Ruling T7-3: the mask is narrow. A difference anywhere else on a
+    /// `-v` line survives it, and `assert_same` still reports it.
+    #[test]
+    fn blanking_keeps_every_other_difference() {
+        let base = "a:\t 54.2% -- replaced with a.gz\n";
+        for other in [
+            "a:\t 54.2% -- replaced with b.gz\n",
+            "a:\t 54.2% -- created a.gz\n",
+            "b:\t 54.2% -- replaced with a.gz\n",
+            "a: 54.2% -- replaced with a.gz\n",
+            "a:\t 54.2%% -- replaced with a.gz\n",
+            "a:\t 54.2% -- replaced with a.gz\nextra\n",
+            "a:\t 54.2 -- replaced with a.gz\n",
+        ] {
+            assert_ne!(blank_lines(base), blank_lines(other), "{other:?}");
+        }
+        // Only the number is masked: ratios of any value and width agree.
+        assert_eq!(
+            blank_lines(base),
+            blank_lines("a:\t-133.3% -- replaced with a.gz\n")
+        );
+        // Through the whole comparison.
+        let c = gz(&["-v", "a.txt"], vec![("a.txt", b"x".to_vec())]);
+        let run = |err: &str| Run {
+            code: 0,
+            stdout: Vec::new(),
+            stderr: err.to_owned(),
+            tree: Tree::new(),
+            start: now_secs(),
+        };
+        let (mut r, mut s) = (run(base), run("a:\t-12.0% -- replaced with b.gz\n"));
+        blank_both(&mut r, &mut s);
+        let res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assert_same(&c, &r, &s)));
+        let msg = panic_text(res.expect_err("a different name must be caught"));
+        assert!(
+            msg.contains("stderr differs") && msg.contains("in 1 way(s)"),
+            "{msg}"
+        );
+        let (mut r, mut s) = (run(base), run("a:\t-12.0% -- replaced with a.gz\n"));
+        blank_both(&mut r, &mut s);
+        assert_same(&c, &r, &s);
     }
 
     /// The ratio blanking touches only ratios.
