@@ -402,7 +402,19 @@ jobs:
       # Apple's /usr/bin/gzip (the other reference) on PATH. ncompress makes
       # the `.Z` inputs of `compat_gzip_gnu`'s foreign-format group (also by
       # keg path: Apple's /usr/bin/compress is another program).
+      #
+      # No `brew update` first, deliberately: the image's keg is what runs
+      # (1.14 on macos-26 20260907, where stuffr models 1.15). The GNU suite
+      # gates every version difference (`Since` in compat_gzip_gnu.rs), so
+      # it is correct on either, and the 1.15-only cases already run on every
+      # local `make check` against the developer's 1.15 keg. Updating would
+      # cost a minute a run and make the result depend on Homebrew's head.
       - run: brew install gzip ncompress
+      # Which releases this run compares against: the logs said neither.
+      - run: |
+          sw_vers
+          /usr/bin/gzip -V 2>&1 | head -n 1
+          /opt/homebrew/opt/gzip/bin/gzip --version | head -n 1
       # `CI` is set by Actions, so `require_reference` panics if a reference
       # tool is missing instead of skipping. The second line runs the gzip
       # suites again on the compatible tier. The Apple suites target Apple
