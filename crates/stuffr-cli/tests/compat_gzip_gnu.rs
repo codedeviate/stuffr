@@ -1931,6 +1931,65 @@ mod differential {
         }
     }
 
+    /// Residual of the final review's item 1: an input given as a symbolic
+    /// link to the output's own name (`a.gz -> a` under `-df`, `l -> l.gz`
+    /// under `-f`). The output replaces the link's target; GNU then removes
+    /// the link, so only the output is left. The identity guard must not
+    /// follow the link onto the fresh output and keep it. With a corrupt
+    /// body GNU loses the data; stuffr keeps it (Ruling T8-5), so that
+    /// case compares streams only.
+    #[test]
+    fn an_input_linked_to_its_output_name_is_removed() {
+        fn a_gz_to_a(d: &Path) {
+            std::os::unix::fs::symlink("a", d.join("a.gz")).unwrap();
+        }
+        fn l_to_l_gz(d: &Path) {
+            std::os::unix::fs::symlink("l.gz", d.join("l")).unwrap();
+        }
+        let t = txt();
+        let mut cases = Vec::new();
+        for args in [&["-df", "a.gz"][..], &["-dfv", "a.gz"], &["-dfk", "a.gz"]] {
+            cases.push(with_setup(
+                dz("gzip", args, vec![("a", gzm(&t, b"a"))]),
+                a_gz_to_a,
+            ));
+        }
+        check_exact("input_linked_to_its_output", &cases, none_skipped());
+        // Compressing overwrites the plain text the harness would round
+        // trip against, so the trees are compared by name and the output
+        // decoded here.
+        for args in [&["-f", "l"][..], &["-fk", "l"]] {
+            let c = with_setup(gz(args, vec![("l.gz", t.clone())]), l_to_l_gz);
+            let s = stuffr_as(&c);
+            if let Some(r) = reference(gnu_gzip_dir(), &c) {
+                assert_eq!(
+                    (r.code, &r.stdout, &r.stderr),
+                    (s.code, &s.stdout, &s.stderr)
+                );
+                let names = |t: &Tree| t.keys().cloned().collect::<Vec<_>>();
+                assert_eq!(names(&r.tree), names(&s.tree), "{args:?}");
+            }
+            assert_eq!(s.code, 0, "{}", s.stderr);
+            let decoded = ref_decompress_with(&c.roundtrip, &s.tree["l.gz"].0);
+            assert_eq!(decoded.unwrap(), t, "{args:?}");
+        }
+        // A failure keeps the data the link points to.
+        let crc = member_with(plain_member(&t), Some(1), None);
+        let c = with_setup(
+            dz("gzip", &["-df", "a.gz"], vec![("a", crc.clone())]),
+            a_gz_to_a,
+        );
+        let s = stuffr_as(&c);
+        if let Some(r) = reference(gnu_gzip_dir(), &c) {
+            assert_eq!(
+                (r.code, &r.stdout, &r.stderr),
+                (s.code, &s.stdout, &s.stderr)
+            );
+        }
+        assert_eq!(s.code, 1, "{}", s.stderr);
+        assert_eq!(s.tree["a"].0, crc, "the data must survive unchanged");
+    }
+
     /// Review focus 2: `gunzip a.gz b.gz c.gz` with `b.gz` corrupt keeps
     /// `b.gz`, leaves no partial `b`, and exits with the worst code. GNU
     /// ends the run at a CRC error or a cut-short input (so `c.gz` is left

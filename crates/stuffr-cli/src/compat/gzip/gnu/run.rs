@@ -603,9 +603,23 @@ fn parent_of(out_path: &Path) -> PathBuf {
 /// `out_path` was published: it still names the input (`meta`'s file) and
 /// not the output. Judged by identity, so a name that differs from
 /// `out_path` only in case, on a volume that folds case, is not removed.
-/// When `path` cannot be looked up its removal is attempted, so the error
-/// is GNU's; off unix, where there is no identity, the spellings decide.
+/// A symbolic link (an input given with `-f`) is judged as the link, not
+/// what it now leads to: removing it never touches the output's data, so
+/// it goes unless the link entry is itself the output's (`a.gz -> a`
+/// under `-df` and `l -> l.gz` under `-f` lose the link, as GNU's do,
+/// though the link now leads to the fresh output). When `path` cannot be
+/// looked up its removal is attempted, so the error is GNU's; off unix,
+/// where there is no identity, the spellings decide.
 fn still_the_input(path: &Path, meta: &Metadata, out_path: &Path) -> bool {
+    if let Ok(link) = fs::symlink_metadata(path)
+        && link.file_type().is_symlink()
+    {
+        let entry = fs::symlink_metadata(out_path).ok();
+        return match entry.and_then(|o| same_file(&link, &o)) {
+            Some(is_output) => !is_output,
+            None => path != out_path,
+        };
+    }
     let Ok(now) = fs::metadata(path) else {
         return path != out_path;
     };

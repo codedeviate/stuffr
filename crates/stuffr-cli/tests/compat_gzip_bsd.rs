@@ -2083,6 +2083,43 @@ mod differential {
         check_exact("odd_members", &cases, Skipped::none());
     }
 
+    /// Residual of the final review's item 1: an input given with `-f` as
+    /// a symbolic link to the output's own name (`a.gz -> a`, `l ->
+    /// l.gz`). Apple's `unlink_input` `stat`s the name, which by then
+    /// leads to the fresh output, not the input, so the link is kept (GNU
+    /// removes it). Pinned against `/usr/bin/gzip`; the compressed output
+    /// is compared by name and decoded here.
+    #[test]
+    fn an_input_linked_to_its_output_name_keeps_the_link() {
+        fn a_gz_to_a(d: &Path) {
+            std::os::unix::fs::symlink("a", d.join("a.gz")).unwrap();
+        }
+        fn l_to_l_gz(d: &Path) {
+            std::os::unix::fs::symlink("l.gz", d.join("l")).unwrap();
+        }
+        let t = txt();
+        let cases: Vec<Case> = [&["-df", "a.gz"][..], &["-dfv", "a.gz"], &["-dfk", "a.gz"]]
+            .into_iter()
+            .map(|args| with_setup(dz("gzip", args, vec![("a", gzm(&t, b"a"))]), a_gz_to_a))
+            .collect();
+        check_exact("input_linked_to_its_output", &cases, Skipped::none());
+        for args in [&["-f", "l"][..], &["-fk", "l"]] {
+            let c = with_setup(gz(args, vec![("l.gz", t.clone())]), l_to_l_gz);
+            let s = stuffr_as(&c);
+            if let Some(r) = reference("/usr/bin", &c) {
+                assert_eq!(
+                    (r.code, &r.stdout, &r.stderr),
+                    (s.code, &s.stdout, &s.stderr)
+                );
+                let names = |t: &Tree| t.keys().cloned().collect::<Vec<_>>();
+                assert_eq!(names(&r.tree), names(&s.tree), "{args:?}");
+            }
+            assert_eq!(s.code, 0, "{}", s.stderr);
+            let decoded = ref_decompress_with(&c.roundtrip, &s.tree["l.gz"].0);
+            assert_eq!(decoded.unwrap(), t, "{args:?}");
+        }
+    }
+
     /// Final review, item 2: Apple reads a stored name or comment of any
     /// length (`gz_uncompress`'s state machine reads past them), and `-N`
     /// takes the name from offset 10 into a `PATH_MAX` buffer. A 1.5 MiB

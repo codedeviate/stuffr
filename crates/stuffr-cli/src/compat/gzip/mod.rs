@@ -248,7 +248,9 @@ mod tests {
             ] {
                 let dir = root.clone();
                 let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+                // Named, so a stack overflow's abort names the test.
                 let (code, _, err) = std::thread::Builder::new()
+                    .name("recursion_depth_costs_no_stack".into())
                     .stack_size(SMALL_STACK)
                     .spawn(move || run_in(flavour, &dir, name, &argv, b"", &|_| None))
                     .unwrap()
