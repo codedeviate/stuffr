@@ -286,7 +286,7 @@ impl Gz<'_> {
         let mut path = opath.to_vec();
         let mut retried = false;
         // `__APPLE__`: `zcat` in Unix 2003 mode reads `NAME.Z` unless the
-        // name's last `.` starts `.Z`, or `-f`.
+        // text from the name's last `.` is `.Z`, or `-f`.
         if self.zcat_adds_z && !self.s.force {
             let ends_z = path
                 .iter()

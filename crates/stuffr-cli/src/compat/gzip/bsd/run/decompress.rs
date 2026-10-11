@@ -607,7 +607,8 @@ impl Gz<'_> {
                 // To standard output whatever the output is.
                 let mut stdout = self.take_stdout();
                 let mut gsize = 0;
-                let n = self.cat_fd_to(&[], fd, 3, &mut gsize, &mut stdout);
+                let n_fd = raw_fd(fd);
+                let n = self.cat_fd_to(&[], fd, n_fd, &mut gsize, &mut stdout);
                 self.stdout = Some(stdout);
                 Decoded::from(n)
             }
@@ -1285,9 +1286,10 @@ impl Gz<'_> {
         pre: &[u8],
         out: &mut dyn Write,
     ) -> (Option<u64>, Option<u64>) {
-        let mut flushing = FlushEach(out);
+        // unlz.c's `fwrite`s reach the file at `fclose`, which every path
+        // reaches; the caller flushes `out` after the decoder.
         let bound = self.sandbox_bound(SANDBOX_OUTPUT_CAP);
-        match unlz::unlz(input, pre, &mut flushing, bound) {
+        match unlz::unlz(input, pre, out, bound) {
             Ok(Some((size, member))) => (Some(size), Some(member)),
             Ok(None) | Err(_) => (None, None),
         }
@@ -1411,19 +1413,6 @@ impl Gz<'_> {
     }
 }
 
-/// A writer that flushes after every write: stdio's `fwrite` to a file
-/// flushes on `fclose`, which every path reaches.
-struct FlushEach<'w>(&'w mut dyn Write);
-
-impl Write for FlushEach<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
-    }
-}
-
 /// A `Send` reader that counts what passes, and says when it met the end,
 /// for a decoder that owns it.
 #[cfg(not(feature = "xz-c"))]
@@ -1526,6 +1515,20 @@ enum Decoded {
 impl From<Option<u64>> for Decoded {
     fn from(o: Option<u64>) -> Self {
         o.map_or(Decoded::Failed, Decoded::Size)
+    }
+}
+
+/// The descriptor number "read from fd %d" names: the input's own.
+fn raw_fd(f: &File) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        f.as_raw_fd()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = f;
+        3
     }
 }
 
