@@ -254,7 +254,10 @@ pub mod zip_salvage;
 pub mod salvage_verify;
 #[cfg(feature = "zlib")]
 pub mod zlib;
+// The gzip compatibility family's C-tier deflate, reached through
+// `stuffr-cli` only; not part of the public surface.
 #[cfg(feature = "zlib-c")]
+#[doc(hidden)]
 pub mod zlib_c;
 #[cfg(feature = "zstd-c")]
 pub mod zstd_c;
