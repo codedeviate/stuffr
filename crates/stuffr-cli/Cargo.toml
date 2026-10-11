@@ -11,6 +11,8 @@ rust-version.workspace = true
 # of the University of California's BSD-3-Clause), which the `.Z` reader
 # ports. SPDX deprecated `BSD-2-Clause-NetBSD` and `-FreeBSD` for
 # `BSD-2-Clause`, whose text they share.
+# One caveat: the Lzd notice in unlz.c is BSD-style but not word for word the
+# SPDX BSD-2-Clause text; the full notice ships in LICENSE-gzip-bsd.
 license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause"
 repository.workspace = true
 keywords = ["compression", "archive", "cli", "unzip", "extract"]

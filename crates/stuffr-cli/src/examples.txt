@@ -1291,8 +1291,9 @@ WHAT THIS BUILD CAN DO
 COMPATIBILITY LINKS (INSTALL-LINKS)
 
   stuffr install-links --dir ~/.local/bin
-      Creates symlinks named bzip2, bunzip2, bzcat and bzip2recover in that
-      directory, each pointing at this stuffr binary. Run under one of those
+      Creates symlinks named bzip2, bunzip2, bzcat, bzip2recover, gzip,
+      gunzip, zcat and gzcat in that directory, each pointing at this stuffr
+      binary. Run under one of those
       names, the binary behaves as that tool, with its flags, messages and
       exit codes. This is opt-in: nothing creates these links unless you run
       this verb. The directory must exist (exit 2 if not); one that cannot
@@ -1304,7 +1305,14 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       already at that name and truncates a file already there (Debian's
       patched bzip2recover refuses both).
 
-  stuffr install-links --dir ~/.local/bin --names bzcat
+      The gzip names behave as GNU gzip on Linux and as Apple's gzip on macOS
+      and the BSDs; STUFFR_GZIP_FLAVOR=gnu or bsd overrides that (any other
+      value is refused, exit 1). Stdout, stderr and exit codes match the
+      real tool. Apple-style compressed bytes are identical to /usr/bin/gzip
+      on a --features c-backed build and merely compatible otherwise; GNU's
+      are always compatible only. GNU -V and -L print stuffr's own MIT notice.
+
+  stuffr install-links --dir ~/.local/bin --names bzcat,zcat
       Only the named links; --names takes a comma-separated list. A name that
       is not a compatibility name is a usage error (exit 2).
 

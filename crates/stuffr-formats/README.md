@@ -47,5 +47,7 @@ trusting the size a file declares about itself.
 
 ## License
 
-[MIT](LICENSE). `lzma-rust2`, behind the pure xz/LZMA1/LZIP backends, is
+[MIT](LICENSE), plus BSD-2-Clause for the pack decoder, a port of FreeBSD's
+`unpack.c` (`LICENSE-unpack-bsd`); the crate's metadata is
+`MIT AND BSD-2-Clause`. `lzma-rust2`, behind the pure xz/LZMA1/LZIP backends, is
 Apache-2.0.

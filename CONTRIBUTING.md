@@ -32,6 +32,11 @@ brew install gnu-tar cpio binutils
   `/opt/homebrew/opt/binutils/bin/ar`. The GNU `ar` symbol-table tests (in
   `ar.rs`, `ar_salvage.rs` and `cli.rs`) also need a C compiler (`cc`,
   from the Xcode command-line tools).
+- **From 0.12.0 the gzip suites also use two keg-only tools,** addressed by
+  path and never put on `PATH`: GNU gzip (`brew install gzip`,
+  `/opt/homebrew/opt/gzip/bin/gzip`; Apple's `/usr/bin/gzip` is the other
+  reference) and `ncompress` (`/opt/homebrew/opt/ncompress/bin`). Without them
+  `require_reference` skips locally with a note and panics under `CI`.
 - **Known gap: Intel Macs.** Homebrew's prefix there is `/usr/local`, not
   `/opt/homebrew`, so those two paths do not exist and the cpio and ar
   catalogues fail even with the tools installed. Resolving the keg through
@@ -242,7 +247,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.10.3` | Linear salvage scans: `ForwardSearch` (growing-chunk forward search, window kept per source), cpio zero-run memo, tar per-header chain and scan-wide extension budgets, a scan-wide verdict budget (`ScanBudget`, `2 × file_len + 32 KiB`) in zip, zoo, lha, arj and cpio, reported as work- or verdict-bounded sightings; the `salvage` fuzz oracle `check_scan_is_linear` (8× + 64 KiB); GNU tar `L`/`K` capped at 16 MiB (exit 6); GNU ar `/SYM64/` read; `cargo doc -D warnings` gated. |
 | `0.10.4` | Honest ends: a truncated `ar` (member, `/`, `/SYM64/`, `//`) is exit 5 in every verb, the message naming the record; a zip symlink target over 64 KiB is exit 6 (seekable); a salvage refusal keeps its bounded notes; stored sightings capped at 64 per shape (`SightingLog`, `Sighting.more`). |
 | `0.11.0` | Phase 5's first part — compatibility links: `argv[0]` dispatch, `stuffr install-links --dir DIR` (opt-in, Homebrew's stable `opt` target), the differential harness, and the bzip2 family (`bzip2`, `bunzip2`, `bzcat`, `bzip2recover`) behaving as bzip2 1.0.8 — flags, files, exit codes and stderr byte-identical, compressed output byte-identical on both tiers; the `compat` fuzz target; `stuffr-cli` licensed `MIT AND bzip2-1.0.6`. A MINOR because it is a new user-facing surface. |
-| `0.12.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (gzip, then xz/lzma, zstd, lz4, then `unzip`/`zipinfo`; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
+| `0.12.0` | Phase 5's second part — the gzip compatibility family (`gzip`, `gunzip`, `zcat`, `gzcat`) in two personalities, GNU gzip 1.15 and Apple's gzip 487.0.1 (a port, `LICENSE-gzip-bsd`), chosen by platform or `STUFFR_GZIP_FLAVOR`; stdout, stderr and exit codes byte-identical to the reference in both, Apple's compressed bytes identical on the `c-backed` tier and compatible elsewhere, GNU's compatible only; `install-links` now makes eight names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`, `stuffr-formats` `MIT AND BSD-2-Clause`. A MINOR because it is a new user-facing surface. |
+| `0.13.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (xz/lzma next, then zstd, lz4, then `unzip`/`zipinfo`; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -1008,7 +1014,8 @@ fix and is not meant to be committed.
 
 A compatibility family is a set of names under which the `stuffr` binary
 behaves as another tool (README, "Compatibility links"). bzip2 (`bzip2`,
-`bunzip2`, `bzcat`, `bzip2recover`) is the first, in `0.11.0`. **The family's
+`bunzip2`, `bzcat`, `bzip2recover`) is the first, in `0.11.0`; gzip (`gzip`,
+`gunzip`, `zcat`, `gzcat`) is the second, in `0.12.0`. **The family's
 own spec decides its byte-identity promise** before any code is written:
 which tier, against which tool and version, byte-identical or compatible
 behaviour only. The planned tiers come from the Phase 5 design's Decision 2,
@@ -1047,6 +1054,46 @@ Adding a family touches these places, and the tests fail if one is missed:
   keeps it equal to `compat::names()`, in order, so a name added to one and
   not the other fails the gate rather than going unfuzzed.
 - **`examples.txt`** documents the names under COMPATIBILITY LINKS.
+
+**The gzip family** (`compat/gzip/`) differs from bzip2 in that the tool it
+emulates is two programs:
+
+- **Two personalities.** `compat/gzip/gnu/` behaves as GNU gzip 1.15 and
+  `compat/gzip/bsd/` as Apple's gzip 487.0.1; `compat/gzip/mod.rs` picks one
+  (`default_flavour`: BSD on Apple platforms and the BSDs, GNU elsewhere;
+  `STUFFR_GZIP_FLAVOR=gnu|bsd` overrides, anything else is exit 1). Each
+  personality's module doc carries its quirks and its known deviations; the
+  README's list is drawn from them. The member layer (`member`) and the
+  format sniffer (`sniff`) are shared.
+- **The GNU source ban.** GNU gzip is GPLv3 and stuffr is MIT, so **nothing
+  of GNU's source is read or ported**. Its behaviour comes from `--help`, the
+  manual, the NEWS file and running the binary, and the GNU personality's
+  strings were established the same way. This is why GNU `-V`/`-L` print
+  stuffr's own notice rather than GNU's. The Apple personality is the opposite:
+  a port of BSD-licensed `gzip.c` and its decoders, with their notices in
+  `LICENSE-gzip-bsd` (and the pack decoder's in `stuffr-formats`'s
+  `LICENSE-unpack-bsd`). Do not mix the two: a change to the GNU side that
+  starts from GNU's source is wrong by construction.
+- **Reference tools.** GNU gzip is the Homebrew `gzip` keg on macOS, addressed
+  by path (`/opt/homebrew/opt/gzip/bin/gzip`, 1.15 here) and never linked, so
+  it cannot shadow Apple's; on Linux it is the platform's, and CI's ubuntu has
+  1.12. The suites probe the version (`gnu_gzip_version()`) and adjust where
+  1.12 differs. Apple's is `/usr/bin/gzip` (487.0.1). `ncompress` supplies the
+  `.Z` inputs of the GNU foreign-format group (the keg path again; Apple's
+  `/usr/bin/compress` is a different program). A Mac that wants the gzip suites to
+  run rather than skip (they panic under `CI`) needs `brew install gzip
+  ncompress`.
+- **CI.** The `compat-macos` job is the only one that runs on macOS: it
+  installs `gzip` and `ncompress` and runs the bzip2 and gzip suites against
+  the macOS tools, `--all-features` and then again on the pure tier. The Apple
+  suites target 487.0.1; on a runner with another release every differing case
+  says so rather than hiding it. Linux CI runs the GNU suite against 1.12.
+- **The tier promise.** Stdout, stderr and exit codes are the reference's on
+  both tiers in both personalities. Compressed bytes: Apple's are byte-identical
+  on the C tier (zlib, `--features c-backed`) and compatible on the pure tier;
+  GNU's are never identical, since GNU's deflate is its own. The differential
+  harness masks `-v`'s ratio on the pure tier and on every GNU run for that
+  reason.
 
 **Reference tools.** The bzip2 family is tested against the system
 `/usr/bin/bzip2` and `/usr/bin/bzip2recover`, which are not the same program

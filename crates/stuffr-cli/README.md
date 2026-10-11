@@ -58,9 +58,17 @@ and `zoo` are two read-only containers. That is what a plain
 `cargo install stuffr-cli` gives you; `stuffr formats` prints the matrix for
 the build you actually have.
 
+Invoked as `bzip2`, `bunzip2`, `bzcat`, `bzip2recover`, `gzip`, `gunzip`,
+`zcat` or `gzcat`, the binary behaves as that tool, byte for byte on stdout,
+stderr and exit codes. `stuffr install-links --dir DIR` makes the links, and
+nothing makes them for you. The gzip names follow the platform (GNU gzip, or
+Apple's on macOS and the BSDs); `STUFFR_GZIP_FLAVOR=gnu|bsd` overrides that.
+
 Full documentation, including the safety defaults and the two build tiers, is in
 the [project README](https://github.com/codedeviate/stuffr#readme).
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE), with ported code under other permissive licences: the crate's
+metadata is `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`. The
+notices ship as `LICENSE-bzip2` and `LICENSE-gzip-bsd`.

@@ -843,11 +843,13 @@ cargo add stuffr                # the facade; re-exports stuffr-core + stuffr-fo
 ## Compatibility links
 
 Invoked as `bzip2`, `bunzip2`, `bzcat` or `bzip2recover`, the `stuffr` binary
-behaves as **bzip2 1.0.8**: that tool's flags, files, exit codes and messages,
-not stuffr's. The binary reads the name from `argv[0]`, the file name only,
-before parsing anything. Any other name, `stuffr` included, runs the stuffr
-CLI unchanged. So does a link you make by hand under a name stuffr does not
-handle: `gzip -> stuffr` runs `stuffr`, not gzip.
+behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
+(from `0.12.0`), as **gzip**. In both cases that tool's flags, files, exit
+codes and messages, not stuffr's. The binary reads the name from `argv[0]`,
+the file name only, before parsing anything. Any other name, `stuffr`
+included, runs the stuffr CLI unchanged. So does a link you make by hand
+under a name stuffr does not handle: `xzcat -> stuffr` runs `stuffr`, not
+xzcat.
 
 ### Opting in
 
@@ -855,8 +857,8 @@ handle: `gzip -> stuffr` runs `stuffr`, not gzip.
 Homebrew. One verb makes them:
 
 ```sh
-stuffr install-links --dir ~/.local/bin                  # all four names
-stuffr install-links --dir ~/.local/bin --names bzcat    # comma-separated subset
+stuffr install-links --dir ~/.local/bin                  # all eight names
+stuffr install-links --dir ~/.local/bin --names bzcat,zcat   # comma-separated subset
 stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
 stuffr install-links --dir ~/.local/bin --force          # replace what is already there
 stuffr install-links --dir ~/.local/bin --remove         # remove stuffr's links, nothing else
@@ -926,16 +928,101 @@ and mtimes.
   already there. This differs from Debian's patched build, which refuses
   both (it opens with `O_EXCL`, mode 0600).
 
+### The gzip family
+
+`gzip`, `gunzip`, `zcat` and `gzcat`. Unlike bzip2, gzip has two common
+implementations that differ in flags, messages and exit codes, so stuffr
+carries both and picks one:
+
+- **GNU gzip** (written against 1.15) on Linux, Windows and everywhere that
+  is not listed next. `gunzip` and `zcat` behave as GNU's scripts do
+  (`gzip -d`, `gzip -dc`, every message saying `gzip:`); `gzcat`, which GNU
+  does not install, behaves as `zcat`.
+- **Apple/BSD gzip** (Apple's 487.0.1, a port of FreeBSD's and NetBSD's) on
+  macOS and the BSDs.
+- **`STUFFR_GZIP_FLAVOR=gnu|bsd`** overrides the choice, whatever the
+  platform; unset or empty means the platform's own. Any other value is
+  refused, exit 1, naming the variable. Neither reference tool has the
+  variable, so that message is stuffr's own.
+
+**The promise, per personality:**
+
+- **Stdout, stderr and exit codes are byte-identical to the reference tool**,
+  in both personalities: every documented flag, the `GZIP` environment
+  word (GNU), the suffix rules, which failures end the whole run and which
+  do not, the `-l` and `-v` output, and what each tool does with `.Z`, pack
+  and (Apple) bzip2, xz and lzip input. A differential suite runs each case
+  through the real tool and a stuffr link and compares those streams, the
+  file tree, modes and mtimes.
+- **Compressed output.** The Apple personality's output is **byte-identical
+  to `/usr/bin/gzip`** on the `c-backed` tier (`--features c-backed`, which
+  builds zlib; Apple's gzip uses zlib too). On the default pure tier, and for
+  the GNU personality on every tier, the output is **compatible**: it decodes
+  everywhere, and the header matches the reference through the stored name
+  (FNAME). **GNU's compressed bytes are never identical**, because GNU gzip
+  has its own deflate.
+
+**Known differences:**
+
+- **GNU `-V` and `-L` print stuffr's own notice,** not GNU's copyright and
+  GPL text: stuffr is MIT and contains no GNU code. The first line names
+  stuffr, the layout is GNU's, and the exit code and stream match. The Apple
+  personality prints Apple's BSD notice, with only the first line naming
+  stuffr.
+- **GNU `-v` prints a different percentage,** because the compressed size
+  differs; the rest of the line is GNU's.
+- **GNU `--rsyncable` and `--synchronous` are accepted and change nothing.**
+  The output is not chunked for rsync. (Apple's gzip has neither option.)
+- **LZH (`compress -H`, magic `1f a0`) is not decoded** by the GNU
+  personality: GNU reads it, stuffr says "not in gzip format" (a later member:
+  trailing garbage). Apple's gzip has no LZH reader either.
+- **A `.Z` whose header claims fewer than 9 bits** is "corrupt input." with
+  no output; GNU writes about 22 bytes of garbage first.
+- **An input that is also the output is never lost.** `gzip -dNf` on a file
+  whose stored name is its own name, or a symbolic link whose compressed
+  name leads back to itself, makes both tools unlink the input before
+  decoding, so a failure loses it (GNU loses both files). stuffr prints and
+  exits the same, keeps the input on failure and replaces it only with a
+  finished output.
+- **A mid-input read error keeps the input** and removes the partial output.
+  Apple's gzip keeps the cut-short output and removes the input. Streams and
+  exit code match.
+- **A closed standard input or output** (`gzip <&-`): the Rust runtime
+  reopens it on `/dev/null` before `main`, so stuffr compresses an empty input
+  or writes nowhere and exits 0, where Apple's gzip says "Can't stat stdin"
+  or "write: Bad file descriptor".
+- **Pure-tier xz, Apple personality.** Apple's gzip reads `.xz`; off the C tier
+  stuffr decodes it with its own decoder, which judges the stream header as
+  liblzma does but can differ in how a failing stream reads ("Unexpected end
+  of input" against "File is corrupt") and in what it outputs first.
+- **Two edge cases of GNU's own state are not reproduced:** a zip refused
+  with its data-descriptor flag set no longer makes the next input's gzip
+  trailer fail its check, and undefined behaviour in either tool is never
+  copied.
+- **An interrupted run leaves a hidden `.stuffr-gzip-*.tmp` file,** as with
+  bzip2: output is written under a temporary name and put in place at the
+  end, and stuffr has no signal handler. (Apple's `SIGINFO` progress is not
+  printed either.)
+- **When the parent ignores `SIGPIPE`,** the references report a broken pipe
+  (GNU 1.13 and later exit 2 with a warning); stuffr dies of `SIGPIPE`, for
+  the same reason as the bzip2 family. Under the default setting both die of
+  it.
+- **The reference version matters.** GNU 1.12 and 1.15 differ in places
+  (`-l` on several members, `-S` with a `/`, which `GZIP` words count,
+  quoted names). stuffr follows 1.15; Linux CI's 1.12 cases are adjusted
+  where the older tool differs.
+
 ### Roadmap
 
 One family per release, each with its own spec stating its byte-identity
-promise: **gzip next, then xz/lzma, zstd, lz4, then `unzip`/`zipinfo`.**
+promise: **bzip2 (`0.11.0`) and gzip (`0.12.0`) are done; xz/lzma is next,
+then zstd, lz4, then `unzip`/`zipinfo`.**
 `tar` is excluded (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)). The planned
 tiers:
 
-- **Byte-identical:** bzip2, on both tiers; xz/lzma and zstd on the
-  `c-backed` tier, against stated tool versions; gzip against BSD gzip on
-  the `c-backed` tier, via zlib.
+- **Byte-identical:** bzip2, on both tiers; gzip against Apple's gzip on
+  the `c-backed` tier, via zlib (done); xz/lzma and zstd on the `c-backed`
+  tier, against stated tool versions.
 - **Compatible behaviour only** (the same flags, files, exit codes and
   messages, and output the real tool reads): lz4; GNU gzip's exact bytes;
   every family except bzip2 on the pure tier.
@@ -946,7 +1033,16 @@ The bzip2 family is ported from bzip2 1.0.8's `bzip2.c` and
 `bzip2recover.c`, copyright (C) 1996-2019 Julian Seward, under the bzip2
 licence reproduced in
 [`crates/stuffr-cli/LICENSE-bzip2`](crates/stuffr-cli/LICENSE-bzip2).
-`stuffr-cli`'s licence metadata is therefore `MIT AND bzip2-1.0.6`.
+The gzip family's Apple personality is ported from Apple's `gzip.c`
+(`file_cmds`, itself FreeBSD's and NetBSD's, copyright (c) 1997-2017
+Matthew R. Green) and from the decoders it carries (`unpack.c`, `unbzip2.c`,
+`unxz.c`, `unlz.c`, `zuncompress.c`), under BSD licences whose notices are in
+[`crates/stuffr-cli/LICENSE-gzip-bsd`](crates/stuffr-cli/LICENSE-gzip-bsd).
+`stuffr-cli`'s licence metadata is therefore
+`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`. The GNU
+personality contains no GNU code: GNU gzip is GPLv3 and its source was never
+read, so that behaviour comes from the manual, `--help`, the NEWS file and
+running the binary.
 
 ## Why another one
 
@@ -1037,7 +1133,7 @@ six round-trip containers
 (`ar`, `arj`, `cpio`, `lha`, `tar`, `zip`/`zip64`) `stuffr formats` lists — `pack`/`unpack`/
 `cat` are entry-aware for every container, with extraction-time path
 containment and bomb limits on by default. `convert` and `install-links`
-work too (the bzip2 family only, so far). `pack` walks a directory tree, and
+work too (the bzip2 and gzip families so far). `pack` walks a directory tree, and
 `pack -o bundle.tar.gz` composes a container on top of a codec in one pass.
 `salvage` is the one recovery-biased verb, and everything else here stays
 as uncompromising as it was before it existed. It recovered zip archives
@@ -1221,10 +1317,27 @@ compatibility links' bzip2 family (`crates/stuffr-cli/src/compat/bzip2/` and
 `compat/bzip2recover/`) is ported from bzip2 1.0.8 and stays under Julian
 Seward's bzip2 licence, reproduced in
 [`crates/stuffr-cli/LICENSE-bzip2`](crates/stuffr-cli/LICENSE-bzip2). That
-is why `stuffr-cli`'s licence metadata is `MIT AND bzip2-1.0.6`; the other
-three crates are MIT. The bzip2 licence is a permissive BSD-style one: it
-asks that the notice be kept, the origin not be misrepresented, and altered
-source be plainly marked as such.
+is why `stuffr-cli`'s licence metadata starts `MIT AND bzip2-1.0.6`. The bzip2
+licence is a permissive BSD-style one: it asks that the notice be kept, the
+origin not be misrepresented, and altered source be plainly marked as such.
+
+Since `0.12.0` the gzip family's Apple personality is ported too, from Apple's
+`gzip.c` and the decoders it carries (`unpack.c`, `unbzip2.c`, `unxz.c`,
+`unlz.c`, `zuncompress.c`), and their notices are in
+[`crates/stuffr-cli/LICENSE-gzip-bsd`](crates/stuffr-cli/LICENSE-gzip-bsd).
+`stuffr-cli`'s full expression is therefore
+**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`**: the
+BSD-2-Clause covers `gzip.c` and the decoders, and the BSD-3-Clause covers
+`zuncompress.c`, the University of California's `.Z` reader. One notice is
+BSD-style but not word for word the SPDX `BSD-2-Clause` text: the Lzd one in
+`unlz.c`. The full notice ships in `LICENSE-gzip-bsd`, and that file, not the
+SPDX name, is what to read. `stuffr-formats` is
+**`MIT AND BSD-2-Clause`**, because its pack decoder (`pack.rs`) is a port of
+FreeBSD's `unpack.c` (Xin LI), whose notice is
+[`crates/stuffr-formats/LICENSE-unpack-bsd`](crates/stuffr-formats/LICENSE-unpack-bsd).
+`stuffr` and `stuffr-core` are MIT. On the `c-backed` tier zlib is built too,
+under the `Zlib` licence (also permissive); the default pure tier does not
+contain it.
 
 Neither licence extends to dependencies, and two are worth naming.
 
