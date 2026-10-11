@@ -366,6 +366,52 @@ mod c_tier {
         }
     }
 
+    /// `.lz` through `Format::Lzip` and through `auto`'s magic sniff. As
+    /// `xz` 5.8.4 does (checked 2026-10-11 against `lzip` 1.26 output:
+    /// `xz -dc` of two members plus `junk` prints both and exits 0;
+    /// `--single-stream` prints the first): members concatenate, trailing
+    /// non-`.lz` bytes end the stream unconsumed, `single_stream` stops
+    /// after the first member.
+    #[cfg(feature = "lzip")]
+    #[test]
+    fn lzip_members_and_trailing_data() {
+        let one = text(30_000, 11);
+        let member = crate::lzip::encode_for_test(&one);
+        let mut file = member.clone();
+        file.extend_from_slice(&member);
+        file.extend_from_slice(b"junk");
+        let both = [one.clone(), one.clone()].concat();
+        for auto in [false, true] {
+            for (single_stream, want, used) in
+                [(false, &both, 2 * member.len()), (true, &one, member.len())]
+            {
+                let o = DecodeOptions {
+                    format: if auto { Format::Xz } else { Format::Lzip },
+                    auto,
+                    single_stream,
+                    ..DecodeOptions::default()
+                };
+                let what = format!("auto {auto} single_stream {single_stream}");
+                let mut d = Decoder::new(&o).unwrap();
+                let mut out = Vec::new();
+                // Pieces small enough that the sniff spans two feeds.
+                for piece in file.chunks(3) {
+                    d.feed(piece, &mut out).unwrap();
+                }
+                d.finish(&mut out).unwrap();
+                assert!(out == *want, "{what}: {} bytes", out.len());
+                assert_eq!(d.progress().in_bytes, used as u64, "{what}");
+            }
+        }
+        // A cut member is still an unexpected end, not trailing data.
+        let o = DecodeOptions {
+            format: Format::Lzip,
+            ..DecodeOptions::default()
+        };
+        let cut = &member[..member.len() - 3];
+        assert!(matches!(decode(&o, cut), Err(XzError::BufError)));
+    }
+
     #[test]
     fn multithread_ignores_thread_count() {
         let input = text(1 << 20, 0x1d);
