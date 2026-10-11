@@ -169,8 +169,8 @@ mod unix {
         assert!(major == 1 && minor >= 12, "unexpected {major}.{minor}");
     }
 
-    /// `-S` is found in every spelling, clusters included, and never after
-    /// `--` or as `-b`'s operand.
+    /// `-S` is found in every spelling, clusters included, never after `--`
+    /// or as `-b`'s operand; the last one given wins.
     #[test]
     fn the_custom_suffix_is_found_in_clusters() {
         let cases: &[(&[&str], Option<&str>)] = &[
@@ -190,6 +190,10 @@ mod unix {
             (&["-bS", "a"], None),
             (&["-b", "-S", ".y"], None),
             (&["-b", "3", "-S", ".y"], Some(".y")),
+            // The last one wins.
+            (&["-S", ".x", "-S", ".y", "a"], Some(".y")),
+            (&["-kS.x", "--suffix=.z", "a"], Some(".z")),
+            (&["-S", ".x", "--", "-S", ".y"], Some(".x")),
         ];
         for (args, want) in cases {
             assert_eq!(gzip_custom_suffix(args), *want, "{args:?}");

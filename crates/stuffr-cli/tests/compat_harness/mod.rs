@@ -460,10 +460,13 @@ fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
 }
 
 /// The `-S`/`--suffix` operand of `args`, if any: `-S X`, `-SX`, `--suffix X`,
-/// `--suffix=X` (or an abbreviation, `--su=X`), and `S` inside a short cluster (`-kS .z`, `-kS.z`). A
-/// cluster's `b` takes the rest of it as its own operand, so an `S` after
-/// it is not an option. Options after `--` are operands and do not count.
+/// `--suffix=X` (or an abbreviation, `--su=X`), and `S` inside a short cluster
+/// (`-kS .z`, `-kS.z`). A cluster's `b` takes the rest of it as its own
+/// operand, so an `S` after it is not an option. Options after `--` are
+/// operands and do not count. When several are given the last wins, as in
+/// both references.
 pub fn gzip_custom_suffix<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut found = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if *a == "--" {
@@ -477,7 +480,7 @@ pub fn gzip_custom_suffix<'a>(args: &[&'a str]) -> Option<&'a str> {
                 None => (long, None),
             };
             if name.len() >= 2 && "suffix".starts_with(name) {
-                return inline.or_else(|| it.next().copied());
+                found = inline.or_else(|| it.next().copied()).or(found);
             }
             continue;
         }
@@ -488,11 +491,12 @@ pub fn gzip_custom_suffix<'a>(args: &[&'a str]) -> Option<&'a str> {
             match ch {
                 'S' => {
                     let rest = &cluster[i + 1..];
-                    return if rest.is_empty() {
-                        it.next().copied()
+                    found = if rest.is_empty() {
+                        it.next().copied().or(found)
                     } else {
                         Some(rest)
                     };
+                    break;
                 }
                 // `-b N`: the rest of the cluster (or the next word) is N.
                 'b' => {
@@ -505,7 +509,20 @@ pub fn gzip_custom_suffix<'a>(args: &[&'a str]) -> Option<&'a str> {
             }
         }
     }
-    None
+    found
+}
+
+/// The suffix case `c` compresses with: `-S` in its arguments, or in
+/// `$GZIP`, whose words come first (Apple's `prepend_gzip`).
+fn case_suffix<'a>(c: &Case<'a>) -> Option<&'a str> {
+    let mut words: Vec<&'a str> = c
+        .env
+        .iter()
+        .filter(|(k, _)| *k == "GZIP")
+        .flat_map(|(_, v)| v.split([' ', '\t']).filter(|w| !w.is_empty()))
+        .collect();
+    words.extend(c.args.iter().copied());
+    gzip_custom_suffix(&words)
 }
 
 /// Whether tree entry `n` is a compressed output of this case.
@@ -515,7 +532,7 @@ fn is_compressed_name(c: &Case, n: &str) -> bool {
         Roundtrip::Gzip { .. } => {
             n.ends_with(".gz")
                 || n.ends_with(".tgz")
-                || gzip_custom_suffix(&c.args).is_some_and(|s| !s.is_empty() && n.ends_with(s))
+                || case_suffix(c).is_some_and(|s| !s.is_empty() && n.ends_with(s))
         }
     }
 }
@@ -577,7 +594,7 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
             .map(str::to_owned)
             .or_else(|| name.strip_suffix(".tgz").map(|b| format!("{b}.tar")))
             .or_else(|| {
-                gzip_custom_suffix(&c.args)
+                case_suffix(c)
                     .filter(|s| !s.is_empty())
                     .and_then(|s| name.strip_suffix(s))
                     .map(str::to_owned)
@@ -960,4 +977,232 @@ pub fn mixed(n: usize, seed: u64) -> Vec<u8> {
 /// A short period repeated to `n` bytes.
 pub fn repetitive(n: usize) -> Vec<u8> {
     b"abcabcabd".iter().copied().cycle().take(n).collect()
+}
+
+// ---- running a group of differential cases ----
+
+/// Cases left out on this reference, and why: counted as known oracle
+/// skips by [`run_group`].
+pub struct Skipped {
+    pub count: usize,
+    pub why: String,
+}
+
+impl Skipped {
+    pub fn none() -> Self {
+        Skipped {
+            count: 0,
+            why: String::new(),
+        }
+    }
+
+    /// Record `n` more skipped cases, for `why`.
+    pub fn add(&mut self, n: usize, why: &str) {
+        self.count += n;
+        if !self.why.is_empty() {
+            self.why.push_str("; ");
+        }
+        self.why.push_str(why);
+    }
+}
+
+/// The text of a caught panic.
+pub fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
+    p.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Run `one` over every case, a few at a time, and fail once listing every
+/// case that differed (`one` panics with the differences, or returns false
+/// when the reference is absent). Prints "N of M cases compared" (M
+/// includes the known oracle skips, which are named); on CI every case not
+/// skipped for a known reason must have run.
+pub fn run_group(
+    group: &str,
+    cases: &[Case],
+    skipped: Skipped,
+    one: &(dyn Fn(&Case) -> bool + Sync),
+) {
+    let run_one = |c: &Case| -> Result<bool, String> {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| one(c))).map_err(panic_text)
+    };
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(8));
+    let next = AtomicUsize::new(0);
+    let mut results: Vec<(usize, Result<bool, String>)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..workers)
+            .map(|_| {
+                sc.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(c) = cases.get(i) else { break out };
+                        out.push((i, run_one(c)));
+                    }
+                })
+            })
+            .collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    results.sort_by_key(|(i, _)| *i);
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for (_, r) in results {
+        match r {
+            Ok(true) => ran += 1,
+            Ok(false) => {}
+            Err(p) => failures.push(p),
+        }
+    }
+    let total = cases.len() + skipped.count;
+    if skipped.count > 0 {
+        println!(
+            "{group}: {ran} of {total} cases compared, {} skipped: {}",
+            skipped.count, skipped.why
+        );
+    } else {
+        println!("{group}: {ran} of {total} cases compared");
+    }
+    if std::env::var_os("CI").is_some() {
+        assert_eq!(
+            ran,
+            cases.len(),
+            "{group}: CI is set but only {ran} of {} cases were compared",
+            cases.len()
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "{group}: {} of {} cases differ:\n\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n\n")
+    );
+}
+
+// ---- Apple's gzip ----
+
+/// The Apple gzip release the BSD personality reproduces: what its usage
+/// text and `-V` print.
+pub const APPLE_GZIP_VERSION_LINE: &str = "Apple gzip 487.0.1";
+
+/// The installed Apple gzip's `-V` line (on standard error), `None` when
+/// it is absent.
+pub fn apple_gzip_version_line() -> Option<&'static str> {
+    static V: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        let out = Command::new(Path::new(APPLE_GZIP_DIR).join("gzip"))
+            .arg("-V")
+            .env_clear()
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stderr).into_owned();
+        text.lines().next().map(str::to_owned)
+    })
+    .as_deref()
+}
+
+/// The length of an Apple `print_ratio` token (`%5s%%`: spaces, an
+/// optional `-`, digits, `.`, one digit, `%`) at the start of `b`.
+fn apple_ratio_at(b: &[u8]) -> Option<usize> {
+    let mut i = b.iter().take_while(|&&c| c == b' ').count();
+    if b.get(i) == Some(&b'-') {
+        i += 1;
+    }
+    let d = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+    if d == 0 {
+        return None;
+    }
+    i += d;
+    (b.get(i) == Some(&b'.')
+        && b.get(i + 1).is_some_and(u8::is_ascii_digit)
+        && b.get(i + 2) == Some(&b'%'))
+    .then_some(i + 3)
+}
+
+/// Blank Apple's `-v` ratios, which count compressed bytes: at a line's
+/// start (standard input's line) and after `name:\t\t  ` or `name:\t  `.
+/// Everything else in the line is kept.
+pub fn blank_apple_ratios(s: &str) -> String {
+    s.split_inclusive('\n')
+        .map(|line| {
+            let at = line.find(":\t").map(|i| {
+                let tabs = line[i + 1..].bytes().take_while(|&b| b == b'\t').count();
+                i + 1 + tabs
+            });
+            let start = at.unwrap_or(0);
+            match apple_ratio_at(&line.as_bytes()[start..]) {
+                Some(n) => format!("{}<ratio>{}", &line[..start], &line[start + n..]),
+                None => line.to_owned(),
+            }
+        })
+        .collect()
+}
+
+/// Apple's gzip stores the current time for standard input that is not a
+/// regular file. Where both runs' standard output hold a member header at
+/// the same offset whose times differ, each within its own run's
+/// wall-clock window, take the reference's time, so the rest is compared
+/// byte for byte (on the compatible tier only the first member's header is
+/// compared, at offset 0, which this covers).
+pub fn mask_stdin_mtimes(r: &Run, s: &mut Run) {
+    let now = now_secs();
+    let within = |t: u32, start: i64| (start - 2..=now + 2).contains(&i64::from(t));
+    let n = r.stdout.len().min(s.stdout.len());
+    let magic = [0x1f, 0x8b, 0x08];
+    let mut k = 0;
+    while k + 8 <= n {
+        if r.stdout[k..k + 3] == magic && s.stdout[k..k + 3] == magic {
+            let t = |b: &[u8]| u32::from_le_bytes([b[k + 4], b[k + 5], b[k + 6], b[k + 7]]);
+            let (rt, st) = (t(&r.stdout), t(&s.stdout));
+            if rt != st && within(rt, r.start) && within(st, s.start) {
+                s.stdout[k + 4..k + 8].copy_from_slice(&r.stdout[k + 4..k + 8]);
+            }
+        }
+        k += 1;
+    }
+}
+
+/// Run case `c` against Apple's gzip and stuffr and compare (panicking
+/// with every difference). Normalised first, and nothing else:
+///
+/// - the installed reference's version line becomes
+///   [`APPLE_GZIP_VERSION_LINE`] when another macOS ships another release,
+///   so its usage text is still compared;
+/// - stuffr's `-V`/`-L` first line names stuffr (Ruling T9-1): `Apple gzip
+///   (stuffr X) 487.0.1` is read as `Apple gzip 487.0.1`, the rest compared;
+/// - standard input's stored time ([`mask_stdin_mtimes`]);
+/// - on the compatible tier only (`!c.compare_output_bytes`), `-v`'s
+///   ratios (Ruling T9-2).
+///
+/// False when the reference is absent (skip; panics instead under `CI`).
+pub fn apple_compare(c: &Case) -> bool {
+    let Some(mut r) = reference(APPLE_GZIP_DIR, c) else {
+        return false;
+    };
+    let mut s = stuffr_as(c);
+    if let Some(line) = apple_gzip_version_line()
+        && line != APPLE_GZIP_VERSION_LINE
+        && line.starts_with("Apple gzip ")
+    {
+        r.stderr = r.stderr.replace(line, APPLE_GZIP_VERSION_LINE);
+    }
+    let ours = format!("Apple gzip (stuffr {}) ", env!("CARGO_PKG_VERSION"));
+    if s.stderr.contains(&ours) {
+        assert!(
+            r.stderr.contains(APPLE_GZIP_VERSION_LINE),
+            "stuffr printed its version line, the reference {:?}",
+            r.stderr
+        );
+        s.stderr = s.stderr.replacen(&ours, "Apple gzip ", 1);
+    }
+    mask_stdin_mtimes(&r, &mut s);
+    if !c.compare_output_bytes {
+        r.stderr = blank_apple_ratios(&r.stderr);
+        s.stderr = blank_apple_ratios(&s.stderr);
+    }
+    assert_same(c, &r, &s);
+    true
 }

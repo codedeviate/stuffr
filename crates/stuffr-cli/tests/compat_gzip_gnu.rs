@@ -222,24 +222,8 @@ mod differential {
 
     // ---- the group runner ----
 
-    fn panic_text(p: Box<dyn std::any::Any + Send>) -> String {
-        p.downcast_ref::<String>()
-            .cloned()
-            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-            .unwrap_or_default()
-    }
-
-    /// Cases left out on this reference, and why.
-    struct Skipped {
-        count: usize,
-        why: String,
-    }
-
     fn none_skipped() -> Skipped {
-        Skipped {
-            count: 0,
-            why: String::new(),
-        }
+        Skipped::none()
     }
 
     /// Keep the cases this reference can judge: those built by `newer` need
@@ -254,18 +238,17 @@ mod differential {
         if version() >= min || version() == (0, 0) {
             cases.extend(newer);
         } else {
-            skipped.count += newer.len();
-            if !skipped.why.is_empty() {
-                skipped.why.push_str("; ");
-            }
-            skipped.why.push_str(&format!(
-                "{} on a {}.{} reference ({why}, {}.{}+)",
+            skipped.add(
                 newer.len(),
-                version().0,
-                version().1,
-                min.0,
-                min.1
-            ));
+                &format!(
+                    "{} on a {}.{} reference ({why}, {}.{}+)",
+                    newer.len(),
+                    version().0,
+                    version().1,
+                    min.0,
+                    min.1
+                ),
+            );
         }
         cases
     }
@@ -274,10 +257,8 @@ mod differential {
         check_all_skipping(group, cases, none_skipped());
     }
 
-    /// Run every case against the reference and stuffr, a few at a time, and
-    /// fail once listing every case that differed. Prints "N of M cases
-    /// compared" (M includes the known oracle skips, which are named); on CI
-    /// every case not skipped for a known reason must have run.
+    /// Run every case against the reference and stuffr ([`run_group`]),
+    /// blanking `-v`'s ratios.
     fn check_all_skipping(group: &str, cases: &[Case], skipped: Skipped) {
         check_all_with(group, cases, skipped, true);
     }
@@ -290,75 +271,22 @@ mod differential {
     }
 
     fn check_all_with(group: &str, cases: &[Case], skipped: Skipped, blank: bool) {
-        let one = |c: &Case| -> Result<bool, String> {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let refc = renamed(c, reference_name(c.name));
-                let Some(mut r) = reference(gnu_gzip_dir(), &refc) else {
-                    return false;
-                };
-                let mut s = stuffr_as(c);
-                script_usage(&mut r);
-                script_usage(&mut s);
-                version_text(&mut r, &mut s);
-                if blank {
-                    blank_both(&mut r, &mut s);
-                }
-                assert_same(c, &r, &s);
-                true
-            }))
-            .map_err(panic_text)
-        };
-        let workers = std::thread::available_parallelism().map_or(2, |n| n.get().min(8));
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let mut results: Vec<(usize, Result<bool, String>)> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..workers)
-                .map(|_| {
-                    sc.spawn(|| {
-                        let mut out = Vec::new();
-                        loop {
-                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(c) = cases.get(i) else { break out };
-                            out.push((i, one(c)));
-                        }
-                    })
-                })
-                .collect();
-            hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
-        });
-        results.sort_by_key(|(i, _)| *i);
-        let mut failures = Vec::new();
-        let mut ran = 0;
-        for (_, r) in results {
-            match r {
-                Ok(true) => ran += 1,
-                Ok(false) => {}
-                Err(p) => failures.push(p),
+        let one = |c: &Case| -> bool {
+            let refc = renamed(c, reference_name(c.name));
+            let Some(mut r) = reference(gnu_gzip_dir(), &refc) else {
+                return false;
+            };
+            let mut s = stuffr_as(c);
+            script_usage(&mut r);
+            script_usage(&mut s);
+            version_text(&mut r, &mut s);
+            if blank {
+                blank_both(&mut r, &mut s);
             }
-        }
-        let total = cases.len() + skipped.count;
-        if skipped.count > 0 {
-            println!(
-                "{group}: {ran} of {total} cases compared, {} skipped: {}",
-                skipped.count, skipped.why
-            );
-        } else {
-            println!("{group}: {ran} of {total} cases compared");
-        }
-        if std::env::var_os("CI").is_some() {
-            assert_eq!(
-                ran,
-                cases.len(),
-                "{group}: CI is set but only {ran} of {} cases were compared",
-                cases.len()
-            );
-        }
-        assert!(
-            failures.is_empty(),
-            "{group}: {} of {} cases differ:\n\n{}",
-            failures.len(),
-            cases.len(),
-            failures.join("\n\n")
-        );
+            assert_same(c, &r, &s);
+            true
+        };
+        run_group(group, cases, skipped, &one);
     }
 
     // ---- setups (run in the working directory before the program) ----
