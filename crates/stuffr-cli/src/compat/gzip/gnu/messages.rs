@@ -246,8 +246,10 @@ pub(super) const STDOUT_NAME: &[u8] = b"stdout";
 pub(super) const STDIN_NAME: &[u8] = b"stdin";
 
 /// The read or write error on a stream, in the shape of [`OPEN_FAILED`]:
-/// `gzip: stdin: …` or `gzip: NAME: …`. Not observed (a full disk was
-/// not reproduced); the shape is the one every other file error has.
+/// `gzip: stdin: …` or `gzip: NAME: …`. Observed for the unlink `-f`
+/// does first: `gzip -df a.gz` with a directory `a` says `gzip: a:
+/// Operation not permitted`, no leading newline. A full disk was not
+/// reproduced; read and write errors take the same shape.
 pub(super) const IO_FAILED: &str = "%s: %s: %s\n";
 
 // ---- decompression, -t and -l ----

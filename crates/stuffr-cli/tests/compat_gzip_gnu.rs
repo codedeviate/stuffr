@@ -821,6 +821,19 @@ mod differential {
             with_setup(expect(gz(&["-c", "a.txt"], a()), &t), sticky),
             with_setup(gz(&["a.gz"], vec![("a.gz", t.clone())]), sticky_gz),
         ]);
+        // An output that is a directory: under `-f` GNU unlinks it first,
+        // which fails (`Operation not permitted` on macOS); the run goes on
+        // (fix round 1).
+        for args in [&["a.txt", "b.txt"][..], &["-f", "a.txt", "b.txt"]] {
+            cases.push(gz(
+                args,
+                vec![
+                    ("a.txt", t.clone()),
+                    ("a.txt.gz/f", Vec::new()),
+                    ("b.txt", t.clone()),
+                ],
+            ));
+        }
         // Under `-r` the "already has a suffix" note needs `-v`.
         let tree = |extra: Vec<(&'static str, Vec<u8>)>| {
             let mut v = vec![("d/a.txt", t.clone()), ("d/b.gz", t.clone())];
@@ -1607,6 +1620,19 @@ mod differential {
             }),
             with_setup(dz("gzip", &["-d", "d"], vec![("a.gz", g())]), subdir),
         ]);
+        // An output that is a directory: refused, and under `-f` unlinked
+        // first, which fails (fix round 1); the run goes on.
+        for args in [
+            &["-d", "a.gz", "b.gz"][..],
+            &["-df", "a.gz", "b.gz"],
+            &["-dfv", "a.gz", "b.gz"],
+        ] {
+            cases.push(dz(
+                "gzip",
+                args,
+                vec![("a.gz", g()), ("a/f", Vec::new()), ("b.gz", g())],
+            ));
+        }
         check_exact("decompress", &cases, none_skipped());
     }
 
@@ -2086,6 +2112,30 @@ mod differential {
             }
             cases.push(dz("gunzip", &["-N", "in.gz"], vec![("in.gz", m.clone())]));
         }
+        // Names with no last component (fix round 1). GNU's base of an
+        // all-slash name is empty, so the output is the operand's
+        // directory; under `-f` it unlinks what is there first and reports
+        // that failure (`Operation not permitted` for a directory on
+        // macOS), never writing anywhere.
+        for (stored, args, op) in [
+            (&b"/"[..], &["-dN"][..], "s/in.gz"),
+            (b"/", &["-dNf"], "s/in.gz"),
+            (b"//", &["-dN"], "s/in.gz"),
+            (b"", &["-dNf"], "s/in.gz"),
+            (b"", &["-dNfv"], "s/in.gz"),
+            (b".", &["-dNf"], "a.gz"),
+            (b"..", &["-dNf"], "a.gz"),
+            (b"..", &["-dNfv"], "a.gz"),
+            (b"..", &["-dN"], "a.gz"),
+        ] {
+            let m = member(Member {
+                name: Some(stored),
+                ..plain_member(&t)
+            });
+            let mut a = args.to_vec();
+            a.push(op);
+            cases.push(dz("gzip", &a, vec![(op, m)]));
+        }
         check_exact("header_name_escape", &cases, none_skipped());
         assert!(
             !Path::new(&escape).exists(),
@@ -2106,6 +2156,32 @@ mod differential {
             assert_eq!(keys, [&"s/".to_owned(), &want], "{stored:?}");
         }
         assert!(!Path::new(&escape).exists());
+    }
+
+    /// Ruling T8-4: under `-dNf`, a stored name equal to the input's own
+    /// makes GNU replace the input with the output and then remove it, so
+    /// both are lost. stuffr prints what GNU prints and exits as it does,
+    /// but never removes the input when the published output is the input,
+    /// so the decoded file survives. Streams compared with GNU; the file is
+    /// asserted on stuffr's side.
+    #[test]
+    fn a_stored_name_equal_to_the_input_keeps_the_output() {
+        let t = txt();
+        let m = gzm(&t, b"a.gz");
+        for args in [&["-dNf", "a.gz"][..], &["-dNfv", "a.gz"]] {
+            let c = dz("gzip", args, vec![("a.gz", m.clone())]);
+            let s = stuffr_as(&c);
+            if let Some(r) = reference(gnu_gzip_dir(), &c) {
+                assert_eq!(
+                    (r.code, &r.stdout, &r.stderr),
+                    (s.code, &s.stdout, &s.stderr)
+                );
+                assert!(r.tree.is_empty(), "GNU kept {:?}", r.tree.keys());
+            }
+            assert_eq!(s.code, 0, "{}", s.stderr);
+            assert_eq!(s.tree.len(), 1, "{:?}", s.tree.keys());
+            assert_eq!(s.tree["a.gz"].0, t, "the decoded file must survive");
+        }
     }
 
     /// Review focus 2: `gunzip a.gz b.gz c.gz` with `b.gz` corrupt keeps

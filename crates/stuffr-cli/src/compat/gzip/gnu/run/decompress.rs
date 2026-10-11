@@ -66,10 +66,11 @@ fn mtime_secs(meta: &Metadata) -> i64 {
 
 /// The last component of a stored name, as GNU takes it: after the last
 /// `/` that is not at the end (observed: `../x` gives `x`, `a/b/` gives
-/// `b/`, `dir/` stays `dir/`).
+/// `b/`, `dir/` stays `dir/`), and nothing for a name of slashes only
+/// (`/` under `-dN` on `s/in.gz` names `s/`).
 fn stored_base(name: &[u8]) -> &[u8] {
     let Some(last) = name.iter().rposition(|&b| b != b'/') else {
-        return name;
+        return b"";
     };
     match name[..last].iter().rposition(|&b| b == b'/') {
         Some(slash) => &name[slash + 1..],
@@ -654,6 +655,8 @@ mod tests {
             (b"a/b/", b"b/"),
             (b"", b""),
             (b"..", b".."),
+            (b"/", b""),
+            (b"//", b""),
         ] {
             assert_eq!(stored_base(stored), base, "{stored:?}");
         }

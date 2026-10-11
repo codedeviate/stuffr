@@ -355,12 +355,20 @@ impl Gz<'_> {
 
     /// Whether the output `out_path` may be written: `Some(replace)`, or
     /// `None` when it exists and is not to be replaced (said, exit 2). With
-    /// `-f` it is replaced; otherwise a terminal on standard input is asked.
+    /// `-f` it is removed first, and a failure to remove it is an error
+    /// (exit 1, the run goes on; observed: `gzip -df a.gz` with a directory
+    /// `a` says `gzip: a: Operation not permitted`, macOS's `unlink` error,
+    /// and so does `gzip -f a` with a directory `a.gz`); otherwise a
+    /// terminal on standard input is asked.
     fn may_write(&mut self, out_path: &Path, qout: &[u8]) -> Option<bool> {
         if fs::symlink_metadata(out_path).is_err() {
             return Some(false);
         }
         if self.s.force {
+            if let Err(e) = fs::remove_file(out_path) {
+                self.error(m::IO_FAILED, &[PROGRAM, qout, &strerror(&e)]);
+                return None;
+            }
             return Some(true);
         }
         self.say(m::ALREADY_EXISTS, &[PROGRAM, qout]);
@@ -379,7 +387,8 @@ impl Gz<'_> {
 
     /// Finish a written output `tmp`: the input's mode, owner and times
     /// (the modification time `mtime` instead, when given), then publish it
-    /// as `out_path` and remove the input `path` unless `-k`. False if it
+    /// as `out_path` and remove the input `path` unless `-k` (or it is
+    /// `out_path`). False if it
     /// was not published (said).
     #[allow(clippy::too_many_arguments)]
     fn commit(
@@ -422,7 +431,11 @@ impl Gz<'_> {
                 return false;
             }
         }
+        // Ruling T8-4: never remove the input when the output now stands in
+        // its place (`gzip -dNf a.gz` with a stored name `a.gz`): GNU loses
+        // both, stuffr keeps the decoded file.
         if !self.s.keep
+            && path != out_path
             && let Err(e) = fs::remove_file(path)
         {
             self.error(m::IO_FAILED, &[PROGRAM, qname, &strerror(&e)]);
