@@ -976,6 +976,12 @@ carries both and picks one:
 - **LZH (`compress -H`, magic `1f a0`) is not decoded** by the GNU
   personality: GNU reads it, stuffr says "not in gzip format" (a later member:
   trailing garbage). Apple's gzip has no LZH reader either.
+- **GNU, an output name longer than the file system allows** (`NAME_MAX`,
+  255 bytes on most): GNU 1.15 shortens it and goes on. Compressing a file
+  whose name is 253 bytes or longer, it says "NAME compressed to SHORTER.gz"
+  and exits 0; under `-dN`, a stored name past the limit is written cut
+  short with "warning, name truncated", exit 2. stuffr does not shorten
+  names: it says "File name too long", exits 1 and keeps the input.
 - **A `.Z` whose header claims fewer than 9 bits** is "corrupt input." with
   no output; GNU writes about 22 bytes of garbage first.
 - **An input that is also the output is never lost.** `gzip -dNf` on a file

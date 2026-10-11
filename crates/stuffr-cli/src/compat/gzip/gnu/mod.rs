@@ -78,6 +78,12 @@
 //!   interrupted run leaves a `.stuffr-gzip-*.tmp` file.
 //! - LZH (`1f a0`, `compress -H`) is not decoded: a first member is "not in
 //!   gzip format", a later one trailing garbage (Ruling T5).
+//! - An output name past the file system's `NAME_MAX` is not shortened:
+//!   GNU compresses a 253-byte name to a cut-short `.gz` name ("NAME
+//!   compressed to SHORTER", exit 0) and under `-dN` writes a too-long
+//!   stored name cut short ("warning, name truncated", exit 2); stuffr
+//!   says "File name too long", exit 1, and keeps the input (observed:
+//!   `gzip -k` on 252- to 255-byte names; final review, item 3).
 //! - A `.Z` header claiming fewer than 9 bits is "corrupt input." before
 //!   any output; GNU writes a few bytes first.
 //! - A zip refused as "not a valid zip file" with its data-descriptor flag
