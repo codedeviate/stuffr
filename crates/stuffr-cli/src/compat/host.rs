@@ -2,8 +2,8 @@
 //! bytes, C library behaviours the ported tools rely on (`strerror`, sticky
 //! end of file), the input reader that reads the way libbzip2 does, the
 //! sandbox the fuzz targets run under, and the helpers that create and
-//! publish an output file (`create_temp`, `publish`) and restore `SIGPIPE`
-//! (`reset_sigpipe`).
+//! publish an output file (`create_temp`, `publish`), restore `SIGPIPE`
+//! (`reset_sigpipe`) and remove a partial output on interrupt (`arm_cleanup`).
 //!
 //! Nothing here knows a tool's messages or flags; each family keeps its own
 //! checks and wording and calls these helpers.
@@ -36,6 +36,155 @@ pub(crate) fn reset_sigpipe() {
     // and touches no Rust state; it is done before any other thread or I/O.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+/// The signals whose arrival removes an armed output (ruling R6). xz's
+/// signals.c also hooks SIGPIPE, SIGXCPU and SIGXFSZ; here those keep their
+/// default action (SIGPIPE as `reset_sigpipe` leaves it), so a run they kill
+/// leaves its temporary behind.
+#[cfg(unix)]
+const CLEANUP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+/// The slot's size: `PATH_MAX`, the terminating NUL included.
+#[cfg(unix)]
+const SLOT_LEN: usize = libc::PATH_MAX as usize;
+
+/// The armed path, NUL-terminated, for the handler to `unlink`. A fixed
+/// static, so the handler never allocates or locks.
+#[cfg(unix)]
+struct PathSlot(std::cell::UnsafeCell<[u8; SLOT_LEN]>);
+
+// SAFETY: the slot is written only by `arm_cleanup`, with `ARMED` false and
+// the cleanup signals blocked on the writing thread, and read only by the
+// handler after it has seen `ARMED` true (Acquire, pairing with the Release
+// that follows the write). One compat run per process arms at a time.
+#[cfg(unix)]
+unsafe impl Sync for PathSlot {}
+
+#[cfg(unix)]
+static SLOT: PathSlot = PathSlot(std::cell::UnsafeCell::new([0; SLOT_LEN]));
+
+/// Whether `SLOT` holds a path the handler should remove.
+#[cfg(unix)]
+static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a run holds while its output is partial; dropping it disarms the
+/// handler, so a published output is never removed.
+#[must_use = "dropping the guard disarms the cleanup at once"]
+pub(crate) struct CleanupGuard {
+    #[cfg(unix)]
+    armed: bool,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.armed {
+            ARMED.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// Arm the removal of `path`, the run's partial output, should SIGINT,
+/// SIGTERM or SIGHUP arrive before the guard drops; the signal is then
+/// re-raised at its default action, so the process dies of it, as xz does
+/// (signals.c: `signal_handler`, `signals_exit`).
+///
+/// The caller drops the guard right after a successful publish, and on every
+/// error path after removing the file itself. Under `Host::Sandbox` nothing
+/// is armed and no handler installed. A path the slot cannot hold (or one
+/// with a NUL) is not armed. Arming never allocates.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the xz family arms it; until then only tests")
+)]
+pub(crate) fn arm_cleanup(host: &Host, path: &Path) -> CleanupGuard {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        if matches!(host, Host::Sandbox(_)) || bytes.len() >= SLOT_LEN || bytes.contains(&0) {
+            return CleanupGuard { armed: false };
+        }
+        install_handlers();
+        // SAFETY: sigset_t is plain data, initialised by sigemptyset before
+        // use. Blocking the cleanup signals on this thread while the slot is
+        // written means this thread's handler never sees it half-written;
+        // `ARMED` is false meanwhile, so a handler on another thread reads
+        // nothing. The write stays inside the slot (len < SLOT_LEN), and the
+        // previous mask is restored after.
+        unsafe {
+            let mut block: libc::sigset_t = std::mem::zeroed();
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut block);
+            for sig in CLEANUP_SIGNALS {
+                libc::sigaddset(&mut block, sig);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+            ARMED.store(false, Ordering::SeqCst);
+            let slot = SLOT.0.get().cast::<u8>();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, bytes.len());
+            slot.add(bytes.len()).write(0);
+            ARMED.store(true, Ordering::Release);
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
+        CleanupGuard { armed: true }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, path);
+        CleanupGuard {}
+    }
+}
+
+/// Install `on_cleanup_signal` for each cleanup signal not already carrying
+/// it. As signals.c does, a signal the parent left ignored stays ignored
+/// (`nohup`), and `SA_RESTART` is off. Queried per signal rather than
+/// latched in a flag, so it holds in a child forked mid-install.
+#[cfg(unix)]
+fn install_handlers() {
+    let handler = on_cleanup_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    // SAFETY: sigaction structs are plain data, zeroed then filled; a query
+    // passes a null new action. The handler only makes async-signal-safe
+    // calls (`on_cleanup_signal`), and the mask blocks all three cleanup
+    // signals while it runs, so one handler never interrupts another.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        libc::sigemptyset(&mut action.sa_mask);
+        for sig in CLEANUP_SIGNALS {
+            libc::sigaddset(&mut action.sa_mask, sig);
+        }
+        action.sa_flags = 0;
+        action.sa_sigaction = handler;
+        for sig in CLEANUP_SIGNALS {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &mut old) == 0
+                && (old.sa_sigaction == libc::SIG_IGN || old.sa_sigaction == handler)
+            {
+                continue;
+            }
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+/// The handler: remove the armed path, restore the default action, re-raise.
+/// It never allocates or locks.
+#[cfg(unix)]
+extern "C" fn on_cleanup_signal(sig: libc::c_int) {
+    if ARMED.load(Ordering::Acquire) {
+        // SAFETY: `ARMED` true means the slot holds a NUL-terminated path,
+        // written before the Release store this load pairs with; unlink is
+        // async-signal-safe.
+        unsafe { libc::unlink(SLOT.0.get().cast::<libc::c_char>()) };
+    }
+    // SAFETY: signal and raise are async-signal-safe. The re-raised signal
+    // is blocked until this handler returns, then delivered at SIG_DFL,
+    // which ends the process with that signal.
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
     }
 }
 
@@ -723,6 +872,134 @@ mod tests {
             fs::metadata(&a).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// While the guard lives the slot holds the path, NUL-terminated; once
+    /// it drops the handler is armed with nothing. A path the slot cannot
+    /// hold is never armed (a truncated one would name another file).
+    #[cfg(unix)]
+    #[test]
+    fn arm_then_drop_disarms() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("arm");
+        let file = dir.join("partial.xz");
+        fs::write(&file, b"partial").unwrap();
+        let bytes = file.as_os_str().as_bytes();
+        {
+            let _guard = arm_cleanup(&Host::Real, &file);
+            assert!(ARMED.load(Ordering::Acquire), "not armed");
+            // SAFETY: no handler runs (no signal is sent), and this test is
+            // the only in-process arm, so nothing writes the slot meanwhile.
+            let slot = unsafe { &*SLOT.0.get() };
+            assert_eq!(&slot[..bytes.len()], bytes);
+            assert_eq!(slot[bytes.len()], 0);
+        }
+        assert!(!ARMED.load(Ordering::Acquire), "still armed after drop");
+
+        let long = dir.join("x".repeat(SLOT_LEN));
+        let guard = arm_cleanup(&Host::Real, &long);
+        assert!(!ARMED.load(Ordering::Acquire), "an over-long path armed");
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Fork, run `child` in the child, and return its raw wait status.
+    /// `child` runs after `fork` in a multithreaded process, so it calls only
+    /// async-signal-safe functions and never allocates; it ends the child
+    /// itself (`_exit` or a signal), and `_exit(99)` catches a return.
+    #[cfg(unix)]
+    fn in_child(child: impl FnOnce()) -> libc::c_int {
+        // SAFETY: the child runs `child` (async-signal-safe calls only, by
+        // this function's contract) and `_exit`s; it never returns into the
+        // test harness. The parent only waits.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+            if pid == 0 {
+                child();
+                libc::_exit(99);
+            }
+            let mut status = 0;
+            while libc::waitpid(pid, &mut status, 0) < 0 {
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EINTR));
+            }
+            status
+        }
+    }
+
+    /// Start a child at the default dispositions, whatever this process has
+    /// installed (another test's arm) or inherited (`nohup`).
+    #[cfg(unix)]
+    fn default_dispositions() {
+        for sig in CLEANUP_SIGNALS {
+            // SAFETY: SIG_DFL installs no handler and touches no Rust state.
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
+    }
+
+    /// The real path end to end, as xz's signals.c behaves: an armed run
+    /// that takes SIGINT, SIGTERM or SIGHUP loses its partial output and
+    /// dies of that same signal.
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_removes_the_armed_file() {
+        let dir = scratch("interrupt");
+        for sig in CLEANUP_SIGNALS {
+            let file = dir.join(format!("partial-{sig}.xz"));
+            fs::write(&file, b"partial").unwrap();
+            let status = in_child(|| {
+                default_dispositions();
+                let _guard = arm_cleanup(&Host::Real, &file);
+                // SAFETY: raise is async-signal-safe; the handler unlinks
+                // the armed path and re-raises at SIG_DFL, ending the child.
+                unsafe { libc::raise(sig) };
+            });
+            assert!(
+                libc::WIFSIGNALED(status),
+                "signal {sig}: the child exited (status {status:#x})"
+            );
+            assert_eq!(libc::WTERMSIG(status), sig);
+            assert!(!file.exists(), "signal {sig}: the partial file survived");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A sandboxed run never touches the process's signal dispositions.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_never_installs_handlers() {
+        let dir = scratch("sandbox-signals");
+        let file = dir.join("partial.xz");
+        fs::write(&file, b"partial").unwrap();
+        let host = Host::Sandbox(Sandbox {
+            dir: dir.clone(),
+            stdin: None,
+            stdout: Arc::default(),
+            budget: Arc::new(AtomicU64::new(0)),
+            reads: ReadLog::default(),
+        });
+        let status = in_child(|| {
+            default_dispositions();
+            let _guard = arm_cleanup(&host, &file);
+            let mut all_default = !ARMED.load(Ordering::Acquire);
+            for sig in CLEANUP_SIGNALS {
+                // SAFETY: a zeroed sigaction is a valid out-parameter, and a
+                // query (null new action) changes nothing.
+                unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    let queried = libc::sigaction(sig, std::ptr::null(), &mut old) == 0;
+                    all_default &= queried && old.sa_sigaction == libc::SIG_DFL;
+                }
+            }
+            // SAFETY: _exit is async-signal-safe and ends the child.
+            unsafe { libc::_exit(if all_default { 0 } else { 1 }) };
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "a sandboxed arm installed a handler (status {status:#x})"
+        );
+        assert!(file.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }
