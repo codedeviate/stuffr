@@ -6,10 +6,12 @@ edition.workspace = true
 rust-version.workspace = true
 # Not the workspace's MIT alone: `compat` ports code from bzip2.c and
 # bzip2recover.c, whose licence ships as LICENSE-bzip2, and from Apple's
-# (FreeBSD's, NetBSD's) gzip.c, whose BSD-2-Clause notice ships as
-# LICENSE-gzip-bsd. SPDX deprecated `BSD-2-Clause-NetBSD` and
-# `-FreeBSD` for `BSD-2-Clause`, whose text they share.
-license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause"
+# (FreeBSD's, NetBSD's) gzip.c and its decoders, whose notices ship as
+# LICENSE-gzip-bsd: BSD-2-Clause for all but zuncompress.c (the Regents
+# of the University of California's BSD-3-Clause), which the `.Z` reader
+# ports. SPDX deprecated `BSD-2-Clause-NetBSD` and `-FreeBSD` for
+# `BSD-2-Clause`, whose text they share.
+license = "MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause"
 repository.workspace = true
 keywords = ["compression", "archive", "cli", "unzip", "extract"]
 categories = ["command-line-utilities", "compression"]
@@ -42,8 +44,12 @@ pure = ["stuffr/pure"]
 # its integration tests can see it; `c-backed` implies it, and `full` names
 # `c-backed` itself — `stuffr/full` alone would turn on stuffr's `zlib-c` but
 # not this crate's, and the byte suite would silently run the compatible tier.
-c-backed = ["stuffr/c-backed", "zlib-c"]
+c-backed = ["stuffr/c-backed", "zlib-c", "xz-c"]
 zlib-c = ["stuffr/zlib-c"]
+# The Apple gzip personality's `unxz` runs over liblzma itself on the C
+# tier (`stuffr::xz_stream`), as Apple's does; elsewhere over the
+# registry's xz decoder.
+xz-c = ["stuffr/xz-c"]
 legacy = ["stuffr/legacy"]
 full = ["stuffr/full", "c-backed"]
 lha = ["stuffr/lha"]

@@ -19,7 +19,7 @@
 use std::io::{self, BufRead, Read};
 
 use stuffr::FormatId;
-use stuffr::pack_stream::PackReader;
+use stuffr::pack_stream::{PackError, PackReader};
 
 use super::member::{Lookahead, PEEK};
 
@@ -111,6 +111,12 @@ fn codec_id(d: Detected) -> Option<&'static str> {
 /// A decoder for a non-gzip format, reading `r` to its end. Errors are
 /// `io::Error`s carrying the codec's own error, for the flavour to word.
 ///
+/// A pack header's failure keeps its [`PackError`] inside an error of the
+/// kind every other codec gives the same failure: `UnexpectedEof` for an
+/// input that ends in the header or the tables, `InvalidData` for one that
+/// contradicts itself, the reader's own error for a failed read. (The
+/// bitstream's failures come from the reader, `PackError` inside `Other`.)
+///
 /// `r` is `Send + 'static` because stuffr's codecs own their source.
 pub(crate) fn foreign_reader(
     d: Detected,
@@ -119,7 +125,15 @@ pub(crate) fn foreign_reader(
     if d == Detected::Pack {
         return match PackReader::new(r) {
             Ok(p) => Ok(Box::new(p)),
-            Err(e) => Err(io::Error::other(e)),
+            Err(PackError::Io(e)) => Err(e),
+            Err(e @ (PackError::Truncated | PackError::BadHeader(_))) => {
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, e))
+            }
+            Err(PackError::Corrupt("Symbol table truncated")) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                PackError::Corrupt("Symbol table truncated"),
+            )),
+            Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
         };
     }
     let Some(id) = codec_id(d) else {
@@ -394,6 +408,108 @@ mod tests {
             .read_to_end(&mut out)
             .unwrap();
         assert_eq!(out, b"BAAAAAAA");
+    }
+
+    /// Every foreign format's failures through `foreign_reader`: a header
+    /// cut short, a stream cut short, and bytes that contradict
+    /// themselves are each an error (from `foreign_reader` or from the
+    /// reader), never a panic or a quiet short read.
+    #[test]
+    fn foreign_reader_fails_on_bad_input() {
+        let data = sample();
+        let mut formats: Vec<(Detected, Vec<u8>)> = Vec::new();
+        for (d, id) in [
+            (Detected::Bzip2, "bzip2"),
+            (Detected::Xz, "xz"),
+            (Detected::Lzip, "lzip"),
+            (Detected::Compress, "compress"),
+        ] {
+            if has(id)
+                && stuffr::registry()
+                    .codec(FormatId::new(id))
+                    .is_some_and(|c| c.caps().encode)
+            {
+                formats.push((d, encode(id, &data)));
+            }
+        }
+        let decode = |d: Detected, b: Vec<u8>| -> io::Result<Vec<u8>> {
+            let mut out = Vec::new();
+            foreign_reader(d, Box::new(io::Cursor::new(b)))?.read_to_end(&mut out)?;
+            Ok(out)
+        };
+        for (d, packed) in formats {
+            // The header alone, and half the stream. (`.Z` has no end
+            // marker: cut short, it is a shorter stream.)
+            if d != Detected::Compress {
+                for cut in [3, packed.len() / 2] {
+                    assert!(
+                        decode(d, packed[..cut].to_vec()).is_err(),
+                        "{d:?} cut at {cut}"
+                    );
+                }
+            }
+            // A run of bytes overwritten in the middle.
+            let mut bad = packed.clone();
+            let at = packed.len() / 2;
+            for b in &mut bad[at..at + 16.min(packed.len() - at)] {
+                *b ^= 0x5a;
+            }
+            assert!(
+                decode(d, bad).map_or(true, |o| o != data),
+                "{d:?}: corruption went unnoticed"
+            );
+        }
+        // pack: each header failure has its kind and keeps its words.
+        let kind_and_words = |b: &[u8]| {
+            let e = foreign_reader(Detected::Pack, Box::new(io::Cursor::new(b.to_vec())))
+                .err()
+                .unwrap();
+            let words = e.get_ref().map(ToString::to_string).unwrap_or_default();
+            (e.kind(), words)
+        };
+        assert_eq!(
+            kind_and_words(b"\x1f\x1e\x00\x00"),
+            (
+                io::ErrorKind::UnexpectedEof,
+                "header shorter than 7 bytes".into()
+            )
+        );
+        assert_eq!(
+            kind_and_words(b"\x1f\x1e\x00\x00\x00\x08\x03\x01"),
+            (
+                io::ErrorKind::UnexpectedEof,
+                "File appears to be truncated".into()
+            )
+        );
+        assert_eq!(
+            kind_and_words(b"\x1f\x1e\x00\x00\x00\x08\x03\x01\x00\x00A"),
+            (
+                io::ErrorKind::UnexpectedEof,
+                "Symbol table truncated".into()
+            )
+        );
+        assert_eq!(
+            kind_and_words(b"\x1f\x1e\x00\x00\x00\x08\x1a"),
+            (
+                io::ErrorKind::InvalidData,
+                "Huffman tree has insane levels".into()
+            )
+        );
+        // And the bitstream's, from the reader, after what it decoded.
+        let mut r = foreign_reader(
+            Detected::Pack,
+            Box::new(io::Cursor::new(
+                b"\x1f\x1e\x00\x00\x00\x0a\x03\x01\x00\x00AB\x80".to_vec(),
+            )),
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        let e = r.read_to_end(&mut out).unwrap_err();
+        assert_eq!(out, b"BAAAAAAA");
+        assert_eq!(
+            e.get_ref().map(ToString::to_string).unwrap(),
+            "Premature EOF"
+        );
     }
 
     #[test]

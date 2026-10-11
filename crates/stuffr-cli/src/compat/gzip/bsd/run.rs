@@ -1,10 +1,11 @@
-//! Compression, ported from Apple's `gzip.c` (file_cmds-479): `main`'s
+//! The run, ported from Apple's `gzip.c` (file_cmds-479): `main`'s
 //! operand loop, `handle_pathname`, `handle_dir`, `handle_file`,
 //! `file_compress`, `check_outfile`, `gz_compress`, `handle_stdout`,
 //! `copymodes`, `unlink_input`, `print_verbage` and `print_ratio`, with the
 //! `__APPLE__` branches (the operand named twice when it cannot be
 //! stat'ed; `fcopyfile` of ACLs and extended attributes and
-//! `clear_type_and_creator`).
+//! `clear_type_and_creator`; `zcat`'s `.Z`). Decompression, `-t` and `-l`
+//! are in [`decompress`].
 //!
 //! Every warning is `maybe_warn`/`maybe_warnx`: printed unless `-q`, and
 //! the exit code becomes 1; nothing stops the run. An existing output
@@ -24,8 +25,12 @@ use std::path::{Path, PathBuf};
 
 use super::args::Settings;
 use super::messages::{self as m, printf};
+
+mod decompress;
+
 use crate::compat::gzip::member::{Engine, Header, compress_body, write_header, write_trailer};
 use crate::compat::host::{Host, Published, create_temp, publish, stdin_file, strerror};
+pub(super) use decompress::Fatal;
 
 /// `BUFLEN`: gzip's read and write size.
 const BUFLEN: usize = 64 * 1024;
@@ -70,11 +75,13 @@ fn engine() -> Engine {
     }
 }
 
-/// Run the compress operation `s` describes for the invoked `name`;
-/// returns the exit code.
+/// Run what `s` describes for the invoked `name`; returns the exit code.
+/// `zcat_adds_z`: invoked as `zcat` in Unix 2003 mode (`COMPAT_MODE`),
+/// where an operand gets `.Z` added.
 pub(super) fn execute(
     name: &'static str,
     mut s: Settings,
+    zcat_adds_z: bool,
     host: &mut Host,
     err: &mut dyn Write,
 ) -> u8 {
@@ -88,17 +95,29 @@ pub(super) fn execute(
         stdout: None,
         stdin_closed: false,
         answers: Vec::new(),
+        zcat_adds_z,
+        errno: 0,
+        list: decompress::ListTotals::default(),
     };
-    if files.is_empty() {
-        g.handle_stdout();
-    } else {
-        for f in &files {
-            g.handle_pathname(f);
+    let run = if files.is_empty() {
+        if g.s.decompress {
+            g.handle_stdin()
+        } else {
+            g.handle_stdout();
+            Ok(())
         }
+    } else {
+        files.iter().try_for_each(|f| g.handle_pathname(f))
+    };
+    // `maybe_err`/`maybe_errx`: `exit(2)`, stdio flushed.
+    if run.is_err() {
+        g.flush_stdout();
+        return 2;
     }
-    if let Some(mut out) = g.stdout.take() {
-        let _ = out.flush();
+    if !g.s.quiet && g.s.list && files.len() > 1 {
+        g.print_list_totals();
     }
+    g.flush_stdout();
     g.exit_value
 }
 
@@ -115,6 +134,13 @@ struct Gz<'a> {
     stdin_closed: bool,
     /// What stdio has read from the terminal and `fgets` not yet taken.
     answers: Vec<u8>,
+    /// Invoked as `zcat` in Unix 2003 mode: operands get `.Z` added.
+    zcat_adds_z: bool,
+    /// `errno` as the last failed call left it, for the one message that
+    /// prints a stale one (unpack.c's "File appears to be truncated").
+    errno: i32,
+    /// `print_list`'s statics.
+    list: decompress::ListTotals,
 }
 
 /// What `gz_compress` returns: the bytes read and the bytes written
@@ -234,42 +260,81 @@ impl Gz<'_> {
 
     // ---- operands ----
 
-    /// `handle_pathname`, compressing.
-    fn handle_pathname(&mut self, path: &[u8]) {
-        if path == b"-" {
-            self.handle_stdout();
-            return;
+    fn flush_stdout(&mut self) {
+        if let Some(mut out) = self.stdout.take() {
+            let _ = out.flush();
         }
-        let p = self.host.path(path);
+    }
+
+    /// Remember a failed call's `errno`.
+    fn set_errno(&mut self, e: &io::Error) {
+        if let Some(n) = e.raw_os_error() {
+            self.errno = n;
+        }
+    }
+
+    /// `handle_pathname`. Decompressing, a missing operand is tried again
+    /// with `.gz` (or `-S`'s) added, unless `zcat` already added `.Z`.
+    fn handle_pathname(&mut self, opath: &[u8]) -> Result<(), Fatal> {
+        if opath == b"-" {
+            if self.s.decompress {
+                return self.handle_stdin();
+            }
+            self.handle_stdout();
+            return Ok(());
+        }
+        let mut path = opath.to_vec();
+        let mut retried = false;
+        // `__APPLE__`: `zcat` in Unix 2003 mode reads `NAME.Z` unless the
+        // name's last `.` starts `.Z`, or `-f`.
+        if self.zcat_adds_z && !self.s.force {
+            let ends_z = path
+                .iter()
+                .rposition(|&b| b == b'.')
+                .is_some_and(|i| &path[i..] == b".Z");
+            if !ends_z {
+                path.extend_from_slice(b".Z");
+                retried = true;
+            }
+        }
         // `stat`, then (without -f or -c) `lstat`, whose answer wins.
         let follow = self.s.force || self.s.to_stdout;
-        let sb = fs::metadata(&p).and_then(|md| {
-            if follow {
-                Ok(md)
-            } else {
-                fs::symlink_metadata(&p)
-            }
-        });
-        let sb = match sb {
-            Ok(sb) => sb,
-            Err(e) => {
-                self.warn(m::CANT_STAT, &[path, path], &e);
-                return;
+        let sb = loop {
+            let p = self.host.path(&path);
+            let sb = fs::metadata(&p).and_then(|md| {
+                if follow {
+                    Ok(md)
+                } else {
+                    fs::symlink_metadata(&p)
+                }
+            });
+            match sb {
+                Ok(sb) => break sb,
+                Err(e) => {
+                    self.set_errno(&e);
+                    if self.s.decompress && !retried && e.kind() == io::ErrorKind::NotFound {
+                        path.extend_from_slice(&self.s.suffix);
+                        retried = true;
+                        continue;
+                    }
+                    self.warn(m::CANT_STAT, &[opath, &path], &e);
+                    return Ok(());
+                }
             }
         };
         if sb.is_dir() {
             if self.s.recursive {
-                self.handle_dir(path);
-            } else {
-                self.warnx(m::IS_DIRECTORY, &[path]);
+                return self.handle_dir(&path);
             }
-            return;
+            self.warnx(m::IS_DIRECTORY, &[&path]);
+            return Ok(());
         }
         if sb.is_file() {
-            self.handle_file(path, &sb);
+            self.handle_file(&path, &sb)?;
         } else {
-            self.warnx(m::NOT_REGULAR, &[path]);
+            self.warnx(m::NOT_REGULAR, &[&path]);
         }
+        Ok(())
     }
 
     /// `handle_dir`: `fts_open(FTS_PHYSICAL | FTS_NOCHDIR)` with no
@@ -278,21 +343,24 @@ impl Gz<'_> {
     /// is `PATH/NAME` with the root as given. Only regular files are
     /// compressed; symbolic links (the root's too) and other files are
     /// skipped without a word.
-    fn handle_dir(&mut self, dir: &[u8]) {
+    fn handle_dir(&mut self, dir: &[u8]) -> Result<(), Fatal> {
         match fs::symlink_metadata(self.host.path(dir)) {
             Ok(md) if md.is_dir() => self.walk(dir),
-            Ok(_) => {}
-            Err(e) => self.warn(m::PATH_ONLY, &[dir], &e),
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.warn(m::PATH_ONLY, &[dir], &e);
+                Ok(())
+            }
         }
     }
 
-    fn walk(&mut self, dir: &[u8]) {
+    fn walk(&mut self, dir: &[u8]) -> Result<(), Fatal> {
         let rd = match fs::read_dir(self.host.path(dir)) {
             Ok(rd) => rd,
             Err(e) => {
                 // FTS_DNR: `warn("%s", path)`.
                 self.warn(m::PATH_ONLY, &[dir], &e);
-                return;
+                return Ok(());
             }
         };
         let mut entries: Vec<(Vec<u8>, io::Result<Metadata>)> = Vec::new();
@@ -312,25 +380,44 @@ impl Gz<'_> {
             let mut child = dir.to_vec();
             child.push(b'/');
             child.extend_from_slice(&entry);
+            // `while (errno = 0, (entry = fts_read(fts)))`.
+            self.errno = 0;
             match md {
                 Err(e) => self.warn(m::PATH_ONLY, &[&child], &e),
-                Ok(md) if md.is_dir() => self.walk(&child),
-                Ok(md) if md.is_file() => self.handle_file(&child, &md),
+                Ok(md) if md.is_dir() => self.walk(&child)?,
+                Ok(md) if md.is_file() => self.handle_file(&child, &md)?,
                 Ok(_) => {}
             }
         }
+        Ok(())
     }
 
-    /// `handle_file`, compressing: then `-v`'s line, with the size `sb`
-    /// gave and the bytes written.
-    fn handle_file(&mut self, file: &[u8], sb: &Metadata) {
+    /// `handle_file`: compress or decompress, then `-v`'s line (the test
+    /// verdict under `-t`), with the size `sb` gave.
+    fn handle_file(&mut self, file: &[u8], sb: &Metadata) -> Result<(), Fatal> {
+        if self.s.decompress {
+            let mut outfile = Vec::new();
+            let usize = self.file_uncompress(file, &mut outfile)?;
+            if self.s.verbose && self.s.test {
+                self.print_test(file, usize.is_some());
+            }
+            if let Some(usize) = usize
+                && self.s.verbose
+                && !self.s.test
+            {
+                let nfile = (!self.s.to_stdout).then_some(outfile.as_slice());
+                self.print_verbage(Some(file), nfile, usize, sb.len());
+            }
+            return Ok(());
+        }
         let Some((outfile, gsize)) = self.file_compress(file) else {
-            return;
+            return Ok(());
         };
         if self.s.verbose {
             let nfile = (!self.s.to_stdout).then_some(outfile.as_slice());
             self.print_verbage(Some(file), nfile, sb.len(), gsize);
         }
+        Ok(())
     }
 
     /// `file_compress`: `Some((outfile, bytes written))`, or `None` where
@@ -453,7 +540,7 @@ impl Gz<'_> {
         }
         #[cfg(target_os = "macos")]
         apple_copy_attributes(&input, &fd);
-        self.copymodes(&fd, &isb, &outfile);
+        self.copymodes(&fd, &isb, None, &outfile);
         drop(input);
         self.unlink_input(&path, &isb, &out_path);
         Some((outfile, size))
@@ -486,8 +573,12 @@ impl Gz<'_> {
     /// fails; stuffr leaves it until the new output replaces it (Ruling
     /// T8-4/T8-5, carried over).
     fn check_outfile(&mut self, outfile: &[u8], out_path: &Path, isb: &Metadata) -> Option<bool> {
-        let Ok(osb) = fs::metadata(out_path) else {
-            return Some(false);
+        let osb = match fs::metadata(out_path) {
+            Ok(osb) => osb,
+            Err(e) => {
+                self.set_errno(&e);
+                return Some(false);
+            }
         };
         let is_input = same_file(&osb, isb);
         let unlink = |p: &Path| {
@@ -554,8 +645,10 @@ impl Gz<'_> {
     /// `copymodes`: owner (a refused `fchown` drops the set-id bits), then
     /// the set-id and permission bits (never the sticky bit), the access
     /// and modification times, and the file flags if the input has any, on
-    /// the output's descriptor.
-    fn copymodes(&mut self, fd: &File, isb: &Metadata, outfile: &[u8]) {
+    /// the output's descriptor. `mtime` replaces the modification time's
+    /// seconds (`-N`'s stored time: `isb.st_mtime = timestamp`, the
+    /// nanoseconds kept).
+    fn copymodes(&mut self, fd: &File, isb: &Metadata, mtime: Option<i64>, outfile: &[u8]) {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -583,7 +676,7 @@ impl Gz<'_> {
                     tv_nsec: isb.atime_nsec() as _,
                 },
                 libc::timespec {
-                    tv_sec: isb.mtime() as libc::time_t,
+                    tv_sec: mtime.unwrap_or(isb.mtime()) as libc::time_t,
                     tv_nsec: isb.mtime_nsec() as _,
                 },
             ];
@@ -594,7 +687,7 @@ impl Gz<'_> {
             }
         }
         #[cfg(not(unix))]
-        let _ = (fd, isb, outfile);
+        let _ = (fd, isb, mtime, outfile);
         #[cfg(target_os = "macos")]
         {
             use std::os::fd::AsRawFd;

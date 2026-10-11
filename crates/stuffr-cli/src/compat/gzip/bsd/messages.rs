@@ -14,8 +14,7 @@
 //! their first line (Ruling T9-1, as bzip2's `--version` does); the rest of
 //! `-L` is Apple's notice, which `LICENSE-gzip-bsd` carries. The usage
 //! text, which `-h` and every option error print, keeps Apple's version
-//! line byte for byte. [`DECOMPRESS_NOT_BUILT`] is stuffr's own, for the
-//! part a later task builds.
+//! line byte for byte.
 
 pub(super) use crate::compat::host::printf;
 
@@ -237,14 +236,236 @@ pub(super) const RATIO: &str = "%s%%";
 /// `print_verbage`: the output's name, when not `-c`.
 pub(super) const REPLACED_WITH: &str = " -- replaced with %s";
 
-// ---- stuffr's own ----
+// ---- handle_pathname (decompressing), handle_stdin ----
 
-/// stuffr's own: the BSD personality's decompression, `-t` and `-l` are
-/// built by a later task.
-pub(super) const DECOMPRESS_NOT_BUILT: &str = concat!(
-    "%s: decompression, -t and -l are not built yet ",
-    "in stuffr's BSD personality\n"
-);
+/// `handle_stdin`, without `-f` or `-l`.
+pub(super) const STDIN_IS_TERMINAL: &str = "standard input is a terminal -- ignoring";
+
+/// `handle_stdin`: `fstat(STDIN_FILENO)` failed.
+pub(super) const FSTAT: &str = "fstat";
+
+/// `handle_stdin`: the first four bytes could not be read.
+pub(super) const CANT_READ_STDIN: &str = "can't read stdin";
+
+/// `handle_stdin`: fewer than four bytes.
+pub(super) const STDIN_UNEXPECTED_EOF: &str = "(stdin): unexpected end of file";
+
+/// `handle_stdin`: not a format `file_gettype` knows, without `-f`.
+pub(super) const UNKNOWN_FORMAT: &str = "unknown compression format";
+
+/// `handle_stdin`, `handle_stdin`'s `print_list` and `print_test`: the
+/// name standard input goes by (`infile_set("(stdin)", ...)`).
+pub(super) const STDIN_NAME: &str = "(stdin)";
+
+// ---- file_uncompress ----
+
+/// `file_uncompress`: `fstat` of the input failed.
+pub(super) const CANT_STAT_FILE: &str = "can't stat %s";
+
+/// `file_uncompress`: no suffix of the table, and neither `-c` nor `-l`.
+pub(super) const UNKNOWN_SUFFIX: &str = "%s: unknown suffix -- ignored";
+
+/// `file_uncompress`: reading the first four bytes failed.
+pub(super) const CANT_READ: &str = "can't read %s";
+
+/// `file_uncompress` (`unexpected_EOF`) and `gz_uncompress`.
+pub(super) const UNEXPECTED_EOF: &str = "%s: unexpected end of file";
+
+/// `file_uncompress`: not a format `file_gettype` knows, without `-f`.
+pub(super) const NOT_IN_GZIP_FORMAT: &str = "%s: not in gzip format";
+
+/// `file_uncompress`: more than one link without `-f` or `-l` (`%ju`,
+/// never singular, unlike `file_compress`'s).
+pub(super) const HAS_LINKS_UNCOMPRESS: &str = "%s has %s other links -- skipping";
+
+/// `file_uncompress`: the exclusive create of the output failed.
+pub(super) const CANT_OPEN_OUTPUT: &str = "can't open %s";
+
+/// `file_uncompress`, under `-l`.
+pub(super) const NO_L_BZIP2: &str = "no -l with bzip2 files";
+
+/// `file_uncompress`, under `-l`.
+pub(super) const NO_L_COMPRESS: &str = "no -l with Lempel-Ziv files";
+
+/// `file_uncompress`, under `-l`.
+pub(super) const NO_L_PACK: &str = "no -l with packed files";
+
+/// `file_uncompress`, under `-l`.
+pub(super) const NO_L_LZIP: &str = "no -l with lzip files";
+
+/// `file_uncompress`, under `-l` with `-f`.
+pub(super) const NO_L_UNKNOWN: &str = "no -l for unknown filetypes";
+
+/// `file_uncompress`: the `.Z` decoder's stream reported an error
+/// (`ferror(in)`; `errno` is `zread`'s `EFTYPE`).
+pub(super) const FAILED_INFILE: &str = "failed infile";
+
+/// `file_uncompress`: the decoder failed (`size == -1`).
+pub(super) const UNCOMPRESS_FAILED: &str = "%s: uncompress failed";
+
+/// `file_uncompress`: the output's size is not what was decoded.
+pub(super) const DIFFERENT_SIZE: &str = "stat gave different size: %s != %s (leaving original)";
+
+/// `file_uncompress`: the finished output could not be opened again.
+pub(super) const COULDNT_OPEN_LEAVING: &str = "couldn't open (leaving original): %s";
+
+// ---- gz_uncompress ----
+
+/// `gz_uncompress`: `read` failed.
+pub(super) const FAILED_TO_READ: &str = "failed to read stdin";
+
+/// `gz_uncompress`: a byte other than `1f` where a member would start.
+pub(super) const TRAILING_GARBAGE: &str = "%s: trailing garbage ignored";
+
+/// `gz_uncompress`: `1f` and then neither `8b` nor `9e`.
+pub(super) const NOT_GZIPED_MAGIC1: &str = "input not gziped (MAGIC1)";
+
+/// `gz_uncompress`: CM is not 8.
+pub(super) const UNKNOWN_METHOD: &str = "unknown compression method";
+
+/// `gz_uncompress`: `inflate` returned `Z_DATA_ERROR`.
+pub(super) const DATA_STREAM_ERROR: &str = "data stream error";
+
+/// `gz_uncompress`: `write` of the output failed.
+pub(super) const ERROR_WRITING: &str = "error writing to output";
+
+/// `gz_uncompress`: the input ended inside CRC32 or ISIZE.
+pub(super) const TRUNCATED_INPUT: &str = "truncated input";
+
+/// `gz_uncompress`.
+pub(super) const CRC_ERROR: &str = "invalid compressed data--crc error";
+
+/// `gz_uncompress`.
+pub(super) const LENGTH_ERROR: &str = "invalid compressed data--length error";
+
+// ---- cat_fd ----
+
+/// `cat_fd`: `write` to standard output failed.
+pub(super) const WRITE_TO_STDOUT: &str = "write to stdout";
+
+/// `cat_fd`: `read` failed; `%s` is the descriptor's number.
+pub(super) const READ_FROM_FD: &str = "read from fd %s";
+
+// ---- unbzip2 (each `maybe_errx`/`maybe_err` ends the run, exit 2) ----
+
+/// `unbzip2`: the input ended inside a stream.
+pub(super) const BZ_TRUNCATED: &str = "truncated file";
+
+/// `unbzip2`: `read` failed (`maybe_err`).
+pub(super) const BZ_READ: &str = "read";
+
+/// `unbzip2`: `write` failed (`maybe_err`).
+pub(super) const BZ_WRITE: &str = "write";
+
+/// `unbzip2`: `BZ_DATA_ERROR` (a warning; the file fails).
+pub(super) const BZ_DATA_ERROR: &str = "bzip2 data integrity error";
+
+/// `unbzip2`: `BZ_DATA_ERROR_MAGIC` (a warning; the file fails).
+pub(super) const BZ_MAGIC_ERROR: &str = "bzip2 magic number error";
+
+/// `unbzip2`: `BZ_MEM_ERROR` (a warning; the file fails).
+pub(super) const BZ_MEMORY: &str = "bzip2 out of memory";
+
+/// `unbzip2`: any other result (a warning; the file fails).
+pub(super) const BZ_UNKNOWN: &str = "unknown bzip2 error: %s";
+
+// ---- unxz (`maybe_errx`/`maybe_err`: exit 2) ----
+
+/// `unxz`: `read` failed (`maybe_err`).
+pub(super) const XZ_READ_FAILED: &str = "read failed";
+
+/// `unxz`: `lzma_stream_decoder` failed with the `lzma_ret` given.
+#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // liblzma's, the C tier
+pub(super) const XZ_CANT_INITIALIZE: &str = "Can't initialize decoder (%s)";
+
+/// `unxz`: `LZMA_FORMAT_ERROR`.
+#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // liblzma's, the C tier
+pub(super) const XZ_FORMAT: &str = "File format not recognized";
+
+/// `unxz`: any other `lzma_ret`.
+#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // liblzma's, the C tier
+pub(super) const XZ_UNKNOWN: &str = "Unknown error (%s)";
+
+/// `unxz`: the first `lzma_code`, on the stream header, failed with the
+/// `lzma_ret` given.
+pub(super) const XZ_CANT_READ_HEADERS: &str = "Can't read headers (%s)";
+
+/// `unxz`: `write` failed (`maybe_err`).
+pub(super) const XZ_WRITE_FAILED: &str = "write failed";
+
+/// `unxz`: `LZMA_OPTIONS_ERROR`.
+#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // liblzma's, the C tier
+pub(super) const XZ_OPTIONS: &str = "Unsupported compression options";
+
+/// `unxz`: `LZMA_DATA_ERROR`, and bytes after the last stream.
+pub(super) const XZ_CORRUPT: &str = "File is corrupt";
+
+/// `unxz`: `LZMA_BUF_ERROR`.
+pub(super) const XZ_UNEXPECTED_END: &str = "Unexpected end of input";
+
+/// `unxz`: `LZMA_MEMLIMIT_ERROR`.
+#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // liblzma's, the C tier
+pub(super) const XZ_MEMLIMIT: &str = "Reached memory limit";
+
+// ---- unpack (`maybe_errx`/`maybe_err`: exit 2) ----
+
+/// `unpack_parse_header`: the level count is 0 or more than 24.
+pub(super) const PACK_INSANE_LEVELS: &str = "Huffman tree has insane levels";
+
+/// `unpack_parse_header`: the input ended in the level counts
+/// (`maybe_err`: `errno` is whatever the last failed call left).
+pub(super) const PACK_TRUNCATED: &str = "File appears to be truncated";
+
+/// `unpack_parse_header`: more than 256 symbols.
+pub(super) const PACK_BAD_TABLE: &str = "Bad symbol table";
+
+/// `unpack_parse_header`: the input ended in the symbol table.
+pub(super) const PACK_TABLE_TRUNCATED: &str = "Symbol table truncated";
+
+/// `unpack_decode`: a code past the tree.
+pub(super) const PACK_CORRUPT: &str = "File corrupt";
+
+/// `unpack_decode`: the input ended before the length was reached.
+pub(super) const PACK_PREMATURE_EOF: &str = "Premature EOF";
+
+// ---- print_test ----
+
+/// `print_test`: the name, [`TABS_SHORT`] or [`TAB_LONG`], two spaces and
+/// the verdict.
+pub(super) const TEST_LINE: &str = "%s:%s  %s\n";
+
+/// `print_test`.
+pub(super) const OK: &str = "OK";
+
+/// `print_test`.
+pub(super) const NOT_OK: &str = "NOT OK";
+
+// ---- print_list, print_list_out (standard output) ----
+
+/// `print_list`, first call, with `-v` (even under `-q`): no newline.
+pub(super) const LIST_VERBOSE_HEADER: &str = "method  crc     date  time  ";
+
+/// `print_list`, first call, unless `-q`.
+pub(super) const LIST_HEADER: &str = "  compressed uncompressed  ratio uncompressed_name\n";
+
+/// `print_list`: the last eight bytes could not be read.
+pub(super) const READ_OF_SIZE: &str = "read of uncompressed size";
+
+/// `print_list`, the totals line under `-v`.
+pub(super) const LIST_VERBOSE_TOTALS: &str = "                            ";
+
+/// `print_list` under `-v`: `"%5s %08x %11s "` of `"defla"`, the CRC and
+/// `ctime`'s month, day and time.
+pub(super) const LIST_VERBOSE_ROW: &str = "defla %s %s ";
+
+/// `print_list_out`: `"%12llu %12llu "`, the ratio, the name.
+pub(super) const LIST_ROW: &str = "%s %s ";
+
+/// `print_list_out`, after the ratio.
+pub(super) const LIST_NAME: &str = " %s\n";
+
+/// `main`: the totals line's name.
+pub(super) const TOTALS: &str = "(totals)";
 
 #[cfg(test)]
 mod tests {

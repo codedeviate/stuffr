@@ -31,8 +31,11 @@ use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
 mod bsd;
 mod gnu;
-// `after_member` and parts of the sniffer (`ZipEntry::data`, the BSD table's
-// codecs) are the BSD personality's, which a later task wires in.
+// Some of the member layer and the sniffer is used by neither personality
+// outside tests: `read_header`, `after_member` and `MemberInfo`'s sizes
+// (GNU reads with `read_header_with`; Apple's `gz_uncompress` is a
+// byte-at-a-time state machine of its own, `bsd/run/decompress.rs`),
+// `ZipEntry::data` and `Detected::Lzh` (GNU's zip and LZH paths).
 #[allow(dead_code)]
 pub(crate) mod member;
 #[allow(dead_code)]

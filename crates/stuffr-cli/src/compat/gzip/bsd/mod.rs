@@ -52,6 +52,42 @@
 //! - `-v`'s ratio is `print_ratio`'s integer arithmetic (`-99.9%` for an
 //!   output more than twice the input).
 //!
+//! Decompressing (`run/decompress.rs`, Task 10):
+//!
+//! - gzip, `.Z`, `.bz2`, `.xz`, pack and lzip are read (`file_gettype`;
+//!   lzip's first member only), anything else is "not in gzip format" (or
+//!   with `-f` copied to standard output, even when the output is a file,
+//!   which then has the wrong size and is removed);
+//! - a gzip member is read byte by byte as Apple's state machine reads it:
+//!   the old `1f 9e` magic in any member, reserved flags ignored, FHCRC
+//!   skipped unchecked; any byte other than `1f` after a member, NULs too,
+//!   is "trailing garbage ignored", exit 2;
+//! - only whole 64 KiB buffers of a member reach the output before a
+//!   failure (so nothing of a short one); a CRC error comes after the data
+//!   and adds "uncompress failed";
+//! - a gzip failure is a warning (exit 1, the output removed, the run goes
+//!   on); a failure in `.bz2`, `.xz` or pack data, and a `.bz2` cut short,
+//!   ends the run with exit 2 (`maybe_errx`), keeping what was written in
+//!   a 0600 output file; `.Z` and lzip failures say "failed infile" or
+//!   "uncompress failed";
+//! - `-t` writes the decoded data of `.xz`, pack and lzip to standard
+//!   output (their decoders do not look at `-t`);
+//! - `zcat` (not `gzcat`) adds `.Z` to an operand not ending in it, unless
+//!   `-f` or `COMMAND_MODE=legacy`;
+//! - a missing operand is retried with `.gz` (or `-S`'s) added, nothing
+//!   else;
+//! - `-N` reads the stored time at offset 4 and the name at offset 10
+//!   whatever FEXTRA says, keeps its last component in the input's
+//!   directory, and sets only the seconds of the output's time;
+//! - `-l` reads the last eight bytes of a gzip file (so the last member's
+//!   size and CRC, and 0 for a pipe), decodes nothing, and refuses every
+//!   other format but `.xz`, whose line has no header and no part in the
+//!   totals; `-lt` lists, then tests from where the list left the file
+//!   (its end), so it always passes;
+//! - "File appears to be truncated" (pack) carries whatever `errno` the
+//!   last failed call left: `ENOENT` from the output's `stat`, `ENOTTY`
+//!   from standard input's `isatty`, 0 otherwise.
+//!
 //! Known deviations:
 //!
 //! - `-V` and `-L` name stuffr on their first line (Ruling T9-1).
@@ -77,8 +113,30 @@
 //!   stdin" or "write: Bad file descriptor"; the Rust runtime reopens a
 //!   closed standard descriptor on `/dev/null` before `main`, so stuffr
 //!   compresses an empty input, or writes to nowhere, and exits 0.
-//! - Decompression, `-t` and `-l` are not built yet (a later task): any
-//!   name or option that decompresses stops with a message, exit 1.
+//! - Implementer ruling: a stored name or `-S ''` naming the input itself
+//!   (Rulings T8-4/T8-5, carried over): gzip unlinks the input under `-f`
+//!   and decodes from the open file, so a failure loses it; stuffr prints
+//!   and exits the same and replaces the input only with a finished output.
+//!   A failure that ends the run (exit 2) leaves its partial output, as
+//!   gzip does, except over the input itself.
+//! - Implementer ruling, undefined behaviour not reproduced: a pack EOB
+//!   before the header's length (unpack.c outputs the byte past its
+//!   symbol table and goes on) stops with "Premature EOF", exit 2; a pack
+//!   header shorter than seven bytes (unpack.c reads bytes it never set)
+//!   is "Huffman tree has insane levels", what the binary was seen to say;
+//!   `-N` on a 10-byte file (an unset name) restores no name; `-v` on a
+//!   piped pack (an uninitialised byte count) counts from 0.
+//! - `.Z` from standard input goes through stdio's `stdout` in gzip, so it
+//!   reaches the output only at exit, after later operands' output; stuffr
+//!   writes it in order. The failed `fflush(stdout)` check at exit is not
+//!   made.
+//! - Off the C tier (`xz-c`), `.xz` is decoded by stuffr's pure decoder:
+//!   the stream header is judged as liblzma judges it, but what a failing
+//!   stream outputs first, and whether a failure is "Unexpected end of
+//!   input" (taken as: met at the end of the input) or "File is corrupt",
+//!   can differ from liblzma's.
+//! - A sandboxed run (`run_in`) bounds what a decoder may hold: lzip's
+//!   dictionary buffer to the output budget, liblzma to 128 MiB.
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -86,8 +144,11 @@ use std::io::Write;
 use crate::compat::host::Host;
 
 mod args;
+mod list;
 mod messages;
 mod run;
+mod unlz;
+mod zread;
 
 /// Apple gzip's `main`, for the invoked `name`.
 pub(super) fn main(
@@ -101,11 +162,10 @@ pub(super) fn main(
         args::Parsed::Exit(code) => return code,
         args::Parsed::Run(s) => s,
     };
-    if s.decompress || s.list || s.test {
-        messages::printf(err, messages::DECOMPRESS_NOT_BUILT, &[name.as_bytes()]);
-        return 1;
-    }
-    run::execute(name, s, host, err)
+    // `zcat` (not `gzcat`) in Unix 2003 mode, which libc's `compat_mode`
+    // takes unless `COMMAND_MODE` is `legacy` in any case.
+    let legacy = env("COMMAND_MODE").is_some_and(|v| v.eq_ignore_ascii_case("legacy"));
+    run::execute(name, s, name == "zcat" && !legacy, host, err)
 }
 
 #[cfg(test)]
@@ -219,22 +279,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Decompression is a later task's; until then it says so, exit 1,
-    /// after the options are parsed (so `gunzip -h` is still usage).
+    /// `-t` in the sandbox charges what it decodes to the output budget,
+    /// so a small bomb ends with the write error a full disk gives, and
+    /// "uncompress failed".
     #[test]
-    fn decompression_is_not_built_yet() {
-        let d = scratch("dec");
+    fn a_test_of_a_bomb_is_bounded() {
+        use std::io::Write;
+        let d = scratch("bomb");
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        e.write_all(&vec![0u8; 20 << 20]).unwrap();
+        std::fs::write(d.join("z.gz"), e.finish().unwrap()).unwrap();
         let none = |_: &str| None;
-        let (code, _, err) = run_in(Flavour::Bsd, &d, "gunzip", &[], b"", &none);
+        let (code, out, err) = run_in(Flavour::Bsd, &d, "gzip", &args(&["-t", "z.gz"]), b"", &none);
         assert_eq!(code, 1);
-        assert!(
-            String::from_utf8(err)
-                .unwrap()
-                .starts_with("gunzip: decompression")
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "gzip: error writing to output: No space left on device\ngzip: z.gz: uncompress failed\n"
         );
-        let (code, _, err) = run_in(Flavour::Bsd, &d, "gunzip", &args(&["-h"]), b"", &none);
-        assert_eq!(code, 0);
-        assert!(String::from_utf8(err).unwrap().contains("usage: gunzip ["));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// lzip's dictionary buffer grows with what is decoded; in the sandbox
+    /// it stops at the output budget whatever the header claims (here 512
+    /// MiB), and the member fails.
+    #[test]
+    fn an_lzip_dictionary_is_bounded_in_the_sandbox() {
+        let d = scratch("lzdict");
+        let codec = stuffr::registry()
+            .codec(stuffr::FormatId::new("lzip"))
+            .unwrap();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = codec
+            .encoder(
+                Box::new(Shared(buf.clone())),
+                &stuffr::EncodeOpts::default(),
+            )
+            .unwrap();
+        sink.write_all(&vec![7u8; 12 << 20]).unwrap();
+        sink.finish().unwrap();
+        let mut lz = buf.lock().unwrap().clone();
+        lz[5] = 29; // a 512 MiB dictionary
+        std::fs::write(d.join("z.lz"), lz).unwrap();
+        let none = |_: &str| None;
+        let (code, out, err) = run_in(
+            Flavour::Bsd,
+            &d,
+            "gzip",
+            &args(&["-dc", "z.lz"]),
+            b"",
+            &none,
+        );
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "gzip: z.lz: uncompress failed\n"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }
