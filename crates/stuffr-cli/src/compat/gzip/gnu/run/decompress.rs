@@ -78,6 +78,21 @@ fn stored_base(name: &[u8]) -> &[u8] {
     }
 }
 
+/// The longest path `-N` restores, the operand's directory part and the
+/// whole stored name together, less one (observed with GNU 1.15 under
+/// `-dN` and `-lN`: a stored name of 1023 bytes is used for `n.gz` and
+/// 1024 refused; 1021/1022 for `./n.gz`, 1019/1020 for `sub/n.gz`; a
+/// 1204-byte `d/d/.../base` is refused although its last component is
+/// short).
+const MAX_PATH_LEN: usize = 1024;
+
+/// Whether `-N` must refuse `h`'s stored name for an operand whose
+/// directory part is `dir`: "corrupted input -- file name too large".
+fn name_too_large(dir: &[u8], h: Option<&Header>) -> bool {
+    h.and_then(|h| h.name.as_deref())
+        .is_some_and(|n| dir.len() + n.len() >= MAX_PATH_LEN)
+}
+
 /// The operand's directory part, `/` included (empty for a bare name).
 fn dir_part(name: &[u8]) -> &[u8] {
     match name.iter().rposition(|&b| b == b'/') {
@@ -264,6 +279,15 @@ impl Gz<'_> {
                 return if named.is_none() { Err(Stop) } else { step };
             }
         };
+        if mode == Mode::List
+            && self.s.restore
+            && name_too_large(
+                named.as_ref().map_or(b"", |n| dir_part(n.operand)),
+                opened.header.as_ref(),
+            )
+        {
+            return self.refused(Fail::NameTooLarge, qname, m::STDOUT_NAME);
+        }
         let header = opened.header.clone();
         if named.is_some() && self.s.verbose > 0 && mode != Mode::List {
             self.say(m::VERBOSE_NAME, &[qname]);
@@ -384,6 +408,9 @@ impl Gz<'_> {
             Ok(o) => o,
             Err(f) => return self.refused(f, &qname, b""),
         };
+        if self.s.restore && name_too_large(dir_part(name), opened.header.as_ref()) {
+            return self.refused(Fail::NameTooLarge, &qname, b"");
+        }
         let out_name = self.output_name(name, Some(suffix), opened.header.as_ref());
         let qout = quote(&out_name);
         let out_path = self.host.path(&out_name);
@@ -559,6 +586,7 @@ impl Gz<'_> {
             Fail::PackFew => self.error(m::PACK_FEW, &[p, qname]),
             Fail::PackMany => self.error(m::PACK_MANY, &[p, qname]),
             Fail::PackBitLength => self.error(m::PACK_BIT_LENGTH, &[p, qname]),
+            Fail::NameTooLarge => self.error(m::NAME_TOO_LARGE, &[p, qname]),
             Fail::Read(e) => self.error(m::IO_FAILED, &[p, qname, &strerror(e)]),
             Fail::Write(e) => self.error(m::IO_FAILED, &[p, qout, &strerror(e)]),
         }

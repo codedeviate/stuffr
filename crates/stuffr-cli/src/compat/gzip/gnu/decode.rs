@@ -119,6 +119,9 @@ pub(super) enum Fail {
     PackFew,
     PackMany,
     PackBitLength,
+    /// Under `-N`, a stored name too long to restore (judged by the
+    /// caller, which knows the operand's directory).
+    NameTooLarge,
     Read(io::Error),
     Write(io::Error),
 }
@@ -128,7 +131,10 @@ impl Fail {
     /// Observed with a good file after each: truncation, a corrupt body or
     /// header CRC, a corrupt `.Z` and every pack failure always stop; a
     /// CRC or length error stops `-d` (and `-dc`) but not `-t` or `-l`;
-    /// header-stage refusals never do.
+    /// header-stage refusals never do, except a stored name too long for
+    /// `-N` (observed: `gzip -dN n.gz g.gz` and `gzip -lN g.gz n.gz`, with
+    /// a 1024-byte name in `n.gz`, leave `g.gz` alone and print no
+    /// totals).
     pub(super) fn fatal(&self, decompressing: bool) -> bool {
         match self {
             Fail::Eof
@@ -138,6 +144,7 @@ impl Fail {
             | Fail::PackMany
             | Fail::PackBitLength
             | Fail::PackLength
+            | Fail::NameTooLarge
             | Fail::Read(_)
             | Fail::Write(_) => true,
             Fail::Crc | Fail::Length | Fail::CrcLength => decompressing,
@@ -193,6 +200,19 @@ pub(super) struct Done {
     /// else 0 (observed: a two-member file's ratio counts every byte, and
     /// so does a member followed by zeros).
     pub(super) header_bytes: u64,
+}
+
+/// GNU's input buffer: what `-v` and `-l` count of a header longer than it.
+const INBUF: u64 = 256 * 1024;
+
+/// The part of a `len`-byte first header that `-v` and `-l` subtract: all
+/// of it up to [`INBUF`] bytes, then only what lies in the last buffer's
+/// worth, `(len - 1) % INBUF + 1` (observed with GNU 1.15's `-l` ratios
+/// over stored names of up to 1.5 MiB: a 262,144-byte header counts
+/// 262,144, a 262,145-byte one 1, a 600,011-byte one 75,723; the same from
+/// a file and from a pipe written 1,000 or 65,536 bytes at a time).
+fn counted_header(len: u64) -> u64 {
+    if len == 0 { 0 } else { (len - 1) % INBUF + 1 }
 }
 
 fn read_fail(e: io::Error) -> Fail {
@@ -361,7 +381,7 @@ pub(super) fn finish<R: Read + Send + 'static>(
         failed: false,
     };
     let first_kind = o.kind;
-    let first_len = o.header.as_ref().map_or(0, |h| h.len);
+    let first_len = o.header.as_ref().map_or(0, |h| counted_header(h.len));
     progress.header_bytes = if first_kind == Kind::Gzip {
         first_len + 8
     } else {

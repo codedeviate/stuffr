@@ -10,9 +10,13 @@
 
 use std::io::{self, BufRead, Read, Write};
 
-/// Longest FNAME/FCOMMENT accepted. A longer one is reported as
-/// `Truncated(Header)`; what each reference does with such names is pinned by
-/// the differential suites, not decided here.
+/// Longest FNAME/FCOMMENT kept. A longer one is read to its NUL (both
+/// references decode such a member: observed with GNU 1.15 and Apple
+/// 487.0.1 on a 1.5 MiB FNAME and FCOMMENT under `-dc`, `-t` and `-l`), but
+/// only its first `MAX_FIELD` bytes are stored, so memory stays bounded;
+/// the rest still counts toward the header's length and FHCRC. What each
+/// personality does with a long name (GNU's `-N` refuses one past 1023
+/// bytes) is decided there.
 pub(crate) const MAX_FIELD: usize = 1 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,18 +120,31 @@ impl HeaderReader<'_> {
         Ok(v)
     }
 
-    /// A NUL-terminated field, without the NUL. Capped at [`MAX_FIELD`].
+    /// A NUL-terminated field, without the NUL: its first [`MAX_FIELD`]
+    /// bytes, the rest read (counted and summed) but not kept.
     fn cstr(&mut self) -> Result<Vec<u8>, MemberError> {
         let mut out = Vec::new();
         loop {
-            let b = self.bytes(1)?[0];
-            if b == 0 {
-                return Ok(out);
-            }
-            if out.len() >= MAX_FIELD {
+            let buf = loop {
+                match self.r.fill_buf() {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    other => break other.map_err(MemberError::Io)?,
+                }
+            };
+            if buf.is_empty() {
                 return Err(MemberError::Fault(Fault::Truncated(Where::Header)));
             }
-            out.push(b);
+            let nul = buf.iter().position(|&b| b == 0);
+            let n = nul.map_or(buf.len(), |i| i + 1);
+            let field = &buf[..nul.unwrap_or(n)];
+            let room = MAX_FIELD - out.len();
+            out.extend_from_slice(&field[..field.len().min(room)]);
+            self.crc.update(&buf[..n]);
+            self.len += n as u64;
+            self.r.consume(n);
+            if nul.is_some() {
+                return Ok(out);
+            }
         }
     }
 }
@@ -818,8 +835,61 @@ mod tests {
         assert_eq!(out, data);
     }
 
+    /// Final review, item 2: a field longer than `MAX_FIELD` is read to
+    /// its NUL and kept to `MAX_FIELD` bytes; the header's length and FHCRC
+    /// cover every byte, and the body after it decodes.
     #[test]
-    fn fname_is_bounded() {
+    fn a_long_field_is_kept_to_its_first_max_field_bytes() {
+        let data = b"payload\n";
+        let mut b = vec![0x1f, 0x8b, 8, 8 | 16 | 2, 0, 0, 0, 0, 0, 3];
+        b.extend((0..MAX_FIELD + 10).map(|i| b'a' + (i % 26) as u8));
+        b.push(0);
+        b.extend(std::iter::repeat_n(b'c', 2 * MAX_FIELD + 3));
+        b.push(0);
+        let mut crc = flate2::Crc::new();
+        crc.update(&b);
+        b.extend_from_slice(&((crc.sum() & 0xffff) as u16).to_le_bytes());
+        let header_len = b.len() as u64;
+        let mut e = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::new(6));
+        e.write_all(data).unwrap();
+        b.extend(e.finish().unwrap());
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        b.extend_from_slice(&crc.sum().to_le_bytes());
+        b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        // Fed one byte per read, too, so the field spans every boundary.
+        for one_byte in [false, true] {
+            let src: Box<dyn Read> = if one_byte {
+                Box::new(Trickle(&b[..]))
+            } else {
+                Box::new(&b[..])
+            };
+            let mut r = Lookahead::new(src);
+            let h = read_header(&mut r).expect("header");
+            let name = h.name.as_deref().unwrap();
+            assert_eq!(name.len(), MAX_FIELD);
+            assert_eq!(&name[..3], b"abc");
+            assert_eq!(h.comment.as_deref().unwrap(), &vec![b'c'; MAX_FIELD][..]);
+            assert_eq!(h.len, header_len);
+            let mut out = Vec::new();
+            inflate_member(&mut r, h, &mut out).expect("body");
+            assert_eq!(out, data);
+        }
+    }
+
+    /// One byte per read.
+    struct Trickle<'a>(&'a [u8]);
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.len().min(buf.len()).min(1);
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_field_without_its_nul_is_cut_short() {
         let mut b = vec![0x1f, 0x8b, 8, 8, 0, 0, 0, 0, 0, 3];
         b.extend(std::iter::repeat_n(b'a', MAX_FIELD + 10));
         let mut r = la(&b[..]);

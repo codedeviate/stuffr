@@ -288,6 +288,10 @@ pub(super) const LENGTH_ERROR: &str = "\n%s: %s: invalid compressed data--length
 /// cut short.
 pub(super) const CRC_LENGTH_ERROR: &str = "\n%s: %s: invalid compressed data--crc/length error\n";
 
+/// Observed: `gzip -dN n.gz` and `gzip -lN n.gz` where `n.gz` stores a
+/// 1024-byte name (the run stops there; `-dNc` and `-tN` do not look).
+pub(super) const NAME_TOO_LARGE: &str = "\n%s: %s: corrupted input -- file name too large\n";
+
 /// Observed: `gzip -dc` on a corrupt deflate body (the run stops there).
 pub(super) const FORMAT_VIOLATED: &str = "\n%s: %s: invalid compressed data--format violated\n";
 

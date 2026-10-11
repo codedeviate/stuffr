@@ -2082,4 +2082,64 @@ mod differential {
         }
         check_exact("odd_members", &cases, Skipped::none());
     }
+
+    /// Final review, item 2: Apple reads a stored name or comment of any
+    /// length (`gz_uncompress`'s state machine reads past them), and `-N`
+    /// takes the name from offset 10 into a `PATH_MAX` buffer. A 1.5 MiB
+    /// FNAME and FCOMMENT (with FHCRC) through `-d`, `-t`, `-l` and `-N`,
+    /// and stored names on either side of 1024 bytes.
+    #[test]
+    fn long_header_fields() {
+        let t = txt();
+        let big = vec![b'n'; 1536 * 1024];
+        let inputs = [
+            (
+                "name.gz",
+                member(Member {
+                    name: Some(&big),
+                    mtime: 1_234_567_890,
+                    ..plain_member(&t)
+                }),
+            ),
+            (
+                "comment.gz",
+                member(Member {
+                    name: Some(b"short"),
+                    comment: Some(&big),
+                    ..plain_member(&t)
+                }),
+            ),
+            (
+                "hcrc.gz",
+                member(Member {
+                    name: Some(&big),
+                    comment: Some(&big),
+                    hcrc: true,
+                    ..plain_member(&t)
+                }),
+            ),
+            ("n1023.gz", gzm(&t, &[b'n'; 1023])),
+            ("n1024.gz", gzm(&t, &[b'n'; 1024])),
+        ];
+        let mut cases = Vec::new();
+        for (file, bytes) in &inputs {
+            for args in [
+                &["-dc"][..],
+                &["-t"],
+                &["-tv"],
+                &["-l"],
+                &["-lv"],
+                &["-d"],
+                &["-dk"],
+                &["-dN"],
+                &["-dNv"],
+                &["-lN"],
+            ] {
+                let mut a = args.to_vec();
+                a.push(file);
+                cases.push(dz("gzip", &a, vec![(file, bytes.clone())]));
+            }
+        }
+        check_exact("long_header_fields", &cases, Skipped::none());
+    }
 }

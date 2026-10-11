@@ -40,7 +40,12 @@
 //!   members of any of the first three may follow one another;
 //! - a missing operand is looked for with a suffix added; `-N` restores the
 //!   stored name's last component only, beside the input, and the last
-//!   stored time;
+//!   stored time; a stored name that with the operand's directory part
+//!   reaches 1024 bytes is "corrupted input -- file name too large" under
+//!   `-N` to a file and `-lN` (the run ends), while `-dNc`, `-tN` and every
+//!   mode without `-N` read a stored name or comment of any length;
+//! - `-v` and `-l` subtract a first header longer than GNU's 256 KiB input
+//!   buffer only modulo that buffer (`decode::counted_header`);
 //! - which failures end the whole run (truncation, a corrupt body, a
 //!   corrupt `.Z`, any pack failure, and CRC or length errors under `-d`)
 //!   and which do not, and that standard input refused at its header ends

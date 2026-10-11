@@ -2109,6 +2109,137 @@ mod differential {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Final review, item 2: a stored name or comment of any length is
+    /// read (stuffr keeps its first MiB and skips the rest), so a 1.5 MiB
+    /// FNAME or FCOMMENT decodes, tests and lists as GNU's does. Where the
+    /// name is used (`-N` to a file, `-lN`), GNU refuses one whose length
+    /// plus the operand's directory part reaches 1024 bytes, "corrupted
+    /// input -- file name too large", and ends the run; the cases on
+    /// either side of that edge pin it (observed with GNU 1.15: 1023
+    /// passes and 1024 fails for `n.gz`, 1021/1022 for `./n.gz`, 1019/1020
+    /// for `sub/n.gz`; the whole stored name counts, not its last
+    /// component). Below the edge but past `NAME_MAX`, GNU truncates the
+    /// output name and stuffr does not (a documented difference), so those
+    /// lengths are only listed here.
+    #[test]
+    fn long_header_fields() {
+        let t = txt();
+        let big = vec![b'n'; 1536 * 1024];
+        let long_name = member(Member {
+            name: Some(&big),
+            mtime: 1_234_567_890,
+            ..plain_member(&t)
+        });
+        let long_comment = member(Member {
+            name: Some(b"short"),
+            comment: Some(&big),
+            ..plain_member(&t)
+        });
+        let both_hcrc = member(Member {
+            name: Some(&big),
+            comment: Some(&big),
+            hcrc: true,
+            ..plain_member(&t)
+        });
+        let mut cases = Vec::new();
+        for (file, bytes) in [
+            ("name.gz", &long_name),
+            ("comment.gz", &long_comment),
+            ("hcrc.gz", &both_hcrc),
+        ] {
+            for args in [
+                &["-dc"][..],
+                &["-t"],
+                &["-tv"],
+                &["-l"],
+                &["-lv"],
+                &["-d"],
+                &["-dk"],
+                &["-dN"],
+                &["-dNv"],
+                &["-dNc"],
+                &["-lN"],
+                &["-lNv"],
+            ] {
+                let mut a = args.to_vec();
+                a.push(file);
+                cases.push(dz("gzip", &a, vec![(file, bytes.clone())]));
+            }
+        }
+        // A header past GNU's 256 KiB input buffer: `-l` and `-v` count
+        // only its last buffer's worth (header lengths 262,144, 262,145
+        // and 600,011 bytes; the fixed part and the NUL are 11).
+        for len in [262_133, 262_134, 600_000] {
+            let stored = vec![b'n'; len];
+            let m = gzm(&t, &stored);
+            for args in [&["-l"][..], &["-lv"], &["-dv"], &["-dcv"]] {
+                let mut a = args.to_vec();
+                a.push("w.gz");
+                cases.push(dz("gzip", &a, vec![("w.gz", m.clone())]));
+            }
+            cases.push(fed(dz("gzip", &["-l"], vec![]), &m));
+        }
+        // The edge, and a whole stored name past it whose last component
+        // is short.
+        let good = gzm(&t, b"good");
+        let n = |len: usize| gzm(&t, &vec![b'n'; len]);
+        let deep = gzm(
+            &t,
+            &b"d/"
+                .repeat(600)
+                .into_iter()
+                .chain(*b"base")
+                .collect::<Vec<_>>(),
+        );
+        for (op, len, past) in [
+            ("n.gz", 1023, false),
+            ("n.gz", 1024, true),
+            ("./n.gz", 1021, false),
+            ("./n.gz", 1022, true),
+            ("sub/n.gz", 1019, false),
+            ("sub/n.gz", 1020, true),
+        ] {
+            let file = op.trim_start_matches("./");
+            let mut args: Vec<&[&str]> = vec![&["-lN"], &["-tN"], &["-dNc"]];
+            if past {
+                args.push(&["-dN"]);
+            }
+            for a in args {
+                let mut a = a.to_vec();
+                a.push(op);
+                cases.push(dz("gzip", &a, vec![(file, n(len))]));
+            }
+        }
+        for args in [&["-dN"][..], &["-lN"], &["-dNv"], &["-dNk"], &["-dNf"]] {
+            let mut a = args.to_vec();
+            a.push("n.gz");
+            cases.push(dz("gzip", &a, vec![("n.gz", deep.clone())]));
+        }
+        // The refusal ends the run, and under `-k` takes the last output.
+        for args in [
+            &["-dN", "n.gz", "g.gz"][..],
+            &["-lN", "n.gz", "g.gz"],
+            &["-lNv", "g.gz", "n.gz"],
+            &["-lN", "g.gz", "n.gz"],
+            &["-dNk", "g.gz", "n.gz"],
+            &["-dNv", "g.gz", "n.gz"],
+        ] {
+            cases.push(dz(
+                "gzip",
+                args,
+                vec![("n.gz", n(1024)), ("g.gz", good.clone())],
+            ));
+        }
+        cases.push(fed(dz("gzip", &["-lN"], vec![]), &n(1024)));
+        cases.push(fed(dz("gzip", &["-lN"], vec![]), &n(1023)));
+        cases.push(fed(dz("gzip", &["-dN"], vec![]), &n(1024)));
+        cases.push(fed(
+            dz("gzip", &["-lN", "-", "g.gz"], vec![("g.gz", good)]),
+            &n(1024),
+        ));
+        check_exact("long_header_fields", &cases, none_skipped());
+    }
+
     /// Review focus 5: an empty file, a member with an empty body, a member
     /// followed by an empty one, an empty one followed by a member, and a
     /// member with FEXTRA, FCOMMENT and FHCRC (also with a wrong FHCRC),
