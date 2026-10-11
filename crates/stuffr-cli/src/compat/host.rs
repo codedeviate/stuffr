@@ -39,12 +39,26 @@ pub(crate) fn reset_sigpipe() {
     }
 }
 
-/// The signals whose arrival removes an armed output (ruling R6). xz's
-/// signals.c also hooks SIGPIPE, SIGXCPU and SIGXFSZ; here those keep their
-/// default action (SIGPIPE as `reset_sigpipe` leaves it), so a run they kill
-/// leaves its temporary behind.
+/// The signals whose arrival removes an armed output: the six xz 5.8.4's
+/// signals.c `signals_init` hooks, in its order.
+///
+/// SIGPIPE: the Rust runtime starts every process with SIGPIPE ignored, and
+/// `install_handlers` (as signals.c) leaves an ignored signal alone, so a
+/// family calls `reset_sigpipe()` before arming; SIGPIPE then carries the
+/// cleanup handler like the rest. `reset_sigpipe` cannot tell the runtime's
+/// ignore from a parent's, so under a parent that ignores SIGPIPE stuffr
+/// still hooks it: where xz would see `EPIPE` and report a write error, a
+/// stuffr run removes its partial output and dies of SIGPIPE (the bzip2
+/// family's documented SIGPIPE deviation, in the same direction).
 #[cfg(unix)]
-const CLEANUP_SIGNALS: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+const CLEANUP_SIGNALS: [libc::c_int; 6] = [
+    libc::SIGINT,
+    libc::SIGTERM,
+    libc::SIGHUP,
+    libc::SIGPIPE,
+    libc::SIGXCPU,
+    libc::SIGXFSZ,
+];
 
 /// The slot's size: `PATH_MAX`, the terminating NUL included.
 #[cfg(unix)]
@@ -86,15 +100,16 @@ impl Drop for CleanupGuard {
     }
 }
 
-/// Arm the removal of `path`, the run's partial output, should SIGINT,
-/// SIGTERM or SIGHUP arrive before the guard drops; the signal is then
+/// Arm the removal of `path`, the run's partial output, should one of
+/// `CLEANUP_SIGNALS` arrive before the guard drops; the signal is then
 /// re-raised at its default action, so the process dies of it, as xz does
 /// (signals.c: `signal_handler`, `signals_exit`).
 ///
 /// The caller drops the guard right after a successful publish, and on every
 /// error path after removing the file itself. Under `Host::Sandbox` nothing
 /// is armed and no handler installed. A path the slot cannot hold (or one
-/// with a NUL) is not armed. Arming never allocates.
+/// with a NUL) is not armed. Arming never allocates. Call `reset_sigpipe()`
+/// first, or SIGPIPE stays ignored and unhooked (see `CLEANUP_SIGNALS`).
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "the xz family arms it; until then only tests")
@@ -147,8 +162,8 @@ fn install_handlers() {
     let handler = on_cleanup_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     // SAFETY: sigaction structs are plain data, zeroed then filled; a query
     // passes a null new action. The handler only makes async-signal-safe
-    // calls (`on_cleanup_signal`), and the mask blocks all three cleanup
-    // signals while it runs, so one handler never interrupts another.
+    // calls (`on_cleanup_signal`), and the mask blocks every cleanup
+    // signal while it runs, so one handler never interrupts another.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         libc::sigemptyset(&mut action.sa_mask);
@@ -939,8 +954,8 @@ mod tests {
     }
 
     /// The real path end to end, as xz's signals.c behaves: an armed run
-    /// that takes SIGINT, SIGTERM or SIGHUP loses its partial output and
-    /// dies of that same signal.
+    /// that takes any of the six signals xz hooks loses its partial output
+    /// and dies of that same signal.
     #[cfg(unix)]
     #[test]
     fn an_interrupt_removes_the_armed_file() {
@@ -981,6 +996,10 @@ mod tests {
         });
         let status = in_child(|| {
             default_dispositions();
+            // ARMED is inherited from the parent at fork, where another
+            // test may hold it; clear it so the check below sees only this
+            // arm.
+            ARMED.store(false, Ordering::SeqCst);
             let _guard = arm_cleanup(&host, &file);
             let mut all_default = !ARMED.load(Ordering::Acquire);
             for sig in CLEANUP_SIGNALS {
