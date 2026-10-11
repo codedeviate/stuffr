@@ -424,6 +424,24 @@ impl Gz<'_> {
             }
             return Some(true);
         }
+        // "Already exists" is the system's refusal to create a name that
+        // exists; any other refusal is said in the system's words (exit 1).
+        // The two differ for a name ending in `/` over a directory: macOS
+        // says EEXIST, Linux EISDIR (CI's 1.12: `gzip -dN s/in.gz` storing
+        // `/` says `gzip: s/: Is a directory`). So ask the system: an
+        // exclusive create of a name that exists creates nothing, and one
+        // that vanished meanwhile is removed again.
+        match File::options().write(true).create_new(true).open(out_path) {
+            Ok(_) => {
+                let _ = fs::remove_file(out_path);
+                return Some(false);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                self.error(m::IO_FAILED, &[PROGRAM, qout, &strerror(&e)]);
+                return None;
+            }
+        }
         self.say(m::ALREADY_EXISTS, &[PROGRAM, qout]);
         if self.host.stdin_is_tty() {
             self.say(m::ASK_OVERWRITE, &[]);

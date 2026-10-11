@@ -246,7 +246,10 @@ pub(super) const STDIN_NAME: &[u8] = b"stdin";
 /// The read or write error on a stream, in the shape of [`OPEN_FAILED`]:
 /// `gzip: stdin: …` or `gzip: NAME: …`. Observed for the unlink `-f`
 /// does first: `gzip -df a.gz` with a directory `a` says `gzip: a:
-/// Operation not permitted`, no leading newline. A full disk was not
+/// Operation not permitted`, no leading newline; and for an existing
+/// output the system refuses other than with EEXIST (observed on ubuntu's
+/// 1.12: `gzip -dN s/in.gz` storing `/` says `gzip: s/: Is a directory`,
+/// exit 1). A full disk was not
 /// reproduced; read and write errors take the same shape.
 pub(super) const IO_FAILED: &str = "%s: %s: %s\n";
 

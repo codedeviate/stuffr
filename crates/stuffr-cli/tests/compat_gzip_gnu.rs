@@ -1910,6 +1910,30 @@ mod differential {
         assert!(!Path::new(&escape).exists());
     }
 
+    /// A stored `/` names the output `s/`, the operand's own directory.
+    /// GNU says the system's refusal to create it exclusively: macOS's
+    /// EEXIST is "already exists" (exit 2), Linux's EISDIR for a name
+    /// ending in `/` is `Is a directory` (exit 1, CI's ubuntu). stuffr
+    /// once said "already exists" everywhere. Asserted on stuffr's side,
+    /// so it holds without a reference; nothing is written either way.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_slash_output_name_gets_the_systems_refusal() {
+        let m = member(Member {
+            name: Some(b"/"),
+            ..plain_member(b"payload\n")
+        });
+        let s = stuffr_as(&dz("gzip", &["-dN", "s/in.gz"], vec![("s/in.gz", m)]));
+        let want = if cfg!(target_os = "linux") {
+            (1, "gzip: s/: Is a directory\n")
+        } else {
+            (2, "gzip: s/ already exists;\tnot overwritten\n")
+        };
+        assert_eq!((s.code, s.stderr.as_str()), want);
+        let keys: Vec<&String> = s.tree.keys().collect();
+        assert_eq!(keys, ["s/", "s/in.gz"]);
+    }
+
     /// Ruling T8-4: under `-dNf`, a stored name equal to the input's own
     /// makes GNU replace the input with the output and then remove it, so
     /// both are lost. stuffr prints what GNU prints and exits as it does,
