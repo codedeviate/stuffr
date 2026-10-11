@@ -1990,6 +1990,71 @@ mod differential {
         assert_eq!(s.tree["a"].0, crc, "the data must survive unchanged");
     }
 
+    /// A member whose CRC32 and ISIZE are both wrong: GNU says the crc
+    /// error and then the length error, each its own `\n`-led line (exit
+    /// 1; the run ends under `-d`/`-dc` only, as for either alone). The
+    /// same for a zip entry whose local header has both wrong; a data
+    /// descriptor with both wrong stays one "crc/length error" line.
+    /// Also as the first of two members, and under `-k`, `-v`, `-l`.
+    #[test]
+    fn crc_and_length_both_wrong() {
+        let t = txt();
+        let both = member_with(plain_member(&t), Some(1), Some(99));
+        let good = gzm(b"good\n", b"g");
+        let multi = [both.clone(), good.clone()].concat();
+        let mut local = zip1(&t, 8, 0);
+        local[14..18].copy_from_slice(&1u32.to_le_bytes());
+        local[22..26].copy_from_slice(&99u32.to_le_bytes());
+        let mut cases = Vec::new();
+        for args in [
+            &["-d", "b.gz", "g.gz"][..],
+            &["-dv", "b.gz", "g.gz"],
+            &["-dc", "b.gz", "g.gz"],
+            &["-dk", "b.gz", "g.gz"],
+            &["-t", "b.gz", "g.gz"],
+            &["-tv", "b.gz", "g.gz"],
+            &["-l", "b.gz", "g.gz"],
+            &["-lv", "b.gz", "g.gz"],
+            &["-d", "m.gz"],
+            &["-dc", "m.gz"],
+            &["-t", "m.gz"],
+            &["-d", "z.gz"],
+            &["-dc", "z.gz"],
+            &["-t", "z.gz"],
+        ] {
+            cases.push(dz(
+                "gzip",
+                args,
+                vec![
+                    ("b.gz", both.clone()),
+                    ("g.gz", good.clone()),
+                    ("m.gz", multi.clone()),
+                    ("z.gz", local.clone()),
+                ],
+            ));
+        }
+        cases.push(fed(dz("zcat", &[], vec![]), &both));
+        let mut dd = zip1(&t, 8, 8);
+        let n = dd.len();
+        // The descriptor (signed) ends the local entry: CRC, sizes.
+        let at = (0..n - 3)
+            .rev()
+            .find(|&i| dd[i..i + 4] == *b"PK\x07\x08")
+            .unwrap();
+        dd[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
+        dd[at + 12..at + 16].copy_from_slice(&99u32.to_le_bytes());
+        // Data descriptors and `-l` on several members are 1.15's (survey
+        // rows 6 and 1).
+        let newer = vec![
+            dz("gzip", &["-dc", "dd.gz"], vec![("dd.gz", dd)]),
+            dz("gzip", &["-l", "m.gz"], vec![("m.gz", multi)]),
+        ];
+        let mut skipped = none_skipped();
+        let what = "a data descriptor, -l of two members";
+        let cases = gated(cases, newer, (1, 15), what, &mut skipped);
+        check_exact("crc_and_length_both_wrong", &cases, skipped);
+    }
+
     /// Review focus 2: `gunzip a.gz b.gz c.gz` with `b.gz` corrupt keeps
     /// `b.gz`, leaves no partial `b`, and exits with the worst code. GNU
     /// ends the run at a CRC error or a cut-short input (so `c.gz` is left

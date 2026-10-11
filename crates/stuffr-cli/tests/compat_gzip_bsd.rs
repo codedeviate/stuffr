@@ -2120,6 +2120,43 @@ mod differential {
         }
     }
 
+    /// A member whose CRC32 and ISIZE are both wrong: Apple's
+    /// `gz_uncompress` checks the CRC first and reports only that (GNU
+    /// says both). Also as the first of two members, under `-k`, `-v`
+    /// and `-l` (which reads the trailer and lists the wrong ISIZE).
+    #[test]
+    fn crc_and_length_both_wrong() {
+        let t = txt();
+        let both = member_with(plain_member(&t), Some(1), Some(99));
+        let good = gzm(b"good\n", b"g");
+        let multi = [both.clone(), good.clone()].concat();
+        let mut cases = Vec::new();
+        for args in [
+            &["-d", "b.gz", "g.gz"][..],
+            &["-dv", "b.gz", "g.gz"],
+            &["-dc", "b.gz", "g.gz"],
+            &["-dk", "b.gz", "g.gz"],
+            &["-t", "b.gz", "g.gz"],
+            &["-tv", "b.gz", "g.gz"],
+            &["-l", "b.gz", "g.gz"],
+            &["-d", "m.gz"],
+            &["-dc", "m.gz"],
+            &["-t", "m.gz"],
+        ] {
+            cases.push(dz(
+                "gzip",
+                args,
+                vec![
+                    ("b.gz", both.clone()),
+                    ("g.gz", good.clone()),
+                    ("m.gz", multi.clone()),
+                ],
+            ));
+        }
+        cases.push(fed(dz("gzcat", &[], vec![]), &both));
+        check_exact("crc_and_length_both_wrong", &cases, Skipped::none());
+    }
+
     /// Final review, item 2: Apple reads a stored name or comment of any
     /// length (`gz_uncompress`'s state machine reads past them), and `-N`
     /// takes the name from offset 10 into a `PATH_MAX` buffer. A 1.5 MiB

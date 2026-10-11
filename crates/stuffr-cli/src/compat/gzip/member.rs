@@ -44,11 +44,22 @@ pub(crate) enum Fault {
     BadMagic,
     BadMethod(u8),
     BadFlags(u8),
-    BadHeaderCrc { stored: u16, computed: u16 },
+    BadHeaderCrc {
+        stored: u16,
+        computed: u16,
+    },
     Truncated(Where),
     Data,
-    Crc { stored: u32, computed: u32 },
-    Length { stored: u32, computed: u32 },
+    Crc {
+        stored: u32,
+        computed: u32,
+    },
+    Length {
+        stored: u32,
+        computed: u32,
+    },
+    /// Both of the above at once (GNU reports the two).
+    CrcAndLength,
 }
 
 #[derive(Debug)]
@@ -290,6 +301,9 @@ pub(crate) fn inflate_member<R: Read>(
     let stored_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
     let stored_len = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
     let computed = crc.sum();
+    if stored_crc != computed && stored_len != written as u32 {
+        return Err(MemberError::Fault(Fault::CrcAndLength));
+    }
     if stored_crc != computed {
         return Err(MemberError::Fault(Fault::Crc {
             stored: stored_crc,
@@ -795,6 +809,18 @@ mod tests {
                 computed: 19
             }
         ));
+    }
+
+    #[test]
+    fn crc_and_length_both_wrong_is_its_own_fault() {
+        let data = b"some bytes to check";
+        let mut b = member(&hdr(), 6, data);
+        let n = b.len();
+        b[n - 8] ^= 0x55;
+        b[n - 4] = 99;
+        let (res, out) = inflate(&b);
+        assert!(matches!(fault(res), Fault::CrcAndLength));
+        assert_eq!(out, data);
     }
 
     #[test]

@@ -98,6 +98,9 @@ pub(super) enum Fail {
     FormatViolated,
     Crc,
     Length,
+    /// Both the CRC and the length (a gzip trailer, or a zip local
+    /// header): GNU says the crc error and then the length error.
+    CrcAndLength,
     /// A pack stream's length field (which, unlike gzip's, ends the run
     /// even under `-t` and `-l`).
     PackLength,
@@ -147,7 +150,7 @@ impl Fail {
             | Fail::NameTooLarge
             | Fail::Read(_)
             | Fail::Write(_) => true,
-            Fail::Crc | Fail::Length | Fail::CrcLength => decompressing,
+            Fail::Crc | Fail::Length | Fail::CrcAndLength | Fail::CrcLength => decompressing,
             Fail::NotGzip
             | Fail::UnknownMethod(_)
             | Fail::Encrypted
@@ -410,6 +413,7 @@ pub(super) fn finish<R: Read + Send + 'static>(
                         Fault::Truncated(_) => Fail::Eof,
                         Fault::Crc { .. } => Fail::Crc,
                         Fault::Length { .. } => Fail::Length,
+                        Fault::CrcAndLength => Fail::CrcAndLength,
                         _ => Fail::FormatViolated,
                     },
                 })?;
@@ -617,6 +621,9 @@ fn zip_entry<R: Read>(s: &mut Stream<R>, z: ZipLocal, sink: &mut Sink<'_>) -> Re
             return Err(Fail::CrcLength);
         }
         return Ok(());
+    }
+    if z.crc != crc && z.usize != len {
+        return Err(Fail::CrcAndLength);
     }
     if z.crc != crc {
         return Err(Fail::Crc);

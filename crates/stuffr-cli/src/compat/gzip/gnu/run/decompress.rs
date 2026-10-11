@@ -553,6 +553,12 @@ impl Gz<'_> {
             Fail::Eof => self.error(m::UNEXPECTED_EOF, &[p, qname]),
             Fail::FormatViolated => self.error(m::FORMAT_VIOLATED, &[p, qname]),
             Fail::Crc => self.error(m::CRC_ERROR, &[p, qname]),
+            // Observed: `gzip -dc` on a member with both wrong prints the
+            // two lines, each with its leading newline.
+            Fail::CrcAndLength => {
+                self.error(m::CRC_ERROR, &[p, qname]);
+                self.error(m::LENGTH_ERROR, &[p, qname]);
+            }
             Fail::Length | Fail::PackLength => self.error(m::LENGTH_ERROR, &[p, qname]),
             Fail::CrcLength => self.error(m::CRC_LENGTH_ERROR, &[p, qname]),
             Fail::NotGzip => self.error(m::NOT_GZIP, &[p, qname]),
