@@ -2315,14 +2315,19 @@ mod differential {
         );
     }
 
-    /// Review focus 3, fix round 1: notes are said as they arise, never
-    /// collected per input. 1.5 million empty-body members, each with an
-    /// empty FEXTRA (22 bytes apiece, 33 MB), once kept a 16-byte note per
-    /// member until the input ended; GNU 1.15 decodes such a stream in
-    /// about 2 MiB. Bounded at 24 MiB, well under what the notes took.
+    /// Review focus 3, fix rounds 1 and 2: notes are said as they arise,
+    /// never collected per input. 750,000 empty-body members, each with an
+    /// empty FEXTRA (22 bytes apiece, 16.5 MB), once kept a 16-byte note
+    /// per member until the input ended; GNU 1.15 decodes such a stream in
+    /// about 2 MiB. Measured on macOS (`/usr/bin/time -l`, debug build, two
+    /// runs each): before the fix 18.0 and 19.4 MiB, after it 7.9 MiB both
+    /// times (the suite's other children peak near 8.8 MiB, which
+    /// `getrusage` also counts). The 13 MiB bound leaves at least 4 MiB on
+    /// either side. At 500,000 members the gap was 14.7-16.0 against 7.9,
+    /// too narrow for a 3 MiB margin both ways.
     #[test]
     fn zcat_of_many_extra_field_members_is_bounded() {
-        const MEMBERS: usize = 1_500_000;
+        const MEMBERS: usize = 750_000;
         let one: [u8; 22] = [
             0x1f, 0x8b, 8, 4, 0, 0, 0, 0, 0, 3, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ];

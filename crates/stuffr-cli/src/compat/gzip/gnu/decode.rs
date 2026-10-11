@@ -683,13 +683,21 @@ mod tests {
     /// Fix round 1: a read error under a `.Z` is a read error (GNU's
     /// `gzip: NAME: strerror` shape), and only the decoder's own
     /// `InvalidData` is "corrupt input.".
+    ///
+    /// Fix round 2: never skipped. `stuffr-cli` always takes `stuffr`'s
+    /// default features, `legacy` (and so `compress`) among them, whatever
+    /// this crate's own feature flags (see its `Cargo.toml`), so the codec
+    /// is in every build of this test; a `cfg(feature = ...)` on this
+    /// crate's flags would drop the test from the plain leg, where the code
+    /// under test is present. The assertion makes a build without it fail
+    /// loudly instead of passing having checked nothing.
     #[test]
     fn a_read_error_under_lzw_is_not_corruption() {
-        if sniff::detect(&mut Lookahead::new(&b"\x1f\x9d\x90\x00"[..]), Flavour::Gnu).unwrap()
-            != Detected::Compress
-        {
-            return; // no `compress` codec in this build
-        }
+        assert_eq!(
+            sniff::detect(&mut Lookahead::new(&b"\x1f\x9d\x90\x00"[..]), Flavour::Gnu).unwrap(),
+            Detected::Compress,
+            "the compress codec is in every stuffr-cli build"
+        );
         let head = b"\x1f\x9d\x90\x61\x00";
         assert!(matches!(
             lzw_over(head, io::ErrorKind::PermissionDenied),
