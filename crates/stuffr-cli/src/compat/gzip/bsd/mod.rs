@@ -348,4 +348,111 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    /// Hostile headers and bodies never panic (this runs with overflow
+    /// checks, as the fuzz target does): valid lzip, `.Z`, xz, bzip2,
+    /// pack and gzip files with random bytes overwritten (the header twice
+    /// as often), random truncations, and random header bytes after each
+    /// magic, through `-dc`, `-t` and `-l`. Every run ends with one of
+    /// Apple's codes. `STUFFR_BSD_SMOKE` raises the 150 rounds per format.
+    #[test]
+    fn hostile_inputs_never_panic() {
+        let rounds: usize = std::env::var("STUFFR_BSD_SMOKE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(150);
+        let d = scratch("smoke");
+        let plain: Vec<u8> = (0..3000u32)
+            .flat_map(|i| format!("{i} smoke ").into_bytes())
+            .collect();
+        let encode = |id: &'static str| {
+            let codec = stuffr::registry().codec(stuffr::FormatId::new(id)).unwrap();
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            struct Shared(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+            impl std::io::Write for Shared {
+                fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(b);
+                    Ok(b.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut sink = codec
+                .encoder(
+                    Box::new(Shared(buf.clone())),
+                    &stuffr::EncodeOpts::default(),
+                )
+                .unwrap();
+            sink.write_all(&plain).unwrap();
+            sink.finish().unwrap();
+            buf.lock().unwrap().clone()
+        };
+        let gz = {
+            use std::io::Write;
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&plain).unwrap();
+            e.finish().unwrap()
+        };
+        let samples: Vec<(&str, Vec<u8>)> = vec![
+            ("a.lz", encode("lzip")),
+            ("a.Z", encode("compress")),
+            ("a.xz", encode("xz")),
+            ("a.bz2", encode("bzip2")),
+            (
+                "a.z",
+                b"\x1f\x1e\x00\x00\x00\x08\x03\x01\x00\x00AB\x80".to_vec(),
+            ),
+            ("a.gz", gz),
+        ];
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let none = |_: &str| None;
+        let mut runs = 0;
+        for (name, good) in &samples {
+            for round in 0..rounds {
+                let mut b = good.clone();
+                match round % 3 {
+                    // Bytes overwritten, mostly in the header.
+                    0 | 1 => {
+                        for _ in 0..1 + next() % 4 {
+                            let span = if next() % 2 == 0 {
+                                b.len().min(24)
+                            } else {
+                                b.len()
+                            };
+                            let at = (next() as usize) % span;
+                            b[at] = next() as u8;
+                        }
+                    }
+                    // Cut short.
+                    _ => b.truncate((next() as usize) % b.len()),
+                }
+                // Now and then a whole random header after the magic.
+                if round % 7 == 0 && b.len() > 12 {
+                    for v in &mut b[4..12] {
+                        *v = next() as u8;
+                    }
+                }
+                std::fs::write(d.join(name), &b).unwrap();
+                for flags in [&["-dc"][..], &["-t"], &["-l"], &["-lt"]] {
+                    let mut a = flags.to_vec();
+                    a.push(name);
+                    let (code, _, _) = run_in(Flavour::Bsd, &d, "gzip", &args(&a), b"", &none);
+                    assert!(matches!(code, 0..=2), "{name} {flags:?}: exit {code}");
+                    runs += 1;
+                }
+                let (code, _, _) = run_in(Flavour::Bsd, &d, "gzcat", &[], &b, &none);
+                assert!(matches!(code, 0..=2), "stdin {name}: exit {code}");
+                runs += 1;
+            }
+        }
+        assert_eq!(runs, samples.len() * rounds * 5);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

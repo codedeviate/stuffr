@@ -119,7 +119,7 @@ impl RangeDecoder<'_> {
             self.range >>= 1;
             symbol <<= 1;
             if self.code >= self.range {
-                self.code -= self.range;
+                self.code = self.code.wrapping_sub(self.range);
                 symbol |= 1;
             }
             self.normalize();
@@ -127,6 +127,8 @@ impl RangeDecoder<'_> {
         symbol
     }
 
+    /// The range coder's arithmetic is unsigned and wraps, as in C (a
+    /// corrupt stream can leave `code` past `range`).
     fn decode_bit(&mut self, bm: &mut i32) -> u32 {
         let bound = (self.range >> BIT_MODEL_TOTAL_BITS).wrapping_mul(*bm as u32);
         let symbol = if self.code < bound {
@@ -134,8 +136,8 @@ impl RangeDecoder<'_> {
             *bm += (BIT_MODEL_TOTAL - *bm) >> BIT_MODEL_MOVE_BITS;
             0
         } else {
-            self.range -= bound;
-            self.code -= bound;
+            self.range = self.range.wrapping_sub(bound);
+            self.code = self.code.wrapping_sub(bound);
             *bm -= *bm >> BIT_MODEL_MOVE_BITS;
             1
         };
@@ -399,8 +401,10 @@ impl Decoder<'_, '_> {
 /// with fraction bits gets a smaller dictionary than its writer meant
 /// (defined, so kept: a stream reaching past it fails).
 fn dict_size(c: u8) -> u32 {
-    let mut d: u32 = 1 << (c & 0x1f);
-    d -= (d >> 2) * u32::from((c >> 5) & 0x7);
+    let d: u32 = 1 << (c & 0x1f);
+    // Unsigned, as in C: five to seven quarters wrap, and the range check
+    // below refuses the result.
+    let d = d.wrapping_sub((d >> 2).wrapping_mul(u32::from((c >> 5) & 0x7)));
     if !(MIN_DICTIONARY_SIZE..=MAX_DICTIONARY_SIZE).contains(&d) {
         return 0;
     }
@@ -507,6 +511,18 @@ mod tests {
         // minus 3/4, and four quarters leave nothing (refused).
         assert_eq!(dict_size(20 | (3 << 5)), (1 << 20) - 3 * (1 << 18));
         assert_eq!(dict_size(20 | (4 << 5)), 0);
+        // Five to seven quarters take more than there is: unlz.c's
+        // unsigned subtraction wraps, and the range check refuses it.
+        for frac in 5u8..=7 {
+            assert_eq!(dict_size(20 | (frac << 5)), 0, "fraction {frac}");
+            assert_eq!(dict_size(12 | (frac << 5)), 0, "fraction {frac}");
+        }
+        assert_eq!(dict_size(31 | (7 << 5)), 0);
+        assert_eq!(dict_size(0xff), 0);
+        // Every header byte is judged without a panic.
+        for c in 0..=255u8 {
+            let _ = dict_size(c);
+        }
     }
 
     #[test]

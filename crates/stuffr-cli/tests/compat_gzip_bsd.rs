@@ -1340,6 +1340,12 @@ mod differential {
         lz_frac[5] |= 1 << 5;
         let mut lz_frac4 = lz.clone();
         lz_frac4[5] |= 4 << 5;
+        // Five quarters take more than there is: unlz.c's unsigned
+        // subtraction wraps and the header is refused.
+        let mut lz_frac5 = lz.clone();
+        lz_frac5[5] |= 5 << 5;
+        let mut lz_frac7 = lz.clone();
+        lz_frac7[5] = 31 | (7 << 5);
         let mut lz_bad = lz.clone();
         let at = lz.len() / 2;
         lz_bad[at..at + 4].copy_from_slice(&[0xff; 4]);
@@ -1403,6 +1409,8 @@ mod differential {
             ("junk.lz", lz_junk),
             ("frac.lz", lz_frac),
             ("frac4.lz", lz_frac4),
+            ("frac5.lz", lz_frac5),
+            ("frac7.lz", lz_frac7),
             ("bad.lz", lz_bad.clone()),
             ("a.Z", z.clone()),
             ("b12.Z", z12),
