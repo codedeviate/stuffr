@@ -1,0 +1,47 @@
+name: xz reference
+description: >-
+  Builds XZ Utils 5.8.4 from the release tarball and exports
+  STUFFR_XZ_REFERENCE, the oracle of the xz compatibility suites
+  (compat_xz*). Every job that runs those tests needs it; with CI set, the
+  harness panics if the reference is missing or is not exactly 5.8.4.
+
+runs:
+  using: composite
+  steps:
+    # Keyed on the version, the OS and the CPU: the install is a native build.
+    - name: cache the xz 5.8.4 install
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/xz-5.8.4
+        key: xz-5.8.4-${{ runner.os }}-${{ runner.arch }}
+
+    # The tarball, not a distro package: ubuntu and Homebrew ship other
+    # releases, and the promise is byte identity with 5.8.4. The SHA-256 was
+    # recorded from a download whose detached signature (key 3690C240CE51B467
+    # 0D30AD1C38EE757D69184620, Lasse Collin) gpg reported as good.
+    - name: build xz 5.8.4
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        url=https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4.tar.gz
+        sha256=0014c7886930454fe8bd4228665b51af55eeae560ea135c9c4cd33f55b2591d9
+        src="$RUNNER_TEMP/xz-src"
+        mkdir -p "$src"
+        curl -fsSL --retry 3 -o "$src/xz-5.8.4.tar.gz" "$url"
+        echo "$sha256  $src/xz-5.8.4.tar.gz" | shasum -a 256 -c -
+        tar -xzf "$src/xz-5.8.4.tar.gz" -C "$src"
+        cd "$src/xz-5.8.4"
+        ./configure --disable-nls --disable-shared --prefix="$RUNNER_TEMP/xz-5.8.4"
+        make -j"$(getconf _NPROCESSORS_ONLN)"
+        make install
+
+    - name: use it as the reference
+      shell: bash
+      run: |
+        set -euo pipefail
+        xz="$RUNNER_TEMP/xz-5.8.4/bin/xz"
+        echo "STUFFR_XZ_REFERENCE=$xz" >> "$GITHUB_ENV"
+        "$xz" --version
+        "$xz" --robot --version
