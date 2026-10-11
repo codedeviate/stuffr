@@ -734,6 +734,13 @@ const COMPAT_SHAPES: &[&str] = &[
     "gunzip-bsd-lzip-damaged",
     "zcat-bsd-compress-truncated",
     "gzip-bsd-test-pack",
+    // Fix round 1: a damaged member decompressed to a file (the partial-
+    // output oracle's case), GNU's LZH magic (`1f a0`, a documented gap),
+    // and Apple `zcat` without `-f`, which looks for `a.gz.Z`.
+    "gunzip-gnu-damaged",
+    "gunzip-bsd-damaged",
+    "gunzip-gnu-lzh",
+    "zcat-bsd-appends-dot-z",
 ];
 
 /// A bzip2 stream of `plain` at `level`, through this build's encoder.
@@ -1124,6 +1131,14 @@ fn gzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
             g(&["a.gz"], &["a.gz"], false, &cut(&z, z.len() / 2))
         }
         "test-pack" => g(&["-t", "a.z"], &["a.z"], false, &pack_ab(&ab_text())),
+        "damaged" => g(&["a.gz"], &["a.gz"], false, &damaged(&gz)),
+        "lzh" => {
+            let mut v = vec![0x1f, 0xa0];
+            v.extend_from_slice(&text[..64]);
+            g(&["-k", "a.gz"], &["a.gz"], false, &v)
+        }
+        // No `-f`: past `g`, which adds it to every other Apple `zcat`.
+        "appends-dot-z" => encode_compat_case(tool, flavour, &["a.gz"], &["a.gz"], false, &gz),
         other => unreachable!("COMPAT_SHAPES lists an unhandled gzip shape {other:?}"),
     }))
 }

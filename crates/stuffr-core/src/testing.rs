@@ -1642,8 +1642,67 @@ mod tests {
     fn old_seeds_decode_unchanged() {
         const OLD_NAMES: [&str; 4] = ["bzip2", "bunzip2", "bzcat", "bzip2recover"];
         const OLD_FILES: [&str; 4] = ["a", "a.bz2", "a.tbz2", "a.out"];
-        const OLD_TOKENS: usize = 56;
-        assert_eq!(COMPAT_TOKENS[OLD_TOKENS - 1], "a.out");
+        // `git show v0.11.0:crates/stuffr-core/src/testing.rs`, verbatim.
+        const OLD_TOKEN_TABLE: [&str; 56] = [
+            "-c",
+            "-d",
+            "-z",
+            "-f",
+            "-t",
+            "-k",
+            "-s",
+            "-q",
+            "-v",
+            "-V",
+            "-L",
+            "-h",
+            "-1",
+            "-2",
+            "-3",
+            "-4",
+            "-5",
+            "-6",
+            "-7",
+            "-8",
+            "-9",
+            "-x",
+            "-dc",
+            "-cd",
+            "-tv",
+            "-kf",
+            "-dfk",
+            "-qt",
+            "-vvv",
+            "-zc",
+            "-s1",
+            "-dq",
+            "--stdout",
+            "--decompress",
+            "--compress",
+            "--force",
+            "--test",
+            "--keep",
+            "--small",
+            "--quiet",
+            "--version",
+            "--license",
+            "--exponential",
+            "--repetitive-best",
+            "--repetitive-fast",
+            "--fast",
+            "--best",
+            "--verbose",
+            "--help",
+            "--bogus",
+            "--",
+            "-",
+            "a",
+            "a.bz2",
+            "a.tbz2",
+            "a.out",
+        ];
+        const OLD_TOKENS: usize = OLD_TOKEN_TABLE.len();
+        assert_eq!(COMPAT_TOKENS[..OLD_TOKENS], OLD_TOKEN_TABLE);
         assert_eq!(COMPAT_NAMES[..4], OLD_NAMES);
         assert_eq!(COMPAT_FILES[..4], OLD_FILES);
 
@@ -1674,7 +1733,7 @@ mod tests {
                         .collect();
                     assert_eq!(case.name, OLD_NAMES[usize::from(name)]);
                     assert_eq!(case.flavour, 0);
-                    assert_eq!(case.args, [COMPAT_TOKENS[usize::from(token)]]);
+                    assert_eq!(case.args, [OLD_TOKEN_TABLE[usize::from(token)]]);
                     assert_eq!(case.files, old_files);
                     assert_eq!(case.stdin, mask & 0x10 != 0);
                 }

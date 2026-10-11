@@ -43,9 +43,13 @@
 //!   it opens no file an operand cannot name; it leaves no `.stuffr-gzip-*`
 //!   temporary behind, and (unless `-N` lets a member's stored name choose
 //!   the output) no name in the run's directory that `could_be_written`
-//!   does not allow. A partial output kept after a foreign-format failure
-//!   (Apple's `maybe_err` exit 2 for `.bz2`, `.xz`, lzip, pack and `.Z`,
-//!   Ruling T10-2) is such a name: an operand less its suffix.
+//!   does not allow;
+//! - a failed gzip-family run with one operand leaves no partial output
+//!   (`check_gzip_no_partial`, whose doc says exactly which runs it judges
+//!   and which it cannot): `could_be_written` alone cannot see one, because
+//!   a partial output has a legitimate output's name. Apple's partial
+//!   outputs after a foreign-format failure (`maybe_err`, exit 2, for
+//!   `.bz2`, `.xz`, lzip, pack and `.Z`: Ruling T10-2) are allowed.
 //!
 //! Inputs past `COMPAT_FUZZ_MAX_INPUT` (64 KiB; see its doc) are skipped.
 //! Both families' output, to standard output and files together, is capped
@@ -117,7 +121,9 @@ fn could_be_written(name: &str) -> bool {
     for f in COMPAT_FILES {
         bases.push((*f).to_owned());
         for s in affixes() {
-            if let Some(stem) = f.strip_suffix(s) {
+            // A token equal to the whole name (`a`, `a.gz`) strips to
+            // nothing, which is no base: it would admit every affix alone.
+            if let Some(stem) = f.strip_suffix(s).filter(|stem| !stem.is_empty()) {
                 bases.push(stem.to_owned());
             }
         }
@@ -292,8 +298,55 @@ fn run_bzip2(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     );
 }
 
+/// The arguments in operand position: after `--`, everything; before it,
+/// anything not starting with `-` that is not `-S`/`--suffix`'s value
+/// (both getopts permute, and `-` alone is standard input, no file).
+fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let (mut after_dashes, mut suffix_value) = (false, false);
+    for &a in args {
+        if suffix_value {
+            suffix_value = false;
+        } else if after_dashes {
+            out.push(a);
+        } else if a == "--" {
+            after_dashes = true;
+        } else if a == "-S" || a == "--suffix" {
+            suffix_value = true;
+        } else if !a.starts_with('-') {
+            out.push(a);
+        }
+    }
+    out
+}
+
+/// Every file in `dir` with its contents.
+type Contents = BTreeMap<OsString, Vec<u8>>;
+
+fn contents(dir: &Path) -> Contents {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return BTreeMap::new();
+    };
+    listing
+        .flatten()
+        .filter_map(|e| Some((e.file_name(), std::fs::read(e.path()).ok()?)))
+        .collect()
+}
+
+/// The texts GNU gives a later member's refused header (`gnu/messages.rs`:
+/// `UNKNOWN_METHOD`, `ENCRYPTED`, `HAS_FLAGS`, `HEADER_CRC`, `Z_BITS`), the
+/// one exit-1 failure after which GNU keeps what it decoded.
+const GNU_LATER_HEADER: &[&str] = &[
+    "unknown method",
+    "is encrypted -- not supported",
+    "has flags 0x",
+    "header checksum 0x",
+    "can only handle",
+];
+
 /// The gzip family through `run_in_counted`, as `flavour`.
-fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
+fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8], payload: &[u8]) {
+    let before = contents(dir);
     let flavour = if flavour == 0 {
         Flavour::Gnu
     } else {
@@ -316,11 +369,66 @@ fn run_gzip(dir: &Path, name: &str, flavour: u8, args: &[&str], stdin: &[u8]) {
     );
     check_gzip_reads(dir, name, flavour, args, &reads);
     check_gzip_leftovers(dir, name, flavour, args);
+    check_gzip_no_partial(dir, name, flavour, args, code, &err, payload, &before);
+}
+
+/// A failed run leaves no partial output: a run with exactly one operand
+/// (`operands`) that fails creates or changes no file in its directory,
+/// where "fails" is:
+///
+/// - GNU: exit 1, unless standard error carries a later member's header
+///   refusal (`GNU_LATER_HEADER`), after which GNU keeps the members
+///   decoded so far and removes the input (Task 8, observed: `gzip -d` on a
+///   member followed by `1f 8b` and junk). Every other GNU exit-1 failure
+///   (truncation, corrupt data, CRC or length, a write error, a refused
+///   first header) removes the temporary. Exit 2 is warnings only (trailing
+///   garbage, a suffix note): the output is whole.
+/// - BSD: exit 1 when the operand holds a gzip member (`1f 8b` or `1f 9e`;
+///   every case file holds the payload). Apple's gzip failures are
+///   `maybe_warn[x]`, exit 1, output unlinked. Exit 2 is not judged: it is
+///   trailing garbage after whole members (output kept, whole), or a
+///   foreign format's `maybe_err`, whose partial output Ruling T10-2 keeps;
+///   and a foreign-format payload is not judged at all.
+///
+/// Not detected: a partial output in a run with several operands (which
+/// one failed is not known from outside, and an earlier one's output is
+/// legitimate), with no operand (standard input goes to standard output),
+/// or one that a GNU later-header refusal's message accompanies.
+#[allow(clippy::too_many_arguments)]
+fn check_gzip_no_partial(
+    dir: &Path,
+    name: &str,
+    flavour: Flavour,
+    args: &[&str],
+    code: i32,
+    err: &[u8],
+    payload: &[u8],
+    before: &Contents,
+) {
+    if operands(args).len() != 1 || code != 1 {
+        return;
+    }
+    let text = String::from_utf8_lossy(err);
+    let judged = match flavour {
+        Flavour::Gnu => !GNU_LATER_HEADER.iter().any(|m| text.contains(m)),
+        _ => payload.starts_with(&[0x1f, 0x8b]) || payload.starts_with(&[0x1f, 0x9e]),
+    };
+    if !judged {
+        return;
+    }
+    for (n, bytes) in contents(dir) {
+        assert!(
+            before.get(&n) == Some(&bytes),
+            "{name} ({flavour:?}) {args:?}: failed (exit 1) and left {n:?} \
+             ({} bytes) new or changed\n{text}",
+            bytes.len()
+        );
+    }
 }
 
 /// The gzip family's read bound: for every path a run opened, at most two
 /// opens and `2 × len` bytes read per operand that can name it, where an
-/// operand can name a path when the path's file name starts with it (the
+/// operand (an argument in operand position, `operands`) can name a path when the path's file name starts with it (the
 /// operand itself, or the operand plus a suffix a missing operand is
 /// retried with: GNU's suffix search, Apple's `.gz`/`-S` retry and `zcat`'s
 /// `.Z`), and `len` is the largest length the file had when opened (a run
@@ -351,7 +459,10 @@ fn check_gzip_reads(
             .ok()
             .and_then(|p| p.to_str())
             .unwrap_or_else(|| panic!("{name} ({flavour:?}): opened {path:?}, outside {dir:?}"));
-        let operands = args.iter().filter(|a| file.starts_with(**a)).count() as u64;
+        let operands = operands(args)
+            .iter()
+            .filter(|a| file.starts_with(**a))
+            .count() as u64;
         assert!(
             r.opens <= 2 * operands,
             "{name} ({flavour:?}) {args:?}: {} opens of {file:?}, which {operands} operand(s) can name",
@@ -408,9 +519,14 @@ fuzz_target!(|data: &[u8]| {
 
     match case.name {
         "bzip2recover" => run_recover(&dir, &case.args),
-        "gzip" | "gunzip" | "zcat" | "gzcat" => {
-            run_gzip(&dir, case.name, case.flavour, &case.args, stdin)
-        }
+        "gzip" | "gunzip" | "zcat" | "gzcat" => run_gzip(
+            &dir,
+            case.name,
+            case.flavour,
+            &case.args,
+            stdin,
+            case.payload,
+        ),
         _ => run_bzip2(&dir, case.name, &case.args, stdin),
     }
 
