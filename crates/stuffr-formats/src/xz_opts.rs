@@ -10,20 +10,33 @@
 //! as [`XzError`] the way `coder.c`'s `coder_normal`/`message_strm` read
 //! them.
 //!
-//! The types and [`Lzma::preset`] are tier-independent. The liblzma-backed
-//! [`Encoder`], [`Decoder`], [`encoder_memusage`], [`decoder_memusage`],
-//! [`liblzma_version`], [`physmem`] and [`cputhreads`] are the C tier
-//! (`xz-c`), in [`c`]. Not part of the stable API.
+//! The types and [`Lzma::preset`] are tier-independent. [`Encoder`],
+//! [`Decoder`], [`encoder_memusage`], [`decoder_memusage`] and
+//! [`liblzma_version`] are the C tier's (`xz-c`, in `c`) whenever it is
+//! compiled, else the pure tier's (`xz-pure`, in `pure`), as the
+//! registered codecs pick theirs; `physmem` and `cputhreads` exist on
+//! the C tier only. The pure tier is compiled whenever `xz-pure` is, so an
+//! `--all-features` build tests the two against each other. Not part of
+//! the stable API.
 //!
 //! Ported from XZ Utils 5.8.4 (`src/xz/coder.c`,
-//! `src/liblzma/lzma/lzma_encoder_presets.c`), 0BSD.
+//! `src/liblzma/lzma/lzma_encoder_presets.c`, and, for the pure tier,
+//! `src/liblzma/` as `pure` and `memusage` list), 0BSD.
 
 #[cfg(feature = "xz-c")]
 pub mod c;
+#[cfg(feature = "xz-pure")]
+mod check;
+#[cfg(any(feature = "xz-pure", test))]
+pub(crate) mod memusage;
+#[cfg(feature = "xz-pure")]
+pub mod pure;
 #[cfg(feature = "xz-c")]
 pub use c::{
     Decoder, Encoder, cputhreads, decoder_memusage, encoder_memusage, liblzma_version, physmem,
 };
+#[cfg(all(feature = "xz-pure", not(feature = "xz-c")))]
+pub use pure::{Decoder, Encoder, decoder_memusage, encoder_memusage, liblzma_version};
 
 /// The container (`--format`). [`Format::Lzip`] decodes only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

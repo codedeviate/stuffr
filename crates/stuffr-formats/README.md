@@ -48,6 +48,7 @@ trusting the size a file declares about itself.
 ## License
 
 [MIT](LICENSE), plus BSD-2-Clause for the pack decoder, a port of FreeBSD's
-`unpack.c` (`LICENSE-unpack-bsd`); the crate's metadata is
-`MIT AND BSD-2-Clause`. `lzma-rust2`, behind the pure xz/LZMA1/LZIP backends, is
+`unpack.c` (`LICENSE-unpack-bsd`), and 0BSD for liblzma 5.8.4's memory-usage
+formulas and container coders, ported for the pure xz tier
+(`LICENSE-xz-memusage`); the crate's metadata is `MIT AND BSD-2-Clause AND 0BSD`. `lzma-rust2`, behind the pure xz/LZMA1/LZIP backends, is
 Apache-2.0.

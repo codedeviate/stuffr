@@ -14,10 +14,8 @@ fn preset_rejects_levels_above_nine() {
 
 /// A fixed 64-bit LCG (Knuth's MMIX constants), so every input is the same
 /// on every machine and every run.
-#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // the pure tier's tests come in Task 2
 struct Lcg(u64);
 
-#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // the pure tier's tests come in Task 2
 impl Lcg {
     fn next(&mut self) -> u32 {
         self.0 = self
@@ -28,7 +26,6 @@ impl Lcg {
     }
 }
 
-#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // the pure tier's tests come in Task 2
 const WORDS: &[&str] = &[
     "the",
     "of",
@@ -91,7 +88,6 @@ const WORDS: &[&str] = &[
 ];
 
 /// `n` bytes of word salad: LCG-chosen words, a newline every so often.
-#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // the pure tier's tests come in Task 2
 fn text(n: usize, seed: u64) -> Vec<u8> {
     let mut r = Lcg(seed);
     let mut out = Vec::with_capacity(n + 16);
@@ -109,7 +105,6 @@ fn text(n: usize, seed: u64) -> Vec<u8> {
 
 /// 64 KiB shaped like x86 code: a few common opcodes, `call rel32` with
 /// small displacements, ModRM-ish operand bytes.
-#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // the pure tier's tests come in Task 2
 fn bin() -> Vec<u8> {
     let mut r = Lcg(0x0b1a);
     let mut out = Vec::with_capacity(65_536 + 8);
@@ -132,14 +127,13 @@ fn bin() -> Vec<u8> {
 }
 
 /// `n` LCG bytes.
-#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // the pure tier's tests come in Task 2
 fn rand(n: usize) -> Vec<u8> {
     let mut r = Lcg(0x5eed);
     (0..n).map(|_| (r.next() >> 16) as u8).collect()
 }
 
 /// The fixture's four inputs, by name.
-#[cfg_attr(not(feature = "xz-c"), allow(dead_code))] // the pure tier's tests come in Task 2
+#[cfg(feature = "xz-c")]
 fn inputs() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("text", text(300_000, 0x7e47)),
@@ -227,6 +221,58 @@ fn sha256_is_sha256() {
     );
 }
 
+/// The reference `xz` 5.8.4, if this machine has it.
+/// An empty `.xz` stream whose flags name check ID 0x0F, which no
+/// liblzma supports: header, an empty index, footer, CRC32s fixed
+/// (computed once with `zlib.crc32`). `xz -t` on it: "Unsupported type of
+/// integrity check; not verifying file integrity", exit 2.
+const CHECK_0F: [u8; 32] = [
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, // magic
+    0x00, 0x0f, // stream flags: check 0x0F
+    0x6e, 0x0f, 0x66, 0xd1, // CRC32 of the flags
+    0x00, 0x00, 0x00, 0x00, // index: indicator, 0 records, padding
+    0x1c, 0xdf, 0x44, 0x21, // CRC32 of the index
+    0x97, 0x6f, 0x21, 0xea, // CRC32 of backward size + flags
+    0x01, 0x00, 0x00, 0x00, // backward size: (8 / 4) - 1
+    0x00, 0x0f, // stream flags again
+    0x59, 0x5a, // footer magic
+];
+
+#[cfg(any(target_os = "macos", all(unix, feature = "xz-pure")))]
+fn reference() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("STUFFR_XZ_REFERENCE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/opt/homebrew/opt/xz/bin/xz".into());
+    let v = std::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&v.stdout)
+        .contains("5.8.4")
+        .then_some(path)
+}
+
+/// `xz <args> -c` over `input` on stdin.
+#[cfg(any(target_os = "macos", all(unix, feature = "xz-pure")))]
+fn run_reference(xz: &std::path::Path, args: &[&str], input: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(xz)
+        .args(args)
+        .arg("-c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap().unwrap();
+    assert!(out.status.success(), "xz {args:?}");
+    out.stdout
+}
+
 #[cfg(feature = "xz-c")]
 mod c_tier {
     use super::*;
@@ -290,6 +336,184 @@ mod c_tier {
     #[test]
     fn hardware_queries_are_unknown_in_this_build() {
         assert_eq!((physmem(), cputhreads()), (0, 0));
+    }
+
+    /// The chains the formula sweep runs every preset through.
+    fn sweep_chains(l: &Lzma) -> Vec<Vec<Filter>> {
+        vec![
+            vec![Filter::Lzma2(l.clone())],
+            vec![
+                Filter::Bcj {
+                    kind: Bcj::X86,
+                    start: 0,
+                },
+                Filter::Lzma2(l.clone()),
+            ],
+            vec![Filter::Delta { dist: 4 }, Filter::Lzma2(l.clone())],
+            vec![Filter::Lzma1(l.clone())],
+        ]
+    }
+
+    /// `memusage`'s port against liblzma's own functions: every preset and
+    /// `-e` through BCJ + LZMA2, delta + LZMA2 and LZMA1, single-threaded
+    /// and at 1, 2 and 4 threads with block sizes 0 and 1 MiB; then the
+    /// edges (every match finder, `nice_len` and dictionary bounds, bad
+    /// `lc`/`lp`/`pb`, bad chains, a block list with two chains).
+    #[test]
+    fn memusage_formulas_match_liblzma() {
+        let mut cases = 0;
+        let mut check = |o: &EncodeOptions| {
+            assert_eq!(
+                memusage::encoder_memusage(o),
+                encoder_memusage(o),
+                "encoder {o:?}"
+            );
+            assert_eq!(
+                memusage::decoder_memusage(&o.filters),
+                decoder_memusage(&o.filters),
+                "decoder {:?}",
+                o.filters
+            );
+            cases += 1;
+        };
+        for level in 0..=9 {
+            for extreme in [false, true] {
+                let l = Lzma::preset(level, extreme).unwrap();
+                for filters in sweep_chains(&l) {
+                    for format in [Format::Raw, Format::Lzma, Format::Xz] {
+                        check(&EncodeOptions {
+                            format,
+                            filters: filters.clone(),
+                            ..EncodeOptions::default()
+                        });
+                    }
+                    for threads in [1, 2, 4] {
+                        for block_size in [0, 1 << 20] {
+                            check(&EncodeOptions {
+                                filters: filters.clone(),
+                                threads,
+                                block_size,
+                                ..EncodeOptions::default()
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let base = Lzma::preset(1, false).unwrap();
+        let mfs = [
+            MatchFinder::Hc3,
+            MatchFinder::Hc4,
+            MatchFinder::Bt2,
+            MatchFinder::Bt3,
+            MatchFinder::Bt4,
+        ];
+        let dicts = [
+            0,
+            4095,
+            4096,
+            4097,
+            65_535,
+            65_537,
+            (1 << 24) + 3,
+            (1 << 25) - 1,
+            (1 << 30) + (1 << 29),
+            (1 << 30) + (1 << 29) + 1,
+            u32::MAX,
+        ];
+        for mf in mfs {
+            for nice_len in [0, 1, 2, 3, 4, 5, 8, 273, 274] {
+                for dict_size in dicts {
+                    let l = Lzma {
+                        mf,
+                        nice_len,
+                        dict_size,
+                        ..base.clone()
+                    };
+                    for filters in [vec![Filter::Lzma1(l.clone())], vec![Filter::Lzma2(l)]] {
+                        check(&EncodeOptions {
+                            format: Format::Raw,
+                            filters: filters.clone(),
+                            ..EncodeOptions::default()
+                        });
+                        check(&EncodeOptions {
+                            filters,
+                            threads: 3,
+                            ..EncodeOptions::default()
+                        });
+                    }
+                }
+            }
+        }
+        for (lc, lp, pb) in [
+            (4, 0, 4),
+            (5, 0, 2),
+            (0, 5, 2),
+            (3, 2, 2),
+            (2, 2, 5),
+            (9, 0, 0),
+        ] {
+            let l = Lzma {
+                lc,
+                lp,
+                pb,
+                ..base.clone()
+            };
+            for filters in [vec![Filter::Lzma1(l.clone())], vec![Filter::Lzma2(l)]] {
+                check(&EncodeOptions {
+                    format: Format::Raw,
+                    filters,
+                    ..EncodeOptions::default()
+                });
+            }
+        }
+        let lz = Filter::Lzma2(base.clone());
+        let bcj = Filter::Bcj {
+            kind: Bcj::Arm64,
+            start: 8,
+        };
+        for filters in [
+            vec![],
+            vec![bcj.clone()],
+            vec![lz.clone(), lz.clone()],
+            vec![lz.clone(), bcj.clone()],
+            vec![bcj.clone(), bcj.clone(), bcj.clone(), lz.clone()],
+            vec![
+                bcj.clone(),
+                bcj.clone(),
+                bcj.clone(),
+                bcj.clone(),
+                lz.clone(),
+            ],
+            vec![Filter::Delta { dist: 0 }, lz.clone()],
+            vec![Filter::Delta { dist: 256 }, lz.clone()],
+            vec![Filter::Delta { dist: 257 }, lz.clone()],
+        ] {
+            check(&EncodeOptions {
+                format: Format::Raw,
+                filters,
+                ..EncodeOptions::default()
+            });
+        }
+        let nine = vec![Filter::Lzma2(Lzma::preset(9, false).unwrap())];
+        for threads in [0, 2] {
+            for block_size in [0, 40_000] {
+                check(&EncodeOptions {
+                    threads,
+                    block_size,
+                    block_list: vec![(100_000, None), (30_000, Some(nine.clone())), (5, None)],
+                    ..EncodeOptions::default()
+                });
+            }
+        }
+        for threads in [16_384, 16_385] {
+            check(&EncodeOptions {
+                threads,
+                block_size: 1 << 20,
+                ..EncodeOptions::default()
+            });
+        }
+        assert!(cases > 1000, "{cases}");
     }
 
     #[test]
@@ -562,22 +786,6 @@ mod c_tier {
         assert_eq!(d.progress().in_bytes, lzma.len() as u64);
     }
 
-    /// An empty `.xz` stream whose flags name check ID 0x0F, which no
-    /// liblzma supports: header, an empty index, footer, CRC32s fixed
-    /// (computed once with `zlib.crc32`). `xz -t` on it: "Unsupported type of
-    /// integrity check; not verifying file integrity", exit 2.
-    const CHECK_0F: [u8; 32] = [
-        0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, // magic
-        0x00, 0x0f, // stream flags: check 0x0F
-        0x6e, 0x0f, 0x66, 0xd1, // CRC32 of the flags
-        0x00, 0x00, 0x00, 0x00, // index: indicator, 0 records, padding
-        0x1c, 0xdf, 0x44, 0x21, // CRC32 of the index
-        0x97, 0x6f, 0x21, 0xea, // CRC32 of backward size + flags
-        0x01, 0x00, 0x00, 0x00, // backward size: (8 / 4) - 1
-        0x00, 0x0f, // stream flags again
-        0x59, 0x5a, // footer magic
-    ];
-
     #[test]
     fn unsupported_check_warns() {
         let mut d = Decoder::new(&DecodeOptions::default()).unwrap();
@@ -622,42 +830,6 @@ mod c_tier {
             let packed = encode(&block_list_opts(threads), &plain);
             assert_eq!(decode(&DecodeOptions::default(), &packed).unwrap(), plain);
         }
-    }
-
-    /// The reference `xz` 5.8.4, if this machine has it.
-    #[cfg(target_os = "macos")]
-    fn reference() -> Option<std::path::PathBuf> {
-        let path = std::env::var_os("STUFFR_XZ_REFERENCE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/opt/homebrew/opt/xz/bin/xz".into());
-        let v = std::process::Command::new(&path)
-            .arg("--version")
-            .output()
-            .ok()?;
-        String::from_utf8_lossy(&v.stdout)
-            .contains("5.8.4")
-            .then_some(path)
-    }
-
-    /// `xz <args> -c` over `input` on stdin.
-    #[cfg(target_os = "macos")]
-    fn run_reference(xz: &std::path::Path, args: &[&str], input: &[u8]) -> Vec<u8> {
-        use std::io::Write;
-        use std::process::{Command, Stdio};
-        let mut child = Command::new(xz)
-            .args(args)
-            .arg("-c")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let input = input.to_vec();
-        let writer = std::thread::spawn(move || stdin.write_all(&input));
-        let out = child.wait_with_output().unwrap();
-        writer.join().unwrap().unwrap();
-        assert!(out.status.success(), "xz {args:?}");
-        out.stdout
     }
 
     /// Re-derives a sample of the table through the real `xz`, so a stale
@@ -725,5 +897,1042 @@ mod c_tier {
                 "{t}: differs from xz"
             );
         }
+    }
+}
+
+/// One tier's [`Encoder`] and [`Decoder`] behind plain functions, so the
+/// same cases run through either (`c` or `pure`).
+#[cfg(feature = "xz-pure")]
+macro_rules! codec_fns {
+    ($tier:ident) => {
+        /// Encodes `input` fed in `piece`-byte pieces.
+        pub(super) fn encode(
+            o: &EncodeOptions,
+            input: &[u8],
+            piece: usize,
+        ) -> Result<Vec<u8>, XzError> {
+            let mut e = crate::xz_opts::$tier::Encoder::new(o)?;
+            let mut out = Vec::new();
+            for p in input.chunks(piece.max(1)) {
+                e.feed(p, &mut out)?;
+            }
+            e.finish(&mut out)?;
+            assert_eq!(
+                e.progress(),
+                Progress {
+                    in_bytes: input.len() as u64,
+                    out_bytes: out.len() as u64
+                }
+            );
+            Ok(out)
+        }
+
+        /// Decodes `data` fed in `piece`-byte pieces: the output, the
+        /// verdict, the input used (`progress().in_bytes`), the warnings.
+        pub(super) fn decode(
+            o: &DecodeOptions,
+            data: &[u8],
+            piece: usize,
+        ) -> (Vec<u8>, Result<(), XzError>, u64, Vec<u32>) {
+            let mut out = Vec::new();
+            let mut d = match crate::xz_opts::$tier::Decoder::new(o) {
+                Ok(d) => d,
+                Err(e) => return (out, Err(e), 0, Vec::new()),
+            };
+            let r = (|| {
+                for p in data.chunks(piece.max(1)) {
+                    d.feed(p, &mut out)?;
+                }
+                d.finish(&mut out)
+            })();
+            let mut warnings = Vec::new();
+            while let Some(w) = d.take_unsupported_check_warning() {
+                warnings.push(w);
+            }
+            (out, r, d.progress().in_bytes, warnings)
+        }
+    };
+}
+
+#[cfg(feature = "xz-pure")]
+mod pure_codec {
+    use super::*;
+    codec_fns!(pure);
+}
+
+#[cfg(all(feature = "xz-pure", feature = "xz-c"))]
+mod c_codec {
+    use super::*;
+    codec_fns!(c);
+}
+
+/// `EncodeOptions` drawn from `r`: every format, check, filter and thread
+/// setting the pure tier maps, with dictionaries of at most 8 MiB so a
+/// debug build stays quick.
+#[cfg(feature = "xz-pure")]
+fn random_options(r: &mut Lcg) -> EncodeOptions {
+    let mut pick = |n: u32| r.next() % n;
+    let mut l = Lzma::preset(pick(7), pick(2) == 1).unwrap();
+    if pick(3) == 0 {
+        l.dict_size = [4096, 65_536, 300_000, 1 << 20][pick(4) as usize];
+    }
+    if pick(3) == 0 {
+        l.lc = pick(5);
+        l.lp = pick(5 - l.lc);
+        l.pb = pick(5);
+    }
+    if pick(3) == 0 {
+        l.nice_len = 2 + pick(272);
+        l.mf = [
+            MatchFinder::Hc3,
+            MatchFinder::Hc4,
+            MatchFinder::Bt2,
+            MatchFinder::Bt3,
+            MatchFinder::Bt4,
+        ][pick(5) as usize];
+        l.mode = if pick(2) == 0 {
+            Mode::Fast
+        } else {
+            Mode::Normal
+        };
+        l.depth = [0, 1, 10, 100][pick(4) as usize];
+    }
+    let kinds = [
+        Bcj::X86,
+        Bcj::PowerPc,
+        Bcj::Ia64,
+        Bcj::Arm,
+        Bcj::ArmThumb,
+        Bcj::Arm64,
+        Bcj::Sparc,
+        Bcj::RiscV,
+    ];
+    let mut pre = Vec::new();
+    for _ in 0..pick(3) {
+        pre.push(if pick(2) == 0 {
+            Filter::Delta {
+                dist: 1 + pick(256),
+            }
+        } else {
+            Filter::Bcj {
+                kind: kinds[pick(8) as usize],
+                start: 16 * pick(4),
+            }
+        });
+    }
+    let check = [Check::None, Check::Crc32, Check::Crc64, Check::Sha256][pick(4) as usize];
+    match pick(10) {
+        0..=6 => {
+            let mut filters = pre;
+            filters.push(Filter::Lzma2(l.clone()));
+            let mut block_list = Vec::new();
+            if pick(4) == 0 {
+                let other = vec![
+                    Filter::Delta { dist: 2 },
+                    Filter::Lzma2(Lzma::preset(1, false).unwrap()),
+                ];
+                block_list = vec![
+                    (1 + u64::from(pick(40_000)), None),
+                    (1 + u64::from(pick(20_000)), Some(other)),
+                    (1 + u64::from(pick(30_000)), None),
+                ];
+            }
+            EncodeOptions {
+                format: Format::Xz,
+                filters,
+                check,
+                threads: [0, 0, 0, 1, 2, 4][pick(6) as usize],
+                block_size: [0, 0, 10_000, 65_536][pick(4) as usize],
+                block_list,
+                ..EncodeOptions::default()
+            }
+        }
+        7 | 8 => EncodeOptions {
+            format: Format::Lzma,
+            filters: vec![Filter::Lzma1(l)],
+            ..EncodeOptions::default()
+        },
+        _ => {
+            let mut filters = pre;
+            filters.push(match pick(3) {
+                0 => Filter::Lzma1(l),
+                1 => Filter::Lzma1Ext(l),
+                _ => Filter::Lzma2(l),
+            });
+            EncodeOptions {
+                format: Format::Raw,
+                filters,
+                ..EncodeOptions::default()
+            }
+        }
+    }
+}
+
+/// The input for random case `i`.
+#[cfg(feature = "xz-pure")]
+fn random_input(r: &mut Lcg, i: u64) -> Vec<u8> {
+    match i % 4 {
+        0 => text(10_000 + r.next() as usize % 70_000, i),
+        1 => bin(),
+        2 => rand(1 + r.next() as usize % 20_000),
+        _ => Vec::new(),
+    }
+}
+
+/// How to decode what `o` encoded.
+#[cfg(feature = "xz-pure")]
+fn decode_options_for(o: &EncodeOptions) -> DecodeOptions {
+    DecodeOptions {
+        format: o.format,
+        raw_filters: o.filters.clone(),
+        ..DecodeOptions::default()
+    }
+}
+
+/// The `.xz` Index's records, `(unpadded, uncompressed)`, read back from
+/// the end of a single Stream.
+#[cfg(feature = "xz-pure")]
+fn xz_index(packed: &[u8]) -> Vec<(u64, u64)> {
+    let n = packed.len();
+    let backward = u32::from_le_bytes(packed[n - 8..n - 4].try_into().unwrap());
+    let size = (backward as usize + 1) * 4;
+    let index = &packed[n - 12 - size..n - 12];
+    let mut pos = 1;
+    let mut vli = || {
+        let (mut v, mut shift) = (0u64, 0);
+        loop {
+            let b = index[pos];
+            pos += 1;
+            v |= u64::from(b & 0x7F) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                return v;
+            }
+        }
+    };
+    let count = vli();
+    (0..count).map(|_| (vli(), vli())).collect()
+}
+
+#[cfg(feature = "xz-pure")]
+mod pure_tier {
+    use super::pure_codec::{decode, encode};
+    use super::*;
+
+    #[test]
+    fn pure_liblzma_version_is_5_8_4() {
+        assert_eq!(crate::xz_opts::pure::liblzma_version(), "5.8.4");
+    }
+
+    #[test]
+    fn pure_encoder_and_decoder_are_send() {
+        fn send<T: Send>() {}
+        send::<crate::xz_opts::pure::Encoder>();
+        send::<crate::xz_opts::pure::Decoder>();
+    }
+
+    /// 64 LCG-drawn option sets, each round-tripping through the pure
+    /// decoder in uneven pieces, with the container fields the spec pins
+    /// (the Stream Flags, so the check, at both ends), the bytes not
+    /// depending on how the input was fed, and — when the reference `xz`
+    /// 5.8.4 is found — eight representative outputs piped through
+    /// `xz -dc`.
+    #[test]
+    fn pure_roundtrips_and_xz_reads_it() {
+        let mut r = Lcg(0x7e57_0001);
+        let mut samples: Vec<(EncodeOptions, Vec<u8>, Vec<u8>)> = Vec::new();
+        for i in 0..64 {
+            let o = random_options(&mut r);
+            let input = random_input(&mut r, i);
+            let piece = 1 + r.next() as usize % 9_000;
+            let packed = encode(&o, &input, piece).unwrap_or_else(|e| panic!("{i} {o:?}: {e}"));
+            if i % 4 == 0 {
+                let whole = encode(&o, &input, input.len()).unwrap();
+                assert!(whole == packed, "{i}: the bytes depend on the feeding");
+            }
+            let (out, res, used, _) = decode(
+                &decode_options_for(&o),
+                &packed,
+                1 + r.next() as usize % 5_000,
+            );
+            res.unwrap_or_else(|e| panic!("{i} {o:?}: {e}"));
+            assert!(out == input, "{i} {o:?}: round trip differs");
+            assert_eq!(used, packed.len() as u64, "{i}");
+            if o.format == Format::Xz {
+                let flags = [0, o.check.id() as u8];
+                assert_eq!(packed[6..8], flags, "{i}: header flags");
+                let n = packed.len();
+                assert_eq!(packed[n - 4..n - 2], flags, "{i}: footer flags");
+            }
+            if o.format != Format::Raw && !input.is_empty() && samples.len() < 8 {
+                samples.push((o, input, packed));
+            }
+        }
+        assert_eq!(samples.len(), 8);
+        #[cfg(unix)]
+        {
+            let Some(xz) = reference() else {
+                eprintln!("skipped the xz -dc leg: no xz 5.8.4 (set STUFFR_XZ_REFERENCE)");
+                return;
+            };
+            for (o, input, packed) in samples {
+                let format = if o.format == Format::Lzma {
+                    "--format=lzma"
+                } else {
+                    "--format=xz"
+                };
+                let got = run_reference(&xz, &["-d", format], &packed);
+                assert!(got == input, "xz -dc differs for {o:?}");
+            }
+        }
+    }
+
+    /// The single-threaded writer cuts Blocks where `coder.c` does:
+    /// `--block-size`, then a block list (an entry longer than the size, a
+    /// chain change, the last entry repeating).
+    #[test]
+    fn pure_block_boundaries_are_xzs() {
+        let plain = text(300_000, 9);
+        let delta = vec![
+            Filter::Delta { dist: 4 },
+            Filter::Lzma2(Lzma::preset(1, false).unwrap()),
+        ];
+        let o = EncodeOptions {
+            filters: vec![Filter::Lzma2(Lzma::preset(3, false).unwrap())],
+            block_size: 40_000,
+            block_list: vec![(100_000, None), (30_000, Some(delta)), (25_000, None)],
+            ..EncodeOptions::default()
+        };
+        let packed = encode(&o, &plain, 7_919).unwrap();
+        let sizes: Vec<u64> = xz_index(&packed).iter().map(|&(_, u)| u).collect();
+        let mut want = vec![40_000, 40_000, 20_000, 30_000];
+        let mut left = 300_000 - 130_000;
+        while left > 0 {
+            want.push(left.min(25_000));
+            left -= left.min(25_000);
+        }
+        assert_eq!(sizes, want);
+        let (out, res, ..) = decode(&DecodeOptions::default(), &packed, 4_093);
+        res.unwrap();
+        assert!(out == plain);
+        let o = EncodeOptions {
+            block_size: 10_000,
+            block_list: Vec::new(),
+            ..o
+        };
+        let packed = encode(&o, &plain[..25_000], 3_001).unwrap();
+        let sizes: Vec<u64> = xz_index(&packed).iter().map(|&(_, u)| u).collect();
+        assert_eq!(sizes, [10_000, 10_000, 5_000]);
+    }
+
+    /// `flush` makes everything fed so far decodable, and the stream goes
+    /// on; refused where liblzma refuses it.
+    #[test]
+    fn pure_flush_is_a_sync_flush() {
+        use crate::xz_opts::pure::{Decoder, Encoder};
+        let plain = text(50_000, 21);
+        for format in [Format::Xz, Format::Raw] {
+            let o = EncodeOptions {
+                format,
+                ..EncodeOptions::default()
+            };
+            let d = decode_options_for(&o);
+            let mut e = Encoder::new(&o).unwrap();
+            let mut packed = Vec::new();
+            e.feed(&plain[..20_000], &mut packed).unwrap();
+            e.flush(&mut packed).unwrap();
+            let mut dec = Decoder::new(&d).unwrap();
+            let mut out = Vec::new();
+            dec.feed(&packed, &mut out).unwrap();
+            assert!(out == plain[..20_000], "{format:?}: flushed data decodes");
+            e.feed(&plain[20_000..], &mut packed).unwrap();
+            e.finish(&mut packed).unwrap();
+            let (out, res, ..) = decode(&d, &packed, 999);
+            res.unwrap();
+            assert!(out == plain);
+        }
+        let bcj = EncodeOptions {
+            filters: vec![
+                Filter::Bcj {
+                    kind: Bcj::X86,
+                    start: 0,
+                },
+                Filter::Lzma2(Lzma::preset(1, false).unwrap()),
+            ],
+            ..EncodeOptions::default()
+        };
+        let mut e = Encoder::new(&bcj).unwrap();
+        let mut out = Vec::new();
+        e.flush(&mut out).unwrap(); // between Blocks: nothing to flush
+        e.feed(b"data", &mut out).unwrap();
+        assert!(matches!(e.flush(&mut out), Err(XzError::Options)));
+        let mt = EncodeOptions {
+            threads: 2,
+            ..EncodeOptions::default()
+        };
+        let mut e = Encoder::new(&mt).unwrap();
+        assert!(matches!(e.flush(&mut out), Err(XzError::Prog)));
+    }
+
+    /// As the C tier's `decoder_reports_memlimit`: `.xz` says 32 KiB
+    /// (liblzma's threaded decoder, at any thread count, before any Block
+    /// ran), `.lzma` the dictionary.
+    #[test]
+    fn decoder_reports_memlimit() {
+        let nine = Lzma::preset(9, false).unwrap();
+        let packed = encode(
+            &EncodeOptions {
+                filters: vec![Filter::Lzma2(nine.clone())],
+                ..EncodeOptions::default()
+            },
+            b"tiny input",
+            100,
+        )
+        .unwrap();
+        for threads in [1, 2] {
+            let o = DecodeOptions {
+                memlimit: 1 << 20,
+                threads,
+                memlimit_threading: 1 << 20,
+                ..DecodeOptions::default()
+            };
+            match decode(&o, &packed, 4_093).1 {
+                Err(XzError::MemLimit { needed, limit }) => {
+                    assert_eq!((needed, limit), (32_768, 1 << 20));
+                }
+                other => panic!("threads {threads}: {other:?}"),
+            }
+        }
+        // `auto` is liblzma's single-threaded decoder: the Block's figure.
+        let auto = DecodeOptions {
+            auto: true,
+            memlimit: 1 << 20,
+            ..DecodeOptions::default()
+        };
+        match decode(&auto, &packed, 4_093).1 {
+            Err(XzError::MemLimit { needed, limit }) => {
+                assert_eq!(limit, 1 << 20);
+                assert_eq!(
+                    needed,
+                    decoder_memusage(&[Filter::Lzma2(nine.clone())]).unwrap()
+                );
+            }
+            other => panic!("auto: {other:?}"),
+        }
+        let lzma = encode(
+            &EncodeOptions {
+                format: Format::Lzma,
+                filters: vec![Filter::Lzma1(nine)],
+                ..EncodeOptions::default()
+            },
+            b"tiny input",
+            100,
+        )
+        .unwrap();
+        let o = DecodeOptions {
+            format: Format::Lzma,
+            memlimit: 1 << 20,
+            ..DecodeOptions::default()
+        };
+        match decode(&o, &lzma, 4_093).1 {
+            Err(XzError::MemLimit { needed, limit }) => {
+                assert_eq!(limit, 1 << 20);
+                assert_eq!(needed.div_ceil(1 << 20), 65, "{needed}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_is_buf_error() {
+        let plain = text(20_000, 5);
+        let packed = encode(&EncodeOptions::default(), &plain, 7_919).unwrap();
+        let cut = &packed[..packed.len() - 10];
+        assert!(matches!(
+            decode(&DecodeOptions::default(), cut, 4_093).1,
+            Err(XzError::BufError)
+        ));
+        // Everything decodable reached the output before the verdict.
+        let mut d = crate::xz_opts::pure::Decoder::new(&DecodeOptions::default()).unwrap();
+        let mut out = Vec::new();
+        d.feed(cut, &mut out).unwrap();
+        assert!(matches!(d.finish(&mut out), Err(XzError::BufError)));
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn corrupt_is_data_error() {
+        let plain = text(20_000, 6);
+        let mut packed = encode(&EncodeOptions::default(), &plain, 7_919).unwrap();
+        let mid = packed.len() / 2;
+        packed[mid] ^= 0x55;
+        assert!(matches!(
+            decode(&DecodeOptions::default(), &packed, 4_093).1,
+            Err(XzError::Data)
+        ));
+        // Trailing garbage after a `.lzma` stream is corrupt data too, but
+        // `--single-stream` leaves it unconsumed instead.
+        let lzma = encode(
+            &EncodeOptions {
+                format: Format::Lzma,
+                filters: vec![Filter::Lzma1(Lzma::preset(1, false).unwrap())],
+                ..EncodeOptions::default()
+            },
+            &plain,
+            7_919,
+        )
+        .unwrap();
+        let mut junk = lzma.clone();
+        junk.extend_from_slice(b"junk");
+        let o = DecodeOptions {
+            format: Format::Lzma,
+            ..DecodeOptions::default()
+        };
+        for piece in [junk.len(), 4_093, 3] {
+            assert!(
+                matches!(decode(&o, &junk, piece).1, Err(XzError::Data)),
+                "{piece}"
+            );
+            let single = DecodeOptions {
+                single_stream: true,
+                ..o.clone()
+            };
+            let (out, res, used, _) = decode(&single, &junk, piece);
+            res.unwrap();
+            assert!(out == plain, "{piece}");
+            assert_eq!(used, lzma.len() as u64, "{piece}");
+        }
+    }
+
+    #[test]
+    fn unsupported_check_warns() {
+        let (out, res, _, warnings) = decode(&DecodeOptions::default(), &CHECK_0F, 32);
+        res.unwrap();
+        assert!(out.is_empty());
+        assert_eq!(warnings, [0x0f]);
+        // `--ignore-check` does not ask to be told.
+        let o = DecodeOptions {
+            ignore_check: true,
+            ..DecodeOptions::default()
+        };
+        let (_, res, _, warnings) = decode(&o, &CHECK_0F, 5);
+        res.unwrap();
+        assert!(warnings.is_empty());
+    }
+
+    /// `.lz` as the C tier's `lzip_members_and_trailing_data` pins it.
+    #[cfg(feature = "lzip")]
+    #[test]
+    fn lzip_members_and_trailing_data() {
+        let one = text(30_000, 11);
+        let member = crate::lzip::encode_for_test(&one);
+        let mut file = member.clone();
+        file.extend_from_slice(&member);
+        file.extend_from_slice(b"junk");
+        let both = [one.clone(), one.clone()].concat();
+        for auto in [false, true] {
+            for (single_stream, want, used) in
+                [(false, &both, 2 * member.len()), (true, &one, member.len())]
+            {
+                for piece in [3, 4_093, file.len()] {
+                    let o = DecodeOptions {
+                        format: if auto { Format::Xz } else { Format::Lzip },
+                        auto,
+                        single_stream,
+                        ..DecodeOptions::default()
+                    };
+                    let what = format!("auto {auto} single_stream {single_stream} piece {piece}");
+                    let (out, res, in_bytes, _) = decode(&o, &file, piece);
+                    res.unwrap_or_else(|e| panic!("{what}: {e}"));
+                    assert!(out == *want, "{what}: {} bytes", out.len());
+                    assert_eq!(in_bytes, used as u64, "{what}");
+                }
+            }
+        }
+        let o = DecodeOptions {
+            format: Format::Lzip,
+            ..DecodeOptions::default()
+        };
+        let cut = &member[..member.len() - 3];
+        assert!(matches!(decode(&o, cut, 4_093).1, Err(XzError::BufError)));
+    }
+}
+
+/// The pure tier against liblzma itself, case by case: what one encodes
+/// the other decodes, and for the same input both decoders reach the same
+/// verdict — the same [`XzError`], the same `MemLimit { needed, limit }`,
+/// the same warnings, and on success the same output and input used.
+#[cfg(all(feature = "xz-pure", feature = "xz-c"))]
+mod cross_tier {
+    use super::*;
+
+    /// A verdict as the CLI would print it.
+    fn verdict(r: &Result<(), XzError>) -> String {
+        match r {
+            Ok(()) => "ok".to_owned(),
+            Err(XzError::MemLimit { needed, limit }) => format!("memlimit {needed} {limit}"),
+            Err(XzError::UnsupportedCheck(id)) => format!("unsupported check {id}"),
+            Err(XzError::Mem { .. }) => "mem".to_owned(),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// Decodes `data` with both tiers in `piece`-byte feeds and asserts
+    /// they agree; the verdict.
+    fn agree(what: &str, o: &DecodeOptions, data: &[u8], piece: usize) -> String {
+        let (c_out, c_res, c_used, c_warn) = c_codec::decode(o, data, piece);
+        let (p_out, p_res, p_used, p_warn) = pure_codec::decode(o, data, piece);
+        let (cv, pv) = (verdict(&c_res), verdict(&p_res));
+        // The last 20 bytes of input under a raw, `.lzma` or `.lz` stream,
+        // as the pure module doc says: corruption liblzma finds only there
+        // is, on the pure tier, the stream running out.
+        let lzma1 = matches!(o.format, Format::Raw | Format::Lzma | Format::Lzip)
+            || (o.auto && data.first() != Some(&0xFD));
+        if lzma1 && matches!(c_res, Err(XzError::Data)) && matches!(p_res, Err(XzError::BufError)) {
+            return "Compressed data is corrupt, or the end".to_owned();
+        }
+        assert_eq!(pv, cv, "{what} (piece {piece}): pure vs liblzma");
+        assert_eq!(p_warn, c_warn, "{what} (piece {piece}): warnings");
+        if c_res.is_ok() {
+            assert!(p_out == c_out, "{what} (piece {piece}): output differs");
+            assert_eq!(p_used, c_used, "{what} (piece {piece}): input used");
+        }
+        cv
+    }
+
+    #[test]
+    fn tiers_read_each_other() {
+        let mut r = Lcg(0x7e57_0002);
+        for i in 0..64 {
+            let o = random_options(&mut r);
+            let input = random_input(&mut r, i);
+            let d = decode_options_for(&o);
+            let from_c = c_codec::encode(&o, &input, 7_919).unwrap();
+            let (out, res, used, _) = pure_codec::decode(&d, &from_c, 4_093);
+            res.unwrap_or_else(|e| panic!("{i} {o:?}: pure reading C: {e}"));
+            assert!(out == input, "{i} {o:?}: pure reading C");
+            assert_eq!(used, from_c.len() as u64, "{i}");
+            let from_pure = pure_codec::encode(&o, &input, 7_919).unwrap();
+            let (out, res, used, _) = c_codec::decode(&d, &from_pure, 4_093);
+            res.unwrap_or_else(|e| panic!("{i} {o:?}: C reading pure: {e}"));
+            assert!(out == input, "{i} {o:?}: C reading pure");
+            assert_eq!(used, from_pure.len() as u64, "{i}");
+        }
+    }
+
+    /// What the single-threaded encoders write around the compressed data
+    /// is the same: the Stream Header and Footer flags, the Block sizes
+    /// (`--block-size`, `--block-list`), the `.lzma` header.
+    #[test]
+    fn container_fields_match_liblzma() {
+        let plain = text(120_000, 31);
+        let delta = vec![
+            Filter::Delta { dist: 3 },
+            Filter::Lzma2(Lzma::preset(0, false).unwrap()),
+        ];
+        for check in [Check::None, Check::Crc32, Check::Crc64, Check::Sha256] {
+            for (block_size, block_list) in [
+                (0, vec![]),
+                (17_000, vec![]),
+                (
+                    0,
+                    vec![(50_000, None), (1, Some(delta.clone())), (9_999, None)],
+                ),
+                (
+                    20_000,
+                    vec![(45_000, Some(delta.clone())), (u64::MAX, None)],
+                ),
+            ] {
+                let o = EncodeOptions {
+                    check,
+                    block_size,
+                    block_list,
+                    ..EncodeOptions::default()
+                };
+                let c = c_codec::encode(&o, &plain, 7_919).unwrap();
+                let p = pure_codec::encode(&o, &plain, 7_919).unwrap();
+                assert_eq!(p[..12], c[..12], "{o:?}: Stream Header");
+                assert_eq!(p[p.len() - 4..], c[c.len() - 4..], "{o:?}: Footer flags");
+                let sizes = |x: &[u8]| xz_index(x).iter().map(|&(_, u)| u).collect::<Vec<_>>();
+                assert_eq!(sizes(&p), sizes(&c), "{o:?}: Blocks");
+            }
+        }
+        for dict_size in [4096, 5 << 20, 3 << 19, (1 << 20) + 1] {
+            let o = EncodeOptions {
+                format: Format::Lzma,
+                filters: vec![Filter::Lzma1(Lzma {
+                    dict_size,
+                    ..Lzma::preset(1, false).unwrap()
+                })],
+                ..EncodeOptions::default()
+            };
+            let c = c_codec::encode(&o, &plain, 7_919).unwrap();
+            let p = pure_codec::encode(&o, &plain, 7_919).unwrap();
+            assert_eq!(p[..13], c[..13], "dict {dict_size}: .lzma header");
+        }
+    }
+
+    /// `flush` is taken or refused (and how) as liblzma does it.
+    #[test]
+    fn flush_verdicts_match_liblzma() {
+        let l2 = Filter::Lzma2(Lzma::preset(1, false).unwrap());
+        let l1 = Filter::Lzma1(Lzma::preset(1, false).unwrap());
+        let bcj = Filter::Bcj {
+            kind: Bcj::Arm64,
+            start: 0,
+        };
+        let delta = Filter::Delta { dist: 2 };
+        let cases = [
+            (Format::Xz, vec![l2.clone()], 0),
+            (Format::Xz, vec![delta.clone(), l2.clone()], 0),
+            (Format::Xz, vec![bcj.clone(), l2.clone()], 0),
+            (Format::Xz, vec![l2.clone()], 2),
+            (Format::Xz, vec![bcj.clone(), l2.clone()], 2),
+            (Format::Lzma, vec![l1.clone()], 0),
+            (Format::Raw, vec![l2.clone()], 0),
+            (Format::Raw, vec![delta.clone(), l2], 0),
+            (Format::Raw, vec![bcj, l1.clone()], 0),
+            (Format::Raw, vec![l1], 0),
+        ];
+        for (format, filters, threads) in cases {
+            let o = EncodeOptions {
+                format,
+                filters,
+                threads,
+                ..EncodeOptions::default()
+            };
+            for fed in [&b""[..], b"some data to flush"] {
+                let mut c = crate::xz_opts::c::Encoder::new(&o).unwrap();
+                let mut p = crate::xz_opts::pure::Encoder::new(&o).unwrap();
+                let (mut co, mut po) = (Vec::new(), Vec::new());
+                c.feed(fed, &mut co).unwrap();
+                p.feed(fed, &mut po).unwrap();
+                let cv = verdict(&c.flush(&mut co));
+                let pv = verdict(&p.flush(&mut po));
+                assert_eq!(pv, cv, "{o:?} after {} bytes", fed.len());
+            }
+        }
+    }
+
+    /// The encoders refuse the same option sets the same way.
+    #[test]
+    fn encoder_verdicts_match_liblzma() {
+        let base = Lzma::preset(1, false).unwrap();
+        let mut cases = Vec::new();
+        for (kind, start) in [
+            (Bcj::X86, 3),
+            (Bcj::PowerPc, 2),
+            (Bcj::Ia64, 8),
+            (Bcj::Ia64, 32),
+            (Bcj::ArmThumb, 1),
+            (Bcj::RiscV, 6),
+            (Bcj::Sparc, 4),
+        ] {
+            for format in [Format::Xz, Format::Raw] {
+                cases.push(EncodeOptions {
+                    format,
+                    filters: vec![Filter::Bcj { kind, start }, Filter::Lzma2(base.clone())],
+                    ..EncodeOptions::default()
+                });
+            }
+        }
+        for threads in [0, 2] {
+            cases.push(EncodeOptions {
+                filters: vec![Filter::Lzma1(base.clone())],
+                threads,
+                ..EncodeOptions::default()
+            });
+        }
+        cases.push(EncodeOptions {
+            format: Format::Lzip,
+            ..EncodeOptions::default()
+        });
+        cases.push(EncodeOptions {
+            format: Format::Lzma,
+            ..EncodeOptions::default()
+        });
+        cases.push(EncodeOptions {
+            filters: vec![Filter::Delta { dist: 0 }, Filter::Lzma2(base.clone())],
+            ..EncodeOptions::default()
+        });
+        cases.push(EncodeOptions {
+            memlimit: 1 << 20,
+            ..EncodeOptions::default()
+        });
+        cases.push(EncodeOptions {
+            threads: 2,
+            memlimit: 50 << 20,
+            ..EncodeOptions::default()
+        });
+        for o in cases {
+            let c = crate::xz_opts::c::Encoder::new(&o).map(drop);
+            let p = crate::xz_opts::pure::Encoder::new(&o).map(drop);
+            assert_eq!(verdict(&p), verdict(&c), "{o:?}");
+        }
+    }
+
+    /// Samples from liblzma's encoders, each with the options it decodes
+    /// with.
+    fn corpus() -> Vec<(String, DecodeOptions, Vec<u8>)> {
+        let plain = text(3_000, 41);
+        let x86 = bin()[..3_000].to_vec();
+        let enc = |o: &EncodeOptions, input: &[u8]| c_codec::encode(o, input, 1_000).unwrap();
+        // 64 KiB dictionaries: the pure decoder zeroes its whole window,
+        // which a debug build pays for on every one of these decodes.
+        let small = |level| Lzma {
+            dict_size: 1 << 16,
+            ..Lzma::preset(level, false).unwrap()
+        };
+        let base = EncodeOptions {
+            filters: vec![Filter::Lzma2(small(1))],
+            ..EncodeOptions::default()
+        };
+        let mut out = Vec::new();
+        let mut add = |what: &str, o: DecodeOptions, data: Vec<u8>| {
+            out.push((what.to_owned(), o, data));
+        };
+        let xz = DecodeOptions::default();
+        add("xz", xz.clone(), enc(&base, &plain));
+        add(
+            "xz sha256 blocks",
+            xz.clone(),
+            enc(
+                &EncodeOptions {
+                    check: Check::Sha256,
+                    block_size: 1_000,
+                    ..base.clone()
+                },
+                &plain,
+            ),
+        );
+        add(
+            "xz none delta",
+            xz.clone(),
+            enc(
+                &EncodeOptions {
+                    check: Check::None,
+                    filters: vec![Filter::Delta { dist: 2 }, Filter::Lzma2(small(0))],
+                    ..base.clone()
+                },
+                &plain,
+            ),
+        );
+        add(
+            "xz crc32 x86",
+            xz.clone(),
+            enc(
+                &EncodeOptions {
+                    check: Check::Crc32,
+                    filters: vec![
+                        Filter::Bcj {
+                            kind: Bcj::X86,
+                            start: 0,
+                        },
+                        Filter::Lzma2(small(1)),
+                    ],
+                    ..base.clone()
+                },
+                &x86,
+            ),
+        );
+        add(
+            "xz threaded",
+            xz.clone(),
+            enc(
+                &EncodeOptions {
+                    threads: 2,
+                    block_size: 1_200,
+                    filters: vec![Filter::Lzma2(small(0))],
+                    ..base.clone()
+                },
+                &plain,
+            ),
+        );
+        let empty = enc(&base, b"");
+        add("xz empty", xz.clone(), empty.clone());
+        // A reserved Stream Flags bit, its CRC32 right: unsupported options.
+        let mut reserved = empty;
+        reserved[6] = 0x01;
+        let crc = super::super::check::crc32(&reserved[6..8], 0);
+        reserved[8..12].copy_from_slice(&crc.to_le_bytes());
+        add("xz reserved flag", xz.clone(), reserved);
+        // A Block Header naming Filter ID 0x22, its CRC32 right.
+        let mut unknown = enc(&base, &plain);
+        let size = (usize::from(unknown[12]) + 1) * 4;
+        assert_eq!(unknown[14], 0x21, "LZMA2's Filter Flags first");
+        unknown[14] = 0x22;
+        let crc = super::super::check::crc32(&unknown[12..12 + size - 4], 0);
+        unknown[12 + size - 4..12 + size].copy_from_slice(&crc.to_le_bytes());
+        add("xz unknown filter", xz.clone(), unknown);
+        add("xz check 0x0f", xz.clone(), CHECK_0F.to_vec());
+        // Two Streams with Stream Padding between them; the first with a
+        // small dictionary, so a limit refusing the second's says what the
+        // first needed.
+        let first = enc(
+            &EncodeOptions {
+                filters: vec![Filter::Lzma2(small(0))],
+                ..base.clone()
+            },
+            &plain[..1_500],
+        );
+        let mut two = first;
+        two.extend_from_slice(&[0; 8]);
+        two.extend_from_slice(&enc(
+            &EncodeOptions {
+                filters: vec![Filter::Lzma2(Lzma::preset(0, false).unwrap())],
+                ..EncodeOptions::default()
+            },
+            &plain[1_500..],
+        ));
+        add("xz two streams", xz.clone(), two);
+        let lzma = DecodeOptions {
+            format: Format::Lzma,
+            ..DecodeOptions::default()
+        };
+        add(
+            "lzma",
+            lzma,
+            enc(
+                &EncodeOptions {
+                    format: Format::Lzma,
+                    filters: vec![Filter::Lzma1(small(2))],
+                    ..base.clone()
+                },
+                &plain,
+            ),
+        );
+        let raw2 = vec![Filter::Delta { dist: 1 }, Filter::Lzma2(small(1))];
+        let raw1 = vec![Filter::Lzma1(small(1))];
+        for (what, filters) in [("raw lzma2", raw2), ("raw lzma1", raw1)] {
+            let data = enc(
+                &EncodeOptions {
+                    format: Format::Raw,
+                    filters: filters.clone(),
+                    ..base.clone()
+                },
+                &plain,
+            );
+            add(
+                what,
+                DecodeOptions {
+                    format: Format::Raw,
+                    raw_filters: filters,
+                    ..DecodeOptions::default()
+                },
+                data,
+            );
+        }
+        {
+            // A version-1 `.lz` member by hand: liblzma's raw LZMA1 (lc 3,
+            // lp 0, pb 2, end marker) under a 64 KiB dictionary (byte 0x10).
+            let lzma = enc(
+                &EncodeOptions {
+                    format: Format::Raw,
+                    filters: vec![Filter::Lzma1(small(1))],
+                    ..EncodeOptions::default()
+                },
+                &plain,
+            );
+            let mut member = b"LZIP\x01\x10".to_vec();
+            member.extend_from_slice(&lzma);
+            member.extend_from_slice(&super::super::check::crc32(&plain, 0).to_le_bytes());
+            member.extend_from_slice(&(plain.len() as u64).to_le_bytes());
+            member.extend_from_slice(&(member.len() as u64 + 16).to_le_bytes());
+            add(
+                "lzip",
+                DecodeOptions {
+                    format: Format::Lzip,
+                    ..DecodeOptions::default()
+                },
+                [member.clone(), member].concat(),
+            );
+        }
+        out
+    }
+
+    /// The decoder variants each sample runs under.
+    fn variants(o: &DecodeOptions) -> Vec<DecodeOptions> {
+        let mut v = vec![
+            o.clone(),
+            DecodeOptions {
+                single_stream: true,
+                ..o.clone()
+            },
+            DecodeOptions {
+                ignore_check: true,
+                ..o.clone()
+            },
+        ];
+        if o.format != Format::Raw {
+            v.push(DecodeOptions {
+                auto: true,
+                ..o.clone()
+            });
+        }
+        v
+    }
+
+    /// The same verdict from both decoders for every sample cut short at,
+    /// and with a byte flipped at, a spread of offsets (every offset in the
+    /// headers and the tail), with junk or padding after it, and under a
+    /// ladder of memory limits.
+    #[test]
+    fn pure_verdicts_match_liblzma() {
+        let mut seen = std::collections::BTreeMap::<String, u32>::new();
+        let mut tally = |v: String| *seen.entry(v).or_default() += 1;
+        for (what, o, data) in corpus() {
+            let n = data.len();
+            let mut offsets: Vec<usize> = (0..n.min(32)).collect();
+            offsets.extend((n.saturating_sub(48)..n).filter(|&i| i >= 32));
+            offsets.extend((32..n.saturating_sub(48)).step_by(331));
+            for (k, d) in variants(&o).into_iter().enumerate() {
+                let label = format!("{what} {d:?}");
+                tally(agree(&label, &d, &data, n.max(1)));
+                tally(agree(&label, &d, &data, 7));
+                // The mutations under the plain options and `auto`; the
+                // other variants differ only at the ends and in checks.
+                let all = k == 0 || d.auto;
+                for &i in offsets.iter().filter(|&&i| all || i < 16 || i + 16 >= n) {
+                    tally(agree(&format!("{label} cut at {i}"), &d, &data[..i], 4_093));
+                    // A flip in `.lzma`'s size field makes the size known,
+                    // the end marker then the case the module doc lists.
+                    if d.format == Format::Lzma && (5..13).contains(&i) {
+                        continue;
+                    }
+                    let x = if i % 2 == 0 { 0x01 } else { 0x80 };
+                    let mut bad = data.clone();
+                    bad[i] ^= x;
+                    tally(agree(&format!("{label} ^{x:#x} at {i}"), &d, &bad, 4_093));
+                }
+                for tail in [&b"junk"[..], &[0; 4], &[0; 3], &[0; 12], b"\xfd7zXZ\0"] {
+                    let more = [data.clone(), tail.to_vec()].concat();
+                    tally(agree(&format!("{label} + {tail:?}"), &d, &more, 5));
+                    tally(agree(&format!("{label} + {tail:?}"), &d, &more, 4_093));
+                }
+                for memlimit in [1, 4_096, 32_768, 100_000, 300_000, 9 << 20] {
+                    let m = DecodeOptions {
+                        memlimit,
+                        ..d.clone()
+                    };
+                    tally(agree(
+                        &format!("{label} memlimit {memlimit}"),
+                        &m,
+                        &data,
+                        4_093,
+                    ));
+                }
+            }
+        }
+        // Make sure the sweep reached the verdicts it is about.
+        for v in [
+            "ok",
+            "Unexpected end of input",
+            "Compressed data is corrupt",
+            "File format not recognized",
+            "Unsupported options",
+        ] {
+            assert!(seen.contains_key(v), "never saw {v:?}: {seen:?}");
+        }
+        assert!(seen.keys().any(|k| k.starts_with("memlimit")), "{seen:?}");
     }
 }

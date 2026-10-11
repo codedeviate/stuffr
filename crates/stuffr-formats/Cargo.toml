@@ -5,8 +5,9 @@ description = "Codec and container implementations for the stuffr toolkit"
 edition.workspace = true
 rust-version.workspace = true
 # Not the workspace's MIT alone: `pack.rs` ports FreeBSD's unpack.c, whose
-# BSD-2-Clause notice ships as LICENSE-unpack-bsd (Ruling T9-5).
-license = "MIT AND BSD-2-Clause"
+# BSD-2-Clause notice ships as LICENSE-unpack-bsd (Ruling T9-5); and
+# `xz_opts`'s pure tier ports liblzma 5.8.4 (0BSD, LICENSE-xz-memusage).
+license = "MIT AND BSD-2-Clause AND 0BSD"
 repository.workspace = true
 keywords = ["compression", "archive", "gzip", "zstd", "tar"]
 categories = ["compression", "encoding", "filesystem"]
