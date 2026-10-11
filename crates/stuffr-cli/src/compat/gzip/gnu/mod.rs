@@ -15,8 +15,10 @@
 //! Behaviours reproduced because the binary shows them (each pinned by the
 //! differential suite `tests/compat_gzip_gnu.rs`):
 //!
-//! - an input that already has a gzip suffix is skipped with a note and
-//!   exit 0, not 2; the suffixes are `.gz .z -gz -z _z .tgz .taz` in any
+//! - a set-user-ID input is refused even under `-f`, a sticky one unless
+//!   `-f` (whose output then drops the sticky bit); `-c` takes both;
+//! - an input that already has a gzip suffix is skipped with a note (under
+//!   `-r` only with `-v`) and exit 0, not 2; the suffixes are `.gz .z -gz -z _z .tgz .taz` in any
 //!   case, and `-S`'s is tried before them when it holds an uppercase
 //!   letter and after them otherwise (which one the note names);
 //! - standard input compressed after a file operand stores the name

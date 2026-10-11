@@ -1,7 +1,7 @@
 //! The file loop and the compress path, in the order GNU gzip 1.15 was
 //! observed to check things for each operand: open (without following a
-//! final symlink unless `-f` or `-c`), then directory, regular file and
-//! link count, then the suffix, then the output's existence; compress;
+//! final symlink unless `-f` or `-c`), then directory, regular file,
+//! set-user-ID, sticky bit and link count, then the suffix, then the output's existence; compress;
 //! copy the input's mode, owner and times; remove the input.
 //!
 //! Exit codes: 0, 1 for an error, 2 for a warning; across operands an error
@@ -200,6 +200,15 @@ impl Gz<'_> {
                 self.warn(m::NOT_REGULAR, &[PROGRAM, &qname]);
                 return Ok(());
             }
+            let mode = mode_of(&meta);
+            if mode & 0o4000 != 0 {
+                self.warn(m::SET_USER_ID, &[PROGRAM, &qname]);
+                return Ok(());
+            }
+            if mode & 0o1000 != 0 && !self.s.force {
+                self.warn(m::STICKY, &[PROGRAM, &qname]);
+                return Ok(());
+            }
             let others = other_links(&meta);
             if others > 0 && !self.s.force {
                 let s: &[u8] = if others > 1 { b"s" } else { b"" };
@@ -265,7 +274,14 @@ impl Gz<'_> {
         if !self.s.force
             && let Some(suf) = self.suffix_of(name)
         {
-            if !self.s.quiet {
+            // Under `-r` the note needs `-v` (observed: `gzip -r d` over
+            // `d/b.gz` is silent, `gzip -rv d` prints it).
+            let shown = if self.s.recursive {
+                self.s.verbose > 0
+            } else {
+                !self.s.quiet
+            };
+            if shown {
                 self.say(m::HAS_SUFFIX, &[PROGRAM, &qname, &suf]);
             }
             return;
@@ -322,6 +338,16 @@ impl Gz<'_> {
         // The mode, owner and times of the input, as GNU copies them; a
         // failure to copy them does not undo the output.
         let _ = copy_metadata_from(meta, &tmp);
+        // The output never keeps the sticky bit (observed: `chmod 1644 a;
+        // gzip -f a` makes a 0644 `a.gz`).
+        #[cfg(unix)]
+        if mode_of(meta) & 0o1000 != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(
+                &tmp,
+                fs::Permissions::from_mode(mode_of(meta) & 0o7777 & !0o1000),
+            );
+        }
         match publish(&tmp, &out_path, replace) {
             Ok(Published::Done) => {}
             Ok(Published::Exists) => {
@@ -477,6 +503,20 @@ fn open_input(path: &Path, follow: bool) -> io::Result<File> {
     {
         let _ = follow;
         File::open(path)
+    }
+}
+
+/// The permission and special bits of `meta` (0 off unix).
+fn mode_of(meta: &Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
     }
 }
 

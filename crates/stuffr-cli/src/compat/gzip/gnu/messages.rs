@@ -195,7 +195,15 @@ pub(super) const NOT_REGULAR: &str = "%s: %s is not a directory or a regular fil
 /// Observed: `ln a h; gzip h`; the last argument is `"s"` or `""`.
 pub(super) const HAS_LINKS: &str = "%s: %s has %d other link%s -- file ignored\n";
 
-/// Observed: `gzip a.gz`.
+/// Observed: `chmod 4755 a; gzip a` (exit 2, also under `-f`; `-q`
+/// silences it; `-c` compresses).
+pub(super) const SET_USER_ID: &str = "%s: %s is set-user-ID on execution - ignored\n";
+
+/// Observed: `chmod 1644 a; gzip a` (exit 2; `-f` compresses; `-c`
+/// compresses).
+pub(super) const STICKY: &str = "%s: %s has the sticky bit set - file ignored\n";
+
+/// Observed: `gzip a.gz` (under `-r` only with `-v`: `gzip -r d`).
 pub(super) const HAS_SUFFIX: &str = "%s: %s already has %s suffix -- unchanged\n";
 
 /// Observed: `gzip a` with `a.gz` present: this, then [`ASK_OVERWRITE`]

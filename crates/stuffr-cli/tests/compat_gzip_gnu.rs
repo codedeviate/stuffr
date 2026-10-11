@@ -377,6 +377,19 @@ mod differential {
     fn mode_640(d: &Path) {
         set_mode(d, "a.txt", 0o640);
     }
+    fn setuid(d: &Path) {
+        set_mode(d, "a.txt", 0o4755);
+    }
+    fn setuid_hard_linked(d: &Path) {
+        setuid(d);
+        hard_link_h(d);
+    }
+    fn sticky(d: &Path) {
+        set_mode(d, "a.txt", 0o1644);
+    }
+    fn sticky_gz(d: &Path) {
+        set_mode(d, "a.gz", 0o1644);
+    }
     /// An mtime gzip cannot store (1960).
     fn ancient(d: &Path) {
         let t = UNIX_EPOCH - Duration::from_secs(10 * 365 * 86_400);
@@ -774,6 +787,43 @@ mod differential {
             with_setup(expect(gz(&["-c", "a.txt"], a()), &t), ancient),
             with_setup(gz(&["-q", "a.txt"], a()), ancient),
         ];
+        // Set-user-ID inputs are refused, `-f` or not; sticky ones unless
+        // `-f` (which drops the sticky bit from the output); `-c` takes
+        // both. Set-group-ID is left out: an ordinary user's chmod may not
+        // set it (macOS clears it for a group the user is not in).
+        cases.extend([
+            with_setup(gz(&["a.txt"], a()), setuid),
+            with_setup(gz(&["-f", "a.txt"], a()), setuid),
+            with_setup(gz(&["-q", "a.txt"], a()), setuid),
+            with_setup(gz(&["-k", "a.txt"], a()), setuid),
+            with_setup(expect(gz(&["-c", "a.txt"], a()), &t), setuid),
+            with_setup(gz(&["a.txt"], hard()), setuid_hard_linked),
+            with_setup(gz(&["a.txt"], a()), sticky),
+            with_setup(gz(&["-f", "a.txt"], a()), sticky),
+            with_setup(gz(&["-q", "a.txt"], a()), sticky),
+            with_setup(gz(&["-fq", "a.txt"], a()), sticky),
+            with_setup(expect(gz(&["-c", "a.txt"], a()), &t), sticky),
+            with_setup(gz(&["a.gz"], vec![("a.gz", t.clone())]), sticky_gz),
+        ]);
+        // Under `-r` the "already has a suffix" note needs `-v`.
+        let tree = |extra: Vec<(&'static str, Vec<u8>)>| {
+            let mut v = vec![("d/a.txt", t.clone()), ("d/b.gz", t.clone())];
+            v.extend(extra);
+            v
+        };
+        cases.extend([
+            gz(&["-r", "d"], tree(vec![])),
+            gz(&["-rv", "d"], tree(vec![])),
+            gz(&["-r", "d"], tree(vec![("d/e/c.tgz", t.clone())])),
+            gz(&["-r", "d"], tree(vec![("d/a.txt.gz", b"old".to_vec())])),
+            gz(&["-r", "b.gz"], vec![("b.gz", t.clone())]),
+            gz(&["-rv", "b.gz"], vec![("b.gz", t.clone())]),
+            gz(&["-rf", "b.gz"], vec![("b.gz", t.clone())]),
+            gz(
+                &["-r", "a.txt", "b.gz"],
+                vec![("a.txt", t.clone()), ("b.gz", t.clone())],
+            ),
+        ]);
         // A terminal on standard input: the overwrite question.
         for answer in [&b"y\n"[..], b"n\n", b"Y\n", b"\n", b"yes\n"] {
             let mut c = gz(&["a.txt"], with_gz());
