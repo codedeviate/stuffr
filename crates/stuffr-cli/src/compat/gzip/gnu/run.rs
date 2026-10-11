@@ -55,6 +55,7 @@ pub(super) fn execute(mut s: Settings, host: &mut Host, err: &mut dyn Write) -> 
         list: Lister::default(),
         stale: None,
         time_stamp: 0,
+        descend: None,
     };
     let run = if files.is_empty() {
         g.treat_stdin()
@@ -93,6 +94,10 @@ struct Gz<'a> {
     /// modification time (or `-N`'s stored one), which a pipe on standard
     /// input does not change.
     time_stamp: i64,
+    /// Under `-r`, the entries of the directory the last operand turned
+    /// out to be, for [`Gz::treat`] to visit next (`recurse` leaves them
+    /// here rather than recursing, so depth costs heap, not stack).
+    descend: Option<Vec<Vec<u8>>>,
 }
 
 /// Counts the bytes written through it.
@@ -195,8 +200,35 @@ impl Gz<'_> {
 
     // ---- files ----
 
-    /// One operand: the checks, then compression.
+    /// One operand, and under `-r` everything below it: depth first, each
+    /// directory's entries in the order it lists them, with an explicit
+    /// stack of the entries still to visit at each level (final review,
+    /// item 4: a frame per level could exhaust the stack on a tree as deep
+    /// as `PATH_MAX` allows).
     fn treat(&mut self, name: &[u8]) -> Step {
+        let mut stack: Vec<std::vec::IntoIter<Vec<u8>>> = Vec::new();
+        let mut next = name.to_vec();
+        loop {
+            self.treat_one(&next)?;
+            if let Some(entries) = self.descend.take() {
+                stack.push(entries.into_iter());
+            }
+            next = loop {
+                let Some(level) = stack.last_mut() else {
+                    return Ok(());
+                };
+                match level.next() {
+                    Some(child) => break child,
+                    None => {
+                        stack.pop();
+                    }
+                }
+            };
+        }
+    }
+
+    /// One name: the checks, then compression (or [`Gz::treat_compressed`]).
+    fn treat_one(&mut self, name: &[u8]) -> Step {
         if name == b"-" {
             return self.treat_stdin();
         }
@@ -262,7 +294,7 @@ impl Gz<'_> {
 
     /// `-r` on a directory: every entry, in the order the directory lists
     /// them (read in full first, so outputs created meanwhile are not
-    /// visited).
+    /// visited), left in `descend` for [`Gz::treat`] to visit.
     fn recurse(&mut self, name: &[u8]) -> Step {
         let entries: Vec<Vec<u8>> = match fs::read_dir(self.host.path(name)) {
             Ok(rd) => rd
@@ -274,14 +306,18 @@ impl Gz<'_> {
                 return Ok(());
             }
         };
-        for e in entries {
-            let mut child = name.to_vec();
-            if !child.ends_with(b"/") {
-                child.push(b'/');
-            }
-            child.extend_from_slice(&e);
-            self.treat(&child)?;
-        }
+        let children = entries
+            .into_iter()
+            .map(|e| {
+                let mut child = name.to_vec();
+                if !child.ends_with(b"/") {
+                    child.push(b'/');
+                }
+                child.extend_from_slice(&e);
+                child
+            })
+            .collect();
+        self.descend = Some(children);
         Ok(())
     }
 
@@ -708,6 +744,7 @@ mod tests {
             list: Lister::default(),
             stale: None,
             time_stamp: 0,
+            descend: None,
         };
         g.suffix_of(name).map(|s| String::from_utf8(s).unwrap())
     }

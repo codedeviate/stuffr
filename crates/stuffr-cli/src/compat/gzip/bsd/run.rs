@@ -354,16 +354,51 @@ impl Gz<'_> {
         }
     }
 
-    fn walk(&mut self, dir: &[u8]) -> Result<(), Fatal> {
+    /// The walk itself, with an explicit stack of the entries still to
+    /// visit at each level rather than a frame per level (final review,
+    /// item 4: a tree as deep as `PATH_MAX` allows could exhaust the
+    /// stack). The order is the recursive one's.
+    fn walk(&mut self, root: &[u8]) -> Result<(), Fatal> {
+        let mut stack: Vec<(Vec<u8>, std::vec::IntoIter<Entry>)> = Vec::new();
+        if let Some(entries) = self.entries(root) {
+            stack.push((root.to_vec(), entries.into_iter()));
+        }
+        while let Some((dir, level)) = stack.last_mut() {
+            let Some((entry, md)) = level.next() else {
+                stack.pop();
+                continue;
+            };
+            let mut child = dir.clone();
+            child.push(b'/');
+            child.extend_from_slice(&entry);
+            // `while (errno = 0, (entry = fts_read(fts)))`.
+            self.errno = 0;
+            match md {
+                Err(e) => self.warn(m::PATH_ONLY, &[&child], &e),
+                Ok(md) if md.is_dir() => {
+                    if let Some(entries) = self.entries(&child) {
+                        stack.push((child, entries.into_iter()));
+                    }
+                }
+                Ok(md) if md.is_file() => self.handle_file(&child, &md)?,
+                Ok(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// A directory's entries, each with its `lstat`, read in full; `None`
+    /// (said) when it cannot be read.
+    fn entries(&mut self, dir: &[u8]) -> Option<Vec<Entry>> {
         let rd = match fs::read_dir(self.host.path(dir)) {
             Ok(rd) => rd,
             Err(e) => {
                 // FTS_DNR: `warn("%s", path)`.
                 self.warn(m::PATH_ONLY, &[dir], &e);
-                return Ok(());
+                return None;
             }
         };
-        let mut entries: Vec<(Vec<u8>, io::Result<Metadata>)> = Vec::new();
+        let mut entries: Vec<Entry> = Vec::new();
         for e in rd {
             match e {
                 Ok(e) => {
@@ -376,20 +411,7 @@ impl Gz<'_> {
                 }
             }
         }
-        for (entry, md) in entries {
-            let mut child = dir.to_vec();
-            child.push(b'/');
-            child.extend_from_slice(&entry);
-            // `while (errno = 0, (entry = fts_read(fts)))`.
-            self.errno = 0;
-            match md {
-                Err(e) => self.warn(m::PATH_ONLY, &[&child], &e),
-                Ok(md) if md.is_dir() => self.walk(&child)?,
-                Ok(md) if md.is_file() => self.handle_file(&child, &md)?,
-                Ok(_) => {}
-            }
-        }
-        Ok(())
+        Some(entries)
     }
 
     /// `handle_file`: compress or decompress, then `-v`'s line (the test
@@ -996,6 +1018,9 @@ fn nlink(md: &Metadata) -> u64 {
         1
     }
 }
+
+/// A directory entry's name and `lstat`, as [`Gz::walk`] visits them.
+type Entry = (Vec<u8>, io::Result<Metadata>);
 
 /// `host::same_file`; off unix, where there is no identity to compare,
 /// two files are taken to be one (so an existing output is never unlinked

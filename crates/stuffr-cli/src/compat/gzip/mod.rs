@@ -199,6 +199,71 @@ mod tests {
         assert_eq!(flavour_from(Some(" gnu".into())), Err(" gnu".into()));
     }
 
+    /// The thread stack `-r` must fit in, whatever the depth. Compressing
+    /// is left out: a debug build of miniz builds its compressor state on
+    /// the stack before boxing it, which alone needs more than this.
+    const SMALL_STACK: usize = 256 * 1024;
+
+    /// Final review, item 4: `-r` walks a directory tree without native
+    /// recursion, so its depth costs heap, not stack. Both flavours walk a
+    /// chain of nested directories as deep as the platform's `PATH_MAX`
+    /// allows (capped at 1000 levels) on a thread with a 256 KiB stack,
+    /// which a frame per level overflowed: `gzip -r` (the leaf already has
+    /// its suffix, so it is visited and skipped), `gzip -tr` and
+    /// `gunzip -r`, which decodes the leaf. Unix only: the depth is sized
+    /// to unix's `PATH_MAX`.
+    #[cfg(unix)]
+    #[test]
+    fn recursion_depth_costs_no_stack() {
+        let root = std::env::temp_dir().join(format!("stuffr-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // macOS's `/var` is a symbolic link, and its expansion counts.
+        let root = root.canonicalize().unwrap();
+        // `PATH_MAX` counts the NUL; leave room for the leaf and for the
+        // temporary name an output is written under first
+        // (`.stuffr-gzip-<pid>-<n>.tmp`).
+        let path_max = if cfg!(target_os = "macos") {
+            1024
+        } else {
+            4096
+        };
+        let room = path_max - 1 - root.as_os_str().len() - 64;
+        let levels = (room / 2).min(1000);
+        assert!(levels >= 400, "only {levels} levels fit under {root:?}");
+        let deep = root.join(vec!["d"; levels].join("/"));
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(b"deep\n").unwrap();
+        let gz = gz.finish().unwrap();
+        for flavour in [Flavour::Gnu, Flavour::Bsd] {
+            std::fs::create_dir_all(&deep).unwrap();
+            std::fs::write(deep.join("leaf.gz"), &gz).unwrap();
+            // Apple notes the suffix as a warning, exit 1; GNU under `-r`
+            // says nothing.
+            let skipped = if flavour == Flavour::Bsd { 1 } else { 0 };
+            for (name, args, want) in [
+                ("gzip", &["-r", "d"][..], skipped),
+                ("gzip", &["-tr", "d"], 0),
+                ("gunzip", &["-r", "d"], 0),
+            ] {
+                let dir = root.clone();
+                let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+                let (code, _, err) = std::thread::Builder::new()
+                    .stack_size(SMALL_STACK)
+                    .spawn(move || run_in(flavour, &dir, name, &argv, b"", &|_| None))
+                    .unwrap()
+                    .join()
+                    .expect("the walk panicked");
+                let err = String::from_utf8_lossy(&err);
+                assert_eq!(code, want, "{flavour:?} {name} {args:?}: {err}");
+            }
+            assert_eq!(std::fs::read(deep.join("leaf")).unwrap(), b"deep\n");
+            assert!(!deep.join("leaf.gz").exists());
+            std::fs::remove_dir_all(root.join("d")).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn the_default_flavour_follows_the_platform() {
         let bsd = cfg!(any(
