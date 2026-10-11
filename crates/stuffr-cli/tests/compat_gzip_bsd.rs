@@ -162,6 +162,12 @@ mod differential {
         std::fs::remove_file(d.join("d/h")).unwrap();
         std::fs::hard_link(d.join("d/x"), d.join("d/h")).unwrap();
     }
+    /// `a.txt` (a case file holding `a.txt.gz`'s bytes) becomes a symlink
+    /// to `a.txt.gz`: the output is the input itself.
+    fn input_is_the_output(d: &Path) {
+        std::fs::remove_file(d.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink("a.txt.gz", d.join("a.txt")).unwrap();
+    }
     /// `l` is a symlink to the directory `d`.
     fn link_to_d(d: &Path) {
         std::os::unix::fs::symlink("d", d.join("l")).unwrap();
@@ -555,6 +561,18 @@ mod differential {
             cases.push(with_setup(gz(args, a()), output_is_a_dir));
             cases.push(with_setup(gz(args, a()), output_dangles));
             cases.push(with_setup(gz(args, ab()), output_links_to_b));
+        }
+        // The output is the input itself (`a.txt` -> `a.txt.gz`): with -f
+        // gzip replaces it and keeps the link; without, it is not a regular
+        // file.
+        let same = || vec![("a.txt.gz", t.clone()), ("a.txt", t.clone())];
+        for args in [
+            &["-f", "a.txt"][..],
+            &["-fv", "a.txt"],
+            &["-fk", "a.txt"],
+            &["a.txt"],
+        ] {
+            cases.push(with_setup(gz(args, same()), input_is_the_output));
         }
         // The suffix table: exact, case-sensitive, matched against the
         // whole operand (so `d/.gz` has one and `.gz` does not).

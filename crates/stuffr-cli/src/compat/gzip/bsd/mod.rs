@@ -63,14 +63,20 @@
 //!   a failed trailer write) gzip keeps the cut-short output and removes
 //!   the input; stuffr prints the same and exits the same but keeps the
 //!   input and removes the output.
+//! - When the existing output is the input itself (`gzip -f a.txt` with
+//!   `a.txt` a symbolic link to `a.txt.gz`, or a name `PATH_MAX` cuts
+//!   back to itself), gzip unlinks it before compressing, so a failure
+//!   part-way loses the data. stuffr leaves it in place and replaces it
+//!   only with the finished output (Ruling T8-4/T8-5, carried over): the
+//!   same messages and exit code, and on failure the input survives.
 //! - A write that fails part-way is reported with the bytes stuffr's
 //!   buffered writer had passed on, which can differ from what the disk
 //!   took.
-//! - Run with standard input or output closed (`gzip <&-`, `gzip -c a
-//!   >&-`), gzip says "Can't stat stdin" or "write: Bad file descriptor";
-//!   the Rust runtime reopens a closed standard descriptor on `/dev/null`
-//!   before `main`, so stuffr compresses an empty input, or writes to
-//!   nowhere, and exits 0.
+//! - Run with standard input or output closed (`gzip <&-`, or
+//!   `gzip -c a` with standard output closed), gzip says "Can't stat
+//!   stdin" or "write: Bad file descriptor"; the Rust runtime reopens a
+//!   closed standard descriptor on `/dev/null` before `main`, so stuffr
+//!   compresses an empty input, or writes to nowhere, and exits 0.
 //! - Decompression, `-t` and `-l` are not built yet (a later task): any
 //!   name or option that decompresses stops with a message, exit 1.
 
@@ -172,6 +178,44 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left.len(), 2, "{left:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Ruling T8-4/T8-5, carried over: when the existing output is the
+    /// input itself (`a.txt` a symlink to `a.txt.gz`, `gzip -f a.txt`),
+    /// gzip unlinks it before compressing, so a failure part-way loses the
+    /// data. stuffr leaves it in place until the new output is complete:
+    /// a write failure (the sandbox budget, as a full disk) says what gzip
+    /// says and the input survives.
+    #[cfg(unix)]
+    #[test]
+    fn an_output_that_is_the_input_survives_a_failure() {
+        let d = scratch("self");
+        let data = incompressible();
+        std::fs::write(d.join("a.txt.gz"), &data).unwrap();
+        std::os::unix::fs::symlink("a.txt.gz", d.join("a.txt")).unwrap();
+        let none = |_: &str| None;
+        let (code, _, err) = run_in(
+            Flavour::Bsd,
+            &d,
+            "gzip",
+            &args(&["-f", "a.txt"]),
+            b"",
+            &none,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert_eq!(code, 1);
+        assert!(
+            err.starts_with("gzip: write: No space left on device\n")
+                && err.ends_with("gzip: leaving original a.txt\n"),
+            "{err}"
+        );
+        assert!(
+            std::fs::read(d.join("a.txt.gz")).unwrap() == data,
+            "the input was lost"
+        );
+        let left = std::fs::read_dir(&d).unwrap().count();
+        assert_eq!(left, 2, "a temporary file was left");
         let _ = std::fs::remove_dir_all(&d);
     }
 

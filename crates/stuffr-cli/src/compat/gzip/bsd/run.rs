@@ -30,7 +30,11 @@ use crate::compat::host::{Host, Published, create_temp, publish, stdin_file, str
 /// `BUFLEN`: gzip's read and write size.
 const BUFLEN: usize = 64 * 1024;
 
-/// `PATH_MAX` on Apple platforms: `outfile`'s size.
+/// `PATH_MAX`, `outfile`'s size: the platform's own (1024 on macOS and
+/// the BSDs, 4096 on Linux); 1024 where there is no `libc`.
+#[cfg(unix)]
+const PATH_MAX: usize = libc::PATH_MAX as usize;
+#[cfg(not(unix))]
 const PATH_MAX: usize = 1024;
 
 /// The longest file name component (`NAME_MAX`).
@@ -377,10 +381,8 @@ impl Gz<'_> {
         }
         let outfile = out_name(file, &self.s.suffix);
         let out_path = self.host.path(&outfile);
-        if !self.check_outfile(&outfile, &out_path) {
-            return None;
-        }
-        let (tmp, tmp_file) = match create_exclusive(&out_path) {
+        let replace_input = self.check_outfile(&outfile, &out_path, &isb)?;
+        let (tmp, tmp_file) = match create_exclusive(&out_path, replace_input) {
             Ok(t) => t,
             Err(e) => {
                 self.warn(m::COULD_NOT_CREATE, &[&outfile], &e);
@@ -430,18 +432,22 @@ impl Gz<'_> {
         // Published first, then gzip's sequence on the same descriptor: an
         // ACL copied from the input ("deny delete") or an immutable flag
         // would otherwise refuse the temporary name's removal.
-        match publish(&tmp, &out_path, false) {
+        // Over the input itself (see `check_outfile`) by rename; anything
+        // else must not be replaced.
+        match publish(&tmp, &out_path, replace_input) {
             Ok(Published::Done) => {}
             Ok(Published::Exists) => {
                 // Something took the name meanwhile: gzip's exclusive
-                // create would have failed.
+                // create would have failed, and closed standard input.
                 let e = io::Error::from_raw_os_error(eexist());
                 self.warn(m::COULD_NOT_CREATE, &[&outfile], &e);
+                self.stdin_closed = true;
                 return None;
             }
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 self.warn(m::COULD_NOT_CREATE, &[&outfile], &e);
+                self.stdin_closed = true;
                 return None;
             }
         }
@@ -469,29 +475,42 @@ impl Gz<'_> {
             .map(<[u8]>::to_vec)
     }
 
-    /// `check_outfile`: true when the output may be created. An existing
-    /// one (followed through symbolic links) is unlinked under `-f`
-    /// (whatever that does), asked about at a terminal, else refused.
-    fn check_outfile(&mut self, outfile: &[u8], out_path: &Path) -> bool {
-        if fs::metadata(out_path).is_err() {
-            return true;
-        }
+    /// `check_outfile`: `Some` when the output may be created, `None` when
+    /// it may not (said). An existing one (followed through symbolic
+    /// links) is unlinked under `-f` (whatever that does), asked about at
+    /// a terminal, else refused.
+    ///
+    /// `Some(true)`: the existing output is the input itself (`isb`'s file:
+    /// `a.txt` a symlink to `a.txt.gz`, or a name `out_name` cut back to
+    /// itself). gzip unlinks it here and loses it if compressing then
+    /// fails; stuffr leaves it until the new output replaces it (Ruling
+    /// T8-4/T8-5, carried over).
+    fn check_outfile(&mut self, outfile: &[u8], out_path: &Path, isb: &Metadata) -> Option<bool> {
+        let Ok(osb) = fs::metadata(out_path) else {
+            return Some(false);
+        };
+        let is_input = same_file(&osb, isb);
+        let unlink = |p: &Path| {
+            if !is_input {
+                let _ = fs::remove_file(p);
+            }
+        };
         if self.s.force {
-            let _ = fs::remove_file(out_path);
-            return true;
+            unlink(out_path);
+            return Some(is_input);
         }
         if !self.stdin_closed && self.host.stdin_is_tty() {
             printf(self.err, m::ASK_OVERWRITE, &[outfile]);
             let answer = self.fgets(9);
             if !matches!(answer.first(), Some(b'y' | b'Y')) {
                 printf(self.err, m::NOT_OVERWRITING, &[]);
-                return false;
+                return None;
             }
-            let _ = fs::remove_file(out_path);
-            return true;
+            unlink(out_path);
+            return Some(is_input);
         }
         self.warnx(m::ALREADY_EXISTS, &[outfile]);
-        false
+        None
     }
 
     /// `fgets(ans, size, stdin)`: at most `size - 1` bytes, through the
@@ -823,7 +842,9 @@ fn out_name(file: &[u8], suffix: &[u8]) -> Vec<u8> {
 /// beside it: the errors that open would give (an existing name, a
 /// dangling link included, is `EEXIST`; a name component too long is
 /// `ENAMETOOLONG`; a missing or unwritable directory), and the temporary.
-fn create_exclusive(out_path: &Path) -> io::Result<(PathBuf, File)> {
+/// With `replace_input` the name is the input's own, which gzip has
+/// unlinked by now and stuffr has kept, so its existence is no error.
+fn create_exclusive(out_path: &Path, replace_input: bool) -> io::Result<(PathBuf, File)> {
     let too_long = out_path
         .file_name()
         .is_some_and(|n| n.as_encoded_bytes().len() > NAME_MAX);
@@ -837,7 +858,7 @@ fn create_exclusive(out_path: &Path) -> io::Result<(PathBuf, File)> {
     // The directory must be there and searchable before the name can
     // exist (`ENOENT`/`ENOTDIR` come first).
     fs::metadata(&parent)?;
-    if fs::symlink_metadata(out_path).is_ok() {
+    if !replace_input && fs::symlink_metadata(out_path).is_ok() {
         return Err(io::Error::from_raw_os_error(eexist()));
     }
     create_temp(&parent, "gzip")
@@ -1009,10 +1030,14 @@ mod tests {
     #[test]
     fn out_name_is_cut_to_path_max() {
         assert_eq!(out_name(b"a", b".gz"), b"a.gz");
-        let long = vec![b'x'; 1022];
+        let long = vec![b'x'; PATH_MAX - 2];
         let o = out_name(&long, b".gz");
         assert_eq!(o.len(), PATH_MAX - 1);
         assert!(o.ends_with(b"x.gz"));
-        assert_eq!(out_name(&long[..1020], b".gz").len(), 1023);
+        assert_eq!(out_name(&long[..PATH_MAX - 4], b".gz").len(), PATH_MAX - 1);
+        // A name ending in the suffix can be cut back to itself.
+        let mut own = vec![b'y'; PATH_MAX - 4];
+        own.extend_from_slice(b".gz");
+        assert_eq!(out_name(&own, b".gz"), own);
     }
 }
