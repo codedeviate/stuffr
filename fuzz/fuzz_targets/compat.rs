@@ -1,27 +1,35 @@
 //! The compatibility families, run in-process: the bzip2 family (0.11.0
-//! Task 6: `bzip2`, `bunzip2`, `bzcat`, `bzip2recover`) and the gzip family
+//! Task 6: `bzip2`, `bunzip2`, `bzcat`, `bzip2recover`), the gzip family
 //! (0.12.0 Task 11: `gzip`, `gunzip`, `zcat`, `gzcat`, each as GNU and as
-//! Apple/BSD), through `stuffr_cli::compat::run_in_counted` and
-//! `bzip2recover::recover`.
+//! Apple/BSD) and the xz family (0.13.0 Task 9: `xz`, `unxz`, `xzcat`,
+//! `lzma`, `unlzma`, `lzcat`), through `stuffr_cli::compat::run_in_counted`
+//! and `bzip2recover::recover`.
 //!
 //! The only fuzz coverage of `stuffr::bzip2_stream::StreamReader`, the
 //! libbzip2-shaped decoder only the compat layer reaches, and of the gzip
 //! personalities' own decoders: GNU's member reader, pack and `.Z` paths and
 //! its zip entry; Apple's `gz_uncompress` state machine, `unlz`, `zread`, the
-//! xz index reader behind `-l`, and the raw bzip2/xz/pack steps.
+//! xz index reader behind `-l`, and the raw bzip2/xz/pack steps; and of
+//! the xz family's argument parser, coder, `--files` reader and `--list`
+//! walk (`index.rs`, and `list.rs`'s `-vv` Block Header reads, which must
+//! never panic: Ruling P14). Under `Host::Sandbox` the xz encoder's panics
+//! are not caught (Ruling P10), so they reach the fuzzer.
 //!
 //! An input is `[tool][argc][token; argc][file mask] ++ payload`, decoded by
 //! `stuffr_core::testing::decode_compat_case` (whose tables are the wire
 //! format of the seeds `crates/stuffr/tests/fuzz_corpus.rs` writes). The
 //! tool byte also picks the gzip flavour, `(byte / names) & 1` (R7). Each
 //! file the mask names is created holding the payload; with the mask's stdin
-//! bit, standard input carries it too.
+//! bit, standard input carries it too. The xz family's five files take a
+//! second mask byte, there only when the argument-count byte is past 8
+//! (`COMPAT_FILES`).
 //!
 //! Asserted, for every input:
 //!
 //! - no panic;
 //! - the exit code is one the tool has: 0-3 for the bzip2 family (`0` ok,
 //!   `1` environment, `2` corrupt, `3` internal), 0 or 1 for bzip2recover,
+//!   0-2 for the xz family (main.c and message.c: 0 ok, 1 error, 2 warning),
 //!   and 0-2 for the gzip family in both flavours (GNU: 0 ok, 1 error, 2
 //!   warning; Apple's `gzip.c` exits only through `exit(exit_value)` with
 //!   0, 1 or 2, `maybe_err[x]`'s `exit(2)`, `err(1)`/`errx(1)`, and `exit(0)`
@@ -49,7 +57,42 @@
 //!   and which it cannot): `could_be_written` alone cannot see one, because
 //!   a partial output has a legitimate output's name. Apple's partial
 //!   outputs after a foreign-format failure (`maybe_err`, exit 2, for
-//!   `.bz2`, `.xz`, lzip, pack and `.Z`: Ruling T10-2) are allowed.
+//!   `.bz2`, `.xz`, lzip, pack and `.Z`: Ruling T10-2) are allowed;
+//! - the xz family opens each input at most twice per operand that names
+//!   it (an argument in operand position, or a name `--files`/`--files0`
+//!   read from standard input), reads at most `2 × len` of it per operand
+//!   when compressing, decompressing or testing, and within
+//!   `xz_list_bound` under `--list` (`check_xz_reads` says why `--list` is
+//!   not linear); it leaves no `.stuffr-xz-*` temporary and no name
+//!   `could_be_written` does not allow; and standard output plus every new
+//!   or changed file stays within the 8 MiB output budget
+//!   (`check_xz_budget`). A `--files` case whose names hold a `/` is not
+//!   run: such a name could leave the run's directory.
+//!
+//! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit
+//! (2 GiB by default) is the bound, and each verb stays inside it by a
+//! limit stuffr applies or by the token table:
+//!
+//! - compress: the most memory a case can ask for is a preset's, `-9`/`-9e`
+//!   (a 64 MiB dictionary, about 674 MiB per encoder reserved); no token
+//!   sets a larger dictionary (`--lzma2=dict=4KiB` is the only one) or
+//!   more than the sandbox's two threads (`Hardware::SANDBOX`, R3). The
+//!   encoder's tables are allocated untouched and an input is at most
+//!   64 KiB, so only what the input reaches becomes resident: the seeds,
+//!   `-T0 -9` among them, peak at 296 MB.
+//! - decompress and test: the sandbox caps the decoder's memory limit at
+//!   256 MiB (`SANDBOX_DECODER_CAP`) whatever `--memlimit*` says, single-
+//!   and multi-threaded, so a header declaring a larger dictionary is
+//!   refused before it is allocated (measured: a 250 MiB dictionary is
+//!   refused, exit 1). Below the cap the pure tier zero-fills what it
+//!   allocates: a 192 MiB dictionary peaked at 489 MB, two runs of it
+//!   counted with ASan's quarantine. What is decoded goes to the 8 MiB
+//!   budget, `-t` included.
+//! - list: the Index walk stores a Record only once its bytes are read
+//!   (`index.rs`) and is held to the same 256 MiB limit
+//!   (`hardware_memlimit_get(MODE_LIST)`); `-vv` reads at most 1024
+//!   bytes of a Block at a time and allocates nothing from a declared
+//!   size.
 //!
 //! Inputs past `COMPAT_FUZZ_MAX_INPUT` (64 KiB; see its doc) are skipped.
 //! Both families' output, to standard output and files together, is capped
@@ -99,17 +142,17 @@ fn sandbox() -> &'static Path {
 /// `-S`'s suffix): bzip2's, `.out`, both gzips' tables and `.tar`.
 const SUFFIXES: &[&str] = &[
     ".bz2", ".bz", ".tbz2", ".tbz", ".out", ".gz", ".tgz", ".taz", ".z", ".Z", "-gz", "-z", "_z",
-    ".xz", ".lz", ".tar",
+    ".xz", ".lz", ".tar", ".txz", ".lzma", ".tlz",
 ];
 
 /// Suffixes a decompressor maps to `.tar` rather than strip.
-const TAR_SUFFIXES: &[&str] = &[".tbz2", ".tbz", ".tgz", ".taz"];
+const TAR_SUFFIXES: &[&str] = &[".tbz2", ".tbz", ".tgz", ".taz", ".txz", ".tlz"];
 
 /// Whether `name` is one the tools could write in their working directory:
 /// a `COMPAT_FILES` name or one derived from it (a suffix or token stripped,
 /// or mapped to `.tar`; then a suffix or token added: gzip's `-S` takes any
 /// token), a bzip2recover output (`rec` and five digits), or a temporary
-/// (`.stuffr-bzip2-*`, `.stuffr-gzip-*`).
+/// (`.stuffr-bzip2-*`, `.stuffr-gzip-*`, `.stuffr-xz-*`).
 ///
 /// Generous on purpose: it is the real working directory's snapshot filter
 /// (a superset only snapshots more) and the run directory's stray-file
@@ -138,6 +181,7 @@ fn could_be_written(name: &str) -> bool {
         .is_some_and(|r| r.len() >= 5 && r.as_bytes()[..5].iter().all(u8::is_ascii_digit));
     rec || name.starts_with(".stuffr-bzip2-")
         || name.starts_with(".stuffr-gzip-")
+        || name.starts_with(".stuffr-xz-")
         || bases.iter().any(|b| {
             name == b
                 || name
@@ -504,6 +548,234 @@ fn check_gzip_leftovers(dir: &Path, name: &str, flavour: Flavour, args: &[&str])
     }
 }
 
+/// The xz family's operation, as args.c settles it: the invoked name's
+/// default, then the last of `-z`/`-d`/`-t`/`-l` (and their long forms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XzMode {
+    Compress,
+    Decompress,
+    Test,
+    List,
+}
+
+/// xz's options in the token table that take the next argument when it is
+/// not attached (`-S .x`, `-F xz`, `--check crc32`).
+const XZ_TAKES_NEXT: &[&str] = &["-S", "--suffix", "-F", "--format", "--check"];
+
+/// The short options of xz 5.8.4 (`args.c`'s `short_opts`) that take an
+/// argument: the rest of the cluster, or else the next argument.
+const XZ_SHORT_WITH_ARG: &[char] = &['C', 'F', 'M', 'S', 'T'];
+
+/// The xz family's arguments in operand position, and the operation, as
+/// getopt_long (permuting: the environment is not read, so no
+/// `POSIXLY_CORRECT`) and args.c see them.
+fn xz_parse<'a>(name: &str, args: &[&'a str]) -> (Vec<&'a str>, XzMode) {
+    let mut mode = match name {
+        "unxz" | "xzcat" | "unlzma" | "lzcat" => XzMode::Decompress,
+        _ => XzMode::Compress,
+    };
+    let mut out = Vec::new();
+    let (mut after_dashes, mut value) = (false, false);
+    for &a in args {
+        if value {
+            value = false;
+        } else if after_dashes || a == "-" || !a.starts_with('-') {
+            out.push(a);
+        } else if a == "--" {
+            after_dashes = true;
+        } else if XZ_TAKES_NEXT.contains(&a) {
+            value = true;
+        } else if let Some(long) = a.strip_prefix("--") {
+            match long {
+                "compress" => mode = XzMode::Compress,
+                "decompress" | "uncompress" => mode = XzMode::Decompress,
+                "test" => mode = XzMode::Test,
+                "list" => mode = XzMode::List,
+                _ => {}
+            }
+        } else {
+            let cluster: Vec<char> = a[1..].chars().collect();
+            for (i, c) in cluster.iter().enumerate() {
+                match c {
+                    'z' => mode = XzMode::Compress,
+                    'd' => mode = XzMode::Decompress,
+                    't' => mode = XzMode::Test,
+                    'l' => mode = XzMode::List,
+                    c if XZ_SHORT_WITH_ARG.contains(c) => {
+                        value = i + 1 == cluster.len();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (out, mode)
+}
+
+/// Whether the run reads file names from standard input (`--files`,
+/// `--files0`: the table holds no `--files=FILE` form).
+fn xz_names_from_stdin(args: &[&str]) -> bool {
+    args.iter().any(|a| *a == "--files" || *a == "--files0")
+}
+
+/// The xz family through `run_in_counted`.
+fn run_xz(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
+    // `--files`/`--files0` take operands from standard input, which the
+    // payload is: a name holding a `/` could leave the run's directory
+    // (`/…`, `../…`), and xz would compress it and remove it. No token
+    // holds a `/` (`COMPAT_TOKENS`), so without one every name stays
+    // inside. Such a case is not run.
+    if xz_names_from_stdin(args) && stdin.contains(&b'/') {
+        return;
+    }
+    let before = contents(dir);
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
+        .expect("a COMPAT_NAMES entry is a compat name");
+    let why = || String::from_utf8_lossy(&err).into_owned();
+    if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
+        eprintln!("compat: {name} {args:?} -> {code}");
+        for (path, r) in &reads {
+            eprintln!("compat:   {path:?} {r:?}");
+        }
+    }
+    // xz's exits only (main.c, message.c): 0, 1 error, 2 warning; never
+    // stuffr's 3-7.
+    assert!(
+        (0..=2).contains(&code),
+        "{name} {args:?}: exit {code} is not an xz exit code\n{}",
+        why()
+    );
+    let (mut operands, mode) = xz_parse(name, args);
+    if xz_names_from_stdin(args) {
+        // A superset of what `read_name` splits: both terminators.
+        operands.extend(
+            stdin
+                .split(|b| *b == b'\n' || *b == 0)
+                .filter_map(|n| std::str::from_utf8(n).ok()),
+        );
+    }
+    check_xz_reads(dir, name, args, mode, &operands, &reads);
+    check_xz_leftovers(dir, name, args);
+    check_xz_budget(dir, name, args, &out, &before);
+}
+
+/// `IO_BUFFER_SIZE` (file_io.h): the window `--list` reads back from each
+/// Stream's end to find its padding.
+const XZ_IO_BUFFER: u64 = 8192;
+
+/// `LZMA_BLOCK_HEADER_SIZE_MAX`: the most `-vv` reads of one Block Header.
+const XZ_BLOCK_HEADER_MAX: u64 = 1024;
+
+/// The most `--list` may read of a `len`-byte file in one open: see
+/// `check_xz_reads`.
+fn xz_list_bound(len: u64) -> u64 {
+    let walk_steps = len / 32 + 1;
+    XZ_HEADER_SIZE + len + walk_steps * len.min(XZ_IO_BUFFER) + XZ_BLOCK_HEADER_MAX
+}
+
+/// A Stream Header's (and Footer's) size.
+const XZ_HEADER_SIZE: u64 = 12;
+
+/// The xz family's read bound, for every path a run opened: at most two
+/// opens per operand that names it exactly (xz retries no suffix), and in
+/// bytes, with `len` its largest length at an open:
+///
+/// - compress, decompress and test: at most `2 × len` per operand. Every
+///   seed reads each input once (`len`); `2 ×` leaves room for a header
+///   probe without letting a second full pass through.
+/// - `--list`: at most `xz_list_bound(len)` per operand, which is not
+///   linear, because xz's is not. list.c's walk (liblzma's file_info.c,
+///   `index.rs`) reads the first Stream Header (12 bytes), then for each
+///   Stream from the end: a window of up to `IO_BUFFER_SIZE` bytes back
+///   from the Stream's end to measure its padding (whole zero windows are
+///   padding and not read again; the last, partial one is), the Footer, the
+///   Index and the Stream Header. Footers, Indexes, Headers and padding are
+///   disjoint (`len` in all), but each Stream's padding window re-reads up
+///   to 8 KiB of what lies before it, as xz's own `reverse_seek` re-reads
+///   its 8 KiB `temp` from a new seek. A Stream that decodes is at least
+///   32 bytes (Header, an 8-byte Index, Footer), and the first that does not
+///   ends the walk, so there are at most `len / 32 + 1` windows. `-vv` then
+///   reads each Block's Header (at most 1024 bytes) and Check, inside the
+///   Block, except one Block shorter than its Check, whose wrapped Header
+///   read takes 1024 bytes wherever they lie and ends the listing. Measured
+///   on the seeds: a one-Stream 508-byte file reads 532 (the window takes
+///   the Footer and Index once more).
+///
+/// A path no operand names must not be opened at all.
+fn check_xz_reads(
+    dir: &Path,
+    name: &str,
+    args: &[&str],
+    mode: XzMode,
+    operands: &[&str],
+    reads: &BTreeMap<PathBuf, compat::InputReads>,
+) {
+    for (path, r) in reads {
+        let file = path
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_else(|| panic!("{name}: opened {path:?}, outside {dir:?}"));
+        let m = operands.iter().filter(|a| **a == file).count() as u64;
+        let per_operand = match mode {
+            XzMode::List => xz_list_bound(r.len),
+            _ => 2 * r.len,
+        };
+        assert!(
+            r.opens <= 2 * m,
+            "{name} {args:?}: {} opens of {file:?}, which {m} operand(s) name",
+            r.opens
+        );
+        assert!(
+            r.bytes <= per_operand * m,
+            "{name} {args:?} ({mode:?}): read {} bytes of the {}-byte {file:?}, \
+             which {m} operand(s) name",
+            r.bytes,
+            r.len
+        );
+    }
+}
+
+/// No `.stuffr-xz-*` temporary survives a run, and every name in the
+/// run's directory is one `could_be_written` allows.
+fn check_xz_leftovers(dir: &Path, name: &str, args: &[&str]) {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in listing.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        assert!(
+            !n.starts_with(".stuffr-xz-"),
+            "{name} {args:?}: left its temporary {n:?}"
+        );
+        assert!(could_be_written(&n), "{name} {args:?}: left a stray {n:?}");
+    }
+}
+
+/// `run_in`'s output budget (`SANDBOX_OUTPUT_CAP`), restated: standard
+/// output and every output file together.
+const OUTPUT_BUDGET: u64 = 8 * 1024 * 1024;
+
+/// The run kept to its output budget: standard output plus every file
+/// that is new or changed in its directory (each written whole through
+/// the budget, so its final length is at most what it was charged).
+fn check_xz_budget(dir: &Path, name: &str, args: &[&str], out: &[u8], before: &Contents) {
+    let written: u64 = contents(dir)
+        .into_iter()
+        .filter(|(n, bytes)| before.get(n) != Some(bytes))
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum();
+    let total = out.len() as u64 + written;
+    assert!(
+        total <= OUTPUT_BUDGET,
+        "{name} {args:?}: {} bytes to stdout and {written} to files, past the \
+         {OUTPUT_BUDGET}-byte budget",
+        out.len()
+    );
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.len() > COMPAT_FUZZ_MAX_INPUT {
         return;
@@ -532,7 +804,11 @@ fuzz_target!(|data: &[u8]| {
             stdin,
             case.payload,
         ),
-        _ => run_bzip2(&dir, case.name, &case.args, stdin),
+        "xz" | "unxz" | "xzcat" | "lzma" | "unlzma" | "lzcat" => {
+            run_xz(&dir, case.name, &case.args, stdin)
+        }
+        "bzip2" | "bunzip2" | "bzcat" => run_bzip2(&dir, case.name, &case.args, stdin),
+        other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 
     check_extraction_contained(parent, &dir, &[]).expect("compat: contained");

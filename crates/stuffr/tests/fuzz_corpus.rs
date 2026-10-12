@@ -84,8 +84,8 @@ use stuffr::entries;
 use stuffr::ops::{self, CompressOpts, Input, Output};
 use stuffr_core::FormatId;
 use stuffr_core::testing::{
-    CODEC_SLOTS, COMPAT_FUZZ_MAX_INPUT, CONTAINER_SLOTS, SALVAGE_SLOTS, decode_compat_case,
-    encode_compat_case,
+    CODEC_SLOTS, COMPAT_FUZZ_MAX_INPUT, COMPAT_NAMES, CONTAINER_SLOTS, SALVAGE_SLOTS,
+    decode_compat_case, encode_compat_case,
 };
 
 /// The chain target's seeds carry no selector byte, so there is no slot
@@ -745,6 +745,68 @@ const COMPAT_SHAPES: &[&str] = &[
     // that fails (exit 1): the file's output is legitimate, not a partial.
     "gunzip-gnu-file-then-empty-stdin",
     "gunzip-bsd-file-then-empty-stdin",
+    // The xz family (0.13.0 Task 9): every name; compression through stdin
+    // and files, each format and the options that shape a stream.
+    "xz-stdin-to-stdout",
+    "xz-keep-file",
+    "xz-force-verbose-existing-output",
+    "xz-format-lzma",
+    "xz-format-raw",
+    "xz-check-extreme-block-size",
+    "xz-filters",
+    "xz-best-threads",
+    "xz-lzip-refused",
+    "xz-already-suffixed",
+    "xz-files-stdin",
+    "xz-files0-stdin",
+    "lzma-stdin-to-stdout",
+    "xz-args-mix",
+    "xz-help",
+    "xz-version",
+    "xz-bad-flag",
+    "xz-robot-compress-refused",
+    // Decompression of healthy input: each name, `.txz`/`.tlz` to `.tar`,
+    // several streams with padding, `--single-stream` over garbage, the
+    // other formats (`.lzma`, raw, lzip given and detected), a memory
+    // limit, `--no-sparse`.
+    "unxz-keep-file",
+    "unxz-txz",
+    "xzcat-file",
+    "xzcat-multistream-padding",
+    "xz-single-stream-garbage",
+    "unlzma-file",
+    "unlzma-tlz",
+    "lzcat-file",
+    "xz-raw-decompress",
+    "xz-lzip-given",
+    "unxz-lzip-detected",
+    "xz-memlimit-refused",
+    "unxz-no-sparse",
+    // Task 6's damaged shapes: padding of 3 and 5, cut at 1, 12, 13 and
+    // len - 1 bytes, a bit flipped in the header, a Block, the Index and
+    // the footer, and a reserved check ID (warned, then ignored).
+    "xz-test-verbose",
+    "xzcat-padding-3",
+    "unxz-padding-5",
+    "xz-test-cut-1",
+    "xz-test-cut-12",
+    "xzcat-cut-13",
+    "unxz-cut-last",
+    "xz-test-flipped-header",
+    "unxz-flipped-block",
+    "xzcat-flipped-index",
+    "xz-test-flipped-footer",
+    "xz-test-unsupported-check",
+    "xzcat-ignore-check",
+    // `--list`, plain to `-vv` and `--robot`, of healthy, several-stream,
+    // damaged and cut input.
+    "xz-list",
+    "xz-list-vv-two-files",
+    "xz-list-robot-vv",
+    "xz-list-multistream-padding",
+    "xz-list-flipped-index",
+    "xz-list-cut",
+    "xz-list-short",
 ];
 
 /// A bzip2 stream of `plain` at `level`, through this build's encoder.
@@ -928,6 +990,9 @@ fn e(name: &str, args: &[&str], files: &[&str], stdin: bool, payload: &[u8]) -> 
 /// The `compat` seed for `shape`.
 fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     if let Some(seed) = gzip_seed(work, shape)? {
+        return Ok(seed);
+    }
+    if let Some(seed) = xz_seed(work, shape)? {
         return Ok(seed);
     }
     let text = compat_text(4000);
@@ -1145,6 +1210,212 @@ fn gzip_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         // No `-f`: past `g`, which adds it to every other Apple `zcat`.
         "appends-dot-z" => encode_compat_case(tool, flavour, &["a.gz"], &["a.gz"], false, &gz),
         other => unreachable!("COMPAT_SHAPES lists an unhandled gzip shape {other:?}"),
+    }))
+}
+
+/// Flip bit 0 of byte `at` (counted from the end when negative), as Task
+/// 6's differential cases do.
+fn flipped(data: &[u8], at: isize) -> Vec<u8> {
+    let mut v = data.to_vec();
+    let i = if at < 0 {
+        (v.len() as isize + at) as usize
+    } else {
+        at as usize
+    };
+    v[i] ^= 1;
+    v
+}
+
+/// `xz` with its check ID moved to the next, reserved one of the same
+/// size (CRC32's 1 to 2, CRC64's 4 to 5, SHA-256's 10 to 11): both copies
+/// of the Stream Flags and their CRC32s rewritten, so xz warns of an
+/// unsupported check and decodes on.
+fn unsupported_check(xz: &[u8]) -> Vec<u8> {
+    let mut s = xz.to_vec();
+    let n = s.len();
+    s[7] += 1;
+    let crc = crc32(&s[6..8]).to_le_bytes();
+    s[8..12].copy_from_slice(&crc);
+    // Footer: CRC32 (4), Backward Size (4), flags (2), magic (2).
+    s[n - 3] += 1;
+    let crc = crc32(&s[n - 8..n - 2]).to_le_bytes();
+    s[n - 12..n - 8].copy_from_slice(&crc);
+    s
+}
+
+/// The LZMA2 data of the first Block of `xz`, from just past its Block
+/// Header to the end of the file: what `--format=raw` with an LZMA2
+/// filter decodes (it stops at the chunk stream's end marker).
+fn raw_of(xz: &[u8]) -> Vec<u8> {
+    let header = (usize::from(xz[12]) + 1) * 4;
+    xz[12 + header..].to_vec()
+}
+
+/// The `compat` seed for an xz-family `shape` (`<tool>-<case>`), or `None`
+/// for another family's.
+fn xz_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
+    let Some((tool, case)) = shape.split_once('-') else {
+        return Ok(None);
+    };
+    if !matches!(tool, "xz" | "unxz" | "xzcat" | "lzma" | "unlzma" | "lzcat") {
+        return Ok(None);
+    }
+    let x = |args: &[&str], files: &[&str], stdin: bool, payload: &[u8]| {
+        encode_compat_case(tool, 0, args, files, stdin, payload)
+    };
+    let text = compat_text(4000);
+    let xz = encoded(work, &text, "xz", None)?;
+    let second = encoded(work, b"a second stream\n", "xz", Some(0))?;
+    let padded = |n: usize| [xz.as_slice(), &vec![0; n]].concat();
+    Ok(Some(match case {
+        "stdin-to-stdout" => x(&[], &[], true, &text),
+        "keep-file" if tool == "xz" => x(&["-k", "a"], &["a"], false, &text),
+        "force-verbose-existing-output" => x(&["-f", "-v", "a"], &["a", "a.xz"], false, &text),
+        "format-lzma" => x(&["--format", "lzma", "-k", "a"], &["a"], false, &text),
+        "format-raw" => x(
+            &["-F", "raw", "--lzma2=dict=4KiB", "-c", "a"],
+            &["a"],
+            false,
+            &text,
+        ),
+        "check-extreme-block-size" => x(
+            &[
+                "--check",
+                "sha256",
+                "-e",
+                "-0",
+                "--block-size=1KiB",
+                "-T1",
+                "-k",
+                "a",
+            ],
+            &["a"],
+            false,
+            &text,
+        ),
+        "filters" => x(
+            &["--x86", "--delta=dist=2", "--lzma2=dict=4KiB", "-c", "a"],
+            &["a"],
+            false,
+            &text,
+        ),
+        "best-threads" => x(&["-T0", "-9", "-c", "a"], &["a"], false, &text),
+        "lzip-refused" => x(&["-F", "lzip", "a"], &["a"], false, &text),
+        "already-suffixed" => x(&["a.xz", "a.txz"], &["a.xz", "a.txz"], false, &text),
+        // The names on standard input; the files hold them too.
+        "files-stdin" => x(&["--files", "-k"], &["a", "a.lz"], true, b"a\na.lz\n"),
+        "files0-stdin" => x(&["--files0", "-c", "-9"], &["a"], true, b"a\0a\0"),
+        "args-mix" => x(
+            &["-vvv", "-qt", "--no-sparse", "--", "a.xz", "-", "-T1", "a"],
+            &["a.xz", "a"],
+            true,
+            &xz,
+        ),
+        "help" => x(&["-h"], &[], false, b""),
+        "version" => x(&["--version"], &[], false, b""),
+        "bad-flag" => x(&["--bogus", "a"], &["a"], false, &text),
+        "robot-compress-refused" => x(&["--robot", "a"], &["a"], false, &text),
+        "keep-file" => x(&["-k", "a.xz"], &["a.xz"], false, &xz),
+        "txz" => x(&["a.txz"], &["a.txz"], false, &xz),
+        "file" if tool == "xzcat" => x(&["a.xz"], &["a.xz"], false, &xz),
+        "multistream-padding" => {
+            let v = [padded(4).as_slice(), &second].concat();
+            x(&["a.xz"], &["a.xz"], false, &v)
+        }
+        "single-stream-garbage" => {
+            let v = [xz.as_slice(), b"trailing garbage"].concat();
+            x(&["-dc", "--single-stream", "a.xz"], &["a.xz"], false, &v)
+        }
+        "file" => x(
+            &["a.lzma"],
+            &["a.lzma"],
+            false,
+            &encoded(work, &text, "lzma", None)?,
+        ),
+        "tlz" => x(
+            &["-k", "a.tlz"],
+            &["a.tlz"],
+            false,
+            &encoded(work, &text, "lzma", None)?,
+        ),
+        "raw-decompress" => x(
+            &["-F", "raw", "--lzma2=dict=4KiB", "-dc", "a.xz"],
+            &["a.xz"],
+            false,
+            &raw_of(&xz),
+        ),
+        "lzip-given" => x(
+            &["--format", "lzip", "-dc", "a.lz"],
+            &["a.lz"],
+            false,
+            &encoded(work, &text, "lzip", None)?,
+        ),
+        "lzip-detected" => x(
+            &["-k", "a.lz"],
+            &["a.lz"],
+            false,
+            &encoded(work, &text, "lzip", None)?,
+        ),
+        "memlimit-refused" => x(
+            &["--memlimit-decompress=1MiB", "-dc", "a.xz"],
+            &["a.xz"],
+            false,
+            &encoded(work, &text, "xz", Some(9))?,
+        ),
+        "no-sparse" => {
+            let sparse = [text.as_slice(), &vec![0; 20_000], &text].concat();
+            x(
+                &["--no-sparse", "-k", "a.xz"],
+                &["a.xz"],
+                false,
+                &encoded(work, &sparse, "xz", None)?,
+            )
+        }
+        "test-verbose" => x(&["-tv", "a.xz"], &["a.xz"], false, &xz),
+        "padding-3" => x(&["a.xz"], &["a.xz"], false, &padded(3)),
+        "padding-5" => x(&["-k", "a.xz"], &["a.xz"], false, &padded(5)),
+        "test-cut-1" => x(&["-t", "a.xz"], &["a.xz"], false, &cut(&xz, 1)),
+        "test-cut-12" => x(&["-t", "a.xz"], &["a.xz"], false, &cut(&xz, 12)),
+        "cut-13" => x(&["a.xz"], &["a.xz"], false, &cut(&xz, 13)),
+        "cut-last" => x(&["a.xz"], &["a.xz"], false, &cut(&xz, xz.len() - 1)),
+        "test-flipped-header" => x(&["-t", "a.xz"], &["a.xz"], false, &flipped(&xz, 6)),
+        "flipped-block" => x(
+            &["-k", "a.xz"],
+            &["a.xz"],
+            false,
+            &flipped(&xz, (xz.len() / 2) as isize),
+        ),
+        "flipped-index" => x(&["a.xz"], &["a.xz"], false, &flipped(&xz, -17)),
+        "test-flipped-footer" => x(&["-t", "a.xz"], &["a.xz"], false, &flipped(&xz, -1)),
+        "test-unsupported-check" => x(&["-tv", "a.xz"], &["a.xz"], false, &unsupported_check(&xz)),
+        "ignore-check" => x(
+            &["--ignore-check", "a.xz"],
+            &["a.xz"],
+            false,
+            // The Check's last byte: a one-Block Index is 12 bytes here.
+            &flipped(&xz, -25),
+        ),
+        "list" => x(&["-l", "a.xz"], &["a.xz"], false, &xz),
+        "list-vv-two-files" => x(
+            &["-l", "-v", "-v", "a.xz", "a.txz"],
+            &["a.xz", "a.txz"],
+            false,
+            &[xz.as_slice(), &second].concat(),
+        ),
+        "list-robot-vv" => x(
+            &["--robot", "-l", "-v", "-v", "a.xz"],
+            &["a.xz"],
+            false,
+            &xz,
+        ),
+        "list-multistream-padding" => {
+            let v = [padded(8).as_slice(), &second].concat();
+            x(&["-l", "-v", "-v", "a.xz"], &["a.xz"], false, &v)
+        }
+        "list-flipped-index" => x(&["-l", "a.xz"], &["a.xz"], false, &flipped(&xz, -17)),
+        "list-cut" => x(&["-l", "a.xz"], &["a.xz"], false, &cut(&xz, xz.len() - 4)),
+        "list-short" => x(&["-l", "a.xz"], &["a.xz"], false, &cut(&xz, 20)),
+        other => unreachable!("COMPAT_SHAPES lists an unhandled xz shape {other:?}"),
     }))
 }
 
@@ -2748,10 +3019,18 @@ fn block_magics(bytes: &[u8]) -> usize {
 /// Every `compat` seed decodes to the tool and case its shape names (the
 /// gzip family's in the flavour its shape names), fits under the target's
 /// input cap (a seed past it is skipped by every run), and the bzip2recover
-/// seeds carry the several blocks they exist for.
+/// seeds carry the several blocks they exist for. Every tool has a seed.
 #[test]
 fn every_compat_seed_decodes_fits_and_carries_its_shape() {
     let work = tempfile::tempdir().unwrap();
+    for name in COMPAT_NAMES {
+        assert!(
+            COMPAT_SHAPES
+                .iter()
+                .any(|s| s.split('-').next() == Some(*name)),
+            "no compat seed runs {name}"
+        );
+    }
     for shape in COMPAT_SHAPES {
         let seed = compat_seed(work.path(), shape).unwrap();
         assert!(
