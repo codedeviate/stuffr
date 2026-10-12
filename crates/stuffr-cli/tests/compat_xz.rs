@@ -597,8 +597,14 @@ mod unix {
             &["-dcv", "big.xz"],
             &["-dcv", "-T1", "big.xz"],
             &["-tv", "a.xz", "big.xz", "a.xz"],
-            &["-dcv", "cut.xz"],
-            &["-tv", "a.xz", "cut.xz", "big.xz"],
+            // `cut.xz` at `-T1`: in liblzma's threaded decoder a Block
+            // cut short is decoded by a worker the main thread does not
+            // wait for, so the figures at "Unexpected end of input" are
+            // whatever that worker had published (stream_decoder_mt.c) —
+            // timing, in xz itself and the C tier alike. CI saw
+            // xz print no line at all, and stuffr "51 B / 8 B".
+            &["-dcv", "-T1", "cut.xz"],
+            &["-tv", "-T1", "a.xz", "cut.xz", "big.xz"],
             &["-dcv", "-T1", "mid.xz"],
             &["-dcv", "e.xz"],
             &["-dcv", "trailing.xz"],
