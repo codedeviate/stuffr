@@ -487,8 +487,18 @@ mod tests {
         assert_eq!((code, String::from_utf8(err).unwrap()), (0, String::new()));
         let out = String::from_utf8(out).unwrap();
         assert!(out.starts_with("name\ta.xz\nfile\t1\t1\t"), "{out}");
+        // The reference build's LZ_DICT_EXTRA: 32 more bytes on x86 with
+        // SSE2 (memusage.rs, Profile::lz_dict_extra).
+        let needed = if cfg!(any(
+            target_arch = "x86_64",
+            all(target_arch = "x86", target_feature = "sse2")
+        )) {
+            8_454_808
+        } else {
+            8_454_776
+        };
         assert!(
-            out.ends_with("\tCRC64\t0\t1\t8454776\tno\t50000002\n"),
+            out.ends_with(&format!("\tCRC64\t0\t1\t{needed}\tno\t50000002\n")),
             "{out}"
         );
         let read = reads.get(&dir.join("a.xz")).map_or(0, |r| r.bytes);
