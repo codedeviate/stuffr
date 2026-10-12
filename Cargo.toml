@@ -352,3 +352,10 @@ newtua-lzw-z = "=0.1.0"
 # build. `rust-version = "1.85"`, below this workspace's 1.88 floor, so it
 # imposes no MSRV constraint.
 oxiarc-lzhuf = { version = "=0.4.2", default-features = false }
+
+# Dev and test builds compile the pure LZMA codec optimised. Unoptimised, its
+# `-e` presets on a 1 MiB input took over 30 s on CI's x86-64 runners
+# (`compat_xz_bytes`, CI 38291091507), past the differential harness's
+# per-run timeout. Release builds are unaffected.
+[profile.dev.package.lzma-rust2]
+opt-level = 3
