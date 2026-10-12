@@ -3,7 +3,9 @@
 //! end of file), the input reader that reads the way libbzip2 does, the
 //! sandbox the fuzz targets run under, and the helpers that create and
 //! publish an output file (`create_temp`, `publish`), restore `SIGPIPE`
-//! (`reset_sigpipe`) and remove a partial output on interrupt (`arm_cleanup`).
+//! (`reset_sigpipe`), and either remove a partial output on interrupt
+//! (`arm_cleanup`) or record the interrupt for the run to answer
+//! (`arm_interrupt_flag`).
 //!
 //! Nothing here knows a tool's messages or flags; each family keeps its own
 //! checks and wording and calls these helpers.
@@ -39,6 +41,9 @@ pub(crate) fn reset_sigpipe() {
     }
 }
 
+/// The signals a family hooks: a set of `libc` signal numbers.
+pub(crate) type Signals = &'static [std::os::raw::c_int];
+
 /// The signals whose arrival removes an armed output: the six xz 5.8.4's
 /// signals.c `signals_init` hooks, in its order.
 ///
@@ -52,7 +57,7 @@ pub(crate) fn reset_sigpipe() {
 /// run removes its partial output and dies of SIGPIPE (the bzip2 family's
 /// documented SIGPIPE deviation, in the same direction).
 #[cfg(unix)]
-const CLEANUP_SIGNALS: [libc::c_int; 6] = [
+pub(crate) const XZ_SIGNALS: Signals = &[
     libc::SIGINT,
     libc::SIGTERM,
     libc::SIGHUP,
@@ -60,6 +65,34 @@ const CLEANUP_SIGNALS: [libc::c_int; 6] = [
     libc::SIGXCPU,
     libc::SIGXFSZ,
 ];
+#[cfg(not(unix))]
+pub(crate) const XZ_SIGNALS: Signals = &[];
+
+/// GNU gzip 1.15 (measured 2026-10-12): INT, TERM, HUP, PIPE, XCPU and XFSZ
+/// remove the partial output and kill the process; QUIT and USR1 are not
+/// handled; an inherited ignore is kept. The same six as xz.
+// Used by the gzip family from 0.13.1 Task 3.
+#[allow(dead_code)]
+pub(crate) const GNU_GZIP_SIGNALS: Signals = XZ_SIGNALS;
+
+/// Apple's `/usr/bin/gzip` (measured 2026-10-12): SIGINT only.
+// Used by the gzip family from 0.13.1 Task 3.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub(crate) const APPLE_GZIP_SIGNALS: Signals = &[libc::SIGINT];
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub(crate) const APPLE_GZIP_SIGNALS: Signals = &[];
+
+/// bzip2 1.0.8 (measured 2026-10-12): INT, TERM and HUP, installed with
+/// `signal()`, which overrides an inherited ignore.
+// Used by the bzip2 family from 0.13.1 Task 4.
+#[allow(dead_code)]
+#[cfg(unix)]
+pub(crate) const BZIP2_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+#[cfg(not(unix))]
+#[allow(dead_code)]
+pub(crate) const BZIP2_SIGNALS: Signals = &[];
 
 /// The slot's size: `PATH_MAX`, the terminating NUL included.
 #[cfg(unix)]
@@ -102,7 +135,7 @@ impl Drop for CleanupGuard {
 }
 
 /// Arm the removal of `path`, the run's partial output, should one of
-/// `CLEANUP_SIGNALS` arrive before the guard drops; the signal is then
+/// `signals` arrive before the guard drops; the signal is then
 /// re-raised at its default action, so the process dies of it, as xz does
 /// (signals.c: `signal_handler`, `signals_exit`).
 ///
@@ -110,10 +143,12 @@ impl Drop for CleanupGuard {
 /// error path after removing the file itself. Under `Host::Sandbox` nothing
 /// is armed and no handler installed. A path the slot cannot hold (or one
 /// with a NUL) is not armed. Arming never allocates. Call `reset_sigpipe()`
-/// first, or SIGPIPE stays ignored and unhooked (see `CLEANUP_SIGNALS`).
+/// first, or SIGPIPE stays ignored and unhooked (see `XZ_SIGNALS`). The
+/// signals are the family's (`XZ_SIGNALS`, `GNU_GZIP_SIGNALS`,
+/// `APPLE_GZIP_SIGNALS`); a process runs one family, so one set is installed.
 /// One arm at a time: arm the temporary right after `create_temp` and drop
 /// the guard once it is published or removed, before arming another.
-pub(crate) fn arm_cleanup(host: &Host, path: &Path) -> CleanupGuard {
+pub(crate) fn arm_cleanup(host: &Host, path: &Path, signals: Signals) -> CleanupGuard {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -125,7 +160,7 @@ pub(crate) fn arm_cleanup(host: &Host, path: &Path) -> CleanupGuard {
             !ARMED.load(Ordering::Acquire),
             "arm_cleanup: another output is still armed"
         );
-        install_handlers();
+        install_handlers(signals);
         // SAFETY: sigset_t is plain data, initialised by sigemptyset before
         // use. Blocking the cleanup signals on this thread while the slot is
         // written means this thread's handler never sees it half-written;
@@ -136,7 +171,7 @@ pub(crate) fn arm_cleanup(host: &Host, path: &Path) -> CleanupGuard {
             let mut block: libc::sigset_t = std::mem::zeroed();
             let mut old: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(&mut block);
-            for sig in CLEANUP_SIGNALS {
+            for &sig in signals {
                 libc::sigaddset(&mut block, sig);
             }
             libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
@@ -151,7 +186,7 @@ pub(crate) fn arm_cleanup(host: &Host, path: &Path) -> CleanupGuard {
     }
     #[cfg(not(unix))]
     {
-        let _ = (host, path);
+        let _ = (host, path, signals);
         CleanupGuard {}
     }
 }
@@ -161,7 +196,7 @@ pub(crate) fn arm_cleanup(host: &Host, path: &Path) -> CleanupGuard {
 /// (`nohup`), and `SA_RESTART` is off. Queried per signal rather than
 /// latched in a flag, so it holds in a child forked mid-install.
 #[cfg(unix)]
-fn install_handlers() {
+fn install_handlers(signals: Signals) {
     let handler = on_cleanup_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     // SAFETY: sigaction structs are plain data, zeroed then filled; a query
     // passes a null new action. The handler only makes async-signal-safe
@@ -170,12 +205,12 @@ fn install_handlers() {
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         libc::sigemptyset(&mut action.sa_mask);
-        for sig in CLEANUP_SIGNALS {
+        for &sig in signals {
             libc::sigaddset(&mut action.sa_mask, sig);
         }
         action.sa_flags = 0;
         action.sa_sigaction = handler;
-        for sig in CLEANUP_SIGNALS {
+        for &sig in signals {
             let mut old: libc::sigaction = std::mem::zeroed();
             if libc::sigaction(sig, std::ptr::null(), &mut old) == 0
                 && (old.sa_sigaction == libc::SIG_IGN || old.sa_sigaction == handler)
@@ -203,6 +238,92 @@ extern "C" fn on_cleanup_signal(sig: libc::c_int) {
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
+    }
+}
+
+/// Set by `on_interrupt_signal`; read and cleared by [`take_interrupt`].
+#[cfg(unix)]
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a run holds while its interrupt flag is armed; dropping it puts the
+/// previous dispositions back.
+#[must_use = "dropping the guard disarms the flag at once"]
+// Used by the bzip2 family from 0.13.1 Task 4.
+#[allow(dead_code)]
+pub(crate) struct InterruptGuard {
+    #[cfg(unix)]
+    old: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        for (sig, old) in &self.old {
+            // SAFETY: restoring a disposition sigaction itself returned.
+            unsafe { libc::sigaction(*sig, old, std::ptr::null_mut()) };
+        }
+    }
+}
+
+/// bzip2.c's `signal(SIGINT, mySignalCatcher)` and its siblings: each of
+/// `signals` sets a flag the run polls ([`take_interrupt`]), so the reply
+/// (a message, `cleanUpAndFail`) is written by ordinary code, not by the
+/// handler. As `signal()` does, an inherited `SIG_IGN` is overridden.
+/// `SA_RESTART` is on, so an interrupted call resumes and the poll sees the
+/// flag. Under `Host::Sandbox` nothing is installed.
+// Used by the bzip2 family from 0.13.1 Task 4.
+#[allow(dead_code)]
+pub(crate) fn arm_interrupt_flag(host: &Host, signals: Signals) -> InterruptGuard {
+    #[cfg(unix)]
+    {
+        let mut old = Vec::new();
+        if matches!(host, Host::Sandbox(_)) {
+            return InterruptGuard { old };
+        }
+        INTERRUPTED.store(false, Ordering::SeqCst);
+        let handler = on_interrupt_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // SAFETY: zeroed sigaction structs filled before use; the handler
+        // only stores an atomic, which is async-signal-safe.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESTART;
+            action.sa_sigaction = handler;
+            for &sig in signals {
+                let mut prev: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, &action, &mut prev) == 0 {
+                    old.push((sig, prev));
+                }
+            }
+        }
+        InterruptGuard { old }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, signals);
+        InterruptGuard {}
+    }
+}
+
+#[cfg(unix)]
+extern "C" fn on_interrupt_signal(_sig: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+/// Whether an armed signal has arrived since the last call; clears it.
+/// Always `false` under `Host::Sandbox`, so an in-process run never takes
+/// a flag a real run's signal set.
+// Used by the bzip2 family from 0.13.1 Task 4.
+#[allow(dead_code)]
+pub(crate) fn take_interrupt(host: &Host) -> bool {
+    #[cfg(unix)]
+    {
+        !matches!(host, Host::Sandbox(_)) && INTERRUPTED.swap(false, Ordering::SeqCst)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = host;
+        false
     }
 }
 
@@ -312,7 +433,7 @@ pub(crate) fn install_stop_handler(host: &Host) {
             }
             let mut action: libc::sigaction = std::mem::zeroed();
             libc::sigemptyset(&mut action.sa_mask);
-            for &sig in CLEANUP_SIGNALS.iter().chain(PROGRESS_SIGNALS) {
+            for &sig in XZ_SIGNALS.iter().chain(PROGRESS_SIGNALS) {
                 libc::sigaddset(&mut action.sa_mask, sig);
             }
             libc::sigaddset(&mut action.sa_mask, libc::SIGTSTP);
@@ -951,6 +1072,59 @@ pub(crate) fn set_times(meta: &Metadata, to: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn signal_sets_are_the_measured_ones() {
+        // Measured 2026-10-12 (spec, section 3): GNU gzip 1.15 handles
+        // xz's six; Apple's gzip SIGINT only; bzip2 1.0.8 INT, TERM, HUP.
+        assert_eq!(
+            XZ_SIGNALS,
+            &[
+                libc::SIGINT,
+                libc::SIGTERM,
+                libc::SIGHUP,
+                libc::SIGPIPE,
+                libc::SIGXCPU,
+                libc::SIGXFSZ
+            ]
+        );
+        assert_eq!(GNU_GZIP_SIGNALS, XZ_SIGNALS);
+        assert_eq!(APPLE_GZIP_SIGNALS, &[libc::SIGINT]);
+        assert_eq!(BZIP2_SIGNALS, &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_flag_records_a_signal_once_and_restores_on_drop() {
+        // SIGUSR2: no test and no family uses it, so arming it here cannot
+        // disturb a test running beside this one.
+        let host = Host::Real;
+        let guard = arm_interrupt_flag(&host, &[libc::SIGUSR2]);
+        assert!(!take_interrupt(&host));
+        // SAFETY: raise is safe; the handler only stores an atomic.
+        unsafe { libc::raise(libc::SIGUSR2) };
+        assert!(take_interrupt(&host));
+        assert!(!take_interrupt(&host));
+        drop(guard);
+        let mut now: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a query with a null new action.
+        unsafe { libc::sigaction(libc::SIGUSR2, std::ptr::null(), &mut now) };
+        assert_eq!(now.sa_sigaction, libc::SIG_DFL);
+    }
+
+    #[test]
+    fn a_sandbox_never_sees_an_interrupt() {
+        let host = Host::Sandbox(Sandbox {
+            dir: PathBuf::new(),
+            stdin: None,
+            stdout: Arc::default(),
+            budget: Arc::new(AtomicU64::new(0)),
+            reads: ReadLog::default(),
+        });
+        let _g = arm_interrupt_flag(&host, BZIP2_SIGNALS);
+        assert!(!take_interrupt(&host));
+    }
+
     /// A write the budget cannot hold fails whole and leaves the budget
     /// as it was; nothing wraps.
     #[test]
@@ -1042,7 +1216,7 @@ mod tests {
         fs::write(&file, b"partial").unwrap();
         let bytes = file.as_os_str().as_bytes();
         {
-            let _guard = arm_cleanup(&Host::Real, &file);
+            let _guard = arm_cleanup(&Host::Real, &file, XZ_SIGNALS);
             assert!(ARMED.load(Ordering::Acquire), "not armed");
             // SAFETY: no handler runs (no signal is sent), and this test is
             // the only in-process arm, so nothing writes the slot meanwhile.
@@ -1053,7 +1227,7 @@ mod tests {
         assert!(!ARMED.load(Ordering::Acquire), "still armed after drop");
 
         let long = dir.join("x".repeat(SLOT_LEN));
-        let guard = arm_cleanup(&Host::Real, &long);
+        let guard = arm_cleanup(&Host::Real, &long, XZ_SIGNALS);
         assert!(!ARMED.load(Ordering::Acquire), "an over-long path armed");
         drop(guard);
         let _ = fs::remove_dir_all(&dir);
@@ -1087,7 +1261,7 @@ mod tests {
     /// installed (another test's arm) or inherited (`nohup`).
     #[cfg(unix)]
     fn default_dispositions() {
-        for sig in CLEANUP_SIGNALS {
+        for &sig in XZ_SIGNALS {
             // SAFETY: SIG_DFL installs no handler and touches no Rust state.
             unsafe { libc::signal(sig, libc::SIG_DFL) };
         }
@@ -1100,7 +1274,7 @@ mod tests {
     #[test]
     fn an_interrupt_removes_the_armed_file() {
         let dir = scratch("interrupt");
-        for sig in CLEANUP_SIGNALS {
+        for &sig in XZ_SIGNALS {
             let file = dir.join(format!("partial-{sig}.xz"));
             fs::write(&file, b"partial").unwrap();
             let status = in_child(|| {
@@ -1108,7 +1282,7 @@ mod tests {
                 // ARMED is inherited at fork, where `arm_then_drop_disarms`
                 // may hold it; this child's arm is its only one.
                 ARMED.store(false, Ordering::SeqCst);
-                let _guard = arm_cleanup(&Host::Real, &file);
+                let _guard = arm_cleanup(&Host::Real, &file, XZ_SIGNALS);
                 // SAFETY: raise is async-signal-safe; the handler unlinks
                 // the armed path and re-raises at SIG_DFL, ending the child.
                 unsafe { libc::raise(sig) };
@@ -1143,9 +1317,9 @@ mod tests {
             // test may hold it; clear it so the check below sees only this
             // arm.
             ARMED.store(false, Ordering::SeqCst);
-            let _guard = arm_cleanup(&host, &file);
+            let _guard = arm_cleanup(&host, &file, XZ_SIGNALS);
             let mut all_default = !ARMED.load(Ordering::Acquire);
-            for sig in CLEANUP_SIGNALS {
+            for &sig in XZ_SIGNALS {
                 // SAFETY: a zeroed sigaction is a valid out-parameter, and a
                 // query (null new action) changes nothing.
                 unsafe {

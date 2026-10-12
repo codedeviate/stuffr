@@ -547,7 +547,7 @@ impl FilePair {
                 return false;
             }
         };
-        let guard = arm_cleanup(host, &tmp);
+        let guard = arm_cleanup(host, &tmp, host::XZ_SIGNALS);
         let handle = match file.try_clone() {
             Ok(h) => h,
             Err(e) => {
