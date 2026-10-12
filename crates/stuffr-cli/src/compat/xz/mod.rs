@@ -568,6 +568,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `--files=FILE` opens its list through `Host::track`, so the fuzz
+    /// target's read bound sees the list as well as the names in it.
+    #[test]
+    fn files_from_a_file_are_counted() {
+        let dir = std::env::temp_dir().join(format!("stuffr-xz-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("list"), b"a\n").unwrap();
+        std::fs::write(dir.join("a"), b"listed by name\n").unwrap();
+        let args = ["-k".into(), "--files=list".into()];
+        let (code, _, err, reads) = run_in_counted(&dir, "xz", &args, b"", &|_| None);
+        assert_eq!((code, String::from_utf8(err).unwrap()), (0, String::new()));
+        let got = |n: &str| reads.get(&dir.join(n)).copied().unwrap_or_default();
+        assert_eq!(
+            (got("list").opens, got("list").bytes, got("list").len),
+            (1, 2, 2)
+        );
+        assert_eq!((got("a").opens, got("a").bytes), (1, 15));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn run_in_counted_parses_in_the_sandbox() {
         let dir = std::env::temp_dir();

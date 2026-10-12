@@ -534,6 +534,7 @@ pub(crate) type ReadLog = Arc<Mutex<BTreeMap<PathBuf, InputReads>>>;
 /// sandboxed ([`Host::track`]). Derefs to the `File` for metadata and the
 /// descriptor; reads go through `Read`, so they are counted. Never read
 /// through `&File` (`Read for &File`), which would bypass the count.
+#[derive(Debug)]
 pub(crate) struct InFile {
     file: File,
     log: Option<(ReadLog, PathBuf)>,

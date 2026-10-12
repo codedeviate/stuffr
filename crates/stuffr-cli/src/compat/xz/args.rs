@@ -35,7 +35,7 @@ use super::message::{self, Messages, Status, Verbosity, mask_nonprint};
 use super::messages as m;
 use super::options;
 use super::suffix;
-use crate::compat::host::{Host, strerror};
+use crate::compat::host::{Host, InFile, strerror};
 
 /// `enum operation_mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +114,9 @@ pub(crate) struct FilesFrom {
     pub name: Option<Vec<u8>>,
     /// The terminator: `\n` for `--files`, NUL for `--files0`.
     pub delim: u8,
-    /// The file, opened while parsing as `fopen` opens it there.
-    pub file: Option<File>,
+    /// The file, opened while parsing as `fopen` opens it there, through
+    /// [`Host::track`] so a sandboxed run counts what is read of it.
+    pub file: Option<InFile>,
 }
 
 impl FilesFrom {
@@ -720,7 +721,7 @@ impl Parser<'_> {
         let file = match &arg {
             None => None,
             Some(name) => match File::open(self.host.path(name)) {
-                Ok(f) => Some(f),
+                Ok(f) => Some(self.host.track(&self.host.path(name), f)),
                 Err(e) => {
                     return Err(self.msg.fatal(
                         err,
