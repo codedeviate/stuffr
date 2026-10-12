@@ -1810,6 +1810,89 @@ mod unix {
         }
     }
 
+    /// `unxz [-f] a.xz` over `a.xz` holding `xz` beside an existing `a`, in
+    /// a fresh directory: standard error with `exe`'s path cut to its last
+    /// component, the exit code, and what `a` then holds (`None`: gone).
+    fn unxz_over_existing(
+        exe: &Path,
+        tag: &str,
+        force: bool,
+        xz: &[u8],
+    ) -> (String, Option<i32>, Option<Vec<u8>>) {
+        let work = scratch(tag, &[("a.xz", xz), ("a", b"existing\n")]);
+        let mut cmd = Command::new(exe);
+        if force {
+            cmd.arg("-f");
+        }
+        let out = output(
+            cmd.arg("a.xz")
+                .current_dir(&work)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null()),
+        )
+        .unwrap();
+        let kept = fs::read(work.join("a")).ok();
+        let _ = fs::remove_dir_all(&work);
+        let err = String::from_utf8_lossy(&out.stderr).replace(&*exe.to_string_lossy(), "unxz");
+        (err, out.status.code(), kept)
+    }
+
+    /// A pinned, expected deviation: the header probe (`coder.rs`, the
+    /// `mod.rs` deviation list). Byte 30 of a `-T1` stream is the first
+    /// LZMA2 chunk's first range-coder byte; flipped, xz 5.8.4 finds the
+    /// corruption only after it has opened the output, stuffr before. The
+    /// harness has no expected-deviation mechanism, so each side's observed
+    /// outcome is asserted on its own (both observed 2026-10-12):
+    ///
+    /// - without `-f`: xz says "a: File exists", stuffr "a.xz: Compressed
+    ///   data is corrupt"; both exit 1 and keep `a`;
+    /// - with `-f`: both say "a.xz: Compressed data is corrupt" and exit 1,
+    ///   but xz has removed the existing `a` and stuffr has kept it.
+    #[test]
+    fn header_probe_deviation_is_pinned() {
+        let Some(dir) = xz_dir() else { return };
+        let mut xz = reference_output(&["-T1"], &text());
+        assert_eq!(&xz[24..31], [0xe0, 0x06, 0xdf, 0x00, 0x3b, 0x5d, 0x00]);
+        xz[30] ^= 0xff;
+        let existing = Some(b"existing\n".to_vec());
+        let corrupt = "unxz: a.xz: Compressed data is corrupt\n".to_string();
+        let reference = Path::new(dir).join("unxz");
+        let link =
+            std::env::temp_dir().join(format!("stuffr-xz-probe-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&link);
+        fs::create_dir_all(&link).unwrap();
+        let ours = link.join("unxz");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &ours).unwrap();
+
+        let theirs_plain = unxz_over_existing(&reference, "probe-ref", false, &xz);
+        let theirs_forced = unxz_over_existing(&reference, "probe-ref-f", true, &xz);
+        let ours_plain = unxz_over_existing(&ours, "probe", false, &xz);
+        let ours_forced = unxz_over_existing(&ours, "probe-f", true, &xz);
+        let _ = fs::remove_dir_all(&link);
+
+        assert_eq!(
+            theirs_plain,
+            (
+                "unxz: a: File exists\n".to_string(),
+                Some(1),
+                existing.clone()
+            ),
+            "reference, without -f"
+        );
+        assert_eq!(
+            theirs_forced,
+            (corrupt.clone(), Some(1), None),
+            "reference, with -f"
+        );
+        assert_eq!(
+            ours_plain,
+            (corrupt.clone(), Some(1), existing.clone()),
+            "stuffr, without -f"
+        );
+        assert_eq!(ours_forced, (corrupt, Some(1), existing), "stuffr, with -f");
+    }
+
     // ==== Part 3 (Task 7): --list ====
 
     /// An `.xz` variable-length integer.
