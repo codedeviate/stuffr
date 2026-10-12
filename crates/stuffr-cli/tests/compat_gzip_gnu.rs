@@ -2773,12 +2773,12 @@ mod interrupts {
                 std::fs::write(dir.join("s"), "text ".repeat(800)).unwrap();
                 std::fs::write(dir.join("a"), big_input(mib)).unwrap();
                 let d = dir.clone();
-                let ready = move |n: &str| {
-                    let second = if mine { is_tmp(n) } else { n == "a.gz" };
-                    second
-                        && d.join("s.gz").exists()
-                        && std::fs::metadata(d.join(n)).is_ok_and(|m| m.len() > 0)
-                };
+                // GNU removes `s` only after publishing `s.gz`, so wait for
+                // that too, or the signal races the removal.
+                let named = |n: &str| if mine { is_tmp(n) } else { n == "a.gz" };
+                let partial = has_data(&d, &named);
+                let ready =
+                    |n: &str| d.join("s.gz").exists() && !d.join("s").exists() && partial(n);
                 got = interrupt_env(
                     &exe,
                     "gzip",
