@@ -1131,8 +1131,8 @@ emulates is two programs:
 - **R6, signal cleanup.** Under `Host::Real` the partial output is removed
   and the signal re-raised by an async-signal-safe handler in `host.rs`
   (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGPIPE`, `SIGXCPU`, `SIGXFSZ`, as
-  `signals.c`). gzip and bzip2 keep their temporary files on an interrupt;
-  they do not adopt this yet.
+  `signals.c`). Since 0.13.1 GNU gzip uses the same six and Apple gzip
+  `SIGINT` only; bzip2 sets a flag instead and cleans up on its own path.
 - **The tier promise.** Stdout, stderr and exit codes are xz 5.8.4's on both
   tiers. Compressed bytes are identical on the C tier (liblzma 5.8.4 through
   `liblzma-sys` 0.4.9; a test pins the version string) and compatible on the
