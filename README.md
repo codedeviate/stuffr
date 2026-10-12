@@ -866,12 +866,13 @@ cargo add stuffr                # the facade; re-exports stuffr-core + stuffr-fo
 
 Invoked as `bzip2`, `bunzip2`, `bzcat` or `bzip2recover`, the `stuffr` binary
 behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
-(from `0.12.0`), as **gzip**. In both cases that tool's flags, files, exit
-codes and messages, not stuffr's. The binary reads the name from `argv[0]`,
-the file name only, before parsing anything. Any other name, `stuffr`
-included, runs the stuffr CLI unchanged. So does a link you make by hand
-under a name stuffr does not handle: `xzcat -> stuffr` runs `stuffr`, not
-xzcat.
+(from `0.12.0`), as **gzip**; invoked as `xz`, `unxz`, `xzcat`, `lzma`,
+`unlzma` or `lzcat` (from `0.13.0`), as **xz** (XZ Utils 5.8.4). In every
+case that tool's flags, files, exit codes and messages, not stuffr's. The
+binary reads the name from `argv[0]`, the file name only, before parsing
+anything. Any other name, `stuffr` included, runs the stuffr CLI unchanged.
+So does a link you make by hand under a name stuffr does not handle:
+`zstdcat -> stuffr` runs `stuffr`, not zstdcat.
 
 ### Opting in
 
@@ -879,7 +880,7 @@ xzcat.
 Homebrew. One verb makes them:
 
 ```sh
-stuffr install-links --dir ~/.local/bin                  # all eight names
+stuffr install-links --dir ~/.local/bin                  # all fourteen names
 stuffr install-links --dir ~/.local/bin --names bzcat,zcat   # comma-separated subset
 stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
 stuffr install-links --dir ~/.local/bin --force          # replace what is already there
@@ -1042,17 +1043,87 @@ carries both and picks one:
   quoted names). stuffr follows 1.15; Linux CI's 1.12 cases are adjusted
   where the older tool differs.
 
+### The xz family
+
+`xz`, `unxz`, `xzcat`, `lzma`, `unlzma` and `lzcat`, from `0.13.0`. They
+behave as **XZ Utils 5.8.4's `xz`**, and only that version: there is one
+personality and one reference, no flavours. The mode comes from the name as
+xz derives it: `unxz` decompresses, `xzcat` and `lzcat` decompress to
+standard output, and the `lzma` names use the `.lzma` format. `XZ_DEFAULTS`
+and `XZ_OPT` are read before the command line, as xz reads them.
+
+**The promise:**
+
+- **Stdout, stderr and exit codes are byte-identical to xz 5.8.4** (under
+  `LC_ALL=C`), on both build tiers: every documented option, the
+  `--list` and `-vv` tables, `--robot`, `--files` and `--files0`, `--filters`
+  and the filter options, `--block-list`, the suffix rules, `--info-memory`
+  and the memory-limit refusals. The exit codes are xz's, 0, 1 and 2 (2 is a
+  warning); stuffr's 3 to 7 never appear under these names. A run killed by
+  `SIGINT`, `SIGTERM` or `SIGHUP` removes its partial output and dies of the
+  signal, as xz does. A differential suite runs each case through a real
+  xz 5.8.4 and a stuffr link and compares those streams, the file tree,
+  modes and mtimes.
+- **Compressed output.** On the `c-backed` tier (`--features c-backed`,
+  which builds liblzma 5.8.4) the bytes are **identical to xz 5.8.4** for
+  every preset, `-e`, `--check`, `-T`, `--block-size`, `--block-list`,
+  `--format` and filter chain, including xz's default multi-threaded mode.
+  On the default pure tier every option is accepted and the output is
+  **compatible**: xz 5.8.4 decodes it to the input, and the container fields
+  stuffr controls (the check type, the stream flags, `--format`) match.
+- **The intended differences:** `--version`'s first line reads `xz (stuffr
+  X.Y.Z; XZ Utils 5.8.4 compatible)` and the rest is xz's;
+  `--robot --version` is xz's own and reports 5.8.4 on both tiers, because
+  scripts parse it; and the `-v` progress line's speed and elapsed fields
+  vary from run to run, as they do between two runs of xz.
+
+**Known differences:**
+
+- **Pure tier, a damaged stream can read differently.** Corruption in the
+  last few bytes of a raw, `.lzma` or `.lz` stream may be reported as a
+  truncated stream ("Unexpected end of input") where xz says "Compressed
+  data is corrupt". The exit code is the same. Output written before a
+  decode error may be a strict prefix of what xz writes (a raw, `.lzma` or
+  `.lz` stream cut short, or corruption in the middle of a `.xz` Block);
+  stderr, the exit code and the file tree match, and `-v`'s figures at that
+  point follow it.
+- **Pure tier, memory.** A stream that declares a dictionary larger than its
+  data needs commits that memory, where xz only reserves it; bound it with
+  `-M`. Where the size is declared (`.lzma` with a known size, a `.xz`
+  Block's uncompressed size) the window is capped at that size.
+- **Pure tier, `-v` sizes.** The compressed size and ratio `-v` reports are
+  those of stuffr's own output, which is compatible with xz's, not equal.
+- **Pure tier, two refusals and a layout.** A `.lzma` stream that declares
+  its size *and* ends with an end marker is refused (liblzma accepts it; no
+  xz encoder writes one). With threads and a `--block-size` smaller than the
+  dictionary, the Block boundaries differ from xz's.
+- **The memory figures** xz prints (`-vv`, `--list`, the memory-limit
+  messages) come from liblzma's formulas modelled on a configure-built
+  xz 5.8.4 for the host, on both tiers.
+- **No sandbox.** xz on Linux may confine itself with Landlock; stuffr does
+  not. Nothing that confinement changes is observable.
+- **An input that is also the output is never lost,** as with the other
+  families: output is written beside the target and put in place when
+  complete, so a failure keeps the input even where xz would lose it.
+- **The progress timer is polled,** not set with `alarm(2)`. The lines and
+  when they appear are xz's, and `SIGALRM`, `SIGINFO` and `SIGUSR1` each
+  still ask for a line; no visible difference is expected.
+- **When the parent ignores `SIGPIPE`,** xz exits 0 on a closed pipe;
+  stuffr dies of `SIGPIPE`, for the same reason as the other families.
+  Under the default setting both die of it.
+
 ### Roadmap
 
 One family per release, each with its own spec stating its byte-identity
-promise: **bzip2 (`0.11.0`) and gzip (`0.12.0`) are done; xz/lzma is next,
-then zstd, lz4, then `unzip`/`zipinfo`.**
+promise: **bzip2 (`0.11.0`), gzip (`0.12.0`) and xz/lzma (`0.13.0`) are
+done; zstd is next, then lz4, then `unzip`/`zipinfo`.**
 `tar` is excluded (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)). The planned
 tiers:
 
 - **Byte-identical:** bzip2, on both tiers; gzip against Apple's gzip on
-  the `c-backed` tier, via zlib (done); xz/lzma and zstd on the `c-backed`
-  tier, against stated tool versions.
+  the `c-backed` tier, via zlib (done); xz/lzma on the `c-backed` tier, via
+  liblzma, against XZ Utils 5.8.4 (done); zstd on the `c-backed` tier,
+  against a stated tool version.
 - **Compatible behaviour only** (the same flags, files, exit codes and
   messages, and output the real tool reads): lz4; GNU gzip's exact bytes;
   every family except bzip2 on the pure tier.
@@ -1068,8 +1139,12 @@ The gzip family's Apple personality is ported from Apple's `gzip.c`
 Matthew R. Green) and from the decoders it carries (`unpack.c`, `unbzip2.c`,
 `unxz.c`, `unlz.c`, `zuncompress.c`), under BSD licences whose notices are in
 [`crates/stuffr-cli/LICENSE-gzip-bsd`](crates/stuffr-cli/LICENSE-gzip-bsd).
+The xz family is ported from XZ Utils 5.8.4's `src/xz/`, plus the parts of
+liblzma that `--list` and the memory figures need, by Lasse Collin and
+contributors, under 0BSD; the licence is in
+[`crates/stuffr-cli/LICENSE-xz`](crates/stuffr-cli/LICENSE-xz).
 `stuffr-cli`'s licence metadata is therefore
-`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`. The GNU
+`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`. The GNU
 personality contains no GNU code: GNU gzip is GPLv3 and its source was never
 read, so that behaviour comes from the manual, `--help`, the NEWS file and
 running the binary.
@@ -1355,16 +1430,24 @@ Since `0.12.0` the gzip family's Apple personality is ported too, from Apple's
 `gzip.c` and the decoders it carries (`unpack.c`, `unbzip2.c`, `unxz.c`,
 `unlz.c`, `zuncompress.c`), and their notices are in
 [`crates/stuffr-cli/LICENSE-gzip-bsd`](crates/stuffr-cli/LICENSE-gzip-bsd).
+Since `0.13.0` the xz family is ported as well, from XZ Utils 5.8.4's
+`src/xz/` and the liblzma sources behind `--list` and the memory figures, and
+that code is **0BSD** (`crates/stuffr-cli/LICENSE-xz`; 0BSD asks for nothing
+but is named so the origin is not lost).
 `stuffr-cli`'s full expression is therefore
-**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`**: the
-BSD-2-Clause covers `gzip.c` and the decoders, and the BSD-3-Clause covers
-`zuncompress.c`, the University of California's `.Z` reader. One notice is
+**`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`**: the
+BSD-2-Clause covers `gzip.c` and the decoders, the BSD-3-Clause covers
+`zuncompress.c`, the University of California's `.Z` reader, and the 0BSD
+covers the xz family. One notice is
 BSD-style but not word for word the SPDX `BSD-2-Clause` text: the Lzd one in
 `unlz.c`. The full notice ships in `LICENSE-gzip-bsd`, and that file, not the
 SPDX name, is what to read. `stuffr-formats` is
-**`MIT AND BSD-2-Clause`**, because its pack decoder (`pack.rs`) is a port of
-FreeBSD's `unpack.c` (Xin LI), whose notice is
-[`crates/stuffr-formats/LICENSE-unpack-bsd`](crates/stuffr-formats/LICENSE-unpack-bsd).
+**`MIT AND BSD-2-Clause AND 0BSD`**, because its pack decoder (`pack.rs`) is a
+port of FreeBSD's `unpack.c` (Xin LI), whose notice is
+[`crates/stuffr-formats/LICENSE-unpack-bsd`](crates/stuffr-formats/LICENSE-unpack-bsd),
+and since `0.13.0` its liblzma memory-usage formulas and container coders
+(the pure xz tier) are ported from XZ Utils 5.8.4 under 0BSD, notice in
+`crates/stuffr-formats/LICENSE-xz-memusage`.
 `stuffr` and `stuffr-core` are MIT. On the `c-backed` tier zlib is built too,
 under the `Zlib` licence (also permissive); the default pure tier does not
 contain it.

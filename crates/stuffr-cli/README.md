@@ -70,5 +70,5 @@ the [project README](https://github.com/codedeviate/stuffr#readme).
 ## License
 
 [MIT](LICENSE), with ported code under other permissive licences: the crate's
-metadata is `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`. The
-notices ship as `LICENSE-bzip2` and `LICENSE-gzip-bsd`.
+metadata is `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`.
+The notices ship as `LICENSE-bzip2`, `LICENSE-gzip-bsd` and `LICENSE-xz`.

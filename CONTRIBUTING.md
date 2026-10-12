@@ -37,6 +37,11 @@ brew install gnu-tar cpio binutils
   `/opt/homebrew/opt/gzip/bin/gzip`; Apple's `/usr/bin/gzip` is the other
   reference) and `ncompress` (`/opt/homebrew/opt/ncompress/bin`). Without them
   `require_reference` skips locally with a note and panics under `CI`.
+- **From 0.13.0 the xz suites need XZ Utils 5.8.4 exactly** (`brew install
+  xz`, the keg at `/opt/homebrew/opt/xz/bin/xz`, or `STUFFR_XZ_REFERENCE`
+  naming an `xz` you built from the release tarball). Another release is
+  ignored, not used; without 5.8.4 the suites skip with a note locally and
+  panic under `CI`.
 - **Known gap: Intel Macs.** Homebrew's prefix there is `/usr/local`, not
   `/opt/homebrew`, so those two paths do not exist and the cpio and ar
   catalogues fail even with the tools installed. Resolving the keg through
@@ -248,7 +253,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.10.4` | Honest ends: a truncated `ar` (member, `/`, `/SYM64/`, `//`) is exit 5 in every verb, the message naming the record; a zip symlink target over 64 KiB is exit 6 (seekable); a salvage refusal keeps its bounded notes; stored sightings capped at 64 per shape (`SightingLog`, `Sighting.more`). |
 | `0.11.0` | Phase 5's first part — compatibility links: `argv[0]` dispatch, `stuffr install-links --dir DIR` (opt-in, Homebrew's stable `opt` target), the differential harness, and the bzip2 family (`bzip2`, `bunzip2`, `bzcat`, `bzip2recover`) behaving as bzip2 1.0.8 — flags, files, exit codes and stderr byte-identical, compressed output byte-identical on both tiers; the `compat` fuzz target; `stuffr-cli` licensed `MIT AND bzip2-1.0.6`. A MINOR because it is a new user-facing surface. |
 | `0.12.0` | Phase 5's second part — the gzip compatibility family (`gzip`, `gunzip`, `zcat`, `gzcat`) in two personalities, GNU gzip 1.15 and Apple's gzip 487.0.1 (a port, `LICENSE-gzip-bsd`), chosen by platform or `STUFFR_GZIP_FLAVOR`; stdout, stderr and exit codes byte-identical to the reference in both, Apple's compressed bytes identical on the `c-backed` tier and compatible elsewhere, GNU's compatible only; `install-links` now makes eight names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`, `stuffr-formats` `MIT AND BSD-2-Clause`. A MINOR because it is a new user-facing surface. |
-| `0.13.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (xz/lzma next, then zstd, lz4, then `unzip`/`zipinfo`; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
+| `0.13.0` | Phase 5's third part — the xz compatibility family (`xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`) behaving as XZ Utils 5.8.4's `xz`, one personality ported from its 0BSD `src/xz/`; stdout, stderr and exit codes byte-identical on both tiers, compressed bytes identical on the `c-backed` tier and compatible on the pure tier; signal cleanup of the partial output (`host.rs`); `install-links` now makes fourteen names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`, `stuffr-formats` `MIT AND BSD-2-Clause AND 0BSD`. A MINOR because it is a new user-facing surface. |
+| `0.14.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (zstd next, then lz4, then `unzip`/`zipinfo`; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -1015,7 +1021,8 @@ fix and is not meant to be committed.
 A compatibility family is a set of names under which the `stuffr` binary
 behaves as another tool (README, "Compatibility links"). bzip2 (`bzip2`,
 `bunzip2`, `bzcat`, `bzip2recover`) is the first, in `0.11.0`; gzip (`gzip`,
-`gunzip`, `zcat`, `gzcat`) is the second, in `0.12.0`. **The family's
+`gunzip`, `zcat`, `gzcat`) is the second, in `0.12.0`; xz (`xz`, `unxz`,
+`xzcat`, `lzma`, `unlzma`, `lzcat`) is the third, in `0.13.0`. **The family's
 own spec decides its byte-identity promise** before any code is written:
 which tier, against which tool and version, byte-identical or compatible
 behaviour only. The planned tiers come from the Phase 5 design's Decision 2,
@@ -1094,6 +1101,46 @@ emulates is two programs:
   GNU's are never identical, since GNU's deflate is its own. The differential
   harness masks `-v`'s ratio on the pure tier and on every GNU run for that
   reason.
+
+**The xz family** (`compat/xz/`) has one personality and one reference:
+
+- **A 0BSD port.** XZ Utils is 0BSD throughout (every file carries
+  `SPDX-License-Identifier: 0BSD`), so, unlike GNU gzip, its source is read
+  and ported freely, with attribution: one module per C file (`args.rs` from
+  `args.c`, `coder.rs`, `file_io.rs`, `list.rs`, `message.rs` and so on), the
+  module doc of `compat/xz/mod.rs` listing each and the known deviations, and
+  `messages.rs` holding every string with its source function. The notice is
+  `crates/stuffr-cli/LICENSE-xz`; `stuffr-formats` carries the memory-usage
+  formulas and container coders under `LICENSE-xz-memusage`. The SPDX
+  expressions gained `0BSD`, and there is no `deny.toml` to update.
+  Where the source and the 5.8.4 binary disagree, the binary wins, and
+  undefined behaviour in the C is never reproduced.
+- **One version, the tarball.** Only 5.8.4 is promised, so the suites need no
+  `Since` table. The reference is found by `xz_dir()` in the harness:
+  `$STUFFR_XZ_REFERENCE`, then Homebrew's keg (`brew install xz`,
+  `/opt/homebrew/opt/xz/bin/xz`), then `PATH`, and only a tool whose
+  `xz --robot --version` says `50080042` counts. CI builds the release
+  tarball (SHA-256 pinned) in the composite action
+  `.github/actions/xz-reference`, cached, in every job that runs the
+  `compat_xz*` tests, because ubuntu's xz is 5.4.x and Homebrew's drifts.
+- **R3, the hardware.** `Host::Real` reads the machine's processors and
+  memory (they set xz's default thread count and memory limits);
+  `Host::Sandbox` (the fuzz target) sees a fixed two threads and 4 GiB, and
+  limits the decoder to 256 MiB, so a hostile header cannot make the pure
+  tier commit gigabytes.
+- **R6, signal cleanup.** Under `Host::Real` the partial output is removed
+  and the signal re-raised by an async-signal-safe handler in `host.rs`
+  (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGPIPE`, `SIGXCPU`, `SIGXFSZ`, as
+  `signals.c`). gzip and bzip2 keep their temporary files on an interrupt;
+  they do not adopt this yet.
+- **The tier promise.** Stdout, stderr and exit codes are xz 5.8.4's on both
+  tiers. Compressed bytes are identical on the C tier (liblzma 5.8.4 through
+  `liblzma-sys` 0.4.9; a test pins the version string) and compatible on the
+  pure tier. The harness masks only `-v`'s speed and elapsed fields, and the
+  pure tier's `-v` sizes differ with its bytes.
+- **Fuzz.** `COMPAT_NAMES` gained the six names and `COMPAT_FILES` five xz
+  suffixes, append-only; the seed's optional second mask byte carries their
+  file bits.
 
 **Reference tools.** The bzip2 family is tested against the system
 `/usr/bin/bzip2` and `/usr/bin/bzip2recover`, which are not the same program

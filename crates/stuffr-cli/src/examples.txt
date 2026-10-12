@@ -1315,8 +1315,13 @@ COMPATIBILITY LINKS (INSTALL-LINKS)
       The xz names behave as XZ Utils 5.8.4's xz: unxz and xzcat decompress
       (xzcat to standard output), and lzma, unlzma and lzcat use the .lzma
       format. XZ_DEFAULTS and XZ_OPT are read before the command line, as xz
-      reads them. --version's first line names stuffr; --robot --version is
-      xz's own.
+      reads them. Stdout, stderr and exit codes (0, 1, 2) match xz 5.8.4 on
+      every build; compressed bytes are identical to it on a --features
+      c-backed build and merely compatible (xz decodes them) otherwise. On
+      the default build a damaged stream can read differently (corruption in
+      the last bytes of a raw, .lzma or .lz stream as truncation, and less
+      output before the error) and -v's sizes differ. --version's first line
+      names stuffr; --robot --version is xz's own.
 
   stuffr install-links --dir ~/.local/bin --names bzcat,zcat
       Only the named links; --names takes a comma-separated list. A name that
