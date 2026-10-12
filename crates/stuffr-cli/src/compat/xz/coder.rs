@@ -505,41 +505,85 @@ type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
 /// One panic hook swap at a time: the hook is the process's.
 static HOOK_SWAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// An encoder call, `active` for the real process's threaded encoder
-/// (Ruling P10). The pure tier's thread pool panics when the system
-/// refuses a thread; that panic is taken as liblzma's `LZMA_MEM_ERROR`,
-/// which a refused `pthread_create` gives on the C tier, its hook line
-/// swallowed so standard error stays xz's, and `panicked` set so the
-/// encoder, in no known state, is leaked rather than dropped. Any other
-/// panic reaches the previous hook and is re-raised. Inactive (a sandbox,
-/// or no threads), the call is made as it is.
-fn guarded<T>(
-    active: bool,
-    panicked: &mut bool,
-    f: impl FnOnce() -> Result<T, XzError>,
-) -> Result<T, XzError> {
-    if !active {
-        return f();
+/// Ruling P10, for the real process's threaded encoder: while the guard
+/// lives, a panic hook is in place that swallows only a refused thread's
+/// panic (the pure tier's thread pool, `std::thread::spawn`) and hands
+/// every other panic to the hook it replaced. It is put in once for a run
+/// of encoder calls and the replaced hook itself is put back once, on every
+/// path. Inactive (a sandbox, or no threads), it does nothing at all.
+struct SpawnGuard {
+    /// The hook in force before, while ours is installed.
+    prev: Option<std::sync::Arc<PanicHook>>,
+    /// Held while our hook is in place: one swap at a time.
+    lock: Option<std::sync::MutexGuard<'static, ()>>,
+    /// A refused thread's panic was caught: the encoder is in no known
+    /// state, so it is leaked rather than dropped.
+    panicked: bool,
+}
+
+impl SpawnGuard {
+    fn new(active: bool) -> SpawnGuard {
+        let mut g = SpawnGuard {
+            prev: None,
+            lock: None,
+            panicked: false,
+        };
+        if active {
+            g.lock = Some(HOOK_SWAP.lock().unwrap_or_else(|p| p.into_inner()));
+            let prev = std::sync::Arc::new(std::panic::take_hook());
+            let to_prev = prev.clone();
+            std::panic::set_hook(Box::new(move |info| {
+                if !is_spawn_failure(info.payload()) {
+                    to_prev(info);
+                }
+            }));
+            g.prev = Some(prev);
+        }
+        g
     }
-    let lock = HOOK_SWAP.lock().unwrap_or_else(|p| p.into_inner());
-    let prev: std::sync::Arc<PanicHook> = std::sync::Arc::new(std::panic::take_hook());
-    let to_prev = prev.clone();
-    std::panic::set_hook(Box::new(move |info| {
-        if !is_spawn_failure(info.payload()) {
-            to_prev(info);
+
+    /// One encoder call. A refused thread's panic becomes liblzma's
+    /// `LZMA_MEM_ERROR` (what a refused `pthread_create` gives on the C
+    /// tier); any other panic is re-raised, the replaced hook back first.
+    fn call<T>(&mut self, f: impl FnOnce() -> Result<T, XzError>) -> Result<T, XzError> {
+        if self.prev.is_none() {
+            return f();
         }
-    }));
-    let r = catch_unwind(AssertUnwindSafe(f));
-    drop(std::panic::take_hook());
-    std::panic::set_hook(Box::new(move |info| prev(info)));
-    drop(lock);
-    match r {
-        Ok(v) => v,
-        Err(p) if is_spawn_failure(&*p) => {
-            *panicked = true;
-            Err(XzError::Mem { needed: 0 })
+        match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(v) => v,
+            Err(p) if is_spawn_failure(&*p) => {
+                self.panicked = true;
+                Err(XzError::Mem { needed: 0 })
+            }
+            Err(p) => {
+                self.restore();
+                std::panic::resume_unwind(p)
+            }
         }
-        Err(p) => std::panic::resume_unwind(p),
+    }
+
+    /// Put the replaced hook itself back, and let the next swap in.
+    fn restore(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            // Ours holds the other reference; once it is gone the original
+            // box is ours again.
+            drop(std::panic::take_hook());
+            match std::sync::Arc::try_unwrap(prev) {
+                Ok(hook) => std::panic::set_hook(hook),
+                Err(shared) => std::panic::set_hook(Box::new(move |info| shared(info))),
+            }
+        }
+        self.lock = None;
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        // `call` restores before re-raising; the hook cannot be set from a
+        // panicking thread.
+        if !std::thread::panicking() {
+            self.restore();
+        }
     }
 }
 
@@ -599,8 +643,8 @@ fn init(
 ) -> Option<Coder> {
     if a.op == OpMode::Compress {
         let o = encode_options(a);
-        let active = real && o.threads > 0;
-        return match guarded(active, &mut false, || Encoder::new(&o)) {
+        let mut guard = SpawnGuard::new(real && o.threads > 0);
+        return match guard.call(|| Encoder::new(&o)) {
             Ok(e) => Some(Coder::Encode(Box::new(e))),
             Err(e) => {
                 report(a, pair, &e, msg, err);
@@ -707,10 +751,10 @@ pub(crate) fn run(
         {
             success = match coder {
                 Coder::Encode(mut enc) => {
-                    let mut panicked = false;
-                    let active = real && encode_options(a).threads > 0;
-                    let guard = (active, &mut panicked);
-                    let ok = encode(a, &mut pair, &mut enc, guard, msg, err);
+                    let mut guard = SpawnGuard::new(real && encode_options(a).threads > 0);
+                    let ok = encode(a, &mut pair, &mut enc, &mut guard, msg, err);
+                    let panicked = guard.panicked;
+                    drop(guard);
                     if panicked {
                         std::mem::forget(enc);
                     }
@@ -745,7 +789,7 @@ fn encode(
     a: &Args,
     pair: &mut FilePair,
     enc: &mut Encoder,
-    (active, panicked): (bool, &mut bool),
+    guard: &mut SpawnGuard,
     msg: &mut Messages,
     err: &mut dyn Write,
 ) -> bool {
@@ -755,12 +799,12 @@ fn encode(
         let Some(n) = pair.read(&mut buf, msg, err) else {
             return false;
         };
-        let mut r = guarded(active, panicked, || enc.feed(&buf[..n], &mut out));
+        let mut r = guard.call(|| enc.feed(&buf[..n], &mut out));
         let end = pair.src_eof;
         if r.is_ok() && end {
-            r = guarded(active, panicked, || enc.finish(&mut out));
+            r = guard.call(|| enc.finish(&mut out));
         } else if r.is_ok() && pair.flush_needed {
-            r = guarded(active, panicked, || enc.flush(&mut out));
+            r = guard.call(|| enc.flush(&mut out));
             pair.src_has_seen_input = false;
             pair.flush_needed = false;
         }
@@ -981,66 +1025,90 @@ mod tests {
         assert!(!is_format_lzma(&header(0x5d, 1 << 23, 5)[..12]));
     }
 
+    /// The address of a hook, to tell the original from a wrapper.
+    fn hook_addr(h: &PanicHook) -> *const () {
+        let r: &(dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync) = &**h;
+        (r as *const (dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync)).cast::<()>()
+    }
+
     /// Ruling P10: a refused thread's panic becomes `LZMA_MEM_ERROR`
     /// without reaching the previous hook; any other panic reaches it and
-    /// goes on; inactive, nothing is caught. The test's own hook counts
-    /// only payloads that carry its marker.
+    /// goes on; inactive, nothing is caught. Every guard puts the very hook
+    /// it replaced back, however many calls it made, so hooks never nest.
+    /// The test's own hook counts only payloads carrying its marker.
     #[test]
     fn only_a_refused_thread_is_swallowed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static SEEN: AtomicUsize = AtomicUsize::new(0);
         const MARK: &str = "xz-guard-test";
-        let marked = |info: &std::panic::PanicHookInfo<'_>| {
-            let p = info.payload();
-            p.downcast_ref::<String>().is_some_and(|s| s.contains(MARK))
-        };
         let spawn =
             || -> Result<(), XzError> { std::panic::panic_any(format!("{SPAWN_FAILED}: {MARK}")) };
         let other = || -> Result<(), XzError> { std::panic::panic_any(format!("bug: {MARK}")) };
         let lock = HOOK_SWAP.lock().unwrap_or_else(|p| p.into_inner());
         let outer = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            if marked(info) {
+        // Not zero-sized, so its box has an address of its own.
+        let mark = MARK.to_owned();
+        let mine: PanicHook = Box::new(move |info| {
+            let p = info.payload();
+            if p.downcast_ref::<String>()
+                .is_some_and(|s| s.contains(&mark))
+            {
                 SEEN.fetch_add(1, Ordering::SeqCst);
             }
-        }));
+        });
+        let addr = hook_addr(&mine);
+        std::panic::set_hook(mine);
         drop(lock);
+        let current = || {
+            let _lock = HOOK_SWAP.lock().unwrap_or_else(|p| p.into_inner());
+            let h = std::panic::take_hook();
+            let a = hook_addr(&h);
+            std::panic::set_hook(h);
+            a
+        };
 
-        let mut panicked = false;
-        let r = guarded(true, &mut panicked, spawn);
-        assert!(matches!(r, Err(XzError::Mem { needed: 0 })) && panicked);
+        let mut g = SpawnGuard::new(true);
+        assert!(matches!(g.call(spawn), Err(XzError::Mem { needed: 0 })));
+        assert!(g.panicked);
+        for _ in 0..1000 {
+            g.call(|| Ok(())).unwrap();
+        }
+        drop(g);
         assert_eq!(
             SEEN.load(Ordering::SeqCst),
             0,
             "the spawn panic reached the hook"
         );
+        assert_eq!(current(), addr, "the replaced hook was not put back");
 
-        let mut panicked = false;
-        let caught = catch_unwind(AssertUnwindSafe(|| guarded(true, &mut panicked, other)));
+        for _ in 0..1000 {
+            SpawnGuard::new(true).call(|| Ok(())).unwrap();
+        }
+        assert_eq!(current(), addr, "hooks nest across guards");
+
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let mut g = SpawnGuard::new(true);
+            g.call(other)
+        }));
         let payload = caught.expect_err("another panic was swallowed");
         assert_eq!(
             payload.downcast_ref::<String>().unwrap(),
             &format!("bug: {MARK}")
         );
-        assert!(!panicked);
         assert_eq!(
             SEEN.load(Ordering::SeqCst),
             1,
             "another panic missed the hook"
         );
+        assert_eq!(current(), addr, "a re-raise left the guard's hook");
 
-        let mut panicked = false;
-        let caught = catch_unwind(AssertUnwindSafe(|| guarded(false, &mut panicked, spawn)));
-        assert!(
-            caught.is_err() && !panicked,
-            "an inactive guard caught a panic"
-        );
+        let caught = catch_unwind(AssertUnwindSafe(|| SpawnGuard::new(false).call(spawn)));
+        assert!(caught.is_err(), "an inactive guard caught a panic");
         assert_eq!(SEEN.load(Ordering::SeqCst), 2);
 
-        // The test's hook is still the hook: the guard put it back.
-        let mine = std::panic::take_hook();
+        let _lock = HOOK_SWAP.lock().unwrap_or_else(|p| p.into_inner());
+        drop(std::panic::take_hook());
         std::panic::set_hook(outer);
-        drop(mine);
     }
 
     #[test]
