@@ -947,9 +947,11 @@ and mtimes.
 
 - **`-vv` behaves as `-v`.** libbzip2's internal trace (block CRCs, sorting
   statistics) is not reachable through stuffr's codec API.
-- **An interrupted run leaves a hidden `.stuffr-bzip2-*.tmp` file.** Output
-  is written under a temporary name and renamed into place. bzip2's signal
-  handler deletes its partial output; stuffr has no such handler.
+- **With `-f` reading a FIFO or terminal, an interrupt waits for the read.**
+  In file-to-file mode SIGINT, SIGTERM and SIGHUP are answered as bzip2
+  answers them (its message, partial output deleted, exit 1), but stuffr's
+  handlers only set a flag that the read loops poll, so a blocked read
+  delays the answer until it returns.
 - **When the parent ignores `SIGPIPE`**, bzip2 reports a Broken pipe I/O
   error and exits 1; stuffr dies of `SIGPIPE`. The Rust runtime ignores the
   signal before `main`, so the inherited setting cannot be read. Under the

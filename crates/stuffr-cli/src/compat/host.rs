@@ -81,12 +81,9 @@ pub(crate) const APPLE_GZIP_SIGNALS: Signals = &[];
 
 /// bzip2 1.0.8 (measured 2026-10-12): INT, TERM and HUP, installed with
 /// `signal()`, which overrides an inherited ignore.
-// Used by the bzip2 family from 0.13.1 Task 4.
-#[allow(dead_code)]
 #[cfg(unix)]
 pub(crate) const BZIP2_SIGNALS: Signals = &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 #[cfg(not(unix))]
-#[allow(dead_code)]
 pub(crate) const BZIP2_SIGNALS: Signals = &[];
 
 /// The slot's size: `PATH_MAX`, the terminating NUL included.
@@ -243,8 +240,6 @@ static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// What a run holds while its interrupt flag is armed; dropping it puts the
 /// previous dispositions back.
 #[must_use = "dropping the guard disarms the flag at once"]
-// Used by the bzip2 family from 0.13.1 Task 4.
-#[allow(dead_code)]
 pub(crate) struct InterruptGuard {
     #[cfg(unix)]
     old: Vec<(libc::c_int, libc::sigaction)>,
@@ -266,8 +261,6 @@ impl Drop for InterruptGuard {
 /// handler. As `signal()` does, an inherited `SIG_IGN` is overridden.
 /// `SA_RESTART` is on, so an interrupted call resumes and the poll sees the
 /// flag. Under `Host::Sandbox` nothing is installed.
-// Used by the bzip2 family from 0.13.1 Task 4.
-#[allow(dead_code)]
 pub(crate) fn arm_interrupt_flag(host: &Host, signals: Signals) -> InterruptGuard {
     #[cfg(unix)]
     {
@@ -308,8 +301,6 @@ extern "C" fn on_interrupt_signal(_sig: libc::c_int) {
 /// Whether an armed signal has arrived since the last call; clears it.
 /// Always `false` under `Host::Sandbox`, so an in-process run never takes
 /// a flag a real run's signal set.
-// Used by the bzip2 family from 0.13.1 Task 4.
-#[allow(dead_code)]
 pub(crate) fn take_interrupt(host: &Host) -> bool {
     #[cfg(unix)]
     {

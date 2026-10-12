@@ -4,7 +4,9 @@
 //! Seward, under the bzip2 licence reproduced in `LICENSE-bzip2`. Its flag
 //! handling, checks, messages and exit codes are followed line by line; the
 //! compression itself is stuffr's bzip2 codec, whose output is byte-identical
-//! to bzip2's at every level.
+//! to bzip2's at every level. In file-to-file mode SIGINT, SIGTERM and SIGHUP
+//! are caught (even if inherited as ignored, as bzip2's `signal()` does) and
+//! answered at the next chunk with bzip2's message and `cleanUpAndFail(1)`.
 //!
 //! Known deviations from bzip2 1.0.8:
 //!
@@ -14,9 +16,10 @@
 //!   trace (block CRCs, sorting statistics) is not reachable through stuffr's
 //!   codec API, and bzip2.c's own extra blank lines at that level only frame
 //!   that trace, so they are left out with it.
-//! - Output is written under a temporary name and renamed into place, so an
-//!   interrupted run leaves a `.stuffr-bzip2-*.tmp` file where bzip2's signal
-//!   handler would have deleted its partial output.
+//! - In file-to-file mode with `-f` reading a FIFO or terminal, an interrupt
+//!   is answered once the blocked read returns, where bzip2 answers at once:
+//!   stuffr's handlers only set a flag that the read loops poll, and they
+//!   restart an interrupted read.
 //! - When the parent ignores `SIGPIPE` (`SIG_IGN` inherited across exec),
 //!   bzip2 reports a Broken pipe I/O error and exits 1; stuffr dies of
 //!   `SIGPIPE`, because the Rust runtime sets `SIG_IGN` before `main` and the

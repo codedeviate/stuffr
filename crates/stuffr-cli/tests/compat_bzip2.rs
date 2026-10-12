@@ -1330,3 +1330,258 @@ mod differential {
         );
     }
 }
+
+/// 0.13.1 Task 4: in file-to-file mode an INT, TERM or HUP is answered as
+/// bzip2.c's `mySignalCatcher` does: the "caught" line, `cleanUpAndFail(1)`
+/// (exit 1, partial output deleted, input kept), even when INT was inherited
+/// as ignored.
+#[cfg(unix)]
+mod interrupts {
+    use super::compat_harness::interrupt::*;
+    use super::compat_harness::{REFERENCE_DIR, require_reference};
+    use std::cell::Cell;
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const CAUGHT: &str = "\nbzip2: Control-C or similar caught, quitting.\n\
+                          bzip2: Deleting output file a.bz2, if it exists.\n";
+    const CAUGHT_QUIET: &str = "\nbzip2: Control-C or similar caught, quitting.\n";
+    const CAUGHT_TEST: &str = "\nbzip2: Control-C or similar caught, quitting.\n";
+    const NOT_PROCESSED: &str = "bzip2: WARNING: some files have not been processed:\n\
+                                 bzip2:    2 specified on command line, 1 not processed yet.\n\n";
+
+    fn ours() -> &'static Path {
+        Path::new(env!("CARGO_BIN_EXE_stuffr"))
+    }
+
+    fn reference() -> Option<PathBuf> {
+        let exe = Path::new(REFERENCE_DIR).join("bzip2");
+        require_reference(&exe).then_some(exe)
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("stuffr-bz-intr-{}-{tag}", std::process::id()))
+    }
+
+    fn plain(m: usize) -> Vec<u8> {
+        big_input(m).to_vec()
+    }
+
+    /// One interrupted compression of `a` (ours or the reference's).
+    fn run(
+        mine: bool,
+        tag: &str,
+        args: &[&str],
+        inherit: Inherit,
+        sig: i32,
+    ) -> Option<Interrupted> {
+        let dir = scratch(&format!("{tag}-{}", if mine { "ours" } else { "ref" }));
+        let exe = if mine {
+            ours().to_path_buf()
+        } else {
+            reference()?
+        };
+        let named = |n: &str| {
+            if mine {
+                n.starts_with(".stuffr-bzip2-")
+            } else {
+                n == "a.bz2"
+            }
+        };
+        let ready = has_data(&dir, &named);
+        let r = interrupt_with_input(&exe, "bzip2", args, &dir, "a", &plain, inherit, sig, &ready);
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(r)
+    }
+
+    fn check(r: &Interrupted, stderr: &str, left: &[&str], what: &str) {
+        assert_eq!(r.status.code(), Some(1), "{what}: {:?}", r.status);
+        assert_eq!(String::from_utf8_lossy(&r.stderr), stderr, "{what}");
+        assert_eq!(r.left, left, "{what}");
+    }
+
+    #[test]
+    fn bzip2_answers_int_term_and_hup() {
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            for mine in [true, false] {
+                if let Some(r) = run(mine, &format!("s{sig}"), &["a"], Inherit::Default, sig) {
+                    check(&r, CAUGHT, &["a"], &format!("mine={mine} signal {sig}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bzip2_catches_int_even_when_ignored() {
+        for mine in [true, false] {
+            if let Some(r) = run(mine, "ign", &["a"], Inherit::IgnoreInt, libc::SIGINT) {
+                check(&r, CAUGHT, &["a"], &format!("mine={mine}"));
+            }
+        }
+    }
+
+    #[test]
+    fn bzip2_quiet_drops_the_deleting_line() {
+        for mine in [true, false] {
+            if let Some(r) = run(mine, "q", &["-q", "a"], Inherit::Default, libc::SIGINT) {
+                check(&r, CAUGHT_QUIET, &["a"], &format!("mine={mine}"));
+            }
+        }
+    }
+
+    #[test]
+    fn bzip2_decompression_is_interrupted_too() {
+        // A big .bz2 of zeros: cheap to make, a long decode.
+        for mine in [true, false] {
+            let dir = scratch(&format!("d-{}", if mine { "ours" } else { "ref" }));
+            let Some(exe) = (if mine {
+                Some(ours().to_path_buf())
+            } else {
+                reference()
+            }) else {
+                continue;
+            };
+            let named = |n: &str| {
+                if mine {
+                    n.starts_with(".stuffr-bzip2-")
+                } else {
+                    n == "a"
+                }
+            };
+            let ready = has_data(&dir, &named);
+            let r = interrupt_with_input(
+                &exe,
+                "bzip2",
+                &["-d", "a.bz2"],
+                &dir,
+                "a.bz2",
+                &zeros_bz2,
+                Inherit::Default,
+                libc::SIGTERM,
+                &ready,
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(r.status.code(), Some(1), "mine={mine}: {:?}", r.status);
+            assert_eq!(
+                String::from_utf8_lossy(&r.stderr),
+                "\nbzip2: Control-C or similar caught, quitting.\n\
+                 bzip2: Deleting output file a, if it exists.\n",
+                "mine={mine}"
+            );
+            assert_eq!(r.left, ["a.bz2"], "mine={mine}");
+        }
+    }
+
+    #[test]
+    fn bzip2_counts_the_files_not_processed() {
+        for mine in [true, false] {
+            let dir = scratch(&format!("two-{}", if mine { "ours" } else { "ref" }));
+            let Some(exe) = (if mine {
+                Some(ours().to_path_buf())
+            } else {
+                reference()
+            }) else {
+                continue;
+            };
+            let named = |n: &str| {
+                if mine {
+                    n.starts_with(".stuffr-bzip2-")
+                } else {
+                    n == "a.bz2"
+                }
+            };
+            let mut got = None;
+            for mib in [64, 256] {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                for f in ["a", "b"] {
+                    std::fs::write(dir.join(f), big_input(mib)).unwrap();
+                }
+                let ready = has_data(&dir, &named);
+                got = interrupt(
+                    &exe,
+                    "bzip2",
+                    &["a", "b"],
+                    &dir,
+                    Inherit::Default,
+                    libc::SIGINT,
+                    &ready,
+                );
+                if got.is_some() {
+                    break;
+                }
+            }
+            let r = got.expect("finished before the signal even at 256 MiB");
+            let _ = std::fs::remove_dir_all(&dir);
+            check(
+                &r,
+                &format!("{CAUGHT}{NOT_PROCESSED}"),
+                &["a", "b"],
+                &format!("mine={mine}"),
+            );
+        }
+    }
+
+    /// `-t a.bz2` over a big stream: no output file, so only the "caught"
+    /// line. There is nothing to wait for in the directory, so the signal
+    /// goes after a 50 ms head start; a run that ends first is retried
+    /// over a larger input.
+    #[test]
+    fn bzip2_test_mode_is_interrupted_without_deleting() {
+        for mine in [true, false] {
+            let dir = scratch(&format!("t-{}", if mine { "ours" } else { "ref" }));
+            let Some(exe) = (if mine {
+                Some(ours().to_path_buf())
+            } else {
+                reference()
+            }) else {
+                continue;
+            };
+            let first = Cell::new(None::<Instant>);
+            let ready = |_: &str| {
+                let t = first.get().unwrap_or_else(|| {
+                    let now = Instant::now();
+                    first.set(Some(now));
+                    now
+                });
+                t.elapsed() >= Duration::from_millis(50)
+            };
+            let r = interrupt_with_input(
+                &exe,
+                "bzip2",
+                &["-t", "a.bz2"],
+                &dir,
+                "a.bz2",
+                &zeros_bz2,
+                Inherit::Default,
+                libc::SIGINT,
+                &ready,
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            check(&r, CAUGHT_TEST, &["a.bz2"], &format!("mine={mine}"));
+        }
+    }
+
+    /// Four times `mib` MiB of zeros as a `.bz2` (decoding is fast, so the
+    /// stream has to be long), made by stuffr's own bzip2 -1.
+    fn zeros_bz2(mib: usize) -> Vec<u8> {
+        let mib = mib * 4;
+        let dir = scratch(&format!("mk-{mib}-{:?}", std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("z"), vec![0u8; mib << 20]).unwrap();
+        let out = super::compat_harness::output(
+            Command::new(ours())
+                .arg0("bzip2")
+                .args(["-1", "-c", "z"])
+                .current_dir(&dir)
+                .stdin(Stdio::null()),
+        )
+        .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.status.success());
+        out.stdout
+    }
+}

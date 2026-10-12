@@ -177,6 +177,9 @@ pub(super) const CADVISE: &str = concat!(
 /// `showFileNames`.
 pub(super) const SHOW_FILE_NAMES: &str = "\tInput file = %s, output file = %s\n";
 
+/// `mySignalCatcher`.
+pub(super) const CONTROL_C: &str = "\n%s: Control-C or similar caught, quitting.\n";
+
 /// `cleanUpAndFail`.
 pub(super) const DELETING_OUTPUT: &str = "%s: Deleting output file %s, if it exists.\n";
 

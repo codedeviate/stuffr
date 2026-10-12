@@ -19,6 +19,7 @@ use stuffr::{EncodeOpts, FormatId};
 use super::args::{MAX_NAME, OpMode, Settings, SrcMode};
 use super::messages::{self as m, printf};
 use crate::compat::copy_metadata_from;
+use crate::compat::host::{BZIP2_SIGNALS, arm_interrupt_flag, take_interrupt};
 use crate::compat::host::{
     CHUNK, Counting, Host, Input, Kind, Published, count_hard_links, create_temp, errno_text,
     not_a_standard_file, publish, set_times, strerror,
@@ -53,6 +54,8 @@ enum Failure {
     Eof(Kind),
     Memory,
     Panic(&'static str),
+    /// A signal bzip2.c's `mySignalCatcher` catches.
+    Interrupted,
 }
 
 impl From<io::Error> for Failure {
@@ -78,6 +81,9 @@ pub(super) fn execute(prog: &'static str, s: Settings, host: &mut Host, err: &mu
         host,
         err,
     };
+    // bzip2.c installs its handlers for file-to-file mode only (`-t` too).
+    let _interrupt =
+        (bz.s.src == SrcMode::F2F).then(|| arm_interrupt_flag(&*bz.host, BZIP2_SIGNALS));
     let _ = bz.main(&files);
     bz.exit
 }
@@ -110,6 +116,7 @@ impl Bz<'_> {
                     self.compress(None)?;
                 } else {
                     for f in files {
+                        self.poll_interrupt()?;
                         self.processed += 1;
                         self.compress(Some(f))?;
                     }
@@ -121,6 +128,7 @@ impl Bz<'_> {
                     self.uncompress(None)?;
                 } else {
                     for f in files {
+                        self.poll_interrupt()?;
                         self.processed += 1;
                         self.uncompress(Some(f))?;
                     }
@@ -135,6 +143,7 @@ impl Bz<'_> {
                     self.testf(None)?;
                 } else {
                     for f in files {
+                        self.poll_interrupt()?;
                         self.processed += 1;
                         self.testf(Some(f))?;
                     }
@@ -146,6 +155,15 @@ impl Bz<'_> {
                     self.set_exit(2);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The signal flag, as a stop: bzip2's handler runs between any two
+    /// instructions, stuffr's answer comes at the next poll.
+    fn poll_interrupt(&mut self) -> Step {
+        if take_interrupt(self.host) {
+            return Err(self.fail(Failure::Interrupted));
         }
         Ok(())
     }
@@ -443,6 +461,9 @@ impl Bz<'_> {
         let mut nin = 0u64;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
+            if take_interrupt(self.host) {
+                return Err(Failure::Interrupted);
+            }
             let n = match input.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
@@ -571,6 +592,9 @@ impl Bz<'_> {
             let mut sr = StreamReader::new(self.s.small);
             stream_no += 1;
             loop {
+                if take_interrupt(self.host) {
+                    return Err(Failure::Interrupted);
+                }
                 match sr.read(input, &mut obuf) {
                     Ok((n, end)) => {
                         out.write_all(&obuf[..n])?;
@@ -682,6 +706,9 @@ impl Bz<'_> {
             let mut sr = StreamReader::new(self.s.small);
             stream_no += 1;
             loop {
+                if take_interrupt(self.host) {
+                    return Err(self.fail(Failure::Interrupted));
+                }
                 match sr.read(input, &mut obuf) {
                     Ok((n, end)) => {
                         // Free outside a sandbox; in one, decoding counts
@@ -803,6 +830,10 @@ impl Bz<'_> {
             Failure::Memory => {
                 self.say(m::OUT_OF_MEMORY, &[p]);
                 self.show_file_names();
+                self.clean_up_and_fail(1)
+            }
+            Failure::Interrupted => {
+                self.say(m::CONTROL_C, &[p]);
                 self.clean_up_and_fail(1)
             }
             Failure::Panic(what) => {
