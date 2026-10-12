@@ -618,6 +618,9 @@ fn walk(root: &Path, dir: &Path, t: &mut Tree) {
             // Directory mtimes move with every entry; record mode only.
             t.insert(format!("{rel}/"), (Vec::new(), mode, 0));
             walk(root, &p, t);
+        } else if std::os::unix::fs::FileTypeExt::is_fifo(&md.file_type()) {
+            // Never opened: a read would wait for a writer.
+            t.insert(rel, (b"<fifo>".to_vec(), mode, md.mtime()));
         } else if md.file_type().is_symlink() {
             let target = fs::read_link(&p).unwrap();
             t.insert(

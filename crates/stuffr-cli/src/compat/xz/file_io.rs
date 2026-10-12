@@ -260,8 +260,6 @@ impl FilePair {
                 return None;
             }
         };
-        #[cfg(unix)]
-        clear_nonblock(&file);
         let meta = match file.metadata() {
             Ok(md) => md,
             Err(e) => {
@@ -295,6 +293,18 @@ impl FilePair {
                 msg.warning(err, m::HARD_LINKS, &[&shown]);
                 return None;
             }
+        }
+        // Anything but a regular file waits for input before it is read:
+        // a FIFO opened before its writer would otherwise read as empty.
+        #[cfg(unix)]
+        {
+            if !meta.is_file()
+                && let Err(e) = wait_for_input(&file)
+            {
+                msg.error(err, m::POLL_FAILED, &[&shown, &strerror(&e)]);
+                return None;
+            }
+            clear_nonblock(&file);
         }
         pair.src = Src::File(host.track(&path, file));
         pair.src_path = Some(path);
@@ -757,6 +767,32 @@ fn stdout_can_be_sparse(f: &File) -> bool {
     {
         let _ = f;
         false
+    }
+}
+
+/// file_io.c: io_wait(pair, -1, true): `poll` until the input is readable
+/// (or at its end, once a writer has come and gone).
+#[cfg(unix)]
+fn wait_for_input(f: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut pfd = libc::pollfd {
+        fd: f.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd for the call.
+        match unsafe { libc::poll(&mut pfd, 1, -1) } {
+            -1 => {
+                let e = io::Error::last_os_error();
+                if !matches!(errno(&e), libc::EINTR | libc::EAGAIN) {
+                    return Err(e);
+                }
+            }
+            0 => {}
+            _ if pfd.revents != 0 => return Ok(()),
+            _ => {}
+        }
     }
 }
 

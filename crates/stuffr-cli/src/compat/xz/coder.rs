@@ -486,16 +486,61 @@ fn warn_checks(dec: &mut Decoder, pair: &FilePair, msg: &mut Messages, err: &mut
     }
 }
 
-/// An encoder call, with a panic (the pure tier's thread pool when the
-/// system refuses a thread: `std::thread::spawn` panics) taken as
-/// liblzma's `LZMA_MEM_ERROR`, which is what a refused `pthread_create`
-/// gives there. `panicked` is set, so the encoder, in no known state, is
-/// leaked rather than dropped.
-fn guarded<T>(panicked: &mut bool, f: impl FnOnce() -> Result<T, XzError>) -> Result<T, XzError> {
-    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| {
-        *panicked = true;
-        Err(XzError::Mem { needed: 0 })
-    })
+/// What `std::thread::spawn` panics with when the system refuses a thread
+/// (`expect("failed to spawn thread")`).
+const SPAWN_FAILED: &str = "failed to spawn thread";
+
+/// Whether a panic's payload is [`SPAWN_FAILED`]'s.
+fn is_spawn_failure(payload: &(dyn std::any::Any + Send)) -> bool {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .is_some_and(|s| s.starts_with(SPAWN_FAILED))
+}
+
+/// A panic hook, as `std::panic::take_hook` returns it.
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync>;
+
+/// One panic hook swap at a time: the hook is the process's.
+static HOOK_SWAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// An encoder call, `active` for the real process's threaded encoder
+/// (Ruling P10). The pure tier's thread pool panics when the system
+/// refuses a thread; that panic is taken as liblzma's `LZMA_MEM_ERROR`,
+/// which a refused `pthread_create` gives on the C tier, its hook line
+/// swallowed so standard error stays xz's, and `panicked` set so the
+/// encoder, in no known state, is leaked rather than dropped. Any other
+/// panic reaches the previous hook and is re-raised. Inactive (a sandbox,
+/// or no threads), the call is made as it is.
+fn guarded<T>(
+    active: bool,
+    panicked: &mut bool,
+    f: impl FnOnce() -> Result<T, XzError>,
+) -> Result<T, XzError> {
+    if !active {
+        return f();
+    }
+    let lock = HOOK_SWAP.lock().unwrap_or_else(|p| p.into_inner());
+    let prev: std::sync::Arc<PanicHook> = std::sync::Arc::new(std::panic::take_hook());
+    let to_prev = prev.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        if !is_spawn_failure(info.payload()) {
+            to_prev(info);
+        }
+    }));
+    let r = catch_unwind(AssertUnwindSafe(f));
+    drop(std::panic::take_hook());
+    std::panic::set_hook(Box::new(move |info| prev(info)));
+    drop(lock);
+    match r {
+        Ok(v) => v,
+        Err(p) if is_spawn_failure(&*p) => {
+            *panicked = true;
+            Err(XzError::Mem { needed: 0 })
+        }
+        Err(p) => std::panic::resume_unwind(p),
+    }
 }
 
 /// The options `coder_init` builds the encoder from.
@@ -546,6 +591,7 @@ fn encode_options(a: &Args) -> EncodeOptions {
 /// decoder with the headers decoded. `None` once the failure is said.
 fn init(
     a: &Args,
+    real: bool,
     pair: &FilePair,
     first: &[u8],
     msg: &mut Messages,
@@ -553,7 +599,8 @@ fn init(
 ) -> Option<Coder> {
     if a.op == OpMode::Compress {
         let o = encode_options(a);
-        return match guarded(&mut false, || Encoder::new(&o)) {
+        let active = real && o.threads > 0;
+        return match guarded(active, &mut false, || Encoder::new(&o)) {
             Ok(e) => Some(Coder::Encode(Box::new(e))),
             Err(e) => {
                 report(a, pair, &e, msg, err);
@@ -645,6 +692,7 @@ pub(crate) fn run(
     let Some(mut pair) = FilePair::open_src(a, name, host, msg, err) else {
         return;
     };
+    let real = matches!(host, Host::Real);
     let mut success = false;
     let mut first = vec![0u8; IO_BUFFER_SIZE];
     let read = if a.op == OpMode::Compress {
@@ -654,13 +702,15 @@ pub(crate) fn run(
     };
     if let Some(n) = read {
         first.truncate(n);
-        if let Some(coder) = init(a, &pair, &first, msg, err)
+        if let Some(coder) = init(a, real, &pair, &first, msg, err)
             && (a.op == OpMode::Test || pair.open_dest(a, host, msg, err))
         {
             success = match coder {
                 Coder::Encode(mut enc) => {
                     let mut panicked = false;
-                    let ok = encode(a, &mut pair, &mut enc, &mut panicked, msg, err);
+                    let active = real && encode_options(a).threads > 0;
+                    let guard = (active, &mut panicked);
+                    let ok = encode(a, &mut pair, &mut enc, guard, msg, err);
                     if panicked {
                         std::mem::forget(enc);
                     }
@@ -695,7 +745,7 @@ fn encode(
     a: &Args,
     pair: &mut FilePair,
     enc: &mut Encoder,
-    panicked: &mut bool,
+    (active, panicked): (bool, &mut bool),
     msg: &mut Messages,
     err: &mut dyn Write,
 ) -> bool {
@@ -705,12 +755,12 @@ fn encode(
         let Some(n) = pair.read(&mut buf, msg, err) else {
             return false;
         };
-        let mut r = guarded(panicked, || enc.feed(&buf[..n], &mut out));
+        let mut r = guarded(active, panicked, || enc.feed(&buf[..n], &mut out));
         let end = pair.src_eof;
         if r.is_ok() && end {
-            r = guarded(panicked, || enc.finish(&mut out));
+            r = guarded(active, panicked, || enc.finish(&mut out));
         } else if r.is_ok() && pair.flush_needed {
-            r = guarded(panicked, || enc.flush(&mut out));
+            r = guarded(active, panicked, || enc.flush(&mut out));
             pair.src_has_seen_input = false;
             pair.flush_needed = false;
         }
@@ -929,6 +979,68 @@ mod tests {
         assert!(!is_format_lzma(&header(13, 1 << 23, u64::MAX)));
         assert!(!is_format_lzma(&header(0x5d, 1 << 23, (1 << 38) + 1)));
         assert!(!is_format_lzma(&header(0x5d, 1 << 23, 5)[..12]));
+    }
+
+    /// Ruling P10: a refused thread's panic becomes `LZMA_MEM_ERROR`
+    /// without reaching the previous hook; any other panic reaches it and
+    /// goes on; inactive, nothing is caught. The test's own hook counts
+    /// only payloads that carry its marker.
+    #[test]
+    fn only_a_refused_thread_is_swallowed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        const MARK: &str = "xz-guard-test";
+        let marked = |info: &std::panic::PanicHookInfo<'_>| {
+            let p = info.payload();
+            p.downcast_ref::<String>().is_some_and(|s| s.contains(MARK))
+        };
+        let spawn =
+            || -> Result<(), XzError> { std::panic::panic_any(format!("{SPAWN_FAILED}: {MARK}")) };
+        let other = || -> Result<(), XzError> { std::panic::panic_any(format!("bug: {MARK}")) };
+        let lock = HOOK_SWAP.lock().unwrap_or_else(|p| p.into_inner());
+        let outer = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if marked(info) {
+                SEEN.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        drop(lock);
+
+        let mut panicked = false;
+        let r = guarded(true, &mut panicked, spawn);
+        assert!(matches!(r, Err(XzError::Mem { needed: 0 })) && panicked);
+        assert_eq!(
+            SEEN.load(Ordering::SeqCst),
+            0,
+            "the spawn panic reached the hook"
+        );
+
+        let mut panicked = false;
+        let caught = catch_unwind(AssertUnwindSafe(|| guarded(true, &mut panicked, other)));
+        let payload = caught.expect_err("another panic was swallowed");
+        assert_eq!(
+            payload.downcast_ref::<String>().unwrap(),
+            &format!("bug: {MARK}")
+        );
+        assert!(!panicked);
+        assert_eq!(
+            SEEN.load(Ordering::SeqCst),
+            1,
+            "another panic missed the hook"
+        );
+
+        let mut panicked = false;
+        let caught = catch_unwind(AssertUnwindSafe(|| guarded(false, &mut panicked, spawn)));
+        assert!(
+            caught.is_err() && !panicked,
+            "an inactive guard caught a panic"
+        );
+        assert_eq!(SEEN.load(Ordering::SeqCst), 2);
+
+        // The test's hook is still the hook: the guard put it back.
+        let mine = std::panic::take_hook();
+        std::panic::set_hook(outer);
+        drop(mine);
     }
 
     #[test]

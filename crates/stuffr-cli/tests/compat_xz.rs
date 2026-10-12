@@ -846,6 +846,54 @@ mod unix {
         check("compress_files", &cases);
     }
 
+    /// A FIFO `p` whose writer comes 300 ms after the run starts, writes a
+    /// line and goes (giving up after 5 s if nothing ever reads).
+    fn late_fifo_writer(d: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let p = d.join("p");
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        std::thread::spawn(move || {
+            use std::io::Write;
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let w = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&p);
+                match w {
+                    Ok(mut f) => {
+                        let _ = f.write_all(b"hello-data\n");
+                        return;
+                    }
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+
+    /// file_io.c's io_wait: an input that is not a regular file is read
+    /// only once there is input, so a FIFO opened before its writer
+    /// yields the writer's data, not an empty input.
+    #[test]
+    fn a_fifo_waits_for_its_writer() {
+        let cases = vec![
+            expect_plain(
+                with_setup(dcase("xz", &["-c", "p"], vec![]), late_fifo_writer),
+                b"hello-data\n".to_vec(),
+            ),
+            with_setup(dcase("xz", &["-dcf", "p"], vec![]), late_fifo_writer),
+            with_setup(dcase("xz", &["-t", "p"], vec![]), late_fifo_writer),
+        ];
+        check("a_fifo_waits_for_its_writer", &cases);
+    }
+
     /// The reference's `.xz` streams for the decompression cases, by name.
     fn streams() -> Vec<(&'static str, Vec<u8>)> {
         let plain = text();
