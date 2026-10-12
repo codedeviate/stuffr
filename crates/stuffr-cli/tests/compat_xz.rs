@@ -2,6 +2,11 @@
 //! `xz`, `unxz`, `xzcat`, `lzma`, `unlzma` and `lzcat`, compared with the
 //! reference through `compat_harness`, every case under `LC_ALL=C`.
 //!
+//! Part 3 (Task 7): `--list` at every verbosity and under `--robot`, over
+//! the reference's own streams and over hand-made ones (`made_xz`) whose
+//! Block Headers and Indexes no encoder writes: every filter, every check
+//! ID, sizes that only a crafted Index declares, and corrupt ones.
+//!
 //! Part 2 (Task 6): compression, decompression and testing over files and
 //! streams; the compressed bytes themselves are `compat_xz_bytes.rs`'s.
 //!
@@ -465,19 +470,28 @@ mod unix {
         check("flags_accepted", &cases);
     }
 
-    /// `-v` (the progress line, Task 8) and `-l` (list.c, Task 7).
+    /// `-v` (the progress line, Task 8).
     #[test]
-    #[ignore = "Tasks 7 and 8"]
-    fn flags_accepted_verbose_and_list() {
+    #[ignore = "Task 8"]
+    fn flags_accepted_verbose() {
         let packed = reference_output(&[], &text());
         let mut cases: Vec<Case> = [&["-v", "-c", "a"][..], &["--verbose", "-k", "a"]]
             .iter()
             .map(|a| fed(xz(a), text()))
             .collect();
-        for args in [&["-l", "a.xz"][..], &["--list", "a.xz"], &["-dkv", "a.xz"]] {
-            cases.push(with_file(xz(args), "a.xz", packed.clone()));
-        }
-        check("flags_accepted_verbose_and_list", &cases);
+        cases.push(with_file(xz(&["-dkv", "a.xz"]), "a.xz", packed));
+        check("flags_accepted_verbose", &cases);
+    }
+
+    /// `-l` and `--list` (list.c, Task 7).
+    #[test]
+    fn flags_accepted_list() {
+        let packed = reference_output(&[], &text());
+        let cases: Vec<Case> = [&["-l", "a.xz"][..], &["--list", "a.xz"]]
+            .iter()
+            .map(|a| with_file(xz(a), "a.xz", packed.clone()))
+            .collect();
+        check("flags_accepted_list", &cases);
     }
 
     // ---- help and version ----
@@ -1590,5 +1604,530 @@ mod unix {
             assert!(matches!(kept, Ok(true)), "hard {hard}: the input was lost");
             assert_eq!(names, ["a", "a.xz"], "hard {hard}");
         }
+    }
+
+    // ==== Part 3 (Task 7): --list ====
+
+    /// An `.xz` variable-length integer.
+    fn vli(mut n: u64) -> Vec<u8> {
+        let mut v = Vec::new();
+        while n >= 0x80 {
+            v.push(n as u8 | 0x80);
+            n >>= 7;
+        }
+        v.push(n as u8);
+        v
+    }
+
+    /// `lzma_check_size` by check ID.
+    const CHECK_SIZES: [usize; 16] = [0, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64];
+
+    const VLI_MAX: u64 = u64::MAX / 2;
+
+    /// One Block of a hand-made `.xz`: its header's filter flags, the sizes
+    /// its header records (if any), its Compressed Data's length and the
+    /// uncompressed size its Index record declares. The data is filler:
+    /// `--list` never decodes it.
+    #[derive(Clone)]
+    struct Blk {
+        filters: Vec<(u64, Vec<u8>)>,
+        header_sizes: Option<(u64, u64)>,
+        data: usize,
+        uncompressed: u64,
+    }
+
+    fn blk(filters: Vec<(u64, Vec<u8>)>) -> Blk {
+        Blk {
+            filters,
+            header_sizes: None,
+            data: 24,
+            uncompressed: 1000,
+        }
+    }
+
+    fn lzma2(props: u8) -> (u64, Vec<u8>) {
+        (0x21, vec![props])
+    }
+
+    fn x86() -> (u64, Vec<u8>) {
+        (0x04, Vec::new())
+    }
+
+    fn delta(dist: u8) -> (u64, Vec<u8>) {
+        (0x03, vec![dist - 1])
+    }
+
+    /// A Stream of `blocks` with check `check`; `records`, when given,
+    /// replaces the Index's records (unpadded, uncompressed) the Blocks
+    /// would give, so an Index can disagree with its Blocks.
+    fn made_stream(check: u8, blocks: &[Blk], records: Option<Vec<(u64, u64)>>) -> Vec<u8> {
+        let mut s = vec![0xFD, b'7', b'z', b'X', b'Z', 0, 0, check];
+        s.extend(crc32(&[0, check]).to_le_bytes());
+        let csize = CHECK_SIZES[usize::from(check & 15)];
+        let mut recs = Vec::new();
+        for b in blocks {
+            let mut hdr = vec![0u8, (b.filters.len() as u8).wrapping_sub(1) & 3];
+            if let Some((c, u)) = b.header_sizes {
+                hdr[1] |= 0xC0;
+                hdr.extend(vli(c));
+                hdr.extend(vli(u));
+            }
+            for (id, props) in &b.filters {
+                hdr.extend(vli(*id));
+                hdr.extend(vli(props.len() as u64));
+                hdr.extend(props);
+            }
+            while !hdr.len().is_multiple_of(4) {
+                hdr.push(0);
+            }
+            hdr[0] = (hdr.len() / 4) as u8;
+            hdr.extend(crc32(&hdr).to_le_bytes());
+            let start = s.len();
+            s.extend(&hdr);
+            s.extend(vec![0x55; b.data]);
+            while !(s.len() - start).is_multiple_of(4) {
+                s.push(0);
+            }
+            s.extend((0..csize).map(|i| (i * 7 + 3) as u8));
+            recs.push(((hdr.len() + b.data + csize) as u64, b.uncompressed));
+        }
+        let recs = records.unwrap_or(recs);
+        let mut index = vec![0u8];
+        index.extend(vli(recs.len() as u64));
+        for (unpadded, uncompressed) in recs {
+            index.extend(vli(unpadded));
+            index.extend(vli(uncompressed));
+        }
+        while !index.len().is_multiple_of(4) {
+            index.push(0);
+        }
+        index.extend(crc32(&index).to_le_bytes());
+        s.extend(&index);
+        let backward = ((index.len() / 4 - 1) as u32).to_le_bytes();
+        let mut tail = backward.to_vec();
+        tail.extend([0, check]);
+        s.extend(crc32(&tail).to_le_bytes());
+        s.extend(tail);
+        s.extend(b"YZ");
+        s
+    }
+
+    fn made_xz(check: u8, blocks: &[Blk]) -> Vec<u8> {
+        made_stream(check, blocks, None)
+    }
+
+    /// Every list form of `a.xz`, as `tool`.
+    const LIST_FORMS: [&[&str]; 6] = [
+        &["-l"],
+        &["-lv"],
+        &["-lvv"],
+        &["--robot", "-l"],
+        &["--robot", "-lv"],
+        &["--robot", "-lvv"],
+    ];
+
+    fn list_case(args: &[&'static str], files: Vec<(&'static str, Vec<u8>)>) -> Case<'static> {
+        dcase("xz", args, files)
+    }
+
+    /// Each input under every list form.
+    fn every_form(inputs: &[(&'static str, Vec<u8>)]) -> Vec<Case<'static>> {
+        let mut cases = Vec::new();
+        for (name, data) in inputs {
+            let file: &'static str = Box::leak(format!("{name}.xz").into_boxed_str());
+            for form in LIST_FORMS {
+                let mut a = form.to_vec();
+                a.push(file);
+                cases.push(list_case(&a, vec![(file, data.clone())]));
+            }
+        }
+        cases
+    }
+
+    /// The reference's own streams: one Stream, several, padded, many
+    /// Blocks (threaded, `--block-size`, `--block-list`), every check the
+    /// encoder writes, every filter, an empty Stream, each under every list
+    /// form; then several files with their totals.
+    #[test]
+    fn list_reference_streams() {
+        let plain = text();
+        let p6 = reference_output(&[], &plain);
+        let p0 = reference_output(&["-0"], b"second\n");
+        let mut inputs = streams();
+        inputs.push(("two", [p6.clone(), p0.clone()].concat()));
+        inputs.push(("padded", [p6.clone(), vec![0; 8]].concat()));
+        inputs.push((
+            "padmid",
+            [p6.clone(), vec![0; 4], p0.clone(), vec![0; 12]].concat(),
+        ));
+        inputs.push(("crc32", reference_output(&["-C", "crc32"], &plain)));
+        inputs.push(("p9", reference_output(&["-9", "-T1"], &mixed(70_000, 5))));
+        inputs.push((
+            "big",
+            reference_output(&["-T1", "--block-size=40000"], &random(300_000, 4)),
+        ));
+        let mut cases = every_form(&inputs);
+        // Several files: totals in every form, and a failing one between.
+        let files = || {
+            vec![
+                ("a.xz", p6.clone()),
+                ("b.xz", [p6.clone(), vec![0; 4], p0.clone()].concat()),
+                ("c.xz", reference_output(&["-C", "sha256"], &plain)),
+                ("bad.xz", flipped(&p6, -17)),
+            ]
+        };
+        for form in LIST_FORMS {
+            for operands in [
+                &["a.xz", "b.xz", "c.xz"][..],
+                &["a.xz", "bad.xz", "c.xz"],
+                &["a.xz", "missing.xz", "b.xz"],
+                &["bad.xz"],
+                &["a.xz", "a.xz"],
+            ] {
+                let mut a = form.to_vec();
+                a.extend(operands);
+                cases.push(list_case(&a, files()));
+            }
+        }
+        check("list_reference_streams", &cases);
+    }
+
+    /// What `--list` refuses: `.lzma` and other formats, standard input,
+    /// empty, short and non-`.xz` files, a directory; symbolic and hard
+    /// links (followed: `--list` forces `--force`); `-q`; names read with
+    /// `--files`.
+    #[test]
+    fn list_refusals_and_operands() {
+        let plain = text();
+        let p6 = reference_output(&[], &plain);
+        let lzma = reference_output(&["-F", "lzma"], &plain);
+        let a = || vec![("a.xz", p6.clone())];
+        let mut cases = vec![
+            dcase("lzma", &["-l", "a.lzma"], vec![("a.lzma", lzma.clone())]),
+            dcase("unlzma", &["-l", "a.lzma"], vec![("a.lzma", lzma.clone())]),
+            dcase("xz", &["-l", "a.lzma"], vec![("a.lzma", lzma.clone())]),
+            dcase("xz", &["-l", "-F", "lzma", "a.xz"], a()),
+            dcase("xz", &["-l", "-F", "raw", "a.xz"], a()),
+            dcase("xz", &["-l", "-F", "lzip", "a.xz"], a()),
+            dcase("xz", &["-l", "-F", "xz", "a.xz"], a()),
+            dcase("xzcat", &["-l", "a.xz"], a()),
+            dcase("unxz", &["-lv", "a.xz"], a()),
+            dcase("xz", &["-l", "-F", "lzma", "missing"], a()),
+            dcase("xz", &["-lq", "missing", "a.xz"], a()),
+            dcase("xz", &["-lqq", "missing"], a()),
+            dcase("xz", &["-l", "a"], vec![("a", plain.clone())]),
+            dcase("xz", &["-l", "e.xz"], vec![("e.xz", Vec::new())]),
+            dcase("xz", &["-lv", "e.xz"], vec![("e.xz", Vec::new())]),
+            dcase("xz", &["-l", "s.xz"], vec![("s.xz", p6[..23].to_vec())]),
+            dcase("xz", &["-l", "s.xz"], vec![("s.xz", p6[..24].to_vec())]),
+            dcase("xz", &["-l", "z.xz"], vec![("z.xz", vec![0; 64])]),
+            dcase("xz", &["-l", ""], a()),
+            dcase("xz", &["-l", "-c", "-k", "a.xz"], a()),
+            with_setup(dcase("xz", &["-l", "d"], a()), dir_d),
+            with_setup(
+                dcase("xz", &["-l", "l"], vec![("a", p6.clone())]),
+                symlink_l_to_a,
+            ),
+            with_setup(
+                dcase("xz", &["-l", "h"], vec![("a", p6.clone())]),
+                hard_link_h_to_a,
+            ),
+            with_setup(dcase("xz", &["-l", "a"], vec![("a", p6.clone())]), a_setuid),
+            with_setup(
+                dcase("xz", &["-l", "a"], vec![("a", p6.clone())]),
+                a_unreadable,
+            ),
+            with_setup(dcase("xz", &["-l", "p"], a()), |d| {
+                let path =
+                    std::ffi::CString::new(d.join("p").as_os_str().as_encoded_bytes()).unwrap();
+                // SAFETY: a valid C string.
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o644) }, 0);
+            }),
+        ];
+        for form in LIST_FORMS {
+            // Standard input, alone and among files; never read.
+            cases.push(fed(dcase("xz", form, a()), p6.clone()));
+            let mut args = form.to_vec();
+            args.extend(["-", "a.xz"]);
+            cases.push(fed(dcase("xz", &args, a()), p6.clone()));
+            // Names from --files: the count is unknown.
+            let mut args = form.to_vec();
+            args.extend(["--files=names", "a.xz"]);
+            let mut files = a();
+            files.push(("names", b"a.xz\nmissing\n\na.xz\n".to_vec()));
+            cases.push(dcase("xz", &args, files));
+            // Nothing listed at all.
+            let mut args = form.to_vec();
+            args.push("--files=empty");
+            cases.push(dcase("xz", &args, vec![("empty", Vec::new())]));
+        }
+        cases.push(on_tty_stdin(dcase("xz", &["-l"], a())));
+        cases.push(on_tty_stdin(dcase("xz", &["-l", "-F", "lzma"], a())));
+        check("list_refusals_and_operands", &cases);
+    }
+
+    fn on_tty_stdin<'a>(mut c: Case<'a>) -> Case<'a> {
+        c.tty_stdin = true;
+        c
+    }
+
+    /// Corrupt and cut-short files: each spot of the Stream Header, the
+    /// Index and the Stream Footer, Stream Padding of a wrong size, a
+    /// Block Header (seen only at `-vv`), and truncations.
+    #[test]
+    fn list_corrupt_and_truncated() {
+        let p6 = reference_output(&[], &text());
+        let two = [p6.clone(), reference_output(&["-0"], b"second\n")].concat();
+        let n = p6.len() as isize;
+        let mut inputs: Vec<(&'static str, Vec<u8>)> = vec![
+            ("magic", flipped(&p6, 0)),
+            ("hflags", flipped(&p6, 6)),
+            ("hcrc", flipped(&p6, 9)),
+            ("block", flipped(&p6, 13)),
+            ("index", flipped(&p6, -17)),
+            ("indicator", flipped(&p6, -24)),
+            ("fcrc", flipped(&p6, -12)),
+            ("backward", flipped(&p6, -8)),
+            ("fflags", flipped(&p6, -4)),
+            ("fcheck", flipped(&p6, -3)),
+            ("fmagic", flipped(&p6, -1)),
+            ("cut1", p6[..p6.len() - 1].to_vec()),
+            ("cut4", p6[..p6.len() - 4].to_vec()),
+            ("cut12", p6[..p6.len() - 12].to_vec()),
+            ("cuthalf", p6[..(n / 2) as usize & !3].to_vec()),
+            ("pad3", [p6.clone(), vec![0; 3]].concat()),
+            ("pad5", [p6.clone(), vec![0; 5]].concat()),
+            ("junk", [p6.clone(), b"junk".to_vec()].concat()),
+            ("second", flipped(&two, -(n + 30))),
+            ("secondhdr", flipped(&two, p6.len() as isize + 7)),
+            ("zeros", [vec![0; 12], p6.clone()].concat()),
+        ];
+        // Stream Header of the second Stream changed to another check.
+        let mut other = two.clone();
+        other[p6.len() + 7] = 1;
+        let crc = crc32(&other[p6.len() + 6..p6.len() + 8]).to_le_bytes();
+        other[p6.len() + 8..p6.len() + 12].copy_from_slice(&crc);
+        inputs.push(("checkdiff", other));
+        let mut cases = every_form(&inputs);
+        for args in [
+            &["-lvv", "a.xz", "block.xz", "a.xz"][..],
+            &["-l", "a.xz", "cut1.xz"],
+        ] {
+            cases.push(list_case(
+                args,
+                vec![
+                    ("a.xz", p6.clone()),
+                    ("block.xz", flipped(&p6, 13)),
+                    ("cut1.xz", p6[..p6.len() - 1].to_vec()),
+                ],
+            ));
+        }
+        check("list_corrupt_and_truncated", &cases);
+    }
+
+    /// Hand-made Streams: every check ID (the reserved ones listed as
+    /// `Unknown-N`), every filter and option form a Block Header can hold,
+    /// sizes in the headers, the minimum versions, sizes past TiB, ratios
+    /// over 9.999, and the Block Header and Index refusals.
+    #[test]
+    fn list_made_streams() {
+        let l = || blk(vec![lzma2(22)]);
+        let mut inputs: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        for check in 0..16u8 {
+            let name: &'static str = Box::leak(format!("check{check}").into_boxed_str());
+            inputs.push((name, made_xz(check, &[l(), l()])));
+        }
+        let with = |filters: Vec<(u64, Vec<u8>)>| made_xz(1, &[blk(filters)]);
+        inputs.extend([
+            ("noblocks", made_xz(4, &[])),
+            ("x86delta", with(vec![x86(), delta(4), lzma2(18)])),
+            ("x86start", with(vec![(0x04, vec![16, 0, 0, 0]), lzma2(18)])),
+            ("x86zero", with(vec![(0x04, vec![0, 0, 0, 0]), lzma2(18)])),
+            ("ppc", with(vec![(0x05, vec![]), lzma2(18)])),
+            ("ia64", with(vec![(0x06, vec![]), lzma2(18)])),
+            ("arm", with(vec![(0x07, vec![]), lzma2(18)])),
+            ("thumb", with(vec![(0x08, vec![]), lzma2(18)])),
+            ("sparc", with(vec![(0x09, vec![]), lzma2(18)])),
+            ("arm64", with(vec![(0x0A, vec![0, 1, 0, 0]), lzma2(18)])),
+            ("riscv", with(vec![(0x0B, vec![]), lzma2(18)])),
+            ("four", with(vec![x86(), delta(1), delta(255), lzma2(1)])),
+            // Chains liblzma refuses to decode, but lists.
+            ("lzfirst", with(vec![lzma2(18), x86()])),
+            ("bcjonly", with(vec![x86()])),
+            ("twolz", with(vec![lzma2(18), lzma2(18)])),
+            // Header refusals.
+            ("unknown", with(vec![(0x99, vec![]), lzma2(18)])),
+            ("reserved", with(vec![(1 << 62, vec![1]), lzma2(18)])),
+            ("lzma1", with(vec![(0x4000_0000_0000_0001, vec![0; 5])])),
+            ("propsize", with(vec![(0x04, vec![1, 2, 3]), lzma2(18)])),
+            ("lzprops", with(vec![(0x21, vec![1, 2])])),
+            ("dict41", with(vec![lzma2(41)])),
+            ("dictbits", with(vec![lzma2(0x40)])),
+            ("deltaprops", with(vec![(0x03, vec![])])),
+        ]);
+        let mut sized = l();
+        sized.header_sizes = Some((24, 1000));
+        let mut wrongc = l();
+        wrongc.header_sizes = Some((25, 1000));
+        let mut wrongu = l();
+        wrongu.header_sizes = Some((24, 999));
+        let mut empty = l();
+        empty.uncompressed = 0;
+        let mut huge = l();
+        huge.uncompressed = 1 << 50;
+        let mut tiny = l();
+        tiny.uncompressed = 1;
+        tiny.data = 4000;
+        inputs.extend([
+            ("sizes", made_xz(4, &[sized.clone(), sized.clone()])),
+            ("somesizes", made_xz(4, &[sized.clone(), l()])),
+            ("wrongc", made_xz(4, &[wrongc])),
+            ("wrongu", made_xz(4, &[wrongu])),
+            ("emptyblock", made_xz(4, &[empty.clone()])),
+            (
+                "emptyx86",
+                made_xz(
+                    4,
+                    &[blk(vec![x86(), lzma2(18)]), {
+                        let mut e = blk(vec![x86(), lzma2(18)]);
+                        e.uncompressed = 0;
+                        e
+                    }],
+                ),
+            ),
+            ("huge", made_xz(4, &[huge.clone(), huge])),
+            ("tiny", made_xz(0, &[tiny])),
+            (
+                "versions",
+                [
+                    made_xz(4, &[empty]),
+                    made_xz(1, &[blk(vec![(0x0A, vec![]), lzma2(18)])]),
+                    made_xz(10, &[blk(vec![(0x0B, vec![]), lzma2(18)])]),
+                ]
+                .concat(),
+            ),
+        ]);
+        // Index refusals and oddities.
+        let one = [l()];
+        let unpadded = 12 + 24 + 8;
+        inputs.extend([
+            ("unpadded4", made_stream(4, &one, Some(vec![(4, 1000)]))),
+            ("unpadded5", made_stream(4, &one, Some(vec![(5, 1000)]))),
+            (
+                "toolong",
+                made_stream(4, &one, Some(vec![(unpadded + 4, 1000)])),
+            ),
+            (
+                "tooshort",
+                made_stream(4, &one, Some(vec![(unpadded - 4, 1000)])),
+            ),
+            ("norecords", made_stream(4, &one, Some(vec![]))),
+            (
+                "uvlimax",
+                made_stream(4, &one, Some(vec![(unpadded, VLI_MAX), (8, 1)])),
+            ),
+            ("bigrec", made_stream(4, &one, Some(vec![(1 << 40, 1)]))),
+        ]);
+        // Index bytes themselves: padding, count, a non-minimal integer.
+        let mut padbyte = made_xz(4, &one);
+        let at = padbyte.len() - 12 - 4 - 1;
+        padbyte[at] = 1;
+        inputs.push(("indexpad", padbyte));
+        let cases = every_form(&inputs);
+        check("list_made_streams", &cases);
+    }
+
+    /// Memory: `-M` below what the Indexes need (`Memory usage limit
+    /// reached` and the figure needed, through two Streams), and the totals
+    /// that overflow.
+    #[test]
+    fn list_memory_limits_and_overflow() {
+        let l = || blk(vec![lzma2(22)]);
+        let one = made_xz(4, &[l()]);
+        let two = [made_xz(4, &[l()]), made_xz(4, &[l()])].concat();
+        let many = made_xz(4, &vec![l(); 600]);
+        let mut big = l();
+        big.uncompressed = VLI_MAX - 1;
+        let big = made_xz(4, &[big]);
+        let mut cases = Vec::new();
+        for (m, f) in [
+            ("-M1", "one.xz"),
+            ("-M8719", "one.xz"),
+            ("-M8720", "one.xz"),
+            ("-M9000", "two.xz"),
+            ("-M17439", "two.xz"),
+            ("-M17440", "two.xz"),
+            ("-M17007", "many.xz"),
+            ("-M2MiB", "many.xz"),
+            ("--memlimit-decompress=1", "one.xz"),
+            ("--memlimit-compress=1", "one.xz"),
+        ] {
+            for v in ["-l", "-lvv", "-ql"] {
+                cases.push(list_case(
+                    &[v, m, f],
+                    vec![
+                        ("one.xz", one.clone()),
+                        ("two.xz", two.clone()),
+                        ("many.xz", many.clone()),
+                    ],
+                ));
+            }
+        }
+        for form in LIST_FORMS {
+            for operands in [
+                &["big.xz", "big.xz"][..],
+                &["big.xz", "big.xz", "big.xz", "one.xz"],
+                &["bigbig.xz"],
+            ] {
+                let mut a = form.to_vec();
+                a.extend(operands);
+                cases.push(list_case(
+                    &a,
+                    vec![
+                        ("one.xz", one.clone()),
+                        ("big.xz", big.clone()),
+                        ("bigbig.xz", [big.clone(), big.clone()].concat()),
+                    ],
+                ));
+            }
+        }
+        check("list_memory_limits_and_overflow", &cases);
+    }
+
+    /// Review Focus 3: the "Memory needed" figures of `-lvv` and
+    /// `--robot -lvv` are the reference build's, on both tiers: every
+    /// LZMA2 dictionary size a header can declare, behind each kind of
+    /// filter, and across several files' totals.
+    #[test]
+    fn list_memory_needed_matches() {
+        let mut files: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        for props in 0..=40u8 {
+            let name: &'static str = Box::leak(format!("d{props}.xz").into_boxed_str());
+            files.push((name, made_xz(4, &[blk(vec![lzma2(props)])])));
+        }
+        files.push(("x86.xz", made_xz(4, &[blk(vec![x86(), lzma2(30)])])));
+        files.push((
+            "delta.xz",
+            made_xz(4, &[blk(vec![delta(7), lzma2(20)]), blk(vec![lzma2(26)])]),
+        ));
+        files.push((
+            "chain.xz",
+            made_xz(4, &[blk(vec![x86(), delta(2), (0x0A, vec![]), lzma2(12)])]),
+        ));
+        files.push(("p9.xz", reference_output(&["-9", "-T1"], &text())));
+        files.push(("p0.xz", reference_output(&["-0"], &text())));
+        let names: Vec<&'static str> = files.iter().map(|(n, _)| *n).collect();
+        let mut cases = Vec::new();
+        for form in [&["-lvv"][..], &["--robot", "-lvv"]] {
+            for n in &names {
+                let mut a = form.to_vec();
+                a.push(n);
+                cases.push(list_case(&a, files.clone()));
+            }
+            let mut a = form.to_vec();
+            a.extend(names.iter().copied());
+            cases.push(list_case(&a, files.clone()));
+        }
+        check("list_memory_needed_matches", &cases);
     }
 }

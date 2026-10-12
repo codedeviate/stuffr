@@ -73,6 +73,13 @@ pub(crate) struct Messages {
     pub(crate) status: Status,
     /// `-Q`/`--no-warn`.
     pub(crate) no_warn: bool,
+    /// `files_total` (message_set_files): the operands' count, 0 when
+    /// `--files`/`--files0` makes it unknown.
+    pub(crate) files_total: u32,
+    /// `files_pos`: the file being processed, from 1.
+    files_pos: u32,
+    /// `first_filename_printed`.
+    first_filename_printed: bool,
 }
 
 impl Messages {
@@ -82,6 +89,37 @@ impl Messages {
             verbosity: Verbosity::Warning,
             status: Status::Success,
             no_warn: false,
+            files_total: 0,
+            files_pos: 0,
+            first_filename_printed: false,
+        }
+    }
+
+    /// message.c: message_filename under `--list` (`name` `None` for
+    /// standard input): the file is counted, and at `-v` and above its
+    /// name is printed to standard output by print_filename. The
+    /// progress indicator's half (`progress_automatic`) is Task 8's.
+    pub(crate) fn list_filename(&mut self, out: &mut dyn Write, name: Option<&[u8]>, robot: bool) {
+        self.files_pos = self.files_pos.wrapping_add(1);
+        if self.verbosity < Verbosity::Verbose || robot || (self.files_total == 1 && name.is_none())
+        {
+            return;
+        }
+        if self.first_filename_printed {
+            printf(out, m::NEWLINE, &[]);
+        }
+        self.first_filename_printed = true;
+        let shown = mask_nonprint(name.unwrap_or(m::STDIN_NAME));
+        let pos = self.files_pos.to_string();
+        if self.files_total == 0 {
+            printf(out, m::FILENAME_NTH, &[&shown, pos.as_bytes()]);
+        } else {
+            let total = self.files_total.to_string();
+            printf(
+                out,
+                m::FILENAME_OF,
+                &[&shown, pos.as_bytes(), total.as_bytes()],
+            );
         }
     }
 

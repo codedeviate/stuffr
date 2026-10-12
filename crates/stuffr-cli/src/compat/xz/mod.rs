@@ -7,8 +7,11 @@
 //! reach), `options.rs` (options.c, and liblzma's string_conversion.c for
 //! `--filters`), `suffix.rs` (suffix.c), `hardware.rs` (hardware.c, with
 //! tuklib_physmem/tuklib_cpucores), `message.rs` (message.c, main.c's exit
-//! status, tuklib_exit.c) and this module (main.c). Every string is in
-//! `messages.rs`.
+//! status, tuklib_exit.c), `coder.rs` (coder.c), `file_io.rs` (file_io.c),
+//! `list.rs` (list.c, util.c's number formatting), `index.rs` (liblzma's
+//! file_info.c, index_decoder.c and block_header_decoder.c, in pure Rust
+//! so that `--list` is the same on both tiers) and this module (main.c).
+//! Every string is in `messages.rs`.
 //!
 //! **Names** (R2): all six map to this family, and the mode comes from the
 //! invoked name by args.c's substring rule, so `unxz` decompresses,
@@ -25,8 +28,6 @@
 //! - `--version`'s first line names stuffr (`xz (stuffr X.Y.Z; XZ Utils
 //!   5.8.4 compatible)`); its second line and `--robot --version` are the
 //!   reference's, on both tiers.
-//! - `--list` arrives with list.c (0.13.0 Task 7); until then every input
-//!   is refused there with stuffr's own error, exit 1.
 //! - The output is written to a temporary file beside it and published
 //!   when complete (`file_io.rs`); an input that is also the output is
 //!   never lost, even where xz would lose it (spec deviation 4).
@@ -57,6 +58,8 @@ pub(crate) mod args;
 mod coder;
 mod file_io;
 pub(crate) mod hardware;
+mod index;
+mod list;
 pub(crate) mod message;
 mod messages;
 pub(crate) mod options;
@@ -64,6 +67,7 @@ pub(crate) mod suffix;
 
 use args::{Args, OpMode};
 use hardware::Hardware;
+use list::ListTotals;
 use message::{Messages, Status, Verbosity, mask_nonprint};
 
 /// Entry point for the six names; `name` is the canonical invoked name,
@@ -154,6 +158,12 @@ fn main(
     if a.op != OpMode::List && a.robot {
         return msg.fatal(err, messages::ROBOT_CODING, &[]);
     }
+    // message_set_files: unknown with --files/--files0.
+    msg.files_total = if a.files_from.is_some() {
+        0
+    } else {
+        a.files.len() as u32
+    };
     // Refuse to write compressed data to a terminal.
     if a.op == OpMode::Compress
         && (a.to_stdout || a.files == [b"-".to_vec()])
@@ -165,6 +175,7 @@ fn main(
     // signals_init(): the cleanup handlers are installed when an output
     // file is armed (host.rs), the only time they act.
     let names = std::mem::take(&mut a.files);
+    let mut totals = ListTotals::default();
     for n in &names {
         let mut file = Some(n.as_slice());
         if n == b"-" {
@@ -182,7 +193,9 @@ fn main(
             }
             file = None;
         }
-        run_one(&a, file, host, &mut msg, err);
+        if let Err(code) = run_one(&a, file, host, &mut msg, &mut out, err, &mut totals) {
+            return code;
+        }
     }
     if let Some(from) = a.files_from.take() {
         let delim = from.delim;
@@ -193,10 +206,15 @@ fn main(
         };
         let mut reader = BufReader::new(source);
         while let Some(name) = read_name(&mut reader, delim, &display, &mut msg, err) {
-            run_one(&a, Some(&name), host, &mut msg, err);
+            if let Err(code) = run_one(&a, Some(&name), host, &mut msg, &mut out, err, &mut totals)
+            {
+                return code;
+            }
         }
     }
-    // list_totals() for --list comes with list.c (Task 7).
+    if a.op == OpMode::List {
+        list::list_totals(&a, &msg, &totals, &mut out);
+    }
     let status = msg.final_status();
     message::exit(
         status,
@@ -217,21 +235,22 @@ fn is_tty_stdout(host: &Host, msg: &mut Messages, err: &mut dyn Write) -> bool {
 }
 
 /// coder.c: coder_run, or list.c: list_file under `--list`, for one input
-/// (`None`: standard input). `--list` arrives with list.c (Task 7); until
-/// then every input is refused there.
+/// (`None`: standard input). `Err` is the exit code of a run list_file
+/// ends (message_fatal).
 fn run_one(
     a: &Args,
     name: Option<&[u8]>,
     host: &mut Host,
     msg: &mut Messages,
+    out: &mut dyn Write,
     err: &mut dyn Write,
-) {
+    totals: &mut ListTotals,
+) -> Result<(), u8> {
     if a.op == OpMode::List {
-        let shown = mask_nonprint(name.unwrap_or(messages::STDIN_NAME));
-        msg.error(err, messages::NOT_YET, &[&shown]);
-        return;
+        return list::list_file(a, name, host, msg, out, err, totals);
     }
     coder::run(a, name, host, msg, err);
+    Ok(())
 }
 
 /// main.c: read_name: the next name from `--files`/`--files0`'s source,
@@ -368,6 +387,57 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&err)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--list` under `Host::Sandbox`: a file is listed and its reads
+    /// counted, standard input is refused, and arbitrary bytes end in
+    /// xz's own exit codes.
+    #[test]
+    fn run_in_counted_lists_in_the_sandbox() {
+        let dir = std::env::temp_dir().join(format!("stuffr-xz-list-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        let (_, packed, _, _) = run_in_counted(&dir, "xz", &args(&["-T1"]), b"listed\n", &|_| None);
+        std::fs::write(dir.join("a.xz"), &packed).unwrap();
+        let (code, out, err, reads) = run_in_counted(
+            &dir,
+            "xz",
+            &args(&["--robot", "-lvv", "a.xz"]),
+            b"",
+            &|_| None,
+        );
+        assert_eq!((code, String::from_utf8(err).unwrap()), (0, String::new()));
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("name\ta.xz\nfile\t1\t1\t"), "{out}");
+        assert!(
+            out.ends_with("\tCRC64\t0\t1\t8454776\tno\t50000002\n"),
+            "{out}"
+        );
+        let read = reads.get(&dir.join("a.xz")).map_or(0, |r| r.bytes);
+        assert!(read > 0 && read <= 4 * packed.len() as u64, "read {read}");
+        let (code, _, err, _) = run_in_counted(&dir, "xz", &args(&["-l"]), &packed, &|_| None);
+        assert_eq!(code, 1);
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "xz: --list does not support reading from standard input\n"
+        );
+        for (i, junk) in [
+            &b""[..],
+            b"\xfd7zXZ\0\0\x01",
+            &[0u8; 64],
+            &packed[..packed.len() - 4],
+        ]
+        .iter()
+        .enumerate()
+        {
+            let name = format!("j{i}.xz");
+            std::fs::write(dir.join(&name), junk).unwrap();
+            let (code, _, _, _) =
+                run_in_counted(&dir, "xz", &args(&["-lvv", &name]), b"", &|_| None);
+            assert_eq!(code, 1, "{name}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

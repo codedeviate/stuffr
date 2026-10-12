@@ -600,6 +600,18 @@ fn str_append_u32(out: &mut String, v: u32, byte_suffix: bool) {
 /// `--name`, its encoder options after `=` (an LZMA filter's all but
 /// `preset`, a BCJ filter's `start` unless 0), filters apart by a space.
 pub(crate) fn str_from_filters(chain: &[Filter]) -> Vec<u8> {
+    str_from(chain, true)
+}
+
+/// string_conversion.c: lzma_str_from_filters with `LZMA_STR_DECODER |
+/// LZMA_STR_GETOPT_LONG`, what list.c prints for a Block: as
+/// [`str_from_filters`], except that an LZMA filter shows only `dict`
+/// (`strfy_decoder` is 2 for LZMA2, of which `preset` is never printed).
+pub(crate) fn str_from_filters_decoder(chain: &[Filter]) -> Vec<u8> {
+    str_from(chain, false)
+}
+
+fn str_from(chain: &[Filter], encoder: bool) -> Vec<u8> {
     let name_of = |kind: Kind| {
         FILTER_NAMES
             .iter()
@@ -625,6 +637,9 @@ pub(crate) fn str_from_filters(chain: &[Filter]) -> Vec<u8> {
                 out.push_str(name_of(if lzma2 { Kind::Lzma2 } else { Kind::Lzma1 }));
                 out.push_str("=dict=");
                 str_append_u32(&mut out, l.dict_size, true);
+                if !encoder {
+                    continue;
+                }
                 for (name, v) in [("lc", l.lc), ("lp", l.lp), ("pb", l.pb)] {
                     out.push_str(&format!(",{name}="));
                     str_append_u32(&mut out, v, false);

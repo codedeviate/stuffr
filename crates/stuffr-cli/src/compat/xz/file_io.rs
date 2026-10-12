@@ -188,6 +188,32 @@ impl FilePair {
         msg: &mut Messages,
         err: &mut dyn Write,
     ) -> Option<FilePair> {
+        Self::open_src_as(a, name, a.to_stdout, a.force, host, msg, err)
+    }
+
+    /// io_open_src as list.c calls it: `opt_stdout` cleared (only regular
+    /// files) and `opt_force` set (symbolic links followed, set-id,
+    /// sticky and hard-linked files taken).
+    pub(crate) fn open_src_for_list(
+        a: &Args,
+        name: &[u8],
+        host: &mut Host,
+        msg: &mut Messages,
+        err: &mut dyn Write,
+    ) -> Option<FilePair> {
+        Self::open_src_as(a, Some(name), false, true, host, msg, err)
+    }
+
+    /// io_open_src with `opt_stdout` and `opt_force` as given.
+    fn open_src_as(
+        a: &Args,
+        name: Option<&[u8]>,
+        to_stdout: bool,
+        force: bool,
+        host: &mut Host,
+        msg: &mut Messages,
+        err: &mut dyn Write,
+    ) -> Option<FilePair> {
         let real = matches!(host, Host::Real);
         let mut pair = FilePair {
             src_name: name.unwrap_or(m::STDIN_NAME).to_vec(),
@@ -229,8 +255,8 @@ impl FilePair {
         // Symlinks are followed only when writing to standard output or
         // with --force or --keep; only regular files are taken when the
         // output goes to disk.
-        let follow = a.to_stdout || a.force || a.keep;
-        let reg_files_only = !a.to_stdout;
+        let follow = to_stdout || force || a.keep;
+        let reg_files_only = !to_stdout;
         let mut opts = File::options();
         opts.read(true);
         #[cfg(unix)]
@@ -276,7 +302,7 @@ impl FilePair {
             return None;
         }
         #[cfg(unix)]
-        if reg_files_only && !a.force && !a.keep {
+        if reg_files_only && !force && !a.keep {
             use std::os::unix::fs::MetadataExt;
             // S_ISUID | S_ISGID and S_ISVTX (mode_t's width differs by
             // platform; the bits do not).
@@ -380,6 +406,55 @@ impl FilePair {
             }
         }
         Some(pos)
+    }
+
+    /// The input's size (`src_st.st_size`); 0 for standard input.
+    pub(crate) fn src_size(&self) -> u64 {
+        self.src_meta.as_ref().map_or(0, Metadata::len)
+    }
+
+    /// file_io.c: io_seek_src: false (said) when the input cannot seek.
+    pub(crate) fn seek_src(&mut self, pos: u64, msg: &mut Messages, err: &mut dyn Write) -> bool {
+        let result = match &mut self.src {
+            Src::File(f) => f.seek(SeekFrom::Start(pos)).map(|_| ()),
+            Src::Other(_) => Err(io::Error::from(io::ErrorKind::Unsupported)),
+        };
+        match result {
+            Ok(()) => {
+                self.src_eof = false;
+                true
+            }
+            Err(e) => {
+                let name = mask_nonprint(&self.src_name);
+                msg.error(err, m::SEEK_ERROR, &[&name, &strerror(&e)]);
+                false
+            }
+        }
+    }
+
+    /// file_io.c: io_pread: exactly `buf.len()` bytes at `pos`, false
+    /// (said) otherwise. The callers (list.c) read only inside the file
+    /// their Index describes, so io_seek_src's `message_bug` for a
+    /// position past the end has no counterpart.
+    pub(crate) fn pread(
+        &mut self,
+        buf: &mut [u8],
+        pos: u64,
+        msg: &mut Messages,
+        err: &mut dyn Write,
+    ) -> bool {
+        if !self.seek_src(pos, msg, err) {
+            return false;
+        }
+        match self.read(buf, msg, err) {
+            None => false,
+            Some(n) if n != buf.len() => {
+                let name = mask_nonprint(&self.src_name);
+                msg.error(err, m::UNEXPECTED_EOF, &[&name]);
+                false
+            }
+            Some(_) => true,
+        }
     }
 
     /// file_io.c: io_fix_src_pos: hand back the `n` bytes read past the end

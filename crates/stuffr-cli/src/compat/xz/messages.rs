@@ -519,6 +519,12 @@ pub(super) const SPARSE_SEEK_FAILED: &str =
 /// file_io.c: io_read.
 pub(super) const READ_ERROR: &str = "%s: Read error: %s";
 
+/// file_io.c: io_seek_src.
+pub(super) const SEEK_ERROR: &str = "%s: Error seeking the file: %s";
+
+/// file_io.c: io_pread, a short read.
+pub(super) const UNEXPECTED_EOF: &str = "%s: Unexpected end of file";
+
 /// file_io.c: io_write_buf (not for `EPIPE`).
 pub(super) const WRITE_ERROR: &str = "%s: Write error: %s";
 
@@ -646,8 +652,202 @@ pub(super) const GLIBC_NEEDS_ARGUMENT_LONG: &str = "%s: option '--%s' requires a
 /// glibc getopt.c: process_long_option, the word as typed.
 pub(super) const GLIBC_UNRECOGNIZED: &str = "%s: unrecognized option '--%s'\n";
 
-// ---- stuffr's own, until Task 7 ----
+// ---- message.c: print_filename (under --list, to standard output) ----
 
-/// `--list` arrives with list.c (0.13.0 Task 7); until then a file operand
-/// gets this error.
-pub(super) const NOT_YET: &str = "%s: not yet supported by this build";
+/// message.c: print_filename, the number of files known.
+pub(super) const FILENAME_OF: &str = "%s (%s/%s)\n";
+
+/// message.c: print_filename, `--files`/`--files0` in use.
+pub(super) const FILENAME_NTH: &str = "%s (%s)\n";
+
+// ---- list.c ----
+//
+// Every `%s` of a table row is a field list.rs has already padded to its
+// column (the C code's `%*s`/`%-*s` with tuklib_mbstr_fw, which in the C
+// locale pads to the column's width); the spacing between is verbatim.
+
+/// list.c: list_file (with tuklib_exit(E_ERROR, E_ERROR, false) after).
+pub(super) const LIST_XZ_ONLY: &str =
+    "--list works only on .xz files (--format=xz or --format=auto)";
+
+/// list.c: list_file, after [`LIST_XZ_ONLY`] under `--format=lzma`.
+pub(super) const LIST_LZMAINFO: &str = "Try 'lzmainfo' with .lzma files.";
+
+/// list.c: list_file.
+pub(super) const LIST_STDIN: &str = "--list does not support reading from standard input";
+
+/// list.c: parse_indexes.
+pub(super) const LIST_EMPTY: &str = "%s: File is empty";
+
+/// list.c: parse_indexes.
+pub(super) const LIST_TOO_SMALL: &str = "%s: Too small to be a valid .xz file";
+
+/// list.c: update_totals (message_fatal).
+pub(super) const LIST_TOTALS_TOO_LARGE: &str =
+    "Error: The total compressed or uncompressed size of the files is too large";
+
+/// list.c: colon_strs[], in their enum's order (init_colon_strs pads them
+/// all to the longest).
+pub(super) const COLON_STRS: [&str; 10] = [
+    "Streams:",
+    "Blocks:",
+    "Compressed size:",
+    "Uncompressed size:",
+    "Ratio:",
+    "Check:",
+    "Stream Padding:",
+    "Memory needed:",
+    "Sizes in headers:",
+    "Number of files:",
+];
+
+/// list.c: headings[], each with its minimum columns, in their enum's
+/// order (init_headings widens a column to its heading, and Check to the
+/// widest check name).
+pub(super) const HEADINGS: [(&str, usize); 16] = [
+    ("Stream", 6),
+    ("Block", 9),
+    ("Blocks", 9),
+    ("CompOffset", 15),
+    ("UncompOffset", 15),
+    ("CompSize", 15),
+    ("UncompSize", 15),
+    ("TotalSize", 15),
+    ("Ratio", 5),
+    ("Check", 10),
+    ("CheckVal", 1),
+    ("Padding", 7),
+    ("Header", 5),
+    ("Flags", 2),
+    ("MemUsage", 7 + 4),
+    ("Filters", 1),
+];
+
+/// list.c: check_names[], by check ID.
+pub(super) const CHECK_NAMES: [&str; 16] = [
+    "None",
+    "CRC32",
+    "Unknown-2",
+    "Unknown-3",
+    "CRC64",
+    "Unknown-5",
+    "Unknown-6",
+    "Unknown-7",
+    "Unknown-8",
+    "Unknown-9",
+    "SHA-256",
+    "Unknown-11",
+    "Unknown-12",
+    "Unknown-13",
+    "Unknown-14",
+    "Unknown-15",
+];
+
+/// list.c: get_check_names, the separator in tables and under `--robot`.
+pub(super) const CHECK_SEP: &str = ",";
+
+/// list.c: get_check_names, the separator in the `-v` summaries.
+pub(super) const CHECK_SEP_SPACE: &str = ", ";
+
+/// list.c: get_ratio, and parse_check_value with no check.
+pub(super) const NO_VALUE: &str = "---";
+
+/// list.c: print_info_basic, the headings (`puts`).
+pub(super) const BASIC_HEADINGS: &str =
+    "Strms  Blocks   Compressed Uncompressed  Ratio  Check   Filename\n";
+
+/// list.c: print_info_basic, one file (`"%*s %*s  %*s  %*s  %*s  %-*s %s\n"`).
+pub(super) const BASIC_ROW: &str = "%s %s  %s  %s  %s  %s %s\n";
+
+/// list.c: print_totals_basic, the separator (79 dashes, `puts`).
+pub(super) const BASIC_TOTALS_LINE: &str =
+    "-------------------------------------------------------------------------------\n";
+
+/// list.c: print_totals_basic (`"%5s %7s  %11s  %11s  %5s  %-7s "`, then
+/// ngettext's plural, the count always above one).
+pub(super) const BASIC_TOTALS: &str = "%s %s  %s  %s  %s  %s %s files\n";
+
+/// list.c: print_adv_helper and friends (`"  %-*s %s\n"`).
+pub(super) const ADV_ROW: &str = "  %s %s\n";
+
+/// list.c: print_info_adv and print_totals_adv (`"  %-*s %s MiB\n"`).
+pub(super) const ADV_ROW_MIB: &str = "  %s %s MiB\n";
+
+/// list.c: print_info_adv and print_totals_adv.
+pub(super) const ADV_MIN_VERSION: &str = "  Minimum XZ Utils version: %s\n";
+
+/// list.c: print_info_adv and print_totals_adv, "Sizes in headers".
+pub(super) const YES: &str = "Yes";
+pub(super) const NO: &str = "No";
+
+/// list.c: print_info_adv, the Streams table's headings
+/// (`"  %s\n    %*s %*s %*s %*s %*s %*s  %*s  %-*s %*s\n"`).
+pub(super) const ADV_STREAMS_HEADINGS: &str = "  %s\n    %s %s %s %s %s %s  %s  %s %s\n";
+
+/// list.c: print_info_adv, one Stream (`"    %*s %*s %*s %*s "` then
+/// `"%*s %*s  %*s  %-*s %*s\n"`).
+pub(super) const ADV_STREAM_ROW: &str = "    %s %s %s %s %s %s  %s  %s %s\n";
+
+/// list.c: print_info_adv, the Blocks table's headings
+/// (`"  %s\n    %*s %*s %*s %*s %*s %*s  %*s  %-*s"`).
+pub(super) const ADV_BLOCKS_HEADINGS: &str = "  %s\n    %s %s %s %s %s %s  %s  %s";
+
+/// list.c: print_info_adv, the `-vv` headings after them
+/// (`" %-*s  %*s  %-*s %*s %*s  %s"`).
+pub(super) const ADV_BLOCKS_HEADINGS_DEBUG: &str = " %s  %s  %s %s %s  %s";
+
+/// list.c: print_info_adv, one Block (`"    %*s %*s %*s %*s "` then
+/// `"%*s %*s  %*s  %-*s"`).
+pub(super) const ADV_BLOCK_ROW: &str = "    %s %s %s %s %s %s  %s  %s";
+
+/// list.c: print_info_adv, a Block's `-vv` fields
+/// (`" %-*s  %*s  %-*s %*s %*s MiB  %s"`).
+pub(super) const ADV_BLOCK_ROW_DEBUG: &str = " %s  %s  %s %s %s MiB  %s";
+
+/// list.c: the end of a table line (`putchar('\n')`).
+pub(super) const NEWLINE: &str = "\n";
+
+/// list.c: print_totals_adv (`putchar('\n')`, then `puts`).
+pub(super) const ADV_TOTALS: &str = "\nTotals:\n";
+
+/// list.c: xz_ver_to_str (`"%u.%u.%u%s"`), and its stability suffixes.
+pub(super) const VERSION: &str = "%s.%s.%s%s";
+pub(super) const VERSION_ALPHA: &str = "alpha";
+pub(super) const VERSION_BETA: &str = "beta";
+
+/// util.c: uint64_to_nicestr, the units.
+pub(super) const NICESTR_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+/// util.c: uint64_to_nicestr (`"%u"` or `"%.1f"`, then `" %s"`).
+pub(super) const NICESTR: &str = "%s %s";
+
+/// util.c: uint64_to_nicestr with `always_also_bytes`.
+pub(super) const NICESTR_BYTES: &str = " (%s B)";
+
+/// list.c: print_info_robot.
+pub(super) const ROBOT_NAME: &str = "name\t%s\n";
+
+/// list.c: print_info_robot.
+pub(super) const ROBOT_FILE: &str = "file\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n";
+
+/// list.c: print_info_robot, under `-v`.
+pub(super) const ROBOT_STREAM: &str = "stream\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n";
+
+/// list.c: print_info_robot, under `-v`.
+pub(super) const ROBOT_BLOCK: &str = "block\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s";
+
+/// list.c: print_info_robot, a Block's `-vv` fields.
+pub(super) const ROBOT_BLOCK_DEBUG: &str = "\t%s\t%s\t%s\t%s\t%s\t%s";
+
+/// list.c: print_info_robot, under `-vv`.
+pub(super) const ROBOT_SUMMARY: &str = "summary\t%s\t%s\t%s\n";
+
+/// list.c: print_totals_robot.
+pub(super) const ROBOT_TOTALS: &str = "totals\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s";
+
+/// list.c: print_totals_robot, under `-vv`.
+pub(super) const ROBOT_TOTALS_DEBUG: &str = "\t%s\t%s\t%s";
+
+/// list.c: print_info_robot and print_totals_robot, "sizes in headers".
+pub(super) const ROBOT_YES: &str = "yes";
+pub(super) const ROBOT_NO: &str = "no";
