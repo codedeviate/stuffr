@@ -45,11 +45,13 @@ mod unix {
     #[test]
     fn reference_is_5_8_4() {
         let Some(dir) = xz_dir() else { return };
-        let out = Command::new(format!("{dir}/xz"))
-            .args(["--robot", "--version"])
-            .env_clear()
-            .output()
-            .unwrap();
+        let out = output(
+            Command::new(format!("{dir}/xz"))
+                .args(["--robot", "--version"])
+                .env_clear()
+                .stdin(Stdio::null()),
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
             "XZ_VERSION=50080042\nLIBLZMA_VERSION=50080042\n"
@@ -70,15 +72,16 @@ mod unix {
     /// Bytes the reference makes of `data` with `args` (`-c` added).
     fn reference_output(args: &[&str], data: &[u8]) -> Vec<u8> {
         use std::io::Write;
-        let mut child = Command::new(ref_xz())
-            .arg("-c")
-            .args(args)
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn(
+            Command::new(ref_xz())
+                .arg("-c")
+                .args(args)
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let mut stdin = child.stdin.take().unwrap();
         let data = data.to_vec();
         let t = std::thread::spawn(move || stdin.write_all(&data));
@@ -1015,36 +1018,86 @@ mod unix {
     /// A FIFO `p` whose writer comes 300 ms after the setup runs, writes a
     /// line and goes. The writer gives up after 25 s if nothing ever reads:
     /// the clock starts at setup, not at the process's start, so under a
-    /// loaded gate the reference may open the FIFO late, and a writer that
+    /// loaded gate the reader may open the FIFO late, and a writer that
     /// had given up would leave it waiting until the harness's 30 s timeout
     /// (`compat_harness::TIMEOUT`, private, so the figure is repeated here).
+    ///
+    /// On macOS `poll` on a FIFO reports data but never that the last
+    /// writer has gone, and xz reads with `O_NONBLOCK`, polling with no
+    /// timeout after `EAGAIN` (file_io.c: io_read, io_wait). So the
+    /// reference waits for ever if, at its read after the line, the FIFO
+    /// still has a writer. Two things made that happen, so the writer
+    /// - stops the reader (`SIGSTOP`) for its write and close, and only
+    ///   then continues it: the reader could read the line between the
+    ///   `write` and the `close`; and
+    /// - holds the harness's spawn lock from its open to its close: a
+    ///   child another case spawned in that span got a copy of the
+    ///   descriptor (close-on-exec only closes it at the exec), so the
+    ///   writer's `close` was not the last.
+    ///
+    /// stuffr is immune (its reads block once the open's wait is over);
+    /// both runs are written to the same way.
     fn late_fifo_writer(d: &Path) {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
         let p = d.join("p");
         let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
         // SAFETY: a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let work = d.to_path_buf();
         std::thread::spawn(move || {
             use std::io::Write;
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
-            loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let deadline = Instant::now() + Duration::from_secs(25);
+            // The program reading `p`, registered just after its spawn.
+            let pid = loop {
+                if let Some(pid) = child_of(&work) {
+                    break libc::pid_t::try_from(pid).unwrap();
+                }
+                if Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let (lock, mut f) = loop {
+                let lock = spawn_lock();
                 let w = fs::OpenOptions::new()
                     .write(true)
                     .custom_flags(libc::O_NONBLOCK)
                     .open(&p);
                 match w {
-                    Ok(mut f) => {
-                        let _ = f.write_all(b"hello-data\n");
-                        return;
-                    }
-                    Err(_) if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    Ok(f) => break (lock, f),
+                    Err(_) if Instant::now() < deadline => {
+                        drop(lock);
+                        std::thread::sleep(Duration::from_millis(10));
                     }
                     Err(_) => return,
                 }
+            };
+            // SAFETY: a signal to this process's own child, which has `p`
+            // open (the open above succeeded), then a wait for it to stop.
+            // WNOWAIT leaves its state to the harness's wait, which does not
+            // report stops anyway.
+            let stopped = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                libc::kill(pid, libc::SIGSTOP) == 0
+                    && libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut info,
+                        libc::WSTOPPED | libc::WEXITED | libc::WNOWAIT,
+                    ) == 0
+                    && info.si_code == libc::CLD_STOPPED
+            };
+            if !stopped {
+                return; // it ended without the line: the comparison says so
             }
+            let _ = f.write_all(b"hello-data\n");
+            drop(f);
+            drop(lock);
+            // SAFETY: continue the child stopped above.
+            unsafe { libc::kill(pid, libc::SIGCONT) };
         });
     }
 
@@ -1424,17 +1477,18 @@ mod unix {
         let link = dir.join("bin").join(name);
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
         fs::write(dir.join(f), input).unwrap();
-        let mut child = Command::new(&link)
-            .args(args)
-            .arg(f)
-            .current_dir(&dir)
-            .env_clear()
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn(
+            Command::new(&link)
+                .args(args)
+                .arg(f)
+                .current_dir(&dir)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let mut errs = child.stderr.take().unwrap();
         let reader = std::thread::spawn(move || {
             let mut s = String::new();
@@ -1570,16 +1624,17 @@ mod unix {
 
     fn closed_pipe_status(exe: &Path, dir: &Path) -> std::process::ExitStatus {
         use std::io::Read;
-        let mut child = Command::new(exe)
-            .arg("big.xz")
-            .current_dir(dir)
-            .env_clear()
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = spawn(
+            Command::new(exe)
+                .arg("big.xz")
+                .current_dir(dir)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
         let mut out = child.stdout.take().unwrap();
         let mut buf = [0u8; 4096];
         let _ = out.read(&mut buf).unwrap();
@@ -1624,16 +1679,17 @@ mod unix {
         work: &Path,
         after: std::time::Duration,
     ) -> (std::process::ExitStatus, bool) {
-        let mut child = Command::new(exe)
-            .args(args)
-            .current_dir(work)
-            .env_clear()
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = spawn(
+            Command::new(exe)
+                .args(args)
+                .current_dir(work)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
         std::thread::sleep(after);
         let running = child.try_wait().unwrap().is_none();
         // SAFETY: kill only sends a signal to our own child.

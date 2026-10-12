@@ -41,12 +41,13 @@ pub fn gnu_gzip_dir() -> &'static str {
 /// absent or the line does not parse.
 pub fn gnu_gzip_version() -> Option<(u32, u32)> {
     let exe = Path::new(gnu_gzip_dir()).join("gzip");
-    let out = Command::new(exe)
-        .arg("--version")
-        .env_clear()
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let out = output(
+        Command::new(exe)
+            .arg("--version")
+            .env_clear()
+            .stdin(Stdio::null()),
+    )
+    .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let word = text.lines().next()?.split_whitespace().last()?.to_owned();
     let mut it = word.split('.');
@@ -60,12 +61,13 @@ const XZ_LINKS: [&str; 5] = ["unxz", "xzcat", "lzma", "unlzma", "lzcat"];
 
 /// Whether `<dir>/xz --robot --version` says it is XZ Utils 5.8.4.
 fn is_xz_5_8_4(dir: &Path) -> bool {
-    Command::new(dir.join("xz"))
-        .args(["--robot", "--version"])
-        .env_clear()
-        .stdin(Stdio::null())
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(XZ_VERSION_LINE))
+    output(
+        Command::new(dir.join("xz"))
+            .args(["--robot", "--version"])
+            .env_clear()
+            .stdin(Stdio::null()),
+    )
+    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(XZ_VERSION_LINE))
 }
 
 /// A directory holding `xz` and its five links. `xz` itself is `exe`; when
@@ -337,9 +339,58 @@ pub fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-/// Serialises pty creation through spawn so no concurrently spawned child
-/// can inherit a master between `openpty` and its close-on-exec flag.
+/// Held across every spawn in the harness and in the suites that hold a
+/// descriptor no child may have (take it with [`spawn_lock`], spawn with
+/// [`spawn`] or [`output`]). A child being spawned gets a copy of every
+/// descriptor the process has, close-on-exec ones included until its exec
+/// closes them: a pty master between `openpty` and its close-on-exec flag,
+/// or `compat_xz.rs`'s late FIFO writer, whose `close` is then not the
+/// last one, so the FIFO's reader is not at its end yet.
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// [`SPAWN_LOCK`], for a descriptor that must not reach any child: hold it
+/// from the descriptor's open to its close.
+pub fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `cmd.spawn()` under [`SPAWN_LOCK`].
+pub fn spawn(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let _guard = spawn_lock();
+    cmd.spawn()
+}
+
+/// `cmd.output()` with the spawn under [`SPAWN_LOCK`]: standard output and
+/// error captured, standard input as `cmd` sets it.
+pub fn output(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    spawn(cmd)?.wait_with_output()
+}
+
+/// The program each run in flight is running, by the run's work directory
+/// (`execute` registers it after the spawn and removes it once it ends).
+static CHILDREN: Mutex<Vec<(PathBuf, u32)>> = Mutex::new(Vec::new());
+
+/// The process id of the program a run in `work` is running, once
+/// spawned: for a case's setup thread that has to act on that program
+/// (`compat_xz.rs`'s late FIFO writer stops it while it writes).
+pub fn child_of(work: &Path) -> Option<u32> {
+    let children = CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
+    children
+        .iter()
+        .find(|(w, _)| w == work)
+        .map(|&(_, pid)| pid)
+}
+
+/// Removes a run's [`CHILDREN`] entry when the run ends, a timeout's
+/// panic included.
+struct Registered(PathBuf);
+impl Drop for Registered {
+    fn drop(&mut self) {
+        let mut children = CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
+        children.retain(|(w, _)| *w != self.0);
+    }
+}
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -416,7 +467,7 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
         setup(&work);
     }
 
-    let guard = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = spawn_lock();
     let mut cmd = Command::new(exe);
     cmd.args(&c.args)
         .current_dir(&work)
@@ -448,6 +499,11 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
     let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {exe:?}: {e}"));
     drop(cmd); // closes our copies of the pty slaves
     drop(guard);
+    CHILDREN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((work.clone(), child.id()));
+    let registered = Registered(work.clone());
 
     let writer = if let Some(m) = &stdin_master {
         // Type the input, then end-of-file. Canonical mode honours ^D only at
@@ -487,6 +543,7 @@ fn execute(exe: &Path, s: &Scratch, c: &Case) -> Run {
         }
         std::thread::sleep(Duration::from_millis(2));
     };
+    drop(registered);
     // Deliberately not joined: a child that never reads the terminal leaves
     // the writer blocked once the pty buffer is full, and joining would hang
     // the test. Dropping the handle detaches it; the thread ends when the
@@ -723,15 +780,16 @@ fn ref_decompress_args(rt: &Roundtrip, extra: &[String], data: &[u8]) -> Result<
         Roundtrip::Gzip { ref_gzip } => (PathBuf::from(ref_gzip), "gzip"),
         Roundtrip::Xz { ref_xz } => (PathBuf::from(ref_xz), "xz"),
     };
-    let mut child = Command::new(exe)
-        .arg("-dc")
-        .args(extra)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot run reference {what}: {e}"))?;
+    let mut child = spawn(
+        Command::new(exe)
+            .arg("-dc")
+            .args(extra)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|e| format!("cannot run reference {what}: {e}"))?;
     let mut si = child.stdin.take().unwrap();
     let data = data.to_vec();
     let w = std::thread::spawn(move || {
@@ -1197,16 +1255,17 @@ pub fn decoder_peak_rss(
     let link = dir.join("bin").join(name);
     std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
     fs::write(dir.join(file), input).unwrap();
-    let mut child = Command::new(&link)
-        .arg(file)
-        .current_dir(&dir)
-        .env_clear()
-        .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = spawn(
+        Command::new(&link)
+            .arg(file)
+            .current_dir(&dir)
+            .env_clear()
+            .envs(env.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .unwrap();
     let mut out = child.stdout.take().unwrap();
     let reader = std::thread::spawn(move || {
         let mut v = Vec::new();
@@ -1488,12 +1547,13 @@ pub const APPLE_GZIP_VERSION_LINE: &str = "Apple gzip 487.0.1";
 pub fn apple_gzip_version_line() -> Option<&'static str> {
     static V: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     V.get_or_init(|| {
-        let out = Command::new(Path::new(APPLE_GZIP_DIR).join("gzip"))
-            .arg("-V")
-            .env_clear()
-            .stdin(Stdio::null())
-            .output()
-            .ok()?;
+        let out = output(
+            Command::new(Path::new(APPLE_GZIP_DIR).join("gzip"))
+                .arg("-V")
+                .env_clear()
+                .stdin(Stdio::null()),
+        )
+        .ok()?;
         let text = String::from_utf8_lossy(&out.stderr).into_owned();
         text.lines().next().map(str::to_owned)
     })
@@ -1889,13 +1949,14 @@ pub fn filter_through(exe: &str, args: &[&str], data: &[u8]) -> Option<Vec<u8>> 
     if !require_reference(Path::new(exe)) {
         return None;
     }
-    let mut child = Command::new(exe)
-        .args(args)
-        .env_clear()
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = spawn(
+        Command::new(exe)
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped()),
+    )
+    .unwrap();
     let mut si = child.stdin.take().unwrap();
     let d = data.to_vec();
     let w = std::thread::spawn(move || {
