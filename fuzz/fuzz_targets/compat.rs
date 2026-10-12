@@ -60,14 +60,17 @@
 //!   `.bz2`, `.xz`, lzip, pack and `.Z`: Ruling T10-2) are allowed;
 //! - the xz family opens each input at most twice per operand that names
 //!   it (an argument in operand position, or a name `--files`/`--files0`
-//!   read from standard input), reads at most `2 × len` of it per operand
+//!   read from standard input or from the file `--files=FILE`/
+//!   `--files0=FILE` names; one more open and read per such token for the
+//!   list itself), reads at most `2 × len` of it per operand
 //!   when compressing, decompressing or testing, and within
 //!   `xz_list_bound` under `--list` (`check_xz_reads` says why `--list` is
 //!   not linear); it leaves no `.stuffr-xz-*` temporary and no name
 //!   `could_be_written` does not allow; and standard output plus every new
 //!   or changed file stays within the 8 MiB output budget
-//!   (`check_xz_budget`). A `--files` case whose names hold a `/` is not
-//!   run: such a name could leave the run's directory.
+//!   (`check_xz_budget`). A `--files`/`--files0` case whose names (standard
+//!   input, or the list file when it exists) hold a `/` is not run: such a
+//!   name could leave the run's directory.
 //!
 //! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit
 //! (2 GiB by default) is the bound, and each verb stays inside it by a
@@ -614,22 +617,46 @@ fn xz_parse<'a>(name: &str, args: &[&'a str]) -> (Vec<&'a str>, XzMode) {
 }
 
 /// Whether the run reads file names from standard input (`--files`,
-/// `--files0`: the table holds no `--files=FILE` form).
+/// `--files0` with no `=FILE`).
 fn xz_names_from_stdin(args: &[&str]) -> bool {
     args.iter().any(|a| *a == "--files" || *a == "--files0")
 }
 
+/// The list file a `--files=FILE`/`--files0=FILE` token names (the table's
+/// only such tokens name `a`).
+fn xz_names_file<'a>(args: &[&'a str]) -> Option<&'a str> {
+    args.iter().find_map(|a| {
+        a.strip_prefix("--files=")
+            .or_else(|| a.strip_prefix("--files0="))
+    })
+}
+
+/// A superset of the names `read_name` splits out of a list: both
+/// terminators.
+fn xz_list_names(bytes: &[u8]) -> impl Iterator<Item = &str> {
+    bytes
+        .split(|b| *b == b'\n' || *b == 0)
+        .filter_map(|n| std::str::from_utf8(n).ok())
+}
+
 /// The xz family through `run_in_counted`.
 fn run_xz(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
-    // `--files`/`--files0` take operands from standard input, which the
-    // payload is: a name holding a `/` could leave the run's directory
-    // (`/…`, `../…`), and xz would compress it and remove it. No token
-    // holds a `/` (`COMPAT_TOKENS`), so without one every name stays
-    // inside. Such a case is not run.
-    if xz_names_from_stdin(args) && stdin.contains(&b'/') {
+    // `--files`/`--files0` take operands from standard input, or from the
+    // file `--files=FILE`/`--files0=FILE` names, which holds the payload:
+    // a name holding a `/` could leave the run's directory (`/…`, `../…`),
+    // and xz would compress it and remove it. No token holds a `/`
+    // (`COMPAT_TOKENS`), so without one every name stays inside. Such a
+    // case is not run. A list file that was not created (xz cannot open
+    // it) contributes no names and no rule.
+    let before = contents(dir);
+    let list_file = xz_names_file(args).filter(|f| dir.join(f).is_file());
+    // Read before the run: it may compress and remove the list.
+    let list_bytes: &[u8] = list_file
+        .and_then(|f| before.get(std::ffi::OsStr::new(f)))
+        .map_or(&[], |v| v.as_slice());
+    if (xz_names_from_stdin(args) && stdin.contains(&b'/')) || list_bytes.contains(&b'/') {
         return;
     }
-    let before = contents(dir);
     let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
     let (code, out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
         .expect("a COMPAT_NAMES entry is a compat name");
@@ -649,14 +676,12 @@ fn run_xz(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     );
     let (mut operands, mode) = xz_parse(name, args);
     if xz_names_from_stdin(args) {
-        // A superset of what `read_name` splits: both terminators.
-        operands.extend(
-            stdin
-                .split(|b| *b == b'\n' || *b == 0)
-                .filter_map(|n| std::str::from_utf8(n).ok()),
-        );
+        operands.extend(xz_list_names(stdin));
     }
-    check_xz_reads(dir, name, args, mode, &operands, &reads);
+    if list_file.is_some() {
+        operands.extend(xz_list_names(list_bytes));
+    }
+    check_xz_reads(dir, name, args, mode, &operands, list_file, &reads);
     check_xz_leftovers(dir, name, args);
     check_xz_budget(dir, name, args, &out, &before);
 }
@@ -710,6 +735,7 @@ fn check_xz_reads(
     args: &[&str],
     mode: XzMode,
     operands: &[&str],
+    list_file: Option<&str>,
     reads: &BTreeMap<PathBuf, compat::InputReads>,
 ) {
     for (path, r) in reads {
@@ -723,15 +749,22 @@ fn check_xz_reads(
             XzMode::List => xz_list_bound(r.len),
             _ => 2 * r.len,
         };
+        // Each `=` token naming this file as the list is one more open, and
+        // one more read of the whole file.
+        let lists = args
+            .iter()
+            .filter(|a| xz_names_file(&[**a]) == Some(file) && list_file == Some(file))
+            .count() as u64;
         assert!(
-            r.opens <= 2 * m,
-            "{name} {args:?}: {} opens of {file:?}, which {m} operand(s) name",
+            r.opens <= 2 * m + lists,
+            "{name} {args:?}: {} opens of {file:?}, which {m} operand(s) name \
+             and {lists} list token(s) read",
             r.opens
         );
         assert!(
-            r.bytes <= per_operand * m,
+            r.bytes <= per_operand * m + r.len * lists,
             "{name} {args:?} ({mode:?}): read {} bytes of the {}-byte {file:?}, \
-             which {m} operand(s) name",
+             which {m} operand(s) name and {lists} list token(s) read",
             r.bytes,
             r.len
         );

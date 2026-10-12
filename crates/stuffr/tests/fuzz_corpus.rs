@@ -759,6 +759,8 @@ const COMPAT_SHAPES: &[&str] = &[
     "xz-already-suffixed",
     "xz-files-stdin",
     "xz-files0-stdin",
+    "xz-files-from-file",
+    "xz-files0-from-file",
     "lzma-stdin-to-stdout",
     "xz-args-mix",
     "xz-help",
@@ -1305,6 +1307,10 @@ fn xz_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         // The names on standard input; the files hold them too.
         "files-stdin" => x(&["--files", "-k"], &["a", "a.lz"], true, b"a\na.lz\n"),
         "files0-stdin" => x(&["--files0", "-c", "-9"], &["a"], true, b"a\0a\0"),
+        // The names in a file (`--files=FILE`): every created file holds the
+        // payload, so the payload is the list.
+        "files-from-file" => x(&["--files=a", "-k"], &["a"], false, b"a\n"),
+        "files0-from-file" => x(&["--files0=a", "-t"], &["a"], false, b"a\0"),
         "args-mix" => x(
             &["-vvv", "-qt", "--no-sparse", "--", "a.xz", "-", "-T1", "a"],
             &["a.xz", "a"],

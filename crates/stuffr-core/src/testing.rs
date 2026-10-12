@@ -194,7 +194,8 @@ pub const COMPAT_FILES: &[&str] = &[
 /// flag, an unknown one, `--`, `-`, and the [`COMPAT_FILES`] names; then
 /// (0.12.0) gzip's flags that bzip2 lacks, `.x` for `-S` to take, and the
 /// gzip family's files; then (0.13.0) xz's flags, `-F`'s and `--check`'s
-/// values, and the xz family's files. Drawing
+/// values, and the xz family's files; then (0.13.1) `--files=a` and
+/// `--files0=a`, the list-file forms. Drawing
 /// arguments from a fixed set, rather than from raw bytes, is what keeps
 /// every operand inside the case's directory: no token is absolute, holds a
 /// `/` or names `..`. Append-only.
@@ -307,6 +308,11 @@ pub const COMPAT_TOKENS: &[&str] = &[
     "a.lzma",
     "a.tlz",
     "a.lz",
+    // 0.13.1: `--files`/`--files0` reading their names from a file. getopt
+    // takes an optional argument only in the `=` spelling, so the reader
+    // was unreachable before. `a` is `COMPAT_FILES[0]`.
+    "--files=a",
+    "--files0=a",
 ];
 
 /// The largest input the `compat` target runs. Here, not in the target, so
