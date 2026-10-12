@@ -71,17 +71,12 @@ pub(crate) const XZ_SIGNALS: Signals = &[];
 /// GNU gzip 1.15 (measured 2026-10-12): INT, TERM, HUP, PIPE, XCPU and XFSZ
 /// remove the partial output and kill the process; QUIT and USR1 are not
 /// handled; an inherited ignore is kept. The same six as xz.
-// Used by the gzip family from 0.13.1 Task 3.
-#[allow(dead_code)]
 pub(crate) const GNU_GZIP_SIGNALS: Signals = XZ_SIGNALS;
 
 /// Apple's `/usr/bin/gzip` (measured 2026-10-12): SIGINT only.
-// Used by the gzip family from 0.13.1 Task 3.
-#[allow(dead_code)]
 #[cfg(unix)]
 pub(crate) const APPLE_GZIP_SIGNALS: Signals = &[libc::SIGINT];
 #[cfg(not(unix))]
-#[allow(dead_code)]
 pub(crate) const APPLE_GZIP_SIGNALS: Signals = &[];
 
 /// bzip2 1.0.8 (measured 2026-10-12): INT, TERM and HUP, installed with

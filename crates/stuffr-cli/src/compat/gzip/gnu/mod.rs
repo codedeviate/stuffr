@@ -15,6 +15,11 @@
 //! Behaviours reproduced because the binary shows them (each pinned by the
 //! differential suite `tests/compat_gzip_gnu.rs`):
 //!
+//! - output is written under a temporary name (`.stuffr-gzip-*.tmp`) and
+//!   put in place when complete; on SIGINT, SIGTERM, SIGHUP, SIGPIPE,
+//!   SIGXCPU or SIGXFSZ the temporary is removed and the process dies of
+//!   the signal, as GNU's partial output is (SIGQUIT and SIGUSR1 leave it);
+//!   a SIGINT ignored at start stays ignored;
 //! - a set-user-ID input is refused even under `-f`, a sticky one unless
 //!   `-f` (whose output then drops the sticky bit); `-c` takes both;
 //! - an input that already has a gzip suffix is skipped with a note (under
@@ -74,8 +79,6 @@
 //!   stuffr prints the `argv[0]` it was given, which for a command found on
 //!   `PATH` is the bare name, where the shell gives the script its full
 //!   path.
-//! - Output is written under a temporary name and renamed into place, so an
-//!   interrupted run leaves a `.stuffr-gzip-*.tmp` file.
 //! - LZH (`1f a0`, `compress -H`) is not decoded: a first member is "not in
 //!   gzip format", a later one trailing garbage (Ruling T5).
 //! - An output name past the file system's `NAME_MAX` is not shortened:

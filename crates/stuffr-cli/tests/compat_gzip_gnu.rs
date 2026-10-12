@@ -2555,3 +2555,248 @@ mod differential {
         check_exact("odd_members", &cases, skipped);
     }
 }
+
+/// 0.13.1 Task 3: an interrupted run removes its partial output, as GNU
+/// gzip does on INT, TERM, HUP, PIPE, XCPU and XFSZ, and dies of the signal.
+#[cfg(unix)]
+mod interrupts {
+    use super::compat_harness::interrupt::*;
+    use super::compat_harness::{gnu_gzip_dir, require_reference};
+    use std::path::{Path, PathBuf};
+
+    const ENV: &[(&str, &str)] = &[("STUFFR_GZIP_FLAVOR", "gnu")];
+
+    fn ours() -> &'static Path {
+        Path::new(env!("CARGO_BIN_EXE_stuffr"))
+    }
+
+    fn reference() -> Option<PathBuf> {
+        let exe = Path::new(gnu_gzip_dir()).join("gzip");
+        require_reference(&exe).then_some(exe)
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("stuffr-gnu-intr-{}-{tag}", std::process::id()))
+    }
+
+    fn is_tmp(n: &str) -> bool {
+        n.starts_with(".stuffr-gzip-")
+    }
+
+    /// One run of `args` over `file`, ours (`mine`) or the reference's.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        mine: bool,
+        tag: &str,
+        args: &[&str],
+        file: &str,
+        make: &dyn Fn(usize) -> Vec<u8>,
+        inherit: Inherit,
+        sig: i32,
+        partial: &str,
+    ) -> Option<Interrupted> {
+        let dir = scratch(&format!("{tag}-{}", if mine { "ours" } else { "ref" }));
+        let (exe, env) = if mine {
+            (ours().to_path_buf(), ENV)
+        } else {
+            (reference()?, &[][..])
+        };
+        let named = |n: &str| if mine { is_tmp(n) } else { n == partial };
+        let ready = has_data(&dir, &named);
+        let r = interrupt_with_input_env(
+            &exe, "gzip", args, &dir, env, file, make, inherit, sig, &ready,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(r)
+    }
+
+    fn plain(m: usize) -> Vec<u8> {
+        big_input(m).to_vec()
+    }
+
+    #[test]
+    fn gnu_gzip_removes_its_partial_output_on_its_signals() {
+        for sig in [
+            libc::SIGINT,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGXCPU,
+            libc::SIGXFSZ,
+        ] {
+            for mine in [true, false] {
+                let Some(r) = run(
+                    mine,
+                    &format!("c{sig}"),
+                    &["-9", "a"],
+                    "a",
+                    &plain,
+                    Inherit::Default,
+                    sig,
+                    "a.gz",
+                ) else {
+                    continue;
+                };
+                assert!(killed_by(&r, sig), "mine={mine} {sig}: {:?}", r.status);
+                assert_eq!(r.left, ["a"], "mine={mine} {sig}");
+            }
+        }
+    }
+
+    #[test]
+    fn gnu_gzip_leaves_its_partial_output_on_quit() {
+        for mine in [true, false] {
+            let Some(r) = run(
+                mine,
+                "quit",
+                &["-9", "a"],
+                "a",
+                &plain,
+                Inherit::Default,
+                libc::SIGQUIT,
+                "a.gz",
+            ) else {
+                continue;
+            };
+            assert!(killed_by(&r, libc::SIGQUIT), "mine={mine}: {:?}", r.status);
+            // The input and one partial output, whatever its name.
+            assert_eq!(r.left.len(), 2, "mine={mine}: {:?}", r.left);
+            assert!(r.left.contains(&"a".to_string()), "{:?}", r.left);
+        }
+    }
+
+    #[test]
+    fn gnu_gunzip_removes_its_partial_output_on_int() {
+        let gz = |m: usize| stored_gzip(big_input(m));
+        for mine in [true, false] {
+            let Some(r) = run(
+                mine,
+                "d",
+                &["-d", "a.gz"],
+                "a.gz",
+                &gz,
+                Inherit::Default,
+                libc::SIGINT,
+                "a",
+            ) else {
+                continue;
+            };
+            assert!(killed_by(&r, libc::SIGINT), "mine={mine}: {:?}", r.status);
+            assert_eq!(r.left, ["a.gz"], "mine={mine}");
+        }
+    }
+
+    #[test]
+    fn gnu_gzip_keeps_an_inherited_ignored_int() {
+        for mine in [true, false] {
+            let tag = format!("ign-{}", if mine { "ours" } else { "ref" });
+            let dir = scratch(&tag);
+            let (exe, env) = if mine {
+                (ours().to_path_buf(), ENV)
+            } else {
+                let Some(e) = reference() else { continue };
+                (e, &[][..])
+            };
+            let mut finished = false;
+            for mib in [64, 256] {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("a"), big_input(mib)).unwrap();
+                let named = |n: &str| if mine { is_tmp(n) } else { n == "a.gz" };
+                let ready = has_data(&dir, &named);
+                if let Some(r) = interrupt_env(
+                    &exe,
+                    "gzip",
+                    &["-9", "a"],
+                    &dir,
+                    env,
+                    Inherit::IgnoreInt,
+                    libc::SIGINT,
+                    &ready,
+                ) {
+                    assert!(r.status.success(), "mine={mine}: {:?}", r.status);
+                    finished = true;
+                    break;
+                }
+                // Done before the signal: its work must still be whole.
+            }
+            assert_eq!(listing(&dir), ["a.gz"], "mine={mine} finished={finished}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// No temporary ever appears on standard output, so the signal is sent
+    /// at once: the run dies of it and the input stays.
+    #[test]
+    fn gnu_gzip_to_stdout_dies_of_int() {
+        for mine in [true, false] {
+            let dir = scratch(&format!("stdout-{}", if mine { "ours" } else { "ref" }));
+            let (exe, env) = if mine {
+                (ours().to_path_buf(), ENV)
+            } else {
+                let Some(e) = reference() else { continue };
+                (e, &[][..])
+            };
+            let r = interrupt_with_input_env(
+                &exe,
+                "gzip",
+                &["-9", "-c", "a"],
+                &dir,
+                env,
+                "a",
+                &plain,
+                Inherit::Default,
+                libc::SIGINT,
+                &|_| true,
+            );
+            assert!(killed_by(&r, libc::SIGINT), "mine={mine}: {:?}", r.status);
+            assert_eq!(r.left, ["a"], "mine={mine}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// Review focus 2: the first file's output is kept when the second is
+    /// interrupted.
+    #[test]
+    fn gnu_gzip_second_file_interrupted_keeps_the_first() {
+        for mine in [true, false] {
+            let dir = scratch(&format!("second-{}", if mine { "ours" } else { "ref" }));
+            let (exe, env) = if mine {
+                (ours().to_path_buf(), ENV)
+            } else {
+                let Some(e) = reference() else { continue };
+                (e, &[][..])
+            };
+            let mut got = None;
+            for mib in [64, 256] {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("s"), "text ".repeat(800)).unwrap();
+                std::fs::write(dir.join("a"), big_input(mib)).unwrap();
+                let d = dir.clone();
+                let ready = move |n: &str| {
+                    let second = if mine { is_tmp(n) } else { n == "a.gz" };
+                    second
+                        && d.join("s.gz").exists()
+                        && std::fs::metadata(d.join(n)).is_ok_and(|m| m.len() > 0)
+                };
+                got = interrupt_env(
+                    &exe,
+                    "gzip",
+                    &["-1", "s", "a"],
+                    &dir,
+                    env,
+                    Inherit::Default,
+                    libc::SIGINT,
+                    &ready,
+                );
+                if got.is_some() {
+                    break;
+                }
+            }
+            let r = got.expect("finished before the signal even at 256 MiB");
+            assert!(killed_by(&r, libc::SIGINT), "mine={mine}: {:?}", r.status);
+            assert_eq!(r.left, ["a", "s.gz"], "mine={mine}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}

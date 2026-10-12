@@ -24,7 +24,7 @@ use super::list::Lister;
 use super::messages::{self as m, PROGRAM, printf, quote, ratio};
 use crate::compat::gzip::member::{Engine, Header, compress_member};
 use crate::compat::host::{
-    Host, InFile, Published, create_temp, publish, same_file, stdin_file, strerror,
+    self, Host, InFile, Published, create_temp, publish, same_file, stdin_file, strerror,
 };
 
 mod decompress;
@@ -371,6 +371,8 @@ impl Gz<'_> {
                 return;
             }
         };
+        // Held until this file is done: an interrupt removes the temporary.
+        let _guard = host::arm_cleanup(self.host, &tmp, host::GNU_GZIP_SIGNALS);
         self.stdin_named = true;
         self.verbose_name(&qname);
         let header = self.file_header(name, meta);

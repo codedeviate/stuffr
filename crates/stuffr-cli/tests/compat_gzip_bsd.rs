@@ -2217,3 +2217,164 @@ mod differential {
         check_exact("long_header_fields", &cases, Skipped::none());
     }
 }
+
+/// 0.13.1 Task 3: an interrupted run removes its partial output on SIGINT,
+/// the one signal Apple's gzip handles, and dies of it; on any other signal
+/// it dies and leaves the partial output.
+#[cfg(target_os = "macos")]
+mod interrupts {
+    use super::compat_harness::interrupt::*;
+    use super::compat_harness::{APPLE_GZIP_DIR, require_reference};
+    use std::path::{Path, PathBuf};
+
+    const ENV: &[(&str, &str)] = &[("STUFFR_GZIP_FLAVOR", "bsd")];
+
+    fn ours() -> &'static Path {
+        Path::new(env!("CARGO_BIN_EXE_stuffr"))
+    }
+
+    fn scratch(tag: &str, mine: bool) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "stuffr-bsd-intr-{}-{tag}-{}",
+            std::process::id(),
+            if mine { "ours" } else { "ref" }
+        ))
+    }
+
+    /// `args` over `file` (made by `make`), interrupted with `sig`; ours
+    /// (`mine`) or Apple's. `partial` is the reference's partial output.
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        mine: bool,
+        tag: &str,
+        args: &[&str],
+        file: &str,
+        make: &dyn Fn(usize) -> Vec<u8>,
+        inherit: Inherit,
+        sig: i32,
+        partial: &str,
+    ) -> Option<Interrupted> {
+        let (exe, env) = if mine {
+            (ours().to_path_buf(), ENV)
+        } else {
+            let exe = Path::new(APPLE_GZIP_DIR).join("gzip");
+            if !require_reference(&exe) {
+                return None;
+            }
+            (exe, &[][..])
+        };
+        let dir = scratch(tag, mine);
+        let named = |n: &str| {
+            if mine {
+                n.starts_with(".stuffr-gzip-")
+            } else {
+                n == partial
+            }
+        };
+        let ready = has_data(&dir, &named);
+        let r = interrupt_with_input_env(
+            &exe, "gzip", args, &dir, env, file, make, inherit, sig, &ready,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Some(r)
+    }
+
+    #[test]
+    fn apple_gzip_removes_its_partial_output_on_int() {
+        let plain = |m: usize| big_input(m).to_vec();
+        let gz = |m: usize| stored_gzip(big_input(m));
+        for mine in [true, false] {
+            type Make<'a> = &'a dyn Fn(usize) -> Vec<u8>;
+            let cases: [(&[&str], &str, Make, &str); 2] = [
+                (&["-9", "a"], "a", &plain, "a.gz"),
+                (&["-d", "a.gz"], "a.gz", &gz, "a"),
+            ];
+            for (args, file, make, partial) in cases {
+                let Some(r) = run(
+                    mine,
+                    "int",
+                    args,
+                    file,
+                    make,
+                    Inherit::Default,
+                    libc::SIGINT,
+                    partial,
+                ) else {
+                    continue;
+                };
+                assert!(
+                    killed_by(&r, libc::SIGINT),
+                    "mine={mine} {args:?}: {:?}",
+                    r.status
+                );
+                assert_eq!(r.left, [file], "mine={mine} {args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn apple_gzip_leaves_its_partial_output_on_term() {
+        let plain = |m: usize| big_input(m).to_vec();
+        for mine in [true, false] {
+            let Some(r) = run(
+                mine,
+                "term",
+                &["-9", "a"],
+                "a",
+                &plain,
+                Inherit::Default,
+                libc::SIGTERM,
+                "a.gz",
+            ) else {
+                continue;
+            };
+            assert!(killed_by(&r, libc::SIGTERM), "mine={mine}: {:?}", r.status);
+            assert_eq!(r.left.len(), 2, "mine={mine}: {:?}", r.left);
+            assert!(r.left.contains(&"a".to_string()), "{:?}", r.left);
+        }
+    }
+
+    #[test]
+    fn apple_gzip_keeps_an_inherited_ignored_int() {
+        for mine in [true, false] {
+            let (exe, env) = if mine {
+                (ours().to_path_buf(), ENV)
+            } else {
+                let exe = Path::new(APPLE_GZIP_DIR).join("gzip");
+                if !require_reference(&exe) {
+                    continue;
+                }
+                (exe, &[][..])
+            };
+            let dir = scratch("ign", mine);
+            for mib in [64, 256] {
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("a"), big_input(mib)).unwrap();
+                let named = |n: &str| {
+                    if mine {
+                        n.starts_with(".stuffr-gzip-")
+                    } else {
+                        n == "a.gz"
+                    }
+                };
+                let ready = has_data(&dir, &named);
+                if let Some(r) = interrupt_env(
+                    &exe,
+                    "gzip",
+                    &["-9", "a"],
+                    &dir,
+                    env,
+                    Inherit::IgnoreInt,
+                    libc::SIGINT,
+                    &ready,
+                ) {
+                    assert!(r.status.success(), "mine={mine}: {:?}", r.status);
+                    break;
+                }
+            }
+            assert_eq!(listing(&dir), ["a.gz"], "mine={mine}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}

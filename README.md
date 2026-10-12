@@ -1044,10 +1044,10 @@ carries both and picks one:
   with its data-descriptor flag set no longer makes the next input's gzip
   trailer fail its check, and undefined behaviour in either tool is never
   copied.
-- **An interrupted run leaves a hidden `.stuffr-gzip-*.tmp` file,** as with
-  bzip2: output is written under a temporary name and put in place at the
-  end, and stuffr has no signal handler. (Apple's `SIGINFO` progress is not
-  printed either.)
+- **Apple's `SIGINFO` (^T) progress is not printed.** (An interrupted run
+  removes its hidden `.stuffr-gzip-*.tmp` output as the references do: GNU's
+  on INT, TERM, HUP, PIPE, XCPU and XFSZ, Apple's on INT only; a `SIGINT`
+  ignored at start stays ignored.)
 - **When the parent ignores `SIGPIPE`,** the references report a broken pipe
   (GNU 1.13 and later exit 2 with a warning); stuffr dies of `SIGPIPE`, for
   the same reason as the bzip2 family. Under the default setting both die of

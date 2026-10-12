@@ -499,6 +499,8 @@ impl Gz<'_> {
                 return None;
             }
         };
+        // Held until this file is done: an interrupt removes the temporary.
+        let _guard = host::arm_cleanup(self.host, &tmp, host::APPLE_GZIP_SIGNALS);
         let fd_copy = tmp_file.try_clone();
         let sizes = {
             let mut w = self.host.out_writer(Some(tmp_file));

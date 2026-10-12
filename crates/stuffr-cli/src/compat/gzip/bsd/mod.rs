@@ -22,6 +22,11 @@
 //!
 //! Behaviours reproduced (each pinned by `tests/compat_gzip_bsd.rs`):
 //!
+//! - output is written under a temporary name (`.stuffr-gzip-*.tmp`) and
+//!   linked into place when complete; on SIGINT, and only SIGINT, the
+//!   temporary is removed and the process dies of the signal, as gzip's
+//!   handler does for its partial output (any other signal leaves it); a
+//!   SIGINT ignored at start stays ignored;
 //! - an unknown or malformed option prints the usage text and exits **0**;
 //!   so does `-h`; `-V`, `-L` and usage go to standard error;
 //! - every warning is exit 1 (never 2), `-q` silences it but not the code;
@@ -91,10 +96,7 @@
 //! Known deviations:
 //!
 //! - `-V` and `-L` name stuffr on their first line (Ruling T9-1).
-//! - Output is written under a temporary name and linked into place, so an
-//!   interrupted run leaves a `.stuffr-gzip-*.tmp` file where gzip's
-//!   `SIGINT` handler removes its partial output. `SIGINFO` (^T) prints no
-//!   progress.
+//! - `SIGINFO` (^T) prints no progress.
 //! - Implementer ruling: after a read error part-way through an input (or
 //!   a failed trailer write) gzip keeps the cut-short output and removes
 //!   the input; stuffr prints the same and exits the same but keeps the

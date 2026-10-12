@@ -5,6 +5,8 @@
 //! Unix only. The caller declares it as `#[cfg(unix)] mod compat_harness;`.
 #![allow(dead_code)] // each test crate uses a different subset
 
+pub mod interrupt;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};

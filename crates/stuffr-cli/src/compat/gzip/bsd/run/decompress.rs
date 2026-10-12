@@ -36,7 +36,7 @@ use super::super::{unlz, zread::ZRead};
 use super::{BUFLEN, Gz, PATH_MAX, create_exclusive, eexist, print_ratio};
 use crate::compat::gzip::member::Lookahead;
 use crate::compat::gzip::sniff::{self, Detected, Flavour};
-use crate::compat::host::{Host, InFile, Published, SANDBOX_OUTPUT_CAP, publish, stdin_file};
+use crate::compat::host::{self, Host, InFile, Published, SANDBOX_OUTPUT_CAP, publish, stdin_file};
 
 /// `exit(2)` from `maybe_err`/`maybe_errx`: the message is printed (unless
 /// `-q`), the run stops.
@@ -440,6 +440,10 @@ impl Gz<'_> {
                 }
             }
         }
+        // Held until this file is done: an interrupt removes the temporary.
+        let _guard = tmp
+            .as_ref()
+            .map(|(t, _)| host::arm_cleanup(self.host, t, host::APPLE_GZIP_SIGNALS));
         let mut out: io::BufWriter<Box<dyn Write + Send>> = match &tmp {
             Some((_, f)) => match f.try_clone() {
                 Ok(f) => self.host.out_writer(Some(f)),
