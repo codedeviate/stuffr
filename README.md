@@ -290,6 +290,18 @@ read list.
 > **2373** tests under `--all-features`, **2278** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.13.1` is a PATCH: three compatibility-link follow-ups. On the C tier
+> (`xz-c`) the xz family's header probe is now xz's own call, so corrupt
+> input is reported exactly where xz reports it (the difference stays on the
+> pure tier only). The bzip2 and gzip families remove their partial output
+> on interrupt, as their references do: GNU gzip on the six signals it
+> handles, Apple gzip on SIGINT, bzip2 with its own "Control-C or similar
+> caught" message and exit 1. The `compat` fuzz target now reaches xz's
+> `--files=FILE` and `--files0=FILE`. Additive library API, `#[doc(hidden)]`:
+> `xz_opts::Decoder::probe` (C tier).
+> **2398** tests under `--all-features`, **2297** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
