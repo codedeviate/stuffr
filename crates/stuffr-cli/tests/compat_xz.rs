@@ -2,6 +2,14 @@
 //! `xz`, `unxz`, `xzcat`, `lzma`, `unlzma` and `lzcat`, compared with the
 //! reference through `compat_harness`, every case under `LC_ALL=C`.
 //!
+//! Part 4 (Task 8): `-v`/`-vv` with standard error not a terminal
+//! (`flags_accepted_verbose`, and `-vv` in `memlimit_reduces_threads_like_xz`):
+//! the line xz prints as each file ends, and before an error. The speed
+//! and elapsed time are left out of the comparison (`progress_line`); the
+//! terminal forms and the signals' lines are message.rs's unit tests
+//! (Ruling R4, `tests/fixtures/xz_progress/`). `--info-memory` and its
+//! robot form are `info_memory`, here since Task 5.
+//!
 //! Part 3 (Task 7): `--list` at every verbosity and under `--robot`, over
 //! the reference's own streams and over hand-made ones (`made_xz`) whose
 //! Block Headers and Indexes no encoder writes: every filter, every check
@@ -12,11 +20,9 @@
 //!
 //! Part 1 (0.13.0 Task 5): the argument surface. Options refused and their
 //! messages, the help texts, `--version`, `XZ_DEFAULTS`/`XZ_OPT`, the six
-//! names, and the parse-time half of the suffix rules. The cases that run
-//! the coder (every option accepted, each name over standard input, the
-//! suffix rules met while processing a file) are written here too and
-//! ignored until the coder arrives (Task 6); `--info-memory` was planned
-//! for Task 8 but runs now.
+//! names, and the parse-time half of the suffix rules, with the cases that
+//! run the coder (every option accepted, each name over standard input,
+//! the suffix rules met while processing a file).
 //!
 //! The only normalisations: the program path in the help texts' `Usage:`
 //! line (each side prints its own `argv[0]`; the harness already does this
@@ -179,13 +185,69 @@ mod unix {
 
     /// Whether stuffr's run `s` differs from the reference's `r` only by
     /// that shorter partial output: both failed alike, and stuffr's
-    /// standard output is a strict prefix of the reference's.
+    /// standard output is a strict prefix of the reference's. Under `-v`
+    /// the progress line's figures then differ too (the decoder stopped
+    /// elsewhere), so they are masked for this comparison.
     fn short_partial_output(r: &Run, s: &Run) -> bool {
         PURE && r.code != 0
             && r.code == s.code
-            && r.stderr == s.stderr
+            && progress_figures(&r.stderr, true) == progress_figures(&s.stderr, true)
             && s.stdout.len() < r.stdout.len()
             && r.stdout.starts_with(&s.stdout)
+    }
+
+    /// The `-v` line as compared: the speed and elapsed time are not
+    /// promised (`normalise_xz_progress`), and whether they appear at all
+    /// depends on how long each program took (1 s and 3 s), so they are
+    /// left out; how they are written is pinned by message.rs's unit tests
+    /// against message.c's own output. On the pure tier the compressed
+    /// size and ratio are masked too ([`progress_figures`]).
+    fn progress_line(stderr: &str) -> String {
+        let s = normalise_xz_progress(stderr)
+            .replace(", <speed>", "")
+            .replace(", <elapsed>", "");
+        if PURE { progress_figures(&s, false) } else { s }
+    }
+
+    /// The `-v` line's figures masked (`NAME: [P %, ]C / U = R...`): the
+    /// compressed size and the ratio, and with `all` the percentage and
+    /// the uncompressed size too. The pure tier's compressed bytes are
+    /// compatible, not identical, so their count and ratio differ there.
+    fn progress_figures(stderr: &str, all: bool) -> String {
+        let mask = |line: &str| -> Option<String> {
+            let slash = line.find(" / ")?;
+            let colon = line[..slash].rfind(": ")? + 2;
+            let (head, rest) = line.split_at(colon);
+            let (pct, sizes) = match rest.find(" %, ") {
+                Some(i) if i < slash - colon => (Some(&rest[..i]), &rest[i + 4..]),
+                _ => (None, rest),
+            };
+            let (_, after) = sizes.split_once(" / ")?;
+            let (u, op, after) = match (after.split_once(" = "), after.split_once(" > ")) {
+                (Some((u, a)), _) => (u, " = ", a),
+                (None, Some((u, a))) => (u, " > ", a),
+                _ => return None,
+            };
+            let end = after.find(',').unwrap_or(after.len());
+            let mut out = head.to_string();
+            if let Some(p) = pct {
+                out += if all { "<pct>" } else { p };
+                out += " %, ";
+            }
+            out += "<compressed> / ";
+            out += if all { "<uncompressed>" } else { u };
+            out += op;
+            out += "<ratio>";
+            out += &after[end..];
+            Some(out)
+        };
+        let mut out = String::new();
+        for line in stderr.split_inclusive('\n') {
+            let (body, nl) = line.strip_suffix('\n').map_or((line, ""), |b| (b, "\n"));
+            out += &mask(body).unwrap_or_else(|| body.to_string());
+            out += nl;
+        }
+        out
     }
 
     /// [`check`], with exactly `pure_short` cases on the pure tier allowed
@@ -203,9 +265,13 @@ mod unix {
             usage_line(&mut r.stdout, c.name);
             usage_line(&mut s.stdout, c.name);
             version_line(&mut r, &mut s);
+            for run in [&mut r, &mut s] {
+                run.stderr = progress_line(&run.stderr);
+            }
             if short_partial_output(&r, &s) {
                 short.fetch_add(1, Ordering::Relaxed);
                 s.stdout = r.stdout.clone();
+                s.stderr = r.stderr.clone();
             }
             assert_same(c, &r, &s);
             true
@@ -470,17 +536,103 @@ mod unix {
         check("flags_accepted", &cases);
     }
 
-    /// `-v` (the progress line, Task 8).
+    /// `-v` and `-vv` with standard error not a terminal (R4): the line
+    /// xz prints for each file as it ends, and before an error said while
+    /// a file is coded (again at its end), across compression,
+    /// decompression, testing, standard input, pass-through, several files,
+    /// `--files`, the `.lzma` and raw formats and threads. The speed and
+    /// elapsed fields are normalised (`normalise_xz_progress`); every case
+    /// is sized to finish far under a second, where neither is printed.
     #[test]
-    #[ignore = "Task 8"]
     fn flags_accepted_verbose() {
-        let packed = reference_output(&[], &text());
-        let mut cases: Vec<Case> = [&["-v", "-c", "a"][..], &["--verbose", "-k", "a"]]
-            .iter()
-            .map(|a| fed(xz(a), text()))
-            .collect();
-        cases.push(with_file(xz(&["-dkv", "a.xz"]), "a.xz", packed));
-        check("flags_accepted_verbose", &cases);
+        let plain = text();
+        let big = mixed(200_000, 17);
+        let packed = reference_output(&[], &plain);
+        let big_xz = reference_output(&["-T2", "--block-size=40000"], &big);
+        let lzma = reference_output(&["-F", "lzma"], &plain);
+        let cut = packed[..100].to_vec();
+        let mut mid = big_xz.clone();
+        let at = mid.len() / 2;
+        mid[at] ^= 0x55;
+        let mut trailing = packed.clone();
+        trailing.extend_from_slice(b"junk");
+        let mut cases: Vec<Case> = [
+            &["-v", "-c", "a"][..],
+            &["--verbose", "-k", "a"],
+            &["-vv", "-c", "a"],
+            &["-v", "-v", "-k", "a"],
+            &["-v", "-q", "-c", "a"],
+            &["-v", "-0", "-T1", "-c", "a"],
+            &["-v", "-T2", "--block-size=1KiB", "-c", "a"],
+            &["-v", "-F", "lzma", "-c", "a"],
+            &["-v", "-F", "raw", "-c", "a"],
+            &["-v", "-c", "missing", "a"],
+            &["-v", "-c", "-"],
+            &["-v"],
+        ]
+        .iter()
+        .map(|a| fed(xz(a), plain.clone()))
+        .collect();
+        cases.push(with_file(xz(&["-v", "-k", "a", "big"]), "big", big.clone()));
+        cases.push(with_file(
+            xz(&["-vv", "-T1", "-k", "big"]),
+            "big",
+            big.clone(),
+        ));
+        cases.push(with_file(
+            fed(xz(&["-v", "-k", "--files"]), b"a\nbig\n".to_vec()),
+            "big",
+            big.clone(),
+        ));
+        cases.push(with_file(xz(&["-v", "-c", "e"]), "e", Vec::new()));
+        cases.push(with_file(xz(&["-v", "-k", "a"]), "a.xz", packed.clone()));
+        for args in [
+            &["-dkv", "a.xz"][..],
+            &["-dcv", "a.xz"],
+            &["-tv", "a.xz"],
+            &["-tvv", "a.xz"],
+            &["-dcv", "big.xz"],
+            &["-dcv", "-T1", "big.xz"],
+            &["-tv", "a.xz", "big.xz", "a.xz"],
+            &["-dcv", "cut.xz"],
+            &["-tv", "a.xz", "cut.xz", "big.xz"],
+            &["-dcv", "-T1", "mid.xz"],
+            &["-dcv", "e.xz"],
+            &["-dcv", "trailing.xz"],
+            &["-dcv", "--single-stream", "trailing.xz"],
+            &["-dcfv", "a"],
+            &["-dcfv", "a.xz", "a"],
+            &["-dcv", "a"],
+            &["-dcv", "-F", "lzma", "a.lzma"],
+            &["-dcv", "a.lzma"],
+        ] {
+            let mut c = with_file(xz(args), "a.xz", packed.clone());
+            c.files.push(("big.xz", big_xz.clone()));
+            c.files.push(("cut.xz", cut.clone()));
+            c.files.push(("mid.xz", mid.clone()));
+            c.files.push(("e.xz", Vec::new()));
+            c.files.push(("trailing.xz", trailing.clone()));
+            c.files.push(("a.lzma", lzma.clone()));
+            cases.push(c);
+        }
+        cases.push(fed(xz(&["-dv"]), packed.clone()));
+        cases.push(fed(xz(&["-tv", "-"]), packed.clone()));
+        cases.push(fed(xz(&["-dcfv"]), plain.clone()));
+        cases.push(fed(case("xzcat", &["-v"]), packed.clone()));
+        cases.push(with_file(
+            case("unxz", &["-v", "-k", "a.xz"]),
+            "a.xz",
+            packed.clone(),
+        ));
+        cases.push(with_file(
+            case("lzcat", &["-v", "a.lzma"]),
+            "a.lzma",
+            lzma.clone(),
+        ));
+        // The pure tier: corruption mid-Block (`mid.xz`) stops its decoder
+        // elsewhere (Ruling P9), so the output and the line's figures there
+        // are short.
+        check_tolerating("flags_accepted_verbose", &cases, 1);
     }
 
     /// `-l` and `--list` (list.c, Task 7).
@@ -1333,20 +1485,10 @@ mod unix {
         assert!(peak < 64 << 20, "peak memory {peak} bytes");
     }
 
-    /// Strip the reference's `-v` progress line (`NAME: SIZE / SIZE =
-    /// RATIO...`), which is Task 8's to reproduce.
-    fn without_progress(s: &str) -> String {
-        s.lines()
-            .filter(|l| !(l.contains(" / ") && l.contains(" = ") && l.contains(": ")))
-            .map(|l| format!("{l}\n"))
-            .collect()
-    }
-
     /// Review Focus 2: the memory limit lowers the thread count first (the
     /// output unchanged), then falls back to single-threaded mode (with a
     /// warning), then lowers the dictionary, or refuses under
-    /// `--no-adjust`; `-vv` shows each step (the reference's progress line
-    /// is left out until Task 8).
+    /// `--no-adjust`; `-vv` shows each step, then the progress line.
     #[test]
     fn memlimit_reduces_threads_like_xz() {
         let data = mixed(200_000, 81);
@@ -1392,8 +1534,10 @@ mod unix {
             let Some(mut r) = reference(dir, c) else {
                 return false;
             };
-            let s = stuffr_as(c);
-            r.stderr = without_progress(&r.stderr);
+            let mut s = stuffr_as(c);
+            for run in [&mut r, &mut s] {
+                run.stderr = progress_line(&run.stderr);
+            }
             assert_same(c, &r, &s);
             true
         };

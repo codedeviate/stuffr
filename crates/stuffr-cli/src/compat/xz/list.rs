@@ -22,7 +22,7 @@ use super::index::{
     self, Block, CHECK_SIZES, Error, FILTER_ARM, FILTER_ARM64, FILTER_ARMTHUMB, FILTER_IA64,
     FILTER_POWERPC, FILTER_RISCV, FILTER_SPARC, FILTER_X86, HeaderFilter, Index,
 };
-use super::message::{Messages, Status, Verbosity, mask_nonprint};
+use super::message::{self, Messages, Status, Verbosity, mask_nonprint};
 use super::messages::{self as m, printf};
 use super::options::str_from_filters_decoder;
 use crate::compat::host::Host;
@@ -98,30 +98,7 @@ fn num(n: u64) -> Vec<u8> {
 
 /// util.c: uint64_to_nicestr with `NICESTR_B` to `NICESTR_TIB`.
 fn nicestr(value: u64, always_also_bytes: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    let (shown, unit) = if value < 10000 {
-        (num(value), 0)
-    } else {
-        let mut d = value as f64;
-        let mut unit = 0;
-        loop {
-            d /= 1024.0;
-            unit += 1;
-            if !(d > 9999.9 && unit < 4) {
-                break;
-            }
-        }
-        (format!("{d:.1}").into_bytes(), unit)
-    };
-    printf(
-        &mut out,
-        m::NICESTR,
-        &[&shown, m::NICESTR_UNITS[unit].as_bytes()],
-    );
-    if always_also_bytes && value >= 10000 {
-        printf(&mut out, m::NICESTR_BYTES, &[&num(value)]);
-    }
-    out
+    message::nicestr(value, message::NICESTR_B, always_also_bytes)
 }
 
 // ---- list.c ----
@@ -886,7 +863,7 @@ pub(crate) fn list_file(
         }
         return Err(Status::Error as u8);
     }
-    msg.list_filename(out, name, a.robot);
+    msg.filename(out, name);
     let Some(name) = name else {
         msg.error(err, m::LIST_STDIN, &[]);
         return Ok(());

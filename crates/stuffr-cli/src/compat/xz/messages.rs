@@ -652,13 +652,97 @@ pub(super) const GLIBC_NEEDS_ARGUMENT_LONG: &str = "%s: option '--%s' requires a
 /// glibc getopt.c: process_long_option, the word as typed.
 pub(super) const GLIBC_UNRECOGNIZED: &str = "%s: unrecognized option '--%s'\n";
 
-// ---- message.c: print_filename (under --list, to standard output) ----
+// ---- message.c: print_filename (to standard output under --list, else
+// to standard error) ----
 
 /// message.c: print_filename, the number of files known.
 pub(super) const FILENAME_OF: &str = "%s (%s/%s)\n";
 
 /// message.c: print_filename, `--files`/`--files0` in use.
 pub(super) const FILENAME_NTH: &str = "%s (%s)\n";
+
+/// message.c: print_filename, the empty line before every name but the
+/// first (`fputc('\n', file)`).
+pub(super) const FILENAME_GAP: &str = "\n";
+
+// ---- message.c: the progress indicator ----
+//
+// The `%*s` widths of message_progress_update's and progress_flush's
+// lines are applied by message.rs (`tuklib_mbstr_fw` is the plain width
+// for ASCII); numbers are formatted there as the comments say.
+
+/// message.c: progress_percentage, the size unknown or already passed.
+pub(super) const PROGRESS_PERCENT_UNKNOWN: &str = "--- %";
+
+/// message.c: progress_percentage (`"%.1f %%"`).
+pub(super) const PROGRESS_PERCENT: &str = "%s %%";
+
+/// message.c: progress_flush, the percentage column once finished.
+pub(super) const PROGRESS_PERCENT_DONE: &str = "100 %";
+
+/// message.c: progress_sizes (`"%s / %s"`, two uint64_to_nicestr).
+pub(super) const PROGRESS_SIZES: &str = "%s / %s";
+
+/// message.c: progress_sizes, a ratio up to 9.999 (`" = %.3f"`).
+pub(super) const PROGRESS_RATIO: &str = " = %s";
+
+/// message.c: progress_sizes, a worse ratio (`" > %.3f"` of 9.999).
+pub(super) const PROGRESS_RATIO_OVER: &str = " > 9.999";
+
+/// message.c: progress_speed (`"%.*f %ciB/s"`), and its unit letters.
+pub(super) const PROGRESS_SPEED: &str = "%s %siB/s";
+pub(super) const PROGRESS_SPEED_UNITS: [&str; 3] = ["K", "M", "G"];
+
+/// message.c: progress_time, under an hour (`"%u:%02u"`).
+pub(super) const PROGRESS_TIME_MS: &str = "%s:%s";
+
+/// message.c: progress_time, an hour or more (`"%u:%02u:%02u"`).
+pub(super) const PROGRESS_TIME_HMS: &str = "%s:%s:%s";
+
+/// message.c: progress_remaining, up to 50 seconds.
+pub(super) const REMAINING_S: &str = "%s s";
+
+/// message.c: progress_remaining, up to 9 min 50 s.
+pub(super) const REMAINING_MIN_S: &str = "%s min %s s";
+
+/// message.c: progress_remaining, up to 59 min.
+pub(super) const REMAINING_MIN: &str = "%s min";
+
+/// message.c: progress_remaining, up to 9 h 50 min.
+pub(super) const REMAINING_H_MIN: &str = "%s h %s min";
+
+/// message.c: progress_remaining, up to 23 h.
+pub(super) const REMAINING_H: &str = "%s h";
+
+/// message.c: progress_remaining, up to 9 d 23 h.
+pub(super) const REMAINING_D_H: &str = "%s d %s h";
+
+/// message.c: progress_remaining, up to 999 d.
+pub(super) const REMAINING_D: &str = "%s d";
+
+/// message.c: message_progress_update (`"\r %*s %*s   %*s %10s   %10s\r"`),
+/// its five columns already padded.
+pub(super) const PROGRESS_LINE: &str = "\r %s %s   %s %s   %s\r";
+
+/// message.c: message_progress_update, after a line a signal asked for
+/// when the indicator is not updating itself (`fputc('\n', stderr)`).
+pub(super) const PROGRESS_SIGNAL_END: &str = "\n";
+
+/// message.c: progress_flush on a terminal
+/// (`"\r %*s %*s   %*s %10s   %10s\n"`), its columns already padded.
+pub(super) const PROGRESS_FINAL_LINE: &str = "\r %s %s   %s %s   %s\n";
+
+/// message.c: progress_flush elsewhere: the file's name (`_("%s: ")`).
+pub(super) const PROGRESS_NAME: &str = "%s: ";
+
+/// message.c: progress_flush elsewhere, a known percentage (`"%s, "`).
+pub(super) const PROGRESS_PERCENT_FIELD: &str = "%s, ";
+
+/// message.c: progress_flush elsewhere, the speed or the time (`", %s"`).
+pub(super) const PROGRESS_FIELD: &str = ", %s";
+
+/// message.c: progress_flush elsewhere, the end of the line.
+pub(super) const PROGRESS_END: &str = "\n";
 
 // ---- list.c ----
 //

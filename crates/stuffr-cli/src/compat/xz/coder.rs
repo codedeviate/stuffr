@@ -35,8 +35,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use stuffr::xz_opts::memusage::{MEMUSAGE_BASE, lzma_decoder_memusage_nocheck, mt_block_size};
 use stuffr::xz_opts::{
-    Check, DecodeOptions, Decoder, EncodeOptions, Encoder, Filter, Format, Lzma, Profile, XzError,
-    decoder_memusage_with, encoder_memusage_with,
+    self, Check, DecodeOptions, Decoder, EncodeOptions, Encoder, Filter, Format, Lzma, Profile,
+    XzError, decoder_memusage_with, encoder_memusage_with,
 };
 
 use super::args::{Args, CoderSettings, FormatChoice, OpMode};
@@ -733,6 +733,8 @@ pub(crate) fn run(
     msg: &mut Messages,
     err: &mut dyn Write,
 ) {
+    // Set and possibly print the name for the progress indicator.
+    msg.filename(err, name);
     let Some(mut pair) = FilePair::open_src(a, name, host, msg, err) else {
         return;
     };
@@ -749,6 +751,14 @@ pub(crate) fn run(
         if let Some(coder) = init(a, real, &pair, &first, msg, err)
             && (a.op == OpMode::Test || pair.open_dest(a, host, msg, err))
         {
+            // mytime_set_start_time and message_progress_start: standard
+            // input's size is never known (`src_st` is not filled for it).
+            let pos = match &coder {
+                Coder::Encode(enc) => enc.progress(),
+                Coder::Decode { dec, .. } => dec.progress(),
+                Coder::Passthru => xz_opts::Progress::default(),
+            };
+            msg.progress_start(a.op == OpMode::Compress, pair.src_size(), pos);
             success = match coder {
                 Coder::Encode(mut enc) => {
                     let mut guard = SpawnGuard::new(real && encode_options(a).threads > 0);
@@ -778,6 +788,7 @@ pub(crate) fn run(
                 }
                 Coder::Passthru => passthru(&mut pair, first, msg, err),
             };
+            msg.progress_end(success, err);
         }
     }
     pair.close(a, success, msg, err);
@@ -808,6 +819,7 @@ fn encode(
             pair.src_has_seen_input = false;
             pair.flush_needed = false;
         }
+        msg.progress_pos(enc.progress());
         // The output so far is written even when something went wrong.
         let written = pair.write(&out, msg, err);
         out.clear();
@@ -821,6 +833,7 @@ fn encode(
         if end {
             return true;
         }
+        msg.progress_update(err);
     }
 }
 
@@ -833,11 +846,19 @@ fn passthru(
     err: &mut dyn Write,
 ) -> bool {
     let mut n = buf.len();
+    let mut total = 0u64;
     buf.resize(IO_BUFFER_SIZE, 0);
     while n != 0 {
         if !pair.write(&buf[..n], msg, err) {
             return false;
         }
+        // `strm.total_in`/`total_out`, which progress_pos reads here.
+        total += n as u64;
+        msg.progress_pos(xz_opts::Progress {
+            in_bytes: total,
+            out_bytes: total,
+        });
+        msg.progress_update(err);
         match pair.read(&mut buf, msg, err) {
             Some(k) => n = k,
             None => return false,
@@ -918,6 +939,7 @@ impl Decoding<'_> {
         msg: &mut Messages,
         err: &mut dyn Write,
     ) -> Option<bool> {
+        msg.progress_pos(dec.progress());
         warn_checks(dec, pair, msg, err);
         if !self.emit(pair, out, msg, err) {
             return Some(false);
@@ -967,6 +989,7 @@ impl Decoding<'_> {
                 if self.ended(dec) {
                     return self.done(pair, dec, msg, err);
                 }
+                msg.progress_update(err);
             }
             if pair.src_eof {
                 break;

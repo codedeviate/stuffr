@@ -1,0 +1,4 @@
+cut.xz (1/1)
+ 99.9 %              100 B / 1760 B = 0.057                                    
+xz: cut.xz: Unexpected end of input
+ 99.9 %              100 B / 1760 B = 0.057                                    

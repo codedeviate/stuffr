@@ -205,6 +205,136 @@ extern "C" fn on_cleanup_signal(sig: libc::c_int) {
     }
 }
 
+/// The signals that ask for a progress line: xz 5.8.4's message.c
+/// `message_progress_sigs`, SIGALRM, then SIGINFO where the system has it
+/// (Apple and the BSDs), then SIGUSR1.
+#[cfg(unix)]
+const PROGRESS_SIGNALS: &[libc::c_int] = &[
+    libc::SIGALRM,
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    libc::SIGINFO,
+    libc::SIGUSR1,
+];
+
+/// message.c's `progress_needs_updating`: set by a progress signal, taken
+/// by the coder loop when it next polls (`message_progress_update`).
+pub(crate) static PROGRESS_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// message.c: message_init's handlers. Every progress signal sets
+/// [`PROGRESS_REQUESTED`]; the handler does nothing else. As message.c
+/// does, a signal the parent left ignored is hooked all the same (only
+/// signals.c's termination signals keep an inherited `SIG_IGN`).
+/// `SA_RESTART` is on: xz retries every call such a signal interrupts, and
+/// so do stuffr's, so the only difference is fewer retries. Under
+/// `Host::Sandbox` nothing is installed.
+pub(crate) fn install_progress_signals(host: &Host) {
+    #[cfg(unix)]
+    if matches!(host, Host::Real) {
+        let handler = on_progress_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // SAFETY: a zeroed sigaction filled in before use; the handler only
+        // stores to an atomic, which is async-signal-safe.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESTART;
+            action.sa_sigaction = handler;
+            for &sig in PROGRESS_SIGNALS {
+                libc::sigaction(sig, &action, std::ptr::null_mut());
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = host;
+}
+
+/// message.c: progress_signal_handler.
+#[cfg(unix)]
+extern "C" fn on_progress_signal(_sig: libc::c_int) {
+    PROGRESS_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Milliseconds the process has spent stopped by SIGTSTP since it started
+/// (mytime.c: mytime_sigtstp_handler adds them to `start_time`).
+static STOPPED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// mytime.c: mytime_now: a monotonic clock in milliseconds
+/// (`CLOCK_MONOTONIC`, as xz reads it where `clock_gettime` exists).
+fn monotonic_ms() -> u64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: a zeroed timespec for clock_gettime to fill; the call is
+        // async-signal-safe, so the SIGTSTP handler may make it too.
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        (ts.tv_sec as u64).wrapping_mul(1000) + (ts.tv_nsec as u64) / 1_000_000
+    }
+    #[cfg(not(unix))]
+    {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        BASE.get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as u64
+    }
+}
+
+/// The progress indicator's clock: [`monotonic_ms`] less the time spent
+/// stopped, so that, as with xz's SIGTSTP handler, a stopped run's elapsed
+/// time and speed leave the stop out.
+pub(crate) fn running_ms() -> u64 {
+    monotonic_ms().wrapping_sub(STOPPED_MS.load(Ordering::Relaxed))
+}
+
+/// signals.c: signals_init's SIGTSTP handler (`USE_SIGTSTP_HANDLER`,
+/// mytime.c: mytime_sigtstp_handler), unless the parent left SIGTSTP
+/// ignored. Like the other handlers of signals_init, it blocks every
+/// hooked signal while it runs. Under `Host::Sandbox` nothing is
+/// installed.
+pub(crate) fn install_stop_handler(host: &Host) {
+    #[cfg(unix)]
+    if matches!(host, Host::Real) {
+        let handler = on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // SAFETY: zeroed sigaction structs, a query with a null new action;
+        // the handler only makes async-signal-safe calls.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
+            {
+                return;
+            }
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&mut action.sa_mask);
+            for &sig in CLEANUP_SIGNALS.iter().chain(PROGRESS_SIGNALS) {
+                libc::sigaddset(&mut action.sa_mask, sig);
+            }
+            libc::sigaddset(&mut action.sa_mask, libc::SIGTSTP);
+            action.sa_flags = 0;
+            action.sa_sigaction = handler;
+            libc::sigaction(libc::SIGTSTP, &action, std::ptr::null_mut());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = host;
+}
+
+/// mytime.c: mytime_sigtstp_handler: stop (`raise(SIGSTOP)`), and once
+/// continued, count the time stopped.
+#[cfg(unix)]
+extern "C" fn on_stop_signal(_sig: libc::c_int) {
+    let t = monotonic_ms();
+    // SAFETY: raise is async-signal-safe; the process stops here until a
+    // SIGCONT.
+    unsafe { libc::raise(libc::SIGSTOP) };
+    STOPPED_MS.fetch_add(monotonic_ms().wrapping_sub(t), Ordering::Relaxed);
+}
+
 /// Create a temporary output file in `dir`, `create_new`, mode 0600, named
 /// `.stuffr-{family}-{pid}-{n}.tmp`; a name already taken moves on to the
 /// next `n`.
@@ -666,6 +796,12 @@ impl Host {
         matches!(self, Host::Real) && crate::compat::stdout_is_tty()
     }
 
+    /// `isatty(STDERR_FILENO)`; a sandbox has no terminal.
+    pub(crate) fn stderr_is_tty(&self) -> bool {
+        use std::io::IsTerminal;
+        matches!(self, Host::Real) && io::stderr().is_terminal()
+    }
+
     /// Standard input as a decompression or compression input.
     pub(crate) fn stdin(&mut self) -> Input {
         match self {
@@ -1025,5 +1161,117 @@ mod tests {
         );
         assert!(file.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// message.c's message_init: every progress signal (SIGALRM, SIGINFO
+    /// where there is one, SIGUSR1) only sets the flag, and the process
+    /// lives on; one the parent left ignored is hooked all the same. A
+    /// sandbox installs nothing.
+    #[cfg(unix)]
+    #[test]
+    fn progress_signals_only_set_the_flag() {
+        for &sig in PROGRESS_SIGNALS {
+            let status = in_child(|| {
+                // SAFETY: SIG_IGN installs no handler; the parent's `nohup`.
+                unsafe { libc::signal(sig, libc::SIG_IGN) };
+                PROGRESS_REQUESTED.store(false, Ordering::SeqCst);
+                install_progress_signals(&Host::Real);
+                // SAFETY: raise is async-signal-safe; the handler stores.
+                unsafe { libc::raise(sig) };
+                let set = PROGRESS_REQUESTED.load(Ordering::SeqCst);
+                // SAFETY: _exit ends the child.
+                unsafe { libc::_exit(if set { 0 } else { 1 }) };
+            });
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "signal {sig}: status {status:#x}"
+            );
+        }
+        assert!(PROGRESS_SIGNALS.contains(&libc::SIGUSR1));
+        #[cfg(target_vendor = "apple")]
+        assert!(PROGRESS_SIGNALS.contains(&libc::SIGINFO));
+        let host = Host::Sandbox(Sandbox {
+            dir: std::env::temp_dir(),
+            stdin: None,
+            stdout: Arc::default(),
+            budget: Arc::new(AtomicU64::new(0)),
+            reads: ReadLog::default(),
+        });
+        let status = in_child(|| {
+            let mut all_default = true;
+            for &sig in PROGRESS_SIGNALS.iter().chain(&[libc::SIGTSTP]) {
+                // SAFETY: SIG_DFL installs no handler.
+                unsafe { libc::signal(sig, libc::SIG_DFL) };
+            }
+            install_progress_signals(&host);
+            install_stop_handler(&host);
+            for &sig in PROGRESS_SIGNALS.iter().chain(&[libc::SIGTSTP]) {
+                // SAFETY: a zeroed sigaction is a valid out-parameter; a
+                // query changes nothing.
+                unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    let queried = libc::sigaction(sig, std::ptr::null(), &mut old) == 0;
+                    all_default &= queried && old.sa_sigaction == libc::SIG_DFL;
+                }
+            }
+            // SAFETY: _exit ends the child.
+            unsafe { libc::_exit(if all_default { 0 } else { 1 }) };
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "a sandbox installed a progress handler (status {status:#x})"
+        );
+    }
+
+    /// mytime.c's SIGTSTP handler: the process stops by SIGSTOP, and once
+    /// continued the time it spent stopped is left out of the running
+    /// clock. An ignored SIGTSTP stays ignored.
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_is_left_out_of_the_running_clock() {
+        // SAFETY: the child makes only async-signal-safe calls and the
+        // atomics' loads, then `_exit`s; the parent waits for it to stop,
+        // continues it, and reaps it.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork: {}", io::Error::last_os_error());
+            if pid == 0 {
+                libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+                install_stop_handler(&Host::Real);
+                let before = STOPPED_MS.load(Ordering::SeqCst);
+                libc::raise(libc::SIGTSTP);
+                let stopped = STOPPED_MS.load(Ordering::SeqCst) - before;
+                libc::_exit(if stopped >= 150 { 0 } else { 1 });
+            }
+            let mut status = 0;
+            while libc::waitpid(pid, &mut status, libc::WUNTRACED) < 0 {}
+            assert!(libc::WIFSTOPPED(status), "status {status:#x}");
+            assert_eq!(libc::WSTOPSIG(status), libc::SIGSTOP);
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            libc::kill(pid, libc::SIGCONT);
+            while libc::waitpid(pid, &mut status, 0) < 0 {}
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "the stop was not counted (status {status:#x})"
+            );
+        }
+        let status = in_child(|| {
+            // SAFETY: SIG_IGN installs no handler; then a query.
+            unsafe {
+                libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+                install_stop_handler(&Host::Real);
+                let mut old: libc::sigaction = std::mem::zeroed();
+                libc::sigaction(libc::SIGTSTP, std::ptr::null(), &mut old);
+                libc::_exit(if old.sa_sigaction == libc::SIG_IGN {
+                    0
+                } else {
+                    1
+                });
+            }
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "an ignored SIGTSTP was hooked (status {status:#x})"
+        );
     }
 }

@@ -6,8 +6,9 @@
 //! `args.rs` (args.c, with the parts of coder.c and util.c the options
 //! reach), `options.rs` (options.c, and liblzma's string_conversion.c for
 //! `--filters`), `suffix.rs` (suffix.c), `hardware.rs` (hardware.c, with
-//! tuklib_physmem/tuklib_cpucores), `message.rs` (message.c, main.c's exit
-//! status, tuklib_exit.c), `coder.rs` (coder.c), `file_io.rs` (file_io.c),
+//! tuklib_physmem/tuklib_cpucores), `message.rs` (message.c, mytime.c,
+//! main.c's exit status, tuklib_exit.c; signals.c's handlers are in
+//! `compat/host.rs`), `coder.rs` (coder.c), `file_io.rs` (file_io.c),
 //! `list.rs` (list.c, util.c's number formatting), `index.rs` (liblzma's
 //! file_info.c, index_decoder.c and block_header_decoder.c, in pure Rust
 //! so that `--list` is the same on both tiers) and this module (main.c).
@@ -37,9 +38,17 @@
 //! - A parent that ignores SIGPIPE is not seen (the Rust runtime ignores
 //!   it before `main`): writing to a closed pipe still kills stuffr, where
 //!   xz would say nothing and exit 0.
+//! - The `-v` indicator's one-second timer is polled against the clock
+//!   after each coder call rather than set with `alarm(2)` (message.c's
+//!   own way where there is no SIGALRM). The lines and when they appear
+//!   are xz's; SIGALRM, SIGINFO and SIGUSR1 still each ask for a line.
+//! - Pure tier: the `-v` line's compressed size and ratio are those of
+//!   the pure encoder's output, which is compatible with xz's, not equal
+//!   to it.
 //! - Pure tier: before a corrupt or cut-short spot, less of the partial
 //!   output is written than xz writes (`lzma-rust2` drops what its failing
-//!   call had decoded); the messages and exit code are xz's. Near the end
+//!   call had decoded), and `-v`'s figures at that point differ with it;
+//!   the messages and exit code are xz's. Near the end
 //!   of a raw, `.lzma` or `.lz` stream, corruption can be reported as
 //!   truncation (Ruling P6).
 
@@ -52,7 +61,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use super::CountedRun;
-use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe, strerror};
+use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe, strerror};
 
 pub(crate) mod args;
 mod coder;
@@ -105,8 +114,10 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// 4 GiB, and the decoder's memory limit is at most 256 MiB whatever the
 /// arguments say (Ruling P7: the pure tier zero-fills a dictionary as it
 /// allocates it, so a fuzzed header must not reach gigabytes). Standard
-/// output and output files share the [`SANDBOX_OUTPUT_CAP`] budget. For
-/// the fuzz target; not a stable interface.
+/// output and output files share the [`SANDBOX_OUTPUT_CAP`] budget. No
+/// signal handler is installed and the progress clock is frozen, so a
+/// `-v` line never carries a speed or an elapsed time. For the fuzz
+/// target; not a stable interface.
 #[doc(hidden)]
 pub fn run_in_counted(
     dir: &Path,
@@ -150,11 +161,21 @@ fn main(
     hw: Hardware,
     err: &mut dyn Write,
 ) -> u8 {
+    // message_init: the progress signals' handlers (the real process only).
+    host::install_progress_signals(host);
     let mut out = host.out_writer(None);
     let (mut a, mut msg) = match args::parse(name, argv0, env, args, host, hw, &mut out, err) {
         Ok(parsed) => parsed,
         Err(code) => return code,
     };
+    // message_init's progress_automatic, and what message.c reads of the
+    // options.
+    msg.automatic = host.stderr_is_tty();
+    msg.robot = a.robot;
+    msg.list = a.op == OpMode::List;
+    if matches!(host, Host::Sandbox(_)) {
+        msg.clock = message::frozen_clock;
+    }
     if a.op != OpMode::List && a.robot {
         return msg.fatal(err, messages::ROBOT_CODING, &[]);
     }
@@ -172,8 +193,12 @@ fn main(
         msg.try_help(err);
         return Status::Error as u8;
     }
-    // signals_init(): the cleanup handlers are installed when an output
-    // file is armed (host.rs), the only time they act.
+    // signals_init(), not under --list: the SIGTSTP handler now; the
+    // cleanup handlers when an output file is armed (host.rs), the only
+    // time they act.
+    if a.op != OpMode::List {
+        host::install_stop_handler(host);
+    }
     let names = std::mem::take(&mut a.files);
     let mut totals = ListTotals::default();
     for n in &names {
@@ -388,6 +413,24 @@ mod tests {
             String::from_utf8_lossy(&err)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `-v` under `Host::Sandbox`: standard error is no terminal and the
+    /// clock is frozen, so each file gets its one line, with no speed or
+    /// elapsed time however long the run takes.
+    #[test]
+    fn run_in_counted_verbose_is_deterministic() {
+        let dir = std::env::temp_dir();
+        let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        let plain = vec![b'x'; 300_000];
+        let (code, packed, err, _) =
+            run_in_counted(&dir, "xz", &args(&["-v", "-T1", "-0"]), &plain, &|_| None);
+        assert_eq!(code, 0);
+        let ratio = packed.len() as f64 / plain.len() as f64;
+        let want = format!("(stdin): {} B / 293.0 KiB = {ratio:.3}\n", packed.len());
+        assert_eq!(String::from_utf8(err).unwrap(), want);
+        let (code, _, err, _) = run_in_counted(&dir, "xz", &args(&["-tv"]), &packed, &|_| None);
+        assert_eq!((code, String::from_utf8(err).unwrap()), (0, want));
     }
 
     /// `--list` under `Host::Sandbox`: a file is listed and its reads
