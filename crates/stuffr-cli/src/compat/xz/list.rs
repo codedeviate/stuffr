@@ -397,7 +397,11 @@ fn parse_details(
     if !pair.pread(&mut buf, b.compressed_file_offset, msg, err) {
         return None;
     }
-    if buf[0] == 0 {
+    // A Total Size equal to the check's size leaves nothing to read: the
+    // C code tests an uninitialised byte there (undefined behaviour, not
+    // reproduced; Ruling P14). xz 5.8.4 is observed to say the data is
+    // corrupt, as an Index Indicator here would.
+    if buf.first().is_none_or(|&b| b == 0) {
         return data_error(msg, err);
     }
     let header_size = (usize::from(buf[0]) + 1) * 4;
@@ -692,7 +696,9 @@ fn print_info_adv(
                 ],
             );
             if let Some(bhi) = bhi {
-                let compressed = b.unpadded_size - u64::from(bhi.header_size) - check_size(check);
+                // `unpadded_size - header_size - check size`, which
+                // parse_details has already checked is positive.
+                let compressed = bhi.compressed_size;
                 printf(
                     out,
                     m::ADV_BLOCK_ROW_DEBUG,

@@ -423,11 +423,14 @@ mod tests {
             String::from_utf8(err).unwrap(),
             "xz: --list does not support reading from standard input\n"
         );
+        let short = short_block(4, 5);
+        assert_eq!(short.len(), 44);
         for (i, junk) in [
             &b""[..],
             b"\xfd7zXZ\0\0\x01",
             &[0u8; 64],
             &packed[..packed.len() - 4],
+            &short,
         ]
         .iter()
         .enumerate()
@@ -437,6 +440,87 @@ mod tests {
             let (code, _, _, _) =
                 run_in_counted(&dir, "xz", &args(&["-lvv", &name]), b"", &|_| None);
             assert_eq!(code, 1, "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A CRC32 of `data`.
+    fn crc32(data: &[u8]) -> [u8; 4] {
+        let mut c = flate2::Crc::new();
+        c.update(data);
+        c.sum().to_le_bytes()
+    }
+
+    /// A Stream with check `check` of one Block of filler whose Index
+    /// record is (`unpadded`, 1000): a Block as short as its Check (or
+    /// shorter, or a few bytes longer) for `-vv` to read the header of.
+    fn short_block(check: u8, unpadded: u64) -> Vec<u8> {
+        let mut s = vec![0xFD, b'7', b'z', b'X', b'Z', 0, 0, check];
+        s.extend(crc32(&[0, check]));
+        s.extend(std::iter::repeat_n(0x55, ((unpadded + 3) & !3) as usize));
+        let mut index = vec![0, 1];
+        let mut v = unpadded;
+        while v >= 0x80 {
+            index.push(v as u8 | 0x80);
+            v >>= 7;
+        }
+        index.extend([v as u8, 0xE8, 0x07]);
+        while !index.len().is_multiple_of(4) {
+            index.push(0);
+        }
+        let crc = crc32(&index);
+        index.extend(crc);
+        s.extend(&index);
+        let mut tail = ((index.len() / 4 - 1) as u32).to_le_bytes().to_vec();
+        tail.extend([0, check]);
+        s.extend(crc32(&tail));
+        s.extend(tail);
+        s.extend(b"YZ");
+        s
+    }
+
+    /// list.rs's `-vv` paths (Block Headers, Check values) on hostile
+    /// files, not only index.rs's walk: every check ID with Blocks from
+    /// shorter than their Check to a little past it, and every byte of a
+    /// multi-Block file flipped three ways. Never a panic; only xz's exit
+    /// codes.
+    #[test]
+    fn list_vv_on_hostile_input_never_panics() {
+        let dir = std::env::temp_dir().join(format!("stuffr-xz-listvv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        let plain = b"hostile listing\n".repeat(40);
+        let (_, packed, _, _) = run_in_counted(
+            &dir,
+            "xz",
+            &args(&["-T1", "-C", "sha256", "--block-size=100"]),
+            &plain,
+            &|_| None,
+        );
+        let mut inputs = Vec::new();
+        for check in 0..16u8 {
+            for unpadded in 5..=72 {
+                inputs.push(short_block(check, unpadded));
+            }
+        }
+        for i in 0..packed.len() {
+            for mask in [0x01, 0x80, 0xFF] {
+                let mut b = packed.clone();
+                b[i] ^= mask;
+                inputs.push(b);
+            }
+        }
+        for (i, data) in inputs.iter().enumerate() {
+            let name = format!("h{i}.xz");
+            std::fs::write(dir.join(&name), data).unwrap();
+            for form in [&["-lvv"][..], &["--robot", "-lvv"]] {
+                let mut a = form.to_vec();
+                a.push(&name);
+                let (code, _, _, _) = run_in_counted(&dir, "xz", &args(&a), b"", &|_| None);
+                assert!(matches!(code, 0 | 1), "{name} {form:?}: exit {code}");
+            }
+            std::fs::remove_file(dir.join(&name)).unwrap();
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

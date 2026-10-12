@@ -2037,8 +2037,40 @@ mod unix {
         let at = padbyte.len() - 12 - 4 - 1;
         padbyte[at] = 1;
         inputs.push(("indexpad", padbyte));
+        // Blocks as short as their Check, or shorter: at `-vv` list.c reads
+        // `Total Size - check size` header bytes, which is 0 (one per wrap
+        // class: 8, 16, 32 and 64 bytes) or wraps to 1024; or a few bytes.
+        for (check, unpadded) in [
+            (4u8, 5u64),
+            (5, 8),
+            (6, 6),
+            (7, 13),
+            (9, 16),
+            (10, 29),
+            (12, 32),
+            (13, 61),
+            (15, 64),
+            (10, 5),
+            (15, 33),
+            (4, 12),
+            (1, 5),
+            (0, 5),
+        ] {
+            let name: &'static str = Box::leak(format!("short{check}-{unpadded}").into_boxed_str());
+            inputs.push((name, short_block(check, unpadded)));
+        }
         let cases = every_form(&inputs);
         check("list_made_streams", &cases);
+    }
+
+    /// A Stream of one Block whose Index record says `unpadded` (so the
+    /// Block takes `ceil4(unpadded)` bytes, filler here, before the Index):
+    /// a Block too short to hold its own header and check.
+    fn short_block(check: u8, unpadded: u64) -> Vec<u8> {
+        let mut s = made_stream(check, &[], Some(vec![(unpadded, 1000)]));
+        let total = ((unpadded + 3) & !3) as usize;
+        s.splice(12..12, std::iter::repeat_n(0x55, total));
+        s
     }
 
     /// Memory: `-M` below what the Indexes need (`Memory usage limit
