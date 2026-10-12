@@ -860,8 +860,12 @@ mod unix {
         check("compress_files", &cases);
     }
 
-    /// A FIFO `p` whose writer comes 300 ms after the run starts, writes a
-    /// line and goes (giving up after 5 s if nothing ever reads).
+    /// A FIFO `p` whose writer comes 300 ms after the setup runs, writes a
+    /// line and goes. The writer gives up after 25 s if nothing ever reads:
+    /// the clock starts at setup, not at the process's start, so under a
+    /// loaded gate the reference may open the FIFO late, and a writer that
+    /// had given up would leave it waiting until the harness's 30 s timeout
+    /// (`compat_harness::TIMEOUT`, private, so the figure is repeated here).
     fn late_fifo_writer(d: &Path) {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::OpenOptionsExt;
@@ -872,7 +876,7 @@ mod unix {
         std::thread::spawn(move || {
             use std::io::Write;
             std::thread::sleep(std::time::Duration::from_millis(300));
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
             loop {
                 let w = fs::OpenOptions::new()
                     .write(true)
