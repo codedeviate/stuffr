@@ -24,6 +24,10 @@ readme = "README.md"
 [[bin]]
 name = "stuffr"
 path = "src/main.rs"
+# The binary's docs would land in `target/doc/stuffr/`, the facade library's
+# directory: a filename collision that rustdoc warned about and, on CI
+# 38291091507, raced into an I/O error. The library docs are the ones wanted.
+doc = false
 
 # Passthroughs to the facade, and they exist for one reason: `cargo install
 # stuffr-cli --features <x>` is what the documentation tells a user to type,
