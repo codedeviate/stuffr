@@ -1474,6 +1474,49 @@ mod interrupts {
         }
     }
 
+    /// `-df` over a file that is not bzip2 copies it whole (`trycat`); that
+    /// copy is interruptible too, and its output deleted.
+    #[test]
+    fn bzip2_force_copy_of_a_non_bzip2_file_is_interrupted() {
+        for mine in [true, false] {
+            let dir = scratch(&format!("cat-{}", if mine { "ours" } else { "ref" }));
+            let Some(exe) = (if mine {
+                Some(ours().to_path_buf())
+            } else {
+                reference()
+            }) else {
+                continue;
+            };
+            let named = |n: &str| {
+                if mine {
+                    n.starts_with(".stuffr-bzip2-")
+                } else {
+                    n == "a"
+                }
+            };
+            let ready = has_data(&dir, &named);
+            let r = interrupt_with_input(
+                &exe,
+                "bzip2",
+                &["-df", "a.bz2"],
+                &dir,
+                "a.bz2",
+                &plain,
+                Inherit::Default,
+                libc::SIGINT,
+                &ready,
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            check(
+                &r,
+                "\nbzip2: Control-C or similar caught, quitting.\n\
+                 bzip2: Deleting output file a, if it exists.\n",
+                &["a.bz2"],
+                &format!("mine={mine}"),
+            );
+        }
+    }
+
     #[test]
     fn bzip2_counts_the_files_not_processed() {
         for mine in [true, false] {
@@ -1554,7 +1597,12 @@ mod interrupts {
                 &["-t", "a.bz2"],
                 &dir,
                 "a.bz2",
-                &zeros_bz2,
+                // The clock starts per attempt, as the input is written.
+                &|mib| {
+                    let v = zeros_bz2(mib);
+                    first.set(None);
+                    v
+                },
                 Inherit::Default,
                 libc::SIGINT,
                 &ready,

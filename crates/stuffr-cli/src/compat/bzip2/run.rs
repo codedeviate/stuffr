@@ -156,6 +156,8 @@ impl Bz<'_> {
                 }
             }
         }
+        // After the last file: bzip2's handler would still answer.
+        self.poll_interrupt()?;
         Ok(())
     }
 
@@ -429,6 +431,9 @@ impl Bz<'_> {
             Err(f) => return Err(self.fail(f)),
         }
         if self.s.src == SrcMode::F2F {
+            // bzip2 clears `deleteOutputOnInterrupt` only after the output is
+            // closed and stamped: a signal until then deletes the output.
+            self.poll_interrupt()?;
             self.commit()?;
         }
         Ok(())
@@ -551,6 +556,9 @@ impl Bz<'_> {
         };
 
         if magic_ok {
+            if self.s.src == SrcMode::F2F {
+                self.poll_interrupt()?;
+            }
             if self.s.src == SrcMode::F2F && !self.commit()? {
                 return Ok(());
             }
@@ -606,7 +614,10 @@ impl Bz<'_> {
                         if self.s.force {
                             // `trycat`: not bzip2 (or garbage after it) and
                             // `-f`: copy the input as it is.
-                            input.copy_raw(out)?;
+                            let mut stop = || take_interrupt(self.host);
+                            if input.copy_raw(out, &mut stop)? {
+                                return Err(Failure::Interrupted);
+                            }
                             return self.close_ok(out, meta);
                         }
                         if stream_no == 1 {

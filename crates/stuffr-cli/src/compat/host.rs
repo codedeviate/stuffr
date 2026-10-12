@@ -771,7 +771,13 @@ impl Input {
 
     /// Copy the input to `out` as bzip2's `trycat` does: from the start when
     /// it can be rewound, otherwise whatever libbzip2 has not yet read.
-    pub(crate) fn copy_raw(&mut self, out: &mut dyn Write) -> io::Result<()> {
+    ///
+    /// `stop` is asked before each chunk; `Ok(true)` if it said stop.
+    pub(crate) fn copy_raw(
+        &mut self,
+        out: &mut dyn Write,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> io::Result<bool> {
         // `rewind`, whose failure (on a pipe) bzip2 ignores. Either way the
         // buffered bytes are gone: about to be re-read, or already consumed.
         if let InputSrc::File(f) = &mut self.src
@@ -783,9 +789,12 @@ impl Input {
         self.len = 0;
         let mut buf = [0u8; CHUNK];
         loop {
+            if stop() {
+                return Ok(true);
+            }
             let n = self.read_src(&mut buf)?;
             if n == 0 {
-                return Ok(());
+                return Ok(false);
             }
             out.write_all(&buf[..n])?;
         }
