@@ -36,7 +36,7 @@ const FILTER_RESERVED_START: u64 = 1 << 62;
 /// `LZMA_VLI_BYTES_MAX`.
 const VLI_BYTES_MAX: usize = 9;
 const HEADER_MAGIC: [u8; 6] = [0xFD, b'7', b'z', b'X', b'Z', 0x00];
-const FOOTER_MAGIC: [u8; 2] = [b'Y', b'Z'];
+const FOOTER_MAGIC: [u8; 2] = *b"YZ";
 
 /// check.c: lzma_check_size, by check ID (0..=15).
 pub(crate) const CHECK_SIZES: [u32; 16] = [0, 4, 4, 4, 8, 8, 8, 16, 16, 16, 32, 32, 32, 64, 64, 64];

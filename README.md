@@ -276,6 +276,20 @@ read list.
 > **2222** tests under `--all-features`, **2150** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.13.0` is a MINOR, Phase 5's third family: **compatibility links, xz
+> family.** Invoked as `xz`, `unxz`, `xzcat`, `lzma`, `unlzma` or `lzcat`
+> (`stuffr install-links` now makes fourteen names), the binary behaves as XZ
+> Utils 5.8.4's `xz`: the same flags, files, exit codes (0, 1, 2) and stderr.
+> Output is byte-identical on the C tier (`xz-c`) and compatible on the pure
+> tier. The known differences are listed under
+> [Compatibility links](#compatibility-links). **Licence:** the port follows
+> XZ Utils' `src/xz`, which is 0BSD, so `stuffr-cli` is now `MIT AND
+> bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD` (`LICENSE-xz`).
+> Additive library API, all `#[doc(hidden)]`: `stuffr::xz_opts`; the `compat`
+> fuzz target now covers xz.
+> **2373** tests under `--all-features`, **2278** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
