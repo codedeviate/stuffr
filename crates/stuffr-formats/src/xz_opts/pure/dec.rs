@@ -1489,6 +1489,13 @@ impl Decoder {
         }
     }
 
+    /// Whether the stream has ended (`LZMA_STREAM_END`): any input fed
+    /// after it is left unconsumed, or refused. [`Decoder::progress`] is no
+    /// substitute while a threaded `.xz` decoder's workers lag behind.
+    pub fn finished(&self) -> bool {
+        self.state == DState::Ended
+    }
+
     /// The check ID of the oldest unsupported-check warning not yet taken
     /// (`LZMA_UNSUPPORTED_CHECK`, once per Stream that has one).
     pub fn take_unsupported_check_warning(&mut self) -> Option<u32> {

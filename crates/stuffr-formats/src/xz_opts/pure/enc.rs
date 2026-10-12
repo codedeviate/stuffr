@@ -261,10 +261,14 @@ struct XzSerial {
 }
 
 impl XzSerial {
-    /// The first chain is checked here, as liblzma initialises the first
-    /// Block's encoder with the Stream's; a later chain of the block list
-    /// is checked when its Block opens (`lzma_filters_update`).
-    fn new(o: &EncodeOptions, block_size: u64) -> Result<XzSerial, XzError> {
+    /// The first chain is checked here, as liblzma's single-threaded
+    /// encoder initialises the first Block's encoder with the Stream's; a
+    /// later chain of the block list is checked when its Block opens
+    /// (`lzma_filters_update`). For `threaded` output every chain is checked
+    /// when its Block opens, as liblzma's threaded encoder initialises each
+    /// Block's encoder then: an empty input makes an empty Stream, and
+    /// otherwise the Stream Header is out before the refusal.
+    fn new(o: &EncodeOptions, block_size: u64, threaded: bool) -> Result<XzSerial, XzError> {
         let mut chains = vec![o.filters.clone()];
         let mut list = Vec::new();
         for (size, chain) in &o.block_list {
@@ -289,7 +293,9 @@ impl XzSerial {
             }
         }
         let chain = list.first().map_or(0, |&(_, i)| i);
-        chain_supported(&chains[chain])?;
+        if !threaded {
+            chain_supported(&chains[chain])?;
+        }
         Ok(XzSerial {
             check: o.check,
             chains,
@@ -307,10 +313,11 @@ impl XzSerial {
     fn open_block(&mut self, out: &mut Vec<u8>) -> Result<&mut Block, XzError> {
         if self.block.is_none() {
             let chain = &self.chains[self.chain];
+            let w = ChainWriter::new(chain)?;
             let header = block_header(chain);
             out.extend_from_slice(&header);
             self.block = Some(Block {
-                w: ChainWriter::new(chain)?,
+                w,
                 check: Running::of(self.check),
                 header_size: header.len() as u64,
                 compressed: 0,
@@ -525,7 +532,7 @@ impl Encoder {
                 }
                 pending = stream_header(o.check);
                 if o.threads == 0 {
-                    Inner::Xz(Box::new(XzSerial::new(o, o.block_size)?))
+                    Inner::Xz(Box::new(XzSerial::new(o, o.block_size, false)?))
                 } else {
                     let chains = memusage::used_chains(o);
                     let block_size =
@@ -536,7 +543,7 @@ impl Encoder {
                         mt_writer(o, block_size)?
                     } else {
                         threaded = true;
-                        Inner::Xz(Box::new(XzSerial::new(o, block_size)?))
+                        Inner::Xz(Box::new(XzSerial::new(o, block_size, true)?))
                     }
                 }
             }

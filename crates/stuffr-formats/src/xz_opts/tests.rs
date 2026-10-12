@@ -1684,6 +1684,41 @@ mod cross_tier {
         }
     }
 
+    /// liblzma's threaded encoder checks a chain only when a Block opens:
+    /// a misaligned BCJ start makes an empty Stream of an empty input, and
+    /// otherwise the Stream Header and then `LZMA_OPTIONS_ERROR`. The pure
+    /// tier does the same.
+    #[test]
+    fn threaded_chains_are_checked_when_a_block_opens() {
+        let o = EncodeOptions {
+            filters: vec![
+                Filter::Bcj {
+                    kind: Bcj::Arm,
+                    start: 1,
+                },
+                Filter::Lzma2(Lzma::preset(1, false).unwrap()),
+            ],
+            threads: 2,
+            ..EncodeOptions::default()
+        };
+        let mut c = crate::xz_opts::c::Encoder::new(&o).unwrap();
+        let mut p = crate::xz_opts::pure::Encoder::new(&o).unwrap();
+        let (mut co, mut po) = (Vec::new(), Vec::new());
+        c.finish(&mut co).unwrap();
+        p.finish(&mut po).unwrap();
+        assert_eq!(po, co, "the empty Stream");
+        assert_eq!(co.len(), 32);
+        let mut c = crate::xz_opts::c::Encoder::new(&o).unwrap();
+        let mut p = crate::xz_opts::pure::Encoder::new(&o).unwrap();
+        let (mut co, mut po) = (Vec::new(), Vec::new());
+        let cr = c.feed(b"data", &mut co).and_then(|()| c.finish(&mut co));
+        let pr = p.feed(b"data", &mut po).and_then(|()| p.finish(&mut po));
+        assert_eq!(verdict(&pr), verdict(&cr));
+        assert_eq!(verdict(&cr), verdict(&Err(XzError::Options)));
+        assert_eq!(po, co, "the output before the refusal");
+        assert_eq!(co.len(), 12);
+    }
+
     /// Samples from liblzma's encoders, each with the options it decodes
     /// with.
     fn corpus() -> Vec<(String, DecodeOptions, Vec<u8>)> {
@@ -2119,3 +2154,40 @@ fn xz_one_block(lzma2: &[u8], uncompressed: u64, dict_prop: u8) -> Vec<u8> {
     out.extend_from_slice(b"YZ");
     out
 }
+
+/// `Decoder::finished` on each tier: false while a stream is open, true
+/// once it ended, with the input after it left unconsumed under
+/// `single_stream`.
+macro_rules! finished_test {
+    ($name:ident, $tier:path) => {
+        #[test]
+        fn $name() {
+            use $tier as t;
+            let mut packed = Vec::new();
+            let mut enc = t::Encoder::new(&EncodeOptions::default()).unwrap();
+            enc.feed(b"finished", &mut packed).unwrap();
+            enc.finish(&mut packed).unwrap();
+            let o = DecodeOptions {
+                single_stream: true,
+                ..DecodeOptions::default()
+            };
+            let mut dec = t::Decoder::new(&o).unwrap();
+            let mut out = Vec::new();
+            dec.feed(&packed[..packed.len() - 1], &mut out).unwrap();
+            assert!(!dec.finished());
+            dec.feed(&[packed[packed.len() - 1], 0, 0, 0, 0, b'j'], &mut out)
+                .unwrap();
+            assert!(dec.finished());
+            assert_eq!(out, b"finished");
+            assert_eq!(dec.progress().in_bytes, packed.len() as u64);
+        }
+    };
+}
+
+#[cfg(feature = "xz-c")]
+finished_test!(c_decoder_says_when_the_stream_ended, crate::xz_opts::c);
+#[cfg(feature = "xz-pure")]
+finished_test!(
+    pure_decoder_says_when_the_stream_ended,
+    crate::xz_opts::pure
+);

@@ -312,7 +312,7 @@ pub(crate) fn raw_encoder_memusage(filters: &[Filter]) -> Option<u64> {
 /// `lzma_mt_block_size` (`common/filter_encoder.c`) with
 /// `lzma_lzma2_block_size` (`lzma/lzma2_encoder.c`), the only filter that
 /// has a block size; `None` is `UINT64_MAX`.
-pub(crate) fn mt_block_size(filters: &[Filter]) -> Option<u64> {
+pub fn mt_block_size(filters: &[Filter]) -> Option<u64> {
     let mut max = 0;
     for f in filters {
         if let Filter::Lzma2(l) = f {
