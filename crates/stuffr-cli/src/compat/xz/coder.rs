@@ -15,16 +15,18 @@
 //! **The header probe.** `coder_init` decodes the headers before the output
 //! is opened (`lzma_code` with no output room), so an unknown format, an
 //! unsupported check (a warning), or a first Block over the memory limit is
-//! said before any output exists, and `-f` has removed nothing. Here the
-//! first chunk is fed a byte at a time until the decoder makes its first
-//! byte of output; an error before then is the probe's. The difference
-//! (a stated deviation, pinned by `compat_xz`'s
-//! `header_probe_deviation_is_pinned`): corruption in the first LZMA
-//! chunk's properties byte or its range-coder start (`.xz`), or in the
-//! range-coder start (`.lzma`), is said before the output is opened, where
-//! xz finds it after opening it. Without `-f` the corruption is reported
-//! where xz reports that the output exists. With `-f` an existing output
-//! survives where xz removes it.
+//! said before any output exists, and `-f` has removed nothing. On the C
+//! tier the probe is xz's own call (`Decoder::probe`, `lzma_code` with no
+//! output room), so the output is opened, refused or kept exactly as xz
+//! does. On the pure tier the first chunk is fed a byte at a time until the
+//! decoder makes its first byte of output; an error before then is the
+//! probe's. On the pure tier only (a stated deviation, pinned by
+//! `compat_xz`'s `header_probe_matches_on_c_tier_and_deviation_is_pinned_on_pure`):
+//! corruption in the first LZMA chunk's properties byte or its range-coder
+//! start (`.xz`), or in the range-coder start (`.lzma`), is said before the
+//! output is opened, where xz finds it after opening it. Without `-f` the
+//! corruption is reported where xz reports that the output exists. With
+//! `-f` an existing output survives where xz removes it.
 //!
 //! **Feeding.** The xz_opts coders append all their output per call, so
 //! input goes in at most [`DECODE_PIECE`] bytes at a time when decoding
@@ -699,26 +701,45 @@ fn init(
             return None;
         }
     };
-    let mut out = Vec::new();
-    let mut fed = 0;
-    let mut pending = Ok(());
-    if format != Format::Raw {
-        // The header probe: up to the first byte of output (or the end of
-        // a stream with none).
-        while fed < first.len() && out.is_empty() && !dec.finished() {
-            let r = dec.feed(&first[fed..=fed], &mut out);
-            fed += 1;
+    // The header probe (coder_init): on the C tier xz's own call, with no
+    // output room; on the pure tier up to the first byte of output (or the
+    // end of a stream with none) - the stated deviation.
+    #[cfg(feature = "xz-c")]
+    let (fed, out, pending) = {
+        let mut fed = 0;
+        if format != Format::Raw {
+            let (used, r) = dec.probe(first);
+            fed = used;
             warn_checks(&mut dec, pair, msg, err);
             if let Err(e) = r {
-                // With output made, the error is coder_normal's.
-                if out.is_empty() {
-                    report(a, pair, &e, msg, err);
-                    return None;
-                }
-                pending = Err(e);
+                report(a, pair, &e, msg, err);
+                return None;
             }
         }
-    }
+        (fed, Vec::new(), Ok(()))
+    };
+    #[cfg(not(feature = "xz-c"))]
+    let (fed, out, pending) = {
+        let mut out = Vec::new();
+        let mut fed = 0;
+        let mut pending = Ok(());
+        if format != Format::Raw {
+            while fed < first.len() && out.is_empty() && !dec.finished() {
+                let r = dec.feed(&first[fed..=fed], &mut out);
+                fed += 1;
+                warn_checks(&mut dec, pair, msg, err);
+                if let Err(e) = r {
+                    // With output made, the error is coder_normal's.
+                    if out.is_empty() {
+                        report(a, pair, &e, msg, err);
+                        return None;
+                    }
+                    pending = Err(e);
+                }
+            }
+        }
+        (fed, out, pending)
+    };
     Some(Coder::Decode {
         dec,
         fed,

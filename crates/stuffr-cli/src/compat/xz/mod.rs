@@ -35,12 +35,14 @@
 //! - The output is written to a temporary file beside it and published
 //!   when complete (`file_io.rs`); an input that is also the output is
 //!   never lost, even where xz would lose it (spec deviation 4).
-//! - The header probe (`coder.rs`): corruption in the first LZMA chunk's
-//!   properties byte or its range-coder start (`.xz`), or in the
-//!   range-coder start (`.lzma`), is said before the output is opened,
-//!   where xz finds it after opening it. Without `-f` the corruption is
-//!   reported where xz reports that the output exists. With `-f` an
-//!   existing output survives where xz removes it.
+//! - The header probe (`coder.rs`): on the C tier it is xz's own call
+//!   (`lzma_code` with no output room), so the output is opened, refused
+//!   or kept exactly as xz does. On the pure tier only: corruption in the
+//!   first LZMA chunk's properties byte or its range-coder start (`.xz`),
+//!   or in the range-coder start (`.lzma`), is said before the output is
+//!   opened, where xz finds it after opening it. Without `-f` the
+//!   corruption is reported where xz reports that the output exists. With
+//!   `-f` an existing output survives where xz removes it.
 //! - Closed standard streams: run with standard input or output closed
 //!   (`xz <&-`, or `xz -c a >&-`), xz says "(stdin): Read error: Bad file
 //!   descriptor" or "(stdout): Write error: Bad file descriptor" and exits

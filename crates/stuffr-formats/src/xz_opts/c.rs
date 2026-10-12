@@ -660,6 +660,23 @@ impl Strm {
         (used, ret, full)
     }
 
+    /// `lzma_code(action)` with no output room: `next_out` null,
+    /// `avail_out` 0, as `coder_init`'s probe calls it. Returns the bytes
+    /// consumed and the return code.
+    fn code_no_room(&mut self, input: &[u8], action: ffi::lzma_action) -> (usize, ffi::lzma_ret) {
+        self.0.next_in = input.as_ptr();
+        self.0.avail_in = input.len();
+        self.0.next_out = ptr::null_mut();
+        self.0.avail_out = 0;
+        // SAFETY: the stream is initialised; `next_in`/`avail_in` describe
+        // `input`, which lives for the call; there is no output buffer.
+        let ret = unsafe { ffi::lzma_code(self.raw(), action) };
+        let used = input.len() - self.0.avail_in;
+        self.0.next_in = ptr::null();
+        self.0.avail_in = 0;
+        (used, ret)
+    }
+
     /// `lzma_code(action)` with no more input until it says
     /// `LZMA_STREAM_END` (a barrier, a flush, the finish).
     fn drain(&mut self, action: ffi::lzma_action, out: &mut Vec<u8>) -> Result<(), XzError> {
@@ -1051,6 +1068,33 @@ impl Decoder {
         }
         let held = self.init_auto()?;
         self.code(&held, ffi::LZMA_RUN, out)
+    }
+
+    /// `coder_init`'s header probe: one `lzma_code(LZMA_RUN)` over `input`
+    /// with no output room (`next_out = NULL, avail_out = 0`), repeated
+    /// while it says `LZMA_UNSUPPORTED_CHECK` (each a warning, as
+    /// `take_unsupported_check_warning` hands them out). `LZMA_STREAM_END`
+    /// is success and the stream stays open, so the next call returns it
+    /// again, as `coder_normal`'s does. Returns the bytes consumed; what is
+    /// left is the caller's to `feed`. Any other return ends the decoder.
+    /// On a decoder still sniffing (`auto`) it is [`XzError::Prog`].
+    pub fn probe(&mut self, input: &[u8]) -> (usize, Result<(), XzError>) {
+        if self.state != DState::Running {
+            return (0, Err(XzError::Prog));
+        }
+        let mut used = 0;
+        loop {
+            let (n, ret) = self.strm.code_no_room(&input[used..], ffi::LZMA_RUN);
+            used += n;
+            match ret {
+                ffi::LZMA_UNSUPPORTED_CHECK => self.warnings.push_back(self.strm.check()),
+                ffi::LZMA_OK | ffi::LZMA_STREAM_END => return (used, Ok(())),
+                ret => {
+                    self.state = DState::Failed;
+                    return (used, Err(self.strm.error(ret)));
+                }
+            }
+        }
     }
 
     /// `LZMA_FINISH`: the input is over. A stream cut short is

@@ -1844,19 +1844,23 @@ mod unix {
         (err, out.status.code(), kept)
     }
 
-    /// A pinned, expected deviation: the header probe (`coder.rs`, the
-    /// `mod.rs` deviation list). Byte 30 of a `-T1` stream is the first
-    /// LZMA2 chunk's first range-coder byte; flipped, xz 5.8.4 finds the
-    /// corruption only after it has opened the output, stuffr before. The
-    /// harness has no expected-deviation mechanism, so each side's observed
-    /// outcome is asserted on its own (both observed 2026-10-12):
+    /// The header probe (`coder.rs`, the `mod.rs` deviation list). Byte 30
+    /// of a `-T1` stream is the first LZMA2 chunk's first range-coder byte;
+    /// flipped, xz 5.8.4 finds the corruption only after it has opened the
+    /// output:
     ///
-    /// - without `-f`: xz says "a: File exists", stuffr "a.xz: Compressed
-    ///   data is corrupt"; both exit 1 and keep `a`;
-    /// - with `-f`: both say "a.xz: Compressed data is corrupt" and exit 1,
-    ///   but xz has removed the existing `a` and stuffr has kept it.
+    /// - without `-f`: xz says "a: File exists", exits 1 and keeps `a`;
+    /// - with `-f`: xz says "a.xz: Compressed data is corrupt", exits 1 and
+    ///   has removed the existing `a`.
+    ///
+    /// On the C tier (`xz-c`) stuffr makes xz's own probe call and agrees
+    /// exactly. On the pure tier it is a pinned, expected deviation (the
+    /// harness has no expected-deviation mechanism, so its observed outcome
+    /// is asserted on its own): it finds the corruption before opening the
+    /// output, saying "Compressed data is corrupt" without `-f` too, and
+    /// keeps `a` with `-f`.
     #[test]
-    fn header_probe_deviation_is_pinned() {
+    fn header_probe_matches_on_c_tier_and_deviation_is_pinned_on_pure() {
         let Some(dir) = xz_dir() else { return };
         let mut xz = reference_output(&["-T1"], &text());
         assert_eq!(&xz[24..31], [0xe0, 0x06, 0xdf, 0x00, 0x3b, 0x5d, 0x00]);
@@ -1891,12 +1895,22 @@ mod unix {
             (corrupt.clone(), Some(1), None),
             "reference, with -f"
         );
-        assert_eq!(
-            ours_plain,
-            (corrupt.clone(), Some(1), existing.clone()),
-            "stuffr, without -f"
-        );
-        assert_eq!(ours_forced, (corrupt, Some(1), existing), "stuffr, with -f");
+        if cfg!(feature = "xz-c") {
+            // The C tier makes xz's own probe: the same text, exit and files.
+            assert_eq!(ours_plain, theirs_plain, "stuffr (C tier), without -f");
+            assert_eq!(ours_forced, theirs_forced, "stuffr (C tier), with -f");
+        } else {
+            assert_eq!(
+                ours_plain,
+                (corrupt.clone(), Some(1), existing.clone()),
+                "stuffr (pure tier), without -f"
+            );
+            assert_eq!(
+                ours_forced,
+                (corrupt, Some(1), existing),
+                "stuffr (pure tier), with -f"
+            );
+        }
     }
 
     // ==== Part 3 (Task 7): --list ====

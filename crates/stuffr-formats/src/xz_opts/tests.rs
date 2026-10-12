@@ -898,6 +898,87 @@ mod c_tier {
             );
         }
     }
+
+    fn probe_dec(threads: u32, single_stream: bool, memlimit: u64) -> Decoder {
+        Decoder::new(&DecodeOptions {
+            threads,
+            single_stream,
+            memlimit,
+            memlimit_threading: memlimit,
+            ..DecodeOptions::default()
+        })
+        .expect("valid options")
+    }
+
+    #[test]
+    fn probe_reads_the_headers_and_makes_no_output() {
+        let plain = b"hello, probe\n".repeat(100);
+        let xz = encode(&EncodeOptions::default(), &plain);
+        let mut d = probe_dec(1, false, u64::MAX);
+        let (used, r) = d.probe(&xz);
+        assert!(r.is_ok(), "{r:?}");
+        // Stream Header (12) and at least the Block Header; never past the
+        // first LZMA2 chunk's data.
+        assert!(used >= 12 + 8 && used < xz.len(), "used {used}");
+        assert_eq!(d.progress().out_bytes, 0);
+        let mut out = Vec::new();
+        d.feed(&xz[used..], &mut out).unwrap();
+        d.finish(&mut out).unwrap();
+        assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn probe_on_a_partial_header_uses_what_it_can() {
+        let xz = encode(&EncodeOptions::default(), b"x");
+        let mut d = probe_dec(1, false, u64::MAX);
+        let (used, r) = d.probe(&xz[..15]);
+        assert!(r.is_ok(), "{r:?}");
+        assert!(used <= 15);
+        let mut out = Vec::new();
+        d.feed(&xz[used..], &mut out).unwrap();
+        d.finish(&mut out).unwrap();
+        assert_eq!(out, b"x");
+    }
+
+    #[test]
+    fn probe_warns_once_per_unsupported_check() {
+        let mut d = probe_dec(1, false, u64::MAX);
+        let (_, r) = d.probe(&CHECK_0F);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(d.take_unsupported_check_warning(), Some(0x0f));
+        assert_eq!(d.take_unsupported_check_warning(), None);
+    }
+
+    #[test]
+    fn probe_of_an_empty_single_stream_ends_and_feed_agrees() {
+        let xz = encode(&EncodeOptions::default(), b"");
+        let mut d = probe_dec(1, true, u64::MAX);
+        let (used, r) = d.probe(&xz);
+        assert!(r.is_ok(), "{r:?}");
+        let mut out = Vec::new();
+        d.feed(&xz[used..], &mut out).unwrap();
+        d.finish(&mut out).unwrap();
+        assert!(d.finished());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn probe_refuses_a_first_block_over_the_limit() {
+        let xz = encode(&preset_opts(9, false, 0), &[7u8; 4096]);
+        let mut d = probe_dec(1, false, 1 << 20);
+        let (_, r) = d.probe(&xz);
+        assert!(matches!(r, Err(XzError::MemLimit { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn probe_on_an_auto_decoder_is_a_programming_error() {
+        let mut d = Decoder::new(&DecodeOptions {
+            auto: true,
+            ..DecodeOptions::default()
+        })
+        .unwrap();
+        assert!(matches!(d.probe(b"\xfd7zXZ\0").1, Err(XzError::Prog)));
+    }
 }
 
 /// One tier's [`Encoder`] and [`Decoder`] behind plain functions, so the

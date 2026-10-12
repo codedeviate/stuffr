@@ -1121,12 +1121,16 @@ and `XZ_OPT` are read before the command line, as xz reads them.
 - **An input that is also the output is never lost,** as with the other
   families: output is written beside the target and put in place when
   complete, so a failure keeps the input even where xz would lose it.
-- **Some corruption is found before the output is opened.** Corruption in
-  the first LZMA chunk's properties byte or its range-coder start (`.xz`),
-  or in the range-coder start (`.lzma`), is said before the output is
-  opened, where xz finds it after opening it. Without `-f` the corruption
-  is reported where xz reports that the output exists. With `-f` an
-  existing output survives where xz removes it.
+- **Some corruption is found before the output is opened (pure tier
+  only).** On the C tier the header probe is xz's own call (`lzma_code`
+  with no output room), so the output is opened, refused or kept exactly as
+  xz does. On the pure tier the first chunk is fed a byte at a time until
+  the first byte of output, so corruption in the first LZMA chunk's
+  properties byte or its range-coder start (`.xz`), or in the range-coder
+  start (`.lzma`), is said before the output is opened, where xz finds it
+  after opening it. Without `-f` the corruption is reported where xz
+  reports that the output exists. With `-f` an existing output survives
+  where xz removes it.
 - **A closed standard input or output** (`xz <&-`, `xz -c a >&-`): xz says
   "(stdin): Read error: Bad file descriptor" or "(stdout): Write error: Bad
   file descriptor" and exits 1. The Rust runtime reopens a closed standard
