@@ -2658,15 +2658,17 @@ mod interrupts {
                 continue;
             };
             assert!(killed_by(&r, libc::SIGQUIT), "mine={mine}: {:?}", r.status);
-            // The input and one partial output, whatever its name.
-            assert_eq!(r.left.len(), 2, "mine={mine}: {:?}", r.left);
-            assert!(r.left.contains(&"a".to_string()), "{:?}", r.left);
+            // The input and one partial output, whatever its name; SIGQUIT
+            // may dump core where `ulimit -c` allows it, which is neither.
+            let left: Vec<&String> = r.left.iter().filter(|n| !n.starts_with("core")).collect();
+            assert_eq!(left.len(), 2, "mine={mine}: {:?}", r.left);
+            assert!(left.contains(&&"a".to_string()), "{:?}", r.left);
         }
     }
 
     #[test]
     fn gnu_gunzip_removes_its_partial_output_on_int() {
-        let gz = |m: usize| stored_gzip(big_input(m));
+        let gz = |m: usize| stored_gzip(big_input(fast_size(m)));
         for mine in [true, false] {
             let Some(r) = run(
                 mine,

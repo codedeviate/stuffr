@@ -2282,7 +2282,7 @@ mod interrupts {
     #[test]
     fn apple_gzip_removes_its_partial_output_on_int() {
         let plain = |m: usize| big_input(m).to_vec();
-        let gz = |m: usize| stored_gzip(big_input(m));
+        let gz = |m: usize| stored_gzip(big_input(fast_size(m)));
         for mine in [true, false] {
             type Make<'a> = &'a dyn Fn(usize) -> Vec<u8>;
             let cases: [(&[&str], &str, Make, &str); 2] = [

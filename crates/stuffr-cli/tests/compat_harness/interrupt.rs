@@ -29,6 +29,13 @@ pub fn big_input(mib: usize) -> &'static [u8] {
     &v[..mib << 20]
 }
 
+/// The input size for a case that is fast per byte (a near-stored decompress,
+/// a raw copy): three times the attempt's size, capped at what `big_input`
+/// holds, so even the first attempt leaves the run seconds to be signalled.
+pub fn fast_size(mib: usize) -> usize {
+    (mib * 3).min(256)
+}
+
 pub fn listing(dir: &Path) -> Vec<String> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -113,8 +120,10 @@ pub fn interrupt_env(
 }
 
 /// `interrupt` over `input(mib)` written to `dir/file`, retrying once with
-/// four times the input if the run finished before the signal; a second
-/// miss fails the test rather than passing silently.
+/// four times the input if the run finished before the signal (it ended
+/// first, or exited 0 between ready and the kill); a second miss fails the
+/// test rather than passing silently. Cases whose work is fast per byte pass
+/// an `input` that scales `mib` up.
 #[allow(clippy::too_many_arguments)]
 pub fn interrupt_with_input(
     exe: &Path,
@@ -148,11 +157,15 @@ pub fn interrupt_with_input_env(
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(file), input(mib)).unwrap();
-        if let Some(r) = interrupt_env(exe, name, args, dir, env, inherit, sig, ready) {
-            return r;
+        // A run that exited 0 was over before the signal landed (a test
+        // thread descheduled for a few tens of milliseconds is enough on a
+        // fast case): a miss, like `None`. No caller expects success here.
+        match interrupt_env(exe, name, args, dir, env, inherit, sig, ready) {
+            Some(r) if !r.status.success() => return r,
+            _ => {}
         }
     }
-    panic!("{name} {args:?}: finished before the signal even at 256 MiB");
+    panic!("{name} {args:?}: finished before the signal even at the larger size");
 }
 
 pub fn killed_by(r: &Interrupted, sig: i32) -> bool {

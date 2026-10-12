@@ -1347,8 +1347,8 @@ mod interrupts {
 
     const CAUGHT: &str = "\nbzip2: Control-C or similar caught, quitting.\n\
                           bzip2: Deleting output file a.bz2, if it exists.\n";
-    const CAUGHT_QUIET: &str = "\nbzip2: Control-C or similar caught, quitting.\n";
-    const CAUGHT_TEST: &str = "\nbzip2: Control-C or similar caught, quitting.\n";
+    /// The "caught" line alone, for runs with no output file to delete.
+    const CAUGHT_NO_OUTPUT: &str = "\nbzip2: Control-C or similar caught, quitting.\n";
     const NOT_PROCESSED: &str = "bzip2: WARNING: some files have not been processed:\n\
                                  bzip2:    2 specified on command line, 1 not processed yet.\n\n";
 
@@ -1426,7 +1426,7 @@ mod interrupts {
     fn bzip2_quiet_drops_the_deleting_line() {
         for mine in [true, false] {
             if let Some(r) = run(mine, "q", &["-q", "a"], Inherit::Default, libc::SIGINT) {
-                check(&r, CAUGHT_QUIET, &["a"], &format!("mine={mine}"));
+                check(&r, CAUGHT_NO_OUTPUT, &["a"], &format!("mine={mine}"));
             }
         }
     }
@@ -1501,7 +1501,7 @@ mod interrupts {
                 &["-df", "a.bz2"],
                 &dir,
                 "a.bz2",
-                &plain,
+                &|m| plain(fast_size(m)),
                 Inherit::Default,
                 libc::SIGINT,
                 &ready,
@@ -1608,7 +1608,7 @@ mod interrupts {
                 &ready,
             );
             let _ = std::fs::remove_dir_all(&dir);
-            check(&r, CAUGHT_TEST, &["a.bz2"], &format!("mine={mine}"));
+            check(&r, CAUGHT_NO_OUTPUT, &["a.bz2"], &format!("mine={mine}"));
         }
     }
 

@@ -138,8 +138,11 @@ impl Drop for CleanupGuard {
 /// first, or SIGPIPE stays ignored and unhooked (see `XZ_SIGNALS`). The
 /// signals are the family's (`XZ_SIGNALS`, `GNU_GZIP_SIGNALS`,
 /// `APPLE_GZIP_SIGNALS`); a process runs one family, so one set is installed.
-/// One arm at a time: arm the temporary right after `create_temp` and drop
-/// the guard once it is published or removed, before arming another.
+/// One arm at a time: arm the temporary right after `create_temp`, and keep
+/// the guard no longer than that run's scope (before arming another). A
+/// caller may hold it to the end of its function: once the temporary is
+/// published or removed its unique name no longer exists, so a late signal
+/// unlinks nothing, and no second arm is made in that scope.
 pub(crate) fn arm_cleanup(host: &Host, path: &Path, signals: Signals) -> CleanupGuard {
     #[cfg(unix)]
     {
