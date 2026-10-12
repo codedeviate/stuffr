@@ -28,6 +28,56 @@ pub(super) const PREFIX: &str = "%s: ";
 /// message.c: message_try_help (printed at `V_WARNING`).
 pub(super) const TRY_HELP: &str = "Try '%s --help' for more information.";
 
+/// message.c: message_bug (fatal).
+pub(super) const BUG: &str = "Internal error (bug)";
+
+/// message.c: message_strm, `LZMA_UNSUPPORTED_CHECK`.
+pub(super) const STRM_UNSUPPORTED_CHECK: &str =
+    "Unsupported type of integrity check; not verifying file integrity";
+
+/// message.c: message_strm, `LZMA_MEMLIMIT_ERROR`.
+pub(super) const STRM_MEMLIMIT: &str = "Memory usage limit reached";
+
+/// message.c: message_strm, `LZMA_FORMAT_ERROR`.
+pub(super) const STRM_FORMAT: &str = "File format not recognized";
+
+/// message.c: message_strm, `LZMA_OPTIONS_ERROR`.
+pub(super) const STRM_OPTIONS: &str = "Unsupported options";
+
+/// message.c: message_strm, `LZMA_DATA_ERROR`.
+pub(super) const STRM_DATA: &str = "Compressed data is corrupt";
+
+/// message.c: message_strm, `LZMA_BUF_ERROR`.
+pub(super) const STRM_BUF: &str = "Unexpected end of input";
+
+/// message.c: message_mem_needed with no limit (`uint64_to_str` of the
+/// rounded-up MiB).
+pub(super) const MEM_NEEDED_NO_LIMIT: &str =
+    "%s MiB of memory is required. The limiter is disabled.";
+
+/// message.c: message_mem_needed (the limit as [`MEM_LIMIT_BYTES`] or
+/// [`MEM_LIMIT_MIB`]).
+pub(super) const MEM_NEEDED: &str = "%s MiB of memory is required. The limit is %s.";
+
+/// message.c: message_mem_needed, a limit under 1 MiB.
+pub(super) const MEM_LIMIT_BYTES: &str = "%s B";
+
+/// message.c: message_mem_needed, a limit of 1 MiB or more (rounded up).
+pub(super) const MEM_LIMIT_MIB: &str = "%s MiB";
+
+/// message.c: message_filters_show (`fprintf(stderr, ...)`, the program
+/// name and lzma_str_from_filters' string).
+pub(super) const FILTER_CHAIN: &str = "%s: Filter chain: %s\n";
+
+/// message.c: message_error/message_warning's `"%s: %s"` around a name: the
+/// coder's (coder.c: coder_init, coder_normal, with message_strm) and
+/// file_io.c's (io_open_src_real, io_open_dest_real, with `strerror`).
+pub(super) const NAME_COLON: &str = "%s: %s";
+
+/// coder.c: str_to_filters (the masked filter string) and its fatal
+/// message (`message(V_ERROR, "%s", ...)`, `message_fatal("%s", ...)`).
+pub(super) const PLAIN: &str = "%s";
+
 /// message.c: message_version, first line. stuffr's own: the reference
 /// prints `xz (XZ Utils) 5.8.4`.
 pub(super) const VERSION_FIRST_LINE: &str = "xz (stuffr %s; XZ Utils 5.8.4 compatible)\n";
@@ -343,6 +393,141 @@ pub(super) const FILTERS_ERROR: &str = "Error in --filters%s=FILTERS option:";
 /// coder.c: str_to_filters, the caret line (`"%*s^"`; the caller pads).
 pub(super) const CARET: &str = "%s^";
 
+/// coder.c: memlimit_too_small.
+pub(super) const MEMLIMIT_TOO_LOW: &str =
+    "Memory usage limit is too low for the given filter setup.";
+
+/// coder.c: coder_set_compression_settings, a `--block-list` chain with no
+/// `--filtersN` (the number twice).
+pub(super) const CHAIN_NOT_SPECIFIED: &str =
+    "filter chain %s used by --block-list but not specified with --filters%s=";
+
+/// coder.c: coder_set_compression_settings, a preset in raw mode
+/// (`V_WARNING`, the status unchanged), first line.
+pub(super) const RAW_PRESET: &str = "Using a preset in raw mode is discouraged.";
+
+/// coder.c: coder_set_compression_settings, a preset in raw mode, second
+/// line.
+pub(super) const RAW_PRESET_VARIES: &str =
+    "The exact options of the presets may vary between software versions.";
+
+/// coder.c: coder_set_compression_settings.
+pub(super) const LZMA_NEEDS_LZMA1: &str = "The .lzma format supports only the LZMA1 filter";
+
+/// coder.c: coder_set_compression_settings.
+pub(super) const LZMA1_NOT_IN_XZ: &str = "LZMA1 cannot be used with the .xz format";
+
+/// coder.c: coder_set_compression_settings, `--flush-timeout` with a chain
+/// holding something other than LZMA2 and Delta.
+pub(super) const FLUSH_INCOMPATIBLE: &str = "Filter chain %s is incompatible with --flush-timeout";
+
+/// coder.c: coder_set_compression_settings (`V_WARNING`, the status
+/// unchanged).
+pub(super) const FLUSH_SINGLE_THREADED: &str =
+    "Switching to single-threaded mode due to --flush-timeout";
+
+/// coder.c: coder_set_compression_settings, `lzma_mt_block_size` refusing a
+/// chain.
+pub(super) const UNSUPPORTED_CHAIN_N: &str = "Unsupported options in filter chain %s";
+
+/// coder.c: coder_set_compression_settings (`V_DEBUG`).
+pub(super) const USING_THREADS: &str = "Using up to %s threads.";
+
+/// coder.c: coder_set_compression_settings, a memusage of `UINT64_MAX`.
+pub(super) const UNSUPPORTED_CHAIN: &str = "Unsupported filter chain or filter options";
+
+/// coder.c: coder_set_compression_settings (`V_DEBUG`).
+pub(super) const DECOMPRESSION_NEEDS: &str = "Decompression will need %s MiB of memory.";
+
+/// coder.c: coder_set_compression_settings (`V_DEBUG` since 5.6.1).
+pub(super) const REDUCED_THREADS: &str = "Reduced the number of threads from %s to %s to not \
+     exceed the memory usage limit of %s MiB";
+
+/// coder.c: coder_set_compression_settings (`V_DEBUG` since 5.6.1).
+pub(super) const REDUCED_TO_ONE: &str = "Reduced the number of threads from %s to one. The \
+     automatic memory usage limit of %s MiB is still being exceeded. %s MiB of memory is \
+     required. Continuing anyway.";
+
+/// coder.c: coder_set_compression_settings (`V_WARNING`, the status
+/// unchanged).
+pub(super) const SINGLE_THREADED_FOR_LIMIT: &str =
+    "Switching to single-threaded mode to not exceed the memory usage limit of %s MiB";
+
+/// coder.c: coder_set_compression_settings, the default chain (`V_WARNING`,
+/// the status unchanged).
+pub(super) const ADJUSTED_DICT: &str = "Adjusted LZMA%s dictionary size from %s MiB to %s MiB \
+     to not exceed the memory usage limit of %s MiB";
+
+/// coder.c: coder_set_compression_settings, a `--filtersN` chain.
+pub(super) const ADJUSTED_DICT_N: &str = "Adjusted LZMA%s dictionary size for --filters%s from \
+     %s MiB to %s MiB to not exceed the memory usage limit of %s MiB";
+
+// ---- file_io.c ----
+
+/// file_io.c: io_open_src.
+pub(super) const EMPTY_FILENAME: &str = "Empty filename, skipping";
+
+/// file_io.c: io_open_src_real (a warning).
+pub(super) const IS_SYMLINK: &str = "%s: Is a symbolic link, skipping";
+
+/// file_io.c: io_open_src_real (a warning).
+pub(super) const IS_DIRECTORY: &str = "%s: Is a directory, skipping";
+
+/// file_io.c: io_open_src_real (a warning).
+pub(super) const NOT_REGULAR: &str = "%s: Not a regular file, skipping";
+
+/// file_io.c: io_open_src_real (a warning).
+pub(super) const SETID: &str = "%s: File has setuid or setgid bit set, skipping";
+
+/// file_io.c: io_open_src_real (a warning).
+pub(super) const STICKY: &str = "%s: File has sticky bit set, skipping";
+
+/// file_io.c: io_open_src_real (a warning).
+pub(super) const HARD_LINKS: &str = "%s: Input file has more than one hard link, skipping";
+
+/// file_io.c: io_unlink (a warning).
+pub(super) const MOVED: &str = "%s: File seems to have been moved, not removing";
+
+/// file_io.c: io_unlink (a warning) and io_open_dest_real (an error).
+pub(super) const CANNOT_REMOVE: &str = "%s: Cannot remove: %s";
+
+/// file_io.c: io_copy_attrs (a warning, only when root).
+pub(super) const CANNOT_SET_OWNER: &str = "%s: Cannot set the file owner: %s";
+
+/// file_io.c: io_copy_attrs (a warning).
+pub(super) const CANNOT_SET_GROUP: &str = "%s: Cannot set the file group: %s";
+
+/// file_io.c: io_copy_attrs (a warning).
+pub(super) const CANNOT_SET_PERMISSIONS: &str = "%s: Cannot set the file permissions: %s";
+
+/// file_io.c: io_sync_dest.
+pub(super) const SYNC_FILE_FAILED: &str = "%s: Synchronizing the file failed: %s";
+
+/// file_io.c: io_sync_dest.
+pub(super) const SYNC_DIR_FAILED: &str = "%s: Synchronizing the directory of the file failed: %s";
+
+/// file_io.c: io_open_dest_real, `--synchronous`'s directory.
+pub(super) const OPEN_DIR_FAILED: &str = "%s: Opening the directory failed: %s";
+
+/// file_io.c: io_close_dest.
+pub(super) const CLOSE_FAILED: &str = "%s: Closing the file failed: %s";
+
+/// file_io.c: io_write and io_close.
+pub(super) const SPARSE_SEEK_FAILED: &str =
+    "%s: Seeking failed when trying to create a sparse file: %s";
+
+/// file_io.c: io_read.
+pub(super) const READ_ERROR: &str = "%s: Read error: %s";
+
+/// file_io.c: io_write_buf (not for `EPIPE`).
+pub(super) const WRITE_ERROR: &str = "%s: Write error: %s";
+
+/// file_io.c: io_wait.
+pub(super) const POLL_FAILED: &str = "%s: poll() failed: %s";
+
+/// file_io.c: io_open_dest_real, standard output's name.
+pub(super) const STDOUT_NAME: &[u8] = b"(stdout)";
+
 // ---- string_conversion.c (liblzma's error texts, which xz prints) ----
 
 /// string_conversion.c: str_to_filters.
@@ -461,8 +646,8 @@ pub(super) const GLIBC_NEEDS_ARGUMENT_LONG: &str = "%s: option '--%s' requires a
 /// glibc getopt.c: process_long_option, the word as typed.
 pub(super) const GLIBC_UNRECOGNIZED: &str = "%s: unrecognized option '--%s'\n";
 
-// ---- stuffr's own, until Task 6 ----
+// ---- stuffr's own, until Task 7 ----
 
-/// Compression, decompression and `--list` arrive with the coder (0.13.0
-/// Tasks 6 and 7); until then a file operand gets this error.
+/// `--list` arrives with list.c (0.13.0 Task 7); until then a file operand
+/// gets this error.
 pub(super) const NOT_YET: &str = "%s: not yet supported by this build";

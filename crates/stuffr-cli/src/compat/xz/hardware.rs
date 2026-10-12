@@ -212,13 +212,11 @@ impl Limits {
     }
 
     /// hardware.c: hardware_threads_get.
-    #[allow(dead_code)] // the coder (Task 6) reads it
     pub(crate) fn threads_get(&self) -> u32 {
         self.threads_max
     }
 
     /// hardware.c: hardware_threads_is_mt.
-    #[allow(dead_code)] // the coder (Task 6) reads it
     pub(crate) fn threads_is_mt(&self) -> bool {
         self.threads_max > 1 || self.use_mt_mode_with_one_thread
     }
@@ -253,7 +251,6 @@ impl Limits {
 
     /// hardware.c: hardware_memlimit_get: the hard limit, `u64::MAX` for
     /// none. Under the sandbox the decoder's is capped (Ruling P7).
-    #[allow(dead_code)] // the coder (Task 6) reads it
     pub(crate) fn memlimit_get(&self, mode: OpMode) -> u64 {
         let set = if mode == OpMode::Compress {
             self.memlimit_compress
@@ -268,7 +265,6 @@ impl Limits {
     }
 
     /// hardware.c: hardware_memlimit_mtenc_get.
-    #[allow(dead_code)] // the coder (Task 6) reads it
     pub(crate) fn memlimit_mtenc_get(&self) -> u64 {
         if self.memlimit_mtenc_is_default() {
             self.memlimit_mt_default
@@ -278,7 +274,6 @@ impl Limits {
     }
 
     /// hardware.c: hardware_memlimit_mtenc_is_default.
-    #[allow(dead_code)] // the coder (Task 6) reads it
     pub(crate) fn memlimit_mtenc_is_default(&self) -> bool {
         self.memlimit_compress == 0 && self.threads_are_automatic
     }

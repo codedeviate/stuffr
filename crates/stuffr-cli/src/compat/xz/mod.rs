@@ -25,12 +25,25 @@
 //! - `--version`'s first line names stuffr (`xz (stuffr X.Y.Z; XZ Utils
 //!   5.8.4 compatible)`); its second line and `--robot --version` are the
 //!   reference's, on both tiers.
-//! - Compression, decompression, `--test` and `--list` arrive with the
-//!   coder (0.13.0 Tasks 6 and 7); until then every input is refused with
-//!   stuffr's own error, exit 1.
+//! - `--list` arrives with list.c (0.13.0 Task 7); until then every input
+//!   is refused there with stuffr's own error, exit 1.
+//! - The output is written to a temporary file beside it and published
+//!   when complete (`file_io.rs`); an input that is also the output is
+//!   never lost, even where xz would lose it (spec deviation 4).
+//! - `coder_init`'s header probe is approximated (`coder.rs`): corruption
+//!   in the first LZMA2 chunk header, before any output, is said before
+//!   the output is opened rather than after.
+//! - A parent that ignores SIGPIPE is not seen (the Rust runtime ignores
+//!   it before `main`): writing to a closed pipe still kills stuffr, where
+//!   xz would say nothing and exit 0.
+//! - Pure tier: before a corrupt or cut-short spot, less of the partial
+//!   output is written than xz writes (`lzma-rust2` drops what its failing
+//!   call had decoded); the messages and exit code are xz's. Near the end
+//!   of a raw, `.lzma` or `.lz` stream, corruption can be reported as
+//!   truncation (Ruling P6).
 
 use std::collections::BTreeMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -41,35 +54,36 @@ use super::CountedRun;
 use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe, strerror};
 
 pub(crate) mod args;
+mod coder;
+mod file_io;
 pub(crate) mod hardware;
 pub(crate) mod message;
 mod messages;
 pub(crate) mod options;
-// The output name is the coder's to ask for (Task 6); until then only
-// `suffix::check` (`--suffix`) has a caller outside the tests.
-#[allow(dead_code)]
 pub(crate) mod suffix;
 
 use args::{Args, OpMode};
 use hardware::Hardware;
 use message::{Messages, Status, Verbosity, mask_nonprint};
 
-/// Entry point for the six names; `name` is the canonical invoked name and
-/// `args` the arguments after `argv[0]`.
-pub fn run(name: &'static str, args: Vec<OsString>) -> ExitCode {
+/// Entry point for the six names; `name` is the canonical invoked name,
+/// `argv0` the program as invoked (every message's name, as xz's
+/// `progname`) and `args` the arguments after it.
+pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
     // xz dies of SIGPIPE writing to a closed pipe (observed: `xz -dc big.xz
     // | head -c1` exits 141 in bash). Before any interrupt cleanup is armed
     // (Ruling P8).
     reset_sigpipe();
-    let argv0 = std::env::args_os()
-        .next()
-        .map(|a| a.as_encoded_bytes().to_vec())
-        .unwrap_or_else(|| name.as_bytes().to_vec());
+    let argv0 = if argv0.is_empty() {
+        name.as_bytes()
+    } else {
+        argv0.as_encoded_bytes()
+    };
     let env = |k: &str| std::env::var_os(k);
     let mut err = io::stderr();
     let code = main(
         name,
-        &argv0,
+        argv0,
         &args,
         &env,
         &mut Host::Real,
@@ -148,11 +162,12 @@ fn main(
         msg.try_help(err);
         return Status::Error as u8;
     }
-    // signals_init() is armed with the coder (Task 6).
+    // signals_init(): the cleanup handlers are installed when an output
+    // file is armed (host.rs), the only time they act.
     let names = std::mem::take(&mut a.files);
     for n in &names {
-        let mut file = n.as_slice();
-        if file == b"-" {
+        let mut file = Some(n.as_slice());
+        if n == b"-" {
             if a.op == OpMode::Compress {
                 if is_tty_stdout(host, &mut msg, err) {
                     continue;
@@ -165,7 +180,7 @@ fn main(
                 msg.error(err, messages::STDIN_BOTH, &[]);
                 continue;
             }
-            file = messages::STDIN_NAME;
+            file = None;
         }
         run_one(&a, file, host, &mut msg, err);
     }
@@ -178,7 +193,7 @@ fn main(
         };
         let mut reader = BufReader::new(source);
         while let Some(name) = read_name(&mut reader, delim, &display, &mut msg, err) {
-            run_one(&a, &name, host, &mut msg, err);
+            run_one(&a, Some(&name), host, &mut msg, err);
         }
     }
     // list_totals() for --list comes with list.c (Task 7).
@@ -202,10 +217,21 @@ fn is_tty_stdout(host: &Host, msg: &mut Messages, err: &mut dyn Write) -> bool {
 }
 
 /// coder.c: coder_run, or list.c: list_file under `--list`, for one input
-/// (`(stdin)` is standard input). Until the coder lands (Tasks 6 and 7)
-/// every input is refused.
-fn run_one(_a: &Args, name: &[u8], _host: &mut Host, msg: &mut Messages, err: &mut dyn Write) {
-    msg.error(err, messages::NOT_YET, &[&mask_nonprint(name)]);
+/// (`None`: standard input). `--list` arrives with list.c (Task 7); until
+/// then every input is refused there.
+fn run_one(
+    a: &Args,
+    name: Option<&[u8]>,
+    host: &mut Host,
+    msg: &mut Messages,
+    err: &mut dyn Write,
+) {
+    if a.op == OpMode::List {
+        let shown = mask_nonprint(name.unwrap_or(messages::STDIN_NAME));
+        msg.error(err, messages::NOT_YET, &[&shown]);
+        return;
+    }
+    coder::run(a, name, host, msg, err);
 }
 
 /// main.c: read_name: the next name from `--files`/`--files0`'s source,
@@ -291,6 +317,58 @@ mod tests {
         let (got, err, _) = names(b"a\0b\n", b'\n');
         assert!(got.is_empty());
         assert!(err.contains("Null character found"), "{err}");
+    }
+
+    /// The coder under `Host::Sandbox`: standard input to standard output
+    /// and back, a file to its `.xz` (the input removed), a test, and
+    /// output past the sandbox's budget failing as a full disk does.
+    #[test]
+    fn run_in_counted_codes_in_the_sandbox() {
+        let dir = std::env::temp_dir().join(format!("stuffr-xz-sandbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = b"sandboxed\n".repeat(100);
+        let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        let (code, packed, err, _) = run_in_counted(&dir, "xz", &args(&["-T1"]), &plain, &|_| None);
+        assert_eq!((code, err.as_slice()), (0, &b""[..]));
+        assert!(packed.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0]));
+        let (code, out, err, _) = run_in_counted(&dir, "xzcat", &[], &packed, &|_| None);
+        assert_eq!((code, out, err), (0, plain.clone(), Vec::new()));
+
+        std::fs::write(dir.join("a"), &plain).unwrap();
+        let (code, _, err, reads) = run_in_counted(&dir, "xz", &args(&["a"]), b"", &|_| None);
+        assert_eq!((code, err), (0, Vec::new()));
+        assert!(!dir.join("a").exists());
+        assert_eq!(
+            reads.get(&dir.join("a")).map(|r| r.bytes),
+            Some(plain.len() as u64)
+        );
+        let (code, out, err, _) =
+            run_in_counted(&dir, "xz", &args(&["-t", "a.xz"]), b"", &|_| None);
+        assert_eq!((code, out, err), (0, Vec::new(), Vec::new()));
+        let (code, _, err, _) = run_in_counted(&dir, "unxz", &args(&["a.xz"]), b"", &|_| None);
+        assert_eq!((code, err), (0, Vec::new()));
+        assert_eq!(std::fs::read(dir.join("a")).unwrap(), plain);
+
+        // 9 MiB of zeros decode past the 8 MiB budget.
+        let zeros = vec![0u8; 9 << 20];
+        let (_, bomb, _, _) = run_in_counted(&dir, "xz", &args(&["-T1"]), &zeros, &|_| None);
+        let (code, _, err, _) = run_in_counted(&dir, "xzcat", &[], &bomb, &|_| None);
+        assert_eq!(code, 1);
+        assert!(
+            String::from_utf8_lossy(&err).starts_with("xzcat: (stdout): Write error: "),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        // A test counts what it decodes against the same budget.
+        let (code, _, err, _) = run_in_counted(&dir, "xz", &args(&["-t"]), &bomb, &|_| None);
+        assert_eq!(code, 1);
+        assert!(
+            String::from_utf8_lossy(&err).starts_with("xz: (stdout): Write error: "),
+            "{}",
+            String::from_utf8_lossy(&err)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

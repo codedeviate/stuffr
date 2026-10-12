@@ -21,7 +21,7 @@
 //! followed by xz's own "Try 'xz --help'" line (hidden by `-q`), exit 1.
 //!
 //! What `args_parse` calls last, `coder_set_compression_settings`, is
-//! `coder.c`'s and is ported with the coder.
+//! `coder.c`'s, in `coder.rs`.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -29,6 +29,7 @@ use std::io::Write;
 
 use stuffr::xz_opts::{Bcj, Check, Filter};
 
+use super::coder;
 use super::hardware::{Hardware, Limits, THREADS_MAX};
 use super::message::{self, Messages, Status, Verbosity, mask_nonprint};
 use super::messages as m;
@@ -99,6 +100,10 @@ pub(crate) struct CoderSettings {
     pub synchronous: bool,
     /// hardware.c's threads and memory limits.
     pub limits: Limits,
+    /// `mt_options.threads`: the threaded encoder's thread count, which
+    /// `coder_set_compression_settings` may lower below the limits' count
+    /// to fit the memory limit.
+    pub mt_threads: u32,
 }
 
 /// Where `--files`/`--files0` read names from.
@@ -624,14 +629,14 @@ impl Parser<'_> {
             let num: &[u8] = if index > 0 { &[b'0' + index] } else { b"" };
             let msg = &self.msg;
             msg.message(err, Verbosity::Error, m::FILTERS_ERROR, &[num]);
-            msg.message(err, Verbosity::Error, "%s", &[&mask_nonprint(s)]);
+            msg.message(err, Verbosity::Error, m::PLAIN, &[&mask_nonprint(s)]);
             msg.message(
                 err,
                 Verbosity::Error,
                 m::CARET,
                 &[" ".repeat(e.pos).as_bytes()],
             );
-            msg.fatal(err, "%s", &[e.msg.as_bytes()])
+            msg.fatal(err, m::PLAIN, &[e.msg.as_bytes()])
         })
     }
 
@@ -976,6 +981,7 @@ pub(crate) fn parse(
                 flush_timeout: 0,
                 synchronous: true,
                 limits,
+                mt_threads: 0,
             },
         },
         msg: Messages::new(argv0),
@@ -1037,8 +1043,12 @@ fn parse_all(
     {
         return Err(msg.fatal(err, m::RAW_NEEDS_SUFFIX, &[]));
     }
-    // coder_set_compression_settings() runs here in args_parse; it is
-    // coder.c's, ported with the coder.
+    // Compression settings are validated (the options and their memory
+    // usage) when compressing to any format, and when decoding raw data,
+    // whose chain comes from the command line.
+    if a.op == OpMode::Compress || (a.format == FormatChoice::Raw && a.op != OpMode::List) {
+        coder::set_compression_settings(a, msg, err)?;
+    }
     a.files = if operands.is_empty() && a.files_from.is_none() {
         vec![b"-".to_vec()]
     } else {
@@ -1332,11 +1342,14 @@ mod tests {
         );
     }
 
-    /// args.c: parse_block_list (recorded from 5.8.4 where it errs).
+    /// args.c: parse_block_list (recorded from 5.8.4 where it errs). The
+    /// chains the lists name are given, or coder_set_compression_settings
+    /// would refuse them.
     #[test]
     fn block_lists_parse_as_args_c() {
         let l = |s: &str| {
-            ok(&[&format!("--block-list={s}")])
+            let list = format!("--block-list={s}");
+            ok(&["--filters1=lzma2", "--filters2=lzma2", &list])
                 .coder
                 .block_list
                 .unwrap()
@@ -1348,7 +1361,11 @@ mod tests {
             vec![e(1024, 2), e(5, 1), e(5, 1), e(u64::MAX, 0)]
         );
         assert_eq!(l("1:5,2:0"), vec![e(5, 1), e(u64::MAX, 2)]);
-        let a = ok(&["--block-list=2:1KiB,1:5,,0"]);
+        let a = ok(&[
+            "--filters1=lzma2",
+            "--filters2=lzma2",
+            "--block-list=2:1KiB,1:5,,0",
+        ]);
         assert_eq!(a.coder.block_list_chain_mask, 0b111);
         assert_eq!(a.coder.block_list_largest, u64::MAX);
         // No entry is ever 0.
@@ -1401,21 +1418,30 @@ mod tests {
             p.err
                 .starts_with("/x/xz: Error in --filters3=FILTERS option:\n")
         );
+        // coder_set_compression_settings keeps only the chains the list
+        // uses.
         let a = ok(&["--filters2=x86 lzma2", "--block-list=2:1"]);
-        assert_eq!(a.coder.chains_used_mask, 0b101);
+        assert_eq!(a.coder.chains_used_mask, 0b100);
         assert!(a.coder.chains[2].is_some());
+        let a = ok(&["-d", "--filters2=x86 lzma2", "--filters4=lzma2"]);
+        assert_eq!(a.coder.chains_used_mask, 0b10101);
     }
 
     /// coder.c's preset/chain interplay: a preset forgets a chain, a
     /// filter option resets the preset to 6, `--filters` is replaced by a
-    /// later filter option.
+    /// later filter option. Seen when decompressing, where
+    /// coder_set_compression_settings does not run; compressing, the
+    /// preset becomes the chain.
     #[test]
     fn presets_and_chains_forget_each_other() {
-        let a = ok(&["-9", "--lzma2", "-e"]);
+        let a = ok(&["-d", "-9", "--lzma2", "-e"]);
         assert!(a.coder.chain.is_empty());
         assert_eq!((a.coder.preset, a.coder.extreme), (6, true));
-        let a = ok(&["--filters=x86 lzma2", "--delta"]);
+        let a = ok(&["-d", "--filters=x86 lzma2", "--delta"]);
         assert_eq!(a.coder.chain, vec![Filter::Delta { dist: 1 }]);
+        let a = ok(&["-9", "--lzma2", "-e"]);
+        let six_e = stuffr::xz_opts::Lzma::preset(6, true).unwrap();
+        assert_eq!(a.coder.chain, vec![Filter::Lzma2(six_e)]);
         let p = run(&["--x86", "--x86", "--x86", "--x86", "--x86"]);
         assert_eq!(p.err, "/x/xz: Maximum number of filters is four\n");
     }

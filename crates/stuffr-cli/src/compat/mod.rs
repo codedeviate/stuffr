@@ -89,7 +89,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Family::Bzip2 if name == "bzip2recover" => bzip2recover::run(argv0, rest),
         Family::Bzip2 => bzip2::run(name, rest),
         Family::Gzip => gzip::run(name, rest),
-        Family::Xz => xz::run(name, rest),
+        Family::Xz => xz::run(name, &argv0, rest),
     })
 }
 

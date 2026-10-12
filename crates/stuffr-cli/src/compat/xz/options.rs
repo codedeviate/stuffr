@@ -580,6 +580,88 @@ pub(crate) fn str_to_filters(s: &[u8], all_filters: bool) -> Result<Vec<Filter>,
     Ok(chain)
 }
 
+/// string_conversion.c: str_append_u32: `v` in decimal, and with
+/// `byte_suffix` the largest of KiB, MiB, GiB that divides it.
+fn str_append_u32(out: &mut String, v: u32, byte_suffix: bool) {
+    const SUFFIXES: [&str; 4] = ["", "KiB", "MiB", "GiB"];
+    let (mut v, mut suf) = (v, 0);
+    if v != 0 && byte_suffix {
+        while v & 1023 == 0 && suf < SUFFIXES.len() - 1 {
+            v >>= 10;
+            suf += 1;
+        }
+    }
+    out.push_str(&v.to_string());
+    out.push_str(SUFFIXES[suf]);
+}
+
+/// string_conversion.c: lzma_str_from_filters with `LZMA_STR_ENCODER |
+/// LZMA_STR_GETOPT_LONG`, what message_filters_show prints: each filter as
+/// `--name`, its encoder options after `=` (an LZMA filter's all but
+/// `preset`, a BCJ filter's `start` unless 0), filters apart by a space.
+pub(crate) fn str_from_filters(chain: &[Filter]) -> Vec<u8> {
+    let name_of = |kind: Kind| {
+        FILTER_NAMES
+            .iter()
+            .find(|(_, k)| match (k, kind) {
+                (Kind::Bcj(a), Kind::Bcj(b)) => *a == b,
+                (Kind::Lzma1, Kind::Lzma1)
+                | (Kind::Lzma2, Kind::Lzma2)
+                | (Kind::Delta, Kind::Delta) => true,
+                _ => false,
+            })
+            .map_or("", |(n, _)| *n)
+    };
+    let mut out = String::new();
+    for (i, f) in chain.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str("--");
+        match f {
+            // xz never builds LZMA1EXT; its name is not in this table.
+            Filter::Lzma1(l) | Filter::Lzma1Ext(l) | Filter::Lzma2(l) => {
+                let lzma2 = matches!(f, Filter::Lzma2(_));
+                out.push_str(name_of(if lzma2 { Kind::Lzma2 } else { Kind::Lzma1 }));
+                out.push_str("=dict=");
+                str_append_u32(&mut out, l.dict_size, true);
+                for (name, v) in [("lc", l.lc), ("lp", l.lp), ("pb", l.pb)] {
+                    out.push_str(&format!(",{name}="));
+                    str_append_u32(&mut out, v, false);
+                }
+                out.push_str(match l.mode {
+                    Mode::Fast => ",mode=fast",
+                    Mode::Normal => ",mode=normal",
+                });
+                out.push_str(",nice=");
+                str_append_u32(&mut out, l.nice_len, false);
+                out.push_str(match l.mf {
+                    MatchFinder::Hc3 => ",mf=hc3",
+                    MatchFinder::Hc4 => ",mf=hc4",
+                    MatchFinder::Bt2 => ",mf=bt2",
+                    MatchFinder::Bt3 => ",mf=bt3",
+                    MatchFinder::Bt4 => ",mf=bt4",
+                });
+                out.push_str(",depth=");
+                str_append_u32(&mut out, l.depth, false);
+            }
+            Filter::Bcj { kind, start } => {
+                out.push_str(name_of(Kind::Bcj(*kind)));
+                if *start != 0 {
+                    out.push_str("=start=");
+                    str_append_u32(&mut out, *start, true);
+                }
+            }
+            Filter::Delta { dist } => {
+                out.push_str(name_of(Kind::Delta));
+                out.push_str("=dist=");
+                str_append_u32(&mut out, *dist, false);
+            }
+        }
+    }
+    out.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

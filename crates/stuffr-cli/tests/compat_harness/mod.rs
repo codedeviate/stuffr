@@ -665,7 +665,8 @@ pub fn ref_decompress_case(c: &Case, data: &[u8]) -> Result<Vec<u8>, String> {
 /// or `lzcat`), and for `raw` the filter options of `c`, since a raw stream
 /// carries no header to say which chain it is.
 fn xz_decode_args(c: &Case) -> Vec<String> {
-    const FILTERS: [&str; 9] = [
+    const FILTERS: [&str; 10] = [
+        "--filters=",
         "--lzma1",
         "--lzma2",
         "--delta",
@@ -751,8 +752,27 @@ fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
     }
 }
 
+/// Whether case `c` compresses to standard output in a format with no
+/// magic (`.lzma`, raw), so its stdout is judged by decoding it as
+/// [`xz_decode_args`] says, as `.xz` output is. A case compresses when it
+/// is invoked as `xz` or `lzma` and no word before `--` is `-d`, `-t`,
+/// `-l`, their long forms, or a short cluster holding one of them.
+fn xz_magicless_stdout(c: &Case) -> bool {
+    if !matches!(c.roundtrip, Roundtrip::Xz { .. }) || !matches!(c.name, "xz" | "lzma") {
+        return false;
+    }
+    let decodes = c.args.iter().take_while(|a| **a != "--").any(|a| {
+        matches!(*a, "--decompress" | "--uncompress" | "--test" | "--list")
+            || (a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].chars().any(|ch| matches!(ch, 'd' | 't' | 'l')))
+    });
+    !decodes && !xz_decode_args(c).is_empty()
+}
+
 /// The magic of an `.xz` stream header. `.lzma` and raw streams have none:
-/// they are recognised by name (`is_compressed_name`) only.
+/// they are recognised by name (`is_compressed_name`) or by what the case
+/// does ([`xz_magicless_stdout`]).
 const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0];
 
 /// The `-S`/`--suffix` operand of `args`, if any: `-S X`, `-SX`, `--suffix X`,
@@ -917,10 +937,15 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
                     .map(str::to_owned)
             })?,
     };
-    c.files
-        .iter()
-        .find(|(n, _)| *n == base)
-        .map(|(_, b)| b.clone())
+    let found = c.files.iter().find(|(n, _)| *n == base);
+    // An xz output named after a link the case's setup made (`l.xz` from
+    // `l` -> `a`, or `a.xz` from `a` -> `a.xz`) has the case's one file as
+    // its original.
+    let only = match (c.roundtrip, c.files.as_slice()) {
+        (Roundtrip::Xz { .. }, [one]) => Some(one),
+        _ => None,
+    };
+    found.or(only).map(|(_, b)| b.clone())
 }
 
 fn describe_bytes(b: &[u8]) -> String {
@@ -1023,7 +1048,13 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
     }
 
     // stdout
-    if c.compare_output_bytes || !has_magic(&c.roundtrip, &s.stdout) {
+    // Compressed output is judged by decoding only where the bytes differ
+    // from the reference's: the same bytes need no judging, whether a
+    // stream, text a magicless case also prints (`lzma --version`), or a
+    // failed run's partial output.
+    let compressed = r.stdout != s.stdout
+        && (has_magic(&c.roundtrip, &s.stdout) || (!s.stdout.is_empty() && xz_magicless_stdout(c)));
+    if c.compare_output_bytes || !compressed {
         if r.stdout != s.stdout {
             d.push(format!(
                 "stdout differs ({}):\n  reference: {}\n  stuffr:    {}",
@@ -1142,9 +1173,9 @@ pub fn assert_same(c: &Case, r: &Run, s: &Run) {
 ///   sampling loses nothing. Before the exec completes `/proc/<pid>` can
 ///   still describe the spawning test process (CI measured 155 MiB of
 ///   RssAnon that way). The status at the peak and a timeline are printed.
-/// - **Elsewhere:** `getrusage(RUSAGE_CHILDREN)`'s `ru_maxrss`, the largest
-///   child this process has waited for (bytes on macOS, which spawns
-///   without copying the parent, so the figure is the child's own).
+/// - **Elsewhere:** the child's own `ru_maxrss` from `wait4`
+///   ([`wait_with_maxrss`]; bytes on macOS, which spawns without copying
+///   the parent).
 pub fn decoder_peak_rss(
     name: &str,
     file: &str,
@@ -1179,29 +1210,55 @@ pub fn decoder_peak_rss(
         out.read_to_end(&mut v).unwrap();
         v
     });
+    let mut errs = child.stderr.take().unwrap();
+    let err_reader = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = errs.read_to_string(&mut s);
+        s
+    });
     #[cfg(target_os = "linux")]
     let peak = linux_rss_anon_peak(&mut child);
+    #[cfg(target_os = "linux")]
     let st = child.wait().unwrap();
+    #[cfg(not(target_os = "linux"))]
+    let (st, peak) = wait_with_maxrss(child);
     let got = reader.join().unwrap();
-    let mut err = String::new();
-    let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+    let err = err_reader.join().unwrap();
     let _ = fs::remove_dir_all(&dir);
     assert!(st.success(), "{st:?}: {err}");
     assert_eq!(err, "");
     assert!(got == plain, "decoded output differs");
     #[cfg(not(target_os = "linux"))]
-    let peak = {
-        // SAFETY: `ru` is a valid out-pointer; getrusage only writes it.
-        let ru = unsafe {
-            let mut ru: libc::rusage = std::mem::zeroed();
-            assert_eq!(libc::getrusage(libc::RUSAGE_CHILDREN, &mut ru), 0);
-            ru
-        };
-        let peak = ru.ru_maxrss as u64;
-        eprintln!("peak child RSS: {:.1} MiB", peak as f64 / 1048576.0);
-        peak
-    };
+    eprintln!("peak child RSS: {:.1} MiB", peak as f64 / 1048576.0);
     peak
+}
+
+/// Reap `child` with `wait4`, which reports that child's own resource use:
+/// its exit status and its peak resident set in bytes (`ru_maxrss`, which
+/// Linux counts in KiB). Not `getrusage(RUSAGE_CHILDREN)`, the largest of
+/// every child this test process has reaped, which the other tests of the
+/// binary run alongside.
+pub fn wait_with_maxrss(child: std::process::Child) -> (std::process::ExitStatus, u64) {
+    let pid = child.id() as libc::pid_t;
+    let mut status = 0;
+    // SAFETY: `ru` is a valid out-pointer and `status` a valid int; wait4
+    // only writes them, for this child, which is reaped here (`child` is
+    // consumed, so nothing waits on it again).
+    let ru = unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        while libc::wait4(pid, &mut status, 0, &mut ru) != pid {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINTR)
+            );
+        }
+        ru
+    };
+    let unit = if cfg!(target_os = "linux") { 1024 } else { 1 };
+    (
+        std::process::ExitStatus::from_raw(status),
+        ru.ru_maxrss as u64 * unit,
+    )
 }
 
 /// The sampling loop of [`decoder_peak_rss`] on Linux: until `child`

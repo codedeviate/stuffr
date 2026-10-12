@@ -110,10 +110,8 @@ impl Drop for CleanupGuard {
 /// is armed and no handler installed. A path the slot cannot hold (or one
 /// with a NUL) is not armed. Arming never allocates. Call `reset_sigpipe()`
 /// first, or SIGPIPE stays ignored and unhooked (see `CLEANUP_SIGNALS`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the xz family arms it; until then only tests")
-)]
+/// One arm at a time: arm the temporary right after `create_temp` and drop
+/// the guard once it is published or removed, before arming another.
 pub(crate) fn arm_cleanup(host: &Host, path: &Path) -> CleanupGuard {
     #[cfg(unix)]
     {
@@ -122,6 +120,10 @@ pub(crate) fn arm_cleanup(host: &Host, path: &Path) -> CleanupGuard {
         if matches!(host, Host::Sandbox(_)) || bytes.len() >= SLOT_LEN || bytes.contains(&0) {
             return CleanupGuard { armed: false };
         }
+        debug_assert!(
+            !ARMED.load(Ordering::Acquire),
+            "arm_cleanup: another output is still armed"
+        );
         install_handlers();
         // SAFETY: sigset_t is plain data, initialised by sigemptyset before
         // use. Blocking the cleanup signals on this thread while the slot is
@@ -965,6 +967,9 @@ mod tests {
             fs::write(&file, b"partial").unwrap();
             let status = in_child(|| {
                 default_dispositions();
+                // ARMED is inherited at fork, where `arm_then_drop_disarms`
+                // may hold it; this child's arm is its only one.
+                ARMED.store(false, Ordering::SeqCst);
                 let _guard = arm_cleanup(&Host::Real, &file);
                 // SAFETY: raise is async-signal-safe; the handler unlinks
                 // the armed path and re-raises at SIG_DFL, ending the child.

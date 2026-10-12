@@ -4,11 +4,15 @@
 //!
 //! The progress indicator, the `--robot` error forms and the signal-driven
 //! progress line are Task 8's; this module holds what argument handling
-//! needs.
+//! and the coder need.
 
 use std::io::Write;
 
+use stuffr::xz_opts::{Filter, XzError};
+
+use super::hardware::round_up_to_mib;
 use super::messages::{self as m, printf};
+use super::options;
 
 /// `enum message_verbosity`, in its order: a message prints when its level
 /// is at most the current one.
@@ -95,7 +99,6 @@ impl Messages {
 
     /// `message_warning`: at `V_WARNING`, and the exit status becomes a
     /// warning unless it is already an error.
-    #[allow(dead_code)] // suffix.rs's, whose caller is the coder (Task 6)
     pub(crate) fn warning(&mut self, err: &mut dyn Write, fmt: &str, args: &[&[u8]]) {
         self.message(err, Verbosity::Warning, fmt, args);
         self.set_status(Status::Warning);
@@ -112,6 +115,51 @@ impl Messages {
     pub(crate) fn fatal(&self, err: &mut dyn Write, fmt: &str, args: &[&[u8]]) -> u8 {
         self.message(err, Verbosity::Error, fmt, args);
         Status::Error as u8
+    }
+
+    /// message.c: message_mem_needed: `memusage` rounded up to MiB, against
+    /// `memlimit` (`hardware_memlimit_get(opt_mode)`, `u64::MAX` for none).
+    pub(crate) fn mem_needed(
+        &self,
+        err: &mut dyn Write,
+        v: Verbosity,
+        memusage: u64,
+        memlimit: u64,
+    ) {
+        if v > self.verbosity {
+            return;
+        }
+        let usage = round_up_to_mib(memusage).to_string();
+        if memlimit == u64::MAX {
+            self.message(err, v, m::MEM_NEEDED_NO_LIMIT, &[usage.as_bytes()]);
+            return;
+        }
+        let mut limit = Vec::new();
+        if memlimit < 1 << 20 {
+            printf(
+                &mut limit,
+                m::MEM_LIMIT_BYTES,
+                &[memlimit.to_string().as_bytes()],
+            );
+        } else {
+            let mib = round_up_to_mib(memlimit).to_string();
+            printf(&mut limit, m::MEM_LIMIT_MIB, &[mib.as_bytes()]);
+        }
+        self.message(err, v, m::MEM_NEEDED, &[usage.as_bytes(), &limit]);
+    }
+
+    /// message.c: message_filters_show: the chain as
+    /// `lzma_str_from_filters(LZMA_STR_ENCODER | LZMA_STR_GETOPT_LONG)`
+    /// spells it.
+    pub(crate) fn filters_show(&self, err: &mut dyn Write, v: Verbosity, chain: &[Filter]) {
+        if v > self.verbosity {
+            return;
+        }
+        printf(
+            err,
+            m::FILTER_CHAIN,
+            &[&self.progname, &options::str_from_filters(chain)],
+        );
     }
 
     /// `message_try_help`, at `V_WARNING` so that `-q` hides it.
@@ -218,6 +266,34 @@ pub(crate) fn filters_help(
         err,
         msg.verbosity != Verbosity::Silent,
     )
+}
+
+/// message.c: message_strm: what xz says for the return code `e` stands
+/// for. Never `XzError`'s own `Display`.
+pub(crate) fn strm(e: &XzError) -> Vec<u8> {
+    let text: &str = match e {
+        XzError::Mem { .. } => return enomem(),
+        XzError::MemLimit { .. } => m::STRM_MEMLIMIT,
+        XzError::Format => m::STRM_FORMAT,
+        XzError::Options => m::STRM_OPTIONS,
+        XzError::Data => m::STRM_DATA,
+        XzError::BufError => m::STRM_BUF,
+        XzError::UnsupportedCheck(_) => m::STRM_UNSUPPORTED_CHECK,
+        XzError::Prog | XzError::Io(_) => m::BUG,
+    };
+    text.as_bytes().to_vec()
+}
+
+/// `strerror(ENOMEM)`, message_strm's `LZMA_MEM_ERROR`.
+pub(crate) fn enomem() -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        crate::compat::host::errno_text(libc::ENOMEM)
+    }
+    #[cfg(not(unix))]
+    {
+        crate::compat::host::strerror(&std::io::Error::from(std::io::ErrorKind::OutOfMemory))
+    }
 }
 
 /// tuklib_mbstr_nonprint.c: tuklib_mask_nonprint in the C locale: every
