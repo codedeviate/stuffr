@@ -17,11 +17,14 @@
 //! unsupported check (a warning), or a first Block over the memory limit is
 //! said before any output exists, and `-f` has removed nothing. Here the
 //! first chunk is fed a byte at a time until the decoder makes its first
-//! byte of output; an error before then is the probe's. The difference: a
-//! corrupt LZMA2 chunk header or range-coder start before the first byte of
-//! output, which xz finds only once the output is open, is said before it
-//! is opened, so with `-f` an existing output survives and without it the
-//! corruption is said rather than "File exists".
+//! byte of output; an error before then is the probe's. The difference
+//! (a stated deviation, pinned by `compat_xz`'s
+//! `header_probe_deviation_is_pinned`): corruption in the first LZMA
+//! chunk's properties byte or its range-coder start (`.xz`), or in the
+//! range-coder start (`.lzma`), is said before the output is opened, where
+//! xz finds it after opening it. Without `-f` the corruption is reported
+//! where xz reports that the output exists. With `-f` an existing output
+//! survives where xz removes it.
 //!
 //! **Feeding.** The xz_opts coders append all their output per call, so
 //! input goes in at most [`DECODE_PIECE`] bytes at a time when decoding

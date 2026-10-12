@@ -24,33 +24,66 @@
 //! sees two threads and 4 GiB, so fuzzing is deterministic, and its decoder
 //! is limited to 256 MiB (Ruling P7).
 //!
-//! Known deviations:
+//! Known deviations (the source of truth: the README's "The xz family"
+//! and the spec mirror this list):
 //!
 //! - `--version`'s first line names stuffr (`xz (stuffr X.Y.Z; XZ Utils
 //!   5.8.4 compatible)`); its second line and `--robot --version` are the
 //!   reference's, on both tiers.
+//! - The `-v` line's speed and elapsed fields vary from run to run, as they
+//!   do between two runs of xz.
 //! - The output is written to a temporary file beside it and published
 //!   when complete (`file_io.rs`); an input that is also the output is
 //!   never lost, even where xz would lose it (spec deviation 4).
-//! - `coder_init`'s header probe is approximated (`coder.rs`): corruption
-//!   in the first LZMA2 chunk header, before any output, is said before
-//!   the output is opened rather than after.
+//! - The header probe (`coder.rs`): corruption in the first LZMA chunk's
+//!   properties byte or its range-coder start (`.xz`), or in the
+//!   range-coder start (`.lzma`), is said before the output is opened,
+//!   where xz finds it after opening it. Without `-f` the corruption is
+//!   reported where xz reports that the output exists. With `-f` an
+//!   existing output survives where xz removes it.
+//! - Closed standard streams: run with standard input or output closed
+//!   (`xz <&-`, or `xz -c a >&-`), xz says "(stdin): Read error: Bad file
+//!   descriptor" or "(stdout): Write error: Bad file descriptor" and exits
+//!   1; the Rust runtime reopens a closed standard descriptor on
+//!   `/dev/null` before `main`, so stuffr reads an empty input (compressing
+//!   it and exiting 0, or, decompressing, saying "File format not
+//!   recognized"), or writes to nowhere and exits 0.
 //! - A parent that ignores SIGPIPE is not seen (the Rust runtime ignores
 //!   it before `main`): writing to a closed pipe still kills stuffr, where
-//!   xz would say nothing and exit 0.
+//!   xz says nothing and exits 0.
 //! - The `-v` indicator's one-second timer is polled against the clock
 //!   after each coder call rather than set with `alarm(2)` (message.c's
 //!   own way where there is no SIGALRM). The lines and when they appear
-//!   are xz's; SIGALRM, SIGINFO and SIGUSR1 still each ask for a line.
+//!   are xz's; SIGALRM, SIGINFO (where the system has it) and SIGUSR1
+//!   still each ask for a line.
+//! - No sandbox: xz's capsicum, pledge and Landlock confinement
+//!   (`sandbox.c`) is not ported. xz 5.8.4 on macOS has none either, and
+//!   nothing it changes elsewhere is observable.
+//! - The memory figures xz prints (`-vv`, `--list`, the memory-limit
+//!   messages) and every decision against a limit come from liblzma's
+//!   formulas modelled on a configure-built xz 5.8.4 for the host (Ruling
+//!   P5), on both tiers.
+//! - Pure tier: a stream that declares a dictionary larger than its data
+//!   needs commits that memory, where xz only reserves it; `-M` bounds it.
+//!   Where the size is declared (`.lzma` with a known size, a `.xz` Block's
+//!   uncompressed size) the window is capped at that size. A sandboxed run
+//!   caps the decoder at 256 MiB (Ruling P7).
+//! - Pure tier: a `.lzma` whose header gives a known size and that also
+//!   carries an end-of-payload marker is refused (liblzma accepts it; no xz
+//!   encoder writes one).
+//! - Pure tier: with threads and a `--block-size` smaller than the
+//!   dictionary, the Block boundaries differ from xz's (for a lone LZMA2
+//!   chain and no `--block-list`, the threaded encoder's Blocks are at
+//!   least the dictionary size).
 //! - Pure tier: the `-v` line's compressed size and ratio are those of
 //!   the pure encoder's output, which is compatible with xz's, not equal
 //!   to it.
-//! - Pure tier: before a corrupt or cut-short spot, less of the partial
-//!   output is written than xz writes (`lzma-rust2` drops what its failing
-//!   call had decoded), and `-v`'s figures at that point differ with it;
-//!   the messages and exit code are xz's. Near the end
-//!   of a raw, `.lzma` or `.lz` stream, corruption can be reported as
-//!   truncation (Ruling P6).
+//! - Pure tier: output written before a decode error may be a strict
+//!   prefix of xz's (Ruling P9: `lzma-rust2` drops what its failing call
+//!   had decoded), and `-v`'s figures at that point differ with it; the
+//!   messages, exit code and file tree are xz's. Near the end of a raw,
+//!   `.lzma` or `.lz` stream, corruption can be reported as truncation
+//!   (Ruling P6).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

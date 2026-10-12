@@ -1096,21 +1096,36 @@ and `XZ_OPT` are read before the command line, as xz reads them.
 - **Pure tier, two refusals and a layout.** A `.lzma` stream that declares
   its size *and* ends with an end marker is refused (liblzma accepts it; no
   xz encoder writes one). With threads and a `--block-size` smaller than the
-  dictionary, the Block boundaries differ from xz's.
+  dictionary (a lone LZMA2 filter, no `--block-list`), the Block
+  boundaries differ from xz's.
 - **The memory figures** xz prints (`-vv`, `--list`, the memory-limit
   messages) come from liblzma's formulas modelled on a configure-built
   xz 5.8.4 for the host, on both tiers.
-- **No sandbox.** xz on Linux may confine itself with Landlock; stuffr does
-  not. Nothing that confinement changes is observable.
+- **No sandbox.** xz may confine itself (Landlock on Linux, Capsicum on
+  FreeBSD, `pledge` on OpenBSD; nothing on macOS); stuffr does not. Nothing
+  that confinement changes is observable.
 - **An input that is also the output is never lost,** as with the other
   families: output is written beside the target and put in place when
   complete, so a failure keeps the input even where xz would lose it.
+- **Some corruption is found before the output is opened.** Corruption in
+  the first LZMA chunk's properties byte or its range-coder start (`.xz`),
+  or in the range-coder start (`.lzma`), is said before the output is
+  opened, where xz finds it after opening it. Without `-f` the corruption
+  is reported where xz reports that the output exists. With `-f` an
+  existing output survives where xz removes it.
+- **A closed standard input or output** (`xz <&-`, `xz -c a >&-`): xz says
+  "(stdin): Read error: Bad file descriptor" or "(stdout): Write error: Bad
+  file descriptor" and exits 1. The Rust runtime reopens a closed standard
+  descriptor on `/dev/null` before `main`, so stuffr reads an empty input
+  (compressing it and exiting 0, or, decompressing, saying "File format
+  not recognized"), or writes nowhere and exits 0.
 - **The progress timer is polled,** not set with `alarm(2)`. The lines and
-  when they appear are xz's, and `SIGALRM`, `SIGINFO` and `SIGUSR1` each
-  still ask for a line; no visible difference is expected.
-- **When the parent ignores `SIGPIPE`,** xz exits 0 on a closed pipe;
-  stuffr dies of `SIGPIPE`, for the same reason as the other families.
-  Under the default setting both die of it.
+  when they appear are xz's, and `SIGALRM`, `SIGINFO` (where the system
+  has it) and `SIGUSR1` each still ask for a line; no visible difference
+  is expected.
+- **When the parent ignores `SIGPIPE`,** xz says nothing and exits 0 on a
+  closed pipe; stuffr dies of `SIGPIPE`, for the same reason as the other
+  families. Under the default setting both die of it.
 
 ### Roadmap
 

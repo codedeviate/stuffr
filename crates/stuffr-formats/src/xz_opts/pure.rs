@@ -5,8 +5,11 @@
 //! What it promises is the spec's pure-tier promise: the compressed bytes
 //! are *compatible*, not identical — `xz` 5.8.4 decodes them to the input,
 //! and the container fields this layer controls (the stream flags and so the
-//! check, the format, the Block boundaries, each Block's filter chain) are
-//! what the C tier writes. The decoder's verdicts are liblzma's: the same
+//! check, the format, each Block's filter chain) are what the C tier
+//! writes. So are the Block boundaries, except in a threaded encode of a
+//! lone LZMA2 with no `--block-list` whose `--block-size` is below the
+//! dictionary size: `XzWriterMt` raises it to the dictionary size (see
+//! "The threaded encoder" below). The decoder's verdicts are liblzma's: the same
 //! [`XzError`] for the same input, with the memory figures liblzma reports
 //! (`xz_opts::memusage` is liblzma's formulas, ported).
 //!

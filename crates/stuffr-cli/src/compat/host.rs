@@ -47,9 +47,10 @@ pub(crate) fn reset_sigpipe() {
 /// family calls `reset_sigpipe()` before arming; SIGPIPE then carries the
 /// cleanup handler like the rest. `reset_sigpipe` cannot tell the runtime's
 /// ignore from a parent's, so under a parent that ignores SIGPIPE stuffr
-/// still hooks it: where xz would see `EPIPE` and report a write error, a
-/// stuffr run removes its partial output and dies of SIGPIPE (the bzip2
-/// family's documented SIGPIPE deviation, in the same direction).
+/// still hooks it: where xz would see `EPIPE`, say nothing and exit 0
+/// (observed with 5.8.4: `(trap '' PIPE; xz -c big | head -c1)`), a stuffr
+/// run removes its partial output and dies of SIGPIPE (the bzip2 family's
+/// documented SIGPIPE deviation, in the same direction).
 #[cfg(unix)]
 const CLEANUP_SIGNALS: [libc::c_int; 6] = [
     libc::SIGINT,
