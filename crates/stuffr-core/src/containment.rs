@@ -31,7 +31,7 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
     if entry_name.is_empty() {
         return Err(Error::UnsafePath {
             path: entry_name.to_string(),
-            reason: "empty entry name",
+            reason: "empty entry name".to_string(),
         });
     }
     // A name no path can hold, refused HERE rather than by the filesystem —
@@ -75,7 +75,7 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
     if entry_name.contains('\0') {
         return Err(Error::UnsafePath {
             path: entry_name.to_string(),
-            reason: "entry name contains a NUL byte",
+            reason: "entry name contains a NUL byte".to_string(),
         });
     }
 
@@ -92,7 +92,7 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
     walk_within(&mut out, &mut pushed_a_component, Path::new(entry_name)).map_err(|reason| {
         Error::UnsafePath {
             path: entry_name.to_string(),
-            reason,
+            reason: reason.to_string(),
         }
     })?;
 
@@ -109,7 +109,7 @@ pub fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf> {
             // function any more — see its own doc.
             Err(Error::UnsafePath {
                 path: entry_name.to_string(),
-                reason: "path traversal nets back to the destination",
+                reason: "path traversal nets back to the destination".to_string(),
             })
         } else {
             // `.` or `./`: nothing was ever pushed, so nothing was popped
@@ -176,7 +176,13 @@ pub(crate) const CLIMBS_AFTER_A_NAME: &str =
 
 /// [`classify_symlink_target`]'s refusal for a leading `..` run that climbs
 /// past the destination.
-pub(crate) const CLIMBS_OUT_OF_DEST: &str = "symlink target climbs out of the destination";
+/// Quotes the target, escaped the way entry names are in messages.
+pub(crate) fn climbs_out_of_dest(target: &str) -> String {
+    format!(
+        "symlink target `{}` climbs out of the destination",
+        crate::display::fmt_name(target)
+    )
+}
 
 /// What extraction may do with one symlink entry, decided by
 /// [`classify_symlink_target`]. A genuine escape is not a verdict: it is
@@ -207,7 +213,7 @@ pub fn check_symlink_target(dest: &Path, link_path: &Path, target: &str) -> Resu
         SymlinkVerdict::Allowed => Ok(()),
         SymlinkVerdict::Skip(reason) => Err(Error::UnsafePath {
             path: target.to_string(),
-            reason,
+            reason: reason.to_string(),
         }),
     }
 }
@@ -306,7 +312,7 @@ pub fn classify_symlink_target(
     entry: &str,
     target: &str,
 ) -> Result<SymlinkVerdict> {
-    let refuse = |reason: &'static str| Error::UnsafePath {
+    let refuse = |reason: String| Error::UnsafePath {
         path: entry.to_string(),
         reason,
     };
@@ -318,7 +324,7 @@ pub fn classify_symlink_target(
     // Closing only the half the review measured would leave the class open
     // through a door two lines away.
     if target.contains('\0') {
-        return Err(refuse("symlink target contains a NUL byte"));
+        return Err(refuse("symlink target contains a NUL byte".to_string()));
     }
     // An empty target names nothing and has no components, so every rule
     // below would accept it — and `symlink(2)` on Linux answers ENOENT,
@@ -330,7 +336,7 @@ pub fn classify_symlink_target(
     // Checked before the walk purely so the reason names symlinks — the
     // walk's own `RootDir` arm would refuse it anyway.
     if target_path.is_absolute() {
-        return Err(refuse("absolute symlink target"));
+        return Err(refuse("absolute symlink target".to_string()));
     }
 
     let parent = link_path.parent().unwrap_or(dest);
@@ -341,13 +347,14 @@ pub fn classify_symlink_target(
     // `rel` came out of `safe_join`, so it holds only `Normal` components
     // and cannot fail — walked rather than asserted so the depth it
     // contributes is computed by the same code that consumes it.
-    walk_within(&mut out, &mut pushed, rel).map_err(|_| refuse(CLIMBS_OUT_OF_DEST))?;
+    walk_within(&mut out, &mut pushed, rel).map_err(|_| refuse(climbs_out_of_dest(target)))?;
 
     // The depth walk BEFORE the shape rule: a target whose lexical walk
     // leaves `dest` is a genuine escape (exit 7) whatever its shape, and
     // must not be downgraded to a skip by a `..` after a name — `../..`,
     // and `a/../../..` alike.
-    walk_within(&mut out, &mut pushed, target_path).map_err(|_| refuse(CLIMBS_OUT_OF_DEST))?;
+    walk_within(&mut out, &mut pushed, target_path)
+        .map_err(|_| refuse(climbs_out_of_dest(target)))?;
 
     // The shape rule: a `..` after a name is skipped even when it nets
     // inside `dest`, because only the OS knows where the name before it
@@ -669,23 +676,35 @@ mod tests {
     fn an_escape_is_refused_naming_the_entry_even_when_its_shape_would_skip() {
         let dest = Path::new("/tmp/out");
         for (link, target, reason) in [
-            (dest.join("l"), "a/../../..", super::CLIMBS_OUT_OF_DEST),
+            (
+                dest.join("l"),
+                "a/../../..",
+                super::climbs_out_of_dest("a/../../.."),
+            ),
             (
                 dest.join("sub/l"),
                 "../sub/../..",
-                super::CLIMBS_OUT_OF_DEST,
+                super::climbs_out_of_dest("../sub/../.."),
             ),
-            (dest.join("sub/l"), "../..", super::CLIMBS_OUT_OF_DEST),
+            (
+                dest.join("sub/l"),
+                "../..",
+                super::climbs_out_of_dest("../.."),
+            ),
             (
                 dest.join("sub/l"),
                 "../../x/../y",
-                super::CLIMBS_OUT_OF_DEST,
+                super::climbs_out_of_dest("../../x/../y"),
             ),
-            (dest.join("l"), "/etc/passwd", "absolute symlink target"),
+            (
+                dest.join("l"),
+                "/etc/passwd",
+                "absolute symlink target".to_string(),
+            ),
             (
                 dest.join("l"),
                 "a\0/..",
-                "symlink target contains a NUL byte",
+                "symlink target contains a NUL byte".to_string(),
             ),
         ] {
             match super::classify_symlink_target(dest, &link, "the/entry", target) {
@@ -695,6 +714,24 @@ mod tests {
                 }
                 other => panic!("{target:?} from {link:?} must be refused, got {other:?}"),
             }
+        }
+    }
+
+    /// The reason quotes the target, escaped the way entry names are: an
+    /// archive-supplied control character never reaches a terminal raw.
+    #[test]
+    fn a_quoted_target_is_escaped() {
+        let dest = Path::new("/tmp/out");
+        let target = "../\x1b`x/../..";
+        match super::classify_symlink_target(dest, &dest.join("l"), "e", target) {
+            Err(Error::UnsafePath { reason, .. }) => {
+                assert_eq!(
+                    reason,
+                    "symlink target `../\\x1b`x/../..` climbs out of the destination"
+                );
+                assert!(!reason.contains('\x1b'));
+            }
+            other => panic!("expected UnsafePath, got {other:?}"),
         }
     }
 

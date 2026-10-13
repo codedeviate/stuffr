@@ -43,8 +43,12 @@ pub enum Error {
     #[error("archive is corrupt: {}", fmt_name(.0))]
     Corrupt(String),
 
+    /// An entry the extraction refuses to materialise. `path` is the entry
+    /// name, verbatim. `reason` may quote a link target or directory, already
+    /// escaped for display with [`fmt_name`]; `Display` escapes it again,
+    /// which is harmless because escaping is idempotent.
     #[error("unsafe entry path `{}` refused: {}", fmt_name(.path), fmt_name(.reason))]
-    UnsafePath { path: String, reason: &'static str },
+    UnsafePath { path: String, reason: String },
 
     #[error("fidelity degraded under strict mode: {0} warning(s)")]
     FidelityDegraded(usize),
@@ -365,7 +369,7 @@ mod tests {
             Error::EntryNotFound("a\x1bb".into()),
             Error::UnsafePath {
                 path: "a\x1bb".into(),
-                reason: "r",
+                reason: "r".to_string(),
             },
         ];
         for e in all {
@@ -401,7 +405,7 @@ mod tests {
         assert_eq!(
             Error::UnsafePath {
                 path: "../x".into(),
-                reason: "path traversal above the destination",
+                reason: "path traversal above the destination".to_string(),
             }
             .exit_code(),
             7

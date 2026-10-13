@@ -3155,6 +3155,8 @@ enum Raw<'a> {
     ModedFile(&'a str, &'a [u8], u32),
     Dir(&'a str),
     Symlink(&'a str, &'a str),
+    /// A hard link entry: name, then the target it links to.
+    Hardlink(&'a str, &'a str),
     /// A named pipe: `EntryKind::Other`, which has no shape on disk here.
     Fifo(&'a str),
 }
@@ -3191,6 +3193,10 @@ fn write_raw_tar(path: &Path, entries: &[Raw<'_>]) -> PathBuf {
             }
             Raw::Symlink(name, target) => {
                 let header = raw_header(name, tar::EntryType::Symlink, Some(target), 0, 0o777);
+                builder.append(&header, std::io::empty()).unwrap();
+            }
+            Raw::Hardlink(name, target) => {
+                let header = raw_header(name, tar::EntryType::Link, Some(target), 0, 0o644);
                 builder.append(&header, std::io::empty()).unwrap();
             }
             Raw::Fifo(name) => {
@@ -3469,10 +3475,63 @@ fn a_symlink_whose_target_escapes_the_destination_is_refused_before_it_is_create
     // what `stuffr list` shows and what the user can go and look at.
     assert!(
         String::from_utf8_lossy(&out.stderr).contains(
-            "unsafe entry path `link` refused: symlink target climbs out of the destination"
+            "unsafe entry path `link` refused: symlink target `../../etc/passwd` \
+             climbs out of the destination"
         ),
         "the refusal must name the offending entry, got: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Spec 8a: the refusal quotes the target, so a user can find the offending
+/// link text, not only the entry name.
+#[test]
+fn a_hard_link_whose_target_is_unsafe_quotes_the_target() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let evil = write_raw_tar(
+        &dir.join("h.tar"),
+        &[Raw::Hardlink("hl", "../../etc/passwd")],
+    );
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "stderr: {stderr}");
+    assert!(
+        stderr.contains(
+            "unsafe entry path `hl` refused: its hard-link target `../../etc/passwd` \
+             is not a safe path inside the destination"
+        ),
+        "got: {stderr}"
+    );
+}
+
+/// A target is archive-controlled text: control characters in it are escaped
+/// exactly as entry names are, never printed raw.
+#[test]
+fn a_symlink_target_with_control_characters_is_quoted_escaped() {
+    let dir = tmp_dir();
+    let dest = dir.join("out");
+    let evil = write_raw_tar(
+        &dir.join("esc.tar"),
+        &[Raw::Symlink("link", "../\x1b`x/../..")],
+    );
+    let out = run_output(&[
+        "unpack",
+        evil.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "stderr: {stderr}");
+    assert!(!stderr.contains('\x1b'), "raw ESC leaked: {stderr:?}");
+    assert!(
+        stderr.contains("symlink target `../\\x1b`x/../..` climbs out of the destination"),
+        "got: {stderr:?}"
     );
 }
 

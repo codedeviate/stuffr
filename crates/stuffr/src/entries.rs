@@ -929,7 +929,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
         if !target.starts_with(dest) {
             return Err(Error::UnsafePath {
                 path: meta.name.clone(),
-                reason: "resolved outside the destination",
+                reason: "resolved outside the destination".to_string(),
             });
         }
         // `safe_join` resolves `.` and `./` to `dest` ITSELF — deliberately,
@@ -975,7 +975,7 @@ pub fn extract(src: Input, dest: &Path, selection: &Selection, o: &ExtractOpts) 
         if target == dest && !matches!(meta.kind, EntryKind::Dir) {
             return Err(Error::UnsafePath {
                 path: meta.name.clone(),
-                reason: "only a directory entry may name the destination itself",
+                reason: "only a directory entry may name the destination itself".to_string(),
             });
         }
         // Still before any filesystem call for this entry — and the one
@@ -1265,7 +1265,10 @@ fn extract_hard_link(
     if let Err(Error::UnsafePath { .. }) = safe_join(dest, link_to) {
         return Err(Error::UnsafePath {
             path: meta.name.clone(),
-            reason: "its hard-link target is not a safe path inside the destination",
+            reason: format!(
+                "its hard-link target `{}` is not a safe path inside the destination",
+                stuffr_core::fmt_name(link_to)
+            ),
         });
     }
     // Every reader refuses or drops a self-link; this is the backstop.
@@ -1356,9 +1359,20 @@ fn extract_hard_link(
             if let Err(Error::UnsafePath { .. }) =
                 refuse_symlinked_ancestors(dest, target_path, link_to)
             {
+                // The directory is named relative to the destination, as the
+                // archive would spell it; the target itself if the walk finds
+                // none (a target outside `dest`, which cannot happen here).
+                let dir = target_path
+                    .strip_prefix(dest)
+                    .ok()
+                    .and_then(|rel| first_symlinked_ancestor(dest, rel))
+                    .map_or_else(|| link_to.to_string(), |d| d.to_string_lossy().into_owned());
                 return Err(Error::UnsafePath {
                     path: meta.name.clone(),
-                    reason: "a directory in its hard-link target's path is a symlink",
+                    reason: format!(
+                        "a directory in its hard-link target's path (`{}`) is a symlink",
+                        stuffr_core::fmt_name(&dir)
+                    ),
                 });
             }
             // Belt and braces on the map: the target must still be the
@@ -2225,12 +2239,13 @@ pub enum SalvageDisposition {
     /// Two facts a user deciding whether to trust the output needs told
     /// apart. `SkippedUnwritable` is *the OS refused*, and its `reason` is a
     /// rendered, platform-dependent `errno` message. This is *stuffr
-    /// refused*, and its `reason` is the fixed `&'static str`
-    /// [`Error::UnsafePath`] already carries — stable across platforms and
-    /// safe to compare. Folding them would also have collapsed exit 7 into
+    /// refused*, and its `reason` is the `String`
+    /// [`Error::UnsafePath`] already carries — it may quote a link target,
+    /// escaped for display, and is stable across platforms and safe to
+    /// compare. Folding them would also have collapsed exit 7 into
     /// exit 4, discarding the one signal that says an archive tried to write
     /// outside where it was pointed.
-    SkippedUnsafePath { reason: &'static str },
+    SkippedUnsafePath { reason: String },
     /// Fix round 1, REQUIRED 1: not written because [`SalvageOpts::select`]
     /// is `Some` and this scan position is not in it — the caller asked for
     /// a different, narrower set of entries. Distinct from every `Skipped*`
@@ -3320,13 +3335,13 @@ fn salvage_contained_target(
     if !target.starts_with(dest) {
         return Err(Error::UnsafePath {
             path: entry.meta.name.clone(),
-            reason: "resolved outside the destination",
+            reason: "resolved outside the destination".to_string(),
         });
     }
     if target == dest && !matches!(entry.meta.kind, EntryKind::Dir) {
         return Err(Error::UnsafePath {
             path: entry.meta.name.clone(),
-            reason: "only a directory entry may name the destination itself",
+            reason: "only a directory entry may name the destination itself".to_string(),
         });
     }
     refuse_symlinked_ancestors(dest, &target, &entry.meta.name)?;
@@ -5383,25 +5398,35 @@ fn refuse_symlinked_ancestors(dest: &Path, target: &Path, name: &str) -> Result<
         // Unreachable: the caller has just asserted `target.starts_with(dest)`.
         return Err(Error::UnsafePath {
             path: name.to_string(),
-            reason: "resolved outside the destination",
+            reason: "resolved outside the destination".to_string(),
         });
     };
+    if first_symlinked_ancestor(dest, relative).is_some() {
+        return Err(Error::UnsafePath {
+            path: name.to_string(),
+            reason: "a directory in this entry's path is a symlink".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The first directory above `relative`'s final component (as a path
+/// relative to `dest`) that is a symlink on disk, if any.
+fn first_symlinked_ancestor(dest: &Path, relative: &Path) -> Option<PathBuf> {
     let mut ancestors: Vec<_> = relative.components().collect();
     ancestors.pop();
-
     let mut walked = dest.to_path_buf();
+    let mut seen = PathBuf::new();
     for component in ancestors {
         walked.push(component);
+        seen.push(component);
         if let Ok(md) = std::fs::symlink_metadata(&walked)
             && md.file_type().is_symlink()
         {
-            return Err(Error::UnsafePath {
-                path: name.to_string(),
-                reason: "a directory in this entry's path is a symlink",
-            });
+            return Some(seen);
         }
     }
-    Ok(())
+    None
 }
 
 /// What this run made at a path, as far as [`place_entry`] and a later hard
@@ -5699,7 +5724,7 @@ fn place(
         // Unreachable: every caller has asserted `target.starts_with(dest)`.
         return Err(Error::UnsafePath {
             path: name.to_string(),
-            reason: "resolved outside the destination",
+            reason: "resolved outside the destination".to_string(),
         });
     };
     let components: Vec<_> = relative.components().collect();
@@ -7306,7 +7331,7 @@ mod tests {
                 assert_eq!(path, "g", "the link ENTRY is named, not its target");
                 assert_eq!(
                     *reason,
-                    "a directory in its hard-link target's path is a symlink"
+                    "a directory in its hard-link target's path (`d`) is a symlink"
                 );
             }
             other => panic!("expected UnsafePath, got {other:?}"),
@@ -7920,7 +7945,7 @@ mod salvage_tests {
         assert_eq!(
             outcome.entries[0].disposition,
             SalvageDisposition::SkippedUnsafePath {
-                reason: "path traversal above the destination"
+                reason: "path traversal above the destination".to_string()
             }
         );
         assert_eq!(salvage_exit_code(&outcome), 7);
@@ -8041,7 +8066,7 @@ mod salvage_tests {
         assert_eq!(
             outcome.entries[1].disposition,
             SalvageDisposition::SkippedUnsafePath {
-                reason: "path traversal above the destination"
+                reason: "path traversal above the destination".to_string()
             },
             "the refusal must name itself as OURS, not as the OS's — a rendered errno message \
              in SkippedUnwritable would say the filesystem declined a name we never offered it"
@@ -8102,7 +8127,7 @@ mod salvage_tests {
         assert_eq!(
             outcome.entries[1].disposition,
             SalvageDisposition::SkippedUnsafePath {
-                reason: "empty entry name"
+                reason: "empty entry name".to_string()
             }
         );
         assert_eq!(
@@ -8138,7 +8163,7 @@ mod salvage_tests {
         assert_eq!(
             outcome.entries[0].disposition,
             SalvageDisposition::SkippedUnsafePath {
-                reason: "path traversal above the destination"
+                reason: "path traversal above the destination".to_string()
             }
         );
         assert_eq!(
@@ -8449,7 +8474,7 @@ mod salvage_tests {
                 sightings: Vec::new(),
                 walk_stop: None,
                 entries: vec![record(SalvageDisposition::SkippedUnsafePath {
-                    reason: "path traversal above the destination"
+                    reason: "path traversal above the destination".to_string()
                 })],
             }),
             7,
@@ -8467,7 +8492,7 @@ mod salvage_tests {
                         cause: PartialCause::Truncated,
                     }),
                     record(SalvageDisposition::SkippedUnsafePath {
-                        reason: "empty entry name"
+                        reason: "empty entry name".to_string()
                     }),
                 ],
             }),
@@ -8534,7 +8559,7 @@ mod salvage_tests {
         assert_eq!(
             salvage_exit_code(&outcome(vec![record(
                 SalvageDisposition::SkippedUnsafePath {
-                    reason: "empty entry name"
+                    reason: "empty entry name".to_string()
                 }
             )])),
             7,
@@ -8647,7 +8672,7 @@ mod salvage_tests {
                     record(
                         SalvageStatus::Unattested,
                         SalvageDisposition::SkippedUnsafePath {
-                            reason: "path traversal above the destination",
+                            reason: "path traversal above the destination".to_string(),
                         },
                     ),
                 ],
