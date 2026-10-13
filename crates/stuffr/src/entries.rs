@@ -5503,33 +5503,43 @@ struct MadeByRun {
     names: HashMap<String, PathBuf>,
     at: HashMap<PathBuf, MadeAt>,
     ids: HashSet<(u64, u64)>,
-    /// Identity -> the recorded keys holding it, for [`archived_spelling`]
-    /// (Self::archived_spelling): a short list per inode, never a scan of `at`.
-    by_id: HashMap<(u64, u64), HashSet<PathBuf>>,
+    /// `(identity, parent, fold_key(last component))` -> the recorded keys,
+    /// for [`archived_spelling`](Self::archived_spelling): everything the
+    /// lookup filters on is in the key, so a lookup is one map get. Hard
+    /// links are never inserted (they are never candidates). A `BTreeSet`
+    /// keeps the answer deterministic.
+    spelled: HashMap<(u64, u64, PathBuf, String), std::collections::BTreeSet<PathBuf>>,
+}
+
+/// The base letter of a Latin-1 letter that has a canonical decomposition
+/// (`é` is `e` + U+0301); every other character maps to itself. `Æ`, `Ð`,
+/// `Ø`, `Þ`, `ß`, `×` and `÷` have none and stay as they are.
+fn latin1_base(c: char) -> char {
+    match c {
+        '\u{e0}'..='\u{e5}' => 'a',
+        '\u{e7}' => 'c',
+        '\u{e8}'..='\u{eb}' => 'e',
+        '\u{ec}'..='\u{ef}' => 'i',
+        '\u{f1}' => 'n',
+        '\u{f2}'..='\u{f6}' => 'o',
+        '\u{f9}'..='\u{fc}' => 'u',
+        '\u{fd}' | '\u{ff}' => 'y',
+        _ => c,
+    }
 }
 
 /// A name reduced to what a case or Unicode-normalisation fold preserves:
-/// combining marks (U+0300..U+036F) dropped, Latin-1 precomposed letters
-/// reduced to their base letter, lowercased. There is no normalisation
+/// combining marks (U+0300..U+036F) dropped, lowercased, then Latin-1
+/// letters with a canonical decomposition reduced to their base letter
+/// (after lowercasing, so `Ÿ` -> `ÿ` -> `y`). There is no normalisation
 /// table in this crate, so only Latin-1 is covered; a name outside it folds
 /// by case alone. It only ever gates wording.
 fn fold_key(name: &str) -> String {
-    const LATIN1: &[u8; 64] = b"AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
     name.chars()
         .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
-        .flat_map(|c| {
-            let c = match c as u32 {
-                n @ 0xC0..=0xFF => LATIN1[(n - 0xC0) as usize] as char,
-                _ => c,
-            };
-            c.to_lowercase()
-        })
+        .flat_map(char::to_lowercase)
+        .map(latin1_base)
         .collect()
-}
-
-/// Whether two names differ only as a case or normalisation fold would.
-fn names_fold_together(a: &str, b: &str) -> bool {
-    fold_key(a) == fold_key(b)
 }
 
 /// The most keys [`MadeByRun::archived_spelling`] examines (stats) per
@@ -5571,10 +5581,23 @@ impl MadeByRun {
     /// Called once `path` exists, so its identity can be read.
     fn record_path(&mut self, path: &Path, kind: MadeKind) {
         let id = identity(path);
+        let kind_is_linkable = kind != MadeKind::Hardlink;
         self.at.insert(path.to_path_buf(), MadeAt { kind, id });
         if let Some(id) = id {
             self.ids.insert(id);
-            self.by_id.entry(id).or_default().insert(path.to_path_buf());
+            if kind_is_linkable
+                && let (Some(parent), Some(last)) = (path.parent(), path.file_name())
+            {
+                self.spelled
+                    .entry((
+                        id.0,
+                        id.1,
+                        parent.to_path_buf(),
+                        fold_key(&last.to_string_lossy()),
+                    ))
+                    .or_default()
+                    .insert(path.to_path_buf());
+            }
         }
     }
 
@@ -5618,20 +5641,20 @@ impl MadeByRun {
             return None;
         }
         let id = identity(path)?;
-        let last = path.file_name()?.to_string_lossy().into_owned();
-        self.by_id
-            .get(&id)?
+        let key = (
+            id.0,
+            id.1,
+            path.parent()?.to_path_buf(),
+            fold_key(&path.file_name()?.to_string_lossy()),
+        );
+        self.spelled
+            .get(&key)?
             .iter()
-            .filter(|key| key.as_path() != path && key.parent() == path.parent())
-            .filter(|key| {
-                key.file_name()
-                    .is_some_and(|n| names_fold_together(&n.to_string_lossy(), &last))
-            })
-            .filter(|key| !matches!(self.at.get(*key).map(|r| &r.kind), Some(MadeKind::Hardlink)))
             .take(SPELLING_CANDIDATES)
-            .filter(|key| self.made_exact(key))
-            .filter_map(|key| key.strip_prefix(dest).ok())
-            .min()
+            .filter(|k| k.as_path() != path)
+            .filter(|k| !matches!(self.at.get(*k).map(|r| &r.kind), Some(MadeKind::Hardlink)))
+            .find(|k| self.made_exact(k))
+            .and_then(|k| k.strip_prefix(dest).ok())
             .map(|rel| rel.to_string_lossy().into_owned())
     }
 
@@ -7443,7 +7466,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dest);
     }
 
-    /// Fold keys: `a\u{301}` folds with `\u{e1}` and `A\u{301}`, not with `b`.
+    fn names_fold_together(a: &str, b: &str) -> bool {
+        fold_key(a) == fold_key(b)
+    }
+
+    /// Fold keys: `a\u{301}` folds with `\u{e1}` and `A\u{301}`, not with
+    /// `b`; letters with no canonical decomposition fold by case only.
     #[test]
     fn names_fold_by_case_and_normalisation_only() {
         assert!(names_fold_together("a\u{301}", "\u{e1}"));
@@ -7451,19 +7479,50 @@ mod tests {
         assert!(names_fold_together("A", "a"));
         assert!(!names_fold_together("a\u{301}", "b"));
         assert!(!names_fold_together("a", "b"));
+        assert!(!names_fold_together("\u{c6}", "A"));
+        assert!(!names_fold_together("\u{df}", "s"));
+        assert!(names_fold_together("\u{178}", "Y\u{308}"));
+        assert!(names_fold_together("\u{c6}", "\u{e6}"));
     }
 
-    /// Recording many paths on one inode stays linear: one set insert each,
-    /// and a lookup examines at most `SPELLING_CANDIDATES` keys.
+    /// Hard links never enter the spelling index, and a lookup that does not
+    /// take the exact-record exit is one bucket get, however many hard links
+    /// share the inode. Calls the index directly, so it holds on any volume.
     #[cfg(unix)]
     #[test]
-    fn many_keys_on_one_inode_record_without_a_scan() {
+    fn hard_links_stay_out_of_the_spelling_index() {
         let dest = link_scratch("many");
         std::fs::write(dest.join("t"), b"x").unwrap();
         let mut made = MadeByRun::default();
-        let id = identity(&dest.join("t")).unwrap();
+        made.record("t", &dest.join("t"), MadeKind::File);
         for i in 0..10_000 {
-            let p = dest.join(format!("l{i}"));
+            let l = dest.join(format!("l{i}"));
+            std::fs::hard_link(dest.join("t"), &l).unwrap();
+            made.record(&format!("l{i}"), &l, MadeKind::Hardlink);
+        }
+        let id = identity(&dest.join("t")).unwrap();
+        assert_eq!(made.at.len(), 10_001);
+        assert_eq!(made.spelled.len(), 1, "hard links are not indexed");
+        let key = (id.0, id.1, dest.clone(), fold_key("t"));
+        assert_eq!(made.spelled[&key].len(), 1);
+        // A lookup for a path that is not recorded exactly (it is a hard
+        // link, so its own record is a Hardlink) finds no spelling.
+        assert_eq!(made.archived_spelling(&dest, &dest.join("l77")), None);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// Several candidates in one bucket answer the same way every time: the
+    /// first, in path order, that is still current.
+    #[cfg(unix)]
+    #[test]
+    fn spelling_is_deterministic_across_candidates() {
+        let dest = link_scratch("det");
+        std::fs::write(dest.join("T"), b"x").unwrap();
+        let mut made = MadeByRun::default();
+        let id = identity(&dest.join("T")).unwrap();
+        let key = (id.0, id.1, dest.clone(), fold_key("t"));
+        for n in ["Ta", "TA", "tA", "T"] {
+            let p = dest.join(n);
             made.at.insert(
                 p.clone(),
                 MadeAt {
@@ -7471,13 +7530,14 @@ mod tests {
                     id: Some(id),
                 },
             );
-            made.by_id.entry(id).or_default().insert(p);
+            made.spelled.entry(key.clone()).or_default().insert(p);
         }
-        // Re-recording an existing key adds nothing.
-        made.record_path(&dest.join("t"), MadeKind::File);
-        made.record_path(&dest.join("t"), MadeKind::File);
-        assert_eq!(made.by_id[&id].len(), 10_001);
-        assert!(made.archived_spelling(&dest, &dest.join("t")).is_none());
+        // `t` is not a recorded key; on a folding volume it reaches the
+        // inode, elsewhere nothing is there. Either way two lookups agree.
+        let first = made.archived_spelling(&dest, &dest.join("t"));
+        let second = made.archived_spelling(&dest, &dest.join("t"));
+        assert_eq!(first, second);
+        assert!(first.is_none() || first.as_deref() == Some("T"));
         let _ = std::fs::remove_dir_all(&dest);
     }
 
