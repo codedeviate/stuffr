@@ -121,7 +121,7 @@ pub(crate) enum DictType {
     Legacy,
 }
 
-/// What `--train*` hands `DiB_trainFromFiles` (Task 8).
+/// What `--train*` hands `DiB_trainFromFiles`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrainCmd {
     /// `dict`: the algorithm selected last.

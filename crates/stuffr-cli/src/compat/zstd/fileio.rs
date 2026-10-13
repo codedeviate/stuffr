@@ -93,7 +93,7 @@ const LZ4_MAGIC: u32 = 0x184D_2204;
 #[cfg(feature = "zstd-c")]
 const LEGACY_MAGICS: [u32; 3] = [0xFD2F_B525, 0xFD2F_B526, 0xFD2F_B527];
 
-// ---- the foreign formats' hook (Task 6) ----
+// ---- the foreign formats' hook ----
 
 /// The formats `FIO_decompressFrames` recognises by magic besides zstd's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

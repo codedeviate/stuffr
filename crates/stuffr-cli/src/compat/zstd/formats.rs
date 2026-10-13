@@ -1390,11 +1390,10 @@ impl Xxh32 {
             self.stripe(&m);
             self.len = 0;
         }
-        let mut chunks = data.chunks_exact(16);
-        for c in &mut chunks {
+        let (chunks, rest) = data.as_chunks::<16>();
+        for c in chunks {
             self.stripe(c);
         }
-        let rest = chunks.remainder();
         self.mem[..rest.len()].copy_from_slice(rest);
         self.len = rest.len();
     }
