@@ -106,10 +106,10 @@ impl<W: Write> RawDeflate<W> {
     /// A raw-deflate encoder at `level`, 1..=9; any other level is
     /// `InvalidInput`.
     pub fn new(out: W, level: u32) -> io::Result<Self> {
-        if level == 0 {
+        if !(1..=9).contains(&level) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "deflate level 0 is outside 1..=9",
+                format!("deflate level {level} is outside 1..=9"),
             ));
         }
         Self::with_options(out, level, -15, OUT_CHUNK)
