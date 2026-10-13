@@ -204,7 +204,6 @@ fn read_n(f: &mut dyn Read, buf: &mut Vec<u8>, n: usize) -> bool {
 
 /// dibio.c: `DiB_loadFiles`: at most `buffer_size` bytes, at most
 /// `sst_size` samples.
-#[allow(clippy::too_many_arguments)]
 fn load_files(
     host: &Host,
     buffer_size: u64,

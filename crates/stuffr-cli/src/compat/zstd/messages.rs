@@ -897,8 +897,6 @@ pub(super) const LAST_ZERO_FAILED: &str = "Write error : cannot write last zero 
 /// fileio_asyncio.c: AIO_ReadPool_executeReadJob (`EXM_THROW(37, …)`).
 pub(super) const READ_ERROR: &str = "Read error";
 
-// ---- scaffolding (0.14.0 Ruling P1; Tasks 5-8 remove every use) ----
-
 // ---- fileio.c: --list (list.rs) ----
 //
 // The `ERROR_IF` messages are printed at display level 1 followed by

@@ -144,7 +144,6 @@ pub(crate) struct TrainCmd {
 /// (`FIO_prefs_t`, with `FIO_ctx_t`'s and `g_display_prefs`' fields),
 /// filled by [`parse`] and by `main` after it, as zstdcli.c fills them.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Read by Tasks 5-9 (fileio, formats, dibio, display).
 pub(crate) struct Prefs {
     /// `compressionType`.
     pub ctype: CType,
