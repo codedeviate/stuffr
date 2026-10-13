@@ -810,24 +810,423 @@ const COMPAT_SHAPES: &[&str] = &[
     "xz-list-flipped-index",
     "xz-list-cut",
     "xz-list-short",
-    // The zstd family (0.14.0 Task 4): the argument surface only, one per
-    // name; Task 10 adds the coder's shapes.
+    // The zstd family (0.14.0): the argument surface (Task 4), one per
+    // name.
     "zstd-help",
     "unzstd-bad-flag",
     "zstdcat-version",
     "zstdmt-help",
+    // Compression (Task 10): each name, levels and their options, the
+    // foreign formats, the file options, stdin, a dictionary and a prefix
+    // (refused on the pure tier, after the dictionary is read).
+    "zstd-keep-file",
+    "zstd-stdin-to-stdout",
+    "zstdmt-force-file",
+    "zstd-level-19-verbose",
+    "zstd-ultra-22-stdout",
+    "zstd-fast-long",
+    "zstd-args-mix",
+    "zstd-format-gzip",
+    "zstd-format-lz4",
+    "zstd-stream-size-wrong",
+    "zstd-show-default-cparams",
+    "zstd-output-dir-flat",
+    "zstd-rm-existing-output",
+    "zstd-filelist",
+    "zstd-exclude-compressed",
+    "zstdmt-adapt",
+    "zstd-zstd-params",
+    "zstd-dict-compress",
+    "zstd-patch-from-compress",
+    // `--train` with a few files, and its variants (the pure tier answers
+    // as a ZSTD_NODICT build).
+    "zstd-train",
+    "zstd-train-maxdict",
+    "zstd-train-cover",
+    "zstd-train-fastcover",
+    // Decompression: each name, `.tzst`, a dictionary, a prefix, window
+    // limits, pass-through, the foreign formats, frames with skippable
+    // frames between them.
+    "unzstd-keep-file",
+    "unzstd-tzst",
+    "zstdcat-file",
+    "zstd-decompress-dict",
+    "unzstd-patch-from",
+    "unzstd-memory-refused",
+    "unzstd-long-window",
+    "unzstd-window-past-cap",
+    "zstdcat-pass-through",
+    "zstd-decompress-pass-through",
+    "unzstd-gzip",
+    "zstd-decompress-lz4",
+    "zstd-decompress-xz",
+    "zstd-decompress-lzma",
+    "zstdcat-skippable-between",
+    "zstd-test-verbose",
+    "unzstd-sparse",
+    // Task 5's damaged shapes: empty and one byte, cut at 1, 5, 6 and
+    // len - 1 bytes, a bit flipped in the header, a block and the
+    // checksum, trailing garbage.
+    "unzstd-empty-file",
+    "unzstd-one-byte",
+    "zstd-test-cut-1",
+    "zstd-test-cut-5",
+    "unzstd-cut-6",
+    "zstdcat-cut-last",
+    "zstd-test-flipped-header",
+    "unzstd-flipped-block",
+    "zstd-test-flipped-checksum",
+    "zstdcat-trailing-garbage",
+    // `-l`: plain, `-v` over several files, `-vv` over frames and a
+    // skippable frame, a skippable frame whose size field is 0xFFFFFFF8
+    // (Ruling T7-a: exit 1, where zstd loops), a cut file, a foreign one.
+    "zstd-list",
+    "zstd-list-verbose-two-files",
+    "zstd-list-vv-skippable",
+    "zstd-list-skippable-max",
+    "zstd-list-cut",
+    "zstd-list-gzip",
 ];
 
-/// The zstd family's seeds: the argument surface (Task 4).
-fn zstd_seed(shape: &str) -> Option<Vec<u8>> {
-    let e = |tool, args: &[&str]| encode_compat_case(tool, 0, args, &[], false, b"");
-    Some(match shape {
-        "zstd-help" => e("zstd", &["-h"]),
-        "unzstd-bad-flag" => e("unzstd", &["--bogus"]),
-        "zstdcat-version" => e("zstdcat", &["-V"]),
-        "zstdmt-help" => e("zstdmt", &["--help"]),
-        _ => return None,
-    })
+/// `plain` as one zstd frame, through this build's encoder (weak on the
+/// pure tier, so asked for explicitly).
+fn zstd_of(work: &Path, plain: &[u8]) -> stuffr_core::Result<Vec<u8>> {
+    let src = work.join("compat-zstd-plain");
+    let dst = work.join("compat-zstd-plain.zst");
+    std::fs::write(&src, plain)?;
+    let _ = std::fs::remove_file(&dst);
+    let o = CompressOpts {
+        format: Some(FormatId::new("zstd")),
+        allow_weak_encoder: true,
+        sync: false,
+        ..Default::default()
+    };
+    ops::compress(Input::Path(src), Output::Path(dst.clone()), &o)?;
+    Ok(read_all(&dst)?)
+}
+
+/// A zstd frame by hand: no content size, no dictionary ID, a window of
+/// `2^window_log` bytes, one raw last block holding `plain`, and (with
+/// `checksum`) the low 32 bits of `plain`'s XXH64 (seed 0).
+fn zstd_raw_frame(plain: &[u8], window_log: u8, checksum: bool) -> Vec<u8> {
+    let mut f = vec![0x28, 0xb5, 0x2f, 0xfd];
+    f.push(if checksum { 0x04 } else { 0 });
+    // Window_Descriptor: exponent `window_log - 10`, mantissa 0.
+    f.push((window_log - 10) << 3);
+    let header = ((plain.len() as u32) << 3) | 1;
+    f.extend_from_slice(&header.to_le_bytes()[..3]);
+    f.extend_from_slice(plain);
+    if checksum {
+        f.extend_from_slice(&(xxh64(plain) as u32).to_le_bytes());
+    }
+    f
+}
+
+/// A skippable frame (magic `0x184D2A50 + n`) holding `data`, or declaring
+/// `size` when given.
+fn zstd_skippable(n: u8, data: &[u8], size: Option<u32>) -> Vec<u8> {
+    let mut f = vec![0x50 + n, 0x2a, 0x4d, 0x18];
+    f.extend_from_slice(&size.unwrap_or(data.len() as u32).to_le_bytes());
+    f.extend_from_slice(data);
+    f
+}
+
+/// XXH64 with seed 0, the zstd frame checksum's hash.
+fn xxh64(data: &[u8]) -> u64 {
+    const P1: u64 = 0x9E37_79B1_85EB_CA87;
+    const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const P3: u64 = 0x1656_67B1_9E37_79F9;
+    const P4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const P5: u64 = 0x27D4_EB2F_1656_67C5;
+    let u64_at = |b: &[u8]| u64::from_le_bytes(b[..8].try_into().unwrap());
+    let round = |acc: u64, v: u64| {
+        acc.wrapping_add(v.wrapping_mul(P2))
+            .rotate_left(31)
+            .wrapping_mul(P1)
+    };
+    let merge = |acc: u64, v: u64| (acc ^ round(0, v)).wrapping_mul(P1).wrapping_add(P4);
+    let mut rest = data;
+    let mut h = if data.len() >= 32 {
+        let mut v = [P1.wrapping_add(P2), P2, 0, 0u64.wrapping_sub(P1)];
+        while rest.len() >= 32 {
+            for (i, lane) in v.iter_mut().enumerate() {
+                *lane = round(*lane, u64_at(&rest[i * 8..]));
+            }
+            rest = &rest[32..];
+        }
+        let mut h = v[0]
+            .rotate_left(1)
+            .wrapping_add(v[1].rotate_left(7))
+            .wrapping_add(v[2].rotate_left(12))
+            .wrapping_add(v[3].rotate_left(18));
+        for lane in v {
+            h = merge(h, lane);
+        }
+        h
+    } else {
+        P5
+    };
+    h = h.wrapping_add(data.len() as u64);
+    while rest.len() >= 8 {
+        h = (h ^ round(0, u64_at(rest)))
+            .rotate_left(27)
+            .wrapping_mul(P1)
+            .wrapping_add(P4);
+        rest = &rest[8..];
+    }
+    if rest.len() >= 4 {
+        let v = u64::from(u32::from_le_bytes(rest[..4].try_into().unwrap()));
+        h = (h ^ v.wrapping_mul(P1))
+            .rotate_left(23)
+            .wrapping_mul(P2)
+            .wrapping_add(P3);
+        rest = &rest[4..];
+    }
+    for &b in rest {
+        h = (h ^ u64::from(b).wrapping_mul(P5))
+            .rotate_left(11)
+            .wrapping_mul(P1);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(P2);
+    h ^= h >> 29;
+    h = h.wrapping_mul(P3);
+    h ^ (h >> 32)
+}
+
+/// The zstd family's seeds: the argument surface (Task 4), then the
+/// coder's shapes (Task 10).
+fn zstd_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
+    let Some((tool, case)) = shape.split_once('-') else {
+        return Ok(None);
+    };
+    if !matches!(tool, "zstd" | "unzstd" | "zstdcat" | "zstdmt") {
+        return Ok(None);
+    }
+    let z = |args: &[&str], files: &[&str], stdin: bool, payload: &[u8]| {
+        encode_compat_case(tool, 0, args, files, stdin, payload)
+    };
+    let text = compat_text(4000);
+    let frame = zstd_of(work, &text)?;
+    // Hand-built, so its checksum is known to be there.
+    let checked = zstd_raw_frame(&text[..1000], 10, true);
+    let samples = ["a", "a.gz", "a.xz", "a.lz", "a.bz2", "a.out"];
+    Ok(Some(match case {
+        "help" => z(
+            &[if tool == "zstdmt" { "--help" } else { "-h" }],
+            &[],
+            false,
+            b"",
+        ),
+        "bad-flag" => z(&["--bogus"], &[], false, b""),
+        "version" => z(&["-V"], &[], false, b""),
+        "keep-file" if tool == "zstd" => z(&["-k", "a"], &["a"], false, &text),
+        "stdin-to-stdout" => z(&[], &[], true, &text),
+        "force-file" => z(&["-f", "a"], &["a", "a.zst"], false, &text),
+        "level-19-verbose" => z(&["-19", "-v", "-k", "a"], &["a"], false, &text),
+        "ultra-22-stdout" => z(&["--ultra", "-22", "-c"], &[], true, &text),
+        "fast-long" => z(&["--fast=3", "--long=24", "-c", "a"], &["a"], false, &text),
+        "args-mix" => z(
+            &[
+                "-T2",
+                "--rsyncable",
+                "--no-check",
+                "--no-content-size",
+                "-B1K",
+                "--memory=1M",
+                "-c",
+                "a",
+            ],
+            &["a"],
+            false,
+            &text,
+        ),
+        "format-gzip" => z(&["--format=gzip", "-k", "a"], &["a"], false, &text),
+        "format-lz4" => z(&["--format=lz4", "-c", "a"], &["a"], false, &text),
+        "stream-size-wrong" => z(&["--stream-size=10", "-c"], &[], true, &text),
+        "show-default-cparams" => z(&["--show-default-cparams", "-c", "a"], &["a"], false, &text),
+        "output-dir-flat" => z(&["--output-dir-flat=d", "a"], &["a"], false, &text),
+        "rm-existing-output" => z(&["--rm", "a"], &["a", "a.zst"], false, &text),
+        // `a` lists two names; every case file holds that list.
+        "filelist" => z(
+            &["-f", "-k", "--filelist=a"],
+            &["a", "a.gz", "a.lz"],
+            false,
+            b"a.gz\na.lz\n",
+        ),
+        "exclude-compressed" => z(
+            &["--exclude-compressed", "-k", "a", "a.zst"],
+            &["a", "a.zst"],
+            false,
+            &text,
+        ),
+        "adapt" => z(&["--adapt", "-c", "a"], &["a"], false, &text),
+        "zstd-params" => z(
+            &["--zstd=wlog=12", "--sparse", "-k", "a"],
+            &["a"],
+            false,
+            &text,
+        ),
+        "dict-compress" => z(&["-D", "d.dict", "-k", "a"], &["a", "d.dict"], false, &text),
+        "patch-from-compress" => z(
+            &["--patch-from=a", "-c", "a.zst"],
+            &["a", "a.zst"],
+            false,
+            &text,
+        ),
+        "train" => z(
+            &[&["--train"][..], &samples].concat(),
+            &samples,
+            false,
+            &text,
+        ),
+        "train-maxdict" => z(
+            &[&["--train", "--maxdict=1K"][..], &samples].concat(),
+            &samples,
+            false,
+            &text,
+        ),
+        "train-cover" => z(
+            &[&["--train-cover=k=16,d=6", "-B1K"][..], &samples].concat(),
+            &samples,
+            false,
+            &text,
+        ),
+        "train-fastcover" => z(
+            &[&["--train-fastcover"][..], &samples].concat(),
+            &samples,
+            false,
+            &text,
+        ),
+        "keep-file" => z(&["-k", "a.zst"], &["a.zst"], false, &frame),
+        "tzst" => z(&["a.tzst"], &["a.tzst"], false, &frame),
+        "file" => z(&["a.zst"], &["a.zst"], false, &frame),
+        "decompress-dict" => z(
+            &["-d", "-c", "-D", "d.dict", "a.zst"],
+            &["a.zst", "d.dict"],
+            false,
+            &frame,
+        ),
+        "patch-from" => z(
+            &["--patch-from=a", "-c", "a.zst"],
+            &["a", "a.zst"],
+            false,
+            &frame,
+        ),
+        "memory-refused" => z(
+            &["--memory=1M", "-c", "a.zst"],
+            &["a.zst"],
+            false,
+            &zstd_raw_frame(&text, 24, false),
+        ),
+        "long-window" => z(
+            &["--long=24", "-c", "a.zst"],
+            &["a.zst"],
+            false,
+            &zstd_raw_frame(&text, 24, false),
+        ),
+        // 2^27: past the sandbox's window cap (R9: 2^24).
+        "window-past-cap" => z(
+            &["--long", "-c", "a.zst"],
+            &["a.zst"],
+            false,
+            &zstd_raw_frame(&text, 27, false),
+        ),
+        "pass-through" if tool == "zstdcat" => z(&["a"], &["a"], false, &text),
+        "decompress-pass-through" => z(&["-d", "--pass-through", "-c", "a"], &["a"], false, &text),
+        "gzip" => z(
+            &["-k", "a.gz"],
+            &["a.gz"],
+            false,
+            &encoded(work, &text, "gzip", None)?,
+        ),
+        "decompress-lz4" => z(
+            &["-dc", "a"],
+            &["a"],
+            false,
+            &encoded(work, &text, "lz4", None)?,
+        ),
+        "decompress-xz" => z(
+            &["-dc", "a.xz"],
+            &["a.xz"],
+            false,
+            &encoded(work, &text, "xz", None)?,
+        ),
+        "decompress-lzma" => z(
+            &["-dc", "a.lzma"],
+            &["a.lzma"],
+            false,
+            &encoded(work, &text, "lzma", None)?,
+        ),
+        "skippable-between" => {
+            let mut v = frame.clone();
+            v.extend(zstd_skippable(3, b"skip me", None));
+            v.extend(&checked);
+            z(&["a.zst"], &["a.zst"], false, &v)
+        }
+        "test-verbose" => z(&["-tv", "a.zst"], &["a.zst"], false, &frame),
+        "sparse" => z(
+            &["--sparse", "-f", "a.zst"],
+            &["a.zst"],
+            false,
+            &zstd_of(work, &vec![0; 60_000])?,
+        ),
+        "empty-file" => z(&["-c", "a.zst"], &["a.zst"], false, b""),
+        "one-byte" => z(&["-c", "a.zst"], &["a.zst"], false, &frame[..1]),
+        "test-cut-1" => z(&["-t", "a.zst"], &["a.zst"], false, &cut(&frame, 1)),
+        "test-cut-5" => z(&["-t", "a.zst"], &["a.zst"], false, &cut(&frame, 5)),
+        "cut-6" => z(&["-k", "a.zst"], &["a.zst"], false, &cut(&frame, 6)),
+        "cut-last" => z(&["a.zst"], &["a.zst"], false, &cut(&frame, frame.len() - 1)),
+        "test-flipped-header" => {
+            let mut v = checked.clone();
+            // The frame header descriptor's reserved bit.
+            v[4] ^= 0x08;
+            z(&["-t", "a.zst"], &["a.zst"], false, &v)
+        }
+        "flipped-block" => z(&["-k", "a.zst"], &["a.zst"], false, &damaged(&frame)),
+        "test-flipped-checksum" => {
+            let mut v = checked.clone();
+            *v.last_mut().unwrap() ^= 0x01;
+            z(&["-tv", "a.zst"], &["a.zst"], false, &v)
+        }
+        "trailing-garbage" => {
+            let mut v = frame.clone();
+            v.extend_from_slice(b"trailing garbage");
+            z(&["a.zst"], &["a.zst"], false, &v)
+        }
+        "list" => z(&["-l", "a.zst"], &["a.zst"], false, &frame),
+        "list-verbose-two-files" => z(
+            &["-l", "-v", "a.zst", "a.tzst"],
+            &["a.zst", "a.tzst"],
+            false,
+            &checked,
+        ),
+        "list-vv-skippable" => {
+            let mut v = zstd_skippable(0, b"skip", None);
+            v.extend(&frame);
+            v.extend(&checked);
+            z(&["-l", "-vvv", "a.zst"], &["a.zst"], false, &v)
+        }
+        "list-skippable-max" => z(
+            &["-l", "a.zst"],
+            &["a.zst"],
+            false,
+            &zstd_skippable(15, b"", Some(0xFFFF_FFF8)),
+        ),
+        "list-cut" => z(
+            &["-l", "a.zst"],
+            &["a.zst"],
+            false,
+            &cut(&frame, frame.len() / 2),
+        ),
+        "list-gzip" => z(
+            &["-l", "a.gz"],
+            &["a.gz"],
+            false,
+            &encoded(work, &text, "gzip", None)?,
+        ),
+        other => unreachable!("COMPAT_SHAPES lists an unhandled zstd shape {other:?}"),
+    }))
 }
 
 /// A bzip2 stream of `plain` at `level`, through this build's encoder.
@@ -1016,7 +1415,7 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
     if let Some(seed) = xz_seed(work, shape)? {
         return Ok(seed);
     }
-    if let Some(seed) = zstd_seed(shape) {
+    if let Some(seed) = zstd_seed(work, shape)? {
         return Ok(seed);
     }
     let text = compat_text(4000);
@@ -3131,6 +3530,33 @@ fn the_hand_built_compat_payloads_decode() {
         assert_eq!(read_all(&back).unwrap(), plain, "flags {flags:#x}");
     }
     assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+
+    // The hand-built zstd frames: XXH64's published vectors, and a frame
+    // with its checksum (both sides of the 32-byte stripe loop) decoding
+    // through this build's zstd decoder, which checks it.
+    assert_eq!(xxh64(b""), 0xEF46_DB37_51D8_E999);
+    assert_eq!(xxh64(b"abc"), 0x44BC_2CF5_AD77_0999);
+    for plain in [&plain[..20], &plain[..1000]] {
+        let zst = work.path().join("m.zst");
+        std::fs::write(&zst, zstd_raw_frame(plain, 10, true)).unwrap();
+        let back = work.path().join("m");
+        let _ = std::fs::remove_file(&back);
+        ops::decompress(
+            Input::Path(zst.clone()),
+            Output::Path(back.clone()),
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(read_all(&back).unwrap(), plain);
+        // A flipped checksum is refused, so the decoder did check it.
+        let mut bad = zstd_raw_frame(plain, 10, true);
+        *bad.last_mut().unwrap() ^= 1;
+        std::fs::write(&zst, bad).unwrap();
+        let _ = std::fs::remove_file(&back);
+        assert!(
+            ops::decompress(Input::Path(zst), Output::Path(back), &Default::default()).is_err()
+        );
+    }
 }
 
 #[test]

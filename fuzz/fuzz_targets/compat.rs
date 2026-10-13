@@ -1,9 +1,10 @@
 //! The compatibility families, run in-process: the bzip2 family (0.11.0
 //! Task 6: `bzip2`, `bunzip2`, `bzcat`, `bzip2recover`), the gzip family
 //! (0.12.0 Task 11: `gzip`, `gunzip`, `zcat`, `gzcat`, each as GNU and as
-//! Apple/BSD) and the xz family (0.13.0 Task 9: `xz`, `unxz`, `xzcat`,
-//! `lzma`, `unlzma`, `lzcat`), through `stuffr_cli::compat::run_in_counted`
-//! and `bzip2recover::recover`.
+//! Apple/BSD), the xz family (0.13.0 Task 9: `xz`, `unxz`, `xzcat`,
+//! `lzma`, `unlzma`, `lzcat`) and the zstd family (0.14.0 Task 10: `zstd`,
+//! `unzstd`, `zstdcat`, `zstdmt`), through
+//! `stuffr_cli::compat::run_in_counted` and `bzip2recover::recover`.
 //!
 //! The only fuzz coverage of `stuffr::bzip2_stream::StreamReader`, the
 //! libbzip2-shaped decoder only the compat layer reaches, and of the gzip
@@ -13,7 +14,14 @@
 //! the xz family's argument parser, coder, `--files` reader and `--list`
 //! walk (`index.rs`, and `list.rs`'s `-vv` Block Header reads, which must
 //! never panic: Ruling P14). Under `Host::Sandbox` the xz encoder's panics
-//! are not caught (Ruling P10), so they reach the fuzzer.
+//! are not caught (Ruling P10), so they reach the fuzzer. And of the zstd
+//! family's argument parser, its frame driver over `stuffr::zstd_opts`, the
+//! foreign formats it decodes and writes (`--format=gzip|lz4`; gzip, xz,
+//! lzma and lz4 input), `--filelist`, `-r`, the `-l` header walker and
+//! the dictionary paths, on the tier this crate builds: the pure one
+//! (`stuffr-cli` without `zstd-c`), where compressing with `-D` or
+//! `--patch-from`, and `--train*`, refuse with exit 1 (spec deviation 7;
+//! `-D` and `--patch-from` after reading the dictionary).
 //!
 //! An input is `[tool][argc][token; argc][file mask] ++ payload`, decoded by
 //! `stuffr_core::testing::decode_compat_case` (whose tables are the wire
@@ -69,9 +77,21 @@
 //!   not linear); it leaves no `.stuffr-xz-*` temporary and no name
 //!   `could_be_written` does not allow; and standard output plus every new
 //!   or changed file stays within the 8 MiB output budget
-//!   (`check_xz_budget`). A `--files`/`--files0` case whose names (standard
+//!   (`check_budget`). A `--files`/`--files0` case whose names (standard
 //!   input, or the list file when it exists) hold a `/` is not run: such a
 //!   name could leave the run's directory.
+//! - the zstd family exits 0, 1 or 2, or with one of `EXM_THROW`'s codes
+//!   (`ZSTD_EXM`; never a code outside them). Its read bound
+//!   (`check_zstd_reads`, which says what each mode was measured at): per
+//!   operand naming a path exactly, at most two opens, and `2 × len`
+//!   bytes when compressing, decompressing or testing, `len` under `-l`
+//!   and `--train*`; plus one open and `len` bytes per `-D`/`--patch-from`
+//!   value and per `--filelist` value naming it. It leaves no
+//!   `.stuffr-zstd-*` temporary and no name `could_be_written` does not
+//!   allow (a `--filelist` name counts as a base), and keeps the 8 MiB
+//!   output budget. A `--filelist` case whose list holds a `/`, `.` or
+//!   `..` is not run (a name could leave the run's directory, or reach a
+//!   file under `-r` by a path no operand spells).
 //!
 //! **Memory under the xz names (Ruling P7).** libFuzzer's RSS limit
 //! (2 GiB by default) is the bound, and each verb stays inside it by a
@@ -146,33 +166,43 @@ fn sandbox() -> &'static Path {
 /// `-S`'s suffix): bzip2's, `.out`, both gzips' tables and `.tar`.
 const SUFFIXES: &[&str] = &[
     ".bz2", ".bz", ".tbz2", ".tbz", ".out", ".gz", ".tgz", ".taz", ".z", ".Z", "-gz", "-z", "_z",
-    ".xz", ".lz", ".tar", ".txz", ".lzma", ".tlz",
+    ".xz", ".lz", ".tar", ".txz", ".lzma", ".tlz", ".zst", ".tzst", ".lz4", ".tlz4",
 ];
 
 /// Suffixes a decompressor maps to `.tar` rather than strip.
-const TAR_SUFFIXES: &[&str] = &[".tbz2", ".tbz", ".tgz", ".taz", ".txz", ".tlz"];
+const TAR_SUFFIXES: &[&str] = &[
+    ".tbz2", ".tbz", ".tgz", ".taz", ".txz", ".tlz", ".tzst", ".tlz4",
+];
+
+/// Names the zstd family writes that no table file derives: `--train`'s
+/// default output (zstdcli.c's `g_defaultDictName`).
+const ZSTD_NAMES: &[&str] = &["dictionary"];
 
 /// Whether `name` is one the tools could write in their working directory:
 /// a `COMPAT_FILES` name or one derived from it (a suffix or token stripped,
 /// or mapped to `.tar`; then a suffix or token added: gzip's `-S` takes any
 /// token), a bzip2recover output (`rec` and five digits), or a temporary
-/// (`.stuffr-bzip2-*`, `.stuffr-gzip-*`, `.stuffr-xz-*`).
+/// (`.stuffr-bzip2-*`, `.stuffr-gzip-*`, `.stuffr-xz-*`, `.stuffr-zstd-*`),
+/// or zstd's `dictionary` (`--train`'s default output).
 ///
 /// Generous on purpose: it is the real working directory's snapshot filter
 /// (a superset only snapshots more) and the run directory's stray-file
 /// check (where it has to admit every output a run may legitimately leave,
 /// Apple's kept partial outputs included).
 fn could_be_written(name: &str) -> bool {
-    could_be_written_with(name, false)
+    could_be_written_with(name, false, &[])
 }
 
 /// `could_be_written`, with the name and every table name compared
 /// lowercased: a case-insensitive filesystem opens `a.xz` for `A.XZ`.
 fn could_be_written_folded(name: &str) -> bool {
-    could_be_written_with(name, true)
+    could_be_written_with(name, true, &[])
 }
 
-fn could_be_written_with(name: &str, fold: bool) -> bool {
+/// `could_be_written`, also taking each of `extra` (names a zstd run read
+/// from its `--filelist`) as a base: an earlier operand's output can be a
+/// later listed name's input (`a`, `a.zst`: `a.zst.zst`).
+fn could_be_written_with(name: &str, fold: bool, extra: &[&str]) -> bool {
     let key = |s: &str| {
         if fold {
             s.to_ascii_lowercase()
@@ -184,7 +214,7 @@ fn could_be_written_with(name: &str, fold: bool) -> bool {
     let name = name.as_str();
     let affixes = || SUFFIXES.iter().chain(COMPAT_TOKENS);
     let mut bases: Vec<String> = Vec::new();
-    for f in COMPAT_FILES {
+    for f in COMPAT_FILES.iter().chain(extra) {
         bases.push(key(f));
         for s in affixes() {
             // A token equal to the whole name (`a`, `a.gz`) strips to
@@ -205,6 +235,8 @@ fn could_be_written_with(name: &str, fold: bool) -> bool {
     rec || name.starts_with(".stuffr-bzip2-")
         || name.starts_with(".stuffr-gzip-")
         || name.starts_with(".stuffr-xz-")
+        || name.starts_with(".stuffr-zstd-")
+        || ZSTD_NAMES.iter().any(|n| key(n) == name)
         || bases.iter().any(|b| {
             name == b
                 || name
@@ -703,7 +735,7 @@ fn run_xz(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     }
     check_xz_reads(dir, name, args, mode, &operands, list_file, &reads);
     check_xz_leftovers(dir, name, args);
-    check_xz_budget(dir, name, args, &out, &before);
+    check_budget(dir, name, args, &out, &before);
 }
 
 /// `IO_BUFFER_SIZE` (file_io.h): the window `--list` reads back from each
@@ -837,7 +869,7 @@ const OUTPUT_BUDGET: u64 = 8 * 1024 * 1024;
 /// The run kept to its output budget: standard output plus every file
 /// that is new or changed in its directory (each written whole through
 /// the budget, so its final length is at most what it was charged).
-fn check_xz_budget(dir: &Path, name: &str, args: &[&str], out: &[u8], before: &Contents) {
+fn check_budget(dir: &Path, name: &str, args: &[&str], out: &[u8], before: &Contents) {
     let written: u64 = contents(dir)
         .into_iter()
         .filter(|(n, bytes)| before.get(n) != Some(bytes))
@@ -850,6 +882,292 @@ fn check_xz_budget(dir: &Path, name: &str, args: &[&str], out: &[u8], before: &C
          {OUTPUT_BUDGET}-byte budget",
         out.len()
     );
+}
+
+/// zstd's exit codes beyond 0, 1 (an error `main` returns) and 2: every
+/// `EXM_THROW` code zstd 1.5.7's `programs/` can reach (fileio.c,
+/// dibio.c, zstdcli.c), the Global Constraints' list.
+const ZSTD_EXM: &[i32] = &[
+    1, 3, 4, 5, 10, 11, 12, 14, 19, 20, 21, 27, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 42, 43,
+    60, 69, 70, 71, 72, 74, 77, 79, 81, 82, 83, 84, 91, 92, 93, 95, 100, 101, 102, 103, 104,
+];
+
+/// The zstd family's operation, as zstdcli.c settles it: the invoked
+/// name's preset, then the last of `-z`/`-d`/`-t`/`-l`/`--train*` (and the
+/// long forms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZstdMode {
+    Compress,
+    Decompress,
+    Test,
+    List,
+    Train,
+}
+
+/// The arguments of a zstd-family run as zstdcli.c sees them.
+#[derive(Debug)]
+struct ZstdArgs<'a> {
+    /// The arguments in operand position (`-` excluded: standard input).
+    operands: Vec<&'a str>,
+    /// Each `-D` value and `--patch-from` value: a dictionary or prefix,
+    /// read whole once (`FIO_setDictBufferMalloc`).
+    dicts: Vec<&'a str>,
+    /// Each `--filelist` value: a list of names, read whole once.
+    filelists: Vec<&'a str>,
+    mode: ZstdMode,
+}
+
+/// zstdcli.c's long options that take a value with `=` or, without one,
+/// from the next argument (`NEXT_FIELD`, `NEXT_UINT32`, `NEXT_TSIZE`),
+/// matched as prefixes in cli.rs's order.
+const ZSTD_LONG_WITH_VALUE: &[&str] = &[
+    "--threads",
+    "--memlimit",
+    "--memory",
+    "--block-size",
+    "--maxdict",
+    "--dictID",
+    "--stream-size",
+    "--target-compressed-block-size",
+    "--size-hint",
+    "--output-dir-flat",
+    "--auto-threads",
+    "--output-dir-mirror",
+    "--patch-from",
+    "--filelist",
+];
+
+/// The zstd family's arguments as zstdcli.c parses them (no permuting:
+/// operands and options mix freely; `--` makes the rest operands). Only
+/// what the read bound needs: which arguments name inputs, dictionaries
+/// and lists, and the operation. A value taken from the next argument is
+/// no operand. Parse errors stop the run before any file is read, so a
+/// case that ends in one is classified however it falls.
+fn zstd_parse<'a>(name: &str, args: &[&'a str]) -> ZstdArgs<'a> {
+    let mut z = ZstdArgs {
+        operands: Vec::new(),
+        dicts: Vec::new(),
+        filelists: Vec::new(),
+        mode: match name {
+            "unzstd" | "zstdcat" => ZstdMode::Decompress,
+            _ => ZstdMode::Compress,
+        },
+    };
+    let mut after_dashes = false;
+    let mut i = 0;
+    // The value of the option at `args[i]`: after its `=`, else the next
+    // argument (consumed).
+    let value = |i: &mut usize, rest: &'a str| -> Option<&'a str> {
+        if let Some(v) = rest.strip_prefix('=') {
+            Some(v)
+        } else {
+            *i += 1;
+            args.get(*i).copied()
+        }
+    };
+    while i < args.len() {
+        let a = args[i];
+        if after_dashes || !a.starts_with('-') {
+            z.operands.push(a);
+        } else if a == "-" {
+        } else if a == "--" {
+            after_dashes = true;
+        } else if let Some(long) = a.strip_prefix("--") {
+            match long {
+                "list" => z.mode = ZstdMode::List,
+                "compress" => z.mode = ZstdMode::Compress,
+                "decompress" | "uncompress" => z.mode = ZstdMode::Decompress,
+                "test" => z.mode = ZstdMode::Test,
+                l if l.starts_with("train") => z.mode = ZstdMode::Train,
+                _ => {
+                    let found = ZSTD_LONG_WITH_VALUE
+                        .iter()
+                        .find_map(|p| a.strip_prefix(p).map(|rest| (*p, rest)));
+                    if let Some((p, rest)) = found
+                        && let Some(v) = value(&mut i, rest)
+                    {
+                        match p {
+                            "--patch-from" => z.dicts.push(v),
+                            "--filelist" => z.filelists.push(v),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        } else {
+            let cluster = &a[1..];
+            for (k, c) in cluster.char_indices() {
+                match c {
+                    'z' => z.mode = ZstdMode::Compress,
+                    'd' => z.mode = ZstdMode::Decompress,
+                    't' => z.mode = ZstdMode::Test,
+                    'l' => z.mode = ZstdMode::List,
+                    'o' | 'D' => {
+                        // `-D=x` takes the rest; `-D x` the next argument,
+                        // and the cluster goes on after `D`.
+                        let rest = &cluster[k + 1..];
+                        if let Some(v) = rest.strip_prefix('=') {
+                            if c == 'D' {
+                                z.dicts.push(v);
+                            }
+                            break;
+                        }
+                        if let Some(v) = value(&mut i, "")
+                            && c == 'D'
+                        {
+                            z.dicts.push(v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        i += 1;
+    }
+    z
+}
+
+/// A superset of the names `UTIL_createFileNamesTable_fromFileName` reads
+/// from a list: lines, each cut at its first NUL.
+fn zstd_list_names(bytes: &[u8]) -> impl Iterator<Item = &str> {
+    bytes
+        .split(|b| *b == b'\n')
+        .filter_map(|l| l.split(|b| *b == 0).next())
+        .filter_map(|n| std::str::from_utf8(n).ok())
+        .filter(|n| !n.is_empty())
+}
+
+/// The zstd family through `run_in_counted`.
+fn run_zstd(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
+    let before = contents(dir);
+    let z = zstd_parse(name, args);
+    // `--filelist` names come from a case file, which holds the payload: a
+    // name holding a `/` could leave the run's directory, and `.`/`..`
+    // under `-r` reach files by paths no operand spells. Such a case is not
+    // run. A list file that was not created names nothing.
+    let mut listed: Vec<&str> = Vec::new();
+    for f in &z.filelists {
+        if let Some(bytes) = before.get(std::ffi::OsStr::new(f)) {
+            listed.extend(zstd_list_names(bytes));
+        }
+    }
+    if listed
+        .iter()
+        .any(|n| n.contains('/') || *n == "." || *n == "..")
+    {
+        return;
+    }
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, out, err, reads) = compat::run_in_counted(dir, name, os_args, stdin, Flavour::Gnu)
+        .expect("a COMPAT_NAMES entry is a compat name");
+    let why = || String::from_utf8_lossy(&err).into_owned();
+    if std::env::var_os("STUFFR_FUZZ_COMPAT_TRACE").is_some() {
+        eprintln!("compat: {name} {args:?} ({:?}) -> {code}", z.mode);
+        for (path, r) in &reads {
+            eprintln!("compat:   {path:?} {r:?}");
+        }
+    }
+    // zstd's exits only: 0, `main`'s 1 and 2, and `EXM_THROW`'s codes;
+    // never stuffr's 3-7 outside that set's meaning, never a panic's.
+    assert!(
+        (0..=2).contains(&code) || ZSTD_EXM.contains(&code),
+        "{name} {args:?}: exit {code} is not a zstd exit code\n{}",
+        why()
+    );
+    let mut operands = z.operands.clone();
+    operands.extend(&listed);
+    check_zstd_reads(dir, name, args, &z, &operands, &reads);
+    check_zstd_leftovers(dir, name, args, &listed);
+    check_budget(dir, name, args, &out, &before);
+}
+
+/// The zstd family's read bound, for every path a run opened, with `len`
+/// its largest length at an open: per operand that names it exactly (zstd
+/// retries no suffix), at most two opens and
+///
+/// - compress, decompress and test: `2 × len` bytes;
+/// - `-l`: `len` bytes (a header walk, never a re-read);
+/// - `--train*`: `len` bytes (each sample is read once, at most whole);
+///
+/// plus, per `-D`/`--patch-from` value naming it, one open and `len` bytes
+/// (the dictionary or prefix, read whole once per run), and per
+/// `--filelist` value naming it, one open and `len` bytes (the list).
+///
+/// A path nothing names must not be opened at all.
+///
+/// Measured (0.14.0 Task 10) over the seeds on this crate's pure tier and,
+/// for the paths the pure tier refuses, through `run_in_counted` on the C
+/// tier: every mode opens an operand once. Compressing, decompressing
+/// (every format, pass-through included) and testing read it once (`len`;
+/// less when a frame fails early). `-l` reads the headers only: 25 bytes
+/// of a 779-byte one-frame file, 68 of 1804 with a skippable frame and two
+/// frames, 8 of a lone 8-byte skippable header. `--train*` reads each
+/// sample once, at most whole (a file named three times: three opens,
+/// `3 × len`). A dictionary is read once per run whatever the operand
+/// count (`-D d.dict a a.gz a.xz`: one open), and a `--patch-from` prefix
+/// once even when zstd then refuses it as also the input. The `2 ×` on
+/// the coding modes leaves room for a re-read without letting a third
+/// pass through; the dictionary and list allowances are exact.
+fn check_zstd_reads(
+    dir: &Path,
+    name: &str,
+    args: &[&str],
+    z: &ZstdArgs<'_>,
+    operands: &[&str],
+    reads: &BTreeMap<PathBuf, compat::InputReads>,
+) {
+    for (path, r) in reads {
+        let file = path
+            .strip_prefix(dir)
+            .ok()
+            .and_then(|p| p.to_str())
+            .unwrap_or_else(|| panic!("{name}: opened {path:?}, outside {dir:?}"));
+        let count = |names: &[&str]| names.iter().filter(|n| **n == file).count() as u64;
+        let m = count(operands);
+        let once = count(&z.dicts) + count(&z.filelists);
+        let per_operand = match z.mode {
+            ZstdMode::List | ZstdMode::Train => r.len,
+            _ => 2 * r.len,
+        };
+        assert!(
+            r.opens <= 2 * m + once,
+            "{name} {args:?} ({:?}): {} opens of {file:?}, which {m} operand(s) \
+             and {once} dictionary/list value(s) name",
+            z.mode,
+            r.opens
+        );
+        assert!(
+            r.bytes <= per_operand * m + r.len * once,
+            "{name} {args:?} ({:?}): read {} bytes of the {}-byte {file:?}, \
+             which {m} operand(s) and {once} dictionary/list value(s) name",
+            z.mode,
+            r.bytes,
+            r.len
+        );
+    }
+}
+
+/// No `.stuffr-zstd-*` temporary survives a run, and every name in the
+/// run's directory is one `could_be_written` allows, with the names a
+/// `--filelist` gave as bases too. A listed name may differ from a table
+/// name only by ASCII case on a case-folding filesystem (it opens the
+/// table's file; the output is spelled as listed), as under xz.
+fn check_zstd_leftovers(dir: &Path, name: &str, args: &[&str], listed: &[&str]) {
+    let Ok(listing) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in listing.flatten() {
+        let n = e.file_name().to_string_lossy().into_owned();
+        assert!(
+            !n.starts_with(".stuffr-zstd-"),
+            "{name} {args:?}: left its temporary {n:?}"
+        );
+        assert!(
+            could_be_written_with(&n, false, listed)
+                || (case_insensitive_fs() && could_be_written_with(&n, true, listed)),
+            "{name} {args:?}: left a stray {n:?}"
+        );
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -884,13 +1202,7 @@ fuzz_target!(|data: &[u8]| {
             run_xz(&dir, case.name, &case.args, stdin)
         }
         "bzip2" | "bunzip2" | "bzcat" => run_bzip2(&dir, case.name, &case.args, stdin),
-        // The zstd family (0.14.0): no panic and containment (below) until
-        // Task 10 brings its oracle.
-        "zstd" | "unzstd" | "zstdcat" | "zstdmt" => {
-            let os_args: Vec<OsString> = case.args.iter().map(OsString::from).collect();
-            compat::run_in_counted(&dir, case.name, os_args, stdin, Flavour::Gnu)
-                .expect("a COMPAT_NAMES entry is a compat name");
-        }
+        "zstd" | "unzstd" | "zstdcat" | "zstdmt" => run_zstd(&dir, case.name, &case.args, stdin),
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 
