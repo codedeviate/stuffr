@@ -653,8 +653,11 @@ mod tests {
         Encoder::new(&o).unwrap();
     }
 
+    /// Two fresh encoders given the same prefix and input write the same
+    /// frame. (That the prefix's guard byte is excluded, `len - 1`, is
+    /// pinned by the byte-identical C-tier `--patch-from` cases.)
     #[test]
-    fn prefix_output_does_not_depend_on_where_the_input_lives() {
+    fn prefix_output_is_the_same_from_two_fresh_encoders() {
         let old = text(40_000);
         let input = text(4000);
         let o = EncodeOptions {
