@@ -2582,6 +2582,68 @@ mod unix {
     /// `ZSTD_DStreamInSize()`: one read job.
     const DSTREAM_IN_SIZE_REF: usize = (128 << 10) + 3;
 
+    /// `data` as our own `zstd --format=lzma` writes it: liblzma's
+    /// `lzma_alone_encoder` layout, no size and an end marker, so the pure
+    /// tier's decoder finds the end only by reading past it.
+    fn own_lzma(data: &[u8]) -> Vec<u8> {
+        let mut c = case("zstd", &["--format=lzma", "-q", "-c"]);
+        c.stdin = Some(data.to_vec());
+        let r = stuffr_as(&c);
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        r.stdout
+    }
+
+    /// Reference-free: a `.lzma` ending in the last 40 bytes of the first
+    /// read job, followed by a zstd frame. The pure tier's LZMA decoder
+    /// reads up to 40 bytes ahead, so its end can be reported only once the
+    /// next job is loaded; the bytes it read past its end must go back from
+    /// the previous job's tail (`formats.rs`, `decode_frame`'s give-back),
+    /// or the frame after it is lost. Before that give-back read from the
+    /// tail, this wrote wrong output with exit 0.
+    #[test]
+    fn lzma_ending_near_a_read_jobs_end_gives_back_the_tail() {
+        let next = stuffr_encode("zstd", b"TAIL\n", None);
+        let window = DSTREAM_IN_SIZE_REF - 40..DSTREAM_IN_SIZE_REF;
+        let mut cases = Vec::new();
+        // Random input: the `.lzma` is a little longer than the input, by
+        // an amount that varies, so step towards the window, then walk it.
+        let mut n = window.start - 4096;
+        for _ in 0..400 {
+            if cases.len() == 4 {
+                break;
+            }
+            let plain = random(n, n as u64);
+            let data = own_lzma(&plain);
+            if data.len() < window.start {
+                n += (window.start - data.len()).div_ceil(2);
+                continue;
+            }
+            if window.contains(&data.len()) {
+                let mut v = data;
+                v.extend_from_slice(&next);
+                cases.push((plain, v));
+                n += 3;
+            } else {
+                n -= 1;
+            }
+        }
+        assert!(
+            cases.len() >= 2,
+            "{} sizes found in the window",
+            cases.len()
+        );
+        for (plain, v) in cases {
+            let len = v.len() - next.len();
+            let c = with_files("zstdcat", &["l.lzma"], vec![("l.lzma", v)]);
+            let s = stuffr_as(&c);
+            assert_eq!(s.code, 0, "{len}: {}", s.stderr);
+            assert!(s.stderr.is_empty(), "{len}: {}", s.stderr);
+            let mut want = plain;
+            want.extend_from_slice(b"TAIL\n");
+            assert!(s.stdout == want, "{len}: the output differs");
+        }
+    }
+
     /// 128 MiB of zeros as xz (preset 3, a 4 MiB dictionary) and as gzip
     /// -9 decode in bounded memory: each decoder call fills one 128 KiB
     /// buffer, as fileio.c's loops do, however well the data compressed
@@ -3126,10 +3188,13 @@ mod unix {
                 "{:?}: not a dictionary",
                 c.args
             );
+            // One name per call: cases run in parallel, and a key built
+            // from the case could repeat.
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let dir = ScratchDir::at(std::env::temp_dir().join(format!(
                 "stuffr-zstd-cover-{}-{}",
                 std::process::id(),
-                c.args.len() * 1000 + sb.len() % 1000
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             )));
             fs::create_dir_all(&*dir).unwrap();
             let d = dir.join("d");
