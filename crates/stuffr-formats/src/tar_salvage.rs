@@ -605,6 +605,11 @@ const CONVERGED_CHAINS_SHAPE: &str =
 const EXTENSION_BUDGET_SHAPE: &str = "header(s) whose extension chains were not read because the \
      scan's extension-read budget was spent";
 
+/// The phrase for a terminal header whose chain was refused because the scan
+/// already tracked [`MAX_TRACKED_TERMINALS`] others — see [`ChainBudget`].
+const TRACKING_CAP_SHAPE: &str = "header(s) whose extension chains were not read because the \
+     scan was already tracking the most terminal headers it holds at once";
+
 /// The phrase for a block refused as a shifted copy that sits on the
 /// recovered entries' own block boundaries — see
 /// [`UngateableSightings::into_sightings`].
@@ -648,6 +653,11 @@ struct UngateableSightings {
     /// Reported like `converged`, and for the same reason not in
     /// [`Self::any`].
     starved: TerminalLog,
+    /// Every terminal header at which a chain was refused because
+    /// `TarSalvage::chains_read` already held [`MAX_TRACKED_TERMINALS`]
+    /// terminals. Reported like `converged`, and for the same reason not in
+    /// [`Self::any`].
+    capped: TerminalLog,
 }
 
 impl UngateableSightings {
@@ -729,6 +739,7 @@ impl UngateableSightings {
         sightings.extend(self.copies.on_grid(&grid));
         sightings.extend(self.converged.into_sightings(CONVERGED_CHAINS_SHAPE));
         sightings.extend(self.starved.into_sightings(EXTENSION_BUDGET_SHAPE));
+        sightings.extend(self.capped.into_sightings(TRACKING_CAP_SHAPE));
         // Stable: each group stays in its own ascending order, and no two
         // groups share an offset, so the note lists what it always did.
         sightings.sort_by_key(|s| s.offset);
@@ -811,6 +822,12 @@ impl CopyBuckets {
 /// `TarSalvage::chains_read` (each refusal follows that map's lookup or
 /// insert at the same offset), which is pruned at the same position, so
 /// `pending` never holds more than that map already does.
+///
+/// **Hard cap (0.13.2).** That argument bounds `pending` by the map, and the
+/// map is bounded by [`MAX_TRACKED_TERMINALS`]; `pending` is capped by the
+/// same figure on its own as well, so neither bound rests on the other. An
+/// insert past it goes straight to `log`, out of order, which only changes
+/// which of the (already capped) stored sightings are kept, never the count.
 #[derive(Debug, Default)]
 struct TerminalLog {
     /// Refused terminals at or past the search position.
@@ -823,12 +840,16 @@ struct TerminalLog {
 }
 
 impl TerminalLog {
-    fn insert(&mut self, at: u64) {
+    fn insert(&mut self, at: u64, cap: usize, shape: &'static str) {
         debug_assert!(
             at >= self.settled_below,
             "terminal {at} refused after the scan passed {}",
             self.settled_below
         );
+        if self.pending.len() >= cap && !self.pending.contains(&at) {
+            self.log.push(Sighting::work_bounded(TAR, at, shape));
+            return;
+        }
         self.pending.insert(at);
     }
 
@@ -891,6 +912,19 @@ pub const MAX_SALVAGE_PAX_SCAN: u64 = 1 << 20;
 /// header — see `ChainBudget`. A chain past it is not read, and the header
 /// is reported as a [`Sighting`].
 pub const MAX_CHAINS_PER_HEADER: usize = 4;
+
+/// The most terminal headers the scan tracks at once: the keys of
+/// `TarSalvage::chains_read` and each refusal log's pending set (0.13.2).
+///
+/// 4096 x 512 bytes = 2 MiB of headers in flight, and chains converge on a
+/// terminal within [`MAX_CHAINS_PER_HEADER`], so no honest archive comes near
+/// it. Both collections are already bounded by geometry (a chain's payload
+/// is at most [`MAX_SALVAGE_PAX_SCAN`], so only terminals within about a
+/// megabyte ahead of the search position are ever outstanding); this is the
+/// hard cap that holds if that argument ever stops being true. A chain
+/// that would start tracking a terminal past it is not read, and its
+/// terminal is reported as a work-bounded [`Sighting`] ([`TRACKING_CAP_SHAPE`]).
+const MAX_TRACKED_TERMINALS: usize = 4096;
 
 /// Extension-payload bytes the whole scan may read, per byte of input — see
 /// [`extension_read_budget`].
@@ -975,7 +1009,7 @@ pub const SPARSE: FormatId = FormatId::new("tar-sparse");
 /// extension-chain budgets. Reusing an instance across sources carries that
 /// spent state into the next scan, so build a fresh one
 /// (`TarSalvage::default()`) per source.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TarSalvage {
     resume: Option<Resume>,
     /// Header shapes this scan recognised and cannot gate — Ruling 3-J.
@@ -990,6 +1024,26 @@ pub struct TarSalvage {
     /// Extension-payload bytes read so far — against
     /// [`extension_read_budget`].
     payload_read: u64,
+    /// [`MAX_TRACKED_TERMINALS`]; a test may lower it.
+    tracking_cap: usize,
+    /// The most keys `chains_read` and the logs' pending sets held at once.
+    #[cfg(test)]
+    peak_tracked: (usize, usize),
+}
+
+impl Default for TarSalvage {
+    fn default() -> Self {
+        Self {
+            resume: None,
+            seen: UngateableSightings::default(),
+            search: ForwardSearch::default(),
+            chains_read: BTreeMap::new(),
+            payload_read: 0,
+            tracking_cap: MAX_TRACKED_TERMINALS,
+            #[cfg(test)]
+            peak_tracked: (0, 0),
+        }
+    }
 }
 
 /// The last reported candidate whose payload fit in the file.
@@ -1047,14 +1101,30 @@ impl SalvageScan for TarSalvage {
             self.seen
                 .starved
                 .settle_below(search_from, EXTENSION_BUDGET_SHAPE);
+            self.seen
+                .capped
+                .settle_below(search_from, TRACKING_CAP_SHAPE);
             let mut budget = ChainBudget {
                 read: &mut self.chains_read,
                 converged: &mut self.seen.converged,
                 payload_read: &mut self.payload_read,
                 payload_limit: extension_read_budget(file_len),
                 starved: &mut self.seen.starved,
+                capped: &mut self.seen.capped,
+                cap: self.tracking_cap,
             };
-            match read_candidate_at(src, offset, file_len, block, &mut budget) {
+            let scanned = read_candidate_at(src, offset, file_len, block, &mut budget);
+            #[cfg(test)]
+            {
+                let pending = [&self.seen.converged, &self.seen.starved, &self.seen.capped]
+                    .iter()
+                    .map(|t| t.pending.len())
+                    .max()
+                    .unwrap_or(0);
+                self.peak_tracked.0 = self.peak_tracked.0.max(self.chains_read.len());
+                self.peak_tracked.1 = self.peak_tracked.1.max(pending);
+            }
+            match scanned {
                 Scanned::Found(found) => {
                     self.resume = found.next_header.map(|next_header| Resume {
                         header: found.candidate.offset,
@@ -1348,6 +1418,10 @@ struct ChainBudget<'a> {
     /// [`extension_read_budget`] for this input.
     payload_limit: u64,
     starved: &'a mut TerminalLog,
+    /// Terminals refused because `read` was full.
+    capped: &'a mut TerminalLog,
+    /// [`MAX_TRACKED_TERMINALS`], or a test's override.
+    cap: usize,
 }
 
 impl ChainBudget<'_> {
@@ -1403,11 +1477,15 @@ fn gate_chain_at(
             None => {
                 if let Some(&read) = budget.read.get(&at) {
                     if read >= MAX_CHAINS_PER_HEADER {
-                        budget.converged.insert(at);
+                        budget
+                            .converged
+                            .insert(at, budget.cap, CONVERGED_CHAINS_SHAPE);
                         return None;
                     }
                     if budget.scan_budget_spent() {
-                        budget.starved.insert(at);
+                        budget
+                            .starved
+                            .insert(at, budget.cap, EXTENSION_BUDGET_SHAPE);
                         return None;
                     }
                 }
@@ -1463,15 +1541,24 @@ fn gate_chain_at(
                 .sum();
             let after = budget.payload_read.saturating_add(planned);
             let over = budget.scan_budget_spent() || after > budget.payload_limit;
+            // A terminal not yet tracked is not started past the cap.
+            if !budget.read.contains_key(&at) && budget.read.len() >= budget.cap {
+                budget.capped.insert(at, budget.cap, TRACKING_CAP_SHAPE);
+                return None;
+            }
             let read = budget.read.entry(at).or_insert(0);
             if *read >= MAX_CHAINS_PER_HEADER {
-                budget.converged.insert(at);
+                budget
+                    .converged
+                    .insert(at, budget.cap, CONVERGED_CHAINS_SHAPE);
                 return None;
             }
             // A chain whose payloads would take the scan past its budget is
             // refused whole, so the budget is a bound, never overshot.
             if over {
-                budget.starved.insert(at);
+                budget
+                    .starved
+                    .insert(at, budget.cap, EXTENSION_BUDGET_SHAPE);
                 return None;
             }
             *read += 1;
@@ -2706,6 +2793,89 @@ mod tests {
                 .iter()
                 .any(|s| s.offset == terminal_at && s.shape == CONVERGED_CHAINS_SHAPE)
         );
+    }
+
+    /// `n` forged `x` heads, then `n` empty-named terminals: head `k` spans
+    /// exactly to terminal `k`, so while the scan walks the heads every
+    /// earlier terminal is still ahead of it — `n` outstanding at once.
+    fn outstanding_terminals(n: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        for _ in 0..n {
+            data.extend_from_slice(&ustar_block("", b'x', ((n - 1) * 512) as u64));
+        }
+        for _ in 0..n {
+            data.extend_from_slice(&ustar_block("", b'0', 0));
+        }
+        data.extend_from_slice(&[0u8; 1024]);
+        data
+    }
+
+    /// Scans `data` with the tracking cap at `cap`; answers the outcome's
+    /// entries' names, its sightings, and the scanner's peaks.
+    fn scan_with_cap(data: Vec<u8>, cap: usize) -> (Vec<String>, Vec<Sighting>, (usize, usize)) {
+        let mut scanner = TarSalvage::new();
+        scanner.tracking_cap = cap;
+        let outcome = salvage_all(
+            &mut scanner,
+            &mut Cursor::new(data),
+            &SalvagePolicy::default(),
+        )
+        .unwrap();
+        let names = outcome
+            .entries
+            .iter()
+            .map(|e| e.meta.name.clone())
+            .collect();
+        let sightings = std::mem::take(&mut scanner.seen).into_sightings(&outcome.entries);
+        (names, sightings, scanner.peak_tracked)
+    }
+
+    #[test]
+    fn tracked_terminals_stop_at_the_cap() {
+        const CAP: usize = 64;
+        let (_, sightings, peak) = scan_with_cap(outstanding_terminals(CAP + 1), CAP);
+        assert!(peak.0 <= CAP && peak.1 <= CAP, "{peak:?}");
+        assert_eq!(peak.0, CAP, "the map should have filled: {peak:?}");
+        let capped: Vec<_> = sightings
+            .iter()
+            .filter(|s| s.shape == TRACKING_CAP_SHAPE)
+            .collect();
+        assert_eq!(capped.len(), 1, "{sightings:?}");
+        assert_eq!(
+            capped[0].kind,
+            stuffr_core::salvage::SightingKind::WorkBounded
+        );
+        assert_eq!(capped[0].offset, ((2 * CAP + 1) * 512) as u64);
+    }
+
+    #[test]
+    fn at_the_cap_nothing_changes() {
+        const CAP: usize = 64;
+        let at_cap = scan_with_cap(outstanding_terminals(CAP), CAP);
+        let raised = scan_with_cap(outstanding_terminals(CAP), CAP * 4);
+        assert!(
+            at_cap.1.iter().all(|s| s.shape != TRACKING_CAP_SHAPE),
+            "{:?}",
+            at_cap.1
+        );
+        assert_eq!(at_cap.0, raised.0);
+        assert_eq!(at_cap.1.len(), raised.1.len());
+        assert_eq!(at_cap.2, raised.2);
+    }
+
+    /// The pending set's own cap, at the real figure: 4097 distinct
+    /// terminals logged into one `TerminalLog` hold at most
+    /// [`MAX_TRACKED_TERMINALS`] pending, and every one is still counted.
+    #[test]
+    fn a_terminal_log_holds_at_most_the_cap_pending() {
+        let mut log = TerminalLog::default();
+        for at in 0..=MAX_TRACKED_TERMINALS as u64 {
+            log.insert(at * 512, MAX_TRACKED_TERMINALS, CONVERGED_CHAINS_SHAPE);
+            assert!(log.pending.len() <= MAX_TRACKED_TERMINALS);
+        }
+        let sightings = log.into_sightings(CONVERGED_CHAINS_SHAPE);
+        let counted: u64 = sightings.iter().map(|s| 1 + s.more).sum();
+        assert_eq!(counted, MAX_TRACKED_TERMINALS as u64 + 1);
     }
 
     /// A chain of only the header — no extension at all — is never counted
