@@ -319,6 +319,20 @@ read list.
 > **2422** tests under `--all-features`, **2321** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.14.0` is a MINOR that adds the zstd compatibility family: `zstd`,
+> `unzstd`, `zstdcat` and `zstdmt`, ported from zstd 1.5.7, with every `-H`
+> option except the benchmark (`-b`/`-e`/`-i`), including dictionaries and
+> `--train*`, `--patch-from`, `--adapt`, `--list` and
+> `--format=zstd|gzip|xz|lzma|lz4`. On the C tier (`zstd-c`) the output is
+> byte-identical to zstd's, except cover dictionaries and `--format=lz4`; the
+> pure tier is compatible and refuses dictionary compression and training.
+> `install-links` now makes eighteen names. Additive library API,
+> `#[doc(hidden)]`: `stuffr::zstd_opts`, `stuffr::lz4_frame`,
+> `zlib_c::Inflate`, `RawDeflate::with_options`; `stuffr-cli` gains a
+> `zstd-c` feature.
+> **2595** tests under `--all-features`, **2484** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
