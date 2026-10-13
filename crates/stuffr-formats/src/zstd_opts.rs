@@ -253,8 +253,8 @@ pub struct EncodeOptions {
     pub rsyncable: bool,
     /// `ZSTD_c_targetCBlockSize`, `0` for none.
     pub target_cblock_size: u32,
-    /// `ZSTD_c_srcSizeHint` (`--size-hint=`), cast to `int` as `fileio.c`
-    /// casts it.
+    /// `ZSTD_c_srcSizeHint` (`--size-hint=`), clamped to `INT_MAX` as
+    /// `FIO_setSrcSizeHint` stores it.
     pub src_size_hint: Option<u64>,
     /// `ZSTD_CCtx_setPledgedSrcSize`: the file's size, or `--stream-size=`.
     /// [`Encoder::set_pledged_size`] sets it again for each further frame.

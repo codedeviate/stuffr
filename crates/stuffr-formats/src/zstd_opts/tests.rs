@@ -590,6 +590,36 @@ fn window_limit_refuses_before_allocating() {
     }
 }
 
+/// libzstd's single-pass shortcut is taken before its window check: a
+/// single-segment frame whose content (its window) exceeds the limit but
+/// fits `ZSTD_DStreamOutSize()` decodes when it arrives whole, and is
+/// refused when streamed. Both tiers hold the same two expectations.
+#[test]
+fn the_single_pass_shortcut_skips_the_window_check() {
+    let data = text(5000, 7);
+    // Single segment, a 2-byte content size (value - 256), no checksum,
+    // then one last raw block of the whole content.
+    let mut f = MAGIC.to_le_bytes().to_vec();
+    f.push(0x60);
+    f.extend_from_slice(&((data.len() - 256) as u16).to_le_bytes());
+    let bh = 1 | ((data.len() as u32) << 3);
+    f.extend_from_slice(&bh.to_le_bytes()[..3]);
+    f.extend_from_slice(&data);
+    let o = DecodeOptions {
+        max_window_size: 1 << 12,
+        ..DecodeOptions::default()
+    };
+    assert_eq!(decode(&o, &f).unwrap(), data);
+    for chunk in [1, 100, 4000] {
+        let mut d = Decoder::new(&o).unwrap();
+        assert_eq!(
+            code_of(decode_with(&mut d, &f, chunk)),
+            code::WINDOW_TOO_LARGE,
+            "chunk {chunk}"
+        );
+    }
+}
+
 #[test]
 fn formatted_dictionary_decodes() {
     let dict = fixture("dict4k.dict");
@@ -1063,6 +1093,26 @@ mod c_tier {
         let ours = encode(&o, &dict_plain());
         // The reference's own frame for the same input and dictionary.
         assert_eq!(ours, fixture("dict4k.zst"));
+    }
+
+    /// `FIO_setSrcSizeHint` clamps to `INT_MAX`; a larger hint must not
+    /// wrap negative (refused) or past 2^32 (other bytes).
+    #[test]
+    fn src_size_hint_clamps_to_int_max() {
+        let data = text(300_000, 8);
+        let with = |h: u64| {
+            encode(
+                &EncodeOptions {
+                    src_size_hint: Some(h),
+                    ..EncodeOptions::default()
+                },
+                &data,
+            )
+        };
+        let max = with(i32::MAX as u64);
+        assert_eq!(with(3 << 30), max);
+        assert_eq!(with((1 << 32) + 1000), max);
+        assert_eq!(decode(&DecodeOptions::default(), &max).unwrap(), data);
     }
 
     #[test]

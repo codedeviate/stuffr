@@ -481,7 +481,14 @@ impl Decoder {
             } => (header_size, window_size, content_size, dict_id, checksum),
         };
         let window = window_size.max(1 << WINDOWLOG_ABSOLUTEMIN);
-        if window > self.max_window {
+        // libzstd's single-pass shortcut: the whole frame in this call's
+        // input, its content fitting `ZSTD_DStreamOutSize()`. It is taken
+        // before the window check (zstd_decompress.c), so a frame it
+        // decodes is never refused for its window.
+        let shortcut = self.fresh
+            && content_size.is_some_and(|fcs| fcs <= BLOCKSIZE_MAX as u64)
+            && frame_compressed_size(input).is_some_and(|n| n <= input.len());
+        if !shortcut && window > self.max_window {
             return Err(ZstdError::lib(code::WINDOW_TOO_LARGE));
         }
         // `dctx->dictID`: a formatted dictionary's ID, else 0.
@@ -522,12 +529,7 @@ impl Decoder {
         // that overflows, so less of the output precedes it in libzstd.
         let block_max = window.min(BLOCKSIZE_MAX as u64);
         let overflow = match content_size {
-            Some(fcs)
-                if !(self.fresh
-                    && fcs <= BLOCKSIZE_MAX as u64
-                    && frame_compressed_size(input).is_some_and(|n| n <= input.len()))
-                    && fcs <= window + 2 * block_max + 64 =>
-            {
+            Some(fcs) if !shortcut && fcs <= window + 2 * block_max + 64 => {
                 code::DST_SIZE_TOO_SMALL
             }
             _ => code::CORRUPTION_DETECTED,

@@ -101,10 +101,10 @@ impl Encoder {
         e.set(ZSTD_c_checksumFlag, i32::from(o.checksum))?;
         e.set(ZSTD_c_compressionLevel, o.level)?;
         e.set(ZSTD_c_targetCBlockSize, o.target_cblock_size as i32)?;
-        // ZSTD_c_srcSizeHint; fileio.c casts its size_t to int.
+        // ZSTD_c_srcSizeHint; FIO_setSrcSizeHint clamps to INT_MAX.
         e.set(
             ZSTD_c_experimentalParam7,
-            o.src_size_hint.unwrap_or(0) as i32,
+            o.src_size_hint.map_or(0, |h| h.min(i32::MAX as u64) as i32),
         )?;
         e.set(ZSTD_c_enableLongDistanceMatching, o.ldm.value())?;
         e.set(ZSTD_c_ldmHashLog, o.ldm_params.hash_log as i32)?;
