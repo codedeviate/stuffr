@@ -2318,3 +2318,70 @@ pub fn stuffr_encode(id: &'static str, data: &[u8], level: Option<i32>) -> Vec<u
     sink.finish().unwrap();
     buf.contents()
 }
+
+// ---- zstd training material (0.14.0 Task 8) ----
+
+/// 100 small JSON records, one per file under `samples/`: dibio.c's
+/// one-sample-per-file training set, small enough that libzstd trains
+/// in a few milliseconds (its own progress lines are timed by CPU
+/// clock and stay silent below 0.15 s).
+pub fn zstd_samples() -> Vec<(&'static str, Vec<u8>)> {
+    static S: std::sync::OnceLock<Vec<(&'static str, Vec<u8>)>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        const WORDS: [&str; 24] = [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota",
+            "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi", "rho", "sigma", "tau",
+            "upsilon", "phi", "chi", "psi", "omega",
+        ];
+        let mut x: u32 = 12345;
+        let mut rnd = move || {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345) & 0x7fff_ffff;
+            x >> 8
+        };
+        (0..100)
+            .map(|i| {
+                let n = 20 + rnd() % 60;
+                let body: Vec<&str> = (0..n).map(|_| WORDS[(rnd() % 24) as usize]).collect();
+                let user = rnd() % 50;
+                let status = ["ok", "fail", "pending"][(rnd() % 3) as usize];
+                let rec = format!(
+                    "{{\"id\":{i},\"user\":\"user{user}\",\"status\":\"{status}\",\"text\":\"{}\"}}\n",
+                    body.join(" ")
+                );
+                (&*Box::leak(format!("samples/s{i:03}.json").into_boxed_str()), rec.into_bytes())
+            })
+            .collect()
+    })
+    .clone()
+}
+
+/// The reference's own dictionary over the samples, 4 KiB, written to
+/// a scratch file (`None` without a reference).
+pub fn zstd_trained_dictionary() -> Option<&'static [u8]> {
+    static D: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    D.get_or_init(|| {
+        zstd_dir()?;
+        let dir = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-zstd-dict-{}", std::process::id())),
+        );
+        fs::create_dir_all(dir.join("samples")).unwrap();
+        let mut args = vec!["-q".to_string(), "--train".into(), "--maxdict=4K".into()];
+        for (n, b) in zstd_samples() {
+            let p = dir.join(n);
+            fs::write(&p, b).unwrap();
+            args.push(p.to_str().unwrap().to_string());
+        }
+        let out = dir.join("dict");
+        args.push("-o".into());
+        args.push(out.to_str().unwrap().to_string());
+        let st = std::process::Command::new(Path::new(zstd_dir()?).join("zstd"))
+            .args(&args)
+            .env_clear()
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success());
+        Some(fs::read(&out).unwrap())
+    })
+    .as_deref()
+}

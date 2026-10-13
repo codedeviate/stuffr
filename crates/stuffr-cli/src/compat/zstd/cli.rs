@@ -123,7 +123,6 @@ pub(crate) enum DictType {
 
 /// What `--train*` hands `DiB_trainFromFiles` (Task 8).
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Read by Task 8 (dibio.rs).
 pub(crate) struct TrainCmd {
     /// `dict`: the algorithm selected last.
     pub dict: DictType,
@@ -285,7 +284,6 @@ impl Default for Prefs {
 
 /// R9's input-independent bounds for a sandboxed run (`run_in_counted`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `train_*` read by Task 8 (dibio.rs).
 pub(crate) struct Limits {
     /// The decoder's window-log maximum (a lower `--memory`/`--long`
     /// stands).
@@ -311,7 +309,6 @@ impl Limits {
 /// The parsed command line: zstdcli.c's `main` locals at the point the
 /// operation starts.
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // Read by Tasks 5-8 (fileio, list, dibio).
 pub(crate) struct Command {
     /// `operation`.
     pub op: Operation,
@@ -1519,6 +1516,11 @@ fn long_with_value_2(
         ("--train-fastcover", DictType::FastCover),
         ("--train-legacy", DictType::Legacy),
     ] {
+        // The pure tier is a zstd built with ZSTD_NODICT, where these three
+        // are no options (spec deviation 7).
+        if cfg!(not(feature = "zstd-c")) {
+            break;
+        }
         let Some(rest) = long_arg(arg, prefix) else {
             continue;
         };

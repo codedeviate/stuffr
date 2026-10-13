@@ -4,7 +4,8 @@
 //! Ported from zstd 1.5.7 `programs/` by Yann Collet and the zstd
 //! contributors (Meta Platforms, Inc.; BSD-3-Clause, the licence ships as
 //! `LICENSE-zstd`), one module per C file: `cli.rs` (zstdcli.c's argument
-//! parsing, help texts and parameter printers), `util.rs` (util.c),
+//! parsing, help texts and parameter printers), `dibio.rs` (dibio.c,
+//! `--train*`), `util.rs` (util.c),
 //! `display.rs` (fileio_common.h's display macros) and this module
 //! (zstdcli.c's `main` after the arguments). Every string is in
 //! `messages.rs`. libzstd itself is reached through
@@ -45,6 +46,12 @@
 //!    --trace"); `-H` omits their lines. `-B#`, `-S` and `-p#` keep the
 //!    reference's meaning. `--[no-]asyncio` is accepted and has no visible
 //!    effect. `--trace-file-stat` is accepted and prints no trace.
+//! 6. `--train-cover` (ruling T1-a): libzstd 1.5.7's cover sort breaks ties
+//!    by comparing addresses (`cover.c:300`, `:316`), so a cover dictionary
+//!    depends on heap layout, in zstd itself too. It is promised valid and
+//!    usable by zstd, not byte for byte. `--train`, `--train-fastcover` and
+//!    `--train-legacy` write zstd's bytes. `--adapt` changes the level by
+//!    timing, so its frames are compatible, not identical.
 //!
 //! Spec deviation 7, the pure tier (`zstd-pure` without `zstd-c`), as far
 //! as compressing and decompressing go (`fileio.rs`):
@@ -55,7 +62,15 @@
 //!   range-checked as libzstd checks them, then ignored.
 //! - Compressing with `-D` or `--patch-from` is refused, after everything
 //!   zstd prints first: `zstd: error 1 : dictionary compression is not
-//!   available in this build (stuffr pure tier)`.
+//!   available in this build (stuffr pure tier)`. Decompressing with either
+//!   works (a `--patch-from` prefix through a hand-built raw-content
+//!   dictionary, Task 1's spike S1).
+//! - `--train*` answers as a zstd built with `ZSTD_NODICT`: `--train`
+//!   prints `training mode not available`, exit 1, and `--train-cover`,
+//!   `--train-fastcover` and `--train-legacy` are no options there
+//!   (`Incorrect parameter`). `-H` still lists the dictionary builder.
+//! - `--adapt` is accepted and the level never moves (the encoder has no
+//!   jobs to measure).
 //! - A legacy frame (v0.5 to v0.7) is `unsupported format`, what a zstd
 //!   built without legacy support says.
 //! - A corrupt frame whose blocks overflow the output libzstd sized from
@@ -98,6 +113,7 @@ use super::CountedRun;
 use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
 pub(crate) mod cli;
+mod dibio;
 pub(crate) mod display;
 pub(crate) mod fileio;
 mod formats;
@@ -217,15 +233,6 @@ fn wait_enter(host: &mut Host, err: &mut dyn Write) {
     let _ = host.stdin().read(&mut byte);
 }
 
-/// Ruling P1 scaffolding: an operation whose task is not done yet, exit 1
-/// (the message in debug builds only). Tasks 5-8 replace every call.
-fn todo(err: &mut dyn Write, what: &str, task: &str) -> i32 {
-    if cfg!(debug_assertions) {
-        printf(err, m::TODO, &[what.as_bytes(), task.as_bytes()]);
-    }
-    1
-}
-
 /// UTIL_isLink and UTIL_isFIFO: whether `name` is a symbolic link (lstat)
 /// that does not lead to a FIFO (stat). Never on Windows, as util.c.
 fn is_link_not_fifo(host: &Host, name: &[u8]) -> bool {
@@ -307,7 +314,7 @@ fn execute(cmd: &mut Command, host: &mut Host, out: &mut dyn Write, err: &mut dy
 
     match cmd.op {
         Operation::List => return clean(list::list_files(cmd, host, out, err)),
-        Operation::Train => return clean(todo(err, "--train", "8")),
+        Operation::Train => return finish(dibio::train_files(cmd, host, err), pause),
         Operation::Test => {
             cmd.prefs.test_mode = true;
             cmd.out_file = Some(cli::NULMARK.to_vec());

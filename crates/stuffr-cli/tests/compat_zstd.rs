@@ -19,6 +19,15 @@
 //! truncated, corrupted and followed by garbage; pass-through, sparse
 //! output and legacy frames (R12); Review Focus 1-5; SIGINT (R6).
 //!
+//! Part 5 (Task 8): `--train`, `--train-cover`, `--train-fastcover` and
+//! `--train-legacy` over 100 one-record files, with their parameter
+//! strings, `--maxdict`, `--dictID`, `-o`, `-B#`, `-M#` and the refusals.
+//! The dictionary is compared byte for byte, except a cover dictionary
+//! (ruling T1-a), which the reference must be able to use; libzstd's own
+//! CPU-timed progress and dibio.c's wall-clock `Loading` lines past the
+//! first are removed on both sides (`strip_trainer_progress`). The pure
+//! tier answers as a `ZSTD_NODICT` build (`pure_nodict`).
+//!
 //! Part 4 (Task 7): `-l`, `-lv` and `-lvv` over frames the reference made
 //! and frames built here byte by byte (every content-size and dictionary-ID
 //! field width, skippable frames, block types, reserved bits, and every
@@ -156,7 +165,7 @@ mod unix {
     fn check(group: &str, cases: &[Case]) {
         let one = |c: &Case| -> bool {
             let Some(dir) = zstd_dir() else { return false };
-            let Some(mut r) = reference(dir, c) else {
+            let Some(mut r) = nodict_reference(dir, c) else {
                 return false;
             };
             let mut s = stuffr_as(c);
@@ -2981,5 +2990,383 @@ mod unix {
             }
         }
         check("list_totals", &cases);
+    }
+
+    // ---- part 5 (Task 8): training, dictionaries, --patch-from, --adapt ----
+
+    fn samples() -> Vec<(&'static str, Vec<u8>)> {
+        zstd_samples()
+    }
+
+    fn sample_names() -> Vec<&'static str> {
+        samples().iter().map(|(n, _)| *n).collect()
+    }
+
+    /// A `--train*` case over every sample, `args` first.
+    fn training<'a>(args: &[&'a str]) -> Case<'a> {
+        let mut all = args.to_vec();
+        all.extend(sample_names());
+        with_files("zstd", &all, samples())
+    }
+
+    /// Whether `c` trains with the cover algorithm (ruling T1-a).
+    fn trains_cover(c: &Case) -> bool {
+        c.args.iter().any(|a| a.starts_with("--train-cover"))
+    }
+
+    /// The dictionary file `c` writes: `-o NAME`, else `dictionary`.
+    fn dictionary_name<'a>(c: &Case<'a>) -> &'a str {
+        c.args
+            .iter()
+            .position(|a| *a == "-o")
+            .and_then(|i| c.args.get(i + 1).copied())
+            .unwrap_or("dictionary")
+    }
+
+    /// Ruling T1-a (spec deviation 6): libzstd's cover sort breaks ties by
+    /// pointer address, so a cover dictionary is promised valid and usable
+    /// by the reference, not byte for byte. Ours must be a formatted
+    /// dictionary the reference compresses and decompresses every sample
+    /// with; then it stands for the reference's, and the sizes in the
+    /// "Save dictionary" line are blanked on both sides.
+    fn cover_structural(c: &Case, r: &mut Run, s: &mut Run) {
+        let name = dictionary_name(c);
+        let (Some((rb, _, _)), Some((sb, _, _))) = (r.tree.get(name), s.tree.get(name)) else {
+            return;
+        };
+        let (rb, sb) = (rb.clone(), sb.clone());
+        if rb != sb {
+            assert_eq!(
+                &sb[..4],
+                &[0x37, 0xa4, 0x30, 0xec],
+                "{:?}: not a dictionary",
+                c.args
+            );
+            let dir = ScratchDir::at(std::env::temp_dir().join(format!(
+                "stuffr-zstd-cover-{}-{}",
+                std::process::id(),
+                c.args.len() * 1000 + sb.len() % 1000
+            )));
+            fs::create_dir_all(&*dir).unwrap();
+            let d = dir.join("d");
+            fs::write(&d, &sb).unwrap();
+            let d = d.to_str().unwrap();
+            for (_, sample) in samples().iter().step_by(7) {
+                let z = filter_through(ref_zstd(), &["-q", "-c", "-D", d], sample).unwrap();
+                let back = filter_through(ref_zstd(), &["-q", "-dc", "-D", d], &z).unwrap();
+                assert_eq!(&back, sample, "{:?}: the reference cannot use ours", c.args);
+            }
+            s.tree.get_mut(name).unwrap().0 = rb;
+        }
+        let blank = |t: &str| {
+            let mut out = String::new();
+            for line in t.split_inclusive('\n') {
+                match line.strip_prefix("Save dictionary of size ") {
+                    Some(rest) => {
+                        let tail = rest.trim_start_matches(|ch: char| ch.is_ascii_digit());
+                        out.push_str("Save dictionary of size <n>");
+                        out.push_str(tail);
+                    }
+                    None => out.push_str(line),
+                }
+            }
+            out
+        };
+        r.stderr = blank(&r.stderr);
+        s.stderr = blank(&s.stderr);
+    }
+
+    /// zstdcli.c built with `ZSTD_NODICT` (the pure tier, spec deviation
+    /// 7): `--train` says so, exit 1.
+    const NODICT: &str = "training mode not available \n";
+
+    /// The pure tier's training: `--train-cover`, `--train-fastcover` and
+    /// `--train-legacy` are no options there, so the reference's answer
+    /// to the same option under another name (`--Xrain-…`, also unknown)
+    /// is the expectation, the name put back; `--train` itself prints
+    /// [`NODICT`]. Nothing is written either way.
+    fn pure_nodict(dir: &str, c: &Case) -> bool {
+        if c.args.iter().any(|a| a.starts_with("--train-")) {
+            let Some(mut r) = nodict_reference(dir, c) else {
+                return false;
+            };
+            let mut s = stuffr_as(c);
+            mask_banners(&mut r, &mut s);
+            assert_same(c, &r, &s);
+            return true;
+        }
+        let s = stuffr_as(c);
+        assert_eq!(s.code, 1, "{:?}", c.args);
+        if c.args.iter().any(|a| *a == "-qq" || *a == "-qqq") {
+            assert_eq!(s.stderr, "", "{:?}", c.args);
+        } else if c.args.iter().any(|a| a.starts_with("-v")) {
+            assert!(s.stderr.ends_with(NODICT), "{:?}: {:?}", c.args, s.stderr);
+        } else {
+            assert_eq!(s.stderr, NODICT, "{:?}", c.args);
+        }
+        assert!(s.stdout.is_empty(), "{:?}", c.args);
+        let names: Vec<&str> = s
+            .tree
+            .keys()
+            .map(String::as_str)
+            .filter(|n| !n.ends_with('/'))
+            .collect();
+        let mut inputs: Vec<&str> = c.files.iter().map(|(n, _)| *n).collect();
+        inputs.sort_unstable();
+        assert_eq!(names, inputs, "{:?}: wrote something", c.args);
+        true
+    }
+
+    /// The reference's run of `c`, as a zstd built with `ZSTD_NODICT`
+    /// answers it on the pure tier (spec deviation 7): the first
+    /// `--train-cover`, `--train-fastcover` or `--train-legacy` option is
+    /// unknown there, so the reference runs with it renamed to an unknown
+    /// `--Xrain-…` and the name is put back in its standard error. On the
+    /// C tier, and without such an option, the reference's own run.
+    fn nodict_reference(dir: &str, c: &Case) -> Option<Run> {
+        let Some(i) = c
+            .args
+            .iter()
+            .position(|a| a.starts_with("--train-"))
+            .filter(|_| !EXACT)
+        else {
+            return reference(dir, c);
+        };
+        let mut args = c.args.clone();
+        args[i] = leak(format!("--Xrain-{}", &c.args[i]["--train-".len()..]));
+        let renamed = Case {
+            name: c.name,
+            args,
+            files: c.files.clone(),
+            stdin: c.stdin.clone(),
+            tty_stdin: c.tty_stdin,
+            tty_stdout: c.tty_stdout,
+            env: c.env.clone(),
+            compare_output_bytes: c.compare_output_bytes,
+            expect_stdout_plain: None,
+            setup: c.setup,
+            roundtrip: c.roundtrip,
+        };
+        let mut r = reference(dir, &renamed)?;
+        r.stderr = r.stderr.replace("--Xrain-", "--train-");
+        Some(r)
+    }
+
+    /// libzstd's trainers draw their own progress, `\r%u%%       ` (cover,
+    /// fastcover) and `\r%4.2f %% \r` (legacy), whenever 0.15 s of CPU
+    /// time has passed since the last one (`clock()`), so how many appear
+    /// varies from run to run of the reference itself (spec deviation 2's
+    /// timing). Every such token is removed, on both sides. dibio.c's own
+    /// `Loading %s...       \r` is drawn the same way by wall clock (a sixth
+    /// of a second) after the first, so only the first of a run of them is
+    /// kept. The rest of standard error is compared.
+    fn strip_trainer_progress(t: &str) -> String {
+        let b = t.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        let mut after_loading = false;
+        while i < b.len() {
+            if b[i..].starts_with(b"Loading ")
+                && let Some(end) = b[i..].iter().position(|c| *c == b'\r' || *c == b'\n')
+                && b[i + end] == b'\r'
+                && b[i..i + end].ends_with(b"...       ")
+            {
+                if !after_loading {
+                    out.extend_from_slice(&b[i..=i + end]);
+                }
+                after_loading = true;
+                i += end + 1;
+                continue;
+            }
+            after_loading = false;
+            if b[i] == b'\r' {
+                let digits = b[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+                let at = i + 1 + digits;
+                if digits > 0 && b[at..].starts_with(b"%       ") {
+                    i = at + 8;
+                    continue;
+                }
+                // `%4.2f %% \r`: optional padding, digits, '.', two digits.
+                let pad = b[i + 1..].iter().take_while(|c| **c == b' ').count();
+                let at = i + 1 + pad;
+                let whole = b[at..].iter().take_while(|c| c.is_ascii_digit()).count();
+                let at = at + whole;
+                if whole > 0
+                    && b.len() >= at + 3
+                    && b[at] == b'.'
+                    && b[at + 1].is_ascii_digit()
+                    && b[at + 2].is_ascii_digit()
+                    && b[at + 3..].starts_with(b" % \r")
+                {
+                    i = at + 3 + 4;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Training cases against the reference: on the C tier everything is
+    /// compared, the dictionary byte for byte (cover: structurally, ruling
+    /// T1-a); on the pure tier, [`pure_nodict`].
+    fn check_train(group: &str, cases: &[Case]) {
+        let one = |c: &Case| -> bool {
+            let Some(dir) = zstd_dir() else { return false };
+            if !EXACT {
+                return pure_nodict(dir, c);
+            }
+            let Some(mut r) = reference(dir, c) else {
+                return false;
+            };
+            let mut s = stuffr_as(c);
+            r.stderr = strip_trainer_progress(&r.stderr);
+            s.stderr = strip_trainer_progress(&s.stderr);
+            if trains_cover(c) {
+                cover_structural(c, &mut r, &mut s);
+            }
+            mask_banners(&mut r, &mut s);
+            assert_same(c, &r, &s);
+            true
+        };
+        run_group(group, cases, Skipped::none(), &one);
+    }
+
+    /// `--train` and its three algorithms with their parameter strings,
+    /// over 100 one-record files; `-r` on their directory.
+    #[test]
+    fn train_algorithms() {
+        let mut cases = Vec::new();
+        for args in [
+            &["--train"][..],
+            &["--train-fastcover"],
+            &["--train-fastcover=k=64,d=8,f=20,accel=2"],
+            &["--train-fastcover=k=64,d=6,steps=2,split=50"],
+            &["--train-fastcover=shrink"],
+            &["--train-legacy"],
+            &["--train-legacy=s=5"],
+            &["--train-cover"],
+            &["--train-cover=k=64,d=8"],
+            &["--train-cover=shrink"],
+            &["--train-cover=k=48,d=6,shrink=2"],
+            &["-19", "--train"],
+            &["--fast=3", "--train-fastcover=k=64,d=8"],
+            &["--train", "-T1"],
+        ] {
+            cases.push(training(args));
+        }
+        cases.push(with_files("zstd", &["--train", "-r", "samples"], samples()));
+        check_train("train_algorithms", &cases);
+    }
+
+    /// `--maxdict`, `--dictID`, `-o`, `-B#`, `-M#`, the display levels.
+    #[test]
+    fn train_options() {
+        let mut cases = Vec::new();
+        for args in [
+            &["--train", "--maxdict=4K"][..],
+            &["--train", "--maxdict=2000", "--train-legacy"],
+            &["--train", "--dictID=1234"],
+            &["--train-legacy", "--dictID=4294967295"],
+            &["--train", "-o", "mydict"],
+            &["--train", "-M16K"],
+            &["--train", "--memory=1MB"],
+            &["--train", "-q"],
+            &["--train", "-qq"],
+            &["--train-legacy", "-qqq"],
+            &["--train", "-v", "-T1"],
+            &["--train-legacy", "-v"],
+            &["--train", "-vvvv", "-T1"],
+            &["--train", "-B300"],
+            &["--train-legacy", "-B200"],
+        ] {
+            cases.push(training(args));
+        }
+        // -B# over three large files: each one is many samples.
+        let big = vec![
+            ("big1", super::compat_harness::text(64 << 10, 81)),
+            ("big2", super::compat_harness::text(48 << 10, 82)),
+            ("big3", super::compat_harness::text(20 << 10, 83)),
+        ];
+        for args in [
+            &["--train", "-B4K", "big1", "big2", "big3"][..],
+            &["--train", "-B4K", "--maxdict=8K", "big1", "big2", "big3"],
+            &["--train", "big1", "big2", "big3"],
+        ] {
+            cases.push(with_files("zstd", args, big.clone()));
+        }
+        // A sample over 256 KiB: loaded as its first 128 KiB, with the
+        // warnings (`-v`: the per-file note).
+        for v in ["-q", "-v"] {
+            let mut files = samples();
+            files.push(("huge", super::compat_harness::text(300 << 10, 84)));
+            let mut args = vec!["--train", v, "-T1", "huge"];
+            args.extend(sample_names());
+            cases.push(with_files("zstd", &args, files));
+        }
+        check_train("train_options", &cases);
+    }
+
+    /// The refusals: too few samples, empty and missing ones, a bad
+    /// parameter string, no samples at all, an output that cannot be
+    /// opened.
+    #[test]
+    fn train_refused() {
+        let s = samples();
+        let few = vec![s[0].clone(), s[1].clone(), ("empty", Vec::new())];
+        let mut cases = vec![
+            with_files(
+                "zstd",
+                &["--train", "samples/s000.json", "samples/s001.json"],
+                few.clone(),
+            ),
+            with_files(
+                "zstd",
+                &["--train", "-qq", "samples/s000.json", "samples/s001.json"],
+                few.clone(),
+            ),
+            with_files(
+                "zstd",
+                &[
+                    "--train",
+                    "-v",
+                    "samples/s000.json",
+                    "empty",
+                    "samples/s001.json",
+                ],
+                few.clone(),
+            ),
+            with_files("zstd", &["--train"], Vec::new()),
+            // Unmeasurable samples count in dibio.c's totals (size -1).
+            with_files(
+                "zstd",
+                &["--train", "m1", "m2", "m3", "m4", "m5", "m6"],
+                Vec::new(),
+            ),
+            with_files(
+                "zstd",
+                &[
+                    "--train",
+                    "m1",
+                    "samples/s000.json",
+                    "samples/s001.json",
+                    "samples/s002.json",
+                    "samples/s003.json",
+                ],
+                few.clone(),
+            ),
+        ];
+        for args in [
+            &["--train-fastcover=k=64,q=1"][..],
+            &["--train-legacy=s=5,x"],
+            &["--train-cover=k=64,d=8,steps"],
+            &["--train", "-o", "samples"],
+            &["--train-cover=k=8,d=16"],
+            &["--train", "--maxdict=10"],
+        ] {
+            cases.push(training(args));
+        }
+        check_train("train_refused", &cases);
     }
 }

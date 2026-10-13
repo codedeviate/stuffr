@@ -183,3 +183,53 @@ fn compression_parameters_print_before_compressing() {
          --compress-literals --memory=134217728 --threads=2 --content-size"
     );
 }
+
+/// R9: a sandboxed `--train*` loads at most 256 KiB of samples (and runs
+/// at most 4 optimiser steps on 2 threads); the pure tier answers as a
+/// `ZSTD_NODICT` build.
+#[test]
+fn sandboxed_training_is_bounded() {
+    let d = Dir::new("train");
+    let mut names = Vec::new();
+    for i in 0..40 {
+        let name = format!("s{i:02}");
+        let body: Vec<u8> = (0..16_000u32)
+            .map(|k| b"abcdefgh ijklmnop"[((k * 7 + i) % 17) as usize])
+            .collect();
+        std::fs::write(d.0.join(&name), body).unwrap();
+        names.push(name);
+    }
+    let mut args = vec![
+        "--train-fastcover=steps=1000".to_string(),
+        "-T8".into(),
+        "-o".into(),
+        "dict".into(),
+    ];
+    args.extend(names);
+    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    let (code, out, err, reads) = run_in_counted(&d.0, "zstd", &args, b"", &|_| None);
+    let err = String::from_utf8(err).unwrap();
+    assert!(out.is_empty());
+    if cfg!(feature = "zstd-c") {
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            err.contains("Training samples set too large (0 MB); training on 0 MB only...\n"),
+            "{err}"
+        );
+        let read: u64 = reads.values().map(|r| r.bytes).sum();
+        assert!(read <= 256 << 10, "{read} bytes of samples read");
+        let dict = std::fs::read(d.0.join("dict")).unwrap();
+        assert_eq!(&dict[..4], &[0x37, 0xa4, 0x30, 0xec]);
+    } else {
+        // Not an option in a ZSTD_NODICT build: badUsage, exit 1.
+        assert_eq!(code, 1);
+        assert!(
+            err.starts_with(
+                "Incorrect parameter: --train-fastcover=steps=1000 \nCompress or decompress"
+            ),
+            "{err}"
+        );
+        let (code, _, err) = sandbox(&d, "zstd", &["--train", "s00", "s01"]);
+        assert_eq!((code, err.as_str()), (1, "training mode not available \n"));
+    }
+}

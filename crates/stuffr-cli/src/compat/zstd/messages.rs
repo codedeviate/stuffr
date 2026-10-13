@@ -869,10 +869,6 @@ pub(super) const READ_ERROR: &str = "Read error";
 
 // ---- scaffolding (0.14.0 Ruling P1; Tasks 5-8 remove every use) ----
 
-/// Not zstd's: an operation whose task is not done yet, debug builds only
-/// (`%s`: the operation, then the task that brings it).
-pub(super) const TODO: &str = "todo: zstd %s is not implemented yet (0.14.0 Task %s)\n";
-
 // ---- fileio.c: --list (list.rs) ----
 //
 // The `ERROR_IF` messages are printed at display level 1 followed by
@@ -1120,3 +1116,101 @@ pub(super) const LZ4F_FRAME_SIZE_WRONG: &str = "ERROR_frameSize_wrong";
 
 /// lz4frame.c: `LZ4F_ERROR_contentChecksum_invalid`.
 pub(super) const LZ4F_CONTENT_CHECKSUM_INVALID: &str = "ERROR_contentChecksum_invalid";
+
+// ---- dibio.c: training ----
+
+/// zstdcli.c: main, built with `ZSTD_NODICT` (display level 1): the pure
+/// tier's `--train` (spec deviation 7).
+pub(super) const TRAINING_NOT_AVAILABLE: &str = "training mode not available \n";
+
+/// dibio.c: `EXM_THROW`'s head (`DISPLAY`, every display level; `%i`).
+pub(super) const DIB_EXM_ERROR: &str = "Error %d : ";
+
+/// dibio.c: `EXM_THROW`'s end.
+pub(super) const DIB_EXM_END: &str = "\n";
+
+/// dibio.c: DiB_trainFromFiles (display level 3).
+pub(super) const DIB_SHUFFLING: &str = "Shuffling input files\n";
+
+/// dibio.c: DiB_fileStats (display level 3).
+pub(super) const DIB_ZERO_SIZE: &str = "Sample file '%s' has zero size, skipping...\n";
+
+/// dibio.c: DiB_fileStats (display level 3; `%d`: `SAMPLESIZE_MAX` in KB).
+pub(super) const DIB_TOO_LARGE_LIMITING: &str =
+    "Sample file '%s' is too large, limiting to %d KB\n";
+
+/// dibio.c: DiB_fileStats (display level 4).
+pub(super) const DIB_FOUND: &str = "Found training data %d files, %d KB, %d samples\n";
+
+/// dibio.c: DiB_trainFromFiles (display level 2; `%u`).
+pub(super) const DIB_MANUAL_MEMORY_LIMIT: &str =
+    "!  Warning : setting manual memory limit for dictionary training data at %d MB \n";
+
+/// dibio.c: DiB_trainFromFiles (`EXM_THROW(12, …)`).
+pub(super) const DIB_NOT_ENOUGH_MEMORY: &str = "not enough memory for DiB_trainFiles";
+
+/// dibio.c: DiB_trainFromFiles (display level 2; `%u`: `SAMPLESIZE_MAX`).
+pub(super) const DIB_VERY_LARGE: &str = concat!(
+    "!  Warning : some sample(s) are very large \n",
+    "!  Note that dictionary is only useful for small samples. \n",
+    "!  As a consequence, only the first %d bytes of each sample are loaded \n",
+);
+
+/// dibio.c: DiB_trainFromFiles (display level 2).
+pub(super) const DIB_TOO_FEW: &str = concat!(
+    "!  Warning : nb of samples too low for proper processing ! \n",
+    "!  Please provide _one file per sample_. \n",
+    "!  Alternatively, split files into fixed-size blocks representative of samples, with -B# \n",
+);
+
+/// dibio.c: DiB_trainFromFiles (`EXM_THROW(14, …)`).
+pub(super) const DIB_TOO_FEW_SAMPLES: &str = "nb of samples too low";
+
+/// dibio.c: DiB_trainFromFiles (display level 2).
+pub(super) const DIB_DATA_TOO_SMALL: &str = concat!(
+    "!  Warning : data size of samples too small for target dictionary size \n",
+    "!  Samples should be about 100x larger than target dictionary size \n",
+);
+
+/// dibio.c: DiB_trainFromFiles (display level 1; `%u` MB twice).
+pub(super) const DIB_SET_TOO_LARGE: &str =
+    "Training samples set too large (%d MB); training on %d MB only...\n";
+
+/// dibio.c: DiB_loadFiles (`DISPLAYUPDATE(2, …)`).
+pub(super) const DIB_LOADING: &str = "Loading %s...       \r";
+
+/// dibio.c: DiB_loadFiles (`DISPLAYLEVEL(2, "\r%79s\r", "")`).
+pub(super) const DIB_CLEAR: &str =
+    "\r                                                                               \r";
+
+/// dibio.c: DiB_loadFiles (display level 4).
+pub(super) const DIB_LOADED: &str = "Loaded %d KB total training data, %d nb samples \n";
+
+/// dibio.c: DiB_loadFiles (`EXM_THROW(10, …)`; the file, `strerror`).
+pub(super) const DIB_OPEN_FAILED: &str = "zstd: dictBuilder: %s %s ";
+
+/// dibio.c: DiB_loadFiles (`EXM_THROW(11, …)`).
+pub(super) const DIB_READ_FAILED: &str = "Pb reading %s";
+
+/// dibio.c: DiB_trainFromFiles, the optimised cover parameters (display
+/// level 2; `%u`).
+pub(super) const DIB_COVER_CHOSEN: &str = "k=%d\nd=%d\nsteps=%d\nsplit=%d\n";
+
+/// dibio.c: DiB_trainFromFiles, the optimised fastcover parameters
+/// (display level 2; `%u`).
+pub(super) const DIB_FASTCOVER_CHOSEN: &str = "k=%d\nd=%d\nf=%d\nsteps=%d\nsplit=%d\naccel=%d\n";
+
+/// dibio.c: DiB_trainFromFiles (display level 1; `ZDICT_getErrorName`).
+pub(super) const DIB_TRAINING_FAILED: &str = "dictionary training failed : %s \n";
+
+/// dibio.c: DiB_trainFromFiles (display level 2; `%u`, the file).
+pub(super) const DIB_SAVE: &str = "Save dictionary of size %d into file %s \n";
+
+/// dibio.c: DiB_saveDict (`EXM_THROW(3, …)`).
+pub(super) const DIB_CANNOT_OPEN: &str = "cannot open %s ";
+
+/// dibio.c: DiB_saveDict (`EXM_THROW(4, …)`).
+pub(super) const DIB_WRITE_ERROR: &str = "%s : write error";
+
+/// dibio.c: DiB_saveDict (`EXM_THROW(5, …)`).
+pub(super) const DIB_FLUSH_ERROR: &str = "%s : flush error";

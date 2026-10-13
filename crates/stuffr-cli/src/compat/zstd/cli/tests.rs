@@ -577,6 +577,26 @@ fn train_parameters() {
         (t.selectivity, t.max_dict, t.dict_id, t.level),
         (9, 112640, 0, 3)
     );
+    if cfg!(not(feature = "zstd-c")) {
+        // The pure tier is a ZSTD_NODICT build: the three algorithms are
+        // no options there (spec deviation 7), whatever follows them.
+        for opt in [
+            "--train-cover",
+            "--train-cover=k=64,d=8",
+            "--train-fastcover",
+            "--train-fastcover=k=99999999999",
+            "--train-legacy=s=5",
+            "--train-legacy",
+        ] {
+            let (s, _, err) = stop(&[opt]);
+            assert_eq!(s, CLEAN_1, "{opt}");
+            assert!(
+                err.starts_with(&format!("Incorrect parameter: {opt} \n")),
+                "{err}"
+            );
+        }
+        return;
+    }
 
     let c = ok(&[
         "-o",
