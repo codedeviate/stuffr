@@ -25,11 +25,14 @@
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
 //!
-//! 1. The banner (`-V`, `-H`, `-v`'s welcome line) names stuffr: `***
-//!    Zstandard CLI (stuffr X.Y.Z; zstd 1.5.7 compatible) (64-bit) v1.5.7,
-//!    by Yann Collet ***`. `-qV` prints exactly `1.5.7`, and `-vV`'s
-//!    "supports:" line is zstd's. `-vvV`'s library and POSIX lines
-//!    describe zstd's own build and are not printed.
+//! 1. The banner names stuffr wherever zstd prints `WELCOME_MESSAGE`
+//!    (`-V`, `-vV`, `-vvV`, the first line of `-H`, and `-v`'s welcome
+//!    line on standard error): `*** Zstandard CLI (stuffr X.Y.Z; zstd
+//!    1.5.7 compatible) (64-bit) v1.5.7, by Yann Collet ***`. `-qV` prints
+//!    exactly `1.5.7`, and `-vV`'s "supports:" line is zstd's. `-vvV`
+//!    prints zstd's POSIX lines for the platform, but not its three
+//!    library-version lines (the zlib, lz4 and lzma zstd links), which
+//!    describe zstd's own build.
 //! 2. The `-v` summary's timing fields vary from run to run, as they do
 //!    between two runs of zstd.
 //! 3. An input that is also the output is never lost.
@@ -357,7 +360,8 @@ fn execute(cmd: &mut Command, host: &mut Host, out: &mut dyn Write, err: &mut dy
         cmd.prefs.workers = l.workers;
     }
     let workers = cmd.prefs.workers;
-    if cmd.prefs.job_size != 0 && workers == 0 {
+    // FIO_setBlockSize takes `(int)blockSize`.
+    if cmd.prefs.job_size as i32 != 0 && workers == 0 {
         d.at(2, err, m::BLOCK_SIZE_USELESS, &[]);
     }
     if let Some(ovlog) = cmd.prefs.overlap_log
@@ -475,7 +479,7 @@ fn display_compression_parameters(cmd: &Command, err: &mut dyn Write) {
     printf(
         err,
         m::DCP_CONTENT_SIZE,
-        &[if p.content_size { b"" } else { b"no-" }],
+        &[if p.content_size { "" } else { m::DCP_NO }.as_bytes()],
     );
 }
 

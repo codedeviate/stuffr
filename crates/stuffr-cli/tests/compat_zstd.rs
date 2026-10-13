@@ -234,6 +234,14 @@ mod unix {
             &["--train-fastcover=accel=x"],
             &["--train-legacy=x"],
             &["--train-legacy=s=5x"],
+            // fileio.c's setters after the arguments: FIO_setBlockSize takes
+            // `(int)blockSize`, so 4 GiB is no block size and 4 GiB + 1 is
+            // one; adapt and rsyncable refuse a single thread (EXM_THROW).
+            &["--single-thread", "--block-size=4294967296", "--adapt", "a"],
+            &["--single-thread", "--block-size=4294967297", "--adapt", "a"],
+            &["--single-thread", "-B1K", "--zstd=ovlog=3", "--adapt", "a"],
+            &["--single-thread", "--rsyncable", "a"],
+            &["--single-thread", "-B1K", "--rsyncable"],
             // `-p` pauses after a refusal (zstdcli.c's `_end`), not after
             // an overflow (`exit`).
             &["-p", "--frob"],
@@ -278,6 +286,53 @@ mod unix {
             }
         }
         check("help_and_version", &cases);
+    }
+
+    /// The reference's `-vvV` lines naming the libraries it links (zlib,
+    /// lz4, lzma), in order, removed when present whole: ruling T4-a keeps
+    /// them out of stuffr's output and its POSIX lines in.
+    fn strip_library_lines(stdout: &str) -> String {
+        let lines: Vec<&str> = stdout.split_inclusive('\n').collect();
+        let at = lines.windows(3).position(|w| {
+            w[0].starts_with("zlib version ")
+                && w[1].starts_with("lz4 version ")
+                && w[2].starts_with("lzma version ")
+        });
+        match at {
+            Some(i) => [&lines[..i], &lines[i + 3..]].concat().concat(),
+            None => stdout.to_owned(),
+        }
+    }
+
+    /// `-vvV` under every name: everything but the three library lines.
+    #[test]
+    fn verbose_version_without_the_library_lines() {
+        let mut cases: Vec<Case> = Vec::new();
+        for name in ["zstd", "unzstd", "zstdcat", "zstdmt"] {
+            cases.push(case(name, &["-vvV"]));
+            cases.push(case(name, &["-vvvV"]));
+        }
+        let one = |c: &Case| -> bool {
+            let Some(dir) = zstd_dir() else { return false };
+            let Some(mut r) = reference(dir, c) else {
+                return false;
+            };
+            let mut s = stuffr_as(c);
+            let text = String::from_utf8(r.stdout.clone()).unwrap();
+            if c.name != "zstdcat" {
+                assert!(text.contains("zlib version "), "{text}");
+            }
+            r.stdout = strip_library_lines(&text).into_bytes();
+            mask_banners(&mut r, &mut s);
+            assert_same(c, &r, &s);
+            true
+        };
+        run_group(
+            "verbose_version_without_the_library_lines",
+            &cases,
+            Skipped::none(),
+            &one,
+        );
     }
 
     /// The help texts and `-V` differ from the reference by exactly what

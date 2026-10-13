@@ -1780,11 +1780,44 @@ pub(crate) fn usage_advanced(out: &mut dyn Write, program: &str) {
     );
 }
 
+/// zstdcli.c's `_POSIX_C_SOURCE` as printVersion sees it: platform.h
+/// defines it as `200809L` on Linux (and Cygwin) when the build has not;
+/// elsewhere it is not defined.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const POSIX_C_SOURCE: Option<i64> = Some(200809);
+/// zstdcli.c's `_POSIX_C_SOURCE`: not defined off Linux.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const POSIX_C_SOURCE: Option<i64> = None;
+
+/// `_POSIX_VERSION` from the system's `<unistd.h>`: 200112L on Apple's
+/// platforms (observed: zstd 1.5.7 on macOS prints it), 200809L from glibc
+/// under `_POSIX_C_SOURCE 200809L` and from the BSDs' headers; Windows has
+/// none.
+#[cfg(target_vendor = "apple")]
+const POSIX_VERSION: Option<i64> = Some(200112);
+/// `_POSIX_VERSION` (see above).
+#[cfg(all(unix, not(target_vendor = "apple")))]
+const POSIX_VERSION: Option<i64> = Some(200809);
+/// `_POSIX_VERSION` (see above).
+#[cfg(not(unix))]
+const POSIX_VERSION: Option<i64> = None;
+
+/// platform.h's `PLATFORM_POSIX_VERSION`: forced to 200112L on Apple's
+/// platforms, `_POSIX_VERSION` on the other unix systems, 0 on Windows.
+#[cfg(unix)]
+const PLATFORM_POSIX_VERSION: i64 = match POSIX_VERSION {
+    Some(v) => v,
+    None => 1,
+};
+/// platform.h's `PLATFORM_POSIX_VERSION` (see above).
+#[cfg(not(unix))]
+const PLATFORM_POSIX_VERSION: i64 = 0;
+
 /// zstdcli.c: printVersion at display level `level`: the version alone
-/// below the default level, the banner from it, the formats line from 3.
-/// The library and POSIX lines from level 4 describe zstd's own build
-/// (the zlib, lz4 and lzma it links, its `_POSIX_VERSION`), which stuffr
-/// does not have; they are not printed.
+/// below the default level, the banner from it, the formats line from 3,
+/// and from 4 the POSIX lines. The three library-version lines zstd
+/// prints first at level 4 (the zlib, lz4 and lzma it links) describe
+/// zstd's own build and are not printed (spec deviation 1, ruling T4-a).
 pub(crate) fn print_version(out: &mut dyn Write, level: i32) {
     if level < DISPLAY_LEVEL_DEFAULT {
         printf(out, m::VERSION_ONLY, &[m::VERSION_STRING.as_bytes()]);
@@ -1793,6 +1826,19 @@ pub(crate) fn print_version(out: &mut dyn Write, level: i32) {
     printf(out, m::WELCOME, &[env!("CARGO_PKG_VERSION").as_bytes()]);
     if level >= 3 {
         printf(out, m::SUPPORTS, &[]);
+        if level >= 4 {
+            if let Some(v) = POSIX_C_SOURCE {
+                printf(out, m::POSIX_C_SOURCE, &[v.to_string().as_bytes()]);
+            }
+            if let Some(v) = POSIX_VERSION {
+                printf(out, m::POSIX_VERSION, &[v.to_string().as_bytes()]);
+            }
+            printf(
+                out,
+                m::PLATFORM_POSIX_VERSION,
+                &[PLATFORM_POSIX_VERSION.to_string().as_bytes()],
+            );
+        }
     }
 }
 

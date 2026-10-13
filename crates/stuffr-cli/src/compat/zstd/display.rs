@@ -32,7 +32,9 @@ impl Display {
 pub(crate) fn exm_throw(d: &Display, err: &mut dyn Write, code: i32, msg: &[u8]) -> i32 {
     d.at(1, err, m::EXM_PREFIX, &[]);
     d.at(1, err, m::EXM_ERROR, &[code.to_string().as_bytes()]);
-    d.at(1, err, "%s", &[msg]);
+    if d.level >= 1 {
+        let _ = err.write_all(msg);
+    }
     d.at(1, err, m::EXM_END, &[]);
     code
 }

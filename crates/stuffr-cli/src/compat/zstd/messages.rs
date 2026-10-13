@@ -37,6 +37,18 @@ pub(super) const VERSION_ONLY: &str = "%s\n";
 /// `ZSTD_LZMACOMPRESS`), its pieces joined as the reference prints them.
 pub(super) const SUPPORTS: &str = "*** supports: zstd, zstd legacy v0.5+, gzip, lz4, lzma, xz \n";
 
+/// zstdcli.c: printVersion at display level 4, under `#ifdef
+/// _POSIX_C_SOURCE` (platform.h defines it on Linux).
+pub(super) const POSIX_C_SOURCE: &str = "_POSIX_C_SOURCE defined: %dL\n";
+
+/// zstdcli.c: printVersion at display level 4, under `#ifdef
+/// _POSIX_VERSION` (the trailing space is the reference's).
+pub(super) const POSIX_VERSION: &str = "_POSIX_VERSION defined: %dL \n";
+
+/// zstdcli.c: printVersion at display level 4, under `#ifdef
+/// PLATFORM_POSIX_VERSION`.
+pub(super) const PLATFORM_POSIX_VERSION: &str = "PLATFORM_POSIX_VERSION defined: %dL\n";
+
 // ---- zstdcli.c: usage ----
 
 /// zstdcli.c: usage, up to the gzip-only line (`%s`: the program name).
@@ -436,6 +448,10 @@ pub(super) const DCP_EXCLUDE: &str = " --exclude-compressed";
 /// fileio.c: FIO_displayCompressionParameters (`%s`: "" or "no-"), and the
 /// line's end.
 pub(super) const DCP_CONTENT_SIZE: &str = " --%scontent-size\n";
+
+/// fileio.c: FIO_displayCompressionParameters, `contentSize` off (the
+/// `%s` of [`DCP_CONTENT_SIZE`]).
+pub(super) const DCP_NO: &str = "no-";
 
 /// fileio.c: `formatOptions`, by `FIO_compressionType_t`.
 pub(super) const FORMAT_OPTIONS: [&str; 5] = [".zst", ".gz", ".xz", ".lzma", ".lz4"];

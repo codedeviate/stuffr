@@ -283,8 +283,19 @@ fn help_and_version_stop_with_0() {
     assert_eq!(stop(&["-Vv"]).1, banner);
     let supports = "*** supports: zstd, zstd legacy v0.5+, gzip, lz4, lzma, xz \n";
     assert_eq!(stop(&["-vV"]).1, format!("{banner}{supports}"));
-    // -vvV: zstd's own library and POSIX lines are not printed (deviation 1).
-    assert_eq!(stop(&["-vvV"]).1, format!("{banner}{supports}"));
+    // -vvV: the POSIX lines, not zstd's library lines (deviation 1, T4-a).
+    let posix = if cfg!(target_vendor = "apple") {
+        "_POSIX_VERSION defined: 200112L \nPLATFORM_POSIX_VERSION defined: 200112L\n"
+    } else if cfg!(any(target_os = "linux", target_os = "android")) {
+        "_POSIX_C_SOURCE defined: 200809L\n_POSIX_VERSION defined: 200809L \n\
+         PLATFORM_POSIX_VERSION defined: 200809L\n"
+    } else if cfg!(unix) {
+        "_POSIX_VERSION defined: 200809L \nPLATFORM_POSIX_VERSION defined: 200809L\n"
+    } else {
+        "PLATFORM_POSIX_VERSION defined: 0L\n"
+    };
+    assert_eq!(stop(&["-vvV"]).1, format!("{banner}{supports}{posix}"));
+    assert_eq!(stop(&["-vvvvV"]).1, format!("{banner}{supports}{posix}"));
     assert_eq!(stop(&["-qV"]).1, "1.5.7\n");
     assert_eq!(stop(&["-qqV"]).1, "1.5.7\n");
     let (_, cat, _) = run_env("zstdcat", &["-V"], &[]);
