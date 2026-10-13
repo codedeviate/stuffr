@@ -77,14 +77,20 @@ fn is_xz_5_8_4(dir: &Path) -> bool {
 /// symlinks to it, in a temporary directory that lives as long as the test
 /// process's temp dir (a few inodes; never removed).
 fn dir_with_links(exe: &Path) -> Option<PathBuf> {
+    dir_with_links_for(exe, "xz", &XZ_LINKS)
+}
+
+/// [`dir_with_links`] for any tool: `exe` is the tool `main`, `links` the
+/// names that must sit beside it.
+fn dir_with_links_for(exe: &Path, main: &str, links: &[&str]) -> Option<PathBuf> {
     let parent = exe.parent()?;
-    if XZ_LINKS.iter().all(|l| parent.join(l).exists()) {
+    if links.iter().all(|l| parent.join(l).exists()) {
         return Some(parent.to_path_buf());
     }
-    let dir = std::env::temp_dir().join(format!("stuffr-xz-links-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("stuffr-{main}-links-{}", std::process::id()));
     fs::create_dir_all(&dir).ok()?;
     let target = fs::canonicalize(exe).ok()?;
-    for name in std::iter::once("xz").chain(XZ_LINKS) {
+    for name in std::iter::once(main).chain(links.iter().copied()) {
         let l = dir.join(name);
         let _ = fs::remove_file(&l);
         std::os::unix::fs::symlink(&target, &l).ok()?;
@@ -275,6 +281,158 @@ pub fn normalise_xz_progress(stderr: &str) -> String {
     out
 }
 
+const ZSTD_LINKS: [&str; 3] = ["unzstd", "zstdcat", "zstdmt"];
+/// The formats `zstd -vV`'s `*** supports:` line must name for the
+/// `--format=` cases to have an oracle.
+const ZSTD_SUPPORTS: [&str; 4] = ["gzip", "lz4", "lzma", "xz"];
+
+/// Whether `<dir>/zstd` is release 1.5.7 (`-qV` prints exactly `1.5.7`) built
+/// with gzip, lz4, lzma and xz support (the second line of `-vV`).
+fn is_zstd_1_5_7(dir: &Path) -> bool {
+    let run = |arg: &str| {
+        output(
+            Command::new(dir.join("zstd"))
+                .arg(arg)
+                .env_clear()
+                .stdin(Stdio::null()),
+        )
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    if run("-qV").is_none_or(|v| v.trim_end() != "1.5.7") {
+        return false;
+    }
+    let Some(v) = run("-vV") else { return false };
+    let Some(line) = v.lines().find_map(|l| l.strip_prefix("*** supports: ")) else {
+        return false;
+    };
+    let have: Vec<&str> = line.split(',').map(str::trim).collect();
+    ZSTD_SUPPORTS.iter().all(|w| have.contains(w))
+}
+
+/// `zstd` on `PATH`, like a shell's lookup.
+fn zstd_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join("zstd"))
+        .find(|p| p.is_file())
+}
+
+/// The directory holding zstd 1.5.7's `zstd` and its links `unzstd`,
+/// `zstdcat` and `zstdmt`.
+///
+/// Looked up in this order, the first one that [`is_zstd_1_5_7`] accepts
+/// winning:
+/// 1. `$STUFFR_ZSTD_REFERENCE`, the path of a `zstd` (CI builds the release
+///    tarball there; if the three links are not beside it they are made in a
+///    temp dir);
+/// 2. Homebrew's keg, `/opt/homebrew/opt/zstd/bin`;
+/// 3. `zstd` on `PATH`.
+///
+/// `None` when there is none: a skip with a note locally, a panic under `CI`
+/// (the rule of [`require_reference`]), so every test that skips on it would
+/// otherwise pass vacuously. Another release is no reference: stuffr
+/// promises 1.5.7's behaviour.
+pub fn zstd_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let found = DIR.get_or_init(|| {
+        let candidates = [
+            std::env::var_os("STUFFR_ZSTD_REFERENCE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            Some(PathBuf::from("/opt/homebrew/opt/zstd/bin/zstd")),
+            zstd_on_path(),
+        ];
+        for exe in candidates.into_iter().flatten() {
+            if !exe.is_file() {
+                continue;
+            }
+            let Some(dir) = dir_with_links_for(&exe, "zstd", &ZSTD_LINKS) else {
+                continue;
+            };
+            if is_zstd_1_5_7(&dir) {
+                return dir.to_str().map(str::to_owned);
+            }
+        }
+        None
+    });
+    match found {
+        Some(d) => Some(d.as_str()),
+        None => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is set but there is no zstd 1.5.7 reference with gzip, lz4, lzma and xz \
+                 support (looked at $STUFFR_ZSTD_REFERENCE, /opt/homebrew/opt/zstd/bin, PATH)"
+            );
+            eprintln!("skipped: zstd 1.5.7 not installed");
+            None
+        }
+    }
+}
+
+/// Replace the timing fields of zstd's `-vv` completion line, `<name> :
+/// Completed in 0.01 sec  (cpu load : 100%)` (`fileio.c`), with `<elapsed>`
+/// and `<cpu>`, and nothing else: they are the only part of zstd's
+/// non-benchmark output that depends on how fast the run was. The sizes,
+/// ratio and every other line stay as they are, and so does a "Completed in"
+/// whose fields do not have exactly this shape.
+///
+/// 1.5.7 prints no transfer speed outside `-b`, which stuffr does not port
+/// (R13), so there is none to hide.
+pub fn normalise_zstd_progress(stderr: &str) -> String {
+    const HEAD: &str = "Completed in ";
+    const MID: &str = " sec  (cpu load : ";
+    let mut out = String::with_capacity(stderr.len());
+    for line in stderr.split_inclusive('\n') {
+        let replaced = line.find(HEAD).and_then(|at| {
+            let (before, rest) = line.split_at(at + HEAD.len());
+            let (secs, rest) = rest.split_once(MID)?;
+            let (cpu, after) = rest.split_once("%)")?;
+            let (whole, frac) = secs.split_once('.')?;
+            let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+            (digits(whole) && digits(frac) && digits(cpu))
+                .then(|| format!("{before}<elapsed>{MID}<cpu>%){after}"))
+        });
+        out.push_str(replaced.as_deref().unwrap_or(line));
+    }
+    out
+}
+
+/// The `--trace` line of `zstd -H` (`usageAdvanced`, under `#ifndef
+/// ZSTD_NOTRACE`), verbatim from the 1.5.7 reference.
+pub const ZSTD_TRACE_HELP: &str =
+    "  --trace LOG                   Log tracing information to LOG.\n";
+
+/// The benchmark section of `zstd -H` (`usageAdvanced`, under `#ifndef
+/// ZSTD_NOBENCH`; the blank line before it is inside the `#ifndef`),
+/// verbatim from the 1.5.7 reference.
+pub const ZSTD_BENCH_HELP: &str = concat!(
+    "\nBenchmark options:\n",
+    "  -b#                           Perform benchmarking with compression level #. [Default: 3]\n",
+    "  -e#                           Test all compression levels up to #; starting level is `-b#`. [Default: 1]\n",
+    "  -i#                           Set the minimum evaluation to time # seconds. [Default: 3]\n",
+    "  -B#                           Cut file into independent chunks of size #. [Default: No chunking]\n",
+    "  -S                            Output one benchmark result per input file. [Default: Consolidated result]\n",
+    "  -D dictionary                 Benchmark using dictionary \n",
+    "  --priority=rt                 Set process priority to real-time.\n",
+);
+
+/// R13: what the port's `-H` differs from the reference's by. Homebrew's
+/// zstd is built without `ZSTD_NOBENCH` and `ZSTD_NOTRACE`, so its `-H`
+/// lists `--trace` and the benchmark section; the port answers as a build
+/// with both defined does. This removes exactly [`ZSTD_TRACE_HELP`] and
+/// [`ZSTD_BENCH_HELP`], each once and only when present whole, so any other
+/// difference, including a half-removed section, still fails the comparison.
+/// Output without them (`-h`, a version, an error) is returned unchanged.
+pub fn strip_bench_help(stdout: &str) -> String {
+    let mut s = stdout.to_owned();
+    for block in [ZSTD_TRACE_HELP, ZSTD_BENCH_HELP] {
+        if let Some(at) = s.find(block) {
+            s.replace_range(at..at + block.len(), "");
+        }
+    }
+    s
+}
+
 /// How compressed output is judged when its bytes are not promised
 /// identical, and which tool decodes it.
 #[derive(Clone, Copy, Debug)]
@@ -291,6 +449,12 @@ pub enum Roundtrip {
     /// ask. The stream header (magic, stream flags) is compared byte for
     /// byte.
     Xz { ref_xz: &'static str },
+    /// zstd frames (`28 b5 2f fd`, `.zst`/`.tzst`; `--format=` gzip, xz, lzma
+    /// and lz4 write theirs by name), decoded by `ref_zstd -dc` (an absolute
+    /// path), which detects the format itself; a case's `-D` and
+    /// `--patch-from` file is passed on (see `zstd_decode_args`). The kind of
+    /// stream (the magic) is compared, not the frame's own header.
+    Zstd { ref_zstd: &'static str },
 }
 
 pub struct Case<'a> {
@@ -745,6 +909,7 @@ pub fn ref_decompress_with(rt: &Roundtrip, data: &[u8]) -> Result<Vec<u8>, Strin
 pub fn ref_decompress_case(c: &Case, data: &[u8]) -> Result<Vec<u8>, String> {
     let extra = match c.roundtrip {
         Roundtrip::Xz { .. } => xz_decode_args(c),
+        Roundtrip::Zstd { .. } => zstd_decode_args(c),
         _ => Vec::new(),
     };
     ref_decompress_args(&c.roundtrip, &extra, data)
@@ -809,6 +974,7 @@ fn ref_decompress_args(rt: &Roundtrip, extra: &[String], data: &[u8]) -> Result<
         Roundtrip::Bzip2 => (Path::new(REFERENCE_DIR).join("bzip2"), "bzip2"),
         Roundtrip::Gzip { ref_gzip } => (PathBuf::from(ref_gzip), "gzip"),
         Roundtrip::Xz { ref_xz } => (PathBuf::from(ref_xz), "xz"),
+        Roundtrip::Zstd { ref_zstd } => (PathBuf::from(ref_zstd), "zstd"),
     };
     let mut child = spawn(
         Command::new(exe)
@@ -840,6 +1006,7 @@ fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
         Roundtrip::Bzip2 => b.starts_with(b"BZh"),
         Roundtrip::Gzip { .. } => b.starts_with(&[0x1f, 0x8b]),
         Roundtrip::Xz { .. } => b.starts_with(&XZ_MAGIC),
+        Roundtrip::Zstd { .. } => zstd_stream_kind(b).is_some(),
     }
 }
 
@@ -865,6 +1032,92 @@ fn xz_magicless_stdout(c: &Case) -> bool {
 /// they are recognised by name (`is_compressed_name`) or by what the case
 /// does ([`xz_magicless_stdout`]).
 const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0];
+
+/// Which stream format `b` opens as, by the magics `zstd` reads and writes
+/// (`.lzma` has none): `zstd`, `gzip`, `xz` or `lz4`.
+fn zstd_stream_kind(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some("zstd")
+    } else if b.starts_with(&[0x1f, 0x8b]) {
+        Some("gzip")
+    } else if b.starts_with(&XZ_MAGIC) {
+        Some("xz")
+    } else if b.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+        Some("lz4")
+    } else {
+        None
+    }
+}
+
+/// A difference in the kind of stream two compressed outputs are (zstd frame
+/// against gzip member, say), if either is recognised. Within a kind the
+/// frame header is not compared: its descriptor follows from the content and
+/// the options, and byte identity is promised only where the case says so.
+fn zstd_kind_mismatch(reference: &[u8], ours: &[u8]) -> Option<String> {
+    let (r, s) = (zstd_stream_kind(reference), zstd_stream_kind(ours));
+    (r != s && (r.is_some() || s.is_some())).then(|| {
+        format!(
+            "stream format differs: reference {}, stuffr {}",
+            r.unwrap_or("none"),
+            s.unwrap_or("none")
+        )
+    })
+}
+
+/// The `zstd -dc` options that make the reference read what `c` wrote: the
+/// dictionary or patch-from file named by `-D`, `-Dfile`, `--patch-from=f` or
+/// `--patch-from f`, written from the case's own files to a scratch file (the
+/// reference does not run in the case's directory), and `--long=31` so a
+/// frame written with a large window is not refused for its size. A file the
+/// case does not list (one its setup makes) is not passed, and the reference
+/// then says why it cannot decode.
+fn zstd_decode_args(c: &Case) -> Vec<String> {
+    let mut named: Option<&str> = None;
+    let mut it = c.args.iter();
+    while let Some(a) = it.next() {
+        if *a == "--" {
+            break;
+        }
+        if let Some(v) = a.strip_prefix("--patch-from=") {
+            named = Some(v);
+        } else if *a == "--patch-from" || *a == "-D" {
+            named = it.next().copied();
+        } else if !a.starts_with("--")
+            && let Some(v) = a.strip_prefix("-D").filter(|v| !v.is_empty())
+        {
+            named = Some(v);
+        }
+    }
+    let mut v = vec!["--long=31".to_owned()];
+    if let Some((_, bytes)) = named.and_then(|n| c.files.iter().find(|(f, _)| *f == n)) {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "stuffr-zstd-dict-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, bytes).expect("write the dictionary for the reference");
+        v.push(format!("-D{}", path.display()));
+    }
+    v
+}
+
+/// The `--suffix` operand of `args` (`--suffix=X`, `--suffix X`), if any.
+fn zstd_suffix<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut found = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if *a == "--" {
+            break;
+        }
+        if let Some(v) = a.strip_prefix("--suffix=") {
+            found = Some(v);
+        } else if *a == "--suffix" {
+            found = it.next().copied();
+        }
+    }
+    found
+}
 
 /// The `-S`/`--suffix` operand of `args`, if any: `-S X`, `-SX`, `--suffix X`,
 /// `--suffix=X` (or an abbreviation, `--su=X`), and `S` inside a short cluster
@@ -947,6 +1200,14 @@ fn is_compressed_name(c: &Case, n: &str) -> bool {
                 .any(|s| n.ends_with(s))
                 || gzip_custom_suffix(&c.args).is_some_and(|s| !s.is_empty() && n.ends_with(s))
         }
+        Roundtrip::Zstd { .. } => {
+            [
+                ".zst", ".tzst", ".gz", ".tgz", ".xz", ".txz", ".lzma", ".tlz", ".lz4",
+            ]
+            .iter()
+            .any(|s| n.ends_with(s))
+                || zstd_suffix(&c.args).is_some_and(|s| !s.is_empty() && n.ends_with(s))
+        }
     }
 }
 
@@ -1027,13 +1288,29 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
                     .and_then(|s| name.strip_suffix(s))
                     .map(str::to_owned)
             })?,
+        Roundtrip::Zstd { .. } => [".zst", ".gz", ".xz", ".lzma", ".lz4"]
+            .iter()
+            .find_map(|s| name.strip_suffix(s))
+            .map(str::to_owned)
+            .or_else(|| {
+                [".tzst", ".tgz", ".txz", ".tlz"]
+                    .iter()
+                    .find_map(|s| name.strip_suffix(s))
+                    .map(|b| format!("{b}.tar"))
+            })
+            .or_else(|| {
+                zstd_suffix(&c.args)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| name.strip_suffix(s))
+                    .map(str::to_owned)
+            })?,
     };
     let found = c.files.iter().find(|(n, _)| *n == base);
     // An xz output named after a link the case's setup made (`l.xz` from
     // `l` -> `a`, or `a.xz` from `a` -> `a.xz`) has the case's one file as
     // its original.
     let only = match (c.roundtrip, c.files.as_slice()) {
-        (Roundtrip::Xz { .. }, [one]) => Some(one),
+        (Roundtrip::Xz { .. } | Roundtrip::Zstd { .. }, [one]) => Some(one),
         _ => None,
     };
     found.or(only).map(|(_, b)| b.clone())
@@ -1090,6 +1367,7 @@ fn tool_name(rt: &Roundtrip) -> &'static str {
         Roundtrip::Bzip2 => "bzip2",
         Roundtrip::Gzip { .. } => "gzip",
         Roundtrip::Xz { .. } => "xz",
+        Roundtrip::Zstd { .. } => "zstd",
     }
 }
 
@@ -1101,6 +1379,7 @@ fn stream_mismatch(rt: &Roundtrip, reference: &[u8], ours: &[u8]) -> Option<Stri
         Roundtrip::Bzip2 => block_digit_mismatch(reference, ours),
         Roundtrip::Gzip { .. } => gzip_header_mismatch(reference, ours),
         Roundtrip::Xz { .. } => xz_header_mismatch(reference, ours),
+        Roundtrip::Zstd { .. } => zstd_kind_mismatch(reference, ours),
     }
 }
 
