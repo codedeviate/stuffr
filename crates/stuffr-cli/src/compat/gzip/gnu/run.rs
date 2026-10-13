@@ -24,7 +24,7 @@ use super::list::Lister;
 use super::messages::{self as m, PROGRAM, printf, quote, ratio};
 use crate::compat::gzip::member::{Engine, Header, compress_member};
 use crate::compat::host::{
-    self, Host, InFile, Published, create_temp, publish, same_file, stdin_file, strerror,
+    self, Host, InFile, Published, publish, same_file, stdin_file, strerror,
 };
 
 mod decompress;
@@ -364,15 +364,20 @@ impl Gz<'_> {
         let Some(replace) = self.may_write(&out_path, &qout, &path, meta) else {
             return;
         };
-        let (tmp, tmp_file) = match create_temp(&parent_of(&out_path), "gzip") {
+        let (tmp, tmp_file, _guard) = match host::create_temp_armed(
+            self.host,
+            &parent_of(&out_path),
+            "gzip",
+            host::GNU_GZIP_SIGNALS,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 self.error(m::OPEN_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
                 return;
             }
         };
-        // Held until this file is done: an interrupt removes the temporary.
-        let _guard = host::arm_cleanup(self.host, &tmp, host::GNU_GZIP_SIGNALS);
+        // `_guard` is held until this file is done: an interrupt removes the
+        // temporary.
         self.stdin_named = true;
         self.verbose_name(&qname);
         let header = self.file_header(name, meta);

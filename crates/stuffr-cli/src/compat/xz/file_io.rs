@@ -38,7 +38,7 @@ use super::message::{Messages, mask_nonprint};
 use super::messages as m;
 use super::suffix;
 use crate::compat::host::{
-    self, CleanupGuard, Host, InFile, Published, arm_cleanup, create_temp, publish, strerror,
+    self, CleanupGuard, Host, InFile, Published, create_temp_armed, publish, strerror,
 };
 
 /// `IO_BUFFER_SIZE`: the read and write size, and the sparse unit.
@@ -540,14 +540,14 @@ impl FilePair {
             msg.error(err, m::NAME_COLON, &[&shown, &strerror(&e)]);
             return false;
         }
-        let (tmp, file) = match create_temp(&parent_of(&path), "xz") {
-            Ok(t) => t,
-            Err(e) => {
-                msg.error(err, m::NAME_COLON, &[&shown, &strerror(&e)]);
-                return false;
-            }
-        };
-        let guard = arm_cleanup(host, &tmp, host::XZ_SIGNALS);
+        let (tmp, file, guard) =
+            match create_temp_armed(host, &parent_of(&path), "xz", host::XZ_SIGNALS) {
+                Ok(t) => t,
+                Err(e) => {
+                    msg.error(err, m::NAME_COLON, &[&shown, &strerror(&e)]);
+                    return false;
+                }
+            };
         let handle = match file.try_clone() {
             Ok(h) => h,
             Err(e) => {

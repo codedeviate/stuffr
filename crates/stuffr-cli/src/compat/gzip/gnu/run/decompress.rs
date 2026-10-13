@@ -34,7 +34,7 @@ use super::super::list::Entry;
 use super::super::messages::{self as m, PROGRAM, printf, quote};
 use super::{Gz, Step, Stop, open_input, parent_of};
 use crate::compat::gzip::member::{Header, Lookahead};
-use crate::compat::host::{self, Host, InFile, Input, create_temp, stdin_file, strerror};
+use crate::compat::host::{self, Host, InFile, Input, stdin_file, strerror};
 
 /// What is appended, after `-S`'s suffix, to an operand that does not
 /// exist (observed: `gzip -dc f` finds `f.gz`, `f.z`, `f-z` and, on a
@@ -432,15 +432,20 @@ impl Gz<'_> {
             self.error(m::CREATE_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
             return Ok(());
         }
-        let (tmp, tmp_file) = match create_temp(&parent_of(&out_path), "gzip") {
+        let (tmp, tmp_file, _guard) = match host::create_temp_armed(
+            self.host,
+            &parent_of(&out_path),
+            "gzip",
+            host::GNU_GZIP_SIGNALS,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 self.error(m::CREATE_FAILED, &[PROGRAM, &qout, &strerror(&e)]);
                 return Ok(());
             }
         };
-        // Held until this file is done: an interrupt removes the temporary.
-        let _guard = host::arm_cleanup(self.host, &tmp, host::GNU_GZIP_SIGNALS);
+        // `_guard` is held until this file is done: an interrupt removes the
+        // temporary.
         // This output, not the last, is now the one a failure removes.
         self.stale = None;
         if self.s.verbose > 0 {

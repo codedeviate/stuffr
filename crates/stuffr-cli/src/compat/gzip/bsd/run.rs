@@ -29,7 +29,7 @@ use super::messages::{self as m, printf};
 mod decompress;
 
 use crate::compat::gzip::member::{Engine, Header, compress_body, write_header, write_trailer};
-use crate::compat::host::{self, Host, Published, create_temp, publish, stdin_file, strerror};
+use crate::compat::host::{self, Host, Published, publish, stdin_file, strerror};
 pub(super) use decompress::Fatal;
 
 /// `BUFLEN`: gzip's read and write size.
@@ -491,7 +491,7 @@ impl Gz<'_> {
         let outfile = out_name(file, &self.s.suffix);
         let out_path = self.host.path(&outfile);
         let replace_input = self.check_outfile(&outfile, &out_path, &isb)?;
-        let (tmp, tmp_file) = match create_exclusive(&out_path, replace_input) {
+        let (tmp, tmp_file, _guard) = match create_exclusive(self.host, &out_path, replace_input) {
             Ok(t) => t,
             Err(e) => {
                 self.warn(m::COULD_NOT_CREATE, &[&outfile], &e);
@@ -499,8 +499,8 @@ impl Gz<'_> {
                 return None;
             }
         };
-        // Held until this file is done: an interrupt removes the temporary.
-        let _guard = host::arm_cleanup(self.host, &tmp, host::APPLE_GZIP_SIGNALS);
+        // `_guard` is held until this file is done: an interrupt removes the
+        // temporary.
         let fd_copy = tmp_file.try_clone();
         let sizes = {
             let mut w = self.host.out_writer(Some(tmp_file));
@@ -965,7 +965,11 @@ fn out_name(file: &[u8], suffix: &[u8]) -> Vec<u8> {
 /// `ENAMETOOLONG`; a missing or unwritable directory), and the temporary.
 /// With `replace_input` the name is the input's own, which gzip has
 /// unlinked by now and stuffr has kept, so its existence is no error.
-fn create_exclusive(out_path: &Path, replace_input: bool) -> io::Result<(PathBuf, File)> {
+fn create_exclusive(
+    host: &Host,
+    out_path: &Path,
+    replace_input: bool,
+) -> io::Result<(PathBuf, File, host::CleanupGuard)> {
     let too_long = out_path
         .file_name()
         .is_some_and(|n| n.as_encoded_bytes().len() > NAME_MAX);
@@ -982,7 +986,7 @@ fn create_exclusive(out_path: &Path, replace_input: bool) -> io::Result<(PathBuf
     if !replace_input && fs::symlink_metadata(out_path).is_ok() {
         return Err(io::Error::from_raw_os_error(eexist()));
     }
-    create_temp(&parent, "gzip")
+    host::create_temp_armed(host, &parent, "gzip", host::APPLE_GZIP_SIGNALS)
 }
 
 /// The header's MTIME: `(uint32_t)st_mtime`, wrapped, not checked.

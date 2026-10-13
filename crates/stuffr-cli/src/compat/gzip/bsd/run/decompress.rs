@@ -36,7 +36,7 @@ use super::super::{unlz, zread::ZRead};
 use super::{BUFLEN, Gz, PATH_MAX, create_exclusive, eexist, print_ratio};
 use crate::compat::gzip::member::Lookahead;
 use crate::compat::gzip::sniff::{self, Detected, Flavour};
-use crate::compat::host::{self, Host, InFile, Published, SANDBOX_OUTPUT_CAP, publish, stdin_file};
+use crate::compat::host::{Host, InFile, Published, SANDBOX_OUTPUT_CAP, publish, stdin_file};
 
 /// `exit(2)` from `maybe_err`/`maybe_errx`: the message is printed (unless
 /// `-q`), the run stops.
@@ -429,10 +429,14 @@ impl Gz<'_> {
         // The output: standard output (-c, -t), nothing (-l), or a new
         // file under a temporary name.
         let mut tmp = None;
+        let mut _guard = None;
         if !self.s.to_stdout && !self.s.list {
             let out_path = self.host.path(outfile);
-            match create_exclusive(&out_path, replace_input) {
-                Ok(t) => tmp = Some(t),
+            match create_exclusive(self.host, &out_path, replace_input) {
+                Ok((t, f, g)) => {
+                    tmp = Some((t, f));
+                    _guard = Some(g);
+                }
                 Err(e) => {
                     self.set_errno(&e);
                     self.warn(m::CANT_OPEN_OUTPUT, &[outfile], &e);
@@ -440,10 +444,8 @@ impl Gz<'_> {
                 }
             }
         }
-        // Held until this file is done: an interrupt removes the temporary.
-        let _guard = tmp
-            .as_ref()
-            .map(|(t, _)| host::arm_cleanup(self.host, t, host::APPLE_GZIP_SIGNALS));
+        // `_guard` is held until this file is done: an interrupt removes the
+        // temporary.
         let mut out: io::BufWriter<Box<dyn Write + Send>> = match &tmp {
             Some((_, f)) => match f.try_clone() {
                 Ok(f) => self.host.out_writer(Some(f)),

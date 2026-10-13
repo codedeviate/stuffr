@@ -131,8 +131,7 @@ impl Drop for CleanupGuard {
 /// re-raised at its default action, so the process dies of it, as xz does
 /// (signals.c: `signal_handler`, `signals_exit`).
 ///
-/// The caller drops the guard right after a successful publish, and on every
-/// error path after removing the file itself. Under `Host::Sandbox` nothing
+/// Arm through `create_temp_armed`, which leaves no unarmed window. Under `Host::Sandbox` nothing
 /// is armed and no handler installed. A path the slot cannot hold (or one
 /// with a NUL) is not armed. Arming never allocates. Call `reset_sigpipe()`
 /// first, or SIGPIPE stays ignored and unhooked (see `XZ_SIGNALS`). The
@@ -466,6 +465,46 @@ pub(crate) fn create_temp(dir: &Path, family: &str) -> io::Result<(PathBuf, File
         }
     }
     unreachable!("the loop returns")
+}
+
+/// `create_temp` and `arm_cleanup` with `signals` held back between them,
+/// so no signal can find the new temporary unarmed (GNU gzip blocks its
+/// signals across the `open` for the same reason). A signal that arrived
+/// meanwhile is delivered when the mask is restored, with the temporary
+/// already armed. Under `Host::Sandbox`, and off unix, nothing is armed.
+pub(crate) fn create_temp_armed(
+    host: &Host,
+    dir: &Path,
+    family: &str,
+    signals: Signals,
+) -> io::Result<(PathBuf, File, CleanupGuard)> {
+    #[cfg(unix)]
+    {
+        // SAFETY: sigset_t is plain data, initialised by sigemptyset; the
+        // previous mask is restored on every path below.
+        let mut block: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&mut block);
+            for &sig in signals {
+                libc::sigaddset(&mut block, sig);
+            }
+            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        }
+        let made = create_temp(dir, family).map(|(p, f)| {
+            let g = arm_cleanup(host, &p, signals);
+            (p, f, g)
+        });
+        // SAFETY: restoring the mask saved above.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+        made
+    }
+    #[cfg(not(unix))]
+    {
+        let (p, f) = create_temp(dir, family)?;
+        let g = arm_cleanup(host, &p, signals);
+        Ok((p, f, g))
+    }
 }
 
 /// What [`publish`] did.
@@ -1292,6 +1331,132 @@ mod tests {
             assert_eq!(libc::WTERMSIG(status), sig);
             assert!(!file.exists(), "signal {sig}: the partial file survived");
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The child's exit code for `create_temp_armed`'s checks: 0 all held.
+    #[cfg(unix)]
+    fn current_mask() -> libc::sigset_t {
+        // SAFETY: a query (null new set) into a zeroed out-parameter.
+        unsafe {
+            let mut cur: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut cur);
+            cur
+        }
+    }
+
+    #[cfg(unix)]
+    fn same_mask(a: &libc::sigset_t, b: &libc::sigset_t) -> bool {
+        // SAFETY: both sets are initialised; sigismember only reads them.
+        (1..32).all(|s| unsafe { libc::sigismember(a, s) == libc::sigismember(b, s) })
+    }
+
+    /// The new temporary is armed on return, with the path in the slot, and
+    /// disarmed when the guard drops.
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_armed_arms_the_new_temporary() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = scratch("temp-armed");
+        let status = in_child(|| {
+            default_dispositions();
+            ARMED.store(false, Ordering::SeqCst);
+            let code = match create_temp_armed(&Host::Real, &dir, "xz", XZ_SIGNALS) {
+                Err(_) => 1,
+                Ok((path, _file, guard)) => {
+                    let bytes = path.as_os_str().as_bytes();
+                    // SAFETY: no handler runs in this child; nothing else
+                    // writes the slot.
+                    let slot = unsafe { &*SLOT.0.get() };
+                    let armed = ARMED.load(Ordering::Acquire);
+                    let held = &slot[..bytes.len()] == bytes && slot[bytes.len()] == 0;
+                    drop(guard);
+                    let released = !ARMED.load(Ordering::Acquire);
+                    if !armed {
+                        2
+                    } else if !held {
+                        3
+                    } else if !released {
+                        4
+                    } else {
+                        0
+                    }
+                }
+            };
+            // SAFETY: _exit is async-signal-safe and ends the child.
+            unsafe { libc::_exit(code) };
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "status {status:#x}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failed creation arms nothing and leaves the signal mask as it was.
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_armed_failure_leaves_nothing_armed_and_the_mask_restored() {
+        let dir = scratch("temp-armed-fail").join("missing");
+        let status = in_child(|| {
+            default_dispositions();
+            ARMED.store(false, Ordering::SeqCst);
+            let before = current_mask();
+            let failed = create_temp_armed(&Host::Real, &dir, "xz", XZ_SIGNALS).is_err();
+            let after = current_mask();
+            let code = if !failed {
+                1
+            } else if ARMED.load(Ordering::Acquire) {
+                2
+            } else if !same_mask(&before, &after) {
+                3
+            } else {
+                0
+            };
+            // SAFETY: _exit is async-signal-safe and ends the child.
+            unsafe { libc::_exit(code) };
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "status {status:#x}"
+        );
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// Under a sandbox the file is created and nothing is armed.
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_armed_in_a_sandbox_arms_nothing() {
+        let dir = scratch("temp-armed-sandbox");
+        let host = Host::Sandbox(Sandbox {
+            dir: dir.clone(),
+            stdin: None,
+            stdout: Arc::default(),
+            budget: Arc::new(AtomicU64::new(0)),
+            reads: ReadLog::default(),
+        });
+        let status = in_child(|| {
+            default_dispositions();
+            ARMED.store(false, Ordering::SeqCst);
+            let code = match create_temp_armed(&host, &dir, "xz", XZ_SIGNALS) {
+                Err(_) => 1,
+                Ok((path, _file, _guard)) => {
+                    if !path.exists() {
+                        2
+                    } else if ARMED.load(Ordering::Acquire) {
+                        3
+                    } else {
+                        0
+                    }
+                }
+            };
+            // SAFETY: _exit is async-signal-safe and ends the child.
+            unsafe { libc::_exit(code) };
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "status {status:#x}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
