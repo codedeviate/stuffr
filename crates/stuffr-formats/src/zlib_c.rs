@@ -103,10 +103,15 @@ pub struct RawDeflate<W: Write> {
 }
 
 impl<W: Write> RawDeflate<W> {
-    /// A raw-deflate encoder at `level`, 0..=9 (0 is zlib's stored
-    /// blocks, which the zstd family's `--format=gzip -0` asks for); any
-    /// other level is `InvalidInput`.
+    /// A raw-deflate encoder at `level`, 1..=9; any other level is
+    /// `InvalidInput`.
     pub fn new(out: W, level: u32) -> io::Result<Self> {
+        if level == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "deflate level 0 is outside 1..=9",
+            ));
+        }
         Self::with_options(out, level, -15, OUT_CHUNK)
     }
 
@@ -115,8 +120,10 @@ impl<W: Write> RawDeflate<W> {
     /// family's `--format=gzip` has `deflateInit2` write them) and the size
     /// of the output buffer each `deflate` call gets, which decides the
     /// stored blocks of level 0 (`deflate_stored` copies as much as the
-    /// output has room for). `windowBits` outside zlib's ranges is zlib's
-    /// `Z_STREAM_ERROR`; a zero `chunk` is `InvalidInput`.
+    /// output has room for). Here `level` may be 0..=9 (0 is zlib's stored
+    /// blocks, which the zstd family's `--format=gzip -0` asks for).
+    /// `windowBits` outside zlib's ranges is zlib's `Z_STREAM_ERROR`; a
+    /// zero `chunk` is `InvalidInput`.
     pub fn with_options(out: W, level: u32, window_bits: i32, chunk: usize) -> io::Result<Self> {
         if chunk == 0 || u32::try_from(chunk).is_err() {
             return Err(io::Error::new(
@@ -283,3 +290,91 @@ impl<W: Write> Drop for RawDeflate<W> {
         self.end();
     }
 }
+
+/// zlib's `inflate`, one call at a time, as the zstd family's
+/// `FIO_decompressGzFrame` drives it: `inflateInit2(windowBits)` (`15 + 16`
+/// there: one gzip member), then [`Inflate::call`] per loop turn with the
+/// caller's input and output room. Not part of the stable API.
+pub struct Inflate {
+    /// Boxed so it never moves (zlib's state points back to it).
+    stream: Box<z::z_stream>,
+}
+
+impl Inflate {
+    /// `inflateInit2(windowBits)`; `Err` is zlib's return code.
+    pub fn new(window_bits: i32) -> Result<Self, i32> {
+        let mut stream = Box::new(z::z_stream {
+            next_in: ptr::null_mut(),
+            avail_in: 0,
+            total_in: 0,
+            next_out: ptr::null_mut(),
+            avail_out: 0,
+            total_out: 0,
+            msg: ptr::null_mut(),
+            state: ptr::null_mut(),
+            zalloc,
+            zfree,
+            opaque: ptr::null_mut(),
+            data_type: 0,
+            adler: 0,
+            reserved: 0,
+        });
+        // SAFETY: `stream` is a fully initialised `z_stream` on the heap with
+        // valid allocator callbacks; the version and size are libz-sys's
+        // own, as `inflateInit2_` requires. On failure zlib frees what it
+        // allocated and the stream is never used again.
+        let rc = unsafe {
+            z::inflateInit2_(
+                &mut *stream,
+                window_bits as c_int,
+                z::zlibVersion(),
+                size_of::<z::z_stream>() as c_int,
+            )
+        };
+        if rc != z::Z_OK {
+            return Err(rc);
+        }
+        Ok(Inflate { stream })
+    }
+
+    /// One `inflate(flush)` over `input` into `out` (`Z_FINISH` when
+    /// `finish`, else `Z_NO_FLUSH`): (bytes consumed, bytes produced,
+    /// zlib's return code: `Z_OK` 0, `Z_STREAM_END` 1, `Z_BUF_ERROR` -5,
+    /// `Z_DATA_ERROR` -3, ...). Input or output beyond 4 GiB is offered in
+    /// part.
+    pub fn call(&mut self, input: &[u8], out: &mut [u8], finish: bool) -> (usize, usize, i32) {
+        let avail_in = c_uint::try_from(input.len()).unwrap_or(c_uint::MAX);
+        let avail_out = c_uint::try_from(out.len()).unwrap_or(c_uint::MAX);
+        self.stream.next_in = input.as_ptr().cast_mut();
+        self.stream.avail_in = avail_in;
+        self.stream.next_out = out.as_mut_ptr();
+        self.stream.avail_out = avail_out;
+        let flush = if finish { z::Z_FINISH } else { z::Z_NO_FLUSH };
+        // SAFETY: the stream was initialised by `inflateInit2_` and not yet
+        // ended; `next_in` covers `avail_in` readable bytes of `input`
+        // (which zlib only reads) and `next_out` `avail_out` writable bytes
+        // of `out`, both live for the call.
+        let rc = unsafe { z::inflate(&mut *self.stream, flush) };
+        let used = (avail_in - self.stream.avail_in) as usize;
+        let made = (avail_out - self.stream.avail_out) as usize;
+        self.stream.next_in = ptr::null_mut();
+        self.stream.avail_in = 0;
+        self.stream.next_out = ptr::null_mut();
+        self.stream.avail_out = 0;
+        (used, made, rc)
+    }
+}
+
+impl Drop for Inflate {
+    fn drop(&mut self) {
+        // SAFETY: the stream was initialised and is ended exactly once,
+        // here; it is never passed to zlib again.
+        unsafe {
+            z::inflateEnd(&mut *self.stream);
+        }
+    }
+}
+
+// SAFETY: the stream is owned and reached only through `&mut self`; zlib's
+// state holds no thread-affine data.
+unsafe impl Send for Inflate {}

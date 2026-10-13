@@ -53,12 +53,13 @@ pub mod zstd_opts {
     pub use stuffr_formats::zstd_opts::*;
 }
 /// Raw deflate through C zlib, byte-identical to stock zlib's — what the
-/// `stuffr` binary's Apple gzip personality compresses with on the C tier.
+/// `stuffr` binary's Apple gzip personality compresses with on the C tier —
+/// and zlib's `inflate`, which its zstd family decodes gzip members with.
 /// Not part of the stable API.
 #[cfg(feature = "zlib-c")]
 #[doc(hidden)]
 pub mod zlib_c {
-    pub use stuffr_formats::zlib_c::RawDeflate;
+    pub use stuffr_formats::zlib_c::{Inflate, RawDeflate};
 }
 /// LZ4 frames through `lz4_flex` — what the `stuffr` binary's zstd
 /// compatibility family writes for `--format=lz4` and decodes LZ4 frames
