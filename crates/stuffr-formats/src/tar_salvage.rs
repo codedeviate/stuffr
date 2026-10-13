@@ -826,8 +826,15 @@ impl CopyBuckets {
 /// **Hard cap (0.13.2).** That argument bounds `pending` by the map, and the
 /// map is bounded by [`MAX_TRACKED_TERMINALS`]; `pending` is capped by the
 /// same figure on its own as well, so neither bound rests on the other. An
-/// insert past it goes straight to `log`, out of order, which only changes
-/// which of the (already capped) stored sightings are kept, never the count.
+/// insert past it goes straight to `log`, out of order, which changes which
+/// of the (already capped) stored sightings are kept. It is not deduplicated:
+/// a terminal refused repeatedly past the cap is pushed each time, so the
+/// group's total can over-count such terminals (a dedup set would itself
+/// need a cap). Storage stays bounded either way.
+///
+/// The paragraph above holds for `converged` and `starved`, whose terminals
+/// are keys of `chains_read`. It does not hold for `capped`, whose terminals
+/// are by definition NOT keys; that log is bounded by its own cap alone.
 #[derive(Debug, Default)]
 struct TerminalLog {
     /// Refused terminals at or past the search position.
@@ -920,8 +927,10 @@ pub const MAX_CHAINS_PER_HEADER: usize = 4;
 /// terminal within [`MAX_CHAINS_PER_HEADER`], so no honest archive comes near
 /// it. Both collections are already bounded by geometry (a chain's payload
 /// is at most [`MAX_SALVAGE_PAX_SCAN`], so only terminals within about a
-/// megabyte ahead of the search position are ever outstanding); this is the
-/// hard cap that holds if that argument ever stops being true. A chain
+/// megabyte ahead of the search position are outstanding; with block-aligned
+/// terminals that is about 2300, so the cap is unreachable there, but a
+/// head may sit at any byte offset); this is the hard cap that holds if that
+/// argument ever stops being true. A chain
 /// that would start tracking a terminal past it is not read, and its
 /// terminal is reported as a work-bounded [`Sighting`] ([`TRACKING_CAP_SHAPE`]).
 const MAX_TRACKED_TERMINALS: usize = 4096;
@@ -1541,7 +1550,9 @@ fn gate_chain_at(
                 .sum();
             let after = budget.payload_read.saturating_add(planned);
             let over = budget.scan_budget_spent() || after > budget.payload_limit;
-            // A terminal not yet tracked is not started past the cap.
+            // A terminal not yet tracked is not started past the cap. A chain
+            // both over budget and at the cap is logged as `capped`, not
+            // `starved`; linearity still holds, the chain is refused unread.
             if !budget.read.contains_key(&at) && budget.read.len() >= budget.cap {
                 budget.capped.insert(at, budget.cap, TRACKING_CAP_SHAPE);
                 return None;
@@ -2798,14 +2809,25 @@ mod tests {
     /// `n` forged `x` heads, then `n` empty-named terminals: head `k` spans
     /// exactly to terminal `k`, so while the scan walks the heads every
     /// earlier terminal is still ahead of it — `n` outstanding at once.
+    ///
+    /// A real named file stands before the heads and another after the
+    /// terminals, so the recovered entries are never empty.
     fn outstanding_terminals(n: usize) -> Vec<u8> {
-        let mut data = Vec::new();
+        let real = |name: &str| {
+            let mut v = ustar_block(name, b'0', 5).to_vec();
+            let mut payload = b"hello".to_vec();
+            payload.resize(512, 0);
+            v.extend_from_slice(&payload);
+            v
+        };
+        let mut data = real("before.txt");
         for _ in 0..n {
             data.extend_from_slice(&ustar_block("", b'x', ((n - 1) * 512) as u64));
         }
         for _ in 0..n {
             data.extend_from_slice(&ustar_block("", b'0', 0));
         }
+        data.extend_from_slice(&real("after.txt"));
         data.extend_from_slice(&[0u8; 1024]);
         data
     }
@@ -2833,7 +2855,10 @@ mod tests {
     #[test]
     fn tracked_terminals_stop_at_the_cap() {
         const CAP: usize = 64;
-        let (_, sightings, peak) = scan_with_cap(outstanding_terminals(CAP + 1), CAP);
+        let (names, sightings, peak) = scan_with_cap(outstanding_terminals(CAP + 1), CAP);
+        let (lifted, _, _) = scan_with_cap(outstanding_terminals(CAP + 1), CAP * 4);
+        assert_eq!(names, ["before.txt", "after.txt"]);
+        assert_eq!(names, lifted, "the cap must not change what is recovered");
         assert!(peak.0 <= CAP && peak.1 <= CAP, "{peak:?}");
         assert_eq!(peak.0, CAP, "the map should have filled: {peak:?}");
         let capped: Vec<_> = sightings
@@ -2845,7 +2870,7 @@ mod tests {
             capped[0].kind,
             stuffr_core::salvage::SightingKind::WorkBounded
         );
-        assert_eq!(capped[0].offset, ((2 * CAP + 1) * 512) as u64);
+        assert_eq!(capped[0].offset, ((2 * CAP + 3) * 512) as u64);
     }
 
     #[test]
@@ -2858,9 +2883,20 @@ mod tests {
             "{:?}",
             at_cap.1
         );
+        assert!(!at_cap.0.is_empty());
         assert_eq!(at_cap.0, raised.0);
-        assert_eq!(at_cap.1.len(), raised.1.len());
+        let key = |v: &[Sighting]| {
+            v.iter()
+                .map(|s| (s.offset, s.shape, s.kind, s.more))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(key(&at_cap.1), key(&raised.1));
         assert_eq!(at_cap.2, raised.2);
+    }
+
+    #[test]
+    fn the_default_tracking_cap_is_the_constant() {
+        assert_eq!(TarSalvage::default().tracking_cap, MAX_TRACKED_TERMINALS);
     }
 
     /// The pending set's own cap, at the real figure: 4097 distinct
