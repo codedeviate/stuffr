@@ -1264,9 +1264,8 @@ mod c_tier {
 # The --train-cover row is the CLI's output, recorded but not asserted:
 # libzstd 1.5.7's cover trainer gives one of two dictionaries for these
 # samples depending on the process (see train_matches_the_reference).
-# Regenerate everything with
-#   STUFFR_ZSTD_OPTS_REGEN=<dir> cargo test -p stuffr-formats --all-features \\
-#     zstd_opts::tests::c_tier::regenerate_fixtures
+# Regenerate everything with `STUFFR_ZSTD_OPTS_REGEN=<dir> cargo test
+# -p stuffr-formats --all-features zstd_opts::tests::c_tier::regenerate_fixtures`,
 # then copy <dir>/* here (macOS, the reference zstd 1.5.7 present).
 ";
 }
