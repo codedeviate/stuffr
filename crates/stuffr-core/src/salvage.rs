@@ -652,7 +652,7 @@ pub struct SalvageOutcome {
     /// [`salvage_all`], for the same reason [`Self::sightings`] is always
     /// empty there: only the scanner knows its walk ended early, so its own
     /// `salvage_*` entry point fills this in. Like a sighting it is never an
-    /// entry and never touches the run's exit code.
+    /// entry. Unlike a sighting it never touches the run's exit code.
     pub walk_stop: Option<WalkStop>,
 }
 

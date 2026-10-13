@@ -146,8 +146,9 @@
 //! advances by its declared length. A run that recovered nothing while
 //! seeing one is [`Error::Unsupported`] (exit 3) naming the variant — never
 //! "the scan found nothing recoverable" at exit 5 over a healthy archive of
-//! another variant; a mixed run keeps its own exit code and carries the
-//! sightings for the CLI's note. Binary (`070707` as a 16-bit word) cpio is
+//! another variant; a mixed run carries the sightings for the CLI's note, and a
+//! sighting in a non-selective run is exit 4 (selective `--index` runs are
+//! exempt). Binary (`070707` as a 16-bit word) cpio is
 //! neither: its magic is two bytes, far too weak to anchor a scan, and
 //! `stuffr list` does not recognise it either.
 //!
@@ -1912,7 +1913,7 @@ mod tests {
     }
 
     /// In a MIXED run a variant header is carried as a sighting with its
-    /// offset — never a row, never the exit code — and a healthy `newc`
+    /// offset — never a row, but exit 4 in a non-selective run — and a healthy `newc`
     /// archive carries none.
     #[test]
     fn a_mixed_run_carries_its_sightings_and_still_lists_none_of_them() {

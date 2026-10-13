@@ -18,7 +18,11 @@
 //!   documented as zero on this path, so `unix_mode()` returns `None`, which
 //!   in turn means a **symlink is indistinguishable from a regular file
 //!   holding its target as contents** (`S_IFLNK` lives nowhere else in a
-//!   zip). That is a real loss and it is reported as one:
+//!   zip). From a pipe, then, a symlink entry becomes a regular file holding
+//!   its target text, streamed and never buffered, so the 64 KiB
+//!   symlink-target cap (exit 6) applies to seekable reads only; the
+//!   `zip_on_a_pipe` suite pins that asymmetry. That is a real loss and it
+//!   is reported as one:
 //!   [`Fidelity::TrailingIndexUnread`] plus [`Fidelity::EntryCountUnknown`],
 //!   the vocabulary Phase 0 defined for exactly this, seeded by
 //!   `ladder::seed_report` and re-asserted here so the report is complete

@@ -1761,9 +1761,10 @@ pub fn salvage_tar(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     // is a claim about this BUILD. `Error::Unsupported` is exit 3.
     //
     // **Only when nothing came back** (Ruling S-X): an `Err` discards every
-    // entry the run recovered, so a run that got something reports it at its
-    // ordinary exit code — and, since Task 2-N, carries what it saw and could
-    // not gate as `sightings`, which the caller prints. Before that, a mixed
+    // entry the run recovered, so a run that got something reports it — and, since Task 2-N, carries
+    // what it saw and could not gate as `sightings`, which the caller prints.
+    // A sighting in a non-selective run is exit 4 (selective `--index` runs
+    // are exempt; `salvage_exit_code` in the facade's `entries.rs`). Before that, a mixed
     // run said nothing at all about an entry `stuffr list` shows.
     if outcome.entries.is_empty() && scanner.seen.any() {
         // Nothing is gained by dropping what the scan was bounded from

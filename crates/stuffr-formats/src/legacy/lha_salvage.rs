@@ -159,11 +159,13 @@
 //!   is the standing double.
 //! - **Only when the run recovered nothing.** An `Err` discards every entry
 //!   already recovered, which is the one thing this verb exists not to do.
-//!   A MIXED archive therefore still reports what it got, at its ordinary
-//!   exit code — an incompleteness rather than a contradiction, since
-//!   nothing false is claimed. Closing that too would need a note channel
-//!   [`SalvageOutcome`] does not have, and no LHA writer mixes header levels
-//!   within one archive.
+//!   A MIXED archive therefore still reports what it got — an
+//!   incompleteness rather than a contradiction, since nothing false is
+//!   claimed. [`SalvageOutcome`] does have a `sightings` channel, and a
+//!   sighting in a non-selective run is exit 4 (selective `--index` runs are
+//!   exempt), but the two flags behind this refusal carry no offsets and are
+//!   not yet routed onto it, so a mixed LHA run exits at its ordinary code.
+//!   No LHA writer mixes header levels within one archive.
 //!
 //! # The validation gate
 //!
@@ -1969,12 +1971,14 @@ pub fn salvage_lha(src: &mut dyn SeekRead, policy: &SalvagePolicy) -> Result<Sal
     // rather than defensive: an `Err` out of here discards every entry the
     // run recovered, which is the one thing this verb exists not to do. A
     // MIXED archive — some headers gateable, some not — therefore still
-    // reports what it recovered, at its ordinary exit code. That is an
+    // reports what it recovered. That is an
     // incompleteness rather than a contradiction: nothing false is claimed,
     // where exit 5 on a healthy file was. Saying more is now possible —
     // [`SalvageOutcome::sightings`] is that channel since Salvage Stage 3's
-    // Task 2-N, and the CLI prints it — but the two flags behind this refusal
-    // carry no offsets, so a mixed LHA run is still silent about them. The
+    // Task 2-N, and the CLI prints it, and a sighting in a non-selective run
+    // is exit 4 (selective `--index` runs are exempt) — but the two flags
+    // behind this refusal carry no offsets, so a mixed LHA run is still
+    // silent about them and keeps its ordinary exit code. The
     // scanner does emit [`stuffr_core::salvage::Sighting`]s, but only
     // verdict-bounded ones (headers whose extension headers its budget did
     // not read); converting these flags is a recorded follow-up, and no LHA
