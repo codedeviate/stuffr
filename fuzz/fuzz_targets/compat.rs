@@ -772,8 +772,27 @@ fn check_xz_reads(
     }
 }
 
+/// Whether the run's directory folds ASCII case in names (macOS's APFS by
+/// default): `x` created in the sandbox parent also opens as `X`. Probed
+/// once per process.
+fn case_insensitive_fs() -> bool {
+    static FOLDS: OnceLock<bool> = OnceLock::new();
+    *FOLDS.get_or_init(|| {
+        let parent = sandbox();
+        let _ = std::fs::create_dir_all(parent);
+        let probe = parent.join("x-case-probe");
+        let folds =
+            File::create(&probe).is_ok() && parent.join("X-CASE-PROBE").symlink_metadata().is_ok();
+        let _ = std::fs::remove_file(&probe);
+        folds
+    })
+}
+
 /// No `.stuffr-xz-*` temporary survives a run, and every name in the
-/// run's directory is one `could_be_written` allows.
+/// run's directory is one `could_be_written` allows. A name a run reads
+/// itself (`--files`, `--files0`, `--files=FILE`) may differ from a table
+/// name only by ASCII case: on a case-folding filesystem it opens the
+/// table's file, and the output is spelled as the operand was.
 fn check_xz_leftovers(dir: &Path, name: &str, args: &[&str]) {
     let Ok(listing) = std::fs::read_dir(dir) else {
         return;
@@ -784,7 +803,13 @@ fn check_xz_leftovers(dir: &Path, name: &str, args: &[&str]) {
             !n.starts_with(".stuffr-xz-"),
             "{name} {args:?}: left its temporary {n:?}"
         );
-        assert!(could_be_written(&n), "{name} {args:?}: left a stray {n:?}");
+        assert!(
+            could_be_written(&n)
+                || (case_insensitive_fs()
+                    && !n.contains('/')
+                    && could_be_written(&n.to_ascii_lowercase())),
+            "{name} {args:?}: left a stray {n:?}"
+        );
     }
 }
 

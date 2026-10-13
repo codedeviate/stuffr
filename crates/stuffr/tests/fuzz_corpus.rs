@@ -758,6 +758,7 @@ const COMPAT_SHAPES: &[&str] = &[
     "xz-lzip-refused",
     "xz-already-suffixed",
     "xz-files-stdin",
+    "xz-files-stdin-case",
     "xz-files0-stdin",
     "xz-files-from-file",
     "xz-files0-from-file",
@@ -1306,6 +1307,9 @@ fn xz_seed(work: &Path, shape: &str) -> stuffr_core::Result<Option<Vec<u8>>> {
         "already-suffixed" => x(&["a.xz", "a.txz"], &["a.xz", "a.txz"], false, &text),
         // The names on standard input; the files hold them too.
         "files-stdin" => x(&["--files", "-k"], &["a", "a.lz"], true, b"a\na.lz\n"),
+        // A name differing from a file only by case: on a case-folding
+        // filesystem it opens that file and the output keeps its spelling.
+        "files-stdin-case" => x(&["--files", "-k"], &["a"], true, b"A\naa\nz\n"),
         "files0-stdin" => x(&["--files0", "-c", "-9"], &["a"], true, b"a\0a\0"),
         // The names in a file (`--files=FILE`): every created file holds the
         // payload, so the payload is the list.
