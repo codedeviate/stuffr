@@ -458,7 +458,7 @@ pub(crate) fn list_files(
     // The notification level the display functions see: fileio.c's own
     // (`g_display_prefs`, 2 until zstdcli.c's `FIO_setNotificationLevel`,
     // which runs after this operation), not `-q`'s or `-v`'s.
-    let d = Display { level: 2 };
+    let d = Display::new(2);
     let level = cmd.display_level;
     let files = &cmd.files;
     // Ensure no specified input is stdin (needs fseek() capability).
@@ -569,7 +569,7 @@ mod tests {
             ..Info::default()
         };
         let mut err = Vec::new();
-        let d = Display { level: 2 };
+        let d = Display::new(2);
         let status = analyze_frames(&mut info, &mut Cursor::new(data), &d, &mut err);
         (info, status, String::from_utf8(err).unwrap())
     }
@@ -579,7 +579,7 @@ mod tests {
             compressed: data.len() as u64,
             ..Info::default()
         };
-        let d = Display { level: 2 };
+        let d = Display::new(2);
         analyze_frames(&mut info, &mut Cursor::new(data), &d, &mut Vec::new());
         let mut out = Vec::new();
         display_info(name.as_bytes(), &info, level, &mut out, level);
@@ -747,7 +747,7 @@ mod tests {
             compressed: 15,
             ..Info::default()
         };
-        let d = Display { level: 2 };
+        let d = Display::new(2);
         analyze_frames(&mut info, &mut Cursor::new(&data), &d, &mut Vec::new());
         assert_eq!(info.decompressed, 2000);
         let mut out = Vec::new();

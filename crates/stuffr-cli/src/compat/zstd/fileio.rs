@@ -53,7 +53,7 @@ use stuffr::zstd_opts::{
 
 use super::cli::Prefs;
 use super::cli::{CType, Command, NULMARK, Progress, STDINMARK, STDOUTMARK};
-use super::display::{Display, exm_throw};
+use super::display::{self, Display, exm_throw};
 use super::messages::{self as m, printf};
 use super::util::{self, FILESIZE_UNKNOWN, Hrs, PATH_SEP, human_size};
 use crate::compat::host::{self, CleanupGuard, Host, create_temp_armed_exit, strerror};
@@ -311,8 +311,9 @@ pub(crate) struct Io<'a> {
     // the write pool
     sink: Sink,
     stored_skips: u64,
-    /// `g_displayClock`: the last progress update.
-    last_update: Option<Instant>,
+    /// The clock `g_displayClock` is read from ([`Display::update`] takes
+    /// its milliseconds).
+    clock: Instant,
     answers: Option<Answers>,
     codec: Option<Box<dyn FrameCodec>>,
 }
@@ -394,9 +395,7 @@ impl<'a> Io<'a> {
     ) -> Self {
         Io {
             prefs: cmd.prefs.clone(),
-            d: Display {
-                level: cmd.display_level,
-            },
+            d: Display::new(cmd.display_level),
             util_level: cmd.prefs.util_level,
             host,
             out,
@@ -407,7 +406,7 @@ impl<'a> Io<'a> {
             total_out: 0,
             sink: Sink::Unset,
             stored_skips: 0,
-            last_update: None,
+            clock: Instant::now(),
             answers: None,
             codec: Some(frame_codec()),
         }
@@ -479,23 +478,39 @@ impl<'a> Io<'a> {
         self.display_progress(m::CLEAR_LINE, &[blank.as_bytes()]);
     }
 
+    /// The injected clock's reading, in milliseconds.
+    fn now_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis() as u64
+    }
+
     /// `READY_FOR_UPDATE()`.
     fn ready_for_update(&self) -> bool {
-        self.d.level >= 4 || self.last_update.is_none_or(|t| t.elapsed() > REFRESH_RATE)
+        self.d.ready_for_update(self.now_ms())
+    }
+
+    /// `DISPLAY_PROGRESS` of a whole line already rendered (a refresh is
+    /// several `DISPLAY_PROGRESS` calls under one condition).
+    fn display_progress_line(&mut self, line: &[u8]) {
+        if self.should_display_progress() && self.d.level >= 1 {
+            let _ = self.err.write_all(line);
+        }
     }
 
     /// `DISPLAYUPDATE_PROGRESS(…)`.
     pub(crate) fn display_update_progress(&mut self, fmt: &str, args: &[&[u8]]) {
-        if self.should_display_progress()
-            && self.d.level >= 1
-            && self.prefs.progress != Progress::Never
-            && self.ready_for_update()
-        {
-            self.last_update = Some(Instant::now());
-            self.say(1, fmt, args);
-            if self.d.level >= 4 {
-                let _ = self.err.flush();
-            }
+        if self.should_display_progress() && self.prefs.progress != Progress::Never {
+            let now = self.now_ms();
+            self.d.update(now, self.err, |w| printf(w, fmt, args));
+        }
+    }
+
+    /// `DISPLAYUPDATE_PROGRESS` of a line rendered by `display.rs`.
+    fn display_update_line(&mut self, line: &[u8]) {
+        if self.should_display_progress() && self.prefs.progress != Progress::Never {
+            let now = self.now_ms();
+            self.d.update(now, self.err, |w| {
+                let _ = w.write_all(line);
+            });
         }
     }
 
@@ -1416,7 +1431,6 @@ impl Io<'_> {
         let mut compressed = 0u64;
         let mut directive = EndOp::Continue;
         let mut pledged = FILESIZE_UNKNOWN;
-        let file_hrs = self.human(file_size);
         self.say(6, m::USING_ZSTD_FORMAT, &[]);
         if file_size != FILESIZE_UNKNOWN {
             pledged = file_size;
@@ -1496,7 +1510,7 @@ impl Io<'_> {
                     self.adapt_level(&mut adapt, &mut ress.enc, &mut level);
                 }
                 if self.should_display_progress() && self.ready_for_update() {
-                    self.compress_progress(&ress.enc, src_name, file_size, &file_hrs, level);
+                    self.compress_progress(&ress.enc, src_name, file_size, level);
                 }
             }
             let input_len = input.len();
@@ -1599,74 +1613,23 @@ impl Io<'_> {
     }
 
     /// `FIO_compressZstdFrame`'s progress notification.
-    fn compress_progress(
-        &mut self,
-        enc: &Encoder,
-        src_name: &[u8],
-        file_size: u64,
-        file_hrs: &Hrs,
-        level: i32,
-    ) {
+    fn compress_progress(&mut self, enc: &Encoder, src_name: &[u8], file_size: u64, level: i32) {
         let z = enc.progression();
-        let c_share = z.produced as f64 / (z.consumed + u64::from(z.consumed == 0)) as f64 * 100.0;
-        let buffered = self.human(z.ingested - z.consumed);
-        let consumed = self.human(z.consumed);
-        let produced = self.human(z.produced);
-        self.last_update = Some(Instant::now());
-        self.clear_progress();
-        if self.d.level >= 3 {
-            let w5 = |h: &Hrs| format!("{}{}", h.value_w(5), h.suffix);
-            let (l, b, c, p, s) = (
-                level.to_string(),
-                w5(&buffered),
-                w5(&consumed),
-                w5(&produced),
-                format!("{c_share:.2}"),
-            );
-            self.display_progress(
-                m::PROGRESS_VERBOSE,
-                &[
-                    l.as_bytes(),
-                    b.as_bytes(),
-                    c.as_bytes(),
-                    p.as_bytes(),
-                    s.as_bytes(),
-                ],
-            );
-        } else {
-            if self.prefs.nb_files_total > 1 {
-                let (i, t) = (
-                    (self.curr_file_idx + 1).to_string(),
-                    self.prefs.nb_files_total.to_string(),
-                );
-                if src_name.len() > 18 {
-                    let tail = src_name[src_name.len() - 15..].to_vec();
-                    self.display_progress(
-                        m::PROGRESS_FILES_LONG,
-                        &[i.as_bytes(), t.as_bytes(), &tail],
-                    );
-                } else {
-                    // `%*s` with width `18 - len`: the name, right-aligned
-                    // in a field that is never wider than it unless it is
-                    // shorter than 9 bytes.
-                    let w = 18 - src_name.len();
-                    let mut padded = vec![b' '; w.saturating_sub(src_name.len())];
-                    padded.extend_from_slice(src_name);
-                    self.display_progress(
-                        m::PROGRESS_FILES,
-                        &[i.as_bytes(), t.as_bytes(), &padded],
-                    );
-                }
-            }
-            let r = hrs6_4(&consumed);
-            self.display_progress(m::PROGRESS_READ, &[r.as_bytes()]);
-            if file_size != FILESIZE_UNKNOWN {
-                let f = hrs6_4(file_hrs);
-                self.display_progress(m::PROGRESS_OF, &[f.as_bytes()]);
-            }
-            let s = format!("{c_share:2.0}");
-            self.display_progress(m::PROGRESS_RATIO, &[s.as_bytes()]);
-        }
+        let now = self.now_ms();
+        self.d.delay_next_update(now);
+        let line = display::compress_progress_line(&display::CompressProgress {
+            display_level: self.d.level,
+            util_level: self.util_level,
+            nb_files_total: self.prefs.nb_files_total,
+            curr_file_idx: self.curr_file_idx,
+            src_name,
+            file_size,
+            level,
+            ingested: z.ingested,
+            consumed: z.consumed,
+            produced: z.produced,
+        });
+        self.display_progress_line(&line);
     }
 
     /// `FIO_compressFilename_internal`.
@@ -2038,17 +2001,13 @@ impl Io<'_> {
         already: u64,
     ) -> Fio<Option<u64>> {
         let mut frame_size = 0u64;
-        let src20: Vec<u8> = if src.len() > 20 && self.d.level < 3 {
-            src[src.len() - 20..].to_vec()
-        } else {
-            src.to_vec()
-        };
         dec.reset();
         self.fill(rp, FRAMEHEADERSIZE_MAX)?;
         loop {
             let mut out = Vec::new();
             let r = dec.decompress_stream(rp.loaded(), &mut out);
-            let hrs = self.human(already + frame_size);
+            // `hrs` is read before this pass adds its output to the frame.
+            let shown = already + frame_size;
             let (consumed, hint) = match r {
                 Ok(x) => x,
                 Err(e) => {
@@ -2061,23 +2020,15 @@ impl Io<'_> {
             };
             self.write_block(&out)?;
             frame_size += out.len() as u64;
-            if self.prefs.nb_files_total > 1 {
-                let (i, t) = (
-                    format!("{:2}", self.curr_file_idx + 1),
-                    format!("{:2}", self.prefs.nb_files_total),
-                );
-                let h = hrs.plain();
-                self.display_update_progress(
-                    m::PROGRESS_DECOMPRESS_FILES,
-                    &[i.as_bytes(), t.as_bytes(), &src20, h.as_bytes()],
-                );
-            } else {
-                let mut name = src20.clone();
-                name.truncate(20);
-                let name = left20(&name);
-                let h = hrs.plain();
-                self.display_update_progress(m::PROGRESS_DECOMPRESS, &[&name, h.as_bytes()]);
-            }
+            let line = display::decompress_progress_line(
+                self.d.level,
+                self.util_level,
+                self.prefs.nb_files_total,
+                self.curr_file_idx,
+                src,
+                shown,
+            );
+            self.display_update_line(&line);
             rp.consume(consumed);
             if hint == 0 {
                 break;

@@ -1,0 +1,37 @@
+compress 2 1 0 a.txt 1048576 3 0 0 0
+compress 2 1 0 a.txt 1048576 3 131072 0 0
+compress 2 1 0 a.txt 1048576 3 524288 393216 100000
+compress 2 1 0 a.txt 1048576 3 1048576 1048576 1048576
+compress 2 1 0 a.txt -1 3 524288 393216 100000
+compress 2 1 0 a.txt -1 19 12345678 12345678 123456
+compress 2 1 0 a.txt 104857600 3 1073741824 1073741824 5368709120
+compress 2 3 0 a.txt 1048576 3 524288 393216 100000
+compress 2 3 1 report-2024.txt 1048576 3 524288 393216 100000
+compress 2 3 2 exactly-eighteen-ch 1048576 3 524288 393216 100000
+compress 2 3 2 exactly-18-chars-x 1048576 3 524288 393216 100000
+compress 2 12 9 a-rather-long-file-name.dat 52428800 3 20971520 20971520 7340032
+compress 2 12 11 dir/sub/x 52428800 3 20971520 20971520 7340032
+compress 2 2 0 b -1 3 4096 4096 2000
+compress 3 1 0 a.txt 1048576 3 0 0 0
+compress 3 1 0 a.txt 1048576 3 131072 0 0
+compress 3 1 0 a.txt 1048576 3 524288 393216 100000
+compress 3 1 0 a.txt 1048576 5 1073741824 1073741824 536870912
+compress 3 1 0 a.txt -1 19 12345678 12345678 123456
+compress 3 1 0 a.txt 1048576 22 999 999 1000
+compress 3 4 1 a.txt 1048576 3 524288 393216 100000
+compress 4 1 0 a.txt 1048576 3 524288 393216 100000
+compress 4 1 0 a.txt 1048576 3 9007199254740993 9007199254740993 4503599627370497
+decompress 2 1 0 a.txt.zst 0
+decompress 2 1 0 a.txt.zst 512
+decompress 2 1 0 a.txt.zst 131072
+decompress 2 1 0 a.txt.zst 1572864
+decompress 2 1 0 a.txt.zst 1073741824
+decompress 2 1 0 a-very-long-directory/and-a-file-name.txt.zst 1572864
+decompress 2 3 0 a.txt.zst 1572864
+decompress 2 3 1 a-very-long-directory/and-a-file-name.txt.zst 52428800
+decompress 2 12 11 b.zst 131072
+decompress 3 1 0 a.txt.zst 1572864
+decompress 3 1 0 a-very-long-directory/and-a-file-name.txt.zst 1572864
+decompress 3 3 1 a-very-long-directory/and-a-file-name.txt.zst 1572864
+decompress 4 1 0 a.txt.zst 1572864
+decompress 4 2 1 a.txt.zst 1572864

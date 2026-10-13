@@ -38,6 +38,13 @@
 //! field width, skippable frames, block types, reserved bits, and every
 //! prefix of a multi-frame file).
 //!
+//! Part 6 (Task 9): the progress display with standard error not a terminal
+//! (`--progress` forces it): compressing, decompressing and testing at
+//! `-q`, the default, `-v`, `-vv` and `-vvv`, one file and several, named
+//! short and long, from a stream, with `--no-progress`. The forms a
+//! terminal gets are pinned by `display.rs`'s unit tests against
+//! `tests/fixtures/zstd_progress/` (R4).
+//!
 //! The normalisations: the banner (`-V`, `-H`, `-v`'s welcome line),
 //! which names stuffr (spec deviation 1; checked exactly before it is
 //! masked); in `-H` the reference's benchmark section and `--trace` line,
@@ -379,24 +386,87 @@ mod unix {
     }
 
     /// The pure tier's own compressed figures elsewhere: the progress
-    /// line's ` ==> N%`, and `-vvvv`'s `output generated N bytes`.
+    /// lines' ` ==> N%` and the verbose line's `Compressed: N B => R%`
+    /// (Task 9), and `-vvvv`'s `output generated N bytes`.
     fn blank_progress(line: &str) -> String {
-        let mut out = String::new();
-        let mut rest = line;
-        for (head, tail) in [(" ==> ", "%"), ("output generated ", " bytes")] {
+        let numeric = |t: &str| {
+            !t.trim().is_empty() && t.trim().bytes().all(|b| b.is_ascii_digit() || b == b'.')
+        };
+        // Replace what lies between `head` and the next `tail` by `<n>`
+        // wherever it is a bare number.
+        let blank = |text: String, head: &str, tail: &str| -> String {
+            let mut out = String::new();
+            let mut rest = text.as_str();
             while let Some(at) = rest.find(head) {
                 let after = &rest[at + head.len()..];
                 let Some(end) = after.find(tail) else { break };
-                if !after[..end].trim().bytes().all(|b| b.is_ascii_digit()) {
-                    break;
+                if numeric(&after[..end]) {
+                    out.push_str(&rest[..at + head.len()]);
+                    out.push_str("<n>");
+                } else {
+                    out.push_str(&rest[..at + head.len() + end]);
                 }
-                out.push_str(&rest[..at + head.len()]);
-                out.push_str("<n>");
                 rest = &after[end..];
             }
+            out.push_str(rest);
+            out
+        };
+        let mut text = blank(line.to_string(), " ==> ", "%");
+        text = blank(text, "output generated ", " bytes");
+        // `Compressed:%5.*f%s => %.2f%% `: the ratio after the size.
+        if text.contains("Compressed:") {
+            text = blank(text, " => ", "% ");
+            // The size and its unit: `Compressed:   63 B => <n>`.
+            let mut done = String::new();
+            let mut rest = text.as_str();
+            while let Some(c) = rest.find("Compressed:") {
+                let Some(arrow) = rest[c..].find(" => ") else {
+                    break;
+                };
+                done.push_str(&rest[..c]);
+                done.push_str("Compressed:<n>");
+                rest = &rest[c + arrow..];
+            }
+            done.push_str(rest);
+            text = done;
         }
-        out.push_str(rest);
-        out
+        text
+    }
+
+    /// `blank_progress` blanks the pure tier's own compressed figures and
+    /// nothing else: the input side of a line, a name, a unit and the
+    /// uncompressed figures still differ when they should.
+    #[test]
+    fn blank_progress_is_narrow() {
+        let v = "(L3) Buffered:    0 B - Consumed: 1.72 KiB - Compressed:   63 B => 3.58% \n";
+        assert_eq!(
+            blank_progress(v),
+            "(L3) Buffered:    0 B - Consumed: 1.72 KiB - Compressed:<n> => <n>% \n"
+        );
+        assert_ne!(
+            blank_progress(v),
+            blank_progress(&v.replace("1.72", "1.73"))
+        );
+        assert_ne!(
+            blank_progress(v),
+            blank_progress(&v.replace("(L3)", "(L4)"))
+        );
+        assert_ne!(
+            blank_progress(v),
+            blank_progress(&v.replace("Buffered:    0", "Buffered:    1"))
+        );
+        let r = "Read:  1.50 MiB /  24.0 MiB ==> 35%";
+        assert_eq!(blank_progress(r), "Read:  1.50 MiB /  24.0 MiB ==> <n>%");
+        assert_ne!(
+            blank_progress(r),
+            blank_progress(&r.replace("24.0", "25.0"))
+        );
+        assert_eq!(
+            blank_progress("Read : 0 / 0 MB ==> 0.74%"),
+            "Read : 0 / 0 MB ==> <n>%"
+        );
+        // `=> ` outside a `Compressed:` line is not a figure of ours.
+        assert_eq!(blank_progress("a => 5% "), "a => 5% ");
     }
 
     // ---- flags: refused ----
@@ -3657,5 +3727,165 @@ mod unix {
             cases.push(c);
         }
         check("adapt", &cases);
+    }
+
+    // ==== part 6 (Task 9): the progress display ====
+
+    /// Progress with standard error a pipe: only `--progress` shows it
+    /// (the harness cannot make standard error a terminal, R4). The
+    /// inputs are small, so there is one refresh and the line is the same
+    /// on both sides; `-vv`'s "Completed in" fields are normalised.
+    #[test]
+    fn progress_compressing() {
+        let long = "a-rather-long-directory-name-for-it.txt";
+        let files = vec![
+            ("a", text()),
+            ("d", text()),
+            ("p", text()),
+            ("empty", Vec::new()),
+            (long, text()),
+            ("x", text()),
+        ];
+        let mut cases = Vec::new();
+        for args in [
+            &["a", "-c"][..],
+            &["--progress", "a", "-c"],
+            &["--progress", "-k", "a"],
+            &["--progress", "-v", "-k", "a"],
+            &["--progress", "-vv", "-k", "a"],
+            &["--progress", "-vvv", "-k", "a"],
+            &["--progress", "-q", "-k", "a"],
+            &["--progress", "-qq", "-k", "a"],
+            &["-v", "-k", "a"],
+            &["-v", "--no-progress", "-k", "a"],
+            &["--progress", "--no-progress", "-k", "a"],
+            &["--no-progress", "--progress", "-k", "a"],
+            &["--progress", "-k", "empty"],
+            &["--progress", "-v", "-k", "empty"],
+            &["--progress", "-k", "a", "d", "p"],
+            &["--progress", "-v", "-k", "a", "d", "p"],
+            &["--progress", "-vv", "-k", "a", "d", "p"],
+            &["--progress", "-q", "-k", "a", "d", "p"],
+            &["-v", "-k", "a", "d", "p"],
+            &["--progress", "-k", "a", "empty", "x"],
+            &["--progress", "-k", long, "x"],
+            &["--progress", "-k", "x", long],
+            &["--progress", "-v", "-k", long, "x"],
+            &["--progress", "-k", "-1", "a", "d"],
+            &["--progress", "-k", "-19", "a", "d"],
+            &["--progress", "-k", "--fast=3", "a", "d"],
+            &["--progress", "-k", "-T2", "a", "d"],
+            &["--progress", "-k", "--rm", "a", "d"],
+            &["--progress", "-c", "a", "d"],
+            &["--progress", "-v", "-o", "out.zst", "a"],
+            &["--progress", "-f", "-k", "--format=gzip", "a", "d"],
+            &["--progress", "-f", "-k", "--format=xz", "a", "d"],
+            &["--progress", "-f", "-k", "--format=lzma", "a"],
+            &["--progress", "-f", "-k", "--format=lz4", "a"],
+            &["--progress", "-v", "-f", "-k", "--format=gzip", "a"],
+            &["--progress", "-v", "-f", "-k", "--format=lz4", "a"],
+        ] {
+            cases.push(with_files("zstd", args, files.clone()));
+        }
+        // A stream: no size is known, so there is no `/SIZE` in the line.
+        for args in [
+            &["--progress", "-c"][..],
+            &["--progress", "-v", "-c"],
+            &["--progress", "-vv", "-c"],
+            &["--progress", "-q", "-c"],
+            &["--progress", "-c", "-"],
+            &["--progress", "-", "-o", "out.zst"],
+            &["--progress", "-f", "-c", "--format=gzip"],
+        ] {
+            cases.push(fed(with_files("zstd", args, files.clone()), text()));
+        }
+        check("progress_compressing", &cases);
+    }
+
+    /// Decompressing and testing: the `Decompress: N/M files.` form, the
+    /// last 20 characters of a long name (all of it at `-v`), the
+    /// summaries; foreign formats' own `Read :` lines.
+    #[test]
+    fn progress_decompressing() {
+        let z = packed(&[], &text());
+        let gz = packed(&["--format=gzip"], &text());
+        let xz = packed(&["--format=xz"], &text());
+        let lz = packed(&["--format=lzma"], &text());
+        let l4 = packed(&["--format=lz4"], &text());
+        let long = "a-rather-long-directory-name-for-it.txt.zst";
+        let files = vec![
+            ("a.zst", z.clone()),
+            ("b.zst", z.clone()),
+            ("c.zst", z.clone()),
+            (long, z.clone()),
+            ("e.gz", gz),
+            ("e.xz", xz),
+            ("e.lzma", lz),
+            ("e.lz4", l4),
+        ];
+        let mut cases = Vec::new();
+        for args in [
+            &["-d", "-c", "a.zst"][..],
+            &["--progress", "-dc", "a.zst"],
+            &["--progress", "-d", "-k", "a.zst"],
+            &["--progress", "-d", "-v", "-k", "a.zst"],
+            &["--progress", "-d", "-vv", "-k", "a.zst"],
+            &["--progress", "-d", "-vvv", "-k", "a.zst"],
+            &["--progress", "-d", "-q", "-k", "a.zst"],
+            &["--progress", "-d", "-qq", "-k", "a.zst"],
+            &["-d", "-v", "-k", "a.zst"],
+            &["-d", "-v", "--no-progress", "-k", "a.zst"],
+            &["--no-progress", "--progress", "-d", "-k", "a.zst"],
+            &["--progress", "-d", "-k", "a.zst", "b.zst", "c.zst"],
+            &["--progress", "-d", "-v", "-k", "a.zst", "b.zst", "c.zst"],
+            &["--progress", "-d", "-vv", "-k", "a.zst", "b.zst"],
+            &["--progress", "-d", "-q", "-k", "a.zst", "b.zst"],
+            &["-d", "-v", "-k", "a.zst", "b.zst"],
+            &["--progress", "-d", "-k", long],
+            &["--progress", "-d", "-v", "-k", long],
+            &["--progress", "-d", "-k", long, "a.zst"],
+            &["--progress", "-d", "-v", "-k", "a.zst", long],
+            &["--progress", "-d", "-c", "a.zst", "b.zst"],
+            &["--progress", "-d", "-o", "out", "a.zst"],
+            &["--progress", "-d", "--rm", "a.zst", "b.zst"],
+            &["--progress", "-t", "a.zst"],
+            &["--progress", "-tv", "a.zst"],
+            &["--progress", "-tvv", "a.zst"],
+            &["--progress", "-tq", "a.zst"],
+            &["--progress", "-t", "a.zst", "b.zst", "c.zst"],
+            &["--progress", "-tv", "a.zst", "b.zst", long],
+            &["-tv", "a.zst", "b.zst"],
+            &["--progress", "-d", "-k", "e.gz"],
+            &["--progress", "-d", "-v", "-k", "e.gz"],
+            &["--progress", "-d", "-k", "e.xz"],
+            &["--progress", "-d", "-v", "-k", "e.xz"],
+            &["--progress", "-d", "-k", "e.lzma"],
+            &["--progress", "-d", "-v", "-k", "e.lzma"],
+            &["--progress", "-d", "-k", "e.lz4"],
+            &["--progress", "-d", "-v", "-k", "e.lz4"],
+            &["--progress", "-d", "-k", "e.gz", "e.xz", "e.lz4", "a.zst"],
+            &["--progress", "-t", "e.gz", "e.xz", "e.lzma", "e.lz4"],
+            &["--progress", "-d", "-k", "missing.zst", "a.zst"],
+        ] {
+            cases.push(with_files("zstd", args, files.clone()));
+        }
+        for args in [
+            &["--progress", "-dc"][..],
+            &["--progress", "-dc", "-v"],
+            &["--progress", "-dc", "-vv"],
+            &["--progress", "-t"],
+            &["--progress", "-tv"],
+            &["--progress", "-dc", "-q"],
+        ] {
+            cases.push(fed(with_files("zstd", args, files.clone()), z.clone()));
+        }
+        for name in ["unzstd", "zstdcat"] {
+            cases.push(with_files(
+                name,
+                &["--progress", "-v", "a.zst", "b.zst"],
+                files.clone(),
+            ));
+        }
+        check("progress_decompressing", &cases);
     }
 }

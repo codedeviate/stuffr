@@ -292,9 +292,7 @@ fn save_dict(host: &Host, name: &[u8], dict: &[u8], err: &mut dyn Write) -> Fio<
 /// the operation's result (0, or 1 when the trainer fails), or the
 /// `EXM_THROW` that ended it.
 pub(crate) fn train_files(cmd: &Command, host: &mut Host, err: &mut dyn Write) -> Fio<i32> {
-    let d = Display {
-        level: cmd.display_level,
-    };
+    let d = Display::new(cmd.display_level);
     if cfg!(not(feature = "zstd-c")) {
         // zstdcli.c, built with ZSTD_NODICT.
         d.at(1, err, m::TRAINING_NOT_AVAILABLE, &[]);

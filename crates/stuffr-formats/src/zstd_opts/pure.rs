@@ -195,6 +195,15 @@ impl Encoder {
         if !self.started && end == EndOp::End {
             self.pledged = None;
         }
+        if !self.started {
+            // ZSTD_getFrameProgression counts the frame in progress:
+            // libzstd zeroes its counters as a frame begins (and keeps
+            // the finished frame's until then), so a second file's
+            // progress line does not carry the first's.
+            self.ingested = 0;
+            self.consumed = 0;
+            self.produced = 0;
+        }
         self.started = true;
         let taken = (self.buf.len() + input.len()) as u64;
         if let Some(p) = self.pledged

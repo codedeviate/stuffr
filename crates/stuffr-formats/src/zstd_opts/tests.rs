@@ -1350,6 +1350,30 @@ mod c_tier {
 
 #[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
 mod pure_tier {
+    /// `ZSTD_getFrameProgression` counts the frame in progress: a second
+    /// frame starts from zero (the progress line of a second file) and
+    /// the finished frame's figures stay until then.
+    #[test]
+    fn progression_restarts_with_each_frame() {
+        let mut e = Encoder::new(&EncodeOptions::default()).unwrap();
+        let data = text(4096, 3);
+        let mut out = Vec::new();
+        e.compress_stream(&data, &mut out, EndOp::End).unwrap();
+        let first = e.progression();
+        assert_eq!((first.ingested, first.consumed), (4096, 4096));
+        assert_eq!(first.produced, out.len() as u64);
+        let mut out2 = Vec::new();
+        e.compress_stream(&data[..1000], &mut out2, EndOp::Continue)
+            .unwrap();
+        let mid = e.progression();
+        assert_eq!((mid.ingested, mid.consumed, mid.produced), (1000, 0, 0));
+        e.compress_stream(&data[1000..], &mut out2, EndOp::End)
+            .unwrap();
+        let second = e.progression();
+        assert_eq!((second.ingested, second.consumed), (4096, 4096));
+        assert_eq!(second.produced, out2.len() as u64);
+    }
+
     use super::*;
 
     #[test]

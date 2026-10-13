@@ -275,9 +275,7 @@ fn execute(cmd: &mut Command, host: &mut Host, out: &mut dyn Write, err: &mut dy
         clean: false,
         pause,
     };
-    let mut d = Display {
-        level: cmd.display_level,
-    };
+    let mut d = Display::new(cmd.display_level);
     // g_utilDisplayLevel.
     cmd.prefs.util_level = cmd.display_level;
     let util_level = cmd.display_level;
