@@ -1193,8 +1193,9 @@ input through, at display level 1) and `zstdmt` compresses with `-T0`.
   `-v`/`-vv`/`-vvv` and the parameter printers, dictionaries (`-D`,
   `--patch-from`), `--train`, `--filelist`, `-r`, the suffix rules and the
   overwrite prompt. The exit codes are zstd's (0, 1, 2 for an interrupt, and
-  the `EXM_THROW` set zstd uses); stuffr's 3 to 7 never appear under these
-  names. A differential suite runs each case through a real zstd 1.5.7 and a
+  the `EXM_THROW` set zstd uses); stuffr's own meanings for 3 to 7 never
+  apply under these names, and 3, 4 and 5 occur only as zstd's `--train` save
+  errors. A differential suite runs each case through a real zstd 1.5.7 and a
   stuffr link and compares those streams, the file tree, modes and mtimes.
 - **Compressed output.** On the `c-backed` tier (`--features c-backed`, which
   builds libzstd 1.5.7) zstd frames and dictionaries are **byte-identical to
@@ -1229,6 +1230,14 @@ input through, at display level 1) and `zstdmt` compresses with `-T0`.
   Homebrew zstd's `-H` differs by exactly those lines). `-B#`, `-S` and `-p#`
   keep the reference's meaning. `--[no-]asyncio` is accepted and has no
   visible effect; `--trace-file-stat` is accepted and prints no trace.
+- **`-l` on two malformed skippable frames.** A size field of `0xFFFFFFF8`
+  makes zstd loop forever, and stuffr answers exit 1 with `could not find end
+  of skippable frame`; a skippable frame cut after 5 to 7 bytes makes zstd
+  read uninitialised stack, and stuffr reads a deterministic header. Neither
+  upstream defect is reproduced.
+- **No `Error defined at` line.** At display level 5 and above, zstd's
+  `Error defined at <file>, line <n>` line is not printed: it names the C
+  implementation's source lines.
 - **`--train-cover` is valid, not identical.** libzstd 1.5.7's cover sort
   breaks ties by comparing addresses, so a cover dictionary depends on heap
   layout, in zstd itself too. It is promised valid and usable by zstd, not
@@ -1244,7 +1253,14 @@ input through, at display level 1) and `zstdmt` compresses with `-T0`.
 - **Compression is `ruzstd`'s `Fastest` at every level,** so the sizes and
   ratios in the summaries and in `-vvvvvv`'s trace are the tier's own. The
   compression parameters are range-checked as libzstd checks them, then
-  ignored.
+  ignored: `-T`, `--auto-threads` and `zstdmt` run single-threaded, and the
+  LDM, `--rsyncable`, block-size and overlap options have no effect.
+- **Content size and window.** Our frames never record a content size, so
+  `--content-size` has no effect and `-l` on our own output says the
+  decompressed size is unknown. The window is 128 KiB whatever `--long` asks.
+- **Each input is compressed as one frame built in memory:** memory use grows
+  with the input's size (a piped standard input is unbounded), and a run that
+  exhausts memory ends outside zstd's exit codes.
 - **Dictionary compression is refused.** Compressing with `-D` or
   `--patch-from` ends, after everything zstd prints first, with `zstd: error
   1 : dictionary compression is not available in this build (stuffr pure

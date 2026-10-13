@@ -46,6 +46,15 @@
 //!    --trace"); `-H` omits their lines. `-B#`, `-S` and `-p#` keep the
 //!    reference's meaning. `--[no-]asyncio` is accepted and has no visible
 //!    effect. `--trace-file-stat` is accepted and prints no trace.
+//!    - `-l` on two malformed skippable frames (ruling T7-a): a size field
+//!      of `0xFFFFFFF8` makes zstd loop forever, and stuffr answers exit 1
+//!      with `could not find end of skippable frame`; a skippable frame cut
+//!      after 5 to 7 bytes makes zstd read uninitialised stack, and stuffr
+//!      reads a deterministic header. Neither upstream defect is
+//!      reproduced.
+//!    - At display level 5 and above, `EXM_THROW`'s `Error defined at
+//!      <file>, line <n>` line is not printed (ruling T4-b): it names the C
+//!      implementation's source lines.
 //! 6. `--train-cover` (ruling T1-a): libzstd 1.5.7's cover sort breaks ties
 //!    by comparing addresses (`cover.c:300`, `:316`), so a cover dictionary
 //!    depends on heap layout, in zstd itself too. It is promised valid and
@@ -59,7 +68,16 @@
 //! - Every level compresses with `ruzstd`'s `Fastest`, so the sizes and
 //!   ratios in the summaries and in `-vvvvvv`'s trace are the tier's own;
 //!   the reference decodes every frame. The compression parameters are
-//!   range-checked as libzstd checks them, then ignored.
+//!   range-checked as libzstd checks them, then ignored: `-T`,
+//!   `--auto-threads` and `zstdmt` run single-threaded, and the LDM,
+//!   `--rsyncable`, block-size and overlap options have no effect.
+//! - Content size and window: our frames never record a content size, so
+//!   `--content-size` has no effect and `-l` on our own output says the
+//!   decompressed size is unknown. The window is 128 KiB whatever `--long`
+//!   asks.
+//! - Each input is compressed as one frame built in memory: memory use
+//!   grows with the input's size (a piped standard input is unbounded),
+//!   and a run that exhausts memory ends outside zstd's exit codes.
 //! - Compressing with `-D` or `--patch-from` is refused, after everything
 //!   zstd prints first: `zstd: error 1 : dictionary compression is not
 //!   available in this build (stuffr pure tier)`. Decompressing with either
