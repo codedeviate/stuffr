@@ -27,7 +27,14 @@ snap = "1"
 # that cost Task 4 a discovery. It enables multithreading inside the vendored C
 # library and is reachable only through `zstd-c`, so the `pure` graph is
 # unaffected; a CI job asserts that.
-zstd = { version = "0.13", features = ["zstdmt"] }
+#
+# `experimental` (0.14.0) exposes what the zstd compatibility family's
+# `zstd_opts` needs from libzstd's static-linking-only API: `srcSizeHint`,
+# `rsyncable`, `useRowMatchFinder`, `literalCompressionMode`,
+# `getFrameProgression`, `ZSTD_getCParams` and the ZDICT trainers. It swaps
+# in zstd-sys's pregenerated experimental bindings; the C library compiled is
+# the same whole 1.5.7 tree either way.
+zstd = { version = "0.13", features = ["zstdmt", "experimental"] }
 # The exact pin is gone. Under the old 1.85 floor there was no choice: 0.9.0
 # declares `rust-version = "1.87"` and cargo refused it, and 0.8.2 declares no
 # `rust-version` at all while using a 1.87 stdlib method, so it built on a modern
