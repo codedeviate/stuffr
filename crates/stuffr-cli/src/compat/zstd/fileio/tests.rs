@@ -106,7 +106,7 @@ fn sparse_write(dir: &Dir, blocks: &[Vec<u8>]) -> (Vec<u8>, u64) {
         io.write_block(b).unwrap();
     }
     io.sparse_end().unwrap();
-    let (closed, _) = io.close_sink();
+    let (closed, _) = io.close_sink().unwrap();
     closed.unwrap();
     drop(io);
     assert!(err.is_empty());

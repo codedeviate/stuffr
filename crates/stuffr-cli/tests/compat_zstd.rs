@@ -1134,6 +1134,16 @@ mod unix {
         fs::set_permissions(d.join("u"), fs::Permissions::from_mode(0o000)).unwrap();
     }
 
+    fn mode_0444(d: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(d.join("a"), fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    fn zst_0400(d: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(d.join("a.zst"), fs::Permissions::from_mode(0o400)).unwrap();
+    }
+
     fn mode_0640(d: &Path) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(d.join("a"), fs::Permissions::from_mode(0o640)).unwrap();
@@ -1248,6 +1258,23 @@ mod unix {
             with_setup(with_files("zstd", &["a"], a()), mode_0640),
             with_setup(with_files("zstd", &["-o", "x", "a"], a()), mode_0640),
             with_setup(with_files("zstd", &["-c", "a"], a()), mode_0640),
+            // A read-only input: its mode reaches the output before the
+            // times do, which are still set (util.c's UTIL_utime is by
+            // path).
+            with_setup(with_files("zstd", &["-q", "a"], a()), mode_0444),
+            with_setup(with_files("zstd", &["a", "-o", "x"], a()), mode_0444),
+            with_setup(
+                with_files("zstd", &["-dq", "a.zst"], vec![("a.zst", packed(&[], &t))]),
+                zst_0400,
+            ),
+            with_setup(
+                with_files(
+                    "unzstd",
+                    &["a.zst", "-o", "x"],
+                    vec![("a.zst", packed(&[], &t))],
+                ),
+                zst_0400,
+            ),
         ];
         if !root {
             cases.push(with_setup(

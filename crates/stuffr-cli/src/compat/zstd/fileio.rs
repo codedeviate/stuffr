@@ -68,6 +68,8 @@ const CSTREAM_IN_SIZE: usize = BLOCKSIZE_MAX;
 pub(crate) const DSTREAM_IN_SIZE: usize = BLOCKSIZE_MAX + 3;
 /// `ZSTD_DStreamOutSize()`.
 pub(crate) const DSTREAM_OUT_SIZE: usize = BLOCKSIZE_MAX;
+/// `ZSTD_error_parameter_unsupported`.
+const PARAMETER_UNSUPPORTED: u32 = 40;
 /// `ZSTD_FRAMEHEADERSIZE_MAX`.
 const FRAMEHEADERSIZE_MAX: usize = 18;
 /// fileio.c: `DICTSIZE_MAX`.
@@ -447,7 +449,15 @@ impl<'a> Io<'a> {
     /// `CHECK`: a libzstd error is `EXM_THROW(11, ZSTD_getErrorName)`.
     fn check(&mut self, e: ZstdError) -> Thrown {
         match e {
-            ZstdError::Unsupported(_) => self.exm(1, m::PURE_NO_DICTIONARY, &[]),
+            // The pure tier's encoder with a dictionary or prefix (spec
+            // deviation 7).
+            ZstdError::Unsupported("dictionary") => self.exm(1, m::PURE_NO_DICTIONARY, &[]),
+            // Anything else a backend cannot do is libzstd's own answer
+            // for it, `parameter_unsupported`, through CHECK.
+            ZstdError::Unsupported(_) => {
+                let name = zstd_opts::error_name(PARAMETER_UNSUPPORTED);
+                self.exm(11, m::ERROR_NAME, &[name.as_bytes()])
+            }
             e => {
                 let name = e.to_string();
                 self.exm(11, m::ERROR_NAME, &[name.as_bytes()])
@@ -690,17 +700,21 @@ impl<'a> Io<'a> {
     /// `AIO_WritePool_closeFile`: the last skip, then the close (a flush for
     /// standard output). The sink becomes unset; a file's sink is returned
     /// for publishing.
-    fn close_sink(&mut self) -> (io::Result<()>, Option<Box<FileSink>>) {
-        let ended = self.sparse_end();
+    ///
+    /// The last skip's `EXM_THROW(69)` ends the run as zstd's `exit(69)`
+    /// does, the output left as written ([`Io::abandon_sink`]). Every frame
+    /// loop ends its own skip, so nothing is pending here in practice.
+    fn close_sink(&mut self) -> Fio<(io::Result<()>, Option<Box<FileSink>>)> {
+        if let Err(t) = self.sparse_end() {
+            self.abandon_sink();
+            return Err(t);
+        }
         let sink = std::mem::replace(&mut self.sink, Sink::Unset);
-        let (r, file) = match sink {
+        Ok(match sink {
             Sink::Unset => (Ok(()), None),
             Sink::Stdout => (self.out.flush(), None),
             Sink::File(mut f) => (f.w.flush(), Some(f)),
-        };
-        // A failed last skip has already thrown; the caller sees the close.
-        let _ = ended;
-        (r, file)
+        })
     }
 
     /// An `EXM_THROW` while a destination is open: zstd exits leaving the
@@ -911,7 +925,7 @@ impl<'a> Io<'a> {
         transfer: Option<&Metadata>,
         mut result: i32,
         trace_close: bool,
-    ) -> i32 {
+    ) -> Fio<i32> {
         let mut guard = None;
         if let Sink::File(f) = &mut self.sink {
             guard = f.guard.take();
@@ -929,13 +943,13 @@ impl<'a> Io<'a> {
         if trace_close {
             self.say(6, m::CLOSING_DST, &[&name]);
         }
-        let (closed, file) = self.close_sink();
+        let (closed, file) = self.close_sink()?;
         if let Err(e) = closed {
             self.say(1, m::NAME_ERRNO, &[&name, &strerror(&e)]);
             result = 1;
         }
         let Some(f) = file else {
-            return result;
+            return Ok(result);
         };
         let target = f.tmp.clone().unwrap_or_else(|| f.path.clone());
         if let Some(meta) = transfer {
@@ -950,7 +964,7 @@ impl<'a> Io<'a> {
                     let _ = self.remove_file(&name);
                 }
             }
-            return result;
+            return Ok(result);
         }
         if let Some(tmp) = &f.tmp
             && let Err(e) = host::publish(tmp, &f.path, true)
@@ -958,10 +972,10 @@ impl<'a> Io<'a> {
             let _ = fs::remove_file(tmp);
             drop(guard);
             self.say(1, m::NAME_ERRNO, &[&name, &strerror(&e)]);
-            return 1;
+            return Ok(1);
         }
         drop(guard);
-        result
+        Ok(result)
     }
 
     /// `FIO_multiFilesConcatWarning`: true to abort.
@@ -1124,14 +1138,58 @@ fn set_fd_stat(file: &File, meta: &Metadata) {
     }
 }
 
-/// `UTIL_utime`: the access time now, the modification time the input's.
+/// `UTIL_utime`, by path as util.c does it (a destination already given
+/// the input's mode, read-only included, is not opened again): the access
+/// time now, the modification time the input's. Where
+/// `PLATFORM_POSIX_VERSION` is 200809L (Linux, the BSDs), util.c uses
+/// `utimensat` with `UTIME_NOW` and `st_mtim`; on Apple's platforms
+/// (200112L) `utime`, whole seconds: `time(NULL)` and `st_mtime`. Failures
+/// are ignored, as zstd ignores them.
 fn set_times(path: &Path, meta: &Metadata) {
-    let mut times = fs::FileTimes::new().set_accessed(std::time::SystemTime::now());
-    if let Ok(t) = meta.modified() {
-        times = times.set_modified(t);
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
+        #[cfg(target_vendor = "apple")]
+        {
+            let buf = libc::utimbuf {
+                // SAFETY: time with a null pointer only returns the time.
+                actime: unsafe { libc::time(std::ptr::null_mut()) },
+                modtime: meta.mtime() as libc::time_t,
+            };
+            // SAFETY: `c` is a NUL-terminated path and `buf` a valid
+            // utimbuf; utime only reads them.
+            unsafe { libc::utime(c.as_ptr(), &buf) };
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let times = [
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_NOW,
+                },
+                libc::timespec {
+                    tv_sec: meta.mtime() as libc::time_t,
+                    tv_nsec: meta.mtime_nsec() as _,
+                },
+            ];
+            // SAFETY: `c` is a NUL-terminated path and `times` two valid
+            // timespecs; utimensat only reads them.
+            unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        }
     }
-    if let Ok(f) = File::options().write(true).open(path) {
-        let _ = f.set_times(times);
+    #[cfg(not(unix))]
+    {
+        let mut times = fs::FileTimes::new().set_accessed(std::time::SystemTime::now());
+        if let Ok(t) = meta.modified() {
+            times = times.set_modified(t);
+        }
+        if let Ok(f) = File::options().write(true).open(path) {
+            let _ = f.set_times(times);
+        }
     }
 }
 
@@ -1586,7 +1644,7 @@ impl Io<'_> {
             }
         };
         if close {
-            return Ok(self.release_dst(transfer, result, true));
+            return self.release_dst(transfer, result, true);
         }
         Ok(result)
     }
@@ -1681,7 +1739,7 @@ pub(crate) fn compress_files(
                 error |= status;
                 io.curr_file_idx += 1;
             }
-            let (closed, file) = io.close_sink();
+            let (closed, file) = io.close_sink()?;
             drop(file);
             if let Err(e) = closed {
                 return Err(io.exm(29, m::CLOSE_FAILED, &[&strerror(&e), out_name]));
@@ -2028,7 +2086,7 @@ impl Io<'_> {
             }
         };
         if release {
-            return Ok(self.release_dst(transfer, result, false));
+            return self.release_dst(transfer, result, false);
         }
         Ok(result)
     }
@@ -2099,7 +2157,7 @@ pub(crate) fn decompress_files(
             io.curr_file_idx += 1;
         }
         if !io.prefs.test_mode {
-            let (closed, file) = io.close_sink();
+            let (closed, file) = io.close_sink()?;
             drop(file);
             if let Err(e) = closed {
                 return Err(io.exm(72, m::CLOSE_OUTPUT_FAILED, &[&strerror(&e)]));
