@@ -475,6 +475,82 @@ fn frame_header_reads_zstd_and_skippable_frames() {
     }
 }
 
+/// `frame_header` is `ZSTD_getFrameHeader`: every frame descriptor byte,
+/// three window bytes, every length from 0 to the longest header, and
+/// skippable frames, against libzstd.
+#[cfg(feature = "zstd-c")]
+#[test]
+fn frame_header_agrees_with_libzstd() {
+    use zstd::zstd_safe::zstd_sys as sys;
+    let check = |src: &[u8]| {
+        let mut raw = std::mem::MaybeUninit::<sys::ZSTD_FrameHeader>::zeroed();
+        // SAFETY: `raw` is a writable `ZSTD_FrameHeader` and the pointer and
+        // length describe `src`.
+        let ret =
+            unsafe { sys::ZSTD_getFrameHeader(raw.as_mut_ptr(), src.as_ptr().cast(), src.len()) };
+        let ours = frame_header(src);
+        // SAFETY: zero-initialised, and a plain C struct of integers.
+        let theirs = unsafe { raw.assume_init() };
+        // SAFETY: `ZSTD_isError` only inspects the value.
+        if unsafe { sys::ZSTD_isError(ret) } != 0 {
+            let code = 0usize.wrapping_sub(ret) as u32;
+            assert_eq!(ours, Err(FrameHeaderError::Lib(code)), "{src:02x?}");
+        } else if ret > 0 {
+            assert_eq!(ours, Err(FrameHeaderError::Incomplete(ret)), "{src:02x?}");
+        } else if theirs.frameType == sys::ZSTD_FrameType_e::ZSTD_skippableFrame {
+            assert_eq!(
+                ours,
+                Ok(FrameHeader::Skippable {
+                    variant: u32::from(src[0] & 15),
+                    content_size: theirs.frameContentSize as u32,
+                }),
+                "{src:02x?}"
+            );
+        } else {
+            let unknown = theirs.frameContentSize == u64::MAX;
+            assert_eq!(
+                ours,
+                Ok(FrameHeader::Zstd {
+                    header_size: theirs.headerSize as usize,
+                    window_size: theirs.windowSize,
+                    content_size: (!unknown).then_some(theirs.frameContentSize),
+                    dict_id: theirs.dictID,
+                    checksum: theirs.checksumFlag != 0,
+                    single_segment: src[4] & 0x20 != 0,
+                }),
+                "{src:02x?}"
+            );
+        }
+    };
+    let tail = [
+        0x93u8, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc,
+    ];
+    for fhd in 0..=255u8 {
+        for window in [0u8, 0x2d, 0xf8] {
+            let mut data = vec![0x28, 0xb5, 0x2f, 0xfd, fhd, window];
+            data.extend_from_slice(&tail);
+            for len in 0..=data.len() {
+                check(&data[..len]);
+            }
+        }
+    }
+    for v in 0..16u8 {
+        let data = [0x50 + v, 0x2a, 0x4d, 0x18, 9, 0, 0, 0, 1];
+        for len in 0..=data.len() {
+            check(&data[..len]);
+        }
+    }
+    for bad in [
+        [0x28u8, 0xb5, 0x2f, 0xfe, 0, 0, 0, 0],
+        [0x4f, 0x2a, 0x4d, 0x18, 0, 0, 0, 0],
+        [0, 0, 0, 0, 0, 0, 0, 0],
+    ] {
+        for len in 0..=bad.len() {
+            check(&bad[..len]);
+        }
+    }
+}
+
 /// Values `ZSTD_getCParams` returns, read once from libzstd 1.5.7; the C
 /// tier checks the whole range in `default_cparams_match_getcparams`.
 #[test]

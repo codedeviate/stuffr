@@ -101,6 +101,7 @@ pub(crate) mod cli;
 pub(crate) mod display;
 pub(crate) mod fileio;
 mod formats;
+mod list;
 mod messages;
 pub(crate) mod util;
 
@@ -305,7 +306,7 @@ fn execute(cmd: &mut Command, host: &mut Host, out: &mut dyn Write, err: &mut dy
     }
 
     match cmd.op {
-        Operation::List => return clean(todo(err, "--list", "7")),
+        Operation::List => return clean(list::list_files(cmd, host, out, err)),
         Operation::Train => return clean(todo(err, "--train", "8")),
         Operation::Test => {
             cmd.prefs.test_mode = true;

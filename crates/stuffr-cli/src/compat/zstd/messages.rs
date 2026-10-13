@@ -873,6 +873,126 @@ pub(super) const READ_ERROR: &str = "Read error";
 /// (`%s`: the operation, then the task that brings it).
 pub(super) const TODO: &str = "todo: zstd %s is not implemented yet (0.14.0 Task %s)\n";
 
+// ---- fileio.c: --list (list.rs) ----
+//
+// The `ERROR_IF` messages are printed at display level 1 followed by
+// `" \n"`, which each constant below carries. The rows are `displayInfo`'s
+// and `FIO_listMultipleFiles`'s formats with their numbers already padded
+// by the caller (`%6d`, `%5d`, `%6.*f%4s`, `%8.*f%4s`, `%5.3f`, `%5s`).
+
+/// fileio.c: FIO_listMultipleFiles (`ERROR_IF(…, 1, …)` for a `-` operand,
+/// and `DISPLAYLEVEL(1, …)` for no operand at all).
+pub(super) const LIST_NO_STDIN: &str =
+    "zstd: --list does not support reading from standard input \n";
+
+/// fileio.c: FIO_listMultipleFiles.
+pub(super) const LIST_NO_FILES: &str = "No files given \n";
+
+/// fileio.c: FIO_listMultipleFiles (display level 2 and below).
+pub(super) const LIST_HEADER: &str =
+    "Frames  Skips  Compressed  Uncompressed  Ratio  Check  Filename\n";
+
+/// fileio.c: displayInfo (level 2 and below): frames, skips, compressed
+/// value and suffix, decompressed value and suffix, ratio, check, name.
+pub(super) const LIST_ROW: &str = "%s  %s  %s%s  %s%s  %s  %s  %s\n";
+
+/// fileio.c: displayInfo, the decompressed size unavailable: frames, skips,
+/// compressed value and suffix, check, name.
+pub(super) const LIST_ROW_NO_DECOMP: &str = "%s  %s  %s%s                       %s  %s\n";
+
+/// fileio.c: FIO_listMultipleFiles, above the totals.
+pub(super) const LIST_RULE: &str =
+    "----------------------------------------------------------------- \n";
+
+/// fileio.c: FIO_listMultipleFiles, the totals row (as [`LIST_ROW`], with
+/// the file count in place of the name).
+pub(super) const LIST_TOTAL: &str = "%s  %s  %s%s  %s%s  %s  %s  %s files\n";
+
+/// fileio.c: FIO_listMultipleFiles, the totals row without the
+/// decompressed size (as [`LIST_ROW_NO_DECOMP`]).
+pub(super) const LIST_TOTAL_NO_DECOMP: &str = "%s  %s  %s%s                       %s  %s files\n";
+
+/// fileio.c: displayInfo (level 3 and above).
+pub(super) const LIST_V_NAME: &str = "%s \n";
+
+/// fileio.c: displayInfo.
+pub(super) const LIST_V_FRAMES: &str = "# Zstandard Frames: %s\n";
+
+/// fileio.c: displayInfo.
+pub(super) const LIST_V_SKIPPABLE: &str = "# Skippable Frames: %s\n";
+
+/// fileio.c: displayInfo.
+pub(super) const LIST_V_DICTID: &str = "DictID: %s\n";
+
+/// fileio.c: displayInfo: the scaled value and suffix, then the bytes.
+pub(super) const LIST_V_WINDOW: &str = "Window Size: %s%s (%s B)\n";
+
+/// fileio.c: displayInfo.
+pub(super) const LIST_V_COMPRESSED: &str = "Compressed Size: %s%s (%s B)\n";
+
+/// fileio.c: displayInfo.
+pub(super) const LIST_V_DECOMPRESSED: &str = "Decompressed Size: %s%s (%s B)\n";
+
+/// fileio.c: displayInfo (`%.4f`).
+pub(super) const LIST_V_RATIO: &str = "Ratio: %s\n";
+
+/// fileio.c: displayInfo, one frame with a checksum: the name and the
+/// four bytes in hex, most significant first.
+pub(super) const LIST_V_CHECK_VALUE: &str = "Check: %s %s\n";
+
+/// fileio.c: displayInfo.
+pub(super) const LIST_V_CHECK: &str = "Check: %s\n";
+
+/// fileio.c: displayInfo, the blank line after each file's block.
+pub(super) const LIST_V_END: &str = "\n";
+
+/// fileio.c: FIO_analyzeFrames, `DISPLAY` (any level, no newline).
+pub(super) const LIST_DICTID_WARNING: &str = "WARNING: File contains multiple frames with different dictionary IDs. Showing dictID 0 instead";
+
+/// fileio.c: FIO_listFile (`info_frame_error`).
+pub(super) const LIST_PARSE_ERROR: &str = "Error while parsing \"%s\" \n";
+
+/// fileio.c: FIO_listFile (`info_not_zstd`, standard output).
+pub(super) const LIST_NOT_ZSTD: &str = "File \"%s\" not compressed by zstd \n";
+
+/// fileio.c: FIO_listFile (`info_truncated_input`, standard output).
+pub(super) const LIST_TRUNCATED: &str = "File \"%s\" is truncated \n";
+
+/// fileio.c: getFileInfo.
+pub(super) const LIST_NOT_A_FILE: &str = "Error : %s is not a file \n";
+
+/// fileio.c: getFileInfo_fileConfirmed.
+pub(super) const LIST_CANT_OPEN: &str = "Error: could not open source file %s \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_BEYOND_END: &str =
+    "Error: seeked to position %s, which is beyond file size of %s\n \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_INCOMPLETE: &str = "Error: reached end of file with incomplete frame \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_OUT_OF_FRAMES: &str =
+    "Error: did not reach end of file but ran out of frames \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_HEADER_UNDECODABLE: &str = "Error: could not decode frame header \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_BLOCK_HEADER: &str = "Error while reading block header \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_BLOCK_TYPE: &str = "Error: unsupported block type \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_BLOCK_SKIP: &str = "Error: could not skip to end of block \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_CHECKSUM: &str = "Error: could not read checksum \n";
+
+/// fileio.c: FIO_analyzeFrames.
+pub(super) const LIST_SKIPPABLE_END: &str = "Error: could not find end of skippable frame \n";
+
 // ---- fileio.c: the gzip, xz, lzma and lz4 frames (formats.rs) ----
 
 /// fileio.c: FIO_compressGzFrame, `deflateInit2` refusing the level
