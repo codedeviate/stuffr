@@ -522,6 +522,7 @@ fn a_nightly_pack_whose_directory_holds_only_its_own_archive_is_refused() {
 /// from its plan, exactly as the case above does — but a symlink is real
 /// content, its target is what gets stored, and an archive of symlinks is a
 /// legitimate thing to want. Only a plan reduced to pure structure is a shell.
+#[cfg(unix)]
 #[test]
 fn a_tree_whose_only_content_is_a_symlink_still_packs_with_the_output_excluded() {
     let dir = tmp_dir();

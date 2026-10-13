@@ -1211,6 +1211,7 @@ fn examples_pages_first_worked_example_runs_as_documented() {
 /// the wrong exit code for some other refusal is still unchecked prose. The
 /// class is cheap to extend one measured case at a time; it is not a general
 /// executable-docs harness and does not pretend to be.
+#[cfg(unix)]
 #[test]
 fn a_symlink_in_a_walked_tree_is_never_refused_and_the_page_may_not_say_it_is() {
     let dir = tmp("examples-symlink-verdict");

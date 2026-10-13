@@ -2079,6 +2079,7 @@ mod tests {
     /// symlink on disk, via `find | cpio -o -H newc`) must read back through
     /// this container as `EntryKind::Symlink` with the exact target — not
     /// `Other`, and not a file holding the target string as file contents.
+    #[cfg(unix)]
     #[test]
     fn we_accept_a_symlink_system_cpio_writes() {
         let cpio_bin = require_bin("cpio");

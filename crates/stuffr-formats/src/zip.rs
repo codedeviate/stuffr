@@ -4724,6 +4724,7 @@ PK\x03\x04\x14\x00\x00\x00\x0e\x00\x00\x00\x00\x00\x00\x00\x00\x00\
     /// The read direction, against a real archive Info-ZIP `zip` wrote from
     /// real files — including a directory entry and a genuine symlink, the two
     /// shapes a container gets wrong most easily.
+    #[cfg(unix)]
     #[test]
     fn we_read_what_system_zip_writes() {
         let zip_bin = require_bin("zip");
