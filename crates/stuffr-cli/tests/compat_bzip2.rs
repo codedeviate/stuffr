@@ -1404,6 +1404,7 @@ mod interrupts {
 
     #[test]
     fn bzip2_answers_int_term_and_hup() {
+        let _serial = interrupt_lock();
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             for mine in [true, false] {
                 if let Some(r) = run(mine, &format!("s{sig}"), &["a"], Inherit::Default, sig) {
@@ -1415,6 +1416,7 @@ mod interrupts {
 
     #[test]
     fn bzip2_catches_int_even_when_ignored() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             if let Some(r) = run(mine, "ign", &["a"], Inherit::IgnoreInt, libc::SIGINT) {
                 check(&r, CAUGHT, &["a"], &format!("mine={mine}"));
@@ -1424,6 +1426,7 @@ mod interrupts {
 
     #[test]
     fn bzip2_quiet_drops_the_deleting_line() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             if let Some(r) = run(mine, "q", &["-q", "a"], Inherit::Default, libc::SIGINT) {
                 check(&r, CAUGHT_NO_OUTPUT, &["a"], &format!("mine={mine}"));
@@ -1433,6 +1436,7 @@ mod interrupts {
 
     #[test]
     fn bzip2_decompression_is_interrupted_too() {
+        let _serial = interrupt_lock();
         // A big .bz2 of zeros: cheap to make, a long decode.
         for mine in [true, false] {
             let dir = scratch(&format!("d-{}", if mine { "ours" } else { "ref" }));
@@ -1478,6 +1482,7 @@ mod interrupts {
     /// copy is interruptible too, and its output deleted.
     #[test]
     fn bzip2_force_copy_of_a_non_bzip2_file_is_interrupted() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             let dir = scratch(&format!("cat-{}", if mine { "ours" } else { "ref" }));
             let Some(exe) = (if mine {
@@ -1519,6 +1524,7 @@ mod interrupts {
 
     #[test]
     fn bzip2_counts_the_files_not_processed() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             let dir = scratch(&format!("two-{}", if mine { "ours" } else { "ref" }));
             let Some(exe) = (if mine {
@@ -1573,6 +1579,7 @@ mod interrupts {
     /// over a larger input.
     #[test]
     fn bzip2_test_mode_is_interrupted_without_deleting() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             let dir = scratch(&format!("t-{}", if mine { "ours" } else { "ref" }));
             let Some(exe) = (if mine {
@@ -1613,23 +1620,29 @@ mod interrupts {
     }
 
     /// Four times `mib` MiB of zeros as a `.bz2` (decoding is fast, so the
-    /// stream has to be long), made by stuffr's own bzip2 -1.
+    /// stream has to be long): 4 MiB of zeros compressed once by stuffr's
+    /// own bzip2 -1 (a debug-build encode of all of it took ~19 s per call),
+    /// then repeated `mib` times as concatenated streams, which every bzip2
+    /// reads as one input.
     fn zeros_bz2(mib: usize) -> Vec<u8> {
-        let mib = mib * 4;
-        let dir = scratch(&format!("mk-{mib}-{:?}", std::thread::current().id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("z"), vec![0u8; mib << 20]).unwrap();
-        let out = super::compat_harness::output(
-            Command::new(ours())
-                .arg0("bzip2")
-                .args(["-1", "-c", "z"])
-                .current_dir(&dir)
-                .stdin(Stdio::null()),
-        )
-        .unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.status.success());
-        out.stdout
+        static UNIT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        let unit = UNIT.get_or_init(|| {
+            let dir = scratch(&format!("mk-{:?}", std::thread::current().id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("z"), vec![0u8; 4 << 20]).unwrap();
+            let out = super::compat_harness::output(
+                Command::new(ours())
+                    .arg0("bzip2")
+                    .args(["-1", "-c", "z"])
+                    .current_dir(&dir)
+                    .stdin(Stdio::null()),
+            )
+            .unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(out.status.success());
+            out.stdout
+        });
+        unit.repeat(mib)
     }
 }

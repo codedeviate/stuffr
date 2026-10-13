@@ -4,7 +4,7 @@
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 pub struct Interrupted {
@@ -22,11 +22,33 @@ pub enum Inherit {
     IgnoreInt,
 }
 
-/// A shared incompressible input of `mib` MiB, built once per process.
+/// A shared incompressible input of `mib` MiB, built once per process: one
+/// random 4 MiB block repeated. The repeat distance is far beyond gzip's
+/// 32 KiB window and bzip2's 900 KB blocks, so it stays incompressible to
+/// both, and building it costs a fraction of 256 MiB of `random()` in a
+/// debug build.
 pub fn big_input(mib: usize) -> &'static [u8] {
     static BIG: OnceLock<Vec<u8>> = OnceLock::new();
-    let v = BIG.get_or_init(|| super::random(256 << 20, 0x5157_0013));
+    const BLOCK: usize = 4 << 20;
+    let v = BIG.get_or_init(|| {
+        let block = super::random(BLOCK, 0x5157_0013);
+        let mut v = Vec::with_capacity(256 << 20);
+        while v.len() < 256 << 20 {
+            v.extend_from_slice(&block);
+        }
+        v
+    });
     &v[..mib << 20]
+}
+
+static INTERRUPT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Held for a whole interrupt test, so at most one runs at a time in a test
+/// binary: each writes up to 256 MiB and spawns a debug-build run beside the
+/// reference, which starves the timed differential cases on a small runner.
+/// Taken before (never inside) the harness's `spawn_lock`.
+pub fn interrupt_lock() -> MutexGuard<'static, ()> {
+    INTERRUPT_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The input size for a case that is fast per byte (a near-stored decompress,

@@ -2281,6 +2281,7 @@ mod interrupts {
 
     #[test]
     fn apple_gzip_removes_its_partial_output_on_int() {
+        let _serial = interrupt_lock();
         let plain = |m: usize| big_input(m).to_vec();
         let gz = |m: usize| stored_gzip(big_input(fast_size(m)));
         for mine in [true, false] {
@@ -2314,6 +2315,7 @@ mod interrupts {
 
     #[test]
     fn apple_gzip_leaves_its_partial_output_on_term() {
+        let _serial = interrupt_lock();
         let plain = |m: usize| big_input(m).to_vec();
         for mine in [true, false] {
             let Some(r) = run(
@@ -2336,6 +2338,7 @@ mod interrupts {
 
     #[test]
     fn apple_gzip_keeps_an_inherited_ignored_int() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             let (exe, env) = if mine {
                 (ours().to_path_buf(), ENV)

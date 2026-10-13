@@ -2616,6 +2616,7 @@ mod interrupts {
 
     #[test]
     fn gnu_gzip_removes_its_partial_output_on_its_signals() {
+        let _serial = interrupt_lock();
         for sig in [
             libc::SIGINT,
             libc::SIGTERM,
@@ -2644,6 +2645,7 @@ mod interrupts {
 
     #[test]
     fn gnu_gzip_leaves_its_partial_output_on_quit() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             let Some(r) = run(
                 mine,
@@ -2668,6 +2670,7 @@ mod interrupts {
 
     #[test]
     fn gnu_gunzip_removes_its_partial_output_on_int() {
+        let _serial = interrupt_lock();
         let gz = |m: usize| stored_gzip(big_input(fast_size(m)));
         for mine in [true, false] {
             let Some(r) = run(
@@ -2689,6 +2692,7 @@ mod interrupts {
 
     #[test]
     fn gnu_gzip_keeps_an_inherited_ignored_int() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             let tag = format!("ign-{}", if mine { "ours" } else { "ref" });
             let dir = scratch(&tag);
@@ -2730,6 +2734,7 @@ mod interrupts {
     /// at once: the run dies of it and the input stays.
     #[test]
     fn gnu_gzip_to_stdout_dies_of_int() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             let dir = scratch(&format!("stdout-{}", if mine { "ours" } else { "ref" }));
             let (exe, env) = if mine {
@@ -2760,6 +2765,7 @@ mod interrupts {
     /// interrupted.
     #[test]
     fn gnu_gzip_second_file_interrupted_keeps_the_first() {
+        let _serial = interrupt_lock();
         for mine in [true, false] {
             let dir = scratch(&format!("second-{}", if mine { "ours" } else { "ref" }));
             let (exe, env) = if mine {
