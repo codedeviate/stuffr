@@ -131,14 +131,14 @@ impl Drop for CleanupGuard {
 /// re-raised at its default action, so the process dies of it, as xz does
 /// (signals.c: `signal_handler`, `signals_exit`).
 ///
-/// Arm through `create_temp_armed`, which leaves no unarmed window. Under `Host::Sandbox` nothing
-/// is armed and no handler installed. A path the slot cannot hold (or one
+/// Arm through `create_temp_armed`, which leaves no unarmed window. Under
+/// `Host::Sandbox` nothing is armed and no handler installed. A path the slot cannot hold (or one
 /// with a NUL) is not armed. Arming never allocates. Call `reset_sigpipe()`
 /// first, or SIGPIPE stays ignored and unhooked (see `XZ_SIGNALS`). The
 /// signals are the family's (`XZ_SIGNALS`, `GNU_GZIP_SIGNALS`,
 /// `APPLE_GZIP_SIGNALS`); a process runs one family, so one set is installed.
-/// One arm at a time: arm the temporary right after `create_temp`, and keep
-/// the guard no longer than that run's scope (before arming another). A
+/// One arm at a time: keep the guard `create_temp_armed` returns no longer
+/// than that run's scope (before arming another). A
 /// caller may hold it to the end of its function: once the temporary is
 /// published or removed its unique name no longer exists, so a late signal
 /// unlinks nothing, and no second arm is made in that scope.
@@ -1334,7 +1334,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The child's exit code for `create_temp_armed`'s checks: 0 all held.
+    /// The calling thread's current signal mask.
     #[cfg(unix)]
     fn current_mask() -> libc::sigset_t {
         // SAFETY: a query (null new set) into a zeroed out-parameter.

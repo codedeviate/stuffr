@@ -2541,6 +2541,8 @@ mod differential {
                 match *file {
                     "cat.gz" | "cat2.gz" => g_rows.push((Since::MultiMember, c)),
                     "empty.gz" | "ebody.gz" => g_rows.push((Since::InfRatio, c)),
+                    // A single non-empty member (fields.gz, badhcrc.gz) is
+                    // unchanged by NEWS rows 1 and 9; CI's 1.12 and 1.14 agree.
                     _ => cases.push(c),
                 }
             }

@@ -163,20 +163,39 @@ const TAR_SUFFIXES: &[&str] = &[".tbz2", ".tbz", ".tgz", ".taz", ".txz", ".tlz"]
 /// check (where it has to admit every output a run may legitimately leave,
 /// Apple's kept partial outputs included).
 fn could_be_written(name: &str) -> bool {
+    could_be_written_with(name, false)
+}
+
+/// `could_be_written`, with the name and every table name compared
+/// lowercased: a case-insensitive filesystem opens `a.xz` for `A.XZ`.
+fn could_be_written_folded(name: &str) -> bool {
+    could_be_written_with(name, true)
+}
+
+fn could_be_written_with(name: &str, fold: bool) -> bool {
+    let key = |s: &str| {
+        if fold {
+            s.to_ascii_lowercase()
+        } else {
+            s.to_owned()
+        }
+    };
+    let name = key(name);
+    let name = name.as_str();
     let affixes = || SUFFIXES.iter().chain(COMPAT_TOKENS);
     let mut bases: Vec<String> = Vec::new();
     for f in COMPAT_FILES {
-        bases.push((*f).to_owned());
+        bases.push(key(f));
         for s in affixes() {
             // A token equal to the whole name (`a`, `a.gz`) strips to
             // nothing, which is no base: it would admit every affix alone.
             if let Some(stem) = f.strip_suffix(s).filter(|stem| !stem.is_empty()) {
-                bases.push(stem.to_owned());
+                bases.push(key(stem));
             }
         }
         for t in TAR_SUFFIXES {
             if let Some(stem) = f.strip_suffix(t) {
-                bases.push(format!("{stem}.tar"));
+                bases.push(key(&format!("{stem}.tar")));
             }
         }
     }
@@ -190,7 +209,7 @@ fn could_be_written(name: &str) -> bool {
             name == b
                 || name
                     .strip_prefix(b.as_str())
-                    .is_some_and(|rest| affixes().any(|s| *s == rest))
+                    .is_some_and(|rest| affixes().any(|s| key(s) == rest))
         })
 }
 
@@ -805,9 +824,7 @@ fn check_xz_leftovers(dir: &Path, name: &str, args: &[&str]) {
         );
         assert!(
             could_be_written(&n)
-                || (case_insensitive_fs()
-                    && !n.contains('/')
-                    && could_be_written(&n.to_ascii_lowercase())),
+                || (case_insensitive_fs() && !n.contains('/') && could_be_written_folded(&n)),
             "{name} {args:?}: left a stray {n:?}"
         );
     }
