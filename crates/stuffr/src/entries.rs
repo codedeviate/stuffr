@@ -1360,19 +1360,22 @@ fn extract_hard_link(
                 refuse_symlinked_ancestors(dest, target_path, link_to)
             {
                 // The directory is named relative to the destination, as the
-                // archive would spell it; the target itself if the walk finds
-                // none (a target outside `dest`, which cannot happen here).
-                let dir = target_path
+                // archive would spell it. If the second walk finds none (a
+                // symlink removed in between), say so without naming one.
+                let reason = match target_path
                     .strip_prefix(dest)
                     .ok()
                     .and_then(|rel| first_symlinked_ancestor(dest, rel))
-                    .map_or_else(|| link_to.to_string(), |d| d.to_string_lossy().into_owned());
+                {
+                    Some(d) => format!(
+                        "a directory in its hard-link target's path (`{}`) is a symlink",
+                        stuffr_core::fmt_name(&d.to_string_lossy())
+                    ),
+                    None => "a directory in its hard-link target's path is a symlink".to_string(),
+                };
                 return Err(Error::UnsafePath {
                     path: meta.name.clone(),
-                    reason: format!(
-                        "a directory in its hard-link target's path (`{}`) is a symlink",
-                        stuffr_core::fmt_name(&dir)
-                    ),
+                    reason,
                 });
             }
             // Belt and braces on the map: the target must still be the

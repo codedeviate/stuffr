@@ -324,7 +324,10 @@ pub fn classify_symlink_target(
     // Closing only the half the review measured would leave the class open
     // through a door two lines away.
     if target.contains('\0') {
-        return Err(refuse("symlink target contains a NUL byte".to_string()));
+        return Err(refuse(format!(
+            "symlink target `{}` contains a NUL byte",
+            crate::display::fmt_name(target)
+        )));
     }
     // An empty target names nothing and has no components, so every rule
     // below would accept it — and `symlink(2)` on Linux answers ENOENT,
@@ -336,7 +339,10 @@ pub fn classify_symlink_target(
     // Checked before the walk purely so the reason names symlinks — the
     // walk's own `RootDir` arm would refuse it anyway.
     if target_path.is_absolute() {
-        return Err(refuse("absolute symlink target".to_string()));
+        return Err(refuse(format!(
+            "symlink target `{}` is absolute",
+            crate::display::fmt_name(target)
+        )));
     }
 
     let parent = link_path.parent().unwrap_or(dest);
@@ -570,7 +576,8 @@ mod tests {
         match super::check_symlink_target(dest, &dest.join("sub/link"), "tar\0get") {
             Err(Error::UnsafePath { path, reason }) => {
                 assert_eq!(path, "tar\0get");
-                assert_eq!(reason, "symlink target contains a NUL byte");
+                assert_eq!(reason, "symlink target `tar\\0get` contains a NUL byte");
+                assert!(!reason.contains('\0'), "raw NUL leaked");
             }
             other => panic!("expected UnsafePath, got {other:?}"),
         }
@@ -699,12 +706,12 @@ mod tests {
             (
                 dest.join("l"),
                 "/etc/passwd",
-                "absolute symlink target".to_string(),
+                "symlink target `/etc/passwd` is absolute".to_string(),
             ),
             (
                 dest.join("l"),
                 "a\0/..",
-                "symlink target contains a NUL byte".to_string(),
+                "symlink target `a\\0/..` contains a NUL byte".to_string(),
             ),
         ] {
             match super::classify_symlink_target(dest, &link, "the/entry", target) {

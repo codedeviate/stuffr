@@ -1854,7 +1854,10 @@ fn a_symlink_target_climbing_through_another_link_is_skipped() {
 #[test]
 fn an_escaping_symlink_target_is_refused_naming_the_entry() {
     for (target, reason) in [
-        ("/etc/passwd", "absolute symlink target".to_string()),
+        (
+            "/etc/passwd",
+            "symlink target `/etc/passwd` is absolute".to_string(),
+        ),
         (
             "../../..",
             "symlink target `../../..` climbs out of the destination".to_string(),
