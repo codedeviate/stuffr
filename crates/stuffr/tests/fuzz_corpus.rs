@@ -2314,6 +2314,21 @@ fn hardlink_cpio_seed() -> Vec<u8> {
     c
 }
 
+/// A newc cpio whose hard-link groups target the EMPTY name (0.14.0 deep
+/// fuzz): a data-last group whose data member is named `""`, and an
+/// all-empty group whose first name is `""`. tar cannot store a link to the
+/// empty name, so the convert oracle's links must arrive as named skips.
+fn empty_target_cpio_seed() -> Vec<u8> {
+    let mut c = Vec::new();
+    c.extend(seed_newc_member("grp/a", 7, 3, b""));
+    c.extend(seed_newc_member("grp/b", 7, 3, b""));
+    c.extend(seed_newc_member("", 7, 3, b"group payload\n"));
+    c.extend(seed_newc_member("", 9, 2, b""));
+    c.extend(seed_newc_member("empty/b", 9, 2, b""));
+    c.extend(seed_newc_member("TRAILER!!!", 0, 1, b""));
+    c
+}
+
 /// Path-conflict tars (0.10.1): each archive contradicts itself on disk, the
 /// shapes `place_entry` turns into named skips and the `container` target's
 /// extract leg checks. `(file stem, bytes)`.
@@ -2412,6 +2427,11 @@ fn extra_container_seeds() -> Vec<(&'static str, &'static str, Vec<u8>)> {
     vec![
         ("tar-hardlinks", "tar", hardlink_tar_seed()),
         ("cpio-hardlinks", "cpio", hardlink_cpio_seed()),
+        (
+            "cpio-hardlink-empty-target",
+            "cpio",
+            empty_target_cpio_seed(),
+        ),
         ("tar-escaped-names", "tar", escaped_name_tar_seed()),
     ]
     .into_iter()
@@ -2988,6 +3008,17 @@ fn the_link_and_escape_seeds_read_as_what_they_claim() {
     // The data-last group's earlier names and the all-empty group's second
     // name are links (the data holder / first empty name stays a file).
     assert_eq!(links(&cpio), ["grp/a", "grp/b", "empty/b"], "{cpio:?}");
+
+    // Every link of the empty-target seed names the empty name.
+    let empty = list("z", "cpio", empty_target_cpio_seed());
+    assert_eq!(links(&empty), ["grp/a", "grp/b", "empty/b"], "{empty:?}");
+    assert!(
+        empty.iter().all(|m| match &m.kind {
+            stuffr_core::EntryKind::Hardlink { target } => target.is_empty(),
+            _ => true,
+        }),
+        "{empty:?}"
+    );
 
     let esc = list("e", "tar", escaped_name_tar_seed());
     assert!(

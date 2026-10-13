@@ -1263,6 +1263,18 @@ impl ArchiveWrite for TarWrite {
         if let EntryKind::Symlink { target } | EntryKind::Hardlink { target } = &meta.kind {
             refuse_nul("link target", target)?;
         }
+        // An empty link name is how a link naming NOTHING reads: this
+        // module's own reader refuses it (`refuse_corrupt_hard_link`, exit
+        // 5), so writing one would produce a tar stuffr cannot read back.
+        if let EntryKind::Hardlink { target } = &meta.kind
+            && target.is_empty()
+        {
+            return Err(Error::Unsupported(format!(
+                "tar cannot store hard link `{}`: its target is the empty name, and an \
+                 empty link name in tar names no target",
+                meta.name
+            )));
+        }
         let builder = self.builder()?;
 
         // GNU headers so long names and large sizes work without the caller
@@ -1884,6 +1896,31 @@ mod tests {
             .expect_err("a NUL target must be refused");
         assert!(matches!(err, stuffr_core::Error::Unsupported(_)), "{err:?}");
         assert_eq!(err.exit_code(), 3);
+    }
+
+    /// The reader refuses a link with an empty link name as naming no
+    /// target (exit 5), so the writer must never produce one: a cpio link
+    /// group whose data member has an empty name reached it through
+    /// `convert` (0.14.0 deep fuzz).
+    #[test]
+    fn a_hard_link_to_the_empty_name_is_refused() {
+        let buf = SharedBuf::new();
+        let mut w = Tar
+            .create(
+                PlainSink::new(Box::new(buf.clone())),
+                &CreateOpts::default(),
+            )
+            .unwrap();
+        let mut a = EntryMeta::file("grp/a");
+        a.kind = EntryKind::Hardlink {
+            target: String::new(),
+        };
+        let err = w
+            .add(&a, &mut std::io::empty())
+            .expect_err("an empty hard-link target must be refused");
+        assert!(matches!(err, stuffr_core::Error::Unsupported(_)), "{err:?}");
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("grp/a"), "{err}");
     }
 
     fn which(bin: &str) -> Option<std::path::PathBuf> {

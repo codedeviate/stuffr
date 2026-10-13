@@ -1448,6 +1448,63 @@ fn a_cpio_link_to_a_nul_named_target_is_skipped_into_tar() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The empty-name case (0.14.0 deep fuzz): a cpio group whose data member
+/// has the EMPTY name. The member itself is a file tar can hold, but a link
+/// to it would carry an empty link name, which tar reads as naming no
+/// target: written, the tar was one stuffr's own reader refused at exit 5.
+/// Both links are skipped and named; the produced tar reads back. The
+/// all-empty layout reaches the same shape through the trailer flush, whose
+/// first name becomes the target.
+#[cfg(feature = "cpio")]
+#[test]
+fn a_cpio_link_to_the_empty_name_is_skipped_into_tar_and_reads_back() {
+    let dir = tmp_dir();
+    for (case, data) in [("data-last", &b"group payload\n"[..]), ("all-empty", b"")] {
+        let src = dir.join(format!("{case}.cpio"));
+        let mut bytes = Vec::new();
+        if data.is_empty() {
+            newc_member(&mut bytes, "", 7, 3, b"");
+            newc_member(&mut bytes, "grp/a", 7, 3, b"");
+            newc_member(&mut bytes, "grp/b", 7, 3, b"");
+        } else {
+            newc_member(&mut bytes, "grp/a", 7, 3, b"");
+            newc_member(&mut bytes, "grp/b", 7, 3, b"");
+            newc_member(&mut bytes, "", 7, 3, data);
+        }
+        newc_member(&mut bytes, "p", 8, 1, b"plain");
+        newc_member(&mut bytes, "TRAILER!!!", 0, 1, b"");
+        std::fs::write(&src, bytes).unwrap();
+        let out = dir.join(format!("{case}.tar"));
+        let outcome = convert(&src, &out, "tar", &ConvertOpts::default());
+        let skipped = skips(&outcome.fidelity.warnings);
+        let reason = "its hard-link target is the empty name, which `tar` cannot store as a link";
+        assert_eq!(
+            skipped,
+            [
+                ("grp/a".to_string(), reason.to_string()),
+                ("grp/b".to_string(), reason.to_string()),
+            ],
+            "{case}"
+        );
+        // Read back by stuffr's own tar reader: no link names the empty name.
+        let got = entries_of(&out);
+        assert!(
+            got.iter()
+                .all(|(_, kind, _)| !matches!(kind, EntryKind::Hardlink { .. })),
+            "{case}: {got:?}"
+        );
+        assert!(
+            got.contains(&(String::new(), EntryKind::File, data.to_vec())),
+            "{case}: {got:?}"
+        );
+        assert!(
+            got.contains(&("p".to_string(), EntryKind::File, b"plain".to_vec())),
+            "{case}: {got:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// cpio into tar: the target stores links, so the group stays a group.
 #[cfg(feature = "cpio")]
 #[test]

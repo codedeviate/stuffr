@@ -4359,7 +4359,10 @@ pub fn convert_archive_source_with(
 ///
 /// - **Into a target that stores links** (tar), a link is written as a link
 ///   only when its target was written by this run; otherwise it is skipped
-///   ([`hard_link_reason_not_written`]), never stored dangling.
+///   ([`hard_link_reason_not_written`]), never stored dangling. A link whose
+///   target is the empty name is skipped by the plan
+///   ([`hard_link_reason_empty_target`]): tar reads an empty link name as
+///   naming no target.
 /// - **Into any other target**, a link is written as a regular file holding
 ///   exactly its target's bytes, from `links`, which keeps the payloads it
 ///   wants while they stream into the archive. The copy is charged to
@@ -4983,6 +4986,18 @@ fn plan_entry_write(
             });
             WritePlan::Skip
         }
+        // A stored link names its target, and an empty name names nothing:
+        // tar reads a link whose target is empty as corrupt, and its writer
+        // refuses one. A cpio link group whose data member has an empty name
+        // yields it. The writer would refuse it anyway; failing the whole
+        // conversion over one entry is the outcome this function avoids.
+        EntryKind::Hardlink { target } if caps.stores_hardlinks && target.is_empty() => {
+            warnings.push(Fidelity::EntrySkipped {
+                entry: meta.name.clone(),
+                reason: hard_link_reason_empty_target(container),
+            });
+            WritePlan::Skip
+        }
         // Stored as a link; `convert_entries` still skips one whose target
         // this run did not write.
         EntryKind::Hardlink { .. } if caps.stores_hardlinks => WritePlan::Write,
@@ -5134,6 +5149,12 @@ fn hard_link_reason_symlink(container: FormatId, target: &str) -> String {
 /// as above.
 fn hard_link_reason_not_written(target: &str) -> String {
     format!("its hard-link target `{target}` was not written")
+}
+
+/// Why `convert` skips a hard link whose target is the empty name, into a
+/// container that stores links: an empty link target names no target there.
+fn hard_link_reason_empty_target(container: FormatId) -> String {
+    format!("its hard-link target is the empty name, which `{container}` cannot store as a link")
 }
 
 /// Why `unpack` skips a hard link whose target it could not read to copy,
@@ -7138,6 +7159,10 @@ mod tests {
         assert_eq!(
             hard_link_reason_not_written("t"),
             "its hard-link target `t` was not written"
+        );
+        assert_eq!(
+            hard_link_reason_empty_target(FormatId::new("tar")),
+            "its hard-link target is the empty name, which `tar` cannot store as a link"
         );
         assert_eq!(
             hard_link_reason_directory("d"),
