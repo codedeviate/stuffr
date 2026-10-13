@@ -5505,18 +5505,36 @@ struct MadeByRun {
     ids: HashSet<(u64, u64)>,
     /// Identity -> the recorded keys holding it, for [`archived_spelling`]
     /// (Self::archived_spelling): a short list per inode, never a scan of `at`.
-    by_id: HashMap<(u64, u64), Vec<PathBuf>>,
+    by_id: HashMap<(u64, u64), HashSet<PathBuf>>,
 }
 
-/// Whether two names differ only as a case or Unicode-normalisation fold
-/// would: equal once lowercased, or differing where a combining mark
-/// (U+0300..U+036F, so an NFD spelling) is present on either side. A cheap
-/// stand-in for a full NFC fold (no normalisation table in this crate); it
-/// only ever gates wording.
-fn names_fold_together(a: &str, b: &str) -> bool {
-    let combining = |s: &str| s.chars().any(|c| ('\u{300}'..='\u{36f}').contains(&c));
-    a.to_lowercase() == b.to_lowercase() || combining(a) || combining(b)
+/// A name reduced to what a case or Unicode-normalisation fold preserves:
+/// combining marks (U+0300..U+036F) dropped, Latin-1 precomposed letters
+/// reduced to their base letter, lowercased. There is no normalisation
+/// table in this crate, so only Latin-1 is covered; a name outside it folds
+/// by case alone. It only ever gates wording.
+fn fold_key(name: &str) -> String {
+    const LATIN1: &[u8; 64] = b"AAAAAAACEEEEIIIIDNOOOOO*OUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";
+    name.chars()
+        .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
+        .flat_map(|c| {
+            let c = match c as u32 {
+                n @ 0xC0..=0xFF => LATIN1[(n - 0xC0) as usize] as char,
+                _ => c,
+            };
+            c.to_lowercase()
+        })
+        .collect()
 }
+
+/// Whether two names differ only as a case or normalisation fold would.
+fn names_fold_together(a: &str, b: &str) -> bool {
+    fold_key(a) == fold_key(b)
+}
+
+/// The most keys [`MadeByRun::archived_spelling`] examines (stats) per
+/// lookup; wording is all that is at stake, so a bound is fine.
+const SPELLING_CANDIDATES: usize = 16;
 
 /// One exact-path record: what was made, and the identity it had when it
 /// was recorded (`None` when that could not be read). See [`MadeByRun`].
@@ -5556,10 +5574,7 @@ impl MadeByRun {
         self.at.insert(path.to_path_buf(), MadeAt { kind, id });
         if let Some(id) = id {
             self.ids.insert(id);
-            let keys = self.by_id.entry(id).or_default();
-            if !keys.iter().any(|k| k == path) {
-                keys.push(path.to_path_buf());
-            }
+            self.by_id.entry(id).or_default().insert(path.to_path_buf());
         }
     }
 
@@ -5608,12 +5623,13 @@ impl MadeByRun {
             .get(&id)?
             .iter()
             .filter(|key| key.as_path() != path && key.parent() == path.parent())
-            .filter(|key| self.made_exact(key))
-            .filter(|key| !matches!(self.at.get(*key).map(|r| &r.kind), Some(MadeKind::Hardlink)))
             .filter(|key| {
                 key.file_name()
                     .is_some_and(|n| names_fold_together(&n.to_string_lossy(), &last))
             })
+            .filter(|key| !matches!(self.at.get(*key).map(|r| &r.kind), Some(MadeKind::Hardlink)))
+            .take(SPELLING_CANDIDATES)
+            .filter(|key| self.made_exact(key))
             .filter_map(|key| key.strip_prefix(dest).ok())
             .min()
             .map(|rel| rel.to_string_lossy().into_owned())
@@ -7424,6 +7440,44 @@ mod tests {
         );
         assert_eq!(std::fs::read(dest.join("d")).unwrap(), b"delta");
         assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// Fold keys: `a\u{301}` folds with `\u{e1}` and `A\u{301}`, not with `b`.
+    #[test]
+    fn names_fold_by_case_and_normalisation_only() {
+        assert!(names_fold_together("a\u{301}", "\u{e1}"));
+        assert!(names_fold_together("a\u{301}", "A\u{301}"));
+        assert!(names_fold_together("A", "a"));
+        assert!(!names_fold_together("a\u{301}", "b"));
+        assert!(!names_fold_together("a", "b"));
+    }
+
+    /// Recording many paths on one inode stays linear: one set insert each,
+    /// and a lookup examines at most `SPELLING_CANDIDATES` keys.
+    #[cfg(unix)]
+    #[test]
+    fn many_keys_on_one_inode_record_without_a_scan() {
+        let dest = link_scratch("many");
+        std::fs::write(dest.join("t"), b"x").unwrap();
+        let mut made = MadeByRun::default();
+        let id = identity(&dest.join("t")).unwrap();
+        for i in 0..10_000 {
+            let p = dest.join(format!("l{i}"));
+            made.at.insert(
+                p.clone(),
+                MadeAt {
+                    kind: MadeKind::File,
+                    id: Some(id),
+                },
+            );
+            made.by_id.entry(id).or_default().insert(p);
+        }
+        // Re-recording an existing key adds nothing.
+        made.record_path(&dest.join("t"), MadeKind::File);
+        made.record_path(&dest.join("t"), MadeKind::File);
+        assert_eq!(made.by_id[&id].len(), 10_001);
+        assert!(made.archived_spelling(&dest, &dest.join("t")).is_none());
         let _ = std::fs::remove_dir_all(&dest);
     }
 
