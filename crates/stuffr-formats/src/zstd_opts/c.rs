@@ -54,13 +54,28 @@ fn spare(out: &mut Vec<u8>, n: usize) {
     }
 }
 
+/// `bytes` in a boxed slice with one spare trailing byte that libzstd is
+/// never told about. libzstd decides whether an input continues a
+/// referenced prefix or dictionary by address alone (`ZSTD_window_update`,
+/// `zstd_compress_internal.h`: `src != window->nextSrc`), so an input
+/// allocated exactly at `ptr + len` is compressed as contiguous and the
+/// output changes. The spare byte is ours, so nothing else can begin there.
+fn guarded(bytes: &[u8]) -> Box<[u8]> {
+    let mut v = Vec::with_capacity(bytes.len() + 1);
+    v.extend_from_slice(bytes);
+    v.push(0);
+    v.into_boxed_slice()
+}
+
 /// A compression context with `fileio.c`'s parameters
 /// (`FIO_createCResources`, `FIO_compressZstdFrame`).
 pub struct Encoder {
     cctx: NonNull<sys::ZSTD_CCtx>,
-    /// Referenced by libzstd (`loadDictionary_byReference`) for every frame.
+    /// Referenced by libzstd (`loadDictionary_byReference`) for every frame;
+    /// one byte longer than the dictionary (see [`guarded`]).
     _dictionary: Option<Box<[u8]>>,
-    /// Referenced by libzstd (`refPrefix`) for the first frame.
+    /// Referenced by libzstd (`refPrefix`) for the first frame; one byte
+    /// longer than the prefix (see [`guarded`]).
     _prefix: Option<Box<[u8]>>,
 }
 
@@ -92,8 +107,8 @@ impl Encoder {
             .ok_or_else(|| ZstdError::lib(code::MEMORY_ALLOCATION))?;
         let mut e = Encoder {
             cctx,
-            _dictionary: o.dictionary.clone().map(Vec::into_boxed_slice),
-            _prefix: o.prefix.clone().map(Vec::into_boxed_slice),
+            _dictionary: o.dictionary.as_deref().map(guarded),
+            _prefix: o.prefix.as_deref().map(guarded),
         };
         use sys::ZSTD_cParameter::*;
         e.set(ZSTD_c_contentSizeFlag, i32::from(o.content_size))?;
@@ -141,15 +156,16 @@ impl Encoder {
         if let Some(p) = &e._prefix {
             // SAFETY: the prefix is a boxed slice owned by `e`, so the
             // pointer and length stay valid for as long as the context can
-            // read them; libzstd only reads them.
+            // read them; libzstd only reads them. The length passed leaves
+            // out the guard byte, which is inside the allocation.
             check(unsafe {
-                sys::ZSTD_CCtx_refPrefix(e.cctx.as_ptr(), p.as_ptr().cast::<c_void>(), p.len())
+                sys::ZSTD_CCtx_refPrefix(e.cctx.as_ptr(), p.as_ptr().cast::<c_void>(), p.len() - 1)
             })?;
         } else {
             let (ptr, len) = e
                 ._dictionary
                 .as_ref()
-                .map_or((std::ptr::null(), 0), |d| (d.as_ptr(), d.len()));
+                .map_or((std::ptr::null(), 0), |d| (d.as_ptr(), d.len() - 1));
             // SAFETY: as for the prefix: the dictionary is owned by `e` and
             // outlives the context's use of it; (null, 0) clears it, as
             // fileio.c's call without `-D` does.
@@ -597,4 +613,64 @@ pub fn train(samples: &[u8], sizes: &[usize], p: &TrainParams) -> Result<Trained
     dict.truncate(size);
     trained.dict = dict;
     Ok(trained)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(n: usize) -> Vec<u8> {
+        (0..n).map(|i| b"abcdefgh stuff "[i * 7 % 15]).collect()
+    }
+
+    #[test]
+    fn guarded_keeps_one_unreferenced_byte() {
+        assert_eq!(&*guarded(b"abc"), b"abc\0");
+        assert_eq!(guarded(b"").len(), 1);
+    }
+
+    #[test]
+    fn prefix_and_dictionary_end_in_a_byte_nobody_else_can_own() {
+        let old = text(5000);
+        let o = EncodeOptions {
+            prefix: Some(old.clone()),
+            ..EncodeOptions::default()
+        };
+        let e = Encoder::new(&o).unwrap();
+        assert_eq!(e._prefix.as_deref().unwrap().len(), old.len() + 1);
+        let o = EncodeOptions {
+            dictionary: Some(old.clone()),
+            ..EncodeOptions::default()
+        };
+        let e = Encoder::new(&o).unwrap();
+        assert_eq!(e._dictionary.as_deref().unwrap().len(), old.len() + 1);
+        // Empty ones still build.
+        let o = EncodeOptions {
+            prefix: Some(Vec::new()),
+            dictionary: Some(Vec::new()),
+            ..EncodeOptions::default()
+        };
+        Encoder::new(&o).unwrap();
+    }
+
+    #[test]
+    fn prefix_output_does_not_depend_on_where_the_input_lives() {
+        let old = text(40_000);
+        let input = text(4000);
+        let o = EncodeOptions {
+            level: 19,
+            prefix: Some(old),
+            pledged_size: Some(input.len() as u64),
+            ..EncodeOptions::default()
+        };
+        let mut outs = Vec::new();
+        for _ in 0..2 {
+            let mut e = Encoder::new(&o).unwrap();
+            let separate = input.clone();
+            let mut out = Vec::new();
+            e.compress_stream(&separate, &mut out, EndOp::End).unwrap();
+            outs.push(out);
+        }
+        assert_eq!(outs[0], outs[1]);
+    }
 }
