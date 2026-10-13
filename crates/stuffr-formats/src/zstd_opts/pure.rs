@@ -165,6 +165,25 @@ impl Encoder {
         r
     }
 
+    /// One `ZSTD_compressStream2` call: on this tier it takes all of
+    /// `input[*pos..]` (setting `*pos` to its end) and, at
+    /// [`EndOp::End`], appends the whole frame. Returns `0`: nothing is
+    /// ever left to flush.
+    pub fn compress_stream2(
+        &mut self,
+        input: &[u8],
+        pos: &mut usize,
+        out: &mut Vec<u8>,
+        end: EndOp,
+    ) -> Result<usize, ZstdError> {
+        let from = (*pos).min(input.len());
+        let r = self.compress_inner(&input[from..], out, end);
+        if r.is_ok() {
+            *pos = input.len();
+        }
+        r
+    }
+
     fn compress_inner(
         &mut self,
         input: &[u8],

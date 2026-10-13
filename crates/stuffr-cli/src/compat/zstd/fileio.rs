@@ -34,8 +34,12 @@
 //!   `FIO_compressLzmaFrame`, `FIO_compressLz4Frame` and their decoding
 //!   counterparts.
 //! - The progress line is drawn as `DISPLAYUPDATE` draws it, once per
-//!   coder call this port makes (per input job when compressing); its
-//!   terminal behaviour is Task 9's. `--adapt`'s level changes are Task 8's.
+//!   coder call this port makes (each `ZSTD_compressStream2` call when
+//!   compressing, as fileio.c's inner loop); its terminal behaviour is
+//!   Task 9's.
+//! - `--adapt` follows `FIO_compressZstdFrame`'s adaptive loop (R10): the
+//!   frame's progression every `REFRESH_RATE`, the level one step at a
+//!   time between `--adapt=min=`/`max=`.
 
 use std::fs::{self, File, Metadata};
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
@@ -1207,6 +1211,41 @@ struct CRess {
     level: i32,
 }
 
+/// `FIO_compressZstdFrame`'s `speedChange_e`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Speed {
+    NoChange,
+    Slower,
+    Faster,
+}
+
+/// `FIO_compressZstdFrame`'s adaptive-mode statistics, one set per frame.
+struct Adapt {
+    previous_update: zstd_opts::Progress,
+    previous_correction: zstd_opts::Progress,
+    speed: Speed,
+    flush_waiting: bool,
+    input_presented: u32,
+    input_blocked: u32,
+    last_job_id: u32,
+    last_time: Instant,
+}
+
+impl Adapt {
+    fn new() -> Self {
+        Adapt {
+            previous_update: zstd_opts::Progress::default(),
+            previous_correction: zstd_opts::Progress::default(),
+            speed: Speed::NoChange,
+            flush_waiting: false,
+            input_presented: 0,
+            input_blocked: 0,
+            last_job_id: 0,
+            last_time: Instant::now(),
+        }
+    }
+}
+
 /// libzstd 1.5.7's `ZSTD_CCtxParams_setParameter` range checks for the
 /// parameters `FIO_createCResources` sets before the worker count, in that
 /// order: `Err` for the first out of bound (`parameter_outOfBound`). The C
@@ -1403,6 +1442,8 @@ impl Io<'_> {
             let h = self.human(window).plain();
             self.say(4, m::DECOMPRESSION_MEMORY, &[h.as_bytes()]);
         }
+        let mut adapt = Adapt::new();
+        let mut level = level;
         loop {
             let in_size = self.fill(rp, CSTREAM_IN_SIZE)?;
             let n = in_size.to_string();
@@ -1411,42 +1452,55 @@ impl Io<'_> {
             if rp.loaded().is_empty() || *readsize == file_size {
                 directive = EndOp::End;
             }
-            let mut out = Vec::new();
-            let input_len = rp.loaded().len();
-            let mut calls = Vec::new();
-            let r = ress
-                .enc
-                .compress_stream_each(rp.loaded(), &mut out, directive, &mut |c| {
-                    calls.push(c);
-                });
-            for c in calls {
-                let end = match c.end {
+            let input = rp.loaded();
+            let mut pos = 0;
+            let mut still_to_flush = 1;
+            while pos != input.len() || (directive == EndOp::End && still_to_flush != 0) {
+                let old_pos = pos;
+                let mut out = Vec::new();
+                let to_flush_now = ress.enc.to_flush_now();
+                still_to_flush = match ress
+                    .enc
+                    .compress_stream2(input, &mut pos, &mut out, directive)
+                {
+                    Ok(r) => r,
+                    Err(e) => return Err(self.check(e)),
+                };
+                adapt.input_presented += 1;
+                if old_pos == pos {
+                    adapt.input_blocked += 1;
+                }
+                if to_flush_now == 0 {
+                    adapt.flush_waiting = true;
+                }
+                let end = match directive {
                     EndOp::Continue => "0",
                     EndOp::Flush => "1",
                     EndOp::End => "2",
                 };
                 let (p, s, o) = (
-                    c.input_pos.to_string(),
-                    c.input_size.to_string(),
-                    c.produced.to_string(),
+                    pos.to_string(),
+                    input.len().to_string(),
+                    out.len().to_string(),
                 );
                 self.say(
                     6,
                     m::COMPRESS_GENERIC,
                     &[end.as_bytes(), p.as_bytes(), s.as_bytes(), o.as_bytes()],
                 );
+                if !out.is_empty() {
+                    self.write_block(&out)?;
+                    compressed += out.len() as u64;
+                }
+                if self.prefs.adapt && adapt.last_time.elapsed() > REFRESH_RATE {
+                    self.adapt_level(&mut adapt, &mut ress.enc, &mut level);
+                }
+                if self.should_display_progress() && self.ready_for_update() {
+                    self.compress_progress(&ress.enc, src_name, file_size, &file_hrs, level);
+                }
             }
-            if let Err(e) = r {
-                return Err(self.check(e));
-            }
+            let input_len = input.len();
             rp.consume(input_len);
-            if !out.is_empty() {
-                self.write_block(&out)?;
-                compressed += out.len() as u64;
-            }
-            if self.should_display_progress() && self.ready_for_update() {
-                self.compress_progress(&ress.enc, src_name, file_size, &file_hrs, level);
-            }
             if directive == EndOp::End {
                 break;
             }
@@ -1457,6 +1511,91 @@ impl Io<'_> {
         }
         self.sparse_end()?;
         Ok(compressed)
+    }
+
+    /// `FIO_compressZstdFrame`'s adaptive mode (`--adapt`, R10): every
+    /// `REFRESH_RATE`, read the frame's progression and move the level one
+    /// step, slower (higher) when compression waits on output or input,
+    /// faster (lower) when the input is often blocked while output keeps
+    /// up. libzstd applies a new level from its next job. On the pure tier
+    /// the progression has no jobs, so the level never moves.
+    fn adapt_level(&mut self, a: &mut Adapt, enc: &mut Encoder, level: &mut i32) {
+        let zfp = enc.progression();
+        a.last_time = Instant::now();
+        let n = |v: u64| v.to_string();
+        if zfp.current_job_id > 1 {
+            let newly_produced = zfp.produced.wrapping_sub(a.previous_update.produced);
+            let newly_flushed = zfp.flushed.wrapping_sub(a.previous_update.flushed);
+            if zfp.consumed == a.previous_update.consumed && zfp.nb_active_workers == 0 {
+                self.say(6, m::ADAPT_ALL_BUFFERS_FULL, &[]);
+                a.speed = Speed::Slower;
+            }
+            a.previous_update = zfp;
+            if newly_produced > newly_flushed.wrapping_mul(9) / 8 && !a.flush_waiting {
+                let (p, f) = (n(newly_produced), n(newly_flushed));
+                self.say(6, m::ADAPT_FASTER_THAN_FLUSH, &[p.as_bytes(), f.as_bytes()]);
+                a.speed = Speed::Slower;
+            }
+            a.flush_waiting = false;
+        }
+        if zfp.current_job_id > a.last_job_id {
+            self.say(6, m::ADAPT_CHECK, &[]);
+            if i64::from(zfp.current_job_id) > i64::from(self.prefs.workers) + 1 {
+                if a.input_blocked == 0 {
+                    self.say(6, m::ADAPT_INPUT_NEVER_BLOCKED, &[]);
+                    a.speed = Speed::Slower;
+                } else if a.speed == Speed::NoChange {
+                    let p = a.previous_correction;
+                    let ingested = zfp.ingested.wrapping_sub(p.ingested);
+                    let consumed = zfp.consumed.wrapping_sub(p.consumed);
+                    let produced = zfp.produced.wrapping_sub(p.produced);
+                    let flushed = zfp.flushed.wrapping_sub(p.flushed);
+                    a.previous_correction = zfp;
+                    let share = f64::from(a.input_blocked) / f64::from(a.input_presented) * 100.0;
+                    // `%u` of each 64-bit figure, as fileio.c casts them.
+                    let u = |v: u64| (v as u32).to_string();
+                    let args = [
+                        a.input_blocked.to_string(),
+                        a.input_presented.to_string(),
+                        format!("{share:.2}"),
+                        u(ingested),
+                        u(consumed),
+                        u(flushed),
+                        u(produced),
+                    ];
+                    let args: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
+                    self.say(6, m::ADAPT_INPUT_BLOCKED, &args);
+                    if a.input_blocked > a.input_presented / 8
+                        && flushed.wrapping_mul(33) / 32 > produced
+                        && ingested.wrapping_mul(33) / 32 > consumed
+                    {
+                        let args = [n(ingested), n(consumed), n(produced), n(flushed)];
+                        let args: Vec<&[u8]> = args.iter().map(|s| s.as_bytes()).collect();
+                        self.say(6, m::ADAPT_RECOMMEND_FASTER, &args);
+                        a.speed = Speed::Faster;
+                    }
+                }
+                a.input_blocked = 0;
+                a.input_presented = 0;
+            }
+            if a.speed == Speed::Slower {
+                self.say(6, m::ADAPT_SLOWER, &[]);
+                *level = (*level + 1)
+                    .min(zstd_opts::MAX_CLEVEL)
+                    .min(self.prefs.adapt_max);
+                *level += i32::from(*level == 0);
+                // fileio.c ignores the result.
+                let _ = enc.set_level(*level);
+            }
+            if a.speed == Speed::Faster {
+                self.say(6, m::ADAPT_FASTER, &[]);
+                *level = (*level - 1).max(self.prefs.adapt_min);
+                *level -= i32::from(*level == 0);
+                let _ = enc.set_level(*level);
+            }
+            a.speed = Speed::NoChange;
+            a.last_job_id = zfp.current_job_id;
+        }
     }
 
     /// `FIO_compressZstdFrame`'s progress notification.

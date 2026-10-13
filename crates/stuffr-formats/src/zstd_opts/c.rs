@@ -205,6 +205,34 @@ impl Encoder {
         end: EndOp,
         each: &mut dyn FnMut(StreamCall),
     ) -> Result<usize, ZstdError> {
+        let mut pos = 0;
+        loop {
+            let before = out.len();
+            let remaining = self.compress_stream2(input, &mut pos, out, end)?;
+            each(StreamCall {
+                end,
+                input_pos: pos,
+                input_size: input.len(),
+                produced: out.len() - before,
+            });
+            let input_done = pos == input.len();
+            if input_done && (end == EndOp::Continue || remaining == 0) {
+                return Ok(remaining);
+            }
+        }
+    }
+
+    /// One `ZSTD_compressStream2` call, as `fileio.c`'s inner loop makes
+    /// it: takes what it can of `input[*pos..]` (advancing `*pos`) and
+    /// appends at most `ZSTD_CStreamOutSize()` bytes to `out`, `fileio.c`'s
+    /// write buffer. Returns libzstd's "still to flush" figure.
+    pub fn compress_stream2(
+        &mut self,
+        input: &[u8],
+        pos: &mut usize,
+        out: &mut Vec<u8>,
+        end: EndOp,
+    ) -> Result<usize, ZstdError> {
         let directive = match end {
             EndOp::Continue => sys::ZSTD_EndDirective::ZSTD_e_continue,
             EndOp::Flush => sys::ZSTD_EndDirective::ZSTD_e_flush,
@@ -213,43 +241,32 @@ impl Encoder {
         let mut inb = sys::ZSTD_inBuffer {
             src: input.as_ptr().cast::<c_void>(),
             size: input.len(),
-            pos: 0,
+            pos: (*pos).min(input.len()),
         };
         // SAFETY: a pure size query.
         let chunk = unsafe { sys::ZSTD_CStreamOutSize() };
-        loop {
-            spare(out, chunk);
-            let len = out.len();
-            let mut outb = sys::ZSTD_outBuffer {
-                // SAFETY: `len` is within the allocation, so the offset
-                // pointer stays inside it.
-                dst: unsafe { out.as_mut_ptr().add(len) }.cast::<c_void>(),
-                // fileio.c's write buffer is exactly this size.
-                size: chunk,
-                pos: 0,
-            };
-            // SAFETY: cctx is live; inb describes `input`, which outlives the
-            // call; outb describes `chunk` bytes of the vector's spare
-            // capacity (reserved above), which libzstd writes at most `size`
-            // bytes of.
-            let r = check(unsafe {
-                sys::ZSTD_compressStream2(self.cctx.as_ptr(), &mut outb, &mut inb, directive)
-            });
-            // SAFETY: libzstd initialised exactly `outb.pos` bytes past `len`
-            // (its contract, error or not).
-            unsafe { out.set_len(len + outb.pos) };
-            let remaining = r?;
-            each(StreamCall {
-                end,
-                input_pos: inb.pos,
-                input_size: inb.size,
-                produced: outb.pos,
-            });
-            let input_done = inb.pos == inb.size;
-            if input_done && (end == EndOp::Continue || remaining == 0) {
-                return Ok(remaining);
-            }
-        }
+        spare(out, chunk);
+        let len = out.len();
+        let mut outb = sys::ZSTD_outBuffer {
+            // SAFETY: `len` is within the allocation, so the offset pointer
+            // stays inside it.
+            dst: unsafe { out.as_mut_ptr().add(len) }.cast::<c_void>(),
+            // fileio.c's write buffer is exactly this size.
+            size: chunk,
+            pos: 0,
+        };
+        // SAFETY: cctx is live; inb describes `input`, which outlives the
+        // call, with `pos` clamped to its length; outb describes `chunk`
+        // bytes of the vector's spare capacity (reserved above), which
+        // libzstd writes at most `size` bytes of.
+        let r = check(unsafe {
+            sys::ZSTD_compressStream2(self.cctx.as_ptr(), &mut outb, &mut inb, directive)
+        });
+        // SAFETY: libzstd initialised exactly `outb.pos` bytes past `len`
+        // (its contract, error or not).
+        unsafe { out.set_len(len + outb.pos) };
+        *pos = inb.pos;
+        r
     }
 
     /// `ZSTD_getFrameProgression`.

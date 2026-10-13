@@ -26,7 +26,12 @@
 //! (ruling T1-a), which the reference must be able to use; libzstd's own
 //! CPU-timed progress and dibio.c's wall-clock `Loading` lines past the
 //! first are removed on both sides (`strip_trainer_progress`). The pure
-//! tier answers as a `ZSTD_NODICT` build (`pure_nodict`).
+//! tier answers as a `ZSTD_NODICT` build (`pure_nodict`). Then `-D` (the
+//! reference's trained dictionary, raw content, the wrong one, none, a
+//! missing or oversized one, `-l` naming its ID), `--patch-from` both ways
+//! (levels, `--long`, `--memory`, a stream, an old file far larger than
+//! the new one's window and the reverse), and `--adapt` (R10: exit code,
+//! round trip and `-q`'s empty standard error only).
 //!
 //! Part 4 (Task 7): `-l`, `-lv` and `-lvv` over frames the reference made
 //! and frames built here byte by byte (every content-size and dictionary-ID
@@ -211,10 +216,10 @@ mod unix {
             if *a == "-D" || a.starts_with("--patch-from") {
                 dict = true;
             }
-            if matches!(
-                *a,
-                "-d" | "-t" | "-l" | "--decompress" | "--test" | "--list"
-            ) {
+            let cluster = a.len() > 1 && a.starts_with('-') && !a.starts_with("--");
+            if matches!(*a, "--decompress" | "--uncompress" | "--test" | "--list")
+                || (cluster && a[1..].bytes().any(|b| matches!(b, b'd' | b't' | b'l')))
+            {
                 return false;
             }
         }
@@ -224,24 +229,33 @@ mod unix {
     /// Spec deviation 7 on the pure tier: compressing with `-D` or
     /// `--patch-from` is refused (`EXM_THROW(1)`) where the reference's
     /// dictionary would be loaded, after everything it prints before
-    /// compressing. True when `c` is such a case (and the expectation was
-    /// checked); never on the C tier, nor when the reference refuses.
+    /// compressing: stuffr's standard error is whole lines the reference
+    /// printed first (all of them at the levels that print nothing after
+    /// compressing), then the refusal. True when `c` is such a case (and
+    /// the expectation was checked); never on the C tier, nor when the
+    /// reference refuses.
     fn pure_dictionary_refusal(c: &Case, r: &Run, s: &Run) -> bool {
         // A run the reference refuses before compressing is compared as
         // any other.
         if EXACT || r.code != 0 || !compresses_with_dictionary(c) {
             return false;
         }
-        let want = format!(
-            "{}zstd: error 1 : dictionary compression is not available in this build (stuffr pure tier) \n",
+        const REFUSAL: &str = "zstd: error 1 : dictionary compression is not available in this build (stuffr pure tier) \n";
+        assert_eq!(s.code, 1, "{:?}", c.args);
+        let Some(before) = s.stderr.strip_suffix(REFUSAL) else {
+            panic!("{:?}: no refusal in {:?}", c.args, s.stderr);
+        };
+        let before = before.replace(&our_banner(), REFERENCE_BANNER);
+        assert!(
+            r.stderr.starts_with(&before) && (before.is_empty() || before.ends_with('\n')),
+            "{:?}: {:?} is not what the reference printed first ({:?})",
+            c.args,
+            before,
             r.stderr
         );
-        assert_eq!(
-            (s.code, s.stderr.as_str()),
-            (1, want.as_str()),
-            "{:?}",
-            c.args
-        );
+        if !c.args.iter().any(|a| a.starts_with("-v")) {
+            assert_eq!(before, r.stderr, "{:?}", c.args);
+        }
         assert!(s.stdout.is_empty(), "{:?}: stdout written", c.args);
         true
     }
@@ -3368,5 +3382,280 @@ mod unix {
             cases.push(training(args));
         }
         check_train("train_refused", &cases);
+    }
+
+    /// `data` compressed by the reference with the dictionary `dict` (`-D`
+    /// or, with `patch`, `--patch-from`), plus `args`.
+    fn packed_with(dict: &[u8], patch: bool, args: &[&str], data: &[u8]) -> Vec<u8> {
+        if zstd_dir().is_none() {
+            return Vec::new();
+        }
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = ScratchDir::at(std::env::temp_dir().join(format!(
+            "stuffr-zstd-packed-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )));
+        fs::create_dir_all(&*dir).unwrap();
+        let d = dir.join("d");
+        fs::write(&d, dict).unwrap();
+        let d = d.to_str().unwrap();
+        let mut a: Vec<&str> = args.to_vec();
+        if patch {
+            // A stream needs its size for --patch-from.
+            a.push(leak(format!("--patch-from={d}")));
+            a.push(leak(format!("--stream-size={}", data.len())));
+        } else {
+            a.extend(["-D", d]);
+        }
+        a.extend(["-q", "-c"]);
+        filter_through(ref_zstd(), &a, data).unwrap_or_default()
+    }
+
+    /// The dictionary files the `-D` cases use: the reference's trained
+    /// dictionary, the same with another ID (the wrong one), and raw
+    /// content.
+    fn dict_files() -> Vec<(&'static str, Vec<u8>)> {
+        let d = zstd_trained_dictionary().unwrap_or_default().to_vec();
+        let mut wrong = d.clone();
+        if wrong.len() >= 8 {
+            wrong[4..8].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        }
+        let msg = super::compat_harness::text(30_000, 85);
+        let z = packed_with(&d, false, &[], &msg);
+        let zraw = packed_with(&msg[..4000], false, &[], &msg);
+        vec![
+            ("dict", d),
+            ("wrong", wrong),
+            ("raw", msg[..4000].to_vec()),
+            ("msg", msg),
+            ("msg.zst", z),
+            ("raw.zst", zraw),
+        ]
+    }
+
+    /// `-D`: compressing and decompressing with a trained and a raw
+    /// dictionary; the wrong dictionary, none, a missing one, one too
+    /// large; `-l` naming its ID. The pure tier refuses to compress with a
+    /// dictionary (the pinned refusal, in `check`) and decodes with one.
+    #[test]
+    fn dictionaries() {
+        let files = dict_files();
+        let mut cases = Vec::new();
+        for args in [
+            &["-D", "dict", "-c", "msg"][..],
+            &["-q", "-D", "dict", "-o", "m.zst", "msg"],
+            &["-19", "-D", "dict", "-c", "msg"],
+            &["--no-dictID", "-D", "dict", "-c", "msg"],
+            &["-D", "raw", "-c", "msg"],
+            &["-D", "dict", "-c", "-T2", "msg"],
+            &["-D", "dict", "-v", "-c", "msg"],
+            &["-D", "dict", "-vvvv", "-c", "msg"],
+            &["-d", "-D", "dict", "msg.zst"],
+            &["-dc", "-D", "dict", "msg.zst"],
+            &["-t", "-D", "dict", "msg.zst"],
+            &["-dc", "-D", "raw", "raw.zst"],
+            &["-dc", "-D", "wrong", "msg.zst"],
+            &["-dc", "msg.zst"],
+            &["-D", "missing", "-c", "msg"],
+            &["-dc", "-D", "missing", "msg.zst"],
+            &["-D", "samples", "-c", "msg"],
+            &["-l", "msg.zst"],
+            &["-lv", "msg.zst"],
+            &["-lv", "raw.zst"],
+        ] {
+            let mut f = files.clone();
+            if args.contains(&"samples") {
+                f.push(("samples/x", b"x".to_vec()));
+            }
+            cases.push(with_files("zstd", args, f));
+        }
+        check("dictionaries", &cases);
+    }
+
+    /// An input that is the dictionary itself is skipped, after the
+    /// dictionary is loaded; the pure tier refuses at the loading, before
+    /// any input (spec deviation 7).
+    #[test]
+    fn input_is_the_dictionary() {
+        let cases = vec![
+            with_files("zstd", &["-D", "msg", "msg"], vec![("msg", text())]),
+            with_files(
+                "zstd",
+                &["-D", "msg", "msg", "a"],
+                vec![("msg", text()), ("a", text())],
+            ),
+        ];
+        if EXACT {
+            check("input_is_the_dictionary", &cases);
+            return;
+        }
+        for c in &cases {
+            let s = stuffr_as(c);
+            assert_eq!(s.code, 1, "{:?}", c.args);
+            assert_eq!(
+                s.stderr,
+                "zstd: error 1 : dictionary compression is not available in this build (stuffr pure tier) \n",
+                "{:?}",
+                c.args
+            );
+        }
+    }
+
+    /// A frame made with raw content decoded with a formatted dictionary
+    /// of no ID: libzstd decodes garbage and the checksum catches it. The
+    /// pure tier's decoder meets the corruption first and names it so
+    /// (ruling T5-b); the exit code and the rest are compared.
+    #[test]
+    fn dictionary_of_the_wrong_content() {
+        let files = dict_files();
+        let c = with_files("zstd", &["-dc", "-D", "dict", "raw.zst"], files);
+        let one = |c: &Case| -> bool {
+            let Some(dir) = zstd_dir() else { return false };
+            let Some(mut r) = reference(dir, c) else {
+                return false;
+            };
+            let s = stuffr_as(c);
+            if !EXACT {
+                r.stderr = r.stderr.replace(
+                    "Decoding error (36) : Restored data doesn't match checksum",
+                    "Decoding error (36) : Data corruption detected",
+                );
+                // The pure decoder stops at the corruption, libzstd at the
+                // checksum after the last block: ours is a prefix.
+                assert!(r.stdout.starts_with(&s.stdout), "{:?}", c.args);
+                r.stdout.clone_from(&s.stdout);
+            }
+            assert_same(c, &r, &s);
+            true
+        };
+        run_group(
+            "dictionary_of_the_wrong_content",
+            &[c],
+            Skipped::none(),
+            &one,
+        );
+    }
+
+    /// A dictionary over fileio.c's 32 MiB `DICTSIZE_MAX`.
+    #[test]
+    fn dictionary_too_large() {
+        let big = vec![0u8; (32 << 20) + 1];
+        let cases = vec![
+            with_files(
+                "zstd",
+                &["-D", "big", "-c", "msg"],
+                vec![("big", big.clone()), ("msg", text())],
+            ),
+            with_files(
+                "zstd",
+                &["-dc", "-D", "big", "msg"],
+                vec![("big", big), ("msg", text())],
+            ),
+        ];
+        check("dictionary_too_large", &cases);
+    }
+
+    /// An old file and a new one that differs from it in a few places.
+    fn patch_pair(n: usize, seed: u64) -> (Vec<u8>, Vec<u8>) {
+        let old = super::compat_harness::text(n, seed);
+        let mut new = old.clone();
+        for (i, at) in [n / 7, n / 3, n / 2, n * 5 / 6].iter().enumerate() {
+            new.splice(*at..*at, format!(" <edit {i}> ").into_bytes());
+        }
+        new.truncate(new.len() - n / 50);
+        (old, new)
+    }
+
+    /// `--patch-from` both ways: the levels, `--long`, `--memory`, a
+    /// stream, an old file far bigger than the new one's window and the
+    /// other way round, and the display levels that print its notes.
+    #[test]
+    fn patch_from() {
+        let (old, new) = patch_pair(200_000, 86);
+        let (bigold, small) = (
+            super::compat_harness::text(1 << 20, 87),
+            super::compat_harness::text(4000, 88),
+        );
+        let z = packed_with(&old, true, &[], &new);
+        let zl = packed_with(&old, true, &["--long=24", "-19"], &new);
+        let zs = packed_with(&bigold, true, &[], &small);
+        let files = vec![
+            ("old", old),
+            ("new", new.clone()),
+            ("new.zst", z),
+            ("long.zst", zl),
+            ("bigold", bigold),
+            ("small", small),
+            ("small.zst", zs),
+        ];
+        let mut cases = Vec::new();
+        for args in [
+            &["-q", "--patch-from=old", "-o", "p.zst", "new"][..],
+            &["--patch-from=old", "-c", "new"],
+            &["-q", "--patch-from", "old", "-o", "p.zst", "new"],
+            &["-1", "--patch-from=old", "-c", "new"],
+            &["-19", "--patch-from=old", "-c", "new"],
+            &["--long", "--patch-from=old", "-c", "new"],
+            &["--long=24", "-19", "--patch-from=old", "-c", "new"],
+            &["-M1MB", "--patch-from=old", "-c", "new"],
+            &["--memory=512KB", "--patch-from=old", "-c", "new"],
+            &["-vvvv", "-19", "--patch-from=old", "-c", "new"],
+            &["-v", "--patch-from=old", "-c", "new"],
+            &["--patch-from=bigold", "-c", "small"],
+            &["-19", "--patch-from=bigold", "-c", "small"],
+            &["-1", "--patch-from=small", "-c", "bigold"],
+            &["--patch-from=missing", "-c", "new"],
+            &["-d", "--patch-from=old", "new.zst", "-o", "out"],
+            &["-dc", "--patch-from=old", "new.zst"],
+            &["-dc", "--patch-from=old", "long.zst"],
+            &["-dc", "--patch-from=old", "--memory=1MB", "long.zst"],
+            &["-dc", "--patch-from=bigold", "small.zst"],
+            &["-dc", "--patch-from=small", "new.zst"],
+            &["-dc", "new.zst"],
+            &["-t", "--patch-from=old", "new.zst"],
+        ] {
+            let mut c = with_files("zstd", args, files.clone());
+            if args.contains(&"new.zst") || args.contains(&"long.zst") {
+                c.expect_stdout_plain = Some(new.clone());
+            }
+            cases.push(c);
+        }
+        // A stream needs --stream-size.
+        cases.push(fed(
+            with_files("zstd", &["--patch-from=old", "-c"], files.clone()),
+            new.clone(),
+        ));
+        let ss = leak(format!("--stream-size={}", new.len()));
+        cases.push(fed(
+            with_files("zstd", &["--patch-from=old", "-c", ss], files.clone()),
+            new,
+        ));
+        check("patch_from", &cases);
+    }
+
+    /// `--adapt` (R10): the level moves with timing, so only the exit
+    /// code, the round trip and `-q`'s empty standard error are compared.
+    #[test]
+    fn adapt() {
+        let big = super::compat_harness::text(6 << 20, 89);
+        let mut cases = Vec::new();
+        for args in [
+            &["-q", "--adapt", "-c", "big"][..],
+            &["-q", "--adapt=min=1,max=19", "-c", "big"],
+            &["-q", "--adapt", "-T2", "-k", "big"],
+            &["-q", "--adapt=min=3,max=5", "-T4", "-c", "big"],
+            &["-q", "--adapt", "-c", "small"],
+        ] {
+            let mut c = with_files("zstd", args, vec![("big", big.clone()), ("small", text())]);
+            c.compare_output_bytes = false;
+            c.expect_stdout_plain = Some(if args.contains(&"big") {
+                big.clone()
+            } else {
+                text()
+            });
+            cases.push(c);
+        }
+        check("adapt", &cases);
     }
 }

@@ -1517,6 +1517,50 @@ fn each_compress_call_is_reported() {
     assert_eq!(decode(&DecodeOptions::default(), &out).unwrap(), data);
 }
 
+/// `compress_stream2` is one call of `fileio.c`'s inner loop: driven the
+/// way that loop drives it (until the input is taken and, at the end,
+/// nothing is left to flush), it writes what `compress_stream` writes, and
+/// on the C tier no call produces more than one output buffer.
+#[test]
+fn single_calls_make_the_same_frame() {
+    let data = text(300_000, 34);
+    let o = EncodeOptions {
+        workers: 2,
+        ..EncodeOptions::default()
+    };
+    let mut whole = Vec::new();
+    let mut e = Encoder::new(&o).unwrap();
+    let mut stepped = Vec::new();
+    let chunks: Vec<&[u8]> = data.chunks(128 << 10).collect();
+    for (i, c) in chunks.iter().enumerate() {
+        let end = if i + 1 == chunks.len() {
+            EndOp::End
+        } else {
+            EndOp::Continue
+        };
+        let mut pos = 0;
+        let mut still = 1;
+        while pos != c.len() || (end == EndOp::End && still != 0) {
+            let before = stepped.len();
+            still = e.compress_stream2(c, &mut pos, &mut stepped, end).unwrap();
+            // ZSTD_CStreamOutSize(), a block's bound and its header, on
+            // the C tier; the pure tier writes its frame in one call.
+            assert!(cfg!(not(feature = "zstd-c")) || stepped.len() - before < 132 << 10);
+        }
+    }
+    let mut e = Encoder::new(&o).unwrap();
+    for (i, c) in chunks.iter().enumerate() {
+        let end = if i + 1 == chunks.len() {
+            EndOp::End
+        } else {
+            EndOp::Continue
+        };
+        e.compress_stream(c, &mut whole, end).unwrap();
+    }
+    assert_eq!(stepped, whole);
+    assert_eq!(decode(&DecodeOptions::default(), &stepped).unwrap(), data);
+}
+
 /// A frame cut inside its checksum: the last block's output comes out
 /// before the decoder asks for the rest, as libzstd's does
 /// (`ZSTDds_checkChecksum`), so `fileio.c` writes it before saying

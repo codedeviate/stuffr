@@ -677,6 +677,36 @@ pub(super) const FREAD_BYTES: &str = "fread %d bytes from source \n";
 pub(super) const COMPRESS_GENERIC: &str =
     "ZSTD_compress_generic(end:%d) => input pos(%d)<=(%d)size ; output generated %d bytes \n";
 
+/// fileio.c: FIO_compressZstdFrame, `--adapt` (display level 6).
+pub(super) const ADAPT_ALL_BUFFERS_FULL: &str =
+    "all buffers full : compression stopped => slow down \n";
+
+/// fileio.c: FIO_compressZstdFrame, `--adapt` (display level 6; `%llu`:
+/// newly produced, newly flushed).
+pub(super) const ADAPT_FASTER_THAN_FLUSH: &str = "compression faster than flush (%d > %d), and flushed was never slowed down by lack of production => slow down \n";
+
+/// fileio.c: FIO_compressZstdFrame, `--adapt` (display level 6).
+pub(super) const ADAPT_CHECK: &str = "compression level adaptation check \n";
+
+/// fileio.c: FIO_compressZstdFrame, `--adapt` (display level 6).
+pub(super) const ADAPT_INPUT_NEVER_BLOCKED: &str =
+    "input is never blocked => input is slower than ingestion \n";
+
+/// fileio.c: FIO_compressZstdFrame, `--adapt` (display level 6; `%u/%u(%.2f)`
+/// and the four `%u` figures, formatted by the caller).
+pub(super) const ADAPT_INPUT_BLOCKED: &str =
+    "input blocked %d/%d(%d) - ingested:%d vs %d:consumed - flushed:%d vs %d:produced \n";
+
+/// fileio.c: FIO_compressZstdFrame, `--adapt` (display level 6; `%llu`).
+pub(super) const ADAPT_RECOMMEND_FASTER: &str =
+    "recommend faster as in(%d) >= (%d)comp(%d) <= out(%d) \n";
+
+/// fileio.c: FIO_compressZstdFrame, `--adapt` (display level 6).
+pub(super) const ADAPT_SLOWER: &str = "slower speed , higher compression \n";
+
+/// fileio.c: FIO_compressZstdFrame, `--adapt` (display level 6).
+pub(super) const ADAPT_FASTER: &str = "faster speed , lighter compression \n";
+
 /// fileio.c: FIO_compressZstdFrame, the progress line's clearing
 /// (`"\r%79s\r"` with `""`).
 pub(super) const CLEAR_LINE: &str = "\r%s\r";

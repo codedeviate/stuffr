@@ -13,8 +13,12 @@
 //! empty) at `--fast=5`, `-3`, 1-19 and `--ultra` 20-22; `-T1`, `-T4` and
 //! `zstdmt`; `--long`, `--long=30`, `--rsyncable`, `--no-check`,
 //! `--no-content-size`, `--stream-size`, `--zstd=wlog=…` and
-//! `--target-compressed-block-size`. `-D` and `--patch-from` are Task 8's
-//! (dictionaries).
+//! `--target-compressed-block-size`.
+//!
+//! Dictionaries (Task 8): `-D` with the reference's trained dictionary and
+//! with raw content, and `--patch-from`, over the inputs at levels 1, 3,
+//! 19 and `--fast=3`, with `--long` and threads. The pure tier refuses to
+//! compress with either (spec deviation 7), which is pinned instead.
 //!
 //! `--format=` (Task 6), over the same four inputs at levels 1, 3, 9, 19,
 //! 0 and `--fast=1`: gzip is compared byte for byte with C zlib (`zlib-c`;
@@ -196,5 +200,101 @@ mod bytes {
             }
         }
         check("foreign_formats", &cases);
+    }
+
+    /// Spec deviation 7: the pure tier's answer to compressing with a
+    /// dictionary or a prefix, `EXM_THROW(1, …)`.
+    const PURE_REFUSAL: &str = "zstd: error 1 : dictionary compression is not available in this build (stuffr pure tier) \n";
+
+    /// The C tier compares as [`check`]; the pure tier pins the refusal
+    /// (every case here compresses quietly, so it is all stuffr prints).
+    fn check_dictionary(group: &str, cases: &[Case]) {
+        if EXACT {
+            check(group, cases);
+            return;
+        }
+        let one = |c: &Case| -> bool {
+            if zstd_dir().is_none() {
+                return false;
+            }
+            let s = stuffr_as(c);
+            assert_eq!(
+                (s.code, s.stderr.as_str()),
+                (1, PURE_REFUSAL),
+                "{:?}",
+                c.args
+            );
+            assert!(s.stdout.is_empty(), "{:?}", c.args);
+            true
+        };
+        run_group(group, cases, Skipped::none(), &one);
+    }
+
+    fn dict_levels() -> [&'static [&'static str]; 6] {
+        [
+            &["-1"],
+            &["-3"],
+            &["-19"],
+            &["--fast=3"],
+            &["-3", "-T2"],
+            &["-19", "--long"],
+        ]
+    }
+
+    /// `-D`: the reference's trained dictionary and raw content, every
+    /// input, the levels, to standard output and to a file.
+    #[test]
+    fn dictionary_bytes() {
+        let dict = zstd_trained_dictionary().unwrap_or_default().to_vec();
+        let raw = text(6000, 73);
+        let mut cases = Vec::new();
+        for (name, data) in inputs() {
+            for level in dict_levels() {
+                for d in ["dict", "raw"] {
+                    let files = vec![
+                        (name, data.clone()),
+                        ("dict", dict.clone()),
+                        ("raw", raw.clone()),
+                    ];
+                    let mut a = vec!["-c", "-D", d];
+                    a.extend(level.iter().copied());
+                    a.push(name);
+                    cases.push(case("zstd", a, files.clone()));
+                    let mut a = vec!["-q", "-k", "-D", d, "--no-dictID"];
+                    a.extend(level.iter().copied());
+                    a.push(name);
+                    cases.push(case("zstd", a, files));
+                }
+            }
+        }
+        check_dictionary("dictionary_bytes", &cases);
+    }
+
+    /// `--patch-from`: an old file and a new one that differs in a few
+    /// places, both ways round, at the levels.
+    #[test]
+    fn patch_from_bytes() {
+        let old = text(300_000, 74);
+        let mut new = old.clone();
+        for (i, at) in [10_000usize, 90_000, 150_000, 280_000].iter().enumerate() {
+            new.splice(*at..*at, format!("<edit {i}>").into_bytes());
+        }
+        let files = vec![("old", old), ("new", new), ("ls", inputs()[1].1.clone())];
+        let mut cases = Vec::new();
+        for level in dict_levels() {
+            for (from, to) in [("old", "new"), ("new", "old"), ("old", "ls")] {
+                let p: &'static str = Box::leak(format!("--patch-from={from}").into_boxed_str());
+                let mut a = vec!["-c", p];
+                a.extend(level.iter().copied());
+                a.push(to);
+                cases.push(case("zstd", a, files.clone()));
+            }
+        }
+        cases.push(case(
+            "zstd",
+            vec!["-q", "-k", "--patch-from", "old", "-o", "p.zst", "new"],
+            files,
+        ));
+        check_dictionary("patch_from_bytes", &cases);
     }
 }
