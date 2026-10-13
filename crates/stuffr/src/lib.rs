@@ -43,6 +43,15 @@ pub mod xz_stream {
 pub mod xz_opts {
     pub use stuffr_formats::xz_opts::*;
 }
+/// The `zstd` tool's options seam — levels, compression parameters,
+/// threads, dictionaries, training — and the streaming coder over them,
+/// what the `stuffr` binary's zstd compatibility family runs. Not part of
+/// the stable API.
+#[cfg(feature = "zstd-c")]
+#[doc(hidden)]
+pub mod zstd_opts {
+    pub use stuffr_formats::zstd_opts::*;
+}
 /// Raw deflate through C zlib, byte-identical to stock zlib's — what the
 /// `stuffr` binary's Apple gzip personality compresses with on the C tier.
 /// Not part of the stable API.

@@ -1506,12 +1506,15 @@ covers the xz family. One notice is
 BSD-style but not word for word the SPDX `BSD-2-Clause` text: the Lzd one in
 `unlz.c`. The full notice ships in `LICENSE-gzip-bsd`, and that file, not the
 SPDX name, is what to read. `stuffr-formats` is
-**`MIT AND BSD-2-Clause AND 0BSD`**, because its pack decoder (`pack.rs`) is a
-port of FreeBSD's `unpack.c` (Xin LI), whose notice is
+**`MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause`**, because its pack
+decoder (`pack.rs`) is a port of FreeBSD's `unpack.c` (Xin LI), whose notice is
 [`crates/stuffr-formats/LICENSE-unpack-bsd`](crates/stuffr-formats/LICENSE-unpack-bsd),
 and since `0.13.0` its liblzma memory-usage formulas and container coders
 (the pure xz tier) are ported from XZ Utils 5.8.4 under 0BSD, notice in
-`crates/stuffr-formats/LICENSE-xz-memusage`.
+`crates/stuffr-formats/LICENSE-xz-memusage`, and since `0.14.0` zstd
+1.5.7's default compression-parameter table (`clevels.h`, Meta Platforms,
+Inc.) is ported under zstd's BSD licence, notice in
+`crates/stuffr-formats/LICENSE-zstd-clevels`.
 `stuffr` and `stuffr-core` are MIT. On the `c-backed` tier zlib is built too,
 under the `Zlib` licence (also permissive); the default pure tier does not
 contain it.

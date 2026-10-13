@@ -1,0 +1,97 @@
+# zstd_opts fixture: `<input>|<zstd flags>|<sha256>`, the SHA-256 of
+# `zstd <flags> -q -c <input>` (zstd 1.5.7, /opt/homebrew/opt/zstd/bin/zstd,
+# a 12-core machine, so the default is 3 workers) over the inputs
+# `src/zstd_opts/tests.rs` generates (`inputs()`: text, bin, rand, empty);
+# and `train|<flags>|<sha256>`, the dictionary `zstd <flags> -o d s000 ..
+# s099` writes over `samples()` saved as files. dict4k.dict is the
+# `--maxdict=4096` dictionary, dict4k.zst `zstd -D dict4k.dict` over
+# `dict_plain()`, patch.zst `zstd --patch-from=old new` over `patch_pair()`.
+# The --train-cover row is the CLI's output, recorded but not asserted:
+# libzstd 1.5.7's cover trainer gives one of two dictionaries for these
+# samples depending on the process (see train_matches_the_reference).
+# Regenerate everything with
+#   STUFFR_ZSTD_OPTS_REGEN=<dir> cargo test -p stuffr-formats --all-features \
+#     zstd_opts::tests::c_tier::regenerate_fixtures
+# then copy <dir>/* here (macOS, the reference zstd 1.5.7 present).
+text|--fast=5|835c7dd09f6346bf317cf7d67b3037ec251fe4760a694337764ea4d417ca8f98
+text|--fast=5 --single-thread|835c7dd09f6346bf317cf7d67b3037ec251fe4760a694337764ea4d417ca8f98
+text|--fast=5 -T4|835c7dd09f6346bf317cf7d67b3037ec251fe4760a694337764ea4d417ca8f98
+text|-1|b83ed47e0682f1b0ea4cac9feefe6f1cbd8a1a05f7ecbb03756462152782ef18
+text|-1 --single-thread|b83ed47e0682f1b0ea4cac9feefe6f1cbd8a1a05f7ecbb03756462152782ef18
+text|-1 -T4|b83ed47e0682f1b0ea4cac9feefe6f1cbd8a1a05f7ecbb03756462152782ef18
+text|-3|c3b091b15d72af058a694c38648e3b72fb41cb223e6b3d6f640c2022770ee961
+text|-3 --single-thread|c3b091b15d72af058a694c38648e3b72fb41cb223e6b3d6f640c2022770ee961
+text|-3 -T4|c3b091b15d72af058a694c38648e3b72fb41cb223e6b3d6f640c2022770ee961
+text|-9|7841ff71f0d60bf78ee8ee7240dfd29297043172f124dbaa93b08fb9eb291aa7
+text|-9 --single-thread|7841ff71f0d60bf78ee8ee7240dfd29297043172f124dbaa93b08fb9eb291aa7
+text|-9 -T4|7841ff71f0d60bf78ee8ee7240dfd29297043172f124dbaa93b08fb9eb291aa7
+text|-19|c3562eff7ffcd503fadbbefe7da5be558b1bf71aa9330d463a02d4e3d781b912
+text|-19 --single-thread|c3562eff7ffcd503fadbbefe7da5be558b1bf71aa9330d463a02d4e3d781b912
+text|-19 -T4|c3562eff7ffcd503fadbbefe7da5be558b1bf71aa9330d463a02d4e3d781b912
+text|--ultra -22|c3562eff7ffcd503fadbbefe7da5be558b1bf71aa9330d463a02d4e3d781b912
+text|--ultra -22 --single-thread|c3562eff7ffcd503fadbbefe7da5be558b1bf71aa9330d463a02d4e3d781b912
+text|--ultra -22 -T4|c3562eff7ffcd503fadbbefe7da5be558b1bf71aa9330d463a02d4e3d781b912
+bin|--fast=5|27ef29a2c8386e37fb365e74d4b4233a0e0988668d04fae07ade53d76fa0f8e3
+bin|--fast=5 --single-thread|27ef29a2c8386e37fb365e74d4b4233a0e0988668d04fae07ade53d76fa0f8e3
+bin|--fast=5 -T4|27ef29a2c8386e37fb365e74d4b4233a0e0988668d04fae07ade53d76fa0f8e3
+bin|-1|b225c0164b2fb553ed736987877a43a474569d3637a6348d241730bce66bbefd
+bin|-1 --single-thread|b225c0164b2fb553ed736987877a43a474569d3637a6348d241730bce66bbefd
+bin|-1 -T4|b225c0164b2fb553ed736987877a43a474569d3637a6348d241730bce66bbefd
+bin|-3|53972edd07cbb230a17c5405fc6ce4922897fda7d43226fb6470651a1ebb0480
+bin|-3 --single-thread|53972edd07cbb230a17c5405fc6ce4922897fda7d43226fb6470651a1ebb0480
+bin|-3 -T4|53972edd07cbb230a17c5405fc6ce4922897fda7d43226fb6470651a1ebb0480
+bin|-9|729756ceba79cdbdff36b4851e6c08f1991413b7947a4959e86a04e9746ca812
+bin|-9 --single-thread|729756ceba79cdbdff36b4851e6c08f1991413b7947a4959e86a04e9746ca812
+bin|-9 -T4|729756ceba79cdbdff36b4851e6c08f1991413b7947a4959e86a04e9746ca812
+bin|-19|5984474fc7996d9c1c1421466cc748558665e006094a1a8b705c064e70843d0b
+bin|-19 --single-thread|5984474fc7996d9c1c1421466cc748558665e006094a1a8b705c064e70843d0b
+bin|-19 -T4|5984474fc7996d9c1c1421466cc748558665e006094a1a8b705c064e70843d0b
+bin|--ultra -22|5984474fc7996d9c1c1421466cc748558665e006094a1a8b705c064e70843d0b
+bin|--ultra -22 --single-thread|5984474fc7996d9c1c1421466cc748558665e006094a1a8b705c064e70843d0b
+bin|--ultra -22 -T4|5984474fc7996d9c1c1421466cc748558665e006094a1a8b705c064e70843d0b
+rand|--fast=5|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|--fast=5 --single-thread|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|--fast=5 -T4|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-1|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-1 --single-thread|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-1 -T4|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-3|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-3 --single-thread|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-3 -T4|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-9|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-9 --single-thread|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-9 -T4|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-19|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-19 --single-thread|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|-19 -T4|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|--ultra -22|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|--ultra -22 --single-thread|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+rand|--ultra -22 -T4|1fb86e5a310252574a2664de6b529c2e1743c14b13a0e87db8658181cd8de55e
+empty|--fast=5|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|--fast=5 --single-thread|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|--fast=5 -T4|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-1|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-1 --single-thread|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-1 -T4|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-3|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-3 --single-thread|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-3 -T4|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-9|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-9 --single-thread|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-9 -T4|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-19|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-19 --single-thread|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|-19 -T4|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|--ultra -22|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|--ultra -22 --single-thread|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+empty|--ultra -22 -T4|f96deff1816083fdff8bc3e46c3fe6ca46a6bb49f4d5a00627616c13237a512c
+text|-3 --single-thread --no-check|12206e09536911f17b9adfbcb6f35c3af2605d3d94de2f433a624283dd117a68
+text|-3 --single-thread --no-content-size|5865420f09dc999b16cd3bc53a5a6f7debe99307632260df69f3d586fc0a77fc
+text|-3 -T2 --rsyncable|c3b091b15d72af058a694c38648e3b72fb41cb223e6b3d6f640c2022770ee961
+text|-19 --single-thread --long=24|c3562eff7ffcd503fadbbefe7da5be558b1bf71aa9330d463a02d4e3d781b912
+text|-3 --single-thread --zstd=wlog=18,clog=16,hlog=17,slog=3,mml=5,tlen=8,strat=5|f7a55172f2d144804e2689ed22994289a6018dca16fdff4dbbebfd8642694930
+text|-6 --zstd=strat=9,tlen=64|34c3d5367561a8e718a6e56162c4497b716817fd7421c1b1af02e0d2e43ec715
+text|-3 --single-thread --target-compressed-block-size=1024|9c805e912f5024370bf088965477a7b6d9d7d7e7fc4643ff0b540a5b2795f831
+train|--train|17d74a1ccb4a0c140b6a1ad52e436af65d7cf12ddd0fef479060a8b304db24fc
+train|--train-cover=k=64,d=8|ae6e41fc2cd6dfe50f21260d109e63f593570a8465de97c27676c23095b0fd76
+train|--train --maxdict=4096|b065debaec580e1d1c0bff4d2d70896861db207443d346a6c98bf171a98882e9

@@ -50,6 +50,8 @@ trusting the size a file declares about itself.
 [MIT](LICENSE), plus BSD-2-Clause for the pack decoder, a port of FreeBSD's
 `unpack.c` (`LICENSE-unpack-bsd`), and 0BSD for liblzma 5.8.4's memory-usage
 formulas and container coders, ported for the pure xz tier
-(`LICENSE-xz-memusage`); the crate's metadata is
-`MIT AND BSD-2-Clause AND 0BSD`. `lzma-rust2`, behind the pure
-xz/LZMA1/LZIP backends, is Apache-2.0.
+(`LICENSE-xz-memusage`), and BSD-3-Clause for zstd 1.5.7's default
+compression-parameter table (`clevels.h`, Meta Platforms, Inc.), ported for
+the zstd tool's options (`LICENSE-zstd-clevels`); the crate's metadata is
+`MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause`. `lzma-rust2`, behind the
+pure xz/LZMA1/LZIP backends, is Apache-2.0.
