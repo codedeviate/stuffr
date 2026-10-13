@@ -23,28 +23,8 @@ use stuffr::ops::{CompressOpts, Input, Output};
 use stuffr_core::FormatId;
 use stuffr_core::salvage::{SalvagePolicy, SalvageStatus};
 
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "stuffr-salvage-cpio-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+mod common;
+use common::Scratch;
 
 /// The three files every test packs, under `tree/`, in walk order.
 const FILES: [(&str, &[u8]); 3] = [

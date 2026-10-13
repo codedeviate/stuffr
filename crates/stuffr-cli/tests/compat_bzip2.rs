@@ -1338,7 +1338,7 @@ mod differential {
 #[cfg(unix)]
 mod interrupts {
     use super::compat_harness::interrupt::*;
-    use super::compat_harness::{REFERENCE_DIR, require_reference};
+    use super::compat_harness::{REFERENCE_DIR, ScratchDir, require_reference};
     use std::cell::Cell;
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -1361,8 +1361,10 @@ mod interrupts {
         require_reference(&exe).then_some(exe)
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("stuffr-bz-intr-{}-{tag}", std::process::id()))
+    fn scratch(tag: &str) -> ScratchDir {
+        ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-bz-intr-{}-{tag}", std::process::id())),
+        )
     }
 
     fn plain(m: usize) -> Vec<u8> {
@@ -1392,7 +1394,6 @@ mod interrupts {
         };
         let ready = has_data(&dir, &named);
         let r = interrupt_with_input(&exe, "bzip2", args, &dir, "a", &plain, inherit, sig, &ready);
-        let _ = std::fs::remove_dir_all(&dir);
         Some(r)
     }
 
@@ -1466,7 +1467,6 @@ mod interrupts {
                 libc::SIGTERM,
                 &ready,
             );
-            let _ = std::fs::remove_dir_all(&dir);
             assert_eq!(r.status.code(), Some(1), "mine={mine}: {:?}", r.status);
             assert_eq!(
                 String::from_utf8_lossy(&r.stderr),
@@ -1511,7 +1511,6 @@ mod interrupts {
                 libc::SIGINT,
                 &ready,
             );
-            let _ = std::fs::remove_dir_all(&dir);
             check(
                 &r,
                 "\nbzip2: Control-C or similar caught, quitting.\n\
@@ -1563,7 +1562,6 @@ mod interrupts {
                 }
             }
             let r = got.expect("finished before the signal even at 256 MiB");
-            let _ = std::fs::remove_dir_all(&dir);
             check(
                 &r,
                 &format!("{CAUGHT}{NOT_PROCESSED}"),
@@ -1614,7 +1612,6 @@ mod interrupts {
                 libc::SIGINT,
                 &ready,
             );
-            let _ = std::fs::remove_dir_all(&dir);
             check(&r, CAUGHT_NO_OUTPUT, &["a.bz2"], &format!("mine={mine}"));
         }
     }
@@ -1639,7 +1636,6 @@ mod interrupts {
                     .stdin(Stdio::null()),
             )
             .unwrap();
-            let _ = std::fs::remove_dir_all(&dir);
             assert!(out.status.success());
             out.stdout
         });

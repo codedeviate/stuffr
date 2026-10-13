@@ -35,6 +35,9 @@ use stuffr::entries::{self, PartialCause, SalvageDisposition, SalvageOpts};
 use stuffr_core::FormatId;
 use stuffr_core::salvage::SalvagePolicy;
 
+mod common;
+use common::Scratch;
+
 /// The ARJ envelope's `u16` basic header size, at the header's own offset 2
 /// — the field `unarj_rs::arj_archive::read_header` bounds against its own
 /// 2600-byte `MAX_HEADER_SIZE`.
@@ -50,29 +53,6 @@ fn fixture_bytes() -> Vec<u8> {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../stuffr-formats/fixtures/legacy/sample.arj");
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "stuffr-salvage-arj-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 fn opts(dest: Option<PathBuf>) -> SalvageOpts {

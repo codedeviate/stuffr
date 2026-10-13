@@ -12,19 +12,19 @@ const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
 /// A token unique to THIS test-binary run, mixed into every temp path below.
 ///
 /// `{pid}-{something}` was NOT unique enough, and the failure it caused reads
-/// exactly like a code defect. These directories are never removed on a
-/// failing path, PIDs are reused within a day, and a later run landing on a
-/// recycled PID then inherits its predecessor's directories *with their
-/// contents in them* — so five unrelated tests failed with "already exists"
-/// against 4436 leftovers, and deleting the leftovers turned the gate green
-/// with no code change at all. A false red that costs a session.
+/// exactly like a code defect. PIDs are reused within a day, and a later run
+/// landing on a recycled PID inherited its predecessor's leftover directories
+/// *with their contents in them* — so five unrelated tests failed with
+/// "already exists" against 4436 leftovers, and deleting the leftovers turned
+/// the gate green with no code change at all. A false red that costs a session.
 ///
 /// `RandomState` is the dependency-free source of per-process randomness in
 /// `std`: its hasher keys are seeded from the OS, so two concurrent or
-/// consecutive runs cannot agree on this token however their PIDs land. It
-/// makes the name collision-proof rather than merely unlikely, which is the
-/// property that matters — a teardown would still leave the window open for
-/// a run that crashes or is interrupted.
+/// consecutive runs cannot agree on this token however their PIDs land. That
+/// keeps the name collision-proof rather than merely unlikely. The scratch
+/// guard below is the other half: it removes its directory on drop, so a
+/// failing (panicking) test no longer leaves its files behind either; only a
+/// crashed or interrupted run can, and the token keeps those harmless.
 static RUN_TOKEN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     use std::hash::{BuildHasher, Hasher};
     let n = std::collections::hash_map::RandomState::new()
@@ -33,10 +33,72 @@ static RUN_TOKEN: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!("{}-{n:016x}", std::process::id())
 });
 
-fn tmp(name: &str) -> std::path::PathBuf {
+/// A scratch path that removes itself, file or directory tree, when dropped.
+///
+/// Drop runs while a panicking test unwinds, so a failing test no longer
+/// leaves its files behind; only a crashed or interrupted run can, and the
+/// `RUN_TOKEN` in the name keeps those harmless. The path is NOT created (a
+/// test may make it a file or a directory, or check that it does not exist),
+/// and a test's `tmp("a")` and `tmp("a.gz")` still share one parent, which
+/// several tests rely on (`unpack a.gz` writes `a` beside it). It derefs to
+/// `Path`.
+///
+/// `tempfile::TempDir` was tried first and does not fit: it creates its
+/// directory up front, and each call gets a different parent.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Scratch {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for Scratch {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        // A symlink is removed as a file, never followed.
+        match std::fs::symlink_metadata(&self.0) {
+            Ok(m) if m.is_dir() => {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+            Ok(_) => {
+                let _ = std::fs::remove_file(&self.0);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+fn tmp(name: &str) -> Scratch {
     let mut p = std::env::temp_dir();
     p.push(format!("stuffr-cli-{}-{name}", *RUN_TOKEN));
-    p
+    Scratch(p)
+}
+
+#[test]
+fn a_failing_test_leaves_no_scratch_behind() {
+    let seen = std::cell::RefCell::new(None::<PathBuf>);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let probe = tmp("probe");
+        std::fs::write(&probe, b"left behind?").unwrap();
+        *seen.borrow_mut() = Some(probe.to_path_buf());
+        panic!("a failing test, on purpose");
+    }));
+    assert!(r.is_err());
+    let probe = seen.into_inner().expect("the closure ran");
+    assert!(!probe.exists(), "{} survived a panic", probe.display());
 }
 
 // A bare `pack src` with neither `-o` nor `--format` can only default when
@@ -79,9 +141,6 @@ fn info_names_the_format_and_the_rung() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("gzip"), "{text}");
     assert!(text.contains("exact"), "a file is read exactly: {text}");
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -113,9 +172,6 @@ fn info_json_is_structured_and_names_how_the_format_was_detected() {
         "a real gzip file is identified by its magic, not its name"
     );
     assert!(v["warnings"].as_array().unwrap().is_empty());
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 /// `info` has no `--threads` (multi-threaded decode is out of scope this
@@ -167,9 +223,6 @@ fn info_reports_the_resolved_memory_limit() {
     let v: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("not JSON: {e}\n{text}"));
     assert_eq!(v["memory_limit"], 512 * 1024 * 1024);
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 /// The whole `info` fidelity rule, all four cases in one place, because the
@@ -273,8 +326,6 @@ fn info_withholds_the_fidelity_claim_only_where_a_forward_read_could_lose_someth
             );
         }
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `info` must not report a fidelity conclusion it did not reach.
@@ -355,8 +406,6 @@ fn info_on_a_piped_zip_does_not_claim_nothing_was_approximated() {
         text.contains("nothing approximated"),
         "a seekable zip reads its central directory, so nothing is approximated: {text}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The other side of the same fix: a bare CODEC stream has no container to
@@ -409,9 +458,6 @@ fn info_on_a_bare_codec_stream_still_reports_nothing_approximated() {
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap())
         .expect("info --json must be JSON");
     assert_eq!(v["fidelity_evaluated"], true, "{v}");
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 /// Runs `stuffr info -` over `bytes` and returns its stdout.
@@ -464,9 +510,6 @@ fn info_over_a_pipe_reports_forward_only_not_exact() {
         text.contains("forward-only"),
         "a pipe cannot seek, so the rung must not be exact: {text}"
     );
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 /// `head -c N`, `grep -m1`, `less` — every consumer that decides it has seen
@@ -519,9 +562,6 @@ fn cat_exits_cleanly_when_the_reader_closes_early() {
         err_text.is_empty(),
         "a clean broken-pipe exit prints nothing: {err_text}"
     );
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -693,9 +733,6 @@ fn cat_reads_a_stream_on_stdin() {
 
     assert!(out.status.success());
     assert_eq!(out.stdout, b"needle in a haystack");
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 /// The motivating case for the whole flush contract: `stuffr pack - -o out.gz`
@@ -731,8 +768,6 @@ fn pack_reads_input_from_stdin() {
         .unwrap();
     assert!(cat_out.status.success());
     assert_eq!(cat_out.stdout, plain, "round trip must be byte-identical");
-
-    let _ = std::fs::remove_file(&out);
 }
 
 /// The other motivating case: `stuffr pack x -o -` writes to a destination
@@ -782,8 +817,6 @@ fn pack_writes_output_to_stdout() {
         cat_out.stdout, plain,
         "round trip through a piped stdout destination must be byte-identical"
     );
-
-    let _ = std::fs::remove_file(&src);
 }
 
 /// A write line says what the write LOST, in the words every write line uses.
@@ -811,8 +844,6 @@ fn pack_over_a_pipe_says_no_fidelity_loss_not_a_read_rung() {
         !err_text.contains("forward-only") && !err_text.contains("exact"),
         "a write line makes no read-rung claim: {err_text}"
     );
-
-    let _ = std::fs::remove_file(&out);
 }
 
 /// The other half of the pair above: same words from a seekable file.
@@ -832,9 +863,6 @@ fn pack_of_a_seekable_file_says_no_fidelity_loss() {
     assert!(out.status.success());
     let err_text = String::from_utf8_lossy(&out.stderr);
     assert!(err_text.contains("no fidelity loss"), "{err_text}");
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -855,9 +883,6 @@ fn an_existing_output_is_refused_with_exit_two() {
         b"PRE-EXISTING",
         "the refused command changed nothing"
     );
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -893,9 +918,6 @@ fn a_bomb_exits_six_and_leaves_no_partial_output() {
         !out_path.exists(),
         "a refused decode must leave no partial file"
     );
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -1180,8 +1202,6 @@ fn examples_pages_first_worked_example_runs_as_documented() {
         notes.exists(),
         "the page says the input, notes.txt, is left alone"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// **A behavioural claim on the `--examples` page, pinned by RUNNING it.**
@@ -1388,8 +1408,6 @@ fn pack_refuses_a_read_only_legacy_format_clearly() {
             dst.display()
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The positive counterpart to `pack_refuses_a_read_only_legacy_format_
@@ -1454,8 +1472,6 @@ fn pack_writes_a_compress_stream_the_system_tool_reads() {
         .unwrap();
     assert!(cat.status.success());
     assert_eq!(cat.stdout, plain);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The positive counterpart to `pack_refuses_a_read_only_legacy_format_
@@ -1540,8 +1556,6 @@ fn pack_writes_an_lha_archive_the_system_tool_reads() {
             "`stuffr list` lost {name}: {listing}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The positive counterpart to `pack_refuses_a_read_only_legacy_format_
@@ -1646,8 +1660,6 @@ fn pack_writes_an_arj_archive_stuffr_reads_back() {
         "the directory entries must come back as directories, which is what \
          ContainerCaps::stores_dirs claims"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -1682,9 +1694,6 @@ fn a_corrupt_archive_exits_five_not_one() {
         Some(5),
         "a corrupt archive must be distinguishable from a full disk"
     );
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -1752,9 +1761,6 @@ fn cat_accepts_an_explicit_format() {
         String::from_utf8_lossy(&res.stderr)
     );
     assert_eq!(res.stdout, b"payload");
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -1786,9 +1792,6 @@ fn pack_with_no_flags_defaults_to_gzip() {
         "a bare pack with no --format must default to gzip and write {}.gz",
         src.display()
     );
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -1964,9 +1967,6 @@ fn cat_honours_max_ratio() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(6), "resource limits exit 6");
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&gz);
 }
 
 #[test]
@@ -2051,9 +2051,6 @@ fn a_malformed_memory_limit_is_a_usage_error() {
         "must name the accepted forms concretely: {err}"
     );
     assert!(!out_path.exists(), "a refused pack must leave no output");
-
-    let _ = std::fs::remove_file(&src);
-    let _ = std::fs::remove_file(&out_path);
 }
 
 #[test]
@@ -2110,13 +2107,13 @@ static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 /// `create_dir`, which would refuse an existing path): with a random token the
 /// path cannot pre-exist, so a refusal would only ever fire on a genuine
 /// filesystem fault and `create_dir_all` reports that just as loudly.
-fn tmp_dir() -> PathBuf {
+fn tmp_dir() -> Scratch {
     let n = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
     let mut p = std::env::temp_dir();
     p.push(format!("stuffr-cli-archive-{}-{n}", *RUN_TOKEN));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
-    p
+    Scratch(p)
 }
 
 /// Writes a GNU-format tar header for `name`/`data` into `builder`. Kept
@@ -2223,8 +2220,6 @@ fn list_names_every_entry_and_extracts_nothing() {
     // Nothing was written to the filesystem.
     assert!(!dir.join("a.txt").exists(), "list must not extract");
     assert!(!dir.join("b").exists(), "list must not extract");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2238,8 +2233,6 @@ fn ls_is_an_alias_for_list() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8(out.stdout).unwrap().contains("a.txt"));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2260,8 +2253,6 @@ fn list_json_reports_name_kind_and_size() {
     assert_eq!(rows[0]["name"], "a.txt");
     assert_eq!(rows[0]["kind"], "file");
     assert_eq!(rows[0]["size"], 5);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2271,8 +2262,6 @@ fn test_verb_exits_five_on_a_corrupt_archive_and_zero_on_a_good_one() {
     assert_eq!(run(&["test", good.to_str().unwrap()]).code(), Some(0));
     let bad = corrupt_midway(&good);
     assert_eq!(run(&["test", bad.to_str().unwrap()]).code(), Some(5));
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2282,8 +2271,6 @@ fn list_works_on_a_pipe() {
     let bytes = std::fs::read(write_fixture_tar(&dir, &[("a.txt", b"alpha")])).unwrap();
     let text = run_with_stdin(&["list", "-"], &bytes);
     assert!(text.contains("a.txt"), "{text}");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The forward risk flagged for this task: `open_archive` must not decode a
@@ -2318,8 +2305,6 @@ fn list_and_test_succeed_on_a_real_tar_gz_from_a_file() {
         "test stderr: {}",
         String::from_utf8_lossy(&test_out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2346,8 +2331,6 @@ fn list_and_test_succeed_on_a_real_tar_gz_over_a_pipe() {
         "test stderr: {}",
         String::from_utf8_lossy(&test_out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2373,8 +2356,6 @@ fn list_and_test_succeed_on_a_real_tgz_from_a_file() {
         "test stderr: {}",
         String::from_utf8_lossy(&test_out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2401,8 +2382,6 @@ fn list_and_test_succeed_on_a_real_tgz_over_a_pipe() {
         "test stderr: {}",
         String::from_utf8_lossy(&test_out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A truncation strictly INSIDE a single entry's declared payload, well
@@ -2455,8 +2434,6 @@ fn test_catches_a_payload_truncation() {
          payload read: {}",
         String::from_utf8_lossy(&list_out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The `container` fuzz target's own reproducer, minimised by `cargo fuzz
@@ -2544,8 +2521,6 @@ fn a_zip_declaring_an_unreachable_local_header_offset_exits_5_not_1() {
         "`unpack` too: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A stored zip holding one symlink entry (`S_IFLNK` in the central
@@ -2672,8 +2647,6 @@ fn a_zip_symlink_target_over_64_kib_exits_6_and_one_at_the_ceiling_does_not() {
         "`convert` too: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2703,8 +2676,6 @@ fn list_refuses_a_plain_codec_stream_as_not_an_archive() {
         err.contains("gzip"),
         "must name what the input actually resolved to: {err}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -2767,8 +2738,6 @@ fn list_reports_a_truncated_codec_stream_as_corrupt_not_as_an_io_failure() {
         list_err.contains("archive is corrupt"),
         "must be Error::Corrupt's own wording, not Error::Io's: {list_err}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The second shape Task 4b's fuzzing found: an EMPTY file named `.lz`.
@@ -2802,8 +2771,6 @@ fn list_reports_an_empty_lzip_stream_as_corrupt_not_as_an_io_failure() {
         "must be Error::Corrupt's own wording, naming what lzip's decoder actually \
          complained about: {list_err}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A directory handed to a read verb is a usage error (exit 2), never
@@ -2850,8 +2817,6 @@ fn a_directory_input_is_a_usage_error_for_every_read_verb() {
         assert!(!out_dir.exists(), "{args:?} created its destination");
         assert!(!out_file.exists(), "{args:?} created its output file");
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The 21 bytes the `chain` fuzz target's honesty oracle caught after the
@@ -2917,8 +2882,6 @@ fn list_reports_a_zstd_stream_that_decodes_into_arj_magic_as_corrupt() {
             "must be Error::Corrupt's own wording, not Error::Io's: {err}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The second shape the same enumeration turned up, and one no fuzz target
@@ -2978,8 +2941,6 @@ fn a_ratio_refusal_below_a_container_is_a_resource_limit_not_an_io_failure() {
             "must be Error::ResourceLimit's own wording, naming the knob: {err}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------
@@ -3038,8 +2999,6 @@ fn list_and_test_refuse_a_bomb_tar_gz_at_a_tight_max_ratio() {
         test_err.contains("100") && test_err.contains("--max-ratio"),
         "must name the limit and the flag: {test_err}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -3064,8 +3023,6 @@ fn raising_max_ratio_lets_the_bomb_through() {
         "test stderr: {}",
         String::from_utf8_lossy(&test_out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The false-positive trap the guard must NOT fall into: a real, sizeable
@@ -3095,8 +3052,6 @@ fn a_legitimately_compressible_tar_gz_is_not_refused_at_the_default_ratio() {
         "a legitimately compressible archive must not be refused at the default ratio: {}",
         String::from_utf8_lossy(&test_out.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------
@@ -3824,7 +3779,6 @@ fn a_tar_pax_header_past_the_ceiling_exits_6() {
         "a pipe: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The ceiling's healthy side: GNU tar's own `--format=pax` archive of a
@@ -3861,7 +3815,6 @@ fn a_gnu_tar_pax_archive_with_a_300_byte_path_lists_normally() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(stdout.contains(&rel), "{stdout}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `tar.rs`'s own tests gate on the system tool the same way rather than
@@ -4686,8 +4639,9 @@ fn an_st_mode_shaped_header_mode_raises_no_warning() {
 /// byte 5, the coded dictionary size, forced to `0x1D` — 512 MiB. The
 /// payload is untouched and still decodes, so anything the crafted file
 /// costs comes purely from the DECLARATION, which is what makes it the
-/// right probe for a pre-output allocation guard.
-fn craft_a_tar_lz_declaring_a_huge_dictionary(tag: &str) -> (PathBuf, PathBuf) {
+/// right probe for a pre-output allocation guard. The third element is the
+/// directory guard; the caller keeps it alive for as long as it uses the paths.
+fn craft_a_tar_lz_declaring_a_huge_dictionary(tag: &str) -> (PathBuf, PathBuf, Scratch) {
     let dir = tmp(tag);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -4721,7 +4675,7 @@ fn craft_a_tar_lz_declaring_a_huge_dictionary(tag: &str) -> (PathBuf, PathBuf) {
     let crafted = dir.join("crafted.tar.lz");
     std::fs::write(&crafted, &bytes).unwrap();
 
-    (legit, crafted)
+    (legit, crafted, dir)
 }
 
 /// The Phase 2 final review's C1, pinned on every entry-aware verb.
@@ -4750,7 +4704,7 @@ fn craft_a_tar_lz_declaring_a_huge_dictionary(tag: &str) -> (PathBuf, PathBuf) {
 /// `info_reports_the_resolved_memory_limit` states the same convention.
 #[test]
 fn a_container_under_a_codec_declaring_a_huge_dictionary_is_refused_on_every_verb() {
-    let (_legit, crafted) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-refuse");
+    let (_legit, crafted, _dir) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-refuse");
     let path = crafted.to_str().unwrap();
     // Below the fixture's 512 MiB declaration, above what the legitimate
     // sibling needs — see `a_legitimate_archive_of_the_same_size_still_works_on_every_verb`.
@@ -4821,7 +4775,7 @@ fn a_container_under_a_codec_declaring_a_huge_dictionary_is_refused_on_every_ver
 /// worse defect than the one it closed.
 #[test]
 fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
-    let (legit, crafted) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-allow");
+    let (legit, crafted, _dir) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-allow");
     let path = legit.to_str().unwrap();
     assert_eq!(
         std::fs::metadata(&legit).unwrap().len(),
@@ -4884,7 +4838,6 @@ fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(dest.join("a.txt").exists());
-    let _ = std::fs::remove_dir_all(&dest);
 }
 
 /// `--memory-limit` is now ACCEPTED and honoured on the entry-aware paths,
@@ -4894,7 +4847,7 @@ fn a_legitimate_archive_of_the_same_size_still_works_on_every_verb() {
 /// than being parsed and dropped.
 #[test]
 fn memory_limit_is_honoured_rather_than_refused_on_the_container_path() {
-    let (_legit, crafted) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-flag");
+    let (_legit, crafted, _dir) = craft_a_tar_lz_declaring_a_huge_dictionary("c1-flag");
     let path = crafted.to_str().unwrap();
 
     for args in [
@@ -4930,7 +4883,6 @@ fn memory_limit_is_honoured_rather_than_refused_on_the_container_path() {
         "unpack -C must accept --memory-limit rather than refusing it; stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = std::fs::remove_dir_all(&dest);
 }
 
 /// The Phase 2 final review's I1, end to end.
@@ -5239,8 +5191,6 @@ fn info_does_not_claim_nothing_was_approximated_for_a_container_under_a_codec() 
             "a bare seekable .{ext} is unaffected by the codec-wrapped rule: {text}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The Phase 2 final review's I3: `entries::test` built no `ArchiveBudget`
@@ -8484,8 +8434,6 @@ fn the_index_list_prints_is_the_index_cat_selects_by() {
              the same entry"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The property the two-route implementation rests on, at the level a user
@@ -8536,8 +8484,6 @@ fn index_selection_agrees_between_a_seekable_zip_and_the_same_zip_on_a_pipe() {
             "index {n} did not reach the entry the archive was built with"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Repeatable, delivered in archive order however the flags were ordered,
@@ -8574,8 +8520,6 @@ fn repeated_index_flags_are_deduplicated_and_delivered_in_archive_order() {
         out.stdout, b"alphacharlie",
         "archive order, once each — not typed order, and not twice"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An index past the end is the caller's mistake, so exit 2 and say how many
@@ -8607,8 +8551,6 @@ fn an_index_past_the_end_is_a_usage_error_naming_the_real_entry_count() {
             "an out-of-range index must not stream anything first"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--index` and PATTERNS are alternative ways of saying "which entries",
@@ -8639,8 +8581,6 @@ fn index_and_patterns_together_are_a_usage_error() {
         !dest.exists(),
         "the refusal must come before anything is created"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--index` selects entries, so on `unpack` it needs -C for exactly the
@@ -8657,8 +8597,6 @@ fn unpack_by_index_without_a_directory_names_the_index_in_its_refusal() {
         stderr.contains("--index 1") && stderr.contains("-C"),
         "the refusal must name what was typed and what to do instead: {stderr}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The containered half of the feature: `unpack --index N -C out` writes
@@ -8691,8 +8629,6 @@ fn unpack_by_index_extracts_only_the_selected_entry() {
     assert_eq!(std::fs::read(dest.join("b.txt")).unwrap(), b"bravo");
     assert!(!dest.join("a.txt").exists(), "only the selected entry");
     assert!(!dest.join("c.txt").exists(), "only the selected entry");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--json` carries the index too, since a script selecting by position has
@@ -8709,8 +8645,6 @@ fn list_json_carries_the_archive_index_of_every_entry() {
     assert_eq!(rows[0]["name"], "a.txt");
     assert_eq!(rows[1]["index"], 1);
     assert_eq!(rows[1]["name"], "b.txt");
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------
@@ -8761,8 +8695,6 @@ fn list_reports_the_same_fidelity_warnings_test_does() {
         warnings_of(&test_err),
         "list:\n{list_err}\ntest:\n{test_err}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// And the gate: `list --strict-fidelity` exits 4 on the same archive it
@@ -8802,8 +8734,6 @@ fn list_strict_fidelity_turns_a_warning_into_exit_four() {
         "a seekable zip loses nothing: {}",
         String::from_utf8_lossy(&clean.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------
@@ -8856,8 +8786,6 @@ fn a_temp_directory_name_is_not_reproducible_from_the_pid_and_a_counter() {
         other_name.ends_with("-token-check"),
         "…and must still end in the caller's own name: {other_name}"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Every `cargo install stuffr-cli --features <x>` a shipped document prints
@@ -11589,8 +11517,6 @@ fn legacy_truncated_tail_row(
         went_in[..recovered.len()],
         "{label}: every recovered byte must be one the archive itself still held"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// ARC. Two borrowed entries (`cpm.arc`, `DDTZ.COM` then `READ.COM`) so the
@@ -11805,8 +11731,6 @@ fn lhasa_agrees_with_the_lha_damage_catalogue() {
             );
         }
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// **The tripwire, not a skip — and named for what it measures.**
@@ -11989,8 +11913,6 @@ fn damage_catalogue_the_three_partial_causes_are_distinguishable() {
             rows[0]
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Salvage Stage 3 Task 2: `stuffr salvage` over a real tar, at the CLI.
@@ -13313,8 +13235,6 @@ fn checksumless_catalogue_end_to_end(format: &str, tier: &str, whole_exit: i32) 
             "{format}"
         );
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// tar: `Complete` (header self-check only), so a flipped payload byte is
@@ -13354,7 +13274,6 @@ fn damage_catalogue_tar_end_to_end() {
         "one header at offset 0, not its late copy too: {stderr}"
     );
     assert!(!stderr.contains("offset(s) 0, 1"), "{stderr}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// cpio (`newc`): `Unattested`, exit 4 even when whole.
@@ -13420,7 +13339,6 @@ fn a_tar_sparse_header_the_tar_crate_would_overflow_on_exits_5() {
         "salvage: {code:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The healthy shape the guard above stands in front of: a real GNU tar
@@ -13512,7 +13430,6 @@ fn a_gnu_tar_sparse_archive_lists_tests_and_unpacks_byte_identical() {
         got[data.len()..].iter().all(|&b| b == 0),
         "the hole unpacks as zeros"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -13530,7 +13447,7 @@ fn convert_payloads() -> (Vec<u8>, Vec<u8>) {
 
 /// A fresh scratch directory holding `d/one.txt` and `d/sub/two.bin`, packed
 /// by stuffr itself into `a.tar.gz`. Returns `(dir, a.tar.gz)`.
-fn convert_fixture() -> (PathBuf, PathBuf) {
+fn convert_fixture() -> (Scratch, PathBuf) {
     let dir = tmp_dir();
     let d = dir.join("d");
     std::fs::create_dir_all(d.join("sub")).unwrap();
@@ -13583,7 +13500,6 @@ fn convert_recompresses_a_tar_gz_to_tar_zst() {
         stderr_text(&out)
     );
     assert_unpacks_to_the_fixture(&dir, &b, "out");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13593,7 +13509,6 @@ fn convert_accepts_the_destination_as_a_second_positional() {
     let out = run_output(&["convert", a.to_str().unwrap(), b.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert_unpacks_to_the_fixture(&dir, &b, "out");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13613,7 +13528,6 @@ fn convert_refuses_both_destination_forms_at_once() {
     // Neither form at all is the same mistake from the other side.
     let out = run_output(&["convert", a.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13648,7 +13562,6 @@ fn convert_refuses_a_plain_stream_into_a_container() {
         "{err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&fdir);
 }
 
 #[test]
@@ -13674,7 +13587,6 @@ fn convert_refuses_nothing_to_convert() {
     ]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert_unpacks_to_the_fixture(&dir, &b, "out");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -13736,7 +13648,6 @@ fn convert_refuses_overwriting_its_own_input() {
         "--level",
         "9",
     ]));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13758,7 +13669,6 @@ fn convert_to_stdout_needs_format() {
     let back = run_with_stdin_output(&["cat", "-"], &out.stdout);
     assert_eq!(back.status.code(), Some(0), "{}", stderr_text(&back));
     assert_eq!(back.stdout, payload);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13771,7 +13681,6 @@ fn convert_reads_stdin() {
     );
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert_unpacks_to_the_fixture(&dir, &b, "out");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13810,7 +13719,6 @@ fn convert_refuses_a_format_that_contradicts_the_name() {
     ]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert_unpacks_to_the_fixture(&dir, &b, "out");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13855,7 +13763,6 @@ fn convert_refuses_encoder_flags_a_codecless_target_cannot_honour() {
         "{}",
         stderr_text(&out)
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13877,7 +13784,6 @@ fn convert_points_an_unrecognised_input_at_pack() {
         stderr_text(&out)
     );
     assert!(!out_path.exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13902,7 +13808,6 @@ fn convert_to_a_bare_stream_names_raw_in_its_progress_line() {
         stderr_text(&out)
     );
     assert_eq!(std::fs::read(&back).unwrap(), payload);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -13943,7 +13848,6 @@ fn convert_refuses_usage_errors_before_opening_the_input() {
     if stderr_text(&out).contains("weak") {
         assert_eq!(out.status.code(), Some(2), "{}", stderr_text(&out));
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -13971,7 +13875,6 @@ fn convert_refuses_a_codecless_identical_chain_whatever_the_flags() {
         );
         assert!(!i.exists());
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -14007,7 +13910,6 @@ fn convert_refuses_stdin_redirected_from_its_own_output() {
         before,
         "the input was truncated"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -14030,7 +13932,6 @@ fn convert_progress_line_says_what_the_write_lost_in_packs_words() {
     let err = stderr_text(&out);
     assert!(err.contains(" bytes, no fidelity loss)"), "{err}");
     assert!(!err.contains("forward-only"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -14056,7 +13957,6 @@ fn convert_container_to_stdout_plain_points_at_the_pipe() {
     let tar = dir.join("piped.tar");
     assert!(run(&["unpack", xz.to_str().unwrap(), "-o", tar.to_str().unwrap()]).success());
     assert_eq!(std::fs::read(&tar).unwrap(), first.stdout);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -14075,7 +13975,6 @@ fn convert_tar_gz_to_zip_round_trips() {
     assert!(err.contains("-> zip ("), "{err}");
     assert!(err.contains(" bytes, no fidelity loss)"), "{err}");
     assert_unpacks_to_the_fixture(&dir, &zip, "out");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A `.tar.gz` the way `gtar czf` writes one — the tar padded with zeros to
@@ -14089,7 +13988,7 @@ fn convert_tar_gz_to_zip_round_trips() {
 /// `.tar.gz` hides the defect. `Compression::none()` stores every deflate
 /// block, so the flip changes a payload byte and nothing else: the stream
 /// decodes in full, and only the CRC can tell.
-fn gnu_padded_tar_gz() -> (PathBuf, PathBuf, PathBuf) {
+fn gnu_padded_tar_gz() -> (Scratch, PathBuf, PathBuf) {
     let dir = tmp_dir();
     let payload: Vec<u8> = (0..4000u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
@@ -14133,7 +14032,6 @@ fn convert_refuses_a_tar_gz_whose_gzip_trailer_disagrees() {
     let out = run_output(&["convert", corrupt.to_str().unwrap(), zip.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(5), "{}", stderr_text(&out));
     assert!(!zip.exists(), "a corrupt source publishes nothing");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -14155,7 +14053,6 @@ fn every_read_verb_checks_the_gzip_trailer_under_a_padded_tar() {
             stderr_text(&out)
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -14169,7 +14066,6 @@ fn a_clean_gnu_padded_tar_gz_converts_and_tests_clean() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     let out = run_output(&["test", zip.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Every container this build can WRITE, with the extension `pack` takes it
@@ -14306,7 +14202,6 @@ fn convert_every_container_into_every_other() {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// M2 (Phase 5a final review): `convert DIR x.zip` is exit 2 naming `pack`,
@@ -14328,7 +14223,6 @@ fn convert_refuses_a_directory_input_as_a_usage_error() {
         "{err}"
     );
     assert!(!zip.exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// I1 (Phase 5a final review): a target that stores no owner loses nothing
@@ -14360,7 +14254,6 @@ fn convert_reports_missing_ownership_only_into_a_target_that_stores_one() {
     let err = stderr_text(&out);
     assert_eq!(out.status.code(), Some(0), "{err}");
     assert!(err.contains("missing metadata: uid_gid"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Archives written by the real tools — not by stuffr — convert to
@@ -14422,7 +14315,6 @@ fn convert_reads_archives_the_reference_tools_wrote() {
         assert_eq!(std::fs::read(back.join("one.txt")).unwrap(), one, "{label}");
         assert_eq!(std::fs::read(back.join("two.bin")).unwrap(), two, "{label}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A real reader for convert's output: the system `unzip` lists the zip a
@@ -14445,7 +14337,6 @@ fn convert_writes_a_zip_the_system_unzip_reads() {
     let listing = String::from_utf8_lossy(&listing);
     assert!(listing.contains("d/one.txt"), "{listing}");
     assert!(listing.contains("d/sub/two.bin"), "{listing}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A zip another tool streamed to a pipe declares its sizes only in data
@@ -14489,7 +14380,6 @@ fn convert_reads_a_descriptor_zip_from_stdin() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert_eq!(std::fs::read(back.join("one.txt")).unwrap(), one);
     assert_eq!(std::fs::read(back.join("two.bin")).unwrap(), two);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A symlink into a container with no symlink entries is a fidelity loss:
@@ -14531,7 +14421,6 @@ fn convert_strict_fidelity_exits_4_and_keeps_the_output() {
     let out = run_output(&["unpack", a.to_str().unwrap(), "-C", back.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert_eq!(std::fs::read(back.join("d/real.txt")).unwrap(), b"real");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Controller ruling C4b: `--strict-fidelity` on convert judges the merged
@@ -14562,7 +14451,6 @@ fn convert_strict_fidelity_passes_a_lossless_piped_source() {
         stderr_text(&out)
     );
     assert_unpacks_to_the_fixture(&dir, &zip, "out");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A name a target's writer genuinely refuses: an `lha` level-1 header's
@@ -14616,7 +14504,6 @@ fn convert_into_lha_with_a_name_too_long_matches_pack() {
         stderr_text(&convert)
     );
     assert!(!converted.exists(), "a failed convert leaves no OUT");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Entry mode into a container this build only READS (`zoo`, `arc`) is a
@@ -14652,7 +14539,6 @@ fn convert_into_a_read_only_container_exits_3_and_writes_nothing() {
         );
         assert!(!t.exists(), "{id} stdin: no OUT");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// An ar archive in the BSD extended form (`#1/N`), whose member names may
@@ -14730,7 +14616,6 @@ fn convert_skips_a_name_with_a_nul_its_target_cannot_store() {
         "--strict-fidelity",
     ]);
     assert_eq!(out.status.code(), Some(4), "{}", stderr_text(&out));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A BSD `#1/N` member is padded by its WHOLE size, name included, and
@@ -14813,7 +14698,6 @@ fn bsd_ar_with_odd_names_lists_and_unpacks() {
     for (name, _, data) in members {
         assert_eq!(std::fs::read(back.join(name)).unwrap(), data, "{name}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 0.10.3: `llvm-ar` writes GNU's 64-bit symbol table (`/SYM64/`) past
@@ -14854,7 +14738,6 @@ fn llvm_ar_with_a_sym64_symbol_table_lists() {
     let out = run_output(&["list", dir.join("out.a").to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("obj.o"));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A hostile entry name inside a library error message must not reach the
@@ -14872,7 +14755,6 @@ fn a_hostile_name_in_a_corrupt_archive_error_is_escaped() {
     assert!(!out.stderr.contains(&0x1b), "raw ESC on stderr");
     let err = stderr_text(&out);
     assert!(err.contains("a\\x1b[31mbc"), "{err}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -14909,7 +14791,6 @@ fn control_bytes_in_entry_names_never_reach_the_terminal_raw() {
     let out = run_output(&["list", "--json", t]);
     let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(rows[0]["name"].as_str().unwrap(), evil);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---- Hard links on unpack (0.10.0 Task 8) --------------------------------
@@ -14999,7 +14880,6 @@ fn unpack_recreates_gnu_tar_hard_links() {
         "--strict-fidelity",
     ]);
     assert_links_recreated(&out, &dest);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -15026,7 +14906,6 @@ fn unpack_recreates_gnu_cpio_hard_links() {
         "--strict-fidelity",
     ]);
     assert_links_recreated(&out, &dest);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review Focus 4: forward-only, from a pipe, links are created exactly as
@@ -15055,7 +14934,6 @@ fn unpack_recreates_hard_links_from_a_piped_tar() {
         &std::fs::read(&tar).unwrap(),
     );
     assert_links_recreated(&out, &dest);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A link whose target was not selected is skipped, named on stderr, and
@@ -15096,7 +14974,6 @@ fn unpack_skips_a_link_whose_target_was_not_selected() {
         "{stderr}"
     );
     assert!(std::fs::symlink_metadata(dest.join("a1")).is_err());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A GNU tar of `hard_link_tree`, its entries named `./a` and so on.
@@ -15154,7 +15031,6 @@ fn a_gnu_tar_naming_a_file_twice_lists_and_unpacks() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"shared payload");
     assert_eq!(std::fs::read(dest.join("b")).unwrap(), b"shared payload");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// tar into zip: every link name holds its target's bytes, as a copy, and
@@ -15184,7 +15060,6 @@ fn convert_gnu_tar_with_hard_links_to_zip_copies_them() {
         let got = run_tool(&unzip, &[os(&"-p"), os(&zip), os(&name)], &dir, b"");
         assert_eq!(got, want, "{name}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// cpio into tar: the target stores links, so GNU tar sees links.
@@ -15212,7 +15087,6 @@ fn convert_gnu_cpio_with_hard_links_to_tar_keeps_links() {
     let listing = run_tool(&require_gnu_tar(), &[os(&"-tvf"), os(&tar)], &dir, b"");
     let listing = String::from_utf8_lossy(&listing);
     assert_eq!(listing.matches(" link to ").count(), 3, "{listing}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A tar link whose target is larger than the copy cache's memory tier (the
@@ -15257,7 +15131,6 @@ fn convert_strict_fidelity_exits_4_when_a_link_cannot_be_copied() {
             .contains("skipped entry `link`: its hard-link target `big` was not kept for copying"),
         "{stderr}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `cat` of a link and its target writes the target's bytes for both.
@@ -15269,7 +15142,6 @@ fn cat_of_a_link_writes_its_targets_bytes() {
     let out = run_output(&["cat", tar.to_str().unwrap(), "./a", "./a1", "./a2"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_text(&out));
     assert_eq!(out.stdout, b"alpha payload".repeat(3));
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `cat` of a link alone, its target not selected: a usage refusal (exit 2)
@@ -15306,7 +15178,6 @@ fn cat_of_a_link_without_its_target_is_classified_not_1() {
         "`a` IS in the archive: {stderr}"
     );
     assert!(out.stdout.is_empty());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// GNU cpio into zip, `--strict-fidelity`: every link is a full copy, the
@@ -15345,7 +15216,6 @@ fn convert_gnu_cpio_with_hard_links_to_zip_copies_them_strictly() {
         let got = run_tool(&unzip, &[os(&"-p"), os(&zip), os(&name)], &dir, b"");
         assert_eq!(got, want, "{name}");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 0.10.1: an archive that contradicts itself on disk — directory `x` then
@@ -15396,7 +15266,6 @@ fn unpack_skips_entries_an_archive_contradicts() {
         assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"alpha");
         assert!(std::fs::symlink_metadata(dest.join("x")).unwrap().is_dir());
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 0.10.1 fix round 1: a 300-byte entry name is past the filesystem's
@@ -15434,7 +15303,6 @@ fn unpack_skips_a_name_too_long_for_the_filesystem() {
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha");
         assert_eq!(std::fs::read(dest.join("z.txt")).unwrap(), b"zulu");
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Unpacks `entries` (file name, data) from a tar into a fresh directory and
@@ -15540,7 +15408,6 @@ fn skip_reason_names_the_folded_directory_as_archived() {
         stderr.contains("a directory `A` from earlier in this archive is in the way"),
         "{stderr}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Review Focus 2: a file `a` the destination held before the run is not the
@@ -15574,7 +15441,6 @@ fn skip_reason_for_a_prior_destination_file_is_unchanged() {
     );
     assert!(!stderr.contains("earlier in this archive"), "{stderr}");
     assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"prior");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A hard link the run made shares its target's inode but is not a fold of
@@ -15609,7 +15475,6 @@ fn skip_reason_never_names_a_hard_link_as_the_ancestor() {
         stderr.contains("skipped entry `a/x`: `a`, earlier in this archive, is not a directory"),
         "{stderr}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Directory `A`, directory `a` (re-recorded onto the same inode on a folding
@@ -15648,5 +15513,4 @@ fn skip_reason_keeps_the_exact_spelling_when_a_folded_directory_was_rerecorded()
         stderr.contains("skipped entry `A`: a directory `A` from earlier in this archive"),
         "{stderr}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -2224,8 +2224,8 @@ mod differential {
 #[cfg(target_os = "macos")]
 mod interrupts {
     use super::compat_harness::interrupt::*;
-    use super::compat_harness::{APPLE_GZIP_DIR, require_reference};
-    use std::path::{Path, PathBuf};
+    use super::compat_harness::{APPLE_GZIP_DIR, ScratchDir, require_reference};
+    use std::path::Path;
 
     const ENV: &[(&str, &str)] = &[("STUFFR_GZIP_FLAVOR", "bsd")];
 
@@ -2233,12 +2233,12 @@ mod interrupts {
         Path::new(env!("CARGO_BIN_EXE_stuffr"))
     }
 
-    fn scratch(tag: &str, mine: bool) -> PathBuf {
-        std::env::temp_dir().join(format!(
+    fn scratch(tag: &str, mine: bool) -> ScratchDir {
+        ScratchDir::at(std::env::temp_dir().join(format!(
             "stuffr-bsd-intr-{}-{tag}-{}",
             std::process::id(),
             if mine { "ours" } else { "ref" }
-        ))
+        )))
     }
 
     /// `args` over `file` (made by `make`), interrupted with `sig`; ours
@@ -2275,7 +2275,6 @@ mod interrupts {
         let r = interrupt_with_input_env(
             &exe, "gzip", args, &dir, env, file, make, inherit, sig, &ready,
         );
-        let _ = std::fs::remove_dir_all(&dir);
         Some(r)
     }
 
@@ -2377,7 +2376,6 @@ mod interrupts {
                 }
             }
             assert_eq!(listing(&dir), ["a.gz"], "mine={mine}");
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

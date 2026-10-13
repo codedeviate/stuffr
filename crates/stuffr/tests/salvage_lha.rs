@@ -41,6 +41,9 @@ use stuffr::entries::{self, SalvageDisposition, SalvageOpts};
 use stuffr_core::FormatId;
 use stuffr_core::salvage::SalvagePolicy;
 
+mod common;
+use common::Scratch;
+
 /// `sample.lzh`'s two entries, as `lhasa` extracts them. See this module's
 /// doc for why these are literals.
 const EXPECTED: [(&str, &[u8]); 2] = [
@@ -66,29 +69,6 @@ fn fixture_bytes() -> Vec<u8> {
     let path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../stuffr-formats/fixtures/legacy/sample.lzh");
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "stuffr-salvage-lha-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 fn opts(dest: Option<PathBuf>) -> SalvageOpts {

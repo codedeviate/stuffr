@@ -28,6 +28,9 @@ use stuffr::entries::{self, SalvageDisposition, SalvageOpts};
 use stuffr_core::FormatId;
 use stuffr_core::salvage::SalvagePolicy;
 
+mod common;
+use common::Scratch;
+
 // ---------------------------------------------------------------------
 // `zoo.h`'s record layout, hand-copied — and that IS a copy, which this
 // comment used to deny.
@@ -93,29 +96,6 @@ fn stored_payload(bytes: &[u8]) -> Vec<u8> {
     let offset = le32(record + 10) as usize;
     let size_now = le32(record + 24) as usize;
     bytes[offset..offset + size_now].to_vec()
-}
-
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Self {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "stuffr-salvage-zoo-{tag}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Scratch(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 fn opts(dest: Option<PathBuf>) -> SalvageOpts {

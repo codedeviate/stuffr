@@ -2560,7 +2560,7 @@ mod differential {
 #[cfg(unix)]
 mod interrupts {
     use super::compat_harness::interrupt::*;
-    use super::compat_harness::{gnu_gzip_dir, require_reference};
+    use super::compat_harness::{ScratchDir, gnu_gzip_dir, require_reference};
     use std::path::{Path, PathBuf};
 
     const ENV: &[(&str, &str)] = &[("STUFFR_GZIP_FLAVOR", "gnu")];
@@ -2574,8 +2574,10 @@ mod interrupts {
         require_reference(&exe).then_some(exe)
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("stuffr-gnu-intr-{}-{tag}", std::process::id()))
+    fn scratch(tag: &str) -> ScratchDir {
+        ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-gnu-intr-{}-{tag}", std::process::id())),
+        )
     }
 
     fn is_tmp(n: &str) -> bool {
@@ -2605,7 +2607,6 @@ mod interrupts {
         let r = interrupt_with_input_env(
             &exe, "gzip", args, &dir, env, file, make, inherit, sig, &ready,
         );
-        let _ = std::fs::remove_dir_all(&dir);
         Some(r)
     }
 
@@ -2725,7 +2726,6 @@ mod interrupts {
                 // Done before the signal: its work must still be whole.
             }
             assert_eq!(listing(&dir), ["a.gz"], "mine={mine} finished={finished}");
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -2756,7 +2756,6 @@ mod interrupts {
             );
             assert!(killed_by(&r, libc::SIGINT), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["a"], "mine={mine}");
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -2779,7 +2778,7 @@ mod interrupts {
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(dir.join("s"), "text ".repeat(800)).unwrap();
                 std::fs::write(dir.join("a"), big_input(mib)).unwrap();
-                let d = dir.clone();
+                let d = dir.to_path_buf();
                 // GNU removes `s` only after publishing `s.gz`, so wait for
                 // that too, or the signal races the removal.
                 let named = |n: &str| if mine { is_tmp(n) } else { n == "a.gz" };
@@ -2803,7 +2802,6 @@ mod interrupts {
             let r = got.expect("finished before the signal even at 256 MiB");
             assert!(killed_by(&r, libc::SIGINT), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["a", "s.gz"], "mine={mine}");
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

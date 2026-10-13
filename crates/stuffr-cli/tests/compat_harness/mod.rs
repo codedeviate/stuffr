@@ -394,6 +394,34 @@ impl Drop for Registered {
     }
 }
 
+/// A scratch directory path that removes itself (tree and all) when dropped,
+/// a panicking test's unwind included. The directory is NOT created: callers
+/// (and `interrupt_with_input_env`, which removes and recreates it between
+/// attempts) make it themselves. Any stale tree at the path is removed first.
+pub struct ScratchDir(PathBuf);
+impl ScratchDir {
+    pub fn at(path: PathBuf) -> Self {
+        let _ = fs::remove_dir_all(&path);
+        ScratchDir(path)
+    }
+}
+impl std::ops::Deref for ScratchDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+impl AsRef<Path> for ScratchDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
