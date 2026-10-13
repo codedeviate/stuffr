@@ -82,9 +82,16 @@ pub(super) fn execute(prog: &'static str, s: Settings, host: &mut Host, err: &mu
         err,
     };
     // bzip2.c installs its handlers for file-to-file mode only (`-t` too).
-    let _interrupt =
+    let interrupt =
         (bz.s.src == SrcMode::F2F).then(|| arm_interrupt_flag(&*bz.host, BZIP2_SIGNALS));
     let _ = bz.main(&files);
+    // bzip2.c's handler stays installed until exit; ours is restored here,
+    // so a signal from now on takes its default action. One arriving
+    // after `main`'s last poll set the flag and is answered now, as
+    // bzip2 answers a signal after `deleteOutputOnInterrupt` turns False.
+    drop(interrupt);
+    let late = take_interrupt(&*bz.host);
+    let _ = bz.answer_late_interrupt(late);
     bz.exit
 }
 
@@ -165,6 +172,15 @@ impl Bz<'_> {
     /// instructions, stuffr's answer comes at the next poll.
     fn poll_interrupt(&mut self) -> Step {
         if take_interrupt(self.host) {
+            return Err(self.fail(Failure::Interrupted));
+        }
+        Ok(())
+    }
+
+    /// The answer to a signal that set the flag after `main`'s last poll:
+    /// the same stop as [`Self::poll_interrupt`], given the flag's value.
+    fn answer_late_interrupt(&mut self, interrupted: bool) -> Step {
+        if interrupted {
             return Err(self.fail(Failure::Interrupted));
         }
         Ok(())
@@ -967,5 +983,41 @@ mod tests {
             }
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A signal that lands after `main`'s last poll is answered once the
+    /// handler is restored: the caught line and exit 1, nothing otherwise.
+    #[test]
+    fn a_late_interrupt_is_answered_and_a_quiet_run_is_not() {
+        for interrupted in [true, false] {
+            let mut err = Vec::new();
+            let mut host = Host::Real;
+            let mut bz = Bz {
+                prog: "bzip2",
+                s: settings(false),
+                num_files: 1,
+                exit: 0,
+                processed: 1,
+                in_name: b"a".to_vec(),
+                out_name: b"a.bz2".to_vec(),
+                pending: None,
+                unz_fails: false,
+                test_fails: false,
+                host: &mut host,
+                err: &mut err,
+            };
+            let r = bz.answer_late_interrupt(interrupted);
+            let exit = bz.exit;
+            let msg = String::from_utf8(err).unwrap();
+            if interrupted {
+                assert!(r.is_err());
+                assert_eq!(exit, 1);
+                assert_eq!(msg, "\nbzip2: Control-C or similar caught, quitting.\n");
+            } else {
+                assert!(r.is_ok());
+                assert_eq!(exit, 0);
+                assert_eq!(msg, "");
+            }
+        }
     }
 }
