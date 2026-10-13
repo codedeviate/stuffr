@@ -53,8 +53,16 @@ pub fn big_input(mib: usize) -> &'static [u8] {
     &v[..mib << 20]
 }
 
-/// How long a signalled child gets to exit before it counts as hung.
+/// How long a signalled child gets to exit before it counts as hung, when the
+/// signal is expected to end the run (`Inherit::Default`).
 const HANG_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a child that ignores the signal (`Inherit::IgnoreInt`) gets: it
+/// is expected to finish its whole job, a debug-build `gzip -9` of 64 MiB
+/// (about 8 s here, far more on a slow runner), so only a real hang should
+/// reach this. A hung stuffr panics and a hung reference is a miss, as with
+/// `HANG_DEADLINE`.
+const IGNORED_SIGNAL_DEADLINE: Duration = Duration::from_secs(600);
 
 thread_local! {
     /// Set when the last `interrupt_env` on this thread lost its attempt to a
@@ -108,7 +116,7 @@ pub fn listing(dir: &Path) -> Vec<String> {
 
 /// Runs `exe` (argv[0] = `name`) with `args` in `dir`; waits until a
 /// directory entry satisfies `ready`, sends `sig`, waits up to
-/// `HANG_DEADLINE` for exit. `None` if the run ended before the signal could
+/// `HANG_DEADLINE` (`IGNORED_SIGNAL_DEADLINE` if the child ignores it) for exit. `None` if the run ended before the signal could
 /// be sent, or if a reference (not stuffr) hung after it
 /// ([`take_reference_hung`] tells which); stuffr hanging panics.
 pub fn interrupt(
@@ -182,7 +190,11 @@ pub fn interrupt_env(
     });
     // SAFETY: kill on a child we spawned and have not reaped.
     unsafe { libc::kill(child.id() as i32, sig) };
-    let hang_at = Instant::now() + HANG_DEADLINE;
+    let hang_at = Instant::now()
+        + match inherit {
+            Inherit::Default => HANG_DEADLINE,
+            Inherit::IgnoreInt => IGNORED_SIGNAL_DEADLINE,
+        };
     let status = loop {
         if let Some(st) = child.try_wait().unwrap() {
             break Some(st);
