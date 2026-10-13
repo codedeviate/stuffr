@@ -302,6 +302,23 @@ read list.
 > **2398** tests under `--all-features`, **2297** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
+> `0.13.2` is a PATCH that closes twelve old follow-ups. An unsafe-path
+> refusal (exit 7) now quotes the offending link target, escaped, and a skip
+> reason names an earlier entry the way the archive spelled it (`A`, not
+> `a`). `install-links` shows an existing link's own text. The bzip2, gzip and
+> xz links close their last interrupt windows: no empty temporary between
+> creating and arming it, and bzip2 answers a signal that lands after its last
+> check. tar salvage caps the terminal headers it tracks at once at 4096 (a
+> sighting past that, never exit 6). The test suites build on Windows, and
+> test scratch directories are removed when a test fails. **Source breaks,
+> released as a PATCH because no crate outside this workspace depends on
+> these crates:** `stuffr_core::Error::UnsafePath.reason` and
+> `stuffr::entries::SalvageDisposition::SkippedUnsafePath.reason` are
+> `String` (were `&'static str`); `stuffr_cli::compat::links::LinkAction::
+> AlreadyPresent` is a struct variant `{ path, text }`.
+> **2422** tests under `--all-features`, **2321** on the default tier —
+> measured from this bump's own `make check`, `GATE_EXIT=0`.
+>
 > Two user-visible changes on archives that already exist. First, `salvage
 > --list` no longer calls an intact-length archive truncated: `Partial
 > (truncated)` now means the archive FILE is shorter than the entry's own
