@@ -12,8 +12,14 @@ use std::path::{Path, PathBuf};
 pub enum LinkAction {
     /// A new link was created.
     Created(PathBuf),
-    /// The link already points at this stuffr; nothing was changed.
-    AlreadyPresent(PathBuf),
+    /// The link already points at this stuffr; nothing was changed. `text`
+    /// is the link's own text, which may differ from the target.
+    AlreadyPresent {
+        /// The link.
+        path: PathBuf,
+        /// What `read_link` returned for it.
+        text: PathBuf,
+    },
     /// An existing entry was replaced: a stale stuffr link, or with
     /// `--force` a file or foreign link.
     Replaced(PathBuf),
@@ -35,7 +41,9 @@ impl LinkAction {
         let t = target.display();
         match self {
             LinkAction::Created(p) => format!("created {} -> {t}", p.display()),
-            LinkAction::AlreadyPresent(p) => format!("already present {} -> {t}", p.display()),
+            LinkAction::AlreadyPresent { path, text } => {
+                format!("already present {} -> {}", path.display(), text.display())
+            }
             LinkAction::Replaced(p) => format!("replaced {} -> {t}", p.display()),
             LinkAction::Removed(p) => format!("removed {}", p.display()),
             LinkAction::WouldCreate(p) => format!("would create {} -> {t}", p.display()),
@@ -216,7 +224,10 @@ pub fn install_links(
     let mut actions = Vec::new();
     for (path, step) in plan {
         actions.push(match step {
-            Step::Keep => LinkAction::AlreadyPresent(path),
+            Step::Keep => {
+                let text = std::fs::read_link(&path).map_err(|e| at(&path, e))?;
+                LinkAction::AlreadyPresent { path, text }
+            }
             Step::Leave(why) => LinkAction::Left(path, why),
             Step::Create if dry_run => LinkAction::WouldCreate(path),
             Step::Replace if dry_run => LinkAction::WouldReplace(path),

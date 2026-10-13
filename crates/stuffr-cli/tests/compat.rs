@@ -203,12 +203,32 @@ mod unix {
         // Install leaves it, reporting it as present.
         let o = il(&s.0, &["--names", "bzip2"]);
         assert!(stdout(&o).contains("already present"), "{}", stdout(&o));
+        let line = stdout(&o);
+        let line = line
+            .lines()
+            .find(|l| l.contains("already present"))
+            .unwrap();
+        assert!(line.ends_with(&format!(" -> {}", l.display())), "{line}");
         assert_eq!(std::fs::read_link(canon.join("bzip2")).unwrap(), l);
         // Remove deletes the link, never what it leads through.
         let o = il(&s.0, &["--remove"]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert!(canon.join("bzip2").symlink_metadata().is_err());
         assert_eq!(std::fs::read_link(&l).unwrap(), canon_stuffr());
+    }
+
+    /// The line shows the link's own text, even a relative one.
+    #[test]
+    fn install_links_shows_a_relative_link_text_as_is() {
+        let s = Scratch::new("rel-text");
+        let canon = s.0.canonicalize().unwrap();
+        std::os::unix::fs::symlink(canon_stuffr(), canon.join("l")).unwrap();
+        std::os::unix::fs::symlink("./l", canon.join("gzip")).unwrap();
+        let o = il(&s.0, &["--names", "gzip"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        let out = stdout(&o);
+        let line = out.lines().find(|l| l.contains("already present")).unwrap();
+        assert!(line.ends_with(" -> ./l"), "{line}");
     }
 
     /// The Homebrew shape: links made by an older version point into a
