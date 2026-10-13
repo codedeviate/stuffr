@@ -36,7 +36,7 @@ mod unix {
     }
 
     const STUFFR: &str = env!("CARGO_BIN_EXE_stuffr");
-    const ALL: [&str; 14] = [
+    const ALL: [&str; 18] = [
         "bzip2",
         "bunzip2",
         "bzcat",
@@ -51,6 +51,10 @@ mod unix {
         "lzma",
         "unlzma",
         "lzcat",
+        "zstd",
+        "unzstd",
+        "zstdcat",
+        "zstdmt",
     ];
 
     /// A scratch directory removed on drop.
@@ -135,9 +139,9 @@ mod unix {
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert!(s.0.join("bzcat").symlink_metadata().is_ok());
         assert!(s.0.join("bzip2").symlink_metadata().is_err());
-        let o = il(&s.0, &["--names", "zstd"]);
+        let o = il(&s.0, &["--names", "lz4"]);
         assert_eq!(o.status.code(), Some(2));
-        assert!(stderr(&o).contains("zstd"));
+        assert!(stderr(&o).contains("lz4"));
     }
 
     #[test]
@@ -490,6 +494,38 @@ mod unix {
         }
         let one = Scratch::new("lzcat");
         let o = il(&one.0, &["--names", "lzcat,unxz"]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
+    }
+
+    /// The four zstd names are links like the rest, and a link runs as its
+    /// name: `-H` names the program, `zstdcat` is at display level 1 so its
+    /// `-V` is the bare version, and the others print stuffr's banner.
+    #[test]
+    fn install_links_creates_the_zstd_names() {
+        let s = Scratch::new("zstd");
+        let o = il(&s.0, &[]);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+        let dir = s.0.canonicalize().unwrap();
+        let banner = format!(
+            "*** Zstandard CLI (stuffr {}; zstd 1.5.7 compatible) (64-bit) v1.5.7, by Yann Collet ***\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        for n in ["zstd", "unzstd", "zstdcat", "zstdmt"] {
+            let link = dir.join(n);
+            assert_eq!(std::fs::read_link(&link).unwrap(), canon_stuffr(), "{n}");
+            let o = Command::new(&link).arg("-h").output().unwrap();
+            assert_eq!(o.status.code(), Some(0), "{n}: {}", stderr(&o));
+            let usage = format!("Usage: {n} [OPTIONS...] [INPUT... | -] [-o OUTPUT]\n");
+            assert!(stdout(&o).contains(&usage), "{n}: {}", stdout(&o));
+            let o = Command::new(&link).arg("-V").output().unwrap();
+            let want = if n == "zstdcat" { "1.5.7\n" } else { &banner };
+            assert_eq!(stdout(&o), want, "{n}");
+            let o = Command::new(&link).arg("-qV").output().unwrap();
+            assert_eq!(stdout(&o), "1.5.7\n", "{n}");
+        }
+        let one = Scratch::new("zstdmt");
+        let o = il(&one.0, &["--names", "zstdmt,unzstd"]);
         assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
         assert_eq!(std::fs::read_dir(&one.0).unwrap().count(), 2);
     }

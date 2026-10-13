@@ -14,6 +14,7 @@ pub mod gzip;
 mod host;
 pub mod links;
 pub mod xz;
+pub mod zstd;
 
 #[doc(hidden)]
 pub use host::InputReads;
@@ -34,6 +35,8 @@ pub enum Family {
     Gzip,
     /// `xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`.
     Xz,
+    /// `zstd`, `unzstd`, `zstdcat`, `zstdmt`.
+    Zstd,
 }
 
 /// Invoked name to family. The name is matched exactly, after the directory
@@ -53,6 +56,10 @@ const NAMES: &[(&str, Family)] = &[
     ("lzma", Family::Xz),
     ("unlzma", Family::Xz),
     ("lzcat", Family::Xz),
+    ("zstd", Family::Zstd),
+    ("unzstd", Family::Zstd),
+    ("zstdcat", Family::Zstd),
+    ("zstdmt", Family::Zstd),
 ];
 
 /// Every compatibility name, from the one table `family_for` also reads.
@@ -96,6 +103,7 @@ pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
         Family::Bzip2 => bzip2::run(name, rest),
         Family::Gzip => gzip::run(name, rest),
         Family::Xz => xz::run(name, &argv0, rest),
+        Family::Zstd => zstd::run(name, &argv0, rest),
     })
 }
 
@@ -122,7 +130,8 @@ pub fn run_in(
 /// [`run_in`], also returning the inputs the run opened and what it read
 /// from each, by path. Only the gzip family counts its inputs; the map is
 /// empty for the others. The xz family runs with a fixed machine and a
-/// capped decoder memory limit ([`xz::run_in_counted`]).
+/// capped decoder memory limit ([`xz::run_in_counted`]), the zstd family
+/// with a fixed machine and R9's bounds ([`zstd::run_in_counted`]).
 #[doc(hidden)]
 pub fn run_in_counted(
     dir: &Path,
@@ -143,6 +152,7 @@ pub fn run_in_counted(
         }
         Family::Gzip => gzip::run_in_counted(gzip_flavour, dir, canonical, &args, stdin, &|_| None),
         Family::Xz => xz::run_in_counted(dir, canonical, &args, stdin, &|_| None),
+        Family::Zstd => zstd::run_in_counted(dir, canonical, &args, stdin, &|_| None),
     })
 }
 
@@ -373,7 +383,11 @@ mod tests {
                 "xzcat",
                 "lzma",
                 "unlzma",
-                "lzcat"
+                "lzcat",
+                "zstd",
+                "unzstd",
+                "zstdcat",
+                "zstdmt"
             ]
         );
     }

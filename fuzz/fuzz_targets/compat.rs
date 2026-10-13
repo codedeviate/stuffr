@@ -884,6 +884,13 @@ fuzz_target!(|data: &[u8]| {
             run_xz(&dir, case.name, &case.args, stdin)
         }
         "bzip2" | "bunzip2" | "bzcat" => run_bzip2(&dir, case.name, &case.args, stdin),
+        // The zstd family (0.14.0): no panic and containment (below) until
+        // Task 10 brings its oracle.
+        "zstd" | "unzstd" | "zstdcat" | "zstdmt" => {
+            let os_args: Vec<OsString> = case.args.iter().map(OsString::from).collect();
+            compat::run_in_counted(&dir, case.name, os_args, stdin, Flavour::Gnu)
+                .expect("a COMPAT_NAMES entry is a compat name");
+        }
         other => unreachable!("{other} is in COMPAT_NAMES but has no arm here"),
     }
 

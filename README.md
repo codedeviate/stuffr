@@ -1207,6 +1207,10 @@ The xz family is ported from XZ Utils 5.8.4's `src/xz/`, plus the parts of
 liblzma that `--list` and the memory figures need, by Lasse Collin and
 contributors, under 0BSD; the licence is in
 [`crates/stuffr-cli/LICENSE-xz`](crates/stuffr-cli/LICENSE-xz).
+The zstd family is ported from zstd 1.5.7's `programs/` by Yann Collet and
+the zstd contributors (Meta Platforms, Inc.), under zstd's BSD licence; the
+licence is in
+[`crates/stuffr-cli/LICENSE-zstd`](crates/stuffr-cli/LICENSE-zstd).
 `stuffr-cli`'s licence metadata is therefore
 `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`. The GNU
 personality contains no GNU code: GNU gzip is GPLv3 and its source was never
@@ -1498,11 +1502,14 @@ Since `0.13.0` the xz family is ported as well, from XZ Utils 5.8.4's
 `src/xz/` and the liblzma sources behind `--list` and the memory figures, and
 that code is **0BSD** (`crates/stuffr-cli/LICENSE-xz`; 0BSD asks for nothing
 but is named so the origin is not lost).
+Since `0.14.0` the zstd family is ported from zstd 1.5.7's `programs/`
+(Meta Platforms, Inc.) under zstd's BSD licence, which is BSD-3-Clause
+(`crates/stuffr-cli/LICENSE-zstd`), so the expression does not change.
 `stuffr-cli`'s full expression is therefore
 **`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`**: the
 BSD-2-Clause covers `gzip.c` and the decoders, the BSD-3-Clause covers
-`zuncompress.c`, the University of California's `.Z` reader, and the 0BSD
-covers the xz family. One notice is
+`zuncompress.c`, the University of California's `.Z` reader, and the zstd
+family; the 0BSD covers the xz family. One notice is
 BSD-style but not word for word the SPDX `BSD-2-Clause` text: the Lzd one in
 `unlz.c`. The full notice ships in `LICENSE-gzip-bsd`, and that file, not the
 SPDX name, is what to read. `stuffr-formats` is

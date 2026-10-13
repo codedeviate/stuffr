@@ -810,7 +810,25 @@ const COMPAT_SHAPES: &[&str] = &[
     "xz-list-flipped-index",
     "xz-list-cut",
     "xz-list-short",
+    // The zstd family (0.14.0 Task 4): the argument surface only, one per
+    // name; Task 10 adds the coder's shapes.
+    "zstd-help",
+    "unzstd-bad-flag",
+    "zstdcat-version",
+    "zstdmt-help",
 ];
+
+/// The zstd family's seeds: the argument surface (Task 4).
+fn zstd_seed(shape: &str) -> Option<Vec<u8>> {
+    let e = |tool, args: &[&str]| encode_compat_case(tool, 0, args, &[], false, b"");
+    Some(match shape {
+        "zstd-help" => e("zstd", &["-h"]),
+        "unzstd-bad-flag" => e("unzstd", &["--bogus"]),
+        "zstdcat-version" => e("zstdcat", &["-V"]),
+        "zstdmt-help" => e("zstdmt", &["--help"]),
+        _ => return None,
+    })
+}
 
 /// A bzip2 stream of `plain` at `level`, through this build's encoder.
 fn bzip2_of(work: &Path, plain: &[u8], level: i32) -> stuffr_core::Result<Vec<u8>> {
@@ -996,6 +1014,9 @@ fn compat_seed(work: &Path, shape: &str) -> stuffr_core::Result<Vec<u8>> {
         return Ok(seed);
     }
     if let Some(seed) = xz_seed(work, shape)? {
+        return Ok(seed);
+    }
+    if let Some(seed) = zstd_seed(shape) {
         return Ok(seed);
     }
     let text = compat_text(4000);
