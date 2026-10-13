@@ -910,12 +910,13 @@ cargo add stuffr                # the facade; re-exports stuffr-core + stuffr-fo
 Invoked as `bzip2`, `bunzip2`, `bzcat` or `bzip2recover`, the `stuffr` binary
 behaves as **bzip2 1.0.8**; invoked as `gzip`, `gunzip`, `zcat` or `gzcat`
 (from `0.12.0`), as **gzip**; invoked as `xz`, `unxz`, `xzcat`, `lzma`,
-`unlzma` or `lzcat` (from `0.13.0`), as **xz** (XZ Utils 5.8.4). In every
-case that tool's flags, files, exit codes and messages, not stuffr's. The
+`unlzma` or `lzcat` (from `0.13.0`), as **xz** (XZ Utils 5.8.4); invoked as
+`zstd`, `unzstd`, `zstdcat` or `zstdmt` (from `0.14.0`), as **zstd** (zstd
+1.5.7). In every case that tool's flags, files, exit codes and messages, not stuffr's. The
 binary reads the name from `argv[0]`, the file name only, before parsing
 anything. Any other name, `stuffr` included, runs the stuffr CLI unchanged.
 So does a link you make by hand under a name stuffr does not handle:
-`zstdcat -> stuffr` runs `stuffr`, not zstdcat.
+`lz4cat -> stuffr` runs `stuffr`, not lz4cat.
 
 ### Opting in
 
@@ -923,7 +924,7 @@ So does a link you make by hand under a name stuffr does not handle:
 Homebrew. One verb makes them:
 
 ```sh
-stuffr install-links --dir ~/.local/bin                  # all fourteen names
+stuffr install-links --dir ~/.local/bin                  # all eighteen names
 stuffr install-links --dir ~/.local/bin --names bzcat,zcat   # comma-separated subset
 stuffr install-links --dir ~/.local/bin --dry-run        # "would create ...", changes nothing
 stuffr install-links --dir ~/.local/bin --force          # replace what is already there
@@ -1176,20 +1177,127 @@ and `XZ_OPT` are read before the command line, as xz reads them.
   closed pipe; stuffr dies of `SIGPIPE`, for the same reason as the other
   families. Under the default setting both die of it.
 
+### The zstd family
+
+`zstd`, `unzstd`, `zstdcat` and `zstdmt`, from `0.14.0`. They behave as
+**zstd 1.5.7's command line tool**, and only that version: one personality,
+one reference. The preset comes from the name as zstd derives it: `unzstd`
+decompresses, `zstdcat` decompresses to standard output (passing unrecognised
+input through, at display level 1) and `zstdmt` compresses with `-T0`.
+`ZSTD_CLEVEL` and `ZSTD_NBTHREADS` are read as zstd reads them.
+
+**The promise:**
+
+- **Stdout, stderr and exit codes are byte-identical to zstd 1.5.7** (under
+  `LC_ALL=C`), on both build tiers: every documented option, `--list`,
+  `-v`/`-vv`/`-vvv` and the parameter printers, dictionaries (`-D`,
+  `--patch-from`), `--train`, `--filelist`, `-r`, the suffix rules and the
+  overwrite prompt. The exit codes are zstd's (0, 1, 2 for an interrupt, and
+  the `EXM_THROW` set zstd uses); stuffr's 3 to 7 never appear under these
+  names. A differential suite runs each case through a real zstd 1.5.7 and a
+  stuffr link and compares those streams, the file tree, modes and mtimes.
+- **Compressed output.** On the `c-backed` tier (`--features c-backed`, which
+  builds libzstd 1.5.7) zstd frames and dictionaries are **byte-identical to
+  zstd 1.5.7** for every level, `--ultra`, `--long`, `-T`, `--rsyncable`,
+  `--format=gzip|xz|lzma`, dictionaries and `--patch-from`. The exceptions:
+  `--train-cover` (see below), `--adapt` (its level moves by timing, so its
+  frames are compatible, not identical) and `--format=lz4`, which is
+  **compatible only** on every tier. On the default pure tier every option is
+  accepted and the output is **compatible**: zstd 1.5.7 decodes it to the
+  input. The pure tier's refusals of dictionary compression and `--train` are
+  listed below.
+- **The intended differences:** the banner. `-V`, `-vV`, `-vvV`, the first
+  line of `-H` and `-v`'s welcome line name stuffr: `*** Zstandard CLI
+  (stuffr X.Y.Z; zstd 1.5.7 compatible) (64-bit) v1.5.7, by Yann Collet ***`.
+  `-qV` prints exactly `1.5.7`.
+
+**Known differences, both tiers:**
+
+- **`-vvV`'s library lines.** It prints zstd's POSIX lines for the platform,
+  but not the three library-version lines (zlib, lz4, lzma) that describe
+  zstd's own build. `-vV`'s "supports:" line is zstd's.
+- **Timing fields vary** in the `-v` summary, as they do between two runs of
+  zstd.
+- **An input that is also the output is never lost,** as with the other
+  families.
+- **Closed standard streams, and a parent that ignores `SIGPIPE`.** The Rust
+  runtime reopens a closed standard descriptor on `/dev/null` and resets
+  `SIGPIPE` before `main`, so neither is seen.
+- **Benchmark and trace are out of scope.** `-b`, `-e#`, `-i#` and `--trace`
+  are refused as a zstd built with `ZSTD_NOBENCH` and `ZSTD_NOTRACE` refuses
+  them ("Incorrect parameter: -b", exit 1), and `-H` omits their lines (so a
+  Homebrew zstd's `-H` differs by exactly those lines). `-B#`, `-S` and `-p#`
+  keep the reference's meaning. `--[no-]asyncio` is accepted and has no
+  visible effect; `--trace-file-stat` is accepted and prints no trace.
+- **`--train-cover` is valid, not identical.** libzstd 1.5.7's cover sort
+  breaks ties by comparing addresses, so a cover dictionary depends on heap
+  layout, in zstd itself too. It is promised valid and usable by zstd, not
+  byte for byte. `--train`, `--train-fastcover` and `--train-legacy` write
+  zstd's bytes.
+- **`--format=lz4` is compatible only,** on every tier: the frames are
+  `lz4_flex`'s fast compressor at every level, inside liblz4's frame
+  descriptor (64 KiB linked blocks, content size, content checksum, as zstd
+  sets them).
+
+**Known differences, pure tier only** (`zstd-pure` without `zstd-c`):
+
+- **Compression is `ruzstd`'s `Fastest` at every level,** so the sizes and
+  ratios in the summaries and in `-vvvvvv`'s trace are the tier's own. The
+  compression parameters are range-checked as libzstd checks them, then
+  ignored.
+- **Dictionary compression is refused.** Compressing with `-D` or
+  `--patch-from` ends, after everything zstd prints first, with `zstd: error
+  1 : dictionary compression is not available in this build (stuffr pure
+  tier)`. Decompressing with either works.
+- **`--train*` answers as a zstd built with `ZSTD_NODICT`.** `--train` prints
+  `training mode not available`, exit 1; `--train-cover`,
+  `--train-fastcover` and `--train-legacy` are no options there ("Incorrect
+  parameter"). `-H` still lists the dictionary builder.
+- **`--adapt` is accepted and the level never moves.**
+- **A legacy frame** (v0.5 to v0.7) is `unsupported format`, as a zstd built
+  without legacy support says.
+- **A corrupt frame whose blocks overflow** the output libzstd sized from its
+  header can be named `Data corruption detected` where libzstd says
+  `Destination buffer is too small`.
+- **`--format=gzip|xz|lzma` write compatible bytes,** from flate2's and the
+  pure xz encoders, which the reference decodes; the summaries' sizes are the
+  tier's own (with `zlib-c` gzip is zlib's bytes, with `xz-c` xz's).
+- **A gzip member's deflate data goes through flate2** (miniz_oxide), which
+  accepts some streams zlib refuses (a distance reaching before the output, a
+  code with no end of block): where the reference says `inflate error -3` and
+  writes nothing, the pure tier may write bytes and then fail (`premature gz
+  end`), or, when the trailer's CRC and size match what miniz_oxide decoded,
+  succeed with exit 0 and that output. With `zlib-c` it is zlib's own
+  `inflate`.
+- **An xz or lzma frame that fails to decode** may leave a strict prefix of
+  what liblzma writes, and corruption in the last bytes of a `.lzma` reads as
+  the input ending there (`premature lzma end`, the jobs before it written)
+  where liblzma says `lzma_code decoding error 9`.
+
+**Interrupts and the sandbox.** With a file destination SIGINT is answered as
+zstd answers it: the partial output is removed, a newline is written to
+standard error, and the process exits 2. With standard output as the
+destination nothing is armed and SIGINT keeps its default action, as in zstd.
+The fuzz target's sandboxed entry point caps the decoder's window log at 24,
+`--train*` samples at 256 KiB (4 optimiser steps) and workers at 2; those
+bounds never apply to a real run.
+
 ### Roadmap
 
 One family per release, each with its own spec stating its byte-identity
-promise: **bzip2 (`0.11.0`), gzip (`0.12.0`) and xz/lzma (`0.13.0`) are
-done; zstd is next, then lz4, then `unzip`/`zipinfo`.**
+promise: **bzip2 (`0.11.0`), gzip (`0.12.0`), xz/lzma (`0.13.0`) and zstd
+(`0.14.0`) are done; lz4 is next, then `unzip`/`zipinfo`.**
 `tar` is excluded (see [OUT-OF-SCOPE.md](OUT-OF-SCOPE.md)). The planned
 tiers:
 
 - **Byte-identical:** bzip2, on both tiers; gzip against Apple's gzip on
   the `c-backed` tier, via zlib (done); xz/lzma on the `c-backed` tier, via
   liblzma, against XZ Utils 5.8.4 (done); zstd on the `c-backed` tier,
-  against a stated tool version.
+  via libzstd, against zstd 1.5.7 (done; `--train-cover` and `--adapt`
+  excepted, as stated above).
 - **Compatible behaviour only** (the same flags, files, exit codes and
-  messages, and output the real tool reads): lz4; GNU gzip's exact bytes;
+  messages, and output the real tool reads): lz4 (and zstd's `--format=lz4`);
+  GNU gzip's exact bytes;
   every family except bzip2 on the pure tier.
 
 ### Attribution
@@ -1210,7 +1318,10 @@ contributors, under 0BSD; the licence is in
 The zstd family is ported from zstd 1.5.7's `programs/` by Yann Collet and
 the zstd contributors (Meta Platforms, Inc.), under zstd's BSD licence; the
 licence is in
-[`crates/stuffr-cli/LICENSE-zstd`](crates/stuffr-cli/LICENSE-zstd).
+[`crates/stuffr-cli/LICENSE-zstd`](crates/stuffr-cli/LICENSE-zstd). One test
+fixture carries verbatim zstd source: `crates/stuffr-cli/tests/fixtures/zstd_progress/gen.c`
+copies `UTIL_makeHumanReadableSize` from `programs/util.c` (BSD, covered by
+`LICENSE-zstd`).
 `stuffr-cli`'s licence metadata is therefore
 `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`. The GNU
 personality contains no GNU code: GNU gzip is GPLv3 and its source was never
@@ -1504,7 +1615,10 @@ that code is **0BSD** (`crates/stuffr-cli/LICENSE-xz`; 0BSD asks for nothing
 but is named so the origin is not lost).
 Since `0.14.0` the zstd family is ported from zstd 1.5.7's `programs/`
 (Meta Platforms, Inc.) under zstd's BSD licence, which is BSD-3-Clause
-(`crates/stuffr-cli/LICENSE-zstd`), so the expression does not change.
+(`crates/stuffr-cli/LICENSE-zstd`), so the expression does not change. The
+test fixture `crates/stuffr-cli/tests/fixtures/zstd_progress/gen.c` contains
+verbatim zstd source (`UTIL_makeHumanReadableSize` from `programs/util.c`),
+also BSD and covered by `LICENSE-zstd`.
 `stuffr-cli`'s full expression is therefore
 **`MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`**: the
 BSD-2-Clause covers `gzip.c` and the decoders, the BSD-3-Clause covers

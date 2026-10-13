@@ -37,6 +37,11 @@ brew install gnu-tar cpio binutils
   `/opt/homebrew/opt/gzip/bin/gzip`; Apple's `/usr/bin/gzip` is the other
   reference) and `ncompress` (`/opt/homebrew/opt/ncompress/bin`). Without them
   `require_reference` skips locally with a note and panics under `CI`.
+- **From 0.14.0 the zstd suites need zstd 1.5.7 exactly** (`brew install
+  zstd`, the keg at `/opt/homebrew/opt/zstd/bin/zstd`, or
+  `STUFFR_ZSTD_REFERENCE` naming a `zstd` built from the release tarball),
+  with gzip, lz4, lzma and xz support. Another release is ignored; without it
+  the suites skip with a note locally and panic under `CI`.
 - **From 0.13.0 the xz suites need XZ Utils 5.8.4 exactly** (`brew install
   xz`, the keg at `/opt/homebrew/opt/xz/bin/xz`, or `STUFFR_XZ_REFERENCE`
   naming an `xz` you built from the release tarball). Another release is
@@ -254,7 +259,8 @@ These come from the design specification and are the reason Phase 0 shipped as
 | `0.11.0` | Phase 5's first part — compatibility links: `argv[0]` dispatch, `stuffr install-links --dir DIR` (opt-in, Homebrew's stable `opt` target), the differential harness, and the bzip2 family (`bzip2`, `bunzip2`, `bzcat`, `bzip2recover`) behaving as bzip2 1.0.8 — flags, files, exit codes and stderr byte-identical, compressed output byte-identical on both tiers; the `compat` fuzz target; `stuffr-cli` licensed `MIT AND bzip2-1.0.6`. A MINOR because it is a new user-facing surface. |
 | `0.12.0` | Phase 5's second part — the gzip compatibility family (`gzip`, `gunzip`, `zcat`, `gzcat`) in two personalities, GNU gzip 1.15 and Apple's gzip 487.0.1 (a port, `LICENSE-gzip-bsd`), chosen by platform or `STUFFR_GZIP_FLAVOR`; stdout, stderr and exit codes byte-identical to the reference in both, Apple's compressed bytes identical on the `c-backed` tier and compatible elsewhere, GNU's compatible only; `install-links` now makes eight names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause`, `stuffr-formats` `MIT AND BSD-2-Clause`. A MINOR because it is a new user-facing surface. |
 | `0.13.0` | Phase 5's third part — the xz compatibility family (`xz`, `unxz`, `xzcat`, `lzma`, `unlzma`, `lzcat`) behaving as XZ Utils 5.8.4's `xz`, one personality ported from its 0BSD `src/xz/`; stdout, stderr and exit codes byte-identical on both tiers, compressed bytes identical on the `c-backed` tier and compatible on the pure tier; signal cleanup of the partial output (`host.rs`); `install-links` now makes fourteen names; `stuffr-cli` licensed `MIT AND bzip2-1.0.6 AND BSD-2-Clause AND BSD-3-Clause AND 0BSD`, `stuffr-formats` `MIT AND BSD-2-Clause AND 0BSD`. A MINOR because it is a new user-facing surface. |
-| `0.14.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (zstd next, then lz4, then `unzip`/`zipinfo`; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
+| `0.14.0` | Phase 5's fourth part — the zstd compatibility family (`zstd`, `unzstd`, `zstdcat`, `zstdmt`) behaving as zstd 1.5.7's command line tool, one personality ported from its BSD `programs/`; stdout, stderr and exit codes byte-identical on both tiers, frames and dictionaries identical on the `c-backed` tier (`zstd-c`) and compatible on the pure tier, with `--train-cover`, `--adapt` and `--format=lz4` compatible only; SIGINT cleanup answered as zstd answers it; `install-links` now makes eighteen names; `stuffr-formats` licensed `MIT AND BSD-2-Clause AND 0BSD AND BSD-3-Clause` (`LICENSE-zstd`, `LICENSE-zstd-clevels`). A MINOR because it is a new user-facing surface. |
+| `0.15.x`/later | The rest of Phase 5 — the remaining compatibility families, one per release (lz4 next, then `unzip`/`zipinfo`; `tar` excluded), each claiming the next open number; polish (completions, man pages) under a separate spec. |
 | `1.0.0` | Reserved for feature-complete, not for any single phase — no earlier milestone claims it. |
 
 This table was revised after Phase 1: the original plan put legacy read/write
@@ -1022,7 +1028,8 @@ A compatibility family is a set of names under which the `stuffr` binary
 behaves as another tool (README, "Compatibility links"). bzip2 (`bzip2`,
 `bunzip2`, `bzcat`, `bzip2recover`) is the first, in `0.11.0`; gzip (`gzip`,
 `gunzip`, `zcat`, `gzcat`) is the second, in `0.12.0`; xz (`xz`, `unxz`,
-`xzcat`, `lzma`, `unlzma`, `lzcat`) is the third, in `0.13.0`. **The family's
+`xzcat`, `lzma`, `unlzma`, `lzcat`) is the third, in `0.13.0`; zstd (`zstd`,
+`unzstd`, `zstdcat`, `zstdmt`) is the fourth, in `0.14.0`. **The family's
 own spec decides its byte-identity promise** before any code is written:
 which tier, against which tool and version, byte-identical or compatible
 behaviour only. The planned tiers come from the Phase 5 design's Decision 2,
@@ -1141,6 +1148,47 @@ emulates is two programs:
 - **Fuzz.** `COMPAT_NAMES` gained the six names and `COMPAT_FILES` five xz
   suffixes, append-only; the seed's optional second mask byte carries their
   file bits.
+
+**The zstd family** (`compat/zstd/`) has one personality and one reference:
+
+- **A BSD port.** zstd's `programs/` is BSD-licensed (Meta Platforms, Inc.),
+  so, as with xz, its source is read and ported with attribution: one module
+  per C file (`cli.rs` from `zstdcli.c`, `dibio.rs`, `util.rs`, `display.rs`,
+  `fileio.rs`, ...), the module doc of `compat/zstd/mod.rs` listing each and
+  the known deviations (the source of truth; the README mirrors it), and
+  `messages.rs` holding every string with its source function. The notice is
+  `crates/stuffr-cli/LICENSE-zstd`; `stuffr-formats` carries the ported
+  `clevels.h` table under `LICENSE-zstd-clevels`. `stuffr-cli`'s expression
+  already held `BSD-3-Clause`, so it did not change. The progress fixture
+  generator `tests/fixtures/zstd_progress/gen.c` holds zstd source verbatim
+  and is covered by the same notice.
+- **One version, the tarball.** Only 1.5.7 is promised. The reference is found
+  by `zstd_dir()` in the harness: `$STUFFR_ZSTD_REFERENCE`, then Homebrew's
+  keg (`/opt/homebrew/opt/zstd/bin/zstd`), then `PATH`, and only a 1.5.7 with
+  gzip, lz4, lzma and xz support counts. CI builds the release tarball
+  (SHA-256 pinned) in the composite action `.github/actions/zstd-reference`.
+- **R6, the interrupt answer.** `host.rs`'s `arm_cleanup_exit` installs a
+  SIGINT-only handler while a file destination is armed, and restores the
+  default action when the guard drops. The handler does only
+  async-signal-safe work: ignore SIGINT, unlink the partial output, write a
+  newline to standard error, `_exit(2)`. When nothing is armed (`zstd -c`)
+  SIGINT keeps its default action, as in zstd.
+- **R9, the sandbox limits for fuzzing.** `Host::Sandbox` (`run_in_counted`)
+  caps the decoder's window log at 24 unless the arguments ask for less,
+  `--train*` samples at 256 KiB in total with at most 4 optimiser steps, and
+  workers at 2. They are input-independent bounds, as the xz family's memory
+  limit is, and never apply to a real run.
+- **R13, benchmark and trace.** Homebrew's zstd is built without
+  `ZSTD_NOBENCH`, but `-b` is out of scope: the port answers `-b`, `-e#`,
+  `-i#` and `--trace` as a `ZSTD_NOBENCH`/`ZSTD_NOTRACE` build does, and
+  `-H` omits their lines. The differential help cases remove exactly those
+  lines from the reference's output (the block is pinned as a constant), so
+  any other difference still fails.
+- **The tier promise.** Stdout, stderr and exit codes are zstd 1.5.7's on
+  both tiers. Frames and dictionaries are identical on the C tier except
+  `--train-cover` (libzstd's cover sort breaks ties by address), `--adapt`
+  (timing) and `--format=lz4` (compatible only); the pure tier is compatible
+  and refuses dictionary compression and `--train`.
 
 **Reference tools.** The bzip2 family is tested against the system
 `/usr/bin/bzip2` and `/usr/bin/bzip2recover`, which are not the same program
