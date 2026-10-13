@@ -329,8 +329,11 @@ read list.
 > `install-links` now makes eighteen names. Additive library API,
 > `#[doc(hidden)]`: `stuffr::zstd_opts`, `stuffr::lz4_frame`,
 > `zlib_c::Inflate`, `RawDeflate::with_options`; `stuffr-cli` gains a
-> `zstd-c` feature.
-> **2595** tests under `--all-features`, **2484** on the default tier —
+> `zstd-c` feature. Also fixed (found by deep fuzz, present since 0.10.0):
+> `convert` to tar no longer writes a hard link whose target is the empty
+> name, which stuffr's own reader then refused; it skips the link with a
+> warning naming it.
+> **2598** tests under `--all-features`, **2487** on the default tier —
 > measured from this bump's own `make check`, `GATE_EXIT=0`.
 >
 > Two user-visible changes on archives that already exist. First, `salvage
