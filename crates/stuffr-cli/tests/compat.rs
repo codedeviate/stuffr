@@ -513,7 +513,11 @@ mod unix {
             cmd.env("STUFFR_GZIP_FLAVOR", v);
         }
         let mut child = cmd.spawn().unwrap();
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        // A child that exits without reading its stdin closes the pipe; EPIPE is fine.
+        match child.stdin.take().unwrap().write_all(stdin) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            r => r.unwrap(),
+        }
         child.wait_with_output().unwrap()
     }
 

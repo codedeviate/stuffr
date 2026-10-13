@@ -2195,7 +2195,11 @@ fn run_with_stdin_output(args: &[&str], input: &[u8]) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    // A child that exits without reading its stdin closes the pipe; EPIPE is fine.
+    match child.stdin.take().unwrap().write_all(input) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        r => r.unwrap(),
+    }
     child.wait_with_output().unwrap()
 }
 
