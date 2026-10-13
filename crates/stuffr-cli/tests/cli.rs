@@ -15436,3 +15436,137 @@ fn unpack_skips_a_name_too_long_for_the_filesystem() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Unpacks `entries` (file name, data) from a tar into a fresh directory and
+/// returns stderr. `None` when the scratch filesystem does not fold `fold_a`
+/// onto `fold_b` (case-sensitive volume), so the test has nothing to say.
+fn unpack_folded(entries: &[(&str, &[u8])], fold_a: &str, fold_b: &str) -> Option<String> {
+    let dir = tmp_dir();
+    std::fs::write(dir.join(fold_a), b"probe").unwrap();
+    let folds = std::fs::symlink_metadata(dir.join(fold_b)).is_ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    if !folds {
+        return None;
+    }
+    let dir = tmp_dir();
+    let tar = dir.join("f.tar");
+    {
+        let mut builder = Builder::new(std::fs::File::create(&tar).unwrap());
+        for (name, data) in entries {
+            append_tar_entry(&mut builder, name, data);
+        }
+        builder.finish().unwrap();
+    }
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        tar.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(stderr)
+}
+
+/// 0.13.2: a skip reason names an ancestor this run made as the archive
+/// spelled it, not as the later entry spells it. File `A`, then `a/b`.
+#[test]
+fn skip_reason_names_the_case_folded_ancestor_as_archived() {
+    let Some(stderr) = unpack_folded(&[("A", b"alpha"), ("a/b", b"beneath")], "A", "a") else {
+        return;
+    };
+    assert!(
+        stderr.contains(
+            "skipped entry `a/b`: `A`, earlier in this archive, is not a directory, so `a/b` \
+             cannot be placed beneath it"
+        ),
+        "{stderr}"
+    );
+}
+
+/// The same for a normalisation fold: NFC `é` as a file, then NFD `é/x`.
+#[test]
+fn skip_reason_names_the_normalisation_folded_ancestor_as_archived() {
+    let nfc = "\u{e9}";
+    let nfd = "e\u{301}";
+    let Some(stderr) = unpack_folded(
+        &[(nfc, b"alpha"), (&format!("{nfd}/x"), b"beneath")],
+        nfc,
+        nfd,
+    ) else {
+        return;
+    };
+    assert!(
+        stderr.contains(&format!(
+            "`{nfc}`, earlier in this archive, is not a directory"
+        )),
+        "{stderr}"
+    );
+}
+
+/// A directory `A` this run made, then file `a`: the directory is named as
+/// the archive spelled it.
+#[test]
+fn skip_reason_names_the_folded_directory_as_archived() {
+    let dir = tmp_dir();
+    let tar = dir.join("d.tar");
+    {
+        let mut builder = Builder::new(std::fs::File::create(&tar).unwrap());
+        let mut d = Header::new_gnu();
+        d.set_entry_type(tar::EntryType::Directory);
+        d.set_size(0);
+        d.set_mode(0o755);
+        builder.append_data(&mut d, "A", std::io::empty()).unwrap();
+        append_tar_entry(&mut builder, "a", b"file");
+        builder.finish().unwrap();
+    }
+    std::fs::write(dir.join("A.probe"), b"p").unwrap();
+    if std::fs::symlink_metadata(dir.join("a.probe")).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        tar.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("a directory `A` from earlier in this archive is in the way"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review Focus 2: a file `a` the destination held before the run is not the
+/// run's own record; the wording stays what it is today.
+#[test]
+fn skip_reason_for_a_prior_destination_file_is_unchanged() {
+    let dir = tmp_dir();
+    let tar = dir.join("p.tar");
+    {
+        let mut builder = Builder::new(std::fs::File::create(&tar).unwrap());
+        append_tar_entry(&mut builder, "a/b", b"beneath");
+        builder.finish().unwrap();
+    }
+    let dest = dir.join("out");
+    std::fs::create_dir_all(&dest).unwrap();
+    std::fs::write(dest.join("a"), b"prior").unwrap();
+    let out = run_output(&[
+        "unpack",
+        tar.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    // Whatever the exit code and wording are today, they must not claim the
+    // archive made `a`.
+    assert!(!stderr.contains("earlier in this archive"), "{stderr}");
+    assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"prior");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -5572,6 +5572,25 @@ impl MadeByRun {
         !self.ids.is_empty() && identity(path).is_some_and(|id| self.ids.contains(&id))
     }
 
+    /// The spelling this run gave what is at `path` now, relative to `dest`,
+    /// when that differs from `path`'s own: under a case or normalisation
+    /// fold `A` (a file) and then `a/b` reach one inode, and a skip reason
+    /// names the archive's `A`, not the later entry's `a`. Found by identity
+    /// (unix); `None` when nothing recorded matches, so the caller keeps the
+    /// spelling it has. Only keys of the same depth qualify, so a hard link
+    /// elsewhere never stands in for the ancestor. Wording only.
+    fn archived_spelling(&self, dest: &Path, path: &Path) -> Option<String> {
+        let id = identity(path)?;
+        let depth = path.strip_prefix(dest).ok()?.components().count();
+        self.at
+            .iter()
+            .filter(|(key, rec)| rec.id == Some(id) && key.as_path() != path)
+            .filter_map(|(key, _)| key.strip_prefix(dest).ok())
+            .filter(|rel| rel.components().count() == depth)
+            .min()
+            .map(|rel| rel.to_string_lossy().into_owned())
+    }
+
     /// The path and current kind for an entry name, by the exact string:
     /// GNU tar's `./b` link finds the `./b` entry it wrote.
     fn resolve(&self, name: &str) -> Option<(&Path, &MadeKind)> {
@@ -5743,9 +5762,12 @@ fn place(
             Ok(md) if md.is_dir() => {}
             Ok(_) if made.made(&walked) => {
                 let ancestor: PathBuf = components[..=i].iter().collect();
+                let ancestor = made
+                    .archived_spelling(dest, &walked)
+                    .unwrap_or_else(|| ancestor.to_string_lossy().into_owned());
                 return Ok(Placed::Skip(Fidelity::EntrySkipped {
                     entry: name.to_string(),
-                    reason: conflict_reason_not_a_directory(&ancestor.to_string_lossy(), name),
+                    reason: conflict_reason_not_a_directory(&ancestor, name),
                 }));
             }
             Ok(_) => return Ok(Placed::Held(Held::NotADirectoryAbove(walked))),
@@ -5765,9 +5787,12 @@ fn place(
             Ok(md) if md.is_dir() => {
                 if !placing_dir {
                     if made.made(target) {
+                        let spelled = made
+                            .archived_spelling(dest, target)
+                            .unwrap_or_else(|| name.to_string());
                         return Ok(Placed::Skip(Fidelity::EntrySkipped {
                             entry: name.to_string(),
-                            reason: conflict_reason_directory_in_the_way(name),
+                            reason: conflict_reason_directory_in_the_way(&spelled),
                         }));
                     }
                     return Ok(Placed::Held(Held::DirectoryInTheWay(target.to_path_buf())));

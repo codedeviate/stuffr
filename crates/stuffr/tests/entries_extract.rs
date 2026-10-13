@@ -1118,13 +1118,13 @@ fn a_case_folded_directory_conflict_is_attributed_to_the_archive() {
     let outcome = extract_with(&archive, &dest, false).expect("a self-contradiction is a skip");
     assert_eq!(
         outcome.fidelity.warnings,
-        [skipped("a", &reason_directory_in_the_way("a"))]
+        [skipped("a", &reason_directory_in_the_way("A"))]
     );
     assert!(std::fs::symlink_metadata(dest.join("A")).unwrap().is_dir());
 }
 
 /// File `A`, then `a/b`: the archive's own file is above the entry. The
-/// ancestor is named as the entry spells it, `a`.
+/// ancestor is named as the archive spelled it, `A` (0.13.2).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_case_folded_file_above_an_entry_is_attributed_to_the_archive() {
@@ -1140,7 +1140,7 @@ fn a_case_folded_file_above_an_entry_is_attributed_to_the_archive() {
     let outcome = extract_with(&archive, &dest, false).expect("a self-contradiction is a skip");
     assert_eq!(
         outcome.fidelity.warnings,
-        [skipped("a/b", &reason_not_a_directory("a", "a/b"))]
+        [skipped("a/b", &reason_not_a_directory("A", "a/b"))]
     );
     assert_eq!(std::fs::read(dest.join("A")).unwrap(), b"alpha");
 }
@@ -1213,7 +1213,7 @@ fn unicode_normalisation_folds_are_attributed_to_the_archive() {
         outcome.fidelity.warnings,
         [skipped(
             DECOMPOSED,
-            &reason_directory_in_the_way(DECOMPOSED)
+            &reason_directory_in_the_way(PRECOMPOSED)
         )]
     );
     assert!(
@@ -1231,7 +1231,10 @@ fn unicode_normalisation_folds_are_attributed_to_the_archive() {
     let outcome = extract_with(&archive, &dest, false).expect("a self-contradiction is a skip");
     assert_eq!(
         outcome.fidelity.warnings,
-        [skipped(&below, &reason_not_a_directory(DECOMPOSED, &below))]
+        [skipped(
+            &below,
+            &reason_not_a_directory(PRECOMPOSED, &below)
+        )]
     );
     assert_eq!(std::fs::read(dest.join(PRECOMPOSED)).unwrap(), b"alpha");
 }
