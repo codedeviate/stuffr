@@ -61,6 +61,22 @@
 //! - A corrupt frame whose blocks overflow the output libzstd sized from
 //!   its header can be named `Data corruption detected` where libzstd says
 //!   `Destination buffer is too small`.
+//! - `--format=gzip|xz|lzma` write flate2's and `xz_opts`' pure encoders'
+//!   bytes, which the reference decodes (compatible, not identical; the
+//!   summaries' sizes are the tier's own).
+//! - An xz or lzma frame that fails to decode (the xz family's P6 and P9):
+//!   what is written before the error can be a strict prefix of what
+//!   liblzma writes, and corruption in the last bytes of a `.lzma` reads as
+//!   the input ending there (`premature lzma end`, the jobs before it
+//!   written) where liblzma says `lzma_code decoding error 9`.
+//!
+//! The foreign formats on both tiers (`formats.rs`; spec "Promises"):
+//! `--format=gzip` is zlib's bytes with `zlib-c`, `--format=xz|lzma`
+//! liblzma's with `xz-c`; `--format=lz4` is compatible only on every tier:
+//! `lz4_flex`'s fast compressor at every level, inside liblz4's frame
+//! descriptor (64 KiB linked blocks, content size, content checksum as
+//! fileio.c sets them). A gzip member's deflate data is decoded by flate2
+//! on every tier, its header and trailer checked as zlib checks them.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -78,6 +94,7 @@ use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 pub(crate) mod cli;
 pub(crate) mod display;
 pub(crate) mod fileio;
+mod formats;
 mod messages;
 pub(crate) mod util;
 
@@ -122,8 +139,9 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
 /// R9's input-independent bounds hold whatever the arguments say: the
 /// decoder's window log is at most 24 (16 MiB; a lower `--memory` or
 /// `--long` stands), `--train*` loads at most 256 KiB of samples with at
-/// most 4 optimiser steps, and compression runs at most 2 workers.
-/// Standard output and output files share the [`SANDBOX_OUTPUT_CAP`]
+/// most 4 optimiser steps, and compression runs at most 2 workers; xz and
+/// lzma frames decode under a 256 MiB memory limit and compress at preset
+/// 6 at most (`formats.rs`). Standard output and output files share the [`SANDBOX_OUTPUT_CAP`]
 /// budget. No signal handler is installed. For the fuzz target; not a
 /// stable interface.
 #[doc(hidden)]

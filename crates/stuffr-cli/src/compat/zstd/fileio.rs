@@ -29,8 +29,10 @@
 //!   `FIO_openDstFile` already refuses a destination that is its source;
 //!   the one output of several inputs (`-o`), which zstd opens without that
 //!   check, is refused the same way when it is one of the inputs.
-//! - gzip, xz, lzma and lz4 frames go through [`FrameCodec`] (Task 6); until
-//!   then they answer as a zstd built without zlib, liblzma and liblz4 does.
+//! - gzip, xz, lzma and lz4 frames go through [`FrameCodec`], which
+//!   `formats.rs` implements as fileio.c's `FIO_compressGzFrame`,
+//!   `FIO_compressLzmaFrame`, `FIO_compressLz4Frame` and their decoding
+//!   counterparts.
 //! - The progress line is drawn as `DISPLAYUPDATE` draws it, once per
 //!   coder call this port makes (per input job when compressing); its
 //!   terminal behaviour is Task 9's. `--adapt`'s level changes are Task 8's.
@@ -63,7 +65,7 @@ pub(crate) type Fio<T> = Result<T, Thrown>;
 /// `ZSTD_BLOCKSIZE_MAX`.
 const BLOCKSIZE_MAX: usize = zstd_opts::BLOCKSIZE_MAX;
 /// `ZSTD_CStreamInSize()`.
-const CSTREAM_IN_SIZE: usize = BLOCKSIZE_MAX;
+pub(crate) const CSTREAM_IN_SIZE: usize = BLOCKSIZE_MAX;
 /// `ZSTD_DStreamInSize()`: a block and its header.
 pub(crate) const DSTREAM_IN_SIZE: usize = BLOCKSIZE_MAX + 3;
 /// `ZSTD_DStreamOutSize()`.
@@ -127,49 +129,9 @@ pub(crate) trait FrameCodec {
     ) -> Fio<Option<u64>>;
 }
 
-/// Until Task 6: a zstd built without `ZSTD_GZCOMPRESS`/`ZSTD_LZMACOMPRESS`/
-/// `ZSTD_LZ4COMPRESS` and their decompressing counterparts, with that
-/// build's own texts.
-struct NoFrameCodec;
-
-impl FrameCodec for NoFrameCodec {
-    fn compress(
-        &mut self,
-        io: &mut Io<'_>,
-        _rp: &mut ReadPool,
-        ctype: CType,
-        src_name: &[u8],
-        _file_size: u64,
-        _level: i32,
-    ) -> Fio<(u64, u64)> {
-        let fmt = match ctype {
-            CType::Gzip => m::NO_GZ_COMPRESS,
-            CType::Lz4 => m::NO_LZ4_COMPRESS,
-            _ => m::NO_LZMA_COMPRESS,
-        };
-        Err(io.exm(20, fmt, &[src_name]))
-    }
-
-    fn decompress(
-        &mut self,
-        io: &mut Io<'_>,
-        _rp: &mut ReadPool,
-        kind: Foreign,
-        src_name: &[u8],
-    ) -> Fio<Option<u64>> {
-        let fmt = match kind {
-            Foreign::Gzip => m::NO_GZ_DECOMPRESS,
-            Foreign::Lz4 => m::NO_LZ4_DECOMPRESS,
-            Foreign::Xz | Foreign::Lzma => m::NO_LZMA_DECOMPRESS,
-        };
-        io.d.at(1, io.err, fmt, &[src_name]);
-        Ok(None)
-    }
-}
-
 /// The frame coders this build has.
 fn frame_codec() -> Box<dyn FrameCodec> {
-    Box::new(NoFrameCodec)
+    Box::new(super::formats::Formats)
 }
 
 // ---- the read pool ----
@@ -200,6 +162,13 @@ impl ReadPool {
     /// `srcBuffer`, `srcBufferLoaded` bytes.
     pub(crate) fn loaded(&self) -> &[u8] {
         &self.buf[self.start..]
+    }
+
+    /// Puts `bytes` back in front of what is loaded: input a decoder took
+    /// but its frame did not use.
+    pub(crate) fn give_back(&mut self, bytes: &[u8]) {
+        self.buf
+            .splice(self.start..self.start, bytes.iter().copied());
     }
 
     /// `AIO_ReadPool_consumeBytes`.
@@ -470,7 +439,7 @@ impl<'a> Io<'a> {
         self.d.at(l, self.err, fmt, args);
     }
 
-    fn human(&self, size: u64) -> Hrs {
+    pub(crate) fn human(&self, size: u64) -> Hrs {
         human_size(size, self.util_level)
     }
 
@@ -512,7 +481,7 @@ impl<'a> Io<'a> {
     }
 
     /// `DISPLAYUPDATE_PROGRESS(…)`.
-    fn display_update_progress(&mut self, fmt: &str, args: &[&[u8]]) {
+    pub(crate) fn display_update_progress(&mut self, fmt: &str, args: &[&[u8]]) {
         if self.should_display_progress()
             && self.d.level >= 1
             && self.prefs.progress != Progress::Never

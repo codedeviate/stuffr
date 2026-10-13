@@ -60,6 +60,14 @@ pub mod zstd_opts {
 pub mod zlib_c {
     pub use stuffr_formats::zlib_c::RawDeflate;
 }
+/// LZ4 frames through `lz4_flex` — what the `stuffr` binary's zstd
+/// compatibility family writes for `--format=lz4` and decodes LZ4 frames
+/// with. Not part of the stable API.
+#[cfg(feature = "lz4")]
+#[doc(hidden)]
+pub mod lz4_frame {
+    pub use stuffr_formats::lz4::raw::*;
+}
 pub mod entries;
 mod link_cache;
 pub mod ops;

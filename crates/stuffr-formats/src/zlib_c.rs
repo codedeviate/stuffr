@@ -79,7 +79,8 @@ fn zlib_error(what: &str, code: c_int) -> io::Error {
 }
 
 /// Raw deflate (no zlib/gzip framing) through C zlib:
-/// `deflateInit2(level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY)`.
+/// `deflateInit2(level, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY)`
+/// ([`RawDeflate::with_options`] takes other `windowBits`).
 ///
 /// Writes are `Z_NO_FLUSH`; [`Write::flush`] flushes only the inner writer
 /// (a zlib sync flush would change the bytes). [`RawDeflate::finish`] ends
@@ -102,13 +103,31 @@ pub struct RawDeflate<W: Write> {
 }
 
 impl<W: Write> RawDeflate<W> {
-    /// A raw-deflate encoder at `level`, 1..=9; any other level is
-    /// `InvalidInput`.
+    /// A raw-deflate encoder at `level`, 0..=9 (0 is zlib's stored
+    /// blocks, which the zstd family's `--format=gzip -0` asks for); any
+    /// other level is `InvalidInput`.
     pub fn new(out: W, level: u32) -> io::Result<Self> {
-        if !(1..=9).contains(&level) {
+        Self::with_options(out, level, -15, OUT_CHUNK)
+    }
+
+    /// As [`RawDeflate::new`], with zlib's `windowBits` (`-15` raw, `31`
+    /// gzip: zlib writes the header and trailer itself, as the zstd
+    /// family's `--format=gzip` has `deflateInit2` write them) and the size
+    /// of the output buffer each `deflate` call gets, which decides the
+    /// stored blocks of level 0 (`deflate_stored` copies as much as the
+    /// output has room for). `windowBits` outside zlib's ranges is zlib's
+    /// `Z_STREAM_ERROR`; a zero `chunk` is `InvalidInput`.
+    pub fn with_options(out: W, level: u32, window_bits: i32, chunk: usize) -> io::Result<Self> {
+        if chunk == 0 || u32::try_from(chunk).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("deflate level {level} is outside 1..=9"),
+                format!("deflate output buffer of {chunk} bytes"),
+            ));
+        }
+        if level > 9 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("deflate level {level} is outside 0..=9"),
             ));
         }
         let mut stream = Box::new(z::z_stream {
@@ -135,7 +154,7 @@ impl<W: Write> RawDeflate<W> {
                 &mut *stream,
                 level as c_int,
                 z::Z_DEFLATED,
-                -15,
+                window_bits as c_int,
                 8,
                 z::Z_DEFAULT_STRATEGY,
                 z::zlibVersion(),
@@ -151,7 +170,7 @@ impl<W: Write> RawDeflate<W> {
         Ok(RawDeflate {
             stream,
             out: Some(out),
-            buf: vec![0; OUT_CHUNK],
+            buf: vec![0; chunk],
             live: true,
             poisoned: false,
         })

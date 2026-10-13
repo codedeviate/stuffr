@@ -62,12 +62,33 @@ mod unix {
             tty_stdin: false,
             tty_stdout: false,
             env: vec![("LC_ALL", "C")],
-            compare_output_bytes: EXACT,
+            compare_output_bytes: exact_for(args),
             expect_stdout_plain: None,
             setup: None,
             roundtrip: Roundtrip::Zstd {
                 ref_zstd: ref_zstd(),
             },
+        }
+    }
+
+    /// Whether the output of a case with `args` is promised byte for byte:
+    /// zstd frames on the C tier (`zstd-c`), `--format=gzip` with C zlib
+    /// (`zlib-c`; spike S2 measured zlib's bytes identical to the
+    /// reference's), `--format=xz|lzma` with liblzma (`xz-c`, 5.8.4 on both
+    /// sides); `--format=lz4` never (R11: `lz4_flex`, not liblz4). The last
+    /// `--format=` counts.
+    fn exact_for(args: &[&str]) -> bool {
+        let format = args
+            .iter()
+            .take_while(|a| **a != "--")
+            .filter_map(|a| a.strip_prefix("--format="))
+            .last()
+            .unwrap_or("zstd");
+        match format {
+            "gzip" => cfg!(feature = "zlib-c"),
+            "xz" | "lzma" => cfg!(feature = "xz-c"),
+            "lz4" => false,
+            _ => EXACT,
         }
     }
 
@@ -144,22 +165,24 @@ mod unix {
                 r.stdout = strip_bench_help(t).into_bytes();
             }
             mask_banners(&mut r, &mut s);
+            pure_tier_lzma_decoding(c, &mut r, &mut s);
             // Spec deviation 2: `-vv`'s "Completed in" timing fields.
             r.stderr = normalise_zstd_progress(&r.stderr);
             s.stderr = normalise_zstd_progress(&s.stderr);
-            pure_tier_sizes(&mut r, &mut s);
+            pure_tier_sizes(c, &mut r, &mut s);
             assert_same(c, &r, &s);
             true
         };
         run_group(group, cases, Skipped::none(), &one);
     }
 
-    /// Spec deviation 7 on the pure tier: the compressed sizes and ratios
-    /// in the summaries are those of stuffr's own frames, so on both sides
-    /// they become `<ratio>` and `<size>` (the input size, the names and
-    /// every other byte still compared). Nothing changes on the C tier.
-    fn pure_tier_sizes(r: &mut Run, s: &mut Run) {
-        if !EXACT {
+    /// Spec deviation 7 on the pure tier, and `--format=lz4` on either
+    /// (R11): the compressed sizes and ratios in the summaries are those of
+    /// stuffr's own frames, so on both sides they become `<ratio>` and
+    /// `<size>` (the input size, the names and every other byte still
+    /// compared). Nothing changes where the bytes are promised.
+    fn pure_tier_sizes(c: &Case, r: &mut Run, s: &mut Run) {
+        if !EXACT || !c.compare_output_bytes {
             r.stderr = blank_compressed_sizes(&r.stderr);
             s.stderr = blank_compressed_sizes(&s.stderr);
         }
@@ -252,6 +275,45 @@ mod unix {
                 "Decoding error (36) : Destination buffer is too small",
                 "Decoding error (36) : Data corruption detected",
             );
+        }
+    }
+
+    /// Whether `c` decodes an xz or lzma frame: an operand named so, or
+    /// standard input opening with either's magic.
+    fn decodes_lzma(c: &Case) -> bool {
+        c.files
+            .iter()
+            .any(|(n, _)| n.ends_with(".xz") || n.ends_with(".lzma"))
+            || c.stdin
+                .as_ref()
+                .is_some_and(|d| d.starts_with(&[0xfd, b'7']) || d.starts_with(&[0x5d, 0]))
+    }
+
+    /// The pure tier's liblzma port (`xz_opts::pure`; the xz family's P6
+    /// and P9, this family's module doc): an xz or lzma frame that fails
+    /// to decode can have written a strict prefix of what liblzma writes
+    /// before the error, and corruption in the last bytes of a `.lzma`
+    /// reads as the input ending (`premature lzma end` where liblzma says
+    /// `lzma_code decoding error 9`), answered as an input that ends there
+    /// is: the jobs decoded before it are written, where liblzma's failing
+    /// call loses them (so the reference's output is then a prefix of
+    /// ours). Both are accepted there, in failing runs only; the exit code
+    /// and every other byte are still compared. Nothing changes with
+    /// `xz-c`.
+    fn pure_tier_lzma_decoding(c: &Case, r: &mut Run, s: &mut Run) {
+        if cfg!(feature = "xz-c") || r.code == 0 || s.code != r.code || !decodes_lzma(c) {
+            return;
+        }
+        if s.stdout.len() < r.stdout.len() && r.stdout.starts_with(&s.stdout) {
+            s.stdout = r.stdout.clone();
+        }
+        let theirs = ": lzma_code decoding error 9 \n";
+        let ours = ": premature lzma end \n";
+        if r.stderr.contains(theirs) && s.stderr == r.stderr.replace(theirs, ours) {
+            r.stderr = s.stderr.clone();
+            if s.stdout.starts_with(&r.stdout) {
+                s.stdout = r.stdout.clone();
+            }
         }
     }
 
@@ -768,7 +830,6 @@ mod unix {
 
     /// The `--format=` options of [`ACCEPTED`] for gzip, xz, lzma and lz4.
     #[test]
-    #[ignore = "Task 6 (formats.rs)"]
     fn flags_accepted_foreign_formats() {
         let mut cases: Vec<Case> = Vec::new();
         for args in ACCEPTED.iter().filter(|a| foreign_format(a)) {
@@ -1801,7 +1862,6 @@ mod unix {
 
     /// Review Focus 5's gzip leg: `unzstd a.gz` decodes by magic.
     #[test]
-    #[ignore = "Task 6 (formats.rs)"]
     fn suffix_rules_foreign() {
         let t = text();
         let gz = gzm(&t, b"a");
@@ -1923,5 +1983,286 @@ mod unix {
         );
         assert_eq!(theirs.stderr, b"\n");
         assert_eq!(theirs.left, ["big"]);
+    }
+
+    // ==== part 3 (Task 6): gzip, xz, lzma and lz4 ====
+
+    /// The foreign formats `--format=` names.
+    const FOREIGN: [&str; 4] = ["gzip", "xz", "lzma", "lz4"];
+
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// `--format=f`.
+    fn format_arg(f: &str) -> &'static str {
+        leak(format!("--format={f}"))
+    }
+
+    /// The suffix `--format=f` writes (fileio.c's `*_EXTENSION`).
+    fn ext(f: &str) -> &'static str {
+        match f {
+            "gzip" => ".gz",
+            "xz" => ".xz",
+            "lzma" => ".lzma",
+            _ => ".lz4",
+        }
+    }
+
+    /// The levels each format is driven at: 1, 3 and 19 (clamped to 9 by
+    /// gzip, xz and lzma), 0 (gzip's stored blocks, xz's preset 0), and
+    /// `--fast=1`/`--fast=3`: zlib's `Z_DEFAULT_COMPRESSION` and its
+    /// refusal of -3 (`deflateInit2 error -2`, exit 71); preset 0 for xz
+    /// and lzma (negative levels clamp up).
+    fn foreign_levels() -> [&'static str; 6] {
+        ["-1", "-3", "-19", "-0", "--fast=1", "--fast=3"]
+    }
+
+    /// The inputs of part 3: empty, 1 KiB of text, and 1 MiB mixed (eight
+    /// read jobs, sixteen 64 KiB lz4 blocks).
+    fn foreign_inputs() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("text", super::compat_harness::text(1024, 21)),
+            ("mixed", mixed(1 << 20, 22)),
+        ]
+    }
+
+    /// `--format=gzip|xz|lzma|lz4` at every level of [`foreign_levels`]
+    /// over every input: file to file (the summary printed), to standard
+    /// output, and standard input to standard output.
+    #[test]
+    fn foreign_compress() {
+        let mut cases = Vec::new();
+        for f in FOREIGN {
+            for level in foreign_levels() {
+                for (name, data) in foreign_inputs() {
+                    let fa = format_arg(f);
+                    cases.push(with_files(
+                        "zstd",
+                        &[fa, level, "-k", name],
+                        vec![(name, data.clone())],
+                    ));
+                    cases.push(with_files(
+                        "zstd",
+                        &[fa, level, "-c", name],
+                        vec![(name, data.clone())],
+                    ));
+                    cases.push(fed(with_files("zstd", &[fa, level], Vec::new()), data));
+                }
+            }
+        }
+        // Several files (the totals), `--rm`, `-o`, the content checksum
+        // switches lz4 reads, and the format's own suffix with `-S`-less
+        // names already carrying it.
+        let t = text();
+        for f in FOREIGN {
+            let fa = format_arg(f);
+            for args in [
+                &[fa, "-k", "a", "d"][..],
+                &[fa, "--rm", "a"],
+                &[fa, "-k", "--no-check", "a"],
+                &[fa, "-k", "-C", "a"],
+                &[fa, "-vv", "-k", "a"],
+                &[fa, "-q", "-k", "a", "d", "-c"],
+            ] {
+                cases.push(with_files(
+                    "zstd",
+                    args,
+                    vec![("a", t.clone()), ("d", t.repeat(3))],
+                ));
+            }
+        }
+        for f in FOREIGN {
+            cases.push(with_files(
+                "zstd",
+                &[format_arg(f), "-k", "a", "-o", "out"],
+                vec![("a", t.clone())],
+            ));
+        }
+        check("foreign_compress", &cases);
+    }
+
+    /// The LZ4 frame descriptor (FLG, BD, the content size and the header
+    /// checksum) is the reference's, byte for byte, though the blocks
+    /// after it are `lz4_flex`'s (R11): 64 KiB linked blocks, the content
+    /// size when the input's is known and non-zero, and a content checksum
+    /// only for `checksumFlag` 1 (`-C` sets 2, which liblz4 reads as no
+    /// checksum).
+    #[test]
+    fn lz4_frame_descriptor_matches() {
+        let Some(_) = zstd_dir() else { return };
+        let t = text();
+        for (args, stdin) in [
+            (&["--format=lz4", "-c", "a"][..], false),
+            (&["--format=lz4", "-c", "--no-check", "a"], false),
+            (&["--format=lz4", "-c", "-C", "a"], false),
+            (&["--format=lz4", "-c", "e"], false),
+            (&["--format=lz4", "-c"], true),
+        ] {
+            let mut c = with_files("zstd", args, vec![("a", t.clone()), ("e", Vec::new())]);
+            if stdin {
+                c.stdin = Some(t.clone());
+            }
+            let Some(r) = reference(zstd_dir().unwrap(), &c) else {
+                return;
+            };
+            let s = stuffr_as(&c);
+            let header = |b: &[u8]| {
+                let flg = b[4];
+                let len = 7 + if flg & 8 != 0 { 8 } else { 0 } + if flg & 1 != 0 { 4 } else { 0 };
+                b[..len].to_vec()
+            };
+            assert_eq!(
+                header(&s.stdout),
+                header(&r.stdout),
+                "{args:?}: the frame descriptor differs"
+            );
+            assert_eq!(s.code, r.code, "{args:?}");
+            assert_eq!(s.stderr, r.stderr, "{args:?}");
+        }
+    }
+
+    /// `data` in `f` written by the reference with `extra` options.
+    fn foreign_packed(f: &str, extra: &[&str], data: &[u8]) -> Vec<u8> {
+        let mut a = vec![format_arg(f), "-q"];
+        a.extend_from_slice(extra);
+        packed(&a, data)
+    }
+
+    /// A gzip member with a header CRC (`FHCRC`), right (`good`) or not.
+    fn gz_with_hcrc(data: &[u8], good: bool) -> Vec<u8> {
+        let mut v = member(Member {
+            hcrc: true,
+            name: Some(b"n"),
+            ..plain_member(data)
+        });
+        if !good {
+            // The CRC16 follows the name's NUL at 10 + 2.
+            v[12] ^= 0x55;
+        }
+        v
+    }
+
+    /// Every format by magic, through `unzstd`, `zstdcat`, `zstd -t`,
+    /// `zstd -dv -c` and `zstd -d` from standard input: the reference's own
+    /// output at two levels; other encoders' (a named gzip member with and
+    /// without a header CRC, `lz4_flex`'s independent blocks); members
+    /// followed by other members, by zstd frames, by stream padding and by
+    /// garbage; and each format truncated (in its header, halfway, one
+    /// byte short) and corrupted (halfway, in its trailing check, and in
+    /// each header field the decoder checks).
+    #[test]
+    fn foreign_decompress() {
+        let t = text();
+        let big = mixed(1 << 20, 23);
+        let zst_frame = packed(&[], &t);
+        let mut inputs: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        for f in FOREIGN {
+            let one = foreign_packed(f, &[], &t);
+            let big_one = foreign_packed(f, &["-19"], &big);
+            let n = one.len();
+            let bn = big_one.len();
+            let name = |what: &str| leak(format!("{what}{}", ext(f)));
+            let mut two = one.clone();
+            two.extend_from_slice(&foreign_packed(f, &["-1"], &t.repeat(2)));
+            let mut then_zst = one.clone();
+            then_zst.extend_from_slice(&zst_frame);
+            let mut zst_then = zst_frame.clone();
+            zst_then.extend_from_slice(&one);
+            let mut padded = one.clone();
+            padded.extend_from_slice(&[0, 0, 0, 0]);
+            let mut garbage = one.clone();
+            garbage.extend_from_slice(b"garbage");
+            let mut garbage3 = one.clone();
+            garbage3.extend_from_slice(b"gar");
+            let head = match f {
+                "gzip" => 4,
+                "xz" => 8,
+                "lzma" => 6,
+                _ => 6,
+            };
+            inputs.extend([
+                (name("one"), one.clone()),
+                (name("big"), big_one.clone()),
+                (name("two"), two),
+                (name("thenzst"), then_zst),
+                (name("zstthen"), zst_then),
+                (name("padded"), padded),
+                (name("garbage"), garbage),
+                (name("garbage3"), garbage3),
+                (name("cuthead"), one[..head].to_vec()),
+                (name("cuthalf"), one[..n / 2].to_vec()),
+                (name("cutlast"), one[..n - 1].to_vec()),
+                (name("bigcut"), big_one[..bn / 2].to_vec()),
+                (name("midbit"), flipped(one.clone(), n / 2, 2)),
+                (name("checkbit"), flipped(one.clone(), n - 2, 0)),
+                (name("bigmidbit"), flipped(big_one.clone(), bn / 2, 2)),
+            ]);
+        }
+        inputs.extend([
+            ("named.gz", gzm(&t, b"a")),
+            ("hcrc.gz", gz_with_hcrc(&t, true)),
+            ("badhcrc.gz", gz_with_hcrc(&t, false)),
+            ("method.gz", {
+                let mut v = gzm(&t, b"a");
+                v[2] = 7;
+                v
+            }),
+            ("reserved.gz", flipped(gzm(&t, b"a"), 3, 5)),
+            ("badlen.gz", member_with(plain_member(&t), None, Some(1))),
+            ("flex.lz4", stuffr_encode("lz4", &big, None)),
+            (
+                "lz4reserved.lz4",
+                flipped(foreign_packed("lz4", &[], &t), 4, 1),
+            ),
+            (
+                "lz4version.lz4",
+                flipped(foreign_packed("lz4", &[], &t), 4, 7),
+            ),
+            ("lz4bd.lz4", flipped(foreign_packed("lz4", &[], &t), 5, 4)),
+            ("lz4hc.lz4", {
+                let v = foreign_packed("lz4", &[], &t);
+                if v.is_empty() {
+                    v
+                } else {
+                    // The header checksum ends the descriptor.
+                    let flg = v[4];
+                    let at =
+                        6 + if flg & 8 != 0 { 8 } else { 0 } + if flg & 1 != 0 { 4 } else { 0 };
+                    flipped(v, at, 0)
+                }
+            }),
+        ]);
+        let mut cases = Vec::new();
+        for (name, data) in &inputs {
+            let name: &'static str = name;
+            let files = vec![(name, data.clone())];
+            cases.push(with_files("unzstd", &["-k", name], files.clone()));
+            cases.push(with_files("zstdcat", &[name], files.clone()));
+            cases.push(with_files("zstd", &["-t", name], files.clone()));
+            cases.push(with_files("zstd", &["-dv", "-c", name], files.clone()));
+            cases.push(fed(with_files("zstd", &["-d"], Vec::new()), data.clone()));
+        }
+        // Several files, the totals and one failing.
+        let files: Vec<(&'static str, Vec<u8>)> = inputs
+            .iter()
+            .filter(|(n, _)| n.starts_with("one."))
+            .cloned()
+            .collect();
+        let names: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
+        let mut args = vec!["-dk"];
+        args.extend(names.iter().copied());
+        cases.push(with_files("zstd", &args, files.clone()));
+        let mut args = vec!["-dc", "-v"];
+        args.extend(names.iter().copied());
+        cases.push(with_files("zstd", &args, files.clone()));
+        let mut args = vec!["-t"];
+        args.extend(names.iter().copied());
+        args.push("cuthalf.gz");
+        let mut more = files;
+        more.extend(inputs.iter().filter(|(n, _)| *n == "cuthalf.gz").cloned());
+        cases.push(with_files("zstd", &args, more));
+        check("foreign_decompress", &cases);
     }
 }

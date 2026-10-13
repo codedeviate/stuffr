@@ -721,18 +721,6 @@ pub(super) const SUMMARY: &str = "%s :%s%%   (%s => %s, %s) \n";
 /// Completed in %.2f sec  (cpu load : %.0f%%)\n`).
 pub(super) const COMPLETED: &str = "%s : Completed in %s sec  (cpu load : %s%%)\n";
 
-/// fileio.c: FIO_compressFilename_internal without ZSTD_GZCOMPRESS
-/// (`EXM_THROW(20, …)`), until Task 6 brings gzip.
-pub(super) const NO_GZ_COMPRESS: &str = "zstd: %s: file cannot be compressed as gzip (zstd compiled without ZSTD_GZCOMPRESS) -- ignored \n";
-
-/// fileio.c: FIO_compressFilename_internal without ZSTD_LZMACOMPRESS
-/// (`EXM_THROW(20, …)`), until Task 6 brings xz and lzma.
-pub(super) const NO_LZMA_COMPRESS: &str = "zstd: %s: file cannot be compressed as xz/lzma (zstd compiled without ZSTD_LZMACOMPRESS) -- ignored \n";
-
-/// fileio.c: FIO_compressFilename_internal without ZSTD_LZ4COMPRESS
-/// (`EXM_THROW(20, …)`), until Task 6 brings lz4.
-pub(super) const NO_LZ4_COMPRESS: &str = "zstd: %s: file cannot be compressed as lz4 (zstd compiled without ZSTD_LZ4COMPRESS) -- ignored \n";
-
 /// fileio.c: FIO_compressFilename_dstFile (display level 6).
 pub(super) const OPENING_DST: &str = "FIO_compressFilename_dstFile: opening dst: %s \n";
 
@@ -818,21 +806,6 @@ pub(super) const UNEXPECTED_EOF: &str = "zstd: %s: unexpected end of file \n";
 /// fileio.c: FIO_decompressFrames, fewer than four bytes left.
 pub(super) const UNKNOWN_HEADER: &str = "zstd: %s: unknown header \n";
 
-/// fileio.c: FIO_decompressFrames without ZSTD_GZDECOMPRESS, until Task 6
-/// brings gzip.
-pub(super) const NO_GZ_DECOMPRESS: &str =
-    "zstd: %s: gzip file cannot be uncompressed (zstd compiled without HAVE_ZLIB) -- ignored \n";
-
-/// fileio.c: FIO_decompressFrames without ZSTD_LZMADECOMPRESS, until Task 6
-/// brings xz and lzma.
-pub(super) const NO_LZMA_DECOMPRESS: &str =
-    "zstd: %s: xz/lzma file cannot be uncompressed (zstd compiled without HAVE_LZMA) -- ignored \n";
-
-/// fileio.c: FIO_decompressFrames without ZSTD_LZ4DECOMPRESS, until Task 6
-/// brings lz4.
-pub(super) const NO_LZ4_DECOMPRESS: &str =
-    "zstd: %s: lz4 file cannot be uncompressed (zstd compiled without HAVE_LZ4) -- ignored \n";
-
 /// fileio.c: FIO_decompressFrames.
 pub(super) const UNSUPPORTED_FORMAT: &str = "zstd: %s: unsupported format \n";
 
@@ -899,3 +872,131 @@ pub(super) const READ_ERROR: &str = "Read error";
 /// Not zstd's: an operation whose task is not done yet, debug builds only
 /// (`%s`: the operation, then the task that brings it).
 pub(super) const TODO: &str = "todo: zstd %s is not implemented yet (0.14.0 Task %s)\n";
+
+// ---- fileio.c: the gzip, xz, lzma and lz4 frames (formats.rs) ----
+
+/// fileio.c: FIO_compressGzFrame, `deflateInit2` refusing the level
+/// (`EXM_THROW(71, …)`).
+pub(super) const GZ_DEFLATE_INIT: &str = "zstd: %s: deflateInit2 error %d \n";
+
+/// fileio.c: FIO_compressGzFrame, `deflate` failing (`EXM_THROW(72, …)`
+/// with `Z_NO_FLUSH`, `EXM_THROW(77, …)` with `Z_FINISH`).
+pub(super) const GZ_DEFLATE_ERROR: &str = "zstd: %s: deflate error %d \n";
+
+/// fileio.c: FIO_compressGzFrame (`\rRead : %u MB ==> %.2f%% `).
+pub(super) const GZ_PROGRESS: &str = "\rRead : %s MB ==> %s%% ";
+
+/// fileio.c: FIO_compressGzFrame (`\rRead : %u / %u MB ==> %.2f%% `).
+pub(super) const GZ_PROGRESS_OF: &str = "\rRead : %s / %s MB ==> %s%% ";
+
+/// fileio.c: FIO_compressLzmaFrame, `lzma_alone_encoder` failing
+/// (`EXM_THROW(82, …)`).
+pub(super) const LZMA_ALONE_ENCODER_ERROR: &str = "zstd: %s: lzma_alone_encoder error %d";
+
+/// fileio.c: FIO_compressLzmaFrame, `lzma_easy_encoder` failing
+/// (`EXM_THROW(83, …)`).
+pub(super) const LZMA_EASY_ENCODER_ERROR: &str = "zstd: %s: lzma_easy_encoder error %d";
+
+/// fileio.c: FIO_compressLzmaFrame, `lzma_code` failing (`EXM_THROW(84,
+/// …)`).
+pub(super) const LZMA_ENCODING_ERROR: &str = "zstd: %s: lzma_code encoding error %d";
+
+/// fileio.c: FIO_compressLzmaFrame and FIO_compressLz4Frame (`\rRead : %u
+/// MB ==> %.2f%%`).
+pub(super) const READ_PROGRESS: &str = "\rRead : %s MB ==> %s%%";
+
+/// fileio.c: FIO_compressLzmaFrame and FIO_compressLz4Frame (`\rRead : %u /
+/// %u MB ==> %.2f%%`).
+pub(super) const READ_PROGRESS_OF: &str = "\rRead : %s / %s MB ==> %s%%";
+
+/// fileio.c: FIO_compressLz4Frame, `LZ4F_compressUpdate` failing
+/// (`EXM_THROW(35, …)`).
+pub(super) const LZ4_COMPRESS_FAILED: &str = "zstd: %s: lz4 compression failed : %s";
+
+/// fileio.c: FIO_compressLz4Frame, `LZ4F_compressEnd` failing
+/// (`EXM_THROW(38, …)`).
+pub(super) const LZ4_END_FAILED: &str = "zstd: %s: lz4 end of file generation failed : %s";
+
+/// fileio.c: FIO_decompressGzFrame, `inflate` returning `Z_BUF_ERROR`.
+pub(super) const GZ_PREMATURE: &str = "zstd: %s: premature gz end \n";
+
+/// fileio.c: FIO_decompressGzFrame, `inflate` failing otherwise.
+pub(super) const GZ_INFLATE_ERROR: &str = "zstd: %s: inflate error %d \n";
+
+/// fileio.c: FIO_decompressLzmaFrame, the decoder's initialiser failing:
+/// the format's first `%s` is the initialiser's name, the second the file
+/// (zstd passes them in that order).
+pub(super) const LZMA_DECODER_INIT_ERROR: &str = "zstd: %s: %s error %d \n";
+
+/// fileio.c: FIO_decompressLzmaFrame, [`LZMA_DECODER_INIT_ERROR`]'s
+/// initialiser for `.lzma`.
+pub(super) const LZMA_ALONE_DECODER: &str = "lzma_alone_decoder";
+
+/// fileio.c: FIO_decompressLzmaFrame, [`LZMA_DECODER_INIT_ERROR`]'s
+/// initialiser for `.xz`.
+pub(super) const LZMA_STREAM_DECODER: &str = "lzma_stream_decoder";
+
+/// fileio.c: FIO_decompressLzmaFrame, `lzma_code` returning
+/// `LZMA_BUF_ERROR`.
+pub(super) const LZMA_PREMATURE: &str = "zstd: %s: premature lzma end \n";
+
+/// fileio.c: FIO_decompressLzmaFrame, `lzma_code` failing otherwise.
+pub(super) const LZMA_DECODING_ERROR: &str = "zstd: %s: lzma_code decoding error %d \n";
+
+/// fileio.c: FIO_decompressLz4Frame (`\rDecompressed : %.*f%s  `).
+pub(super) const LZ4_PROGRESS: &str = "\rDecompressed : %s  ";
+
+/// fileio.c: FIO_decompressLz4Frame, `LZ4F_decompress` failing (the name
+/// is `LZ4F_getErrorName`'s).
+pub(super) const LZ4_DECOMPRESSION_ERROR: &str = "zstd: %s: lz4 decompression error : %s \n";
+
+/// fileio.c: FIO_decompressLz4Frame, the input ending inside a frame.
+pub(super) const LZ4_UNFINISHED: &str = "zstd: %s: unfinished lz4 stream \n";
+
+/// fileio.c: FIO_compressLzmaFrame, `lzma_lzma_preset` failing
+/// (`EXM_THROW(81, …)`).
+pub(super) const LZMA_PRESET_ERROR: &str = "zstd: %s: lzma_lzma_preset error";
+
+/// C's `printf("%.2f")` of a NaN (the compressing loops' ratio of an empty
+/// input): glibc on x86 prints the sign of the NaN 0.0/0.0 makes there.
+pub(super) const NAN: &str = if cfg!(all(
+    target_os = "linux",
+    any(target_arch = "x86", target_arch = "x86_64")
+)) {
+    "-nan"
+} else {
+    "nan"
+};
+
+/// C's `printf("%.2f")` of an infinity.
+pub(super) const INF: &str = "inf";
+
+// lz4frame.c (liblz4 1.10.0): `LZ4F_getErrorName`'s names for the errors
+// fileio.c prints.
+
+/// lz4frame.c: `LZ4F_ERROR_GENERIC`.
+pub(super) const LZ4F_GENERIC: &str = "ERROR_GENERIC";
+
+/// lz4frame.c: `LZ4F_ERROR_reservedFlag_set`.
+pub(super) const LZ4F_RESERVED_FLAG_SET: &str = "ERROR_reservedFlag_set";
+
+/// lz4frame.c: `LZ4F_ERROR_headerVersion_wrong`.
+pub(super) const LZ4F_HEADER_VERSION_WRONG: &str = "ERROR_headerVersion_wrong";
+
+/// lz4frame.c: `LZ4F_ERROR_maxBlockSize_invalid`.
+pub(super) const LZ4F_MAX_BLOCK_SIZE_INVALID: &str = "ERROR_maxBlockSize_invalid";
+
+/// lz4frame.c: `LZ4F_ERROR_headerChecksum_invalid`.
+pub(super) const LZ4F_HEADER_CHECKSUM_INVALID: &str = "ERROR_headerChecksum_invalid";
+
+/// lz4frame.c: `LZ4F_ERROR_blockChecksum_invalid`.
+pub(super) const LZ4F_BLOCK_CHECKSUM_INVALID: &str = "ERROR_blockChecksum_invalid";
+
+/// lz4frame.c: `LZ4F_ERROR_decompressionFailed`.
+pub(super) const LZ4F_DECOMPRESSION_FAILED: &str = "ERROR_decompressionFailed";
+
+/// lz4frame.c: `LZ4F_ERROR_frameSize_wrong`.
+pub(super) const LZ4F_FRAME_SIZE_WRONG: &str = "ERROR_frameSize_wrong";
+
+/// lz4frame.c: `LZ4F_ERROR_contentChecksum_invalid`.
+pub(super) const LZ4F_CONTENT_CHECKSUM_INVALID: &str = "ERROR_contentChecksum_invalid";

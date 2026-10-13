@@ -1033,8 +1033,11 @@ fn xz_magicless_stdout(c: &Case) -> bool {
 /// does ([`xz_magicless_stdout`]).
 const XZ_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0];
 
-/// Which stream format `b` opens as, by the magics `zstd` reads and writes
-/// (`.lzma` has none): `zstd`, `gzip`, `xz` or `lz4`.
+/// Which stream format `b` opens as, by the magics `zstd` reads and writes:
+/// `zstd`, `gzip`, `xz`, `lzma` or `lz4`. `.lzma` has no magic; zstd's
+/// `FIO_decompressFrames` takes a stream opening `5d 00` (the properties
+/// byte of `lc=3 lp=0 pb=2` and a dictionary size's low byte, what
+/// `lzma_alone_encoder` writes at every preset) for one, and so does this.
 fn zstd_stream_kind(b: &[u8]) -> Option<&'static str> {
     if b.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
         Some("zstd")
@@ -1042,6 +1045,8 @@ fn zstd_stream_kind(b: &[u8]) -> Option<&'static str> {
         Some("gzip")
     } else if b.starts_with(&XZ_MAGIC) {
         Some("xz")
+    } else if b.starts_with(&[0x5d, 0x00]) {
+        Some("lzma")
     } else if b.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
         Some("lz4")
     } else {
@@ -1303,7 +1308,10 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
                     .filter(|s| !s.is_empty())
                     .and_then(|s| name.strip_suffix(s))
                     .map(str::to_owned)
-            })?,
+            })
+            // A name `-o` gave carries no suffix; the case's one file is
+            // then its original (below).
+            .unwrap_or_default(),
     };
     let found = c.files.iter().find(|(n, _)| *n == base);
     // An xz output named after a link the case's setup made (`l.xz` from

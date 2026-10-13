@@ -14,7 +14,14 @@
 //! `zstdmt`; `--long`, `--long=30`, `--rsyncable`, `--no-check`,
 //! `--no-content-size`, `--stream-size`, `--zstd=wlog=…` and
 //! `--target-compressed-block-size`. `-D` and `--patch-from` are Task 8's
-//! (dictionaries), `--format=` Task 6's.
+//! (dictionaries).
+//!
+//! `--format=` (Task 6), over the same four inputs at levels 1, 3, 9, 19,
+//! 0 and `--fast=1`: gzip is compared byte for byte with C zlib (`zlib-c`;
+//! spike S2 measured zlib's deflate and header identical to the
+//! reference's, the OS byte included), xz and lzma with liblzma (`xz-c`,
+//! 5.8.4 on both sides); elsewhere, and for lz4 always (R11: `lz4_flex`,
+//! not liblz4), the reference decodes stuffr's output to the input.
 
 #[cfg(unix)]
 mod compat_harness;
@@ -162,5 +169,32 @@ mod bytes {
             cases.push(c);
         }
         check("parameters", &cases);
+    }
+
+    /// Whether `--format=f`'s bytes are promised on this build.
+    fn foreign_exact(f: &str) -> bool {
+        (f == "gzip" && cfg!(feature = "zlib-c"))
+            || (matches!(f, "xz" | "lzma") && cfg!(feature = "xz-c"))
+    }
+
+    /// `--format=gzip|xz|lzma|lz4` over every input, file to file and to
+    /// standard output.
+    #[test]
+    fn foreign_formats() {
+        let mut cases = Vec::new();
+        for f in ["gzip", "xz", "lzma", "lz4"] {
+            let fa: &'static str = Box::leak(format!("--format={f}").into_boxed_str());
+            for level in ["-1", "-3", "-9", "-19", "-0", "--fast=1"] {
+                for (name, data) in inputs() {
+                    for mut args in [vec!["-q", "-k"], vec!["-c"]] {
+                        args.extend([fa, level, name]);
+                        let mut c = case("zstd", args, vec![(name, data.clone())]);
+                        c.compare_output_bytes = foreign_exact(f);
+                        cases.push(c);
+                    }
+                }
+            }
+        }
+        check("foreign_formats", &cases);
     }
 }
