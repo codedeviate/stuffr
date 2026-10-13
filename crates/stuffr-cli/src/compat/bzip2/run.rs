@@ -84,14 +84,16 @@ pub(super) fn execute(prog: &'static str, s: Settings, host: &mut Host, err: &mu
     // bzip2.c installs its handlers for file-to-file mode only (`-t` too).
     let interrupt =
         (bz.s.src == SrcMode::F2F).then(|| arm_interrupt_flag(&*bz.host, BZIP2_SIGNALS));
-    let _ = bz.main(&files);
+    let main_ok = bz.main(&files).is_ok();
     // bzip2.c's handler stays installed until exit; ours is restored here,
     // so a signal from now on takes its default action. One arriving
     // after `main`'s last poll set the flag and is answered now, as
     // bzip2 answers a signal after `deleteOutputOnInterrupt` turns False.
+    // A run `main` already stopped has had its one message (bzip2 exits at
+    // the first `cleanUpAndFail`); the flag is cleared and not answered.
     drop(interrupt);
     let late = take_interrupt(&*bz.host);
-    let _ = bz.answer_late_interrupt(late);
+    let _ = bz.answer_late_interrupt(main_ok, late);
     bz.exit
 }
 
@@ -179,8 +181,8 @@ impl Bz<'_> {
 
     /// The answer to a signal that set the flag after `main`'s last poll:
     /// the same stop as [`Self::poll_interrupt`], given the flag's value.
-    fn answer_late_interrupt(&mut self, interrupted: bool) -> Step {
-        if interrupted {
+    fn answer_late_interrupt(&mut self, main_ok: bool, interrupted: bool) -> Step {
+        if main_ok && interrupted {
             return Err(self.fail(Failure::Interrupted));
         }
         Ok(())
@@ -990,6 +992,7 @@ mod tests {
     #[test]
     fn a_late_interrupt_is_answered_and_a_quiet_run_is_not() {
         for interrupted in [true, false] {
+            let main_ok = true;
             let mut err = Vec::new();
             let mut host = Host::Real;
             let mut bz = Bz {
@@ -1006,7 +1009,7 @@ mod tests {
                 host: &mut host,
                 err: &mut err,
             };
-            let r = bz.answer_late_interrupt(interrupted);
+            let r = bz.answer_late_interrupt(main_ok, interrupted);
             let exit = bz.exit;
             let msg = String::from_utf8(err).unwrap();
             if interrupted {
@@ -1019,5 +1022,31 @@ mod tests {
                 assert_eq!(msg, "");
             }
         }
+    }
+
+    /// A run `main` already stopped has said its piece: a flag set as well
+    /// adds no second message and no second "not processed" line.
+    #[test]
+    fn a_stopped_run_is_not_answered_twice() {
+        let mut err = Vec::new();
+        let mut host = Host::Real;
+        let mut bz = Bz {
+            prog: "bzip2",
+            s: settings(false),
+            num_files: 3,
+            exit: 2,
+            processed: 1,
+            in_name: b"a".to_vec(),
+            out_name: b"a.bz2".to_vec(),
+            pending: None,
+            unz_fails: false,
+            test_fails: false,
+            host: &mut host,
+            err: &mut err,
+        };
+        assert!(bz.answer_late_interrupt(false, true).is_ok());
+        let exit = bz.exit;
+        assert_eq!(exit, 2);
+        assert!(err.is_empty());
     }
 }
