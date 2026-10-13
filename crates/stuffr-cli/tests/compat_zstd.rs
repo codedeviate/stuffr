@@ -1517,9 +1517,15 @@ mod unix {
     /// Review Focus 2: 48 MiB compressed with the host's default worker
     /// count (R3), `-T1` and `zstdmt`: the C tier's bytes are the
     /// reference's; and a 2-worker run equals a 3-worker run.
+    ///
+    /// The pure tier's frames are its own and are not compared, so the size
+    /// buys it nothing, and its unoptimised encoder took over 30 s per run
+    /// on the 48 MiB on CI's macOS runner (CI 38465447873; about 6 s here
+    /// unloaded): it compresses 8 MiB.
     #[test]
     fn default_threading_matches_on_a_large_input() {
-        let big = super::compat_harness::text(48 << 20, 93);
+        let size = if EXACT { 48 << 20 } else { 8 << 20 };
+        let big = super::compat_harness::text(size, 93);
         let cases = vec![
             with_files("zstd", &["-q", "-c", "big"], vec![("big", big.clone())]),
             with_files(
