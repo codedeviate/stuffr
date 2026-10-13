@@ -907,6 +907,30 @@ mod unix {
         &["-of", "out"],
     ];
 
+    /// The table sizes `--max` would allocate, overridden: alone it sets
+    /// zstd's 64-bit maxima (windowLog 31, chainLog, hashLog and
+    /// ldmHashLog 30), and zstd 1.5.7 then touches 16 GiB compressing
+    /// stdin and 8 GiB compressing a file, the reference and the C tier
+    /// alike (peak footprint measured on macOS). One such run fills a
+    /// 16 GB CI runner, and every Linux job died of it (CI 38465447873).
+    /// The override comes after `--max`, so every other maximum (search
+    /// log, minimum match, target length, strategy, overlap log, the other
+    /// LDM fields) still reaches the encoder and its bytes are still
+    /// compared; `flags_parse` reads bare `--max` without compressing.
+    const MAX_TABLES: &str = "--zstd=wlog=20,clog=20,hlog=20,lhlog=20";
+
+    /// `args`, with [`MAX_TABLES`] after any `--max`.
+    fn bounded<'a>(args: &[&'a str]) -> Vec<&'a str> {
+        let mut v = Vec::with_capacity(args.len() + 1);
+        for a in args {
+            v.push(*a);
+            if *a == "--max" {
+                v.push(MAX_TABLES);
+            }
+        }
+        v
+    }
+
     /// `--format=` for the foreign formats, which Task 6 brings.
     fn foreign_format(args: &[&str]) -> bool {
         args.iter()
@@ -919,6 +943,7 @@ mod unix {
     fn flags_accepted() {
         let mut cases: Vec<Case> = Vec::new();
         for args in ACCEPTED.iter().filter(|a| !foreign_format(a)) {
+            let args = &bounded(args);
             cases.push(fed(zstd(args), text()));
             let mut with_file = args.to_vec();
             with_file.extend(["-k", "a"]);
@@ -956,7 +981,7 @@ mod unix {
             &["--max"],
         ]
         .iter()
-        .map(|a| fed(zstd(a), text()))
+        .map(|a| fed(zstd(&bounded(a)), text()))
         .collect();
         check("levels_above_19_warn", &cases);
     }
