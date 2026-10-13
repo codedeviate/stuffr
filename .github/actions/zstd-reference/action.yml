@@ -6,6 +6,12 @@ description: >-
   harness panics if the reference is missing or is not exactly 1.5.7 with
   gzip, lz4, lzma and xz support.
 
+# The built zstd is dynamically linked against zlib, liblzma and liblz4, so
+# the cached install is only usable where those libraries are present. The
+# runtime libraries are therefore installed on EVERY run, cache hit or not
+# (cheap: the runners have most of them), and a verification step after the
+# cache restore runs the binary and says so if the cache is broken.
+
 runs:
   using: composite
   steps:
@@ -21,10 +27,15 @@ runs:
     # builds, and the promise is byte identity with 1.5.7. The SHA-256 is the
     # one in the release's own zstd-1.5.7.tar.gz.sha256, and matches a local
     # `shasum -a 256` of the download.
-    - name: install the zstd build dependencies
-      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+    - name: install the zstd libraries (build and run time)
       shell: bash
-      run: sudo apt-get update && sudo apt-get install -y zlib1g-dev liblzma-dev liblz4-dev
+      run: |
+        set -euo pipefail
+        if [ "$RUNNER_OS" = Linux ]; then
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev liblzma-dev liblz4-dev
+        elif [ "$RUNNER_OS" = macOS ]; then
+          brew list xz lz4 >/dev/null 2>&1 || brew install xz lz4
+        fi
 
     - name: build zstd 1.5.7
       if: steps.cache.outputs.cache-hit != 'true'
@@ -44,7 +55,6 @@ runs:
         # appends its own -D flags to CPPFLAGS, and a command-line value
         # would replace them (the build then says "supports: zstd" only).
         if [ "$RUNNER_OS" = macOS ]; then
-          brew list xz lz4 >/dev/null 2>&1 || brew install xz lz4
           xz_prefix="$(brew --prefix xz)"
           lz4_prefix="$(brew --prefix lz4)"
           export CPPFLAGS="-I$xz_prefix/include -I$lz4_prefix/include"
@@ -61,4 +71,7 @@ runs:
         bin="$RUNNER_TEMP/zstd-1.5.7/bin"
         for l in unzstd zstdcat zstdmt; do ln -sf zstd "$bin/$l"; done
         echo "STUFFR_ZSTD_REFERENCE=$bin/zstd" >> "$GITHUB_ENV"
-        "$bin/zstd" -vV
+        if ! "$bin/zstd" -vV; then
+          echo "::error::the zstd reference at $bin/zstd does not start (cache hit: ${{ steps.cache.outputs.cache-hit }}); its shared libraries are missing or the cache is broken. This is not a missing reference." >&2
+          exit 1
+        fi
