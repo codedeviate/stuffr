@@ -27,8 +27,9 @@
 //! Asserted, for every input:
 //!
 //! - no panic;
-//! - the exit code is one the tool has: 0-3 for the bzip2 family (`0` ok,
-//!   `1` environment, `2` corrupt, `3` internal), 0 or 1 for bzip2recover,
+//! - the exit code is one the tool has: 0-2 for the bzip2 family (`0` ok,
+//!   `1` environment, `2` corrupt; `3` is bzip2's internal-panic exit, which
+//!   only a stuffr defect reaches), 0 or 1 for bzip2recover,
 //!   0-2 for the xz family (main.c and message.c: 0 ok, 1 error, 2 warning),
 //!   and 0-2 for the gzip family in both flavours (GNU: 0 ok, 1 error, 2
 //!   warning; Apple's `gzip.c` exits only through `exit(exit_value)` with
@@ -339,8 +340,8 @@ fn run_bzip2(dir: &Path, name: &str, args: &[&str], stdin: &[u8]) {
     let (code, _out, err) = compat::run_in(dir, name, args, stdin, Flavour::Gnu)
         .expect("a COMPAT_NAMES entry is a compat name");
     assert!(
-        (0..=3).contains(&code),
-        "{name}: exit {code} is not a bzip2 exit code\n{}",
+        (0..=2).contains(&code),
+        "{name}: exit {code} is not a bzip2 exit code a hostile input may give (0 ok, 1 environment, 2 corrupt; 3 is bzip2's internal-panic exit, which only a stuffr defect reaches)\n{}",
         String::from_utf8_lossy(&err)
     );
 }
