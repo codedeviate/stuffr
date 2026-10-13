@@ -1,6 +1,18 @@
 //! Interrupting a run part-way: the partial-output cleanup each family's
 //! reference does on a signal (0.13.1). Unix only.
+//!
+//! The wait after the signal is bounded (`HANG_DEADLINE`). bzip2 1.0.8's
+//! `mySignalCatcher` calls `fprintf` and then `cleanUpAndFail`, which calls
+//! `fprintf`, `fclose`, `remove` and `exit`, all inside the signal handler and
+//! none async-signal-safe. A SIGINT that lands while bzip2 holds a stdio or
+//! malloc lock (the `-v`/`-q` progress output, a malloc in the compressor)
+//! deadlocks it; one `make check` saw `/usr/bin/bzip2 -q a` stall for 20
+//! minutes. That is a defect of the reference, not of stuffr, so a reference
+//! that hangs is a miss of the attempt (retried, then the comparison is
+//! skipped with a note); a stuffr that hangs panics, always.
 
+use std::cell::Cell;
+use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
@@ -41,6 +53,32 @@ pub fn big_input(mib: usize) -> &'static [u8] {
     &v[..mib << 20]
 }
 
+/// How long a signalled child gets to exit before it counts as hung.
+const HANG_DEADLINE: Duration = Duration::from_secs(30);
+
+thread_local! {
+    /// Set when the last `interrupt_env` on this thread lost its attempt to a
+    /// hung *reference* (never to a hung stuffr, which panics).
+    static REFERENCE_HUNG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True, once, if an `interrupt_env` on this thread returned `None` because
+/// the reference hung after the signal rather than finishing early.
+pub fn take_reference_hung() -> bool {
+    REFERENCE_HUNG.with(|h| h.replace(false))
+}
+
+/// Whether `exe` is the stuffr binary under test (directly or by a link).
+fn is_stuffr(exe: &Path) -> bool {
+    match (
+        std::fs::canonicalize(exe),
+        std::fs::canonicalize(env!("CARGO_BIN_EXE_stuffr")),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 static INTERRUPT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Held for a whole interrupt test, so at most one runs at a time in a test
@@ -69,8 +107,10 @@ pub fn listing(dir: &Path) -> Vec<String> {
 }
 
 /// Runs `exe` (argv[0] = `name`) with `args` in `dir`; waits until a
-/// directory entry satisfies `ready`, sends `sig`, waits for exit. `None`
-/// if the run ended before the signal could be sent.
+/// directory entry satisfies `ready`, sends `sig`, waits up to
+/// `HANG_DEADLINE` for exit. `None` if the run ended before the signal could
+/// be sent, or if a reference (not stuffr) hung after it
+/// ([`take_reference_hung`] tells which); stuffr hanging panics.
 pub fn interrupt(
     exe: &Path,
     name: &str,
@@ -116,6 +156,7 @@ pub fn interrupt_env(
             Ok(())
         });
     }
+    REFERENCE_HUNG.with(|h| h.set(false));
     let mut child = super::spawn(&mut cmd).expect("spawn");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -131,12 +172,43 @@ pub fn interrupt_env(
         );
         std::thread::sleep(Duration::from_millis(2));
     }
+    // Drain stderr on a thread, so a chatty child can neither fill the pipe
+    // nor leave us blocked in a read after a kill.
+    let mut pipe = child.stderr.take().expect("piped stderr");
+    let reader = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = pipe.read_to_end(&mut v);
+        v
+    });
     // SAFETY: kill on a child we spawned and have not reaped.
     unsafe { libc::kill(child.id() as i32, sig) };
-    let out = child.wait_with_output().unwrap();
+    let hang_at = Instant::now() + HANG_DEADLINE;
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break Some(st);
+        }
+        if Instant::now() >= hang_at {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let stderr = reader.join().unwrap_or_default();
+        let note = format!(
+            "{name} {args:?}: hung after the signal ({sig}); stderr so far: {:?}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(!is_stuffr(exe), "{note}");
+        eprintln!("note: reference {note}; attempt counted as a miss");
+        REFERENCE_HUNG.with(|h| h.set(true));
+        return None;
+    };
+    let stderr = reader.join().unwrap_or_default();
     Some(Interrupted {
-        status: out.status,
-        stderr: out.stderr,
+        status,
+        stderr,
         left: listing(dir),
     })
 }
@@ -145,7 +217,9 @@ pub fn interrupt_env(
 /// four times the input if the run finished before the signal (it ended
 /// first, or exited 0 between ready and the kill); a second miss fails the
 /// test rather than passing silently. Cases whose work is fast per byte pass
-/// an `input` that scales `mib` up.
+/// an `input` that scales `mib` up. `None` only when the reference hung after
+/// the signal on every attempt (see the module doc): the caller skips that
+/// comparison; a hung stuffr panics inside.
 #[allow(clippy::too_many_arguments)]
 pub fn interrupt_with_input(
     exe: &Path,
@@ -157,7 +231,7 @@ pub fn interrupt_with_input(
     inherit: Inherit,
     sig: i32,
     ready: &dyn Fn(&str) -> bool,
-) -> Interrupted {
+) -> Option<Interrupted> {
     interrupt_with_input_env(exe, name, args, dir, &[], file, input, inherit, sig, ready)
 }
 
@@ -174,7 +248,8 @@ pub fn interrupt_with_input_env(
     inherit: Inherit,
     sig: i32,
     ready: &dyn Fn(&str) -> bool,
-) -> Interrupted {
+) -> Option<Interrupted> {
+    let mut hung = false;
     for mib in [64, 256] {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
@@ -183,9 +258,13 @@ pub fn interrupt_with_input_env(
         // thread descheduled for a few tens of milliseconds is enough on a
         // fast case): a miss, like `None`. No caller expects success here.
         match interrupt_env(exe, name, args, dir, env, inherit, sig, ready) {
-            Some(r) if !r.status.success() => return r,
-            _ => {}
+            Some(r) if !r.status.success() => return Some(r),
+            _ => hung |= take_reference_hung(),
         }
+    }
+    if hung {
+        eprintln!("note: {name} {args:?}: the reference hung after the signal; comparison skipped");
+        return None;
     }
     panic!("{name} {args:?}: finished before the signal even at the larger size");
 }

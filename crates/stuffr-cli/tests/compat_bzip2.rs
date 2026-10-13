@@ -1393,8 +1393,7 @@ mod interrupts {
             }
         };
         let ready = has_data(&dir, &named);
-        let r = interrupt_with_input(&exe, "bzip2", args, &dir, "a", &plain, inherit, sig, &ready);
-        Some(r)
+        interrupt_with_input(&exe, "bzip2", args, &dir, "a", &plain, inherit, sig, &ready)
     }
 
     fn check(r: &Interrupted, stderr: &str, left: &[&str], what: &str) {
@@ -1456,7 +1455,7 @@ mod interrupts {
                 }
             };
             let ready = has_data(&dir, &named);
-            let r = interrupt_with_input(
+            let Some(r) = interrupt_with_input(
                 &exe,
                 "bzip2",
                 &["-d", "a.bz2"],
@@ -1466,7 +1465,9 @@ mod interrupts {
                 Inherit::Default,
                 libc::SIGTERM,
                 &ready,
-            );
+            ) else {
+                continue;
+            };
             assert_eq!(r.status.code(), Some(1), "mine={mine}: {:?}", r.status);
             assert_eq!(
                 String::from_utf8_lossy(&r.stderr),
@@ -1500,7 +1501,7 @@ mod interrupts {
                 }
             };
             let ready = has_data(&dir, &named);
-            let r = interrupt_with_input(
+            let Some(r) = interrupt_with_input(
                 &exe,
                 "bzip2",
                 &["-df", "a.bz2"],
@@ -1510,7 +1511,9 @@ mod interrupts {
                 Inherit::Default,
                 libc::SIGINT,
                 &ready,
-            );
+            ) else {
+                continue;
+            };
             check(
                 &r,
                 "\nbzip2: Control-C or similar caught, quitting.\n\
@@ -1561,6 +1564,10 @@ mod interrupts {
                     break;
                 }
             }
+            if got.is_none() && take_reference_hung() {
+                eprintln!("note: bzip2 reference hung after the signal; comparison skipped");
+                continue;
+            }
             let r = got.expect("finished before the signal even at 256 MiB");
             check(
                 &r,
@@ -1596,7 +1603,7 @@ mod interrupts {
                 });
                 t.elapsed() >= Duration::from_millis(50)
             };
-            let r = interrupt_with_input(
+            let Some(r) = interrupt_with_input(
                 &exe,
                 "bzip2",
                 &["-t", "a.bz2"],
@@ -1611,7 +1618,9 @@ mod interrupts {
                 Inherit::Default,
                 libc::SIGINT,
                 &ready,
-            );
+            ) else {
+                continue;
+            };
             check(&r, CAUGHT_NO_OUTPUT, &["a.bz2"], &format!("mine={mine}"));
         }
     }

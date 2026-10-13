@@ -2606,10 +2606,9 @@ mod interrupts {
         };
         let named = |n: &str| if mine { is_tmp(n) } else { n == partial };
         let ready = has_data(&dir, &named);
-        let r = interrupt_with_input_env(
+        interrupt_with_input_env(
             &exe, "gzip", args, &dir, env, file, make, inherit, sig, &ready,
-        );
-        Some(r)
+        )
     }
 
     fn plain(m: usize) -> Vec<u8> {
@@ -2727,6 +2726,10 @@ mod interrupts {
                 }
                 // Done before the signal: its work must still be whole.
             }
+            if take_reference_hung() {
+                eprintln!("note: gzip reference hung after the signal; comparison skipped");
+                continue;
+            }
             assert_eq!(listing(&dir), ["a.gz"], "mine={mine} finished={finished}");
         }
     }
@@ -2744,7 +2747,7 @@ mod interrupts {
                 let Some(e) = reference() else { continue };
                 (e, &[][..])
             };
-            let r = interrupt_with_input_env(
+            let Some(r) = interrupt_with_input_env(
                 &exe,
                 "gzip",
                 &["-9", "-c", "a"],
@@ -2755,7 +2758,9 @@ mod interrupts {
                 Inherit::Default,
                 libc::SIGINT,
                 &|_| true,
-            );
+            ) else {
+                continue;
+            };
             assert!(killed_by(&r, libc::SIGINT), "mine={mine}: {:?}", r.status);
             assert_eq!(r.left, ["a"], "mine={mine}");
         }
@@ -2800,6 +2805,10 @@ mod interrupts {
                 if got.is_some() {
                     break;
                 }
+            }
+            if got.is_none() && take_reference_hung() {
+                eprintln!("note: gzip reference hung after the signal; comparison skipped");
+                continue;
             }
             let r = got.expect("finished before the signal even at 256 MiB");
             assert!(killed_by(&r, libc::SIGINT), "mine={mine}: {:?}", r.status);

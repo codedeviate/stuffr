@@ -2272,10 +2272,9 @@ mod interrupts {
             }
         };
         let ready = has_data(&dir, &named);
-        let r = interrupt_with_input_env(
+        interrupt_with_input_env(
             &exe, "gzip", args, &dir, env, file, make, inherit, sig, &ready,
-        );
-        Some(r)
+        )
     }
 
     #[test]
@@ -2374,6 +2373,10 @@ mod interrupts {
                     assert!(r.status.success(), "mine={mine}: {:?}", r.status);
                     break;
                 }
+            }
+            if take_reference_hung() {
+                eprintln!("note: gzip reference hung after the signal; comparison skipped");
+                continue;
             }
             assert_eq!(listing(&dir), ["a.gz"], "mine={mine}");
         }
