@@ -67,9 +67,10 @@
 //! - A gzip member's deflate data goes through flate2 (miniz_oxide), which
 //!   accepts some streams zlib refuses (a distance reaching before the
 //!   output, a code with no end of block): where the reference says
-//!   `inflate error -3` and writes nothing, the pure tier can write output
-//!   and fail later (`premature gz end` or `inflate error -3`, exit 1 all
-//!   the same). With `zlib-c` it is zlib's own `inflate`.
+//!   `inflate error -3` and writes nothing, the pure tier may write bytes
+//!   and then fail (`premature gz end`), or, when the trailer's CRC and
+//!   size match what miniz_oxide decoded, succeed with exit 0 and that
+//!   output. With `zlib-c` it is zlib's own `inflate`.
 //! - An xz or lzma frame that fails to decode (the xz family's P6 and P9):
 //!   what is written before the error can be a strict prefix of what
 //!   liblzma writes, and corruption in the last bytes of a `.lzma` reads as

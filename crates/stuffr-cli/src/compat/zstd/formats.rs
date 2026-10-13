@@ -48,7 +48,11 @@
 //!   (method, reserved flags, the header CRC, the CRC-32 and ISIZE: `-3`)
 //!   and the deflate data goes through flate2 (miniz_oxide), which accepts
 //!   some streams zlib refuses, a distance reaching before the output and
-//!   a code with no end of block among them: a stated pure-tier deviation.
+//!   a code with no end of block among them. A stated pure-tier deviation:
+//!   where zstd says `inflate error -3` and writes nothing, the pure tier
+//!   may write bytes and then fail (`premature gz end`), or, when the
+//!   trailer's CRC and size match what miniz_oxide decoded, succeed with
+//!   exit 0 and that output.
 //! - xz and lzma: `lzma_stream_decoder(UINT64_MAX, 0)` (one stream, no
 //!   check warnings) and `lzma_alone_decoder(UINT64_MAX)` through
 //!   `stuffr::xz_opts`, the return codes printed as liblzma's numbers. The
@@ -594,12 +598,19 @@ fn decode_frame(
             }
         }
     };
-    rp.consume(pos);
     if failed.is_none() {
-        let back = dec.unused().min(tail.len());
-        if back > 0 {
-            rp.give_back(&tail[tail.len() - back..]);
+        // Input earlier calls took that the frame did not use: first what
+        // this job's calls took, then what earlier jobs' did (`tail`).
+        let back = dec.unused();
+        let rewind = back.min(pos);
+        pos -= rewind;
+        rp.consume(pos);
+        let rest = (back - rewind).min(tail.len());
+        if rest > 0 {
+            rp.give_back(&tail[tail.len() - rest..]);
         }
+    } else {
+        rp.consume(pos);
     }
     io.sparse_end()?;
     let Some(f) = failed else {
@@ -690,7 +701,7 @@ enum GzSt {
 /// zlib's `inflate` (`windowBits` 15 + 16) checks them, the deflate data
 /// through flate2 (miniz_oxide), which accepts some streams zlib refuses
 /// (a distance reaching before the output, a code with no end of block):
-/// a stated pure-tier deviation.
+/// a stated pure-tier deviation (module doc).
 #[cfg(not(feature = "zlib-c"))]
 struct GzMember {
     st: GzSt,
@@ -976,11 +987,20 @@ impl Coder for LzmaMember {
                 let piece = &input[used..(used + LZMA_PIECE).min(input.len())];
                 let r = self.dec.feed(piece, &mut self.pending);
                 if self.dec.finished() {
+                    // The stream used `in_bytes` in all; the read-ahead it
+                    // did not use may lie in this call's earlier pieces
+                    // (taken back from `used`) or before this call
+                    // (`back`, for the driver to rewind).
                     let in_bytes = self.dec.progress().in_bytes;
-                    let before = self.fed;
-                    self.back = before.saturating_sub(in_bytes) as usize;
-                    used += in_bytes.saturating_sub(before) as usize;
-                    self.fed = in_bytes.max(before);
+                    let call_start = self.fed - used as u64;
+                    if in_bytes >= call_start {
+                        used = (in_bytes - call_start) as usize;
+                        self.back = 0;
+                    } else {
+                        used = 0;
+                        self.back = (call_start - in_bytes) as usize;
+                    }
+                    self.fed = in_bytes;
                 } else {
                     used += piece.len();
                     self.fed += piece.len() as u64;

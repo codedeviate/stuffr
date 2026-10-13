@@ -2314,9 +2314,15 @@ mod unix {
         v
     }
 
+    /// What flate2 (miniz_oxide) makes of [`distance_too_far`]'s deflate
+    /// data: the literal, then three bytes of its zero-filled window.
+    const FAR_AS_MINIZ_READS_IT: &[u8] = b"a\0\0\0";
+
     /// A fixed-Huffman block: one literal `a`, then a match of length 3 at
     /// distance 5, which reaches before the output's start (zlib: "invalid
-    /// distance too far back"), then the end of block.
+    /// distance too far back"), then the end of block. The trailer is the
+    /// CRC and size of [`FAR_AS_MINIZ_READS_IT`], so miniz_oxide completes
+    /// the member; only a decoder that refuses the distance fails it.
     fn distance_too_far() -> Vec<u8> {
         let mut b = Bits::default();
         b.put(1, 1); // BFINAL
@@ -2326,7 +2332,7 @@ mod unix {
         b.code(4, 5); // distance code 4: 5-6
         b.put(0, 1); // its extra bit: 5
         b.code(0, 7); // end of block
-        gz_around(&b.done(), b"aaaa")
+        gz_around(&b.done(), FAR_AS_MINIZ_READS_IT)
     }
 
     /// A dynamic block whose literal/length code gives the end-of-block
@@ -2366,9 +2372,13 @@ mod unix {
     /// Two members zlib refuses and flate2 (miniz_oxide) does not: a
     /// distance before the output's start, and a code with no end of
     /// block. With C zlib (`zlib-c`) stuffr answers exactly as the
-    /// reference does (`inflate error -3`, nothing written). Off it, the
-    /// stated pure-tier deviation: the run still fails (exit 1, a gzip
-    /// error line naming the file), but how far it gets differs.
+    /// reference does (`inflate error -3`, exit 1, nothing written). Off
+    /// it, the stated pure-tier deviation: where the reference says
+    /// `inflate error -3` and writes nothing, the pure tier may write bytes
+    /// and then fail (`premature gz end`), or, when the trailer's CRC and
+    /// size match what miniz_oxide decoded, succeed with exit 0 and that
+    /// output. `far.gz`'s trailer is built to match, so it shows the
+    /// exit-0 shape; `noeob.gz` fails.
     #[test]
     fn gzip_streams_zlib_refuses() {
         let inputs = [
@@ -2390,25 +2400,89 @@ mod unix {
         }
         for c in &cases {
             let s = stuffr_as(c);
-            assert_eq!(s.code, 1, "{} {:?}: {}", c.name, c.args, s.stderr);
             let name = c.args.last().filter(|_| !c.files.is_empty()).copied();
             let shown = name.unwrap_or("/*stdin*\\");
-            assert!(
-                s.stderr == format!("zstd: {shown}: inflate error -3 \n")
-                    || s.stderr == format!("zstd: {shown}: premature gz end \n"),
-                "{} {:?}: {:?}",
-                c.name,
-                c.args,
-                s.stderr
-            );
+            let far = c.files.first().is_none_or(|(n, _)| *n == "far.gz")
+                && c.stdin.as_deref().is_none_or(|d| d == distance_too_far());
+            if far {
+                assert_eq!(s.code, 0, "{} {:?}: {}", c.name, c.args, s.stderr);
+                assert!(!s.stderr.contains("zstd: "), "{:?}: {:?}", c.args, s.stderr);
+                if c.name == "zstdcat" || c.args == ["-d"] {
+                    assert_eq!(s.stdout, FAR_AS_MINIZ_READS_IT, "{:?}", c.args);
+                }
+                if c.name == "unzstd" {
+                    assert_eq!(s.tree["far"].0, FAR_AS_MINIZ_READS_IT);
+                }
+            } else {
+                assert_eq!(s.code, 1, "{} {:?}: {}", c.name, c.args, s.stderr);
+                assert!(
+                    s.stderr == format!("zstd: {shown}: inflate error -3 \n")
+                        || s.stderr == format!("zstd: {shown}: premature gz end \n"),
+                    "{} {:?}: {:?}",
+                    c.name,
+                    c.args,
+                    s.stderr
+                );
+            }
             if let Some(dir) = zstd_dir()
                 && let Some(r) = reference(dir, c)
             {
                 assert_eq!(r.code, 1, "reference: {:?}", r.stderr);
                 assert_eq!(r.stderr, format!("zstd: {shown}: inflate error -3 \n"));
+                assert!(r.stdout.is_empty());
             }
         }
     }
+
+    /// A `.lzma` frame followed by a zstd frame, the `.lzma` ending at
+    /// every offset around the 256-byte pieces its decoder is fed, in the
+    /// first read job and in a later one: the frame after it is read from
+    /// its first byte. (The pure tier's LZMA decoder reads up to 40 bytes
+    /// ahead and may report the end only a piece later.)
+    #[test]
+    fn lzma_followed_by_a_frame() {
+        if zstd_dir().is_none() {
+            return;
+        }
+        let next = packed(&[], b"TAIL\n");
+        let mut sizes = std::collections::BTreeSet::new();
+        let mut cases = Vec::new();
+        let mut add = |data: Vec<u8>, sizes: &mut std::collections::BTreeSet<usize>| {
+            sizes.insert(data.len());
+            let mut v = data;
+            v.extend_from_slice(&next);
+            cases.push(with_files("zstdcat", &["l.lzma"], vec![("l.lzma", v)]));
+        };
+        // In the first read job: ends around 256, 512 and 768.
+        for (k, n) in (180..=300).chain(420..=500).chain(680..=760).enumerate() {
+            add(
+                foreign_packed("lzma", &[], &random(n, 400 + k as u64)),
+                &mut sizes,
+            );
+        }
+        for edge in [256, 512, 768] {
+            let near = (edge - 13..edge).filter(|z| sizes.contains(z)).count();
+            assert!(near >= 8, "{near} sizes in the 13 below {edge}: {sizes:?}");
+        }
+        // In the third read job: ends in the last 13 bytes of one of its
+        // 256-byte pieces (the job starts at 2 x `ZSTD_DStreamInSize()`).
+        let mut later = 0;
+        let mut n = 299_800;
+        while later < 3 && n < 300_600 {
+            let data = foreign_packed("lzma", &[], &random(n, n as u64));
+            let at = data.len() - 2 * DSTREAM_IN_SIZE_REF;
+            if (243..=255).contains(&(at % 256)) {
+                later += 1;
+                add(data, &mut sizes);
+            }
+            n += 7;
+        }
+        assert_eq!(later, 3, "no later-job sizes found");
+        check("lzma_followed_by_a_frame", &cases);
+    }
+
+    /// `ZSTD_DStreamInSize()`: one read job.
+    const DSTREAM_IN_SIZE_REF: usize = (128 << 10) + 3;
 
     /// 128 MiB of zeros as xz (preset 3, a 4 MiB dictionary) and as gzip
     /// -9 decode in bounded memory: each decoder call fills one 128 KiB
