@@ -4,7 +4,8 @@
 //! sandbox the fuzz targets run under, and the helpers that create and
 //! publish an output file (`create_temp`, `publish`), restore `SIGPIPE`
 //! (`reset_sigpipe`), and either remove a partial output on interrupt
-//! (`arm_cleanup`) or record the interrupt for the run to answer
+//! (`arm_cleanup`, which dies of the signal; `arm_cleanup_exit`, which
+//! exits 2) or record the interrupt for the run to answer
 //! (`arm_interrupt_flag`).
 //!
 //! Nothing here knows a tool's messages or flags; each family keeps its own
@@ -115,14 +116,62 @@ static ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 pub(crate) struct CleanupGuard {
     #[cfg(unix)]
     armed: bool,
+    #[cfg(unix)]
+    kind: GuardKind,
+}
+
+/// How an armed run answers its signal.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardKind {
+    /// [`arm_cleanup`]: remove the output and die of the signal; the
+    /// handler stays installed after the guard drops.
+    Reraise,
+    /// [`arm_cleanup_exit`]: remove the output and exit 2; dropping the
+    /// guard puts SIGINT back to `SIG_DFL` (zstd's `clearHandler`).
+    Exit,
 }
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
         if self.armed {
+            if self.kind == GuardKind::Exit {
+                // SAFETY: setting SIGINT to SIG_DFL installs no handler and
+                // touches no Rust state (fileio.c: clearHandler).
+                unsafe { libc::signal(libc::SIGINT, libc::SIG_DFL) };
+            }
             ARMED.store(false, Ordering::Release);
         }
+    }
+}
+
+/// Write `bytes` (shorter than `SLOT_LEN`, no NUL) into the slot,
+/// NUL-terminated, and mark it armed, with `signals` blocked on this thread
+/// meanwhile.
+#[cfg(unix)]
+fn fill_slot(bytes: &[u8], signals: Signals) {
+    debug_assert!(bytes.len() < SLOT_LEN && !bytes.contains(&0));
+    // SAFETY: sigset_t is plain data, initialised by sigemptyset before
+    // use. Blocking the cleanup signals on this thread while the slot is
+    // written means this thread's handler never sees it half-written;
+    // `ARMED` is false meanwhile, so a handler on another thread reads
+    // nothing. The write stays inside the slot (len < SLOT_LEN), and the
+    // previous mask is restored after.
+    unsafe {
+        let mut block: libc::sigset_t = std::mem::zeroed();
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut block);
+        for &sig in signals {
+            libc::sigaddset(&mut block, sig);
+        }
+        libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
+        ARMED.store(false, Ordering::SeqCst);
+        let slot = SLOT.0.get().cast::<u8>();
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, bytes.len());
+        slot.add(bytes.len()).write(0);
+        ARMED.store(true, Ordering::Release);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
     }
 }
 
@@ -147,36 +196,17 @@ pub(crate) fn arm_cleanup(host: &Host, path: &Path, signals: Signals) -> Cleanup
     {
         use std::os::unix::ffi::OsStrExt;
         let bytes = path.as_os_str().as_bytes();
+        let kind = GuardKind::Reraise;
         if matches!(host, Host::Sandbox(_)) || bytes.len() >= SLOT_LEN || bytes.contains(&0) {
-            return CleanupGuard { armed: false };
+            return CleanupGuard { armed: false, kind };
         }
         debug_assert!(
             !ARMED.load(Ordering::Acquire),
             "arm_cleanup: another output is still armed"
         );
         install_handlers(signals);
-        // SAFETY: sigset_t is plain data, initialised by sigemptyset before
-        // use. Blocking the cleanup signals on this thread while the slot is
-        // written means this thread's handler never sees it half-written;
-        // `ARMED` is false meanwhile, so a handler on another thread reads
-        // nothing. The write stays inside the slot (len < SLOT_LEN), and the
-        // previous mask is restored after.
-        unsafe {
-            let mut block: libc::sigset_t = std::mem::zeroed();
-            let mut old: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut block);
-            for &sig in signals {
-                libc::sigaddset(&mut block, sig);
-            }
-            libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
-            ARMED.store(false, Ordering::SeqCst);
-            let slot = SLOT.0.get().cast::<u8>();
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot, bytes.len());
-            slot.add(bytes.len()).write(0);
-            ARMED.store(true, Ordering::Release);
-            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-        }
-        CleanupGuard { armed: true }
+        fill_slot(bytes, signals);
+        CleanupGuard { armed: true, kind }
     }
     #[cfg(not(unix))]
     {
@@ -232,6 +262,92 @@ extern "C" fn on_cleanup_signal(sig: libc::c_int) {
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
+    }
+}
+
+/// zstd 1.5.7's addHandler (fileio.c): arm the removal of `path`, the run's
+/// output file, should SIGINT arrive before the guard drops; the handler
+/// ([`on_interrupt_exit`]) then removes it, writes a newline to standard
+/// error and exits 2, so the process exits rather than dying of the signal
+/// (R6). Only SIGINT is hooked, installed as `signal()` installs it, over
+/// an inherited ignore; every other signal keeps its disposition, so
+/// SIGTERM still kills and leaves the file. Dropping the guard puts SIGINT
+/// back to `SIG_DFL` (clearHandler).
+///
+/// As addHandler does, only a regular file is armed: for anything else
+/// (`/dev/null`, a missing path) nothing is installed and SIGINT keeps its
+/// default action. Nothing is armed under `Host::Sandbox`, or for a path
+/// the slot cannot hold. It shares the slot with [`arm_cleanup`]: one
+/// family per process, one arm at a time. Prefer [`create_temp_armed_exit`]
+/// for a new temporary, which leaves no unarmed window.
+// Used by the zstd family from 0.14.0 Task 5.
+#[allow(dead_code)]
+pub(crate) fn arm_cleanup_exit(host: &Host, path: &Path) -> CleanupGuard {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        let unarmed = CleanupGuard {
+            armed: false,
+            kind: GuardKind::Exit,
+        };
+        if matches!(host, Host::Sandbox(_)) || bytes.len() >= SLOT_LEN || bytes.contains(&0) {
+            return unarmed;
+        }
+        // UTIL_isRegularFile: stat, following a final symlink.
+        if !fs::metadata(path).is_ok_and(|m| m.is_file()) {
+            return unarmed;
+        }
+        debug_assert!(
+            !ARMED.load(Ordering::Acquire),
+            "arm_cleanup_exit: another output is still armed"
+        );
+        const INT: Signals = &[libc::SIGINT];
+        fill_slot(bytes, INT);
+        let handler = on_interrupt_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        // SAFETY: a zeroed sigaction filled in before use. The handler only
+        // makes async-signal-safe calls (`on_interrupt_exit`). SIGINT is
+        // blocked while it runs (no SA_NODEFER) and SA_RESTART is on, as
+        // BSD and glibc `signal()` install a handler.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESTART;
+            action.sa_sigaction = handler;
+            libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        }
+        CleanupGuard {
+            armed: true,
+            kind: GuardKind::Exit,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, path);
+        CleanupGuard {}
+    }
+}
+
+/// zstd 1.5.7's INThandler (fileio.c), with `_exit` for `exit`, which is not
+/// async-signal-safe; zstd arms only a file destination, so no buffered
+/// standard output is lost by not flushing (R6). It never allocates or
+/// locks.
+#[cfg(unix)]
+extern "C" fn on_interrupt_exit(_sig: libc::c_int) {
+    // SAFETY: signal is async-signal-safe; ignoring SIGINT installs no
+    // handler.
+    unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    if ARMED.load(Ordering::Acquire) {
+        // SAFETY: `ARMED` true means the slot holds a NUL-terminated path,
+        // written before the Release store this load pairs with; unlink is
+        // async-signal-safe.
+        unsafe { libc::unlink(SLOT.0.get().cast::<libc::c_char>()) };
+    }
+    // SAFETY: write and _exit are async-signal-safe; the buffer is a
+    // one-byte static literal.
+    unsafe {
+        libc::write(2, b"\n".as_ptr().cast(), 1);
+        libc::_exit(2);
     }
 }
 
@@ -478,10 +594,45 @@ pub(crate) fn create_temp_armed(
     family: &str,
     signals: Signals,
 ) -> io::Result<(PathBuf, File, CleanupGuard)> {
+    held_back(signals, || {
+        create_temp(dir, family).map(|(p, f)| {
+            let g = arm_cleanup(host, &p, signals);
+            (p, f, g)
+        })
+    })
+}
+
+/// `create_temp` and `arm_cleanup_exit` with SIGINT held back between
+/// them, as [`create_temp_armed`] does for its signals, so no SIGINT finds
+/// the new temporary unarmed. Under `Host::Sandbox`, and off unix, nothing
+/// is armed.
+// Used by the zstd family from 0.14.0 Task 5.
+#[allow(dead_code)]
+pub(crate) fn create_temp_armed_exit(
+    dir: &Path,
+    family: &str,
+    host: &Host,
+) -> io::Result<(PathBuf, File, CleanupGuard)> {
+    #[cfg(unix)]
+    const INT: Signals = &[libc::SIGINT];
+    #[cfg(not(unix))]
+    const INT: Signals = &[];
+    held_back(INT, || {
+        create_temp(dir, family).map(|(p, f)| {
+            let g = arm_cleanup_exit(host, &p);
+            (p, f, g)
+        })
+    })
+}
+
+/// Run `f` with `signals` blocked on this thread, then restore the mask; a
+/// signal that arrived meanwhile is delivered on the restore. Off unix, just
+/// `f`.
+fn held_back<T>(signals: Signals, f: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
     {
         // SAFETY: sigset_t is plain data, initialised by sigemptyset; the
-        // previous mask is restored on every path below.
+        // previous mask is restored below whatever `f` returns.
         let mut block: libc::sigset_t = unsafe { std::mem::zeroed() };
         let mut old: libc::sigset_t = unsafe { std::mem::zeroed() };
         unsafe {
@@ -491,20 +642,41 @@ pub(crate) fn create_temp_armed(
             }
             libc::pthread_sigmask(libc::SIG_BLOCK, &block, &mut old);
         }
-        let made = create_temp(dir, family).map(|(p, f)| {
-            let g = arm_cleanup(host, &p, signals);
-            (p, f, g)
-        });
+        let made = f();
         // SAFETY: restoring the mask saved above.
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
         made
     }
     #[cfg(not(unix))]
     {
-        let (p, f) = create_temp(dir, family)?;
-        let g = arm_cleanup(host, &p, signals);
-        Ok((p, f, g))
+        let _ = signals;
+        f()
     }
+}
+
+/// `__compat-signal-test exit FILE`: the interrupt integration test's
+/// helper, in debug builds only (argv[0] picks it, so nothing of the stuffr
+/// CLI changes). It arms FILE with [`arm_cleanup_exit`], creates
+/// `FILE.ready` to say so, and waits up to a minute for a signal; reaching
+/// the end exits 0, which the test reads as a miss. A bad mode or argument
+/// count exits 64.
+#[cfg(all(unix, debug_assertions))]
+pub(crate) fn signal_test(args: &[OsString]) -> std::process::ExitCode {
+    let [mode, file] = args else {
+        return std::process::ExitCode::from(64);
+    };
+    if mode != "exit" {
+        return std::process::ExitCode::from(64);
+    }
+    let file = Path::new(file);
+    let _guard = arm_cleanup_exit(&Host::Real, file);
+    let mut ready = file.as_os_str().to_owned();
+    ready.push(".ready");
+    if fs::write(&ready, b"").is_err() {
+        return std::process::ExitCode::from(64);
+    }
+    std::thread::sleep(std::time::Duration::from_secs(60));
+    std::process::ExitCode::SUCCESS
 }
 
 /// What [`publish`] did.
@@ -1499,6 +1671,153 @@ mod tests {
             "a sandboxed arm installed a handler (status {status:#x})"
         );
         assert!(file.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The SIGINT disposition, queried.
+    #[cfg(unix)]
+    fn sigint_action() -> libc::sighandler_t {
+        // SAFETY: a zeroed sigaction is a valid out-parameter, and a query
+        // (null new action) changes nothing.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGINT, std::ptr::null(), &mut old);
+            old.sa_sigaction
+        }
+    }
+
+    /// zstd's addHandler/clearHandler: arming a regular file installs the
+    /// exit handler on SIGINT (over an inherited ignore, as `signal()`
+    /// does) and nothing else; dropping the guard disarms and puts SIGINT
+    /// back to `SIG_DFL`, not to what it was. A path that is not a regular
+    /// file arms nothing and installs nothing.
+    #[cfg(unix)]
+    #[test]
+    fn exit_kind_restores_sig_dfl_on_drop() {
+        let dir = scratch("exit-kind");
+        let file = dir.join("partial.zst");
+        fs::write(&file, b"partial").unwrap();
+        let status = in_child(|| {
+            default_dispositions();
+            // SAFETY: SIG_IGN installs no handler; the parent's `nohup`.
+            unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+            ARMED.store(false, Ordering::SeqCst);
+            let handler = on_interrupt_exit as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            let guard = arm_cleanup_exit(&Host::Real, &file);
+            let armed = ARMED.load(Ordering::Acquire) && sigint_action() == handler;
+            let term_default = {
+                // SAFETY: a query into a zeroed out-parameter.
+                let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+                unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut old) };
+                old.sa_sigaction == libc::SIG_DFL
+            };
+            drop(guard);
+            let restored = !ARMED.load(Ordering::Acquire) && sigint_action() == libc::SIG_DFL;
+            // A directory is not a regular file: nothing armed, SIGINT kept.
+            // SAFETY: as above.
+            unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+            let g = arm_cleanup_exit(&Host::Real, &dir);
+            let skipped = !ARMED.load(Ordering::Acquire) && sigint_action() == libc::SIG_IGN;
+            drop(g);
+            let untouched = sigint_action() == libc::SIG_IGN;
+            let code = match (armed, term_default, restored, skipped, untouched) {
+                (false, ..) => 1,
+                (_, false, ..) => 2,
+                (_, _, false, ..) => 3,
+                (_, _, _, false, _) => 4,
+                (.., false) => 5,
+                _ => 0,
+            };
+            // SAFETY: _exit is async-signal-safe and ends the child.
+            unsafe { libc::_exit(code) };
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "status {status:#x}"
+        );
+        assert!(file.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A sandboxed exit-style arm, directly or through
+    /// `create_temp_armed_exit`, arms nothing and leaves SIGINT alone.
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_installs_nothing() {
+        let dir = scratch("exit-sandbox");
+        let file = dir.join("partial.zst");
+        fs::write(&file, b"partial").unwrap();
+        let host = Host::Sandbox(Sandbox {
+            dir: dir.clone(),
+            stdin: None,
+            stdout: Arc::default(),
+            budget: Arc::new(AtomicU64::new(0)),
+            reads: ReadLog::default(),
+        });
+        let status = in_child(|| {
+            default_dispositions();
+            ARMED.store(false, Ordering::SeqCst);
+            let g = arm_cleanup_exit(&host, &file);
+            let direct = !ARMED.load(Ordering::Acquire) && sigint_action() == libc::SIG_DFL;
+            drop(g);
+            let made = match create_temp_armed_exit(&dir, "zstd", &host) {
+                Ok((path, _file, _g)) => {
+                    path.exists()
+                        && !ARMED.load(Ordering::Acquire)
+                        && sigint_action() == libc::SIG_DFL
+                }
+                Err(_) => false,
+            };
+            let after = sigint_action() == libc::SIG_DFL;
+            let code = match (direct, made, after) {
+                (false, ..) => 1,
+                (_, false, _) => 2,
+                (.., false) => 3,
+                _ => 0,
+            };
+            // SAFETY: _exit is async-signal-safe and ends the child.
+            unsafe { libc::_exit(code) };
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "status {status:#x}"
+        );
+        assert!(file.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `create_temp_armed_exit` arms the new temporary, regular by
+    /// construction, and an interrupt then removes it and exits 2.
+    #[cfg(unix)]
+    #[test]
+    fn create_temp_armed_exit_arms_the_new_temporary() {
+        let dir = scratch("exit-temp");
+        let status = in_child(|| {
+            default_dispositions();
+            ARMED.store(false, Ordering::SeqCst);
+            // The handler's "\n" would land in the test's output.
+            // SAFETY: open and dup2 are async-signal-safe; the path is a
+            // NUL-terminated literal.
+            unsafe {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                libc::dup2(null, 2);
+            }
+            if let Ok((_path, _file, _guard)) = create_temp_armed_exit(&dir, "zstd", &Host::Real) {
+                // SAFETY: raise is async-signal-safe; the handler removes
+                // the temporary and `_exit(2)`s.
+                unsafe { libc::raise(libc::SIGINT) };
+            }
+            // SAFETY: _exit is async-signal-safe and ends the child.
+            unsafe { libc::_exit(1) };
+        });
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 2,
+            "status {status:#x}"
+        );
+        assert!(
+            fs::read_dir(&dir).unwrap().next().is_none(),
+            "the temporary survived"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

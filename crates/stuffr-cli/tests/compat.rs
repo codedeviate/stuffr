@@ -578,4 +578,82 @@ mod unix {
             assert!(text.contains(needle), "examples page lacks {needle}");
         }
     }
+
+    /// zstd 1.5.7's `INThandler` (fileio.c), R6, through the debug-only
+    /// `__compat-signal-test exit FILE` helper, which arms FILE with
+    /// `arm_cleanup_exit` and waits: SIGINT removes it, writes `"\n"` to
+    /// standard error and exits 2 (an exit, not a death by the signal).
+    /// SIGTERM is not zstd's: it keeps its default action, the process dies
+    /// of it, and the file stays, as zstd leaves it.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn an_interrupt_exits_2_and_removes_the_armed_file() {
+        use std::io::Read;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let s = Scratch::new("signal-exit");
+        for (sig, answered) in [(libc::SIGINT, true), (libc::SIGTERM, false)] {
+            let file = s.0.join(format!("armed-{sig}"));
+            let ready = s.0.join(format!("armed-{sig}.ready"));
+            std::fs::write(&file, b"partial").unwrap();
+            let mut cmd = Command::new(STUFFR);
+            cmd.arg0("__compat-signal-test")
+                .arg("exit")
+                .arg(&file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            // SAFETY: only async-signal-safe calls between fork and exec;
+            // the child starts with both signals at their default action,
+            // whatever this test process inherited.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                    Ok(())
+                });
+            }
+            let mut child = cmd.spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !ready.exists() {
+                if let Some(st) = child.try_wait().unwrap() {
+                    let mut err = Vec::new();
+                    let _ = child.stderr.take().unwrap().read_to_end(&mut err);
+                    panic!(
+                        "signal {sig}: the helper ended before arming: {st:?}, {:?}",
+                        String::from_utf8_lossy(&err)
+                    );
+                }
+                assert!(Instant::now() < deadline, "signal {sig}: never armed");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // SAFETY: kill on a child we spawned and have not reaped.
+            unsafe { libc::kill(child.id() as i32, sig) };
+            let status = loop {
+                if let Some(st) = child.try_wait().unwrap() {
+                    break st;
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("signal {sig}: the helper hung after the signal");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let mut err = Vec::new();
+            child.stderr.take().unwrap().read_to_end(&mut err).unwrap();
+            if answered {
+                assert_eq!(status.signal(), None, "SIGINT killed it: {status:?}");
+                assert_eq!(status.code(), Some(2), "{status:?}");
+                assert_eq!(err, b"\n", "{:?}", String::from_utf8_lossy(&err));
+                assert!(!file.exists(), "the armed file survived SIGINT");
+            } else {
+                assert_eq!(status.signal(), Some(sig), "{status:?}");
+                assert!(err.is_empty(), "{:?}", String::from_utf8_lossy(&err));
+                assert!(file.exists(), "SIGTERM removed the armed file");
+            }
+        }
+    }
 }

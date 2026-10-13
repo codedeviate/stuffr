@@ -80,6 +80,12 @@ pub fn family_for(argv0: &OsStr) -> Option<(Family, &'static str)> {
 /// after `args[0]`; `bzip2recover`, which prints its `argv[0]` verbatim,
 /// gets `args[0]` as well.
 pub fn dispatch(args: Vec<OsString>) -> Option<ExitCode> {
+    // The interrupt integration test's helper (`host::signal_test`), in
+    // debug builds only.
+    #[cfg(all(unix, debug_assertions))]
+    if Path::new(args.first()?).file_name() == Some(OsStr::new("__compat-signal-test")) {
+        return Some(host::signal_test(&args[1..]));
+    }
     let (family, name) = family_for(args.first()?)?;
     let mut args = args.into_iter();
     let argv0 = args.next().unwrap_or_default();
