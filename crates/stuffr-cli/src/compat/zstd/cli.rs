@@ -228,6 +228,9 @@ pub(crate) struct Prefs {
     pub fake_stderr_console: bool,
     /// `--trace-file-stat` (`g_traceFileStat`).
     pub trace_file_stat: bool,
+    /// `g_utilDisplayLevel`: the display level as zstdcli.c sets it after
+    /// the arguments, before `main` lowers it for standard output.
+    pub util_level: i32,
 }
 
 impl Default for Prefs {
@@ -275,6 +278,7 @@ impl Default for Prefs {
             fake_stdout_console: false,
             fake_stderr_console: false,
             trace_file_stat: false,
+            util_level: DISPLAY_LEVEL_DEFAULT,
         }
     }
 }

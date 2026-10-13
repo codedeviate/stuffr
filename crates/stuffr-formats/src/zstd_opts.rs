@@ -325,6 +325,20 @@ pub enum EndOp {
     End,
 }
 
+/// One `ZSTD_compressStream2` call, as [`Encoder::compress_stream_each`]
+/// reports it: `fileio.c`'s display-level-6 trace prints these fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCall {
+    /// The directive (`ZSTD_EndDirective`).
+    pub end: EndOp,
+    /// `inBuff.pos` after the call.
+    pub input_pos: usize,
+    /// `inBuff.size`.
+    pub input_size: usize,
+    /// `outBuff.pos`: the bytes the call produced.
+    pub produced: usize,
+}
+
 /// What [`Decoder::new`] builds: `FIO_createDResources`' settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeOptions {

@@ -1379,3 +1379,88 @@ mod pure_tier {
         ));
     }
 }
+
+/// Both tiers hold a frame to its pledged size, as libzstd does: more or
+/// less input is `srcSize_wrong`; the right size, or none, compresses. A
+/// frame whose first call ends it takes that call's size as its pledge
+/// (`ZSTD_CCtx_init_compressStream2`), so the input is first given with
+/// `Continue`, as `fileio.c` gives standard input.
+#[test]
+fn a_frame_is_held_to_its_pledged_size() {
+    let data = text(5000, 31);
+    let pledged = |n: u64| {
+        let mut e = Encoder::new(&EncodeOptions {
+            pledged_size: Some(n),
+            ..EncodeOptions::default()
+        })
+        .unwrap();
+        let mut out = Vec::new();
+        e.compress_stream(&data, &mut out, EndOp::Continue)?;
+        e.compress_stream(&[], &mut out, EndOp::End)
+    };
+    let one_call = |n: u64| {
+        let mut e = Encoder::new(&EncodeOptions {
+            pledged_size: Some(n),
+            ..EncodeOptions::default()
+        })
+        .unwrap();
+        e.compress_stream(&data, &mut Vec::new(), EndOp::End)
+    };
+    assert!(one_call(4999).is_ok() && one_call(5001).is_ok());
+    assert!(pledged(5000).is_ok());
+    assert_eq!(code_of(pledged(4999)), code::SRC_SIZE_WRONG);
+    assert_eq!(code_of(pledged(5001)), code::SRC_SIZE_WRONG);
+    // The pledge is for one frame: the next one is free again.
+    let mut e = Encoder::new(&EncodeOptions::default()).unwrap();
+    e.set_pledged_size(Some(5000)).unwrap();
+    let mut out = Vec::new();
+    e.compress_stream(&data, &mut out, EndOp::End).unwrap();
+    e.compress_stream(&data[..10], &mut out, EndOp::End)
+        .unwrap();
+    assert_eq!(decode(&DecodeOptions::default(), &out).unwrap().len(), 5010);
+}
+
+/// `compress_stream_each` reports the calls `fileio.c` traces at display
+/// level 6: the directive, the input taken and the bytes produced, adding
+/// up to the frame.
+#[test]
+fn each_compress_call_is_reported() {
+    let data = text(300_000, 32);
+    let mut e = Encoder::new(&EncodeOptions::default()).unwrap();
+    let mut out = Vec::new();
+    let mut calls = Vec::new();
+    for (i, c) in data.chunks(128 << 10).enumerate() {
+        let end = if i == 2 { EndOp::End } else { EndOp::Continue };
+        e.compress_stream_each(c, &mut out, end, &mut |call| calls.push(call))
+            .unwrap();
+    }
+    assert!(!calls.is_empty());
+    assert_eq!(calls.last().unwrap().end, EndOp::End);
+    assert!(calls.iter().all(|c| c.input_pos <= c.input_size));
+    assert_eq!(calls.iter().map(|c| c.produced).sum::<usize>(), out.len());
+    assert_eq!(decode(&DecodeOptions::default(), &out).unwrap(), data);
+}
+
+/// A frame cut inside its checksum: the last block's output comes out
+/// before the decoder asks for the rest, as libzstd's does
+/// (`ZSTDds_checkChecksum`), so `fileio.c` writes it before saying
+/// "premature end".
+#[test]
+fn the_last_block_is_out_before_its_checksum_is_read() {
+    let data = text(3000, 33);
+    let frame = encode(&EncodeOptions::default(), &data);
+    let cut = &frame[..frame.len() - 2];
+    let mut d = Decoder::new(&DecodeOptions::default()).unwrap();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        let (used, hint) = d.decompress_stream(&cut[pos..], &mut out).unwrap();
+        pos += used;
+        assert_ne!(hint, 0, "the frame cannot end without its checksum");
+        if used == 0 {
+            assert_eq!(hint, 2, "the two missing checksum bytes");
+            break;
+        }
+    }
+    assert_eq!(out, data);
+}

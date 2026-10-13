@@ -1553,6 +1553,25 @@ pub fn decoder_peak_rss(
     plain: &[u8],
     env: &[(&str, &str)],
 ) -> u64 {
+    let (st, got, err, peak) = peak_rss_run(name, &[file], file, input, env);
+    assert!(st.success(), "{st:?}: {err}");
+    assert_eq!(err, "");
+    assert!(got == plain, "decoded output differs");
+    peak
+}
+
+/// Run stuffr as `name ARGS` in a scratch directory holding `file`
+/// (written with `input`), with only `env` in the environment; return its
+/// wait status, standard output, standard error and peak memory in bytes,
+/// measured as [`decoder_peak_rss`] describes. For a run expected to fail
+/// (0.14.0's `window_limit_refuses_before_allocating`).
+pub fn peak_rss_run(
+    name: &str,
+    args: &[&str],
+    file: &str,
+    input: &[u8],
+    env: &[(&str, &str)],
+) -> (std::process::ExitStatus, Vec<u8>, String, u64) {
     static N: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "stuffr-rss-{}-{}",
@@ -1566,7 +1585,7 @@ pub fn decoder_peak_rss(
     fs::write(dir.join(file), input).unwrap();
     let mut child = spawn(
         Command::new(&link)
-            .arg(file)
+            .args(args)
             .current_dir(&dir)
             .env_clear()
             .envs(env.iter().copied())
@@ -1596,12 +1615,9 @@ pub fn decoder_peak_rss(
     let got = reader.join().unwrap();
     let err = err_reader.join().unwrap();
     let _ = fs::remove_dir_all(&dir);
-    assert!(st.success(), "{st:?}: {err}");
-    assert_eq!(err, "");
-    assert!(got == plain, "decoded output differs");
     #[cfg(not(target_os = "linux"))]
     eprintln!("peak child RSS: {:.1} MiB", peak as f64 / 1048576.0);
-    peak
+    (st, got, err, peak)
 }
 
 /// Reap `child` with `wait4`, which reports that child's own resource use:

@@ -45,6 +45,22 @@
 //!    --trace"); `-H` omits their lines. `-B#`, `-S` and `-p#` keep the
 //!    reference's meaning. `--[no-]asyncio` is accepted and has no visible
 //!    effect. `--trace-file-stat` is accepted and prints no trace.
+//!
+//! Spec deviation 7, the pure tier (`zstd-pure` without `zstd-c`), as far
+//! as compressing and decompressing go (`fileio.rs`):
+//!
+//! - Every level compresses with `ruzstd`'s `Fastest`, so the sizes and
+//!   ratios in the summaries and in `-vvvvvv`'s trace are the tier's own;
+//!   the reference decodes every frame. The compression parameters are
+//!   range-checked as libzstd checks them, then ignored.
+//! - Compressing with `-D` or `--patch-from` is refused, after everything
+//!   zstd prints first: `zstd: error 1 : dictionary compression is not
+//!   available in this build (stuffr pure tier)`.
+//! - A legacy frame (v0.5 to v0.7) is `unsupported format`, what a zstd
+//!   built without legacy support says.
+//! - A corrupt frame whose blocks overflow the output libzstd sized from
+//!   its header can be named `Data corruption detected` where libzstd says
+//!   `Destination buffer is too small`.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -61,6 +77,7 @@ use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
 pub(crate) mod cli;
 pub(crate) mod display;
+pub(crate) mod fileio;
 mod messages;
 pub(crate) mod util;
 
@@ -187,27 +204,30 @@ fn todo(err: &mut dyn Write, what: &str, task: &str) -> i32 {
 /// UTIL_isLink and UTIL_isFIFO: whether `name` is a symbolic link (lstat)
 /// that does not lead to a FIFO (stat). Never on Windows, as util.c.
 fn is_link_not_fifo(host: &Host, name: &[u8]) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        let p = host.path(name);
-        std::fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink())
-            && !std::fs::metadata(&p).is_ok_and(|m| m.file_type().is_fifo())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (host, name);
-        false
-    }
+    util::is_link(host, name) && !util::is_fifo(host, name)
 }
 
 /// UTIL_getFileSize: a regular file's size (following links), else
 /// unknown.
 fn file_size(host: &Host, name: &[u8]) -> Option<u64> {
-    std::fs::metadata(host.path(name))
-        .ok()
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
+    Some(util::file_size(host, name)).filter(|&s| s != util::FILESIZE_UNKNOWN)
+}
+
+/// An operation's result as `main` ends it: `CLEAN_RETURN` with the
+/// result, or the `EXM_THROW` exit.
+fn finish(r: fileio::Fio<i32>, pause: bool) -> Stop {
+    match r {
+        Ok(code) => Stop {
+            code,
+            clean: true,
+            pause,
+        },
+        Err(fileio::Thrown(code)) => Stop {
+            code,
+            clean: false,
+            pause,
+        },
+    }
 }
 
 /// zstdcli.c: main, from the symbolic-link filter to the operation.
@@ -226,6 +246,9 @@ fn execute(cmd: &mut Command, host: &mut Host, out: &mut dyn Write, err: &mut dy
     let mut d = Display {
         level: cmd.display_level,
     };
+    // g_utilDisplayLevel.
+    cmd.prefs.util_level = cmd.display_level;
+    let util_level = cmd.display_level;
 
     if !cmd.follow_links {
         let total = cmd.files.len();
@@ -242,12 +265,19 @@ fn execute(cmd: &mut Command, host: &mut Host, out: &mut dyn Write, err: &mut dy
             return clean(1);
         }
     }
-    if !cmd.filelists.is_empty() {
-        return clean(todo(err, "--filelist", "5"));
+    for list in std::mem::take(&mut cmd.filelists) {
+        match util::names_from_file(host, &list, util_level, err) {
+            Some(names) => cmd.files.extend(names),
+            None => {
+                d.at(1, err, m::ERROR_READING, &[&list]);
+                return clean(1);
+            }
+        }
     }
     cmd.nb_input_files = cmd.files.len();
     if cmd.recursive {
-        return clean(todo(err, "-r", "5"));
+        let names = std::mem::take(&mut cmd.files);
+        cmd.files = util::expand_names(host, names, cmd.follow_links, util_level, err);
     }
 
     match cmd.op {
@@ -349,7 +379,7 @@ fn execute(cmd: &mut Command, host: &mut Host, out: &mut dyn Write, err: &mut dy
             // R9: the decoder's window log at most 24.
             cmd.prefs.memory_limit = cmd.prefs.memory_limit.min(1 << l.window_log_max);
         }
-        return clean(todo(err, "decompression", "5"));
+        return finish(fileio::decompress_files(cmd, host, out, err), pause);
     }
 
     // FIO_setCompressionType .. FIO_setSparseWrite, with their messages.
@@ -402,9 +432,7 @@ fn execute(cmd: &mut Command, host: &mut Host, out: &mut dyn Write, err: &mut dy
     if d.level >= 4 {
         display_compression_parameters(cmd, err);
     }
-    // Task 5 writes through `out`.
-    let _ = out;
-    clean(todo(err, "compression", "5"))
+    finish(fileio::compress_files(cmd, host, out, err), pause)
 }
 
 /// fileio.c: FIO_displayCompressionParameters (display level 4).

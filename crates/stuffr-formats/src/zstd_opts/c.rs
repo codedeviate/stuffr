@@ -12,8 +12,8 @@ use std::ptr::NonNull;
 use zstd::zstd_safe::zstd_sys as sys;
 
 use super::{
-    CParamKey, DecodeOptions, EncodeOptions, EndOp, Progress, TrainAlgo, TrainParams, Trained,
-    ZstdError, code,
+    CParamKey, DecodeOptions, EncodeOptions, EndOp, Progress, StreamCall, TrainAlgo, TrainParams,
+    Trained, ZstdError, code,
 };
 
 /// `ZSTD_versionString()`: the libzstd this build links, `"1.5.7"`.
@@ -192,6 +192,19 @@ impl Encoder {
         out: &mut Vec<u8>,
         end: EndOp,
     ) -> Result<usize, ZstdError> {
+        self.compress_stream_each(input, out, end, &mut |_| {})
+    }
+
+    /// [`Encoder::compress_stream`], telling `each` about every
+    /// `ZSTD_compressStream2` call made (`fileio.c`'s display level 6
+    /// traces them).
+    pub fn compress_stream_each(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        end: EndOp,
+        each: &mut dyn FnMut(StreamCall),
+    ) -> Result<usize, ZstdError> {
         let directive = match end {
             EndOp::Continue => sys::ZSTD_EndDirective::ZSTD_e_continue,
             EndOp::Flush => sys::ZSTD_EndDirective::ZSTD_e_flush,
@@ -226,6 +239,12 @@ impl Encoder {
             // (its contract, error or not).
             unsafe { out.set_len(len + outb.pos) };
             let remaining = r?;
+            each(StreamCall {
+                end,
+                input_pos: inb.pos,
+                input_size: inb.size,
+                produced: outb.pos,
+            });
             let input_done = inb.pos == inb.size;
             if input_done && (end == EndOp::Continue || remaining == 0) {
                 return Ok(remaining);

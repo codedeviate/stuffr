@@ -304,7 +304,6 @@ pub(super) const COMPRESSING_WITH: &str = "Compressing with %d worker threads \n
 pub(super) const SYMLINK_IGNORED: &str = "Warning : %s is a symbolic link, ignoring \n";
 
 /// zstdcli.c: main, `--filelist` unreadable.
-#[allow(dead_code)] // Used from Task 5 (`--filelist`).
 pub(super) const ERROR_READING: &str = "zstd: error reading %s \n";
 
 /// zstdcli.c: main, every input an empty directory.
@@ -466,6 +465,434 @@ pub(super) const EXM_ERROR: &str = "error %d : ";
 
 /// fileio_common.h: EXM_THROW, after the message.
 pub(super) const EXM_END: &str = " \n";
+
+// ---- util.c ----
+
+/// util.c: readLinesFromFile, `perror("zstd:util:readLinesFromFile")`.
+pub(super) const PERROR_READ_LINES: &str = "zstd:util:readLinesFromFile: %s\n";
+
+/// util.c: UTIL_prepareFileList (POSIX).
+pub(super) const CANNOT_OPEN_DIR: &str = "Cannot open directory '%s': %s\n";
+
+/// util.c: UTIL_prepareFileList (POSIX).
+pub(super) const READDIR_ERROR: &str = "readdir(%s) error: %s \n";
+
+/// util.c: UTIL_prepareFileList (POSIX), a link under a `-r` directory.
+pub(super) const UTIL_SYMLINK_IGNORED: &str = "Warning : %s is a symbolic link, ignoring\n";
+
+/// util.c: getDirMode.
+pub(super) const DIR_STAT_FAILED: &str = "zstd: failed to get DIR stats %s: %s\n";
+
+/// util.c: getDirMode.
+pub(super) const EXPECTED_DIRECTORY: &str = "zstd: expected directory: %s\n";
+
+/// util.c: makeDir.
+pub(super) const MKDIR_FAILED: &str = "zstd: failed to create DIR %s: %s\n";
+
+/// util.c: UTIL_requireUserConfirmation, when standard input is an input.
+pub(super) const STDIN_IS_AN_INPUT: &str = "stdin is an input - not proceeding.\n";
+
+/// util.c: UTIL_requireUserConfirmation, the abort message's format
+/// (`"%s \n"`).
+pub(super) const CONFIRM_ABORT: &str = "%s \n";
+
+// ---- fileio.c: files ----
+
+/// fileio.c: FIO_removeFile.
+pub(super) const REMOVE_STAT_FAILED: &str = "zstd: Failed to stat %s while trying to remove it\n";
+
+/// fileio.c: FIO_removeFile.
+pub(super) const REMOVE_NOT_REGULAR: &str = "zstd: Refusing to remove non-regular file %s\n";
+
+/// fileio.c: FIO_openSrcFile (display level 4).
+pub(super) const USING_STDIN: &str = "Using stdin for input \n";
+
+/// fileio.c: FIO_openSrcFile.
+pub(super) const CANT_STAT: &str = "zstd: can't stat %s : %s -- ignored \n";
+
+/// fileio.c: FIO_openSrcFile.
+pub(super) const NOT_REGULAR: &str = "zstd: %s is not a regular file -- ignored \n";
+
+/// fileio.c: FIO_openSrcFile, FIO_compressFilename_dstFile and others: a
+/// name and `strerror(errno)`.
+pub(super) const NAME_ERRNO: &str = "zstd: %s: %s \n";
+
+/// fileio.c: FIO_openDstFile (display level 4).
+pub(super) const USING_STDOUT: &str = "Using stdout for output \n";
+
+/// fileio.c: FIO_openDstFile (display level 4).
+pub(super) const SPARSE_OFF_STDOUT: &str =
+    "Sparse File Support is automatically disabled on stdout ; try --sparse \n";
+
+/// fileio.c: FIO_openDstFile, the same-file guard.
+pub(super) const REFUSING_OVERWRITE_INPUT: &str =
+    "zstd: Refusing to open an output file which will overwrite the input file \n";
+
+/// fileio.c: FIO_openDstFile (display level 4).
+pub(super) const SPARSE_OFF_NOT_FILE: &str =
+    "Sparse File Support is disabled when output is not a file \n";
+
+/// fileio.c: FIO_openDstFile (`EXM_THROW(40, …)`).
+pub(super) const NUL_IS_REGULAR: &str = "%s is unexpectedly categorized as a regular file";
+
+/// fileio.c: FIO_openDstFile, at display level 1 or below (two spaces
+/// before the newline, as zstd prints it).
+pub(super) const NOT_OVERWRITTEN: &str = "zstd: %s already exists; not overwritten  \n";
+
+/// fileio.c: FIO_openDstFile, before the prompt.
+pub(super) const ALREADY_EXISTS: &str = "zstd: %s already exists; ";
+
+/// fileio.c: FIO_openDstFile, UTIL_requireUserConfirmation's prompt.
+pub(super) const OVERWRITE_PROMPT: &str = "overwrite (y/n) ? ";
+
+/// fileio.c: FIO_openDstFile, UTIL_requireUserConfirmation's abort
+/// message.
+pub(super) const OVERWRITE_ABORT: &str = "Not overwritten  \n";
+
+/// fileio.c: FIO_openDstFile, `open` failing (no space before the
+/// newline).
+pub(super) const OPEN_DST_FAILED: &str = "zstd: %s: %s\n";
+
+/// fileio.c: FIO_getDictFileStat (`EXM_THROW(31, …)`).
+pub(super) const DICT_STAT_FAILED: &str = "Stat failed on dictionary file %s: %s";
+
+/// fileio.c: FIO_getDictFileStat (`EXM_THROW(32, …)`).
+pub(super) const DICT_NOT_REGULAR: &str = "Dictionary %s must be a regular file.";
+
+/// fileio.c: FIO_setDictBufferMalloc (display level 4).
+pub(super) const LOADING_DICT: &str = "Loading %s as dictionary \n";
+
+/// fileio.c: FIO_setDictBufferMalloc (`EXM_THROW(33, …)`).
+pub(super) const DICT_OPEN_FAILED: &str = "Couldn't open dictionary %s: %s";
+
+/// fileio.c: FIO_setDictBufferMalloc (`EXM_THROW(34, …)`).
+pub(super) const DICT_TOO_LARGE: &str = "Dictionary file %s is too large (> %d bytes)";
+
+/// fileio.c: FIO_setDictBufferMalloc (`EXM_THROW(35, …)`).
+pub(super) const DICT_READ_FAILED: &str = "Error reading dictionary file %s : %s";
+
+/// fileio.c: FIO_checkFilenameCollisions (display level 2).
+pub(super) const SAME_FILENAME: &str = "WARNING: Two files have same filename: %s\n";
+
+/// fileio.c: FIO_adjustMemLimitForPatchFromMode (`EXM_THROW(42, …)`).
+pub(super) const PATCH_FROM_STDIN: &str = "Using --patch-from with stdin requires --stream-size";
+
+/// fileio.c: FIO_adjustMemLimitForPatchFromMode (`EXM_THROW(42, …)`; the
+/// newline is zstd's).
+pub(super) const PATCH_FROM_TOO_LARGE: &str = "Can't handle files larger than %d GB\n";
+
+/// fileio.c: FIO_multiFilesConcatWarning (`EXM_THROW(43, …)`).
+pub(super) const RM_TO_STDOUT: &str = concat!(
+    "It's not allowed to remove input files when processed output is piped to stdout. ",
+    "This scenario is not supposed to be possible. ",
+    "This is a programming error. File an issue for it to be fixed."
+);
+
+/// fileio.c: FIO_multiFilesConcatWarning (`EXM_THROW(43, …)`).
+pub(super) const RM_IN_TEST: &str = concat!(
+    "Test mode shall not remove input files! ",
+    "This scenario is not supposed to be possible. ",
+    "This is a programming error. File an issue for it to be fixed."
+);
+
+/// fileio.c: FIO_multiFilesConcatWarning (display level 2).
+pub(super) const CONCAT_STDOUT: &str =
+    "zstd: WARNING: all input files will be processed and concatenated into stdout. \n";
+
+/// fileio.c: FIO_multiFilesConcatWarning (display level 2).
+pub(super) const CONCAT_FILE: &str = "zstd: WARNING: all input files will be processed and concatenated into a single output file: %s \n";
+
+/// fileio.c: FIO_multiFilesConcatWarning (display level 2).
+pub(super) const CONCAT_NO_NAMES: &str =
+    "The concatenated output CANNOT regenerate original file names nor directory structure. \n";
+
+/// fileio.c: FIO_multiFilesConcatWarning (display level 2).
+pub(super) const CONCAT_NOT_REMOVED: &str =
+    "Since it's a destructive operation, input files will not be removed. \n";
+
+/// fileio.c: FIO_multiFilesConcatWarning, quiet.
+pub(super) const CONCAT_LOSES_METADATA: &str =
+    "Concatenating multiple processed inputs into a single output loses file metadata. \n";
+
+/// fileio.c: FIO_multiFilesConcatWarning, quiet.
+pub(super) const CONCAT_ABORTING: &str = "Aborting. \n";
+
+/// fileio.c: FIO_multiFilesConcatWarning, UTIL_requireUserConfirmation's
+/// prompt.
+pub(super) const PROCEED_PROMPT: &str = "Proceed? (y/n): ";
+
+/// fileio.c: FIO_multiFilesConcatWarning, UTIL_requireUserConfirmation's
+/// abort message.
+pub(super) const PROCEED_ABORT: &str = "Aborting...";
+
+/// fileio.c: CHECK (`EXM_THROW(11, "%s", ZSTD_getErrorName(…))`).
+pub(super) const ERROR_NAME: &str = "%s";
+
+/// Not zstd's: compressing with a dictionary or prefix on the pure tier
+/// (spec deviation 7), `EXM_THROW(1, …)`.
+pub(super) const PURE_NO_DICTIONARY: &str =
+    "dictionary compression is not available in this build (stuffr pure tier)";
+
+// ---- fileio.c: compression ----
+
+/// fileio.c: FIO_adjustParamsForPatchFromMode.
+pub(super) const MAX_WINDOW_LOG_EXCEEDED: &str =
+    "Max window log exceeded by file (compression ratio will suffer)\n";
+
+/// fileio.c: FIO_adjustParamsForPatchFromMode (display level 2).
+pub(super) const LONG_MODE_TRIGGERED: &str = "long mode automatically triggered\n";
+
+/// fileio.c: FIO_adjustParamsForPatchFromMode (display level 4; `%d`:
+/// `ZSTD_CHAINLOG_MAX`, `ZSTD_LDM_HASHLOG_MAX`, `ZSTD_LDM_HASHRATELOG_MIN`).
+pub(super) const OPTIMAL_PARSER_NOTES: &str = concat!(
+    "[Optimal parser notes] Consider the following to improve patch size at the cost of speed:\n",
+    "- Set a larger targetLength (e.g. --zstd=targetLength=4096)\n",
+    "- Set a larger chainLog (e.g. --zstd=chainLog=%d)\n",
+    "- Set a larger LDM hashLog (e.g. --zstd=ldmHashLog=%d)\n",
+    "- Set a smaller LDM rateLog (e.g. --zstd=ldmHashRateLog=%d)\n",
+    "Also consider playing around with searchLog and hashLog\n",
+);
+
+/// fileio.c: FIO_createCResources (display level 6).
+pub(super) const CREATE_CRESOURCES: &str = "FIO_createCResources \n";
+
+/// fileio.c: FIO_createCResources (display level 5).
+pub(super) const SET_NB_WORKERS: &str = "set nb workers = %d \n";
+
+/// fileio.c: FIO_createCResources (display level 3).
+pub(super) const SET_OVERLAP_LOG: &str = "set overlapLog = %d \n";
+
+/// fileio.c: FIO_compressZstdFrame (display level 6).
+pub(super) const USING_ZSTD_FORMAT: &str = "compression using zstd format \n";
+
+/// fileio.c: FIO_compressZstdFrame (display level 4; `%s`: `%.*f%s`).
+pub(super) const DECOMPRESSION_MEMORY: &str = "Decompression will require %s of memory\n";
+
+/// fileio.c: FIO_compressZstdFrame (display level 6).
+pub(super) const FREAD_BYTES: &str = "fread %d bytes from source \n";
+
+/// fileio.c: FIO_compressZstdFrame (display level 6): one
+/// `ZSTD_compressStream2` call (`%u`: the directive, the input position and
+/// size, the bytes produced).
+pub(super) const COMPRESS_GENERIC: &str =
+    "ZSTD_compress_generic(end:%d) => input pos(%d)<=(%d)size ; output generated %d bytes \n";
+
+/// fileio.c: FIO_compressZstdFrame, the progress line's clearing
+/// (`"\r%79s\r"` with `""`).
+pub(super) const CLEAR_LINE: &str = "\r%s\r";
+
+/// fileio.c: FIO_compressZstdFrame, verbose progress (`(L%i)
+/// Buffered:%5.*f%s - Consumed:%5.*f%s - Compressed:%5.*f%s => %.2f%% `).
+pub(super) const PROGRESS_VERBOSE: &str =
+    "(L%s) Buffered:%s - Consumed:%s - Compressed:%s => %s%% ";
+
+/// fileio.c: FIO_compressZstdFrame, a long name's progress (`%u/%u`,
+/// `...%s`).
+pub(super) const PROGRESS_FILES_LONG: &str = "Compress: %s/%s files. Current: ...%s ";
+
+/// fileio.c: FIO_compressZstdFrame, a short name's progress (`%u/%u`,
+/// `%*s`).
+pub(super) const PROGRESS_FILES: &str = "Compress: %s/%s files. Current: %s ";
+
+/// fileio.c: FIO_compressZstdFrame (`Read:%6.*f%4s `).
+pub(super) const PROGRESS_READ: &str = "Read:%s ";
+
+/// fileio.c: FIO_compressZstdFrame (`/%6.*f%4s`).
+pub(super) const PROGRESS_OF: &str = "/%s";
+
+/// fileio.c: FIO_compressZstdFrame (` ==> %2.f%%`).
+pub(super) const PROGRESS_RATIO: &str = " ==> %s%%";
+
+/// fileio.c: FIO_compressZstdFrame (`EXM_THROW(27, …)`).
+pub(super) const INCOMPLETE_READ: &str = "Read error : Incomplete read : %d / %d B";
+
+/// fileio.c: FIO_compressFilename_internal (display level 5; `%llu`).
+pub(super) const SRC_BYTES: &str = "%s: %d bytes \n";
+
+/// fileio.c: FIO_compressFilename_internal, the summary of an empty input
+/// (`%-20s :  (%6.*f%s => %6.*f%s, %s) \n`).
+pub(super) const SUMMARY_EMPTY: &str = "%s :  (%s => %s, %s) \n";
+
+/// fileio.c: FIO_compressFilename_internal, the summary (`%-20s
+/// :%6.2f%%   (%6.*f%s => %6.*f%s, %s) \n`).
+pub(super) const SUMMARY: &str = "%s :%s%%   (%s => %s, %s) \n";
+
+/// fileio.c: FIO_compressFilename_internal (display level 4; `%-20s :
+/// Completed in %.2f sec  (cpu load : %.0f%%)\n`).
+pub(super) const COMPLETED: &str = "%s : Completed in %s sec  (cpu load : %s%%)\n";
+
+/// fileio.c: FIO_compressFilename_internal without ZSTD_GZCOMPRESS
+/// (`EXM_THROW(20, …)`), until Task 6 brings gzip.
+pub(super) const NO_GZ_COMPRESS: &str = "zstd: %s: file cannot be compressed as gzip (zstd compiled without ZSTD_GZCOMPRESS) -- ignored \n";
+
+/// fileio.c: FIO_compressFilename_internal without ZSTD_LZMACOMPRESS
+/// (`EXM_THROW(20, …)`), until Task 6 brings xz and lzma.
+pub(super) const NO_LZMA_COMPRESS: &str = "zstd: %s: file cannot be compressed as xz/lzma (zstd compiled without ZSTD_LZMACOMPRESS) -- ignored \n";
+
+/// fileio.c: FIO_compressFilename_internal without ZSTD_LZ4COMPRESS
+/// (`EXM_THROW(20, …)`), until Task 6 brings lz4.
+pub(super) const NO_LZ4_COMPRESS: &str = "zstd: %s: file cannot be compressed as lz4 (zstd compiled without ZSTD_LZ4COMPRESS) -- ignored \n";
+
+/// fileio.c: FIO_compressFilename_dstFile (display level 6).
+pub(super) const OPENING_DST: &str = "FIO_compressFilename_dstFile: opening dst: %s \n";
+
+/// fileio.c: FIO_compressFilename_dstFile (display level 6).
+pub(super) const CLOSING_DST: &str = "FIO_compressFilename_dstFile: closing dst: %s \n";
+
+/// fileio.c: FIO_compressFilename_srcFile (display level 6).
+pub(super) const COMPRESS_SRC_FILE: &str = "FIO_compressFilename_srcFile: %s \n";
+
+/// fileio.c: FIO_compressFilename_srcFile and FIO_decompressSrcFile.
+pub(super) const IS_A_DIRECTORY: &str = "zstd: %s is a directory -- ignored \n";
+
+/// fileio.c: FIO_compressFilename_srcFile.
+pub(super) const INPUT_IS_DICTIONARY: &str =
+    "zstd: cannot use %s as an input file and dictionary \n";
+
+/// fileio.c: FIO_compressFilename_srcFile (display level 4).
+pub(super) const ALREADY_COMPRESSED: &str = "File is already compressed : %s \n";
+
+/// fileio.c: FIO_compressFilename_srcFile, `--rm` failing (`EXM_THROW(1,
+/// …)`).
+pub(super) const RM_FAILED: &str = "zstd: %s: %s";
+
+/// fileio.c: FIO_compressMultipleFilenames (display level 2).
+pub(super) const MIRROR_CANNOT_COMPRESS: &str =
+    "zstd: --output-dir-mirror cannot compress '%s' into '%s' \n";
+
+/// fileio.c: FIO_compressMultipleFilenames (`EXM_THROW(29, …)`).
+pub(super) const CLOSE_FAILED: &str = "Write error (%s) : cannot properly close %s";
+
+/// fileio.c: FIO_compressMultipleFilenames, nothing read (`%3d files
+/// compressed : (%6.*f%4s => %6.*f%4s)\n`).
+pub(super) const FILES_COMPRESSED_EMPTY: &str = "%s files compressed : (%s => %s)\n";
+
+/// fileio.c: FIO_compressMultipleFilenames (`%3d files compressed :
+/// %.2f%% (%6.*f%4s => %6.*f%4s)\n`).
+pub(super) const FILES_COMPRESSED: &str = "%s files compressed : %s%% (%s => %s)\n";
+
+/// fileio.c: `compressedFileExtensions` (`--exclude-compressed`).
+pub(super) const COMPRESSED_EXTENSIONS: &[&str] = &[
+    ".zst", ".tzst", ".gz", ".tgz", ".lzma", ".xz", ".txz", ".lz4", ".tlz4", ".7z", ".aa3", ".aac",
+    ".aar", ".ace", ".alac", ".ape", ".apk", ".apng", ".arc", ".archive", ".arj", ".ark", ".asf",
+    ".avi", ".avif", ".ba", ".br", ".bz2", ".cab", ".cdx", ".chm", ".cr2", ".divx", ".dmg", ".dng",
+    ".docm", ".docx", ".dotm", ".dotx", ".dsft", ".ear", ".eftx", ".emz", ".eot", ".epub", ".f4v",
+    ".flac", ".flv", ".gho", ".gif", ".gifv", ".gnp", ".iso", ".jar", ".jpeg", ".jpg", ".jxl",
+    ".lz", ".lzh", ".m4a", ".m4v", ".mkv", ".mov", ".mp2", ".mp3", ".mp4", ".mpa", ".mpc", ".mpe",
+    ".mpeg", ".mpg", ".mpl", ".mpv", ".msi", ".odp", ".ods", ".odt", ".ogg", ".ogv", ".otp",
+    ".ots", ".ott", ".pea", ".png", ".pptx", ".qt", ".rar", ".s7z", ".sfx", ".sit", ".sitx",
+    ".sqx", ".svgz", ".swf", ".tbz2", ".tib", ".tlz", ".vob", ".war", ".webm", ".webp", ".wma",
+    ".wmv", ".woff", ".woff2", ".wvl", ".xlsx", ".xpi", ".xps", ".zip", ".zipx", ".zoo", ".zpaq",
+];
+
+// ---- fileio.c: decompression ----
+
+/// fileio.c: FIO_zstdErrorHelp (`%llu > %u`).
+pub(super) const WINDOW_TOO_LARGE: &str = "%s : Window size larger than maximum : %d > %d \n";
+
+/// fileio.c: FIO_zstdErrorHelp.
+pub(super) const WINDOW_HINT: &str = "%s : Use --long=%d or --memory=%dMB \n";
+
+/// fileio.c: FIO_zstdErrorHelp.
+pub(super) const WINDOW_LOG_TOO_LARGE: &str =
+    "%s : Window log larger than ZSTD_WINDOWLOG_MAX=%d; not supported \n";
+
+/// fileio.c: FIO_decompressZstdFrame.
+pub(super) const DECODING_ERROR: &str = "%s : Decoding error (36) : %s \n";
+
+/// fileio.c: FIO_decompressZstdFrame, several files (`\rDecompress: %2u/%2u
+/// files. Current: %s : %.*f%s...    `).
+pub(super) const PROGRESS_DECOMPRESS_FILES: &str =
+    "\rDecompress: %s/%s files. Current: %s : %s...    ";
+
+/// fileio.c: FIO_decompressZstdFrame, one file (`\r%-20.20s : %.*f%s...
+/// `).
+pub(super) const PROGRESS_DECOMPRESS: &str = "\r%s : %s...     ";
+
+/// fileio.c: FIO_decompressZstdFrame.
+pub(super) const PREMATURE_END: &str = "%s : Read error (39) : premature end \n";
+
+/// fileio.c: FIO_decompressFrames, an empty input.
+pub(super) const UNEXPECTED_EOF: &str = "zstd: %s: unexpected end of file \n";
+
+/// fileio.c: FIO_decompressFrames, fewer than four bytes left.
+pub(super) const UNKNOWN_HEADER: &str = "zstd: %s: unknown header \n";
+
+/// fileio.c: FIO_decompressFrames without ZSTD_GZDECOMPRESS, until Task 6
+/// brings gzip.
+pub(super) const NO_GZ_DECOMPRESS: &str =
+    "zstd: %s: gzip file cannot be uncompressed (zstd compiled without HAVE_ZLIB) -- ignored \n";
+
+/// fileio.c: FIO_decompressFrames without ZSTD_LZMADECOMPRESS, until Task 6
+/// brings xz and lzma.
+pub(super) const NO_LZMA_DECOMPRESS: &str =
+    "zstd: %s: xz/lzma file cannot be uncompressed (zstd compiled without HAVE_LZMA) -- ignored \n";
+
+/// fileio.c: FIO_decompressFrames without ZSTD_LZ4DECOMPRESS, until Task 6
+/// brings lz4.
+pub(super) const NO_LZ4_DECOMPRESS: &str =
+    "zstd: %s: lz4 file cannot be uncompressed (zstd compiled without HAVE_LZ4) -- ignored \n";
+
+/// fileio.c: FIO_decompressFrames.
+pub(super) const UNSUPPORTED_FORMAT: &str = "zstd: %s: unsupported format \n";
+
+/// fileio.c: FIO_decompressFrames, the summary (`%-20s: %llu bytes \n`).
+pub(super) const DECOMPRESSED_BYTES: &str = "%s: %d bytes \n";
+
+/// fileio.c: FIO_determineDstName (`%s`: the name, then `suffixListStr`).
+pub(super) const UNKNOWN_SUFFIX: &str = "zstd: %s: unknown suffix (%s expected). Can't derive the output file name. Specify it with -o dstFileName. Ignoring.\n";
+
+/// fileio.c: `suffixListStr` with gzip, lzma and lz4 decompression.
+pub(super) const SUFFIX_LIST_STR: &str = ".zst/.tzst/.gz/.tgz/.lzma/.xz/.txz/.lz4/.tlz4";
+
+/// fileio.c: `suffixList` with gzip, lzma and lz4 decompression.
+pub(super) const SUFFIX_LIST: &[&str] = &[
+    ".zst", ".tzst", ".zstd", ".gz", ".tgz", ".lzma", ".xz", ".txz", ".lz4", ".tlz4",
+];
+
+/// fileio.c: FIO_determineDstName, the tar suffixes' output suffix.
+pub(super) const TAR_SUFFIX: &str = ".tar";
+
+/// fileio.c: FIO_decompressMultipleFilenames (`EXM_THROW(19, …)`).
+pub(super) const CANNOT_OPEN: &str = "cannot open %s";
+
+/// fileio.c: FIO_decompressMultipleFilenames (`EXM_THROW(72, …)`).
+pub(super) const CLOSE_OUTPUT_FAILED: &str = "Write error : %s : cannot properly close output file";
+
+/// fileio.c: FIO_decompressMultipleFilenames (display level 2).
+pub(super) const MIRROR_CANNOT_DECOMPRESS: &str =
+    "zstd: --output-dir-mirror cannot decompress '%s' into '%s'\n";
+
+/// fileio.c: FIO_decompressMultipleFilenames (`%d files decompressed :
+/// %6llu bytes total \n`).
+pub(super) const FILES_DECOMPRESSED: &str = "%s files decompressed : %s bytes total \n";
+
+// ---- fileio_asyncio.c ----
+
+/// fileio_asyncio.c: AIO_fwriteSparse (`EXM_THROW(70, …)`).
+pub(super) const WRITE_BLOCK_FAILED: &str = "Write error : cannot write block : %s";
+
+/// fileio_asyncio.c: AIO_fwriteSparse (`EXM_THROW(91, …)`).
+pub(super) const SKIP_1GB_FAILED: &str = "1 GB skip error (sparse file support)";
+
+/// fileio_asyncio.c: AIO_fwriteSparse (`EXM_THROW(92, …)`).
+pub(super) const SPARSE_SKIP_FAILED: &str = "Sparse skip error ; try --no-sparse";
+
+/// fileio_asyncio.c: AIO_fwriteSparse (`EXM_THROW(93, …)`).
+pub(super) const SPARSE_WRITE_FAILED: &str = "Write error : cannot write block : %s";
+
+/// fileio_asyncio.c: AIO_fwriteSparse (`EXM_THROW(95, …)`).
+pub(super) const SPARSE_END_WRITE_FAILED: &str =
+    "Write error : cannot write end of decoded block : %s";
+
+/// fileio_asyncio.c: AIO_fwriteSparseEnd (`EXM_THROW(69, …)`).
+pub(super) const FINAL_SKIP_FAILED: &str = "Final skip error (sparse file support)";
+
+/// fileio_asyncio.c: AIO_fwriteSparseEnd (`EXM_THROW(69, …)`).
+pub(super) const LAST_ZERO_FAILED: &str = "Write error : cannot write last zero : %s";
+
+/// fileio_asyncio.c: AIO_ReadPool_executeReadJob (`EXM_THROW(37, …)`).
+pub(super) const READ_ERROR: &str = "Read error";
 
 // ---- scaffolding (0.14.0 Ruling P1; Tasks 5-8 remove every use) ----
 

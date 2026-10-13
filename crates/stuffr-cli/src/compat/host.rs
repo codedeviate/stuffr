@@ -280,8 +280,6 @@ extern "C" fn on_cleanup_signal(sig: libc::c_int) {
 /// the slot cannot hold. It shares the slot with [`arm_cleanup`]: one
 /// family per process, one arm at a time. Prefer [`create_temp_armed_exit`]
 /// for a new temporary, which leaves no unarmed window.
-// Used by the zstd family from 0.14.0 Task 5.
-#[allow(dead_code)]
 pub(crate) fn arm_cleanup_exit(host: &Host, path: &Path) -> CleanupGuard {
     #[cfg(unix)]
     {
@@ -606,8 +604,6 @@ pub(crate) fn create_temp_armed(
 /// them, as [`create_temp_armed`] does for its signals, so no SIGINT finds
 /// the new temporary unarmed. Under `Host::Sandbox`, and off unix, nothing
 /// is armed.
-// Used by the zstd family from 0.14.0 Task 5.
-#[allow(dead_code)]
 pub(crate) fn create_temp_armed_exit(
     dir: &Path,
     family: &str,

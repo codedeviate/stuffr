@@ -27,9 +27,10 @@ impl Drop for Dir {
 fn sandbox(dir: &Dir, name: &'static str, args: &[&str]) -> (i32, String, String) {
     let args: Vec<OsString> = args.iter().map(OsString::from).collect();
     let (code, out, err, _) = run_in_counted(&dir.0, name, &args, b"", &|_| None);
+    // Standard output may hold a frame now that compression runs.
     (
         code,
-        String::from_utf8(out).unwrap(),
+        String::from_utf8_lossy(&out).into_owned(),
         String::from_utf8(err).unwrap(),
     )
 }

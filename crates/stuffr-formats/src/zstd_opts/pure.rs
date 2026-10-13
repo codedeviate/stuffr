@@ -8,7 +8,8 @@ use ruzstd::encoding::{CompressionLevel, FrameCompressor};
 
 use super::{
     BLOCKSIZE_MAX, DecodeOptions, EncodeOptions, EndOp, FrameHeader, FrameHeaderError, Progress,
-    TrainParams, Trained, WINDOWLOG_ABSOLUTEMIN, WINDOWLOG_MAX, ZstdError, code, frame_header,
+    StreamCall, TrainParams, Trained, WINDOWLOG_ABSOLUTEMIN, WINDOWLOG_MAX, ZstdError, code,
+    frame_header,
 };
 
 /// The libzstd this tier answers for: `"1.5.7"` (R7).
@@ -83,8 +84,17 @@ impl<W: Write> Write for ChecksumStrip<W> {
 /// frame per `End`; every parameter but the checksum flag is ignored.
 pub struct Encoder {
     buf: Vec<u8>,
+    /// The pledged size of the frame in progress (libzstd forgets it at
+    /// each frame's end).
+    pledged: Option<u64>,
+    /// A call has been made in the frame in progress (libzstd's stream
+    /// stage is past `zcss_init`).
+    started: bool,
     checksum: bool,
     ingested: u64,
+    /// Input compressed so far: a frame's input counts once its `End`
+    /// compresses it.
+    consumed: u64,
     produced: u64,
 }
 
@@ -103,14 +113,20 @@ impl Encoder {
         }
         Ok(Encoder {
             buf: Vec::new(),
+            pledged: o.pledged_size,
+            started: false,
             checksum: o.checksum,
             ingested: 0,
+            consumed: 0,
             produced: 0,
         })
     }
 
-    /// Accepted and ignored: this tier never records a content size.
-    pub fn set_pledged_size(&mut self, _size: Option<u64>) -> Result<(), ZstdError> {
+    /// Never recorded in the frame (this tier writes no content size), but
+    /// held to as libzstd holds a frame to it: a frame of any other size is
+    /// `srcSize_wrong`.
+    pub fn set_pledged_size(&mut self, size: Option<u64>) -> Result<(), ZstdError> {
+        self.pledged = size;
         Ok(())
     }
 
@@ -123,6 +139,53 @@ impl Encoder {
         out: &mut Vec<u8>,
         end: EndOp,
     ) -> Result<usize, ZstdError> {
+        self.compress_stream_each(input, out, end, &mut |_| {})
+    }
+
+    /// [`Encoder::compress_stream`], telling `each` about the one call it
+    /// stands for (all the input taken, the frame produced at
+    /// [`EndOp::End`]).
+    pub fn compress_stream_each(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        end: EndOp,
+        each: &mut dyn FnMut(StreamCall),
+    ) -> Result<usize, ZstdError> {
+        let before_call = out.len();
+        let r = self.compress_inner(input, out, end);
+        if r.is_ok() {
+            each(StreamCall {
+                end,
+                input_pos: input.len(),
+                input_size: input.len(),
+                produced: out.len() - before_call,
+            });
+        }
+        r
+    }
+
+    fn compress_inner(
+        &mut self,
+        input: &[u8],
+        out: &mut Vec<u8>,
+        end: EndOp,
+    ) -> Result<usize, ZstdError> {
+        // ZSTD_CCtx_init_compressStream2: a frame whose first call ends it
+        // takes that call's input size as its pledge, whatever was pledged.
+        if !self.started && end == EndOp::End {
+            self.pledged = None;
+        }
+        self.started = true;
+        let taken = (self.buf.len() + input.len()) as u64;
+        if let Some(p) = self.pledged
+            && (taken > p || (end == EndOp::End && taken != p))
+        {
+            self.buf.clear();
+            self.pledged = None;
+            self.started = false;
+            return Err(ZstdError::lib(code::SRC_SIZE_WRONG));
+        }
         self.buf.extend_from_slice(input);
         self.ingested += input.len() as u64;
         if end == EndOp::End {
@@ -138,16 +201,20 @@ impl Encoder {
             }
             strip.finish()?;
             self.produced += (out.len() - before) as u64;
+            self.consumed = self.ingested;
             self.buf.clear();
+            self.pledged = None;
+            self.started = false;
         }
         Ok(0)
     }
 
-    /// Bytes taken and frame bytes produced; this tier has no workers.
+    /// Bytes taken, bytes compressed (a frame's, once its `End` has run)
+    /// and frame bytes produced; this tier has no workers.
     pub fn progression(&self) -> Progress {
         Progress {
             ingested: self.ingested,
-            consumed: self.ingested,
+            consumed: self.consumed,
             produced: self.produced,
             flushed: self.produced,
             current_job_id: 0,
@@ -225,6 +292,10 @@ enum State {
         block_max: u64,
         produced: u64,
     },
+    /// After a frame's last block, gathering its four-byte content
+    /// checksum (libzstd's `ZSTDds_checkChecksum`): the block's output is
+    /// already out.
+    Checksum,
 }
 
 /// `ruzstd`'s `FrameDecoder` in a frame loop that answers as
@@ -415,9 +486,16 @@ impl Decoder {
                         return Err(ZstdError::lib(code::CORRUPTION_DETECTED));
                     }
                     let wire = if block_type == 1 { 1 } else { size as usize };
-                    let want = 3 + wire + if last && checksum { 4 } else { 0 };
+                    let want = 3 + wire;
                     if !self.gather(input, &mut used, want) {
                         return Ok((used, want - self.pending.len()));
+                    }
+                    if last && checksum {
+                        // `ruzstd` reads the checksum with the last block;
+                        // libzstd outputs the block first and then waits
+                        // for it, so it is checked by hand
+                        // (`State::Checksum`) and `ruzstd` gets a stand-in.
+                        self.pending.extend_from_slice(&[0; 4]);
                     }
                     let mut src = self.pending.as_slice();
                     self.fd
@@ -448,9 +526,29 @@ impl Decoder {
                             code::CORRUPTION_DETECTED
                         }));
                     }
-                    if checksum
-                        && !self.ignore_checksum
-                        && crate::zstd_pure::checksum_mismatch(&self.fd).is_some()
+                    if checksum {
+                        self.state = State::Checksum;
+                        continue;
+                    }
+                    self.state = State::Start;
+                    return Ok((used, 0));
+                }
+                State::Checksum => {
+                    if !self.gather(input, &mut used, 4) {
+                        return Ok((used, 4 - self.pending.len()));
+                    }
+                    let stored = u32::from_le_bytes([
+                        self.pending[0],
+                        self.pending[1],
+                        self.pending[2],
+                        self.pending[3],
+                    ]);
+                    self.pending.clear();
+                    if !self.ignore_checksum
+                        && self
+                            .fd
+                            .get_calculated_checksum()
+                            .is_some_and(|c| c != stored)
                     {
                         return Err(ZstdError::lib(code::CHECKSUM_WRONG));
                     }
