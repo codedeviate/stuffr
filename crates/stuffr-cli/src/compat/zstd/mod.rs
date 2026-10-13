@@ -64,6 +64,12 @@
 //! - `--format=gzip|xz|lzma` write flate2's and `xz_opts`' pure encoders'
 //!   bytes, which the reference decodes (compatible, not identical; the
 //!   summaries' sizes are the tier's own).
+//! - A gzip member's deflate data goes through flate2 (miniz_oxide), which
+//!   accepts some streams zlib refuses (a distance reaching before the
+//!   output, a code with no end of block): where the reference says
+//!   `inflate error -3` and writes nothing, the pure tier can write output
+//!   and fail later (`premature gz end` or `inflate error -3`, exit 1 all
+//!   the same). With `zlib-c` it is zlib's own `inflate`.
 //! - An xz or lzma frame that fails to decode (the xz family's P6 and P9):
 //!   what is written before the error can be a strict prefix of what
 //!   liblzma writes, and corruption in the last bytes of a `.lzma` reads as
@@ -75,8 +81,7 @@
 //! liblzma's with `xz-c`; `--format=lz4` is compatible only on every tier:
 //! `lz4_flex`'s fast compressor at every level, inside liblz4's frame
 //! descriptor (64 KiB linked blocks, content size, content checksum as
-//! fileio.c sets them). A gzip member's deflate data is decoded by flate2
-//! on every tier, its header and trailer checked as zlib checks them.
+//! fileio.c sets them).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};

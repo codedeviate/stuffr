@@ -31,26 +31,35 @@
 //!   `FIO_compressLz4Frame`, whose settings the binary shows).
 //!
 //! **Decompressing.** Each frame is read as fileio.c's loops read it: the
-//! decoder is handed whatever the read pool holds, a whole read job at a
-//! time, and stops exactly at the frame's end, so what follows (another
+//! decoder is called with whatever the read pool holds and a fresh
+//! `ZSTD_DStreamOutSize()` (128 KiB) output buffer, which is written out
+//! after the call unless the call failed (fileio.c loses a failing call's
+//! output); the pool is refilled a job at a time once the input is used
+//! up, and the frame stops exactly at its end, so what follows (another
 //! frame of any kind, stream padding, garbage) goes back to
-//! `FIO_decompressFrames`. Output goes out as each zlib/liblzma/liblz4 call
-//! hands it over, into 128 KiB buffers, and the call that fails loses what
-//! it decoded: here the output a failing job decoded is written in whole
-//! `ZSTD_DStreamOutSize()` buffers and the rest dropped.
+//! `FIO_decompressFrames`. Nothing holds more than a buffer's worth of
+//! decoded output, however well the data compressed.
 //!
-//! - gzip: one member (`inflateInit2(15 + 16)`), the header and trailer
-//!   checked here as zlib checks them (method, reserved flags, the header
-//!   CRC, the CRC-32 and ISIZE), each failure `inflate error -3`, the input
-//!   ending inside the member `premature gz end`. The deflate data is
-//!   flate2's on both tiers (zlib's own inflate is not linked; both reject
-//!   the same malformed streams with `Z_DATA_ERROR`).
+//! - gzip: one member, `inflateInit2(15 + 16)`, `Z_NO_FLUSH` until the
+//!   input is over and `Z_FINISH` after, `Z_BUF_ERROR` printed as
+//!   `premature gz end` and any other failure as `inflate error %d`. On
+//!   the C tier (`zlib-c`) that is zlib itself (`stuffr::zlib_c::Inflate`).
+//!   Off it, the header and trailer are checked here as zlib checks them
+//!   (method, reserved flags, the header CRC, the CRC-32 and ISIZE: `-3`)
+//!   and the deflate data goes through flate2 (miniz_oxide), which accepts
+//!   some streams zlib refuses, a distance reaching before the output and
+//!   a code with no end of block among them: a stated pure-tier deviation.
 //! - xz and lzma: `lzma_stream_decoder(UINT64_MAX, 0)` (one stream, no
 //!   check warnings) and `lzma_alone_decoder(UINT64_MAX)` through
-//!   `stuffr::xz_opts`, the return codes printed as liblzma's numbers.
+//!   `stuffr::xz_opts`, the return codes printed as liblzma's numbers. The
+//!   decoder is fed 256 bytes at a time and what it decodes past the
+//!   output buffer waits for the next call, as liblzma, which decodes
+//!   nothing into a full buffer, leaves it: a full buffer is always handed
+//!   over, and a failure loses only the call's partial one.
 //! - lz4: liblz4 1.10.0's `LZ4F_decompress` frame layer is ported here (its
-//!   checks in its order, its `LZ4F_getErrorName` names), the blocks
-//!   decoded by `lz4_flex`.
+//!   checks in its order, its `LZ4F_getErrorName` names, a block decoded
+//!   with no room left waiting as its `tmpOut` does), the blocks decoded by
+//!   `lz4_flex`.
 //!
 //! **A sandboxed run** (the fuzz target) bounds liblzma's memory whatever
 //! the input or the level says: decoders run under a 256 MiB limit (an
@@ -61,6 +70,7 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::rc::Rc;
 
+#[cfg(not(feature = "zlib-c"))]
 use flate2::{Crc, Decompress, FlushDecompress, Status};
 use stuffr::lz4_frame::{
     BlockMode, BlockSize, FrameEncoder, FrameInfo, decompress_into, decompress_into_with_dict,
@@ -104,7 +114,10 @@ impl FrameCodec for Formats {
         src_name: &[u8],
     ) -> Fio<Option<u64>> {
         match kind {
-            Foreign::Gzip => decode_frame(io, rp, kind, src_name, &mut GzMember::new()),
+            Foreign::Gzip => match gzip_member() {
+                Some(mut dec) => decode_frame(io, rp, kind, src_name, dec.as_mut()),
+                None => Ok(None),
+            },
             Foreign::Lz4 => decode_frame(io, rp, kind, src_name, &mut Lz4Member::new()),
             Foreign::Xz | Foreign::Lzma => {
                 let plain = kind == Foreign::Lzma;
@@ -115,17 +128,7 @@ impl FrameCodec for Formats {
                     ..DecodeOptions::default()
                 };
                 match xz_opts::Decoder::new(&opts) {
-                    Ok(dec) => decode_frame(
-                        io,
-                        rp,
-                        kind,
-                        src_name,
-                        &mut LzmaMember {
-                            dec,
-                            fed: 0,
-                            back: 0,
-                        },
-                    ),
+                    Ok(dec) => decode_frame(io, rp, kind, src_name, &mut LzmaMember::new(dec)),
                     Err(e) => {
                         let what = if plain {
                             m::LZMA_ALONE_DECODER
@@ -497,90 +500,107 @@ enum Fail {
     Unfinished,
 }
 
-/// One frame's decoder, fed a read job at a time.
-trait Member {
-    /// Decodes `input`, appending the output to `out`: `Some(used)` when
-    /// the frame ended after `used` bytes of it, else `None` (all of it
-    /// taken).
-    fn step(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Option<usize>, Fail>;
+/// What one decoder call did: input taken, output made into the caller's
+/// buffer, and whether the frame ended (`Ok(true)`) or failed. The output
+/// of a failing call is lost, as fileio.c loses it.
+struct Call {
+    used: usize,
+    made: usize,
+    r: Result<bool, Fail>,
+}
 
-    /// The input is over inside the frame (zlib's and liblzma's
-    /// `*_FINISH` with nothing left).
-    fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Fail>;
+/// One frame's decoder, a call at a time, as zlib's `inflate`, liblzma's
+/// `lzma_code` and liblz4's `LZ4F_decompress` are called: the input the
+/// read pool holds, an output buffer of `ZSTD_DStreamOutSize()` bytes, and
+/// (zlib and liblzma) whether the input is over (`*_FINISH`).
+trait Coder {
+    fn call(&mut self, input: &[u8], out: &mut [u8], finish: bool) -> Call;
 
-    /// Once the frame has ended: how many bytes of the input fed before
-    /// the call that ended it the frame did not use (the pure tier's LZMA
-    /// decoder reads ahead), to go back to the read pool.
+    /// Once the frame has ended: how many bytes of the input taken by
+    /// earlier calls it did not use (the pure tier's LZMA decoder reads
+    /// ahead), to go back to the read pool.
     fn unused(&self) -> usize {
         0
     }
 }
 
-/// The most input a decoder reads ahead of a frame's end ([`Member::unused`];
-/// `lzma-rust2` reads up to 40 bytes).
+/// The most input a decoder reads ahead of a frame's end
+/// ([`Coder::unused`]; `lzma-rust2` reads up to 40 bytes).
 const READ_AHEAD: usize = 64;
 
-/// The frame loops of `FIO_decompressGzFrame`, `FIO_decompressLzmaFrame`
-/// and `FIO_decompressLz4Frame`: the decoded size, or `None` for
-/// `FIO_ERROR_FRAME_DECODING` (said).
+/// The frame loops of `FIO_decompressGzFrame` and `FIO_decompressLzmaFrame`
+/// (`lz4` false) and `FIO_decompressLz4Frame` (`lz4` true): the decoded
+/// size, or `None` for `FIO_ERROR_FRAME_DECODING` (said). Each call gets a
+/// fresh `ZSTD_DStreamOutSize()` buffer, written out after it unless the
+/// call failed.
 fn decode_frame(
     io: &mut Io<'_>,
     rp: &mut ReadPool,
     kind: Foreign,
     src: &[u8],
-    dec: &mut dyn Member,
+    dec: &mut dyn Coder,
 ) -> Fio<Option<u64>> {
-    let progress = kind == Foreign::Lz4;
+    let lz4 = kind == Foreign::Lz4;
+    let mut buf = vec![0u8; DSTREAM_OUT_SIZE];
     let mut total = 0u64;
-    let mut out = Vec::new();
     // The last bytes consumed, for a decoder that read ahead of its end.
     let mut tail: Vec<u8> = Vec::new();
-    let give_back = |rp: &mut ReadPool, tail: &[u8], dec: &dyn Member| {
+    let keep_tail = |rp: &ReadPool, n: usize, tail: &mut Vec<u8>| {
+        tail.extend_from_slice(&rp.loaded()[n.saturating_sub(READ_AHEAD)..n]);
+        if tail.len() > READ_AHEAD {
+            tail.drain(..tail.len() - READ_AHEAD);
+        }
+    };
+    let mut pos = 0;
+    let mut finish = false;
+    // lz4's `fullBufferDecoded`: call again before reading more.
+    let mut full = false;
+    let failed = loop {
+        if pos == rp.loaded().len() && !(lz4 && full) {
+            // `AIO_ReadPool_consumeAndRefill` (lz4: `consumeBytes` after
+            // the inner loop, then `fillBuffer(nextToLoad)`).
+            keep_tail(rp, pos, &mut tail);
+            rp.consume(pos);
+            pos = 0;
+            io.fill(rp, DSTREAM_IN_SIZE)?;
+            if rp.loaded().is_empty() {
+                if lz4 {
+                    break Some(Fail::Unfinished);
+                }
+                finish = true;
+            }
+        }
+        let c = dec.call(&rp.loaded()[pos..], &mut buf, finish);
+        pos += c.used;
+        full = c.made == buf.len();
+        match c.r {
+            Err(f) => break Some(f),
+            Ok(ended) => {
+                if c.made > 0 {
+                    io.write_block(&buf[..c.made])?;
+                    total += c.made as u64;
+                    if lz4 {
+                        let h = io.human(total).plain();
+                        io.display_update_progress(m::LZ4_PROGRESS, &[h.as_bytes()]);
+                    }
+                }
+                if ended {
+                    break None;
+                }
+                if !lz4 && c.used == 0 && c.made == 0 && finish {
+                    // No progress with nothing left: the input is over.
+                    break Some(Fail::BufError);
+                }
+            }
+        }
+    };
+    rp.consume(pos);
+    if failed.is_none() {
         let back = dec.unused().min(tail.len());
         if back > 0 {
             rp.give_back(&tail[tail.len() - back..]);
         }
-    };
-    let failed = loop {
-        if rp.loaded().is_empty() {
-            io.fill(rp, DSTREAM_IN_SIZE)?;
-            if rp.loaded().is_empty() {
-                match dec.finish(&mut out) {
-                    Ok(()) => {
-                        give_back(rp, &tail, dec);
-                        emit(io, &out, progress, &mut total)?;
-                        break None;
-                    }
-                    Err(f) => {
-                        emit_failed(io, &out, kind, &mut total)?;
-                        break Some(f);
-                    }
-                }
-            }
-        }
-        let n = rp.loaded().len();
-        match dec.step(rp.loaded(), &mut out) {
-            Ok(None) => {
-                tail.extend_from_slice(&rp.loaded()[n.saturating_sub(READ_AHEAD)..]);
-                if tail.len() > READ_AHEAD {
-                    tail.drain(..tail.len() - READ_AHEAD);
-                }
-                rp.consume(n);
-                emit(io, &out, progress, &mut total)?;
-                out.clear();
-            }
-            Ok(Some(used)) => {
-                rp.consume(used);
-                give_back(rp, &tail, dec);
-                emit(io, &out, progress, &mut total)?;
-                break None;
-            }
-            Err(f) => {
-                emit_failed(io, &out, kind, &mut total)?;
-                break Some(f);
-            }
-        }
-    };
+    }
     io.sparse_end()?;
     let Some(f) = failed else {
         return Ok(Some(total));
@@ -609,36 +629,50 @@ fn decode_frame(
     Ok(None)
 }
 
-/// Writes a job's output as the decoders hand it over, in
-/// `ZSTD_DStreamOutSize()` buffers (with lz4's progress line per buffer).
-fn emit(io: &mut Io<'_>, out: &[u8], progress: bool, total: &mut u64) -> Fio<()> {
-    for chunk in out.chunks(DSTREAM_OUT_SIZE) {
-        io.write_block(chunk)?;
-        *total += chunk.len() as u64;
-        if progress {
-            let h = io.human(*total).plain();
-            io.display_update_progress(m::LZ4_PROGRESS, &[h.as_bytes()]);
-        }
+// ---- gzip members ----
+
+/// zlib's `Z_DATA_ERROR`.
+#[cfg(not(feature = "zlib-c"))]
+const Z_DATA_ERROR: i32 = -3;
+
+/// A gzip member through zlib itself (`inflateInit2(15 + 16)`), on the C
+/// tier: each call is one `inflate(Z_NO_FLUSH)`, or `inflate(Z_FINISH)`
+/// once the input is over, read as `FIO_decompressGzFrame` reads its
+/// return code.
+#[cfg(feature = "zlib-c")]
+struct ZlibMember(stuffr::zlib_c::Inflate);
+
+#[cfg(feature = "zlib-c")]
+impl Coder for ZlibMember {
+    fn call(&mut self, input: &[u8], out: &mut [u8], finish: bool) -> Call {
+        let (used, made, rc) = self.0.call(input, out, finish);
+        let r = match rc {
+            0 => Ok(false),
+            1 => Ok(true),
+            -5 => Err(Fail::BufError),
+            rc => Err(Fail::Code(rc)),
+        };
+        Call { used, made, r }
     }
-    Ok(())
 }
 
-/// What a failing job got out: the buffers filled by the calls before the
-/// failing one, whose own output is lost. zlib and liblz4 go on checking
-/// past a full buffer (an end of block, a trailer, a corrupt code or block
-/// needs no room), so the call that fills the last buffer can be the one
-/// that fails; liblzma decodes nothing once the buffer is full, so a
-/// filled buffer is always handed over.
-fn emit_failed(io: &mut Io<'_>, out: &[u8], kind: Foreign, total: &mut u64) -> Fio<()> {
-    let b = DSTREAM_OUT_SIZE;
-    let keep = match kind {
-        Foreign::Xz | Foreign::Lzma => out.len() / b * b,
-        Foreign::Gzip | Foreign::Lz4 => out.len().saturating_sub(1) / b * b,
-    };
-    emit(io, &out[..keep], kind == Foreign::Lz4, total)
+/// The gzip member decoder of this build.
+#[cfg(feature = "zlib-c")]
+fn gzip_member() -> Option<Box<dyn Coder>> {
+    // `inflateInit2` failing is `FIO_ERROR_FRAME_DECODING`, unsaid.
+    stuffr::zlib_c::Inflate::new(15 + 16)
+        .ok()
+        .map(|z| Box::new(ZlibMember(z)) as Box<dyn Coder>)
+}
+
+/// The gzip member decoder of this build.
+#[cfg(not(feature = "zlib-c"))]
+fn gzip_member() -> Option<Box<dyn Coder>> {
+    Some(Box::new(GzMember::new()))
 }
 
 /// Where a gzip member is.
+#[cfg(not(feature = "zlib-c"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GzSt {
     Head,
@@ -652,8 +686,12 @@ enum GzSt {
     Done,
 }
 
-/// One gzip member, read as zlib's `inflate` (`windowBits` 15 + 16) reads
-/// it.
+/// One gzip member off the C tier: the header and trailer checked here as
+/// zlib's `inflate` (`windowBits` 15 + 16) checks them, the deflate data
+/// through flate2 (miniz_oxide), which accepts some streams zlib refuses
+/// (a distance reaching before the output, a code with no end of block):
+/// a stated pure-tier deviation.
+#[cfg(not(feature = "zlib-c"))]
 struct GzMember {
     st: GzSt,
     /// Bytes into the current field.
@@ -668,9 +706,7 @@ struct GzMember {
     crc: Crc,
 }
 
-/// zlib's `Z_DATA_ERROR`.
-const Z_DATA_ERROR: i32 = -3;
-
+#[cfg(not(feature = "zlib-c"))]
 impl GzMember {
     fn new() -> Self {
         GzMember {
@@ -785,99 +821,191 @@ impl GzMember {
         Ok(())
     }
 
-    /// Inflates from `input`; returns the bytes taken.
-    fn body(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<usize, Fail> {
-        let mut used = 0;
+    /// One `decompress` from `input` into `out`: (taken, made).
+    fn body(&mut self, input: &[u8], out: &mut [u8]) -> Result<(usize, usize), Fail> {
+        let (before_in, before_out) = (self.inflate.total_in(), self.inflate.total_out());
+        let st = self
+            .inflate
+            .decompress(input, out, FlushDecompress::None)
+            .map_err(|_| Fail::Code(Z_DATA_ERROR))?;
+        let took = (self.inflate.total_in() - before_in) as usize;
+        let made = (self.inflate.total_out() - before_out) as usize;
+        self.crc.update(&out[..made]);
+        if st == Status::StreamEnd {
+            self.st = GzSt::Trailer;
+            self.at = 0;
+        }
+        Ok((took, made))
+    }
+
+    fn run(
+        &mut self,
+        input: &[u8],
+        out: &mut [u8],
+        used: &mut usize,
+        made: &mut usize,
+    ) -> Result<bool, Fail> {
         loop {
-            out.reserve(DSTREAM_OUT_SIZE);
-            let start = out.len();
-            let room = out.capacity() - start;
-            let before = self.inflate.total_in();
-            let st = self
-                .inflate
-                .decompress_vec(&input[used..], out, FlushDecompress::None)
-                .map_err(|_| Fail::Code(Z_DATA_ERROR))?;
-            let took = (self.inflate.total_in() - before) as usize;
-            used += took;
-            let made = out.len() - start;
-            self.crc.update(&out[start..]);
-            if st == Status::StreamEnd {
-                self.st = GzSt::Trailer;
-                self.at = 0;
-                return Ok(used);
-            }
-            if used == input.len() && made < room {
-                return Ok(used);
-            }
-            if took == 0 && made == 0 {
-                // No progress with input and room: not a deflate stream.
-                return Err(Fail::Code(Z_DATA_ERROR));
+            match self.st {
+                GzSt::Done => return Ok(true),
+                GzSt::Body => {
+                    if *made == out.len() {
+                        return Ok(false);
+                    }
+                    let (took, n) = self.body(&input[*used..], &mut out[*made..])?;
+                    *used += took;
+                    *made += n;
+                    if took == 0 && n == 0 && self.st == GzSt::Body {
+                        if *used == input.len() {
+                            return Ok(false);
+                        }
+                        // No progress with input and room: not deflate.
+                        return Err(Fail::Code(Z_DATA_ERROR));
+                    }
+                }
+                _ => {
+                    let Some(&b) = input.get(*used) else {
+                        return Ok(false);
+                    };
+                    self.byte(b)?;
+                    *used += 1;
+                }
             }
         }
     }
 }
 
-impl Member for GzMember {
-    fn step(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Option<usize>, Fail> {
-        let mut i = 0;
-        while i < input.len() && self.st != GzSt::Done {
-            if self.st == GzSt::Body {
-                i += self.body(&input[i..], out)?;
-            } else {
-                self.byte(input[i])?;
-                i += 1;
-            }
-        }
-        Ok((self.st == GzSt::Done).then_some(i))
-    }
-
-    fn finish(&mut self, _out: &mut Vec<u8>) -> Result<(), Fail> {
-        if self.st == GzSt::Done {
-            Ok(())
-        } else {
-            Err(Fail::BufError)
-        }
+#[cfg(not(feature = "zlib-c"))]
+impl Coder for GzMember {
+    fn call(&mut self, input: &[u8], out: &mut [u8], finish: bool) -> Call {
+        let (mut used, mut made) = (0, 0);
+        let r = match self.run(input, out, &mut used, &mut made) {
+            // `inflate(Z_FINISH)` short of the end is `Z_BUF_ERROR`.
+            Ok(false) if finish => Err(Fail::BufError),
+            r => r,
+        };
+        Call { used, made, r }
     }
 }
 
-/// One xz stream or `.lzma` file through liblzma.
+// ---- xz and lzma streams ----
+
+/// How much input is handed to `xz_opts::Decoder` at once: small enough
+/// that what it decodes from one piece stays a few MiB however well the
+/// data compressed.
+const LZMA_PIECE: usize = 256;
+
+/// One xz stream or `.lzma` file through `xz_opts` (liblzma on the C tier),
+/// called as `lzma_code` is: liblzma decodes nothing once the output buffer
+/// is full, so a full buffer is always handed over, and a failure loses
+/// only the call's partial buffer. The decoder is fed [`LZMA_PIECE`] bytes
+/// at a time; what it decoded past the buffer waits in `pending`.
 struct LzmaMember {
     dec: xz_opts::Decoder,
-    /// Bytes handed to the decoder before this job.
+    /// Bytes handed to the decoder so far.
     fed: u64,
-    /// [`Member::unused`].
+    pending: Vec<u8>,
+    pend_at: usize,
+    /// A failure met while `pending` still held full buffers.
+    failed: Option<Fail>,
+    /// [`Coder::unused`].
     back: usize,
 }
 
 impl LzmaMember {
+    fn new(dec: xz_opts::Decoder) -> Self {
+        LzmaMember {
+            dec,
+            fed: 0,
+            pending: Vec::new(),
+            pend_at: 0,
+            failed: None,
+            back: 0,
+        }
+    }
+
     fn fail(e: &XzError) -> Fail {
         match e {
             XzError::BufError => Fail::BufError,
             e => Fail::Code(lzma_ret(e)),
         }
     }
+
+    /// Moves pending output into `out[made..]`.
+    fn flush(&mut self, out: &mut [u8], made: &mut usize) {
+        let n = (self.pending.len() - self.pend_at).min(out.len() - *made);
+        out[*made..*made + n].copy_from_slice(&self.pending[self.pend_at..self.pend_at + n]);
+        self.pend_at += n;
+        *made += n;
+        if self.pend_at == self.pending.len() {
+            self.pending.clear();
+            self.pend_at = 0;
+        }
+    }
 }
 
-impl Member for LzmaMember {
-    fn step(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Option<usize>, Fail> {
-        self.dec.feed(input, out).map_err(|e| Self::fail(&e))?;
-        if self.dec.finished() {
-            let used = self.dec.progress().in_bytes;
-            self.back = self.fed.saturating_sub(used) as usize;
-            let used = used.saturating_sub(self.fed);
-            return Ok(Some((used as usize).min(input.len())));
-        }
-        self.fed += input.len() as u64;
-        Ok(None)
-    }
-
-    fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), Fail> {
-        self.dec.finish(out).map_err(|e| Self::fail(&e))?;
-        if self.dec.finished() {
-            self.back = self.fed.saturating_sub(self.dec.progress().in_bytes) as usize;
-            Ok(())
-        } else {
-            Err(Fail::BufError)
+impl Coder for LzmaMember {
+    fn call(&mut self, input: &[u8], out: &mut [u8], finish: bool) -> Call {
+        let (mut used, mut made) = (0, 0);
+        loop {
+            self.flush(out, &mut made);
+            if made == out.len() {
+                return Call {
+                    used,
+                    made,
+                    r: Ok(false),
+                };
+            }
+            if let Some(f) = self.failed.take() {
+                // The rest of the decoded output does not fill a buffer:
+                // liblzma's failing call loses it.
+                return Call {
+                    used,
+                    made,
+                    r: Err(f),
+                };
+            }
+            if self.dec.finished() {
+                return Call {
+                    used,
+                    made,
+                    r: Ok(true),
+                };
+            }
+            let r = if used < input.len() {
+                let piece = &input[used..(used + LZMA_PIECE).min(input.len())];
+                let r = self.dec.feed(piece, &mut self.pending);
+                if self.dec.finished() {
+                    let in_bytes = self.dec.progress().in_bytes;
+                    let before = self.fed;
+                    self.back = before.saturating_sub(in_bytes) as usize;
+                    used += in_bytes.saturating_sub(before) as usize;
+                    self.fed = in_bytes.max(before);
+                } else {
+                    used += piece.len();
+                    self.fed += piece.len() as u64;
+                }
+                r
+            } else if finish {
+                let r = self.dec.finish(&mut self.pending);
+                if r.is_ok() && !self.dec.finished() {
+                    Err(XzError::BufError)
+                } else {
+                    if self.dec.finished() {
+                        self.back = self.fed.saturating_sub(self.dec.progress().in_bytes) as usize;
+                    }
+                    r
+                }
+            } else {
+                return Call {
+                    used,
+                    made,
+                    r: Ok(false),
+                };
+            };
+            if let Err(e) = r {
+                self.failed = Some(Self::fail(&e));
+            }
         }
     }
 
@@ -885,6 +1013,8 @@ impl Member for LzmaMember {
         self.back
     }
 }
+
+// ---- lz4 frames ----
 
 /// Where an LZ4 frame is (`dStage`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -900,7 +1030,9 @@ enum L4 {
     Done,
 }
 
-/// One LZ4 frame, read as liblz4 1.10.0's `LZ4F_decompress` reads it.
+/// One LZ4 frame, read as liblz4 1.10.0's `LZ4F_decompress` reads it: a
+/// block decoded while the output buffer has no room waits in `pending`
+/// (liblz4's `tmpOut`), and the call stops there.
 struct Lz4Member {
     st: L4,
     /// The bytes of the unit being gathered (header, block header, block,
@@ -920,7 +1052,8 @@ struct Lz4Member {
     block_hash: Xxh32,
     /// The last 64 KiB of output (linked blocks' dictionary).
     dict: Vec<u8>,
-    block_out: Vec<u8>,
+    pending: Vec<u8>,
+    pend_at: usize,
 }
 
 impl Lz4Member {
@@ -940,7 +1073,8 @@ impl Lz4Member {
             content_hash: Xxh32::new(0),
             block_hash: Xxh32::new(0),
             dict: Vec::new(),
-            block_out: Vec::new(),
+            pending: Vec::new(),
+            pend_at: 0,
         }
     }
 
@@ -953,8 +1087,7 @@ impl Lz4Member {
     }
 
     /// Decoded bytes: counted, hashed and kept for the next linked block.
-    fn produced(&mut self, data: &[u8], out: &mut Vec<u8>) {
-        out.extend_from_slice(data);
+    fn produced(&mut self, data: &[u8]) {
         self.decoded += data.len() as u64;
         if self.content_checksum {
             self.content_hash.update(data);
@@ -964,6 +1097,18 @@ impl Lz4Member {
             if self.dict.len() > 2 * LZ4_BLOCK {
                 self.dict.drain(..self.dict.len() - LZ4_BLOCK);
             }
+        }
+    }
+
+    /// Moves pending output into `out[made..]`.
+    fn flush(&mut self, out: &mut [u8], made: &mut usize) {
+        let n = (self.pending.len() - self.pend_at).min(out.len() - *made);
+        out[*made..*made + n].copy_from_slice(&self.pending[self.pend_at..self.pend_at + n]);
+        self.pend_at += n;
+        *made += n;
+        if self.pend_at == self.pending.len() {
+            self.pending.clear();
+            self.pend_at = 0;
         }
     }
 
@@ -1021,18 +1166,27 @@ impl Lz4Member {
         };
         Ok(())
     }
-}
 
-impl Member for Lz4Member {
-    fn step(&mut self, input: &[u8], out: &mut Vec<u8>) -> Result<Option<usize>, Fail> {
-        let mut i = 0;
+    /// `LZ4F_decompress`'s stages until the input runs out, the output is
+    /// full with a block waiting, or the frame ends (`Ok(true)`).
+    fn run(
+        &mut self,
+        input: &[u8],
+        out: &mut [u8],
+        i: &mut usize,
+        made: &mut usize,
+    ) -> Result<bool, Fail> {
         loop {
+            self.flush(out, made);
+            if self.pend_at < self.pending.len() {
+                return Ok(false);
+            }
             match self.st {
-                L4::Done => return Ok(Some(i)),
+                L4::Done => return Ok(true),
                 L4::Header => {
                     let need = if self.fhs == 0 { 7 } else { self.fhs };
-                    if !self.gather(input, &mut i, need) {
-                        return Ok(None);
+                    if !self.gather(input, i, need) {
+                        return Ok(false);
                     }
                     let had = self.fhs;
                     self.header()?;
@@ -1042,8 +1196,8 @@ impl Member for Lz4Member {
                     }
                 }
                 L4::BlockHeader => {
-                    if !self.gather(input, &mut i, 4) {
-                        return Ok(None);
+                    if !self.gather(input, i, 4) {
+                        return Ok(false);
                     }
                     let word = u32::from_le_bytes(self.buf[..4].try_into().expect("four"));
                     self.buf.clear();
@@ -1065,16 +1219,19 @@ impl Member for Lz4Member {
                     }
                 }
                 L4::Copy => {
-                    let take = self.left.min(input.len() - i);
+                    // `dstage_copyDirect`: as much as both sides allow.
+                    let take = self.left.min(input.len() - *i).min(out.len() - *made);
                     if take == 0 {
-                        return Ok(None);
+                        return Ok(false);
                     }
-                    let data = &input[i..i + take];
+                    let data = &input[*i..*i + take];
                     if self.block_checksum {
                         self.block_hash.update(data);
                     }
-                    self.produced(data, out);
-                    i += take;
+                    out[*made..*made + take].copy_from_slice(data);
+                    self.produced(data);
+                    *i += take;
+                    *made += take;
                     self.left -= take;
                     if self.left == 0 {
                         self.st = if self.block_checksum {
@@ -1085,8 +1242,8 @@ impl Member for Lz4Member {
                     }
                 }
                 L4::BlockCrc => {
-                    if !self.gather(input, &mut i, 4) {
-                        return Ok(None);
+                    if !self.gather(input, i, 4) {
+                        return Ok(false);
                     }
                     let want = u32::from_le_bytes(self.buf[..4].try_into().expect("four"));
                     self.buf.clear();
@@ -1097,8 +1254,8 @@ impl Member for Lz4Member {
                 }
                 L4::Block => {
                     let need = self.size + if self.block_checksum { 4 } else { 0 };
-                    if !self.gather(input, &mut i, need) {
-                        return Ok(None);
+                    if !self.gather(input, i, need) {
+                        return Ok(false);
                     }
                     let data = std::mem::take(&mut self.buf);
                     let block = &data[..self.size];
@@ -1108,7 +1265,7 @@ impl Member for Lz4Member {
                             return Err(Fail::Lz4(m::LZ4F_BLOCK_CHECKSUM_INVALID));
                         }
                     }
-                    let mut dec = std::mem::take(&mut self.block_out);
+                    let mut dec = std::mem::take(&mut self.pending);
                     dec.resize(self.max_block, 0);
                     let r = if self.linked {
                         let at = self.dict.len().saturating_sub(LZ4_BLOCK);
@@ -1117,13 +1274,17 @@ impl Member for Lz4Member {
                         decompress_into(block, &mut dec)
                     };
                     let n = r.map_err(|_| Fail::Lz4(m::LZ4F_DECOMPRESSION_FAILED))?;
-                    self.produced(&dec[..n], out);
-                    self.block_out = dec;
+                    dec.truncate(n);
+                    self.produced(&dec);
+                    self.pending = dec;
+                    self.pend_at = 0;
+                    self.buf = data;
+                    self.buf.clear();
                     self.st = L4::BlockHeader;
                 }
                 L4::Suffix => {
-                    if !self.gather(input, &mut i, 4) {
-                        return Ok(None);
+                    if !self.gather(input, i, 4) {
+                        return Ok(false);
                     }
                     let want = u32::from_le_bytes(self.buf[..4].try_into().expect("four"));
                     self.buf.clear();
@@ -1135,13 +1296,13 @@ impl Member for Lz4Member {
             }
         }
     }
+}
 
-    fn finish(&mut self, _out: &mut Vec<u8>) -> Result<(), Fail> {
-        if self.st == L4::Done {
-            Ok(())
-        } else {
-            Err(Fail::Unfinished)
-        }
+impl Coder for Lz4Member {
+    fn call(&mut self, input: &[u8], out: &mut [u8], _finish: bool) -> Call {
+        let (mut used, mut made) = (0, 0);
+        let r = self.run(input, out, &mut used, &mut made);
+        Call { used, made, r }
     }
 }
 
@@ -1288,8 +1449,31 @@ mod tests {
         assert_eq!((xxh32(&[0x44, 0x40], 0) >> 8) as u8, 0x5e);
     }
 
+    /// Drives `dec` over `input` handed over `piece` bytes at a time, into
+    /// an output buffer of `room` bytes, until the frame ends: (input used,
+    /// output).
+    fn drive(dec: &mut dyn Coder, input: &[u8], piece: usize, room: usize) -> (usize, Vec<u8>) {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; room];
+        let (mut at, mut end) = (0, piece.min(input.len()));
+        loop {
+            let c = dec.call(&input[at..end], &mut buf, false);
+            out.extend_from_slice(&buf[..c.made]);
+            at += c.used;
+            match c.r {
+                Err(_) => panic!("piece {piece}, room {room}: failed"),
+                Ok(true) => return (at, out),
+                Ok(false) => {}
+            }
+            if at == end && c.made < room {
+                assert!(end < input.len(), "piece {piece}, room {room}: ran out");
+                end = (end + piece).min(input.len());
+            }
+        }
+    }
+
     /// An lz4 frame of `lz4_flex`'s (linked, checksummed) decodes here
-    /// whole, in any job sizes, and stops at its end.
+    /// whole, in any input pieces and output rooms, and stops at its end.
     #[test]
     fn lz4_frames_decode_in_any_pieces() {
         let data: Vec<u8> = (0..300_000u32)
@@ -1307,25 +1491,16 @@ mod tests {
         let mut frame = sink.take();
         let len = frame.len();
         frame.extend_from_slice(b"tail");
-        for piece in [1, 7, 4096, 1 << 20] {
-            let mut d = Lz4Member::new();
-            let mut out = Vec::new();
-            let mut at = 0;
-            let used = loop {
-                let end = (at + piece).min(frame.len());
-                match d.step(&frame[at..end], &mut out) {
-                    Ok(Some(u)) => break at + u,
-                    Ok(None) => at = end,
-                    Err(_) => panic!("piece {piece}: failed"),
-                }
-            };
+        for (piece, room) in [(1, 1000), (7, 70_000), (4096, 128 << 10), (1 << 20, 3)] {
+            let (used, out) = drive(&mut Lz4Member::new(), &frame, piece, room);
             assert_eq!(used, len, "piece {piece}");
             assert!(out == data, "piece {piece}: output differs");
         }
     }
 
     /// A gzip member of flate2's, with every optional header field,
-    /// decodes in any job sizes and stops at its trailer.
+    /// decodes in any input pieces and output rooms and stops at its
+    /// trailer, through this build's gzip decoder.
     #[test]
     fn gzip_members_decode_in_any_pieces() {
         let data = b"hello hello hello gzip\n".repeat(500);
@@ -1338,20 +1513,42 @@ mod tests {
         let mut v = gz.finish().unwrap();
         let len = v.len();
         v.extend_from_slice(b"next");
-        for piece in [1, 3, 64, 1 << 20] {
-            let mut d = GzMember::new();
-            let mut out = Vec::new();
-            let mut at = 0;
-            let used = loop {
-                let end = (at + piece).min(v.len());
-                match d.step(&v[at..end], &mut out) {
-                    Ok(Some(u)) => break at + u,
-                    Ok(None) => at = end,
-                    Err(_) => panic!("piece {piece}: failed"),
-                }
-            };
+        for (piece, room) in [(1, 100), (3, 7), (64, 128 << 10), (1 << 20, 1)] {
+            let mut dec = gzip_member().expect("inflateInit2");
+            let (used, out) = drive(dec.as_mut(), &v, piece, room);
             assert_eq!(used, len, "piece {piece}");
             assert_eq!(out, data, "piece {piece}");
         }
+    }
+
+    /// An xz stream of 8 MiB of zeros decodes through output buffers of
+    /// 128 KiB without holding more than a few MiB at a time.
+    #[test]
+    fn lzma_output_waits_in_bounded_pieces() {
+        let data = vec![0u8; 8 << 20];
+        let mut enc = xz_opts::Encoder::new(&EncodeOptions::default()).unwrap();
+        let mut xz = Vec::new();
+        enc.feed(&data, &mut xz).unwrap();
+        enc.finish(&mut xz).unwrap();
+        let opts = DecodeOptions {
+            single_stream: true,
+            ..DecodeOptions::default()
+        };
+        let mut dec = LzmaMember::new(xz_opts::Decoder::new(&opts).unwrap());
+        let mut buf = vec![0u8; DSTREAM_OUT_SIZE];
+        let (mut at, mut total, mut most) = (0, 0, 0);
+        loop {
+            let c = dec.call(&xz[at..], &mut buf, false);
+            at += c.used;
+            total += c.made;
+            most = most.max(dec.pending.capacity());
+            assert!(buf[..c.made].iter().all(|&b| b == 0));
+            if matches!(c.r, Ok(true)) {
+                break;
+            }
+            assert!(c.r.is_ok());
+        }
+        assert_eq!((at, total), (xz.len(), data.len()));
+        assert!(most < 8 << 20, "pending grew to {most} bytes");
     }
 }

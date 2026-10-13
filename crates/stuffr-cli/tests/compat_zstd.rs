@@ -278,15 +278,19 @@ mod unix {
         }
     }
 
-    /// Whether `c` decodes an xz or lzma frame: an operand named so, or
-    /// standard input opening with either's magic.
+    /// Whether `c` decodes exactly one input and it is xz or lzma: its one
+    /// file named so, or (no files) standard input opening with either's
+    /// magic. A case over several inputs never qualifies, so the tolerance
+    /// below cannot cover another format's output.
     fn decodes_lzma(c: &Case) -> bool {
-        c.files
-            .iter()
-            .any(|(n, _)| n.ends_with(".xz") || n.ends_with(".lzma"))
-            || c.stdin
+        match c.files.as_slice() {
+            [(n, _)] => n.ends_with(".xz") || n.ends_with(".lzma"),
+            [] => c
+                .stdin
                 .as_ref()
-                .is_some_and(|d| d.starts_with(&[0xfd, b'7']) || d.starts_with(&[0x5d, 0]))
+                .is_some_and(|d| d.starts_with(&[0xfd, b'7']) || d.starts_with(&[0x5d, 0])),
+            _ => false,
+        }
     }
 
     /// The pure tier's liblzma port (`xz_opts::pure`; the xz family's P6
@@ -2264,5 +2268,167 @@ mod unix {
         more.extend(inputs.iter().filter(|(n, _)| *n == "cuthalf.gz").cloned());
         cases.push(with_files("zstd", &args, more));
         check("foreign_decompress", &cases);
+    }
+
+    /// Deflate bits, least significant first, as RFC 1951 packs them.
+    #[derive(Default)]
+    struct Bits {
+        out: Vec<u8>,
+        acc: u64,
+        n: u32,
+    }
+
+    impl Bits {
+        /// `n` bits of `v`, least significant first (header fields, extra
+        /// bits).
+        fn put(&mut self, v: u32, n: u32) {
+            self.acc |= u64::from(v) << self.n;
+            self.n += n;
+            while self.n >= 8 {
+                self.out.push(self.acc as u8);
+                self.acc >>= 8;
+                self.n -= 8;
+            }
+        }
+
+        /// A Huffman code of `len` bits, most significant first.
+        fn code(&mut self, code: u32, len: u32) {
+            let rev = code.reverse_bits() >> (32 - len);
+            self.put(rev, len);
+        }
+
+        fn done(mut self) -> Vec<u8> {
+            if self.n > 0 {
+                self.out.push(self.acc as u8);
+            }
+            self.out
+        }
+    }
+
+    /// A gzip member around `deflate` (no name, the trailer of `plain`).
+    fn gz_around(deflate: &[u8], plain: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3];
+        v.extend_from_slice(deflate);
+        v.extend_from_slice(&crc32(plain).to_le_bytes());
+        v.extend_from_slice(&(plain.len() as u32).to_le_bytes());
+        v
+    }
+
+    /// A fixed-Huffman block: one literal `a`, then a match of length 3 at
+    /// distance 5, which reaches before the output's start (zlib: "invalid
+    /// distance too far back"), then the end of block.
+    fn distance_too_far() -> Vec<u8> {
+        let mut b = Bits::default();
+        b.put(1, 1); // BFINAL
+        b.put(1, 2); // BTYPE 01, fixed
+        b.code(0x30 + u32::from(b'a'), 8); // literal 'a'
+        b.code(1, 7); // length symbol 257: 3
+        b.code(4, 5); // distance code 4: 5-6
+        b.put(0, 1); // its extra bit: 5
+        b.code(0, 7); // end of block
+        gz_around(&b.done(), b"aaaa")
+    }
+
+    /// A dynamic block whose literal/length code gives the end-of-block
+    /// symbol no length (zlib: "invalid code -- missing end-of-block"),
+    /// followed by literals.
+    fn missing_end_of_block() -> Vec<u8> {
+        let mut b = Bits::default();
+        b.put(1, 1); // BFINAL
+        b.put(2, 2); // BTYPE 10, dynamic
+        b.put(0, 5); // HLIT: 257 codes
+        b.put(0, 5); // HDIST: 1 code
+        b.put(14, 4); // HCLEN: 18 code-length codes
+        // Code-length code lengths in RFC 1951's order (16, 17, 18, 0, 8,
+        // 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1): 18 gets 1 bit, 0
+        // and 1 get 2.
+        for l in [0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2] {
+            b.put(l, 3);
+        }
+        // Canonical: 18 = `0`, 0 = `10`, 1 = `11`.
+        let zeros = |b: &mut Bits, n: u32| {
+            b.code(0, 1);
+            b.put(n - 11, 7);
+        };
+        zeros(&mut b, 97); // symbols 0-96
+        b.code(3, 2); // 'a': 1
+        b.code(3, 2); // 'b': 1
+        zeros(&mut b, 138); // 99-236
+        zeros(&mut b, 20); // 237-256, the end of block included
+        b.code(2, 2); // the one distance code: 0
+        for _ in 0..64 {
+            b.code(0, 1); // 'a'
+            b.code(1, 1); // 'b'
+        }
+        gz_around(&b.done(), &b"ab".repeat(64))
+    }
+
+    /// Two members zlib refuses and flate2 (miniz_oxide) does not: a
+    /// distance before the output's start, and a code with no end of
+    /// block. With C zlib (`zlib-c`) stuffr answers exactly as the
+    /// reference does (`inflate error -3`, nothing written). Off it, the
+    /// stated pure-tier deviation: the run still fails (exit 1, a gzip
+    /// error line naming the file), but how far it gets differs.
+    #[test]
+    fn gzip_streams_zlib_refuses() {
+        let inputs = [
+            ("far.gz", distance_too_far()),
+            ("noeob.gz", missing_end_of_block()),
+        ];
+        let mut cases = Vec::new();
+        for (name, data) in &inputs {
+            let name: &'static str = name;
+            let files = vec![(name, data.clone())];
+            cases.push(with_files("zstdcat", &[name], files.clone()));
+            cases.push(with_files("zstd", &["-t", name], files.clone()));
+            cases.push(with_files("unzstd", &["-k", name], files.clone()));
+            cases.push(fed(with_files("zstd", &["-d"], Vec::new()), data.clone()));
+        }
+        if cfg!(feature = "zlib-c") {
+            check("gzip_streams_zlib_refuses", &cases);
+            return;
+        }
+        for c in &cases {
+            let s = stuffr_as(c);
+            assert_eq!(s.code, 1, "{} {:?}: {}", c.name, c.args, s.stderr);
+            let name = c.args.last().filter(|_| !c.files.is_empty()).copied();
+            let shown = name.unwrap_or("/*stdin*\\");
+            assert!(
+                s.stderr == format!("zstd: {shown}: inflate error -3 \n")
+                    || s.stderr == format!("zstd: {shown}: premature gz end \n"),
+                "{} {:?}: {:?}",
+                c.name,
+                c.args,
+                s.stderr
+            );
+            if let Some(dir) = zstd_dir()
+                && let Some(r) = reference(dir, c)
+            {
+                assert_eq!(r.code, 1, "reference: {:?}", r.stderr);
+                assert_eq!(r.stderr, format!("zstd: {shown}: inflate error -3 \n"));
+            }
+        }
+    }
+
+    /// 128 MiB of zeros as xz (preset 3, a 4 MiB dictionary) and as gzip
+    /// -9 decode in bounded memory: each decoder call fills one 128 KiB
+    /// buffer, as fileio.c's loops do, however well the data compressed
+    /// (a whole read job's output held at once was 128 MiB here). The
+    /// reference stays under the same bound.
+    #[test]
+    fn foreign_frames_decode_in_bounded_memory() {
+        const N: usize = 128 << 20;
+        if zstd_dir().is_none() {
+            return;
+        }
+        let plain = vec![0u8; N];
+        for (f, level, file) in [("xz", "-3", "zeros.xz"), ("gzip", "-9", "zeros.gz")] {
+            let packed_ = foreign_packed(f, &[level], &plain);
+            let peak = decoder_peak_rss("zstdcat", file, &packed_, &plain, &[("LC_ALL", "C")]);
+            assert!(
+                peak < 48 << 20,
+                "{f}: peak memory {peak} bytes is not under 48 MiB"
+            );
+        }
     }
 }
