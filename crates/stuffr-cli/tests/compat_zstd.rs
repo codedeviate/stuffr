@@ -175,6 +175,12 @@ mod unix {
 
     /// Run every case against the reference and stuffr.
     fn check(group: &str, cases: &[Case]) {
+        check_with(group, cases, |_, _, _| {});
+    }
+
+    /// [`check`], with `extra` normalising both runs (after the common
+    /// normalisation, before the comparison).
+    fn check_with(group: &str, cases: &[Case], extra: fn(&Case, &mut Run, &mut Run)) {
         let one = |c: &Case| -> bool {
             let Some(dir) = zstd_dir() else { return false };
             let Some(mut r) = nodict_reference(dir, c) else {
@@ -196,10 +202,115 @@ mod unix {
             r.stderr = normalise_zstd_progress(&r.stderr);
             s.stderr = normalise_zstd_progress(&s.stderr);
             pure_tier_sizes(c, &mut r, &mut s);
+            extra(c, &mut r, &mut s);
             assert_same(c, &r, &s);
             true
         };
         run_group(group, cases, Skipped::none(), &one);
+    }
+
+    /// The compression progress refreshes zstd throttles by wall clock
+    /// (`READY_FOR_UPDATE`: more than `REFRESH_RATE`, a sixth of a second,
+    /// since the last one). A refresh is `"\r"`, 79 spaces and `"\r"` (the clearing) and then
+    /// `Compress: N/M files. Current: ...` or, from `-v`, `(L#) Buffered:
+    /// ...`, up to the next `\r` or newline. Whether one beyond the first
+    /// appears depends on how long the run took, in the reference and in
+    /// stuffr alike (a loaded machine let the reference draw
+    /// `Compress: 2/2` where stuffr, a moment faster, did not), so every
+    /// refresh but the first is removed from both sides.
+    ///
+    /// Safe because nothing else is lost: the first refresh is
+    /// unconditional (zstd's clock starts at zero) and stays, so a missing,
+    /// extra or different first line still fails; the clearing before each
+    /// result line, the result lines, the summary, the exit code and the
+    /// output bytes are all outside a refresh and compared exactly; and the
+    /// line's own bytes at every counter are pinned against the recorded
+    /// reference by `display.rs`'s fixtures. At `-vv` and above
+    /// (`DISPLAYLEVEL` 4) the gate is open, every refresh is drawn on both
+    /// sides, and nothing is removed.
+    fn throttled_refreshes(c: &Case, r: &mut Run, s: &mut Run) {
+        let always = c
+            .args
+            .iter()
+            .take_while(|a| **a != "--")
+            .any(|a| a.starts_with("-vv") || *a == "--verbose");
+        if !always {
+            r.stderr = drop_later_refreshes(&r.stderr);
+            s.stderr = drop_later_refreshes(&s.stderr);
+        }
+    }
+
+    /// Every compression progress refresh of `t` but the first (see
+    /// [`throttled_refreshes`]).
+    fn drop_later_refreshes(t: &str) -> String {
+        let b = t.as_bytes();
+        let mut clear = vec![b'\r'];
+        clear.extend([b' '; 79]);
+        clear.push(b'\r');
+        let is_refresh = |at: usize| -> bool {
+            let rest = &b[at..];
+            rest.starts_with(&clear) && {
+                let body = &rest[clear.len()..];
+                body.starts_with(b"Compress: ")
+                    || (body.starts_with(b"(L")
+                        && body[2..].iter().position(|c| *c == b')').is_some_and(|n| {
+                            n > 0
+                                && body[2..2 + n].iter().all(u8::is_ascii_digit)
+                                && body[3 + n..].starts_with(b" Buffered:")
+                        }))
+            }
+        };
+        let mut out = Vec::with_capacity(b.len());
+        let mut seen = false;
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'\r' && is_refresh(i) {
+                let end = b[i + clear.len()..]
+                    .iter()
+                    .position(|c| *c == b'\r' || *c == b'\n')
+                    .map_or(b.len(), |n| i + clear.len() + n);
+                if seen {
+                    i = end;
+                    continue;
+                }
+                seen = true;
+                out.extend_from_slice(&b[i..end]);
+                i = end;
+                continue;
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    /// The refresh dropper keeps the first refresh and everything that is
+    /// not one, and touches nothing else.
+    #[test]
+    fn later_refreshes_are_dropped_and_only_they() {
+        let clear = format!("\r{}\r", " ".repeat(79));
+        let r = |body: &str| format!("{clear}{body}");
+        let tail = format!("{clear}a : 6.88% ( 480 B => 33 B, a.zst) \n");
+        let one = format!("{}{tail}", r("Compress: 1/2 files. Current: a Read: 1 B "));
+        let two = format!(
+            "{}{}{tail}",
+            r("Compress: 1/2 files. Current: a Read: 1 B "),
+            r("Compress: 2/2 files. Current: d Read: 1 B ")
+        );
+        assert_eq!(drop_later_refreshes(&two), one);
+        assert_eq!(drop_later_refreshes(&one), one);
+        let v = format!(
+            "{}{}{tail}",
+            r("(L3) Buffered: 0 B"),
+            r("(L3) Buffered: 1 B")
+        );
+        assert_eq!(
+            drop_later_refreshes(&v),
+            format!("{}{tail}", r("(L3) Buffered: 0 B"))
+        );
+        // Not refreshes: the clearing alone, other lines.
+        let other = format!("{tail}{clear}{clear}Decompress: 1/2\nzstd: x\n");
+        assert_eq!(drop_later_refreshes(&other), other);
     }
 
     /// Spec deviation 7 on the pure tier, and `--format=lz4` on either
@@ -3895,7 +4006,7 @@ mod unix {
         ] {
             cases.push(fed(with_files("zstd", args, files.clone()), text()));
         }
-        check("progress_compressing", &cases);
+        check_with("progress_compressing", &cases, throttled_refreshes);
     }
 
     /// Decompressing and testing: the `Decompress: N/M files.` form, the
