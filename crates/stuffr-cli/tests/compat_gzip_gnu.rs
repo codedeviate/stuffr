@@ -267,13 +267,6 @@ mod differential {
         /// NEWS 1.15: "gzip -d no longer rejects PKZIP signatures, local
         /// header, and data descriptors" (row 6).
         ZipDescriptors,
-        /// `-l` of the odd members: an empty one (`-Inf%`, 1.15) or
-        /// several (1.14). One row, at the later release, as first gated.
-        OddMembersList,
-        /// A data descriptor (1.15) and `-l` of two members (1.14) with
-        /// both the CRC and the length wrong. One row, at the later
-        /// release, as first gated.
-        BothWrongNewer,
     }
 
     impl Since {
@@ -289,8 +282,6 @@ mod differential {
                 Since::SuffixMessage => ((1, 15), "`'': invalid suffix` wording"),
                 Since::InfRatio => ((1, 15), "-Inf%"),
                 Since::ZipDescriptors => ((1, 15), "zip data descriptors"),
-                Since::OddMembersList => ((1, 15), "-l of these, -Inf%"),
-                Since::BothWrongNewer => ((1, 15), "a data descriptor, -l of two members"),
             }
         }
 
@@ -2166,13 +2157,18 @@ mod differential {
             .unwrap();
         dd[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
         dd[at + 12..at + 16].copy_from_slice(&99u32.to_le_bytes());
-        // Data descriptors and `-l` on several members are 1.15's (survey
-        // rows 6 and 1).
-        let newer = vec![
+        // A data descriptor is 1.15's (survey row 6), `-l` on several
+        // members 1.14's (row 1).
+        let mut g = Gated::new(cases);
+        g.since(
+            Since::ZipDescriptors,
             dz("gzip", &["-dc", "dd.gz"], vec![("dd.gz", dd)]),
+        );
+        g.since(
+            Since::MultiMember,
             dz("gzip", &["-l", "m.gz"], vec![("m.gz", multi)]),
-        ];
-        let (cases, skipped) = gated(cases, newer, Since::BothWrongNewer);
+        );
+        let (cases, skipped) = g.done();
         check_exact("crc_and_length_both_wrong", &cases, skipped);
     }
 
@@ -2513,8 +2509,7 @@ mod differential {
             ("badhcrc.gz", bad_hcrc),
         ];
         let mut cases = Vec::new();
-        let mut later = Vec::new();
-        let mut several = Vec::new();
+        let mut g_rows: Vec<(Since, Case)> = Vec::new();
         for (file, bytes) in &inputs {
             for args in [
                 &["-d"][..],
@@ -2530,10 +2525,10 @@ mod differential {
                 let c = dz("gzip", &a, vec![(file, bytes.clone())]);
                 // An empty output's ratio is `-Inf%` (1.15, survey row 9).
                 if *file == "ebody.gz" && args.iter().any(|a| a.contains('v')) {
-                    later.push(c);
+                    g_rows.push((Since::InfRatio, c));
                 } else if *file == "cat.gz" && matches!(args, ["-dv" | "-dcv"]) {
                     // `-v`'s ratio counts both members.
-                    several.push(c);
+                    g_rows.push((Since::MultiMember, c));
                 } else {
                     cases.push(c);
                 }
@@ -2542,14 +2537,18 @@ mod differential {
                 let mut a = args.to_vec();
                 a.push(file);
                 // -l on several members (row 1) or an empty output (row 9).
-                later.push(dz("gzip", &a, vec![(file, bytes.clone())]));
+                let c = dz("gzip", &a, vec![(file, bytes.clone())]);
+                match *file {
+                    "cat.gz" | "cat2.gz" => g_rows.push((Since::MultiMember, c)),
+                    "empty.gz" | "ebody.gz" => g_rows.push((Since::InfRatio, c)),
+                    _ => cases.push(c),
+                }
             }
             cases.push(fed(dz("zcat", &[], vec![]), bytes));
         }
         let mut g = Gated::new(cases);
-        g.since_all(Since::OddMembersList, later);
-        for c in several {
-            g.since(Since::MultiMember, c);
+        for (row, c) in g_rows {
+            g.since(row, c);
         }
         let (cases, skipped) = g.done();
         check_exact("odd_members", &cases, skipped);
