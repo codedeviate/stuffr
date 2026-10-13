@@ -247,6 +247,65 @@ mod unix {
 
     // ---- help and version ----
 
+    #[test]
+    fn help_and_version() {
+        let mut cases: Vec<Case> = [
+            &["-h"][..],
+            &["-H"],
+            &["--help"],
+            &["-V"],
+            &["--version"],
+            &["-vV"],
+            &["-qV"],
+            &["-qqV"],
+            &["-Vv"],
+            &["-hV"],
+            &["-Vh"],
+            &["-q", "-h"],
+            &["-qq", "-H"],
+            &["-v", "-H"],
+            &["-19", "-H"],
+            &["-h", "--frob"],
+            &["a", "-h"],
+            &["-p", "-h"],
+        ]
+        .iter()
+        .map(|a| zstd(a))
+        .collect();
+        for name in ["unzstd", "zstdcat", "zstdmt"] {
+            for args in [&["-h"][..], &["-H"], &["-V"], &["-vV"], &["-qV"]] {
+                cases.push(case(name, args));
+            }
+        }
+        check("help_and_version", &cases);
+    }
+
+    /// The help texts and `-V` differ from the reference by exactly what
+    /// R13 and spec deviation 1 say, checked without the comparison's
+    /// normalisation.
+    #[test]
+    fn help_differs_only_by_the_bench_section_and_the_banner() {
+        let Some(dir) = zstd_dir() else { return };
+        let c = zstd(&["-H"]);
+        let Some(r) = reference(dir, &c) else { return };
+        let s = stuffr_as(&c);
+        let reference = String::from_utf8(r.stdout).unwrap();
+        assert!(reference.contains(ZSTD_BENCH_HELP) && reference.contains(ZSTD_TRACE_HELP));
+        let want = strip_bench_help(&reference).replacen(REFERENCE_BANNER, &our_banner(), 1);
+        assert_eq!(String::from_utf8(s.stdout).unwrap(), want);
+        let c = zstd(&["-qV"]);
+        assert_eq!(stuffr_as(&c).stdout, b"1.5.7\n");
+        let c = zstd(&["-vV"]);
+        let s = String::from_utf8(stuffr_as(&c).stdout).unwrap();
+        assert_eq!(
+            s,
+            format!(
+                "{}*** supports: zstd, zstd legacy v0.5+, gzip, lz4, lzma, xz \n",
+                our_banner()
+            )
+        );
+    }
+
     // ---- the environment ----
 
     #[test]
@@ -492,6 +551,58 @@ mod unix {
     }
 
     // ---- --show-default-cparams ----
+
+    /// `--show-default-cparams` refused when decompressing.
+    #[test]
+    fn show_default_cparams_refused_decompressing() {
+        let cases: Vec<Case> = [
+            &["-d", "--show-default-cparams"][..],
+            &["-d", "--show-default-cparams", "a"],
+            &["--show-default-cparams", "-dq"],
+            &["--show-default-cparams", "-dqq"],
+        ]
+        .iter()
+        .map(|a| zstd(a))
+        .collect();
+        check("show_default_cparams_refused_decompressing", &cases);
+    }
+
+    /// The spec's levels and sizes (1, 3, 19, 22; `--ultra`, `--long`,
+    /// `--patch-from` and `-D`).
+    #[test]
+    #[ignore = "Task 5"]
+    fn show_default_cparams() {
+        let sized = |name: &'static str, n: usize| (name, vec![b'x'; n]);
+        let mut cases: Vec<Case> = Vec::new();
+        for level in ["-1", "-3", "-19", "--fast=5"] {
+            cases.push(fed(zstd(&["--show-default-cparams", level]), text()));
+            let mut c = zstd(&["--show-default-cparams", level, "-c", "s1", "s200k", "s1m"]);
+            c.files = vec![
+                sized("s1", 1),
+                sized("s200k", 200_000),
+                sized("s1m", 1 << 20),
+            ];
+            cases.push(c);
+        }
+        for args in [
+            &["--show-default-cparams", "--ultra", "-22", "-c", "s1m"][..],
+            &["--show-default-cparams", "--long", "-c", "s1m"],
+            &[
+                "--show-default-cparams",
+                "--patch-from=d",
+                "-19",
+                "-c",
+                "s1m",
+            ],
+            &["--show-default-cparams", "-D", "d", "-c", "s1m"],
+            &["--show-default-cparams", "-D", "missing", "-c", "s1m"],
+        ] {
+            let mut c = zstd(args);
+            c.files = vec![sized("s1m", 1 << 20), sized("d", 112_640)];
+            cases.push(c);
+        }
+        check("show_default_cparams", &cases);
+    }
 
     // ---- names ----
 

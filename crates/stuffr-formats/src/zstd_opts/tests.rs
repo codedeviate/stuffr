@@ -508,6 +508,13 @@ fn default_cparams_pins() {
         default_cparams(19, Some(100_000), 0),
         p(17, 18, 17, 5, 3, 256, Btultra2)
     );
+    // The CLI's `--show-default-cparams -D missing`: a dictionary of
+    // unknown size is `UTIL_FILESIZE_UNKNOWN`, and libzstd's sums wrap
+    // (`zstd --show-default-cparams -D missing -c` of 5000 bytes).
+    assert_eq!(
+        default_cparams(3, Some(5000), usize::MAX),
+        p(14, 14, 15, 2, 4, 0, Dfast)
+    );
 }
 
 #[test]

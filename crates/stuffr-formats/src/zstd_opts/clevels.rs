@@ -183,19 +183,21 @@ pub(super) fn get_cparams(level: i32, src_size_hint: u64, dict_size: u64) -> CPa
     adjust(c, src_size, dict_size)
 }
 
-/// `ZSTD_dictAndWindowLog`.
+/// `ZSTD_dictAndWindowLog`. The sums are C's `U64` arithmetic, which
+/// wraps: the zstd CLI passes a dictionary file of unknown size as
+/// `UTIL_FILESIZE_UNKNOWN` (`u64::MAX`) to `--show-default-cparams`.
 fn dict_and_window_log(window_log: u32, src_size: u64, dict_size: u64) -> u32 {
     if dict_size == 0 {
         return window_log;
     }
     let window_size = 1u64 << window_log;
-    let dict_and_window = dict_size + window_size;
-    if window_size >= dict_size + src_size {
+    let dict_and_window = dict_size.wrapping_add(window_size);
+    if window_size >= dict_size.wrapping_add(src_size) {
         window_log
     } else if dict_and_window >= 1u64 << WINDOWLOG_MAX {
         WINDOWLOG_MAX
     } else {
-        highbit32((dict_and_window as u32) - 1) + 1
+        highbit32((dict_and_window as u32).wrapping_sub(1)) + 1
     }
 }
 

@@ -60,6 +60,11 @@ const EXIT_1: Stop = Stop {
     clean: false,
     pause: false,
 };
+const CLEAN_0: Stop = Stop {
+    code: 0,
+    clean: true,
+    pause: false,
+};
 
 #[test]
 fn numbers_take_k_and_m_suffixes_and_refuse_overflow() {
@@ -247,6 +252,54 @@ fn benchmark_and_trace_are_refused_as_a_nobench_notrace_build_refuses_them() {
     assert!(ok(&["-p"]).main_pause);
     // `--trace-file-stat` is its own option.
     assert!(ok(&["--trace-file-stat"]).prefs.trace_file_stat);
+}
+
+#[test]
+fn help_and_version_stop_with_0() {
+    let (s, out, err) = stop(&["-h", "-Y"]);
+    assert_eq!((s, out, err), (CLEAN_0, usage_text("zstd"), String::new()));
+    let (s, out, _) = stop(&["-H"]);
+    assert_eq!(s, CLEAN_0);
+    let banner = format!(
+        "*** Zstandard CLI (stuffr {}; zstd 1.5.7 compatible) (64-bit) v1.5.7, by Yann Collet ***\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    assert!(out.starts_with(&format!("{banner}\n{}", usage_text("zstd"))));
+    assert!(out.contains("Advanced options:\n"));
+    assert!(out.ends_with("[Default: Random]\n"), "{out}");
+    assert!(!out.contains("Benchmark options") && !out.contains("--trace"));
+    assert_eq!(stop(&["--help"]).1, out);
+    let (_, cat, _) = run_env("zstdcat", &["-H"], &[]);
+    let line = |v: &str| {
+        let mut l = Vec::new();
+        printf(&mut l, m::ADV_PASS_THROUGH, &[v.as_bytes()]);
+        String::from_utf8(l).unwrap()
+    };
+    assert!(cat.contains(&line("Enabled")) && !cat.contains(&line("Disabled")));
+    assert!(out.contains(&line("Disabled")));
+
+    assert_eq!(stop(&["-V"]).1, banner);
+    assert_eq!(stop(&["--version"]).1, banner);
+    assert_eq!(stop(&["-Vv"]).1, banner);
+    let supports = "*** supports: zstd, zstd legacy v0.5+, gzip, lz4, lzma, xz \n";
+    assert_eq!(stop(&["-vV"]).1, format!("{banner}{supports}"));
+    // -vvV: zstd's own library and POSIX lines are not printed (deviation 1).
+    assert_eq!(stop(&["-vvV"]).1, format!("{banner}{supports}"));
+    assert_eq!(stop(&["-qV"]).1, "1.5.7\n");
+    assert_eq!(stop(&["-qqV"]).1, "1.5.7\n");
+    let (_, cat, _) = run_env("zstdcat", &["-V"], &[]);
+    assert_eq!(cat, "1.5.7\n");
+    let (_, cat, _) = run_env("zstdcat", &["-vV"], &[]);
+    assert_eq!(cat, banner);
+}
+
+#[test]
+fn the_gzip_name_adds_its_help_lines() {
+    let (_, out, _) = run_env("gzip", &["-H"], &[]);
+    assert!(out.contains("Do not store original filename when compressing.\n\n\n"));
+    assert!(out.contains("Compatibility alias for `-9`.\n"));
+    let (_, out, _) = run_env("zstd", &["-H"], &[]);
+    assert!(!out.contains("Compatibility alias"));
 }
 
 #[test]
@@ -677,4 +730,87 @@ fn an_argument_ends_at_a_nul_as_a_c_string_does() {
     let c = ok(&["-1\u{0}9", "a\u{0}b"]);
     assert_eq!(c.level, 1);
     assert_eq!(c.files, [b"a".to_vec()]);
+}
+
+/// zstdcli.c:708-735, printDefaultCParams, against the reference's output
+/// (zstd 1.5.7, `--show-default-cparams -c FILE`, captured 2026-10-13).
+#[test]
+fn default_cparams_print_as_the_reference_prints_them() {
+    let show = |size: Option<u64>, dict: u64, level: i32| {
+        let mut v = Vec::new();
+        print_default_cparams(&mut v, b"f", size, dict, level);
+        let s = String::from_utf8(v).unwrap();
+        let mut lines = s.lines();
+        let head = lines.next().unwrap().to_string();
+        let nums: Vec<String> = lines
+            .map(|l| l.split(" : ").nth(1).unwrap().to_string())
+            .collect();
+        (head, nums.join(","))
+    };
+    let k = |head: &str, nums: &str| (head.to_string(), nums.to_string());
+    assert_eq!(
+        show(Some(1), 0, 1),
+        k("f (1 bytes)", "10,6,7,1,5,0,ZSTD_fast (1)")
+    );
+    assert_eq!(
+        show(Some(200000), 0, 1),
+        k("f (200000 bytes)", "18,13,14,1,6,0,ZSTD_fast (1)")
+    );
+    assert_eq!(
+        show(Some(1 << 20), 0, 1),
+        k("f (1048576 bytes)", "19,13,14,1,7,0,ZSTD_fast (1)")
+    );
+    assert_eq!(
+        show(Some(1), 0, 3),
+        k("f (1 bytes)", "10,6,7,2,4,0,ZSTD_dfast (2)")
+    );
+    assert_eq!(show(Some(200000), 0, 3).1, "18,16,16,1,4,0,ZSTD_dfast (2)");
+    assert_eq!(show(Some(1 << 20), 0, 3).1, "20,16,17,1,5,0,ZSTD_dfast (2)");
+    assert_eq!(show(Some(5000), 0, 3).1, "13,13,14,2,4,0,ZSTD_dfast (2)");
+    assert_eq!(show(Some(1), 0, 19).1, "10,7,7,8,3,256,ZSTD_btultra2 (9)");
+    assert_eq!(
+        show(Some(200000), 0, 19).1,
+        "18,19,19,8,3,256,ZSTD_btultra2 (9)"
+    );
+    assert_eq!(
+        show(Some(1 << 20), 0, 19).1,
+        "20,21,21,7,3,256,ZSTD_btultra2 (9)"
+    );
+    assert_eq!(
+        show(Some(5000), 0, 19).1,
+        "13,14,14,8,3,256,ZSTD_btultra2 (9)"
+    );
+    assert_eq!(show(Some(1), 0, -5).1, "10,6,7,1,5,5,ZSTD_fast (1)");
+    assert_eq!(show(Some(1 << 20), 0, -5).1, "19,12,13,1,6,5,ZSTD_fast (1)");
+    assert_eq!(
+        show(None, 0, 3),
+        k("f (src size unknown)", "21,16,17,1,5,0,ZSTD_dfast (2)")
+    );
+    assert_eq!(show(None, 0, 22).1, "27,27,25,9,3,999,ZSTD_btultra2 (9)");
+    // -D with a 110 KiB dictionary; --patch-from with a 200000-byte file.
+    assert_eq!(
+        show(Some(1 << 20), 112640, 3).1,
+        "21,16,17,1,5,0,ZSTD_dfast (2)"
+    );
+    assert_eq!(
+        show(Some(1 << 20), 200000, 19).1,
+        "21,22,22,7,3,256,ZSTD_btultra2 (9)"
+    );
+    // A dictionary file whose size is unknown (missing): zstd passes
+    // UTIL_FILESIZE_UNKNOWN on, and libzstd's arithmetic wraps.
+    assert_eq!(
+        show(Some(5000), u64::MAX, 3).1,
+        "14,14,15,2,4,0,ZSTD_dfast (2)"
+    );
+}
+
+#[test]
+fn actual_cparams_overlay_the_zstd_parameters() {
+    let c = ok(&["--zstd=strat=12,wlog=15"]);
+    let mut v = Vec::new();
+    print_actual_cparams(&mut v, Some(5000), 0, 3, &c);
+    assert_eq!(
+        String::from_utf8(v).unwrap(),
+        "--zstd=wlog=15,clog=13,hlog=14,slog=2,mml=4,tlen=0,strat=12\n"
+    );
 }
