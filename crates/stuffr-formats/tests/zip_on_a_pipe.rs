@@ -511,6 +511,63 @@ fn the_same_zip_read_seekably_and_over_a_pipe_agrees_on_data_and_differs_on_rung
     );
 }
 
+/// A symlink entry whose target is 100 KiB, past the 64 KiB cap.
+///
+/// Pins an asymmetry: the central directory carries the `S_IFLNK` mode, so a
+/// seekable read sees a symlink and refuses the over-long target
+/// (`Error::ResourceLimit`, exit 6). Local headers carry no mode, so a piped
+/// read sees a regular file holding the target text, streamed, and the cap
+/// never applies.
+#[test]
+fn a_piped_zip_reads_a_symlink_as_a_plain_file_past_the_target_cap() {
+    let target = "t".repeat(100 * 1024);
+    let mut buf = Vec::new();
+    {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        w.add_symlink("link", &target, opts).expect("add_symlink");
+        w.start_file("plain.txt", opts).expect("start_file");
+        w.write_all(b"plain").expect("write");
+        w.finish().expect("finish");
+    }
+
+    // Piped: a regular file holding the target text.
+    let dir = scratch("piped-symlink");
+    let out_dir = dir.join("out");
+    let out_str = out_dir.to_str().unwrap();
+    let piped = run_piped(&["unpack", "-", "-C", out_str], &buf);
+    assert!(piped.status.success(), "piped unpack failed: {piped:?}");
+    let meta = std::fs::symlink_metadata(out_dir.join("link")).expect("link entry extracted");
+    assert!(
+        meta.file_type().is_file(),
+        "a piped symlink entry must become a regular file, got {:?}",
+        meta.file_type()
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("link")).unwrap(),
+        target.as_bytes(),
+        "the regular file must hold the target text"
+    );
+    assert_eq!(std::fs::read(out_dir.join("plain.txt")).unwrap(), b"plain");
+
+    // Seekable: the same bytes are a symlink with an over-long target.
+    let sdir = scratch("seekable-symlink");
+    let zip_path = write_temp_zip(&sdir, &buf);
+    let sout = sdir.join("out");
+    let seek = run_on_path(&[
+        "unpack",
+        zip_path.to_str().unwrap(),
+        "-C",
+        sout.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        seek.status.code(),
+        Some(6),
+        "a seekable read must refuse the 100 KiB symlink target (exit 6): {seek:?}"
+    );
+}
+
 /// The write direction, with an external arbiter — the precedent being system
 /// `xz` validating what `lzma-rust2` writes. `unzip` is required to be on
 /// `PATH` (via `require_bin`, panicking rather than skipping): a missing
