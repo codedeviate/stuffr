@@ -15564,9 +15564,89 @@ fn skip_reason_for_a_prior_destination_file_is_unchanged() {
         dest.to_str().unwrap(),
     ]);
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    // Whatever the exit code and wording are today, they must not claim the
-    // archive made `a`.
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "usage error: `{}` exists and is not a directory, so `a/b` cannot be placed beneath it",
+            dest.join("a").display()
+        )),
+        "{stderr}"
+    );
     assert!(!stderr.contains("earlier in this archive"), "{stderr}");
     assert_eq!(std::fs::read(dest.join("a")).unwrap(), b"prior");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A hard link the run made shares its target's inode but is not a fold of
+/// it: file `a`, hard link `B -> a`, then `a/x` still names `a`. Runs on any
+/// unix volume.
+#[cfg(unix)]
+#[test]
+fn skip_reason_never_names_a_hard_link_as_the_ancestor() {
+    let dir = tmp_dir();
+    let tar = dir.join("h.tar");
+    {
+        let mut builder = Builder::new(std::fs::File::create(&tar).unwrap());
+        append_tar_entry(&mut builder, "a", b"alpha");
+        let mut h = Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Link);
+        h.set_size(0);
+        h.set_mode(0o644);
+        builder.append_link(&mut h, "B", "a").unwrap();
+        append_tar_entry(&mut builder, "a/x", b"beneath");
+        builder.finish().unwrap();
+    }
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        tar.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("skipped entry `a/x`: `a`, earlier in this archive, is not a directory"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Directory `A`, directory `a` (re-recorded onto the same inode on a folding
+/// volume), then file `A`: the exact spelling wins, so the reason names `A`.
+#[test]
+fn skip_reason_keeps_the_exact_spelling_when_a_folded_directory_was_rerecorded() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("A.probe"), b"p").unwrap();
+    if std::fs::symlink_metadata(dir.join("a.probe")).is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    let tar = dir.join("r.tar");
+    {
+        let mut builder = Builder::new(std::fs::File::create(&tar).unwrap());
+        for n in ["A", "a"] {
+            let mut d = Header::new_gnu();
+            d.set_entry_type(tar::EntryType::Directory);
+            d.set_size(0);
+            d.set_mode(0o755);
+            builder.append_data(&mut d, n, std::io::empty()).unwrap();
+        }
+        append_tar_entry(&mut builder, "A", b"file");
+        builder.finish().unwrap();
+    }
+    let dest = dir.join("out");
+    let out = run_output(&[
+        "unpack",
+        tar.to_str().unwrap(),
+        "-C",
+        dest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("skipped entry `A`: a directory `A` from earlier in this archive"),
+        "{stderr}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

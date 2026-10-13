@@ -5503,6 +5503,19 @@ struct MadeByRun {
     names: HashMap<String, PathBuf>,
     at: HashMap<PathBuf, MadeAt>,
     ids: HashSet<(u64, u64)>,
+    /// Identity -> the recorded keys holding it, for [`archived_spelling`]
+    /// (Self::archived_spelling): a short list per inode, never a scan of `at`.
+    by_id: HashMap<(u64, u64), Vec<PathBuf>>,
+}
+
+/// Whether two names differ only as a case or Unicode-normalisation fold
+/// would: equal once lowercased, or differing where a combining mark
+/// (U+0300..U+036F, so an NFD spelling) is present on either side. A cheap
+/// stand-in for a full NFC fold (no normalisation table in this crate); it
+/// only ever gates wording.
+fn names_fold_together(a: &str, b: &str) -> bool {
+    let combining = |s: &str| s.chars().any(|c| ('\u{300}'..='\u{36f}').contains(&c));
+    a.to_lowercase() == b.to_lowercase() || combining(a) || combining(b)
 }
 
 /// One exact-path record: what was made, and the identity it had when it
@@ -5543,6 +5556,10 @@ impl MadeByRun {
         self.at.insert(path.to_path_buf(), MadeAt { kind, id });
         if let Some(id) = id {
             self.ids.insert(id);
+            let keys = self.by_id.entry(id).or_default();
+            if !keys.iter().any(|k| k == path) {
+                keys.push(path.to_path_buf());
+            }
         }
     }
 
@@ -5580,13 +5597,24 @@ impl MadeByRun {
     /// spelling it has. Only keys of the same depth qualify, so a hard link
     /// elsewhere never stands in for the ancestor. Wording only.
     fn archived_spelling(&self, dest: &Path, path: &Path) -> Option<String> {
+        // An exact record is the spelling already; a hard link or a re-recorded
+        // folded directory shares the inode but is not a fold of it.
+        if self.made_exact(path) {
+            return None;
+        }
         let id = identity(path)?;
-        let depth = path.strip_prefix(dest).ok()?.components().count();
-        self.at
+        let last = path.file_name()?.to_string_lossy().into_owned();
+        self.by_id
+            .get(&id)?
             .iter()
-            .filter(|(key, rec)| rec.id == Some(id) && key.as_path() != path)
-            .filter_map(|(key, _)| key.strip_prefix(dest).ok())
-            .filter(|rel| rel.components().count() == depth)
+            .filter(|key| key.as_path() != path && key.parent() == path.parent())
+            .filter(|key| self.made_exact(key))
+            .filter(|key| !matches!(self.at.get(*key).map(|r| &r.kind), Some(MadeKind::Hardlink)))
+            .filter(|key| {
+                key.file_name()
+                    .is_some_and(|n| names_fold_together(&n.to_string_lossy(), &last))
+            })
+            .filter_map(|key| key.strip_prefix(dest).ok())
             .min()
             .map(|rel| rel.to_string_lossy().into_owned())
     }
