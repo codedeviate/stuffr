@@ -1,0 +1,64 @@
+name: zstd reference
+description: >-
+  Builds zstd 1.5.7 from the release tarball and exports
+  STUFFR_ZSTD_REFERENCE, the oracle of the zstd compatibility suites
+  (compat_zstd*). Every job that runs those tests needs it; with CI set, the
+  harness panics if the reference is missing or is not exactly 1.5.7 with
+  gzip, lz4, lzma and xz support.
+
+runs:
+  using: composite
+  steps:
+    # Keyed on the version, the OS and the CPU: the install is a native build.
+    - name: cache the zstd 1.5.7 install
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/zstd-1.5.7
+        key: zstd-1.5.7-${{ runner.os }}-${{ runner.arch }}
+
+    # The tarball, not a distro package: ubuntu and Homebrew ship other
+    # builds, and the promise is byte identity with 1.5.7. The SHA-256 is the
+    # one in the release's own zstd-1.5.7.tar.gz.sha256, and matches a local
+    # `shasum -a 256` of the download.
+    - name: install the zstd build dependencies
+      if: steps.cache.outputs.cache-hit != 'true' && runner.os == 'Linux'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y zlib1g-dev liblzma-dev liblz4-dev
+
+    - name: build zstd 1.5.7
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        url=https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+        sha256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+        src="$RUNNER_TEMP/zstd-src"
+        mkdir -p "$src"
+        curl -fsSL --retry 3 -o "$src/zstd-1.5.7.tar.gz" "$url"
+        echo "$sha256  $src/zstd-1.5.7.tar.gz" | shasum -a 256 -c -
+        tar -xzf "$src/zstd-1.5.7.tar.gz" -C "$src"
+        # macOS: xz and lz4 come from Homebrew (usually already on the
+        # runner), whose headers and libraries are not on the default paths.
+        # These are environment variables, not make arguments: the Makefile
+        # appends its own -D flags to CPPFLAGS, and a command-line value
+        # would replace them (the build then says "supports: zstd" only).
+        if [ "$RUNNER_OS" = macOS ]; then
+          brew list xz lz4 >/dev/null 2>&1 || brew install xz lz4
+          xz_prefix="$(brew --prefix xz)"
+          lz4_prefix="$(brew --prefix lz4)"
+          export CPPFLAGS="-I$xz_prefix/include -I$lz4_prefix/include"
+          export LDFLAGS="-L$xz_prefix/lib -L$lz4_prefix/lib"
+        fi
+        make -C "$src/zstd-1.5.7/programs" zstd-release HAVE_ZLIB=1 HAVE_LZMA=1 HAVE_LZ4=1 HAVE_THREAD=1 -j"$(getconf _NPROCESSORS_ONLN)"
+        mkdir -p "$RUNNER_TEMP/zstd-1.5.7/bin"
+        cp "$src/zstd-1.5.7/programs/zstd" "$RUNNER_TEMP/zstd-1.5.7/bin/zstd"
+
+    - name: use it as the reference
+      shell: bash
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/zstd-1.5.7/bin"
+        for l in unzstd zstdcat zstdmt; do ln -sf zstd "$bin/$l"; done
+        echo "STUFFR_ZSTD_REFERENCE=$bin/zstd" >> "$GITHUB_ENV"
+        "$bin/zstd" -vV

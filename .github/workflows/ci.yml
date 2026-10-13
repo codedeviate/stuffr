@@ -91,6 +91,8 @@ jobs:
       # they need `brew install gnu-tar` and panic naming it otherwise.
       # xz 5.8.4 from the release tarball: the compat_xz* oracle (see the action).
       - uses: ./.github/actions/xz-reference
+      # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
+      - uses: ./.github/actions/zstd-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
       # The same command CONTRIBUTING.md tells a human to run — but NOT the
       # same toolchain, and not the same platform. The `rm` above puts this
@@ -121,6 +123,8 @@ jobs:
       # absence) turn this job red rather than silently no-op'ing.
       # xz 5.8.4 from the release tarball: the compat_xz* oracle (see the action).
       - uses: ./.github/actions/xz-reference
+      # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
+      - uses: ./.github/actions/zstd-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
       # rust-version claims 1.88 and this job is the only thing that checks it.
       # The floor was 1.85 through Phase 1d; it moved because holding it forced an
@@ -171,6 +175,8 @@ jobs:
       # did not. 11 lzip tests panicked.
       # xz 5.8.4 from the release tarball: the compat_xz* oracle (see the action).
       - uses: ./.github/actions/xz-reference
+      # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
+      - uses: ./.github/actions/zstd-reference
       - run: sudo apt-get update && sudo apt-get install -y lzip cpio zip unzip ncompress lhasa
       - run: cargo test --workspace --no-default-features --features c-backed
 
@@ -418,6 +424,8 @@ jobs:
       - run: brew install gzip ncompress
       # xz 5.8.4 from the release tarball: the compat_xz* oracle (see the action).
       - uses: ./.github/actions/xz-reference
+      # zstd 1.5.7 from the release tarball: the compat_zstd* oracle (see the action).
+      - uses: ./.github/actions/zstd-reference
       # Which releases this run compares against: the logs said neither.
       - run: |
           sw_vers
@@ -429,5 +437,5 @@ jobs:
       # gzip 487.0.1; on a runner whose macOS ships another release, every
       # differing case says so (`apple_compare`), so a release's change is
       # named, not hidden.
-      - run: cargo test -p stuffr-cli --all-features --test compat_bzip2 --test compat_gzip_harness_selftest --test compat_gzip_gnu --test compat_gzip_bsd --test compat_gzip_bytes --test compat_xz_harness_selftest --test compat_xz --test compat_xz_bytes
-      - run: cargo test -p stuffr-cli --no-default-features --features pure,legacy --test compat_gzip_gnu --test compat_gzip_bsd --test compat_gzip_bytes --test compat_xz_harness_selftest --test compat_xz --test compat_xz_bytes
+      - run: cargo test -p stuffr-cli --all-features --test compat_bzip2 --test compat_gzip_harness_selftest --test compat_gzip_gnu --test compat_gzip_bsd --test compat_gzip_bytes --test compat_xz_harness_selftest --test compat_xz --test compat_xz_bytes --test compat_zstd --test compat_zstd_bytes --test compat_zstd_harness_selftest
+      - run: cargo test -p stuffr-cli --no-default-features --features pure,legacy --test compat_gzip_gnu --test compat_gzip_bsd --test compat_gzip_bytes --test compat_xz_harness_selftest --test compat_xz --test compat_xz_bytes --test compat_zstd --test compat_zstd_bytes --test compat_zstd_harness_selftest
