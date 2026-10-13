@@ -11,10 +11,13 @@
 //! thread count, the level limit and the console checks, so every warning
 //! on the way is compared too) and compressing for real.
 //!
-//! Part 2 (Task 5): compressing. Every level over six inputs; the thread
-//! and parameter options; standard streams, existing outputs and the
-//! overwrite prompt at a terminal (R14), links, directories, `-o`, the
-//! output directories and `--filelist`; Review Focus 2; SIGINT (R6).
+//! Part 2 (Task 5): compressing, decompressing and testing. Every level
+//! over six inputs and every compressed output decoded three ways; the
+//! thread and parameter options; standard streams, existing outputs and
+//! the overwrite prompt at a terminal (R14), links, directories, `-o`, the
+//! output directories and `--filelist`; frames concatenated, skippable,
+//! truncated, corrupted and followed by garbage; pass-through, sparse
+//! output and legacy frames (R12); Review Focus 1-5; SIGINT (R6).
 //!
 //! The normalisations: the banner (`-V`, `-H`, `-v`'s welcome line),
 //! which names stuffr (spec deviation 1; checked exactly before it is
@@ -1327,6 +1330,460 @@ mod unix {
         ));
         assert_eq!((two.code, three.code), (0, 0));
         assert!(two.stdout == three.stdout, "-T2 and -T3 differ");
+    }
+
+    // ---- decompressing and testing ----
+
+    /// A name with `.zst` added, leaked for a `Case`'s lifetime.
+    fn zst(name: &str) -> &'static str {
+        Box::leak(format!("{name}.zst").into_boxed_str())
+    }
+
+    /// Every compression case's reference output through `unzstd`,
+    /// `zstdcat` and `zstd -t`.
+    #[test]
+    fn decompress_every_level() {
+        let mut cases = Vec::new();
+        for (name, data) in inputs() {
+            for level in levels() {
+                let z = zst(name);
+                let frame = packed(&level, &data);
+                cases.push(with_files("unzstd", &["-k", z], vec![(z, frame.clone())]));
+                cases.push(with_files("zstdcat", &[z], vec![(z, frame.clone())]));
+                cases.push(with_files("zstd", &["-t", z], vec![(z, frame)]));
+            }
+        }
+        check("decompress_every_level", &cases);
+    }
+
+    /// `n` with bit `bit` of byte `at` flipped.
+    fn flipped(mut v: Vec<u8>, at: usize, bit: u8) -> Vec<u8> {
+        v[at] ^= 1 << bit;
+        v
+    }
+
+    /// A skippable frame of `payload`.
+    fn skippable(variant: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x50 + variant, 0x2a, 0x4d, 0x18];
+        v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Concatenated and skippable frames, empty and short inputs, truncated
+    /// and corrupted frames, trailing garbage, unknown headers and
+    /// pass-through, each through `unzstd`, `zstdcat` and `-t`.
+    #[test]
+    fn decompress_frames() {
+        let t = text();
+        let one = packed(&[], &t);
+        let two = packed(&["-19"], &t.repeat(2));
+        let len = one.len();
+        let mut concat = one.clone();
+        concat.extend_from_slice(&two);
+        let mut skip = skippable(0, b"abcd");
+        skip.extend_from_slice(&one);
+        skip.extend(skippable(15, &[]));
+        let mut garbage = one.clone();
+        garbage.extend_from_slice(b"garbage");
+        let mut garbage3 = one.clone();
+        garbage3.extend_from_slice(b"gar");
+        let inputs: Vec<(&'static str, Vec<u8>)> = vec![
+            ("concat", concat),
+            ("skip", skip),
+            ("skiponly", skippable(3, b"hidden")),
+            ("empty", Vec::new()),
+            ("one", b"x".to_vec()),
+            ("cut1", one[..1].to_vec()),
+            ("cut5", one[..5].to_vec()),
+            ("cut6", one[..6].to_vec()),
+            ("cutlast", one[..len - 1].to_vec()),
+            ("headerbit", flipped(one.clone(), 4, 3)),
+            ("windowbit", flipped(one.clone(), 4, 5)),
+            ("blockbit", flipped(one.clone(), len / 2, 2)),
+            ("checkbit", flipped(one.clone(), len - 1, 0)),
+            ("garbage", garbage),
+            ("garbage3", garbage3),
+            ("abc", b"abc".to_vec()),
+            ("plain", t.clone()),
+            ("nocheck", packed(&["--no-check"], &t)),
+            ("nosize", packed(&["--no-content-size"], &t)),
+        ];
+        let mut cases = Vec::new();
+        for (name, data) in &inputs {
+            let z = zst(name);
+            let files = vec![(z, data.clone())];
+            cases.push(with_files("unzstd", &["-k", z], files.clone()));
+            cases.push(with_files("zstdcat", &[z], files.clone()));
+            cases.push(with_files("zstd", &["-t", z], files.clone()));
+            cases.push(with_files("zstd", &["-dv", "-c", z], files.clone()));
+            cases.push(fed(zstd(&["-d"]), data.clone()));
+        }
+        // Pass-through: zstdcat's default, -dcf, --pass-through, and its
+        // refusal.
+        for args in [
+            &["-dcf", "plain"][..],
+            &["-dc", "--pass-through", "plain"],
+            &["-dcf", "--no-pass-through", "plain"],
+            &["-df", "plain.zst"],
+            &["-dcf", "plain", "concat.zst", "abc"],
+        ] {
+            cases.push(with_files(
+                "zstd",
+                args,
+                vec![
+                    ("plain", t.clone()),
+                    ("plain.zst", t.clone()),
+                    ("concat.zst", inputs[0].1.clone()),
+                    ("abc", b"abc".to_vec()),
+                ],
+            ));
+        }
+        cases.push(with_files(
+            "zstdcat",
+            &["plain", "abc"],
+            vec![("plain", t.clone()), ("abc", b"abc".to_vec())],
+        ));
+        cases.push(fed(case("zstdcat", &[]), t.clone()));
+        cases.push(fed(
+            zstd(&["-t", "--no-check"]),
+            flipped(one.clone(), len - 1, 0),
+        ));
+        cases.push(fed(zstd(&["-d", "-C"]), flipped(one.clone(), len - 1, 0)));
+        check("decompress_frames", &cases);
+    }
+
+    /// Sparse output: zeros skipped (`--sparse`), written (`--no-sparse`),
+    /// and the platform default; the bytes and size the same, and
+    /// `--sparse` to a pipe refused as the reference refuses it.
+    #[test]
+    fn decompress_sparse() {
+        let mut zeros = vec![0u8; 3 << 20];
+        zeros[100_000] = 1;
+        zeros[(1 << 20) + 5] = 7;
+        let tail = vec![0u8; 200_001];
+        let mut cases = Vec::new();
+        for (name, data) in [("zeros", zeros), ("tail", tail), ("text", text())] {
+            let z = zst(name);
+            let frame = packed(&[], &data);
+            for args in [
+                &[][..],
+                &["--sparse"],
+                &["--no-sparse"],
+                &["-c", "--no-sparse"],
+                &["-c", "--sparse"],
+            ] {
+                let mut a = vec!["-d", "-k"];
+                a.extend(args.iter().copied());
+                a.push(z);
+                cases.push(with_files("zstd", &a, vec![(z, frame.clone())]));
+            }
+            // Overwriting an existing file, where the automatic setting
+            // applies.
+            cases.push(with_files(
+                "zstd",
+                &["-d", "-f", z],
+                vec![(z, frame.clone()), (name, b"old".to_vec())],
+            ));
+        }
+        check("decompress_sparse", &cases);
+    }
+
+    /// R12: legacy zstd frames (v0.4 to v0.8) from zstd 1.5.7's own
+    /// `tests/legacy.c` (BSD, its `COMPRESSED` array, 917 bytes, vendored
+    /// as `tests/fixtures/zstd_legacy/legacy_c.zst`): five frames at offsets
+    /// 0 (v0.4), 198 (v0.5), 382 (v0.6), 560 (v0.7) and 738 (v0.8, the
+    /// current format). The reference, built with `ZSTD_LEGACY_SUPPORT=5`,
+    /// decodes v0.5 and later; the C tier answers alike. The pure tier has
+    /// no legacy decoder (spec deviation 7) and says what a zstd built
+    /// without legacy support says.
+    fn legacy_frames() -> Vec<(&'static str, Vec<u8>)> {
+        let all = include_bytes!("fixtures/zstd_legacy/legacy_c.zst");
+        assert_eq!(all.len(), 917);
+        vec![
+            ("v04.zst", all[..198].to_vec()),
+            ("v05.zst", all[198..382].to_vec()),
+            ("v06.zst", all[382..560].to_vec()),
+            ("v07.zst", all[560..738].to_vec()),
+            ("v08.zst", all[738..].to_vec()),
+            ("v05to08.zst", all[198..].to_vec()),
+        ]
+    }
+
+    #[test]
+    fn decompress_legacy_frames() {
+        let mut cases = Vec::new();
+        for (name, data) in legacy_frames() {
+            for args in [&["-d", "-k"][..], &["-dc"], &["-t"]] {
+                let mut a = args.to_vec();
+                a.push(name);
+                cases.push(with_files("zstd", &a, vec![(name, data.clone())]));
+            }
+        }
+        if EXACT {
+            check("decompress_legacy_frames", &cases);
+            return;
+        }
+        // The pure tier: v0.8 (the current format) decodes as on the C
+        // tier; a legacy frame is an unsupported format.
+        let legacy_name = |c: &Case| c.args.last().is_some_and(|n| *n != "v08.zst");
+        let (legacy, current): (Vec<Case>, Vec<Case>) = cases.into_iter().partition(legacy_name);
+        check("decompress_legacy_frames", &current);
+        for c in &legacy {
+            let s = stuffr_as(c);
+            let name = c.args.last().unwrap();
+            assert_eq!(s.code, 1, "{:?}", c.args);
+            assert!(s.stdout.is_empty(), "{:?}", c.args);
+            // v05to08 fails at its first frame, as the reference fails at
+            // v0.4.
+            assert_eq!(
+                s.stderr,
+                format!("zstd: {name}: unsupported format \n"),
+                "{:?}",
+                c.args
+            );
+        }
+    }
+
+    // ---- Review Focus 1-5 ----
+
+    /// Review Focus 1: a 64 MiB stream decodes in bounded memory.
+    #[test]
+    fn zstdcat_streams_a_large_input() {
+        const N: usize = 64 << 20;
+        let plain = mixed(N, 91);
+        if zstd_dir().is_none() {
+            return;
+        }
+        let frame = packed(&["-1"], &plain);
+        let peak = decoder_peak_rss("zstdcat", "big.zst", &frame, &plain, &[("LC_ALL", "C")]);
+        assert!(
+            peak < 64 << 20,
+            "peak memory {peak} bytes is not under 64 MiB"
+        );
+    }
+
+    fn closed_pipe_status(exe: &Path, dir: &Path) -> std::process::ExitStatus {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let mut child = spawn(
+            Command::new(exe)
+                .arg("big.zst")
+                .current_dir(dir)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = out.read(&mut buf).unwrap();
+        drop(out);
+        let st = child.wait().unwrap();
+        let mut err = String::new();
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        assert_eq!(err, "", "{exe:?} wrote to stderr");
+        st
+    }
+
+    /// Review Focus 1: `zstdcat big.zst | head` ends stuffr by SIGPIPE with
+    /// nothing said, as it ends zstd.
+    #[test]
+    fn zstdcat_into_a_closed_pipe() {
+        use std::os::unix::process::ExitStatusExt;
+        let Some(dir) = zstd_dir() else { return };
+        let plain = text().repeat(4000);
+        let work = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-zstdcat-pipe-{}", std::process::id())),
+        );
+        fs::create_dir_all(work.join("bin")).unwrap();
+        let link = work.join("bin").join("zstdcat");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        fs::write(work.join("big.zst"), packed(&[], &plain)).unwrap();
+        let ours = closed_pipe_status(&link, &work);
+        let theirs = closed_pipe_status(&Path::new(dir).join("zstdcat"), &work);
+        assert_eq!(
+            theirs.signal(),
+            Some(libc::SIGPIPE),
+            "reference: {theirs:?}"
+        );
+        assert_eq!(
+            ours.signal(),
+            theirs.signal(),
+            "stuffr as zstdcat: {ours:?}"
+        );
+    }
+
+    /// Review Focus 3: a frame with a 2 GiB window (`--long=31` over
+    /// standard input) is refused without `--long`/`--memory`, with the
+    /// hint, before any window is allocated; with them it decodes.
+    #[test]
+    fn window_limit_refuses_before_allocating() {
+        let t = text();
+        let frame = packed(&["--long=31"], &t);
+        let cases = vec![
+            with_files("zstd", &["-d", "w.zst"], vec![("w.zst", frame.clone())]),
+            with_files("zstd", &["-dc", "w.zst"], vec![("w.zst", frame.clone())]),
+            with_files("zstd", &["-t", "w.zst"], vec![("w.zst", frame.clone())]),
+            with_files(
+                "zstd",
+                &["-d", "--long=31", "w.zst"],
+                vec![("w.zst", frame.clone())],
+            ),
+            with_files(
+                "zstd",
+                &["-d", "--long=30", "w.zst"],
+                vec![("w.zst", frame.clone())],
+            ),
+            with_files(
+                "zstd",
+                &["-d", "--memory=2048MB", "w.zst"],
+                vec![("w.zst", frame.clone())],
+            ),
+            with_files(
+                "zstd",
+                &["-d", "-M2047MB", "w.zst"],
+                vec![("w.zst", frame.clone())],
+            ),
+            with_files(
+                "zstd",
+                &["-d", "--memory=1", "w.zst"],
+                vec![("w.zst", frame.clone())],
+            ),
+            fed(zstd(&["-d"]), frame.clone()),
+        ];
+        check("window_limit_refuses_before_allocating", &cases);
+        if zstd_dir().is_none() {
+            return;
+        }
+        // Peak memory while refusing, the frame offered many times so a
+        // sampling measurement sees the run.
+        let mut args = vec!["-dc"];
+        args.extend(std::iter::repeat_n("w.zst", 200));
+        let (st, out, err, peak) = peak_rss_run("zstd", &args, "w.zst", &frame, &[("LC_ALL", "C")]);
+        assert_eq!(st.code(), Some(1), "{err}");
+        assert!(out.is_empty());
+        assert!(
+            err.contains("Window size larger than maximum : 2147483648 > 134217728"),
+            "{err}"
+        );
+        assert!(
+            peak < 32 << 20,
+            "peak memory {peak} bytes is not under 32 MiB"
+        );
+    }
+
+    /// Review Focus 4: several files where one fails, with the same
+    /// messages, summary and exit code, and the good outputs made.
+    #[test]
+    fn several_files_one_failing() {
+        let t = text();
+        let good = packed(&[], &t);
+        let bad = flipped(good.clone(), good.len() / 2, 2);
+        let zfiles = || {
+            vec![
+                ("a.zst", good.clone()),
+                ("bad.zst", bad.clone()),
+                ("c.zst", packed(&["-9"], &t.repeat(2))),
+            ]
+        };
+        let pfiles = || vec![("a", t.clone()), ("c", t.repeat(2))];
+        let cases = vec![
+            with_files("zstd", &["-d", "a.zst", "bad.zst", "c.zst"], zfiles()),
+            with_files("zstd", &["-dv", "a.zst", "bad.zst", "c.zst"], zfiles()),
+            with_files("zstd", &["-dq", "a.zst", "bad.zst", "c.zst"], zfiles()),
+            with_files(
+                "zstd",
+                &["-d", "--rm", "a.zst", "bad.zst", "c.zst"],
+                zfiles(),
+            ),
+            with_files("zstd", &["-t", "a.zst", "bad.zst", "c.zst"], zfiles()),
+            with_files("zstd", &["-dc", "a.zst", "bad.zst", "c.zst"], zfiles()),
+            with_files(
+                "zstd",
+                &["-d", "-o", "out", "a.zst", "bad.zst", "c.zst"],
+                zfiles(),
+            ),
+            with_files(
+                "zstd",
+                &["-d", "-f", "-o", "out", "a.zst", "bad.zst", "c.zst"],
+                zfiles(),
+            ),
+            with_files(
+                "zstd",
+                &["-d", "-f", "--rm", "-o", "out", "a.zst", "bad.zst", "c.zst"],
+                zfiles(),
+            ),
+            with_files("zstd", &["-d", "missing.zst", "a.zst"], zfiles()),
+            with_files("zstd", &["a", "missing", "c"], pfiles()),
+            with_files("zstd", &["-v", "a", "missing", "c"], pfiles()),
+            with_files("zstd", &["--rm", "a", "missing", "c"], pfiles()),
+            with_files("zstd", &["-o", "out", "a", "missing", "c"], pfiles()),
+            with_files("zstd", &["-f", "-o", "out", "a", "missing", "c"], pfiles()),
+            with_files("zstd", &["-c", "a", "missing", "c"], pfiles()),
+        ];
+        check("several_files_one_failing", &cases);
+    }
+
+    /// Review Focus 5: the suffix rules.
+    #[test]
+    fn suffix_rules() {
+        let t = text();
+        let z = packed(&[], &t);
+        let files = || {
+            vec![
+                ("a.tzst", z.clone()),
+                ("b.zst", z.clone()),
+                ("c.zstd", z.clone()),
+                ("d", z.clone()),
+                ("e.ZST", z.clone()),
+                (".zst", z.clone()),
+                ("f.tar.zst", z.clone()),
+            ]
+        };
+        let mut cases = Vec::new();
+        for name in [
+            "a.tzst",
+            "b.zst",
+            "c.zstd",
+            "d",
+            "e.ZST",
+            ".zst",
+            "f.tar.zst",
+        ] {
+            cases.push(with_files("unzstd", &[name], files()));
+            cases.push(with_files(
+                "zstd",
+                &["-d", "-k", "--output-dir-flat=o", name],
+                files(),
+            ));
+        }
+        cases.push(with_files("unzstd", &["d", "b.zst"], files()));
+        cases.push(with_files("unzstd", &["-o", "out", "d"], files()));
+        cases.push(with_files("zstd", &["b.zst"], files()));
+        cases.push(with_files(
+            "zstd",
+            &["--exclude-compressed", "b.zst", "a.tzst"],
+            files(),
+        ));
+        cases.push(fed(zstd(&["-d"]), z.clone()));
+        check("suffix_rules", &cases);
+    }
+
+    /// Review Focus 5's gzip leg: `unzstd a.gz` decodes by magic.
+    #[test]
+    #[ignore = "Task 6 (formats.rs)"]
+    fn suffix_rules_foreign() {
+        let t = text();
+        let gz = gzm(&t, b"a");
+        let cases = vec![
+            with_files("unzstd", &["a.gz"], vec![("a.gz", gz.clone())]),
+            with_files("unzstd", &["a.tgz"], vec![("a.tgz", gz.clone())]),
+            with_files("zstdcat", &["a.gz"], vec![("a.gz", gz)]),
+        ];
+        check("suffix_rules_foreign", &cases);
     }
 
     /// Spec deviation 3: the one output of several inputs (`-o`) that is
