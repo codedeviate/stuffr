@@ -386,11 +386,7 @@ impl Read for LazyRuzstdDecoder {
                     // merely carried in the frame into something this
                     // decoder actually enforces — see the module doc.
                     //
-                    if let (Some(expected), Some(actual)) = (
-                        dec.decoder.get_checksum_from_data(),
-                        dec.decoder.get_calculated_checksum(),
-                    ) && expected != actual
-                    {
+                    if let Some((expected, actual)) = checksum_mismatch(&dec.decoder) {
                         return Err(std::io::Error::new(
                             ErrorKind::InvalidData,
                             format!(
@@ -447,6 +443,17 @@ impl Read for LazyRuzstdDecoder {
                 }
             }
         }
+    }
+}
+
+/// The content checksum a finished frame carried and the one `ruzstd`
+/// computed over what it decoded, when both exist and differ: the
+/// comparison `ruzstd` never makes itself (see the module doc). Shared with
+/// `zstd_opts`'s pure decoder, which needs the same verdict.
+pub(crate) fn checksum_mismatch(dec: &ruzstd::decoding::FrameDecoder) -> Option<(u32, u32)> {
+    match (dec.get_checksum_from_data(), dec.get_calculated_checksum()) {
+        (Some(expected), Some(actual)) if expected != actual => Some((expected, actual)),
+        _ => None,
     }
 }
 

@@ -69,9 +69,13 @@ mod clevels;
 
 #[cfg(feature = "zstd-c")]
 pub mod c;
+#[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
+pub mod pure;
 
 #[cfg(feature = "zstd-c")]
 pub use c::{Decoder, Encoder, libzstd_version, train};
+#[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
+pub use pure::{Decoder, Encoder, libzstd_version, train};
 
 /// The zstd frame magic number (`ZSTD_MAGICNUMBER`).
 pub const MAGIC: u32 = 0xFD2F_B528;

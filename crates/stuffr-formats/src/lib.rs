@@ -267,9 +267,10 @@ pub mod zlib;
 pub mod zlib_c;
 #[cfg(feature = "zstd-c")]
 pub mod zstd_c;
-// The `zstd` compatibility family's options seam over libzstd, reached
-// through `stuffr-cli` only; not part of the public surface.
-#[cfg(feature = "zstd-c")]
+// The `zstd` compatibility family's options seam over libzstd (C tier) and
+// ruzstd (pure tier), reached through `stuffr-cli` only; not part of the
+// public surface.
+#[cfg(any(feature = "zstd-c", feature = "zstd-pure"))]
 #[doc(hidden)]
 pub mod zstd_opts;
 #[cfg(feature = "zstd-pure")]

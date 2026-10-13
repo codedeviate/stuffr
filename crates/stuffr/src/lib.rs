@@ -47,7 +47,7 @@ pub mod xz_opts {
 /// threads, dictionaries, training — and the streaming coder over them,
 /// what the `stuffr` binary's zstd compatibility family runs. Not part of
 /// the stable API.
-#[cfg(feature = "zstd-c")]
+#[cfg(any(feature = "zstd-c", feature = "zstd-pure"))]
 #[doc(hidden)]
 pub mod zstd_opts {
     pub use stuffr_formats::zstd_opts::*;

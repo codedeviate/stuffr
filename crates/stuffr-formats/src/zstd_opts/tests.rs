@@ -1213,3 +1213,113 @@ mod c_tier {
 # then copy <dir>/* here (macOS, the reference zstd 1.5.7 present).
 ";
 }
+
+// --------------------------------------------------------------- pure tier
+
+#[cfg(all(feature = "zstd-pure", not(feature = "zstd-c")))]
+mod pure_tier {
+    use super::*;
+
+    #[test]
+    fn libzstd_version_is_pinned() {
+        assert_eq!(libzstd_version(), "1.5.7");
+    }
+
+    #[test]
+    fn pure_round_trips_and_the_reference_reads_it() {
+        #[cfg(unix)]
+        let zstd = reference();
+        let mut r = Lcg(0x64);
+        for case in 0..64u64 {
+            let n = match case % 4 {
+                0 => r.next() as usize % 100,
+                1 => r.next() as usize % 5000,
+                2 => r.next() as usize % 300_000,
+                _ => 128 << 10,
+            };
+            let data = if case % 3 == 0 {
+                rand(n, case)
+            } else {
+                text(n, case)
+            };
+            let o = EncodeOptions {
+                checksum: case % 5 != 0,
+                level: (r.next() % 30) as i32 - 7,
+                ..EncodeOptions::default()
+            };
+            let f = encode(&o, &data);
+            let mut d = Decoder::new(&DecodeOptions::default()).unwrap();
+            let chunk = 1 + r.next() as usize % 70_000;
+            let (frames, out) = decode_with(&mut d, &f, chunk).unwrap();
+            assert_eq!((frames, out.len()), (1, data.len()), "case {case}");
+            assert!(out == data, "case {case}");
+            #[cfg(unix)]
+            if let Some(zstd) = &zstd {
+                let back = run_reference(zstd, &["-d", "-c"], &f);
+                assert!(back.as_deref() == Some(&data[..]), "case {case}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_check_strips_the_checksum() {
+        let data = text(50_000, 6);
+        let with = encode(&EncodeOptions::default(), &data);
+        let without = encode(
+            &EncodeOptions {
+                checksum: false,
+                ..EncodeOptions::default()
+            },
+            &data,
+        );
+        assert_ne!(with[4] & 0x04, 0);
+        let mut expect = with[..with.len() - 4].to_vec();
+        expect[4] &= !0x04;
+        assert_eq!(without, expect);
+        assert_eq!(decode(&DecodeOptions::default(), &without).unwrap(), data);
+        // The adapter itself, fed a byte at a time.
+        let mut sink = Vec::new();
+        let mut s = pure::ChecksumStrip::new(&mut sink, false);
+        for b in &with {
+            std::io::Write::write_all(&mut s, std::slice::from_ref(b)).unwrap();
+        }
+        s.finish().unwrap();
+        assert_eq!(sink, expect);
+        #[cfg(unix)]
+        if let Some(zstd) = reference() {
+            assert_eq!(run_reference(&zstd, &["-d", "-c"], &without).unwrap(), data);
+        }
+    }
+
+    #[test]
+    fn dictionary_encode_is_unsupported() {
+        for o in [
+            EncodeOptions {
+                dictionary: Some(fixture("dict4k.dict")),
+                ..EncodeOptions::default()
+            },
+            EncodeOptions {
+                prefix: Some(b"prefix".to_vec()),
+                ..EncodeOptions::default()
+            },
+        ] {
+            assert!(matches!(
+                Encoder::new(&o),
+                Err(ZstdError::Unsupported("dictionary"))
+            ));
+        }
+        let p = TrainParams {
+            algo: TrainAlgo::Legacy { selectivity: 9 },
+            optimize: false,
+            max_dict: 4096,
+            dict_id: 0,
+            level: 3,
+            threads: 1,
+            notification: 0,
+        };
+        assert!(matches!(
+            train(b"abc", &[3], &p),
+            Err(ZstdError::Unsupported("train"))
+        ));
+    }
+}
