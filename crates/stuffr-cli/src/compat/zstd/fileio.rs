@@ -1056,8 +1056,11 @@ impl<'a> Io<'a> {
             return Ok(None);
         };
         self.say(4, m::LOADING_DICT, &[name]);
-        let mut f = match File::open(self.host.path(name)) {
-            Ok(f) => f,
+        // Counted under the sandbox (`Host::track`): the fuzz target's read
+        // bound allows the dictionary or prefix one read.
+        let path = self.host.path(name);
+        let mut f = match File::open(&path) {
+            Ok(f) => self.host.track(&path, f),
             Err(e) => return Err(self.exm(33, m::DICT_OPEN_FAILED, &[name, &strerror(&e)])),
         };
         let size = util::file_size_stat(meta);

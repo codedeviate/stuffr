@@ -3,7 +3,7 @@
 //! expansion and `--output-dir-mirror`'s directories.
 
 use std::fs::{self, Metadata};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 
 use super::messages::{self as m, printf};
 use crate::compat::host::{self, Host, strerror};
@@ -358,7 +358,14 @@ pub(crate) fn names_from_file(
     if file_size_stat(&meta) > MAX_FILE_OF_FILE_NAMES_SIZE {
         return None;
     }
-    let data = match fs::read(host.path(name)) {
+    // Through `Host::track`, so the fuzz target counts the list's read.
+    let path = host.path(name);
+    let read = fs::File::open(&path).and_then(|f| {
+        let mut f = host.track(&path, f);
+        let mut data = Vec::new();
+        f.read_to_end(&mut data).map(|_| data)
+    });
+    let data = match read {
         Ok(d) => d,
         Err(e) => {
             util_display(util_level, 1, err, m::PERROR_READ_LINES, &[&strerror(&e)]);

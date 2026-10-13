@@ -336,6 +336,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The zstd family counts every file it reads: an input, a `-D`
+    /// dictionary and a `--filelist` list (the fuzz target's read bound
+    /// is blind to an open that bypasses `Host::track`).
+    #[test]
+    fn run_in_counted_counts_the_zstd_familys_inputs() {
+        let dir = std::env::temp_dir().join(format!("stuffr-run-in-zstd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let args = |a: &[&str]| a.iter().map(OsString::from).collect::<Vec<_>>();
+        let run = |a: &[&str]| {
+            let (code, _, err, reads) =
+                run_in_counted(&dir, "zstd", args(a), b"", gzip::Flavour::Gnu).unwrap();
+            assert_eq!(code, 0, "{a:?}: {}", String::from_utf8_lossy(&err));
+            reads
+        };
+        std::fs::write(dir.join("a"), b"hello hello hello\n").unwrap();
+        std::fs::write(dir.join("d.dict"), b"a raw dictionary\n").unwrap();
+        std::fs::write(dir.join("l"), b"a\n").unwrap();
+
+        let reads = run(&["-q", "-k", "a"]);
+        assert_eq!(
+            reads[&dir.join("a")],
+            InputReads {
+                opens: 1,
+                bytes: 18,
+                len: 18
+            }
+        );
+        let zst = std::fs::metadata(dir.join("a.zst")).unwrap().len();
+
+        let reads = run(&["-d", "-c", "-D", "d.dict", "a.zst"]);
+        let dict = reads[&dir.join("d.dict")];
+        assert_eq!(
+            dict,
+            InputReads {
+                opens: 1,
+                bytes: 17,
+                len: 17
+            }
+        );
+        assert_eq!(reads[&dir.join("a.zst")].len, zst);
+
+        let reads = run(&["-c", "--filelist=l"]);
+        assert_eq!(
+            reads[&dir.join("l")],
+            InputReads {
+                opens: 1,
+                bytes: 2,
+                len: 2
+            }
+        );
+        assert_eq!(reads[&dir.join("a")].opens, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Output past the sandbox's cap fails as a full disk does: exit 1.
     #[test]
     fn run_in_caps_what_a_run_writes() {
