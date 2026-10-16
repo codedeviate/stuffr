@@ -26,7 +26,7 @@ use std::io::Write;
 use stuffr::zstd_opts::{self, CParamKey, ParamSwitch, TrainAlgo};
 
 use super::messages::{self as m, printf};
-use super::util::Cores;
+use crate::compat::host::Cores;
 
 /// fileio.h: `stdinmark`, the name standing for standard input.
 pub(crate) const STDINMARK: &[u8] = b"/*stdin*\\";

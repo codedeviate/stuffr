@@ -20,7 +20,7 @@
 //! belong to other families).
 //!
 //! **The machine** (R3): the real process counts its cores as util.c does
-//! (`util::Cores::detect`); a sandboxed run ([`run_in_counted`]) sees 8
+//! (`host::cores`, shared with the lz4 family since 0.15.0); a sandboxed run ([`run_in_counted`]) sees 8
 //! logical and 4 physical cores.
 //!
 //! Known deviations (the source of truth; the README and the spec mirror
@@ -128,7 +128,7 @@ use std::sync::{Arc, Mutex};
 use stuffr::zstd_opts::{self, CParamKey};
 
 use super::CountedRun;
-use super::host::{Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
+use super::host::{self, Cores, Host, SANDBOX_OUTPUT_CAP, Sandbox, reset_sigpipe};
 
 pub(crate) mod cli;
 mod dibio;
@@ -142,7 +142,6 @@ pub(crate) mod util;
 use cli::{Command, Limits, Operation, Progress, STDINMARK, STDOUTMARK, Stop};
 use display::{Display, exm_throw};
 use messages::{self as m, printf};
-use util::Cores;
 
 /// Entry point for the four names; `name` is the canonical invoked name,
 /// `argv0` the program as invoked (its last component is zstd's
@@ -162,7 +161,7 @@ pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
         &args,
         &env,
         &mut Host::Real,
-        Cores::detect(),
+        host::cores(&Host::Real),
         None,
         &mut err,
     );

@@ -5,8 +5,8 @@
 use std::ffi::OsString;
 
 use super::*;
+use crate::compat::host::Cores;
 use crate::compat::zstd::cli;
-use crate::compat::zstd::util::Cores;
 
 /// A reader handing out at most `step` bytes per `read`, as a pipe does.
 struct Trickle {
