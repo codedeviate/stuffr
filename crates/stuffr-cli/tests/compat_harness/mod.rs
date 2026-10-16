@@ -433,6 +433,289 @@ pub fn strip_bench_help(stdout: &str) -> String {
     s
 }
 
+const LZ4_LINKS: [&str; 3] = ["unlz4", "lz4cat", "lz4c"];
+
+/// Whether `<dir>/lz4`'s `-V` says release 1.10.0 (`*** lz4 v1.10.0 64-bit
+/// multithread, by Yann Collet ***`).
+fn is_lz4_1_10_0(dir: &Path) -> bool {
+    output(
+        Command::new(dir.join("lz4"))
+            .arg("-V")
+            .env_clear()
+            .stdin(Stdio::null()),
+    )
+    .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("v1.10.0"))
+}
+
+/// `lz4` on `PATH`, like a shell's lookup.
+fn lz4_on_path() -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join("lz4"))
+        .find(|p| p.is_file())
+}
+
+/// The directory holding lz4 1.10.0's `lz4` and its links `unlz4`, `lz4cat`
+/// and `lz4c`.
+///
+/// Looked up in this order, the first one that [`is_lz4_1_10_0`] accepts
+/// winning:
+/// 1. `$STUFFR_LZ4_REFERENCE`, the path of an `lz4` (CI builds the release
+///    tarball there; if the three links are not beside it they are made in a
+///    temp dir);
+/// 2. Homebrew's keg, `/opt/homebrew/opt/lz4/bin`;
+/// 3. `lz4` on `PATH`.
+///
+/// `None` when there is none: a skip with a note locally, a panic under `CI`
+/// (the rule of [`require_reference`]), so every test that skips on it would
+/// otherwise pass vacuously. Another release is no reference: stuffr
+/// promises 1.10.0's behaviour.
+pub fn lz4_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let found = DIR.get_or_init(|| {
+        let candidates = [
+            std::env::var_os("STUFFR_LZ4_REFERENCE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
+            Some(PathBuf::from("/opt/homebrew/opt/lz4/bin/lz4")),
+            lz4_on_path(),
+        ];
+        for exe in candidates.into_iter().flatten() {
+            if !exe.is_file() {
+                continue;
+            }
+            let Some(dir) = dir_with_links_for(&exe, "lz4", &LZ4_LINKS) else {
+                continue;
+            };
+            if is_lz4_1_10_0(&dir) {
+                return dir.to_str().map(str::to_owned);
+            }
+        }
+        None
+    });
+    match found {
+        Some(d) => Some(d.as_str()),
+        None => {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI is set but there is no lz4 1.10.0 reference \
+                 (looked at $STUFFR_LZ4_REFERENCE, /opt/homebrew/opt/lz4/bin, PATH)"
+            );
+            eprintln!("skipped: lz4 1.10.0 not installed");
+            None
+        }
+    }
+}
+
+/// A `\r`-refreshed progress segment of lz4's display level 2 (probe, 1.10.0,
+/// stderr a file): `\rRead : <n> MiB   ==> <ratio>%   ` while compressing,
+/// `\rDecompressed : <n> MiB  ` while decoding. Returns its length when
+/// `s` opens with exactly one such segment. `racy` accepts a decode refresh
+/// that more blanks follow on its line (see [`normalise_lz4_progress`]).
+fn lz4_refresh_len(s: &str, racy: bool) -> Option<usize> {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let rest = s.strip_prefix('\r')?;
+    let end = rest.find(['\r', '\n']).unwrap_or(rest.len());
+    let seg = &rest[..end];
+    if let Some(r) = seg.strip_prefix("Read : ") {
+        let ok = r.strip_suffix("%   ").is_some_and(|r| {
+            r.split_once(" MiB   ==> ").is_some_and(|(n, ratio)| {
+                digits(n)
+                    && (matches!(ratio, "inf" | "nan")
+                        || ratio
+                            .split_once('.')
+                            .is_some_and(|(w, f)| digits(w) && digits(f)))
+            })
+        });
+        return ok.then_some(1 + end);
+    }
+    let r = seg.strip_prefix("Decompressed : ")?;
+    if racy {
+        // The refresh is one write; the blanks after it belong to what the
+        // other thread was in the middle of printing.
+        let n = r.find(" MiB  ")?;
+        return digits(&r[..n]).then_some(1 + "Decompressed : ".len() + n + " MiB  ".len());
+    }
+    r.strip_suffix(" MiB  ")
+        .is_some_and(digits)
+        .then_some(1 + end)
+}
+
+/// Whether a stderr holds a failure message of the decoder, lz4's
+/// `Error N : ...` or `Stream followed by undecodable data`. On a failing
+/// decode the refresh is drawn by one thread while the other prints the
+/// message in several writes, so the refresh may come before the message,
+/// after it, inside it (`Error 26 : \rDecompressed : 0 MiB  LZ4F ...`) or
+/// not at all: 60 runs of `lz4 -t` over a cut header gave four different
+/// stderrs (probe, 2026-10-16).
+fn lz4_failed(stderr: &str) -> bool {
+    stderr.contains("Stream followed by undecodable data")
+        || stderr.match_indices("Error ").any(|(at, _)| {
+            let rest = &stderr[at + "Error ".len()..];
+            let n = rest.bytes().take_while(u8::is_ascii_digit).count();
+            n > 0 && rest[n..].starts_with(" : ")
+        })
+}
+
+/// Deviation 2 of the lz4 family, and only it. Three things depend on timing
+/// or on the machine and are replaced:
+/// - a run of `\r`-refreshed progress segments ([`lz4_refresh_len`]) becomes
+///   one `\r<progress>`: how many refreshes a run prints depends on its
+///   speed. On a failing decode ([`lz4_failed`]) the refreshes are removed
+///   instead: the reference itself draws them at random places or not at
+///   all;
+/// - the fields of `Done in S s ==> T MiB/s  (cpu load : L%)` become
+///   `<s>`, `<speed>`, `<cpu>`;
+/// - N in `Using N threads for compression ` becomes `<n>` (the cores).
+///
+/// Every other byte stays, including the final summary, the 79-blank
+/// clearing line and a refresh-looking text of another shape (one not led
+/// by `\r`, or with other numbers' syntax).
+pub fn normalise_lz4_progress(stderr: &str) -> String {
+    let racy = lz4_failed(stderr);
+    let mut collapsed = String::with_capacity(stderr.len());
+    let mut rest = stderr;
+    while !rest.is_empty() {
+        if let Some(n) = lz4_refresh_len(rest, racy) {
+            let mut total = n;
+            while let Some(m) = lz4_refresh_len(&rest[total..], racy) {
+                total += m;
+            }
+            if !racy {
+                collapsed.push_str("\r<progress>");
+            }
+            rest = &rest[total..];
+        } else {
+            let ch = rest.chars().next().unwrap();
+            collapsed.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    let mut out = String::with_capacity(collapsed.len());
+    for line in collapsed.split_inclusive('\n') {
+        out.push_str(&normalise_lz4_line(line));
+    }
+    out
+}
+
+/// The per-line half of [`normalise_lz4_progress`].
+fn normalise_lz4_line(line: &str) -> String {
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    let decimal = |t: &str| {
+        t.split_once('.')
+            .is_some_and(|(w, f)| digits(w) && digits(f))
+    };
+    if let Some(rest) = line.strip_prefix("Using ")
+        && let Some((n, tail)) = rest.split_once(" threads for compression ")
+        && digits(n)
+    {
+        return format!("Using <n> threads for compression {tail}");
+    }
+    if let Some(rest) = line.strip_prefix("Done in ")
+        && let Some((secs, rest)) = rest.split_once(" s ==> ")
+        && let Some((speed, rest)) = rest.split_once(" MiB/s  (cpu load : ")
+        && let Some((cpu, after)) = rest.split_once("%)")
+        && decimal(secs)
+        && decimal(speed)
+        && digits(cpu)
+    {
+        return format!("Done in <s> s ==> <speed> MiB/s  (cpu load : <cpu>%){after}");
+    }
+    line.to_owned()
+}
+
+/// How much a failed lz4 decode had written is the reference's own race: it
+/// decodes on one thread and writes on another, and the failure exits the
+/// process, so what reached the output (stdout or the named file) is nothing,
+/// or everything decoded before the failing block (probe, 2026-10-16:
+/// `lz4 -d` over a frame with 1, 4 or 100 trailing bytes, or cut at its
+/// checksum, left 0 or 8800 bytes of 8800, run to run, in the reference
+/// alone). The comparison therefore accepts, in a run that failed the same
+/// way (same nonzero exit code), a stdout or a file that is a prefix of the
+/// other side's, by truncating both to the shorter. A run that succeeded, a
+/// failure with different exit codes, and bytes that are not a prefix are
+/// untouched, so every real difference is still reported.
+pub fn tolerate_lz4_partial_output(r: &mut Run, s: &mut Run) {
+    fn common(a: &mut Vec<u8>, b: &mut Vec<u8>) {
+        if a.starts_with(b) || b.starts_with(a) {
+            let n = a.len().min(b.len());
+            a.truncate(n);
+            b.truncate(n);
+        }
+    }
+    if r.code == 0 || r.code != s.code {
+        return;
+    }
+    common(&mut r.stdout, &mut s.stdout);
+    for (name, (rb, _, _)) in r.tree.iter_mut() {
+        if let Some((sb, _, _)) = s.tree.get_mut(name) {
+            common(rb, sb);
+        }
+    }
+}
+
+/// The two stream kinds lz4 reads and writes: a modern frame (`04 22 4d 18`)
+/// or a legacy one (`02 21 4c 18`).
+fn lz4_stream_kind(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(&[0x04, 0x22, 0x4d, 0x18]) {
+        Some("frame")
+    } else if b.starts_with(&[0x02, 0x21, 0x4c, 0x18]) {
+        Some("legacy")
+    } else {
+        None
+    }
+}
+
+/// A difference in the kind of stream two compressed outputs are, if either
+/// is recognised. Within a kind the header is not compared: its descriptor
+/// follows from the options, and byte identity is promised only where the
+/// case says so.
+fn lz4_kind_mismatch(reference: &[u8], ours: &[u8]) -> Option<String> {
+    let (r, s) = (lz4_stream_kind(reference), lz4_stream_kind(ours));
+    (r != s && (r.is_some() || s.is_some())).then(|| {
+        format!(
+            "stream format differs: reference lz4 {}, stuffr lz4 {}",
+            r.unwrap_or("none"),
+            s.unwrap_or("none")
+        )
+    })
+}
+
+/// The `lz4 -dc` options that make the reference read what `c` wrote: the
+/// dictionary named by `-D file` or `-Dfile` (probe: both spellings work),
+/// written from the case's own files to a scratch file (the reference does
+/// not run in the case's directory). A file the case does not list (one its
+/// setup makes) is not passed, and the reference then says why it cannot
+/// decode.
+fn lz4_decode_args(c: &Case) -> Vec<String> {
+    let mut named: Option<&str> = None;
+    let mut it = c.args.iter();
+    while let Some(a) = it.next() {
+        if *a == "--" {
+            break;
+        }
+        if *a == "-D" {
+            named = it.next().copied();
+        } else if !a.starts_with("--")
+            && let Some(v) = a.strip_prefix("-D").filter(|v| !v.is_empty())
+        {
+            named = Some(v);
+        }
+    }
+    let mut v = Vec::new();
+    if let Some((_, bytes)) = named.and_then(|n| c.files.iter().find(|(f, _)| *f == n)) {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "stuffr-lz4-dict-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&path, bytes).expect("write the dictionary for the reference");
+        v.push("-D".to_owned());
+        v.push(path.display().to_string());
+    }
+    v
+}
+
 /// How compressed output is judged when its bytes are not promised
 /// identical, and which tool decodes it.
 #[derive(Clone, Copy, Debug)]
@@ -455,6 +738,11 @@ pub enum Roundtrip {
     /// `--patch-from` file is passed on (see `zstd_decode_args`). The kind of
     /// stream (the magic) is compared, not the frame's own header.
     Zstd { ref_zstd: &'static str },
+    /// lz4 frames (`04 22 4d 18`) and legacy frames (`02 21 4c 18`), `.lz4`,
+    /// decoded by `ref_lz4 -dc` (an absolute path), plus the case's `-D`
+    /// dictionary (see `lz4_decode_args`). The kind of stream (the magic) is
+    /// compared, not the frame's own header.
+    Lz4 { ref_lz4: &'static str },
 }
 
 pub struct Case<'a> {
@@ -910,6 +1198,7 @@ pub fn ref_decompress_case(c: &Case, data: &[u8]) -> Result<Vec<u8>, String> {
     let extra = match c.roundtrip {
         Roundtrip::Xz { .. } => xz_decode_args(c),
         Roundtrip::Zstd { .. } => zstd_decode_args(c),
+        Roundtrip::Lz4 { .. } => lz4_decode_args(c),
         _ => Vec::new(),
     };
     ref_decompress_args(&c.roundtrip, &extra, data)
@@ -975,6 +1264,7 @@ fn ref_decompress_args(rt: &Roundtrip, extra: &[String], data: &[u8]) -> Result<
         Roundtrip::Gzip { ref_gzip } => (PathBuf::from(ref_gzip), "gzip"),
         Roundtrip::Xz { ref_xz } => (PathBuf::from(ref_xz), "xz"),
         Roundtrip::Zstd { ref_zstd } => (PathBuf::from(ref_zstd), "zstd"),
+        Roundtrip::Lz4 { ref_lz4 } => (PathBuf::from(ref_lz4), "lz4"),
     };
     let mut child = spawn(
         Command::new(exe)
@@ -1007,6 +1297,7 @@ fn has_magic(rt: &Roundtrip, b: &[u8]) -> bool {
         Roundtrip::Gzip { .. } => b.starts_with(&[0x1f, 0x8b]),
         Roundtrip::Xz { .. } => b.starts_with(&XZ_MAGIC),
         Roundtrip::Zstd { .. } => zstd_stream_kind(b).is_some(),
+        Roundtrip::Lz4 { .. } => lz4_stream_kind(b).is_some(),
     }
 }
 
@@ -1213,6 +1504,7 @@ fn is_compressed_name(c: &Case, n: &str) -> bool {
             .any(|s| n.ends_with(s))
                 || zstd_suffix(&c.args).is_some_and(|s| !s.is_empty() && n.ends_with(s))
         }
+        Roundtrip::Lz4 { .. } => n.ends_with(".lz4"),
     }
 }
 
@@ -1312,13 +1604,16 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
             // A name `-o` gave carries no suffix; the case's one file is
             // then its original (below).
             .unwrap_or_default(),
+        // An explicit output name (`lz4 a x.lz4`) may carry no `.lz4`; the
+        // case's one file is then its original (below).
+        Roundtrip::Lz4 { .. } => name.strip_suffix(".lz4").unwrap_or_default().to_owned(),
     };
     let found = c.files.iter().find(|(n, _)| *n == base);
     // An xz output named after a link the case's setup made (`l.xz` from
     // `l` -> `a`, or `a.xz` from `a` -> `a.xz`) has the case's one file as
     // its original.
     let only = match (c.roundtrip, c.files.as_slice()) {
-        (Roundtrip::Xz { .. } | Roundtrip::Zstd { .. }, [one]) => Some(one),
+        (Roundtrip::Xz { .. } | Roundtrip::Zstd { .. } | Roundtrip::Lz4 { .. }, [one]) => Some(one),
         _ => None,
     };
     found.or(only).map(|(_, b)| b.clone())
@@ -1376,6 +1671,7 @@ fn tool_name(rt: &Roundtrip) -> &'static str {
         Roundtrip::Gzip { .. } => "gzip",
         Roundtrip::Xz { .. } => "xz",
         Roundtrip::Zstd { .. } => "zstd",
+        Roundtrip::Lz4 { .. } => "lz4",
     }
 }
 
@@ -1388,6 +1684,7 @@ fn stream_mismatch(rt: &Roundtrip, reference: &[u8], ours: &[u8]) -> Option<Stri
         Roundtrip::Gzip { .. } => gzip_header_mismatch(reference, ours),
         Roundtrip::Xz { .. } => xz_header_mismatch(reference, ours),
         Roundtrip::Zstd { .. } => zstd_kind_mismatch(reference, ours),
+        Roundtrip::Lz4 { .. } => lz4_kind_mismatch(reference, ours),
     }
 }
 
