@@ -22,7 +22,11 @@ zlib = ["dep:flate2"]
 deflate = ["dep:flate2"]
 bzip2 = ["dep:bzip2"]
 brotli = ["dep:brotli"]
-lz4 = ["dep:lz4_flex"]
+lz4 = ["dep:lz4_flex", "dep:twox-hash"]
+# The lz4 compatibility family's C tier: `lz4_opts` over liblz4 1.10.0
+# (`lz4-sys`), byte-identical to the lz4 CLI. Without it `lz4_opts` runs its
+# own frame writer and reader over `lz4_flex::block`.
+lz4-c = ["lz4", "dep:lz4-sys"]
 snappy = ["dep:snap"]
 zstd-c = ["dep:zstd"]
 zstd-pure = ["dep:ruzstd"]
@@ -103,6 +107,8 @@ flate2 = { workspace = true, optional = true }
 bzip2 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
 lz4_flex = { workspace = true, optional = true }
+lz4-sys = { workspace = true, optional = true }
+twox-hash = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 ruzstd = { workspace = true, optional = true }

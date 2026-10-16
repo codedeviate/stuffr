@@ -20,6 +20,17 @@ flate2 = "1"
 bzip2 = "0.6"
 brotli = "8"
 lz4_flex = "0.14"
+# liblz4 1.10.0, vendored and built whole by its `cc` build script (no
+# pkg-config, no system library), for the lz4 compatibility family's C tier
+# (`lz4-c`): `stuffr_formats::lz4_opts` drives `LZ4F_*` as the lz4 CLI does,
+# so its `.lz4` output is byte-identical to the reference's. Reachable only
+# through `lz4-c`; the `pure` graph is unaffected.
+lz4-sys = "1.11.1"
+# xxHash32 for `lz4_opts`' own frame writer and reader (header, block and
+# content checksums). Already in every `lz4` build's graph: `lz4_flex`'s
+# default `frame` feature depends on this exact crate, so naming it adds no
+# crate and no version to the lock file.
+twox-hash = { version = "2", default-features = false, features = ["xxhash32"] }
 snap = "1"
 # `zstdmt` is required, not decorative: `Encoder::multithread` does not exist
 # without it. The method is present in the crate's source unconditionally, so
