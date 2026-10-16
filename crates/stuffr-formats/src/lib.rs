@@ -208,6 +208,11 @@ pub mod gzip;
 pub mod legacy;
 #[cfg(feature = "lz4")]
 pub mod lz4;
+// The `lz4` compatibility family's options seam over liblz4 (C tier),
+// reached through `stuffr-cli` only; not part of the public surface.
+#[cfg(feature = "lz4-c")]
+#[doc(hidden)]
+pub mod lz4_opts;
 #[cfg(feature = "lzip")]
 pub mod lzip;
 #[cfg(feature = "lzma-c")]

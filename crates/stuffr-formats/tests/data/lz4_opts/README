@@ -1,0 +1,30 @@
+lz4_opts fixtures (src/lz4_opts/tests.rs)
+
+ref.txt      SHA-256 digests of the reference tools' output, one row per
+             input x source x flags; its header says what each row means.
+             The C tier (lz4-c) must reproduce every row byte for byte.
+
+*.lz4        The reference lz4's own output, read by both tiers:
+
+  small.lz4             lz4 -q -c small
+  small-cs-bx.lz4       lz4 -q -c --content-size -BX small
+  small-nocrc.lz4       lz4 -q -c --no-frame-crc small
+  small-d10.lz4         lz4 -q -c -D d10 small
+  small-legacy.lz4      lz4 -q -c -l small
+  multi-b4-bd.lz4       lz4 -q -c -B4 -BD multi
+  multi-b4-bd-d10.lz4   lz4 -q -c -B4 -BD -D d10 multi
+  multi-b4-bx-9-cs.lz4  lz4 -q -c -B4 -BX -9 --content-size multi
+  rand-b4-bd.lz4        lz4 -q -c -B4 -BD rand66
+  empty.lz4             lz4 -q -c empty
+
+  The inputs and the dictionary are generated, not stored: small, multi,
+  rand66 and empty are tests.rs' fixture_input(), d10 its dictionary().
+
+Reference tools: lz4 1.10.0 (/opt/homebrew/opt/lz4/bin/lz4, or
+$STUFFR_LZ4_REFERENCE) and zstd 1.5.7 (/opt/homebrew/opt/zstd/bin/zstd, or
+$STUFFR_ZSTD_REFERENCE), on macOS. Regenerate everything with
+
+  STUFFR_LZ4_OPTS_REGEN=<dir> cargo test -p stuffr-formats --features lz4 \
+      --lib lz4_opts::tests::regenerate_fixtures -- --ignored
+
+then copy <dir>/* here.
