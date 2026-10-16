@@ -52,13 +52,29 @@
 //! - **Legacy (`-l`)**: the magic, then the input in 8 MiB pieces, each
 //!   compressed as one block (always compressed, even when larger).
 //!
+//! ## The pure tier
+//!
+//! Its own frame writer and reader over `lz4_flex::block`, following
+//! `doc/lz4_Frame_format.md`: the same frame layout, block sizes, flags,
+//! checksums and one-shot rule as the C tier, with `lz4_flex`'s single
+//! compressor for every level (spec deviation 6: compatible, not
+//! byte-identical). The reader checks every block-size word against the
+//! frame's declared maximum before it allocates, and a truncated frame is an
+//! error, never a short success.
+
 #[cfg(feature = "lz4-c")]
 pub mod c;
+#[cfg(not(feature = "lz4-c"))]
+pub mod pure;
 
 #[cfg(feature = "lz4-c")]
 use c::legacy_block_decode;
 #[cfg(feature = "lz4-c")]
 pub use c::{Decoder, Encoder, liblz4_version};
+#[cfg(not(feature = "lz4-c"))]
+use pure::legacy_block_decode;
+#[cfg(not(feature = "lz4-c"))]
+pub use pure::{Decoder, Encoder, liblz4_version};
 
 /// The LZ4 frame magic number (`LZ4F_MAGICNUMBER`).
 pub const MAGIC: u32 = 0x184D_2204;

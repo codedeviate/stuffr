@@ -275,6 +275,22 @@ impl Drop for Scratch {
     }
 }
 
+/// `lz4 -d -c` (with `-D dict` if given) over `input`; stdout, or None.
+#[cfg(all(unix, not(feature = "lz4-c")))]
+fn reference_decode(
+    lz4: &std::path::Path,
+    input: &[u8],
+    dict: Option<&std::path::Path>,
+) -> Option<Vec<u8>> {
+    let mut args = vec!["-d"];
+    let ds;
+    if let Some(d) = dict {
+        ds = d.to_str().unwrap().to_owned();
+        args.extend(["-D", &ds]);
+    }
+    run_reference(lz4, &args, None, input)
+}
+
 /// The CLI flags the fixture table covers, compressing a file.
 const FILE_FLAGS: &[&str] = &[
     "-1",
@@ -1243,6 +1259,81 @@ mod c_tier {
             let (t, n) = c::Decoder::frame_info(&f).unwrap();
             assert_eq!(u32::from(o.block_size.id()), t.block_size_id, "{name}");
             assert_eq!(o.header_len, n, "{name}");
+        }
+    }
+}
+
+#[cfg(not(feature = "lz4-c"))]
+mod pure_tier {
+    use super::*;
+
+    #[test]
+    fn liblz4_version_is_the_c_tiers() {
+        assert_eq!(liblz4_version(), "1.10.0");
+    }
+
+    /// Seeded cases over every option the pure tier accepts: each decodes
+    /// on this tier, and with the reference lz4 when it is here.
+    #[test]
+    fn pure_round_trips_and_the_reference_reads_it() {
+        #[cfg(unix)]
+        let lz4 = reference();
+        #[cfg(unix)]
+        let dir = Scratch::new("pure");
+        let mut g = Lcg(0x9e37);
+        for case in 0..64 {
+            let n = match case {
+                0 => 0,
+                1 => FRAME_CHUNK + 4321,
+                2 => 2 * FRAME_CHUNK + 1,
+                _ => g.next() as usize % 300_000,
+            };
+            let data = match g.next() % 3 {
+                0 => text(n, u64::from(g.next())),
+                1 => rand(n, u64::from(g.next())),
+                _ => {
+                    let mut b = bin();
+                    b.resize(n, 0);
+                    b
+                }
+            };
+            let dict_name = ["d10", "d100"][g.next() as usize % 2];
+            let o = EncodeOptions {
+                level: [-5, 1, 2, 3, 9, 12][g.next() as usize % 6],
+                block_size: BlockSizeId::from_id(4 + (g.next() % 4) as u8).unwrap(),
+                block_bytes: (g.next().is_multiple_of(5)).then(|| 32 + g.next() % 5_000_000),
+                block_linked: g.next().is_multiple_of(2),
+                block_checksum: g.next().is_multiple_of(2),
+                content_checksum: !g.next().is_multiple_of(4),
+                content_size: (g.next().is_multiple_of(3)).then_some(n as u64),
+                favor_dec_speed: g.next().is_multiple_of(4),
+                dictionary: (g.next().is_multiple_of(3)).then(|| dictionary(dict_name)),
+                legacy: g.next().is_multiple_of(8),
+            };
+            let plain = !o.legacy && g.next().is_multiple_of(6);
+            let slice = 1 + g.next() as usize % (1 << 20);
+            let f = if plain {
+                encode_plain(&o, &data, slice)
+            } else {
+                encode_chunked(&o, &data, slice)
+            };
+            let back = if o.legacy {
+                decode_legacy(&f).unwrap()
+            } else {
+                let dictionary = o.dictionary.clone().filter(|_| !o.legacy);
+                decode(&DecodeOptions { dictionary }, &f).unwrap()
+            };
+            assert!(back == data, "case {case}: {o:?}");
+            #[cfg(unix)]
+            if let Some(lz4) = &lz4 {
+                let dp = dir.0.join(dict_name);
+                let dict = o.dictionary.as_ref().map(|d| {
+                    std::fs::write(&dp, d).unwrap();
+                    dp.as_path()
+                });
+                let theirs = reference_decode(lz4, &f, dict);
+                assert!(theirs.as_deref() == Some(&data[..]), "case {case}: {o:?}");
+            }
         }
     }
 }

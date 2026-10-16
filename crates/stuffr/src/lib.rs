@@ -72,8 +72,9 @@ pub mod lz4_frame {
 /// The `lz4` tool's options seam — levels, block sizes and modes,
 /// checksums, dictionaries, the legacy format — and the streaming coder over
 /// them, what the `stuffr` binary's lz4 compatibility family runs: liblz4
-/// 1.10.0 under `lz4-c`. Not part of the stable API.
-#[cfg(feature = "lz4-c")]
+/// 1.10.0 under `lz4-c`, else its own frame writer and reader. Not part of
+/// the stable API.
+#[cfg(feature = "lz4")]
 #[doc(hidden)]
 pub mod lz4_opts {
     pub use stuffr_formats::lz4_opts::*;
