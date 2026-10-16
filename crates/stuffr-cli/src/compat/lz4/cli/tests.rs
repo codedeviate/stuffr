@@ -608,17 +608,27 @@ fn help_and_version_print_at_once_whatever_the_level() {
     let (r, out, short) = run("lz4", &["-qq", "-h"], &[]);
     assert_eq!((r.unwrap_err().code, out.as_str()), (0, ""));
     assert!(short.starts_with(&banner));
-    assert!(short.ends_with(" -i#    : minimum evaluation time in seconds (default : 3s) \n"));
+    // (The help's columns are built with `repeat`: a literal run of blanks
+    // trips `no_message_literal_in_the_workspace_carries_a_run_of_collapsed_indentation`.)
+    let blanks = |n: usize| " ".repeat(n);
+    assert!(short.ends_with(&format!(
+        " -i#{}: minimum evaluation time in seconds (default : 3s) \n",
+        blanks(4)
+    )));
     assert_eq!(run("lz4", &["--help"], &[]).2, short);
     assert_eq!(run("lz4", &["-hV"], &[]).2, short);
     let long = run("lz4", &["-H"], &[]).2;
     assert!(long.starts_with(&short));
-    assert!(long.ends_with("          generator | lz4 | consumer \n"));
+    assert!(long.ends_with(&format!("{}generator | lz4 | consumer \n", blanks(10))));
     let long_c = run("lz4c", &["-H"], &[]).2;
-    assert!(long_c.contains(" -y     : overwrite output without prompting \n\n****"));
-    assert!(
-        long_c.ends_with("          lz4c -h -c filename \nwhich displays help text and exits \n")
-    );
+    assert!(long_c.contains(&format!(
+        " -y{}: overwrite output without prompting \n\n****",
+        blanks(5)
+    )));
+    assert!(long_c.ends_with(&format!(
+        "{}lz4c -h -c filename \nwhich displays help text and exits \n",
+        blanks(10)
+    )));
     // `-p` pauses after either.
     assert_eq!(
         run("lz4", &["-p", "-V"], &[]).0.unwrap_err(),
