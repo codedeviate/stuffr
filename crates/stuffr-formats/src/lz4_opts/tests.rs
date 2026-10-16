@@ -805,6 +805,65 @@ fn block_size_word_over_the_max_refuses_before_allocating() {
     );
 }
 
+/// Feeds `s` to a fresh legacy decoder as a caller does: the first call
+/// sees `s[..split]`, later calls everything from the first unconsumed
+/// byte. Returns (consumed, last hint, output), or the error.
+fn legacy_feed(s: &[u8], split: usize) -> Result<(usize, usize, Vec<u8>), Lz4fError> {
+    let mut d = LegacyDecoder::new();
+    let mut out = Vec::new();
+    let (mut pos, mut end) = (0, split);
+    loop {
+        let (n, hint) = d.decompress(&s[pos..end], &mut out).map_err(|e| match e {
+            Lz4Error::Lib(e) => e,
+            Lz4Error::Io(e) => panic!("{e}"),
+        })?;
+        pos += n;
+        if hint == 0 || (end == s.len() && n == 0) {
+            return Ok((pos, hint, out));
+        }
+        end = s.len();
+    }
+}
+
+/// The word that ends a legacy frame may arrive split across calls: it is
+/// never consumed in part, so the accounting matches a whole-buffer feed
+/// at every split (fix round 1: it used to underflow `pos -= 4`).
+#[test]
+fn a_legacy_frame_split_anywhere_ends_the_same() {
+    let a = text(1000, 0xa1);
+    let legacy = encode(
+        &EncodeOptions {
+            legacy: true,
+            ..EncodeOptions::default()
+        },
+        &a,
+    );
+    let tails: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "frame",
+            encode(&EncodeOptions::default(), &text(2000, 0xb2)),
+        ),
+        ("skippable", skippable(2, 10)),
+        ("garbage", vec![0xFF; 6]),
+        ("small word", vec![1, 0, 0, 0, 9, 9]),
+        ("short", vec![0xFF; 3]),
+        ("nothing", Vec::new()),
+    ];
+    for (name, tail) in tails {
+        let s = [&legacy[..], &tail[..]].concat();
+        let whole = legacy_feed(&s, s.len());
+        for split in 0..=s.len() {
+            assert_eq!(legacy_feed(&s, split), whole, "{name} split at {split}");
+        }
+        if let Ok((n, hint, out)) = &whole {
+            assert!(out == &a, "{name}");
+            if matches!(name, "frame" | "skippable" | "garbage") {
+                assert_eq!((*n, *hint), (legacy.len(), 0), "{name}");
+            }
+        }
+    }
+}
+
 #[test]
 fn a_legacy_frame_ends_at_the_next_magic() {
     let a = text(1000, 0xa1);

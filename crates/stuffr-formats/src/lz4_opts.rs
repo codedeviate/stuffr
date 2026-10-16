@@ -489,6 +489,14 @@ enum LegacyStage {
 /// a following frame's magic number. [`LegacyDecoder::decompress`] then
 /// returns a hint of `0` *without* consuming that word, so the caller reads
 /// it as the next frame's magic (or rejects it as garbage).
+///
+/// **A size word is only ever consumed whole, from one call's input.** When
+/// fewer than four bytes of one remain, they are left unconsumed and the
+/// hint is `4`: the caller presents them again, followed by more input (as
+/// with any unconsumed bytes). So the word that ends the frame is always
+/// still in the caller's hands, however the input was split. At end of
+/// input, leftover bytes (1..=3 of a word) are trailing data the caller
+/// judges; the decoder is then still [`at_block_boundary`](Self::at_block_boundary).
 #[derive(Debug)]
 pub struct LegacyDecoder {
     stage: LegacyStage,
@@ -532,7 +540,11 @@ impl LegacyDecoder {
         loop {
             let want = match self.stage {
                 LegacyStage::Done => return Ok((pos, 0)),
-                LegacyStage::Magic | LegacyStage::Size => 4,
+                LegacyStage::Magic => 4,
+                // Never gathered across calls (the type's doc): the word
+                // that ends the frame must be given back whole.
+                LegacyStage::Size if input.len() - pos < 4 => return Ok((pos, 4)),
+                LegacyStage::Size => 4,
                 LegacyStage::Block(n) => n,
             };
             let take = (want - self.buf.len()).min(input.len() - pos);
@@ -551,7 +563,8 @@ impl LegacyDecoder {
                 LegacyStage::Size => {
                     let n = le32(&self.buf, 0) as usize;
                     if n > LEGACY_BLOCK_BOUND {
-                        // Not a block: the next frame's magic. Give it back.
+                        // Not a block: the next frame's magic. Give it back
+                        // (all four bytes came from this call's input).
                         pos -= 4;
                         self.buf.clear();
                         self.stage = LegacyStage::Done;
@@ -560,8 +573,12 @@ impl LegacyDecoder {
                     self.stage = LegacyStage::Block(n);
                 }
                 LegacyStage::Block(_) => {
+                    // No LZ4 block expands past 255 bytes per input byte (a
+                    // match length grows by at most 255 per byte), so a
+                    // small block needs no 8 MiB of room.
+                    let room = self.buf.len().saturating_mul(255).saturating_add(64);
                     let start = out.len();
-                    out.resize(start + LEGACY_BLOCK_SIZE, 0);
+                    out.resize(start + room.min(LEGACY_BLOCK_SIZE), 0);
                     match legacy_block_decode(&self.buf, &mut out[start..]) {
                         Ok(n) => out.truncate(start + n),
                         Err(e) => {
