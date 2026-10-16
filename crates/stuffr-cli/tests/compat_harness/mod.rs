@@ -710,20 +710,7 @@ fn lz4_kind_mismatch(reference: &[u8], ours: &[u8]) -> Option<String> {
 /// setup makes) is not passed, and the reference then says why it cannot
 /// decode.
 fn lz4_decode_args(c: &Case) -> Vec<String> {
-    let mut named: Option<&str> = None;
-    let mut it = c.args.iter();
-    while let Some(a) = it.next() {
-        if *a == "--" {
-            break;
-        }
-        if *a == "-D" {
-            named = it.next().copied();
-        } else if !a.starts_with("--")
-            && let Some(v) = a.strip_prefix("-D").filter(|v| !v.is_empty())
-        {
-            named = Some(v);
-        }
-    }
+    let named = lz4_dictionary_name(c);
     let mut v = Vec::new();
     if let Some((_, bytes)) = named.and_then(|n| c.files.iter().find(|(f, _)| *f == n)) {
         static N: AtomicUsize = AtomicUsize::new(0);
@@ -1632,14 +1619,58 @@ fn original_for(c: &Case, name: &str) -> Option<Vec<u8>> {
         Roundtrip::Lz4 { .. } => name.strip_suffix(".lz4").unwrap_or_default().to_owned(),
     };
     let found = c.files.iter().find(|(n, _)| *n == base);
+    if found.is_none() && matches!(c.roundtrip, Roundtrip::Lz4 { .. }) {
+        return lz4_original(c, name, &base);
+    }
     // An xz output named after a link the case's setup made (`l.xz` from
     // `l` -> `a`, or `a.xz` from `a` -> `a.xz`) has the case's one file as
     // its original.
     let only = match (c.roundtrip, c.files.as_slice()) {
-        (Roundtrip::Xz { .. } | Roundtrip::Zstd { .. } | Roundtrip::Lz4 { .. }, [one]) => Some(one),
+        (Roundtrip::Xz { .. } | Roundtrip::Zstd { .. }, [one]) => Some(one),
         _ => None,
     };
     found.or(only).map(|(_, b)| b.clone())
+}
+
+/// [`original_for`] for an lz4 output not named after a case file. lz4's
+/// outputs may be named anything (`lz4 a x.lz4`, `lz4 -f a o` over an
+/// existing `o`, `lz4 - out`): `stdin.lz4` is standard input's (`lz4 -m e
+/// stdin`); otherwise the case's one file that is neither this output (a
+/// file it replaced) nor the `-D` dictionary, or, when there is none,
+/// standard input.
+fn lz4_original(c: &Case, name: &str, base: &str) -> Option<Vec<u8>> {
+    if base == "stdin" {
+        return c.stdin.clone();
+    }
+    let dict = lz4_dictionary_name(c);
+    let mut rest = c
+        .files
+        .iter()
+        .filter(|(n, _)| *n != name && Some(*n) != dict);
+    match (rest.next(), rest.next()) {
+        (Some((_, b)), None) => Some(b.clone()),
+        (None, _) => c.stdin.clone(),
+        _ => None,
+    }
+}
+
+/// The file `-D FILE` or `-DFILE` names in `c`'s arguments.
+fn lz4_dictionary_name<'a>(c: &Case<'a>) -> Option<&'a str> {
+    let mut named = None;
+    let mut it = c.args.iter();
+    while let Some(a) = it.next() {
+        if *a == "--" {
+            break;
+        }
+        if *a == "-D" {
+            named = it.next().copied();
+        } else if !a.starts_with("--")
+            && let Some(v) = a.strip_prefix("-D").filter(|v| !v.is_empty())
+        {
+            named = Some(v);
+        }
+    }
+    named
 }
 
 fn describe_bytes(b: &[u8]) -> String {
