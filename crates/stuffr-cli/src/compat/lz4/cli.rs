@@ -43,6 +43,13 @@ const STDOUTMARK: &[u8] = b"stdout";
 /// lz4 -H: "'null' to discard output (test mode)" (only as the output
 /// operand).
 const NULMARK: &[u8] = b"null";
+/// The system's null device, spelled exactly so, is the same output as
+/// [`NULMARK`] (probe 2026-10-16: `lz4 a /dev/null` and `lz4 -d a.lz4
+/// /dev/null` print their summaries and exit 0 with no question, and
+/// `lz4 a /dev/null -m -d a.lz4` writes standard output as `null` does;
+/// `//dev/null`, `/dev//null`, `./../../dev/null`, a symlink to it and
+/// `/dev/zero` are files, asked about when they exist).
+const DEVNULL: &[u8] = b"/dev/null";
 /// lz4 -H: "for compression, output to filename.lz4"; probe: `lz4 x.LZ4`
 /// compresses (the match is case-sensitive).
 pub(crate) const EXTENSION: &[u8] = b".lz4";
@@ -365,7 +372,7 @@ impl State<'_> {
             // lz4 -H: "[output] : 'stdout' ... 'null' to discard output".
             self.output = match a {
                 STDOUTMARK => Output::Stdout,
-                NULMARK => Output::Null,
+                NULMARK | DEVNULL => Output::Null,
                 _ => Output::File(a.to_vec()),
             };
         } else {

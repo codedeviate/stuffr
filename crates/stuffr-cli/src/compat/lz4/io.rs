@@ -32,7 +32,9 @@
 //!   `lz4 -t a.lz4 -` does, its output being discarded).
 //! - **`--rm`** removes an input once it was processed (also after `-t`,
 //!   `-c`, and a decode that met undecodable trailing data); standard input
-//!   is removed by its name, `stdin` (`Error 50`).
+//!   is removed by its name, `stdin`, as lz4 does: a file named `stdin` in
+//!   the working directory is deleted (probe: `lz4 -c --rm < a` with a file
+//!   `stdin` present), and with none it is `Error 50`.
 //! - **Sparse output** (decompression only; on for files, off for standard
 //!   output unless `--sparse`): runs of zero words become seeks, and the
 //!   last skip ends with a written zero. lz4 seeks before each piece of data
@@ -614,10 +616,12 @@ impl Run<'_> {
         let (Target::File(name), Some(meta)) = (target, input) else {
             return;
         };
-        if !meta.is_file() {
+        let path = self.host.path(name);
+        // Only a regular file to a regular file (probe: `lz4 -f b fifo`
+        // leaves the FIFO's own mode; a device is never touched).
+        if !meta.is_file() || !fs::metadata(&path).is_ok_and(|m| m.is_file()) {
             return;
         }
-        let path = self.host.path(name);
         if let Ok(t) = meta.modified() {
             let times = fs::FileTimes::new().set_modified(t);
             let _ = File::options()

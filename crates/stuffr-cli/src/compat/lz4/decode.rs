@@ -170,6 +170,13 @@ fn modern(
         out.clear();
         show_decode_progress(run, d.written, true, shown);
         match r {
+            // The guard against an endless loop: both backends consume
+            // input until the frame ends or the input given is used up (C:
+            // LZ4F_decompress always takes bytes when it has output room,
+            // and the decoder loops with a fresh 256 KiB scratch; pure: every
+            // stage gathers bytes before it acts), so with a nonempty slice
+            // nothing consumed cannot happen; if it ever did, the frame is
+            // unfinishable, which is Error 26's meaning.
             Ok((0, _)) => return Err(run.exm(26, m::E26_INCOMPLETE, &[])),
             Ok((_, h)) => hint = h,
             Err(e) => return Err(failed(run, &e)),

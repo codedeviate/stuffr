@@ -2714,6 +2714,9 @@ mod unix {
         fs::write(w.join("d/sub/y.lz4"), fx("b.lz4")).unwrap();
         fs::write(w.join("d/k.lz4"), fx("b.lz4")).unwrap();
     }
+    fn link_to_dev_null(w: &Path) {
+        std::os::unix::fs::symlink("/dev/null", w.join("nl")).unwrap();
+    }
     fn set_up(c: Case<'static>, f: fn(&Path)) -> Case<'static> {
         Case {
             setup: Some(f),
@@ -3242,6 +3245,19 @@ mod unix {
             lz4_case("lz4", &["-t", "f.lz4", "-"], files()),
             piped("lz4", &[], vec![], text()),
             piped("lz4", &["-", "o.lz4"], vec![], text()),
+            // `/dev/null`, spelled exactly so, is the `null` output (probe
+            // 2026-10-16): no question, the summary, nothing written.
+            lz4_case("lz4", &["f", "/dev/null"], files()),
+            lz4_case("lz4", &["-d", "f.lz4", "/dev/null"], files()),
+            lz4_case("lz4", &["-t", "f.lz4", "/dev/null"], files()),
+            lz4_case("lz4", &["--rm", "f", "/dev/null"], files()),
+            lz4_case("lz4", &["g", "/dev/null", "-m", "-d", "f.lz4"], files()),
+            // Other spellings and a link to it are files that exist: asked
+            // about, and refused at end of input.
+            lz4_case("lz4", &["f", "//dev/null"], files()),
+            lz4_case("lz4", &["-d", "f.lz4", "/dev//null"], files()),
+            set_up(lz4_case("lz4", &["f", "nl"], files()), link_to_dev_null),
+            lz4_case("lz4", &["f", "/dev/zero"], files()),
         ];
         for args in [&["-z", "f"][..], &["f", "-"], &["-c", "f"], &["f", "null"]] {
             let mut c = lz4_case("lz4", args, files());
@@ -3284,6 +3300,62 @@ mod unix {
             cases.push(lz4_case("lz4", &["-dc", name], f()));
         }
         check("sparse_output_matches_the_reference", &cases);
+    }
+
+    /// The input's mode and time go only onto a regular output (probe
+    /// 2026-10-16: `lz4 -f b fifo`, `b` mode 600, leaves the FIFO 644).
+    #[test]
+    fn metadata_goes_only_onto_a_regular_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(dir) = lz4_dir() else { return };
+        let mode_after = |exe: &Path, tag: &str| -> u32 {
+            let w = ScratchDir::at(
+                std::env::temp_dir().join(format!("stuffr-lz4-fifo-{tag}-{}", std::process::id())),
+            );
+            fs::create_dir_all(&*w).unwrap();
+            fs::write(w.join("b"), text()).unwrap();
+            fs::set_permissions(w.join("b"), fs::Permissions::from_mode(0o600)).unwrap();
+            let fifo = w.join("fifo");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `c` is a NUL-terminated path that outlives the call.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+            fs::set_permissions(&fifo, fs::Permissions::from_mode(0o644)).unwrap();
+            let reader = {
+                let fifo = fifo.clone();
+                std::thread::spawn(move || {
+                    let mut v = Vec::new();
+                    std::io::Read::read_to_end(&mut fs::File::open(fifo).unwrap(), &mut v).unwrap();
+                    v
+                })
+            };
+            let o = output(
+                std::process::Command::new(exe)
+                    .args(["-q", "-f", "b", "fifo"])
+                    .current_dir(&*w)
+                    .stdin(std::process::Stdio::null()),
+            )
+            .unwrap();
+            assert!(
+                o.status.success(),
+                "{exe:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            let got = reader.join().unwrap();
+            assert!(
+                got.starts_with(&[0x04, 0x22, 0x4d, 0x18]),
+                "{exe:?} wrote no frame"
+            );
+            fs::symlink_metadata(&fifo).unwrap().permissions().mode() & 0o7777
+        };
+        let link_dir = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-lz4-fifo-bin-{}", std::process::id())),
+        );
+        fs::create_dir_all(&*link_dir).unwrap();
+        let link = link_dir.join("lz4");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        let theirs = mode_after(&Path::new(dir).join("lz4"), "ref");
+        assert_eq!(theirs, 0o644, "the reference changed the FIFO's mode");
+        assert_eq!(mode_after(&link, "ours"), theirs);
     }
 
     /// Spec deviation 3, an expected difference: an output that is the
