@@ -1119,7 +1119,7 @@ mod unix {
             r.stderr = normalise_lz4_progress(&r.stderr);
             s.stderr = normalise_lz4_progress(&s.stderr);
             // The reference's own race over how much a failed decode wrote.
-            tolerate_lz4_partial_output(&mut r, &mut s);
+            tolerate_lz4_partial_output(c, &mut r, &mut s);
             assert_same(c, &r, &s);
             true
         };
@@ -1164,8 +1164,11 @@ mod unix {
             let Some(run) = reference(dir, &c) else {
                 return;
             };
-            let stderr = run.stderr.replace(REFERENCE_BANNER, "");
-            if run.code != r.code || !stderr.contains(r.msg) {
+            // The refresh of a failing decode lands anywhere in the message
+            // (the reference's own race): judge the normalised text.
+            let raw = run.stderr.replace(REFERENCE_BANNER, "");
+            let stderr = normalise_lz4_progress(&raw);
+            if run.code != r.code || !(raw.contains(r.msg) || stderr.contains(r.msg)) {
                 bad.push(format!(
                     "{} ({} {:?}): recorded exit {} with {:?}; the reference gave exit {} and {:?}",
                     r.label, r.name, r.args, r.code, r.msg, run.code, run.stderr

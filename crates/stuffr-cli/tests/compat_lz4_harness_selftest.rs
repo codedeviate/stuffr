@@ -203,8 +203,8 @@ lz4: Read : 0 MiB   ==> 1.25%   \n";
             r
         };
         let verdict_of = |mut r: Run, mut s: Run| {
-            tolerate_lz4_partial_output(&mut r, &mut s);
             let c = case("/nonexistent", vec!["-d", "x.lz4"]);
+            tolerate_lz4_partial_output(&c, &mut r, &mut s);
             verdict(&c, &r, &s)
         };
         // Nothing against everything, in either direction, and a shorter
@@ -230,6 +230,44 @@ lz4: Read : 0 MiB   ==> 1.25%   \n";
         let mut s = mk(34, b"", b"");
         s.tree.clear();
         assert!(verdict_of(mk(34, b"", b""), s).is_some());
+    }
+
+    /// A deterministic failure is compared exactly: exit 1 with the
+    /// reference writing nothing and stuffr writing something is a
+    /// difference, for a decode and for a non-decode; the race excuse is
+    /// only for a decode failing after data.
+    #[test]
+    fn a_deterministic_failure_gets_no_tolerance() {
+        let mk = |code: i32, out: &[u8], err: &str| {
+            let mut r = run(code, err);
+            r.stdout = out.to_vec();
+            r.tree.insert("o".into(), (out.to_vec(), 0o644, 0));
+            r
+        };
+        for args in [
+            vec!["-d", "x.lz4"],
+            vec!["--list", "x.lz4"],
+            vec!["-m", "x"],
+        ] {
+            let c = case("/nonexistent", args);
+            let msg = "x: No such file ";
+            let (mut r, mut s) = (mk(1, b"", msg), mk(1, b"junk", msg));
+            tolerate_lz4_partial_output(&c, &mut r, &mut s);
+            let m = verdict(&c, &r, &s).expect("arbitrary output on an exit-1 failure passed");
+            assert!(m.contains("stdout differs"), "{m}");
+        }
+        // A non-decode with a race-prone code is not excused either.
+        let c = case("/nonexistent", vec!["-m", "x"]);
+        let (mut r, mut s) = (mk(34, b"", ""), mk(34, b"junk", ""));
+        tolerate_lz4_partial_output(&c, &mut r, &mut s);
+        assert!(verdict(&c, &r, &s).is_some());
+        // The decode race at exit 1 is excused only for the trailing-data
+        // message.
+        let c = case("/nonexistent", vec!["-t", "x.lz4"]);
+        let msg = "Stream followed by undecodable data at position 8 \n";
+        let (mut r, mut s) = (mk(1, b"", msg), mk(1, b"abc", msg));
+        tolerate_lz4_partial_output(&c, &mut r, &mut s);
+        assert_eq!(verdict(&c, &r, &s), None);
     }
 
     #[test]

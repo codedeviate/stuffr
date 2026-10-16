@@ -530,8 +530,11 @@ fn lz4_refresh_len(s: &str, racy: bool) -> Option<usize> {
     }
     let r = seg.strip_prefix("Decompressed : ")?;
     if racy {
-        // The refresh is one write; the blanks after it belong to what the
-        // other thread was in the middle of printing.
+        // The refresh is one write, `\rDecompressed : N MiB  ` (two blanks).
+        // The other thread prints the message in pieces (`...invalid frame`
+        // then ` \n`), so a refresh can land between them and the line then
+        // reads `frame\rDecompressed : 0 MiB   \n`: the blanks beyond the
+        // refresh's two are the message's own trailing blank, and are kept.
         let n = r.find(" MiB  ")?;
         return digits(&r[..n]).then_some(1 + "Decompressed : ".len() + n + " MiB  ".len());
     }
@@ -634,7 +637,7 @@ fn normalise_lz4_line(line: &str) -> String {
 /// other side's, by truncating both to the shorter. A run that succeeded, a
 /// failure with different exit codes, and bytes that are not a prefix are
 /// untouched, so every real difference is still reported.
-pub fn tolerate_lz4_partial_output(r: &mut Run, s: &mut Run) {
+pub fn tolerate_lz4_partial_output(c: &Case, r: &mut Run, s: &mut Run) {
     fn common(a: &mut Vec<u8>, b: &mut Vec<u8>) {
         if a.starts_with(b) || b.starts_with(a) {
             let n = a.len().min(b.len());
@@ -642,7 +645,27 @@ pub fn tolerate_lz4_partial_output(r: &mut Run, s: &mut Run) {
             b.truncate(n);
         }
     }
-    if r.code == 0 || r.code != s.code {
+    // Only a decode (`-d`, `-t`, `--decompress`, `--test`, `unlz4`, `lz4cat`)
+    // has the race, and only a failure that comes after data: every exit
+    // but 1, and 1 only for "Stream followed by undecodable data". A
+    // deterministic failure (usage, a missing file, `--list`) writes
+    // what it writes, exactly.
+    let flags = |a: &&str| {
+        a.strip_prefix('-')
+            .filter(|t| !t.starts_with('-'))
+            .is_some_and(|t| {
+                t.chars()
+                    .take_while(char::is_ascii_lowercase)
+                    .any(|ch| ch == 'd' || ch == 't')
+            })
+    };
+    let decode = matches!(c.name, "unlz4" | "lz4cat")
+        || c.args
+            .iter()
+            .take_while(|a| **a != "--")
+            .any(|a| flags(a) || matches!(*a, "--decompress" | "--uncompress" | "--test"));
+    let after_data = r.code != 1 || r.stderr.contains("Stream followed by undecodable data");
+    if !decode || !after_data || r.code == 0 || r.code != s.code {
         return;
     }
     common(&mut r.stdout, &mut s.stdout);
