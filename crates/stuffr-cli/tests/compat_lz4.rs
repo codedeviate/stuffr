@@ -2247,8 +2247,45 @@ mod unix {
         s.stderr = normalise_lz4_progress(&s.stderr);
         // The reference's own race over how much a failed decode wrote.
         tolerate_lz4_partial_output(c, &mut r, &mut s);
+        // Spec deviation 6: the pure tier's summary counts its own bytes,
+        // and its compressed bytes on a terminal (which rewrites newlines)
+        // cannot be decoded back; whether anything was written still is
+        // compared.
+        if !EXACT {
+            r.stderr = mask_compressed_size(&r.stderr);
+            s.stderr = mask_compressed_size(&s.stderr);
+            if c.tty_stdout && r.stdout.is_empty() == s.stdout.is_empty() {
+                r.stdout.clear();
+                s.stdout.clear();
+            }
+        }
         assert_same(c, &r, &s);
         true
+    }
+
+    /// `Compressed A bytes into B bytes ==> R%` with B and R masked: the
+    /// pure tier's frames are compatible, not identical (spec deviation 6),
+    /// so only the bytes read are compared.
+    fn mask_compressed_size(stderr: &str) -> String {
+        let mut out = String::with_capacity(stderr.len());
+        let mut rest = stderr;
+        while let Some(at) = rest.find(" bytes into ") {
+            let (head, tail) = rest.split_at(at + " bytes into ".len());
+            out.push_str(head);
+            let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+            let after = &tail[digits..];
+            if digits > 0
+                && let Some(r) = after.strip_prefix(" bytes ==> ")
+                && let Some(pct) = r.find('%')
+            {
+                out.push_str("<n> bytes ==> <r>");
+                rest = &r[pct..];
+            } else {
+                rest = tail;
+            }
+        }
+        out.push_str(rest);
+        out
     }
 
     /// Every row of `task` against the reference and stuffr.
@@ -2341,7 +2378,6 @@ mod unix {
     }
 
     #[test]
-    #[ignore = "Task 4"]
     fn task4_rows_match_the_reference() {
         check_task("Task 4");
     }
@@ -2399,7 +2435,15 @@ mod unix {
     ///
     /// Task 3 added 50: `lz4 -c --rm` on standard input is `Error 50 :
     /// Remove error : stdin: No such file or directory` (probed 2026-10-16).
-    const EXIT_CODES: [i32; 15] = [0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 50, 61, 63, 64, 70];
+    ///
+    /// Task 4 added 69, 72 and 74: `--sparse` decoding into a pipe (`lz4
+    /// --sparse -dc X | cat`: `Error 69 : Final skip error (sparse file)`,
+    /// `Error 72 : Sparse skip error(29): Illegal seek ; try --no-sparse`,
+    /// `Error 74 : Sparse skip error ; try --no-sparse`; probed 2026-10-16,
+    /// pinned by `sparse_output_matches_the_reference`).
+    const EXIT_CODES: [i32; 18] = [
+        0, 1, 26, 27, 34, 38, 40, 42, 43, 44, 50, 61, 63, 64, 69, 70, 72, 74,
+    ];
 
     #[test]
     fn every_recorded_code_is_in_the_exit_set() {
@@ -2445,6 +2489,859 @@ mod unix {
         );
     }
 
+    // ---- part 2 (Task 4): compression, decompression, test, files ----
+    //
+    // Every case below runs the reference and stuffr side by side and
+    // compares standard output, standard error (deviation 2 normalised),
+    // the exit code and the file tree (bytes, mode, mtime); on the C tier
+    // compressed bytes are compared exactly, on the pure tier the
+    // reference decodes them (deviation 6). Probed 2026-10-16.
+
+    /// A case of `name ARGS` over `files`.
+    fn lz4_case(
+        name: &'static str,
+        args: &[&'static str],
+        files: Vec<(&'static str, Vec<u8>)>,
+    ) -> Case<'static> {
+        Case {
+            name,
+            args: args.to_vec(),
+            files,
+            stdin: None,
+            tty_stdin: false,
+            tty_stdout: false,
+            env: vec![("LC_ALL", "C")],
+            compare_output_bytes: EXACT,
+            expect_stdout_plain: None,
+            setup: None,
+            roundtrip: Roundtrip::Lz4 { ref_lz4: ref_lz4() },
+        }
+    }
+
+    /// [`lz4_case`] fed `stdin`.
+    fn piped(
+        name: &'static str,
+        args: &[&'static str],
+        files: Vec<(&'static str, Vec<u8>)>,
+        stdin: Vec<u8>,
+    ) -> Case<'static> {
+        Case {
+            stdin: Some(stdin),
+            ..lz4_case(name, args, files)
+        }
+    }
+
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
+    /// Run `cases` against the reference; skipped when it is absent.
+    fn check(group: &str, cases: &[Case]) {
+        if lz4_dir().is_none() {
+            return;
+        }
+        run_group(group, cases, Skipped::none(), &compare);
+    }
+
+    /// The brief's six inputs: empty, one byte, 1 KiB of text, 1 MiB mixed,
+    /// 1 MiB random, and 9 MiB repetitive (past a legacy block's 8 MiB and
+    /// two frame jobs of 4 MiB).
+    fn inputs() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one", b"x".to_vec()),
+            ("kib", super::compat_harness::text(1024, 41)),
+            ("mixed", mixed(1 << 20, 42)),
+            ("random", random(1 << 20, 43)),
+            ("rep", repetitive(9 << 20)),
+        ]
+    }
+
+    /// `--fast=5`, `-0` to `-12`, `--best`, `--favor-decSpeed` (alone and
+    /// where liblz4 uses it, levels 10 and up).
+    const LEVELS: [&[&str]; 18] = [
+        &["--fast=5"],
+        &["-0"],
+        &["-1"],
+        &["-2"],
+        &["-3"],
+        &["-4"],
+        &["-5"],
+        &["-6"],
+        &["-7"],
+        &["-8"],
+        &["-9"],
+        &["-10"],
+        &["-11"],
+        &["-12"],
+        &["--best"],
+        &["--favor-decSpeed"],
+        &["--favor-decSpeed", "-10"],
+        &["--favor-decSpeed", "--best"],
+    ];
+
+    /// Every level over every input, file to file (the summary at level 2
+    /// included); the 9 MiB input at the levels that exercise each
+    /// compressor (the high levels take long in a debug build).
+    #[test]
+    fn every_level_of_every_input() {
+        let mut cases = Vec::new();
+        for (name, data) in inputs() {
+            for level in LEVELS {
+                if name == "rep" && !matches!(level[0], "--fast=5" | "-1" | "-3" | "-9") {
+                    continue;
+                }
+                let mut args = level.to_vec();
+                args.extend([name, "o.lz4"]);
+                cases.push(lz4_case("lz4", &args, vec![(name, data.clone())]));
+            }
+        }
+        check("every_level_of_every_input", &cases);
+    }
+
+    /// The frame options over the inputs: block sizes, linked blocks, block
+    /// checksums, no content checksum, the content size (from a file, from
+    /// standard input redirected from a pipe), legacy, a dictionary, and
+    /// the thread counts (which do not change the bytes).
+    #[test]
+    fn frame_options_match_the_reference() {
+        const OPTIONS: [&[&str]; 18] = [
+            &["-B4"],
+            &["-B5"],
+            &["-B6"],
+            &["-B7"],
+            &["-B4", "-BD"],
+            &["-BD"],
+            &["-BX"],
+            &["-B4", "-BD", "-BX"],
+            &["--no-frame-crc"],
+            &["--content-size"],
+            &["--content-size", "-B4", "-BD"],
+            &["-l"],
+            &["-l", "-9"],
+            &["-D", "dict"],
+            &["-D", "dict", "-BD", "-B4"],
+            &["-T1"],
+            &["-T4"],
+            &["-T0"],
+        ];
+        let dict = mixed(70 << 10, 44);
+        let mut cases = Vec::new();
+        for (name, data) in inputs() {
+            for opt in OPTIONS {
+                if name == "rep" && opt.contains(&"-T4") {
+                    continue;
+                }
+                let mut args = opt.to_vec();
+                args.extend([name, "o.lz4"]);
+                let mut files = vec![(name, data.clone())];
+                if opt.contains(&"-D") {
+                    files.push(("dict", dict.clone()));
+                }
+                cases.push(lz4_case("lz4", &args, files));
+            }
+            // Standard input: a pipe has no size (probe: `cat big | lz4
+            // --content-size -c` records none).
+            for opt in [&["--content-size"][..], &["-l"], &["-BD", "-B5"]] {
+                let mut args = opt.to_vec();
+                args.push("-c");
+                cases.push(piped("lz4", &args, vec![], data.clone()));
+            }
+        }
+        check("frame_options_match_the_reference", &cases);
+    }
+
+    /// Ruling T3-d: levels at the edge of `i32` (probe 2026-10-16: frames at
+    /// `i32::MIN` and `i32::MIN + 1` are level 1's bytes, everything at or
+    /// below −65535 is −65536's; legacy at `i32::MIN` is level 1's).
+    #[test]
+    fn extreme_levels_match_the_reference() {
+        let data = mixed(300 << 10, 45);
+        let mut cases = Vec::new();
+        for legacy in [false, true] {
+            for level in [
+                "--fast=2147483646",
+                "--fast=2147483647",
+                "--fast=2147483648",
+                "-2147483648",
+                "-2147483647",
+            ] {
+                let mut args = vec![level, "-c", "in"];
+                if legacy {
+                    args.insert(0, "-l");
+                }
+                cases.push(lz4_case("lz4", &args, vec![("in", data.clone())]));
+            }
+            let mut c = lz4_case(
+                "lz4",
+                if legacy {
+                    &["-l", "-c", "in"]
+                } else {
+                    &["-c", "in"]
+                },
+                vec![("in", data.clone())],
+            );
+            c.env.push(("LZ4_CLEVEL", "2147483648"));
+            cases.push(c);
+        }
+        check("extreme_levels_match_the_reference", &cases);
+    }
+
+    // ---- files ----
+
+    fn link_a_to_la(w: &Path) {
+        std::os::unix::fs::symlink("a", w.join("la")).unwrap();
+    }
+    fn dangling(w: &Path) {
+        std::os::unix::fs::symlink("nowhere", w.join("dangle")).unwrap();
+    }
+    fn tree(w: &Path) {
+        fs::create_dir_all(w.join("d/sub")).unwrap();
+        fs::create_dir_all(w.join("d/emp")).unwrap();
+        for (n, b) in [
+            ("d/zz", "1\n"),
+            ("d/aa", "2\n"),
+            ("d/Mm", "3\n"),
+            ("d/sub/x", "4\n"),
+            ("d/.h", "5\n"),
+        ] {
+            fs::write(w.join(n), b).unwrap();
+        }
+        std::os::unix::fs::symlink("../a", w.join("d/lnk")).unwrap();
+    }
+    fn tree_of_frames(w: &Path) {
+        tree(w);
+        fs::write(w.join("d/sub/y.lz4"), fx("b.lz4")).unwrap();
+        fs::write(w.join("d/k.lz4"), fx("b.lz4")).unwrap();
+    }
+    fn set_up(c: Case<'static>, f: fn(&Path)) -> Case<'static> {
+        Case {
+            setup: Some(f),
+            ..c
+        }
+    }
+    fn mode_640_a(w: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(w.join("a"), fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    fn mode_604_b(w: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(w.join("b.lz4"), fs::Permissions::from_mode(0o604)).unwrap();
+    }
+    fn stdin_file(w: &Path) {
+        fs::write(w.join("stdin"), b"a file named stdin\n").unwrap();
+    }
+
+    /// Where outputs go and what happens to the files around them: `-k`
+    /// and `--rm`, `-f`, the overwrite question (R11: answered `y`, `n`, at
+    /// end of file, and twice from one input), symbolic links, `-m` and
+    /// `-r` trees, metadata, standard input and output.
+    #[test]
+    fn files_match_the_reference() {
+        let a = || ("a", text());
+        let e = || ("e", Vec::new());
+        let b = || ("b.lz4", fx("b.lz4"));
+        let old = || ("a.lz4", b"old\n".to_vec());
+        let mut cases = vec![
+            // Standard input to standard output, and to a file.
+            piped("lz4", &[], vec![], text()),
+            piped("lz4", &["-", "o.lz4"], vec![], text()),
+            piped("unlz4", &[], vec![], fx("b.lz4")),
+            piped("unlz4", &["-", "o"], vec![], fx("b.lz4")),
+            piped("lz4", &["-d", "stdin", "o"], vec![], fx("b.lz4")),
+            // Several files to standard output, and as a list.
+            lz4_case("lz4", &["-m", "-c", "a", "e"], vec![a(), e()]),
+            lz4_case("lz4", &["-m", "a", "e"], vec![a(), e()]),
+            lz4_case("lz4", &["-m", "-d", "b.lz4"], vec![b()]),
+            lz4_case("lz4cat", &["b.lz4", "b.lz4"], vec![b()]),
+            lz4_case("lz4", &["-dc", "-m", "b.lz4", "b.lz4"], vec![b()]),
+            piped("lz4", &["-m", "stdin", "e"], vec![e()], text()),
+            piped("lz4", &["-m", "e", "stdin"], vec![e()], text()),
+            // Keep, remove, force.
+            lz4_case("lz4", &["a"], vec![a()]),
+            lz4_case("lz4", &["-k", "a"], vec![a()]),
+            lz4_case("lz4", &["--rm", "a"], vec![a()]),
+            lz4_case("lz4", &["--rm", "-m", "a", "e"], vec![a(), e()]),
+            lz4_case("lz4", &["--rm", "a", "o.lz4"], vec![a()]),
+            lz4_case("unlz4", &["--rm", "b.lz4"], vec![b()]),
+            lz4_case("lz4", &["--rm", "-dc", "b.lz4"], vec![b()]),
+            lz4_case("lz4", &["-f", "a"], vec![a(), old()]),
+            lz4_case("lz4", &["-f", "-m", "a", "e"], vec![a(), e(), old()]),
+            lz4_case(
+                "unlz4",
+                &["-f", "b.lz4"],
+                vec![b(), ("b", b"old\n".to_vec())],
+            ),
+            // The overwrite question.
+            piped("lz4", &["a"], vec![a(), old()], b"y\n".to_vec()),
+            piped("lz4", &["a"], vec![a(), old()], b"n\n".to_vec()),
+            piped("lz4", &["a"], vec![a(), old()], b"".to_vec()),
+            piped("lz4", &["a"], vec![a(), old()], b"yes please\n".to_vec()),
+            piped("lz4", &["a"], vec![a(), old()], b" y\n".to_vec()),
+            piped("lz4", &["-q", "a"], vec![a(), old()], b"y\n".to_vec()),
+            piped("lz4", &["-m", "a"], vec![a(), old()], b"y\n".to_vec()),
+            piped("lz4", &["-", "e"], vec![e()], b"y\nhello".to_vec()),
+            piped(
+                "unlz4",
+                &["b.lz4"],
+                vec![b(), ("b", b"x".to_vec())],
+                b"Y".to_vec(),
+            ),
+            // Symbolic links: followed.
+            set_up(lz4_case("lz4", &["la"], vec![a()]), link_a_to_la),
+            set_up(lz4_case("lz4", &["dangle"], vec![]), dangling),
+            set_up(lz4_case("lz4", &["-m", "la"], vec![a()]), link_a_to_la),
+            // Metadata: mode and mtime are the input's.
+            set_up(lz4_case("lz4", &["a"], vec![a()]), mode_640_a),
+            set_up(
+                lz4_case("lz4", &["-d", "b.lz4", "o"], vec![b()]),
+                mode_604_b,
+            ),
+            set_up(
+                lz4_case("lz4", &["-f", "a", "o"], vec![a(), ("o", vec![])]),
+                mode_640_a,
+            ),
+            // `--rm` of standard input removes a file named `stdin`.
+            set_up(piped("lz4", &["-c", "--rm"], vec![], text()), stdin_file),
+            // Trees.
+            set_up(lz4_case("lz4", &["-r", "d"], vec![a()]), tree),
+            set_up(lz4_case("lz4", &["-r", "-c", "d"], vec![a()]), tree),
+            set_up(
+                lz4_case("lz4", &["-r", "-d", "d"], vec![a()]),
+                tree_of_frames,
+            ),
+            set_up(lz4_case("lz4", &["-r", "d", "a"], vec![a()]), tree),
+            set_up(lz4_case("lz4", &["-dr", "d"], vec![a()]), tree_of_frames),
+            set_up(lz4_case("lz4", &["-m", "d", "a"], vec![a()]), tree),
+            // Directories and unreadable inputs.
+            set_up(lz4_case("lz4", &["d"], vec![]), mkdir_d),
+            set_up(lz4_case("lz4", &["-d", "d.lz4", "o"], vec![]), mkdir_dlz4),
+            set_up(lz4_case("unlz4", &["b.lz4"], vec![b()]), unreadable_b),
+            lz4_case("lz4", &["-d", "-f", "nosuch.lz4", "a"], vec![a()]),
+        ];
+        // `-r -c d` writes the tree's files in the directory's own order,
+        // which only byte identity (the C tier) can judge.
+        if !EXACT {
+            cases.retain(|c| c.args != ["-r", "-c", "d"]);
+        }
+        check("files_match_the_reference", &cases);
+    }
+
+    /// A terminal as standard output: refused without `-c`, written with
+    /// it; a file named is written whatever standard output is.
+    #[test]
+    fn a_terminal_output_matches_the_reference() {
+        let mut cases = Vec::new();
+        for args in [
+            &["-c", "a"][..],
+            &["a"],
+            &["-d", "-c", "b.lz4"],
+            &["a", "-"],
+            &["-m", "-t", "b.lz4"],
+        ] {
+            let mut c = lz4_case("lz4", args, vec![("a", text()), ("b.lz4", fx("b.lz4"))]);
+            c.tty_stdout = true;
+            cases.push(c);
+        }
+        let mut c = piped("lz4", &["-c"], vec![], text());
+        c.tty_stdout = true;
+        cases.push(c);
+        check("a_terminal_output_matches_the_reference", &cases);
+    }
+
+    // ---- decompression and test ----
+
+    /// The frames every decoder name reads: the reference's own, over the
+    /// inputs, with the frame options.
+    fn frames() -> Vec<(&'static str, Vec<u8>)> {
+        let mut v = Vec::new();
+        for (name, data) in inputs() {
+            if name == "rep" {
+                continue;
+            }
+            for (tag, opts) in [
+                ("", &[][..]),
+                ("bdx", &["-B4", "-BD", "-BX"]),
+                ("cs", &["--content-size", "--no-frame-crc"]),
+                ("l", &["-l"]),
+                ("hc", &["-9"]),
+            ] {
+                let mut args = vec!["-c", "-q"];
+                args.extend_from_slice(opts);
+                v.push((leak(format!("{name}{tag}.lz4")), made(&args, &data)));
+            }
+        }
+        v.push(("rep.lz4", made(&["-c", "-q"], &repetitive(9 << 20))));
+        v.push(("repl.lz4", made(&["-c", "-q", "-l"], &repetitive(9 << 20))));
+        v
+    }
+
+    /// Every frame through `unlz4` (the derived name), `lz4cat`, `lz4 -d`
+    /// into a named file, and `lz4 -t`.
+    #[test]
+    fn every_frame_decodes_as_the_reference_decodes_it() {
+        let mut cases = Vec::new();
+        for (name, frame) in frames() {
+            let files = || vec![(name, frame.clone())];
+            cases.push(lz4_case("unlz4", &[name], files()));
+            cases.push(lz4_case("lz4cat", &[name], files()));
+            cases.push(lz4_case("lz4", &["-d", name, "o"], files()));
+            cases.push(lz4_case("lz4", &["-t", name], files()));
+            cases.push(piped("lz4", &["-t"], vec![], frame.clone()));
+        }
+        check("every_frame_decodes_as_the_reference_decodes_it", &cases);
+    }
+
+    /// The offsets of a frame's structure: the header's fields, each block's
+    /// size word, data and checksum, the end mark and the content checksum.
+    fn boundaries(frame: &[u8]) -> Vec<usize> {
+        let flg = frame[4];
+        let header = 7 + if flg & 8 != 0 { 8 } else { 0 } + if flg & 1 != 0 { 4 } else { 0 };
+        let bcrc = if flg & 0x10 != 0 { 4 } else { 0 };
+        let mut v = vec![1, 2, 3, 4, 5, 6, header - 1, header];
+        let mut at = header;
+        loop {
+            let word = u32::from_le_bytes(frame[at..at + 4].try_into().unwrap());
+            v.extend([at + 1, at + 3, at + 4]);
+            at += 4;
+            if word == 0 {
+                break;
+            }
+            let len = (word & 0x7fff_ffff) as usize;
+            v.extend([at + 1, at + len / 2, at + len]);
+            at += len;
+            if bcrc > 0 {
+                v.extend([at + 2, at + bcrc]);
+                at += bcrc;
+            }
+        }
+        if flg & 4 != 0 {
+            v.extend([at + 1, at + 3]);
+        }
+        v.retain(|&n| n < frame.len());
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    /// Review Focus 3/4's neighbours: frames cut at every structural
+    /// boundary, legacy frames cut inside their words and blocks, and one
+    /// byte flipped in the header, a block, a block size word and each
+    /// checksum, under `-t` and `-dc`.
+    #[test]
+    fn damaged_frames_fail_as_the_reference_fails() {
+        let plain = mixed(150 << 10, 46);
+        let frame = made(&["-c", "-q", "-B4", "-BD", "-BX", "--content-size"], &plain);
+        let legacy = made(&["-c", "-q", "-l"], &plain);
+        let mut damaged: Vec<Vec<u8>> = Vec::new();
+        for cut in boundaries(&frame) {
+            damaged.push(frame[..cut].to_vec());
+        }
+        for cut in [1, 3, 4, 5, 7, 8, 9, 20, legacy.len() - 1] {
+            damaged.push(legacy[..cut].to_vec());
+        }
+        // FLG, BD, the content size, the header checksum, the first block's
+        // size word and data, its checksum, the end mark, the content
+        // checksum.
+        let first_block = 15 + 4;
+        for at in [4, 5, 8, 14, 15, 17, first_block + 10, first_block + 300] {
+            damaged.push(flipped(frame.clone(), at as isize));
+        }
+        for at in [-1, -5, -9] {
+            damaged.push(flipped(frame.clone(), at));
+        }
+        damaged.push(flipped(legacy.clone(), 6));
+        damaged.push(flipped(legacy.clone(), 20));
+        let mut cases = Vec::new();
+        for (i, d) in damaged.into_iter().enumerate() {
+            let name = leak(format!("x{i}.lz4"));
+            cases.push(lz4_case("lz4", &["-t", name], vec![(name, d.clone())]));
+            cases.push(lz4_case("lz4", &["-dc", name], vec![(name, d.clone())]));
+            cases.push(lz4_case("lz4", &["-d", name, "o"], vec![(name, d)]));
+        }
+        check("damaged_frames_fail_as_the_reference_fails", &cases);
+    }
+
+    // ---- Review Focus 1-5 ----
+
+    /// Review Focus 1: a 64 MiB stream decodes in bounded memory (peak RSS
+    /// under 32 MiB) on both tiers, as a frame of 4 MiB blocks and as a
+    /// legacy frame of 8 MiB blocks.
+    #[test]
+    fn lz4cat_streams_a_large_input() {
+        const N: usize = 64 << 20;
+        if lz4_dir().is_none() {
+            return;
+        }
+        let plain = mixed(N, 47);
+        for opts in [&["-1"][..], &["-l"], &["-B4", "-BD"]] {
+            let mut args = vec!["-c", "-q"];
+            args.extend_from_slice(opts);
+            let frame = made(&args, &plain);
+            let peak = decoder_peak_rss("lz4cat", "big.lz4", &frame, &plain, &[("LC_ALL", "C")]);
+            assert!(
+                peak < 32 << 20,
+                "{opts:?}: peak memory {peak} bytes is not under 32 MiB"
+            );
+        }
+    }
+
+    /// The status of `exe big.lz4` (argv[0] `name`) whose standard output is
+    /// closed after the first read, under the default SIGPIPE disposition:
+    /// the status and standard error.
+    fn closed_pipe(
+        exe: &Path,
+        name: &str,
+        args: &[&str],
+        dir: &Path,
+    ) -> (std::process::ExitStatus, String) {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut child = spawn(
+            Command::new(exe)
+                .arg0(name)
+                .args(args)
+                .current_dir(dir)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        )
+        .unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = out.read(&mut buf).unwrap();
+        drop(out);
+        let st = child.wait().unwrap();
+        let mut err = String::new();
+        let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+        (st, err)
+    }
+
+    /// Review Focus 1: `lz4cat big.lz4 | head` and `lz4 -c big | head` end
+    /// stuffr by SIGPIPE with nothing said. The reference races here (its
+    /// writing thread and the signal; probed 2026-10-16): it dies by
+    /// SIGPIPE, sometimes after printing its write error, and under load it
+    /// sometimes exits with that error instead (`Error 38` / `Error 70`).
+    /// Each of those is accepted from the reference; stuffr's answer is the
+    /// first, always.
+    #[test]
+    fn lz4cat_into_a_closed_pipe() {
+        use interrupt::big_input;
+        use std::os::unix::process::ExitStatusExt;
+        let Some(dir) = lz4_dir() else { return };
+        let work = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-lz4cat-pipe-{}", std::process::id())),
+        );
+        fs::create_dir_all(&*work).unwrap();
+        let big = big_input(48).to_vec();
+        fs::write(work.join("big"), &big).unwrap();
+        fs::write(work.join("big.lz4"), made(&["-1", "-q", "-c"], &big)).unwrap();
+        let stuffr = Path::new(env!("CARGO_BIN_EXE_stuffr"));
+        let reference = Path::new(dir).join("lz4");
+        for (name, args, msg) in [
+            (
+                "lz4cat",
+                &["big.lz4"][..],
+                "Error 70 : Write error : cannot write decoded block \n",
+            ),
+            (
+                "lz4",
+                &["-T1", "-c", "big"][..],
+                "Error 38 : Write error : cannot write compressed block \n",
+            ),
+        ] {
+            let (theirs, their_err) = closed_pipe(&reference, name, args, &work);
+            let code = msg[6..8].parse::<i32>().unwrap();
+            let raced = theirs.signal() == Some(libc::SIGPIPE)
+                && (their_err.is_empty() || their_err == msg);
+            let answered = theirs.code() == Some(code) && their_err == msg;
+            assert!(
+                raced || answered,
+                "reference {name}: {theirs:?} {their_err:?}"
+            );
+            let (ours, our_err) = closed_pipe(stuffr, name, args, &work);
+            assert_eq!(
+                ours.signal(),
+                Some(libc::SIGPIPE),
+                "stuffr as {name}: {ours:?}"
+            );
+            assert_eq!(our_err, "", "stuffr as {name}");
+        }
+    }
+
+    /// Review Focus 2: several inputs where one fails: the same messages,
+    /// the same exit code (lz4 counts the inputs that failed; an `Error N`
+    /// ends the run with N), the good outputs written, and `--rm` removing
+    /// only what was processed.
+    #[test]
+    fn several_files_one_failing() {
+        let a = || ("a", text());
+        let c = || ("c", b"cee\n".to_vec());
+        let b = || ("b.lz4", fx("b.lz4"));
+        let bad = || ("bad.lz4", fx("bad_data.lz4"));
+        let c4 = || ("c.lz4", made(&["-c", "-q"], b"cee\n"));
+        let lg = || ("lg.lz4", fx("leg_garbage100.lz4"));
+        let cases = vec![
+            lz4_case("lz4", &["-m", "a", "missing", "c"], vec![a(), c()]),
+            lz4_case("lz4", &["-m", "a", "n1", "n2", "n3", "c"], vec![a(), c()]),
+            lz4_case(
+                "unlz4",
+                &["-m", "b.lz4", "bad.lz4", "c.lz4"],
+                vec![b(), bad(), c4()],
+            ),
+            lz4_case("lz4", &["-m", "--rm", "a", "missing"], vec![a()]),
+            lz4_case(
+                "lz4",
+                &["-m", "--rm", "-d", "b.lz4", "bad.lz4", "c.lz4"],
+                vec![b(), bad(), c4()],
+            ),
+            lz4_case("lz4", &["-m", "-d", "lg.lz4", "b.lz4"], vec![lg(), b()]),
+            lz4_case(
+                "lz4",
+                &["-m", "-d", "--rm", "lg.lz4", "b.lz4"],
+                vec![lg(), b()],
+            ),
+            lz4_case(
+                "lz4",
+                &["-m", "-d", "n1.lz4", "x", "y", "b.lz4"],
+                vec![b(), ("x", vec![]), ("y", vec![])],
+            ),
+            lz4_case(
+                "lz4cat",
+                &["b.lz4", "missing.lz4", "c.lz4"],
+                vec![b(), c4()],
+            ),
+            lz4_case(
+                "lz4",
+                &["-tm", "b.lz4", "bad.lz4", "c.lz4"],
+                vec![b(), bad(), c4()],
+            ),
+            lz4_case("lz4", &["-p", "-m", "a", "missing"], vec![a()]),
+            lz4_case("lz4", &["-p", "-t", "bad.lz4"], vec![bad()]),
+        ];
+        check("several_files_one_failing", &cases);
+    }
+
+    /// Review Focus 3: two frames, a skippable frame between them, a legacy
+    /// frame then a modern one (and the other way), a frame followed by 1,
+    /// 3, 4 and 100 bytes of garbage and by zeros, and the skippable
+    /// frame's edges, from a file and from a pipe.
+    #[test]
+    fn concatenation_and_trailing_data() {
+        let good = made(&["-c", "-q"], &text());
+        let legacy = made(&["-c", "-q", "-l"], &text());
+        let skip = cat(&[&[0x50, 0x2a, 0x4d, 0x18], &le32(3), b"abc"]);
+        let streams: Vec<Vec<u8>> = vec![
+            cat(&[&good, &good]),
+            cat(&[&good, &skip, &good]),
+            cat(&[&skip, &skip, &good]),
+            cat(&[&legacy, &good]),
+            cat(&[&good, &legacy]),
+            cat(&[&legacy, &skip, &good]),
+            cat(&[&legacy, &legacy]),
+            cat(&[&skip, &legacy]),
+            cat(&[&good, b"A"]),
+            cat(&[&good, b"AAA"]),
+            cat(&[&good, b"AAAA"]),
+            cat(&[&good, &[b'A'; 100]]),
+            cat(&[&good, &[0; 8]]),
+            cat(&[&legacy, b"A"]),
+            cat(&[&legacy, b"AAA"]),
+            cat(&[&legacy, &[b'A'; 100]]),
+            cat(&[&legacy, &[0; 4]]),
+            cat(&[&skip, b"AB"]),
+            cat(&[&skip, b"garbage!"]),
+            cat(&[&legacy, &skip, b"garbage!"]),
+            cat(&[&[0x50, 0x2a, 0x4d, 0x18], &le32(10), b"abc"]),
+            cat(&[&[0x50, 0x2a, 0x4d, 0x18], &le32(0xffff_ffff), b"abc"]),
+            cat(&[&[0x5f, 0x2a, 0x4d, 0x18], &le32(0)]),
+            cat(&[&legacy, &[0x50, 0x2a, 0x4d, 0x18, 1]]),
+            LEGACY.to_vec(),
+            LEGACY[..2].to_vec(),
+            Vec::new(),
+        ];
+        let mut cases = Vec::new();
+        for (i, s) in streams.into_iter().enumerate() {
+            let name = leak(format!("s{i}.lz4"));
+            cases.push(lz4_case("lz4", &["-d", name, "o"], vec![(name, s.clone())]));
+            cases.push(lz4_case("lz4", &["-dc", name], vec![(name, s.clone())]));
+            cases.push(lz4_case("lz4cat", &[name], vec![(name, s.clone())]));
+            cases.push(piped("lz4", &["-d", "-", "o"], vec![], s.clone()));
+            cases.push(piped("lz4", &["-dcf"], vec![], s));
+        }
+        check("concatenation_and_trailing_data", &cases);
+    }
+
+    /// Review Focus 4: a 4 MiB frame whose block word claims 16 MiB, a
+    /// 64 KiB frame claiming 128 KiB, a legacy block claiming more than
+    /// `LZ4_compressBound(8 MiB)` and one just under it, a content size of
+    /// 2^63: the reference's exit and message, before anything is
+    /// allocated (peak RSS under 32 MiB on both tiers).
+    #[test]
+    fn hostile_block_sizes() {
+        let hostile: Vec<(&str, Vec<u8>)> = vec![
+            ("blk_16m.lz4", fx("blk_16m.lz4")),
+            ("blk_too_big.lz4", fx("blk_too_big.lz4")),
+            (
+                "blk_2g.lz4",
+                cat(&[&header(0x64, 0x70, &[]), &le32(0x7fff_ffff), &[b'x'; 16]]),
+            ),
+            ("leg_huge.lz4", fx("leg_huge.lz4")),
+            ("leg_8m.lz4", fx("leg_8m.lz4")),
+            ("leg_bound.lz4", cat(&[&LEGACY, &le32(8_421_520), b"abc"])),
+            ("leg_bound1.lz4", cat(&[&LEGACY, &le32(8_421_521), b"abc"])),
+            ("cs_2p63.lz4", fx("cs_2p63.lz4")),
+        ];
+        let mut cases = Vec::new();
+        for (name, data) in &hostile {
+            cases.push(lz4_case("lz4", &["-t", name], vec![(name, data.clone())]));
+            cases.push(lz4_case("lz4", &["-dc", name], vec![(name, data.clone())]));
+        }
+        check("hostile_block_sizes", &cases);
+        if lz4_dir().is_none() {
+            return;
+        }
+        for (name, data) in &hostile {
+            let (_, _, _, peak) =
+                peak_rss_run("lz4", &["-t", name], name, data, &[("LC_ALL", "C")]);
+            assert!(
+                peak < 32 << 20,
+                "{name}: peak memory {peak} bytes is not under 32 MiB"
+            );
+        }
+    }
+
+    /// Review Focus 5: where the output goes, with standard output a pipe
+    /// and (for the refusals) a terminal.
+    #[test]
+    fn where_the_output_goes() {
+        let files = || {
+            vec![
+                ("f", text()),
+                ("g", b"gee\n".to_vec()),
+                ("f.lz4", fx("b.lz4")),
+            ]
+        };
+        let to_stdout = |args: &[&'static str]| Case {
+            expect_stdout_plain: Some(text()),
+            ..lz4_case("lz4", args, files())
+        };
+        let mut cases = vec![
+            lz4_case("lz4", &["-z", "f"], files()),
+            to_stdout(&["f", "-"]),
+            to_stdout(&["f", "stdout"]),
+            lz4_case("lz4", &["f", "null"], files()),
+            to_stdout(&["-c", "f"]),
+            lz4_case("lz4", &["-z", "-m", "f", "g"], files()),
+            lz4_case("unlz4", &["f"], files()),
+            lz4_case("unlz4", &["f.lz4", "out"], files()),
+            lz4_case("lz4", &["-d", "f.lz4", "null"], files()),
+            lz4_case("lz4", &["-t", "f.lz4", "-"], files()),
+            piped("lz4", &[], vec![], text()),
+            piped("lz4", &["-", "o.lz4"], vec![], text()),
+        ];
+        for args in [&["-z", "f"][..], &["f", "-"], &["-c", "f"], &["f", "null"]] {
+            let mut c = lz4_case("lz4", args, files());
+            c.tty_stdout = true;
+            cases.push(c);
+        }
+        let mut c = piped("lz4", &[], vec![], text());
+        c.tty_stdout = true;
+        cases.push(c);
+        check("where_the_output_goes", &cases);
+    }
+
+    /// Sparse output (decompression only): a file gets the same bytes and
+    /// size with or without it; standard output is not sparse unless
+    /// `--sparse` asks, and a pipe then refuses the first seek (lz4 seeks
+    /// before every piece of data, an empty skip included: `Error 72` for
+    /// data in whole words, `Error 74` after the last whole word, `Error
+    /// 69` for the final skip of an all-zero output).
+    #[test]
+    fn sparse_output_matches_the_reference() {
+        let mut zeros = vec![0u8; 300_000];
+        zeros[100] = b'A';
+        zeros[200_000] = b'B';
+        let streams: Vec<(&str, Vec<u8>)> = vec![
+            ("holes.lz4", made(&["-c", "-q"], &zeros)),
+            ("zeros.lz4", made(&["-c", "-q"], &[0u8; 100_000])),
+            ("z10.lz4", made(&["-c", "-q"], &[0u8; 10])),
+            ("a8.lz4", made(&["-c", "-q"], b"AAAAAAAA")),
+            ("z8a.lz4", made(&["-c", "-q"], b"\0\0\0\0\0\0\0\0A")),
+            ("zl.lz4", made(&["-c", "-q", "-l"], &[0u8; 70_000])),
+            ("empty.lz4", fx("empty.lz4")),
+        ];
+        let mut cases = Vec::new();
+        for (name, s) in &streams {
+            let f = || vec![(*name, s.clone())];
+            cases.push(lz4_case("lz4", &["-d", name, "o"], f()));
+            cases.push(lz4_case("lz4", &["-d", "--no-sparse", name, "o"], f()));
+            cases.push(lz4_case("lz4", &["-d", "--sparse", name, "o"], f()));
+            cases.push(lz4_case("lz4", &["--sparse", "-dc", name], f()));
+            cases.push(lz4_case("lz4", &["-dc", name], f()));
+        }
+        check("sparse_output_matches_the_reference", &cases);
+    }
+
+    /// Spec deviation 3, an expected difference: an output that is the
+    /// input itself. lz4 truncates it before reading (the data is lost:
+    /// pinned on the reference); stuffr refuses it, keeps it, and counts the
+    /// input as failed.
+    #[test]
+    fn an_input_that_is_its_output_is_never_lost() {
+        let dir = ScratchDir::at(
+            std::env::temp_dir().join(format!("stuffr-lz4-same-{}", std::process::id())),
+        );
+        fs::create_dir_all(&*dir).unwrap();
+        let link = dir.join("lz4");
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_stuffr"), &link).unwrap();
+        let run = |exe: &Path, args: &[&str], stdin: Option<&str>| {
+            fs::write(dir.join("a"), text()).unwrap();
+            fs::write(dir.join("s.lz4"), fx("b.lz4")).unwrap();
+            let _ = fs::remove_file(dir.join("h"));
+            fs::hard_link(dir.join("a"), dir.join("h")).unwrap();
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(args).current_dir(&*dir).env("LC_ALL", "C");
+            cmd.stdin(match stdin {
+                Some(f) => std::process::Stdio::from(fs::File::open(dir.join(f)).unwrap()),
+                None => std::process::Stdio::null(),
+            });
+            let o = output(&mut cmd).unwrap();
+            (
+                o.status.code(),
+                String::from_utf8_lossy(&o.stderr).into_owned(),
+                fs::read(dir.join("a")).unwrap(),
+                fs::read(dir.join("s.lz4")).unwrap(),
+            )
+        };
+        let cases: [(&[&str], Option<&str>, &str); 5] = [
+            (&["-f", "a", "a"], None, "a"),
+            (&["a", "a"], None, "a"),
+            (&["-df", "s.lz4", "s.lz4"], None, "s.lz4"),
+            (&["-f", "h", "a"], None, "a"),
+            (&["-f", "-", "a"], Some("a"), "a"),
+        ];
+        for (args, stdin, out) in cases {
+            let (code, err, a, s) = run(&link, args, stdin);
+            assert_eq!(code, Some(1), "{args:?}: {err}");
+            assert_eq!(
+                err,
+                format!("{out} is the input file; not overwritten (stuffr)  \n"),
+                "{args:?}"
+            );
+            assert_eq!((a, s), (text(), fx("b.lz4")), "{args:?}: the input changed");
+        }
+        // The reference loses the data (what the deviation is about).
+        if let Some(d) = lz4_dir() {
+            let (code, _, a, _) = run(&Path::new(d).join("lz4"), &["-f", "a", "a"], None);
+            assert_eq!(code, Some(0));
+            assert_ne!(a, text(), "lz4 -f a a kept its input: deviation 3 is moot");
+        }
+    }
+
     // ---- interrupts (R3) ----
     //
     // Probed 2026-10-16 with the harness's `interrupt()` driver (default
@@ -2461,7 +3358,6 @@ mod unix {
     /// `unlz4 big.lz4 out`: both die by the signal and leave the partial
     /// output.
     #[test]
-    #[ignore = "Task 4"]
     fn an_interrupt_leaves_the_partial_output_and_dies_by_the_signal() {
         use interrupt::*;
         let _serial = interrupt_lock();
@@ -2490,6 +3386,10 @@ mod unix {
             ),
             ("unlz4", &["big.lz4", "out"], "big.lz4", "out", &packed),
         ];
+        // A reference that hung after the signal is skipped, by name; on CI
+        // every comparison must have run, so the test cannot pass vacuously.
+        let mut compared = 0;
+        let mut skipped = Vec::new();
         for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             for (name, args, input, out, make) in &jobs {
                 let ours = interrupt_with_input(
@@ -2515,8 +3415,11 @@ mod unix {
                     sig,
                     &has_data(&ref_dir, &|n| n == *out),
                 ) else {
+                    assert!(take_reference_hung(), "no reference result for {name}");
+                    skipped.push(format!("{name} signal {sig}"));
                     continue;
                 };
+                compared += 1;
                 assert!(
                     killed_by(&theirs, sig),
                     "reference {name}: {:?}",
@@ -2541,21 +3444,25 @@ mod unix {
                 }
             }
         }
+        println!("interrupts: {compared} compared, skipped (reference hung): {skipped:?}");
+        if std::env::var_os("CI").is_some() {
+            assert!(skipped.is_empty(), "CI: the reference hung on {skipped:?}");
+        }
     }
 
-    // ---- a closed pipe ----
+    // ---- a closed pipe, with SIGPIPE ignored by the parent ----
 
-    /// `lz4cat big.lz4` and `lz4 -c big` into a pipe closed after one byte,
-    /// SIGPIPE ignored in both children (what stuffr's runtime does to
-    /// itself): the same message and exit code, 70 for a decode and 38 for
-    /// a compress. With a default SIGPIPE the reference dies by the signal
-    /// (rc -13), sometimes after printing the message; not compared.
+    /// Spec deviation 4, an expected difference: with SIGPIPE ignored by the
+    /// parent, lz4 inherits the ignore and answers `Error 70` (decoding) or
+    /// `Error 38` (compressing) into a closed pipe; stuffr restores the
+    /// default action in `run`, as the earlier families do (ruling T3-c),
+    /// and dies of the signal with nothing said. Review Focus 1's
+    /// default-disposition case is `lz4cat_into_a_closed_pipe`.
     #[test]
-    #[ignore = "Task 4"]
     fn closed_pipe_with_sigpipe_ignored() {
         use interrupt::big_input;
         use std::io::Read;
-        use std::os::unix::process::CommandExt;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
         use std::process::{Command, Stdio};
         let Some(dir) = lz4_dir() else { return };
         let work = ScratchDir::at(
@@ -2565,7 +3472,7 @@ mod unix {
         let big = big_input(48).to_vec();
         fs::write(work.join("big"), &big).unwrap();
         fs::write(work.join("big.lz4"), made(&["-1", "-q", "-c"], &big)).unwrap();
-        let run = |exe: &Path, name: &str, args: &[&str]| -> (Option<i32>, String) {
+        let run = |exe: &Path, name: &str, args: &[&str]| -> (std::process::ExitStatus, String) {
             let mut cmd = Command::new(exe);
             cmd.arg0(name)
                 .args(args)
@@ -2586,7 +3493,7 @@ mod unix {
             child.stdout.take().unwrap().read_exact(&mut one).unwrap();
             let out = child.wait_with_output().unwrap();
             (
-                out.status.code(),
+                out.status,
                 String::from_utf8_lossy(&out.stderr).into_owned(),
             )
         };
@@ -2607,10 +3514,21 @@ mod unix {
             ),
         ] {
             let theirs = run(&reference, name, args);
-            assert_eq!(theirs.0, Some(code), "reference {name}: {:?}", theirs.1);
+            assert_eq!(
+                theirs.0.code(),
+                Some(code),
+                "reference {name}: {:?}",
+                theirs.1
+            );
             assert_eq!(theirs.1, msg);
             let ours = run(stuffr, name, args);
-            assert_eq!(ours, theirs, "{name}");
+            assert_eq!(
+                ours.0.signal(),
+                Some(libc::SIGPIPE),
+                "stuffr as {name}: {:?}",
+                ours.0
+            );
+            assert_eq!(ours.1, "", "stuffr as {name}");
         }
     }
 }

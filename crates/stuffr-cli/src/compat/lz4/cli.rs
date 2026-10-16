@@ -101,7 +101,10 @@ pub(crate) enum Output {
 
 /// A parsed command line.
 #[derive(Debug, Clone)]
-#[allow(dead_code, reason = "0.15.0 Tasks 4-6 read the fields the run uses")]
+#[allow(
+    dead_code,
+    reason = "0.15.0 Task 6 reads the thread fields; keep and legacy_cli are parse results the run does not need"
+)]
 pub(crate) struct Command {
     /// The program name usage texts print (R12: the last path component of
     /// `argv[0]`).
@@ -922,7 +925,6 @@ pub(crate) fn plan(cmd: &Command, stdin_tty: bool, stdout_tty: bool) -> Result<P
 /// standard output (`lz4 -m -t b.lz4`, `lz4 a null -m -d b.lz4`, and
 /// `lz4cat -t`), which a terminal does not refuse; `lz4 -m a stdin` writes
 /// `stdin.lz4`.
-#[allow(dead_code, reason = "0.15.0 Task 4 runs the list")]
 pub(crate) fn list_target(cmd: &Command, op: Op, name: &[u8]) -> Option<Target> {
     match op {
         Op::Test => Some(Target::Stdout),

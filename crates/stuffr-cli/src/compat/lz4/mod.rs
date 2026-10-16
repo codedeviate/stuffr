@@ -23,8 +23,17 @@
 //! counts its cores (`host::cores`), a sandboxed run
 //! ([`run_in_counted`]) sees 8 logical and 4 physical.
 //!
-//! **Signals** (ruling T2-a): lz4 installs no handler; an interrupt kills
-//! the process and leaves the partial output. Nothing is armed here.
+//! **Signals** (ruling T2-a): lz4 installs no handler; SIGINT, SIGTERM and
+//! SIGHUP kill it and the partial output stays under its name (probed).
+//! So nothing is armed here, and outputs are written directly to their
+//! names (`io.rs`), never to a temporary file: an interrupt leaves what lz4
+//! leaves. `run` restores SIGPIPE's default action, as the earlier families
+//! do (deviation 4).
+//!
+//! **Files** (`io.rs`, `decode.rs`): compression, decompression and test
+//! over files and streams, with lz4's order of opening, its overwrite
+//! question, `-m`/`-r`, `--rm`, sparse output and its display level 2
+//! (ruling P3).
 //!
 //! Known deviations (the source of truth; the README and the spec mirror
 //! this list):
@@ -37,9 +46,22 @@
 //!    in` line's seconds, speed and cpu load, the progress refreshes, and
 //!    the `Using N threads` count where two programs count the host's
 //!    cores differently.
-//! 3. An input that is also the output is never lost.
+//! 3. An input that is also the output is never lost. Where the output
+//!    named is the input file itself (the same device and inode: `lz4 -f a
+//!    a`, `lz4 -df s.lz4 s.lz4`, a hard link, standard input redirected
+//!    from it), lz4 truncates it before reading it, and the data is gone;
+//!    stuffr opens nothing, prints `NAME is the input file; not overwritten
+//!    (stuffr)` and counts that input as failed (exit 1, or one more in
+//!    `-m`'s count), whatever `-f` says.
 //! 4. Closed standard streams and a parent that ignores SIGPIPE behave as
-//!    in the earlier families.
+//!    in the earlier families: a closed pipe kills stuffr by SIGPIPE, as it
+//!    kills lz4 under the default disposition; where the parent ignores
+//!    SIGPIPE, lz4 answers `Error 70` (decoding) or `Error 38` (compressing)
+//!    and stuffr still dies of the signal (the Rust runtime ignores SIGPIPE
+//!    before `main`, so the inherited disposition cannot be told apart).
+//!    A closed standard input or output is reopened on `/dev/null` by the
+//!    runtime before `main`, so `lz4 -c <&-` (lz4: `Error 40`) compresses
+//!    an empty input.
 //! 5. Out of scope and refused: `-b#`, `-e#` and `-i#` print `Benchmark
 //!    mode is not available in this build (stuffr)` and exit 1, once the
 //!    whole command line has parsed (a usage error, `-h` or `-V` still
@@ -49,11 +71,16 @@
 //! 6. The pure tier (`lz4_flex`): levels 3 to 12, `--best` and
 //!    `--favor-decSpeed` compress with its single level; a corrupt frame's
 //!    `Error N` text may differ, and output written before it may be a
-//!    strict prefix of lz4's.
+//!    strict prefix of lz4's. The summary's compressed size and ratio are
+//!    those of its own bytes.
+//! 7. A decode that fails keeps everything decoded before the fault in its
+//!    output (a file or standard output). lz4 writes on another thread and
+//!    exits from the failing one, so it leaves nothing or all of that, run
+//!    to run (probed: 0 or 8800 bytes of 8800 for the same input).
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::atomic::AtomicU64;
@@ -63,6 +90,8 @@ use super::CountedRun;
 use super::host::{self, Host, SANDBOX_OUTPUT_CAP, Sandbox};
 
 pub(crate) mod cli;
+mod decode;
+mod io;
 mod messages;
 
 use cli::{Command, Op, Stop};
@@ -73,13 +102,15 @@ use messages::{self as m, printf};
 /// the usage texts print, and picks the presets) and `args` the arguments
 /// after it.
 pub fn run(name: &'static str, argv0: &OsStr, args: Vec<OsString>) -> ExitCode {
+    // Ruling T3-c, deviation 4: as `gzip::run` and `xz::run`.
+    host::reset_sigpipe();
     let argv0 = if argv0.is_empty() {
         name.as_bytes()
     } else {
         argv0.as_encoded_bytes()
     };
     let env = |k: &str| std::env::var_os(k);
-    let code = main(argv0, &args, &env, &mut Host::Real, &mut io::stderr());
+    let code = main(argv0, &args, &env, &mut Host::Real, &mut std::io::stderr());
     // The process's exit status is the code's low byte, as `exit()` makes
     // it.
     ExitCode::from(code as u8)
@@ -159,16 +190,19 @@ fn execute(cmd: &Command, host: &mut Host, out: &mut dyn Write, err: &mut dyn Wr
             };
         }
     };
-    let _ = out;
-    let (what, task) = match plan.op {
-        Op::Compress => ("compress", "Task 4"),
-        Op::Decompress => ("decompress", "Task 4"),
-        Op::Test => ("test", "Task 4"),
-        Op::List => ("--list", "Task 5"),
+    let ended = match plan.op {
+        Op::Compress => io::compress_files(cmd, &plan, host, out, err),
+        Op::Decompress | Op::Test => io::decompress_files(cmd, &plan, host, out, err),
+        Op::List => {
+            return Stop {
+                code: not_yet(err, "--list", "Task 5"),
+                pause: cmd.pause,
+            };
+        }
     };
     Stop {
-        code: not_yet(err, what, task),
-        pause: cmd.pause,
+        code: ended.code,
+        pause: ended.pause,
     }
 }
 
@@ -227,5 +261,97 @@ mod tests {
         let (code, _, err) = run("lz4", &["--bogus"], b"");
         assert_eq!(code, 1);
         assert!(err.starts_with("Incorrect parameters\n"), "{err}");
+    }
+
+    /// A scratch directory for one sandboxed run, unique in the process.
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new(files: &[(&str, &[u8])]) -> Scratch {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("stuffr-lz4-io-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, data) in files {
+                std::fs::write(dir.join(name), data).unwrap();
+            }
+            Scratch(dir)
+        }
+        fn run(&self, name: &'static str, args: &[&str], stdin: &[u8]) -> CountedRun {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            run_in_counted(&self.0, name, &args, stdin, &|_| None)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A sandboxed run compresses into a file, decodes to its captured
+    /// standard output, tests, and counts what it read through
+    /// `Host::track` (R9).
+    #[test]
+    fn a_sandboxed_run_compresses_decodes_and_tests() {
+        let plain = b"hello hello hello hello\n".repeat(50);
+        let d = Scratch::new(&[("a", &plain)]);
+        let (code, out, err, reads) = d.run("lz4", &["-q", "a"], b"");
+        assert_eq!((code, out.len(), err.len()), (0, 0, 0));
+        let read = reads.get(&d.0.join("a")).copied().unwrap_or_default();
+        assert_eq!((read.opens, read.bytes), (1, plain.len() as u64));
+        let (code, out, err, _) = d.run("lz4cat", &["a.lz4"], b"");
+        assert_eq!((code, out, err.len()), (0, plain.clone(), 0));
+        let (code, _, err, _) = d.run("lz4", &["-t", "a.lz4"], b"");
+        assert_eq!(code, 0);
+        let err = String::from_utf8(err).unwrap();
+        let summary = format!("a.lz4{}: decoded 1200 bytes \n", " ".repeat(26));
+        assert!(err.ends_with(&summary), "{err:?}");
+    }
+
+    /// R11 in the sandbox: the overwrite question reads the run's standard
+    /// input, and the data after the answer is the input compressed.
+    #[test]
+    fn the_overwrite_question_reads_standard_input() {
+        let d = Scratch::new(&[("e", b"old")]);
+        let (code, _, err, _) = d.run("lz4", &["-", "e"], b"y\nhello");
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let (code, out, _, _) = d.run("lz4", &["-dc", "e"], b"");
+        assert_eq!((code, out.as_slice()), (0, &b"hello"[..]));
+        let (code, _, err, _) = d.run("lz4", &["-", "e"], b"n\nhello");
+        assert_eq!(code, 1);
+        let refused = format!("?{}not overwritten  \n", " ".repeat(5));
+        assert!(String::from_utf8(err).unwrap().ends_with(&refused));
+    }
+
+    /// `--sparse` to standard output: a sandbox's is a pipe, which refuses
+    /// the first seek, as lz4's does (`Error 72` for data, `Error 69` for
+    /// an output of zeros only).
+    #[test]
+    fn sparse_standard_output_is_a_pipe_in_the_sandbox() {
+        let d = Scratch::new(&[("a", b"AAAAAAAA"), ("z", &[0u8; 100])]);
+        assert_eq!(d.run("lz4", &["-q", "-m", "a", "z"], b"").0, 0);
+        let (code, out, err, _) = d.run("lz4", &["--sparse", "-dc", "z.lz4"], b"");
+        assert_eq!((code, out.len()), (69, 0));
+        assert_eq!(err, b"Error 69 : Final skip error (sparse file)\n \n");
+        let (code, out, err, _) = d.run("lz4", &["--sparse", "-dc", "a.lz4"], b"");
+        assert_eq!((code, out.len()), (72, 0));
+        let err = String::from_utf8(err).unwrap();
+        assert!(err.starts_with("Error 72 : Sparse skip error("), "{err:?}");
+        assert!(err.ends_with(" ; try --no-sparse \n"), "{err:?}");
+        // Without `--sparse`, standard output is written plainly.
+        let (code, out, _, _) = d.run("lz4", &["-dc", "a.lz4"], b"");
+        assert_eq!((code, out.as_slice()), (0, &b"AAAAAAAA"[..]));
+    }
+
+    /// Spec deviation 3 in the sandbox: an output that is the input is
+    /// refused and the input kept.
+    #[test]
+    fn an_output_that_is_the_input_is_refused() {
+        let d = Scratch::new(&[("a", b"keep me")]);
+        let (code, _, err, _) = d.run("lz4", &["-f", "a", "a"], b"");
+        assert_eq!(code, 1);
+        assert_eq!(err, b"a is the input file; not overwritten (stuffr)  \n");
+        assert_eq!(std::fs::read(d.0.join("a")).unwrap(), b"keep me");
     }
 }

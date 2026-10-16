@@ -199,19 +199,166 @@ pub(super) const STDIN_CONSOLE: &str = "refusing to read from a console\n";
 pub(super) const STDOUT_CONSOLE: &str = "refusing to write to console without -c \n";
 
 /// probe: `lz4 -m -d b.lz4 a` (per file, the run continues; exit 1).
-#[allow(dead_code, reason = "0.15.0 Task 4 prints it")]
 pub(super) const EXTENSION_MISMATCH: &str =
     "File extension doesn't match expected LZ4_EXTENSION (.lz4); will not process file: %s\n";
 
 /// probe: `lz4 a` (display level 2): a compressed output name derived from
 /// the input's.
-#[allow(dead_code, reason = "0.15.0 Task 4 prints it")]
 pub(super) const COMPRESSED_FILENAME: &str = "Compressed filename will be : %s \n";
 
 /// probe: `lz4 -d b.lz4` (display level 2): a decompressed output name
 /// derived from the input's.
-#[allow(dead_code, reason = "0.15.0 Task 4 prints it")]
 pub(super) const DECODING_FILE: &str = "Decoding file %s \n";
+
+// ---- files (display level 1 unless noted) ----
+
+/// probe: `lz4 nosuch`, `lz4 -d nosuch.lz4 o`, `lz4 -D nosuch a` (an
+/// input or dictionary that cannot be opened): the name as given, then
+/// `strerror` and a blank.
+pub(super) const OPEN_INPUT_FAILED: &str = "%s: %s \n";
+
+/// probe: `lz4 -f a ro/x`, `lz4 -d b.lz4 nodir/x`, `lz4 -f a d`: an output
+/// that cannot be created; no blank before the newline.
+pub(super) const OPEN_OUTPUT_FAILED: &str = "%s: %s\n";
+
+/// probe: `lz4 d`, `lz4 -d d.lz4 o`, `lz4 -D d a` (the same text under
+/// every name: `unlz4 d.lz4 o` prints `lz4:` too).
+pub(super) const IS_A_DIRECTORY: &str = "lz4: %s is a directory -- ignored \n";
+
+/// probe: `lz4 a` with `a.lz4` present (display level 2 and up; standard
+/// input is read for the answer whether or not it is a terminal, R11).
+pub(super) const OVERWRITE_PROMPT: &str = "%s already exists; do you want to overwrite (y/N) ? ";
+
+/// probe: `lz4 a < /dev/null` with `a.lz4` present: a refused answer
+/// (anything but `y` or `Y` first, or end of file).
+pub(super) const NOT_OVERWRITTEN: &str = "    not overwritten  \n";
+
+/// probe: `lz4 -q a`, `lz4 -m a`, `lz4 -qqqq a` with `a.lz4` present: below
+/// display level 2 there is no question, and this line is printed at every
+/// level.
+pub(super) const ALREADY_EXISTS: &str = "%s already exists; not overwritten  \n";
+
+/// Spec deviation 3 (stuffr's own text, in lz4's words): an output that is
+/// the input file itself is refused, so the input is never lost (lz4
+/// truncates it first: probe `lz4 -f a a` leaves an empty frame). Printed
+/// at every level, as [`ALREADY_EXISTS`] is.
+pub(super) const SAME_FILE: &str = "%s is the input file; not overwritten (stuffr)  \n";
+
+// ---- progress and summaries (display level 2; stderr not a terminal) ----
+
+/// probe: `lz4 a 2>err` (`\r`-refreshed while compressing): MiB read, then
+/// the ratio so far as `%.2f` (deviation 2: the harness normalises both).
+pub(super) const READ_PROGRESS: &str = "\rRead : %d MiB   ==> %s%%   ";
+
+/// probe: `lz4 -d b.lz4 2>err`: MiB decoded so far.
+pub(super) const DECODE_PROGRESS: &str = "\rDecompressed : %d MiB  ";
+
+/// probe: `lz4 a 2>err`, `lz4 -t b.lz4 2>err`: the progress line is
+/// cleared (79 blanks) before the summary, even when no refresh was drawn.
+pub(super) const CLEAR_LINE: &str = concat!(
+    "\r",
+    "                                                                               ",
+    "\r"
+);
+
+/// probe: `lz4 a` (a frame): bytes read, bytes written, the ratio (`%.2f`,
+/// of at least one byte read: `lz4 e` says `1500.00%`).
+pub(super) const COMPRESSED_SUMMARY: &str = "Compressed %d bytes into %d bytes ==> %s%%\n";
+
+/// probe: `lz4 -l a`: the legacy format's summary has a blank before the
+/// newline.
+pub(super) const COMPRESSED_LEGACY_SUMMARY: &str = "Compressed %d bytes into %d bytes ==> %s%% \n";
+
+/// probe: `lz4 -t b.lz4`, `lz4 -d sub/x.lz4`: the input name as given
+/// (`stdin` for standard input), cut or padded to 30 bytes by the caller
+/// (`a_very_long_file_name_more_tha`), then the bytes decoded.
+pub(super) const DECODED_SUMMARY: &str = "%s : decoded %d bytes \n";
+
+/// probe: `lz4 -d lg.lz4` (a legacy frame, then bytes that are no frame;
+/// display level 2): the run decodes what came before, prints this and
+/// the summary, and ends with exit 1. lz4 says where the bytes were only
+/// when it can tell (`ftell` on a file: [`AT_POSITION`]); on a pipe the
+/// line ends here.
+pub(super) const UNDECODABLE: &str = "Stream followed by undecodable data ";
+
+/// probe: `lz4 -d lg.lz4` on a file: the offset just past the four bytes
+/// read as a magic number.
+pub(super) const AT_POSITION: &str = "at position %d ";
+
+/// The end of [`UNDECODABLE`]'s line.
+pub(super) const NEWLINE: &str = "\n";
+
+// ---- `Error N : ...` (display level 1; the run ends with exit N) ----
+
+/// probe: `lz4 -t t_hdr.lz4`, `lz4 -dc g4.lz4` (a frame left unfinished at
+/// end of input).
+pub(super) const E26_INCOMPLETE: &str =
+    "Error 26 : LZ4F frame decoding could not complete: invalid frame \n";
+
+/// probe: `lz4 -D nosuch a`, `lz4 -D d a` (after the open's own line).
+pub(super) const E27_DICTIONARY: &str =
+    "Error 27 : Dictionary error : could not open dictionary file \n";
+
+/// probe: `lz4 -t bad_hc.lz4`: liblz4's error name (`LZ4F_getErrorName`).
+pub(super) const E34_DECOMPRESSION: &str = "Error 34 : Decompression error : %s \n";
+
+/// probe: `lz4 -c big | head -c1` with SIGPIPE ignored.
+pub(super) const E38_WRITE_COMPRESSED: &str =
+    "Error 38 : Write error : cannot write compressed block \n";
+
+/// probe: `lz4 -c <&-` (closed standard input): the first read of a frame's
+/// input failed. Two blanks before the newline.
+pub(super) const E40_FIRST_CHUNK: &str =
+    "Error 40 : Error reading first chunk (%d bytes) of '%s'  \n";
+
+/// probe: `lz4 -t t_magic.lz4`, a skippable frame then two bytes.
+pub(super) const E40_MAGIC_UNREADABLE: &str =
+    "Error 40 : Unrecognized header : Magic Number unreadable \n";
+
+/// probe: `lz4 -t skip_hdr_trunc.lz4`.
+pub(super) const E42_SKIPPABLE_SIZE: &str =
+    "Error 42 : Stream error : skippable size unreadable \n";
+
+/// probe: `cat skip_trunc.lz4 | lz4 -dc` (on a pipe the area is read, and it
+/// ends early; a file is seeked past its end instead, silently).
+pub(super) const E43_SKIP: &str = "Error 43 : Stream error : cannot skip skippable area \n";
+
+/// probe: `lz4 -d unk_hdr.lz4`.
+pub(super) const E44_UNRECOGNIZED: &str =
+    "Error 44 : Unrecognized header : file cannot be decoded \n";
+
+/// probe: `lz4 -c --rm < a` (the name removed is `stdin`): the name, then
+/// `strerror`.
+pub(super) const E50_REMOVE: &str = "Error 50 : Remove error : %s: %s \n";
+
+/// probe: `lz4 -t leg_bsz_trunc.lz4`, `lz4 -t leg_garbage.lz4`.
+pub(super) const E61_LEGACY_SIZE: &str =
+    "Error 61 : Error: cannot read block size in Legacy format \n";
+
+/// probe: `lz4 -t leg_blk_trunc.lz4`.
+pub(super) const E63_LEGACY_BLOCK: &str =
+    "Error 63 : Read error : cannot access compressed block ! \n";
+
+/// probe: `lz4 -t leg_bad.lz4`, `lz4 -t legzero.lz4`.
+pub(super) const E64_LEGACY_DECODE: &str =
+    "Error 64 : Decoding Failed ! Corrupted input detected ! \n";
+
+/// probe: `lz4 --sparse -dc z.lz4 | cat` (all zeros, so only the final
+/// skip, which a pipe refuses). The blank line is lz4's.
+pub(super) const E69_FINAL_SKIP: &str = "Error 69 : Final skip error (sparse file)\n \n";
+
+/// probe: `lz4cat big.lz4 | head -c1` with SIGPIPE ignored.
+pub(super) const E70_WRITE_DECODED: &str = "Error 70 : Write error : cannot write decoded block \n";
+
+/// probe: `lz4 --sparse -dc a8.lz4 | cat` (data in whole words: the skip
+/// before it is tried, even an empty one, and a pipe refuses): `errno`, then
+/// `strerror`.
+pub(super) const E72_SPARSE_SKIP: &str =
+    "Error 72 : Sparse skip error(%d): %s ; try --no-sparse \n";
+
+/// probe: `lz4 --sparse -dc z8a.lz4 | cat` (8 zero bytes then `A`: data in
+/// the bytes after the last whole word).
+pub(super) const E74_SPARSE_TAIL_SKIP: &str = "Error 74 : Sparse skip error ; try --no-sparse \n";
 
 // ---- the end of a run ----
 
